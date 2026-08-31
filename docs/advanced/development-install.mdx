@@ -25,16 +25,20 @@ source .venv/bin/activate
 
 ## Optional extras
 
-Install optional dependency groups as needed (the install script includes `lerobot` and `sim`):
+Install optional dependency groups as needed (the install script includes `lerobot`, `sim`, and `tracker`):
 
 | Extra | Contents | When to use |
 |---|---|---|
-| `lerobot` | LeRobot (from PyPI, >= 0.6.1) | `collect-data`, `run-policy` |
+| `lerobot` | LeRobot (from PyPI, pinned to 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
 
 ```bash
-uv sync --extra lerobot --extra sim   # everything
+uv sync --extra lerobot --extra sim --extra tracker   # hosted feature set
 ```
+
+<Warning>
+  PyPI's `torch==2.10.0` wheel is CPU-only on aarch64. On a Jetson, an exact `uv sync` also replaces an out-of-band Torch build with that locked CPU wheel. If local policy inference needs CUDA, manage a JetPack-compatible Torch + Torchvision build explicitly after dependency sync, and do not exact-sync that deployed environment again without a restoration plan. Remote inference and `--device cpu` work with the hosted dependency set.
+</Warning>
 
 <Note>
   Streaming the ZED camera feeds to the headset (`teleop --cameras`, `collect-data`) isn't a dependency extra — it needs the system GStreamer + camera stack, installed via [`axol provision`](/cli/provision) (see [Headset-video stack](#headset-video-stack) below).

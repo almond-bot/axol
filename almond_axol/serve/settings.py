@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +37,7 @@ from typing import Any, Callable
 
 from ..utils.can_channels import require_mantis_channels
 from ..utils.paths import almond_path
+from ..utils.state_files import secure_atomic_write_json, secure_read_text
 
 _logger = logging.getLogger(__name__)
 
@@ -693,7 +693,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="recording.root",
                 label="Dataset root",
                 type="text",
-                help="Local directory datasets are written to / read from.",
+                help=(
+                    "Local directory datasets are written to / read from. "
+                    "The installed root service always uses its sealed "
+                    "/var/lib/almond-axol/datasets store and ignores custom "
+                    "roots; custom paths remain available to non-root CLI runs."
+                ),
                 effective_default=_lerobot_dataset_root,
                 targets={
                     "collect-data": ("root",),
@@ -1112,7 +1117,7 @@ class SettingsStore:
 
     def _load(self) -> dict[str, Any]:
         try:
-            raw = json.loads(self._path.read_text())
+            raw = json.loads(secure_read_text(self._path))
             if isinstance(raw, dict):
                 values = dict(raw.get("values") or {})
                 advanced = dict(raw.get("advanced") or {})
@@ -1135,10 +1140,7 @@ class SettingsStore:
 
     def _save_locked(self) -> None:
         payload = {"version": 1, **self._data}
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        os.replace(tmp, self._path)
+        secure_atomic_write_json(self._path, payload)
 
     # -- API surface ---------------------------------------------------------
 
@@ -1375,4 +1377,26 @@ class SettingsStore:
             elif target_op == "collect-data":
                 merged.pop(f"{_VRT}.tracker_key", None)
         merged.update(args)
+
+        # Third-party dataset writers reopen names internally, so the hosted
+        # root service must always use the installer-sealed store. Stale saved
+        # values and request overrides remain valid for non-root embeddings,
+        # but cannot redirect (or merely break) panel operations. Aliases such
+        # as collect-dagger resolve through ``target_op`` above.
+        if target_op in {"collect-data", "run-policy", "replay-dataset"}:
+            from ..utils.state_files import (
+                privileged_service_active,
+                service_dataset_path_for_repo_id,
+            )
+
+            if privileged_service_active():
+                repo_id = merged.get("repo_id")
+                if repo_id:
+                    merged["root"] = str(service_dataset_path_for_repo_id(repo_id))
+                else:
+                    # run-policy may intentionally run without recording. A
+                    # stale/request root must not turn that into an implicit
+                    # dataset operation; required-repo operations will surface
+                    # their normal config error after this sanitization.
+                    merged.pop("root", None)
         return merged

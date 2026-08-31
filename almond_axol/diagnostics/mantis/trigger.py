@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 
 from ...constants import ARM_JOINTS
+from ...robot.base import HardwareCleanupError
 from ...robot.mantis import Mantis
 from ...tracker.trigger import TriggerReader
 from ...utils.can_channels import require_mantis_channels
@@ -296,14 +297,36 @@ async def _run(
     finally:
         if status_started:
             print()
-        try:
-            if robot is not None:
+        cleanup_failures: list[tuple[str, BaseException]] = []
+        if robot is not None:
+            try:
                 await robot.disable()
-        finally:
-            # Reader teardown must not be skipped even if a best-effort motor
-            # disable reports its own hardware error.
-            for reader in readers.values():
+            except BaseException as exc:
+                cleanup_failures.append(("robot disable", exc))
+        # Attempt every reader even when motor disable or an earlier reader
+        # reports a cleanup failure.
+        for side, reader in readers.items():
+            try:
                 reader.close()
+            except BaseException as exc:
+                cleanup_failures.append((f"{side} trigger", exc))
+
+        if cleanup_failures:
+            label, first = cleanup_failures[0]
+            for extra_label, extra in cleanup_failures[1:]:
+                first.add_note(
+                    f"additional {extra_label} cleanup failure: "
+                    f"{type(extra).__name__}: {extra}"
+                )
+            if label == "robot disable":
+                if isinstance(first, HardwareCleanupError):
+                    raise first
+                raise HardwareCleanupError(
+                    "Mantis disable failed; hardware ownership is uncertain"
+                ) from first
+            raise RuntimeError(
+                f"{label} teardown failed; CAN ownership is uncertain"
+            ) from first
 
 
 if __name__ == "__main__":

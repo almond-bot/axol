@@ -15,8 +15,10 @@ import {
   setQuestProximityDisabled,
   type AdvancedSection,
   type CameraDevice,
+  type CameraSlot,
   type CameraSpec,
   type FormValue,
+  type HardwareProfile,
   type SettingsCategory,
   type SettingsField,
   type SettingsPatch,
@@ -34,7 +36,7 @@ import { Switch } from "@/components/ui/switch"
 import { useToast } from "@/components/ui/toast"
 import { Card } from "@/components/ui/card"
 import { FieldRow, FlatSchemaForm } from "@/components/config-form"
-import { materializeCameraSpec } from "@/lib/camera-spec"
+import { materializeCameraSpec, type CameraProfileBySlot } from "@/lib/camera-spec"
 import { CamerasPanel } from "./cameras-panel"
 import { PosePanel } from "./pose-panel"
 import { TrackerBindingPanel } from "./tracker-binding-panel"
@@ -45,7 +47,39 @@ export type SettingsTab = string // "cameras" | "mantis" | "usb" | "pose" | "adv
 interface Draft {
   values: Record<string, SettingValue>
   cameras: CameraSpec
+  /** Layout whose controls most recently changed each shared logical slot. */
+  cameraProfiles: CameraProfileBySlot
   advanced: Record<string, FormValue>
+}
+
+const CAMERA_SLOTS: CameraSlot[] = ["overhead", "left_arm", "right_arm"]
+
+function assignedSerial(spec: CameraSpec, profile: HardwareProfile, slot: CameraSlot): string {
+  if (profile === "mantis" && slot !== "overhead") {
+    return spec.mantis_serials?.[slot] ?? spec.serials[slot]
+  }
+  return spec.serials[slot]
+}
+
+/** Attribute only the logical slots an edit actually touched to its layout. */
+function cameraProfilesAfterEdit(
+  before: CameraSpec,
+  after: CameraSpec,
+  current: CameraProfileBySlot,
+  profile: HardwareProfile
+): CameraProfileBySlot {
+  const next = { ...current }
+  for (const slot of CAMERA_SLOTS) {
+    // Mantis has no overhead assignment/control; an imported overhead change
+    // always belongs to the Axol layout even when imported from that tab.
+    const slotProfile = slot === "overhead" ? "axol" : profile
+    const assignmentChanged =
+      assignedSerial(before, slotProfile, slot) !== assignedSerial(after, slotProfile, slot)
+    const streamChanged = before.stream?.[slot] !== after.stream?.[slot]
+    const recordChanged = before.record?.[slot] !== after.record?.[slot]
+    if (assignmentChanged || streamChanged || recordChanged) next[slot] = slotProfile
+  }
+  return next
 }
 
 /**
@@ -64,7 +98,6 @@ export function SettingsSection({
   snapshot,
   supportError,
   cameras,
-  mantisMode,
   onSave,
   devices,
   detecting,
@@ -86,8 +119,6 @@ export function SettingsSection({
   supportError: string | null
   /** Current camera spec (server-stored, with localStorage fallback). */
   cameras: CameraSpec
-  /** Whether the currently selected run is using the Mantis hardware profile. */
-  mantisMode: boolean
   onSave: (patch: SettingsPatch) => Promise<void>
   devices: CameraDevice[] | null
   detecting: boolean
@@ -108,8 +139,8 @@ export function SettingsSection({
   const fileRef = useRef<HTMLInputElement>(null)
 
   const patch = useMemo(
-    () => (draft ? computePatch(snapshot, cameras, draft, devices, mantisMode) : null),
-    [draft, snapshot, cameras, devices, mantisMode]
+    () => (draft ? computePatch(snapshot, cameras, draft, devices) : null),
+    [draft, snapshot, cameras, devices]
   )
   const dirty = patch != null && Object.keys(patch).length > 0
 
@@ -123,6 +154,7 @@ export function SettingsSection({
   const seedDraft = (): Draft => ({
     values: { ...(snapshot?.values ?? {}) },
     cameras,
+    cameraProfiles: {},
     advanced: { ...(snapshot?.advanced ?? {}) },
   })
   const settingsResolved = snapshot !== null || supportError !== null
@@ -188,15 +220,22 @@ export function SettingsSection({
     try {
       const data = JSON.parse(text)
       if (!data || typeof data !== "object") throw new Error("invalid settings file")
-      setDraft((d) =>
-        d
-          ? {
-              values: { ...(data.values ?? {}) },
-              cameras: (data.cameras as CameraSpec) ?? d.cameras,
-              advanced: { ...(data.advanced ?? {}) },
-            }
-          : d
-      )
+      setDraft((d) => {
+        if (!d) return d
+        const importedCameras = (data.cameras as CameraSpec) ?? d.cameras
+        const profile = tab === "mantis" ? "mantis" : "axol"
+        return {
+          values: { ...(data.values ?? {}) },
+          cameras: importedCameras,
+          cameraProfiles: cameraProfilesAfterEdit(
+            d.cameras,
+            importedCameras,
+            d.cameraProfiles,
+            profile
+          ),
+          advanced: { ...(data.advanced ?? {}) },
+        }
+      })
     } catch (e) {
       toast.error(`Import failed: ${e}`)
     }
@@ -287,7 +326,22 @@ export function SettingsSection({
               <CamerasPanel
                 spec={draft.cameras}
                 mantisMode={false}
-                onChange={(spec) => setDraft((d) => (d ? { ...d, cameras: spec } : d))}
+                onChange={(spec) =>
+                  setDraft((d) =>
+                    d
+                      ? {
+                          ...d,
+                          cameras: spec,
+                          cameraProfiles: cameraProfilesAfterEdit(
+                            d.cameras,
+                            spec,
+                            d.cameraProfiles,
+                            "axol"
+                          ),
+                        }
+                      : d
+                  )
+                }
                 devices={devices}
                 detecting={detecting}
                 onRefresh={onRefresh}
@@ -344,7 +398,22 @@ export function SettingsSection({
                   <CamerasPanel
                     spec={draft.cameras}
                     mantisMode
-                    onChange={(spec) => setDraft((d) => (d ? { ...d, cameras: spec } : d))}
+                    onChange={(spec) =>
+                      setDraft((d) =>
+                        d
+                          ? {
+                              ...d,
+                              cameras: spec,
+                              cameraProfiles: cameraProfilesAfterEdit(
+                                d.cameras,
+                                spec,
+                                d.cameraProfiles,
+                                "mantis"
+                              ),
+                            }
+                          : d
+                      )
+                    }
                     devices={devices}
                     detecting={detecting}
                     onRefresh={onRefresh}
@@ -440,8 +509,7 @@ function computePatch(
   snapshot: SettingsSnapshot | null,
   storedCameras: CameraSpec,
   draft: Draft,
-  devices: CameraDevice[] | null,
-  mantisMode: boolean
+  devices: CameraDevice[] | null
 ): SettingsPatch {
   const patch: SettingsPatch = {}
 
@@ -455,10 +523,16 @@ function computePatch(
   }
   if (Object.keys(valuesPatch).length > 0) patch.values = valuesPatch
 
-  const camerasOut = materializeCameraSpec(draft.cameras, devices, mantisMode)
-  if (JSON.stringify(camerasOut) !== JSON.stringify(storedCameras)) {
-    patch.cameras = camerasOut
-    patch.camerasSet = true
+  // Only materialize after an actual camera edit, and use the layout whose
+  // controls produced each slot edit. The operation selected elsewhere is
+  // unrelated, and untouched explicit values may encode stereo eyes for the
+  // other hardware profile, so they must never be normalized opportunistically.
+  if (JSON.stringify(draft.cameras) !== JSON.stringify(storedCameras)) {
+    const camerasOut = materializeCameraSpec(draft.cameras, devices, draft.cameraProfiles)
+    if (JSON.stringify(camerasOut) !== JSON.stringify(storedCameras)) {
+      patch.cameras = camerasOut
+      patch.camerasSet = true
+    }
   }
 
   const beforeAdv = snapshot?.advanced ?? {}

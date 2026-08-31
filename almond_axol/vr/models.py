@@ -6,9 +6,10 @@ The VR headset sends JSON matching VRFrame over the WebSocket connection.
 
 from __future__ import annotations
 
+import math
 from enum import Enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, FiniteFloat, model_validator
 
 
 class VRState(str, Enum):
@@ -38,18 +39,30 @@ class VREpisodeOutcome(str, Enum):
 class VRPosition(BaseModel):
     """3-DOF position in metres."""
 
-    x: float
-    y: float
-    z: float
+    x: FiniteFloat
+    y: FiniteFloat
+    z: FiniteFloat
 
 
 class VRQuaternion(BaseModel):
     """Unit quaternion orientation."""
 
-    x: float
-    y: float
-    z: float
-    w: float
+    x: FiniteFloat
+    y: FiniteFloat
+    z: FiniteFloat
+    w: FiniteFloat
+
+    @model_validator(mode="after")
+    def normalize(self) -> VRQuaternion:
+        """Reject degenerate rotations and canonicalize valid wire input."""
+        norm = math.hypot(self.x, self.y, self.z, self.w)
+        if norm <= 1e-12:
+            raise ValueError("quaternion norm must be nonzero")
+        self.x /= norm
+        self.y /= norm
+        self.z /= norm
+        self.w /= norm
+        return self
 
 
 class VRPose(BaseModel):
@@ -119,9 +132,11 @@ class VRFrame(BaseModel):
             with ``l_pose_space`` to ensure a calibrated mount transform is
             never applied to another controller generation or local datum.
         r_pose_profile: Same for the right Quest controller.
-        l_pose_space: ``"grip"`` when ``l_ee`` came from WebXR ``gripSpace``;
-            ``"target-ray"`` only for compatibility runtimes lacking it.
-            Production Quest collection requires the calibrated grip datum.
+        l_pose_space: ``"target-ray"`` for legacy relative Axol control;
+            ``"grip"`` when absolute/Mantis ``l_ee`` came from WebXR
+            ``gripSpace``. Absolute compatibility runtimes may report
+            ``"target-ray"`` when they lack gripSpace, but production Quest
+            collection requires the calibrated grip datum.
         r_pose_space: Same for the right Quest controller.
         l_tracked: True while the left controller's position is optically
             tracked. ``False`` means the headset lost sight of the controller
@@ -154,17 +169,17 @@ class VRFrame(BaseModel):
     r_ee: VRPose
     l_elbow: VRPosition
     r_elbow: VRPosition
-    l_grip: float = 1.0
-    r_grip: float = 1.0
+    l_grip: FiniteFloat = 1.0
+    r_grip: FiniteFloat = 1.0
     l_lock: bool = False
     r_lock: bool = False
     reset: bool = False
     state: VRState = VRState.TELEOP
     episode_outcome: VREpisodeOutcome | None = None
     lock_release_id: int | None = None
-    t: float | None = None
+    t: FiniteFloat | None = None
     seq: int | None = None
-    t_host: float | None = None
+    t_host: FiniteFloat | None = None
     pose_source_id: str | None = None
     pose_source_kind: str | None = None
     l_pose_profile: str | None = None
@@ -175,8 +190,8 @@ class VRFrame(BaseModel):
     r_tracked: bool = True
     l_trigger_live: bool = True
     r_trigger_live: bool = True
-    l_stick_x: float = 0.0
-    l_stick_y: float = 0.0
-    r_stick_x: float = 0.0
+    l_stick_x: FiniteFloat = 0.0
+    l_stick_y: FiniteFloat = 0.0
+    r_stick_x: FiniteFloat = 0.0
     l_stick_click: bool = False
     r_stick_click: bool = False

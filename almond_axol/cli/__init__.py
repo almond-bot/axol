@@ -17,6 +17,7 @@ from . import (
 from . import migrate_dataset as migrate_dataset_cmd
 from . import provision as provision_cmd
 from . import serve as serve_cmd
+from . import update_preflight as update_preflight_cmd
 from .can import driver as can_driver
 from .can import enable as can_enable
 from .can import setup as can_setup
@@ -143,6 +144,7 @@ def main() -> None:
     gst_install.add_parser(subparsers)
     gst_build_zed.add_parser(subparsers)
     provision_cmd.add_parser(subparsers)
+    update_preflight_cmd.add_parser(subparsers)
     jetson_setup.add_parser(subparsers)
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)

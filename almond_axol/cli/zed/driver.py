@@ -22,20 +22,36 @@ reboot-required notice instead.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
+from ...utils.state_files import (
+    secure_atomic_copy_file,
+    secure_ensure_directory,
+    secure_unlink,
+)
 from ...utils.sudo import run_root
+from .download import atomic_https_download
 
 _PACKAGE = "stereolabs-zedbox-duo"
 _TARGET_VERSION = "1.4.2"
+_DEB_VERSION = "1.4.2-LI-MAX96712-ZEDBOX-L4T36.4.0"
 _DEB_URL = (
     "https://download.stereolabs.com/drivers/zedx/1.4.2/R36.4/"
     "stereolabs-zedbox-duo_1.4.2-LI-MAX96712-ZEDBOX-L4T36.4.0_arm64.deb"
 )
+# Stereolabs does not publish a detached signature or authoritative checksum
+# for this fixed download.  This is the SHA-256 of the artifact reviewed when
+# the pin was added: it provides immutability from that point forward, but is
+# not independent proof of the first artifact's provenance.  A mismatch must
+# fail closed until a replacement has been reviewed and this value updated.
+_DEB_SHA256 = "40be96cb0223c92be353793b0d5a747b2f5ff2d414c06b61134960d08425c784"
+_DEB_ARCHITECTURE = "arm64"
+_DEB_MAX_BYTES = 16 * 1024 * 1024
 # The pinned .deb is built against L4T 36.4.x (JetPack 6.x on the ZED Box
 # Duo). Installing it on any other L4T would leave the cameras dead, so the
 # upgrade is skipped (with a warning) when the running release differs —
@@ -47,6 +63,7 @@ _L4T_RELEASE_FILE = Path("/etc/nv_tegra_release")
 # recovered by re-running — or by the manual `dpkg -i` the failure prints —
 # without re-downloading.
 _CACHE_DIR = Path.home() / ".almond" / "drivers"
+_ROOT_CACHE_DIR = Path("/var/cache/almond-axol/drivers")
 
 
 def _installed_version() -> str | None:
@@ -87,6 +104,46 @@ def _is_older(installed: str) -> bool:
     )
 
 
+def _deb_field(deb: Path, field: str) -> str:
+    proc = subprocess.run(
+        ["dpkg-deb", "--field", str(deb), field],
+        capture_output=True,
+        text=True,
+    )
+    value = proc.stdout.strip()
+    if proc.returncode != 0 or not value:
+        detail = (proc.stderr or "").strip()
+        raise RuntimeError(f"downloaded .deb has no valid {field}: {detail}")
+    return value
+
+
+def _validate_deb(deb: Path) -> None:
+    """Verify the pinned bytes and the package identity they encode."""
+    if deb.is_symlink() or not deb.is_file():
+        raise RuntimeError("downloaded .deb is not a regular file")
+
+    with deb.open("rb") as artifact:
+        digest = hashlib.file_digest(artifact, "sha256").hexdigest()
+    if digest != _DEB_SHA256:
+        raise RuntimeError(
+            "ZED driver SHA-256 does not match the reviewed artifact; refusing "
+            "to install changed vendor bytes. Review the replacement and update "
+            "_DEB_SHA256 in almond_axol/cli/zed/driver.py"
+        )
+
+    expected_fields = {
+        "Package": _PACKAGE,
+        "Version": _DEB_VERSION,
+        "Architecture": _DEB_ARCHITECTURE,
+    }
+    for field, expected in expected_fields.items():
+        actual = _deb_field(deb, field)
+        if actual != expected:
+            raise RuntimeError(
+                f"downloaded .deb {field} is {actual!r}, expected {expected!r}"
+            )
+
+
 def _download_deb() -> Path:
     """Download the pinned .deb into the cache and verify it is a valid archive.
 
@@ -100,27 +157,81 @@ def _download_deb() -> Path:
     deb = _CACHE_DIR / _DEB_URL.rsplit("/", 1)[-1]
     if not deb.exists():
         print(f"Downloading {_DEB_URL}")
-        # Download to a temp name and rename so an interrupted download can
-        # never be mistaken for a complete cached .deb on the next run.
-        partial = deb.with_suffix(".part")
-        urllib.request.urlretrieve(_DEB_URL, partial)
-        partial.rename(deb)
+        atomic_https_download(
+            _DEB_URL,
+            deb,
+            max_bytes=_DEB_MAX_BYTES,
+            validate=_validate_deb,
+        )
     else:
         print(f"Already downloaded: {deb}")
-    proc = subprocess.run(
-        ["dpkg-deb", "--info", str(deb)], capture_output=True, text=True
-    )
-    if proc.returncode != 0:
-        deb.unlink()  # corrupt — drop it so the next run re-downloads
-        raise RuntimeError(
-            f"downloaded .deb failed verification: {(proc.stderr or '').strip()}"
-        )
+    try:
+        _validate_deb(deb)
+    except Exception:
+        # Never retain unreviewed bytes under the trusted cache name.  A
+        # changed upstream artifact will fail the same pin on the next run and
+        # therefore cannot be silently accepted by retrying.
+        deb.unlink(missing_ok=True)
+        raise
     return deb
+
+
+def _stage_deb_as_root(deb: Path) -> Path:
+    """No-follow copy into a private root cache and validate the pinned fd bytes."""
+    if os.geteuid() != 0:
+        raise PermissionError("reviewed ZED driver staging must run as root")
+    expected_name = _DEB_URL.rsplit("/", 1)[-1]
+    if deb.name != expected_name:
+        raise RuntimeError(f"unexpected ZED driver artifact name: {deb.name!r}")
+
+    staged = _ROOT_CACHE_DIR / expected_name
+    secure_ensure_directory(_ROOT_CACHE_DIR, mode=0o700)
+    try:
+        # The source is opened descriptor-relative with O_NOFOLLOW and copied
+        # from that pinned descriptor. A symlink swap cannot disclose a root-
+        # readable file into the cache, and an in-place mutation makes the
+        # post-copy reviewed digest fail.
+        secure_atomic_copy_file(deb, staged, mode=0o600)
+        _validate_deb(staged)
+    except Exception:
+        # Never leave mismatched or partially trusted bytes readable at the
+        # predictable recovery path.
+        try:
+            secure_unlink(staged, missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return staged
+
+
+def _stage_deb_for_root(deb: Path) -> Path:
+    """Copy into a root-owned cache, then validate that immutable copy.
+
+    Interactive invocations may download into an operator-owned home.  Root
+    must not consume that path directly: the operator could swap it between
+    validation and ``dpkg -i``. Interactive use invokes this module's narrow
+    root helper; the hosted root service calls the same implementation
+    directly. The fixed cache is root-only and validation happens after copy.
+    """
+    staged = _ROOT_CACHE_DIR / _DEB_URL.rsplit("/", 1)[-1]
+    if os.geteuid() == 0:
+        return _stage_deb_as_root(deb)
+    run_root(
+        [
+            sys.executable,
+            "-m",
+            "almond_axol.cli.zed.driver",
+            "--stage-reviewed-deb",
+            str(deb),
+        ],
+        check=True,
+    )
+    return staged
 
 
 def _upgrade() -> None:
     """Replace the installed factory package with the pinned .deb (needs root)."""
-    deb = _download_deb()
+    deb = _stage_deb_for_root(_download_deb())
     # Remove the factory package first (per Stereolabs' upgrade procedure)
     # rather than upgrading in place; best-effort since a half-removed
     # package still gets replaced by the install below.
@@ -203,3 +314,19 @@ def run(_args: object = None) -> None:
             f"{_PACKAGE} is not installed — not a factory-flashed ZED Box Duo; "
             "nothing to do."
         )
+
+
+def _module_main() -> None:
+    """Entry point for the narrow interactive-sudo staging helper."""
+    if len(sys.argv) == 3 and sys.argv[1] == "--stage-reviewed-deb":
+        try:
+            _stage_deb_as_root(Path(sys.argv[2]))
+        except Exception as exc:  # noqa: BLE001 - concise sudo helper failure
+            print(f"ERROR: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        return
+    raise SystemExit("this module entry point only supports --stage-reviewed-deb PATH")
+
+
+if __name__ == "__main__":
+    _module_main()

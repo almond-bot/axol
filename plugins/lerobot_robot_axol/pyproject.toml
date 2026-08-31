@@ -1,17 +1,19 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "lerobot_robot_axol"
-version = "0.1.0"
+version = "0.1.1"
 description = "LeRobot plugin for the Almond Axol dual-arm robot: robot `axol`, VR teleoperator `axol_vr`, camera `zed`."
 license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.12"
 # 0.1.24 is the first release published to PyPI (and the first with the
-# LeRobot bindings this plugin re-exports).
-dependencies = ["almond-axol[lerobot]>=0.1.24"]
+# LeRobot bindings this plugin re-exports). This shim imports SDK module paths,
+# so keep it within the compatible pre-1.0 SDK line and widen deliberately when
+# a plugin release has been tested against the next SDK API line.
+dependencies = ["almond-axol[lerobot]>=0.1.24,<0.2"]
 
 [project.urls]
 Homepage = "https://docs.almond.bot"

@@ -40,7 +40,9 @@ class AlmondHomeTest(unittest.TestCase):
         ):
             self.assertEqual(almond_home(), Path("/home/operator/.almond"))
 
-    def test_state_consumers_share_environment_override(self) -> None:
+    def test_state_consumers_share_environment_override_except_root_executables(
+        self,
+    ) -> None:
         code = """
 from almond_axol.constants import CAN_BRINGUP_SCRIPT
 from almond_axol.mantis.calibration import MANTIS_TCP_TRANSFORM_FILE
@@ -67,7 +69,7 @@ print(CERTFILE)
         self.assertEqual(
             result.stdout.splitlines(),
             [
-                "/srv/operator state/can/startup.sh",
+                "/etc/almond-axol/can/startup.sh",
                 "/srv/operator state/mantis/tcp_transform.json",
                 "/srv/operator state/settings.json",
                 "/srv/operator state/tracker/config.json",

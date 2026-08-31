@@ -9,7 +9,7 @@ Public API
     InProcessRecorder          Degraded fallback (recorder in the control process)
     default_vcodec             Pick a video codec that can open on this machine
     make_episode_durable       Flush a just-saved episode so a kill can't lose it
-    restore_dataset_ownership  Hand a root-recorded dataset back to the operator
+    restore_dataset_ownership  Safely expose a root-recorded dataset for reading
 """
 
 from .ownership import restore_dataset_ownership

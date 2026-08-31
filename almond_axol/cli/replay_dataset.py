@@ -32,9 +32,13 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+import numpy as np
 from lerobot.robots.config import RobotConfig
 
 from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..mantis.relative import quat_xyzw_to_rotvec
+from ..mantis.smoothing import rotvec_to_quat_xyzw
+from ..robot.base import HardwareCleanupError
 from .config import LogLevel, parse
 
 _logger = logging.getLogger(__name__)
@@ -43,6 +47,60 @@ _logger = logging.getLogger(__name__)
 # so the arm receives setpoints at the same cadence it was driven with when
 # the episode was recorded.
 _INTERP_HZ = 120
+
+
+def _slerp_rotvec(start: np.ndarray, end: np.ndarray, alpha: float) -> np.ndarray:
+    """Interpolate two rotation vectors along the shortest path on SO(3)."""
+    q0 = rotvec_to_quat_xyzw(np.asarray(start, dtype=np.float64))
+    q1 = rotvec_to_quat_xyzw(np.asarray(end, dtype=np.float64))
+    dot = float(np.clip(np.dot(q0, q1), -1.0, 1.0))
+    if dot < 0.0:
+        # q and -q encode the same orientation. Pick the representative in the
+        # same quaternion hemisphere so interpolation follows the short arc.
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:
+        quat = q0 + alpha * (q1 - q0)
+        quat /= max(float(np.linalg.norm(quat)), 1e-12)
+    else:
+        theta = float(np.arccos(dot))
+        sin_theta = float(np.sin(theta))
+        quat = (
+            np.sin((1.0 - alpha) * theta) / sin_theta * q0
+            + np.sin(alpha * theta) / sin_theta * q1
+        )
+    return quat_xyzw_to_rotvec(quat)
+
+
+def _interpolate_action_values(
+    base: np.ndarray,
+    nxt: np.ndarray,
+    alpha: float,
+    action_names: list[str],
+) -> np.ndarray:
+    """Interpolate an action, using SO(3) for Cartesian EE orientations.
+
+    Joint targets, Cartesian positions, and grippers retain the existing
+    componentwise interpolation. Each complete ``*_ee.rx/.ry/.rz`` group is
+    then replaced with shortest-path orientation interpolation. This matters
+    at the canonical rotation-vector branch cut: adjacent equivalent poses can
+    be represented near ``+pi * axis`` and ``-pi * axis``, whose scalar midpoint
+    is the identity rather than the intended 180-degree orientation.
+    """
+    values = base + (nxt - base) * alpha
+    by_name = {name: i for i, name in enumerate(action_names)}
+    for name, rx in by_name.items():
+        if not name.endswith("_ee.rx"):
+            continue
+        prefix = name[: -len("rx")]
+        rotation_indices = [
+            by_name.get(f"{prefix}{axis}") for axis in ("rx", "ry", "rz")
+        ]
+        if any(index is None for index in rotation_indices):
+            continue
+        indices = [int(index) for index in rotation_indices if index is not None]
+        values[indices] = _slerp_rotvec(base[indices], nxt[indices], alpha)
+    return values
 
 
 def _default_robot_config() -> AxolRobotConfig:
@@ -135,6 +193,10 @@ def main(argv: list[str]) -> None:
 
 def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) -> None:
     """Load the episode, return to rest, replay its actions, then return to rest."""
+    from ..utils.state_files import require_service_dataset_configuration
+
+    require_service_dataset_configuration()
+
     from ..lerobot.robot.config_mantis import MantisRobotConfig
 
     if isinstance(cfg.robot_config, MantisRobotConfig):
@@ -142,7 +204,6 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
 
     from pathlib import Path
 
-    import numpy as np
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME
     from lerobot.utils.utils import log_say
@@ -163,15 +224,30 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     # --root. LeRobotDataset only needs a valid-looking repo id once a root
     # is given, so the directory name stands in for it.
     from ..recording.datasets import is_dataset_dir, list_datasets
+    from ..utils.state_files import (
+        confine_service_dataset_path,
+        privileged_service_active,
+    )
 
     repo_path = Path(repo_id).expanduser()
-    if root is None and is_dataset_dir(repo_path):
+    hosted_service = privileged_service_active()
+    # Plain CLI users may replay an arbitrary local dataset by path. The root
+    # service must not probe an operator-supplied filesystem path before it has
+    # been confined to the configured LeRobot tree, so it deliberately skips
+    # this path shorthand and treats the value as a repo id instead.
+    if root is None and not hosted_service and is_dataset_dir(repo_path):
         root = str(repo_path)
         repo_id = repo_path.name
 
     # Verify the dataset is present and complete before loading (a clear error
     # beats LeRobotDataset's deeper failure, and mirrors collect-data's checks).
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+    if hosted_service:
+        dataset_root = confine_service_dataset_path(
+            dataset_root,
+            label="replay dataset root",
+        )
+        root = str(dataset_root)
     meta = dataset_root / "meta"
     if not (meta / "info.json").exists():
         available = list_datasets()
@@ -280,11 +356,10 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         )
 
     # Interpolated playback commands the arms at ~_INTERP_HZ (the teleop rate)
-    # by linearly blending between consecutive recorded actions. Episode timing
-    # is unchanged — substeps subdivide each recorded frame's period. Linear
-    # blending is exact for joint targets and a good small-step approximation
-    # for Cartesian poses (positions are linear; consecutive rotation vectors
-    # are close enough that lerp ~= slerp at these deltas).
+    # between consecutive recorded actions. Episode timing is unchanged —
+    # substeps subdivide each recorded frame's period. Joint targets, Cartesian
+    # positions, and grippers blend componentwise; Cartesian rotations follow
+    # the shortest path on SO(3), including across the rotation-vector pi cut.
     substeps = max(1, round(_INTERP_HZ / fps)) if cfg.interpolate else 1
 
     async def _play_episode() -> tuple[str, float] | None:
@@ -323,7 +398,13 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
                 if _stopped():
                     return None
                 deadline += send_period
-                values = base if sub == 0 else base + (nxt - base) * (sub / substeps)
+                values = (
+                    base
+                    if sub == 0
+                    else _interpolate_action_values(
+                        base, nxt, sub / substeps, action_names
+                    )
+                )
                 action = {name: float(values[i]) for i, name in enumerate(action_names)}
                 await robot.send_action_async(action)
                 if watchdog is not None:
@@ -449,10 +530,12 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
                 _logger.warning("return-to-rest during teardown failed", exc_info=True)
 
         log_say("Stopping.")
+        disconnect_failure: BaseException | None = None
         try:
             robot.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
+        except BaseException as exc:
+            _logger.exception("robot disconnect failed")
+            disconnect_failure = exc
         try:
             reset_controller.stop()
         except Exception:  # noqa: BLE001
@@ -462,3 +545,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
             signal.signal(signal.SIGINT, signal.SIG_DFL)
         except (ValueError, OSError):
             pass
+        if disconnect_failure is not None:
+            raise HardwareCleanupError(
+                "robot disconnect failed; hardware ownership is uncertain"
+            ) from disconnect_failure

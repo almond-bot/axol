@@ -555,7 +555,28 @@ class H264MuxStreamingEncoder:
         for cam in self._cams.values():
             cam.cancel()
             if cam.video_path.parent.exists():
-                shutil.rmtree(str(cam.video_path.parent), ignore_errors=True)
+                from ..utils.state_files import (
+                    privileged_service_active,
+                    secure_rmdir,
+                    secure_unlink,
+                )
+
+                if privileged_service_active():
+                    # The episode directory is below an operator-owned
+                    # dataset. Remove only the exact Axol-created file and an
+                    # empty parent through pinned descriptors; never recurse
+                    # through names that can be swapped after preflight.
+                    try:
+                        secure_unlink(cam.video_path, missing_ok=True)
+                        secure_rmdir(cam.video_path.parent, missing_ok=True)
+                    except OSError as exc:
+                        _logger.warning(
+                            "keeping cancelled camera staging directory %s: %s",
+                            cam.video_path.parent,
+                            exc,
+                        )
+                else:
+                    shutil.rmtree(str(cam.video_path.parent), ignore_errors=True)
         self._cams = {}
         self._episode_active = False
 

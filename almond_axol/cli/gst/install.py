@@ -213,10 +213,8 @@ def run(_args: object = None) -> None:
         print("GStreamer appsink + NVENC stack installed.")
         _note_zed_sources()
     else:
-        print(
-            "WARNING: the GStreamer appsink + NVENC stack is still unavailable. "
-            "Ensure PyGObject and the Jetson NVENC elements (nvvidconv / "
-            "nvv4l2h264enc) are installed. Camera video will fall back to the "
-            "ZED SDK path (higher latency) until then.",
-            file=sys.stderr,
+        raise SystemExit(
+            "The GStreamer appsink + NVENC stack is still unavailable after "
+            "installation. Ensure PyGObject and the Jetson NVENC elements "
+            "(nvvidconv / nvv4l2h264enc) are installed, then retry."
         )

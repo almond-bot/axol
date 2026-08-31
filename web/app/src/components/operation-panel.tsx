@@ -21,6 +21,7 @@ import {
   type DatasetInfo,
   type EpisodeControlSpec,
   type FormValue,
+  type MantisTrackerSource,
   type OperationMeta,
   type PolicyState,
   type RobotStatus,
@@ -35,6 +36,12 @@ import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
+
+const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse", "ultimate"])
+
+function isMantisTrackerSource(value: string): value is MantisTrackerSource {
+  return MANTIS_TRACKER_SOURCES.has(value as MantisTrackerSource)
+}
 
 /**
  * One operation's panel: just its per-run inputs (dataset / task / policy
@@ -62,6 +69,7 @@ export function OperationPanel({
   vrPort,
   startPhase,
   hostBlocker,
+  connected,
   policy,
   onStart,
   onStop,
@@ -90,6 +98,8 @@ export function OperationPanel({
   startPhase: string | null
   /** Active setup/diagnostic or other operation that owns the host. */
   hostBlocker: string | null
+  /** False while disconnected or validating a replacement host. */
+  connected: boolean
   /** run-policy episode phase/count (null unless run-policy is the live op). */
   policy: PolicyState | null
   onStart: () => void
@@ -108,6 +118,7 @@ export function OperationPanel({
     liveArgs && typeof liveArgs.mantis_source === "string"
       ? liveArgs.mantis_source
       : configuredMantisSource
+  const trackerSource = isMantisTrackerSource(mantisSource) ? mantisSource : null
   // Gravity-comp's joint subset gets a proper picker instead of a text field.
   const jointField = runFields.find((f) => f.key === "free_joints")
   const textFields = useMemo(() => runFields.filter((f) => f.key !== "free_joints"), [runFields])
@@ -127,7 +138,7 @@ export function OperationPanel({
   >("idle")
   const [trackerReadinessSource, setTrackerReadinessSource] = useState<string | null>(null)
   useEffect(() => {
-    if (!wantsDatasets || live) return
+    if (!connected || !wantsDatasets || live) return
     let cancelled = false
     fetchDatasets()
       .then((found) => {
@@ -137,9 +148,9 @@ export function OperationPanel({
     return () => {
       cancelled = true
     }
-  }, [wantsDatasets, live])
+  }, [connected, wantsDatasets, live])
   useEffect(() => {
-    if (!mantisMode || live) return
+    if (!connected || !mantisMode || !trackerSource || live) return
     let cancelled = false
     const refresh = () => {
       fetchTrackerBindings()
@@ -170,7 +181,7 @@ export function OperationPanel({
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [mantisMode, mantisSource, live])
+  }, [connected, mantisMode, mantisSource, trackerSource, live])
   const suggestions = useMemo<Record<string, FieldSuggestion[]> | undefined>(() => {
     if (!wantsDatasets || datasets.length === 0) return undefined
     return {
@@ -221,23 +232,24 @@ export function OperationPanel({
       blockers.push(`Fix motor fault: ${motorFaultLabel(f)}`)
     }
   }
-  if (mantisMode && currentTrackerReadinessState !== "ready") {
+  if (mantisMode && !trackerSource) {
+    blockers.push("Choose a valid Mantis tracker source in Settings → Mantis")
+  } else if (mantisMode && currentTrackerReadinessState !== "ready") {
     blockers.push(
       currentTrackerReadinessState === "error"
         ? "Mantis tracker readiness is unavailable — reconnect the host or update Axol"
         : "Checking Mantis tracker readiness…"
     )
   }
-  if (mantisMode && currentTrackerReadiness) {
-    const source = mantisSource as "quest" | "lighthouse" | "ultimate"
-    const ready = currentTrackerReadiness[source]
-    if (source === "lighthouse") {
+  if (mantisMode && trackerSource && currentTrackerReadiness) {
+    const ready = currentTrackerReadiness[trackerSource]
+    if (trackerSource === "lighthouse") {
       const status = currentTrackerReadiness.lighthouse
       if (!status.available) blockers.push("Install libsurvive in Mantis settings")
       else if (!status.installed) blockers.push("Repair Lighthouse support in Mantis settings")
       if (!status.udevReady) blockers.push("Install the Lighthouse Vive USB permissions rule")
       if (!status.binding.complete) blockers.push("Identify left + right Lighthouse trackers")
-    } else if (source === "ultimate") {
+    } else if (trackerSource === "ultimate") {
       const status = currentTrackerReadiness.ultimate
       if (!status.nativeDependencies) blockers.push("Install the Ultimate native HID libraries")
       if (!status.pythonHid || !status.apiCompatible)
@@ -265,7 +277,7 @@ export function OperationPanel({
         )
       }
       if (
-        source === "quest" &&
+        trackerSource === "quest" &&
         (currentTrackerReadiness.quest.datumStatus !== "configured" ||
           currentTrackerReadiness.quest.poseSpace !== "grip")
       ) {

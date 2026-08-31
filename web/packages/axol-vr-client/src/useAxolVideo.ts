@@ -93,20 +93,26 @@ export function useAxolVideo(
     }
 
     async function handleOffer(
+      signalingWs: WebSocket,
       sdp: string,
       trackMap: Record<string, string>,
       iceServers: RTCIceServer[]
     ) {
+      // A queued offer from a socket that was just replaced must not close the
+      // new socket's peer connection or send its SDP answer to the new host.
+      if (attachedWsRef.current !== signalingWs) return
       closePc()
       // Off-LAN operators get TURN/STUN servers from the server; on a LAN the
       // list is empty and we use the browser default (direct host candidates).
       const pc = new RTCPeerConnection(iceServers.length > 0 ? { iceServers } : undefined)
       pcRef.current = pc
+      const isCurrent = () => attachedWsRef.current === signalingWs && pcRef.current === pc
 
       // Accumulate streams as tracks arrive, matching each transceiver's mid to
       // its camera name from the server's map.
       const acc: CameraStreams = {}
       pc.ontrack = (e: RTCTrackEvent) => {
+        if (!isCurrent()) return
         // Keep the receiver buffer small for low-latency LAN teleop, but not
         // zero: a tiny buffer still lets a NACK retransmit recover a lost or
         // reordered packet before playout, instead of decoding an incomplete
@@ -128,6 +134,7 @@ export function useAxolVideo(
         setStreams({ ...acc })
       }
       pc.onconnectionstatechange = () => {
+        if (!isCurrent()) return
         if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           setStreams({})
           // Let the retry loop renegotiate a fresh connection. Only remotely
@@ -137,17 +144,30 @@ export function useAxolVideo(
         }
       }
 
-      await pc.setRemoteDescription({ type: "offer", sdp })
-      const answer = await pc.createAnswer()
-      await pc.setLocalDescription(answer)
-      // Non-trickle: wait for gathering so the (TURN relay) candidate is in the
-      // SDP we signal back. On a LAN this completes immediately.
-      await waitForIceGathering(pc)
-      const answerSdp = pc.localDescription?.sdp ?? answer.sdp
-      attachedWsRef.current?.send(JSON.stringify({ type: "webrtc-answer", sdp: answerSdp }))
+      try {
+        await pc.setRemoteDescription({ type: "offer", sdp })
+        if (!isCurrent()) return
+        const answer = await pc.createAnswer()
+        if (!isCurrent()) return
+        await pc.setLocalDescription(answer)
+        if (!isCurrent()) return
+        // Non-trickle: wait for gathering so the (TURN relay) candidate is in
+        // the SDP we signal back. On a LAN this completes immediately.
+        await waitForIceGathering(pc)
+        if (!isCurrent()) return
+        const answerSdp = pc.localDescription?.sdp ?? answer.sdp
+        signalingWs.send(JSON.stringify({ type: "webrtc-answer", sdp: answerSdp }))
+      } catch {
+        if (!isCurrent()) return
+        closePc()
+        setStreams({})
+        // Negotiation failed; let the retry loop request a fresh offer.
+        offerSeenRef.current = false
+      }
     }
 
-    function onMessage(e: MessageEvent) {
+    function onMessage(signalingWs: WebSocket, e: MessageEvent) {
+      if (attachedWsRef.current !== signalingWs) return
       let msg: unknown
       try {
         msg = JSON.parse(e.data as string)
@@ -164,10 +184,7 @@ export function useAxolVideo(
       if (m.type === "webrtc-offer" && typeof m.sdp === "string") {
         offerSeenRef.current = true
         setAvailable(true)
-        handleOffer(m.sdp, m.tracks ?? {}, m.iceServers ?? []).catch(() => {
-          // Negotiation failed; let the retry loop request a fresh offer.
-          offerSeenRef.current = false
-        })
+        void handleOffer(signalingWs, m.sdp, m.tracks ?? {}, m.iceServers ?? [])
       } else if (m.type === "webrtc-pending") {
         // The robot's cameras are configured but still starting; the server
         // will push the offer when they're up. Stay in the "connecting"
@@ -196,9 +213,10 @@ export function useAxolVideo(
       }
       if (!ws || ws.readyState !== WebSocket.OPEN) return
       if (!listenerRef.current) {
-        listenerRef.current = onMessage
+        const listener = (event: MessageEvent) => onMessage(ws, event)
+        listenerRef.current = listener
         attachedWsRef.current = ws
-        ws.addEventListener("message", onMessage)
+        ws.addEventListener("message", listener)
       }
       // Keep requesting until an offer lands (first request fires
       // immediately; see REQUEST_RETRY_MS for why this retries).

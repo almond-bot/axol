@@ -5,6 +5,11 @@ description: "Record teleoperation episodes to a LeRobot-format dataset."
 
 Records teleoperation episodes using VR controller inputs and locally attached ZED cameras. Saves to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. Loops until `Ctrl+C`.
 
+<Note>
+  The hosted panel confines this command to its root-owned dataset store;
+  direct non-root CLI runs use the operator's normal HuggingFace cache.
+</Note>
+
 <Tip>
   For the end-to-end workflow, see the [Data Collection guide](/operations/data-collection).
 </Tip>

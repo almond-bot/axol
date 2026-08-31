@@ -50,6 +50,11 @@ from numbers import Real
 from pathlib import Path
 
 from ..utils.paths import almond_path
+from ..utils.state_files import (
+    secure_atomic_write_text,
+    secure_read_text,
+    secure_unlink,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -61,12 +66,40 @@ _PRE_MANTIS_TCP_TRANSFORM_FILE = almond_path("u" + "mi", "tcp_transform.json")
 LEGACY_TRACKER_KEY = "legacy"
 QUEST_POSE_SPACES = frozenset({"grip", "target-ray"})
 
-# Bench-verified factory tracker→gripper transforms for the Mantis rig's
-# standard tracker mounts, keyed by tracker backend family — the part of a
-# tracker key before the ":" (``"survive:T20"`` → ``"survive"``). These are
-# design constants of the rig, identical for every unit up to manufacturing
-# tolerance, so they apply out of the box; a per-unit entry in the override
-# file always wins over them.
+# Tracker reference-origin positions reported in the shared gripper/CAD frame
+# G, in millimetres. These are not tracker→TCP transforms by themselves: their
+# difference establishes how the two device datums move relative to the
+# otherwise unchanged Mantis mount geometry.
+VIVE_TRACKER_CAD_ORIGINS_MM: dict[str, tuple[float, float, float]] = {
+    "survive": (47.0, 0.0, 35.0),
+    "ultimate": (47.0, 0.0, 46.0),
+}
+_ULTIMATE_CAD_ORIGIN_DELTA_Z_M = (
+    VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"][2]
+    - VIVE_TRACKER_CAD_ORIGINS_MM["survive"][2]
+) / 1000.0
+# Let G be the shared gripper/CAD frame and T the bridge-reported tracker
+# frame. The stored quaternion is R_TG = Rx(+90 deg), and the translation is
+# the TCP origin expressed in T. Moving the tracker origin by delta_O in G
+# therefore changes that translation by
+#
+#     delta_p_TG = -R_TG @ delta_O.
+#
+# Rx(+90 deg) maps CAD +z to tracker -y, so negating the +11 mm origin shift
+# produces +11 mm on the candidate's tracker-y TCP component. This is a mount-
+# frame derivation, not the bridge's z-up-world -> y-up-world basis relabel.
+_ULTIMATE_TRACKER_Y_TCP_DELTA_M = _ULTIMATE_CAD_ORIGIN_DELTA_Z_M
+# A tracker mounted to a hand-held gripper cannot plausibly be farther than a
+# metre from its TCP. This catches the dangerous and easy mm-as-m typo (for
+# example entering 47 instead of 0.047) before it can authorize collection.
+MAX_TCP_TRANSLATION_M = 1.0
+
+# Tracker→gripper transform candidates and eventual bench-verified factory
+# values for the Mantis rig's standard mounts are keyed by tracker backend
+# family — the part of a tracker key before the ":" (``"survive:T20"`` →
+# ``"survive"``). Only entries promoted into ``DESIGN_TCP_TRANSFORMS`` below
+# are factory values that apply out of the box; a per-unit measured entry in
+# the override file always wins over them.
 #
 # survive (Vive Tracker 3.0, standard mount): derived from the rig CAD
 # (2026-08-10) — tracker seated flat, stabilizing-pin recess toward the jaws,
@@ -80,8 +113,10 @@ QUEST_POSE_SPACES = frozenset({"grip", "target-ray"})
 #
 # Each entry is ``[x, y, z, qx, qy, qz, qw]``: the gripper TCP frame
 # expressed in that tracker's device-local frame as the bridge/headset
-# reports it — the TCP origin in metres plus the rotation taking tracker
-# axes to gripper axes, straight from the mount CAD.
+# reports it — the TCP origin in metres plus ``R_TG``, whose columns are the
+# gripper axes expressed in tracker coordinates (equivalently, it maps
+# gripper-coordinate vectors into tracker coordinates), straight from the
+# mount CAD.
 #
 # TODO(mantis-calibration): Measure the Quest 3 cradle transform empirically.
 # The headset client streams WebXR ``gripSpace`` (with ``targetRaySpace`` only
@@ -94,22 +129,39 @@ QUEST_POSE_SPACES = frozenset({"grip", "target-ray"})
 # mount-dependent, so production collection rejects the missing transform.
 #
 # ultimate (Vive Ultimate Tracker, standard mount): starts from the Tracker 3.0
-# candidate above. Reported reference-origin coordinates in their shared CAD
-# frame are respectively [47, 0, 35] mm and [47, 0, 46] mm. The common 47/0
-# coordinates cancel and establish an 11 mm vertical delta. Applying that delta
-# to the existing V3 candidate's independently derived 35.5 mm bridge-local
-# vertical component gives 46.5 mm; the -92 mm forward offset and mount rotation
-# are inherited. pyvut's axes/quaternion and the physical overlay still require
-# bench verification, so this remains a candidate and must not be promoted to
-# DESIGN_TCP_TRANSFORMS yet.
+# candidate above. :data:`VIVE_TRACKER_CAD_ORIGINS_MM` records their respective
+# [47, 0, 35] mm and [47, 0, 46] mm reference origins. The common 47/0
+# coordinates cancel and establish delta_O = [0, 0, +11] mm in the shared
+# gripper/CAD frame. With the inherited R_TG = Rx(+90 deg),
+# delta_p_TG = -R_TG @ delta_O = [0, +11, 0] mm. Applying that tracker-y delta
+# to the V3 candidate's independently derived 35.5 mm component gives 46.5 mm;
+# the -92 mm forward offset and mount rotation are inherited. pyvut's axes and
+# quaternion still require a physical bench overlay, so this remains a
+# candidate and must not be promoted to DESIGN_TCP_TRANSFORMS yet.
 CANDIDATE_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
     "survive": {
         "left": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
         "right": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
     },
     "ultimate": {
-        "left": [0.0, 0.0465, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
-        "right": [0.0, 0.0465, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
+        "left": [
+            0.0,
+            0.0355 + _ULTIMATE_TRACKER_Y_TCP_DELTA_M,
+            -0.092,
+            0.7071068,
+            0.0,
+            0.0,
+            0.7071068,
+        ],
+        "right": [
+            0.0,
+            0.0355 + _ULTIMATE_TRACKER_Y_TCP_DELTA_M,
+            -0.092,
+            0.7071068,
+            0.0,
+            0.0,
+            0.7071068,
+        ],
     },
 }
 
@@ -123,10 +175,12 @@ def validate_tcp_transform(transform: object) -> list[float]:
     """Return one safe tracker→TCP transform as seven floats.
 
     ``transform`` must be ``[x, y, z, qx, qy, qz, qw]`` with exactly seven
-    finite numeric entries. As with the calibration-file loader's historical
-    behavior, a finite non-zero quaternion is normalized before use. A zero
-    (or numerically degenerate) quaternion is rejected rather than becoming an
-    invalid rotation matrix in the teleop worker.
+    finite numeric entries. The translation magnitude must be at most one
+    metre, which is a deliberately generous physical bound for a tracker
+    mounted on a hand-held rig. As with the calibration-file loader's
+    historical behavior, a finite non-zero quaternion is normalized before
+    use. A zero (or numerically degenerate) quaternion is rejected rather than
+    becoming an invalid rotation matrix in the teleop worker.
 
     Raises:
         ValueError: If the shape, values, or quaternion are unsafe.
@@ -147,6 +201,13 @@ def validate_tcp_transform(transform: object) -> list[float]:
         if not math.isfinite(converted):
             raise ValueError(f"value at index {index} must be finite")
         values.append(converted)
+
+    translation_m = math.hypot(*values[:3])
+    if translation_m > MAX_TCP_TRANSLATION_M:
+        raise ValueError(
+            f"translation magnitude must be at most {MAX_TCP_TRANSLATION_M:g} metre; "
+            "positions are entered in metres, not millimetres"
+        )
 
     quat_norm = math.hypot(*values[3:])
     if not math.isfinite(quat_norm) or quat_norm <= 1e-12:
@@ -307,9 +368,10 @@ def load_tcp_transforms(
         and not path.exists()
         and _PRE_MANTIS_TCP_TRANSFORM_FILE.exists()
     ):
-        path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            _PRE_MANTIS_TCP_TRANSFORM_FILE.replace(path)
+            legacy = secure_read_text(_PRE_MANTIS_TCP_TRANSFORM_FILE)
+            secure_atomic_write_text(path, legacy)
+            secure_unlink(_PRE_MANTIS_TCP_TRANSFORM_FILE)
             _logger.info("migrated Mantis TCP calibration to %s", path)
         except OSError as exc:
             _logger.warning("could not migrate Mantis TCP calibration: %s", exc)
@@ -317,7 +379,7 @@ def load_tcp_transforms(
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(secure_read_text(path))
     except (OSError, ValueError) as exc:
         _logger.warning("could not read %s: %s", path, exc)
         return {}

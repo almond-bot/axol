@@ -180,6 +180,15 @@ def run(output: str | None = None, kind: str = "auto") -> None:
             be resolved, the camera cannot be opened, no frames can be grabbed, or
             any captured frame fails validation.
     """
+    if output:
+        from almond_axol.utils.state_files import privileged_service_active
+
+        if privileged_service_active():
+            raise CableTestError(
+                "--output is disabled in the root control-panel service; run "
+                "diag.zed-cable directly as the non-root operator to save a frame"
+            )
+
     import pyzed.sl as sl
 
     try:

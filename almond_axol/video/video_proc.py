@@ -85,14 +85,24 @@ def _open_sdk_camera(name: str, spec: dict) -> object | None:
     return None
 
 
-def _gsth264_meta(socket_path: str, width: int, height: int, fps: int) -> dict:
+def _gsth264_meta(
+    socket_path: str,
+    width: int,
+    height: int,
+    fps: int,
+    latency_s: float,
+) -> dict:
     """Describe the encoded-H.264 shared-memory transport for one dataset source.
 
     The relay encodes the dataset stream on the GPU and writes AU-aligned H.264
     to ``socket_path`` via ``shmsink``; the recorder attaches an
     :class:`~almond_axol.video.shm_frames.EncodedAuReader` and muxes it. Shared
     memory carries no caps, but H.264 dimensions come from the SPS, so only the
-    dims (to size the dataset observation feature) and fps need to cross.
+    dims (to size the dataset observation feature), fps, and the relay's
+    best-effort pipeline latency need to cross. ``latency_s`` is the minimum
+    latency reported by GStreamer's pipeline query; it includes only elements
+    that implement that query and excludes recorder-side ``shmsrc`` / Python
+    scheduling latency.
     """
     return {
         "transport": "gstshm-h264",
@@ -100,6 +110,7 @@ def _gsth264_meta(socket_path: str, width: int, height: int, fps: int) -> dict:
         "width": width,
         "height": height,
         "fps": fps,
+        "latency_s": latency_s,
     }
 
 
@@ -269,7 +280,13 @@ def _open_gst_camera_raw(
                 if sbs:
                     sources[f"{name}_sbs"] = cam.sbs_view
                 raw_meta = {
-                    src: _gsth264_meta(socks[side], raw_w, raw_h, fps)
+                    src: _gsth264_meta(
+                        socks[side],
+                        raw_w,
+                        raw_h,
+                        fps,
+                        getattr(cam, "raw_latency_s", 0.0),
+                    )
                     for side, src in raw_plan
                 }
                 return cam, sources, [], raw_meta
@@ -325,7 +342,15 @@ def _open_gst_camera_raw(
                     raw_dims=raw_dims,
                 )
                 cam.connect()
-                meta = {name: _gsth264_meta(sock, raw_w, raw_h, fps)}
+                meta = {
+                    name: _gsth264_meta(
+                        sock,
+                        raw_w,
+                        raw_h,
+                        fps,
+                        getattr(cam, "raw_latency_s", 0.0),
+                    )
+                }
                 return cam, ({name: cam} if wants_stream else {}), [], meta
             writer = RawFrameWriter.create(raw_w, raw_h, cond)
             writers = [writer]

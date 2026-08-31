@@ -8,7 +8,7 @@ streams their output, and stops them. The four core operations (teleop,
 gravity-comp, collect-data, run-policy) run in-process so they share one robot
 connection; the setup/calibration commands run as ``axol`` subprocesses.
 
-    axol serve                  # serve on http://localhost:8001
+    axol serve                  # serve on https://localhost:8001
     axol serve --port 9000
     axol serve --open           # also open a browser window on startup
     axol serve --host 127.0.0.1 # localhost only
@@ -24,6 +24,7 @@ import time
 import webbrowser
 from pathlib import Path
 
+from ..utils.browser_origin import configure_self_hosted_browser_origins
 from ..utils.certs import CERTFILE, KEYFILE, create_self_signed_cert
 
 # The VR server and this control-panel API share one self-signed certificate
@@ -83,12 +84,20 @@ def _local_ip() -> str:
 
 def run(args: argparse.Namespace) -> None:
     """Start the control-panel server."""
+    # Explicit process marker: security gates must remain active for a manual
+    # root ``axol serve`` even when the installer did not set ALMOND_HOME.
+    from ..utils.state_files import mark_privileged_service
+
+    mark_privileged_service()
+    if os.geteuid() == 0:
+        # Third-party dataset writers must never create group-writable entries
+        # inside the immutable hosted store, including on manual serve runs
+        # outside the installed systemd unit.
+        os.umask(0o027)
+
     import uvicorn
 
     from ..serve import create_app
-
-    static_dir = _find_static_dir()
-    app = create_app(static_dir)
 
     tls = not args.no_tls
     ssl_kwargs: dict[str, str] = {}
@@ -96,12 +105,28 @@ def run(args: argparse.Namespace) -> None:
         _ensure_cert()
         ssl_kwargs = {"ssl_certfile": CERTFILE, "ssl_keyfile": KEYFILE}
     scheme = "https" if tls else "http"
+    lan_ip = _local_ip() if args.host in {"0.0.0.0", "::"} else args.host
+    configure_self_hosted_browser_origins(
+        scheme=scheme,
+        port=args.port,
+        hosts={
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            lan_ip,
+            socket.gethostname(),
+            socket.getfqdn(),
+        },
+    )
+
+    static_dir = _find_static_dir()
+    app = create_app(static_dir)
 
     local = f"{scheme}://localhost:{args.port}"
     print("Axol control panel:")
     print(f"  Local : {local}")
     if args.host == "0.0.0.0":
-        print(f"  LAN   : {scheme}://{_local_ip()}:{args.port}")
+        print(f"  LAN   : {scheme}://{lan_ip}:{args.port}")
     if tls:
         print(
             "  (self-signed TLS — to connect from a browser on another machine, "

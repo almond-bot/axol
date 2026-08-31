@@ -80,6 +80,12 @@ class SurviveSource(TrackerSource):
     # -- Lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
+        if self._thread is not None:
+            if self._thread.is_alive():
+                raise TrackerSourceError(
+                    "libsurvive reader is already running or cleanup is incomplete"
+                )
+            self._thread = None
         self._stop.clear()
         with self._lock:
             self._failure = None
@@ -109,16 +115,43 @@ class SurviveSource(TrackerSource):
 
     def stop(self) -> None:
         self._stop.set()
-        if self._proc is not None:
-            self._proc.terminate()
+        failures: list[BaseException] = []
+        proc = self._proc
+        if proc is not None:
             try:
-                self._proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-            self._proc = None
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-            self._thread = None
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    # kill() only sends a signal; wait again to reap the child
+                    # and prove it no longer owns libsurvive/USB resources.
+                    proc.wait(timeout=3.0)
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                self._proc = None
+        thread = self._thread
+        if thread is not None:
+            try:
+                thread.join(timeout=3.0)
+            except BaseException as exc:
+                failures.append(exc)
+            if thread.is_alive():
+                failures.append(
+                    RuntimeError("libsurvive reader thread is still alive after stop")
+                )
+            else:
+                self._thread = None
+        if failures:
+            for extra in failures[1:]:
+                failures[0].add_note(
+                    "additional libsurvive teardown failure: "
+                    f"{type(extra).__name__}: {extra}"
+                )
+            raise TrackerSourceError(
+                "libsurvive teardown failed; tracker ownership is uncertain"
+            ) from failures[0]
 
     def poses(self) -> dict[str, TrackerPose]:
         with self._lock:
@@ -151,6 +184,17 @@ class SurviveSource(TrackerSource):
         _logger.error("%s", failure)
 
     def _publish(self, key: str, pos_zup: np.ndarray, quat_wxyz: np.ndarray) -> None:
+        # libsurvive's CLI parser accepts IEEE nan/inf spellings, and bindings
+        # can surface an incomplete/zero pose while tracking initializes.  Such
+        # a sample must not get a fresh timestamp and pass the bridge's tracked
+        # gate: non-finite values would otherwise propagate into the IK target.
+        if pos_zup.shape != (3,) or quat_wxyz.shape != (4,):
+            return
+        if not np.all(np.isfinite(pos_zup)) or not np.all(np.isfinite(quat_wxyz)):
+            return
+        quat_norm = float(np.linalg.norm(quat_wxyz))
+        if not np.isfinite(quat_norm) or quat_norm <= 0.0:
+            return
         pos, quat = _convert(pos_zup, quat_wxyz)
         sample = TrackerPose(pos=pos, quat=quat, t=time.perf_counter())
         with self._lock:

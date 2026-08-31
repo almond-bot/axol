@@ -43,6 +43,9 @@ function parseDraft(draft: TransformDraft): Omit<TrackerCalibrationValue, "key">
   if (raw.some((value) => value.trim() === "")) return "Enter all seven measured values."
   const values = raw.map(Number)
   if (values.some((value) => !Number.isFinite(value))) return "Every value must be a finite number."
+  if (Math.hypot(...values.slice(0, 3)) > 1) {
+    return "Position must be within 1 metre of the tracker. Enter metres, not millimetres."
+  }
   const quatNorm = Math.hypot(...values.slice(3))
   if (quatNorm <= 1e-12) return "The quaternion must have a non-zero norm."
   return {

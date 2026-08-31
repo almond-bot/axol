@@ -40,6 +40,14 @@ def _prepare_mantis_teleop(cfg: TeleopCmdConfig) -> None:
             "cart — pick one"
         )
 
+    # Mantis is a handheld rig whose arms are virtual. A host may have the
+    # robot's powered-cart setting persisted from an earlier Axol session;
+    # never let that unrelated setting open or move base/lift hardware during
+    # a Mantis run.
+    if cfg.cart.enabled:
+        _logger.info("--mantis: disabling powered-cart control.")
+        cfg.cart.enabled = False
+
     from ..kinematics.config import apply_mantis_kinematics_profile
     from ..teleop.config import apply_mantis_teleop_profile
 
@@ -429,7 +437,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         )
     # Powered-cart robots (--cart.enabled true) get the base + lift driven by
     # the headset thumbsticks; VRTeleop owns the cart's lifecycle. Skipped in
-    # sim — there's no cart hardware model in the visualizer.
+    # sim and Mantis mode — neither has cart hardware in its model/profile.
     cart = None
     if cfg.cart.enabled and not cfg.sim:
         from ..robot.cart import Cart

@@ -194,10 +194,10 @@ class _ArmLink:
 
     async def close(self) -> None:
         if self._bus is not None:
-            try:
-                await self._bus.close()
-            except Exception as exc:  # noqa: BLE001 - teardown is best-effort
-                _logger.debug("closing %s bus failed: %s", self.channel, exc)
+            # Retain the live/uncertain bus reference when close fails so the
+            # caller can retry and cannot mistake dropped Python state for
+            # exclusive hardware ownership.
+            await self._bus.close()
         self._bus = None
         self._motors = {}
         self._locks = {}
@@ -310,7 +310,15 @@ class RobotLink:
         self._thread.start()
         self._ping_task: asyncio.Task[Any] | None = None
         self._sample_task: asyncio.Task[Any] | None = None
+        # A caller-side Future timeout only requests cancellation; the loop
+        # coroutine can still be unwinding.  Serialize open/close lifecycles
+        # on the owning loop so an immediate retry can never overlap it.
+        self._lifecycle_lock = asyncio.Lock()
         self._lock = threading.Lock()
+        # True from before the first bus open until every close completes.
+        # It deliberately means "open or uncertain": a timeout/cancellation
+        # must never be mistaken for proof that another hardware owner is safe.
+        self._buses_may_be_open = False
         # Joint set snapshotted when the buses open, so status() stays
         # consistent with the motors actually being pinged even if the
         # has_gripper setting is toggled mid-connection. None = link down;
@@ -341,7 +349,14 @@ class RobotLink:
     def _submit(self, coro: Any, timeout: float = 30.0) -> Any:
         """Run a coroutine on the link loop from any thread and wait for it."""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except BaseException:
+            # Most importantly, cancel cleanup that timed out before a caller
+            # retries it; two overlapping close coroutines are not evidence of
+            # exclusive CAN ownership. Cancel is harmless if it already ended.
+            future.cancel()
+            raise
 
     def _set_state(self, state: str, error: str | None = None) -> None:
         with self._lock:
@@ -354,9 +369,18 @@ class RobotLink:
     def connect(self) -> dict[str, Any]:
         """Bring up CAN, open the buses, and start the ping loop."""
         with self._lock:
-            if self._state in (STATE_CONNECTED, STATE_BUSY):
-                return self.status()
+            already_active = self._state in (STATE_CONNECTED, STATE_BUSY)
+            cleanup_needed = self._buses_may_be_open
+        if already_active:
+            return self.status()
         self._set_state(STATE_CONNECTING)
+        if cleanup_needed:
+            try:
+                self._submit(self._stop_and_close())
+            except Exception as exc:  # noqa: BLE001
+                self._set_state(STATE_ERROR, _format_error(exc))
+                _logger.warning("robot pre-connect cleanup failed: %s", exc)
+                return self.status()
         try:
             self._enable_can()
         except Exception as exc:  # noqa: BLE001 - report any bring-up failure
@@ -374,10 +398,15 @@ class RobotLink:
 
     def disconnect(self) -> dict[str, Any]:
         """Stop pinging and close the buses."""
+        with self._lock:
+            if self._state == STATE_BUSY:
+                raise RuntimeError("cannot disconnect while a task owns the robot bus")
         try:
             self._submit(self._stop_and_close())
         except Exception as exc:  # noqa: BLE001
-            _logger.debug("robot disconnect cleanup failed: %s", exc)
+            self._set_state(STATE_ERROR, _format_error(exc))
+            _logger.warning("robot disconnect cleanup failed: %s", exc)
+            return self.status()
         self._set_state(STATE_DISCONNECTED)
         with self._lock:
             self._last_ping = None
@@ -396,13 +425,18 @@ class RobotLink:
         :meth:`reacquire` only reconnects if the link was up before the task.
         """
         with self._lock:
-            if self._state not in (STATE_CONNECTED,):
+            if self._state != STATE_CONNECTED and not self._buses_may_be_open:
                 return
         self._set_state(STATE_BUSY)
         try:
             self._submit(self._stop_and_close())
         except Exception as exc:  # noqa: BLE001
-            _logger.debug("robot release cleanup failed: %s", exc)
+            # An operation must never open the same CAN buses after a failed
+            # telemetry shutdown.  Preserve the failure in status and let the
+            # runner abort before it starts a hardware worker.
+            self._set_state(STATE_ERROR, _format_error(exc))
+            _logger.warning("robot release failed: %s", exc)
+            raise RuntimeError(f"could not release robot link: {exc}") from exc
 
     def reacquire(self) -> None:
         """Re-open the buses + ping loop after a task releases the bus."""
@@ -414,7 +448,7 @@ class RobotLink:
         except Exception as exc:  # noqa: BLE001
             self._set_state(STATE_ERROR, _format_error(exc))
             _logger.warning("robot reacquire failed: %s", exc)
-            return
+            raise RuntimeError(f"could not reacquire robot link: {exc}") from exc
         self._set_state(STATE_CONNECTED)
 
     def motor_faults(self) -> list[dict[str, Any]]:
@@ -456,6 +490,11 @@ class RobotLink:
             if self._state not in (STATE_DISCONNECTED, STATE_ERROR):
                 raise RuntimeError(
                     "disconnect the robot link before changing CAN interfaces"
+                )
+            if self._buses_may_be_open:
+                raise RuntimeError(
+                    "robot bus ownership is uncertain; retry disconnect before "
+                    "changing CAN interfaces"
                 )
             self._arms = []
             if left_channel:
@@ -521,37 +560,61 @@ class RobotLink:
     def shutdown(self) -> None:
         """Tear down the link and stop the loop thread (server shutdown)."""
         try:
-            self.disconnect()
+            with self._lock:
+                busy = self._state == STATE_BUSY
+            if busy:
+                _logger.warning(
+                    "server stopped while a task still owned the robot bus; "
+                    "skipping detached-link cleanup"
+                )
+            else:
+                self.disconnect()
         finally:
             self._loop.call_soon_threadsafe(self._loop.stop)
 
     # -- loop-side coroutines ----------------------------------------------
 
     async def _open_and_start(self) -> None:
-        # Snapshot the joint set from the live setting for this connection;
-        # status() reports from the same snapshot until the link is torn down.
-        joints = self._joints()
-        with self._lock:
-            self._active_joints = joints
-        for arm in self._arms:
-            await arm.open(joints)
-        if self._ping_task is None or self._ping_task.done():
-            self._ping_task = asyncio.ensure_future(self._ping_loop())
-        if self._sample_task is None or self._sample_task.done():
-            self._sample_task = asyncio.ensure_future(self._sample_loop())
+        async with self._lifecycle_lock:
+            # Snapshot the joint set from the live setting for this connection;
+            # status() reports from the same snapshot until the link is torn down.
+            joints = self._joints()
+            with self._lock:
+                self._active_joints = joints
+                self._buses_may_be_open = bool(self._arms)
+            for arm in self._arms:
+                await arm.open(joints)
+            if self._ping_task is None or self._ping_task.done():
+                self._ping_task = asyncio.ensure_future(self._ping_loop())
+            if self._sample_task is None or self._sample_task.done():
+                self._sample_task = asyncio.ensure_future(self._sample_loop())
 
     async def _stop_and_close(self) -> None:
-        for task in (self._ping_task, self._sample_task):
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        self._ping_task = None
-        self._sample_task = None
-        for arm in self._arms:
-            await arm.close()
+        async with self._lifecycle_lock:
+            failures: list[BaseException] = []
+            for task in (self._ping_task, self._sample_task):
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except BaseException as exc:  # preserve but still close buses
+                        failures.append(exc)
+            self._ping_task = None
+            self._sample_task = None
+            closed = await asyncio.gather(
+                *(arm.close() for arm in self._arms), return_exceptions=True
+            )
+            close_failures = [
+                result for result in closed if isinstance(result, BaseException)
+            ]
+            if not close_failures:
+                with self._lock:
+                    self._buses_may_be_open = False
+            failures.extend(close_failures)
+            if failures:
+                raise failures[0]
 
     async def _ping_loop(self) -> None:
         while True:

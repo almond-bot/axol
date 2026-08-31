@@ -178,6 +178,11 @@ export default function ControlPanel() {
   // Anchor for the on-page settings card, so "…live in Settings" links can
   // scroll to it.
   const settingsRef = useRef<HTMLDivElement>(null)
+  // Every API helper targets the module-level server base. A slow response
+  // from the previous host must therefore never update this host's UI (or
+  // trigger the legacy camera-settings migration against the new host).
+  const connectionGenerationRef = useRef(0)
+  const [connectionGeneration, setConnectionGeneration] = useState(0)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
 
@@ -192,26 +197,31 @@ export default function ControlPanel() {
   // Enumerate the ZED cameras on the serve host so the Cameras badge can verify
   // the assigned serials are actually connected (best-effort: failures leave the
   // last known state and surface as a "can't detect" warning).
-  const refreshCameras = useCallback(async () => {
+  const refreshCameras = useCallback(async (generation = connectionGenerationRef.current) => {
+    if (generation !== connectionGenerationRef.current) return
     setCameraDetecting(true)
     try {
       const result = await detectCameras()
+      if (generation !== connectionGenerationRef.current) return
       setCameraDevices(result.devices)
       setCameraDetectError(result.error)
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       setCameraDevices(null)
       setCameraDetectError(String(e).replace(/^Error:\s*/, ""))
     } finally {
-      setCameraDetecting(false)
+      if (generation === connectionGenerationRef.current) setCameraDetecting(false)
     }
   }, [])
 
   // Pull the shared settings from the serve host. A host whose stored camera
   // spec is empty gets this browser's legacy localStorage spec migrated up
   // once, so nobody has to re-enter serials after updating.
-  const loadSettings = useCallback(async () => {
+  const loadSettings = useCallback(async (generation = connectionGenerationRef.current) => {
+    if (generation !== connectionGenerationRef.current) return
     try {
       const snap = await fetchSettings()
+      if (generation !== connectionGenerationRef.current) return
       setSettingsError(null)
       if (snap.cameras) {
         setCameras(snap.cameras)
@@ -221,9 +231,12 @@ export default function ControlPanel() {
         const local = loadCameras()
         if (cameraCount(local) > 0) {
           try {
+            if (generation !== connectionGenerationRef.current) return
             await saveSettings({ cameras: local, camerasSet: true })
+            if (generation !== connectionGenerationRef.current) return
             setSettingsSnap({ ...snap, cameras: local })
           } catch {
+            if (generation !== connectionGenerationRef.current) return
             setSettingsSnap(snap)
           }
         } else {
@@ -231,6 +244,7 @@ export default function ControlPanel() {
         }
       }
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       // Old serve host without /api/settings: keep the localStorage camera
       // flow; the settings dialog explains the needed update.
       setSettingsSnap(null)
@@ -240,22 +254,49 @@ export default function ControlPanel() {
 
   const loadServer = useCallback(
     async (host: string) => {
+      const generation = ++connectionGenerationRef.current
+      setConnectionGeneration(generation)
       setServerBase(host)
       setConn({ state: "loading" })
+      // Hide all state owned by the previous host immediately. The generation
+      // checks below also stop its in-flight responses from repopulating it.
+      setCommands([])
+      setHostInfo(null)
+      setUpdate(null)
+      setStartingUpdate(false)
+      setUpdateAbandoned(false)
+      setUpdatePhase(null)
+      setRobot(null)
+      setRobotBusy(false)
+      setUsb(null)
+      setUsbBusy(false)
+      setSession(null)
+      setActiveCommandSession(null)
+      setPolicy(null)
+      setBusy(false)
+      setStartPhase(null)
+      setCameraDevices(null)
+      setCameraDetectError(null)
+      setCameraDetecting(false)
+      setSettingsSnap(null)
+      setSettingsError(null)
       try {
         const cmds = await fetchCommands()
+        if (generation !== connectionGenerationRef.current) return
         setCommands(cmds)
         setConn({ state: "ok" })
         setSetupOpen(false)
       } catch (e) {
+        if (generation !== connectionGenerationRef.current) return
         setCommands([])
         setConn({ state: "err", message: String(e) })
         return
       }
-      refreshCameras()
-      loadSettings()
+      void refreshCameras(generation)
+      void loadSettings(generation)
       fetchInfo()
         .then((info) => {
+          if (generation !== connectionGenerationRef.current) return
           setViewerPort(info.viewerPort)
           setHostInfo(info)
         })
@@ -263,13 +304,18 @@ export default function ControlPanel() {
       // Force a synchronous remote check on connect/page load so the banner
       // reflects reality immediately; the steady-state poll below stays cheap.
       fetchUpdateStatus(true)
-        .then(setUpdate)
+        .then((value) => {
+          if (generation === connectionGenerationRef.current) setUpdate(value)
+        })
         .catch(() => {})
       fetchRobotStatus()
-        .then(setRobot)
+        .then((value) => {
+          if (generation === connectionGenerationRef.current) setRobot(value)
+        })
         .catch(() => {})
       fetchOpStatus()
         .then((op) => {
+          if (generation !== connectionGenerationRef.current) return
           if (op.running && op.session) {
             setSession(op.session)
             setSelectedOp(op.session.command as OperationId)
@@ -282,7 +328,6 @@ export default function ControlPanel() {
   )
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadServer(serverHost)
     // Only on mount — reconnects are explicit via the setup dialog.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -392,18 +437,25 @@ export default function ControlPanel() {
   // once) or when the headset goes away, while preventing a per-poll retry loop
   // if `adb reverse` can't establish it.
   const autoUsbRef = useRef(false)
-  const usbConnectClick = useCallback(async () => {
-    setUsbBusy(true)
-    try {
-      // Runs `adb reverse`; the first touch also pops the USB-debugging
-      // authorization prompt on the headset.
-      setUsb(await usbConnect())
-    } catch (e) {
-      toast.error(String(e))
-    } finally {
-      setUsbBusy(false)
-    }
-  }, [toast])
+  const usbConnectClick = useCallback(
+    async (generation = connectionGenerationRef.current) => {
+      if (generation !== connectionGenerationRef.current) return
+      setUsbBusy(true)
+      try {
+        const status = await usbConnect()
+        if (generation !== connectionGenerationRef.current) return
+        // Runs `adb reverse`; the first touch also pops the USB-debugging
+        // authorization prompt on the headset.
+        setUsb(status)
+      } catch (e) {
+        if (generation !== connectionGenerationRef.current) return
+        toast.error(String(e))
+      } finally {
+        if (generation === connectionGenerationRef.current) setUsbBusy(false)
+      }
+    },
+    [toast]
+  )
 
   useEffect(() => {
     if (conn.state !== "ok") {
@@ -429,19 +481,29 @@ export default function ControlPanel() {
     // Purely client-side: drop this browser's view of the host without
     // touching server state. Other control panels on the network may be
     // driving the same host, so never stop a running op from here.
+    connectionGenerationRef.current += 1
+    setConnectionGeneration(connectionGenerationRef.current)
     setConn({ state: "idle" })
     setCommands([])
+    setHostInfo(null)
     setRobot(null)
+    setUsb(null)
+    setUsbBusy(false)
     setSession(null)
+    setActiveCommandSession(null)
     setPolicy(null)
+    setBusy(false)
+    setStartPhase(null)
     setCameraDevices(null)
     setCameraDetectError(null)
+    setCameraDetecting(false)
     setSettingsSnap(null)
     setSettingsError(null)
     setUpdate(null)
     setStartingUpdate(false)
     setUpdateAbandoned(false)
     setUpdatePhase(null)
+    setRobotBusy(false)
     autoRobotRef.current = null
   }
 
@@ -459,7 +521,11 @@ export default function ControlPanel() {
 
   // Persist a settings-dialog save: cameras also mirror to localStorage (the
   // fallback for old hosts / offline), everything else goes to the serve host.
-  async function handleSettingsSave(patch: SettingsPatch) {
+  async function handleSettingsSave(
+    patch: SettingsPatch,
+    generation = connectionGenerationRef.current
+  ) {
+    if (generation !== connectionGenerationRef.current) return
     const mantisChannelsChanged = ["mantis.left_channel", "mantis.right_channel"].some((key) =>
       Object.prototype.hasOwnProperty.call(patch.values ?? {}, key)
     )
@@ -472,6 +538,7 @@ export default function ControlPanel() {
       return
     }
     const snap = await saveSettings(patch)
+    if (generation !== connectionGenerationRef.current) return
     setSettingsSnap((prev) => ({
       ...snap,
       schema: prev?.schema ?? snap.schema,
@@ -534,33 +601,41 @@ export default function ControlPanel() {
   // -- robot connection --
   const robotConnectClick = useCallback(
     async (profile: HardwareProfile) => {
+      const generation = connectionGenerationRef.current
       setRobotBusy(true)
       try {
         const status = await robotConnect(undefined, profile)
+        if (generation !== connectionGenerationRef.current) return
         setRobot(status)
         if (!status.connected) {
           throw new Error(status.error ?? `Could not connect the ${profile} CAN link`)
         }
       } catch (e) {
+        if (generation !== connectionGenerationRef.current) return
         toast.error(String(e))
       } finally {
-        setRobotBusy(false)
+        if (generation === connectionGenerationRef.current) setRobotBusy(false)
       }
     },
     [toast]
   )
 
   async function robotDisconnectClick() {
+    const generation = connectionGenerationRef.current
     setRobotBusy(true)
     try {
       // Kill any running task and wait for it to exit before releasing the
       // robot connection out from under it, then disconnect.
-      await stopRunningOp()
-      setRobot(await robotDisconnect())
+      if (!(await stopRunningOp(generation))) return
+      if (generation !== connectionGenerationRef.current) return
+      const status = await robotDisconnect()
+      if (generation !== connectionGenerationRef.current) return
+      setRobot(status)
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       toast.error(String(e))
     } finally {
-      setRobotBusy(false)
+      if (generation === connectionGenerationRef.current) setRobotBusy(false)
     }
   }
 
@@ -681,9 +756,15 @@ export default function ControlPanel() {
   // (handleUpdate drives its own watch poll then).
   useEffect(() => {
     if (conn.state !== "ok" || updating) return
+    let active = true
     fetchUpdateStatus()
-      .then(setUpdate)
+      .then((value) => {
+        if (active) setUpdate(value)
+      })
       .catch(() => {})
+    return () => {
+      active = false
+    }
   }, [conn.state, updating, isLive])
 
   // Drive an in-flight update to completion on ANY connected computer: advance
@@ -746,25 +827,33 @@ export default function ControlPanel() {
   // The server-side stop now returns immediately with "stopping" (it force-kills
   // a stuck op in the background), so we poll op status until the op is truly
   // gone rather than relying on the stop response to block.
-  async function stopRunningOp() {
-    if (!isLive) return
-    setSession(await stopOperation())
+  async function stopRunningOp(generation = connectionGenerationRef.current): Promise<boolean> {
+    if (!isLive) return generation === connectionGenerationRef.current
+    const stopped = await stopOperation()
+    if (generation !== connectionGenerationRef.current) return false
+    setSession(stopped)
     // Bounded so an unkillable op (abandoned server-side) can't wedge the UI;
     // we proceed best-effort after the deadline.
     const deadline = Date.now() + 30_000
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 500))
+      if (generation !== connectionGenerationRef.current) return false
       try {
         const op = await fetchOpStatus()
+        if (generation !== connectionGenerationRef.current) return false
         if (op.session) setSession(op.session)
-        if (!op.running) return
+        if (!op.running) return true
       } catch {
-        return // host unreachable — nothing left to wait on
+        // Host unreachable — nothing left to wait on, but do not let a host
+        // switch turn the caller's next step into a request to the new host.
+        return generation === connectionGenerationRef.current
       }
     }
+    return generation === connectionGenerationRef.current
   }
 
   async function handleStart() {
+    const generation = connectionGenerationRef.current
     setBusy(true)
     try {
       // Only ops that actually require cameras (collect-data / run-policy) are
@@ -783,6 +872,7 @@ export default function ControlPanel() {
         if (devices === null) {
           setStartPhase("Checking cameras…")
           const detect = await detectCameras()
+          if (generation !== connectionGenerationRef.current) return
           setCameraDevices(detect.devices)
           setCameraDetectError(detect.error)
           devices = detect.devices
@@ -824,35 +914,47 @@ export default function ControlPanel() {
       // spec in their settings store; sending it stays compatible with old ones.
       const camSpec =
         meta.requiresCameras || cameraCount(cameras, mantisSelected) > 0 ? cameras : undefined
+      if (generation !== connectionGenerationRef.current) return
       const result = await startOperation(opId, args, camSpec)
+      if (generation !== connectionGenerationRef.current) return
       setSession(result)
       // Fresh run — clear any stale phase; the live poll repopulates it.
       setPolicy(null)
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       toast.error(String(e))
     } finally {
-      setStartPhase(null)
-      setBusy(false)
+      if (generation === connectionGenerationRef.current) {
+        setStartPhase(null)
+        setBusy(false)
+      }
     }
   }
 
   async function handleStop() {
+    const generation = connectionGenerationRef.current
     setBusy(true)
     // Reflect "Stopping…" immediately — the server stop returns right away and
     // teardown runs in the background, so don't wait for the response/next poll
     // to flip the button.
     setSession((s) => (s ? { ...s, status: "stopping" } : s))
     try {
-      setSession(await stopOperation())
+      const stopped = await stopOperation()
+      if (generation !== connectionGenerationRef.current) return
+      setSession(stopped)
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       toast.error(String(e))
     } finally {
-      setBusy(false)
+      if (generation === connectionGenerationRef.current) setBusy(false)
     }
   }
 
   function handleEpisode(command: string) {
-    sendEpisodeCommand(command).catch((e) => toast.error(String(e)))
+    const generation = connectionGenerationRef.current
+    sendEpisodeCommand(command).catch((e) => {
+      if (generation === connectionGenerationRef.current) toast.error(String(e))
+    })
   }
 
   // Kick off the available update. The server upgrades and exits (systemd
@@ -861,12 +963,15 @@ export default function ControlPanel() {
   // hard-reloads once the backend is back on the new release.
   async function handleUpdate() {
     if (!update?.remoteVersion) return
+    const generation = connectionGenerationRef.current
     setUpdateAbandoned(false)
     setStartingUpdate(true)
     setUpdatePhase("upgrading")
     try {
       await startUpdate()
+      if (generation !== connectionGenerationRef.current) return
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       toast.error(`Update failed to start: ${e}`)
       setStartingUpdate(false)
       setUpdatePhase(null)
@@ -876,6 +981,7 @@ export default function ControlPanel() {
     // takes over; then drop the optimistic flag (server state carries it now).
     fetchUpdateStatus()
       .then((u) => {
+        if (generation !== connectionGenerationRef.current) return
         setUpdate(u)
         setStartingUpdate(false)
       })
@@ -884,6 +990,10 @@ export default function ControlPanel() {
 
   const viewerHost = serverHost || hostInfo?.lanIp || ""
   const mantisSource = String(settingsSnap?.values["teleop.mantis_source"] ?? "lighthouse")
+  // Child settings actions can finish after their old-host tree unmounts.
+  // Capture the generation represented by these callbacks so an old camera
+  // daemon restart or diagnostics launch cannot refresh/repopulate a new host.
+  const renderedConnectionGeneration = connectionGeneration
 
   // UI/backend skew warning (stale local bundle, or hosted UI on a different
   // release than the robot). Suppressed while the update banner covers the
@@ -937,14 +1047,13 @@ export default function ControlPanel() {
               snapshot={settingsSnap}
               supportError={settingsError}
               cameras={cameras}
-              mantisMode={mantisMode}
-              onSave={handleSettingsSave}
+              onSave={(patch) => handleSettingsSave(patch, renderedConnectionGeneration)}
               devices={cameraDevices}
               detecting={cameraDetecting}
-              onRefresh={refreshCameras}
+              onRefresh={() => void refreshCameras(renderedConnectionGeneration)}
               usb={usb}
               usbBusy={usbBusy}
-              onUsbConnect={() => usbConnectClick()}
+              onUsbConnect={() => void usbConnectClick(renderedConnectionGeneration)}
               actionBlocker={
                 isLive
                   ? `${runningOp ?? "An operation"} is running`
@@ -953,7 +1062,11 @@ export default function ControlPanel() {
                     : null
               }
               activeCommandSession={activeCommandSession}
-              onCommandSessionChange={setActiveCommandSession}
+              onCommandSessionChange={(next) => {
+                if (connectionGenerationRef.current === renderedConnectionGeneration) {
+                  setActiveCommandSession(next)
+                }
+              }}
             />
           </div>
         )}
@@ -973,6 +1086,7 @@ export default function ControlPanel() {
         )}
 
         <OperationPanel
+          key={renderedConnectionGeneration}
           meta={meta}
           spec={spec}
           settings={settings}
@@ -998,6 +1112,7 @@ export default function ControlPanel() {
                 ? `${runningOp ?? "Another operation"} is running`
                 : null
           }
+          connected={conn.state === "ok"}
           policy={selectedLive ? policy : null}
           onStart={handleStart}
           onStop={handleStop}

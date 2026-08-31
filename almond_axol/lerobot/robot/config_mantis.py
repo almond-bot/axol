@@ -25,3 +25,10 @@ class MantisRobotConfig(AxolRobotConfig):
 
     left_channel: str = CAN_MANTIS_LEFT
     right_channel: str = CAN_MANTIS_RIGHT
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.axol_config.has_gripper:
+            raise ValueError(
+                "Mantis always has two physical grippers; has_gripper cannot be false"
+            )

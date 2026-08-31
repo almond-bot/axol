@@ -3,12 +3,14 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest.mock import Mock
 
 import numpy as np
 
 from almond_axol.cli.collect_data import EpisodeQAStats, evaluate_episode_qa
 from almond_axol.tracker.base import TrackerPose
 from almond_axol.tracker.bridge import StopEventControls, TrackerBridge
+from almond_axol.tracker.trigger import TriggerReader
 from almond_axol.vr.models import VRFrame
 
 
@@ -55,6 +57,35 @@ def _bridge() -> tuple[TrackerBridge, _Trigger, _Trigger]:
 
 
 class MantisTriggerSafetyTest(unittest.TestCase):
+    def test_reader_close_surfaces_lingering_thread_after_socket_shutdown(
+        self,
+    ) -> None:
+        reader = object.__new__(TriggerReader)
+        reader._stop = threading.Event()
+        reader._bus = Mock()
+        reader._thread = Mock()
+        reader._thread.is_alive.return_value = True
+
+        with self.assertRaisesRegex(RuntimeError, "CAN ownership is uncertain"):
+            reader.close()
+
+        self.assertTrue(reader._stop.is_set())
+        reader._bus.shutdown.assert_called_once_with()
+        reader._thread.join.assert_called_once_with(timeout=1.0)
+
+    def test_reader_close_joins_even_when_socket_shutdown_fails(self) -> None:
+        reader = object.__new__(TriggerReader)
+        reader._stop = threading.Event()
+        reader._bus = Mock()
+        reader._bus.shutdown.side_effect = OSError("shutdown failed")
+        reader._thread = Mock()
+        reader._thread.is_alive.return_value = False
+
+        with self.assertRaisesRegex(RuntimeError, "CAN ownership is uncertain"):
+            reader.close()
+
+        reader._thread.join.assert_called_once_with(timeout=1.0)
+
     def test_stale_trigger_clears_armed_alignment_confirmation(self) -> None:
         bridge, left, right = _bridge()
 

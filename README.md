@@ -13,20 +13,22 @@ The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). 
 ## Requirements
 
 - **Linux**
-- **Python 3.13+**
+- **Python 3.12+** (the hosted installer bundles 3.13)
 - **(Optional) NVIDIA Jetson** (e.g. a ZED Box) — required for the GMSL-attached ZED cameras (data collection / policy inference).
 
 ## Installation
 
 ### One-command install (recommended)
 
-One command installs `uv`, the `axol` CLI (from PyPI, with every extra), and a root systemd service that keeps `axol serve` running at boot:
+One command installs `uv`, the `axol` CLI (from PyPI, with the `lerobot`, `sim`, and `tracker` extras), and a root systemd service that keeps `axol serve` running at boot:
 
 ```bash
 curl https://axol.almond.bot/install -fsS | bash
 ```
 
 Then open [axol.almond.bot](https://axol.almond.bot) and connect to the machine. The install tracks [releases](https://github.com/almond-bot/axol/releases): when a newer release exists, the control panel shows an update banner, and pressing **Update** reinstalls at the new release and restarts the server once idle.
+
+On aarch64/Jetson, PyPI's pinned Torch 2.10 wheel is CPU-only. Local CUDA policy inference needs an explicitly managed JetPack-compatible Torch + Torchvision build; otherwise use remote inference or `--device cpu`. The hosted update paths refuse to overwrite an existing custom/CUDA build.
 
 ### Development install
 
@@ -46,11 +48,11 @@ Install optional dependency groups as needed:
 
 | Extra | Contents | When to use |
 |---|---|---|
-| `lerobot` | LeRobot (from PyPI, >= 0.6.1) | `collect-data`, `run-policy` |
+| `lerobot` | LeRobot (from PyPI, pinned to 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
 
 ```bash
-uv sync --extra lerobot --extra sim   # everything
+uv sync --extra lerobot --extra sim --extra tracker   # hosted feature set
 ```
 
 The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separately after the ZED SDK is installed:

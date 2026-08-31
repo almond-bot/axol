@@ -29,7 +29,12 @@ import logging
 import time
 from typing import Any, Callable
 
-from ..tracker.base import TRACKER_PAIR_MAX_SKEW_S, TRACKER_POSE_MAX_AGE_S
+from ..tracker.base import (
+    TRACKER_PAIR_MAX_SKEW_S,
+    TRACKER_POSE_MAX_AGE_S,
+    TrackerSourceError,
+    valid_tracker_pose,
+)
 from ..utils.ports import VR_PORT
 
 _logger = logging.getLogger(__name__)
@@ -243,9 +248,26 @@ def run_configured_bridge(
     except KeyboardInterrupt:
         pass
     finally:
+        cleanup_failures: list[tuple[str, BaseException]] = []
         for reader in triggers.values():
-            reader.close()
-        source.stop()
+            try:
+                reader.close()
+            except BaseException as exc:
+                cleanup_failures.append(("trigger", exc))
+        try:
+            source.stop()
+        except BaseException as exc:
+            cleanup_failures.append(("tracker source", exc))
+        if cleanup_failures:
+            label, failure = cleanup_failures[0]
+            for extra_label, extra in cleanup_failures[1:]:
+                failure.add_note(
+                    f"additional {extra_label} cleanup failure: "
+                    f"{type(extra).__name__}: {extra}"
+                )
+            raise TrackerSourceError(
+                f"{label} teardown failed; tracker ownership is uncertain"
+            ) from failure
 
 
 def _wait_for_live_inputs(
@@ -271,6 +293,8 @@ def _wait_for_live_inputs(
             pose = poses.get(key)
             if pose is None:
                 missing.append(f"{side} tracker {key!r} is not reporting")
+            elif not valid_tracker_pose(pose):
+                missing.append(f"{side} tracker {key!r} reported an invalid pose")
             elif not pose.tracking:
                 missing.append(f"{side} tracker {key!r} has not converged")
             elif not now - pose.t <= TRACKER_POSE_MAX_AGE_S:

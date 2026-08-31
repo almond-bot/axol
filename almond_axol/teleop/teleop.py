@@ -40,7 +40,11 @@ import time
 import numpy as np
 
 from ..kinematics import KinematicsConfig
-from ..robot.base import RobotBase
+from ..robot.base import (
+    HardwareCleanupError,
+    RobotBase,
+    mark_hardware_cleanup_uncertain,
+)
 from ..robot.cart import Cart
 from ..robot.control import ContactWatchdog
 from ..utils.jetson_diag import TegraStatsDiag
@@ -106,6 +110,9 @@ class VRTeleop:
         # Lock the headset HUD to plain teleop: no data-collection toggle and no
         # recording controls, since this flow never records.
         self._vr_server.set_mode("teleop")
+        self._vr_server.set_pose_mode(
+            "absolute" if config.absolute_mode else "relative"
+        )
 
         # Engage toggle, EMA/trapezoidal smoothing, and reset handling all live
         # in the shared core so this flow and `axol collect-data` (AxolVRTeleop)
@@ -186,6 +193,19 @@ class VRTeleop:
 
     async def enable(self) -> None:
         """Start the VR server, robot, and IK subprocess."""
+        if any(
+            resource is not None
+            for resource in (
+                self._ik_thread,
+                self._parent_conn,
+                self._ik_process,
+                self._vr_thread,
+            )
+        ):
+            raise HardwareCleanupError(
+                "previous teleop cleanup is incomplete; retry disable() before "
+                "starting another session"
+            )
         self._vr_stop.clear()
         self._vr_ready.clear()
         self._vr_thread = threading.Thread(
@@ -245,43 +265,133 @@ class VRTeleop:
 
     async def disable(self) -> None:
         """Disable motors, stop IK subprocess, and stop VR server."""
+        cleanup_failures: list[tuple[str, BaseException]] = []
+        hardware_failures: list[tuple[str, BaseException]] = []
+
+        # Stop new work first, then turn the hardware off before waiting on
+        # background workers.  A wedged IK reader must not delay torque-off.
         if self._ik_thread is not None:
             self._ik_stop.set()
-            self._ik_thread.join(timeout=3.0)
-            self._ik_thread = None
+        if self._vr_thread is not None:
+            self._vr_stop.set()
+
+        if self._cart is not None:
+            try:
+                await self._cart.disable()
+            except BaseException as exc:  # finish the arm shutdown too
+                _logger.exception("cart disable failed")
+                hardware_failures.append(("cart", exc))
+        try:
+            await self._robot.disable()
+        except BaseException as exc:
+            _logger.exception("robot disable failed")
+            hardware_failures.append(("robot", exc))
+
+        thread = self._ik_thread
+        if thread is not None:
+            try:
+                thread.join(timeout=3.0)
+            except BaseException as exc:
+                cleanup_failures.append(("IK thread join", exc))
+            try:
+                thread_alive = thread.is_alive()
+            except BaseException as exc:
+                cleanup_failures.append(("IK thread liveness check", exc))
+                thread_alive = True
+            if thread_alive:
+                cleanup_failures.append(
+                    ("IK thread", RuntimeError("IK dispatch thread did not stop"))
+                )
+            else:
+                self._ik_thread = None
 
         if self._parent_conn is not None:
+            # Only send the graceful sentinel after the dispatch thread has
+            # released its end of the pipe. Closing still happens when it is
+            # stuck, which unblocks a pending recv without racing two readers.
+            if self._ik_thread is None:
+                try:
+                    while self._parent_conn.poll(0):
+                        self._parent_conn.recv()
+                    self._parent_conn.send(None)
+                except BaseException:
+                    # EOF/worker death is acceptable; process termination below
+                    # is the authoritative ownership check.
+                    pass
             try:
                 # Drain in-flight worker responses before closing: the dispatch
                 # thread can stop mid solve, and closing a connection with
                 # unread data RSTs the peer — the worker's blocking recv then
                 # dies with ConnectionResetError instead of reading the None
                 # shutdown sentinel.
-                while self._parent_conn.poll(0):
-                    self._parent_conn.recv()
-                self._parent_conn.send(None)
-            except Exception:
-                pass
-            self._parent_conn.close()
-            self._parent_conn = None
+                self._parent_conn.close()
+            except BaseException as exc:
+                cleanup_failures.append(("IK pipe close", exc))
+            else:
+                self._parent_conn = None
 
-        if self._ik_process is not None:
-            self._ik_process.join(timeout=3.0)
-            if self._ik_process.is_alive():
-                self._ik_process.terminate()
-            self._ik_process = None
-
-        if self._vr_thread is not None:
-            self._vr_stop.set()
-            self._vr_thread.join(timeout=5.0)
-            self._vr_thread = None
-
-        if self._cart is not None:
+        process = self._ik_process
+        if process is not None:
             try:
-                await self._cart.disable()
-            except Exception:  # noqa: BLE001 - never block the arm shutdown
-                _logger.exception("cart disable failed")
-        await self._robot.disable()
+                process.join(timeout=3.0)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=2.0)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=2.0)
+                process_alive = process.is_alive()
+            except BaseException as exc:
+                cleanup_failures.append(("IK process shutdown", exc))
+                process_alive = True
+            if process_alive:
+                cleanup_failures.append(
+                    ("IK process", RuntimeError("IK worker process did not stop"))
+                )
+            else:
+                self._ik_process = None
+
+        vr_thread = self._vr_thread
+        if vr_thread is not None:
+            try:
+                vr_thread.join(timeout=5.0)
+            except BaseException as exc:
+                cleanup_failures.append(("VR thread join", exc))
+            try:
+                vr_alive = vr_thread.is_alive()
+            except BaseException as exc:
+                cleanup_failures.append(("VR thread liveness check", exc))
+                vr_alive = True
+            if vr_alive:
+                cleanup_failures.append(
+                    ("VR thread", RuntimeError("VR server thread did not stop"))
+                )
+            else:
+                self._vr_thread = None
+                self._vr_loop = None
+
+        if hardware_failures:
+            first_label, first_failure = hardware_failures[0]
+            for extra_label, extra in hardware_failures[1:] + cleanup_failures:
+                first_failure.add_note(
+                    f"additional teleop {extra_label} cleanup failure: "
+                    f"{type(extra).__name__}: {extra}"
+                )
+            if isinstance(first_failure, HardwareCleanupError):
+                raise first_failure
+            raise HardwareCleanupError(
+                f"teleop {first_label} disable failed; hardware ownership is uncertain"
+            ) from first_failure
+        if cleanup_failures:
+            label, first_failure = cleanup_failures[0]
+            for extra_label, extra in cleanup_failures[1:]:
+                first_failure.add_note(
+                    f"additional teleop {extra_label} cleanup failure: "
+                    f"{type(extra).__name__}: {extra}"
+                )
+            raise RuntimeError(
+                f"teleop {label} failed; background ownership is uncertain"
+            ) from first_failure
 
     async def __aenter__(self) -> VRTeleop:
         # If enable() is interrupted partway — e.g. the operation is stopped
@@ -293,11 +403,12 @@ class VRTeleop:
         # started before propagating.
         try:
             await self.enable()
-        except BaseException:
+        except BaseException as setup_error:
             try:
                 await self.disable()
-            except Exception:
+            except BaseException as cleanup_error:
                 _logger.exception("teleop startup cleanup failed")
+                mark_hardware_cleanup_uncertain(setup_error, cleanup_error)
             raise
         return self
 

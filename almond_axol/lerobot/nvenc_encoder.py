@@ -547,7 +547,24 @@ class NvencStreamingEncoder:
             cam.cancel()
             video_path = cam.video_path
             if video_path.exists() or video_path.parent.exists():
-                shutil.rmtree(str(video_path.parent), ignore_errors=True)
+                from ..utils.state_files import (
+                    privileged_service_active,
+                    secure_rmdir,
+                    secure_unlink,
+                )
+
+                if privileged_service_active():
+                    try:
+                        secure_unlink(video_path, missing_ok=True)
+                        secure_rmdir(video_path.parent, missing_ok=True)
+                    except OSError as exc:
+                        _logger.warning(
+                            "keeping cancelled camera staging directory %s: %s",
+                            video_path.parent,
+                            exc,
+                        )
+                else:
+                    shutil.rmtree(str(video_path.parent), ignore_errors=True)
         self._cams = {}
         self._episode_active = False
 

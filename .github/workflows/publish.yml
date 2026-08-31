@@ -22,28 +22,100 @@
 # The plugin's version lives in plugins/lerobot_robot_axol/pyproject.toml and
 # only needs bumping when the plugin itself changes (skip-existing keeps
 # unbumped re-uploads harmless).
-name: Publish to PyPI
+name: Validate and publish to PyPI
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   release:
     types: [published]
 
+permissions:
+  contents: read
+
 jobs:
+  validate-python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - run: uv python install "${{ matrix.python-version }}"
+      - name: Verify release tag matches the SDK version
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          expected_tag="v$(uv version --short)"
+          if [ "${RELEASE_TAG}" != "${expected_tag}" ]; then
+            echo "Release tag ${RELEASE_TAG} does not match pyproject version ${expected_tag}." >&2
+            exit 1
+          fi
+      # LeRobot's training extras produce a multi-gigabyte environment. Avoid
+      # retaining a second persistent copy in uv's cache on the hosted runner.
+      - run: uv sync --python "${{ matrix.python-version }}" --no-cache --frozen --extra sim --extra lerobot --extra tracker
+      # The preceding exact sync selected all hosted extras. Avoid a second
+      # default-only sync here, which would prune those extras before tests.
+      - run: uv run --python "${{ matrix.python-version }}" --no-sync python -m unittest discover -s tests
+      - run: uvx ruff@0.9.7 check .
+      - run: uvx ruff@0.9.7 format --check .
+      - if: matrix.python-version == '3.13'
+        run: bash -n web/app/public/install
+      - if: matrix.python-version == '3.13'
+        run: uv build
+      - if: matrix.python-version == '3.13'
+        run: uv build --project plugins/lerobot_robot_axol
+      - if: matrix.python-version == '3.13'
+        run: uvx --from twine==7.0.0 twine check dist/* plugins/lerobot_robot_axol/dist/*
+
+  validate-web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run build
+
   publish-sdk:
+    if: github.event_name == 'release'
+    needs: [validate-python, validate-web]
     runs-on: ubuntu-latest
     permissions:
       # Required for PyPI trusted publishing (OIDC).
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.12.3"
+          enable-cache: false
       - run: uv build
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           skip-existing: true
 
   publish-plugin:
+    if: github.event_name == 'release'
+    needs: [validate-python, validate-web]
     runs-on: ubuntu-latest
     # Distinct OIDC environment claim; see the header comment.
     environment: pypi-plugin
@@ -51,10 +123,15 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.12.3"
+          enable-cache: false
       - run: uv build --project plugins/lerobot_robot_axol
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: plugins/lerobot_robot_axol/dist
           skip-existing: true

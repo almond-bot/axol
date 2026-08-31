@@ -1,5 +1,5 @@
 import type { RefObject } from "react"
-import { useRef } from "react"
+import { useEffect, useRef } from "react"
 import { useFrame } from "@react-three/fiber"
 
 /** Base transform of the virtual robot in the XR reference space. */
@@ -45,13 +45,33 @@ export function useAxolUrdfState(
   const stateRef = useRef<AxolUrdfState | null>(null)
   // WebSocket we've attached the listener to, to avoid re-attaching.
   const attachedWsRef = useRef<WebSocket | null>(null)
+  const listenerRef = useRef<((event: MessageEvent) => void) | null>(null)
+
+  useEffect(
+    () => () => {
+      if (attachedWsRef.current && listenerRef.current) {
+        attachedWsRef.current.removeEventListener("message", listenerRef.current)
+      }
+      attachedWsRef.current = null
+      listenerRef.current = null
+    },
+    []
+  )
 
   useFrame(() => {
     const ws = wsRef.current
     if (ws !== attachedWsRef.current) {
+      if (attachedWsRef.current && listenerRef.current) {
+        attachedWsRef.current.removeEventListener("message", listenerRef.current)
+      }
       attachedWsRef.current = ws
+      listenerRef.current = null
       stateRef.current = null
-      ws?.addEventListener("message", (event: MessageEvent) => {
+      if (!ws) return
+      const onMessage = (event: MessageEvent) => {
+        // A message already queued by a superseded socket must not repopulate
+        // the state that was just cleared for the new connection.
+        if (wsRef.current !== ws) return
         try {
           const msg = JSON.parse(event.data as string) as {
             type?: string
@@ -68,7 +88,9 @@ export function useAxolUrdfState(
         } catch {
           // ignore malformed messages
         }
-      })
+      }
+      listenerRef.current = onMessage
+      ws.addEventListener("message", onMessage)
     }
   })
 

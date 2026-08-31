@@ -14,6 +14,7 @@ from almond_axol.serve import app as app_module
 from almond_axol.serve import tracker_setup
 from almond_axol.serve.commands import COMMANDS, get_schema
 from almond_axol.tracker.config import TrackerConfig, save_tracker_config
+from almond_axol.tracker.ultimate import ultimate_wifi_config_error
 
 _IDENTITY = {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]}
 
@@ -56,7 +57,7 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
             tracker_setup.save_ultimate_wifi(
                 {
                     "ssid": "old",
-                    "pass": "keep-me",
+                    "pass": "keep-me!",
                     "country": "US",
                     "freq": 5180,
                 },
@@ -66,9 +67,9 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                 {"ssid": "new", "country": "CA", "freq": 5200}, path
             )
             saved = json.loads(path.read_text())
-            self.assertEqual(saved["pass"], "keep-me")
+            self.assertEqual(saved["pass"], "keep-me!")
             self.assertEqual(saved["ssid"], "new")
-            self.assertNotIn("keep-me", json.dumps(result))
+            self.assertNotIn("keep-me!", json.dumps(result))
 
     def test_wifi_rejects_unknown_fields_without_echoing_secret(self) -> None:
         secret = "do-not-echo-this"
@@ -92,7 +93,7 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                 json.dumps(
                     {
                         "ssid": "AXOL",
-                        "pass": "hidden",
+                        "pass": "hidden!!",
                         "country": "US",
                         "freq": 5240,
                     }
@@ -102,20 +103,55 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
             result = tracker_setup.ultimate_wifi_snapshot(path)
             self.assertEqual(result["status"], "permissions-warning")
             self.assertFalse(result["configured"])
-            self.assertNotIn("hidden", json.dumps(result))
+            self.assertNotIn("hidden!!", json.dumps(result))
+
+    def test_wifi_rejects_values_that_cannot_be_valid_credentials(self) -> None:
+        baseline: dict[str, object] = {
+            "ssid": "AXOL",
+            "pass": "valid-password",
+            "country": "US",
+            "freq": 5240,
+        }
+        invalid = {
+            "oversized SSID": {"ssid": "x" * 33},
+            "control character": {"ssid": "AXOL\n"},
+            "short passphrase": {"pass": "short"},
+            "unknown country": {"country": "ZZ"},
+            "non-Wi-Fi frequency": {"freq": 1},
+        }
+        for label, replacement in invalid.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "wifi.json"
+                payload = {**baseline, **replacement}
+                with self.assertRaises(tracker_setup.TrackerSetupError) as caught:
+                    tracker_setup.save_ultimate_wifi(payload, path)
+                self.assertFalse(path.exists())
+                self.assertNotIn(str(payload["pass"]), str(caught.exception))
+
+    def test_runtime_wifi_validation_uses_the_same_rules_as_the_editor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "wifi.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "ssid": "AXOL",
+                        "pass": "valid-password",
+                        "country": "ZZ",
+                        "freq": 1,
+                    }
+                )
+            )
+            self.assertIn("country", ultimate_wifi_config_error(path) or "")
 
     def test_atomic_writer_preserves_existing_operator_owner_when_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "wifi.json"
             path.write_text("{}")
-            owner = (path.stat().st_uid, path.stat().st_gid)
-            with (
-                patch.object(tracker_setup.os, "geteuid", return_value=0),
-                patch.object(tracker_setup.os, "chown") as chown,
-                patch.object(tracker_setup, "adopt_state_file"),
-            ):
+            with patch.object(
+                tracker_setup, "secure_atomic_write_json"
+            ) as secure_write:
                 tracker_setup._atomic_write_json(path, {"ok": True})  # noqa: SLF001
-            chown.assert_called_once_with(path, *owner)
+            secure_write.assert_called_once_with(path, {"ok": True})
 
     def _tracker_config(self, path: Path) -> None:
         save_tracker_config(
@@ -298,6 +334,72 @@ def _test_app(settings: _Settings) -> Any:
 
 
 class TrackerSetupApiTest(unittest.IsolatedAsyncioTestCase):
+    async def test_untrusted_browser_cannot_read_or_probe_api(self) -> None:
+        app = _test_app(_Settings())
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://attacker.example:8001"
+        ) as client:
+            explicit_origin = await client.get(
+                "/api/tracker/ultimate/wifi",
+                headers={"Origin": "http://attacker.example:8001"},
+            )
+            originless_navigation = await client.get(
+                "/api/tracker/ultimate/wifi",
+                headers={"Sec-Fetch-Site": "cross-site"},
+            )
+            native_client = await client.get("/api/tracker/ultimate/wifi")
+
+        self.assertEqual(explicit_origin.status_code, 403)
+        self.assertEqual(originless_navigation.status_code, 403)
+        self.assertEqual(native_client.status_code, 200)
+
+    async def test_untrusted_browser_origin_cannot_write_tracker_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "wifi.json"
+            app = _test_app(_Settings())
+            transport = httpx.ASGITransport(app=app)
+            with patch.object(tracker_setup, "ULTIMATE_WIFI_CONFIG_FILE", path):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://attacker.example:8001"
+                ) as client:
+                    response = await client.put(
+                        "/api/tracker/ultimate/wifi",
+                        # Matching Origin and Host is still untrusted: both are
+                        # attacker-controlled in a plain-HTTP DNS rebind.
+                        headers={"Origin": "http://attacker.example:8001"},
+                        json={
+                            "ssid": "AXOL",
+                            "pass": "must-not-write",
+                            "country": "US",
+                            "freq": 5240,
+                        },
+                    )
+            self.assertEqual(response.status_code, 403)
+            self.assertFalse(path.exists())
+
+    async def test_hosted_browser_origin_can_write_tracker_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "wifi.json"
+            app = _test_app(_Settings())
+            transport = httpx.ASGITransport(app=app)
+            with patch.object(tracker_setup, "ULTIMATE_WIFI_CONFIG_FILE", path):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    response = await client.put(
+                        "/api/tracker/ultimate/wifi",
+                        headers={"Origin": "https://axol.almond.bot"},
+                        json={
+                            "ssid": "AXOL",
+                            "pass": "allowed-write",
+                            "country": "US",
+                            "freq": 5240,
+                        },
+                    )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue(path.exists())
+
     async def test_wifi_api_never_echoes_password_and_preserves_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "wifi.json"

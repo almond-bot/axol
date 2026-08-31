@@ -481,15 +481,17 @@ class _GstPipelineBase:
         return recv_perf - latency_s
 
     def _measure_raw_latency_s(self, fps: int) -> float:
-        """Best-effort glass-to-pull latency (s) for shmsink-path frame stamps.
+        """Best-effort reported pipeline latency for shmsink-path frame stamps.
 
         On the ``shmsink`` raw path the recorder gets no buffer PTS, so it can't
         run :meth:`_cap_perf_from_pts`; it stamps ``recv_perf - latency_s``
-        instead. The pipeline's queried latency is a cheap, one-shot proxy for
-        that compensation (no per-frame cost); fall back to one frame interval
-        when the query is unavailable. A small constant bias here only shifts all
-        images uniformly vs the joint samples (both on the same perf_counter
-        clock), within the capture loop's frame tolerance.
+        instead. GStreamer's minimum-latency query is a cheap, one-shot proxy for
+        that compensation (no per-frame cost), but it includes only elements that
+        report their latency and excludes recorder-side shmsrc/Python scheduling.
+        Fall back to one frame interval when the query is unavailable. A small
+        constant bias here only shifts all images uniformly vs the joint samples
+        (both on the same perf_counter clock), within the capture loop's frame
+        tolerance.
         """
         try:
             q = self._gst.Query.new_latency()

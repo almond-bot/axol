@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import io
+import subprocess
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
+
+import numpy as np
 
 from almond_axol.cli.mantis_bridge import managed_mantis_bridge
-from almond_axol.tracker.base import TrackerSourceError
+from almond_axol.cli.tracker_bridge import run_configured_bridge
+from almond_axol.tracker.base import (
+    TrackerSourceError,
+    zup_to_yup_pos,
+    zup_to_yup_quat,
+)
 from almond_axol.tracker.bridge import (
     ManagedStdinControls,
     StopEventControls,
@@ -152,6 +160,46 @@ class ManagedControlsTest(unittest.TestCase):
 
 
 class SurviveLifecycleTest(unittest.TestCase):
+    def test_native_z_up_pose_is_relabelled_to_webxr_y_up(self) -> None:
+        source = SurviveSource()
+        half = np.sqrt(0.5)
+        native_pos = np.array([1.0, 2.0, 3.0])
+        native_quat_xyzw = np.array([0.0, 0.0, half, half])
+        np.testing.assert_allclose(zup_to_yup_pos(native_pos), [1.0, 3.0, -2.0])
+        np.testing.assert_allclose(
+            zup_to_yup_quat(native_quat_xyzw), [0.0, half, 0.0, half]
+        )
+        source._publish(
+            "tracker",
+            native_pos,
+            np.array([half, 0.0, 0.0, half]),  # wxyz, +90 deg around native z
+        )
+
+        sample = source.poses()["tracker"]
+        np.testing.assert_allclose(sample.pos, [1.0, 3.0, -2.0])
+        np.testing.assert_allclose(sample.quat, [0.0, half, 0.0, half])
+
+    def test_malformed_pose_is_not_published_as_fresh_tracking(self) -> None:
+        good_pos = np.array([0.1, 0.2, 0.3])
+        good_quat = np.array([1.0, 0.0, 0.0, 0.0])
+        invalid = (
+            (np.array([np.nan, 0.0, 0.0]), good_quat),
+            (good_pos, np.array([1.0, 0.0, np.inf, 0.0])),
+            (good_pos, np.zeros(4)),
+            (np.zeros(2), good_quat),
+            (good_pos, np.zeros(3)),
+        )
+
+        for pos, quat in invalid:
+            with self.subTest(pos=pos, quat=quat):
+                source = SurviveSource()
+                source._publish("tracker", pos, quat)
+                self.assertEqual(source.poses(), {})
+
+        source = SurviveSource()
+        source._publish("tracker", good_pos, good_quat)
+        self.assertIn("tracker", source.poses())
+
     def test_worker_exception_is_rethrown_from_pose_health_check(self) -> None:
         source = SurviveSource()
 
@@ -183,8 +231,74 @@ class SurviveLifecycleTest(unittest.TestCase):
         source._run_worker(lambda: None)
         self.assertEqual(source.poses(), {})
 
+    def test_stop_kills_and_reaps_survive_cli(self) -> None:
+        source = SurviveSource()
+        process = SimpleNamespace(
+            terminate=Mock(),
+            wait=Mock(side_effect=(subprocess.TimeoutExpired("survive-cli", 3.0), 9)),
+            kill=Mock(),
+        )
+        source._proc = process
+
+        source.stop()
+
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
+        self.assertIsNone(source._proc)
+
+    def test_stop_surfaces_and_retains_lingering_reader(self) -> None:
+        source = SurviveSource()
+        reader = SimpleNamespace(
+            join=Mock(),
+            is_alive=Mock(return_value=True),
+        )
+        source._thread = reader
+
+        with self.assertRaisesRegex(TrackerSourceError, "ownership is uncertain"):
+            source.stop()
+
+        self.assertIs(source._thread, reader)
+
 
 class UltimateLifecycleTest(unittest.TestCase):
+    def test_pose_callback_converts_axes_and_preserves_tracking_status(self) -> None:
+        source = UltimateSource(quat_order="wxyz", up_axis="z")
+        half = np.sqrt(0.5)
+        source._on_pose(
+            SimpleNamespace(
+                mac="AA:BB",
+                position=[1.0, 2.0, 3.0],
+                rotation=[half, 0.0, 0.0, half],
+                tracking_status=2,
+            )
+        )
+
+        sample = source.poses()["AA:BB"]
+        np.testing.assert_allclose(sample.pos, [1.0, 3.0, -2.0])
+        np.testing.assert_allclose(sample.quat, [0.0, half, 0.0, half])
+        self.assertTrue(sample.tracking)
+
+        source._on_pose(
+            SimpleNamespace(
+                mac="CC:DD",
+                position=[0.0, 0.0, 0.0],
+                rotation=[1.0, 0.0, 0.0, 0.0],
+                tracking_status="lost",
+            )
+        )
+        self.assertFalse(source.poses()["CC:DD"].tracking)
+
+        source._on_pose(
+            SimpleNamespace(
+                mac="invalid",
+                position=[np.nan, 0.0, 0.0],
+                rotation=[1.0, 0.0, 0.0, 0.0],
+                tracking_status="tracking",
+            )
+        )
+        self.assertNotIn("invalid", source.poses())
+
     def test_pinned_running_api_rejects_absent_or_dead_reader_thread(self) -> None:
         source = UltimateSource()
         running = threading.Event()
@@ -212,6 +326,22 @@ class UltimateLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(source.poses(), {})
 
+    def test_stop_surfaces_and_retains_lingering_pyvut_reader(self) -> None:
+        source = UltimateSource()
+        reader = SimpleNamespace(
+            join=Mock(),
+            is_alive=Mock(return_value=True),
+        )
+        api = SimpleNamespace(_thread=reader, stop=Mock())
+        source._api = api
+
+        with self.assertRaisesRegex(TrackerSourceError, "HID ownership is uncertain"):
+            source.stop()
+
+        api.stop.assert_called_once_with()
+        reader.join.assert_called_once()
+        self.assertIs(source._api, api)
+
 
 class BridgeFatalityTest(unittest.IsolatedAsyncioTestCase):
     async def test_source_failure_is_fatal_instead_of_reconnectable(self) -> None:
@@ -226,6 +356,36 @@ class BridgeFatalityTest(unittest.IsolatedAsyncioTestCase):
             self.assertRaisesRegex(TrackerSourceError, "hardware reader died"),
         ):
             await asyncio.wait_for(bridge.run(), timeout=1.0)
+
+
+class BridgeCleanupTest(unittest.TestCase):
+    def test_trigger_close_failure_does_not_skip_source_stop(self) -> None:
+        source = SimpleNamespace(start=Mock(), stop=Mock())
+        left_reader = SimpleNamespace(close=Mock(side_effect=OSError("left close")))
+        right_reader = SimpleNamespace(close=Mock())
+        bridge = SimpleNamespace(run=AsyncMock())
+        config = SimpleNamespace(
+            backend="survive",
+            left="left",
+            right="right",
+            allow_single_side=False,
+            trigger_can_left="can-left",
+            trigger_can_right="can-right",
+        )
+        with (
+            patch("almond_axol.tracker.create_source", return_value=source),
+            patch(
+                "almond_axol.tracker.trigger.TriggerReader",
+                side_effect=(left_reader, right_reader),
+            ),
+            patch("almond_axol.tracker.bridge.TrackerBridge", return_value=bridge),
+            self.assertRaisesRegex(TrackerSourceError, "trigger teardown failed"),
+        ):
+            run_configured_bridge(config)
+
+        source.stop.assert_called_once_with()
+        left_reader.close.assert_called_once_with()
+        right_reader.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

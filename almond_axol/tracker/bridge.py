@@ -56,6 +56,7 @@ from .base import (
     TrackerPose,
     TrackerSource,
     TrackerSourceError,
+    valid_tracker_pose,
 )
 from .trigger import TriggerReader
 
@@ -470,6 +471,7 @@ class TrackerBridge:
             sample = poses.get(key)
             if (
                 sample is not None
+                and valid_tracker_pose(sample)
                 and sample.tracking
                 and now - sample.t <= TRACKER_POSE_MAX_AGE_S
             ):

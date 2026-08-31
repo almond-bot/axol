@@ -96,6 +96,29 @@ class TrackerPose:
     tracking: bool = True
 
 
+def valid_tracker_pose(sample: object) -> bool:
+    """Whether a backend sample is structurally safe to publish as live.
+
+    Backend adapters validate their native packets, but this shared boundary
+    also protects custom sources and future adapters from marking malformed
+    arrays or a degenerate rotation fresh enough to engage motion.
+    """
+    try:
+        pos = np.asarray(sample.pos, dtype=np.float64)  # type: ignore[attr-defined]
+        quat = np.asarray(sample.quat, dtype=np.float64)  # type: ignore[attr-defined]
+        timestamp = float(sample.t)  # type: ignore[attr-defined]
+    except (AttributeError, OverflowError, TypeError, ValueError):
+        return False
+    return bool(
+        pos.shape == (3,)
+        and quat.shape == (4,)
+        and np.all(np.isfinite(pos))
+        and np.all(np.isfinite(quat))
+        and np.isfinite(timestamp)
+        and float(np.linalg.norm(quat)) > 1e-12
+    )
+
+
 class TrackerSource(abc.ABC):
     """A backend producing per-device 6-DOF poses in the y-up convention.
 

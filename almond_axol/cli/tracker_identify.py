@@ -19,7 +19,7 @@ import time
 
 import numpy as np
 
-from ..tracker.base import TRACKER_POSE_MAX_AGE_S
+from ..tracker.base import TRACKER_POSE_MAX_AGE_S, valid_tracker_pose
 
 _DISCOVER_TIMEOUT_S = 30.0
 _CAPTURE_S = 3.0
@@ -67,7 +67,11 @@ def _motion(source, window_s: float) -> dict[str, float]:
     deadline = time.perf_counter() + window_s
     while time.perf_counter() < deadline:
         for key, sample in source.poses().items():
-            if not sample.tracking or time.perf_counter() - sample.t > _FRESH_S:
+            if (
+                not valid_tracker_pose(sample)
+                or not sample.tracking
+                or time.perf_counter() - sample.t > _FRESH_S
+            ):
                 last.pop(key, None)
                 continue
             prev = last.get(key)
@@ -118,7 +122,9 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
             live = sorted(
                 key
                 for key, sample in source.poses().items()
-                if sample.tracking and now - sample.t <= _FRESH_S
+                if valid_tracker_pose(sample)
+                and sample.tracking
+                and now - sample.t <= _FRESH_S
             )
             if time.perf_counter() >= deadline:
                 source_hint = (

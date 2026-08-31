@@ -228,9 +228,10 @@ def _concat_constant_fps(
     step = 1000
     time_base = Fraction(fps.denominator, fps.numerator * step)
 
-    with tempfile.NamedTemporaryFile(
-        suffix=".mp4", delete=False, dir=output_video_path.parent
-    ) as tmp_named_file:
+    # PyAV reopens its output path after NamedTemporaryFile closes. Keep that
+    # path outside the operator-owned dataset tree, then publish the completed
+    # bytes through descriptor-relative no-follow I/O.
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
     try:
         with av.open(tmp_output_video_path, mode="w") as dst:
@@ -291,7 +292,10 @@ def _concat_constant_fps(
                             pad.stream = out_stream
                             dst.mux(pad)
                             frame_idx += 1
-        shutil.move(tmp_output_video_path, str(output_video_path))
+        from ..utils.state_files import secure_atomic_copy_file
+
+        secure_atomic_copy_file(tmp_output_video_path, output_video_path)
+        Path(tmp_output_video_path).unlink()
     except Exception:
         Path(tmp_output_video_path).unlink(missing_ok=True)
         raise
@@ -312,9 +316,7 @@ def _concat_shift_rebased(input_video_paths: list, output_video_path: "Path") ->
     import av
 
     # Same-dir temp + no faststart, for the same reasons as _concat_constant_fps.
-    with tempfile.NamedTemporaryFile(
-        suffix=".mp4", delete=False, dir=output_video_path.parent
-    ) as tmp_named_file:
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
 
     try:
@@ -378,7 +380,10 @@ def _concat_shift_rebased(input_video_paths: list, output_video_path: "Path") ->
                     for out_stream, end in seg_end.items():
                         offsets[out_stream] = end
 
-        shutil.move(tmp_output_video_path, str(output_video_path))
+        from ..utils.state_files import secure_atomic_copy_file
+
+        secure_atomic_copy_file(tmp_output_video_path, output_video_path)
+        Path(tmp_output_video_path).unlink()
     except Exception:
         Path(tmp_output_video_path).unlink(missing_ok=True)
         raise
@@ -1069,15 +1074,16 @@ def run_encoded_capture_loop(
     frame nearest each tick and dropping the rest), an encoded stream cannot drop
     frames — every P-frame depends on its predecessor — so this loop is driven by
     the **arrival** of access units: it consumes exactly one AU per camera per
-    dataset row and pairs it with the latest joint/action snapshot. The blocking
+    dataset row and pairs it with the nearest joint/action snapshot using the
+    relay-compensated capture-time estimate. The blocking
     per-camera read naturally paces the loop to the camera cadence and keeps the
     cameras mutually frame-aligned; a genuine per-camera stall (no fresh AU within
     :data:`_ENCODED_ROW_TIMEOUT_S`) re-muxes that camera's previous AU so every
     mp4 keeps frame-count == row-count (the encoded analog of "reuse last frame").
 
     The muxer assigns each AU a constant-fps PTS (``k / fps``), so the mp4
-    timeline is exact regardless of arrival jitter; ``recv_ts`` is used only for
-    the (best-effort) snapshot pairing. The first delivered AU per camera is
+    timeline is exact regardless of arrival jitter; the reader's estimated
+    capture timestamp is used only for snapshot pairing. The first delivered AU per camera is
     always an IDR (:meth:`EncodedAuReader.flush` re-arms keyframe-wait), so each
     episode's mp4 is decodable from frame 0.
     """
@@ -1157,16 +1163,16 @@ def run_encoded_capture_loop(
             # advances any camera whose AU is already queued.
             row_deadline = time.perf_counter() + budget
             aus: dict[str, bytes] = {}
-            row_recv_ts = 0.0
+            row_capture_ts = 0.0
             missing_first = False
             for cam_key, cam in cameras.items():
                 popped = read_au(cam, row_deadline)
                 if popped is not None:
-                    au, recv_ts = popped
+                    au, capture_ts = popped
                     aus[cam_key] = au
                     last_au[cam_key] = au
-                    if recv_ts > row_recv_ts:
-                        row_recv_ts = recv_ts
+                    if capture_ts > row_capture_ts:
+                        row_capture_ts = capture_ts
                 elif cam_key in last_au:
                     aus[cam_key] = last_au[cam_key]
                     repeats += 1
@@ -1188,12 +1194,13 @@ def run_encoded_capture_loop(
                 )
             primed = True
 
-            # Pair the row with the snapshot captured nearest the row's AU
-            # arrival time (encoded AUs carry no exposure timestamp, so
-            # arrival stands in); latest-wins when no nearest reader was
-            # provided. A full-stall row (every camera re-muxed its previous
-            # AU) has no fresh arrival — fall back to "now".
-            pair_ts = row_recv_ts if row_recv_ts else time.perf_counter()
+            # Pair the row with the snapshot captured nearest the latest camera
+            # capture estimate. Each reader subtracts the relay-measured camera
+            # + dataset-encode latency from AU receipt time; latest-wins when no
+            # nearest reader was provided. A full-stall row (every camera
+            # re-muxed its previous AU) has no fresh timestamp — fall back to
+            # "now".
+            pair_ts = row_capture_ts if row_capture_ts else time.perf_counter()
             snap = (
                 read_snapshot_nearest(pair_ts)
                 if read_snapshot_nearest is not None
@@ -1214,9 +1221,9 @@ def run_encoded_capture_loop(
             # AU reaches feed_frame unmodified (the obs processor never sees, and
             # so never mangles, the encoded bytes).
             obs_processed = robot_obs_proc(dict(joint_obs))
-            # Residual pose↔image skew (see run_capture_loop). Encoded AUs
-            # carry no exposure timestamp, so the AU arrival time stands in —
-            # it overstates the true skew by the encode+transport latency.
+            # Residual pose↔image skew (see run_capture_loop). Encoded AUs do
+            # not retain their sensor PTS, so pair_ts is the reader's compensated
+            # capture-time estimate rather than an exact exposure timestamp.
             # Only recorded when the dataset declares observation.pose_lag.
             obs_processed["pose_lag"] = pair_ts - snap_ts
             for cam_key, au in aus.items():
@@ -1273,8 +1280,36 @@ def run_encoded_capture_loop(
 def _open_dataset(config: dict) -> "LeRobotDataset":
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    from ..utils.state_files import (
+        confine_service_dataset_path,
+        privileged_service_active,
+    )
+
+    if privileged_service_active():
+        # Every current caller validates before hardware startup. Repeat the
+        # boundary at the final third-party write site so a future caller—or a
+        # separately spawned recorder with altered config—cannot bypass it.
+        dataset_root = confine_service_dataset_path(
+            Path(config["dataset_root"]),
+            label="recorder dataset root",
+        )
+        config["dataset_root"] = str(dataset_root)
+        config["root"] = str(dataset_root)
+
     rgb_encoder = make_rgb_encoder(config["vcodec"])
     if config["is_complete"]:
+        # Defense in depth: callers validate before opening hardware, then the
+        # recorder rechecks immediately before LeRobot.resume. This closes the
+        # gap where changed metadata (or a future unchecked caller) could make
+        # resume silently retain a schema different from ``config['features']``.
+        from .datasets import require_dataset_resume_schema
+
+        require_dataset_resume_schema(
+            Path(config["dataset_root"]),
+            config["features"],
+            fps=int(config["fps"]),
+            allowed_extra_features=frozenset(config.get("allowed_resume_features", ())),
+        )
         return LeRobotDataset.resume(
             repo_id=config["repo_id"],
             root=config["dataset_root"],
@@ -1583,13 +1618,22 @@ def _finalize_dataset(
         dataset.push_to_hub()
     dataset_root = Path(config["dataset_root"])
     if not config["is_complete"] and episodes_recorded == 0 and dataset_root.exists():
-        try:
-            shutil.rmtree(dataset_root)
-            log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
-        except OSError as exc:
+        from ..utils.state_files import privileged_service_active
+
+        if privileged_service_active():
             _logger.warning(
-                "Failed to remove empty dataset at %s: %s", dataset_root, exc
+                "Keeping the empty dataset at %s because the hosted service "
+                "will not recursively delete operator-owned paths",
+                dataset_root,
             )
+        else:
+            try:
+                shutil.rmtree(dataset_root)
+                log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
+            except OSError as exc:
+                _logger.warning(
+                    "Failed to remove empty dataset at %s: %s", dataset_root, exc
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1806,6 +1850,7 @@ def _recorder_main(
                 meta["height"],
                 meta["fps"],
                 name=source,
+                latency_s=meta.get("latency_s", 0.0),
             )
             cam.connect()
             cameras[source] = cam

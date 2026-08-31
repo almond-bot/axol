@@ -25,7 +25,17 @@ declared PyPI dependency is dropped and must be reinstalled before we restart
 onto the new code (pyzed, PyGObject), along with the patched zedxonesrc/zedsrc
 plugins. Rather than enumerate those steps here, this just shells out to ``axol
 provision`` -- the single provisioning path the hosted installer also runs, so
-the two can't drift. Every step there is idempotent and self-gating.
+the two can't drift. Every step there is idempotent and self-gating.  A VIVE
+Ultimate runtime is an explicit operator opt-in, so an already-installed exact
+pyvut pin is preserved in the uv transaction and verified with the newly
+installed ``tracker.ultimate.install`` command before restart. An explicitly
+installed published ``lerobot_robot_axol`` plugin is likewise carried into the
+same transaction; direct/custom plugin sources block because their provenance
+cannot be reconstructed safely. On aarch64,
+PyPI's pinned PyTorch 2.10 wheel is CPU-only; an existing CUDA-enabled or custom
+build therefore blocks before the force reinstall rather than being silently
+replaced. That comparatively expensive torch probe runs only for an explicit
+update, never during the read-only status poll.
 
 The read-only ``git ls-remote --tags`` indicator is deliberately separate from
 the *destructive* reinstall: the reinstall rebuilds (and so prunes
@@ -59,13 +69,15 @@ from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from typing import Callable
 
+from ..cli.update_preflight import release_update_requirements
+
 _logger = logging.getLogger(__name__)
 
 _PACKAGE = "almond-axol"
 # The version-pinned reinstall must reproduce the hosted installer's
 # requirement (web/app/public/install): same extras, same Python. Keep the two
 # in sync.
-_EXTRAS = "lerobot,sim"
+_EXTRAS = "lerobot,sim,tracker"
 _PYTHON_VERSION = "3.13"
 # Where release tags live. Index (PyPI) installs carry no repository metadata,
 # so the release check falls back to this; git installs keep using their own
@@ -431,6 +443,10 @@ class SelfUpdater:
             # Snapshot the release being installed: a background status poll
             # could refresh the cached remote mid-update.
             tag, target_version = self._remote_tag, self._remote_version
+            update_requirements, update_preflight_error = release_update_requirements()
+            if update_preflight_error is not None:
+                self._fail(update_preflight_error)
+                return
             # Reinstall pinned to the newest release's version, from PyPI (the
             # release workflow publishes every release there; GitHub tags stay
             # the source of truth for what the newest release *is*). `uv tool
@@ -438,35 +454,63 @@ class SelfUpdater:
             # requested version, so it would never move to a new release. The
             # requirement mirrors the hosted installer's.
             requirement = f"{_PACKAGE}[{_EXTRAS}]=={target_version or tag.lstrip('v')}"
+            install_command = [
+                "uv",
+                "tool",
+                "install",
+                "--python",
+                _PYTHON_VERSION,
+                "--force",
+            ]
+            for update_requirement in update_requirements:
+                # Keep every explicit opt-in inside the same resolver
+                # transaction. If a preserved dependency cannot be restored,
+                # uv fails without reporting a successful Axol update.
+                install_command.extend(["--with", update_requirement])
+            install_command.append(requirement)
             self._phase = "upgrading"
             async with self._env_lock:
                 try:
                     proc = await asyncio.create_subprocess_exec(
-                        "uv",
-                        "tool",
-                        "install",
-                        "--python",
-                        _PYTHON_VERSION,
-                        "--force",
-                        requirement,
+                        *install_command,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.STDOUT,
                     )
-                    out, _ = await proc.communicate()
+                    await proc.communicate()
                 except OSError as exc:
                     self._fail(f"could not run uv: {exc}")
                     return
                 if proc.returncode != 0:
-                    tail = out.decode("utf-8", "replace").strip().splitlines()
+                    _logger.warning(
+                        "self-update: uv tool install failed (%s)", proc.returncode
+                    )
+                    # uv output can contain a configured private-index URL.
+                    # Keep API/UI errors fixed and credential-free.
                     self._fail(
-                        f"uv tool install failed: {tail[-1] if tail else 'no output'}"
+                        f"uv tool install failed ({proc.returncode}); run the "
+                        "hosted installer directly for diagnostic output"
                     )
                     return
 
             # The reinstall rebuilt the env, so reprovision before restarting
             # onto the new code (pyzed/PyGObject were pruned).
             self._phase = "provisioning"
-            await self._provision()
+            provision_error = await self._provision()
+            if provision_error is not None:
+                self._fail(provision_error)
+                return
+            if any(
+                requirement.startswith("git+https://github.com/nijkah/pyvut.git@")
+                for requirement in update_requirements
+            ):
+                # Run the command from the newly installed Axol release.  It
+                # verifies API shape/system dependencies and moves to a newer
+                # expected pyvut pin if that release changed it.  A failure is
+                # surfaced without restarting into a degraded tracker setup.
+                ultimate_error = await self._verify_ultimate_runtime()
+                if ultimate_error is not None:
+                    self._fail(ultimate_error)
+                    return
 
             # The install succeeded, so the target tag is what's on disk now.
             # Deliberately don't re-read the installed version through
@@ -501,7 +545,7 @@ class SelfUpdater:
         self._provision_started = True
         asyncio.create_task(self._provision())
 
-    async def _provision(self) -> None:
+    async def _provision(self) -> str | None:
         """Run ``axol provision`` in the background (the single provisioning path).
 
         The upgrade reinstall rebuilds the tool env and drops everything that
@@ -514,8 +558,9 @@ class SelfUpdater:
         """
         axol = shutil.which("axol")
         if axol is None:
-            _logger.warning("self-update: axol not on PATH; cannot provision")
-            return
+            error = "axol is not on PATH; cannot provision the updated environment"
+            _logger.warning("self-update: %s", error)
+            return error
         async with self._env_lock:
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -524,19 +569,54 @@ class SelfUpdater:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                 )
-                out, _ = await proc.communicate()
+                await proc.communicate()
             except OSError as exc:
-                _logger.warning("self-update: could not run axol provision: %s", exc)
-                return
+                error = f"could not run axol provision: {exc}"
+                _logger.warning("self-update: %s", error)
+                return error
         if proc.returncode != 0:
-            tail = out.decode("utf-8", "replace").strip().splitlines()
             _logger.warning(
-                "self-update: `axol provision` failed (%s): %s",
+                "self-update: `axol provision` failed (%s); run it directly for details",
                 proc.returncode,
-                tail[-1] if tail else "no output",
             )
-        else:
-            _logger.info("self-update: provisioning complete")
+            # Command output can include package-index credentials. Keep logs
+            # and the UI deterministic and direct the operator to an explicit
+            # foreground run instead of copying captured output anywhere.
+            return (
+                f"updated Axol, but provisioning failed ({proc.returncode}); "
+                "run `axol provision` directly, repair the host, and retry"
+            )
+        _logger.info("self-update: provisioning complete")
+        return None
+
+    async def _verify_ultimate_runtime(self) -> str | None:
+        """Verify an opted-in Ultimate runtime with the newly installed CLI."""
+        axol = shutil.which("axol")
+        if axol is None:
+            return "updated Axol, but cannot restore VIVE Ultimate: axol is not on PATH"
+        async with self._env_lock:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    axol,
+                    "tracker.ultimate.install",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                await proc.communicate()
+            except OSError as exc:
+                return f"updated Axol, but could not restore VIVE Ultimate: {exc}"
+        if proc.returncode == 0:
+            _logger.info("self-update: VIVE Ultimate runtime restored and verified")
+            return None
+        _logger.warning(
+            "self-update: VIVE Ultimate runtime restore failed (%s)", proc.returncode
+        )
+        # The child may invoke package tooling configured with private indexes.
+        # Do not expose captured output through the control-panel API.
+        return (
+            "updated Axol, but VIVE Ultimate runtime restore failed"
+            f" ({proc.returncode}); run `axol tracker.ultimate.install` directly"
+        )
 
     def _maybe_restart(self) -> None:
         if not self._is_idle():

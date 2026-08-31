@@ -32,6 +32,7 @@ the dataset relies on.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -60,6 +61,34 @@ _CHANNELS = 3
 # the float64 payload that follows stays 8-byte aligned.
 _SNAP_META_DTYPE = np.dtype([("seq", "<i8")])
 _SNAP_HEADER_BYTES = 16
+
+# A healthy local camera/encode/shared-memory path is measured in milliseconds.
+# Treat anything above this generous ceiling as corrupt metadata: subtracting an
+# arbitrary large value can select the oldest entry in the finite snapshot ring.
+_MAX_CAPTURE_LATENCY_S = 5.0
+
+
+def _capture_perf_from_receive(recv_perf: float, latency_s: object) -> float:
+    """Estimate capture time from receipt time and measured pipeline latency.
+
+    Invalid, non-finite, or negative latency metadata is treated as unavailable,
+    preserving the historical receipt-time fallback instead of producing a
+    future, NaN, or otherwise unusable snapshot lookup timestamp.
+    """
+    if isinstance(latency_s, bool):
+        return recv_perf
+    try:
+        latency = float(latency_s)
+    except (TypeError, ValueError):
+        return recv_perf
+    if (
+        not math.isfinite(latency)
+        or latency < 0.0
+        or latency > _MAX_CAPTURE_LATENCY_S
+        or latency > recv_perf
+    ):
+        return recv_perf
+    return recv_perf - latency
 
 
 def _block_size(width: int, height: int) -> int:
@@ -458,8 +487,14 @@ class EncodedAuReader:
     misalignment — video and joints both start there). ``recv_ts`` is
     ``perf_counter`` at pull time
     (shared-clock across processes), used only to pair the frame with the nearest
-    joint snapshot — the mp4's own timeline is the constant-fps PTS the muxer
-    assigns, independent of ``recv_ts``.
+    joint snapshot. Because ``shmsrc`` does not preserve the sensor PTS, the
+    relay supplies its GStreamer-reported minimum pipeline latency and this
+    reader reports ``recv_perf - latency_s`` as a best-effort capture time. Only
+    elements that answer GStreamer's latency query contribute to that scalar,
+    and it excludes recorder-side ``shmsrc`` / Python scheduling latency;
+    invalid or unavailable measurements fall back to ``recv_perf``. The mp4's
+    own timeline is the constant-fps PTS the muxer assigns, independent of this
+    pairing timestamp.
     """
 
     def __init__(
@@ -469,6 +504,7 @@ class EncodedAuReader:
         height: int,
         fps: int,
         name: str | None = None,
+        latency_s: float = 0.0,
     ) -> None:
         from .gst_zed import _DATASET_IDR_INTERVAL_S, _require_gst
 
@@ -477,6 +513,7 @@ class EncodedAuReader:
         self.height = height
         self.fps = fps
         self._name = name or socket_path
+        self._latency_s = latency_s
         self._queue: deque[tuple[bytes, float]] = deque()
         self._cond = threading.Condition()
         self._await_keyframe = True
@@ -551,6 +588,7 @@ class EncodedAuReader:
             if sample is None:
                 continue  # valve shut (not recording) or starting up — idle
             recv_perf = time.perf_counter()
+            capture_perf = _capture_perf_from_receive(recv_perf, self._latency_s)
             buf = sample.get_buffer()
             is_keyframe = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
             discont = buf.has_flags(Gst.BufferFlags.DISCONT)
@@ -589,7 +627,7 @@ class EncodedAuReader:
                         self._delivered,
                     )
                 self._seen_first_au = True
-                self._queue.append((au, recv_perf))
+                self._queue.append((au, capture_perf))
                 self._delivered += 1
                 self._cond.notify()
 
@@ -609,7 +647,9 @@ class EncodedAuReader:
     def read_next_au(self, timeout_ms: float = 500) -> tuple[bytes, float]:
         """Pop the next access unit in order; block up to ``timeout_ms``.
 
-        Returns ``(au_bytes, recv_ts)``. Raises :class:`TimeoutError` if no AU
+        Returns ``(au_bytes, capture_ts)``. ``capture_ts`` is receipt time minus
+        the relay-reported camera/encode pipeline latency, or receipt time when
+        that measurement is unavailable. Raises :class:`TimeoutError` if no AU
         arrives in time (the caller re-muxes the previous AU to keep frame counts
         aligned across cameras).
         """

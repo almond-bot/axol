@@ -14,11 +14,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-import shutil
+import stat
+import tempfile
 from pathlib import Path
 from typing import Any
+
+from ..utils.state_files import (
+    secure_atomic_copy_file,
+    secure_atomic_write_json,
+    secure_unlink,
+)
 
 
 _MIGRATION_ID = "axol-urdf-root-yaw-v0.1.32"
@@ -27,9 +33,7 @@ _ARMS = ("left", "right")
 
 
 def _atomic_json(path: Path, data: dict[str, Any]) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(data, indent=4, ensure_ascii=False) + "\n")
-    os.replace(tmp, path)
+    secure_atomic_write_json(path, data, sort_keys=False, indent=4)
 
 
 def _resolve_dataset(repo_id: str, root: str | None) -> Path:
@@ -151,10 +155,11 @@ def _write_parquet_atomic(path: Path, table: Any) -> None:
     compression = "snappy"
     if parquet.metadata.num_row_groups and parquet.metadata.num_columns:
         compression = parquet.metadata.row_group(0).column(0).compression.lower()
-    tmp = path.with_name(f".{path.name}.tmp")
-    pq.write_table(table, tmp, compression=compression)
-    shutil.copymode(path, tmp)
-    os.replace(tmp, path)
+    mode = stat.S_IMODE(path.lstat().st_mode)
+    with tempfile.TemporaryDirectory(prefix="axol-dataset-migrate-") as directory:
+        staged = Path(directory) / "migrated.parquet"
+        pq.write_table(table, staged, compression=compression)
+        secure_atomic_copy_file(staged, path, mode=mode)
 
 
 def _backup_files(
@@ -168,11 +173,10 @@ def _backup_files(
         "marker_existed": marker.exists(),
     }
     files_root = backup_root / "files"
-    files_root.mkdir(parents=True, exist_ok=True)
     for source in files:
         destination = files_root / source.relative_to(dataset_root)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+        mode = stat.S_IMODE(source.lstat().st_mode)
+        secure_atomic_copy_file(source, destination, mode=mode)
     _atomic_json(backup_root / "manifest.json", manifest)
     return manifest
 
@@ -184,11 +188,10 @@ def _restore_backup(
     for relative in manifest["files"]:
         source = files_root / relative
         destination = dataset_root / relative
-        tmp = destination.with_name(f".{destination.name}.restore.tmp")
-        shutil.copy2(source, tmp)
-        os.replace(tmp, destination)
+        mode = stat.S_IMODE(source.lstat().st_mode)
+        secure_atomic_copy_file(source, destination, mode=mode)
     if not manifest.get("marker_existed", False):
-        (dataset_root / "meta" / "axol.json").unlink(missing_ok=True)
+        secure_unlink(dataset_root / "meta" / "axol.json", missing_ok=True)
 
 
 def _stats_from_row(row: dict[str, Any]) -> dict[str, dict[str, Any]]:

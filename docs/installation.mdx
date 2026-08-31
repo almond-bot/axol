@@ -39,15 +39,19 @@ Run this on the robot machine:
 curl https://axol.almond.bot/install -fsS | bash
 ```
 
+<Warning>
+  On aarch64/Jetson, the pinned PyPI `torch==2.10.0` wheel is CPU-only. Teleoperation, recording, and remote policy inference remain available, but local `run-policy` / `collect-dagger` CUDA inference requires an explicitly managed, JetPack-compatible Torch + Torchvision build (or use `--device cpu`). Once such a custom/CUDA build is present, the installer and control-panel updater refuse a force update before changing the environment rather than silently replacing it with the CPU wheel. Use remote inference until that platform-specific build is managed separately.
+</Warning>
+
 This one command:
 
 - Installs [`uv`](https://docs.astral.sh/uv/) if it isn't already present.
-- Installs the `axol` CLI from PyPI, pinned to the **latest release** (Python 3.13 bundled), with the `lerobot` and `sim` extras.
+- Installs the `axol` CLI from PyPI, pinned to the **latest release** (Python 3.13 bundled), with the `lerobot`, `sim`, and `tracker` extras. The reverse-engineered pyvut runtime remains a separate explicit VIVE Ultimate setup step.
 - Provisions the headset-video stack — the pyzed bindings, GStreamer/PyGObject, and the patched ZED source plugins — via [`axol provision`](/cli/provision). Each step self-gates and no-ops if the ZED SDK isn't present.
 - Installs `adb` and the Quest udev rule (also via [`axol provision`](/cli/provision)) for the optional [Quest-over-USB](/guides/quest-over-usb) controller link — no extra setup needed on the robot to use it.
 - On a factory-flashed **ZED Box Duo**, upgrades the known-bad factory GMSL camera driver to the pinned release ([`zed.driver`](/cli/zed-driver), also via [`axol provision`](/cli/provision)). The new driver only loads at boot, so the installer prints a **reboot-required** notice in its summary when it upgrades — reboot when convenient. A no-op on any other machine.
 - On a Jetson, pins the real-time clocks ([`jetson.setup`](/cli/jetson-setup)) for low-latency camera encode and a steady IK loop.
-- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at boot and restarts it automatically if it ever goes down. The service is pointed at the installing user's home for dataset storage (`HF_LEROBOT_HOME=~<user>/.cache/huggingface/lerobot`), so [`collect-data`](/cli/collect-data) datasets land in that account rather than `/root` even though the service runs as root. The recording commands also hand each dataset back to that user after every episode save, so you never need `sudo` to read, copy, or upload your own recordings.
+- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at boot and restarts it automatically if it ever goes down. Hosted datasets live below the root-owned, non-writable `/var/lib/almond-axol/datasets` boundary, not an operator-writable home: this contains LeRobot/PyArrow/PyAV's pathname-based writes against local symlink races. Saved files remain root-owned and operator-group-readable (directories `2750`, files `0640`), so the login account can inspect/copy/upload them but cannot mutate a live hosted dataset. Plain non-root CLI recordings keep using the user's normal HuggingFace cache.
 
 When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to the machine — see the [Web Control Panel guide](/guides/control-panel). From then on, everything happens in the browser.
 
@@ -55,9 +59,13 @@ When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to
   The service runs as root, so privileged steps (CAN bring-up, ZED daemon restarts) need no `sudo` password.
 </Note>
 
+<Note>
+  Existing datasets under `~/.cache/huggingface/lerobot` remain available to the non-root CLI but are not migrated into the hosted store automatically. On upgrade, the installer detects them and stops instead of silently hiding them. After backing them up, acknowledge that they will remain CLI-only with `curl https://axol.almond.bot/install -fsS | sudo env AXOL_ACK_LEGACY_DATASETS=1 bash`; new panel recordings use the hosted store. Any previously configured external/custom panel dataset root is likewise CLI-only after this upgrade. Do not symlink a writable legacy tree into `/var/lib`.
+</Note>
+
 ### Staying up to date
 
-Installs track [GitHub releases](https://github.com/almond-bot/axol/releases), not individual commits. The server checks for a newer release in the background; when one exists, the control panel shows an update banner with the installed and latest versions (e.g. `v0.1.2 → v0.1.3`). Press **Update** to apply it — the server reinstalls at the new release tag, re-provisions, and restarts once idle. Nothing updates without that button press. Re-running the install command also upgrades to the latest release.
+Installs track [GitHub releases](https://github.com/almond-bot/axol/releases), not individual commits. The server checks for a newer release in the background; when one exists, the control panel shows an update banner with the installed and latest versions (e.g. `v0.1.2 → v0.1.3`). Press **Update** to apply it — the server reinstalls at the new release tag, re-provisions, and restarts once idle. Nothing updates without that button press. Re-running the install command also upgrades to the latest release. On aarch64, either path checks for an existing CUDA/custom PyTorch only when the update is explicitly started and blocks before the force reinstall if it cannot preserve that deployment.
 
 ```bash
 journalctl -u axol -f        # follow the service logs

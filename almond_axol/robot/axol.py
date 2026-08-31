@@ -25,6 +25,7 @@ from ..motor import (
     MotorStatus,
 )
 from ..utils.paths import almond_path
+from ..utils.state_files import secure_atomic_write_json, secure_read_text
 from .base import RobotBase
 from .config import AxolConfig
 from .control import Differentiator, compute_friction
@@ -74,6 +75,20 @@ _GRIPPER_CALIB_PATH = almond_path("gripper_calibration.json")
 _GRIPPER_CALIB_MARGIN = 0.35
 
 
+def _validated_motion_target(q: np.ndarray, *, label: str) -> np.ndarray:
+    """Return one finite, exact-shape joint target before hardware is touched."""
+    try:
+        target = np.asarray(q, dtype=float)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} target must be numeric") from exc
+    expected = len(Joint)
+    if target.shape != (expected,):
+        raise ValueError(f"{label} target must have shape ({expected},)")
+    if not np.all(np.isfinite(target)):
+        raise ValueError(f"{label} target contains a non-finite position")
+    return target
+
+
 def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
     """Persist one gripper's calibrated open position (raw motor rad).
 
@@ -84,7 +99,7 @@ def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
     side = "left" if is_left else "right"
     data: dict = {}
     try:
-        existing = json.loads(_GRIPPER_CALIB_PATH.read_text())
+        existing = json.loads(secure_read_text(_GRIPPER_CALIB_PATH))
         if isinstance(existing, dict):
             data = existing
     except (OSError, ValueError):
@@ -93,8 +108,7 @@ def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
         pass
     data[side] = {"open_pos": open_pos, "saved_at": time.time()}
     try:
-        _GRIPPER_CALIB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _GRIPPER_CALIB_PATH.write_text(json.dumps(data, indent=2))
+        secure_atomic_write_json(_GRIPPER_CALIB_PATH, data)
     except OSError as exc:
         _logger.warning(
             "Could not persist %s gripper calibration to %s: %s",
@@ -112,7 +126,7 @@ def _load_gripper_calibration(is_left: bool) -> float:
     """
     side = "left" if is_left else "right"
     try:
-        data = json.loads(_GRIPPER_CALIB_PATH.read_text())
+        data = json.loads(secure_read_text(_GRIPPER_CALIB_PATH))
         return float(data[side]["open_pos"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise MotorError(
@@ -862,7 +876,12 @@ class AxolArm:
 
     async def disable(self) -> None:
         """Disable all motors and engage brakes."""
-        await asyncio.gather(*[m.disable() for m in self.motors.values()])
+        results = await asyncio.gather(
+            *(m.disable() for m in self.motors.values()), return_exceptions=True
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise failures[0]
 
     async def clear_errors(self) -> None:
         """Clear latched error flags on all motors."""
@@ -1107,8 +1126,9 @@ class AxolArm:
                Arm joints are in radians in the joint frame (0 = rest);
                gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open).
         """
+        side = "left" if self._is_left else "right"
+        q = _validated_motion_target(q, label=f"{side} arm").copy()
         await self.resolve_joint_offsets()
-        q = q.copy()
 
         # Safety: reject commands with arm-joint deltas that exceed max_step_rad.
         # Deltas are frame-invariant (constant offset), so compute in joint frame.
@@ -1451,6 +1471,12 @@ class Axol(RobotBase):
         else:
             self.right = None
 
+        # A failed torque-off or bus close must remain retryable.  In
+        # particular, never close either bus after an unverified motor disable:
+        # retaining both transports is the only way to retry safely.
+        self._shutdown_pending = False
+        self._motors_disabled = False
+
     # ------------------------------------------------------------------ #
     # Polling                                                              #
     # ------------------------------------------------------------------ #
@@ -1512,6 +1538,10 @@ class Axol(RobotBase):
         already holding. Calling ``connect()`` first is optional:
         :meth:`enable` opens the buses itself.
         """
+        if self._shutdown_pending:
+            raise MotorError(
+                "robot shutdown is incomplete; retry disable before reconnecting"
+            )
         bus_tasks = []
         if self.left is not None:
             bus_tasks.append(self._left_bus.start())
@@ -1544,6 +1574,7 @@ class Axol(RobotBase):
         if self.right is not None:
             motor_tasks.append(self.right.enable(hold=hold))
         await asyncio.gather(*motor_tasks)
+        self._motors_disabled = False
 
     async def disconnect(self) -> None:
         """Close the CAN buses, leaving motor torque exactly as it is.
@@ -1553,6 +1584,10 @@ class Axol(RobotBase):
         later process can reconnect and :meth:`enable` again. Telemetry is
         stopped first. Use :meth:`disable` instead to torque off.
         """
+        if self._shutdown_pending:
+            raise MotorError(
+                "robot shutdown is incomplete; retry disable before disconnecting"
+            )
         tasks = []
         if self.left is not None:
             tasks.append(self.left.stop_telemetry())
@@ -1569,23 +1604,41 @@ class Axol(RobotBase):
             await asyncio.gather(*close_tasks)
 
     async def disable(self) -> None:
-        """Disable all motors and close CAN buses."""
-        tasks = []
-        if self.left is not None:
-            tasks.extend([self.left.stop_telemetry(), self.left.disable()])
-        if self.right is not None:
-            tasks.extend([self.right.stop_telemetry(), self.right.disable()])
-        try:
-            await asyncio.gather(*tasks)
-        except Exception:
-            pass
-        finally:
-            close_tasks = []
+        """Disable every motor, then close both CAN buses.
+
+        If any arm cannot verify torque-off, both buses remain open so the
+        caller can retry.  Once torque-off has been verified, a close failure
+        is likewise retained and retryable without sending motor commands over
+        a bus that may already have closed successfully.
+        """
+        self._shutdown_pending = True
+        if not self._motors_disabled:
+            tasks = []
             if self.left is not None:
-                close_tasks.append(self._left_bus.close())
+                tasks.extend([self.left.stop_telemetry(), self.left.disable()])
             if self.right is not None:
-                close_tasks.append(self._right_bus.close())
-            await asyncio.gather(*close_tasks)
+                tasks.extend([self.right.stop_telemetry(), self.right.disable()])
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            failures = [
+                result for result in results if isinstance(result, BaseException)
+            ]
+            if failures:
+                raise failures[0]
+            self._motors_disabled = True
+
+        close_tasks = []
+        if self.left is not None:
+            close_tasks.append(self._left_bus.close())
+        if self.right is not None:
+            close_tasks.append(self._right_bus.close())
+        closed = await asyncio.gather(*close_tasks, return_exceptions=True)
+        close_failures = [
+            result for result in closed if isinstance(result, BaseException)
+        ]
+        if close_failures:
+            raise close_failures[0]
+        self._motors_disabled = False
+        self._shutdown_pending = False
 
     async def clear_errors(self) -> None:
         """Clear latched error flags on both arms."""
@@ -1834,13 +1887,17 @@ class Axol(RobotBase):
                    (arm joints in rad, gripper in [0, 1]).  ``None`` skips.
             right: Same for the right arm.
         """
-        tasks = []
+        targets: list[tuple[AxolArm, np.ndarray]] = []
         if left is not None and self.left is not None:
-            tasks.append(self.left.motion_control(left))
+            targets.append(
+                (self.left, _validated_motion_target(left, label="left arm"))
+            )
         if right is not None and self.right is not None:
-            tasks.append(self.right.motion_control(right))
-        if tasks:
-            await asyncio.gather(*tasks)
+            targets.append(
+                (self.right, _validated_motion_target(right, label="right arm"))
+            )
+        if targets:
+            await asyncio.gather(*(arm.motion_control(q) for arm, q in targets))
 
     async def gravity_compensate(
         self,

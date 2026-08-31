@@ -839,8 +839,8 @@ class KinematicsSolver:
             dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
             kwargs["left_elbow_pos"] = dummy_elbow
             kwargs["right_elbow_pos"] = dummy_elbow
-        try:
-            self.ik(**kwargs)
-        except Exception:
-            pass
+        # Compilation/runtime failures here mean the worker cannot safely
+        # serve the first real pose. Propagate them instead of announcing a
+        # false-ready solver and leaving teleop frozen on its seed pose.
+        self.ik(**kwargs)
         _logger.info("IK solver ready.")

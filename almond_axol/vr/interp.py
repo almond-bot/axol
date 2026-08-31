@@ -906,6 +906,14 @@ def _build_frame(
         r_tracked=r_tracked,
         l_trigger_live=latest.l_trigger_live,
         r_trigger_live=latest.r_trigger_live,
+        # Cart input is control state, not delayed motion. Preserve the newest
+        # thumbstick/click values exactly so interpolation cannot neutralize a
+        # drive command or keep a stale lift command alive.
+        l_stick_x=latest.l_stick_x,
+        l_stick_y=latest.l_stick_y,
+        r_stick_x=latest.r_stick_x,
+        l_stick_click=latest.l_stick_click,
+        r_stick_click=latest.r_stick_click,
     )
     motion = np.concatenate(
         [
@@ -957,4 +965,9 @@ def _same_control(a: VRFrame, b: VRFrame) -> bool:
         and a.r_tracked == b.r_tracked
         and a.l_trigger_live == b.l_trigger_live
         and a.r_trigger_live == b.r_trigger_live
+        and a.l_stick_x == b.l_stick_x
+        and a.l_stick_y == b.l_stick_y
+        and a.r_stick_x == b.r_stick_x
+        and a.l_stick_click == b.l_stick_click
+        and a.r_stick_click == b.r_stick_click
     )

@@ -26,7 +26,7 @@ import numpy as np
 
 from ..constants import ARM_JOINTS, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
 from ..motor import CanBus, ControlMode, Joint, Motor, MotorError
-from .axol import GRIPPER_TRAVEL, calibrate_gripper_open_stop
+from .axol import GRIPPER_TRAVEL, _validated_motion_target, calibrate_gripper_open_stop
 from .base import RobotBase
 from .config import AxolConfig, PositionForceConfig
 
@@ -210,9 +210,7 @@ class MantisGripperArm:
             q: Shape (8,) targets in Joint order — arm joints in radians
                (stored, nothing physical to move), gripper normalised [0, 1].
         """
-        q = np.asarray(q, dtype=float)
-        if q.size < _N_ARM + 1:
-            raise ValueError(f"Mantis target must contain {_N_ARM + 1} positions")
+        q = _validated_motion_target(q, label="Mantis gripper")
         self._virtual_arm = np.asarray(q[:_N_ARM], dtype=np.float32).copy()
         self._gripper_target = float(np.clip(q[_N_ARM], 0.0, 1.0))
         if not self._enabled:
@@ -258,6 +256,11 @@ class Mantis(RobotBase):
         self.right: MantisGripperArm | None = None
         self._defer_gripper_enable = defer_gripper_enable
         self._connected = False
+        # True from the first teardown attempt until every gripper disable and
+        # bus close has succeeded.  It prevents a failed shutdown from being
+        # mistaken for an idle rig and lets disable() retry only unfinished
+        # work while the buses needed for a motor-disable retry remain open.
+        self._shutdown_pending = False
         self._telemetry_settings: tuple[float, bool] | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._left_bus: CanBus | None = None
@@ -289,6 +292,10 @@ class Mantis(RobotBase):
             await self._connect_unlocked()
 
     async def _connect_unlocked(self) -> None:
+        if self._shutdown_pending:
+            raise MotorError(
+                "Mantis shutdown is incomplete; retry disable() before reconnecting"
+            )
         if self._connected:
             return
         buses = [b for b in (self._left_bus, self._right_bus) if b is not None]
@@ -311,9 +318,13 @@ class Mantis(RobotBase):
             )
             failures = [r for r in disabled if isinstance(r, BaseException)]
             if failures:
-                await asyncio.gather(
-                    *[b.close() for b in buses], return_exceptions=True
-                )
+                # A timed-out force-disable leaves torque state unknown. Keep
+                # every bus open and mark this as an incomplete shutdown so
+                # disable() can retry only the arms whose pending bit remains
+                # set. Closing here would destroy the sole command path while a
+                # gripper might still be holding torque.
+                self._connected = True
+                self._shutdown_pending = True
                 raise failures[0]
         self._connected = True
 
@@ -370,19 +381,58 @@ class Mantis(RobotBase):
                 raise failures[0]
 
     async def disable(self) -> None:
-        """Disable the grippers and close the CAN buses."""
+        """Disable both grippers and close both buses, or report uncertainty.
+
+        Every side is attempted even when its peer fails.  The connected flag
+        is cleared only after every hardware disable and bus close succeeds;
+        otherwise callers must treat ownership as retained and may retry this
+        method instead of opening a second connection to uncertain hardware.
+        """
         async with self._lifecycle_lock:
             arms = [a for a in (self.left, self.right) if a is not None]
             buses = [b for b in (self._left_bus, self._right_bus) if b is not None]
             await self._stop_telemetry_unlocked()
-            results = await asyncio.gather(
-                *[a.force_disable() for a in arms], return_exceptions=True
+            first_attempt = not self._shutdown_pending
+            self._shutdown_pending = True
+            disable_results = await asyncio.gather(
+                *[a.force_disable() if first_attempt else a.disable() for a in arms],
+                return_exceptions=True,
             )
-            for result in results:
-                if isinstance(result, BaseException):
-                    _logger.error("Mantis gripper disable failed: %s", result)
-            await asyncio.gather(*[b.close() for b in buses], return_exceptions=True)
+            failures = [
+                result
+                for result in disable_results
+                if isinstance(result, BaseException)
+            ]
+            if failures:
+                for failure in failures:
+                    _logger.error("Mantis gripper disable failed: %s", failure)
+                if len(failures) > 1:
+                    failures[0].add_note(
+                        f"{len(failures) - 1} additional Mantis gripper disable "
+                        "failure(s) were logged"
+                    )
+                raise failures[0]
+
+            # Keep both buses open until both motors have positively disabled:
+            # closing the only command path after a timeout would make a retry
+            # impossible while a gripper might still be holding torque.
+            close_results = await asyncio.gather(
+                *[b.close() for b in buses], return_exceptions=True
+            )
+            failures = [
+                result for result in close_results if isinstance(result, BaseException)
+            ]
+            if failures:
+                for failure in failures:
+                    _logger.error("Mantis CAN close failed: %s", failure)
+                if len(failures) > 1:
+                    failures[0].add_note(
+                        f"{len(failures) - 1} additional Mantis CAN close "
+                        "failure(s) were logged"
+                    )
+                raise failures[0]
             self._connected = False
+            self._shutdown_pending = False
 
     # -- Telemetry ---------------------------------------------------------------
 
@@ -437,13 +487,17 @@ class Mantis(RobotBase):
         left: np.ndarray | None = None,
         right: np.ndarray | None = None,
     ) -> None:
-        tasks = []
+        targets: list[tuple[MantisGripperArm, np.ndarray]] = []
         if left is not None and self.left is not None:
-            tasks.append(self.left.motion_control(left))
+            targets.append(
+                (self.left, _validated_motion_target(left, label="left Mantis"))
+            )
         if right is not None and self.right is not None:
-            tasks.append(self.right.motion_control(right))
-        if tasks:
-            await asyncio.gather(*tasks)
+            targets.append(
+                (self.right, _validated_motion_target(right, label="right Mantis"))
+            )
+        if targets:
+            await asyncio.gather(*(arm.motion_control(q) for arm, q in targets))
 
     # -- Axol-surface stubs -----------------------------------------------------
 

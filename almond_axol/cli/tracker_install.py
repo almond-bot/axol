@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 from ..tracker.survive import is_available
+from ..utils.state_files import secure_atomic_write_text
 from ..utils.sudo import prime_sudo, run_root
 
 _logger = logging.getLogger(__name__)
@@ -196,9 +197,17 @@ def _install_machine_stamp(src: Path) -> bool:
     try:
         digest = _file_digest(rule)
         local_stamp = src / _STAMP
-        local_stamp.write_text(f"{_PINNED_REF}\n{_BUILD_REVISION}\n")
+        secure_atomic_write_text(
+            local_stamp,
+            f"{_PINNED_REF}\n{_BUILD_REVISION}\n",
+            mode=0o644,
+        )
         manifest = src / ".axol-machine-install-manifest"
-        manifest.write_text(f"{_PINNED_REF}\n{_BUILD_REVISION}\n{digest}\n")
+        secure_atomic_write_text(
+            manifest,
+            f"{_PINNED_REF}\n{_BUILD_REVISION}\n{digest}\n",
+            mode=0o644,
+        )
     except OSError as exc:
         _logger.warning("could not prepare libsurvive install manifest: %s", exc)
         return False

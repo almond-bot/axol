@@ -14,6 +14,7 @@ from pathlib import Path
 
 from ..constants import CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
 from ..utils.paths import almond_path
+from ..utils.state_files import secure_atomic_write_json, secure_read_text
 
 TRACKER_CONFIG_FILE = almond_path("tracker", "config.json")
 
@@ -69,7 +70,7 @@ class TrackerConfig:
 def load_tracker_config(path: Path = TRACKER_CONFIG_FILE) -> TrackerConfig:
     """Load the saved config, tolerating a missing file or unknown keys."""
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(secure_read_text(path))
     except (OSError, ValueError):
         return TrackerConfig()
     if not isinstance(data, dict):
@@ -116,8 +117,7 @@ def save_tracker_config(
             "left": config.left,
             "right": config.right,
         }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(config), indent=2) + "\n")
+    secure_atomic_write_json(path, asdict(config), sort_keys=False)
 
 
 def select_tracker_backend(config: TrackerConfig, backend: str) -> None:

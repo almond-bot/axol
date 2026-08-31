@@ -14,6 +14,26 @@ function message(error: unknown): string {
   return String(error).replace(/^Error:\s*/, "")
 }
 
+function validChannelCenter(frequency: number): boolean {
+  return (
+    (frequency >= 2412 && frequency <= 2472 && (frequency - 2412) % 5 === 0) ||
+    frequency === 2484 ||
+    (frequency >= 5000 && frequency <= 5895 && frequency % 5 === 0) ||
+    (frequency >= 5955 && frequency <= 7115 && (frequency - 5955) % 5 === 0)
+  )
+}
+
+function validPassword(value: string): boolean {
+  const printableAscii = Array.from(value).every((character) => {
+    const code = character.charCodeAt(0)
+    return code >= 32 && code <= 126
+  })
+  return (
+    (value.length >= 8 && value.length <= 63 && printableAscii) ||
+    (value.length === 64 && /^[0-9a-f]+$/i.test(value))
+  )
+}
+
 /** Redacted editor for pyvut's private two-tracker shared-map network. */
 export function UltimateWifiPanel() {
   const toast = useToast()
@@ -53,12 +73,15 @@ export function UltimateWifiPanel() {
   }, [])
 
   const parsedFrequency = Number(frequency)
+  const ssidBytes = new TextEncoder().encode(ssid).length
+  const passwordValid = password.length > 0 ? validPassword(password) : config?.passwordSet
   const valid =
-    ssid.length > 0 &&
+    ssidBytes >= 1 &&
+    ssidBytes <= 32 &&
     /^[A-Za-z]{2}$/.test(country) &&
     Number.isInteger(parsedFrequency) &&
-    parsedFrequency > 0 &&
-    (config?.passwordSet || password.length > 0)
+    validChannelCenter(parsedFrequency) &&
+    Boolean(passwordValid)
 
   async function save() {
     if (!valid) return
@@ -146,6 +169,8 @@ export function UltimateWifiPanel() {
                 onChange={(event) => setPassword(event.target.value)}
                 autoComplete="new-password"
                 spellCheck={false}
+                minLength={8}
+                maxLength={64}
                 placeholder={
                   config?.passwordSet ? "Saved password remains unchanged" : "Choose a password"
                 }
@@ -178,7 +203,8 @@ export function UltimateWifiPanel() {
             <Input
               id="ultimate-wifi-frequency"
               type="number"
-              min={1}
+              min={2412}
+              max={7115}
               step={1}
               value={frequency}
               onChange={(event) => setFrequency(event.target.value)}
@@ -194,8 +220,8 @@ export function UltimateWifiPanel() {
       )}
       {!loading && !valid && (
         <p className="text-[11px] leading-relaxed text-amber-300/75">
-          Enter an SSID, a two-letter country code, a positive whole-number frequency, and a
-          password on the first save.
+          Enter a 1–32 byte SSID, ISO country code, valid Wi-Fi channel center in MHz, and an 8–63
+          character password on the first save. Verify the channel is permitted in that country.
         </p>
       )}
       {!loading && (

@@ -21,8 +21,18 @@ from pydantic import BaseModel
 
 from ..constants import URDF_PATH
 from ..utils import adb, ports
+from ..utils.browser_origin import (
+    LOOPBACK_ORIGIN_REGEX,
+    allowed_browser_origins,
+    browser_origin_allowed,
+)
 from ..utils.can_channels import require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
+from ..utils.state_files import (
+    mark_privileged_service,
+    privileged_service_active,
+    validated_service_dataset_root,
+)
 from ..utils.sudo import prime_sudo
 from .commands import COMMANDS, command_specs, flag_enabled, operation_ids
 from .manager import Session, SessionManager
@@ -228,6 +238,13 @@ def _usb_status_dict(status: adb.AdbStatus) -> dict[str, Any]:
 
 
 def create_app(static_dir: Path | None = None) -> FastAPI:
+    # ``create_app`` is the public embedding surface as well as the factory
+    # used by ``axol serve``. Mark a root embedding before constructing any
+    # API-owned state so it cannot silently bypass the hosted path gates.
+    if os.geteuid() == 0:
+        mark_privileged_service()
+        os.umask(0o027)
+
     app = FastAPI(title="axol serve")
     # System setup (Jetson clock pinning, GStreamer install) is owned by the
     # host installer and its boot service (`axol jetson.setup` runs as an
@@ -316,13 +333,44 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             status_code=409,
         )
 
-    # Allow the Vite dev server (different origin) to call the API directly.
+    # The hosted UI and loopback Vite dev servers call this LAN API from a
+    # different origin. Do not grant arbitrary websites browser access to
+    # robot motion, host-power, calibration, or protected Wi-Fi writes.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=sorted(allowed_browser_origins()),
+        allow_origin_regex=LOOPBACK_ORIGIN_REGEX,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def reject_untrusted_browser_api_requests(
+        request: Request, call_next: Any
+    ) -> Response:
+        origin = request.headers.get("origin")
+        # GET is not uniformly passive here: camera previews open hardware,
+        # motor details query CAN, update status can hit the network, and
+        # /api/info starts one-time provisioning. Protect the whole API rather
+        # than only write verbs. Native SDK/CLI clients omit both browser-only
+        # headers and remain compatible. Fetch Metadata closes the remaining
+        # top-level navigation / image-tag case, where browsers can omit Origin.
+        untrusted_origin = not browser_origin_allowed(
+            origin,
+            scheme=request.url.scheme,
+            host=request.headers.get("host", request.url.netloc),
+        )
+        originless_cross_site_browser = (
+            origin is None
+            and request.headers.get("sec-fetch-site", "").lower() == "cross-site"
+        )
+        if request.url.path.startswith("/api/") and (
+            untrusted_origin or originless_cross_site_browser
+        ):
+            return JSONResponse(
+                {"error": "browser origin is not allowed"}, status_code=403
+            )
+        return await call_next(request)
 
     @app.get("/__accept")
     async def accept_cert() -> HTMLResponse:
@@ -420,8 +468,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def robot_status() -> dict[str, Any]:
         return robot.status()
 
-    @app.post("/api/robot/connect", response_model=None)
-    async def robot_connect(
+    async def _connect_robot(
         req: RobotConnectRequest | None = None,
     ) -> dict[str, Any] | JSONResponse:
         """Connect the robot link, optionally onto explicit CAN interfaces.
@@ -481,9 +528,33 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             robot.set_channels(*channels, profile=profile)
         return await asyncio.to_thread(robot.connect)
 
-    @app.post("/api/robot/disconnect")
-    async def robot_disconnect() -> dict[str, Any]:
-        return await asyncio.to_thread(robot.disconnect)
+    @app.post("/api/robot/connect", response_model=None)
+    async def robot_connect(
+        req: RobotConnectRequest | None = None,
+    ) -> dict[str, Any] | JSONResponse:
+        async with session_launch_reservation:
+            if runner.is_running() or _diagnostic_session_active():
+                return JSONResponse(
+                    {
+                        "error": "cannot connect the robot link while an operation "
+                        "or setup/diagnostics session owns hardware"
+                    },
+                    status_code=409,
+                )
+            return await _connect_robot(req)
+
+    @app.post("/api/robot/disconnect", response_model=None)
+    async def robot_disconnect() -> dict[str, Any] | JSONResponse:
+        async with session_launch_reservation:
+            if runner.is_running() or _diagnostic_session_active():
+                return JSONResponse(
+                    {
+                        "error": "cannot disconnect the robot link while an operation "
+                        "or setup/diagnostics session owns hardware"
+                    },
+                    status_code=409,
+                )
+            return await asyncio.to_thread(robot.disconnect)
 
     @app.get("/api/can/interfaces")
     async def can_interfaces() -> dict[str, Any]:
@@ -518,6 +589,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.websocket("/api/telemetry/ws")
     async def telemetry_ws(ws: WebSocket) -> None:
         """Live telemetry stream: frame / slow / state messages (see telemetry.py)."""
+        if not browser_origin_allowed(
+            ws.headers.get("origin"),
+            scheme=ws.url.scheme,
+            host=ws.headers.get("host", ws.url.netloc),
+        ):
+            await ws.close(code=1008, reason="browser origin is not allowed")
+            return
         await ws.accept()
         queue = hub.subscribe()
         try:
@@ -761,6 +839,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             )
         except (KeyError, ValueError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError:
+            return JSONResponse(
+                {"error": "could not securely write the shared settings"},
+                status_code=500,
+            )
         return JSONResponse(snapshot)
 
     def quest_calibration_key() -> object:
@@ -1009,16 +1092,19 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def get_datasets() -> dict[str, Any]:
         """LeRobot datasets on this host, newest first.
 
-        Scans the shared ``recording.root`` setting when set (the directory
-        collect-data writes to), otherwise the LeRobot cache dir — the same
-        place replay-dataset resolves a bare repo id against.
+        A hosted root service always scans its validated immutable dataset
+        store. A plain non-root embedding retains the shared ``recording.root``
+        setting/default used by direct CLI commands.
         """
         from pathlib import Path
 
         from ..recording.datasets import list_datasets
 
-        stored_root = settings.snapshot()["values"].get("recording.root")
-        base = Path(str(stored_root)).expanduser() if stored_root else None
+        if privileged_service_active():
+            base = validated_service_dataset_root()
+        else:
+            stored_root = settings.snapshot()["values"].get("recording.root")
+            base = Path(str(stored_root)).expanduser() if stored_root else None
         found = await asyncio.to_thread(list_datasets, base)
         return {
             "datasets": [
@@ -1280,6 +1366,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.websocket("/api/sessions/{session_id}/logs")
     async def logs(ws: WebSocket, session_id: str) -> None:
+        if not browser_origin_allowed(
+            ws.headers.get("origin"),
+            scheme=ws.url.scheme,
+            host=ws.headers.get("host", ws.url.netloc),
+        ):
+            await ws.close(code=1008, reason="browser origin is not allowed")
+            return
         await ws.accept()
         session, owner = _find_session(session_id)
         if session is None:

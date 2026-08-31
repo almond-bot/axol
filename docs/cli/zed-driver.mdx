@@ -5,6 +5,8 @@ description: "Upgrade the ZED Box Duo camera driver (stereolabs-zedbox-duo) to t
 
 Replaces the ZED Box Duo's factory-flashed GMSL capture driver (`stereolabs-zedbox-duo`) with the pinned known-good release from Stereolabs. ZED Box Duo units ship with a buggy driver version, which this command upgrades in place (`dpkg -r` the factory package, then `dpkg -i` the pinned `.deb`).
 
+The download is pinned to the exact reviewed SHA-256 and package/version/architecture metadata and is staged through an exclusive temporary file before installation. Stereolabs does not publish an independent signature or checksum for this artifact, so the committed digest protects against later server changes but is not independent proof of the original artifact's provenance. Any changed vendor artifact is rejected until its bytes are reviewed and the code pin is deliberately updated.
+
 ```bash
 axol zed.driver
 ```

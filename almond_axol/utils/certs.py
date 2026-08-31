@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
+from pathlib import Path
 
-from .paths import adopt_state_file, almond_path
+from .paths import almond_path
+from .state_files import secure_atomic_write_bytes
 
 # Shared cert location. Kept under ``vr/`` even though ``axol serve`` now uses it
 # too: renaming would force every existing install to regenerate (and re-accept)
@@ -53,33 +56,34 @@ def create_self_signed_cert(certfile: str, keyfile: str) -> None:
     it once per origin via the in-app "Authorize USB certificate" flow — same
     as the LAN-IP host cert.
     """
-    cert_dir = os.path.dirname(certfile)
-    if cert_dir:
-        os.makedirs(cert_dir, exist_ok=True)
-
-    subprocess.run(
-        [
-            "openssl",
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-keyout",
-            keyfile,
-            "-out",
-            certfile,
-            "-days",
-            "365",
-            "-nodes",
-            "-subj",
-            "/CN=localhost",
-            "-addext",
-            "subjectAltName=DNS:localhost,IP:127.0.0.1",
-        ],
-        check=True,
-        capture_output=True,
-    )
-
-    # Custom paths outside ALMOND_HOME are deliberately left alone.
-    adopt_state_file(certfile)
-    adopt_state_file(keyfile)
+    # OpenSSL cannot accept already-open output descriptors. Generate into a
+    # root-private random directory, then publish through the no-follow atomic
+    # writer; never let it open predictable names in operator-owned state.
+    with tempfile.TemporaryDirectory(prefix="axol-cert-") as temporary_dir:
+        temporary = Path(temporary_dir)
+        temporary_cert = temporary / "cert.pem"
+        temporary_key = temporary / "key.pem"
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                str(temporary_key),
+                "-out",
+                str(temporary_cert),
+                "-days",
+                "365",
+                "-nodes",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        secure_atomic_write_bytes(certfile, temporary_cert.read_bytes(), mode=0o644)
+        secure_atomic_write_bytes(keyfile, temporary_key.read_bytes(), mode=0o600)

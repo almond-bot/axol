@@ -46,6 +46,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..constants import URDF_PATH
+from ..utils.browser_origin import browser_origin_allowed
 from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
 from ..utils.ports import open_listen_socket
 from .config import VRServerConfig
@@ -62,6 +63,22 @@ _logger = logging.getLogger(__name__)
 _quest_datum_lock = threading.Lock()
 _last_quest_datum: dict[str, Any] | None = None
 _QUEST_DATUM_FRESH_S = 5.0
+# A newly loaded Quest page may connect before uvicorn notices that the old
+# socket is half-open. Once the active logical producer has stopped sending for
+# this long, another producer of the same kind may take ownership immediately.
+_POSE_OWNER_TAKEOVER_STALE_S = 1.0
+# Duplicated browser tabs inherit sessionStorage, including the logical pose
+# source id, but reserve disjoint sequence ranges. A tab can therefore publish
+# a higher range and then leave XR while keeping its signaling socket open. Do
+# not let that inactive client's orphaned high-water suppress a surviving tab
+# indefinitely; after one pose-silence interval the next active client may
+# lower the source-wide high-water (with an interpolation reset).
+_POSE_SEQUENCE_CLIENT_STALE_S = 1.0
+# A browser/native transport has one logical producer in normal operation. A
+# small allowance covers compatibility relays and source rollover, while
+# preventing one long-lived unauthenticated LAN socket from retaining an
+# unbounded number of attacker-chosen source ids in the arbitration maps.
+_MAX_POSE_SOURCES_PER_CLIENT = 8
 
 
 def get_last_quest_pose_datum() -> dict[str, Any] | None:
@@ -194,6 +211,12 @@ class VRServer:
         # in its legacy free-toggle behaviour (older backends that never set it).
         self._mode: str | None = None
 
+        # Pose convention announced independently from the HUD/recording mode.
+        # Relative is the legacy Axol contract (target-ray controllers + body
+        # elbows); absolute is the Mantis contract (calibrated grip datum,
+        # elbows ignored). Defaulting here keeps direct/older call sites safe.
+        self._pose_mode = "relative"
+
         # Last tracking state reported by the teleop core. Keep it alongside
         # the other connection-seeded state so a managed tracker bridge that
         # reconnects can distinguish an already-engaged core from one that
@@ -216,15 +239,18 @@ class VRServer:
         self._hud: dict[str, Any] | None = None
         self._hud_client: int | None = None
 
-        # Sequence high-water marks are keyed by a *logical producer*, not a
-        # transport. Quest sends one id/sequence over USB, WebRTC, and network
-        # WebSocket, so the first copy wins globally and a delayed standby copy
-        # cannot rewind state or inflate the jitter buffer. A producer also
-        # owns the pose stream exclusively: other clients still receive video,
-        # HUD, and URDF broadcasts but their VRFrames are ignored.
+        # The source-wide sequence high-water deduplicates one logical Quest
+        # producer copied over USB, WebRTC, and network. Per-client high-water
+        # marks let that source-wide maximum be recomputed when one connection
+        # leaves: duplicated browser tabs copy sessionStorage's source id but
+        # reserve disjoint 1M sequence blocks, so the higher tab must not leave
+        # an older surviving tab permanently below an orphaned maximum.
         self._last_seq: dict[str, int] = {}
+        self._client_last_seq: dict[tuple[int, str], int] = {}
+        self._client_last_seq_seen: dict[tuple[int, str], float] = {}
         self._pose_owner: str | None = None
         self._pose_owner_kind: str | None = None
+        self._pose_owner_last_seen: float | None = None
         self._source_kind: dict[str, str] = {}
         self._source_clients: dict[str, set[int]] = {}
         self._client_sources: dict[int, set[str]] = {}
@@ -317,11 +343,24 @@ class VRServer:
 
         ``mode`` is ``"teleop"`` for ``axol teleop`` or ``"data_collection"``
         for ``axol collect-data``; the web UI locks its HUD accordingly (see
-        ``self._mode``). Applies to clients that connect *after* this call — the
-        mode is pushed once per client in the WebSocket accept handler. Safe to
-        call before :meth:`enable`.
+        ``self._mode``). It is pushed on connect and replayed on request after
+        the browser's listener is attached. Safe to call before :meth:`enable`.
         """
         self._mode = mode
+
+    def set_pose_mode(self, mode: str) -> None:
+        """Set the controller-pose convention announced to every headset.
+
+        This is deliberately separate from :meth:`set_mode`: teleop and data
+        collection can each run either ordinary relative Axol control or the
+        absolute Mantis mapping. New web clients default to ``"relative"`` if
+        an older server never sends the announcement.
+        """
+        if mode not in ("relative", "absolute"):
+            raise ValueError(
+                f"pose mode must be 'relative' or 'absolute'; got {mode!r}"
+            )
+        self._pose_mode = mode
 
     def set_episode(self, episode: int | None) -> None:
         """Record the current episode number announced to headsets on connect.
@@ -560,9 +599,12 @@ class VRServer:
         self._signaling_tasks.clear()
         self._pose_owner = None
         self._pose_owner_kind = None
+        self._pose_owner_last_seen = None
         self._source_kind.clear()
         self._source_clients.clear()
         self._client_sources.clear()
+        self._client_last_seq.clear()
+        self._client_last_seq_seen.clear()
         self._loop = None
         # Fresh session next enable(): don't gate a reloaded headset's restarted
         # seq counter against a stale high-water mark.
@@ -609,7 +651,7 @@ class VRServer:
 
     def _register_pose_source(
         self, frame: VRFrame, stream: Any, client_id: int
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str] | None:
         """Resolve and remember a frame's logical producer and kind."""
         raw_id = frame.pose_source_id
         source_id = (
@@ -619,6 +661,13 @@ class VRServer:
         )
         raw_kind = frame.pose_source_kind
         source_kind = raw_kind if raw_kind in ("webxr", "tracker") else "legacy"
+        client_sources = self._client_sources.get(client_id)
+        if (
+            client_sources is not None
+            and source_id not in client_sources
+            and len(client_sources) >= _MAX_POSE_SOURCES_PER_CLIENT
+        ):
+            return None
         previous_kind = self._source_kind.setdefault(source_id, source_kind)
         if previous_kind != source_kind:
             # A logical id cannot change privilege/kind mid-session.
@@ -627,7 +676,9 @@ class VRServer:
         self._client_sources.setdefault(client_id, set()).add(source_id)
         return source_id, source_kind
 
-    def _pose_source_allowed(self, source_id: str, source_kind: str) -> bool:
+    def _pose_source_allowed(
+        self, source_id: str, source_kind: str, *, now: float
+    ) -> bool:
         """Claim or validate exclusive ownership for one logical producer."""
         if (
             self._expected_pose_source_id is not None
@@ -641,16 +692,41 @@ class VRServer:
             return False
 
         if self._pose_owner == source_id:
+            self._pose_owner_last_seen = now
             return True
         if self._pose_owner is None:
             if self._tracker_source_latched and source_kind != "tracker":
                 return False
             self._pose_owner = source_id
             self._pose_owner_kind = source_kind
+            self._pose_owner_last_seen = now
             if source_kind == "tracker":
                 self._tracker_source_latched = True
             self._reset_pose_buffer()
             _logger.info("pose source %s claimed control (%s)", source_id, source_kind)
+            return True
+
+        owner_kind = self._pose_owner_kind
+        same_source_family = source_kind == owner_kind or {
+            source_kind,
+            owner_kind,
+        } <= {"webxr", "legacy"}
+        owner_stale = (
+            self._pose_owner_last_seen is not None
+            and now - self._pose_owner_last_seen > _POSE_OWNER_TAKEOVER_STALE_S
+        )
+        if same_source_family and owner_stale:
+            previous = self._pose_owner
+            self._pose_owner = source_id
+            self._pose_owner_kind = source_kind
+            self._pose_owner_last_seen = now
+            self._reset_pose_buffer()
+            _logger.warning(
+                "pose source %s replaced stale owner %s (%s)",
+                source_id,
+                previous,
+                source_kind,
+            )
             return True
 
         # On an unrestricted compatibility server, a tracker bridge may take
@@ -664,6 +740,7 @@ class VRServer:
             )
             self._pose_owner = source_id
             self._pose_owner_kind = source_kind
+            self._pose_owner_last_seen = now
             self._tracker_source_latched = True
             self._reset_pose_buffer()
             return True
@@ -672,11 +749,31 @@ class VRServer:
     def _drop_pose_client(self, client_id: int) -> None:
         """Release a client's logical-source memberships on disconnect."""
         for source_id in self._client_sources.pop(client_id, set()):
+            self._client_last_seq.pop((client_id, source_id), None)
+            self._client_last_seq_seen.pop((client_id, source_id), None)
             clients = self._source_clients.get(source_id)
             if clients is None:
                 continue
             clients.discard(client_id)
             if clients:
+                previous_max = self._last_seq.get(source_id)
+                remaining = [
+                    seq
+                    for remaining_client in clients
+                    if (seq := self._client_last_seq.get((remaining_client, source_id)))
+                    is not None
+                ]
+                if remaining:
+                    self._last_seq[source_id] = max(remaining)
+                else:
+                    self._last_seq.pop(source_id, None)
+                if self._pose_owner == source_id and previous_max != self._last_seq.get(
+                    source_id
+                ):
+                    # The active transport/timing domain left. Do not blend
+                    # its buffered capture timestamps with the surviving tab
+                    # whose lower sequence window is about to resume.
+                    self._reset_pose_buffer()
                 continue
             self._source_clients.pop(source_id, None)
             self._source_kind.pop(source_id, None)
@@ -687,6 +784,7 @@ class VRServer:
             if self._pose_owner == source_id:
                 self._pose_owner = None
                 self._pose_owner_kind = None
+                self._pose_owner_last_seen = None
                 self._reset_pose_buffer()
                 _logger.info("pose source %s released control", source_id)
 
@@ -706,7 +804,10 @@ class VRServer:
             _logger.warning("invalid frame: %s", exc)
             return False
 
-        source_id, source_kind = self._register_pose_source(frame, stream, client_id)
+        source = self._register_pose_source(frame, stream, client_id)
+        if source is None:
+            return False
+        source_id, source_kind = source
         # A Quest remains a useful video/URDF viewer during a managed
         # Lighthouse/Ultimate run. Its pose frames stay view-only, but its
         # controller datum is still setup information worth surfacing.
@@ -716,7 +817,8 @@ class VRServer:
                 server_token=self._quest_datum_token,
                 source_id=source_id,
             )
-        if not self._pose_source_allowed(source_id, source_kind):
+        now = time.monotonic()
+        if not self._pose_source_allowed(source_id, source_kind, now=now):
             return False
 
         # A copy with seq <= this logical producer's high-water mark is a
@@ -724,9 +826,55 @@ class VRServer:
         # transport. Frames without seq retain legacy latest-wins behavior.
         seq = frame.seq
         if seq is not None:
+            client_key = (client_id, source_id)
+            client_last = self._client_last_seq.get(client_key)
+            client_is_new = client_last is None
+            if client_last is not None and seq <= client_last:
+                return True
+            client_seen = self._client_last_seq_seen.get(client_key)
+            client_was_stale = (
+                client_seen is not None
+                and now - client_seen > _POSE_SEQUENCE_CLIENT_STALE_S
+            )
+            self._client_last_seq[client_key] = seq
+            self._client_last_seq_seen[client_key] = now
             last = self._last_seq.get(source_id)
             if last is not None and seq <= last:
-                return True
+                # A duplicated tab may have used a much higher reserved block,
+                # then exited XR without closing its WebSocket. Recompute the
+                # source maximum from clients that are still publishing poses.
+                # The current frame is already in the per-client maps above;
+                # when it establishes the new active maximum, accept it as the
+                # first frame of the recovered stream after resetting timing.
+                active = [
+                    client_seq
+                    for remaining_client in self._source_clients.get(source_id, set())
+                    if (
+                        client_seq := self._client_last_seq.get(
+                            (remaining_client, source_id)
+                        )
+                    )
+                    is not None
+                    and now
+                    - self._client_last_seq_seen.get(
+                        (remaining_client, source_id), float("-inf")
+                    )
+                    <= _POSE_SEQUENCE_CLIENT_STALE_S
+                ]
+                active_max = max(active) if active else seq
+                if active_max < last:
+                    self._last_seq[source_id] = active_max
+                    self._reset_pose_buffer()
+                    if seq < active_max:
+                        return True
+                else:
+                    return True
+            elif last is not None and (client_is_new or client_was_stale):
+                # A new or previously inactive tab/transport arrived above the
+                # active high-water. A page reload resets performance.now(),
+                # and a transport switch can change receive timing, so start a
+                # fresh interpolation domain before accepting its first frame.
+                self._reset_pose_buffer()
             self._last_seq[source_id] = seq
 
         self._latest_frame = frame
@@ -757,6 +905,13 @@ class VRServer:
     ) -> None:
         """Handle a WebRTC signaling message from the headset."""
         msg_type = obj.get("type")
+
+        # Initial announcements can beat a browser component's message
+        # listener on a very fast local socket. Let the client request an
+        # idempotent replay after its listener is attached.
+        if msg_type == "session-config-request":
+            await self._send_session_config(websocket)
+            return
 
         # Control data channel (pose transport): negotiated independently of the
         # cameras, so it's handled before the video-availability check below and
@@ -900,6 +1055,27 @@ class VRServer:
         finally:
             self._video_offering.discard(client_id)
 
+    async def _send_session_config(self, websocket: WebSocket) -> None:
+        """Best-effort replay of authoritative per-session client state."""
+        announcements: list[tuple[str, Any]] = []
+        if self._mode is not None:
+            announcements.append(("mode", self._mode))
+        announcements.append(("pose_mode", self._pose_mode))
+        if self._tracking is not None:
+            announcements.append(("tracking", self._tracking))
+        if self._episode is not None:
+            announcements.append(("episode", self._episode))
+        if self._hud is not None:
+            announcements.append(("hud", self._hud))
+
+        for message_type, value in announcements:
+            try:
+                await websocket.send_text(
+                    json.dumps({"type": message_type, "value": value})
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort announce
+                _logger.warning("failed to send %s to client: %s", message_type, exc)
+
     def _build_app(self) -> FastAPI:
         app = FastAPI()
         server = self
@@ -926,50 +1102,22 @@ class VRServer:
 
         @app.websocket("/ws")
         async def _ws(websocket: WebSocket) -> None:
+            if not browser_origin_allowed(
+                websocket.headers.get("origin"),
+                scheme=websocket.url.scheme,
+                host=websocket.headers.get("host", websocket.url.netloc),
+            ):
+                await websocket.close(code=1008, reason="browser origin is not allowed")
+                return
             await websocket.accept()
             _logger.info("client connected %s", websocket.client)
             server._client_count += 1
             server._active_clients.add(websocket)
             client_id = id(websocket)
-            # Announce the operating mode so the UI can lock its HUD (teleop vs
-            # data collection). Sent per client on connect since a client may
-            # join after set_mode(); best-effort so a send failure never blocks
-            # the receive loop below.
-            if server._mode is not None:
-                try:
-                    await websocket.send_text(
-                        json.dumps({"type": "mode", "value": server._mode})
-                    )
-                except Exception as exc:  # noqa: BLE001 - best-effort announce
-                    _logger.warning("failed to send mode to client: %s", exc)
-            # Seed tracking too: managed Mantis bridges use this state after a
-            # reconnect to re-engage only when the core is actually disabled.
-            if server._tracking is not None:
-                try:
-                    await websocket.send_text(
-                        json.dumps({"type": "tracking", "value": server._tracking})
-                    )
-                except Exception as exc:  # noqa: BLE001 - best-effort announce
-                    _logger.warning("failed to send tracking to client: %s", exc)
-            # Likewise seed the current episode number so a headset joining
-            # mid-session shows the right value immediately, not on the next
-            # episode. Best-effort for the same reason as the mode announce.
-            if server._episode is not None:
-                try:
-                    await websocket.send_text(
-                        json.dumps({"type": "episode", "value": server._episode})
-                    )
-                except Exception as exc:  # noqa: BLE001 - best-effort announce
-                    _logger.warning("failed to send episode to client: %s", exc)
-            # And any live headset HUD state (armed popup / countdown), so a
-            # dashboard joining mid-dialog mirrors it immediately.
-            if server._hud is not None:
-                try:
-                    await websocket.send_text(
-                        json.dumps({"type": "hud", "value": server._hud})
-                    )
-                except Exception as exc:  # noqa: BLE001 - best-effort announce
-                    _logger.warning("failed to send hud to client: %s", exc)
+            # Seed HUD and pose conventions for clients joining after setup.
+            # The browser requests an idempotent replay once its listener is
+            # attached too, closing the fast-connect announcement race.
+            await server._send_session_config(websocket)
             try:
                 while True:
                     data = await websocket.receive_text()
@@ -1003,7 +1151,10 @@ class VRServer:
                 if server._client_count == 0:
                     server._pose_owner = None
                     server._pose_owner_kind = None
+                    server._pose_owner_last_seen = None
                     server._last_seq.clear()
+                    server._client_last_seq.clear()
+                    server._client_last_seq_seen.clear()
                     server._source_kind.clear()
                     server._source_clients.clear()
                     server._client_sources.clear()

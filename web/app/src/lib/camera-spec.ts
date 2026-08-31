@@ -18,18 +18,23 @@ export const selEyes = (v: BranchSel | undefined, slot: CameraSlot): StereoEyes 
 
 type BranchMap = Partial<Record<CameraSlot, BranchSel>>
 
+export type CameraProfileBySlot = Partial<Record<CameraSlot, "axol" | "mantis">>
+
 /**
  * Persist exactly what each Cameras control displays. A slot the operator
  * never touched still shows a default (e.g. overhead streams "both"); writing
  * that default explicitly keeps the saved spec matching the panel, so the
  * backend never falls back to a different value (streaming would otherwise
- * default to the recorded eyes). Materialized only for slots whose kind is
- * known, so mono saves a boolean and stereo an eye selection.
+ * default to the recorded eyes). Only edited slots are supplied here: Axol
+ * and Mantis share the branch maps, but can assign devices of different kinds
+ * to the same logical slot. Explicit values therefore stay byte-for-byte
+ * intact unless that slot's control was edited; this function only fills an
+ * implicit value for an affected slot whose camera kind is known.
  */
 export function materializeCameraSpec(
   spec: CameraSpec,
   devices: CameraDevice[] | null,
-  mantis = false
+  profileBySlot: CameraProfileBySlot
 ): CameraSpec {
   const kindBySerial = new Map((devices ?? []).map((d) => [String(d.serial), d.kind]))
   const materialize = (map: BranchMap, slot: CameraSlot, stereo: boolean): BranchSel =>
@@ -37,15 +42,21 @@ export function materializeCameraSpec(
   const outStream: BranchMap = { ...(spec.stream ?? {}) }
   const outRecord: BranchMap = { ...(spec.record ?? {}) }
   for (const key of CAMERA_SLOT_KEYS) {
+    const profile = profileBySlot[key]
+    if (!profile) continue
     const mappedSerial =
-      mantis && key !== "overhead"
+      profile === "mantis" && key !== "overhead"
         ? (spec.mantis_serials?.[key] ?? spec.serials[key])
         : spec.serials[key]
     const kind = kindBySerial.get(mappedSerial.trim())
     if (!kind) continue // unknown kind / unassigned: leave backend defaults
     const stereo = kind === "stereo"
-    outStream[key] = materialize(spec.stream ?? {}, key, stereo)
-    outRecord[key] = materialize(spec.record ?? {}, key, stereo)
+    if (outStream[key] === undefined) {
+      outStream[key] = materialize(spec.stream ?? {}, key, stereo)
+    }
+    if (outRecord[key] === undefined) {
+      outRecord[key] = materialize(spec.record ?? {}, key, stereo)
+    }
   }
   return {
     serials: {

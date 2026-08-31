@@ -3,10 +3,10 @@
 #
 #   curl https://axol.almond.bot/install -fsS | bash
 #
-# Installs uv, installs the axol CLI as a uv tool (from GitHub, pinned to the
-# latest release tag, all extras), installs the pyzed bindings when the ZED SDK
-# is present, installs adb for Quest-over-USB teleop, and registers a root
-# systemd service that keeps `axol serve` running at boot and restarts it if it
+# Installs uv, installs the axol CLI as a uv tool (from PyPI, pinned to the
+# latest GitHub release tag, with hosted feature extras), installs pyzed when
+# the ZED SDK is present, installs adb for Quest-over-USB teleop, and registers
+# a root systemd service that keeps `axol serve` running at boot and restarts it if it
 # ever goes down. Safe to re-run: re-running upgrades to the latest release.
 
 set -euo pipefail
@@ -20,8 +20,9 @@ REPO_URL="https://github.com/almond-bot/axol"
 # (GStreamer NVENC + PyGObject + the patched zed-gstreamer source plugins),
 # provisioned below by `axol provision`, not via a PyPI extra (see
 # pyproject.toml). WebRTC transport itself is aiortc, a normal core dependency.
-EXTRAS="lerobot,sim"
+EXTRAS="lerobot,sim,tracker"
 PYTHON_VERSION="3.13"
+UV_VERSION="0.12.3"
 BIN_DIR="/usr/local/bin"
 SERVICE_NAME="axol"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -40,6 +41,10 @@ say() { printf "\033[1;36m[axol]\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31m[axol]\033[0m %s\n" "$*" >&2; exit 1; }
 
 [ "$(uname -s)" = "Linux" ] || die "This installer only supports Linux."
+AARCH64_HOST=0
+case "$(uname -m)" in
+    aarch64|arm64) AARCH64_HOST=1 ;;
+esac
 
 # The systemd service runs as root, so install everything as root. When piped
 # into a non-root shell, re-fetch ourselves and re-run elevated.
@@ -50,8 +55,9 @@ fi
 
 command -v systemctl >/dev/null 2>&1 || die "systemd is required."
 command -v curl >/dev/null 2>&1 || die "curl is required."
-# git is needed both to resolve the latest release tag and by uv itself to
-# install from the GitHub URL.
+command -v realpath >/dev/null 2>&1 || die "coreutils realpath is required."
+# git resolves the latest release tag and restores the pinned Ultimate VCS
+# requirement when that runtime was explicitly configured.
 command -v git >/dev/null 2>&1 || die "git is required."
 
 # Resolve the login that owns this robot's operator state once and reuse it for
@@ -60,18 +66,46 @@ command -v git >/dev/null 2>&1 || die "git is required."
 # first-/home-user fallback.
 OPERATOR_USER="${SUDO_USER:-}"
 if [ -z "${OPERATOR_USER}" ] || [ "${OPERATOR_USER}" = "root" ]; then
-    OPERATOR_USER="$(ls -ld /home/*/ 2>/dev/null | awk 'NR==1 {print $3}')"
+    # With pipefail, an unmatched /home/* glob would make the old `ls | awk`
+    # fallback terminate the whole installer before it could use root's
+    # defaults. Walk candidates explicitly and leave the value empty when a
+    # machine genuinely has no non-root home.
+    OPERATOR_USER=""
+    for candidate_home in /home/*/; do
+        [ -d "${candidate_home}" ] || continue
+        candidate_user="$(stat -c '%U' -- "${candidate_home}" 2>/dev/null || true)"
+        if [ -n "${candidate_user}" ] && [ "${candidate_user}" != "root" ] \
+            && getent passwd "${candidate_user}" >/dev/null 2>&1; then
+            OPERATOR_USER="${candidate_user}"
+            break
+        fi
+    done
 fi
 OPERATOR_HOME=""
 OPERATOR_GROUP=""
+OPERATOR_UID=""
+OPERATOR_GID=""
+RUNUSER=""
 if [ -n "${OPERATOR_USER}" ] && [ "${OPERATOR_USER}" != "root" ]; then
     OPERATOR_HOME="$(getent passwd "${OPERATOR_USER}" | cut -d: -f6)"
     OPERATOR_GROUP="$(id -gn "${OPERATOR_USER}" 2>/dev/null || true)"
+    OPERATOR_UID="$(id -u "${OPERATOR_USER}" 2>/dev/null || true)"
+    OPERATOR_GID="$(id -g "${OPERATOR_USER}" 2>/dev/null || true)"
     case "${OPERATOR_HOME}" in
         /*) ;;
         *) OPERATOR_HOME="" ;;
     esac
+    if [ -n "${OPERATOR_HOME}" ] && [ -n "${OPERATOR_GROUP}" ]; then
+        RUNUSER="$(command -v runuser || true)"
+        [ -n "${RUNUSER}" ] \
+            || die "util-linux runuser is required for safe operator-state setup."
+    fi
 fi
+
+operator_run() {
+    [ -n "${RUNUSER}" ] || die "Cannot run a command as the operator account."
+    "${RUNUSER}" -u "${OPERATOR_USER}" -- "$@"
+}
 
 # systemd parses Environment= with its own quoting rules, not shell quoting.
 # Escape quoting plus systemd's ``%`` specifier marker, and reject line breaks
@@ -91,8 +125,9 @@ systemd_environment_line() {
 # -- uv -----------------------------------------------------------------------
 
 if ! command -v uv >/dev/null 2>&1; then
-    say "Installing uv to ${BIN_DIR}..."
-    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="${BIN_DIR}" sh
+    say "Installing uv ${UV_VERSION} to ${BIN_DIR}..."
+    curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" \
+        | env UV_INSTALL_DIR="${BIN_DIR}" sh
 else
     say "uv already installed ($(command -v uv))."
 fi
@@ -113,11 +148,158 @@ LATEST_TAG="$(git ls-remote --tags "${REPO_URL}" "refs/tags/v*" \
 VERSION="${LATEST_TAG#v}"
 say "Latest release: ${LATEST_TAG}."
 
+# Ask the currently installed, root-owned Axol CLI for its machine-readable
+# preflight before --force rebuilds the environment. It returns only allowlisted
+# requirements for explicitly installed Ultimate and published LeRobot plugin
+# runtimes. On aarch64 it also refuses to overwrite an existing CUDA-enabled/
+# custom PyTorch with PyPI's CPU-only 2.10 wheel. Older releases still get the
+# conservative legacy probes below.
+legacy_aarch64_torch_preflight() {
+    local existing_python="$1"
+    [ "${AARCH64_HOST}" = "1" ] || return 0
+    [ -x "${existing_python}" ] \
+        || die "Could not inspect the existing aarch64 Axol environment."
+    set +e
+    "${existing_python}" -c '
+import importlib.metadata as metadata
+
+try:
+    dist = metadata.distribution("torch")
+except metadata.PackageNotFoundError:
+    raise SystemExit(0)
+if dist.version != "2.10.0" or dist.read_text("direct_url.json"):
+    raise SystemExit(20)
+try:
+    import torch
+except BaseException:
+    raise SystemExit(21)
+cuda_build = bool(getattr(getattr(torch, "version", None), "cuda", None))
+standard_cpu = str(getattr(torch, "__version__", "")) in {"2.10.0", "2.10.0+cpu"}
+raise SystemExit(20 if cuda_build or not standard_cpu else 0)
+'
+    LEGACY_TORCH_STATUS=$?
+    set -e
+    case "${LEGACY_TORCH_STATUS}" in
+        0) ;;
+        20)
+            die "Axol update blocked: this aarch64 environment has a CUDA-enabled or custom PyTorch build. The hosted force install would replace it with PyPI's CPU-only torch==2.10.0. Keep the current install; this updater cannot reconstruct its wheel source. Use a manual update with an explicit restoration plan for the same JetPack-compatible torch and torchvision builds, or intentionally switch to CPU Torch before retrying."
+            ;;
+        *) die "Could not safely inspect the existing aarch64 PyTorch environment; refusing the force update." ;;
+    esac
+}
+
+legacy_plugin_update_requirement() {
+    local existing_python="$1"
+    local plugin_output plugin_status
+    [ -x "${existing_python}" ] \
+        || die "Could not inspect the existing Axol plugin environment."
+    set +e
+    plugin_output="$("${existing_python}" -c '
+import importlib.metadata as metadata
+import re
+
+try:
+    dist = metadata.distribution("lerobot_robot_axol")
+except metadata.PackageNotFoundError:
+    raise SystemExit(0)
+try:
+    version = dist.version
+    direct_url = dist.read_text("direct_url.json")
+except Exception:
+    raise SystemExit(21)
+if direct_url is not None or re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version) is None:
+    raise SystemExit(20)
+print(f"lerobot_robot_axol=={version}")
+')"
+    plugin_status=$?
+    set -e
+    case "${plugin_status}" in
+        0)
+            if [ -n "${plugin_output}" ]; then
+                [[ "${plugin_output}" =~ ^lerobot_robot_axol==[0-9]+(\.[0-9]+)+$ ]] \
+                    || die "Installed Axol returned an invalid LeRobot plugin preservation requirement."
+                UPDATE_WITH_ARGS+=(--with "${plugin_output}")
+                PLUGIN_PRESERVED=1
+                say "Preserving the explicitly installed published LeRobot plugin."
+            fi
+            ;;
+        20)
+            die "Axol update blocked: this environment has a direct or customized lerobot_robot_axol plugin install. The hosted force install cannot reconstruct that source safely. Reinstall Axol manually with an explicit plan for the same plugin source, or replace it with a published PyPI plugin release before retrying."
+            ;;
+        *) die "Could not safely inspect the existing Axol plugin environment; refusing the force update." ;;
+    esac
+}
+
+UPDATE_WITH_ARGS=()
+ULTIMATE_PRESERVED=0
+PLUGIN_PRESERVED=0
+if [ -x "${BIN_DIR}/axol" ]; then
+    set +e
+    UPDATE_PREFLIGHT_OUTPUT="$("${BIN_DIR}/axol" update-preflight 2>&1)"
+    UPDATE_PREFLIGHT_STATUS=$?
+    set -e
+    case "${UPDATE_PREFLIGHT_STATUS}" in
+        0)
+            if [ -n "${UPDATE_PREFLIGHT_OUTPUT}" ]; then
+                while IFS= read -r update_requirement; do
+                    if [[ "${update_requirement}" =~ ^git\+https://github\.com/nijkah/pyvut\.git@[0-9a-f]{40}$ ]]; then
+                        [ "${ULTIMATE_PRESERVED}" -eq 0 ] \
+                            || die "Installed Axol returned a duplicate VIVE Ultimate preservation requirement."
+                        UPDATE_WITH_ARGS+=(--with "${update_requirement}")
+                        ULTIMATE_PRESERVED=1
+                    elif [[ "${update_requirement}" =~ ^lerobot_robot_axol==[0-9]+(\.[0-9]+)+$ ]]; then
+                        [ "${PLUGIN_PRESERVED}" -eq 0 ] \
+                            || die "Installed Axol returned a duplicate LeRobot plugin preservation requirement."
+                        UPDATE_WITH_ARGS+=(--with "${update_requirement}")
+                        PLUGIN_PRESERVED=1
+                    else
+                        die "Installed Axol returned an invalid update preservation requirement."
+                    fi
+                done <<< "${UPDATE_PREFLIGHT_OUTPUT}"
+                if [ "${ULTIMATE_PRESERVED}" -eq 1 ]; then
+                    say "Preserving the explicitly installed VIVE Ultimate runtime."
+                fi
+                if [ "${PLUGIN_PRESERVED}" -eq 1 ]; then
+                    say "Preserving the explicitly installed published LeRobot plugin."
+                fi
+            fi
+            ;;
+        2)
+            if [[ "${UPDATE_PREFLIGHT_OUTPUT}" != *"invalid choice: 'update-preflight'"* ]]; then
+                die "Could not inspect the existing Axol runtime before updating."
+            fi
+            # Backward-compatible protection for an Axol release that does not
+            # yet expose the shared preflight. uv-generated entry points use
+            # their environment's absolute Python in the shebang.
+            IFS= read -r EXISTING_AXOL_SHEBANG < "${BIN_DIR}/axol" \
+                || die "Could not inspect the existing Axol environment."
+            EXISTING_AXOL_PYTHON="${EXISTING_AXOL_SHEBANG#\#!}"
+            case "${EXISTING_AXOL_PYTHON}" in
+                /*) ;;
+                *) die "Could not inspect the existing Axol environment." ;;
+            esac
+            legacy_aarch64_torch_preflight "${EXISTING_AXOL_PYTHON}"
+            legacy_plugin_update_requirement "${EXISTING_AXOL_PYTHON}"
+            ;;
+        20)
+            die "${UPDATE_PREFLIGHT_OUTPUT}"
+            ;;
+        *)
+            die "Could not inspect the existing Axol runtime before updating."
+            ;;
+    esac
+elif [ -x "${UV_TOOL_DIR}/almond-axol/bin/python" ]; then
+    # Recover safely from a missing wrapper left by an interrupted/older install.
+    legacy_aarch64_torch_preflight "${UV_TOOL_DIR}/almond-axol/bin/python"
+    legacy_plugin_update_requirement "${UV_TOOL_DIR}/almond-axol/bin/python"
+fi
+
 say "Installing axol ${VERSION} from PyPI (extras: ${EXTRAS}) — this can take a few minutes..."
 mkdir -p "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
     --python "${PYTHON_VERSION}" \
     --force \
+    "${UPDATE_WITH_ARGS[@]}" \
     "almond-axol[${EXTRAS}]==${VERSION}"
 
 # uv creates the tool venv + managed Python with the root umask; make sure every
@@ -127,6 +309,11 @@ chmod -R a+rX "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 
 command -v axol >/dev/null 2>&1 || die "axol did not end up on PATH (expected ${BIN_DIR}/axol)."
 say "axol installed at $(command -v axol)."
+if [ "${AARCH64_HOST}" = "1" ]; then
+    say "WARNING: PyPI torch 2.10 is CPU-only on aarch64."
+    say "WARNING: local CUDA run-policy/collect-dagger is unavailable until you explicitly manage a JetPack-compatible torch + torchvision build."
+    say "WARNING: use remote inference or pass --device cpu in the meantime."
+fi
 
 # -- System provisioning (pyzed + GStreamer camera stack + adb) ---------------
 
@@ -146,11 +333,25 @@ say "axol installed at $(command -v axol)."
 # in the summary below rather than rebooting the box mid-install.
 say "Provisioning system dependencies (pyzed + GStreamer camera stack + adb)..."
 PROVISION_LOG="$(mktemp)"
-axol provision 2>&1 | tee "${PROVISION_LOG}" \
-    || say "WARNING: provisioning failed; cameras may be unavailable or fall back to the slower ZED SDK path. Re-run 'axol provision'."
+set +e
+axol provision 2>&1 | tee "${PROVISION_LOG}"
+PROVISION_STATUS="${PIPESTATUS[0]}"
+set -e
 REBOOT_REQUIRED=0
 if grep -q "REBOOT REQUIRED" "${PROVISION_LOG}"; then REBOOT_REQUIRED=1; fi
 rm -f "${PROVISION_LOG}"
+if [ "${PROVISION_STATUS}" -ne 0 ]; then
+    die "Axol was updated, but provisioning failed. The service was not restarted; repair the reported host dependencies and rerun this installer."
+fi
+
+# Verify with the newly installed CLI, which repairs system dependencies and
+# advances to its expected pyvut pin if it changed between Axol releases. Never
+# restart the service into a silently degraded Ultimate setup.
+if [ "${ULTIMATE_PRESERVED}" -eq 1 ]; then
+    say "Verifying the preserved VIVE Ultimate runtime..."
+    axol tracker.ultimate.install \
+        || die "Axol was updated, but VIVE Ultimate restore failed. The service was not restarted; repair the runtime and rerun this installer."
+fi
 
 # -- Quest-over-USB operator access -------------------------------------------
 
@@ -178,28 +379,47 @@ axol jetson.setup || say "WARNING: jetson.setup failed (non-Jetson, or needs roo
 
 # -- Dataset storage location -------------------------------------------------
 
-# The service runs as root, so without help LeRobot would write collected
-# datasets to /root/.cache/huggingface/lerobot. Point HF_LEROBOT_HOME at the
-# installing user's home instead so datasets live in their account.
-DATASET_USER="${OPERATOR_USER}"
-LEROBOT_HOME_ENV=""
-if [ -n "${DATASET_USER}" ] && [ -n "${OPERATOR_HOME}" ]; then
-    DATASET_HOME="${OPERATOR_HOME}"
-    if [ -d "${DATASET_HOME}" ]; then
-        LEROBOT_HOME="${DATASET_HOME}/.cache/huggingface/lerobot"
-        say "Datasets will be stored under ${LEROBOT_HOME} (user: ${DATASET_USER})."
-        mkdir -p "${LEROBOT_HOME}"
-        # Own the cache chain so the user can browse/manage datasets (episode
-        # files written by the root service stay root-owned but readable).
-        chown "${DATASET_USER}:" \
-            "${DATASET_HOME}/.cache" \
-            "${DATASET_HOME}/.cache/huggingface" \
-            "${LEROBOT_HOME}" 2>/dev/null || true
-        LEROBOT_HOME_ENV="$(systemd_environment_line HF_LEROBOT_HOME "${LEROBOT_HOME}")"
-    fi
+# Third-party LeRobot/PyArrow/PyAV writers reopen paths by name. A root service
+# cannot safely target an operator-writable home: a local symlink swap could
+# redirect a later open outside the checked tree. Keep hosted datasets below a
+# root-owned, non-writable /var/lib boundary instead. The operator's group gets
+# read/traverse access after each save, never write access; plain CLI commands
+# remain in the operator's normal HuggingFace cache.
+SERVICE_DATASET_ROOT="/var/lib/almond-axol/datasets"
+DATASET_GROUP="${OPERATOR_GROUP:-root}"
+DATASET_UID="${OPERATOR_UID:-0}"
+DATASET_GID="${OPERATOR_GID:-0}"
+[ ! -L "/var/lib/almond-axol" ] \
+    || die "/var/lib/almond-axol must not be a symlink."
+# Seal the parent while its entry is protected by /var/lib. Only after that is
+# immutable to the operator is it safe to inspect/create the child: GNU
+# `install -d` follows a symlink-to-directory and must never see a swappable
+# child name.
+install -d -o root -g root -m 0750 /var/lib/almond-axol
+[ ! -L "${SERVICE_DATASET_ROOT}" ] \
+    || die "${SERVICE_DATASET_ROOT} must not be a symlink."
+install -d -o root -g "${DATASET_GROUP}" -m 2750 "${SERVICE_DATASET_ROOT}"
+install -d -o root -g "${DATASET_GROUP}" -m 0750 /var/lib/almond-axol
+LEROBOT_HOME_ENV="$(systemd_environment_line HF_LEROBOT_HOME "${SERVICE_DATASET_ROOT}")"
+SERVICE_DATASET_ROOT_ENV="$(systemd_environment_line AXOL_SERVICE_DATASET_ROOT "${SERVICE_DATASET_ROOT}")"
+SERVICE_OPERATOR_UID_ENV="$(systemd_environment_line AXOL_OPERATOR_UID "${DATASET_UID}")"
+SERVICE_OPERATOR_GID_ENV="$(systemd_environment_line AXOL_OPERATOR_GID "${DATASET_GID}")"
+say "Hosted datasets: ${SERVICE_DATASET_ROOT} (read-only group: ${DATASET_GROUP})."
+
+# Moving the service from the operator-writable HuggingFace cache into this
+# immutable store must never make existing recordings silently disappear. Run
+# discovery as the operator (not root), stop with an actionable opt-in, and
+# leave every legacy byte untouched. There is deliberately no automatic copy:
+# safely importing an adversarial tree requires a reviewed no-link importer.
+LEGACY_LEROBOT_HOME="${OPERATOR_HOME:+${OPERATOR_HOME}/.cache/huggingface/lerobot}"
+LEGACY_DATASET=""
+if [ -n "${RUNUSER}" ] && [ -d "${LEGACY_LEROBOT_HOME}" ]; then
+    LEGACY_DATASET="$(operator_run find -P "${LEGACY_LEROBOT_HOME}" \
+        -mindepth 3 -maxdepth 4 -type f -path '*/meta/info.json' \
+        -print -quit 2>/dev/null || true)"
 fi
-if [ -z "${LEROBOT_HOME_ENV}" ]; then
-    say "WARNING: could not resolve a non-root user home; datasets default to root's cache."
+if [ -n "${LEGACY_DATASET}" ] && [ "${AXOL_ACK_LEGACY_DATASETS:-}" != "1" ]; then
+    die "Existing datasets were found under ${LEGACY_LEROBOT_HOME}. They remain available to the non-root CLI but cannot be consumed safely by the root service. Back them up, then run exactly: curl ${INSTALL_URL} -fsS | sudo env AXOL_ACK_LEGACY_DATASETS=1 bash. This keeps legacy datasets CLI-only and uses ${SERVICE_DATASET_ROOT} for new panel recordings."
 fi
 
 # -- Shared operator state ----------------------------------------------------
@@ -210,25 +430,77 @@ fi
 # existing file always wins and the legacy copy remains as a backup.
 ALMOND_HOME_ENV_LINE=""
 SERVICE_GROUP_LINE=""
-if [ -n "${OPERATOR_HOME}" ] && [ -n "${OPERATOR_GROUP}" ] && [ -d "${OPERATOR_HOME}" ]; then
-    ALMOND_STATE_HOME="${OPERATOR_HOME}/.almond"
-    mkdir -p "${ALMOND_STATE_HOME}"
+ALMOND_STATE_HOME="${OPERATOR_HOME:+${OPERATOR_HOME}/.almond}"
+if [ -L "${ALMOND_STATE_HOME}" ]; then
+    say "WARNING: ${ALMOND_STATE_HOME} is a symlink; refusing root state migration and using /root/.almond for the service."
+elif [ -n "${OPERATOR_HOME}" ] && [ -n "${OPERATOR_GROUP}" ] && [ -d "${OPERATOR_HOME}" ]; then
+    operator_run mkdir -p -- "${ALMOND_STATE_HOME}"
+
+    # A root installer must never let an existing nested symlink redirect a
+    # missing destination into /etc, /root, or another tree. realpath -m
+    # resolves existing path components without requiring the final parent to
+    # exist; the final file itself must not be a symlink either.
+    state_destination_safe() {
+        local destination="$1"
+        local state_root destination_parent
+        [ ! -L "${destination}" ] || return 1
+        state_root="$(realpath -e -- "${ALMOND_STATE_HOME}")" || return 1
+        destination_parent="$(realpath -m -- "$(dirname -- "${destination}")")" \
+            || return 1
+        case "${destination_parent}" in
+            "${state_root}"|"${state_root}"/*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    # Never write legacy root-owned bytes directly into an operator-writable
+    # tree as root. Stage each source in a root-controlled random slot, hand
+    # only that slot to the operator, then let the operator create/copy the
+    # destination. A symlink swap after state_destination_safe is therefore
+    # privilege-contained; --no-clobber also preserves a destination that
+    # appears after the check.
+    STATE_MIGRATION_STAGE="$(mktemp -d /tmp/axol-state-migration.XXXXXX)"
+    chmod 0711 "${STATE_MIGRATION_STAGE}"
+    cleanup_state_migration_stage() {
+        case "${STATE_MIGRATION_STAGE:-}" in
+            /tmp/axol-state-migration.*)
+                rm -rf -- "${STATE_MIGRATION_STAGE}"
+                ;;
+        esac
+    }
+    trap cleanup_state_migration_stage EXIT
+
+    operator_state_copy() {
+        local source="$1"
+        local destination="$2"
+        local slot
+        slot="$(mktemp -d "${STATE_MIGRATION_STAGE}/item.XXXXXX")"
+        cp -a --no-dereference -- "${source}" "${slot}/payload"
+        chown -hR "${OPERATOR_USER}:${OPERATOR_GROUP}" "${slot}"
+        operator_run mkdir -p -- "$(dirname -- "${destination}")"
+        operator_run cp -a --no-clobber --no-target-directory -- \
+            "${slot}/payload" "${destination}"
+        rm -rf -- "${slot}"
+    }
 
     LEGACY_STATE_HOME="/root/.almond"
-    if [ "${ALMOND_STATE_HOME}" != "${LEGACY_STATE_HOME}" ] && [ -d "${LEGACY_STATE_HOME}" ]; then
+    if [ "${ALMOND_STATE_HOME}" != "${LEGACY_STATE_HOME}" ] \
+        && [ -d "${LEGACY_STATE_HOME}" ] && [ ! -L "${LEGACY_STATE_HOME}" ]; then
         PRE_MANTIS_STATE_DIR="u""mi"
+        # CAN bring-up/quirk scripts are deliberately not operator state: root
+        # cron/systemd execute them, so current releases regenerate root-owned
+        # copies under /etc/almond-axol/can instead of migrating writable ones.
         for item in \
             settings.json tracker/config.json tracker/ultimate_wifi.json \
             mantis/tcp_transform.json \
             "${PRE_MANTIS_STATE_DIR}/tcp_transform.json" \
-            gripper_calibration.json can/startup.sh can/startup_mantis.sh \
-            can/rp1-usb-quirk.sh waypoints.json; do
+            gripper_calibration.json waypoints.json; do
             legacy_item="${LEGACY_STATE_HOME}/${item}"
             operator_item="${ALMOND_STATE_HOME}/${item}"
-            if { [ -e "${legacy_item}" ] || [ -L "${legacy_item}" ]; } \
-                && [ ! -e "${operator_item}" ] && [ ! -L "${operator_item}" ]; then
-                mkdir -p "$(dirname "${operator_item}")"
-                cp -a -- "${legacy_item}" "${operator_item}"
+            if [ -f "${legacy_item}" ] && [ ! -L "${legacy_item}" ] \
+                && [ ! -e "${operator_item}" ] && [ ! -L "${operator_item}" ] \
+                && state_destination_safe "${operator_item}"; then
+                operator_state_copy "${legacy_item}" "${operator_item}"
                 if [ "${item}" = "${PRE_MANTIS_STATE_DIR}/tcp_transform.json" ]; then
                     say "Migrated operator state: legacy Mantis calibration"
                 else
@@ -248,28 +520,37 @@ if [ -n "${OPERATOR_HOME}" ] && [ -n "${OPERATOR_GROUP}" ] && [ -d "${OPERATOR_H
             && [ ! -e "${operator_cert_dir}/cert.pem" ] \
             && [ ! -L "${operator_cert_dir}/cert.pem" ] \
             && [ ! -e "${operator_cert_dir}/key.pem" ] \
-            && [ ! -L "${operator_cert_dir}/key.pem" ]; then
-            mkdir -p "${operator_cert_dir}"
-            cp -a -- "${legacy_cert_dir}/cert.pem" "${legacy_cert_dir}/key.pem" \
-                "${operator_cert_dir}/"
+            && [ ! -L "${operator_cert_dir}/key.pem" ] \
+            && state_destination_safe "${operator_cert_dir}/cert.pem" \
+            && state_destination_safe "${operator_cert_dir}/key.pem"; then
+            operator_state_copy \
+                "${legacy_cert_dir}/cert.pem" "${operator_cert_dir}/cert.pem"
+            operator_state_copy \
+                "${legacy_cert_dir}/key.pem" "${operator_cert_dir}/key.pem"
             say "Migrated operator state: Quest/control-panel TLS certificate"
         fi
 
         # Diagnostics are append-only history. Preserve the legacy tree only
         # when the operator does not already have one; never merge run IDs.
         if [ -d "${LEGACY_STATE_HOME}/diagnostics" ] \
-            && [ ! -e "${ALMOND_STATE_HOME}/diagnostics" ]; then
-            cp -a -- "${LEGACY_STATE_HOME}/diagnostics" \
+            && [ ! -L "${LEGACY_STATE_HOME}/diagnostics" ] \
+            && [ ! -e "${ALMOND_STATE_HOME}/diagnostics" ] \
+            && [ ! -L "${ALMOND_STATE_HOME}/diagnostics" ] \
+            && state_destination_safe "${ALMOND_STATE_HOME}/diagnostics"; then
+            operator_state_copy "${LEGACY_STATE_HOME}/diagnostics" \
                 "${ALMOND_STATE_HOME}/diagnostics"
             say "Migrated operator state: diagnostics"
         fi
     fi
 
-    # The service remains uid 0 for hardware setup, but runs with the
-    # operator's primary group and a group-writable umask. State first created
-    # by the service can therefore still be updated by the interactive CLI.
-    chown -R "${OPERATOR_USER}:${OPERATOR_GROUP}" "${ALMOND_STATE_HOME}"
-    chmod 2775 "${ALMOND_STATE_HOME}"
+    cleanup_state_migration_stage
+    trap - EXIT
+
+    # The operator created this root, and each staged legacy payload is handed
+    # over before the operator copies it. Never recursively chown an
+    # operator-controlled tree as root: a planted hardlink could transfer
+    # ownership of an external inode.
+    operator_run chmod 2775 -- "${ALMOND_STATE_HOME}"
     ALMOND_HOME_ENV_LINE="$(systemd_environment_line ALMOND_HOME "${ALMOND_STATE_HOME}")"
     SERVICE_GROUP_LINE="Group=${OPERATOR_GROUP}"
     say "Shared operator state: ${ALMOND_STATE_HOME} (user: ${OPERATOR_USER})."
@@ -290,7 +571,7 @@ Wants=network-online.target
 # Keep root privileges for hardware setup while making newly-created operator
 # state writable by the login account selected above.
 ${SERVICE_GROUP_LINE}
-UMask=0002
+UMask=0027
 # Re-pin the Jetson clocks at every boot (they reset on reboot). The leading
 # '-' makes a failure non-fatal, so serve still starts on non-Jetson hosts.
 ExecStartPre=-${BIN_DIR}/axol jetson.setup
@@ -307,11 +588,18 @@ TimeoutStopSec=240
 # Include the sbin dirs: CAN bring-up shells out to modinfo/modprobe/ip/etc.
 Environment=PATH=${BIN_DIR}:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
+# Keep privileged-service path guards active independently of optional state
+# redirects. The CLI also sets this marker at serve startup for manual runs.
+Environment=AXOL_PRIVILEGED_SERVICE=1
+# Hosted dataset writes stay below this immutable root-owned boundary. The
+# numeric group receives read/traverse access when Axol seals each save.
+${SERVICE_DATASET_ROOT_ENV}
+${SERVICE_OPERATOR_UID_ENV}
+${SERVICE_OPERATOR_GID_ENV}
 # Share settings, tracker bindings, Mantis calibration, CAN state, and Quest
 # certificates with the interactive CLI. Empty only when no operator resolved.
 ${ALMOND_HOME_ENV_LINE}
-# Store collected datasets under the installing user's home (see above) rather
-# than root's cache. Empty when no non-root user home was resolved.
+# Store hosted datasets below the immutable service boundary initialized above.
 ${LEROBOT_HOME_ENV}
 # Keep the self-updater's tag-pinned reinstall on the same shared install the
 # installer wrote, rather than letting uv fall back to its /root defaults.
@@ -344,6 +632,10 @@ fi
 say ""
 say "  Service logs  : journalctl -u ${SERVICE_NAME} -f"
 say "  Re-run this installer anytime to upgrade."
+if [ "${AARCH64_HOST}" = "1" ]; then
+    say ""
+    say "WARNING: this hosted aarch64 install uses CPU-only PyTorch; local CUDA policy inference requires an explicitly managed JetPack-compatible build."
+fi
 if [ "${REBOOT_REQUIRED}" = "1" ]; then
     say ""
     say "REBOOT REQUIRED: the ZED Box camera driver was upgraded and only loads"

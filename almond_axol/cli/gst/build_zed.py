@@ -39,6 +39,7 @@ from pathlib import Path
 
 from ...utils.jetson import _is_jetson
 from ...utils.sudo import prime_sudo, run_root
+from ...utils.state_files import secure_atomic_write_text
 
 _logger = logging.getLogger(__name__)
 
@@ -245,40 +246,37 @@ def run(_args: object = None) -> None:
 
     print("Installing zed-gstreamer build dependencies (apt)...")
     if not _apt_install_build_deps():
-        print(
-            "WARNING: could not install zed-gstreamer build dependencies. "
+        raise SystemExit(
+            "Could not install zed-gstreamer build dependencies. "
             "Install the packages listed above and re-run "
             "'axol gst.build-zed'."
         )
-        return
 
     print(f"Fetching zed-gstreamer @ {_PINNED_REF[:12]} into {src}...")
     if not _sync_source(src):
-        print("WARNING: could not fetch zed-gstreamer source; skipping build.")
-        return
+        raise SystemExit("Could not fetch zed-gstreamer source; retry the build.")
 
     print("Applying the sensor-exposure-timestamp patch...")
     if not _apply_patch(src):
-        print("WARNING: patch did not apply (upstream drift?); skipping build.")
-        return
+        raise SystemExit(
+            "The zed-gstreamer timestamp patch did not apply; check upstream drift."
+        )
 
     print("Building + installing the patched plugins (this can take a few minutes)...")
     if not _build_and_install(src):
-        print(
-            "WARNING: zed-gstreamer build/install failed. The GPU camera path "
-            "may be unavailable or use host-receive timestamps; see the log "
-            "above and re-run 'axol gst.build-zed'."
+        raise SystemExit(
+            "zed-gstreamer build/install failed; see the log above and re-run "
+            "'axol gst.build-zed'."
         )
-        return
 
     if _element_installed("zedxonesrc"):
         try:
-            stamp_file.write_text(desired)
+            secure_atomic_write_text(stamp_file, desired, mode=0o644)
         except OSError:
             pass
         print("Patched zed-gstreamer plugins installed (sensor-accurate timestamps).")
     else:
-        print(
-            "WARNING: zedxonesrc is still not visible to gst-inspect after "
-            "install; check the GStreamer plugin path."
+        raise SystemExit(
+            "zedxonesrc is still not visible to gst-inspect after install; "
+            "check the GStreamer plugin path."
         )

@@ -73,7 +73,11 @@ from typing import TYPE_CHECKING, Any
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
-from ..lerobot.camera.configuration_zed import ZedCameraConfig, resolution_for_dims
+from ..lerobot.camera.configuration_zed import (
+    ZED_RESOLUTION_DIMS,
+    ZedCameraConfig,
+    resolution_for_dims,
+)
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..recording import (
@@ -82,6 +86,7 @@ from ..recording import (
     default_vcodec,
     restore_dataset_ownership,
 )
+from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
 from ..utils import affinity
 from ..utils.jetson_diag import TegraStatsDiag
@@ -112,9 +117,11 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
 
     Applied after parsing, so it overrides these specific teleop fields even if
     set on the CLI (a warning is logged); other teleop knobs (One Euro, rest
-    poses, frequency) pass through untouched.
+    poses, frequency) pass through untouched. Powered-cart control is always
+    disabled: Mantis is a handheld rig, and a persisted robot cart setting
+    must not open or move unrelated base/lift hardware during collection.
     """
-    from dataclasses import fields
+    from dataclasses import fields, replace
 
     from ..constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
     from ..lerobot.robot.config_mantis import MantisRobotConfig
@@ -127,6 +134,11 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
             for f in fields(cfg.robot_config)
             if f.init
         }
+        # ``robot.has_gripper`` is a shared Axol setting and may be false for a
+        # gripperless robot SKU. Mantis hardware always has two real grippers;
+        # copy rather than mutate the inherited Axol config object, then force
+        # the schema/hardware invariant for this run.
+        kwargs["axol_config"] = replace(kwargs["axol_config"], has_gripper=True)
         if kwargs.get("left_channel") == CAN_LEFT:
             kwargs["left_channel"] = CAN_MANTIS_LEFT
         if kwargs.get("right_channel") == CAN_RIGHT:
@@ -141,6 +153,12 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
         kwargs["cameras"] = cameras
         cfg.robot_config = MantisRobotConfig(**kwargs)
 
+    if isinstance(cfg.robot_config, MantisRobotConfig):
+        # Also normalize an explicitly supplied Mantis config. Its own
+        # ``__post_init__`` rejects false, but keeping the assignment here makes
+        # the collection invariant explicit before feature construction.
+        cfg.robot_config.axol_config.has_gripper = True
+
     # Mantis datasets are Cartesian: state/action are absolute base-frame EE
     # poses (+ gripper), the same schema on-robot collection produces with
     # ``observe_cartesian`` — so rig and robot episodes mix in one dataset,
@@ -154,6 +172,10 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
         from ..kinematics.config import apply_mantis_kinematics_profile
         from ..teleop.config import apply_mantis_teleop_profile
 
+        if cfg.teleop_config.cart.enabled:
+            _logger.info("--mantis: disabling powered-cart control.")
+            cfg.teleop_config.cart.enabled = False
+        cfg.teleop_config.has_gripper = True
         tc = cfg.teleop_config.vr_teleop_config
         if not tc.absolute_mode or tc.hold_to_engage or tc.ik_alpha != 1.0:
             _logger.info(
@@ -970,13 +992,14 @@ def _run(
     with the VR headset events inside the episode loop; ``None`` (plain CLI)
     leaves the VR headset as the only episode-control source.
     """
+    from ..utils.state_files import require_service_dataset_configuration
+
+    require_service_dataset_configuration()
+
     import numpy as np
     from lerobot.processor import make_default_processors
     from lerobot.teleoperators.utils import TeleopEvents
-    from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
-    from lerobot.utils.feature_utils import (
-        hw_to_dataset_features,
-    )
+    from lerobot.utils.constants import HF_LEROBOT_HOME
     from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun
 
@@ -1012,6 +1035,19 @@ def _run(
     push_to_hub = cfg.push_to_hub
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
+
+    dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+    from ..utils.state_files import (
+        confine_service_dataset_path,
+        privileged_service_active,
+    )
+
+    if privileged_service_active():
+        dataset_root = confine_service_dataset_path(
+            dataset_root,
+            label="recording dataset root",
+        )
+        root = str(dataset_root)
 
     # Pin the control process to its dedicated cores before any threads are
     # created (the control loop, VR server, and IK dispatch threads inherit it on
@@ -1055,7 +1091,6 @@ def _run(
     teleop = AxolVRTeleop(cfg.teleop_config)
 
     # Check resume eligibility before connecting (file check only)
-    dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
     meta = dataset_root / "meta"
     has_info = (meta / "info.json").exists()
     is_complete = (
@@ -1064,12 +1099,8 @@ def _run(
     if has_info and not is_complete:
         raise RuntimeError(
             f"Incomplete dataset found at {dataset_root} (missing tasks.parquet or episodes/). "
-            f"Delete the directory and rerun to start fresh:\n"
-            f"  rm -rf {dataset_root}"
+            "Move or delete that exact dataset directory, then rerun to start fresh."
         )
-    if is_complete:
-        check_resume_consistency(dataset_root)
-
     # A resumed dataset's image resolution is fixed by its existing metadata, so
     # the relay must record at it regardless of the configured dataset_resolution
     # — otherwise the downscaled frames mismatch the stored feature shape and
@@ -1098,6 +1129,40 @@ def _run(
                 cfg.dataset_resolution,
             )
         dataset_resolution = existing
+
+        # LeRobot.resume keeps the old schema and ignores the fresh feature
+        # mapping. Prove semantic state/action names, camera set/shape, and fps
+        # before opening the relay or any actuator. The relay records every
+        # image at ``dataset_resolution`` even when the headset stream is larger.
+        from ..recording.datasets import (
+            RESUME_FILLABLE_FEATURES,
+            dataset_features_for_robot,
+            require_dataset_resume_schema,
+        )
+
+        width, height = ZED_RESOLUTION_DIMS[dataset_resolution]
+        resume_extras = (
+            {"observation.pose_lag": RESUME_FILLABLE_FEATURES["observation.pose_lag"]}
+            if mantis_mode
+            else None
+        )
+        expected_resume_features = dataset_features_for_robot(
+            robot,
+            image_shape=(height, width, 3),
+            extra_features=resume_extras,
+        )
+        require_dataset_resume_schema(
+            dataset_root,
+            expected_resume_features,
+            fps=fps,
+            # Ordinary collection supplies false intervention labels when
+            # appending to a DAgger dataset, and pose lag when appending to a
+            # Mantis dataset.
+            allowed_extra_features=frozenset({"intervention", "observation.pose_lag"}),
+        )
+        # Only repair a torn episode tail after proving this is the exact
+        # dataset schema the current run is authorized to append to.
+        check_resume_consistency(dataset_root)
 
     from ..utils.network import local_ip
 
@@ -1173,6 +1238,35 @@ def _run(
     # leak a held camera (it is daemonic, but a long-lived parent could outlive
     # the failure).
     imu_src: Any | None = None  # board-gyro yaw source for the cart, if wired
+
+    def _cleanup_failed_setup() -> BaseException | None:
+        """Release every resource opened before the main teardown guard exists.
+
+        This runs while another exception is already active, so cleanup errors
+        are logged individually and must never replace the setup failure that
+        explains why collection did not start.
+        """
+        cleanups: list[tuple[str, Any]] = []
+        if imu_src is not None:
+            cleanups.append(("board gyro", imu_src.close))
+        cleanups.extend(
+            (
+                ("teleop", teleop.disconnect),
+                ("robot", robot.disconnect),
+            )
+        )
+        if relay is not None:
+            cleanups.append(("video relay", relay.shutdown))
+        hardware_failure: BaseException | None = None
+        for label, cleanup in cleanups:
+            try:
+                cleanup()
+            except BaseException as exc:  # preserve the active setup failure
+                _logger.exception("%s cleanup after failed setup failed", label)
+                if label == "robot" or isinstance(exc, HardwareCleanupError):
+                    hardware_failure = hardware_failure or exc
+        return hardware_failure
+
     try:
         robot.connect()
 
@@ -1180,22 +1274,33 @@ def _run(
         # Its features come from the robot's joint features + the camera image
         # dims; the snapshot schema is the joint-observation keys (no images) +
         # action keys, in a fixed order shared with the recorder's SnapshotReader.
-        action_features = hw_to_dataset_features(robot.action_features, ACTION)
-        obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
-        features = {**action_features, **obs_features}
+        from ..recording.datasets import (
+            RESUME_FILLABLE_FEATURES,
+            dataset_features_for_robot,
+            require_dataset_resume_schema,
+        )
+
+        extra_features = (
+            {"observation.pose_lag": RESUME_FILLABLE_FEATURES["observation.pose_lag"]}
+            if mantis_mode
+            else None
+        )
+        features = dataset_features_for_robot(robot, extra_features=extra_features)
         obs_keys = list(robot.get_joint_observation().keys())
         action_keys = list(robot.action_features.keys())
-        if mantis_mode:
-            # ``observation.pose_lag`` is the residual pose↔image skew per row
-            # (camera capture time minus pose capture time), injected by the
-            # capture loop for training-time latency handling. On-robot
-            # sessions appended to this dataset (collect-data resume,
-            # run-policy recording) fill it too.
-            features["observation.pose_lag"] = {
-                "dtype": "float32",
-                "shape": (1,),
-                "names": ["pose_lag"],
-            }
+        if is_complete:
+            # External relay readers expose the actual downscaled dataset
+            # dimensions. Recheck that final contract before the recorder is
+            # spawned; this also catches an in-process fallback whose live
+            # camera shape cannot honor the existing dataset resolution.
+            require_dataset_resume_schema(
+                dataset_root,
+                features,
+                fps=fps,
+                allowed_extra_features=frozenset(
+                    {"intervention", "observation.pose_lag"}
+                ),
+            )
 
         # The VR server accepts headsets during the IK worker's JAX compile
         # inside connect(), before the video registration below runs. Declare
@@ -1232,22 +1337,15 @@ def _run(
                     "hold disabled",
                     exc,
                 )
-    except BaseException:
-        # Tear down teleop too: if a stop interrupts teleop.connect() while the
-        # IK worker is still compiling JAX, its VR server thread is otherwise
-        # left running and keeps holding its WebSocket port, so the next run
-        # can't bind it. disconnect() is a no-op if connect() never ran.
-        if imu_src is not None:
-            imu_src.close()
-        try:
-            teleop.disconnect()
-        except Exception:
-            _logger.exception("teleop cleanup after failed setup failed")
-        if relay is not None:
-            relay.shutdown()
+    except BaseException as setup_error:
+        # A stop or failure can land after any subset of robot, camera, IK,
+        # teleop, gyro, and relay setup. This block precedes the main session's
+        # finally guard, so it must release all of them here.
+        if (cleanup_error := _cleanup_failed_setup()) is not None:
+            # Keep the original setup exception as the visible failure while
+            # carrying a machine-readable safety signal to OperationRunner.
+            mark_hardware_cleanup_uncertain(setup_error, cleanup_error)
         raise
-
-    teleop_action_proc, robot_action_proc, robot_obs_proc = make_default_processors()
 
     # The dataset capture + encode runs OUT of the control process so its
     # per-frame numpy / add_frame / save_episode work never shares the GIL with
@@ -1260,6 +1358,7 @@ def _run(
         "dataset_root": str(dataset_root),
         "is_complete": is_complete,
         "features": features,
+        "allowed_resume_features": ["intervention", "observation.pose_lag"],
         "robot_type": robot.name,
         "fps": fps,
         "vcodec": vcodec,
@@ -1272,6 +1371,9 @@ def _run(
         "smooth_ee_hz": cfg.mantis_smooth_hz if mantis_mode else 0.0,
     }
     try:
+        teleop_action_proc, robot_action_proc, robot_obs_proc = (
+            make_default_processors()
+        )
         if is_complete:
             log_say(f"Resuming existing dataset at {dataset_root}.")
         if use_relay:
@@ -1286,9 +1388,11 @@ def _run(
             )
         else:
             recorder = InProcessRecorder(recorder_config, robot, robot_obs_proc)
-    except BaseException:
-        if relay is not None:
-            relay.shutdown()
+    except BaseException as setup_error:
+        # Processor/recorder construction still happens before the main
+        # session's finally guard, but robot and teleop are already live.
+        if (cleanup_error := _cleanup_failed_setup()) is not None:
+            mark_hardware_cleanup_uncertain(setup_error, cleanup_error)
         raise
 
     # Background perf samplers (per-second /proc CPU + memory breakdown and
@@ -1910,9 +2014,8 @@ def _run(
         elif recording:
             log_say("Saving episode…")
             recorder.save_episode()
-            # The serve unit records as root into the operator's home; hand the
-            # tree back after every save so a crash never leaves a root-owned
-            # dataset behind (no-op off the root service).
+            # Hosted saves remain root-owned inside the immutable service
+            # store; normalize read-only operator-group access after each take.
             restore_dataset_ownership(dataset_root)
             episodes_recorded += 1
             control.note_saved()
@@ -2088,20 +2191,32 @@ def _run(
     finally:
         log_say("Stopping.")
 
-        diag.stop()
-        tegra.stop()
+        cleanup_failures: list[tuple[str, BaseException]] = []
+
+        def _cleanup(label: str, cleanup: Any) -> None:
+            try:
+                cleanup()
+            except BaseException as exc:  # finish every teardown step first
+                _logger.exception("%s cleanup failed", label)
+                cleanup_failures.append((label, exc))
+
+        _cleanup("system diagnostics", diag.stop)
+        _cleanup("Tegra diagnostics", tegra.stop)
 
         if imu_src is not None:
-            imu_src.close()
-        robot.disconnect()
-        teleop.disconnect()
+            _cleanup("board gyro", imu_src.close)
+        _cleanup("robot disconnect", robot.disconnect)
+        _cleanup("teleop disconnect", teleop.disconnect)
         # Recorder owns the dataset: finalize, optional push, and empty-dataset
         # cleanup all happen in recorder.close().
-        recorder.close()
+        _cleanup("recorder", recorder.close)
         # Finalize wrote the last meta/stats files as root; adopt them too.
-        restore_dataset_ownership(dataset_root)
+        _cleanup(
+            "dataset ownership restore",
+            lambda: restore_dataset_ownership(dataset_root),
+        )
         if relay is not None:
-            relay.shutdown()
+            _cleanup("video relay", relay.shutdown)
 
         # Restore the process's original CPU affinity (a serve process is
         # long-lived and runs other operations after this one).
@@ -2110,3 +2225,18 @@ def _run(
                 os.sched_setaffinity(0, _orig_affinity)
             except OSError:
                 pass
+
+        robot_failure = next(
+            (
+                failure
+                for label, failure in cleanup_failures
+                if label == "robot disconnect"
+            ),
+            None,
+        )
+        if robot_failure is not None:
+            raise HardwareCleanupError(
+                "robot disconnect failed; hardware ownership is uncertain"
+            ) from robot_failure
+        if cleanup_failures:
+            raise cleanup_failures[0][1]

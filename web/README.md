@@ -43,6 +43,7 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 | `AxolConnectionStatus` | Enum — `Idle`, `Connecting`, `Open`, `Error`, `Failed` |
 | `AxolPoseData` | Type — shape of each frame sent over the WebSocket |
 | `AxolMode` | Type — `"teleop" \| "data_collection"`, the server-announced operating mode that locks the HUD |
+| `AxolPoseMode` | Type — `"relative" \| "absolute"`, the independently announced controller-space convention |
 | `ConfirmAction` | Type — `"save" \| "discard"`, which episode action a stop-recording confirmation popup is gating |
 | `CameraStreams` | Type — `Record<string, MediaStream>`, the camera-name → stream map returned by `useAxolVideo` |
 
@@ -56,6 +57,7 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 | `onPendingRecording` | `(pendingAt: number \| null) => void` | Fires with a timestamp when a 3-second recording countdown begins; `null` when cancelled or resolved |
 | `onPendingConfirm` | `(action: ConfirmAction \| null) => void` | Fires with `"save"` / `"discard"` when the stop-recording confirmation popup is armed, and `null` when it's confirmed or cancelled |
 | `onMode` | `(mode: AxolMode) => void` | Fires once per connection with the server-announced operating mode (`"teleop"` / `"data_collection"`) that locks the HUD |
+| `onPoseMode` | `(mode: AxolPoseMode) => void` | Fires with the server-announced controller convention; defaults to legacy-safe `"relative"` while reconnecting |
 | `onEpisode` | `(episode: number \| null) => void` | Fires with the current 1-based episode number during data collection (and `null` when the server clears it, e.g. on a connection change); drives the `Episode N` HUD readout |
 | `onExit` | `() => void` | Fires when the Y button exits the XR session |
 
@@ -100,7 +102,7 @@ Each frame sends a JSON message over the WebSocket:
   r_tracked: boolean // right controller optical-tracking state; see l_tracked
   l_pose_profile: string | null // first WebXR input profile; Quest mount calibration is scoped to this controller generation
   r_pose_profile: string | null
-  l_pose_space: "grip" | "target-ray" // production Mantis requires the calibrated gripSpace datum
+  l_pose_space: "grip" | "target-ray" // relative Axol keeps targetRaySpace; absolute Mantis uses calibrated gripSpace
   r_pose_space: "grip" | "target-ray"
   reset:   boolean   // true on the frame X (reset) or Y (exit) was pressed — Y piggy-backs a reset so the arms return to rest before the session ends
   state:   "teleop" | "data_collection" | "recording"  // client-driven; "saving" is server-pushed via feedback message
@@ -111,7 +113,7 @@ Each frame sends a JSON message over the WebSocket:
   r_stick_click: boolean  // right thumbstick pressed in — lift up while held
   pose_source_id: string       // stable logical Quest id shared by USB, WebRTC, network, and reconnects
   pose_source_kind: "webxr"    // managed server source policy; Lighthouse/Ultimate bridges use "tracker"
-  seq:     number    // monotonic within pose_source_id; the server accepts the first transport copy exactly once
+  seq:     number    // monotonic within pose_source_id (including page reloads); the server accepts the first transport copy exactly once
 }
 ```
 
@@ -121,7 +123,7 @@ The server admits only one logical pose producer. A managed Quest Mantis run acc
 
 ![Quest controller diagram](assets/quest.png)
 
-The operating mode (teleop vs. data collection) is **announced by the server on connect and locked** for the session — there's no in-headset toggle. In plain teleop the recording controls are inert; in data collection they drive episodes.
+The operating mode (teleop vs. data collection) is **announced by the server on connect and locked** for the session — there's no in-headset toggle. In plain teleop the recording controls are inert; in data collection they drive episodes. The independent `{ "type": "pose_mode", "value": "relative" | "absolute" }` announcement selects the controller convention: relative Axol retains `targetRaySpace` and requires body elbows, while absolute/Mantis uses `gripSpace` and does not depend on elbow tracking. A client connected to an older server safely defaults to `relative`.
 
 | # | Button | Action |
 |---|---|---|

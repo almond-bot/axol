@@ -42,6 +42,7 @@ from ..lerobot.rollout import (
     RolloutCaptureThread,
 )
 from ..recording import make_episode_durable, restore_dataset_ownership
+from ..robot.base import HardwareCleanupError
 from ..robot.control import ContactWatchdog
 from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
@@ -654,66 +655,10 @@ def _wait_for_port(host: str, port: int, timeout: float = 30.0) -> None:
 
 
 def _training_fps(policy_path: str) -> int | None:
-    """Best-effort lookup of the fps the checkpoint was trained at.
+    """Safely resolve the fps the checkpoint was trained at from JSON metadata."""
+    from ..lerobot.action_schema import resolve_policy_training_fps
 
-    Reads ``train_config.json`` next to the model (written by LeRobot's
-    trainer; absent for hand-built checkpoints or not-yet-downloaded Hub repo
-    ids, in which case the caller skips the check). LeRobot's train config
-    records no fps field of its own, so the value comes from, in order:
-
-    - a top-level ``fps`` key, honoured in case a pipeline stamps one in;
-    - the training dataset's ``meta/info.json`` (the authoritative dataset
-      fps), located via the recorded ``dataset.root`` / ``dataset.repo_id``.
-
-    Args:
-        policy_path: ``--policy_path`` as given (local dir or Hub repo id).
-
-    Returns:
-        The training fps, or ``None`` when nothing conclusive was found.
-    """
-    import json
-    from pathlib import Path
-
-    model_dir = Path(policy_path)
-    if not model_dir.is_dir():
-        return None
-    train_config_path = model_dir / "train_config.json"
-    if not train_config_path.is_file():
-        return None
-    try:
-        train_cfg = json.loads(train_config_path.read_text())
-    except (OSError, ValueError):
-        _logger.warning(
-            "Unreadable train_config.json at %s; skipping the fps sanity check.",
-            train_config_path,
-        )
-        return None
-
-    fps = train_cfg.get("fps")
-    if isinstance(fps, (int, float)):
-        return int(fps)
-
-    dataset_cfg = train_cfg.get("dataset") or {}
-    candidates: list[Path] = []
-    root = dataset_cfg.get("root")
-    if root:
-        candidates.append(Path(root))
-    repo_id = dataset_cfg.get("repo_id")
-    if repo_id:
-        from lerobot.utils.constants import HF_LEROBOT_HOME
-
-        candidates.append(HF_LEROBOT_HOME / repo_id)
-    for candidate in candidates:
-        info_path = candidate / "meta" / "info.json"
-        if not info_path.is_file():
-            continue
-        try:
-            fps = json.loads(info_path.read_text()).get("fps")
-        except (OSError, ValueError):
-            continue
-        if isinstance(fps, (int, float)):
-            return int(fps)
-    return None
+    return resolve_policy_training_fps(policy_path)
 
 
 def _check_training_fps(cfg: RunPolicyConfig) -> None:
@@ -722,11 +667,22 @@ def _check_training_fps(cfg: RunPolicyConfig) -> None:
     A policy trained on 30 Hz data but executed at 60 Hz replays every action
     chunk at double speed (and drifts the chunk-timestep bookkeeping), so a
     detectable mismatch is a hard error unless ``--allow_fps_mismatch`` is
-    set. When the training fps cannot be determined (see :func:`_training_fps`)
-    the check is skipped with a warning rather than guessing.
+    set. A Hub checkpoint whose training fps cannot be determined is rejected:
+    unlike a local hand-built checkpoint, there is no operator-controlled
+    colocated metadata to justify guessing its execution rate.
     """
     trained_fps = _training_fps(cfg.policy_path)
     if trained_fps is None:
+        from pathlib import Path
+
+        if not Path(cfg.policy_path).is_dir():
+            raise ValueError(
+                "Could not determine the training fps for Hub policy "
+                f"{cfg.policy_path!r} from its train_config.json / training "
+                "dataset meta/info.json. Refusing to guess an execution rate: "
+                "publish the dataset metadata referenced by the checkpoint, "
+                "or use a local checkpoint with verified metadata."
+            )
         _logger.warning(
             "Could not determine the fps the policy at %s was trained at "
             "(no readable train_config.json / dataset meta); skipping the "
@@ -767,9 +723,13 @@ def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    from ..lerobot.inference_patch import disable_observation_similarity_filter
+    from ..lerobot.inference_patch import (
+        disable_observation_similarity_filter,
+        enable_action_schema_handshake,
+    )
 
     disable_observation_similarity_filter()
+    enable_action_schema_handshake()
 
     # Register the Mantis relative-EE processor steps so checkpoints trained with
     # `axol mantis.train` deserialize their processor pipelines here.
@@ -815,6 +775,64 @@ def _snap_to_newest_indices(
         i
         for i, key in enumerate(action_features)
         if key.endswith("gripper.pos") or key.endswith((".rx", ".ry", ".rz"))
+    )
+
+
+def _align_action_chunk(
+    incoming_actions: Any,
+    *,
+    last_target: Any,
+    latest_action: int,
+    align_ticks: int,
+    exempt_indices: tuple[int, ...],
+) -> None:
+    """Fade a chunk's linear offset from the last executed target in place.
+
+    ``exempt_indices`` must include non-linear or discrete action dimensions.
+    In particular, Cartesian rotation vectors cannot be componentwise aligned:
+    the physically equivalent representatives ``+pi * axis`` and ``-pi * axis``
+    would look about ``2*pi`` apart and create a large artificial wrist sweep.
+    Grippers are exempt for the same reason they bypass ensembling (bang-bang
+    commands should not be smeared).
+
+    This is kept separate from the LeRobot client subclass so the physical
+    continuity boundary can be regression-tested without opening a gRPC client.
+    """
+    if align_ticks <= 0 or not incoming_actions or last_target is None:
+        return
+
+    import torch
+
+    sorted_in = sorted(incoming_actions, key=lambda action: action.get_timestep())
+    anchor_ts = latest_action + 1
+    origin = sorted_in[0].get_timestep()
+    idx = min(max(anchor_ts - origin, 0), len(sorted_in) - 1)
+    anchor_action = sorted_in[idx].get_action()
+    previous = torch.as_tensor(
+        last_target, dtype=anchor_action.dtype, device=anchor_action.device
+    )
+    offset = previous - anchor_action
+    for exempt_idx in exempt_indices:
+        offset[exempt_idx] = 0.0
+    for timed_action in sorted_in:
+        fade = 1.0 - (timed_action.get_timestep() - anchor_ts) / align_ticks
+        fade = min(max(fade, 0.0), 1.0)
+        if fade > 0.0:
+            timed_action.get_action().add_(offset * fade)
+
+
+def _lingering_episode_thread_error(
+    threads: list[tuple[str, Any]],
+) -> HardwareCleanupError | None:
+    """Return a fail-closed error if any episode worker missed its join bound."""
+    alive = [
+        name for name, thread in threads if thread is not None and thread.is_alive()
+    ]
+    if not alive:
+        return None
+    return HardwareCleanupError(
+        "episode worker(s) did not stop: "
+        f"{', '.join(alive)}; hardware access may still be active"
     )
 
 
@@ -972,12 +990,25 @@ def _build_axol_robot_client(
     import grpc
     from lerobot.async_inference.helpers import (
         FPSTracker,
-        RemotePolicyConfig,
+        TimedObservation,
         map_robot_keys_to_lerobot_features,
     )
     from lerobot.async_inference.robot_client import RobotClient
     from lerobot.transport import services_pb2, services_pb2_grpc
-    from lerobot.transport.utils import grpc_channel_options
+    from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+
+    from ..lerobot.action_schema import (
+        ActionSchemaError,
+        AxolRemotePolicyConfig,
+        confirmed_schema_from_metadata,
+        encode_axol_policy_setup,
+        require_exact_action_schema,
+    )
+    from ..lerobot.inference_wire import (
+        InferenceWireError,
+        decode_timed_actions,
+        encode_timed_observation,
+    )
 
     class AxolRobotClient(RobotClient):  # type: ignore[misc, valid-type]
         """``RobotClient`` adapted to reuse a pre-connected ``AxolRobot``.
@@ -1128,12 +1159,15 @@ def _build_axol_robot_client(
             lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
             self.server_address = config.server_address
-            self.policy_config = RemotePolicyConfig(
+            self._expected_action_schema = tuple(robot.action_features)
+            self._action_schema_confirmed = False
+            self.policy_config = AxolRemotePolicyConfig(
                 config.policy_type,
                 config.pretrained_name_or_path,
                 lerobot_features,
                 config.actions_per_chunk,
                 config.policy_device,
+                action_schema=self._expected_action_schema,
             )
 
             self.channel = grpc.insecure_channel(
@@ -1158,6 +1192,207 @@ def _build_axol_robot_client(
             self.fps_tracker = FPSTracker(target_fps=self.config.fps)
             self.must_go = _threading.Event()
             self.must_go.set()
+
+        def start(self) -> bool:  # type: ignore[override]
+            """Load the policy and prove its ordered action schema.
+
+            LeRobot's setup response is otherwise an empty protobuf, so a
+            same-width joint/Cartesian mismatch survives until tensors are
+            mapped positionally to motors.  Axol's patched server returns the
+            independently resolved checkpoint schema as versioned gRPC
+            metadata; no robot connection or receiver thread starts unless it
+            exactly equals this client's ordered ``robot.action_features``.
+            """
+            try:
+                started = time.perf_counter()
+                self.stub.Ready(services_pb2.Empty())
+                self.logger.debug(
+                    "Connected to policy server in %.4fs",
+                    time.perf_counter() - started,
+                )
+
+                setup = services_pb2.PolicySetup(
+                    data=encode_axol_policy_setup(self.policy_config)
+                )
+                self.logger.info(
+                    "Sending policy instructions and expected action schema to server"
+                )
+                _, call = self.stub.SendPolicyInstructions.with_call(setup)
+                confirmed = confirmed_schema_from_metadata(call.initial_metadata())
+                require_exact_action_schema(
+                    confirmed,
+                    self._expected_action_schema,
+                    policy_label="Policy server",
+                )
+                self._action_schema_confirmed = True
+                self.shutdown_event.clear()
+                self.logger.info(
+                    "Policy action schema confirmed (%d ordered dimensions).",
+                    len(confirmed),
+                )
+                return True
+            except ActionSchemaError:
+                self._action_schema_confirmed = False
+                raise
+            except grpc.RpcError as exc:
+                self._action_schema_confirmed = False
+                if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
+                    raise ActionSchemaError(
+                        "Policy server rejected the action-schema handshake: "
+                        f"{exc.details()}"
+                    ) from exc
+                self.logger.error("Failed to connect to policy server: %s", exc)
+                return False
+
+        def send_observation(self, obs: TimedObservation) -> bool:  # type: ignore[override]
+            """Send a bounded numeric/image frame; never pickle robot data."""
+            if not self.running or not self._action_schema_confirmed:
+                raise ActionSchemaError(
+                    "Refusing to send observations before the safe policy handshake."
+                )
+            try:
+                payload = encode_timed_observation(
+                    obs, self.policy_config.lerobot_features
+                )
+                chunks = send_bytes_in_chunks(
+                    payload,
+                    services_pb2.Observation,
+                    log_prefix="[CLIENT] Safe observation",
+                    silent=True,
+                )
+                self.stub.SendObservations(chunks)
+                return True
+            except InferenceWireError as exc:
+                self.fatal_error = exc
+                self.shutdown_event.set()
+                raise
+            except grpc.RpcError as exc:
+                self.logger.error(
+                    "Safe observation send failed at step %s: %s",
+                    obs.get_timestep(),
+                    exc,
+                )
+                if exc.code() in {
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    grpc.StatusCode.DATA_LOSS,
+                    grpc.StatusCode.RESOURCE_EXHAUSTED,
+                    grpc.StatusCode.INTERNAL,
+                }:
+                    error = InferenceWireError(
+                        "Policy server rejected the safe observation protocol: "
+                        f"{exc.details()}"
+                    )
+                    self.fatal_error = error
+                    self.shutdown_event.set()
+                return False
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error(
+                    "Safe observation encoding/sending failed locally: %s", exc
+                )
+                self.fatal_error = exc
+                self.shutdown_event.set()
+                raise
+
+        def _accept_action_payload(
+            self,
+            payload: bytes,
+            *,
+            verbose: bool = False,
+            receive_time: float | None = None,
+        ) -> None:
+            """Validate and install one safe action response (testable seam)."""
+            timed_actions = decode_timed_actions(payload, self._expected_action_schema)
+            client_device = self.config.client_device
+            if client_device != "cpu":
+                for timed_action in timed_actions:
+                    timed_action.action = timed_action.get_action().to(client_device)
+
+            self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
+            if verbose:
+                receive_time = receive_time if receive_time is not None else time.time()
+                with self.latest_action_lock:
+                    latest_action = self.latest_action
+                old_size, old_timesteps = self._inspect_action_queue()
+                if not old_timesteps:
+                    old_timesteps = [latest_action]
+                incoming_timesteps = [action.get_timestep() for action in timed_actions]
+                latency_ms = (receive_time - timed_actions[0].get_timestamp()) * 1000
+                self.logger.info(
+                    "Received safe actions %d:%d | latest=%d | latency=%.2fms",
+                    incoming_timesteps[0],
+                    incoming_timesteps[-1],
+                    latest_action,
+                    latency_ms,
+                )
+
+            started = time.perf_counter()
+            self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
+            if verbose:
+                new_size, new_timesteps = self._inspect_action_queue()
+                self.logger.debug(
+                    "Safe action queue update %.3fms | before=%d %s | after=%d %s",
+                    (time.perf_counter() - started) * 1000,
+                    old_size,
+                    old_timesteps,
+                    new_size,
+                    new_timesteps,
+                )
+            self.must_go.set()
+
+        def receive_actions(self, verbose: bool = False) -> None:  # type: ignore[override]
+            """Receive only bounded numeric action frames; malformed is fatal."""
+            if not self._action_schema_confirmed:
+                error = ActionSchemaError(
+                    "Refusing to receive policy actions before exact action-schema "
+                    "confirmation."
+                )
+                self.fatal_error = error
+                self.shutdown_event.set()
+                return
+            self.start_barrier.wait()
+            self.logger.info("Safe action receiver starting")
+            while self.running:
+                try:
+                    response = self.stub.GetActions(services_pb2.Empty())
+                    if not response.data:
+                        continue
+                    self._accept_action_payload(
+                        response.data,
+                        verbose=verbose,
+                        receive_time=time.time(),
+                    )
+                except InferenceWireError as exc:
+                    self.logger.error(
+                        "Rejected malformed policy action payload: %s; shutting down",
+                        exc,
+                    )
+                    self.fatal_error = exc
+                    self.shutdown_event.set()
+                    return
+                except grpc.RpcError as exc:
+                    self.logger.error("Error receiving safe actions: %s", exc)
+                    if exc.code() in {
+                        grpc.StatusCode.FAILED_PRECONDITION,
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        grpc.StatusCode.DATA_LOSS,
+                        grpc.StatusCode.RESOURCE_EXHAUSTED,
+                        grpc.StatusCode.INTERNAL,
+                    }:
+                        error = InferenceWireError(
+                            "Policy server rejected the safe action protocol: "
+                            f"{exc.details()}"
+                        )
+                        self.fatal_error = error
+                        self.shutdown_event.set()
+                        return
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.error(
+                        "Safe action receiver failed locally: %s; shutting down", exc
+                    )
+                    self.fatal_error = exc
+                    self.shutdown_event.set()
+                    return
 
         def reset_episode_state(self) -> None:
             """Reset client queues/flags AND the server's per-episode state.
@@ -1354,11 +1589,9 @@ def _build_axol_robot_client(
 
             Runs at the aggregation dispatch so every strategy benefits
             (``temporal_ensemble`` and the upstream scalar blends alike), and
-            it is action-space agnostic: pure vector offsets work for joint
-            radians and for Cartesian pose values (positions in metres,
-            axis-angle orientation — locally linear; a wrap at ±π could
-            misread the offset, but poses one inference latency apart never
-            span that). Grippers are exempt (bang-bang by design).
+            it aligns only linear dimensions: grippers (bang-bang by design)
+            and Cartesian rotation vectors (non-unique axis-angle
+            representation) are exempt through ``_snap_indices``.
 
             Args:
                 incoming_actions: Chunk from the policy server; mutated in
@@ -1369,24 +1602,15 @@ def _build_axol_robot_client(
             last_target = self._exec_last_target
             if last_target is None:
                 return
-            import torch
-
-            sorted_in = sorted(incoming_actions, key=lambda a: a.get_timestep())
             with self.latest_action_lock:
-                anchor_ts = self.latest_action + 1
-            origin = sorted_in[0].get_timestep()
-            idx = min(max(anchor_ts - origin, 0), len(sorted_in) - 1)
-            anchor_action = sorted_in[idx].get_action()
-            offset = (
-                torch.from_numpy(last_target).to(anchor_action.dtype) - anchor_action
+                latest_action = self.latest_action
+            _align_action_chunk(
+                incoming_actions,
+                last_target=last_target,
+                latest_action=latest_action,
+                align_ticks=self._align_ticks,
+                exempt_indices=self._snap_indices,
             )
-            for gidx in self._gripper_indices:
-                offset[gidx] = 0.0
-            for ta in sorted_in:
-                fade = 1.0 - (ta.get_timestep() - anchor_ts) / self._align_ticks
-                fade = min(max(fade, 0.0), 1.0)
-                if fade > 0.0:
-                    ta.get_action().add_(offset * fade)
 
         def _aggregate_action_queues(self, incoming_actions, aggregate_fn=None):  # type: ignore[no-untyped-def]
             """Align the chunk, then dispatch to the configured aggregation."""
@@ -1408,6 +1632,18 @@ def _build_axol_robot_client(
             Returns:
                 The dict returned by ``robot.send_action``.
             """
+            if not self._action_schema_confirmed:
+                raise ActionSchemaError(
+                    "Refusing to send a policy action before exact action-schema "
+                    "confirmation."
+                )
+            if np.shape(target_vec) != (len(self._expected_action_schema),):
+                raise ActionSchemaError(
+                    "Policy server returned an action with shape "
+                    f"{np.shape(target_vec)}, expected exactly "
+                    f"({len(self._expected_action_schema)},) for the confirmed "
+                    "ordered action schema."
+                )
             out = target_vec
             if self._exec_filter is not None:
                 shaped = self._exec_filter.update(target_vec[self._arm_indices])
@@ -1518,7 +1754,7 @@ def _build_axol_robot_client(
             ``chunk_size_threshold`` — but chunks are consumed from the
             moment they land, so with chunking latency the queue almost
             never sits above the threshold and the loop free-runs: every
-            camera-capture interval it ships another multi-MB pickled
+              camera-capture interval it ships another multi-MB serialized
             observation whose serialization competes with the 60 Hz
             control thread for the GIL, and the server dedups most of
             them by timestep anyway. Two extra gates restore the
@@ -1580,6 +1816,7 @@ def _build_axol_robot_client(
         def stop(self) -> None:  # type: ignore[override]
             """Tear down the gRPC channel; the shared robot stays connected."""
             self.shutdown_event.set()
+            self._action_schema_confirmed = False
             try:
                 self.channel.close()
             except Exception:  # noqa: BLE001
@@ -1611,6 +1848,11 @@ def _run(
     control: "_StdinPolicyControl | _QueuePolicyControl | None" = None,
 ) -> None:
     """Drive the full run-policy session: spawn the policy server, connect the robot, and run episodes."""
+    if getattr(cfg, "repo_id", None):
+        from ..utils.state_files import require_service_dataset_configuration
+
+        require_service_dataset_configuration()
+
     from ..lerobot.robot.config_mantis import MantisRobotConfig
 
     if isinstance(cfg.robot_config, MantisRobotConfig):
@@ -1635,8 +1877,7 @@ def _run(
     from lerobot.async_inference.configs import RobotClientConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.processor import make_default_processors
-    from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
-    from lerobot.utils.feature_utils import hw_to_dataset_features
+    from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME
     from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun
 
@@ -1666,6 +1907,25 @@ def _run(
     # the fps the checkpoint was trained at.
     _check_training_fps(cfg)
 
+    # The hosted service runs as root while its recording tree is writable by
+    # the operator. Never let a control-panel ``--root`` turn the third-party
+    # LeRobot writer into a root filesystem writer. This lexical/current-link
+    # gate is repeated in the recorder itself as defense in depth.
+    dataset_root: Path | None = None
+    if repo_id:
+        dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+        from ..utils.state_files import (
+            confine_service_dataset_path,
+            privileged_service_active,
+        )
+
+        if privileged_service_active():
+            dataset_root = confine_service_dataset_path(
+                dataset_root,
+                label="rollout dataset root",
+            )
+            root = str(dataset_root)
+
     # Finalize the camera set before the robot opens the cameras: prune the
     # unassigned placeholder slots (at least one must be set, and should be the
     # cameras the policy was trained on) and flag any physically-stereo ZED X so
@@ -1687,15 +1947,35 @@ def _run(
     robot = AxolRobot(robot_config)
     _, robot_action_proc, robot_obs_proc = make_default_processors()
 
+    # Camera feature shapes must be known before either creating or resuming a
+    # recording dataset. Run-policy does not use the downscaling relay, so the
+    # config dimensions are the exact stored image dimensions.
+    recording_features: dict[str, dict[str, Any]] | None = None
+    if repo_id:
+        incomplete_cams = [
+            name
+            for name, feat in robot.observation_features.items()
+            if isinstance(feat, tuple) and None in feat
+        ]
+        if incomplete_cams:
+            raise RuntimeError(
+                "Cannot prepare a rollout dataset before the robot connects: "
+                f"camera(s) {', '.join(incomplete_cams)} have no width/height set "
+                "in their config. Set explicit dimensions in the camera config."
+            )
+        from ..recording.datasets import dataset_features_for_robot
+
+        recording_features = dataset_features_for_robot(robot)
+
     # The dataset is constructed before the robot connects — letting us load
     # the policy first (see PolicyServer spawn below). Pre-connect, camera
     # feature shapes come from the camera configs; connect() later enforces
     # that the live streams match, so the shapes baked in here stay valid.
     dataset: "LeRobotDataset | None" = None
-    dataset_root: Path | None = None
     resumed_dataset = False
     if repo_id:
-        dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+        assert recording_features is not None
+        assert dataset_root is not None
         meta = dataset_root / "meta"
         has_info = (meta / "info.json").exists()
         is_complete = (
@@ -1707,17 +1987,41 @@ def _run(
         if has_info and not is_complete:
             raise RuntimeError(
                 f"Incomplete dataset found at {dataset_root} (missing "
-                f"tasks.parquet or episodes/). Delete the directory and "
-                f"rerun to start fresh:\n  rm -rf {dataset_root}"
+                "tasks.parquet or episodes/). Move or delete that exact dataset "
+                "directory, then rerun to start fresh."
             )
         if dataset_root.exists() and not is_complete:
-            log_say(f"Removing empty dataset directory at {dataset_root}.")
-            shutil.rmtree(dataset_root)
+            try:
+                # Only clear a provably empty directory. A user-supplied
+                # --root without Axol metadata may contain unrelated data and
+                # must never be recursively erased.
+                from ..utils.state_files import secure_rmdir
+
+                secure_rmdir(dataset_root)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Refusing to create a rollout dataset at {dataset_root}: "
+                    "the existing path is not an empty directory. Choose a new "
+                    "--root, or inspect and move/delete the existing data yourself."
+                ) from exc
+            log_say(f"Removed empty dataset directory at {dataset_root}.")
 
         from lerobot.configs.video import RGBEncoderConfig
 
         rgb_encoder = RGBEncoderConfig(vcodec=vcodec)
         if is_complete:
+            from ..recording.datasets import require_dataset_resume_schema
+
+            require_dataset_resume_schema(
+                dataset_root,
+                recording_features,
+                fps=fps,
+                # RolloutCaptureThread fills this with zero when appending
+                # robot rollouts to a Mantis-created Cartesian dataset.
+                allowed_extra_features=frozenset({"observation.pose_lag"}),
+            )
+            # Avoid mutating/truncating an incompatible dataset while checking
+            # its torn episode tail.
             check_resume_consistency(dataset_root)
             log_say(f"Resuming existing dataset at {dataset_root}.")
             dataset = LeRobotDataset.resume(
@@ -1730,29 +2034,11 @@ def _run(
             )
             resumed_dataset = True
         else:
-            # Guard against auto-detect camera configs (width/height of None):
-            # the robot is not connected yet, so unknown dimensions here would
-            # bake invalid image shapes into the dataset metadata.
-            incomplete_cams = [
-                name
-                for name, feat in robot.observation_features.items()
-                if isinstance(feat, tuple) and None in feat
-            ]
-            if incomplete_cams:
-                raise RuntimeError(
-                    "Cannot create a dataset before the robot connects: "
-                    f"camera(s) {', '.join(incomplete_cams)} have no width/"
-                    "height set in their config. Set explicit dimensions in "
-                    "the camera config (run-policy builds dataset features "
-                    "before connecting)."
-                )
-            action_features = hw_to_dataset_features(robot.action_features, ACTION)
-            obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
             dataset = LeRobotDataset.create(
                 repo_id=repo_id,
                 fps=fps,
                 root=root,
-                features={**action_features, **obs_features},
+                features=recording_features,
                 robot_type=robot.name,
                 use_videos=True,
                 image_writer_threads=4,
@@ -1764,72 +2050,69 @@ def _run(
             # record Axol's Cartesian world frame separately so this fresh
             # dataset can never be mistaken for pre-v0.1.32 data and rotated
             # a second time by migrate-dataset.
-            action_names = (action_features.get(ACTION) or {}).get("names") or []
+            action_names = (recording_features.get(ACTION) or {}).get("names") or []
             if any("_ee." in name for name in action_names):
                 from ..recording.cartesian_frame import write_cartesian_frame_marker
 
                 write_cartesian_frame_marker(dataset_root)
 
-    if rerun_ip:
-        init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
-
-    # Local inference (default): spawn the policy server and load the policy
-    # BEFORE connecting cameras — the model download + CUDA load is a ~15 s
-    # network + GPU spike that can disrupt already-open camera pipelines.
-    # Remote inference (--server_host): the server is already running via
-    # ``axol inference-server`` on another machine; just point at it.
     server_proc = None
-    if server_host is None:
-        server_host = "127.0.0.1"
-        server_cfg_dict = {
-            "host": "127.0.0.1",
-            "port": server_port,
-            "fps": fps,
-        }
-        # Evict a leftover PolicyServer from a crashed/previous run before
-        # spawning ours, otherwise it would bind-fail and ``_wait_for_port``
-        # would silently attach to the stale (wrong-policy) server.
-        from ..utils.ports import reclaim_port
-
-        reclaim_port(server_port)
-        ctx = mp.get_context("spawn")
-        server_proc = ctx.Process(
-            target=_serve_policy_server,
-            args=(server_cfg_dict,),
-            name="axol-policy-server",
-            daemon=True,
-        )
-        server_proc.start()
-        log_say(
-            f"Started PolicyServer on 127.0.0.1:{server_port} (pid={server_proc.pid})."
-        )
-    else:
-        log_say(f"Using remote inference server at {server_host}:{server_port}.")
-
-    # Spawn the IK worker in parallel so JAX JIT overlaps with policy load.
-    reset_controller = IKResetController()
-    reset_controller.start()
-    log_say("Started IK reset worker (collision-aware return-to-rest).")
-
-    def _return_to_rest_guarded() -> bool:
-        """Guarded return to rest; ``False`` when the operator aborted.
-
-        Plays with the torque watchdog live; on contact the arms drop into
-        a limp gravity-comp hold, and the contact gate (Enter on the
-        terminal, "Return to rest" on the control panel) retries from
-        wherever they were hand-guided to.
-        """
-        return reset_controller.return_to_rest(
-            robot,
-            torque_threshold=cfg.reset_torque_threshold,
-            gravity_comp_kd=cfg.reset_gravity_comp_kd,
-            stopped=stop_event.is_set,
-            wait_retry=control.await_contact_clear,
-        )
-
+    reset_controller: IKResetController | None = None
     client = None
     episodes_recorded = 0
     try:
+        if rerun_ip:
+            init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
+
+        # Local inference (default): spawn the policy server and load the
+        # policy BEFORE connecting cameras — the model download + CUDA load is
+        # a ~15 s network + GPU spike that can disrupt already-open camera
+        # pipelines. Remote inference uses the already-running endpoint. Both
+        # this child and the reset worker are created inside the lifecycle
+        # guard so even a setup-time failure reaches the cleanup below.
+        if server_host is None:
+            server_host = "127.0.0.1"
+            server_cfg_dict = {
+                "host": "127.0.0.1",
+                "port": server_port,
+                "fps": fps,
+            }
+            # Evict a leftover PolicyServer from a crashed/previous run before
+            # spawning ours, otherwise _wait_for_port could attach to it.
+            from ..utils.ports import reclaim_port
+
+            reclaim_port(server_port)
+            ctx = mp.get_context("spawn")
+            server_proc = ctx.Process(
+                target=_serve_policy_server,
+                args=(server_cfg_dict,),
+                name="axol-policy-server",
+                daemon=True,
+            )
+            server_proc.start()
+            log_say(
+                f"Started PolicyServer on 127.0.0.1:{server_port} "
+                f"(pid={server_proc.pid})."
+            )
+        else:
+            log_say(f"Using remote inference server at {server_host}:{server_port}.")
+
+        # Spawn the IK worker in parallel so JAX JIT overlaps with policy load.
+        reset_controller = IKResetController()
+        reset_controller.start()
+        log_say("Started IK reset worker (collision-aware return-to-rest).")
+
+        def _return_to_rest_guarded() -> bool:
+            """Guarded return to rest; ``False`` when the operator aborted."""
+            assert reset_controller is not None
+            return reset_controller.return_to_rest(
+                robot,
+                torque_threshold=cfg.reset_torque_threshold,
+                gravity_comp_kd=cfg.reset_gravity_comp_kd,
+                stopped=stop_event.is_set,
+                wait_retry=control.await_contact_clear,
+            )
+
         _wait_for_port(server_host, server_port, timeout=30.0)
 
         # ``RobotClientConfig`` requires a name from upstream's registry;
@@ -2003,6 +2286,23 @@ def _run(
                 control_thread.join(timeout=5.0)
                 receiver_thread.join(timeout=5.0)
                 obs_thread.join(timeout=5.0)
+                lingering = _lingering_episode_thread_error(
+                    [
+                        ("capture", capture),
+                        ("control", control_thread),
+                        ("receiver", receiver_thread),
+                        ("observation", obs_thread),
+                    ]
+                )
+                if lingering is not None:
+                    if client.fatal_error is not None:
+                        lingering.add_note(
+                            "The client had already reported: "
+                            f"{type(client.fatal_error).__name__}: "
+                            f"{client.fatal_error}"
+                        )
+                    client.fatal_error = lingering
+                    log_say(f"Safety shutdown: {lingering}")
             finally:
                 # Sweep the cyclic garbage deferred during the episode. The
                 # duration doubles as confirmation of the mid-episode GC stall
@@ -2101,9 +2401,8 @@ def _run(
                         "completes at the next save or finalize — do not kill "
                         "this process"
                     )
-                # The serve unit records as root into the operator's home; hand
-                # the tree back after every save so a crash never leaves a
-                # root-owned dataset behind (no-op off the root service). After
+                # Keep hosted output root-owned/non-writable while exposing
+                # read-only operator-group access after every save. After
                 # the durable flush so the episode's freshly rotated files are
                 # all on disk and covered by the chown.
                 restore_dataset_ownership(dataset_root)
@@ -2143,48 +2442,80 @@ def _run(
         # ``disconnect()`` is null-safe and idempotent; always call it so a
         # ``connect()`` that bailed mid-enable doesn't leak the asyncio
         # event-loop thread or any already-opened CAN buses.
+        cleanup_failures: list[tuple[str, BaseException]] = []
         try:
             robot.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
+        except BaseException as exc:  # finish the remaining cleanup first
+            _logger.exception("robot disconnect failed")
+            cleanup_failures.append(("robot disconnect", exc))
 
-        try:
-            reset_controller.stop()
-        except Exception:  # noqa: BLE001
-            pass
+        if reset_controller is not None:
+            try:
+                reset_controller.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
         if server_proc is not None and server_proc.is_alive():
-            server_proc.terminate()
-            server_proc.join(timeout=5.0)
-            if server_proc.is_alive():
-                server_proc.kill()
-                server_proc.join(timeout=2.0)
+            try:
+                server_proc.terminate()
+                server_proc.join(timeout=5.0)
+                if server_proc.is_alive():
+                    server_proc.kill()
+                    server_proc.join(timeout=2.0)
+            except BaseException as exc:
+                _logger.exception("policy server cleanup failed")
+                cleanup_failures.append(("policy server", exc))
 
         if dataset is not None:
-            dataset.finalize()
-            if push_to_hub and episodes_recorded > 0:
-                dataset.push_to_hub()
+            try:
+                dataset.finalize()
+                if push_to_hub and episodes_recorded > 0:
+                    dataset.push_to_hub()
+            except BaseException as exc:
+                _logger.exception("dataset finalization failed")
+                cleanup_failures.append(("dataset finalization", exc))
 
         # Auto-wipe only a freshly-created, never-written dataset. Resumed
         # datasets already have saved rollouts on disk and must be kept.
-        if (
+        empty_fresh_dataset = (
             dataset_root is not None
             and not resumed_dataset
             and episodes_recorded == 0
             and dataset_root.exists()
-        ):
-            try:
-                shutil.rmtree(dataset_root)
-                log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
-            except OSError as exc:
+        )
+        if empty_fresh_dataset:
+            from ..utils.state_files import privileged_service_active
+
+            if privileged_service_active():
+                # LeRobot creates a nested tree even before an episode is
+                # saved. Do not recursively delete through operator-writable
+                # names as root; leave the empty recording for the operator.
                 _logger.warning(
-                    "Failed to remove empty dataset at %s: %s", dataset_root, exc
+                    "Keeping the empty rollout dataset at %s because the hosted "
+                    "service will not recursively delete operator-owned paths",
+                    dataset_root,
                 )
-        elif dataset_root is not None:
+            else:
+                try:
+                    shutil.rmtree(dataset_root)
+                    log_say(
+                        f"No episodes saved — removed empty dataset at {dataset_root}."
+                    )
+                except OSError as exc:
+                    _logger.warning(
+                        "Failed to remove empty dataset at %s: %s", dataset_root, exc
+                    )
+        if dataset_root is not None and dataset_root.exists():
             # Finalize wrote the last meta/stats files as root; adopt them too.
-            # After the wipe above, so a discarded dataset isn't chowned on its
-            # way to being deleted.
-            restore_dataset_ownership(dataset_root)
+            # After the optional wipe above, so a deleted dataset is skipped.
+            try:
+                restore_dataset_ownership(dataset_root)
+            except BaseException as exc:
+                # Keep cleaning up and, in particular, never let an ownership
+                # bookkeeping failure hide an already-recorded robot shutdown
+                # failure below.
+                _logger.exception("dataset ownership restore failed")
+                cleanup_failures.append(("dataset ownership restore", exc))
 
         # Restore the default handler so Ctrl+C can still kill any leaked
         # non-daemon thread keeping the interpreter alive.
@@ -2192,3 +2523,18 @@ def _run(
             signal.signal(signal.SIGINT, signal.SIG_DFL)
         except (ValueError, OSError):
             pass
+
+        robot_failure = next(
+            (
+                failure
+                for label, failure in cleanup_failures
+                if label == "robot disconnect"
+            ),
+            None,
+        )
+        if robot_failure is not None:
+            raise HardwareCleanupError(
+                "robot disconnect failed; hardware ownership is uncertain"
+            ) from robot_failure
+        if cleanup_failures:
+            raise cleanup_failures[0][1]

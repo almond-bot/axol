@@ -38,6 +38,7 @@ import asyncio
 import csv
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -47,6 +48,13 @@ from pathlib import Path
 from typing import Any
 
 from ..utils.paths import almond_path
+from ..utils.state_files import (
+    secure_atomic_write_json,
+    secure_list_names,
+    secure_open_text_read,
+    secure_read_text,
+    secure_unlink,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -56,9 +64,25 @@ SAMPLE_HZ = 10.0
 _BUFFER_FRAMES = int(SAMPLE_HZ * 600)
 
 RUNS_DIR = almond_path("diagnostics", "runs")
+CAPTURES_DIR = almond_path("diagnostics", "captures")
 
 # Marker a bus-owning diagnostic script prints to hand over its own capture.
 _CSV_MARKER = re.compile(r"\[telemetry\] csv=(\S+)")
+_RUN_ID = re.compile(r"^[0-9a-f]{12}$")
+_RUN_FILE = re.compile(r"^([0-9a-f]{12})\.(meta|data)\.json$")
+
+
+def _capture_path(value: object) -> Path | None:
+    """Accept only lexical descendants of the diagnostics capture directory."""
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = Path(os.path.abspath(Path(value).expanduser()))
+    root = Path(os.path.abspath(CAPTURES_DIR))
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return candidate
 
 
 def motor_key(arm: str, joint: str) -> str:
@@ -197,10 +221,13 @@ class DiagnosticsRunStore:
         meta["frameCount"] = len(frames)
 
         try:
-            self._dir.mkdir(parents=True, exist_ok=True)
-            (self._dir / f"{meta['id']}.meta.json").write_text(json.dumps(meta))
-            (self._dir / f"{meta['id']}.data.json").write_text(
-                json.dumps({"frames": frames, "log": log})
+            secure_atomic_write_json(
+                self._dir / f"{meta['id']}.meta.json", meta, indent=None
+            )
+            secure_atomic_write_json(
+                self._dir / f"{meta['id']}.data.json",
+                {"frames": frames, "log": log},
+                indent=None,
             )
         except OSError as exc:
             _logger.warning("failed to persist diagnostics run: %s", exc)
@@ -214,25 +241,35 @@ class DiagnosticsRunStore:
         it's deleted here too — otherwise Clear would leave orphaned capture
         files with no dashboard path to remove them.
         """
-        if not self._dir.is_dir():
+        try:
+            names = secure_list_names(self._dir)
+        except (FileNotFoundError, OSError):
             return 0
         # Delete referenced CSV captures first, before the metas that name them.
-        for meta_path in self._dir.glob("*.meta.json"):
+        for name in names:
+            if not name.endswith(".meta.json") or _RUN_FILE.fullmatch(name) is None:
+                continue
+            meta_path = self._dir / name
             try:
-                csv_path = json.loads(meta_path.read_text()).get("telemetryCsv")
+                csv_path = _capture_path(
+                    json.loads(secure_read_text(meta_path)).get("telemetryCsv")
+                )
             except (OSError, ValueError):
                 continue
-            if csv_path:
+            if csv_path is not None:
                 try:
-                    Path(csv_path).unlink(missing_ok=True)
+                    secure_unlink(csv_path, missing_ok=True)
                 except OSError as exc:
                     _logger.warning("failed to delete capture %s: %s", csv_path, exc)
 
         removed = 0
-        for path in self._dir.glob("*.json"):
+        for name in names:
+            if _RUN_FILE.fullmatch(name) is None:
+                continue
+            path = self._dir / name
             is_meta = path.name.endswith(".meta.json")
             try:
-                path.unlink()
+                secure_unlink(path)
                 if is_meta:
                     removed += 1
             except OSError as exc:
@@ -240,34 +277,43 @@ class DiagnosticsRunStore:
         return removed
 
     def list(self) -> list[dict[str, Any]]:
-        if not self._dir.is_dir():
+        try:
+            names = secure_list_names(self._dir)
+        except (FileNotFoundError, OSError):
             return []
         runs: list[dict[str, Any]] = []
-        for path in self._dir.glob("*.meta.json"):
+        for name in names:
+            if not name.endswith(".meta.json") or _RUN_FILE.fullmatch(name) is None:
+                continue
+            path = self._dir / name
             try:
-                runs.append(json.loads(path.read_text()))
+                runs.append(json.loads(secure_read_text(path)))
             except (OSError, ValueError) as exc:
                 _logger.debug("skipping unreadable run meta %s: %s", path, exc)
         runs.sort(key=lambda r: r.get("startedAt") or 0, reverse=True)
         return runs
 
     def load(self, run_id: str, max_frames: int = 3000) -> dict[str, Any] | None:
-        meta_path = self._dir / f"{run_id}.meta.json"
-        if not meta_path.is_file():
+        if _RUN_ID.fullmatch(run_id) is None:
             return None
-        meta = json.loads(meta_path.read_text())
+        meta_path = self._dir / f"{run_id}.meta.json"
+        try:
+            meta = json.loads(secure_read_text(meta_path))
+        except FileNotFoundError:
+            return None
         data: dict[str, Any] = {"frames": [], "log": []}
         data_path = self._dir / f"{run_id}.data.json"
-        if data_path.is_file():
-            try:
-                data = json.loads(data_path.read_text())
-            except (OSError, ValueError) as exc:
-                _logger.warning("unreadable run data %s: %s", data_path, exc)
+        try:
+            data = json.loads(secure_read_text(data_path))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            _logger.warning("unreadable run data %s: %s", data_path, exc)
 
         frames = data.get("frames", [])
-        csv_path = meta.get("telemetryCsv")
-        if csv_path:
-            csv_frames = _read_csv_frames(Path(csv_path))
+        csv_path = _capture_path(meta.get("telemetryCsv"))
+        if csv_path is not None:
+            csv_frames = _read_csv_frames(csv_path)
             # A script's own capture is denser and spans bus-owned time the
             # server couldn't observe — prefer it when present.
             if csv_frames:
@@ -283,11 +329,9 @@ def _read_csv_frames(path: Path) -> list[dict[str, Any]]:
 
     Columns: ``t`` then ``<arm>:<JOINT>:pos|vel|tq``. Missing cells are empty.
     """
-    if not path.is_file():
-        return []
     frames: list[dict[str, Any]] = []
     try:
-        with path.open(newline="") as fh:
+        with secure_open_text_read(path, newline="") as fh:
             reader = csv.reader(fh)
             header = next(reader, None)
             if not header or header[0] != "t":

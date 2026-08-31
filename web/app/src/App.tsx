@@ -15,6 +15,7 @@ import * as THREE from "three"
 import {
   AxolConnectionStatus,
   type AxolMode,
+  type AxolPoseMode,
   AxolVRClient,
   AxolState,
   type ConfirmAction,
@@ -180,7 +181,7 @@ function AxesMarker({ groupRef }: { groupRef: React.RefObject<THREE.Group | null
   )
 }
 
-function PoseVisualizer() {
+function PoseVisualizer({ poseMode }: { poseMode: AxolPoseMode }) {
   const { gl } = useThree()
   const leftRef = useRef<THREE.Group>(null)
   const rightRef = useRef<THREE.Group>(null)
@@ -234,8 +235,19 @@ function PoseVisualizer() {
       (s: XRInputSource) => s.handedness === "right"
     )
 
-    applyPose(leftRef.current, leftSource?.targetRaySpace ?? null)
-    applyPose(rightRef.current, rightSource?.targetRaySpace ?? null)
+    // Match the spaces actually sent by AxolVRClient: legacy relative Axol
+    // uses target rays, while absolute/Mantis uses the calibrated grip datum
+    // (with target-ray fallback for runtimes that omit gripSpace).
+    const leftSpace =
+      poseMode === "absolute"
+        ? (leftSource?.gripSpace ?? leftSource?.targetRaySpace)
+        : leftSource?.targetRaySpace
+    const rightSpace =
+      poseMode === "absolute"
+        ? (rightSource?.gripSpace ?? rightSource?.targetRaySpace)
+        : rightSource?.targetRaySpace
+    applyPose(leftRef.current, leftSpace ?? null)
+    applyPose(rightRef.current, rightSpace ?? null)
 
     const body = (frame as XRFrame & { body?: XRBody }).body
     applyPosition(lElbowRef.current, body?.get(L_ELBOW_JOINT))
@@ -1192,6 +1204,9 @@ export default function App() {
   // Operating mode the server locked us to (null until it announces one on
   // connect). Drives which HUD/hint controls are shown.
   const [vrMode, setVrMode] = useState<AxolMode | null>(null)
+  // Controller space is independent of the HUD mode. It defaults to the
+  // legacy-safe relative mapping until the host's replayable announcement.
+  const [poseMode, setPoseMode] = useState<AxolPoseMode>("relative")
   // Current 1-based episode number during data collection (null until the
   // server announces one; stays null in plain teleop).
   const [episode, setEpisode] = useState<number | null>(null)
@@ -1442,6 +1457,7 @@ export default function App() {
               onPendingRecording={setRecordingPendingAt}
               onPendingConfirm={setPendingConfirm}
               onMode={setVrMode}
+              onPoseMode={setPoseMode}
               onEpisode={setEpisode}
               onExit={() => store.getState().session?.end()}
             />
@@ -1454,8 +1470,10 @@ export default function App() {
               <CountdownDisplay recordingPendingAt={recordingPendingAt} />
               <ConfirmDisplay action={pendingConfirm} />
             </XRHud>
-            <PoseVisualizer />
-            <RobotModel hostname={hostname} wsRef={wsRef} />
+            <PoseVisualizer poseMode={poseMode} />
+            {/* Remount on host changes so any in-flight URDF/STL requests and
+                cached overlay resources are cancelled and disposed. */}
+            <RobotModel key={hostname} hostname={hostname} wsRef={wsRef} />
           </XR>
         </Suspense>
       </Canvas>

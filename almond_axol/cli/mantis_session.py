@@ -182,10 +182,11 @@ WantedBy=multi-user.target
 """
     if _PRE_MANTIS_SERVICE_PATH.exists():
         print("Migrating the retired Mantis session service name...")
-        run_root(
-            ["systemctl", "disable", "--now", _PRE_MANTIS_SERVICE_NAME],
-            check=False,
-        )
+        # Do not install the replacement while the retired service might still
+        # own adb, the browser bootstrap, or axol serve. Require a verified stop
+        # and disable before deleting its definition.
+        run_root(["systemctl", "stop", _PRE_MANTIS_SERVICE_NAME], check=True)
+        run_root(["systemctl", "disable", _PRE_MANTIS_SERVICE_NAME], check=True)
         run_root(["rm", "-f", str(_PRE_MANTIS_SERVICE_PATH)], check=True)
     print(f"Installing {_SERVICE_PATH} (requires sudo)...")
     run_root(["tee", str(_SERVICE_PATH)], input_text=unit, check=True)

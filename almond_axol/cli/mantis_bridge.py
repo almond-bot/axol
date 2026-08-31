@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import _thread
 import contextlib
+import sys
 import threading
 import uuid
 from collections.abc import Iterator
@@ -306,9 +307,22 @@ def managed_mantis_bridge(
                     f"{type(bridge_failure).__name__}: {bridge_failure}"
                 ) from bridge_failure
     finally:
+        active_error = sys.exception()
         owner_active.clear()
         stop.set()
         thread.join(_STOP_TIMEOUT_S)
+        teardown_failure = current_failure()
         if thread.is_alive():
-            # A third-party backend must not prevent the CLI from exiting.
-            print(f"WARNING: {source} tracker bridge did not stop cleanly.")
+            teardown_failure = RuntimeError(
+                f"{source} tracker bridge did not stop cleanly; tracker ownership "
+                "is uncertain"
+            )
+        if teardown_failure is not None:
+            message = (
+                f"{source} tracker bridge teardown failed: "
+                f"{type(teardown_failure).__name__}: {teardown_failure}"
+            )
+            if active_error is not None:
+                active_error.add_note(message)
+            else:
+                raise RuntimeError(message) from teardown_failure

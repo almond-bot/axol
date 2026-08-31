@@ -41,6 +41,7 @@ import sys
 import threading
 from typing import Any
 
+from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
 from ..zed import stereo_serials
 from .commands import flag_enabled
 from .manager import Session
@@ -440,6 +441,11 @@ class OperationRunner:
         # queue-backed object with push()/snapshot() that the op's episode
         # loop drains.
         self._episode_control: Any = None
+        # A command reported that its hardware disconnect/disable did not
+        # complete.  The command may still own one or both CAN buses, so no
+        # later operation may start and the idle RobotLink must not reacquire
+        # them.  Only restarting the serve process can re-establish ownership.
+        self._hardware_cleanup_uncertain = False
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
 
@@ -472,7 +478,15 @@ class OperationRunner:
             "stopping",
         )
         worker_alive = self._thread is not None and self._thread.is_alive()
-        return active_status or worker_alive
+        bridge_alive = (
+            self._bridge_process is not None and self._bridge_process.is_alive()
+        )
+        return (
+            active_status
+            or worker_alive
+            or bridge_alive
+            or self._hardware_cleanup_uncertain
+        )
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -629,7 +643,14 @@ class OperationRunner:
             try:
                 self._robot_link.release()
             except Exception as exc:  # noqa: BLE001
-                session.emit(f"[serve] robot release warning: {exc}")
+                session.status = "error"
+                session.error = f"{type(exc).__name__}: {exc}"
+                session.emit(
+                    "[serve] error: robot link could not be released; "
+                    "operation was not started"
+                )
+                session.close_stream()
+                return session
 
         if cmd.execution == "async":
             target = self._run_async
@@ -1234,10 +1255,6 @@ class OperationRunner:
             stop_event = self._bridge_stop_event
             command_queue = self._bridge_commands
             monitor = self._bridge_monitor
-            self._bridge_process = None
-            self._bridge_stop_event = None
-            self._bridge_commands = None
-            self._bridge_monitor = None
         if process is None:
             return
         if stop_event is not None:
@@ -1247,11 +1264,31 @@ class OperationRunner:
             session.emit("[serve] tracker bridge did not stop cleanly; terminating")
             process.terminate()
             process.join(timeout=1.0)
+        if process.is_alive():
+            session.emit("[serve] tracker bridge ignored terminate; killing")
+            process.kill()
+            process.join(timeout=1.0)
         if command_queue is not None:
             command_queue.close()
-            command_queue.join_thread()
+            # Reset commands are disposable once this bridge is stopping.
+            # Never let a stuck multiprocessing feeder wedge operation cleanup.
+            command_queue.cancel_join_thread()
         if monitor is not None and monitor is not threading.current_thread():
             monitor.join(timeout=1.0)
+        if process.is_alive():
+            # Retain ownership so is_running() keeps future operations out of
+            # this process until the server is restarted and the native child
+            # can no longer hold the tracker dongle.
+            message = "Mantis tracker bridge could not be killed; restart axol serve"
+            session.emit(f"[serve] error: {message}")
+            self._mark_terminal(session, "error", error=message)
+            return
+        with self._lock:
+            if self._bridge_process is process:
+                self._bridge_process = None
+                self._bridge_stop_event = None
+                self._bridge_commands = None
+                self._bridge_monitor = None
         session.emit("[serve] Mantis tracker bridge stopped")
 
     # -- async ops (teleop / gravity-comp) ----------------------------------
@@ -1275,6 +1312,7 @@ class OperationRunner:
             core = COMMANDS[op_id].load_entrypoint()
             await core(cfg)
 
+        cleanup_uncertain = False
         with _Capture(session, log_level):
             try:
                 if manage_bridge:
@@ -1284,7 +1322,14 @@ class OperationRunner:
                 loop.run_until_complete(task)
             except asyncio.CancelledError:
                 pass
+            except HardwareCleanupError as exc:
+                cleanup_uncertain = True
+                self._mark_terminal(
+                    session, "error", error=f"{type(exc).__name__}: {exc}"
+                )
+                session.emit(f"[serve] error: {session.error}")
             except Exception as exc:  # noqa: BLE001
+                cleanup_uncertain = is_hardware_cleanup_uncertain(exc)
                 self._mark_terminal(
                     session, "error", error=f"{type(exc).__name__}: {exc}"
                 )
@@ -1299,7 +1344,7 @@ class OperationRunner:
                 loop.close()
                 self._async_loop = None
                 self._async_task = None
-        self._finish(session, needs_robot)
+        self._finish(session, needs_robot, cleanup_uncertain=cleanup_uncertain)
 
     # -- thread ops (collect-data / run-policy / replay-dataset) ------------
 
@@ -1315,6 +1360,7 @@ class OperationRunner:
         from .commands import COMMANDS
 
         cmd = COMMANDS[op_id]
+        cleanup_uncertain = False
         with _Capture(session, log_level):
             try:
                 if manage_bridge:
@@ -1330,7 +1376,14 @@ class OperationRunner:
                     control = control_cls(self._stop_event)
                     self._episode_control = control
                     core(cfg, stop_event=self._stop_event, control=control)
+            except HardwareCleanupError as exc:
+                cleanup_uncertain = True
+                self._mark_terminal(
+                    session, "error", error=f"{type(exc).__name__}: {exc}"
+                )
+                session.emit(f"[serve] error: {session.error}")
             except Exception as exc:  # noqa: BLE001
+                cleanup_uncertain = is_hardware_cleanup_uncertain(exc)
                 self._mark_terminal(
                     session, "error", error=f"{type(exc).__name__}: {exc}"
                 )
@@ -1339,7 +1392,7 @@ class OperationRunner:
                 self._episode_control = None
                 if manage_bridge:
                     self._stop_tracker_bridge(session)
-        self._finish(session, needs_robot)
+        self._finish(session, needs_robot, cleanup_uncertain=cleanup_uncertain)
 
     # -- shared teardown ----------------------------------------------------
 
@@ -1361,13 +1414,31 @@ class OperationRunner:
             if status == "exited":
                 session.exit_code = 0
 
-    def _finish(self, session: Session, needs_robot: bool) -> None:
+    def _finish(
+        self,
+        session: Session,
+        needs_robot: bool,
+        *,
+        cleanup_uncertain: bool = False,
+    ) -> None:
+        if cleanup_uncertain:
+            with self._lock:
+                self._hardware_cleanup_uncertain = True
+            message = (
+                "hardware cleanup could not be verified; robot ownership remains "
+                "reserved until axol serve is restarted"
+            )
+            self._mark_terminal(session, "error", error=session.error or message)
+            session.emit(f"[serve] safety lockout: {message}")
         self._mark_terminal(session, "exited")
         session.emit(f"[serve] {session.command_id} finished")
-        session.close_stream()
-        if needs_robot and self._robot_link is not None:
+        if needs_robot and self._robot_link is not None and not cleanup_uncertain:
             try:
                 self._robot_link.reacquire()
                 session.emit("[serve] robot link reacquired")
             except Exception as exc:  # noqa: BLE001
-                _logger.debug("robot reacquire failed: %s", exc)
+                message = f"robot link reacquire failed: {exc}"
+                self._mark_terminal(session, "error", error=message)
+                session.emit(f"[serve] error: {message}")
+                _logger.warning("robot reacquire failed: %s", exc)
+        session.close_stream()

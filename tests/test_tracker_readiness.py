@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 from almond_axol.cli.tracker_bridge import _wait_for_live_inputs
 from almond_axol.tracker.base import (
     TRACKER_PAIR_MAX_SKEW_S,
@@ -25,7 +27,12 @@ class _OffsetPoseSource:
         self.calls += 1
         now = time.perf_counter()
         return {
-            key: SimpleNamespace(t=now - age_s, tracking=tracking)
+            key: SimpleNamespace(
+                pos=np.zeros(3),
+                quat=np.array([0.0, 0.0, 0.0, 1.0]),
+                t=now - age_s,
+                tracking=tracking,
+            )
             for key, (age_s, tracking) in sample.items()
         }
 

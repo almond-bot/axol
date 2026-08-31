@@ -14,15 +14,20 @@ from unittest import mock
 
 import numpy as np
 
-from almond_axol.cli import collect_data
+from almond_axol.cli import collect_data, teleop
+from almond_axol.cli.config import TeleopCmdConfig
 from almond_axol.cli.collect_data import _validate_mantis_calibration
+from almond_axol.lerobot.robot.config_mantis import MantisRobotConfig
+from almond_axol.lerobot.teleop.config_vr import AxolVRTeleopConfig
 from almond_axol.mantis.calibration import (
     LEGACY_TRACKER_KEY,
+    VIVE_TRACKER_CAD_ORIGINS_MM,
     candidate_transform_for,
     design_transform_for,
     load_tcp_transforms,
     validate_tcp_transform,
 )
+from almond_axol.mantis.relative import quat_xyzw_to_matrix
 from almond_axol.teleop.config import VRTeleopConfig, apply_mantis_teleop_profile
 from almond_axol.teleop.core import VRTeleopCore
 from almond_axol.tracker.base import TrackerPose
@@ -86,6 +91,67 @@ class _SkewedSource:
 
 
 class MantisFlowTest(unittest.TestCase):
+    def test_direct_mantis_teleop_disables_inherited_powered_cart(self) -> None:
+        cfg = TeleopCmdConfig(mantis=True)
+        cfg.cart.enabled = True
+        with (
+            mock.patch(
+                "almond_axol.teleop.config.apply_mantis_teleop_profile"
+            ) as apply_teleop,
+            mock.patch(
+                "almond_axol.kinematics.config.apply_mantis_kinematics_profile"
+            ) as apply_kinematics,
+        ):
+            teleop._prepare_mantis_teleop(cfg)
+
+        self.assertFalse(cfg.cart.enabled)
+        apply_teleop.assert_called_once_with(
+            cfg.teleop, tracker_source=cfg.mantis_source
+        )
+        apply_kinematics.assert_called_once_with(cfg.kinematics)
+
+    def test_mantis_collection_disables_inherited_powered_cart(self) -> None:
+        cfg = collect_data.CollectDataConfig(repo_id="test/repo", task="test")
+        self.assertIsInstance(cfg.teleop_config, AxolVRTeleopConfig)
+        assert isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+        cfg.teleop_config.cart.enabled = True
+        with (
+            mock.patch(
+                "almond_axol.teleop.config.apply_mantis_teleop_profile"
+            ) as apply_teleop,
+            mock.patch(
+                "almond_axol.kinematics.config.apply_mantis_kinematics_profile"
+            ) as apply_kinematics,
+        ):
+            collect_data._apply_mantis_profile(cfg)
+
+        self.assertFalse(cfg.teleop_config.cart.enabled)
+        apply_teleop.assert_called_once()
+        apply_kinematics.assert_called_once()
+
+    def test_mantis_collection_restores_required_gripper_schema(self) -> None:
+        cfg = collect_data.CollectDataConfig(repo_id="test/repo", task="test")
+        cfg.robot_config.axol_config.has_gripper = False
+        self.assertIsInstance(cfg.teleop_config, AxolVRTeleopConfig)
+        assert isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+        cfg.teleop_config.has_gripper = False
+
+        with (
+            mock.patch("almond_axol.teleop.config.apply_mantis_teleop_profile"),
+            mock.patch("almond_axol.kinematics.config.apply_mantis_kinematics_profile"),
+        ):
+            collect_data._apply_mantis_profile(cfg)
+
+        self.assertIsInstance(cfg.robot_config, MantisRobotConfig)
+        self.assertTrue(cfg.robot_config.axol_config.has_gripper)
+        self.assertTrue(cfg.teleop_config.has_gripper)
+
+    def test_explicit_mantis_config_rejects_gripperless_hardware_schema(self) -> None:
+        cfg = collect_data._default_robot_config()
+        cfg.axol_config.has_gripper = False
+        with self.assertRaisesRegex(ValueError, "Mantis always has two"):
+            MantisRobotConfig(axol_config=cfg.axol_config)
+
     def test_direct_collection_rejects_camera_config_before_tracker_bridge(
         self,
     ) -> None:
@@ -108,6 +174,64 @@ class MantisFlowTest(unittest.TestCase):
             collect_data.main([])
 
         bridge.assert_not_called()
+
+    def test_failed_collection_setup_disconnects_robot_and_preserves_error(
+        self,
+    ) -> None:
+        dataset_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(dataset_dir.cleanup)
+        robot = mock.Mock()
+        robot.action_features = {}
+        robot.observation_features = {}
+        robot.get_joint_observation.return_value = {}
+        robot.positions = (np.zeros(8), np.zeros(8))
+        robot.cameras = {}
+        robot.name = "test-robot"
+        robot.disconnect.side_effect = RuntimeError("cleanup sentinel")
+
+        teleop = mock.Mock()
+        teleop.cart = None
+        teleop.connect.side_effect = ValueError("setup sentinel")
+        cfg = SimpleNamespace(
+            mantis=False,
+            repo_id="test/repo",
+            task="test",
+            fps=60,
+            teleop_hz=120,
+            vcodec="auto",
+            root=dataset_dir.name,
+            push_to_hub=False,
+            rerun_ip=None,
+            rerun_port=9876,
+            dataset_resolution="SVGA",
+            log_level="INFO",
+            robot_config=SimpleNamespace(observation_cameras=lambda: {}),
+            teleop_config=SimpleNamespace(),
+        )
+
+        with (
+            mock.patch.object(collect_data, "_prepare_recording_cameras"),
+            mock.patch.object(collect_data.affinity, "pin_realtime"),
+            mock.patch.object(collect_data, "_start_video_relay", return_value=None),
+            mock.patch(
+                "almond_axol.lerobot.robot.robot_axol.AxolRobot",
+                return_value=robot,
+            ),
+            mock.patch(
+                "almond_axol.lerobot.teleop.teleop_vr.AxolVRTeleop",
+                return_value=teleop,
+            ),
+            mock.patch("almond_axol.utils.network.local_ip", return_value="127.0.0.1"),
+            self.assertRaisesRegex(ValueError, "setup sentinel") as raised,
+        ):
+            collect_data._run(cfg)
+
+        robot.connect.assert_called_once_with()
+        teleop.disconnect.assert_called_once_with()
+        robot.disconnect.assert_called_once_with()
+        self.assertTrue(
+            getattr(raised.exception, "_axol_hardware_cleanup_uncertain", False)
+        )
 
     def test_trigger_decoder_accepts_both_firmware_lengths(self) -> None:
         core = struct.pack("<fH", 0.25, 1234)
@@ -156,6 +280,29 @@ class MantisFlowTest(unittest.TestCase):
         self.assertEqual(
             bridge.compose_frame()["pose_source_id"], "managed-ultimate-run"
         )
+
+    def test_bridge_never_marks_malformed_custom_source_pose_live(self) -> None:
+        source = _Source()
+        bridge = TrackerBridge(
+            source,
+            left="left",
+            right="right",
+            controls=StopEventControls(threading.Event()),
+        )
+        self.assertTrue(bridge.compose_frame()["l_tracked"])
+
+        original_poses = source.poses
+
+        def malformed() -> dict[str, TrackerPose]:
+            poses = original_poses()
+            poses["left"].pos[0] = math.nan
+            return poses
+
+        source.poses = malformed  # type: ignore[method-assign]
+        frame = bridge.compose_frame()
+        self.assertFalse(frame["l_tracked"])
+        self.assertTrue(frame["r_tracked"])
+        self.assertTrue(math.isfinite(frame["l_ee"]["position"]["x"]))
 
     def test_confirmation_must_restart_after_tracker_dropout(self) -> None:
         source = _Source()
@@ -375,6 +522,7 @@ class MantisFlowTest(unittest.TestCase):
             "non-finite quaternion": [0.0, 0.0, 0.0, 0.0, math.inf, 0.0, 1.0],
             "overflowing numeric": [10**1000, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             "zero quaternion": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "millimetres entered as metres": [47, 0, 35, 0, 0, 0, 1],
         }
         for name, transform in unsafe.items():
             with self.subTest(name=name):
@@ -503,7 +651,11 @@ class MantisFlowTest(unittest.TestCase):
             _validate_mantis_calibration(config)
 
     def test_pending_cad_transform_does_not_authorize_collection(self) -> None:
-        self.assertIsNotNone(candidate_transform_for("left", "survive:T20"))
+        self.assertEqual(VIVE_TRACKER_CAD_ORIGINS_MM["survive"], (47.0, 0.0, 35.0))
+        self.assertEqual(VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"], (47.0, 0.0, 46.0))
+        survive = candidate_transform_for("left", "survive:T20")
+        self.assertIsNotNone(survive)
+        assert survive is not None
         self.assertIsNone(design_transform_for("left", "survive:T20"))
         ultimate = [0.0, 0.0465, -0.092, 0.7071068, 0.0, 0.0, 0.7071068]
         self.assertEqual(
@@ -514,6 +666,20 @@ class MantisFlowTest(unittest.TestCase):
             candidate_transform_for("right", "ultimate:11:22:33:44:55:66"),
             ultimate,
         )
+        # Origins are expressed in the shared gripper/CAD frame G, while the
+        # stored translation is the TCP origin in tracker frame T. Therefore
+        # delta_p_TG = -R_TG @ delta_O; Rx(+90 deg) turns the +11 mm CAD-z
+        # origin shift into +11 mm of tracker-y TCP translation.
+        origin_delta_m = (
+            np.asarray(VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"])
+            - np.asarray(VIVE_TRACKER_CAD_ORIGINS_MM["survive"])
+        ) / 1000.0
+        rotation_tg = quat_xyzw_to_matrix(np.asarray(survive[3:]))
+        np.testing.assert_allclose(
+            np.asarray(ultimate[:3]) - np.asarray(survive[:3]),
+            -(rotation_tg @ origin_delta_m),
+            atol=1e-9,
+        )
         self.assertIsNone(design_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff"))
         config = VRTeleopConfig(tracker_key="survive:T20")
         with mock.patch(
@@ -522,6 +688,36 @@ class MantisFlowTest(unittest.TestCase):
             apply_mantis_teleop_profile(config, tracker_source="lighthouse")
         self.assertIsNone(config.tcp_transform_left)
         self.assertIsNone(config.tcp_transform_right)
+
+        ultimate_config = VRTeleopConfig(tracker_key="ultimate:aa:bb:cc:dd:ee:ff")
+        with mock.patch(
+            "almond_axol.mantis.calibration.load_tcp_transforms", return_value={}
+        ):
+            apply_mantis_teleop_profile(ultimate_config, tracker_source="ultimate")
+        self.assertIsNone(ultimate_config.tcp_transform_left)
+        self.assertIsNone(ultimate_config.tcp_transform_right)
+
+        collection = SimpleNamespace(
+            mantis_allow_uncalibrated=False,
+            mantis_source="ultimate",
+            teleop_config=SimpleNamespace(vr_teleop_config=ultimate_config),
+        )
+        keys = {
+            "left": "ultimate:aa:bb:cc:dd:ee:ff",
+            "right": "ultimate:11:22:33:44:55:66",
+        }
+        with (
+            mock.patch(
+                "almond_axol.mantis.calibration.tracker_key_for_side",
+                side_effect=lambda side, **_kwargs: (keys[side], "test binding"),
+            ),
+            mock.patch(
+                "almond_axol.mantis.calibration.load_tcp_transforms",
+                return_value={},
+            ),
+            self.assertRaisesRegex(ValueError, "no verified.*Ultimate|no verified"),
+        ):
+            _validate_mantis_calibration(collection)
 
     def test_active_source_never_uses_unknown_legacy_transform(self) -> None:
         identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]

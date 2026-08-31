@@ -207,6 +207,266 @@ class CanSetupAssignmentTest(unittest.TestCase):
             [setup.CAN_LEFT, setup.CAN_RIGHT], force_cycle=True
         )
 
+    def test_root_executed_scripts_install_root_owned_outside_operator_state(
+        self,
+    ) -> None:
+        installed_script = ""
+
+        def run_root(command: list[str], **_kwargs: object) -> SimpleNamespace:
+            nonlocal installed_script
+            if command[:2] == ["install", "-o"]:
+                installed_script = Path(command[-2]).read_text()
+            return SimpleNamespace(stdout="")
+
+        with (
+            patch.object(setup, "run_root", side_effect=run_root) as root,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup._write_cron_script(setup._MANTIS_PROFILE)
+
+        self.assertEqual(
+            setup._MANTIS_PROFILE.cron_script,
+            Path("/etc/almond-axol/can/startup_mantis.sh"),
+        )
+        self.assertEqual(root.call_count, 2)
+        self.assertEqual(
+            root.call_args_list[0],
+            unittest.mock.call(
+                [
+                    "install",
+                    "-d",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    "0755",
+                    "/etc/almond-axol/can",
+                ],
+                check=True,
+            ),
+        )
+        file_command = root.call_args_list[1].args[0]
+        self.assertEqual(
+            file_command[:7],
+            ["install", "-o", "root", "-g", "root", "-m", "0755"],
+        )
+        self.assertEqual(file_command[-1], str(setup._MANTIS_PROFILE.cron_script))
+        self.assertIn("can_mantis_l can_mantis_r", installed_script)
+
+    def test_cron_migrates_exact_legacy_operator_script_to_privileged_path(
+        self,
+    ) -> None:
+        legacy = Path("/home/operator/.almond/can")
+        old_entry = f"@reboot {legacy / 'startup.sh'}"
+        old_other_profile = f"@reboot {legacy / 'startup_mantis.sh'}"
+        unrelated = "@reboot /home/operator/bin/backup"
+        root_crontab = SimpleNamespace(
+            returncode=0,
+            stdout=f"{old_entry}\n{old_other_profile}\n{unrelated}\n",
+            stderr="",
+        )
+        with (
+            patch.object(setup, "_LEGACY_CAN_DIRS", {legacy}),
+            patch.object(
+                setup,
+                "run_root",
+                side_effect=(root_crontab, SimpleNamespace(stdout="")),
+            ) as run_root,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup._register_cron(setup._AXOL_PROFILE)
+
+        written = run_root.call_args_list[1].kwargs["input_text"]
+        self.assertNotIn(old_entry, written)
+        self.assertNotIn(old_other_profile, written)
+        self.assertIn(unrelated, written)
+        self.assertIn(
+            "@reboot /etc/almond-axol/can/startup.sh\n",
+            written,
+        )
+
+    def test_pre_mantis_migration_removes_schedulers_before_old_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rules = root / "91-can-old.rules"
+            unit = root / "axol-can-old-up.service"
+            script = root / "startup-old.sh"
+            for path in (rules, unit, script):
+                path.write_text("legacy")
+            legacy_dir = root / "operator" / ".almond" / "can"
+            obsolete = legacy_dir / f"startup_{setup._PRE_MANTIS_NAME}.sh"
+            unrelated = "@reboot /root/bin/backup"
+            crontab = SimpleNamespace(
+                returncode=0,
+                stdout=f"@reboot {obsolete}\n{unrelated}\n",
+                stderr="",
+            )
+            calls: list[tuple[list[str], dict[str, object]]] = []
+
+            def run_root(command: list[str], **kwargs: object) -> object:
+                calls.append((command, kwargs))
+                if command == ["env", "LC_ALL=C", "crontab", "-l"]:
+                    return crontab
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.object(setup, "_PRE_MANTIS_RULES_FILE", rules),
+                patch.object(setup, "_PRE_MANTIS_HOTPLUG_UNIT_FILE", unit),
+                patch.object(setup, "_PRE_MANTIS_CRON_SCRIPT", script),
+                patch.object(setup, "_LEGACY_CAN_DIRS", {legacy_dir}),
+                patch.object(setup, "run_root", side_effect=run_root),
+            ):
+                setup._remove_pre_mantis_config()
+
+            commands = [command for command, _ in calls]
+            cron_write_i = commands.index(["crontab", "-"])
+            stop_i = commands.index(
+                ["systemctl", "stop", setup._PRE_MANTIS_HOTPLUG_UNIT]
+            )
+            unit_rm_i = commands.index(["rm", "-f", str(unit)])
+            rules_rm_i = commands.index(["rm", "-f", str(rules)])
+            script_rm_i = commands.index(["rm", "-f", str(script)])
+            self.assertLess(cron_write_i, stop_i)
+            self.assertLess(stop_i, unit_rm_i)
+            self.assertLess(unit_rm_i, rules_rm_i)
+            self.assertLess(unit_rm_i, script_rm_i)
+            self.assertEqual(calls[cron_write_i][1]["input_text"], unrelated + "\n")
+
+    def test_pre_mantis_crontab_failure_leaves_all_files_and_unit_untouched(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rules = root / "91-can-old.rules"
+            unit = root / "axol-can-old-up.service"
+            script = root / "startup-old.sh"
+            for path in (rules, unit, script):
+                path.write_text("legacy")
+            legacy_dir = root / "operator" / ".almond" / "can"
+            obsolete = legacy_dir / f"startup_{setup._PRE_MANTIS_NAME}.sh"
+            crontab = SimpleNamespace(
+                returncode=0,
+                stdout=f"@reboot {obsolete}\n",
+                stderr="",
+            )
+
+            def run_root(command: list[str], **_kwargs: object) -> object:
+                if command == ["env", "LC_ALL=C", "crontab", "-l"]:
+                    return crontab
+                if command == ["crontab", "-"]:
+                    raise RuntimeError("crontab write denied")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.object(setup, "_PRE_MANTIS_RULES_FILE", rules),
+                patch.object(setup, "_PRE_MANTIS_HOTPLUG_UNIT_FILE", unit),
+                patch.object(setup, "_PRE_MANTIS_CRON_SCRIPT", script),
+                patch.object(setup, "_LEGACY_CAN_DIRS", {legacy_dir}),
+                patch.object(setup, "run_root", side_effect=run_root) as root_run,
+                self.assertRaisesRegex(RuntimeError, "crontab write denied"),
+            ):
+                setup._remove_pre_mantis_config()
+
+            commands = [call.args[0] for call in root_run.call_args_list]
+            self.assertFalse(
+                any(command[0] in {"systemctl", "rm"} for command in commands)
+            )
+            self.assertTrue(all(path.exists() for path in (rules, unit, script)))
+
+    def test_apply_setup_does_not_swallow_rp1_security_cleanup_failure(self) -> None:
+        with (
+            patch.object(setup, "_write_udev_rules"),
+            patch.object(setup, "_write_cron_script"),
+            patch.object(setup, "_write_hotplug_unit"),
+            patch.object(setup, "_reload_udev"),
+            patch.object(setup, "_rename_interfaces"),
+            patch.object(setup, "_register_cron"),
+            patch.object(
+                setup,
+                "_setup_rp1_usb_quirk",
+                side_effect=RuntimeError("legacy unit stop denied"),
+            ),
+            patch.object(setup, "bring_up_can") as bring_up,
+            self.assertRaisesRegex(RuntimeError, "legacy unit stop denied"),
+        ):
+            setup._apply_setup("AXOL", None, None)
+
+        bring_up.assert_not_called()
+
+    def test_hotplug_unit_executes_only_privileged_script_path(self) -> None:
+        with (
+            patch.object(setup, "run_root") as run_root,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup._write_hotplug_unit(setup._MANTIS_PROFILE)
+
+        unit = run_root.call_args_list[0].kwargs["input_text"]
+        self.assertIn(
+            "ExecStart=/bin/bash /etc/almond-axol/can/startup_mantis.sh",
+            unit,
+        )
+        self.assertNotIn(".almond/can", unit)
+
+    def test_inapplicable_rp1_setup_removes_legacy_root_unit_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            unit_file = Path(directory) / "axol-rp1-usb-quirk.service"
+            unit_file.write_text(
+                "ExecStart=/bin/bash /home/operator/.almond/can/rp1-usb-quirk.sh\n"
+            )
+            with (
+                patch.object(setup, "_RP1_QUIRK_UNIT_FILE", unit_file),
+                patch.object(setup, "_is_raspberry_pi_5", return_value=False),
+                patch.object(setup, "run_root") as run_root,
+            ):
+                setup._setup_rp1_usb_quirk()
+
+        self.assertEqual(
+            [call.args[0] for call in run_root.call_args_list],
+            [
+                ["systemctl", "stop", setup._RP1_QUIRK_UNIT],
+                ["systemctl", "disable", setup._RP1_QUIRK_UNIT],
+                ["rm", "-f", str(unit_file)],
+                ["systemctl", "daemon-reload"],
+            ],
+        )
+        self.assertTrue(
+            all(call.kwargs == {"check": True} for call in run_root.call_args_list)
+        )
+
+    def test_rp1_shutdown_failure_keeps_unit_for_retry(self) -> None:
+        for failed_action in ("stop", "disable"):
+            with (
+                self.subTest(failed_action=failed_action),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                unit_file = Path(directory) / "axol-rp1-usb-quirk.service"
+                unit_file.write_text(
+                    "ExecStart=/bin/bash /home/operator/.almond/can/rp1-usb-quirk.sh\n"
+                )
+
+                def run_root(command: list[str], **_kwargs: object) -> object:
+                    if command == [
+                        "systemctl",
+                        failed_action,
+                        setup._RP1_QUIRK_UNIT,
+                    ]:
+                        raise RuntimeError(f"{failed_action} denied")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with (
+                    patch.object(setup, "_RP1_QUIRK_UNIT_FILE", unit_file),
+                    patch.object(setup, "run_root", side_effect=run_root) as root_run,
+                    self.assertRaisesRegex(RuntimeError, f"{failed_action} denied"),
+                ):
+                    setup._remove_rp1_quirk_unit()
+
+                self.assertTrue(unit_file.exists())
+                self.assertNotIn(
+                    ["rm", "-f", str(unit_file)],
+                    [call.args[0] for call in root_run.call_args_list],
+                )
+
     def test_explicit_single_bus_identification_resets_before_probing(self) -> None:
         with (
             patch.object(setup, "_iface_for_serial", return_value=setup.CAN_BASE),

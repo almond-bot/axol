@@ -12,14 +12,22 @@ import numpy as np
 
 import almond_axol.cli as cli_entrypoint
 from almond_axol.diagnostics.mantis import trigger as mantis_trigger
+from almond_axol.robot.base import HardwareCleanupError
 
 
 class _FakeReader:
-    def __init__(self, channel: str, grip: float | None = 1.0) -> None:
+    def __init__(
+        self,
+        channel: str,
+        grip: float | None = 1.0,
+        *,
+        close_error: BaseException | None = None,
+    ) -> None:
         self.channel = channel
         self.value = grip
         self.stale = grip is None
         self.closed = False
+        self.close_error = close_error
 
     def grip(self) -> float | None:
         return self.value
@@ -29,6 +37,8 @@ class _FakeReader:
 
     def close(self) -> None:
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class _FakeRobot:
@@ -315,7 +325,9 @@ class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
         def robot_factory(*_args: Any, **_kwargs: Any) -> _FakeRobot:
             return _FakeRobot(readers, disable_error=OSError("disable failed"))
 
-        with self.assertRaisesRegex(OSError, "disable failed"):
+        with self.assertRaisesRegex(
+            HardwareCleanupError, "hardware ownership is uncertain"
+        ) as raised:
             await mantis_trigger._run(
                 "left-can",
                 "right-can",
@@ -327,6 +339,42 @@ class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
                 duration=0.0,
             )
 
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertTrue(all(reader.closed for reader in readers.values()))
+
+    async def test_reader_failure_still_disables_and_closes_other_reader(self) -> None:
+        readers: dict[str, _FakeReader] = {}
+        robot: _FakeRobot | None = None
+
+        def reader_factory(channel: str) -> _FakeReader:
+            reader = _FakeReader(
+                channel,
+                close_error=(
+                    OSError("left socket stuck") if channel == "left-can" else None
+                ),
+            )
+            readers[channel] = reader
+            return reader
+
+        def robot_factory(*_args: Any, **_kwargs: Any) -> _FakeRobot:
+            nonlocal robot
+            robot = _FakeRobot(readers)
+            return robot
+
+        with self.assertRaisesRegex(RuntimeError, "CAN ownership is uncertain"):
+            await mantis_trigger._run(
+                "left-can",
+                "right-can",
+                reader_factory=reader_factory,
+                robot_factory=robot_factory,
+                wait_timeout=0.1,
+                poll_interval=0.0,
+                status_interval=60.0,
+                duration=0.0,
+            )
+
+        assert robot is not None
+        self.assertEqual(robot.disable_calls, 1)
         self.assertTrue(all(reader.closed for reader in readers.values()))
 
 

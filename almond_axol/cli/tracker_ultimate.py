@@ -54,6 +54,7 @@ _UDEV_RULE = (
 )
 _UDEV_SEARCH_DIRS = (Path("/etc/udev/rules.d"), Path("/lib/udev/rules.d"))
 _RUNTIME_PROBE_CACHE_TTL_S = 15.0
+_UPDATE_PREFLIGHT_BLOCKED = 20
 _runtime_probe_cache_lock = threading.Lock()
 _runtime_probe_cache_at = 0.0
 _runtime_probe_cache: dict[str, object] | None = None
@@ -149,6 +150,10 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         "tracker.ultimate.check",
         help="Check Ultimate dongle, runtime, permissions, and saved bindings.",
     ).set_defaults(func=run_check)
+    subparsers.add_parser(
+        "tracker.ultimate.update-preflight",
+        help="Inspect Ultimate runtime preservation before an Axol update.",
+    ).set_defaults(func=run_update_preflight)
 
 
 def _run(
@@ -578,6 +583,55 @@ def _packaged_wifi_status(probe: dict[str, object]) -> str:
             return "missing"
         return "placeholder" if digest == _PYVUT_DEFAULT_WIFI_SHA256 else "customized"
     return "missing"
+
+
+def ultimate_runtime_update_requirement() -> tuple[str | None, str | None]:
+    """Return the opted-in pyvut requirement to preserve across an Axol update.
+
+    ``uv tool install --force`` rebuilds the complete Axol environment.  An
+    Ultimate runtime is installed explicitly rather than declared in Axol's
+    PyPI metadata, so the self-updater must carry the exact tested VCS
+    requirement into that same transaction or uv will prune it.  A missing or
+    differently pinned runtime is not opted in and is left alone.
+
+    Older manual setups sometimes put private Wi-Fi values directly in
+    pyvut's package-local ``wifi_info.json``.  Rebuilding the environment
+    overwrites that file, so refuse the update until those values have been
+    moved to Axol's durable config.  The returned error never includes a
+    credential value.
+    """
+    _version, commit = _installed_pyvut()
+    if commit != _PYVUT_REF:
+        return None, None
+
+    if _packaged_wifi_status({}) == "customized":
+        config_error = ultimate_wifi_config_error(ULTIMATE_WIFI_CONFIG_FILE)
+        if config_error is not None:
+            return (
+                None,
+                "VIVE Ultimate update preflight failed: pyvut has a customized "
+                "package-local Wi-Fi config, but the durable Axol config is "
+                f"not usable ({config_error}). Save it in "
+                f"{ULTIMATE_WIFI_CONFIG_FILE}, then retry; no credential values "
+                "were read into this error.",
+            )
+    return _PYVUT_SPEC, None
+
+
+def run_update_preflight(_args: object = None) -> None:
+    """Machine-readable preservation contract for the shell installer.
+
+    Success with empty stdout means the explicit runtime is absent; success
+    with one VCS requirement line means preserve it in uv's transaction.  A
+    secret-safe blocked preflight exits with a distinct status so installer
+    re-runs stop before replacing the environment.
+    """
+    requirement, error = ultimate_runtime_update_requirement()
+    if error is not None:
+        print(error, file=sys.stderr)
+        raise SystemExit(_UPDATE_PREFLIGHT_BLOCKED)
+    if requirement is not None:
+        print(requirement)
 
 
 def _wifi_config_status(probe: dict[str, object]) -> tuple[str, str]:

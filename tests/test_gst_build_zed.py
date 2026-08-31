@@ -47,6 +47,16 @@ class ZedGstreamerBuildDependenciesTest(unittest.TestCase):
         pip_install.assert_not_called()
         self.assertIn("Not an NVIDIA Jetson", output.getvalue())
 
+    def test_gst_install_fails_when_attempted_stack_is_still_unready(self) -> None:
+        with (
+            patch.object(install, "_is_jetson", return_value=True),
+            patch.object(install, "_gst_ok", side_effect=(False, False)),  # noqa: SLF001
+            patch.object(install, "_apt_install", return_value=False),  # noqa: SLF001
+            patch.object(install, "_pip_install_pygobject", return_value=False),  # noqa: SLF001
+            self.assertRaisesRegex(SystemExit, "still unavailable"),
+        ):
+            install.run()
+
     def test_declares_zed_sdk_link_dependencies(self) -> None:
         # zed-config.cmake requires BLAS and links the unversioned libusb
         # library. Runtime-only packages do not provide those linker files.
@@ -94,11 +104,11 @@ class ZedGstreamerBuildDependenciesTest(unittest.TestCase):
                 patch.object(build_zed, "_apt_install_build_deps", return_value=False),
                 patch.object(build_zed, "_sync_source", sync_source),  # noqa: SLF001
                 redirect_stdout(output),
+                self.assertRaisesRegex(SystemExit, "Could not install"),
             ):
                 build_zed.run()
 
         sync_source.assert_not_called()
-        self.assertIn("could not install", output.getvalue())
 
     def test_build_is_forced_to_one_job(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

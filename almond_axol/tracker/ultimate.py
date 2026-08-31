@@ -48,11 +48,29 @@ ULTIMATE_DONGLE_VID = 0x0BB4
 ULTIMATE_DONGLE_PID = 0x0350
 ULTIMATE_WIFI_CONFIG_FILE = almond_path("tracker", "ultimate_wifi.json")
 
+_ULTIMATE_WIFI_KEYS = frozenset({"ssid", "pass", "country", "freq"})
+_ISO_ALPHA_2_COUNTRIES = frozenset(
+    """
+    AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI
+    BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN
+    CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK
+    FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM
+    HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN
+    KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK
+    ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP
+    NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW
+    SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF
+    TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI
+    VN VU WF WS YE YT ZA ZM ZW
+    """.split()
+)
+
 # pyvut's numeric status values come from the tracker's pose-status enum:
 # 2 = position + rotation, 3 = rotation only, 4 = frozen position.  Only 2 is
 # a trustworthy 6-DoF sample.  String statuses support API-compatible wrappers.
 _GOOD_STATUS_STRINGS = {"tracking", "ok"}
 _MISSING = object()
+_READER_STOP_TIMEOUT_S = 1.0
 
 
 def _reader_health_error(api: object) -> str | None:
@@ -95,6 +113,77 @@ def _reader_health_error(api: object) -> str | None:
     return None
 
 
+def ultimate_wifi_values_error(value: object) -> str | None:
+    """Return a secret-safe error for pyvut's exact Wi-Fi document shape.
+
+    Channel legality remains country-specific and must be checked by the
+    operator.  The checks here reject values that cannot be valid Wi-Fi
+    credentials or channel centers before they reach pyvut's HID framing.
+    """
+    if not isinstance(value, dict):
+        return "top-level value must be a JSON object"
+    keys = set(value)
+    if keys != _ULTIMATE_WIFI_KEYS:
+        missing = sorted(_ULTIMATE_WIFI_KEYS - keys)
+        extra = sorted(keys - _ULTIMATE_WIFI_KEYS)
+        details: list[str] = []
+        if missing:
+            details.append("missing keys: " + ", ".join(missing))
+        if extra:
+            details.append("unknown keys: " + ", ".join(extra))
+        return "config must contain exactly ssid, pass, country, and freq" + (
+            f" ({'; '.join(details)})" if details else ""
+        )
+
+    ssid = value.get("ssid")
+    password = value.get("pass")
+    country = value.get("country")
+    frequency = value.get("freq")
+    if not isinstance(ssid, str):
+        return "`ssid` must be a string containing 1 to 32 UTF-8 bytes"
+    try:
+        ssid_bytes = ssid.encode("utf-8")
+    except UnicodeEncodeError:
+        return "`ssid` must contain valid UTF-8 text"
+    if not 1 <= len(ssid_bytes) <= 32:
+        return "`ssid` must contain 1 to 32 UTF-8 bytes"
+    if any(ord(char) < 32 or ord(char) == 127 for char in ssid):
+        return "`ssid` must not contain control characters"
+
+    if not isinstance(password, str):
+        return "`pass` must be an 8 to 63 character printable ASCII passphrase"
+    printable_ascii = password.isascii() and all(
+        32 <= ord(char) <= 126 for char in password
+    )
+    raw_psk = len(password) == 64 and all(
+        char in "0123456789abcdefABCDEF" for char in password
+    )
+    if not ((8 <= len(password) <= 63 and printable_ascii) or raw_psk):
+        return (
+            "`pass` must be an 8 to 63 character printable ASCII passphrase "
+            "or a 64-digit hexadecimal PSK"
+        )
+
+    country_code = country.upper() if isinstance(country, str) else ""
+    if country_code not in _ISO_ALPHA_2_COUNTRIES:
+        return "`country` must be an ISO 3166-1 two-letter country code"
+
+    if not isinstance(frequency, int) or isinstance(frequency, bool):
+        return "`freq` must be a Wi-Fi channel center frequency in MHz"
+    is_channel_center = (
+        (2412 <= frequency <= 2472 and (frequency - 2412) % 5 == 0)
+        or frequency == 2484
+        or (5000 <= frequency <= 5895 and frequency % 5 == 0)
+        or (5955 <= frequency <= 7115 and (frequency - 5955) % 5 == 0)
+    )
+    if not is_channel_center:
+        return (
+            "`freq` must be a recognized 2.4, 5, or 6 GHz Wi-Fi channel "
+            "center in MHz; verify that it is permitted for `country`"
+        )
+    return None
+
+
 def ultimate_wifi_config_error(
     path: Path = ULTIMATE_WIFI_CONFIG_FILE,
 ) -> str | None:
@@ -107,22 +196,7 @@ def ultimate_wifi_config_error(
         return f"file cannot be read ({exc})"
     except json.JSONDecodeError as exc:
         return f"file is not valid JSON (line {exc.lineno}, column {exc.colno})"
-    if not isinstance(value, dict):
-        return "top-level value must be a JSON object"
-
-    ssid = value.get("ssid")
-    password = value.get("pass")
-    country = value.get("country")
-    frequency = value.get("freq")
-    if not isinstance(ssid, str) or not ssid:
-        return "`ssid` must be a non-empty string"
-    if not isinstance(password, str) or not password:
-        return "`pass` must be a non-empty string"
-    if not isinstance(country, str) or len(country) != 2 or not country.isalpha():
-        return "`country` must be a two-letter string"
-    if not isinstance(frequency, int) or isinstance(frequency, bool) or frequency <= 0:
-        return "`freq` must be a positive integer"
-    return None
+    return ultimate_wifi_values_error(value)
 
 
 def ultimate_dongle_present() -> bool | None:
@@ -176,17 +250,76 @@ def _dongle_open_error(exc: BaseException) -> RuntimeError:
 
 
 def _stop_api(api: object, *, uses_context_exit: bool) -> None:
-    """Best-effort stop for both supported pyvut lifecycle variants."""
+    """Stop pyvut and prove its captured HID reader thread has exited."""
+    # The pinned pyvut stop() drops ``api._thread`` after a bounded join even
+    # when that thread is still alive. Capture it first so an apparent API
+    # cleanup cannot hide a poller that still owns the dongle.
     try:
-        stop = getattr(api, "stop", None)
-        if not uses_context_exit and callable(stop):
-            stop()
-            return
-        exit_context = getattr(api, "__exit__", None)
-        if uses_context_exit and callable(exit_context):
+        reader = getattr(api, "_thread", None)
+    except Exception:  # noqa: BLE001 - third-party properties may be dynamic
+        reader = None
+
+    failures: list[BaseException] = []
+    try:
+        if uses_context_exit:
+            exit_context = getattr(api, "__exit__", None)
+            if not callable(exit_context):
+                raise RuntimeError("pyvut context exit is no longer callable")
             exit_context(None, None, None)
-    except Exception:  # noqa: BLE001 - teardown must not mask the real failure
-        _logger.exception("ultimate backend teardown failed")
+        else:
+            stop = getattr(api, "stop", None)
+            if not callable(stop):
+                raise RuntimeError("pyvut stop is no longer callable")
+            stop()
+    except BaseException as exc:  # still verify/join the reader below
+        failures.append(exc)
+
+    if reader is not None:
+        join = getattr(reader, "join", None)
+        is_alive = getattr(reader, "is_alive", None)
+        if callable(join) and reader is not threading.current_thread():
+            try:
+                join(timeout=_READER_STOP_TIMEOUT_S)
+            except BaseException as exc:
+                failures.append(exc)
+        if callable(is_alive):
+            try:
+                alive = bool(is_alive())
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                if alive:
+                    failures.append(
+                        RuntimeError(
+                            "pyvut HID reader thread is still alive after stop"
+                        )
+                    )
+
+    if failures:
+        for extra in failures[1:]:
+            failures[0].add_note(
+                f"additional Ultimate teardown failure: {type(extra).__name__}: {extra}"
+            )
+        raise TrackerSourceError(
+            "Ultimate tracker teardown failed; HID ownership is uncertain"
+        ) from failures[0]
+
+
+def _note_start_cleanup_failure(
+    error: BaseException,
+    api: object,
+    *,
+    uses_context_exit: bool,
+) -> None:
+    """Try cleanup after failed startup without replacing its useful error."""
+    try:
+        _stop_api(api, uses_context_exit=uses_context_exit)
+    except BaseException as cleanup_error:
+        _logger.exception("ultimate backend cleanup after failed startup failed")
+        error.add_note(
+            "Ultimate startup cleanup also failed; HID ownership is uncertain: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
 
 
 class UltimateSource(TrackerSource):
@@ -290,13 +423,17 @@ class UltimateSource(TrackerSource):
                 uses_context_exit = True
         except RuntimeError as exc:
             if api is not None:
-                _stop_api(api, uses_context_exit=uses_context_exit)
+                _note_start_cleanup_failure(
+                    exc, api, uses_context_exit=uses_context_exit
+                )
             if "installed pyvut" in str(exc):
                 raise
             raise _dongle_open_error(exc) from exc
         except Exception as exc:  # noqa: BLE001 - pyvut/HID error types vary
             if api is not None:
-                _stop_api(api, uses_context_exit=uses_context_exit)
+                _note_start_cleanup_failure(
+                    exc, api, uses_context_exit=uses_context_exit
+                )
             raise _dongle_open_error(exc) from exc
 
         self._api = api
@@ -306,8 +443,8 @@ class UltimateSource(TrackerSource):
     def stop(self) -> None:
         if self._api is not None:
             api = self._api
-            self._api = None
             _stop_api(api, uses_context_exit=self._api_uses_context_exit)
+            self._api = None
             self._api_uses_context_exit = False
 
     def poses(self) -> dict[str, TrackerPose]:

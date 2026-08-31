@@ -19,13 +19,18 @@ Examples:
 
 import argparse
 import asyncio
-import json
 from pathlib import Path
 from typing import Any
 
 from ...motor.bus import CanBus
 from ...motor.config import Access
 from ...motor.motor import make_driver
+from ...utils.paths import almond_home
+from ...utils.state_files import (
+    privileged_service_active,
+    require_path_beneath,
+    secure_atomic_write_json,
+)
 from . import add_side_and_channel_arguments, resolve_channel
 
 
@@ -148,7 +153,16 @@ async def _run(args: argparse.Namespace) -> None:
         print("\nnothing to save — no motor answered")
         return
 
-    args.out.write_text(
-        json.dumps({"channel": channel, "motors": motors}, indent=2) + "\n"
+    output = args.out
+    if privileged_service_active():
+        output = require_path_beneath(
+            output,
+            almond_home(),
+            label="motor configuration output",
+        )
+    secure_atomic_write_json(
+        output,
+        {"channel": channel, "motors": motors},
+        sort_keys=False,
     )
-    print(f"\nsaved {len(motors)} motor(s) to {args.out}")
+    print(f"\nsaved {len(motors)} motor(s) to {output}")

@@ -30,6 +30,7 @@ import asyncio
 import logging
 import threading
 import time
+from concurrent.futures import Future
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -40,6 +41,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ...constants import Joint
 from ...robot.axol import Axol
+from ...robot.base import HardwareCleanupError
 from ...teleop.config import VRTeleopConfig
 from ...teleop.filter import TrapezoidalFilter
 from .config_axol import AxolRobotConfig
@@ -138,6 +140,11 @@ class AxolRobot(Robot):
         self._axol: Axol | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
+        self._connect_future: Future[None] | None = None
+        # Retain a timed-out shutdown Future.  ``Future.result(timeout)`` does
+        # not stop its coroutine, so a retry must wait for this exact attempt
+        # rather than submit a second, overlapping motor/bus teardown.
+        self._disconnect_future: Future[None] | None = None
         self.cameras, self._stereo_cameras = self._build_cameras()
         self._observation_features: dict[str, type | tuple] | None = None
         self._action_features: dict[str, type | tuple] | None = None
@@ -349,6 +356,14 @@ class AxolRobot(Robot):
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         """Open CAN buses, enable motors, start telemetry, and connect cameras."""
+        if (
+            self._connect_future is not None
+            or self._disconnect_future is not None
+            or (self._loop_thread is not None and self._loop_thread.is_alive())
+        ):
+            raise HardwareCleanupError(
+                "a previous robot shutdown is incomplete; retry disconnect first"
+            )
         loop = asyncio.new_event_loop()
         self._loop = loop
         self._loop_thread = threading.Thread(
@@ -356,7 +371,19 @@ class AxolRobot(Robot):
         )
         self._loop_thread.start()
 
-        asyncio.run_coroutine_threadsafe(self._connect_async(), loop).result(timeout=30)
+        self._connect_future = asyncio.run_coroutine_threadsafe(
+            self._connect_async(), loop
+        )
+        try:
+            self._connect_future.result(timeout=30)
+        except BaseException:
+            # Retain a timed-out attempt so disconnect() waits for this exact
+            # coroutine before disabling. A completed failure can be cleaned
+            # immediately, but its loop still remains for disconnect().
+            if self._connect_future.done():
+                self._connect_future = None
+            raise
+        self._connect_future = None
 
         if self.config.observe_cartesian and self._fk is None:
             from ...kinematics.fk import AxolForwardKinematics
@@ -402,25 +429,70 @@ class AxolRobot(Robot):
 
     def disconnect(self) -> None:
         """Disable motors, stop telemetry, close CAN buses, and disconnect cameras."""
+        camera_failures: list[BaseException] = []
         for cam in self.cameras.values():
             if cam.is_connected:
-                cam.disconnect()
+                try:
+                    cam.disconnect()
+                except BaseException as exc:
+                    # Cameras must not prevent the motor/bus teardown below.
+                    camera_failures.append(exc)
 
-        if self._loop is not None and self._axol is not None:
-            asyncio.run_coroutine_threadsafe(
-                self._disconnect_async(), self._loop
-            ).result(timeout=10)
+        if self._connect_future is not None:
+            connect_future = self._connect_future
+            try:
+                connect_future.result(timeout=10)
+            except TimeoutError as exc:
+                raise HardwareCleanupError(
+                    "robot connect is still running; hardware ownership is uncertain"
+                ) from exc
+            except BaseException:
+                # The failed bring-up is the caller's visible error; cleanup
+                # must still disable whatever subset it opened.
+                pass
+            finally:
+                if connect_future.done():
+                    self._connect_future = None
+
+        if self._loop is not None and (
+            self._axol is not None or self._disconnect_future is not None
+        ):
+            if self._disconnect_future is None:
+                self._disconnect_future = asyncio.run_coroutine_threadsafe(
+                    self._disconnect_async(), self._loop
+                )
+            future = self._disconnect_future
+            try:
+                future.result(timeout=10)
+            except BaseException as exc:
+                # A completed failure is retryable by submitting a fresh
+                # disable. A timeout stays attached so the retry waits for the
+                # still-running coroutine instead of overlapping it.
+                if future.done():
+                    self._disconnect_future = None
+                raise HardwareCleanupError(
+                    "robot disable failed; hardware ownership is uncertain"
+                ) from exc
+            self._disconnect_future = None
 
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=5)
+            if self._loop_thread.is_alive():
+                raise HardwareCleanupError(
+                    "robot event loop did not stop; hardware ownership is uncertain"
+                )
+        if self._loop is not None:
+            self._loop.close()
 
         self._loop = None
         self._loop_thread = None
         self._fk = None
         self._ik = None
         _logger.info("AxolRobot disconnected.")
+        if camera_failures:
+            raise camera_failures[0]
 
     async def _disconnect_async(self) -> None:
         if self._axol is None:
@@ -618,23 +690,25 @@ class AxolRobot(Robot):
                 else default_tracking_ik_config()
             )
             _logger.info("Building IK solver for Cartesian actions...")
-            self._ik = KinematicsSolver(ik_config)
+            solver = KinematicsSolver(ik_config)
 
             # The solver warms up its *with-elbow* IK graph, but our Cartesian
             # sends pass no elbow hint — a distinct graph that would otherwise
             # JIT-compile on the first real send, blocking the event loop past
             # send_action's timeout (and clogging it for the rest of the run).
             # Compile that exact no-elbow variant here, on the caller thread,
-            # with a dummy reachable target. Best-effort: warmup only compiles.
+            # with a dummy reachable target. A failure means this solver cannot
+            # execute the policy's real command shape, so fail startup instead
+            # of logging a false-ready worker and discovering it after motion
+            # begins. Publish ``self._ik`` only after both warmups succeed so a
+            # caller may safely retry construction.
             dummy_pose = (
                 np.array([0.0, 0.0, 0.3], dtype=np.float32),
                 np.eye(3, dtype=np.float32),
             )
-            q0 = np.zeros(self._ik.num_joints, dtype=np.float32)
-            try:
-                self._ik.ik(q0, left_pose=dummy_pose, right_pose=dummy_pose)
-            except Exception:  # noqa: BLE001 - warmup just triggers compilation
-                _logger.warning("Cartesian IK warmup failed", exc_info=True)
+            q0 = np.zeros(solver.num_joints, dtype=np.float32)
+            solver.ik(q0, left_pose=dummy_pose, right_pose=dummy_pose)
+            self._ik = solver
             _logger.info("IK solver ready for Cartesian actions.")
         return self._ik
 

@@ -231,13 +231,35 @@ class TriggerReader:
             return is_stale(self._last_rx, now)
 
     def close(self) -> None:
-        """Stop the reader thread and shut the CAN socket down."""
+        """Stop the reader thread and prove the CAN socket was released."""
         self._stop.set()
-        self._thread.join(timeout=1.0)
+        failures: list[BaseException] = []
+
+        # Closing the socket first also unblocks a backend which does not
+        # honour ``recv(timeout=...)``.  Still join when shutdown itself
+        # fails: the stop event may be enough for the normal timeout path.
         try:
             self._bus.shutdown()
-        except Exception:  # noqa: BLE001 - best-effort teardown
-            pass
+        except BaseException as exc:
+            failures.append(exc)
+        try:
+            self._thread.join(timeout=1.0)
+        except BaseException as exc:
+            failures.append(exc)
+        else:
+            if self._thread.is_alive():
+                failures.append(RuntimeError("trigger CAN reader thread did not stop"))
+
+        if failures:
+            first = failures[0]
+            for extra in failures[1:]:
+                first.add_note(
+                    "additional trigger cleanup failure: "
+                    f"{type(extra).__name__}: {extra}"
+                )
+            raise RuntimeError(
+                "trigger reader teardown failed; CAN ownership is uncertain"
+            ) from first
 
     # -- Reader thread ------------------------------------------------------
 

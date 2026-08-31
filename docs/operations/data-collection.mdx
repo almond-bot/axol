@@ -7,6 +7,12 @@ Data collection records teleoperation episodes plus synchronized camera frames i
 
 You can launch either profile from the **web control panel** or the **CLI** (`axol collect-data`). Quest uses the **A** button for recording. Managed Lighthouse/Ultimate Mantis runs use a triple rig-trigger gesture, and the control panel can drive every source with on-screen episode buttons.
 
+<Note>
+  Panel recordings use `/var/lib/almond-axol/datasets`, a root-owned store the
+  operator group can read but not mutate. CLI recordings run as the operator
+  and retain the usual user-cache location.
+</Note>
+
 ## Before you start
 
 - **Axol installed** ([one-command install](/installation)), CAN up, and the active hardware profile verified. Mantis needs two distinct trigger/gripper channels, normally `can_mantis_l/r`.

@@ -10,9 +10,7 @@ and every validation error in this module.
 from __future__ import annotations
 
 import json
-import os
 import stat
-import tempfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -27,8 +25,8 @@ from ..mantis.calibration import (
     validate_tcp_transform,
 )
 from ..tracker.config import TRACKER_CONFIG_FILE, load_tracker_config
-from ..tracker.ultimate import ULTIMATE_WIFI_CONFIG_FILE
-from ..utils.paths import adopt_state_file
+from ..tracker.ultimate import ULTIMATE_WIFI_CONFIG_FILE, ultimate_wifi_values_error
+from ..utils.state_files import secure_atomic_write_json, secure_read_text
 
 
 class TrackerSetupError(ValueError):
@@ -36,7 +34,6 @@ class TrackerSetupError(ValueError):
 
 
 _SETUP_FILE_LOCK = threading.RLock()
-_WIFI_KEYS = frozenset({"ssid", "pass", "country", "freq"})
 _WIFI_REQUIRED_UPDATE_KEYS = frozenset({"ssid", "country", "freq"})
 _CALIBRATION_SOURCES = frozenset({"quest", "lighthouse", "ultimate"})
 _SIDES = ("left", "right")
@@ -44,85 +41,26 @@ _SIDES = ("left", "right")
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     """Atomically write restrictive JSON while retaining operator ownership."""
-    old_owner: tuple[int, int] | None = None
-    try:
-        before = path.stat()
-        old_owner = (before.st_uid, before.st_gid)
-    except FileNotFoundError:
-        pass
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # A root service may have created this source-specific directory.  Give it
-    # to the owner of ALMOND_HOME just like the finished state file below.
-    adopt_state_file(path.parent)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        tmp.chmod(0o600)
-        os.replace(tmp, path)
-        path.chmod(0o600)
-        if os.geteuid() == 0 and old_owner is not None and old_owner[0] != 0:
-            # Atomic replace creates a new inode.  Preserve an existing
-            # operator-owned file even if ALMOND_HOME itself happens to be
-            # root-owned (for example after a service migration).
-            os.chown(path, *old_owner)
-        else:
-            adopt_state_file(path)
-    finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+    secure_atomic_write_json(path, payload)
 
 
 def _wifi_values(payload: object) -> dict[str, Any]:
     """Validate and normalize the exact pyvut Wi-Fi document shape."""
-    if not isinstance(payload, dict):
-        raise TrackerSetupError("Wi-Fi config must be a JSON object")
-    keys = set(payload)
-    if keys != _WIFI_KEYS:
-        missing = sorted(_WIFI_KEYS - keys)
-        extra = sorted(keys - _WIFI_KEYS)
-        details: list[str] = []
-        if missing:
-            details.append("missing keys: " + ", ".join(missing))
-        if extra:
-            details.append("unknown keys: " + ", ".join(extra))
-        raise TrackerSetupError(
-            "Wi-Fi config must contain exactly ssid, pass, country, and freq"
-            + (f" ({'; '.join(details)})" if details else "")
-        )
-
-    ssid = payload.get("ssid")
-    password = payload.get("pass")
-    country = payload.get("country")
-    frequency = payload.get("freq")
-    if not isinstance(ssid, str) or not ssid.strip():
-        raise TrackerSetupError("`ssid` must be a non-empty string")
-    if not isinstance(password, str) or not password:
-        raise TrackerSetupError("`pass` must be a non-empty string")
-    if not isinstance(country, str) or len(country) != 2 or not country.isalpha():
-        raise TrackerSetupError("`country` must be a two-letter string")
-    if not isinstance(frequency, int) or isinstance(frequency, bool) or frequency <= 0:
-        raise TrackerSetupError("`freq` must be a positive integer")
+    error = ultimate_wifi_values_error(payload)
+    if error is not None:
+        raise TrackerSetupError(error)
+    assert isinstance(payload, dict)
     return {
-        "ssid": ssid,
-        "pass": password,
-        "country": country.upper(),
-        "freq": frequency,
+        "ssid": payload["ssid"],
+        "pass": payload["pass"],
+        "country": payload["country"].upper(),
+        "freq": payload["freq"],
     }
 
 
 def _read_wifi_document(path: Path) -> tuple[object | None, str | None]:
     try:
-        return json.loads(path.read_text()), None
+        return json.loads(secure_read_text(path)), None
     except FileNotFoundError:
         return None, None
     except json.JSONDecodeError as exc:
@@ -171,7 +109,7 @@ def ultimate_wifi_snapshot(path: Path | None = None) -> dict[str, Any]:
                 error = str(exc)
             else:
                 try:
-                    mode = stat.S_IMODE(path.stat().st_mode)
+                    mode = stat.S_IMODE(path.lstat().st_mode)
                 except OSError as exc:
                     status = "invalid"
                     error = f"file metadata cannot be read ({exc})"
@@ -264,7 +202,7 @@ def _exact_tracker_keys(
 
 def _read_calibration_document(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(secure_read_text(path))
     except FileNotFoundError:
         return {}
     except json.JSONDecodeError as exc:
