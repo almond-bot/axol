@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import tempfile
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -82,6 +85,47 @@ class HostUpdateLockTest(unittest.TestCase):
             with host_update_lock.host_update_lock():
                 pass
         validate.assert_not_called()
+
+    def test_holder_owns_the_lock_only_until_its_stdin_closes(self) -> None:
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def fake_lock() -> Iterator[None]:
+            events.append("locked")
+            yield
+            events.append("released")
+
+        stdin = Mock()
+        stdin.buffer.read.side_effect = lambda: events.append("waited") or b""
+        stdout = io.StringIO()
+        with (
+            patch.object(host_update_lock, "host_update_lock", fake_lock),
+            patch.object(host_update_lock.sys, "stdin", stdin),
+            patch.object(host_update_lock.sys, "stdout", stdout),
+        ):
+            code = host_update_lock.hold_until_stdin_closes()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ["locked", "waited", "released"])
+        self.assertEqual(stdout.getvalue(), f"{host_update_lock.HOLDER_READY}\n")
+
+    def test_holder_reports_lock_errors_without_a_ready_line(self) -> None:
+        @contextlib.contextmanager
+        def busy_lock() -> Iterator[None]:
+            raise host_update_lock.HostUpdateLockError("transaction is active")
+            yield  # pragma: no cover - never reached
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            patch.object(host_update_lock, "host_update_lock", busy_lock),
+            patch.object(host_update_lock.sys, "stdout", stdout),
+            patch.object(host_update_lock.sys, "stderr", stderr),
+        ):
+            code = host_update_lock.hold_until_stdin_closes()
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("transaction is active", stderr.getvalue())
 
 
 if __name__ == "__main__":
