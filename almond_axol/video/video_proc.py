@@ -149,10 +149,8 @@ def _set_dataset_branches_enabled(owned: list[object], enabled: bool) -> None:
             raise RuntimeError("; ".join([*errors, *close_errors]))
         return
 
-    # Two phases are intentional: install the IDR probes on every physical
-    # camera before waiting on any one of them. Sequential arm+wait would stop
-    # cameras at different GOP phases and their episode-opening IDRs could be
-    # hundreds of milliseconds apart.
+    # Keep the two-phase camera API even though all-intra closes are immediate:
+    # legacy/raw cameras can still need an arm followed by a bounded finish.
     armed = []
     errors = []
     for cam in owned:
@@ -167,9 +165,7 @@ def _set_dataset_branches_enabled(owned: list[object], enabled: bool) -> None:
                 cam.set_raw_enabled(False)
             except Exception as exc:  # noqa: BLE001 - finish other cameras
                 errors.append(f"{cam}: {exc}")
-    # Matches gst_zed's gate bound. At the supported 1 fps minimum a valid next
-    # encoder output can arrive almost exactly one second later, so a 1.0 s
-    # deadline spuriously fails under any scheduling load.
+    # Matches gst_zed's gate bound for any legacy/raw finish transaction.
     deadline = time.perf_counter() + 2.0
     for cam in armed:
         try:
@@ -705,7 +701,7 @@ def _relay_main(
                 last = now
 
     def _set_raw_enabled(enabled: bool) -> None:
-        """Gate every dataset branch, coordinating encoded GOP phase."""
+        """Gate every dataset branch at a coordinated exposure boundary."""
         _set_dataset_branches_enabled(owned, bool(enabled))
 
     async def serve() -> None:
@@ -749,9 +745,9 @@ def _relay_main(
                 elif kind == "raw_enable":
                     _, enabled = msg
                     try:
-                        # Waiting for the cameras' next natural IDRs can take a
-                        # GOP. Keep that wait off aiortc's event loop so RTP,
-                        # RTCP, and signaling continue uninterrupted.
+                        # Dataset gates can wait for a shared exposure boundary.
+                        # Keep that wait off aiortc's event loop so RTP, RTCP,
+                        # and signaling continue uninterrupted.
                         await loop.run_in_executor(
                             None, _set_raw_enabled, bool(enabled)
                         )

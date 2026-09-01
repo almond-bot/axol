@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import multiprocessing
 import multiprocessing.connection
 import os
@@ -67,13 +68,13 @@ _CMD_TIMEOUT_S = 10.0
 _CAPTURE_STOP_TIMEOUT_S = 10.0
 
 # --- Encoded (relay-side H.264) capture-loop tuning ---
-# How long the first row waits for each camera's first access unit (relay valve
-# open + poised IDR + shmsrc delivery). If a camera produces nothing in this
-# window its dataset branch never came up, so the episode is aborted.
+# How long the first row waits for each camera's first access unit (shared valve
+# open + all-intra NVENC + shmsrc delivery). If a camera produces nothing in
+# this window its dataset branch never came up, so the episode is aborted.
 _ENCODED_START_TIMEOUT_S = 15.0
-# Row-wide budget shared by all cameras. A timeout aborts the episode: replaying
-# a previous predictive AU corrupts decoder reference state until the next IDR.
-# Shared (not per-camera) so serial reads cannot compound the wait.
+# Row-wide budget shared by all cameras. A timeout aborts the episode rather
+# than fabricating an exposure. Shared (not per-camera) so serial reads cannot
+# compound the wait.
 _ENCODED_ROW_TIMEOUT_S = 1.0
 # How often the blocking AU read wakes to re-check stop_event.
 _ENCODED_POLL_MS = 100
@@ -98,6 +99,16 @@ class RecorderDatasetSaveError(RuntimeError):
     The recorder/session must stop: LeRobot may already have appended parquet
     rows or advanced writer indices, and clearing the in-memory episode buffer
     cannot make a subsequent save safe.
+    """
+
+
+class RecorderCaptureError(RuntimeError):
+    """An episode was rejected before commit because capture lost integrity.
+
+    The capture thread has stopped and the in-memory episode buffer has been
+    cleared before this is raised, so the caller may safely retry the same
+    episode.  Recorder lifecycle, IPC, mux preparation, and dataset-writer
+    failures deliberately use other exception paths and remain session-fatal.
     """
 
 
@@ -864,6 +875,103 @@ def _camera_alignment_limit(fps: int) -> float:
     return max(0.010, 1.5 / fps) if fps > 0 else 0.050
 
 
+def _validate_encoded_cadence_step(
+    name: str,
+    *,
+    first_ts: float,
+    previous_ts: float,
+    capture_ts: float,
+    intervals: int,
+    fps: int,
+    capture_fps: int,
+) -> None:
+    """Fail closed when one encoded exposure is missing or off cadence."""
+    if not math.isfinite(capture_ts):
+        raise RuntimeError(f"camera {name!r} produced an invalid capture timestamp")
+    delta = capture_ts - previous_ts
+    if delta <= 0:
+        raise RuntimeError(
+            f"camera {name!r} capture PTS did not advance "
+            f"({delta * 1e3:.2f}ms); episode discarded"
+        )
+    # A non-divisor decimation (e.g. 60 -> 50) legitimately alternates
+    # source-frame spacings. Allow its largest planned spacing plus a quarter
+    # source interval. A whole extra source interval means a selected frame was
+    # lost.
+    planned_steps = (capture_fps + fps - 1) // fps
+    gap_limit = (planned_steps + 0.25) / capture_fps
+    if delta > gap_limit:
+        raise RuntimeError(
+            f"camera {name!r} dropped an encoded frame: capture PTS jumped "
+            f"{delta * 1e3:.2f}ms (limit {gap_limit * 1e3:.2f}ms); "
+            "episode discarded"
+        )
+    elapsed = capture_ts - first_ts
+    # videorate preserves the selected source PTS. Its phase may differ from
+    # an ideal dataset-rate grid by roughly one source interval, but sustained
+    # capture-rate output (for example after reopening a stale downstream
+    # videorate) must not be silently stretched onto the dataset timeline.
+    cadence_slack = 1.5 / capture_fps
+    minimum_elapsed = intervals / fps - cadence_slack
+    maximum_elapsed = intervals / fps + cadence_slack
+    if elapsed < minimum_elapsed or elapsed > maximum_elapsed:
+        direction = "too fast" if elapsed < minimum_elapsed else "too slow"
+        raise RuntimeError(
+            f"camera {name!r} encoded cadence is {direction}: "
+            f"{intervals + 1} frames span {elapsed * 1e3:.2f}ms at requested "
+            f"{fps}fps (allowed {max(0.0, minimum_elapsed) * 1e3:.2f}–"
+            f"{maximum_elapsed * 1e3:.2f}ms); episode discarded"
+        )
+
+
+def _align_independent_encoded_start(
+    packets: dict[str, tuple[bytes, float, float]],
+    read_next: Callable[[str], tuple[bytes, float, float] | None],
+    *,
+    fps: int,
+    capture_fps: dict[str, int],
+) -> tuple[dict[str, tuple[bytes, float, float]], dict[str, int]]:
+    """Advance lagging all-intra streams to one fixed row-zero boundary.
+
+    The shared raw-valve target is the primary synchronization barrier. A
+    dataset input queue can nevertheless shed a leading exposure, and NVENC can
+    deliver a stale in-flight tail after a prior close. Because the dataset
+    stream is explicitly all-intra, advancing a lagging camera here is safe: the
+    retained AU is still a self-contained frame-zero. The newest initial
+    exposure is a fixed boundary; moving it on overshoot could chase forever
+    when unsynchronized sensors have different phases. Predictive streams must
+    never call this helper.
+    """
+    dropped: dict[str, int] = {}
+    if len(packets) <= 1:
+        return packets, dropped
+    boundary = max(packet[1] for packet in packets.values())
+    first_ts = {name: packet[1] for name, packet in packets.items()}
+    intervals = dict.fromkeys(packets, 0)
+    for name in packets:
+        while packets[name][1] < boundary:
+            previous_ts = packets[name][1]
+            packet = read_next(name)
+            if packet is None:
+                raise TimeoutError(
+                    f"camera {name!r} did not catch up to the row-zero exposure window"
+                )
+            next_interval = intervals[name] + 1
+            _validate_encoded_cadence_step(
+                name,
+                first_ts=first_ts[name],
+                previous_ts=previous_ts,
+                capture_ts=packet[1],
+                intervals=next_interval,
+                fps=fps,
+                capture_fps=capture_fps[name],
+            )
+            intervals[name] = next_interval
+            packets[name] = packet
+            dropped[name] = dropped.get(name, 0) + 1
+    return packets, dropped
+
+
 def _warn_timestamp_skew(
     label: str, state_skew_s: float, camera_skew_s: float, fps: int
 ) -> bool:
@@ -1172,19 +1280,18 @@ def run_encoded_capture_loop(
 
     ``frame_counter`` mirrors :func:`run_capture_loop`'s (a mutable
     ``{"n": int}`` incremented per appended row). There is no ``record_event``
-    on this path: an encoded stream cannot gate mid-episode — every dropped
-    access unit is referenced by later P-frames.
+    on this path: capture rows remain continuous within an episode even though
+    each all-intra AU is independently decodable.
 
     Unlike :func:`run_capture_loop` (real-time paced, *selecting* the camera
-    frame nearest each tick and dropping the rest), an encoded stream cannot drop
-    frames — every P-frame depends on its predecessor — so this loop is driven by
-    the **arrival** of access units: it consumes exactly one AU per camera per
-    dataset row. GDP preserves each AU's sensor-exposure PTS; the row is paired
-    with the joint/action snapshot nearest the median camera exposure,
+    frame nearest each tick), this loop is driven by the **arrival** of access
+    units: after a one-time row-zero alignment it consumes exactly one AU per
+    camera per dataset row. GDP preserves each AU's sensor-exposure PTS; the row
+    is paired with the joint/action snapshot nearest the median camera exposure,
     independent of encoder, shm, and scheduler latency. The blocking per-camera
     read naturally paces the loop to the dataset cadence. A timeout, missing PTS,
     dropped frame, cross-camera phase error, or excessive state skew aborts the
-    episode; predictive H.264 AUs are never dropped or duplicated silently.
+    episode; exposures are never duplicated or silently omitted mid-episode.
 
     The muxer assigns each AU a constant-fps PTS (``k / fps``), so the mp4
     timeline is exact regardless of arrival jitter; its physical exposure PTS is
@@ -1200,10 +1307,9 @@ def run_encoded_capture_loop(
 
         tag_intervention = "intervention" in dataset.features
 
-        # Flush before the relay valve opens. Between episodes each encoder is
-        # frozen immediately before an IDR; arming the cutoff first guarantees
-        # that first reopened IDR survives into row zero instead of being
-        # cleared by a racing flush (which would lose a whole GOP of motion).
+        # Flush before the relay valve opens. Arming the cutoff first guarantees
+        # that a newly admitted all-intra AU survives into row zero instead of
+        # being cleared by a racing flush.
         split_flush = [
             cam
             for cam in cameras.values()
@@ -1273,8 +1379,7 @@ def run_encoded_capture_loop(
             # deadline keeps all cameras on the same clock; read_au's final
             # non-blocking attempt still accepts an AU already queued.
             row_deadline = time.perf_counter() + budget
-            aus: dict[str, bytes] = {}
-            capture_ts: dict[str, float] = {}
+            packets: dict[str, tuple[bytes, float, float]] = {}
             for cam_key, cam in cameras.items():
                 packet = read_au(cam, row_deadline)
                 if packet is None:
@@ -1285,19 +1390,68 @@ def run_encoded_capture_loop(
                         f"camera {cam_key!r} produced no fresh encoded frame "
                         f"within {budget:.1f}s during {phase}; episode discarded"
                     )
-                au, cap_ts, _recv_ts = packet
+                _au, cap_ts, _recv_ts = packet
                 if not np.isfinite(cap_ts):
                     raise RuntimeError(
                         f"camera {cam_key!r} produced an invalid capture timestamp"
                     )
-                aus[cam_key] = au
-                capture_ts[cam_key] = cap_ts
+                packets[cam_key] = packet
                 pending = cam.pending
                 if pending > max_pending:
                     max_pending = pending
 
             if stop_event.is_set():
                 return
+
+            # Trust but verify the raw-valve barrier using the timestamps that
+            # actually reached the recorder. A two-buffer leaky input queue or
+            # a stale NVENC tail can make one first AU later/earlier even though
+            # every valve crossed the same target. All-intra makes it safe to
+            # advance only the lagging streams until their first retained
+            # exposures form one valid camera cluster.
+            if not primed and len(packets) > 1:
+                start_times = [packet[1] for packet in packets.values()]
+                camera_limit = _camera_alignment_limit(fps)
+                if max(start_times) - min(start_times) > camera_limit:
+                    non_independent = [
+                        name
+                        for name, cam in cameras.items()
+                        if not bool(getattr(cam, "frames_are_independent", False))
+                    ]
+                    if non_independent:
+                        raise RuntimeError(
+                            "cannot align encoded row zero by dropping predictive "
+                            "frames from " + ", ".join(sorted(non_independent))
+                        )
+                    try:
+                        packets, startup_drops = _align_independent_encoded_start(
+                            packets,
+                            lambda name: read_au(cameras[name], row_deadline),
+                            fps=fps,
+                            capture_fps={
+                                name: max(
+                                    fps,
+                                    int(getattr(camera, "capture_fps", fps)),
+                                )
+                                for name, camera in cameras.items()
+                            },
+                        )
+                    except TimeoutError as exc:
+                        raise RuntimeError(f"{exc}; episode discarded") from exc
+                    if startup_drops:
+                        _logger.info(
+                            "aligned encoded row zero by discarding independent "
+                            "startup AUs: %s",
+                            ", ".join(
+                                f"{name}={count}"
+                                for name, count in sorted(startup_drops.items())
+                            ),
+                        )
+                    for cam in cameras.values():
+                        max_pending = max(max_pending, cam.pending)
+
+            aus = {name: packet[0] for name, packet in packets.items()}
+            capture_ts = {name: packet[1] for name, packet in packets.items()}
             primed = True
 
             for cam_key, cap_ts in capture_ts.items():
@@ -1306,46 +1460,16 @@ def run_encoded_capture_loop(
                     fps, int(getattr(cameras[cam_key], "capture_fps", fps))
                 )
                 if previous is not None:
-                    delta = cap_ts - previous
-                    if delta <= 0:
-                        raise RuntimeError(
-                            f"camera {cam_key!r} capture PTS did not advance "
-                            f"({delta * 1e3:.2f}ms); episode discarded"
-                        )
-                    # A non-divisor decimation (e.g. 60 -> 50) legitimately
-                    # alternates source-frame spacings. Allow its largest
-                    # planned spacing plus a quarter source interval. A whole
-                    # extra source interval means a selected frame was lost.
-                    planned_steps = (capture_fps + fps - 1) // fps
-                    gap_limit = (planned_steps + 0.25) / capture_fps
-                    if delta > gap_limit:
-                        raise RuntimeError(
-                            f"camera {cam_key!r} dropped an encoded frame: "
-                            f"capture PTS jumped {delta * 1e3:.2f}ms "
-                            f"(limit {gap_limit * 1e3:.2f}ms); episode discarded"
-                        )
                     intervals = capture_intervals[cam_key] + 1
-                    elapsed = cap_ts - first_capture_ts[cam_key]
-                    # videorate preserves the selected source PTS. Its phase
-                    # may differ from an ideal dataset-rate grid by roughly one
-                    # source interval, but sustained capture-rate output (for
-                    # example after reopening a stale downstream videorate)
-                    # must not be silently stretched onto the dataset timeline.
-                    cadence_slack = 1.5 / capture_fps
-                    minimum_elapsed = intervals / fps - cadence_slack
-                    maximum_elapsed = intervals / fps + cadence_slack
-                    if elapsed < minimum_elapsed or elapsed > maximum_elapsed:
-                        direction = (
-                            "too fast" if elapsed < minimum_elapsed else "too slow"
-                        )
-                        raise RuntimeError(
-                            f"camera {cam_key!r} encoded cadence is {direction}: "
-                            f"{intervals + 1} frames span {elapsed * 1e3:.2f}ms "
-                            f"at requested {fps}fps (allowed "
-                            f"{max(0.0, minimum_elapsed) * 1e3:.2f}–"
-                            f"{maximum_elapsed * 1e3:.2f}ms); "
-                            "episode discarded"
-                        )
+                    _validate_encoded_cadence_step(
+                        cam_key,
+                        first_ts=first_capture_ts[cam_key],
+                        previous_ts=previous,
+                        capture_ts=cap_ts,
+                        intervals=intervals,
+                        fps=fps,
+                        capture_fps=capture_fps,
+                    )
                     capture_intervals[cam_key] = intervals
                 else:
                     first_capture_ts[cam_key] = cap_ts
@@ -1859,7 +1983,7 @@ class InProcessRecorder:
         self._stop_capture()
         if self._capture_error is not None:
             self._dataset.clear_episode_buffer()
-            raise RuntimeError(
+            raise RecorderCaptureError(
                 f"recorder capture failed: {self._capture_error}; episode discarded"
             )
         return self._frames["n"]
@@ -1874,7 +1998,7 @@ class InProcessRecorder:
         self._stop_capture()
         if self._capture_error is not None:
             self._dataset.clear_episode_buffer()
-            raise RuntimeError(
+            raise RecorderCaptureError(
                 f"recorder capture failed: {self._capture_error}; episode discarded"
             )
         n_dropped = dropped_frames()
@@ -1882,7 +2006,7 @@ class InProcessRecorder:
             # Mirrors the recorder subprocess: a dropped frame's row still
             # exists, so the video is misaligned — never save it silently.
             self._dataset.clear_episode_buffer()
-            raise RuntimeError(
+            raise RecorderCaptureError(
                 f"{n_dropped} video frame(s) were dropped by the encoder "
                 "(feed queue overflow) — the episode's video is misaligned "
                 "with its rows; episode discarded."
@@ -1964,11 +2088,11 @@ def _recorder_main(
     # (recorder encodes). Pick the matching encoder + capture loop from that.
     raw_meta = config["raw_meta"]
     transports = {str(meta["transport"]) for meta in raw_meta.values()}
-    # Capture is either access-unit-driven (every predictive H.264 AU becomes a
-    # row) or raw-frame-driven (one independently selectable image per tick).
-    # Combining those contracts in one episode would require dropping H.264
-    # dependencies or duplicating raw frames, so reject an unsupported mixed
-    # construction explicitly instead of failing later on a missing reader API.
+    # Capture is either access-unit-driven (every H.264 exposure becomes a row)
+    # or raw-frame-driven (one independently selectable image per tick). Combining
+    # those contracts in one episode would require two pacing models, so reject an
+    # unsupported mixed construction explicitly instead of failing later on a
+    # missing reader API.
     if "gstshm-h264" in transports and len(transports) != 1:
         raise RuntimeError(
             "recorder camera transports must be uniformly gstshm-h264 or raw; "
@@ -2136,9 +2260,14 @@ def _recorder_main(
                 except RuntimeError as exc:
                     conn.send(("error", str(exc)))
                 else:
-                    if capture_error["v"] is not None:
+                    finished_capture_error = capture_error["v"]
+                    if finished_capture_error is not None:
                         dataset.clear_episode_buffer()
-                    conn.send(("finished", frame_counter["n"]))
+                    # Carry the post-join result on the command channel.  The
+                    # notification pipe makes live polling prompt, but cannot
+                    # be the finish authority: its delivery may race this
+                    # reply even though the capture thread has already exited.
+                    conn.send(("finished", frame_counter["n"], finished_capture_error))
             elif kind == "pause_episode":
                 if encoded_mode:
                     conn.send(
@@ -2178,7 +2307,7 @@ def _recorder_main(
                 n_dropped = dropped_frames()
                 if capture_error["v"] is not None:
                     dataset.clear_episode_buffer()
-                    conn.send(("error", capture_error["v"]))
+                    conn.send(("capture_error", capture_error["v"]))
                 elif n_dropped:
                     # A dropped frame was never encoded but its row exists, so
                     # the episode's video is misaligned with its rows (and
@@ -2187,7 +2316,7 @@ def _recorder_main(
                     dataset.clear_episode_buffer()
                     conn.send(
                         (
-                            "error",
+                            "capture_error",
                             f"{n_dropped} video frame(s) were dropped by the "
                             "encoder (feed queue overflow) — the episode's "
                             "video is misaligned with its rows; episode "
@@ -2428,12 +2557,17 @@ class DatasetRecorderProcess:
             if not self._conn.poll(_CMD_TIMEOUT_S + 1.0):
                 raise RuntimeError("recorder did not stop episode capture in time")
             msg = self._conn.recv()
-        if msg[0] != "finished":
-            detail = msg[1] if len(msg) > 1 else repr(msg)
+        if not isinstance(msg, tuple) or not msg or msg[0] != "finished":
+            detail = msg[1] if isinstance(msg, tuple) and len(msg) > 1 else repr(msg)
             raise RuntimeError(f"recorder finish_episode failed: {detail}")
-        capture_error = self.poll_capture_error()
-        if capture_error is not None:
+        if len(msg) != 3:
             raise RuntimeError(
+                f"recorder finish_episode sent unexpected reply: {msg!r}"
+            )
+        capture_error = msg[2]
+        if capture_error is not None:
+            self._capture_error = str(capture_error)
+            raise RecorderCaptureError(
                 f"recorder capture failed: {capture_error}; episode discarded"
             )
         return int(msg[1])
@@ -2487,8 +2621,15 @@ class DatasetRecorderProcess:
             if not self._conn.poll(_SAVE_TIMEOUT_S):
                 raise RuntimeError("recorder did not finish save_episode in time")
             msg = self._conn.recv()
+        if not isinstance(msg, tuple) or not msg:
+            raise RuntimeError(f"recorder save_episode sent unexpected reply: {msg!r}")
         if msg[0] == "saved":
             self._episode_count = int(msg[1])
+        elif msg[0] == "capture_error":
+            self._capture_error = str(msg[1])
+            raise RecorderCaptureError(
+                f"recorder capture failed: {msg[1]}; episode discarded"
+            )
         elif msg[0] == "error":
             raise RuntimeError(f"recorder save_episode failed: {msg[1]}")
         elif msg[0] == "fatal":

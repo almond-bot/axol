@@ -94,6 +94,7 @@ from ..lerobot.rollout import (
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..recording import (
     DatasetRecorderProcess,
+    RecorderCaptureError,
     RecorderDatasetSaveError,
     default_vcodec,
 )
@@ -462,6 +463,11 @@ class _DaggerControlLoop(threading.Thread):
         self.teleop_hz = teleop_hz
         self.shutdown_event = threading.Event()
         self.fatal_error: BaseException | None = None
+        # A capture-integrity rejection is scoped to this episode. The
+        # supervisor joins the controller/capture thread, discards the buffer,
+        # homes, and retries the same episode index. Lifecycle/IPC/control
+        # failures continue to use fatal_error.
+        self.capture_error: str | None = None
         # Episode outcome signalled from the VR record button: 's' (terminate)
         # or 'r' (reset+stop). Read by the supervisor.
         self.vr_choice: str | None = None
@@ -528,9 +534,12 @@ class _DaggerControlLoop(threading.Thread):
 
                 capture_error = self.recorder.poll_capture_error()
                 if capture_error is not None:
-                    raise RuntimeError(
-                        f"recorder capture failed: {capture_error}; episode discarded"
+                    self.capture_error = str(capture_error)
+                    log_say(
+                        f"Camera capture failed; ending and discarding this "
+                        f"episode: {capture_error}"
                     )
+                    return
 
                 # --- episode end requested from the VR record button?
                 events = self.teleop.get_teleop_events()
@@ -1197,7 +1206,12 @@ def _run(
                 # close the just-opened capture under the same measured hold.
                 def _finish_cancelled_start() -> int:
                     try:
-                        return recorder.finish_episode()
+                        try:
+                            return recorder.finish_episode()
+                        except RecorderCaptureError:
+                            # The session is already stopping and the rejected
+                            # buffer was cleared by finish_episode.
+                            return 0
                     finally:
                         relay.set_raw_enabled(False)
 
@@ -1270,6 +1284,8 @@ def _run(
                     if time.perf_counter() >= deadline:
                         timed_out = True
                         break
+                    if control_thread.capture_error is not None:
+                        break
                     if control_thread.fatal_error is not None:
                         log_say(
                             f"Fatal error in DAgger control loop: "
@@ -1317,27 +1333,28 @@ def _run(
             # desired pose cannot keep advancing during shutdown.
             finish_hold_action = _measured_joint_hold_action()
 
-            def _finish_capture() -> int:
+            def _finish_capture() -> tuple[int, str | None]:
                 try:
-                    final_rows = recorder.finish_episode()
-                except BaseException as exc:
                     try:
-                        relay.set_raw_enabled(False)
-                    except BaseException as gate_exc:
-                        exc.add_note(f"relay close also failed: {gate_exc!r}")
-                    raise
-                relay.set_raw_enabled(False)
-                return final_rows
+                        return recorder.finish_episode(), None
+                    except RecorderCaptureError as exc:
+                        return 0, str(exc)
+                finally:
+                    # A gate-close failure is session-fatal and deliberately
+                    # overrides an episode-local capture rejection: continuing
+                    # with the relay branch open is not a valid recovery.
+                    relay.set_raw_enabled(False)
 
             def _hold_finish_pose() -> None:
                 robot.send_action(finish_hold_action)
 
-            final_rows = run_blocking_with_sync_control_ticks(
+            final_rows, finish_capture_error = run_blocking_with_sync_control_ticks(
                 _finish_capture,
                 _hold_finish_pose,
                 boundary_period,
                 drain_tick=_hold_finish_pose,
             )
+            capture_error = control_thread.capture_error or finish_capture_error
             # Close a span still open when the loop exited (the episode ended
             # mid-intervention) at the final row count — exact, since capture
             # is paused — so intervention_spans is complete for any consumer.
@@ -1353,6 +1370,20 @@ def _run(
             if control_thread.fatal_error is not None:
                 recorder.cancel_episode()
                 break
+
+            if capture_error is not None:
+                # finish_episode has joined capture and cleared its rejected
+                # buffer. Home exactly like a normal episode boundary before
+                # retrying the unchanged dataset episode index.
+                recorder.cancel_episode()
+                teleop.send_feedback_state(VRState.SAVING)
+                log_say(
+                    f"Episode discarded because camera capture failed: {capture_error}"
+                )
+                log_say("Returning to rest pose.")
+                if not _return_to_rest_guarded(_gate_retry):
+                    break
+                continue
 
             choice = control.poll_choice() or control_thread.vr_choice
             if timed_out and choice is None:
@@ -1392,9 +1423,10 @@ def _run(
                 # Writer indices/parquet rows may already have changed. A
                 # retry in this process could compound the damage.
                 raise
-            except RuntimeError as exc:
-                # e.g. the recorder refused a video/row-misaligned episode
-                # (encoder frame drops). Discarded — keep the session up.
+            except RecorderCaptureError as exc:
+                # An encoder/capture integrity rejection is pre-commit and
+                # already cleared its episode buffer. Other recorder RuntimeErrors
+                # are IPC/lifecycle failures and must stop the session.
                 log_say(f"Episode NOT saved: {exc}")
                 continue
             episode_idx += 1

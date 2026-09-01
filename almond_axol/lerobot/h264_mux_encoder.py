@@ -30,35 +30,32 @@ the physical capture PTS across ``shmsink``/``shmsrc`` for state association;
 this muxer independently assigns the dataset timeline: the *k*-th access unit is
 muxed at ``pts = k / fps`` (``dts`` and ``duration`` match). The caller
 (:func:`~almond_axol.recording.record_proc.run_encoded_capture_loop`) requires
-one fresh AU per camera per row and aborts on a stall—predictive AUs are never
-replayed—so frame-count == row-count by construction. The concat step reasserts
+one fresh AU per camera per row and aborts on a stall—encoded exposures are
+never replayed—so frame-count == row-count by construction. The concat step reasserts
 that exact grid across episodes (see
 :func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`).
 
 Because the frames arrive pre-encoded, the first muxed AU of an episode must be
-an IDR or the mp4 is undecodable from frame 0. Between episodes the relay closes
-each dataset branch immediately before its next natural IDR, keeping encoder
-GOP phases aligned. On reopen,
-:class:`~almond_axol.video.shm_frames.EncodedAuReader` verifies that first AU is
-an actual type-5 IDR.
+an IDR or the mp4 is undecodable from frame 0. The relay's dataset stream is
+all-intra: every AU is an actual type-5 IDR, which removes hidden Jetson encoder
+GOP phase from episode boundaries and permits timestamp-based row-zero
+alignment. :class:`~almond_axol.video.shm_frames.EncodedAuReader` verifies that
+contract before delivering any AU.
 
 Image stats
 -----------
 LeRobot folds a sampled subset of frames into running image-normalization stats.
-Here the recorder no longer has raw frames, so each camera decodes its **IDR
-access units as they are fed** on a per-camera background thread
-(:class:`_StatsWorker`): an IDR is self-contained (the relay muxes SPS/PPS into
-every keyframe), so a plain software decoder fed only keyframes (~4/s given the
-relay's IDR cadence) yields the same sampled subset the old post-finalize file
-decode produced, but the cost is amortized across the episode instead of being
-paid as a lump inside ``save_episode``. The worker folds decoded frames into the
-same ``RunningQuantileStats`` the raw path uses (batched updates — the per-call
-histogram build dominates otherwise); :meth:`_CameraH264Muxer.finish` just joins
-the worker and reads the result. If the worker produced nothing (deps missing,
-decode errors), finish falls back to decoding the finalized file's keyframes
-(:meth:`_CameraH264Muxer._compute_stats_from_file`); if that fails too the
-encoder still records correctly and returns ``None`` stats (recomputable
-offline).
+Here the recorder no longer has raw frames, so each camera samples its all-intra
+AUs at a fixed low rate and decodes those on a per-camera background thread
+(:class:`_StatsWorker`). Sampling is time-based rather than "every IDR" because
+every dataset frame is now an IDR; this preserves the old ~4 Hz stats workload
+instead of accidentally decoding four 60 Hz feeds in software. The worker folds
+decoded frames into the same ``RunningQuantileStats`` the raw path uses (batched
+updates — the per-call histogram build dominates otherwise);
+:meth:`_CameraH264Muxer.finish` just joins the worker and reads the result. If
+the worker produced nothing (deps missing, decode errors), finish falls back to
+sampling the finalized file; if that fails too the encoder still records
+correctly and returns ``None`` stats (recomputable offline).
 """
 
 from __future__ import annotations
@@ -95,6 +92,9 @@ _STATS_QUEUE_MAX = 64
 # frames: per-update overhead (histogram build) dominates single-frame updates,
 # while batching everything to the end would move the whole cost into finish().
 _STATS_BATCH_FRAMES = 48
+# Match the former quarter-second GOP's image-stats sampling density without
+# coupling CPU work to keyframe frequency. Dataset AUs are now all keyframes.
+_STATS_SAMPLE_HZ = 4
 
 
 def _au_is_idr(au: bytes) -> bool:
@@ -119,10 +119,10 @@ def _au_is_idr(au: bytes) -> bool:
 class _StatsWorker:
     """Decode a camera's IDR AUs on a background thread and fold image stats.
 
-    ``feed`` is called from the capture path with keyframe AUs only; the actual
+    ``feed`` is called from the capture path with sampled IDR AUs only; the actual
     decode/convert/downsample/update runs on this worker's thread (PyAV and
     numpy release the GIL for the heavy parts), so the per-row cost on the
-    capture loop is one non-blocking queue put every IDR interval. ``result``
+    capture loop is one non-blocking queue put about four times a second. ``result``
     joins the worker and returns the LeRobot-shaped stats dict, or ``None`` if
     nothing was decoded (caller falls back to the post-finalize file decode).
     """
@@ -262,6 +262,7 @@ class _CameraH264Muxer:
         # compounded across the concat, breaks LeRobot's 1e-4 s per-row lookup.
         self._mux_timescale = fps * 1000
         self._count = 0
+        self._stats_stride = max(1, round(fps / _STATS_SAMPLE_HZ))
         self._error: str | None = None
 
         # Live per-keyframe stats decode (see _StatsWorker); create it only after
@@ -337,18 +338,23 @@ class _CameraH264Muxer:
                 f"frame {self._count} — pipeline is flushing/errored, aborting "
                 "the episode"
             )
+        frame_index = self._count
         self._count += 1
-        if self._stats_worker is not None and _au_is_idr(au):
+        if (
+            self._stats_worker is not None
+            and frame_index % self._stats_stride == 0
+            and _au_is_idr(au)
+        ):
             self._stats_worker.feed(au)
 
     def _compute_stats_from_file(self) -> dict | None:
         """Decode the finalized mp4's keyframes for image-normalization stats.
 
         Runs once per episode after the file is written (recording paused between
-        episodes), so it never competes with the live capture loop. Keyframes
-        only (``skip_frame=NONKEY``): the relay emits an IDR every ~0.25 s, so
-        this still samples ~4 frames/s while the decoder skips every P-frame —
-        the bulk of a full decode's cost. All sampled frames are folded in one
+        episodes), so it never competes with the live capture loop. Every packet
+        is independently decodable, so demux all packets but send only the same
+        ~4 Hz stride used by the live worker into the decoder. All sampled frames
+        are folded in one
         batched ``RunningQuantileStats.update`` (as stock LeRobot's
         ``sample_images`` path does; the per-call histogram build dominates when
         updating frame by frame), using the same downsample + (H*W, C) layout so
@@ -384,13 +390,24 @@ class _CameraH264Muxer:
             with av.open(str(self.video_path)) as container:
                 stream = container.streams.video[0]
                 stream.thread_type = "AUTO"
-                stream.codec_context.skip_frame = "NONKEY"
-                for frame in container.decode(stream):
-                    rgb = frame.to_ndarray(format="rgb24")  # H, W, C
-                    ds = auto_downsample_height_width(
-                        np.ascontiguousarray(rgb).transpose(2, 0, 1)  # -> C, H, W
-                    )
-                    batches.append(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))
+                frame_index = 0
+                for packet in container.demux(stream):
+                    if packet.dts is None:
+                        continue
+                    sample = frame_index % self._stats_stride == 0
+                    frame_index += 1
+                    if not sample:
+                        continue
+                    if not packet.is_keyframe:
+                        raise RuntimeError(
+                            "all-intra dataset contains a predictive packet"
+                        )
+                    for frame in packet.decode():
+                        rgb = frame.to_ndarray(format="rgb24")  # H, W, C
+                        ds = auto_downsample_height_width(
+                            np.ascontiguousarray(rgb).transpose(2, 0, 1)  # -> C, H, W
+                        )
+                        batches.append(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))
         except Exception as exc:  # noqa: BLE001 - never fail the save over stats
             _logger.warning(
                 "post-finalize stats decode failed for %s: %s",

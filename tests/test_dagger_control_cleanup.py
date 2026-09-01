@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import threading
 import unittest
+from unittest.mock import patch
 
-from almond_axol.cli.collect_dagger import _stop_dagger_control_thread
+from almond_axol.cli.collect_dagger import (
+    _DaggerControlLoop,
+    _stop_dagger_control_thread,
+)
 
 
 class _BlockingControlThread(threading.Thread):
@@ -17,7 +21,28 @@ class _BlockingControlThread(threading.Thread):
         self.stopped.set()
 
 
+class _RejectedRecorder:
+    def poll_capture_error(self) -> str:
+        return "camera alignment failed"
+
+
 class DaggerControlCleanupTest(unittest.TestCase):
+    def test_capture_rejection_is_episode_local_not_fatal(self) -> None:
+        control_loop = _DaggerControlLoop(
+            robot=object(),
+            policy=object(),
+            teleop=object(),
+            recorder=_RejectedRecorder(),
+            fps=30,
+            teleop_hz=120,
+        )
+
+        with patch("lerobot.utils.utils.log_say"):
+            control_loop.run()
+
+        self.assertEqual(control_loop.capture_error, "camera alignment failed")
+        self.assertIsNone(control_loop.fatal_error)
+
     def test_outer_cleanup_signals_and_joins_started_control_thread(self) -> None:
         control_thread = _BlockingControlThread()
         control_thread.start()

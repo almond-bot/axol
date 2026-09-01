@@ -139,6 +139,7 @@ class GstDatasetTransportTest(unittest.TestCase):
         branch = pipeline[start:end]
 
         self.assertIn(f"name={encoder_name}", branch)
+        self.assertIn("iframeinterval=1 idrinterval=1", branch)
         self.assertIn(
             "video/x-h264,stream-format=byte-stream,alignment=au ! "
             f"queue name={encoder_name}_outq leaky=downstream "
@@ -189,6 +190,19 @@ class GstDatasetTransportTest(unittest.TestCase):
 
 
 class GstDatasetEnableBarrierTest(unittest.TestCase):
+    def test_all_intra_dataset_close_is_immediate(self) -> None:
+        base, valves = _fake_gate_base()
+        valve = valves["rawvalve"]
+        valve.set_property("drop", False)
+        base._dataset_enabled = True
+
+        base._begin_dataset_disable((("rawvalve", "dsenc"),))
+        base._finish_dataset_disable(time.perf_counter() + 1.0)
+
+        self.assertTrue(valve.drop)
+        self.assertFalse(base._dataset_enabled)
+        self.assertEqual(base._dataset_disable, [])
+
     def test_valve_opens_on_first_exposure_at_or_after_shared_target(self) -> None:
         base, valves = _fake_gate_base(offset_s=90.0)
         valve = valves["rawvalve"]
@@ -201,7 +215,7 @@ class GstDatasetEnableBarrierTest(unittest.TestCase):
         self.assertFalse(valve.drop)
         base._finish_dataset_enable(0.0)
 
-    def test_active_episode_expands_bounded_predictive_queue(self) -> None:
+    def test_active_episode_expands_bounded_encoded_queue(self) -> None:
         base, _valves = _fake_gate_base()
         output_queue = base._pipeline.get_by_name("dsenc_outq")
 

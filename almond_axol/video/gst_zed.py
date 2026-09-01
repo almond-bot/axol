@@ -416,18 +416,22 @@ def _raw_shmsink(socket_path: str) -> str:
     )
 
 
-# The dataset branch keeps a short keyframe interval (~0.25s): frequent IDRs let
-# LeRobot seek/decode the recorded video cheaply, and bound how long the recorder
-# waits for the first keyframe when an episode's valve opens. The encoder can't
-# be force-keyframed on demand on this L4T (the ``force-IDR`` signal segfaults and
-# force-key-unit events are ignored). Between episodes the relay freezes each
-# encoder immediately before a periodic IDR, so reopening emits that IDR as row
-# zero; the reader verifies this and defensively drops any leading P-frames.
-_DATASET_IDR_INTERVAL_S = 0.25
+# Dataset AUs are all-intra. The Jetson encoder cannot be force-keyframed on
+# demand on this L4T (the ``force-IDR`` signal segfaults and force-key-unit
+# events are ignored), and its input/VIC pipeline retains a variable number of
+# frames after an upstream valve closes. With a predictive GOP that hidden tail
+# advances each encoder by a different amount, so the first recorder-visible
+# IDRs can describe exposures several camera ticks apart even though the raw
+# valves reopen on one shared timestamp. Making every dataset frame an IDR
+# removes that unobservable phase state and also lets the recorder discard a
+# leading independently-decodable AU when forming its row-zero camera cluster.
+# Both ``iframeinterval`` and ``idrinterval`` must be one: nvv4l2h264enc exposes
+# them as separate READY-only controls.
+_DATASET_GOP_FRAMES = 1
 # Before the recorder connects, a tiny leaky output queue is intentional: it
 # keeps NVENC returning its NVMM surfaces while shmsink parks GDP's one-shot
 # header. Once an episode opens, two seconds of bounded compressed-AU headroom
-# absorbs scheduler jitter without making predictive H.264 silently lossy.
+# absorbs scheduler jitter without silently losing encoded exposures.
 _DATASET_STARTUP_QUEUE_BUFFERS = 2
 _DATASET_ACTIVE_QUEUE_MIN_BUFFERS = 60
 _DATASET_ACTIVE_QUEUE_SECONDS = 2
@@ -437,9 +441,8 @@ _DATASET_ACTIVE_QUEUE_SECONDS = 2
 # 100 ms is ample time to install the handful of probes without making a record
 # press feel sluggish; the relay caller performs this wait away from control.
 _DATASET_ENABLE_LEAD_S = 0.100
-# A disable observes a complete GOP and closes immediately before the following
-# IDR. Two seconds leaves a full-frame margin even at the supported 1 fps
-# minimum; a timeout therefore indicates a stalled encoder, not scheduler jitter.
+# The shared gate still has a bounded acknowledgement wait. A timeout means a
+# source stopped producing exposure timestamps, not ordinary scheduler jitter.
 _DATASET_GATE_TIMEOUT_S = 2.0
 
 
@@ -500,14 +503,15 @@ def _dataset_enc_shmsink(
     and uniformly sized across cameras even when one sensor is very noisy (see
     ``dataset_vbr_bitrate``).
     """
-    idr = max(1, round(dataset_fps * _DATASET_IDR_INTERVAL_S))
     target, peak = dataset_vbr_bitrate(w, h, dataset_fps)
     return (
         "nvvidconv ! "
         f"video/x-raw(memory:NVMM),format=NV12,width={w},height={h} "
         f"! nvv4l2h264enc name={name} control-rate=0 "
         f"bitrate={target} peak-bitrate={peak} preset-level=1 "
-        f"insert-sps-pps=true insert-aud=true idrinterval={idr} maxperf-enable=true "
+        f"insert-sps-pps=true insert-aud=true "
+        f"iframeinterval={_DATASET_GOP_FRAMES} "
+        f"idrinterval={_DATASET_GOP_FRAMES} maxperf-enable=true "
         "! video/x-h264,stream-format=byte-stream,alignment=au "
         f"! queue name={name}_outq leaky=downstream "
         f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
@@ -560,10 +564,9 @@ class _GstPipelineBase:
         self._pts_perf_offset_s: float | None = None
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
-        # One ``(src_pad, probe_id, event, valve, label)`` per encoded dataset
-        # branch while an IDR-phase-aligned close is in flight. The relay arms every
-        # physical camera first, then waits for all of them, so their encoder
-        # GOP counters restart from the same phase at the next episode.
+        # Kept as a list for cancellation compatibility with an in-flight close.
+        # Dataset encoders are all-intra now, so current closes are immediate and
+        # never populate it.
         self._dataset_disable: list[tuple[Any, int, threading.Event, Any, str]] = []
         # One ``(sink_pad, probe_id, opened, cancelled, lock, status, valve,
         # label)`` per dataset branch waiting for a common exposure boundary.
@@ -584,7 +587,7 @@ class _GstPipelineBase:
         self._dataset_enabled = False
 
     def _cancel_dataset_disable(self) -> None:
-        """Remove any outstanding natural-IDR probes (best effort)."""
+        """Remove any outstanding legacy dataset-close probes (best effort)."""
         pending, self._dataset_disable = self._dataset_disable, []
         for pad, probe_id, event, _valve, _label in pending:
             if event.is_set():
@@ -826,89 +829,23 @@ class _GstPipelineBase:
         self._dataset_enabled = True
 
     def _begin_dataset_disable(self, gates: tuple[tuple[str, str | None], ...]) -> None:
-        """Arm every encoded branch to stop one frame before its next IDR.
+        """Close every dataset input valve immediately.
 
-        Raw/appsink branches have no predictive codec state and close
-        immediately. Encoded branches observe one natural IDR, count through
-        that GOP, and close after its final P-frame. Every encoder is therefore
-        poised to emit an IDR on the first frame after the valve next opens.
+        Every encoded AU is an IDR, so there is no predictive GOP phase to park.
+        NVENC may still emit a small in-flight tail after the close; the reader's
+        quiet flush drains it before the next shared-timestamp open.
         """
         self._cancel_dataset_enable()
         self._cancel_dataset_disable()
         if self._pipeline is None:
             return
-
-        armed: list[tuple[Any, int, threading.Event, Any, str]] = []
         try:
-            for valve_name, encoder_name in gates:
+            for valve_name, _encoder_name in gates:
                 valve = self._pipeline.get_by_name(valve_name)
                 if valve is None:
                     raise RuntimeError(f"missing dataset valve {valve_name!r}")
-                if bool(valve.get_property("drop")):
-                    continue
-                if encoder_name is None:
-                    valve.set_property("drop", True)
-                    continue
-                encoder = self._pipeline.get_by_name(encoder_name)
-                pad = None if encoder is None else encoder.get_static_pad("src")
-                if pad is None:
-                    raise RuntimeError(f"missing dataset encoder {encoder_name!r}")
-                event = threading.Event()
-                idr_interval = max(1, int(encoder.get_property("idrinterval")))
-                phase: dict[str, int | None] = {"since_idr": None}
-
-                def close_before_idr(
-                    _pad: Any,
-                    info: Any,
-                    *,
-                    branch_valve: Any = valve,
-                    closed: threading.Event = event,
-                    interval: int = idr_interval,
-                    branch_phase: dict[str, int | None] = phase,
-                ) -> Any:
-                    buf = info.get_buffer()
-                    if buf is None:
-                        return self._gst.PadProbeReturn.OK
-                    ok, mapinfo = buf.map(self._gst.MapFlags.READ)
-                    if not ok:
-                        return self._gst.PadProbeReturn.OK
-                    try:
-                        is_idr = any(
-                            (nal[0] & 0x1F) == 5
-                            for nal in _split_nals(bytes(mapinfo.data))
-                        )
-                    finally:
-                        buf.unmap(mapinfo)
-                    if is_idr:
-                        branch_phase["since_idr"] = 0
-                        if interval > 1:
-                            return self._gst.PadProbeReturn.OK
-                    elif branch_phase["since_idr"] is None:
-                        # Probe may have been installed mid-GOP. Observe one
-                        # real IDR before trusting the frame count.
-                        return self._gst.PadProbeReturn.OK
-                    else:
-                        branch_phase["since_idr"] += 1
-                        if branch_phase["since_idr"] < interval - 1:
-                            return self._gst.PadProbeReturn.OK
-                    # Let the final P-frame (or, for all-IDR encoding, this IDR)
-                    # continue downstream, then stop new raw frames. The first
-                    # encoded frame after reopening is a self-contained IDR.
-                    branch_valve.set_property("drop", True)
-                    closed.set()
-                    return self._gst.PadProbeReturn.REMOVE
-
-                probe_id = pad.add_probe(
-                    self._gst.PadProbeType.BUFFER, close_before_idr
-                )
-                if not probe_id:
-                    raise RuntimeError(
-                        f"could not install IDR probe on {encoder_name!r}"
-                    )
-                armed.append((pad, probe_id, event, valve, encoder_name))
+                valve.set_property("drop", True)
         except Exception:
-            self._dataset_disable = armed
-            self._cancel_dataset_disable()
             self._dataset_enabled = False
             for valve_name, _encoder_name in gates:
                 valve = self._pipeline.get_by_name(valve_name)
@@ -916,31 +853,12 @@ class _GstPipelineBase:
                     valve.set_property("drop", True)
             self._set_dataset_output_queue_depth(gates, active=False)
             raise
-        self._dataset_disable = armed
+        self._dataset_disable = []
 
     def _finish_dataset_disable(self, deadline: float) -> None:
-        """Wait for all probes armed by :meth:`_begin_dataset_disable`."""
-        pending, self._dataset_disable = self._dataset_disable, []
-        timed_out: list[str] = []
-        for pad, probe_id, event, valve, label in pending:
-            remaining = max(0.0, deadline - time.perf_counter())
-            if event.wait(remaining):
-                continue
-            # Fail closed. Saving an episode after a phase-align timeout would
-            # be unsafe, so the relay reports this error to the parent.
-            if not event.is_set():
-                try:
-                    pad.remove_probe(probe_id)
-                except Exception:  # noqa: BLE001 - race with a REMOVE callback
-                    pass
-                valve.set_property("drop", True)
-                timed_out.append(label)
-        if timed_out:
-            self._dataset_enabled = False
-            raise RuntimeError(
-                "timed out aligning dataset encoder before IDR on "
-                + ", ".join(timed_out)
-            )
+        """Complete an immediate all-intra dataset close."""
+        del deadline
+        self._dataset_disable = []
         self._dataset_enabled = False
 
     @property
@@ -1273,7 +1191,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         return (("rawvalve", "dsenc" if self._raw_socket_path else None),)
 
     def begin_raw_disable(self) -> None:
-        """Arm this camera's dataset encoder to stop before a subsequent IDR."""
+        """Close this camera's all-intra dataset input."""
         self._begin_dataset_disable(self._raw_gates())
 
     def finish_raw_disable(self, deadline: float) -> None:
@@ -1658,7 +1576,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         return tuple(gates)
 
     def begin_raw_disable(self) -> None:
-        """Arm every dataset eye to stop before a subsequent IDR."""
+        """Close every all-intra dataset-eye input."""
         self._begin_dataset_disable(self._raw_gates())
 
     def finish_raw_disable(self, deadline: float) -> None:

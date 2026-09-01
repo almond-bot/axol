@@ -501,26 +501,19 @@ class EncodedAuReader:
     :class:`~almond_axol.lerobot.h264_mux_encoder.H264MuxStreamingEncoder`, which
     just muxes them (no re-encode).
 
-    Unlike the raw :class:`GstShmFrameReader` (which serves ``read_at_or_after`` —
-    *selecting* the frame nearest a target time and dropping the rest), an encoded
-    stream cannot drop frames: every P-frame depends on its predecessors. So this
-    reader delivers **every** AU strictly **in order** via :meth:`read_next_au`,
-    and the capture loop is frame-driven (one AU consumed per dataset row). A
-    dedicated pull thread drains the (non-leaky) appsink. Before the first
-    episode flush it discards validated startup AUs; afterwards it fills an
-    in-process queue so a momentarily slow consumer grows the queue rather than
-    dropping AUs and corrupting the stream.
+    The dataset encoder is all-intra, so every AU is independently decodable.
+    This reader still delivers AUs strictly in order via :meth:`read_next_au`;
+    the capture loop consumes one per dataset row after it discards any leading
+    AUs needed to form a synchronized row-zero cluster. A dedicated pull thread
+    drains the (non-leaky) appsink. Before the first episode flush it discards
+    validated startup AUs; afterwards it fills an in-process bounded queue.
 
-    Each episode's mp4 must start on a keyframe (a leading P-frame is
-    undecodable), so after :meth:`flush` the reader drops AUs until the next IDR.
-    The relay can't force a keyframe on demand (the ``nvv4l2h264enc`` ``force-IDR``
-    signal segfaults and force-key-unit events are ignored on L4T), so the dataset
-    encoder runs a short ``idrinterval``; the episode's rows simply begin at the
-    first IDR after the valve opens. GDP restores the original sensor-exposure
-    PTS after shm; ``pts_perf_offset_s`` maps that pipeline running-time onto the
-    system-wide ``perf_counter`` clock used by joint/action snapshots. The mp4's
-    own timeline remains the constant-fps PTS the muxer assigns, independent of
-    this physical capture timestamp.
+    Each episode's mp4 starts on an IDR, and every following picture is also an
+    IDR. GDP restores the original sensor-exposure PTS after shm;
+    ``pts_perf_offset_s`` maps that pipeline running-time onto the system-wide
+    ``perf_counter`` clock used by joint/action snapshots. The mp4's own timeline
+    remains the constant-fps PTS the muxer assigns, independent of this physical
+    capture timestamp.
     """
 
     def __init__(
@@ -534,7 +527,7 @@ class EncodedAuReader:
         pts_perf_offset_s: float,
         capture_fps: int | None = None,
     ) -> None:
-        from .gst_zed import _DATASET_IDR_INTERVAL_S, _require_gst
+        from .gst_zed import _DATASET_GOP_FRAMES, _require_gst
 
         self._gst, _ = _require_gst()
         self.width = width
@@ -553,8 +546,8 @@ class EncodedAuReader:
         self._queue: deque[tuple[bytes, float, float]] = deque()
         # Never let a capture-loop failure turn into unbounded compressed-frame
         # growth while the operator continues moving before ending the take.
-        # Overflow is fatal for the episode because dropping one predictive AU
-        # invalidates every dependent P-frame until the next IDR.
+        # Overflow is fatal because it loses exposure/row alignment, even though
+        # every retained all-intra frame remains independently decodable.
         self._queue_limit = max(60, 2 * fps)
         self._cond = threading.Condition()
         # Episode-start drain handshake. While the relay valve is closed the
@@ -573,16 +566,10 @@ class EncodedAuReader:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._sink: Any = None
-        # Keyframe-cadence integrity guard. The relay emits an IDR every
-        # ``_DATASET_IDR_INTERVAL_S`` (see gst_zed), so a run of more than
-        # ~1.5x that many frames without a keyframe means a *keyframe was lost
-        # upstream* — and every frame muxed until the next IDR references that
-        # missing reference, so those dataset rows won't decode. We can't undo it
-        # here (the orphaned frames are already delivered), but logging it loudly
-        # turns a silent, train-time-only corruption into a diagnosable signal
-        # (which camera, which frame). ``_delivered`` is the running AU index for
-        # the log; ``_gap_warnings`` counts detections for the disconnect summary.
-        self._expected_gop = max(1, round(fps * _DATASET_IDR_INTERVAL_S))
+        # The relay promises an all-intra dataset stream. Verify that contract in
+        # the reader too: accepting one predictive picture would make startup
+        # realignment unsafe and reintroduce the hidden encoder-GOP phase race.
+        self._expected_gop = max(1, int(_DATASET_GOP_FRAMES))
         self._gop_warn_at = self._expected_gop + max(2, self._expected_gop // 2)
         self._since_keyframe = 0
         self._delivered = 0
@@ -590,8 +577,8 @@ class EncodedAuReader:
         # gdpdepay restores the sender's serialized caps and buffer metadata.
         # Keep a fixed H.264 filter as an integrity check; h264parse re-derives
         # dimensions from the SPS and preserves the exposure PTS.
-        # drop=false: never discard an AU (it would break H.264 decode); the pull
-        # thread keeps the appsink drained so it rarely back-pressures shmsrc.
+        # drop=false: never discard an exposure silently; the pull thread keeps
+        # the appsink drained so it rarely back-pressures shmsrc.
         caps = (
             f"video/x-h264,stream-format=byte-stream,alignment=au,"
             f"width={width},height={height},framerate={fps}/1"
@@ -601,6 +588,11 @@ class EncodedAuReader:
             f"! gdpdepay ! {caps} ! h264parse "
             "! appsink name=au emit-signals=false max-buffers=60 drop=false sync=false"
         )
+
+    @property
+    def frames_are_independent(self) -> bool:
+        """Whether callers may discard an AU without breaking later frames."""
+        return self._expected_gop == 1
 
     @property
     def is_connected(self) -> bool:
@@ -664,8 +656,8 @@ class EncodedAuReader:
         ``_minimum_capture_perf`` is the newest sensor PTS this reader had
         already observed, not the host time at which ``flush`` runs. Exposure
         necessarily predates delivery, so a wall-time cutoff would reject the
-        freshly reopened IDR and delay row zero by a whole GOP. Queue clearing,
-        strictly newer PTS, and the actual-IDR requirement together reject the
+        freshly reopened IDR and delay row zero by another frame. Queue clearing,
+        strictly newer PTS, and the all-intra requirement together reject the
         previous episode's tail without confusing transport latency for age.
         """
         self.begin_flush()
@@ -736,8 +728,8 @@ class EncodedAuReader:
             ok, mapinfo = buf.map(Gst.MapFlags.READ)
             if not ok:
                 self._fail(
-                    f"encoded AU on {self._name} could not be mapped; a "
-                    "dependency-bearing frame was lost"
+                    f"encoded AU on {self._name} could not be mapped; an "
+                    "encoded exposure was lost"
                 )
                 continue
             try:
@@ -750,6 +742,13 @@ class EncodedAuReader:
             if not _au_has_coded_slice(au):
                 continue
             is_idr = _au_is_idr(au)
+            if self.frames_are_independent and not is_idr:
+                self._fail(
+                    f"encoded AU on {self._name} is predictive but the dataset "
+                    "encoder is configured all-intra",
+                    permanent=True,
+                )
+                continue
             if buf.pts == Gst.CLOCK_TIME_NONE:
                 self._fail(
                     f"encoded AU on {self._name} has no PTS; exact "
@@ -761,7 +760,7 @@ class EncodedAuReader:
             # legitimate value only for the pipeline's very first frame; once
             # flush() establishes an episode boundary, seeing it means the
             # sender lost a timestamp. Silently filtering it as an old frame
-            # would also leave subsequent P-frames without a reference.
+            # would also destroy exact exposure/row accounting.
             if buf.pts == 0 and self._episode_cutoff_active:
                 self._fail(
                     f"encoded AU on {self._name} reset to PTS 0; exact "
@@ -813,8 +812,9 @@ class EncodedAuReader:
                         self._fail_keyframe_gap()
                         continue
                 # A shmsrc DISCONT after the first AU means an upstream buffer was
-                # dropped between the relay and here — the following frames can lose
-                # their reference. Surface it (the first AU legitimately carries it).
+                # dropped between the relay and here. Even though later all-intra
+                # frames decode, row/exposure accounting is no longer exact. Surface
+                # it (the first AU legitimately carries the startup discontinuity).
                 if discont and self._seen_first_au:
                     self._fail(
                         f"encoded-AU discontinuity on {self._name} near frame "
@@ -825,7 +825,7 @@ class EncodedAuReader:
                     self._error = (
                         f"encoded-AU backlog on {self._name} exceeded "
                         f"{self._queue_limit} frames; capture stopped draining "
-                        "the predictive stream"
+                        "the encoded stream"
                     )
                     self._queue.clear()
                     self._cond.notify_all()
