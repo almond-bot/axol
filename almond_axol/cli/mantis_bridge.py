@@ -259,8 +259,10 @@ def managed_mantis_bridge(
                 interrupt_owner()
 
     thread = threading.Thread(target=target, name="mantis-tracker-bridge", daemon=True)
-    thread.start()
     try:
+        # Own cleanup before Thread.start(): an interrupt can arrive after the
+        # native thread begins but before start() returns to this owner.
+        thread.start()
         if not ready.wait(_READY_TIMEOUT_S):
             raise RuntimeError(
                 f"{source} tracker bridge did not initialize within "
@@ -310,13 +312,30 @@ def managed_mantis_bridge(
         active_error = sys.exception()
         owner_active.clear()
         stop.set()
-        thread.join(_STOP_TIMEOUT_S)
+        join_failure: BaseException | None = None
+        try:
+            thread.join(_STOP_TIMEOUT_S)
+        except RuntimeError as error:
+            # A start failure before any native thread exists is already clean;
+            # joining such a Thread raises "cannot join thread before it is
+            # started". Any live owner remains an uncertain teardown.
+            if thread.is_alive():
+                join_failure = error
+        except BaseException as error:
+            join_failure = error
         teardown_failure = current_failure()
         if thread.is_alive():
             teardown_failure = RuntimeError(
                 f"{source} tracker bridge did not stop cleanly; tracker ownership "
                 "is uncertain"
             )
+            if join_failure is not None:
+                teardown_failure.add_note(
+                    "bridge thread join also failed: "
+                    f"{type(join_failure).__name__}: {join_failure}"
+                )
+        elif teardown_failure is None and join_failure is not None:
+            teardown_failure = join_failure
         if teardown_failure is not None:
             message = (
                 f"{source} tracker bridge teardown failed: "

@@ -791,23 +791,21 @@ class TrackerBridge:
         frame["seq"] = self._seq
         frame["pose_source_id"] = self._pose_source_id
         frame["pose_source_kind"] = "tracker"
-        # Stamp with the tracker sample's *capture* time (monotonic ms, like
-        # performance.now()), not compose time: the server's interpolator
-        # reconstructs this instant as ``t_host``, and Mantis recording aligns
-        # dataset rows and camera exposures on it — stamping compose time
-        # would fold the tracker→bridge latency into every recorded pose.
-        # A valid two-hand frame is no newer than its oldest contributing
-        # sample. Invalid/stale frames use compose time so the tracking-loss
-        # control edge is delivered monotonically; their false tracked flag
-        # prevents QA or IK from treating that timestamp as a live pose.
+        # Stamp the time this latest-known pair became available: the newest
+        # contributing sample. Using the older side's time would place a pose
+        # update from the future into an earlier frame. The other side is a
+        # bounded (<= TRACKER_PAIR_MAX_SKEW_S) zero-order hold. Backends use
+        # native capture time when exposed and earliest host receipt otherwise;
+        # see TrackerPose.timestamp_is_capture. Invalid/stale frames use compose
+        # time so the tracking-loss control edge remains monotonic.
         required_held = [
             self._held[side]
             for side in required_sides
             if side in self._held and self._fresh[side]
         ]
         all_required_held_fresh = len(required_held) == len(required_sides)
-        capture_t = min(p.t for p in required_held) if all_required_held_fresh else now
-        frame["t"] = capture_t * 1000.0
+        pair_t = max(p.t for p in required_held) if all_required_held_fresh else now
+        frame["t"] = pair_t * 1000.0
         return frame
 
     def _handle_tracking_state(self, engaged: bool) -> None:

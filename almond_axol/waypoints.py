@@ -28,6 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .constants import ARM_JOINTS
 from .utils.paths import almond_home
 from .utils.state_files import (
     privileged_service_active,
@@ -35,8 +36,6 @@ from .utils.state_files import (
     secure_atomic_write_json,
     secure_read_text,
 )
-
-from .constants import ARM_JOINTS
 
 # 7 arm joints + gripper, matching motion_control's argument shape.
 JOINT_VECTOR_LEN = len(ARM_JOINTS) + 1

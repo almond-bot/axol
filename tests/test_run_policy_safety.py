@@ -4,6 +4,7 @@ import math
 import tempfile
 import threading
 import unittest
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,16 +13,16 @@ from unittest import mock
 import numpy as np
 import torch
 
+from almond_axol.cli import run_policy
 from almond_axol.cli.run_policy import (
     _align_action_chunk,
-    _clear_episode_buffer_after_workers,
     _cleanup_after_episode_workers,
+    _clear_episode_buffer_after_workers,
     _lingering_episode_thread_error,
     _shutdown_policy_server_process,
     _snap_to_newest_indices,
     _stop_episode_workers,
 )
-from almond_axol.cli import run_policy
 from almond_axol.lerobot import action_schema as action_schema_module
 from almond_axol.lerobot.rollout import IKResetController
 from almond_axol.robot.base import HardwareCleanupError
@@ -146,6 +147,170 @@ class RunPolicySafetyTest(unittest.TestCase):
             ),
         ):
             run_policy._check_training_fps(cfg)  # noqa: SLF001
+
+    def test_rollout_durability_failure_is_fatal_and_finalizes_without_saved_ack(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dataset_root = Path(directory) / "rollout"
+            cfg = self._hub_run_config(
+                repo_id="local/rollout",
+                root=str(dataset_root),
+                push_to_hub=True,
+            )
+            cfg.reset_torque_threshold = 5.0
+            cfg.reset_gravity_comp_kd = 0.1
+            cfg.ensemble_blend_s = 0.1
+            cfg.align_fade_s = 0.1
+            cfg.exec_max_vel = 1.0
+            cfg.exec_max_accel = 1.0
+            cfg.policy_torque_threshold = 5.0
+
+            dataset = mock.Mock()
+            robot = mock.Mock(
+                name="axol",
+                observation_features={},
+                config=SimpleNamespace(observe_cartesian=False),
+            )
+            reset_controller = mock.Mock()
+            reset_controller.return_to_rest.return_value = True
+            client = mock.Mock(fatal_error=None, contact_tripped=None)
+            client.start.return_value = True
+            publisher = mock.Mock()
+            control = mock.Mock()
+            control.await_continue.return_value = True
+            control.poll_choice.return_value = "s"
+            durability_error = OSError("metadata footer fsync failed")
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.object(run_policy, "_check_training_fps")
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "almond_axol.utils.state_files."
+                        "require_service_dataset_configuration"
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "almond_axol.utils.state_files.privileged_service_active",
+                        return_value=False,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "almond_axol.lerobot.robot.robot_axol.AxolRobot",
+                        return_value=robot,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "lerobot.processor.make_default_processors",
+                        return_value=(None, mock.Mock(), mock.Mock()),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "almond_axol.recording.datasets.dataset_features_for_robot",
+                        return_value={"action": {"names": []}},
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "lerobot.datasets.lerobot_dataset.LeRobotDataset.create",
+                        return_value=dataset,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        run_policy,
+                        "IKResetController",
+                        return_value=reset_controller,
+                    )
+                )
+                stack.enter_context(mock.patch.object(run_policy, "_wait_for_port"))
+                stack.enter_context(
+                    mock.patch(
+                        "lerobot.async_inference.configs.RobotClientConfig",
+                        return_value=object(),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        run_policy,
+                        "ActionPublisher",
+                        return_value=publisher,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        run_policy,
+                        "_build_axol_robot_client",
+                        return_value=client,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        run_policy,
+                        "RolloutCaptureThread",
+                        return_value=mock.Mock(),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        run_policy.threading,
+                        "Thread",
+                        return_value=mock.Mock(),
+                    )
+                )
+                stack.enter_context(mock.patch.object(run_policy.time, "sleep"))
+                stack.enter_context(
+                    mock.patch.object(
+                        run_policy,
+                        "_stop_episode_workers",
+                        return_value=(True, None),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        run_policy,
+                        "make_episode_durable",
+                        side_effect=durability_error,
+                    )
+                )
+                restore = stack.enter_context(
+                    mock.patch.object(run_policy, "restore_dataset_ownership")
+                )
+                log_say = stack.enter_context(mock.patch("lerobot.utils.utils.log_say"))
+                stack.enter_context(mock.patch("signal.signal"))
+                raised = stack.enter_context(
+                    self.assertRaisesRegex(
+                        run_policy.EpisodeDurabilityError,
+                        "cannot continue safely",
+                    )
+                )
+                run_policy._run(  # noqa: SLF001
+                    cfg,
+                    stop_event=threading.Event(),
+                    control=control,
+                )
+
+        self.assertIs(raised.exception.__cause__, durability_error)
+        self.assertNotIsInstance(raised.exception, RuntimeError)
+        dataset.save_episode.assert_called_once_with()
+        dataset.finalize.assert_called_once_with()
+        # The write is counted for recovery, so a successful finalization may
+        # push it; only the live operator acknowledgement remains suppressed.
+        dataset.push_to_hub.assert_called_once_with()
+        control.note_saved.assert_not_called()
+        self.assertFalse(
+            any(
+                args and str(args[0]).startswith("Saved episode")
+                for args, _ in log_say.call_args_list
+            )
+        )
+        restore.assert_not_called()
 
     def test_nonempty_unrecognized_rollout_root_is_never_deleted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

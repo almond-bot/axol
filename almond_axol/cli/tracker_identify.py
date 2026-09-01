@@ -110,8 +110,10 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
 
     source = create_source(config)
     print(f"Starting the {config.backend} backend...")
-    source.start()
     try:
+        # Enter cleanup ownership before start(): a backend can acquire its USB
+        # device or launch a helper before an interrupt/failure reaches us.
+        source.start()
         print(
             "Waiting for trackers to report (power them on and move them a little)..."
         )

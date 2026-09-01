@@ -153,7 +153,10 @@ export class ApiRequestError extends Error {
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
-    throw new ApiRequestError((body as { error?: string }).error ?? `HTTP ${res.status}`, res.status)
+    throw new ApiRequestError(
+      (body as { error?: string }).error ?? `HTTP ${res.status}`,
+      res.status
+    )
   }
   // A non-JSON 200 means whatever answered isn't axol serve (typically the
   // static site itself when no host is configured, answering index.html for
@@ -393,6 +396,8 @@ export interface CanDiscoveryState {
 }
 
 export interface CanInterfaceInventory {
+  /** Opaque app-lifetime identity; omitted by older serve releases. */
+  serverInstanceId?: string
   interfaces: CanInterface[]
   /** Omitted by serve releases that predate hardware-aware auto-connect. */
   profiles?: CanProfileInventory
@@ -405,8 +410,9 @@ export async function fetchCanInterfaces(): Promise<CanInterfaceInventory> {
 }
 
 /** Identify and persist any attached, unassigned Axol/Mantis hub. */
-export async function discoverCanHardware(): Promise<CanInterfaceInventory> {
-  return json(await fetch(apiUrl("/api/can/discover"), { method: "POST" }))
+export async function discoverCanHardware(force = false): Promise<CanInterfaceInventory> {
+  const path = force ? "/api/can/discover?force=true" : "/api/can/discover"
+  return json(await fetch(apiUrl(path), { method: "POST" }))
 }
 
 /** A busy race, transport interruption, or server fault may retry on the next inventory poll. */

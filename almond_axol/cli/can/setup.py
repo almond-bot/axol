@@ -214,6 +214,10 @@ class HeadlessHubSetupResult:
     status: Literal["ready", "configured", "partial", "unidentified"]
     configured_count: int
     message: str | None = None
+    # Exact private epoch this result classified. The serve cache compares it
+    # with its post-call rescan so hardware arriving in that narrow gap is not
+    # accidentally stamped as already validated. Never serialized to clients.
+    validation_identity: tuple[tuple[str, ...], ...] = ()
 
 
 def _die(msg: str) -> None:
@@ -2686,20 +2690,45 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
         _rename_interfaces(None, profile=_MANTIS_PROFILE)
 
     configured_count = int(axol_changed) + int(mantis_changed)
-    remaining = attached_hub_state().candidate_count
-    if configured_count and remaining:
+    final_state = attached_hub_state()
+    remaining = final_state.candidate_count
+    silent_incumbents = [
+        role
+        for role, serial in (
+            ("Axol", configured_axol),
+            ("Mantis", configured_mantis),
+        )
+        if serial is not None
+        and serial in attached_serials
+        and observed.get(serial) in {None, "silent"}
+    ]
+    if silent_incumbents:
+        return HeadlessHubSetupResult(
+            status="unidentified",
+            configured_count=configured_count,
+            message=(
+                f"The saved {' and '.join(silent_incumbents)} CAN assignment could "
+                "not be revalidated. Power its Axol motors or Mantis triggers and "
+                "retry identification; no automatic connection will be guessed."
+            ),
+            validation_identity=final_state.validation_identity,
+        )
+    if remaining and (configured_count or final_state.configured_profiles):
         return HeadlessHubSetupResult(
             status="partial",
             configured_count=configured_count,
             message=(
-                "Configured the identified hardware, but another attached CAN "
-                "adapter remains unassigned. Power its Axol motors or Mantis "
-                "triggers and retry discovery, or run `axol can.setup`."
+                "Known Axol or Mantis hardware is ready, but another attached "
+                "CAN adapter remains unassigned. Power its Axol motors or "
+                "Mantis triggers and retry discovery, or run `axol can.setup`."
             ),
+            validation_identity=final_state.validation_identity,
         )
     if configured_count:
         return HeadlessHubSetupResult(
-            status="configured", configured_count=configured_count
+            status="configured",
+            configured_count=configured_count,
+            validation_identity=final_state.validation_identity,
         )
     if remaining:
         return HeadlessHubSetupResult(
@@ -2707,11 +2736,16 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
             configured_count=0,
             message=(
                 "No unique Axol or Mantis identity was detected. Ensure the Axol "
-                "motors or Mantis triggers are powered, then retry after reconnecting "
-                "the USB hub or run `axol can.setup`."
+                "motors or Mantis triggers are powered, then retry identification "
+                "or run `axol can.setup`."
             ),
+            validation_identity=final_state.validation_identity,
         )
-    return HeadlessHubSetupResult(status="ready", configured_count=0)
+    return HeadlessHubSetupResult(
+        status="ready",
+        configured_count=0,
+        validation_identity=final_state.validation_identity,
+    )
 
 
 def _find_single_serials(

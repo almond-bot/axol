@@ -15,8 +15,8 @@ from unittest import mock
 import numpy as np
 
 from almond_axol.cli import collect_data, teleop
-from almond_axol.cli.config import TeleopCmdConfig
 from almond_axol.cli.collect_data import _validate_mantis_calibration
+from almond_axol.cli.config import TeleopCmdConfig
 from almond_axol.lerobot.robot.config_mantis import MantisRobotConfig
 from almond_axol.lerobot.teleop.config_vr import AxolVRTeleopConfig
 from almond_axol.mantis.calibration import (
@@ -30,7 +30,7 @@ from almond_axol.mantis.calibration import (
 )
 from almond_axol.mantis.relative import quat_xyzw_to_matrix
 from almond_axol.teleop.config import VRTeleopConfig, apply_mantis_teleop_profile
-from almond_axol.teleop.core import VRTeleopCore
+from almond_axol.teleop.core import TCPPoseSnapshot, VRTeleopCore
 from almond_axol.tracker.base import TrackerPose
 from almond_axol.tracker.bridge import StopEventControls, TrackerBridge
 from almond_axol.tracker.config import (
@@ -93,6 +93,55 @@ class _SkewedSource:
 
 
 class MantisFlowTest(unittest.TestCase):
+    def test_tcp_pose_snapshot_keeps_pose_and_timestamp_from_one_publish(self) -> None:
+        core = VRTeleopCore(
+            VRTeleopConfig(absolute_mode=True),
+            logging.getLogger(__name__),
+            lambda _enabled: None,
+        )
+        first = {
+            "left": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            "right": [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        }
+        second = {
+            "left": [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            "right": [-2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        }
+
+        core._publish_tcp_pose(first, 10.0)
+        captured = core.last_tcp_snapshot
+        core._publish_tcp_pose(second, 20.0)
+
+        self.assertEqual(
+            captured,
+            TCPPoseSnapshot(
+                pose_host_ts=10.0,
+                left=tuple(first["left"]),
+                right=tuple(first["right"]),
+            ),
+        )
+        self.assertEqual(core.last_tcp_snapshot.pose_host_ts, 20.0)
+        self.assertEqual(core.last_tcp_snapshot.left[0], 2.0)
+
+    def test_tcp_pose_snapshot_copies_mutable_ik_message(self) -> None:
+        core = VRTeleopCore(
+            VRTeleopConfig(absolute_mode=True),
+            logging.getLogger(__name__),
+            lambda _enabled: None,
+        )
+        tcp = {
+            "left": [1.0] * 7,
+            "right": [2.0] * 7,
+        }
+        core._publish_tcp_pose(tcp, 12.5)
+        snapshot = core.last_tcp_snapshot
+        tcp["left"][0] = 99.0
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.left[0], 1.0)
+        with self.assertRaises(TypeError):
+            snapshot.left[0] = 3.0  # type: ignore[index]
+
     def test_direct_mantis_teleop_disables_inherited_powered_cart(self) -> None:
         cfg = TeleopCmdConfig(mantis=True)
         cfg.cart.enabled = True
@@ -469,7 +518,7 @@ class MantisFlowTest(unittest.TestCase):
         self.assertFalse(frame["l_tracked"])
         self.assertTrue(frame["r_tracked"])
 
-    def test_tracker_frame_timestamp_is_oldest_valid_side(self) -> None:
+    def test_tracker_frame_timestamp_is_newest_contributing_side(self) -> None:
         source = _SkewedSource(0.02)
         bridge = TrackerBridge(
             source,
@@ -479,8 +528,8 @@ class MantisFlowTest(unittest.TestCase):
         )
         frame = bridge.compose_frame()
         self.assertTrue(frame["l_tracked"] and frame["r_tracked"])
-        left_capture_ms = bridge._held["left"].t * 1000.0
-        self.assertAlmostEqual(frame["t"], left_capture_ms, places=3)
+        right_capture_ms = bridge._held["right"].t * 1000.0
+        self.assertAlmostEqual(frame["t"], right_capture_ms, places=3)
 
     def test_source_binding_restore_is_backend_specific(self) -> None:
         config = TrackerConfig(

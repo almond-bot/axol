@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
 from almond_axol.cli import collect_data
+from almond_axol.lerobot.teleop.teleop_vr import AxolVRTeleop
 from almond_axol.recording import record_proc
 from almond_axol.recording.record_proc import (
     DatasetRecorderProcess,
@@ -15,9 +19,10 @@ from almond_axol.recording.record_proc import (
     _shutdown_process,
     _stop_capture_thread,
 )
-from almond_axol.lerobot.teleop.teleop_vr import AxolVRTeleop
 from almond_axol.robot.base import is_hardware_cleanup_uncertain
 from almond_axol.teleop.teleop import VRTeleop
+from almond_axol.utils.state_files import UnsafeStatePathError
+from almond_axol.video import video_proc
 
 
 class CollectDataAffinityIntegrityTest(unittest.TestCase):
@@ -52,6 +57,172 @@ class CollectDataAffinityIntegrityTest(unittest.TestCase):
         run_session.assert_called_once_with(config, stop_event=None, control=None)
         pin.assert_called_once_with()
         restore.assert_called_once_with(0, original)
+
+    def test_diagnostic_start_interrupt_cleans_live_collection_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            robot = Mock(
+                action_features={},
+                observation_features={},
+                cameras={},
+                positions=([], []),
+                name="test-robot",
+            )
+            robot.get_joint_observation.return_value = {}
+            teleop = Mock(cart=None)
+            recorder = Mock(pid=None)
+            diag = Mock()
+            diag.start.side_effect = KeyboardInterrupt("diagnostic start interrupted")
+            cfg = SimpleNamespace(
+                mantis=False,
+                repo_id="test/repo",
+                task="test",
+                fps=60,
+                teleop_hz=120,
+                vcodec="auto",
+                root=directory,
+                push_to_hub=False,
+                rerun_ip=None,
+                rerun_port=9876,
+                dataset_resolution="SVGA",
+                log_level="INFO",
+                robot_config=SimpleNamespace(observation_cameras=lambda: {}),
+                teleop_config=SimpleNamespace(),
+            )
+
+            with (
+                patch.object(collect_data, "_prepare_recording_cameras"),
+                patch.object(collect_data, "_start_video_relay", return_value=None),
+                patch.object(collect_data, "InProcessRecorder", return_value=recorder),
+                patch.object(collect_data, "SystemDiag", return_value=diag),
+                patch(
+                    "almond_axol.lerobot.robot.robot_axol.AxolRobot",
+                    return_value=robot,
+                ),
+                patch(
+                    "almond_axol.lerobot.teleop.teleop_vr.AxolVRTeleop",
+                    return_value=teleop,
+                ),
+                patch(
+                    "almond_axol.utils.state_files.require_service_dataset_configuration"
+                ),
+                patch(
+                    "almond_axol.utils.state_files.privileged_service_active",
+                    return_value=False,
+                ),
+                patch("almond_axol.utils.network.local_ip", return_value="127.0.0.1"),
+                patch(
+                    "lerobot.processor.make_default_processors",
+                    return_value=(Mock(), Mock(), Mock()),
+                ),
+                patch.object(collect_data, "restore_dataset_ownership") as restore,
+                self.assertRaisesRegex(
+                    KeyboardInterrupt, "diagnostic start interrupted"
+                ),
+            ):
+                collect_data._run_session(cfg)
+
+        diag.stop.assert_called_once_with()
+        teleop.disconnect.assert_called_once_with()
+        robot.disconnect.assert_called_once_with()
+        recorder.close.assert_called_once_with()
+        restore.assert_called_once_with(Path(directory))
+
+
+class VideoRelayLifecycleIntegrityTest(unittest.TestCase):
+    def test_partial_process_start_is_stopped_before_constructor_raises(self) -> None:
+        stopped = threading.Event()
+
+        class Connection:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def send(self, message: object) -> None:
+                if message is None:
+                    stopped.set()
+
+            def close(self) -> None:
+                self.closed = True
+
+        class PartialProcess:
+            pid: int | None = None
+
+            def __init__(self) -> None:
+                self.alive = False
+                self.join_calls = 0
+
+            def start(self) -> None:
+                self.pid = 8128
+                self.alive = True
+                raise KeyboardInterrupt("relay startup interrupted")
+
+            def join(self, timeout: float | None = None) -> None:
+                del timeout
+                self.join_calls += 1
+                if stopped.is_set():
+                    self.alive = False
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+        parent_conn = Connection()
+        child_conn = Connection()
+        process = PartialProcess()
+        context = SimpleNamespace(
+            Pipe=Mock(return_value=(parent_conn, child_conn)),
+            Condition=Mock(return_value=object()),
+            Process=Mock(return_value=process),
+        )
+
+        with (
+            patch.object(
+                video_proc.multiprocessing, "get_context", return_value=context
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "relay startup interrupted"),
+        ):
+            video_proc.VideoRelayProcess({}, want_raw=True)
+
+        self.assertTrue(stopped.is_set())
+        self.assertGreaterEqual(process.join_calls, 1)
+        self.assertFalse(process.alive)
+        self.assertTrue(parent_conn.closed)
+        self.assertTrue(child_conn.closed)
+
+    def test_shutdown_escalates_to_kill_and_proves_process_exit(self) -> None:
+        class Process:
+            pid = 8129
+
+            def __init__(self) -> None:
+                self.alive = True
+                self.terminate_calls = 0
+                self.kill_calls = 0
+
+            def join(self, timeout: float | None = None) -> None:
+                del timeout
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+            def terminate(self) -> None:
+                self.terminate_calls += 1
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                self.alive = False
+
+        process = Process()
+        relay = video_proc.VideoRelayProcess.__new__(video_proc.VideoRelayProcess)
+        relay._shutdown_requested = threading.Event()
+        relay._lock = threading.Lock()
+        relay._conn = Mock()
+        relay._proc = process
+        relay.raw_cameras = {}
+
+        relay.shutdown()
+
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.kill_calls, 1)
+        self.assertFalse(process.alive)
+        relay._conn.close.assert_called_once_with()
 
 
 class VRStartupIntegrityTest(unittest.IsolatedAsyncioTestCase):
@@ -380,6 +551,344 @@ class LeRobotVRStartupIntegrityTest(unittest.TestCase):
 
 
 class RecorderLifecycleIntegrityTest(unittest.TestCase):
+    @staticmethod
+    def _encoded_recorder_config(*sources: str) -> dict:
+        return {
+            "log_level": "INFO",
+            "raw_meta": {
+                source: {
+                    "transport": "gstshm-h264",
+                    "socket_path": f"/tmp/{source}.sock",
+                    "width": 640,
+                    "height": 480,
+                    "fps": 60,
+                }
+                for source in sources
+            },
+            "snapshot_shm_name": "snapshot-test",
+            "obs_keys": [],
+            "action_keys": [],
+            "rerun_ip": None,
+            "dataset_root": "/tmp/unused-recorder-test",
+            "smooth_ee_hz": 0.0,
+            "fps": 60,
+        }
+
+    def test_subprocess_reader_connect_abort_rolls_back_every_camera(self) -> None:
+        first = Mock()
+        second = Mock()
+        second.connect.side_effect = KeyboardInterrupt("startup interrupted")
+        conn = Mock()
+        config = self._encoded_recorder_config("left", "right")
+
+        with (
+            patch(
+                "lerobot.processor.make_default_processors",
+                return_value=(None, None, Mock()),
+            ),
+            patch(
+                "almond_axol.video.shm_frames.EncodedAuReader",
+                side_effect=[first, second],
+            ),
+            patch("almond_axol.utils.affinity.pin_background", return_value=True),
+            patch.object(record_proc, "install_encoded_dataset_encoder"),
+            patch("almond_axol.video.shm_frames.SnapshotReader") as snapshot,
+            patch.object(record_proc, "_open_dataset") as open_dataset,
+            self.assertRaisesRegex(KeyboardInterrupt, "startup interrupted"),
+        ):
+            record_proc._recorder_main(conn, object(), config)
+
+        first.close.assert_called_once_with()
+        second.close.assert_called_once_with()
+        snapshot.assert_not_called()
+        open_dataset.assert_not_called()
+        conn.send.assert_not_called()
+
+    def test_subprocess_ready_failure_closes_all_acquired_resources(self) -> None:
+        camera = Mock()
+        snap_reader = Mock()
+        dataset = Mock()
+        verifier = Mock()
+        startup_error = RuntimeError("ready reply failed")
+        conn = Mock()
+        conn.send.side_effect = startup_error
+        config = self._encoded_recorder_config("left")
+
+        with (
+            patch(
+                "lerobot.processor.make_default_processors",
+                return_value=(None, None, Mock()),
+            ),
+            patch(
+                "almond_axol.video.shm_frames.EncodedAuReader",
+                return_value=camera,
+            ),
+            patch(
+                "almond_axol.video.shm_frames.SnapshotReader",
+                return_value=snap_reader,
+            ),
+            patch("almond_axol.utils.affinity.pin_background", return_value=True),
+            patch.object(record_proc, "install_encoded_dataset_encoder"),
+            patch.object(record_proc, "_open_dataset", return_value=dataset),
+            patch.object(
+                record_proc,
+                "_EpisodeVideoVerifier",
+                return_value=verifier,
+            ),
+            patch.object(record_proc, "_finalize_dataset") as finalize,
+            self.assertRaisesRegex(RuntimeError, "ready reply failed") as raised,
+        ):
+            record_proc._recorder_main(conn, object(), config)
+
+        self.assertIs(raised.exception, startup_error)
+        camera.close.assert_called_once_with()
+        snap_reader.close.assert_called_once_with()
+        verifier.close.assert_called_once_with()
+        finalize.assert_called_once_with(dataset, config, episodes_recorded=0)
+        conn.send.assert_called_once_with(("ready", dataset.num_episodes))
+
+    @staticmethod
+    def _durability_dataset(root: Path):
+        latest_episode = {
+            "episode_index": [0],
+            "tasks": [["pick"]],
+            "length": [12],
+            "data/chunk_index": [1],
+            "data/file_index": [2],
+            "meta/episodes/chunk_index": [3],
+            "meta/episodes/file_index": [4],
+            "videos/observation.images.left/chunk_index": [5],
+            "videos/observation.images.left/file_index": [6],
+        }
+        expected = [
+            root / "data/chunk-001/file-002.parquet",
+            root / "meta/episodes/chunk-003/file-004.parquet",
+            root / "videos/observation.images.left/chunk-005/file-006.mp4",
+            root / "meta/info.json",
+            root / "meta/stats.json",
+            root / "meta/tasks.parquet",
+        ]
+        for path in expected:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"durable episode fixture")
+
+        meta = SimpleNamespace(
+            root=root,
+            data_path="data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+            video_path=(
+                "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+            ),
+            latest_episode=latest_episode,
+            episodes=None,
+            _pq_writer=None,
+            _close_writer=Mock(),
+        )
+        writer = SimpleNamespace(close_writer=Mock(), _latest_episode=object())
+        dataset = SimpleNamespace(
+            root=root,
+            meta=meta,
+            writer=writer,
+            num_episodes=1,
+            save_episode=Mock(),
+            clear_episode_buffer=Mock(),
+        )
+        return dataset, expected
+
+    def test_episode_durability_fsyncs_all_files_before_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dataset, expected = self._durability_dataset(Path(directory) / "dataset")
+            events: list[tuple[str, str | None]] = []
+            dataset.writer.close_writer.side_effect = lambda: events.append(
+                ("close-data", None)
+            )
+            dataset.meta._close_writer.side_effect = lambda: events.append(
+                ("close-meta", None)
+            )
+            real_fsync = os.fsync
+
+            def trace_fsync(descriptor: int) -> None:
+                events.append(("fsync", os.readlink(f"/proc/self/fd/{descriptor}")))
+                real_fsync(descriptor)
+
+            with patch.object(record_proc.os, "fsync", side_effect=trace_fsync):
+                episode = record_proc.make_episode_durable(dataset)
+
+            self.assertEqual(events[:2], [("close-data", None), ("close-meta", None)])
+            fsynced = [Path(target) for kind, target in events if kind == "fsync"]
+            self.assertEqual(fsynced[: len(expected)], expected)
+            self.assertTrue(all(path.is_dir() for path in fsynced[len(expected) :]))
+            self.assertEqual(episode["data/chunk_index"], 1)
+            self.assertIsNone(dataset.meta.latest_episode)
+            self.assertIsNone(dataset.writer._latest_episode)
+
+    def test_episode_durability_rejects_link_and_nonregular_payloads(self) -> None:
+        for replacement in ("symlink", "hardlink", "directory"):
+            with self.subTest(replacement=replacement):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory) / "dataset"
+                    dataset, expected = self._durability_dataset(root)
+                    victim = expected[2]
+                    victim.unlink()
+                    if replacement == "symlink":
+                        outside = Path(directory) / "outside.mp4"
+                        outside.write_bytes(b"not dataset content")
+                        victim.symlink_to(outside)
+                    elif replacement == "hardlink":
+                        outside = Path(directory) / "outside.mp4"
+                        outside.write_bytes(b"not dataset content")
+                        os.link(outside, victim)
+                    else:
+                        victim.mkdir()
+
+                    with self.assertRaisesRegex(
+                        UnsafeStatePathError,
+                        "non-regular or hard-linked",
+                    ):
+                        record_proc.make_episode_durable(dataset)
+
+    def test_episode_durability_requires_every_referenced_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dataset, expected = self._durability_dataset(Path(directory) / "dataset")
+            expected[2].unlink()
+
+            with self.assertRaises(FileNotFoundError):
+                record_proc.make_episode_durable(dataset)
+
+    def test_in_process_durability_failure_is_terminal_but_finalizes_episode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dataset, _expected = self._durability_dataset(Path(directory) / "dataset")
+            durability_error = OSError("metadata footer fsync failed")
+            recorder = object.__new__(InProcessRecorder)
+            recorder._thread = None
+            recorder._stop = None
+            recorder._capture_error = {"v": None}
+            recorder._dataset = dataset
+            recorder._config = {"smooth_ee_hz": 0.0}
+            recorder._verifier = Mock()
+            recorder._episodes_recorded = 0
+            recorder._fatal_error = None
+
+            with (
+                patch(
+                    "almond_axol.lerobot.nvenc_encoder.dropped_frames",
+                    return_value=0,
+                ),
+                patch.object(
+                    record_proc.os,
+                    "fsync",
+                    side_effect=durability_error,
+                ),
+                self.assertRaisesRegex(
+                    record_proc.EpisodeDurabilityError,
+                    "cannot continue safely",
+                ) as raised,
+            ):
+                recorder.save_episode()
+
+            self.assertIs(raised.exception.__cause__, durability_error)
+            self.assertNotIsInstance(raised.exception, RuntimeError)
+            recorder._dataset.save_episode.assert_called_once_with()
+            recorder._verifier.submit.assert_not_called()
+            # The episode was written, so cleanup must preserve it even though the
+            # caller did not receive a successful save acknowledgement.
+            self.assertEqual(recorder._episodes_recorded, 1)
+
+            with self.assertRaises(record_proc.EpisodeDurabilityError) as retry:
+                recorder.start_episode("unsafe retry")
+            self.assertIs(retry.exception, raised.exception)
+            recorder._dataset.clear_episode_buffer.assert_not_called()
+
+            with patch.object(record_proc, "_finalize_dataset") as finalize:
+                recorder.close()
+            finalize.assert_called_once_with(
+                recorder._dataset,
+                recorder._config,
+                1,
+            )
+            recorder._verifier.close.assert_called_once_with()
+
+    def test_subprocess_durability_failure_sends_only_fatal_then_finalizes(
+        self,
+    ) -> None:
+        durability_error = OSError("metadata footer fsync failed")
+        dataset = Mock(num_episodes=7)
+        verifier = Mock()
+        snap_reader = Mock()
+        conn = Mock()
+        conn.recv.return_value = ("save_episode",)
+        config = {
+            "log_level": "INFO",
+            "raw_meta": {},
+            "snapshot_shm_name": "snapshot-test",
+            "obs_keys": [],
+            "action_keys": [],
+            "rerun_ip": None,
+            "dataset_root": "/tmp/unused-recorder-test",
+            "smooth_ee_hz": 0.0,
+        }
+
+        with (
+            patch(
+                "lerobot.processor.make_default_processors",
+                return_value=(None, None, Mock()),
+            ),
+            patch(
+                "almond_axol.video.shm_frames.SnapshotReader",
+                return_value=snap_reader,
+            ),
+            patch("almond_axol.utils.affinity.pin_background", return_value=True),
+            patch.object(record_proc, "install_dataset_encoder"),
+            patch.object(record_proc, "_open_dataset", return_value=dataset),
+            patch.object(record_proc, "_EpisodeVideoVerifier", return_value=verifier),
+            patch("almond_axol.lerobot.nvenc_encoder.dropped_frames", return_value=0),
+            patch.object(
+                record_proc,
+                "make_episode_durable",
+                side_effect=durability_error,
+            ),
+            patch.object(record_proc, "_cleanup_recorder_session") as cleanup,
+            self.assertRaisesRegex(
+                record_proc.EpisodeDurabilityError,
+                "cannot continue safely",
+            ) as raised,
+        ):
+            record_proc._recorder_main(conn, object(), config)
+
+        self.assertIs(raised.exception.__cause__, durability_error)
+        self.assertEqual(conn.send.call_args_list[0], call(("ready", 7)))
+        self.assertEqual(conn.send.call_args_list[1][0][0][0], "fatal")
+        self.assertFalse(
+            any(args[0][0] == "saved" for args, _ in conn.send.call_args_list)
+        )
+        verifier.submit.assert_not_called()
+        self.assertEqual(cleanup.call_args.kwargs["episodes_recorded"], 1)
+
+    def test_parent_fatal_save_reply_poison_recorder_without_incrementing(self) -> None:
+        recorder = object.__new__(DatasetRecorderProcess)
+        recorder._lock = threading.Lock()
+        recorder._conn = Mock()
+        recorder._conn.poll.return_value = True
+        recorder._conn.recv.return_value = (
+            "fatal",
+            "episode was written but could not be made crash-durable",
+        )
+        recorder._episode_count = 4
+        recorder._fatal_error = None
+
+        with self.assertRaises(record_proc.EpisodeDurabilityError) as raised:
+            recorder.save_episode()
+
+        self.assertNotIsInstance(raised.exception, RuntimeError)
+        self.assertEqual(recorder.episode_count(), 4)
+        recorder._conn.send.assert_called_once_with(("save_episode",))
+
+        with self.assertRaises(record_proc.EpisodeDurabilityError) as retry:
+            recorder.start_episode("must not reach child")
+        self.assertIs(retry.exception, raised.exception)
+        recorder._conn.send.assert_called_once_with(("save_episode",))
+
     def test_in_process_cancel_keeps_live_writer_and_buffer(self) -> None:
         recorder = object.__new__(record_proc.InProcessRecorder)
         live_thread = Mock()

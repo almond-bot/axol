@@ -88,6 +88,7 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
+from ..teleop.core import TCPPoseSnapshot
 from ..utils import affinity
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
@@ -1288,7 +1289,12 @@ def _run_session(
     # the failure).
     imu_src: Any | None = None  # board-gyro yaw source for the cart, if wired
 
-    def _cleanup_failed_setup() -> BaseException | None:
+    def _cleanup_failed_setup(
+        *,
+        recorder: Any | None = None,
+        diag: SystemDiag | None = None,
+        tegra: TegraStatsDiag | None = None,
+    ) -> BaseException | None:
         """Release every resource opened before the main teardown guard exists.
 
         This runs while another exception is already active, so cleanup errors
@@ -1296,6 +1302,10 @@ def _run_session(
         explains why collection did not start.
         """
         cleanups: list[tuple[str, Any]] = []
+        if diag is not None:
+            cleanups.append(("system diagnostics", diag.stop))
+        if tegra is not None:
+            cleanups.append(("Tegra diagnostics", tegra.stop))
         if imu_src is not None:
             cleanups.append(("board gyro", imu_src.close))
         cleanups.extend(
@@ -1304,6 +1314,16 @@ def _run_session(
                 ("robot", robot.disconnect),
             )
         )
+        if recorder is not None:
+            cleanups.extend(
+                (
+                    ("recorder", recorder.close),
+                    (
+                        "dataset ownership restore",
+                        lambda: restore_dataset_ownership(dataset_root),
+                    ),
+                )
+            )
         if relay is not None:
             cleanups.append(("video relay", relay.shutdown))
         hardware_failure: BaseException | None = None
@@ -1462,17 +1482,34 @@ def _run_session(
             diag_labels[relay_pid] = "relay"
     if getattr(recorder, "pid", None):
         diag_labels[recorder.pid] = "recorder"  # type: ignore[union-attr]
-    diag = SystemDiag(diag_labels, _logger)
-    diag.start()
-    tegra = TegraStatsDiag(_logger)  # no-op off-Tegra
-    tegra.start()
+    diag: SystemDiag | None = None
+    tegra: TegraStatsDiag | None = None
+    try:
+        diag = SystemDiag(diag_labels, _logger)
+        diag.start()
+        tegra = TegraStatsDiag(_logger)  # no-op off-Tegra
+        tegra.start()
 
-    # Keep the relay's raw dataset branch closed until an episode records: the
-    # raw VIC convert + shared-memory copy for every camera is the bulk of the
-    # relay's CPU (~2 cores), and nothing reads raw frames during the pre-record
-    # teleop phase. Closing it there makes that phase as light as `axol teleop`.
-    if relay is not None:
-        relay.set_raw_enabled(False)
+        # Keep the relay's raw dataset branch closed until an episode records: the
+        # raw VIC convert + shared-memory copy for every camera is the bulk of the
+        # relay's CPU (~2 cores), and nothing reads raw frames during the pre-record
+        # teleop phase. Closing it there makes that phase as light as `axol teleop`.
+        if relay is not None:
+            relay.set_raw_enabled(False)
+    except BaseException as setup_error:
+        # Robot, teleop, recorder, and possibly both sampler threads are already
+        # live here, but the main session finally below has not started yet.
+        if (
+            cleanup_error := _cleanup_failed_setup(
+                recorder=recorder,
+                diag=diag,
+                tegra=tegra,
+            )
+        ) is not None:
+            mark_hardware_cleanup_uncertain(setup_error, cleanup_error)
+        raise
+
+    assert diag is not None and tegra is not None
 
     episodes_recorded = 0
     episode_idx = recorder.episode_count()
@@ -1601,7 +1638,7 @@ def _run_session(
         # never reverts a row to FK-of-joints mid-stream. ``None`` until the
         # first IK solve (those early rows fall back to FK, which the worker
         # seeds from the rest pose anyway).
-        last_tcp: dict[str, list[float]] | None = None
+        last_tcp: TCPPoseSnapshot | None = None
         # perf_counter deadline of a panel-started record countdown, or None.
         pending_start: float | None = None
         # Capture-health ack: ~2 s into recording, poll the recorder's row
@@ -1796,9 +1833,14 @@ def _run_session(
             # exposure timestamps.
             row_ts = t0
             act_ds = robot.action_to_dataset(act_processed)
-            pose_ts: float | None = None
             if mantis_mode:
-                pose_ts = teleop.pose_capture_ts()
+                # Pose and host capture time are one immutable sample. Reading
+                # them through separate accessors could straddle an IK publish
+                # and stamp pose N+1 with pose N's timestamp.
+                tcp_snapshot = teleop.tcp_pose_snapshot()
+                if tcp_snapshot is not None:
+                    last_tcp = tcp_snapshot
+                pose_ts = last_tcp.pose_host_ts if last_tcp is not None else None
                 if pose_ts is not None:
                     row_ts = pose_ts
                     lag = t0 - pose_ts
@@ -1812,15 +1854,12 @@ def _run_session(
                 # where the gripper physically is, and training must not
                 # inherit filter/solver artifacts. Grippers stay as-is —
                 # measured feedback in the state, commanded in the action.
-                tcp = teleop.tcp_poses()
-                if tcp is not None:
-                    last_tcp = tcp
                 if last_tcp is not None:
                     joint_obs = dict(joint_obs)
                     act_ds = dict(act_ds)
                     for keys, pose in (
-                        (_LEFT_EE_KEYS, last_tcp["left"]),
-                        (_RIGHT_EE_KEYS, last_tcp["right"]),
+                        (_LEFT_EE_KEYS, last_tcp.left),
+                        (_RIGHT_EE_KEYS, last_tcp.right),
                     ):
                         pose6 = [
                             *pose[:3],

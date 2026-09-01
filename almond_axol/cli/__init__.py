@@ -17,6 +17,7 @@ from . import (
 from . import migrate_dataset as migrate_dataset_cmd
 from . import provision as provision_cmd
 from . import serve as serve_cmd
+from . import update_healthcheck as update_healthcheck_cmd
 from . import update_preflight as update_preflight_cmd
 from .can import driver as can_driver
 from .can import enable as can_enable
@@ -101,8 +102,16 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
 
 def _dispatch_draccus(command: str, argv: list[str]) -> None:
     module_name, _ = _DRACCUS_COMMANDS[command]
-    module = importlib.import_module(f".{module_name}", __name__)
-    module.main(argv)
+    try:
+        module = importlib.import_module(f".{module_name}", __name__)
+        module.main(argv)
+    except ModuleNotFoundError as exc:
+        if exc.name == "lerobot" or (exc.name or "").startswith("lerobot."):
+            raise SystemExit(
+                f"axol {command} requires the LeRobot dependencies. "
+                "Install them with: pip install 'almond-axol[lerobot]'"
+            ) from None
+        raise
 
 
 def main() -> None:
@@ -148,6 +157,7 @@ def main() -> None:
     gst_install.add_parser(subparsers)
     gst_build_zed.add_parser(subparsers)
     provision_cmd.add_parser(subparsers)
+    update_healthcheck_cmd.add_parser(subparsers)
     update_preflight_cmd.add_parser(subparsers)
     jetson_setup.add_parser(subparsers)
     pid.add_parser(subparsers)

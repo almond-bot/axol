@@ -26,7 +26,6 @@ from ..utils.state_files import (
     secure_unlink,
 )
 
-
 _MIGRATION_ID = "axol-urdf-root-yaw-v0.1.32"
 _FIELDS = ("action", "observation.state")
 _ARMS = ("left", "right")

@@ -16,8 +16,7 @@ import sys
 import zipfile
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
-from pathlib import Path
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from .download import atomic_https_download
 

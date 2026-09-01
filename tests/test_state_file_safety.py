@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import stat
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
-from almond_axol.cli import collect_dagger, collect_data, replay_dataset, run_policy
+from almond_axol.cli import (
+    collect_dagger,
+    collect_data,
+    replay_dataset,
+    run_policy,
+    serve,
+)
 from almond_axol.diagnostics.zed import cable
 from almond_axol.serve.settings import SettingsStore
 from almond_axol.serve.telemetry import DiagnosticsRunStore, TelemetryHub
@@ -274,6 +282,108 @@ class SecureStateFileTest(unittest.TestCase):
 
 
 class StateWriterIntegrationTest(unittest.TestCase):
+    def test_manual_root_serve_bootstraps_fixed_dataset_root_for_sudo_user(
+        self,
+    ) -> None:
+        root = state_files.HOSTED_DATASET_ROOT
+        operator = SimpleNamespace(pw_uid=1234, pw_gid=5678, pw_name="alice")
+        with (
+            patch.dict(os.environ, {"SUDO_USER": "alice"}, clear=True),
+            patch.object(state_files.os, "geteuid", return_value=0),
+            patch.object(state_files.pwd, "getpwnam", return_value=operator) as lookup,
+            patch.object(state_files, "_require_root_controlled_directory") as require,
+            patch.object(
+                state_files,
+                "_existing_root_controlled_directory",
+                side_effect=(False, False),
+            ),
+            patch.object(state_files, "secure_ensure_directory") as ensure,
+            patch.object(state_files, "secure_chown_directory") as chown,
+        ):
+            configured = state_files.configure_root_service_dataset()
+            exported = {
+                key: os.environ[key]
+                for key in (
+                    "AXOL_SERVICE_DATASET_ROOT",
+                    "AXOL_OPERATOR_UID",
+                    "AXOL_OPERATOR_GID",
+                    "HF_LEROBOT_HOME",
+                )
+            }
+
+        self.assertEqual(configured, root)
+        lookup.assert_called_once_with("alice")
+        self.assertEqual(
+            ensure.call_args_list,
+            [call(root.parent, mode=0o751), call(root, mode=0o2750)],
+        )
+        self.assertEqual(
+            chown.call_args_list,
+            [
+                call(root.parent, 0, 0, mode=0o751),
+                call(root, 0, 5678, mode=0o2750),
+            ],
+        )
+        self.assertEqual(require.call_count, 2)
+        self.assertEqual(
+            exported,
+            {
+                "AXOL_SERVICE_DATASET_ROOT": str(root),
+                "AXOL_OPERATOR_UID": "1234",
+                "AXOL_OPERATOR_GID": "5678",
+                "HF_LEROBOT_HOME": str(root),
+            },
+        )
+
+    def test_manual_root_serve_explicit_operator_and_fixed_boundary_are_enforced(
+        self,
+    ) -> None:
+        parser = argparse.ArgumentParser()
+        serve.add_parser(parser.add_subparsers(dest="command", required=True))
+        args = parser.parse_args(["serve", "--operator", "robot-op"])
+        self.assertEqual(args.operator, "robot-op")
+
+        operator = SimpleNamespace(pw_uid=2468, pw_gid=1357, pw_name="robot-op")
+        with (
+            patch.dict(os.environ, {"SUDO_USER": "wrong-user"}, clear=True),
+            patch.object(state_files.os, "geteuid", return_value=0),
+            patch.object(state_files.pwd, "getpwnam", return_value=operator) as lookup,
+            patch.object(state_files, "_require_root_controlled_directory"),
+            patch.object(
+                state_files,
+                "_existing_root_controlled_directory",
+                return_value=True,
+            ),
+            patch.object(state_files, "secure_chown_directory"),
+        ):
+            state_files.configure_root_service_dataset(args.operator)
+            self.assertEqual(os.environ["AXOL_OPERATOR_UID"], "2468")
+            self.assertEqual(os.environ["AXOL_OPERATOR_GID"], "1357")
+        lookup.assert_called_once_with("robot-op")
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "AXOL_SERVICE_DATASET_ROOT": "/tmp/operator-selected",
+                    "AXOL_OPERATOR_UID": "2468",
+                    "AXOL_OPERATOR_GID": "1357",
+                },
+                clear=True,
+            ),
+            patch.object(state_files.os, "geteuid", return_value=0),
+            self.assertRaisesRegex(OSError, "fixed boundary"),
+        ):
+            state_files.configure_root_service_dataset()
+
+    def test_manual_root_serve_requires_resolvable_non_root_operator(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(state_files.os, "geteuid", return_value=0),
+            self.assertRaisesRegex(OSError, "--operator USER"),
+        ):
+            state_files.configure_root_service_dataset()
+
     def test_every_hosted_dataset_operation_uses_repo_specific_root(self) -> None:
         boundary = Path("/var/lib/almond-axol/datasets")
         with tempfile.TemporaryDirectory() as directory:

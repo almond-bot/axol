@@ -197,6 +197,7 @@ class HeadlessHubResolverTest(unittest.TestCase):
         chest: str | None = None,
         candidates_before: tuple[str, ...] | None = None,
         candidates_after: tuple[str, ...] = (),
+        profiles_after: set[str] | frozenset[str] = frozenset(),
         second_topology: object | None = None,
         legacy_mantis: bool = False,
         raw_names: frozenset[str] = frozenset(),
@@ -235,10 +236,11 @@ class HeadlessHubResolverTest(unittest.TestCase):
                 )
             ),
             _state(
+                profiles=profiles_after,
                 candidates=tuple(
                     next(device for device in devices if device[1] == serial)
                     for serial in candidates_after
-                )
+                ),
             ),
         ]
         strict = {"axol": strict_axol, "mantis": strict_mantis}
@@ -347,6 +349,34 @@ class HeadlessHubResolverTest(unittest.TestCase):
             candidates_after=("C",),
         )
         self.assertEqual(result.status, "unidentified")
+        calls["apply"].assert_not_called()
+
+    def test_attached_silent_incumbent_remains_unverified_without_candidates(
+        self,
+    ) -> None:
+        result, calls = self._run(
+            {"A": "silent"},
+            strict_axol="A",
+            profiles_after={"axol"},
+        )
+
+        self.assertEqual(result.status, "unidentified")
+        self.assertIn("saved Axol CAN assignment", result.message or "")
+        calls["apply"].assert_not_called()
+
+    def test_existing_proven_profile_stays_usable_with_unidentified_second_hub(
+        self,
+    ) -> None:
+        result, calls = self._run(
+            {"A": "axol", "B": "silent"},
+            strict_axol="A",
+            candidates_before=("B",),
+            candidates_after=("B",),
+            profiles_after={"axol"},
+        )
+
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.configured_count, 0)
         calls["apply"].assert_not_called()
 
     def test_positive_opposite_clears_stale_claim_even_if_incumbent_retains_role(
@@ -556,6 +586,32 @@ class CanDiscoveryCacheTest(unittest.TestCase):
         self.assertEqual(cache.payload()["generation"], 3)
         self.assertNotIn("SECRET", repr(cache.payload()))
 
+    def test_finish_does_not_validate_hardware_that_arrived_after_setup(self) -> None:
+        cache = app_module._CanDiscoveryCache()
+        classified = _state(
+            profiles={"axol"},
+            validation=(("claim", "axol", "A"),),
+        )
+        refreshed = _state(
+            profiles={"axol"},
+            candidates=(("usb-2", "B"),),
+            validation=(
+                ("claim", "axol", "A"),
+                ("usb", "usb-2", "B"),
+            ),
+        )
+
+        cache.finish(
+            refreshed,
+            status="configured",
+            message=None,
+            validated_identity=classified.validation_identity,
+        )
+
+        self.assertEqual(cache.payload()["status"], "needed")
+        self.assertEqual(cache.payload()["candidateCount"], 1)
+        self.assertEqual(cache.validated_identity, classified.validation_identity)
+
 
 class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
@@ -592,6 +648,11 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         discovery = response.json()["discovery"]
+        instance_id = response.json()["serverInstanceId"]
+        self.assertEqual(len(instance_id), 32)
+        self.assertTrue(
+            all(character in "0123456789abcdef" for character in instance_id)
+        )
         self.assertEqual(discovery["status"], "needed")
         self.assertEqual(discovery["candidateCount"], 0)
         self.assertGreater(discovery["generation"], 0)
@@ -673,7 +734,9 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
 
         def discover_hubs() -> setup.HeadlessHubSetupResult:
             current["state"] = final
-            return setup.HeadlessHubSetupResult("configured", 1)
+            return setup.HeadlessHubSetupResult(
+                "configured", 1, validation_identity=final.validation_identity
+            )
 
         discover = Mock(side_effect=discover_hubs)
         with (
@@ -699,6 +762,286 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(robot.disconnects, 1)
         self.assertEqual(robot.connects, 1)
 
+    async def test_app_restart_changes_inventory_instance_id(self) -> None:
+        attached = _state()
+        _first, _robot, _runner, _manager, first_transport = self._transport()
+        _second, _robot, _runner, _manager, second_transport = self._transport()
+        with (
+            patch.object(app_module.os, "geteuid", return_value=0),
+            patch.object(app_module, "_list_can_interfaces", return_value=[]),
+            patch.object(app_module, "_attached_hub_state", return_value=attached),
+        ):
+            async with (
+                httpx.AsyncClient(
+                    transport=first_transport, base_url="http://first"
+                ) as first,
+                httpx.AsyncClient(
+                    transport=second_transport, base_url="http://second"
+                ) as second,
+            ):
+                first_id = (await first.get("/api/can/interfaces")).json()[
+                    "serverInstanceId"
+                ]
+                second_id = (await second.get("/api/can/interfaces")).json()[
+                    "serverInstanceId"
+                ]
+
+        self.assertNotEqual(first_id, second_id)
+
+    async def test_force_retries_unidentified_same_usb_attachment(self) -> None:
+        initial = _state(
+            candidates=(("usb-1", "SERIAL"),),
+            validation=(("usb", "usb-1", "SERIAL"),),
+        )
+        final = _state(
+            profiles={"axol"},
+            validation=(("claim", "axol", "SERIAL"),),
+        )
+        current = {"state": initial}
+        _app, robot, _runner, _manager, transport = self._transport()
+
+        def discover_hubs() -> setup.HeadlessHubSetupResult:
+            if discover.call_count == 1:
+                return setup.HeadlessHubSetupResult(
+                    "unidentified",
+                    0,
+                    message="power hardware",
+                    validation_identity=initial.validation_identity,
+                )
+            current["state"] = final
+            return setup.HeadlessHubSetupResult(
+                "configured", 1, validation_identity=final.validation_identity
+            )
+
+        discover = Mock(side_effect=discover_hubs)
+        with (
+            patch.object(app_module.os, "geteuid", return_value=0),
+            patch.object(app_module, "_list_can_interfaces", return_value=[]),
+            patch.object(
+                app_module,
+                "_attached_hub_state",
+                side_effect=lambda: current["state"],
+            ),
+            patch.object(setup, "setup_detected_hubs", discover),
+        ):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                unidentified = await client.post("/api/can/discover")
+                normal_noop = await client.post("/api/can/discover")
+                retried = await client.post("/api/can/discover?force=true")
+
+        self.assertEqual(unidentified.json()["discovery"]["status"], "unidentified")
+        self.assertEqual(normal_noop.json()["discovery"]["status"], "unidentified")
+        self.assertEqual(retried.json()["discovery"]["status"], "configured")
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(robot.disconnects, 2)
+
+    async def test_force_retry_is_rate_limited_across_tabs(self) -> None:
+        attached = _state(
+            candidates=(("usb-1", "SERIAL"),),
+            validation=(("usb", "usb-1", "SERIAL"),),
+        )
+        result = setup.HeadlessHubSetupResult(
+            "unidentified",
+            0,
+            message="power hardware",
+            validation_identity=attached.validation_identity,
+        )
+        _app, robot, _runner, _manager, transport = self._transport()
+        discover = Mock(return_value=result)
+        with (
+            patch.object(app_module.os, "geteuid", return_value=0),
+            patch.object(app_module, "_list_can_interfaces", return_value=[]),
+            patch.object(app_module, "_attached_hub_state", return_value=attached),
+            patch.object(setup, "setup_detected_hubs", discover),
+        ):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                await client.post("/api/can/discover")
+                first_retry = await client.post("/api/can/discover?force=true")
+                limited = await client.post("/api/can/discover?force=true")
+
+        self.assertEqual(first_retry.status_code, 200)
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(limited.headers["Retry-After"], "2")
+        self.assertTrue(limited.json()["retryable"])
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(robot.disconnects, 2)
+
+    async def test_fresh_raw_mantis_is_discovered_then_connected_by_profile(
+        self,
+    ) -> None:
+        initial = _state(
+            candidates=(("usb-1", "MANTIS"),),
+            validation=(("usb", "usb-1", "MANTIS"),),
+        )
+        final = _state(
+            profiles={"mantis"},
+            validation=(
+                ("usb", "usb-1", "MANTIS"),
+                ("claim", "mantis", "MANTIS"),
+            ),
+        )
+        current = {"state": initial}
+        robot = _Robot(state="disconnected")
+        _app, _robot, _runner, _manager, transport = self._transport(robot=robot)
+
+        def discover_hubs() -> setup.HeadlessHubSetupResult:
+            current["state"] = final
+            return setup.HeadlessHubSetupResult(
+                "configured", 1, validation_identity=final.validation_identity
+            )
+
+        with (
+            patch.object(app_module.os, "geteuid", return_value=0),
+            patch.object(app_module, "_list_can_interfaces", return_value=[]),
+            patch.object(
+                app_module,
+                "_attached_hub_state",
+                side_effect=lambda: current["state"],
+            ),
+            patch.object(setup, "setup_detected_hubs", side_effect=discover_hubs),
+        ):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                discovered = await client.post("/api/can/discover")
+                connected = await client.post(
+                    "/api/robot/connect",
+                    json={"profile": "mantis", "automatic": True},
+                )
+
+        self.assertEqual(discovered.json()["discovery"]["status"], "configured")
+        self.assertEqual(connected.status_code, 200)
+        self.assertTrue(connected.json()["connected"])
+        self.assertEqual(connected.json()["profile"], "mantis")
+        self.assertEqual(robot.connects, 1)
+
+    async def test_partial_discovery_allows_existing_proven_profile_connect(
+        self,
+    ) -> None:
+        attached = _state(
+            profiles={"axol"},
+            candidates=(("usb-2", "UNIDENTIFIED"),),
+            validation=(
+                ("usb", "usb-1", "AXOL"),
+                ("usb", "usb-2", "UNIDENTIFIED"),
+                ("claim", "axol", "AXOL"),
+            ),
+        )
+        result = setup.HeadlessHubSetupResult(
+            "partial",
+            0,
+            message="another adapter remains unassigned",
+            validation_identity=attached.validation_identity,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsStore(Path(directory) / "settings.json")
+            robot = _Robot(
+                channels=settings.can_channels(), profile="axol", state="disconnected"
+            )
+            _app, _robot, _runner, _manager, transport = self._transport(
+                robot=robot, settings=settings
+            )
+            with (
+                patch.object(app_module.os, "geteuid", return_value=0),
+                patch.object(app_module, "_list_can_interfaces", return_value=[]),
+                patch.object(app_module, "_attached_hub_state", return_value=attached),
+                patch.object(setup, "setup_detected_hubs", return_value=result),
+            ):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    discovered = await client.post("/api/can/discover")
+                    connected = await client.post(
+                        "/api/robot/connect",
+                        json={"profile": "axol", "automatic": True},
+                    )
+
+        self.assertEqual(discovered.json()["discovery"]["status"], "partial")
+        self.assertEqual(connected.status_code, 200)
+        self.assertTrue(connected.json()["connected"])
+        self.assertEqual(robot.connects, 1)
+
+    async def test_hardware_arriving_after_setup_requires_another_discovery(
+        self,
+    ) -> None:
+        initial = _state(
+            candidates=(("usb-1", "A"),),
+            validation=(("usb", "usb-1", "A"),),
+        )
+        classified = _state(
+            profiles={"axol"},
+            validation=(("claim", "axol", "A"),),
+        )
+        changed = _state(
+            profiles={"axol"},
+            candidates=(("usb-2", "B"),),
+            validation=(
+                ("claim", "axol", "A"),
+                ("usb", "usb-2", "B"),
+            ),
+        )
+        states = iter((initial, changed, changed))
+        robot = _Robot(state="disconnected")
+        _app, _robot, _runner, _manager, transport = self._transport(robot=robot)
+        result = setup.HeadlessHubSetupResult(
+            "configured", 1, validation_identity=classified.validation_identity
+        )
+        with (
+            patch.object(app_module.os, "geteuid", return_value=0),
+            patch.object(app_module, "_list_can_interfaces", return_value=[]),
+            patch.object(app_module, "_attached_hub_state", side_effect=states),
+            patch.object(setup, "setup_detected_hubs", return_value=result),
+        ):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                response = await client.post("/api/can/discover")
+
+        self.assertEqual(response.json()["discovery"]["status"], "needed")
+        self.assertEqual(response.json()["discovery"]["candidateCount"], 1)
+        self.assertEqual(robot.connects, 0)
+
+    async def test_direct_automatic_custom_connect_observes_raw_usb_first(
+        self,
+    ) -> None:
+        attached = _state(
+            candidates=(("usb-1", "RAW"),),
+            validation=(("usb", "usb-1", "RAW"),),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsStore(Path(directory) / "settings.json")
+            settings.update(
+                values={
+                    "robot.left_channel": "can0",
+                    "robot.right_channel": "null",
+                }
+            )
+            robot = _Robot(
+                channels=settings.can_channels(), profile="axol", state="disconnected"
+            )
+            _app, _robot, _runner, _manager, transport = self._transport(
+                robot=robot, settings=settings
+            )
+            with (
+                patch.object(app_module.os, "geteuid", return_value=0),
+                patch.object(app_module, "_attached_hub_state", return_value=attached),
+            ):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    response = await client.post(
+                        "/api/robot/connect",
+                        json={"profile": "axol", "automatic": True},
+                    )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("hardware discovery", response.json()["error"])
+        self.assertEqual(robot.connects, 0)
+
     async def test_cancelled_request_leaves_singleflight_worker_running(self) -> None:
         initial = _state(
             candidates=(("usb-1", "SERIAL"),),
@@ -718,7 +1061,9 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
             if not release.wait(timeout=5):
                 raise RuntimeError("test discovery gate timed out")
             current["state"] = final
-            return setup.HeadlessHubSetupResult("configured", 1)
+            return setup.HeadlessHubSetupResult(
+                "configured", 1, validation_identity=final.validation_identity
+            )
 
         discover = Mock(side_effect=discover_hubs)
         with (
@@ -856,7 +1201,11 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
         )
         robot = _Robot(state="error")
         _app, _robot, _runner, _manager, transport = self._transport(robot=robot)
-        discover = Mock(return_value=setup.HeadlessHubSetupResult("ready", 0))
+        discover = Mock(
+            return_value=setup.HeadlessHubSetupResult(
+                "ready", 0, validation_identity=attached.validation_identity
+            )
+        )
         with (
             patch.object(app_module.os, "geteuid", return_value=0),
             patch.object(app_module, "_list_can_interfaces", return_value=[]),
@@ -884,7 +1233,11 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
             _app, _robot, _runner, _manager, transport = self._transport(
                 robot=robot, settings=settings
             )
-            discover = Mock(return_value=setup.HeadlessHubSetupResult("ready", 0))
+            discover = Mock(
+                return_value=setup.HeadlessHubSetupResult(
+                    "ready", 0, validation_identity=attached.validation_identity
+                )
+            )
             with (
                 patch.object(app_module.os, "geteuid", return_value=0),
                 patch.object(app_module, "_list_can_interfaces", return_value=[]),
@@ -906,6 +1259,47 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(robot.disconnects, 1)
         self.assertEqual(robot.connects, 1)
 
+    async def test_automatic_managed_connect_rejects_unidentified_epoch(self) -> None:
+        attached = _state(
+            profiles={"axol"},
+            candidates=(("usb-2", "UNKNOWN"),),
+            validation=(
+                ("claim", "axol", "AXOL"),
+                ("usb", "usb-2", "UNKNOWN"),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsStore(Path(directory) / "settings.json")
+            robot = _Robot(channels=settings.can_channels(), profile="axol")
+            _app, _robot, _runner, _manager, transport = self._transport(
+                robot=robot, settings=settings
+            )
+            result = setup.HeadlessHubSetupResult(
+                "unidentified",
+                0,
+                "power the hardware",
+                validation_identity=attached.validation_identity,
+            )
+            with (
+                patch.object(app_module.os, "geteuid", return_value=0),
+                patch.object(app_module, "_list_can_interfaces", return_value=[]),
+                patch.object(app_module, "_attached_hub_state", return_value=attached),
+                patch.object(setup, "setup_detected_hubs", return_value=result),
+            ):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    discovered = await client.post("/api/can/discover")
+                    blocked = await client.post(
+                        "/api/robot/connect",
+                        json={"profile": "axol", "automatic": True},
+                    )
+
+        self.assertEqual(discovered.json()["discovery"]["status"], "unidentified")
+        self.assertEqual(blocked.status_code, 409)
+        self.assertIn("hardware discovery", blocked.json()["error"])
+        self.assertEqual(robot.connects, 0)
+
     async def test_shutdown_waits_for_discovery_worker(self) -> None:
         initial = _state(
             candidates=(("usb-1", "SERIAL"),),
@@ -922,7 +1316,9 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
             if not release.wait(timeout=5):
                 raise RuntimeError("test discovery gate timed out")
             current["state"] = final
-            return setup.HeadlessHubSetupResult("configured", 1)
+            return setup.HeadlessHubSetupResult(
+                "configured", 1, validation_identity=final.validation_identity
+            )
 
         async def run_shutdown_handlers() -> None:
             for handler in app.router.on_shutdown:  # type: ignore[attr-defined]
@@ -985,7 +1381,9 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
             setup_entered.set()
             if not release_setup.wait(timeout=5):
                 raise RuntimeError("test setup gate timed out")
-            return setup.HeadlessHubSetupResult("configured", 1)
+            return setup.HeadlessHubSetupResult(
+                "configured", 1, validation_identity=final.validation_identity
+            )
 
         _app, robot, _runner, _manager, transport = self._transport()
         discover = Mock(side_effect=discover_hubs)

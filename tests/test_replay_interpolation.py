@@ -15,7 +15,6 @@ from almond_axol.robot.base import (
     is_hardware_cleanup_uncertain,
 )
 
-
 _ACTION_NAMES = [
     "left_ee.x",
     "left_ee.y",

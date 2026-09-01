@@ -10,10 +10,10 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 
+from almond_axol.mantis.calibration import ULTIMATE_POSE_CONVENTION_FIELD
 from almond_axol.serve import app as app_module
 from almond_axol.serve import tracker_setup
 from almond_axol.serve.commands import COMMANDS, get_schema
-from almond_axol.mantis.calibration import ULTIMATE_POSE_CONVENTION_FIELD
 from almond_axol.tracker.config import TrackerConfig, save_tracker_config
 from almond_axol.tracker.ultimate import ultimate_wifi_config_error
 

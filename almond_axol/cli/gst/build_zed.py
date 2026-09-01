@@ -21,25 +21,30 @@ Two reasons this exists rather than relying on a stock plugin install:
    uses the SDK), i.e. a train/inference mismatch.
 
 We pin upstream to the exact commit the patch was generated against so the
-unified diff always applies cleanly. Idempotent (a stamp file skips a rebuild
-when the pinned ref + patch are already installed) and best-effort: a no-op on
-machines without the ZED SDK / Jetson toolchain (callers then fall back to the
-SDK ``ZedCamera``). The hosted installer (``web/app/public/install``) runs it
-once after ``axol gst.install``.
+unified diff always applies cleanly. Idempotence is based on a root-owned
+manifest of the exact plugin paths and bytes GStreamer resolves, not merely a
+source-tree stamp. The command remains best-effort on machines without the ZED
+SDK / Jetson toolchain (callers then fall back to the SDK ``ZedCamera``). The
+hosted installer (``web/app/public/install``) runs it once after
+``axol gst.install``.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
+import re
+import secrets
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
 from ...utils.jetson import _is_jetson
-from ...utils.sudo import prime_sudo, run_root
 from ...utils.state_files import secure_atomic_write_text
+from ...utils.sudo import prime_sudo, run_root
 
 _logger = logging.getLogger(__name__)
 
@@ -52,6 +57,15 @@ _PATCH = Path(__file__).parent / "patches" / "zed-gstreamer-sensor-timestamp.pat
 
 # ZED SDK install (find_package(ZED) + the headers the plugins compile against).
 _ZED_SDK = Path("/usr/local/zed")
+
+# This is the authority for an installed patched build.  The source-tree stamp
+# is only a convenience: an operator-owned checkout cannot attest to the bytes
+# GStreamer will actually load.  Keep the manifest in machine state so an
+# unprivileged caller cannot bless a stock or subsequently replaced plugin.
+_MACHINE_MANIFEST = Path("/var/lib/almond-axol/zed-gstreamer-manifest.json")
+_MANIFEST_SCHEMA = 1
+_ZED_ELEMENTS = ("zedxonesrc", "zedsrc")
+_GST_FILENAME_RE = re.compile(r"^\s*Filename\s+(.+?)\s*$", re.MULTILINE)
 
 # apt build deps. OpenCV / RTSP server are optional (their plugins are skipped
 # at configure time). The ZED SDK's own zed-config.cmake unconditionally calls
@@ -122,6 +136,199 @@ def _element_installed(name: str) -> bool:
     if inspect is None:
         return False
     return _run([inspect, name], timeout=60)
+
+
+def _root_controlled_canonical_file(
+    path: Path, *, allow_canonical_alias: bool
+) -> Path | None:
+    """Return a canonical immutable root-owned file, or fail closed.
+
+    ``gst-inspect`` is external input here. Resolving and checking the entire
+    ancestry prevents a root invocation from hashing an attacker-controlled
+    pathname. Plugin filenames may legitimately contain system symlinks, but
+    the manifest itself may not: its fixed machine-state name must be the real
+    file rather than an alias.
+    """
+    if not path.is_absolute():
+        return None
+    try:
+        canonical = path.resolve(strict=True)
+        if not allow_canonical_alias and canonical != path:
+            return None
+        file_stat = canonical.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_uid != 0
+            or stat.S_IMODE(file_stat.st_mode) & 0o022
+        ):
+            return None
+        for parent in canonical.parents:
+            parent_stat = parent.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(parent_stat.st_mode)
+                or parent_stat.st_uid != 0
+                or stat.S_IMODE(parent_stat.st_mode) & 0o022
+            ):
+                return None
+    except (OSError, RuntimeError):
+        return None
+    return canonical
+
+
+def _inspect_element_artifact(name: str) -> Path | None:
+    """Resolve the root-controlled shared object GStreamer loads for an element."""
+    inspect = shutil.which("gst-inspect-1.0")
+    if inspect is None:
+        return None
+    try:
+        result = subprocess.run(
+            [inspect, name],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except Exception as exc:  # noqa: BLE001 - command missing / timed out
+        _logger.warning("could not inspect GStreamer element %s: %s", name, exc)
+        return None
+    if result.returncode != 0:
+        return None
+    match = _GST_FILENAME_RE.search(result.stdout)
+    if match is None:
+        _logger.warning("gst-inspect did not report a plugin filename for %s", name)
+        return None
+    artifact = _root_controlled_canonical_file(
+        Path(match.group(1)), allow_canonical_alias=True
+    )
+    if artifact is None:
+        _logger.warning("%s resolved to an unsafe or unknown plugin artifact", name)
+    return artifact
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _collect_plugin_artifacts() -> dict[str, dict[str, str]] | None:
+    """Resolve and hash both ZED elements exactly as GStreamer sees them."""
+    artifacts: dict[str, dict[str, str]] = {}
+    for element in _ZED_ELEMENTS:
+        path = _inspect_element_artifact(element)
+        if path is None:
+            return None
+        try:
+            digest = _file_sha256(path)
+        except OSError as exc:
+            _logger.warning(
+                "could not hash %s plugin artifact %s: %s", element, path, exc
+            )
+            return None
+        artifacts[element] = {"path": str(path), "sha256": digest}
+    return artifacts
+
+
+def _manifest_payload(artifacts: dict[str, dict[str, str]]) -> str:
+    return (
+        json.dumps(
+            {
+                "schema": _MANIFEST_SCHEMA,
+                "pinnedRef": _PINNED_REF,
+                "patchSha256": hashlib.sha256(_PATCH.read_bytes()).hexdigest(),
+                "plugins": artifacts,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def _installed_plugins_ready(manifest_path: Path = _MACHINE_MANIFEST) -> bool:
+    """Recompute installed paths/digests and compare with the root manifest."""
+    safe_manifest = _root_controlled_canonical_file(
+        manifest_path, allow_canonical_alias=False
+    )
+    if safe_manifest is None:
+        return False
+    try:
+        saved = json.loads(safe_manifest.read_text(encoding="utf-8"))
+        current = _collect_plugin_artifacts()
+        if current is None:
+            return False
+        expected = json.loads(_manifest_payload(current))
+    except (OSError, ValueError, TypeError):
+        return False
+    return saved == expected
+
+
+def _installed_paths_from_build(src: Path) -> set[Path] | None:
+    """Canonical paths written by the just-completed CMake install."""
+    install_manifest = src / "build" / "install_manifest.txt"
+    try:
+        lines = install_manifest.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    installed: set[Path] = set()
+    for line in lines:
+        if not line:
+            continue
+        path = Path(line)
+        if not path.is_absolute():
+            return None
+        try:
+            installed.add(path.resolve(strict=True))
+        except (OSError, RuntimeError):
+            return None
+    return installed
+
+
+def _artifacts_came_from_build(src: Path, artifacts: dict[str, dict[str, str]]) -> bool:
+    installed = _installed_paths_from_build(src)
+    if installed is None:
+        return False
+    return all(Path(details["path"]) in installed for details in artifacts.values())
+
+
+def _publish_machine_manifest(payload: str) -> bool:
+    """Atomically publish the manifest from a root-private machine directory."""
+    parent = _MACHINE_MANIFEST.parent
+    temporary = parent / (f".{_MACHINE_MANIFEST.name}.{secrets.token_hex(16)}.stage")
+    if run_root(["mkdir", "-p", "-m", "0755", str(parent)]).returncode != 0:
+        return False
+    try:
+        canonical_parent = parent.resolve(strict=True)
+        parent_stat = canonical_parent.stat(follow_symlinks=False)
+        if (
+            canonical_parent != parent
+            or parent_stat.st_uid != 0
+            or not stat.S_ISDIR(parent_stat.st_mode)
+            or stat.S_IMODE(parent_stat.st_mode) & 0o022
+        ):
+            _logger.warning("refusing unsafe ZED manifest directory %s", parent)
+            return False
+    except (OSError, RuntimeError):
+        return False
+    try:
+        if run_root(["tee", str(temporary)], input_text=payload).returncode != 0:
+            return False
+        if run_root(["chmod", "0644", str(temporary)]).returncode != 0:
+            return False
+        if run_root(["chown", "root:root", str(temporary)]).returncode != 0:
+            return False
+        return (
+            run_root(
+                ["mv", "-f", "-T", str(temporary), str(_MACHINE_MANIFEST)]
+            ).returncode
+            == 0
+        )
+    finally:
+        # The staging name is random and lives below the fixed machine-state
+        # directory; after a successful rename this is simply a no-op.
+        run_root(["rm", "-f", "--", str(temporary)])
 
 
 def _apt_install_build_deps() -> bool:
@@ -235,12 +442,7 @@ def run(_args: object = None) -> None:
     stamp_file = src / ".axol-build-stamp"
     desired = _desired_stamp()
 
-    already = (
-        stamp_file.exists()
-        and stamp_file.read_text() == desired
-        and _element_installed("zedxonesrc")
-    )
-    if already:
+    if _installed_plugins_ready():
         print("Patched zed-gstreamer plugins already installed (pinned ref + patch).")
         return
 
@@ -269,14 +471,28 @@ def run(_args: object = None) -> None:
             "'axol gst.build-zed'."
         )
 
-    if _element_installed("zedxonesrc"):
-        try:
-            secure_atomic_write_text(stamp_file, desired, mode=0o644)
-        except OSError:
-            pass
-        print("Patched zed-gstreamer plugins installed (sensor-accurate timestamps).")
-    else:
+    artifacts = _collect_plugin_artifacts()
+    if artifacts is None:
         raise SystemExit(
-            "zedxonesrc is still not visible to gst-inspect after install; "
-            "check the GStreamer plugin path."
+            "zedxonesrc and zedsrc must both be visible to gst-inspect after "
+            "install; check the GStreamer plugin path."
         )
+    if not _artifacts_came_from_build(src, artifacts):
+        raise SystemExit(
+            "GStreamer resolved a ZED element to an unknown plugin artifact "
+            "instead of one installed by this patched build."
+        )
+    if not _publish_machine_manifest(_manifest_payload(artifacts)):
+        raise SystemExit("Could not publish the root-owned ZED plugin manifest.")
+    if not _installed_plugins_ready():
+        raise SystemExit(
+            "Installed ZED plugin bytes did not match the published manifest."
+        )
+
+    # Keep the legacy source stamp for operator visibility, but only after the
+    # root-owned installed-byte proof has been written and verified.
+    try:
+        secure_atomic_write_text(stamp_file, desired, mode=0o644)
+    except OSError:
+        pass
+    print("Patched zed-gstreamer plugins installed (sensor-accurate timestamps).")

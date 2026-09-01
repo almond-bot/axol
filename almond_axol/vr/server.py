@@ -35,6 +35,7 @@ import logging
 import socket
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -66,7 +67,9 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _quest_datum_lock = threading.Lock()
-_last_quest_datum: dict[str, Any] | None = None
+_quest_datums: weakref.WeakKeyDictionary[object, dict[str, dict[str, Any]]] = (
+    weakref.WeakKeyDictionary()
+)
 _QUEST_DATUM_FRESH_S = 5.0
 # A newly loaded Quest page may connect before uvicorn notices that the old
 # socket is half-open. Once the active logical producer has stopped sending for
@@ -93,24 +96,25 @@ def get_last_quest_pose_datum() -> dict[str, Any] | None:
     timed out. Internal source ownership fields never leave this process.
     """
     with _quest_datum_lock:
-        if _last_quest_datum is None:
+        candidates = [
+            value for sources in _quest_datums.values() for value in sources.values()
+        ]
+        if not candidates:
             return None
+        latest = max(candidates, key=lambda value: value["_observedMono"])
         result = {
-            key: value
-            for key, value in _last_quest_datum.items()
-            if not key.startswith("_")
+            key: value for key, value in latest.items() if not key.startswith("_")
         }
-        age = max(0.0, time.monotonic() - _last_quest_datum["_observedMono"])
+        age = max(0.0, time.monotonic() - latest["_observedMono"])
         result["ageSeconds"] = round(age, 3)
         result["live"] = age <= _QUEST_DATUM_FRESH_S
         return result
 
 
 def _remember_quest_pose_datum(
-    frame: VRFrame, *, server_token: int, source_id: str
+    frame: VRFrame, *, server: object, source_id: str
 ) -> None:
     """Expose the live Quest datum to setup UI without persisting user data."""
-    global _last_quest_datum
     left = {"profile": frame.l_pose_profile, "poseSpace": frame.l_pose_space}
     right = {"profile": frame.r_pose_profile, "poseSpace": frame.r_pose_space}
     if not any((*left.values(), *right.values())):
@@ -124,18 +128,17 @@ def _remember_quest_pose_datum(
         "commonKey": common_key,
         "observedAt": time.time(),
         "_observedMono": time.monotonic(),
-        "_serverToken": server_token,
         "_sourceId": source_id,
     }
     with _quest_datum_lock:
+        sources = _quest_datums.setdefault(server, {})
+        previous = sources.get(source_id)
         changed = (
-            _last_quest_datum is None
-            or _last_quest_datum.get("left") != left
-            or _last_quest_datum.get("right") != right
-            or _last_quest_datum.get("_serverToken") != server_token
-            or _last_quest_datum.get("_sourceId") != source_id
+            previous is None
+            or previous.get("left") != left
+            or previous.get("right") != right
         )
-        _last_quest_datum = value
+        sources[source_id] = value
     if changed:
         if common_key is not None:
             _logger.info("Quest controller calibration datum: %s", common_key)
@@ -156,17 +159,18 @@ def _remember_quest_pose_datum(
             )
 
 
-def _clear_quest_pose_datum(*, server_token: int, source_id: str | None = None) -> None:
+def _clear_quest_pose_datum(*, server: object, source_id: str | None = None) -> None:
     """Forget a datum once its WebXR source or owning server has stopped."""
-    global _last_quest_datum
     with _quest_datum_lock:
-        if _last_quest_datum is None:
+        sources = _quest_datums.get(server)
+        if sources is None:
             return
-        if _last_quest_datum.get("_serverToken") != server_token:
+        if source_id is None:
+            _quest_datums.pop(server, None)
             return
-        if source_id is not None and _last_quest_datum.get("_sourceId") != source_id:
-            return
-        _last_quest_datum = None
+        sources.pop(source_id, None)
+        if not sources:
+            _quest_datums.pop(server, None)
 
 
 class VRServer:
@@ -187,7 +191,6 @@ class VRServer:
             config: Port, TLS certificate, and private-key paths.
         """
         self._port = config.port
-        self._quest_datum_token = id(self)
         self._on_frame: Callable[[VRFrame], None] | None = None
         self._certfile = config.certfile or CERTFILE
         self._keyfile = config.keyfile or KEYFILE
@@ -298,6 +301,11 @@ class VRServer:
         # receive loop — see _handle_signaling); referenced here so the event
         # loop can't garbage-collect a running task.
         self._signaling_tasks: set[asyncio.Task[None]] = set()
+        # Detached offer work is also owned by its signaling socket. Socket
+        # teardown joins these tasks before closing that client's peers, so a
+        # slow create_offer cannot publish after disconnect cleanup has run.
+        self._client_offer_tasks: dict[int, set[asyncio.Task[Any]]] = {}
+        self._shutting_down = False
         # Event loop this server runs on (captured in enable()) so video
         # registration from another thread can schedule the pending flush.
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -474,9 +482,14 @@ class VRServer:
         if loop is None or not self._video_pending:
             return
         try:
-            asyncio.run_coroutine_threadsafe(self._flush_video_pending(), loop)
+            loop.call_soon_threadsafe(self._spawn_pending_video_flush, loop)
         except RuntimeError:
             pass  # server loop already shut down
+
+    def _spawn_pending_video_flush(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start a tracked pending flush only if this loop still owns the server."""
+        if self._loop is loop and self._video_pending:
+            self._spawn(self._flush_video_pending())
 
     async def _flush_video_pending(self) -> None:
         """Answer every parked video request (runs on the server loop)."""
@@ -489,7 +502,13 @@ class VRServer:
                 if self._webrtc is None:
                     await ws.send_text(json.dumps({"type": "webrtc-unavailable"}))
                 else:
-                    await self._send_webrtc_offer(ws, client_id)
+                    # Each signaling socket owns its own detached offer. If we
+                    # awaited here, disconnecting one client could cancel this
+                    # entire multi-client pending flush.
+                    self._spawn(
+                        self._send_webrtc_offer(ws, client_id),
+                        offer_client_id=client_id,
+                    )
             except Exception as exc:  # noqa: BLE001 - keep serving other clients
                 _logger.warning("failed to resolve pending video request: %s", exc)
 
@@ -561,6 +580,16 @@ class VRServer:
             return False
         if owner not in self._client_sources.get(client_id, set()):
             return False
+        # Membership survives while a duplicated tab's signaling socket stays
+        # open. Once another tab has rebased this logical source to its lower
+        # sequence range, the stale high-range socket must not publish a HUD
+        # watermark that the live tab can never overtake.
+        client_seen = self._client_last_seq_seen.get((client_id, owner))
+        if (
+            client_seen is None
+            or time.monotonic() - client_seen > _POSE_SEQUENCE_CLIENT_STALE_S
+        ):
+            return False
 
         declared_id = obj.get("pose_source_id")
         if declared_id is not None and declared_id != owner:
@@ -579,6 +608,7 @@ class VRServer:
         if self._server_task is not None:
             return
 
+        self._shutting_down = False
         # Captured so video registration (called from other threads) can
         # schedule the pending-request flush onto this loop.
         self._loop = asyncio.get_running_loop()
@@ -616,6 +646,8 @@ class VRServer:
             if sock is not None:
                 sock.close()
             self._listen_socket = None
+            self._loop = None
+            self._shutting_down = True
             tls_files.close()
             raise
         self._tls_files = tls_files
@@ -623,7 +655,21 @@ class VRServer:
 
     async def disable(self) -> None:
         """Gracefully shut down the WSS server."""
-        _clear_quest_pose_datum(server_token=self._quest_datum_token)
+        _clear_quest_pose_datum(server=self)
+
+        # Stop accepting detached signaling work before closing the managers
+        # it uses. Clearing the set alone loses ownership of live offer tasks,
+        # which can otherwise publish after shutdown or race close_all().
+        self._shutting_down = True
+        self._loop = None
+        signaling_tasks = tuple(self._signaling_tasks)
+        for task in signaling_tasks:
+            task.cancel()
+        if signaling_tasks:
+            await asyncio.gather(*signaling_tasks, return_exceptions=True)
+        self._signaling_tasks.clear()
+        self._client_offer_tasks.clear()
+
         if self._webrtc is not None:
             await self._webrtc.close_all()
         await self._control.close_all()
@@ -665,7 +711,6 @@ class VRServer:
         self._video_pending.clear()
         self._video_offering.clear()
         self._control_offering.clear()
-        self._signaling_tasks.clear()
         self._pose_owner = None
         self._pose_owner_kind = None
         self._pose_owner_last_seen = None
@@ -677,7 +722,6 @@ class VRServer:
         self._hud = None
         self._hud_client = None
         self._hud_pose_seq = None
-        self._loop = None
         # Fresh session next enable(): don't gate a reloaded headset's restarted
         # seq counter against a stale high-water mark.
         self._last_seq.clear()
@@ -854,9 +898,7 @@ class VRServer:
             self._source_clients.pop(source_id, None)
             self._source_kind.pop(source_id, None)
             self._last_seq.pop(source_id, None)
-            _clear_quest_pose_datum(
-                server_token=self._quest_datum_token, source_id=source_id
-            )
+            _clear_quest_pose_datum(server=self, source_id=source_id)
             if self._pose_owner == source_id:
                 self._pose_owner = None
                 self._pose_owner_kind = None
@@ -890,7 +932,7 @@ class VRServer:
         if source_kind == "webxr":
             _remember_quest_pose_datum(
                 frame,
-                server_token=self._quest_datum_token,
+                server=self,
                 source_id=source_id,
             )
         now = time.monotonic()
@@ -1011,7 +1053,10 @@ class VRServer:
         # completes.
         if msg_type == "control-request":
             if client_id not in self._control_offering:
-                self._spawn(self._send_control_offer(websocket, client_id))
+                self._spawn(
+                    self._send_control_offer(websocket, client_id),
+                    offer_client_id=client_id,
+                )
             return
         if msg_type == "control-answer":
             sdp = obj.get("sdp")
@@ -1073,7 +1118,10 @@ class VRServer:
                 await websocket.send_text(json.dumps({"type": "webrtc-pending"}))
                 return
             # Built off the receive loop — see the control-request comment.
-            self._spawn(self._send_webrtc_offer(websocket, client_id))
+            self._spawn(
+                self._send_webrtc_offer(websocket, client_id),
+                offer_client_id=client_id,
+            )
         elif msg_type == "webrtc-answer":
             sdp = obj.get("sdp")
             if isinstance(sdp, str):
@@ -1084,15 +1132,74 @@ class VRServer:
         else:
             _logger.debug("ignoring unknown signaling type: %s", msg_type)
 
-    def _spawn(self, coro: Any) -> None:
+    def _spawn(self, coro: Any, *, offer_client_id: int | None = None) -> None:
         """Run a signaling coroutine as its own task on the server loop.
 
         The task set holds a strong reference so a running task can't be
-        garbage-collected mid-flight.
+        garbage-collected mid-flight. Offer ownership is recorded before this
+        method returns: socket teardown can therefore cancel a newly spawned
+        offer even when its coroutine has not had a first chance to run.
         """
+        if self._shutting_down:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            return
         task = asyncio.create_task(coro)
         self._signaling_tasks.add(task)
         task.add_done_callback(self._signaling_tasks.discard)
+        if offer_client_id is not None:
+            self._client_offer_tasks.setdefault(offer_client_id, set()).add(task)
+            task.add_done_callback(
+                lambda completed, client_id=offer_client_id: (
+                    self._untrack_client_offer(client_id, completed)
+                )
+            )
+
+    def _track_client_offer(self, client_id: int) -> asyncio.Task[Any] | None:
+        """Attach the current detached offer task to its signaling client."""
+        task = asyncio.current_task()
+        if task is not None:
+            self._client_offer_tasks.setdefault(client_id, set()).add(task)
+        return task
+
+    def _untrack_client_offer(
+        self, client_id: int, task: asyncio.Task[Any] | None
+    ) -> None:
+        if task is None:
+            return
+        tasks = self._client_offer_tasks.get(client_id)
+        if tasks is None:
+            return
+        tasks.discard(task)
+        if not tasks:
+            self._client_offer_tasks.pop(client_id, None)
+
+    async def _drain_client_offers(self, client_id: int) -> None:
+        """Cancel and join one socket's offers before closing its peers."""
+        current = asyncio.current_task()
+        tasks = tuple(
+            task
+            for task in self._client_offer_tasks.get(client_id, ())
+            if task is not current and not task.done()
+        )
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        remaining = self._client_offer_tasks.get(client_id)
+        if remaining is not None and not remaining:
+            self._client_offer_tasks.pop(client_id, None)
+
+    @staticmethod
+    async def _close_webrtc_peer(webrtc: Any, client_id: int) -> None:
+        """Best-effort retirement of a partial or undeliverable video peer."""
+        try:
+            await webrtc.close(client_id)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not escape a task
+            _logger.warning(
+                "failed to close webrtc peer for client %d: %s", client_id, exc
+            )
 
     async def _send_control_offer(self, websocket: WebSocket, client_id: int) -> None:
         """Create and send the control-channel offer. Runs as its own task.
@@ -1103,6 +1210,7 @@ class VRServer:
         if client_id in self._control_offering:
             return
         self._control_offering.add(client_id)
+        task = self._track_client_offer(client_id)
         try:
             sdp = await self._control.create_offer(client_id)
             await websocket.send_text(
@@ -1116,8 +1224,18 @@ class VRServer:
             )
         except Exception as exc:  # noqa: BLE001 - task context; log and move on
             _logger.warning("control offer for client %d failed: %s", client_id, exc)
+            # create_offer publishes its peer before ICE gathering. Retire that
+            # partial peer and explicitly re-arm current clients; older clients
+            # that do not understand control-error simply ignore it and retain
+            # the ordinary WebSocket pose path.
+            await self._control.close(client_id)
+            try:
+                await websocket.send_text(json.dumps({"type": "control-error"}))
+            except Exception:
+                pass  # the signaling socket left with the failed offer
         finally:
             self._control_offering.discard(client_id)
+            self._untrack_client_offer(client_id, task)
 
     async def _send_webrtc_offer(self, websocket: WebSocket, client_id: int) -> None:
         """Create a fresh per-client offer and send it (unavailable on failure).
@@ -1132,13 +1250,16 @@ class VRServer:
         if client_id in self._video_offering:
             return
         self._video_offering.add(client_id)
+        task = self._track_client_offer(client_id)
         try:
             webrtc = self._webrtc
+            offer_created = False
             if webrtc is None:
                 payload: dict[str, Any] = {"type": "webrtc-unavailable"}
             else:
                 try:
                     sdp, tracks = await webrtc.create_offer(client_id)
+                    offer_created = True
                     payload = {
                         "type": "webrtc-offer",
                         "sdp": sdp,
@@ -1150,13 +1271,23 @@ class VRServer:
                     }
                 except Exception as exc:  # noqa: BLE001 - degrade to no video
                     _logger.error("failed to create webrtc offer: %s", exc)
+                    # Managers publish the per-client peer before ICE/relay
+                    # offer work completes. Retire a partial peer before
+                    # asking a still-connected browser to retry.
+                    await self._close_webrtc_peer(webrtc, client_id)
                     payload = {"type": "webrtc-unavailable"}
             try:
                 await websocket.send_text(json.dumps(payload))
             except Exception as exc:  # noqa: BLE001 - client left mid-offer
                 _logger.warning("failed to send webrtc reply: %s", exc)
+                if webrtc is not None and offer_created:
+                    # No answer can arrive when the offer was not delivered.
+                    # This also closes a peer registered after the socket's
+                    # disconnect cleanup began.
+                    await self._close_webrtc_peer(webrtc, client_id)
         finally:
             self._video_offering.discard(client_id)
+            self._untrack_client_offer(client_id, task)
 
     async def _send_session_config(self, websocket: WebSocket) -> None:
         """Best-effort replay of authoritative per-session client state."""
@@ -1250,6 +1381,7 @@ class VRServer:
                     if server._hud is not None:
                         server._hud = None
                         await server._broadcast_hud()
+                await server._drain_client_offers(client_id)
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
                 await server._control.close(client_id)

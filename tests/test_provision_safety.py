@@ -169,6 +169,9 @@ class ProvisionSafetyTest(unittest.TestCase):
     def test_migration_failure_aborts_before_best_effort_steps(self) -> None:
         with (
             patch.object(
+                provision, "host_update_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(
                 provision,
                 "_neutralize_legacy_can_root_execution",
                 side_effect=RuntimeError("crontab unreadable"),
@@ -191,6 +194,9 @@ class ProvisionSafetyTest(unittest.TestCase):
 
         with (
             tempfile.TemporaryDirectory() as zed_sdk,
+            patch.object(
+                provision, "host_update_lock", return_value=contextlib.nullcontext()
+            ),
             patch.object(provision, "_neutralize_legacy_can_root_execution"),
             patch.object(provision, "_ZED_SDK", Path(zed_sdk)),
             patch.object(provision.adb, "install", side_effect=lambda: succeed("adb")),

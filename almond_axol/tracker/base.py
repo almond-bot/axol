@@ -17,6 +17,7 @@ tracker's SLAM frame) convert through :func:`zup_to_yup_pos` /
 from __future__ import annotations
 
 import abc
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -27,6 +28,12 @@ import numpy as np
 # and the streaming bridge cannot silently disagree about what "live" means.
 TRACKER_POSE_MAX_AGE_S = 0.15
 TRACKER_PAIR_MAX_SKEW_S = 0.05
+
+# Reject relative/device-local values passed as Unix epoch timestamps while
+# preserving genuinely old/delayed epoch samples so freshness checks reject
+# them instead of silently making them fresh at receipt time.
+_HOST_EPOCH_MIN_S = 946_684_800.0  # 2000-01-01 UTC
+_CAPTURE_FUTURE_TOLERANCE_S = 0.05
 
 # Basis change from a right-handed z-up world to the WebXR y-up world:
 # x' = x, y' = z, z' = -y (a -90 deg rotation about x). As a quaternion
@@ -83,17 +90,57 @@ class TrackerPose:
     Attributes:
         pos:      Position in metres, shape (3,).
         quat:     Unit orientation quaternion ``(x, y, z, w)``, shape (4,).
-        t:        Host capture time in ``time.perf_counter()`` seconds.
+        t:        Best available host sample time in ``time.perf_counter()``
+                  seconds. This is capture time when the backend exposes one,
+                  otherwise the earliest available host receipt time.
         tracking: ``True`` while the backend considers the pose trustworthy
                   (lighthouse lock / SLAM converged). The bridge holds the
                   last good pose while this is ``False`` so IK never chases
                   an occlusion or relocalisation glitch.
+        timestamp_is_capture: Whether ``t`` came from a native sensor/solver
+                  timestamp rather than host receipt. Kept last so existing
+                  positional construction remains compatible.
     """
 
     pos: np.ndarray
     quat: np.ndarray
     t: float
     tracking: bool = True
+    timestamp_is_capture: bool = True
+
+
+def epoch_seconds_to_perf_counter(
+    timestamp: object,
+    *,
+    receipt_perf: float | None = None,
+    receipt_epoch: float | None = None,
+) -> float | None:
+    """Map a plausible host Unix timestamp onto ``perf_counter``'s clock.
+
+    Native tracker APIs commonly expose host-epoch seconds while the rest of
+    the capture pipeline uses ``perf_counter``. Sampling both clocks at receipt
+    provides the offset without assuming their platform-specific origins.
+    Relative, zero, non-finite, and implausibly future values return ``None`` so
+    callers can use an explicitly labelled receipt-time fallback.
+    """
+    try:
+        epoch = float(timestamp)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not np.isfinite(epoch) or epoch < _HOST_EPOCH_MIN_S:
+        return None
+    if receipt_perf is None:
+        receipt_perf = time.perf_counter()
+    if receipt_epoch is None:
+        receipt_epoch = time.time()
+    mapped = epoch + (receipt_perf - receipt_epoch)
+    if mapped > receipt_perf:
+        if mapped - receipt_perf > _CAPTURE_FUTURE_TOLERANCE_S:
+            return None
+        # Clock sampling and libsurvive's smoothed device→host offset can put a
+        # capture fractionally in the future. A received sample cannot be.
+        mapped = receipt_perf
+    return mapped
 
 
 def valid_tracker_pose(sample: object) -> bool:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -1275,7 +1276,7 @@ class CanDriverIdentityTest(unittest.TestCase):
             text=True,
         )
 
-    def test_no_srcversion_uses_native_taint_identity_fallback(self) -> None:
+    def test_no_srcversion_never_trusts_native_taint_as_byte_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             modules = root / "modules"
@@ -1304,14 +1305,148 @@ class CanDriverIdentityTest(unittest.TestCase):
                 common[3],
                 common[4],
                 common[5] as root_run,
+                self.assertRaisesRegex(RuntimeError, "enough build identity"),
             ):
                 driver._load_available_driver()
                 root_run.assert_not_called()
 
+            # Even an in-tree-looking loaded module cannot authenticate a
+            # different file that appeared at modprobe's selected path later.
+            native.write_bytes(b"arbitrary replacement")
             (loaded / "taint").write_text("O")
             with common[0], common[1], common[2], common[3], common[4], common[5]:
                 with self.assertRaisesRegex(RuntimeError, "enough build identity"):
                     driver._load_available_driver()
+
+    def test_attached_driver_topology_requires_binding_and_exact_channels(self) -> None:
+        with patch.object(driver, "_bound_can_topology") as topology:
+            driver._verify_attached_driver_devices(())
+        topology.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            usb = root / "usb"
+            net_class = root / "net"
+            device = usb / "1-2"
+            interface = usb / "1-2:1.0"
+            gs_usb = root / "drivers" / "gs_usb"
+            device.mkdir(parents=True)
+            interface.joinpath("net", "can0").mkdir(parents=True)
+            interface.joinpath("net", "can1").mkdir(parents=True)
+            gs_usb.mkdir(parents=True)
+            (device / "idVendor").write_text("1d50\n")
+            (device / "idProduct").write_text("606f\n")
+            (interface / "driver").symlink_to(gs_usb)
+            (interface / "net" / "can0" / "dev_id").write_text("0x0\n")
+            (interface / "net" / "can1" / "dev_id").write_text("0x1\n")
+
+            with (
+                patch.object(driver, "_USB_DEVICES", usb),
+                patch.object(driver, "_NET_CLASS", net_class),
+            ):
+                expected = driver._attached_driver_devices()
+                self.assertEqual(
+                    expected,
+                    (("1-2", "1d50", "606f", ((0,), (0, 1))),),
+                )
+                driver._verify_attached_driver_devices(expected, timeout=0)
+
+                # The same VID/PID is also the supported single-channel
+                # cart/chest adapter. Its complete (0,) topology must not make
+                # first-run driver installation roll back before can.setup can
+                # probe and classify the bus.
+                can1 = interface / "net" / "can1"
+                (can1 / "dev_id").unlink()
+                can1.rmdir()
+                driver._verify_attached_driver_devices(expected, timeout=0)
+
+                can1.mkdir()
+                (can1 / "dev_id").write_text("0x2\n")
+                with self.assertRaisesRegex(RuntimeError, "expected topology"):
+                    driver._verify_attached_driver_devices(expected, timeout=0)
+
+    def test_install_rolls_back_before_commit_when_attached_topology_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ko = root / "built.ko"
+            ko.write_bytes(b"new driver")
+            destination = root / "modules" / "updates" / "gs_usb.ko"
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"previous driver")
+            loaded = root / "loaded"
+            loaded.mkdir()
+            modules_load = root / "modules-load.d" / "gs_usb.conf"
+            depmod = "/sbin/depmod"
+            modprobe = "/sbin/modprobe"
+            commands: list[list[str]] = []
+
+            def run_root(command: list[str], **kwargs: object) -> SimpleNamespace:
+                commands.append(command)
+                executable = Path(command[0]).name
+                if executable == "install":
+                    source, target = map(Path, command[-2:])
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(source.read_bytes())
+                elif command == [modprobe, "-r", "gs_usb"]:
+                    for child in loaded.iterdir():
+                        child.unlink()
+                    loaded.rmdir()
+                elif command == [modprobe, "gs_usb"]:
+                    loaded.mkdir()
+                    (loaded / "version").write_text(driver._VENDORED_MODULE_VERSION)
+                elif executable == "rm":
+                    Path(command[-1]).unlink(missing_ok=True)
+                elif executable == "tee":
+                    target = Path(command[-1])
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(str(kwargs.get("input_text", "")))
+                return SimpleNamespace(returncode=0, stderr="")
+
+            attached = (("1-2", "1d50", "606f", (0, 1)),)
+            with (
+                patch.object(driver, "_BUILD_DIR", root / "build"),
+                patch.object(driver, "_MODULES_LOAD_FILE", modules_load),
+                patch.object(driver, "_LOADED_MODULE", loaded),
+                patch.object(driver, "_vendored_driver_path", return_value=destination),
+                patch.object(
+                    driver, "_selected_driver_path", return_value=str(destination)
+                ),
+                patch.object(driver, "_find_depmod", return_value=depmod),
+                patch.object(driver, "_find_modprobe", return_value=modprobe),
+                patch.object(driver, "_attached_driver_devices", return_value=attached),
+                patch.object(
+                    driver,
+                    "_verify_attached_driver_devices",
+                    side_effect=RuntimeError("bad attached topology"),
+                ) as verify,
+                patch.object(driver, "run_root", side_effect=run_root),
+                redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(RuntimeError, "previous .* state was restored"),
+            ):
+                driver._install(ko)
+
+            verify.assert_called_once_with(attached)
+            self.assertEqual(destination.read_bytes(), b"previous driver")
+            self.assertTrue(loaded.is_dir())
+            self.assertFalse(modules_load.exists())
+            self.assertFalse(
+                any(Path(command[0]).name == "tee" for command in commands)
+            )
+            self.assertTrue(all(Path(command[0]).is_absolute() for command in commands))
+
+    def test_privileged_tool_lookup_ignores_operator_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            malicious = Path(directory) / "modprobe"
+            malicious.write_text("#!/bin/sh\nexit 0\n")
+            malicious.chmod(0o755)
+            self.assertFalse(driver._trusted_root_executable(malicious))
+            with patch.dict(os.environ, {"PATH": directory}):
+                selected = driver._find_modprobe()
+        self.assertIsNotNone(selected)
+        self.assertNotEqual(selected, str(malicious))
+        self.assertTrue(Path(selected or "").is_absolute())
 
     def test_unverifiable_managed_override_is_rebuilt_automatically(self) -> None:
         built = Path("/tmp/gs_usb-build/gs_usb.ko")

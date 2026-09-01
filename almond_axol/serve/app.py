@@ -11,6 +11,7 @@ import asyncio
 import logging
 import math
 import os
+import secrets
 import socket
 import subprocess
 import time
@@ -22,6 +23,8 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.staticfiles import StaticFiles
 
 from ..constants import (
     ARM_JOINTS,
@@ -651,6 +654,7 @@ _CAN_DISCOVERY_STATUSES = {
     "unidentified",
     "error",
 }
+_CAN_DISCOVERY_FORCE_RETRY_SECONDS = 2.0
 
 
 @dataclass
@@ -663,6 +667,7 @@ class _CanDiscoveryCache:
     candidate_identities: tuple[tuple[str, str], ...] | None = None
     validation_identity: tuple[tuple[str, ...], ...] | None = None
     validated_identity: tuple[tuple[str, ...], ...] | None = None
+    last_forced_retry_at: float | None = None
 
     def observe(self, state: Any, *, running: bool = False) -> None:
         candidates = tuple(state.candidate_identities)
@@ -686,11 +691,30 @@ class _CanDiscoveryCache:
         elif self.status == "ready" and (candidates or validation_needed):
             self.status = "needed"
 
-    def finish(self, state: Any, *, status: str, message: str | None) -> None:
+    def finish(
+        self,
+        state: Any,
+        *,
+        status: str,
+        message: str | None,
+        validated_identity: tuple[tuple[str, ...], ...] | None = None,
+    ) -> None:
         if status not in _CAN_DISCOVERY_STATUSES - {"needed", "running"}:
             raise ValueError(f"invalid terminal CAN discovery status: {status}")
         self.observe(state, running=True)
-        self.validated_identity = tuple(state.validation_identity)
+        classified = (
+            tuple(state.validation_identity)
+            if validated_identity is None
+            else tuple(validated_identity)
+        )
+        self.validated_identity = classified
+        if tuple(state.validation_identity) != classified:
+            # setup classified an exact physical/config epoch. Hardware that
+            # arrived or changed before this rescan needs its own pass; never
+            # bless it with the preceding result merely because the call won.
+            self.status = "needed"
+            self.message = None
+            return
         self.status = status
         self.message = message
 
@@ -802,12 +826,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         os.umask(0o027)
 
     app = FastAPI(title="axol serve")
+    # Browser latches must not survive a quick serve restart that happens
+    # entirely between two status polls. This value is opaque, process-local,
+    # and intentionally regenerated for every app lifetime.
+    server_instance_id = secrets.token_hex(16)
     # System setup (Jetson clock pinning, GStreamer install) is owned by the
     # host installer and its boot service (`axol jetson.setup` runs as an
     # ExecStartPre on axol.service; `axol provision` runs at install time). The
-    # one exception is the self-updater (below), which re-runs `axol provision`
-    # after a release upgrade and self-heals a host that upgraded into this
-    # build from an older release.
+    # one exception is the self-updater (below), which delegates upgrades to
+    # the hosted transaction and retains a legacy startup-provision self-heal.
 
     manager = SessionManager()
     hub = TelemetryHub()
@@ -829,10 +856,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # pass its idle check while a Mantis operation was still starting (or vice
     # versa), leaving two readers fighting over the same device.
     session_launch_reservation = asyncio.Lock()
-    # A CAN-owning subprocess becomes terminal just before its watcher has
-    # reopened the idle RobotLink.  Keep that small cleanup window reserved so
-    # a new operation cannot start against a link that is still being restored.
+    # Resource-owning subprocesses become terminal just before their watcher has
+    # completed cleanup. Keep those small windows reserved so a new operation
+    # cannot start against a CAN link still being restored or a camera session
+    # whose lifetime lease has not been released.
     diagnostic_cleanup_pending: set[str] = set()
+    camera_cleanup_pending: set[str] = set()
     # A successful manual Disconnect pauses only the exact profile + channel
     # map that was disconnected.  This lives on the server so opening another
     # browser cannot immediately undo the operator's choice.  It is deliberately
@@ -845,17 +874,27 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     can_discovery_task: asyncio.Task[None] | None = None
 
     def _diagnostic_session_active() -> bool:
-        return bool(diagnostic_cleanup_pending) or any(
+        return bool(diagnostic_cleanup_pending or camera_cleanup_pending) or any(
             session["status"] in ("starting", "running", "stopping")
             for session in manager.list()
         )
 
-    def _is_idle() -> bool:
-        """Safe to restart: no operation running.
+    def _camera_session_active() -> bool:
+        if camera_cleanup_pending:
+            return True
+        return any(
+            session["status"] in ("starting", "running", "stopping")
+            and (command := COMMANDS.get(str(session.get("command")))) is not None
+            and command.uses_cameras
+            for session in manager.list()
+        )
 
-        A connected robot is fine -- restarting drops the CAN link, which simply
-        reconnects after the relaunch; only an in-flight operation must not be
-        interrupted.
+    def _is_idle() -> bool:
+        """Safe to hand host ownership to the updater: no operation running.
+
+        A connected robot is fine -- the hosted transaction stops the service
+        and the candidate reconnects after verification; only an in-flight
+        operation must not be interrupted.
         """
         if runner.is_running():
             return False
@@ -863,9 +902,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # Surfaces "update available" (a newer release tag, found via read-only
     # `git ls-remote --tags`) to the control panel via /api/update/status and
-    # applies an on-demand tag-pinned reinstall via /api/update/start,
-    # restarting the process (systemd relaunches it) once idle. Nothing
-    # upgrades automatically. No-ops for dev checkouts.
+    # delegates an on-demand exact release to a transient hosted-installer
+    # worker via /api/update/start. Nothing upgrades automatically. No-ops for
+    # dev checkouts.
     updater = SelfUpdater(_is_idle)
 
     def _maintenance_launch_response() -> JSONResponse | None:
@@ -926,6 +965,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             == ("mantis", mantis_channels[0], mantis_channels[1])
         )
         return {
+            "serverInstanceId": server_instance_id,
             "interfaces": interfaces,
             "profiles": {
                 "axol": axol_presence,
@@ -955,6 +995,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 refreshed,
                 status=result.status,
                 message=result.message,
+                validated_identity=result.validation_identity,
             )
         except Exception:  # noqa: BLE001 - terminal state is surfaced safely
             _logger.exception("automatic CAN hardware discovery failed")
@@ -973,7 +1014,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         finally:
             session_launch_reservation.release()
 
-    async def _launch_or_join_can_discovery() -> asyncio.Task[None] | JSONResponse:
+    async def _launch_or_join_can_discovery(
+        *, force: bool = False
+    ) -> asyncio.Task[None] | JSONResponse:
         """Start one cancellation-safe discovery task or join the current one."""
         nonlocal can_discovery_task
         async with can_discovery_launch:
@@ -1003,6 +1046,40 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 session_launch_reservation.release()
                 raise
             can_discovery.observe(initial_state)
+            if force and can_discovery.status in {
+                "partial",
+                "unidentified",
+                "error",
+            }:
+                now = time.monotonic()
+                last_retry = can_discovery.last_forced_retry_at
+                if (
+                    last_retry is not None
+                    and now - last_retry < _CAN_DISCOVERY_FORCE_RETRY_SECONDS
+                ):
+                    session_launch_reservation.release()
+                    inventory = await _can_inventory()
+                    retry_after = max(
+                        1,
+                        math.ceil(
+                            _CAN_DISCOVERY_FORCE_RETRY_SECONDS - (now - last_retry)
+                        ),
+                    )
+                    inventory.update(
+                        {
+                            "error": "CAN identification was just retried; wait briefly",
+                            "retryable": True,
+                            "retryAfterSeconds": retry_after,
+                        }
+                    )
+                    return JSONResponse(
+                        inventory,
+                        status_code=429,
+                        headers={"Retry-After": str(retry_after)},
+                    )
+                can_discovery.last_forced_retry_at = now
+                can_discovery.status = "needed"
+                can_discovery.message = None
             if can_discovery.status != "needed":
                 session_launch_reservation.release()
                 inventory = await _can_inventory()
@@ -1122,17 +1199,32 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """
         return HTMLResponse(ACCEPT_PAGE_HTML)
 
+    @app.get("/api/health")
+    async def health() -> dict[str, Any]:
+        """Process readiness used by systemd's post-update verifier.
+
+        This endpoint deliberately does not start lazy provisioning. During a
+        candidate boot the durable marker already blocks every hardware launch;
+        the verifier needs only to prove that the expected backend stayed up on
+        one stable systemd PID before it commits that candidate.
+        """
+        return {
+            "ready": True,
+            "version": updater.version,
+            "pid": os.getpid(),
+        }
+
     @app.get("/api/info")
     async def get_info() -> dict[str, Any]:
         """Identify the serve host so the UI can build reachable links/hints."""
-        # Self-heal a host that upgraded into this build from an older release
-        # (the old code never ran `axol provision`); idempotent, once per process.
+        # Self-heal a host whose legacy update path skipped this build's new
+        # provisioning steps; idempotent, once per process.
         # Startup provisioning mutates the same live tool environment as an
         # update. Enter it through the global launch reservation so it cannot
         # begin between another endpoint's idle check and hardware start.
         async with camera_reservation, session_launch_reservation:
             if _is_idle() and not updater.launches_blocked:
-                updater.ensure_provisioned()
+                await updater.ensure_provisioned()
         return {
             "hostname": socket.gethostname(),
             "lanIp": _lan_ip(),
@@ -1160,7 +1252,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/update/start")
     async def update_start() -> JSONResponse:
-        """Apply a user-initiated upgrade; the server restarts onto new code."""
+        """Delegate a user-initiated exact release to the hosted transaction."""
         # Setting the updater's launch barrier and checking global idleness is
         # atomic with every operation/session/camera launch below.
         async with camera_reservation, session_launch_reservation:
@@ -1316,7 +1408,31 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             if isinstance(target, JSONResponse):
                 return target
             profile, channels = target
-            if _uses_managed_name(channels):
+            automatic = req is not None and req.automatic
+            uses_managed_name = _uses_managed_name(channels)
+            attached = None
+            if automatic or uses_managed_name:
+                # Do not rely on the browser having won its inventory poll.
+                # A direct/stale automatic request must observe raw USB state
+                # before it can open any CAN interface.
+                attached = await asyncio.to_thread(_attached_hub_state)
+                _observe_can_state(attached, running=_discovery_running())
+            if automatic and (
+                can_discovery.status in {"needed", "running", "unidentified", "error"}
+                or (
+                    attached is not None
+                    and attached.candidate_identities
+                    and not uses_managed_name
+                )
+            ):
+                return JSONResponse(
+                    {
+                        "error": "automatic connection is waiting for CAN "
+                        "hardware discovery"
+                    },
+                    status_code=409,
+                )
+            if uses_managed_name:
                 if not _managed_names_match_profile(profile, channels):
                     return JSONResponse(
                         {
@@ -1325,11 +1441,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         },
                         status_code=409,
                     )
-                attached = await asyncio.to_thread(_attached_hub_state)
-                _observe_can_state(attached, running=_discovery_running())
+                assert attached is not None
                 if (
                     profile not in attached.configured_profiles
-                    or can_discovery.status in {"needed", "running", "error"}
+                    or can_discovery.status
+                    in {"needed", "running", "unidentified", "error"}
                 ):
                     return JSONResponse(
                         {
@@ -1340,7 +1456,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         status_code=409,
                     )
             target_key = (profile, channels[0], channels[1])
-            automatic = req is not None and req.automatic
             if automatic and manually_disconnected_target == target_key:
                 return JSONResponse(
                     {
@@ -1399,14 +1514,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return await _can_inventory()
 
     @app.post("/api/can/discover", response_model=None)
-    async def can_discover() -> dict[str, Any] | JSONResponse:
+    async def can_discover(force: bool = False) -> dict[str, Any] | JSONResponse:
         """Positively identify and persist fresh Axol/Mantis hub roles."""
         if os.geteuid() != 0:
             return JSONResponse(
                 {"error": "automatic CAN discovery requires root axol serve"},
                 status_code=403,
             )
-        task = await _launch_or_join_can_discovery()
+        task = await _launch_or_join_can_discovery(force=force)
         if isinstance(task, JSONResponse):
             return task
         # Request cancellation must not cancel a thread performing root setup.
@@ -1467,9 +1582,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # -- diagnostics runs (script launches with telemetry capture) -----------
 
     async def _watch_diagnostics_run(
-        meta: dict[str, Any] | None, session: Session, uses_can_bus: bool
+        meta: dict[str, Any] | None,
+        session: Session,
+        uses_can_bus: bool,
+        uses_cameras: bool,
     ) -> None:
-        """Wait for the session to end, return the bus, persist the run (if any)."""
+        """Wait for exit, release lifetime hardware leases, and persist the run."""
         queue = manager.subscribe(session)
         try:
             while session.status in ("starting", "running", "stopping"):
@@ -1481,16 +1599,21 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     break
         finally:
             manager.unsubscribe(session, queue)
-            if uses_can_bus:
+            if uses_can_bus or uses_cameras:
                 # The process status is already terminal here, so retain the
                 # shared reservation explicitly until the idle link owns CAN
-                # again.  The launch lock makes the pending-check and discard
-                # atomic with both launch endpoints.
+                # again and any camera lease is cleared. The launch lock makes
+                # the pending-check and discard atomic with every launch and
+                # direct camera endpoint.
                 async with session_launch_reservation:
                     try:
-                        await asyncio.to_thread(robot.reacquire)
+                        if uses_can_bus:
+                            await asyncio.to_thread(robot.reacquire)
                     finally:
-                        diagnostic_cleanup_pending.discard(session.id)
+                        if uses_can_bus:
+                            diagnostic_cleanup_pending.discard(session.id)
+                        if uses_cameras:
+                            camera_cleanup_pending.discard(session.id)
         if meta is not None:
             await asyncio.to_thread(
                 runs.finalize,
@@ -1505,7 +1628,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         args: dict[str, Any],
         *,
         stdin_pipe: bool,
-    ) -> tuple[Any, Session, bool] | JSONResponse:
+    ) -> tuple[Any, Session, bool, bool] | JSONResponse:
         """Atomically reserve shared hardware and spawn one catalog command."""
         command = COMMANDS.get(command_id)
         if command is None:
@@ -1600,6 +1723,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # A camera-only diagnostic (ZED cable check) doesn't touch the CAN
             # bus, so leave the idle motor telemetry streaming while it runs.
             uses_can_bus = command.uses_can_bus
+            uses_cameras = command.uses_cameras
             if uses_can_bus:
                 try:
                     await asyncio.to_thread(robot.release)
@@ -1626,7 +1750,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     await asyncio.to_thread(robot.reacquire)
                 else:
                     diagnostic_cleanup_pending.add(session.id)
-            return command, session, uses_can_bus
+            if uses_cameras and session.status != "error":
+                camera_cleanup_pending.add(session.id)
+            return command, session, uses_can_bus, uses_cameras
 
     @app.post("/api/diagnostics/run")
     async def diagnostics_run(req: DiagnosticsRunRequest) -> JSONResponse:
@@ -1641,7 +1767,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         )
         if isinstance(launched, JSONResponse):
             return launched
-        command, session, uses_can_bus = launched
+        command, session, uses_can_bus, uses_cameras = launched
         # Only the Diagnostics tests are recorded in the run history; the
         # ad-hoc launches (CAN bring-up, motor calibration tools) still get
         # the bus handover + prompt plumbing but leave no record behind.
@@ -1657,7 +1783,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     list(session.log),
                 )
         else:
-            asyncio.create_task(_watch_diagnostics_run(meta, session, uses_can_bus))
+            asyncio.create_task(
+                _watch_diagnostics_run(meta, session, uses_can_bus, uses_cameras)
+            )
         return JSONResponse({"run": meta, "session": session.to_dict()})
 
     @app.get("/api/diagnostics/runs")
@@ -1685,6 +1813,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             maintenance = _maintenance_launch_response()
             if maintenance is not None:
                 return maintenance
+            if runner.is_running() or _camera_session_active():
+                return JSONResponse(
+                    {"error": "cannot detect cameras while they are in use"},
+                    status_code=409,
+                )
             return await asyncio.to_thread(_detect_cameras)
 
     @app.get("/api/cameras/preview/{serial}", response_model=None)
@@ -1696,9 +1829,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             maintenance = _maintenance_launch_response()
             if maintenance is not None:
                 return maintenance
-            if runner.is_running():
+            if runner.is_running() or _camera_session_active():
                 return JSONResponse(
-                    {"error": "cannot preview cameras while an operation is running"},
+                    {"error": "cannot preview cameras while they are in use"},
                     status_code=409,
                 )
 
@@ -1733,11 +1866,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             maintenance = _maintenance_launch_response()
             if maintenance is not None:
                 return maintenance
-            if runner.is_running():
+            if runner.is_running() or _camera_session_active():
                 return JSONResponse(
-                    {
-                        "error": "cannot restart the ZED daemon while an operation is running"
-                    },
+                    {"error": "cannot restart the ZED daemon while cameras are in use"},
                     status_code=409,
                 )
 
@@ -2377,9 +2508,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         )
         if isinstance(launched, JSONResponse):
             return launched
-        _command, session, uses_can_bus = launched
+        _command, session, uses_can_bus, uses_cameras = launched
         if session.status != "error":
-            asyncio.create_task(_watch_diagnostics_run(None, session, uses_can_bus))
+            asyncio.create_task(
+                _watch_diagnostics_run(None, session, uses_can_bus, uses_cameras)
+            )
         return JSONResponse(session.to_dict())
 
     @app.post("/api/sessions/{session_id}/stop")
@@ -2459,6 +2592,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        # Freeze maintenance first and reap any locally owned root child before
+        # tearing down the sessions/hardware it is gated against. A confirmed
+        # transient update worker is independently owned by systemd and is not
+        # stopped by this drain.
+        await updater.shutdown()
         if can_discovery_task is not None and not can_discovery_task.done():
             await asyncio.shield(can_discovery_task)
         await runner.shutdown()
@@ -2479,18 +2617,54 @@ def _mount_spa(app: FastAPI, static_dir: Path) -> None:
     rebuild is picked up immediately instead of the browser serving a stale
     ``index.html`` that points at deleted asset hashes.
     """
-    index = static_dir / "index.html"
+    # Resolve the boundary once, then delegate file lookup to StaticFiles. Its
+    # lookup resolves every candidate and checks ``commonpath`` before returning
+    # a FileResponse, so an asset symlink cannot escape the bundle directory.
+    # Keep the explicit validation below as a fail-closed boundary for raw ASGI
+    # paths as well: clients such as ``curl --path-as-is`` can send ``..``
+    # components that ordinary browsers normalize before making a request.
+    static_root = static_dir.resolve(strict=True)
+    static_files = StaticFiles(directory=static_root, follow_symlink=False)
     immutable = {"Cache-Control": "public, max-age=31536000, immutable"}
     no_cache = {"Cache-Control": "no-cache"}
 
+    def safe_relative_path(full_path: str) -> bool:
+        if os.path.isabs(full_path) or "\\" in full_path:
+            return False
+        if any(component in {".", ".."} for component in full_path.split("/")):
+            return False
+        try:
+            candidate = (static_root / full_path).resolve(strict=False)
+            candidate.relative_to(static_root)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return True
+
     @app.get("/{full_path:path}", response_model=None)
-    async def spa(full_path: str) -> FileResponse | JSONResponse:
+    async def spa(full_path: str, request: Request) -> Response:
         if full_path.startswith("api/"):
             return JSONResponse({"error": "not found"}, status_code=404)
-        candidate = static_dir / full_path
-        if full_path and candidate.is_file():
-            headers = immutable if full_path.startswith("assets/") else no_cache
-            return FileResponse(candidate, headers=headers)
-        if index.is_file():
-            return FileResponse(index, headers=no_cache)
-        return JSONResponse({"error": "web bundle not built"}, status_code=404)
+        if not safe_relative_path(full_path):
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        if full_path:
+            try:
+                response = await static_files.get_response(full_path, request.scope)
+            except StarletteHTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+            else:
+                response.headers.update(
+                    immutable if full_path.startswith("assets/") else no_cache
+                )
+                return response
+
+        # Only safe, in-bound application routes receive the SPA fallback.
+        try:
+            response = await static_files.get_response("index.html", request.scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            return JSONResponse({"error": "web bundle not built"}, status_code=404)
+        response.headers.update(no_cache)
+        return response

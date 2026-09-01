@@ -290,8 +290,10 @@ async def _run(side: str, serial: int, duration: float) -> None:
         print("Tracking source connected.\n")
 
         cam = ZedCamera(ZedCameraConfig(serial=serial))
-        cam.connect()
         try:
+            # Enter cleanup ownership before connect(): the SDK handle and its
+            # grab thread may already exist when startup is interrupted.
+            cam.connect()
             await asyncio.to_thread(
                 input,
                 f"[{side.upper()}] Place an ArUco marker (4x4 dictionary) flat "
@@ -309,13 +311,28 @@ async def _run(side: str, serial: int, duration: float) -> None:
                 name="mantis-latency-cam",
                 daemon=True,
             )
-            cam_thread.start()
-            await asyncio.sleep(duration)
-            stop.set()
-            server.set_on_frame(None)
-            cam_thread.join(timeout=5.0)
+            try:
+                cam_thread.start()
+                await asyncio.sleep(duration)
+            finally:
+                stop.set()
+                try:
+                    server.set_on_frame(None)
+                finally:
+                    try:
+                        cam_thread.join(timeout=5.0)
+                    except RuntimeError:
+                        # Thread.start() failed before creating a native owner.
+                        if cam_thread.is_alive():
+                            raise
+                    if cam_thread.is_alive():
+                        raise RuntimeError(
+                            "Mantis latency camera-analysis thread did not stop; "
+                            "camera ownership is uncertain"
+                        )
         finally:
-            cam.disconnect()
+            if cam.is_connected or cam.thread is not None:
+                cam.disconnect()
 
     print(
         f"\ncaptured {stats['detections']}/{stats['frames']} frames with the "

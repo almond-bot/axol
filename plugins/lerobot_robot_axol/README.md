@@ -10,6 +10,7 @@ auto-discovery — no changes to LeRobot itself.
 | Kind | `type` | Class |
 |---|---|---|
 | Robot | `axol` | `almond_axol.lerobot.robot.AxolRobot` |
+| Robot | `axol_mantis` | `almond_axol.lerobot.robot.MantisRobot` |
 | Teleoperator | `axol_vr` | `almond_axol.lerobot.teleop.AxolVRTeleop` |
 | Camera | `zed` | `almond_axol.lerobot.camera.ZedCamera` |
 

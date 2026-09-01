@@ -7,6 +7,16 @@ import type {
   RobotState,
 } from "./supervisor"
 
+/** Prefer the backend's app lifetime; retain the failure heuristic for old hosts. */
+export function canServerEpoch(
+  serverInstanceId: string | null | undefined,
+  legacyRecoveryEpoch: number
+): string {
+  return serverInstanceId
+    ? `instance:${serverInstanceId}`
+    : `legacy-recovery:${legacyRecoveryEpoch}`
+}
+
 /** Discovery must settle before any saved-profile auto-connect decision. */
 export function canDiscoveryBlocksAutoConnect(
   discovery: CanDiscoveryState | null | undefined
@@ -14,6 +24,7 @@ export function canDiscoveryBlocksAutoConnect(
   return (
     discovery?.status === "needed" ||
     discovery?.status === "running" ||
+    discovery?.status === "unidentified" ||
     discovery?.status === "error"
   )
 }

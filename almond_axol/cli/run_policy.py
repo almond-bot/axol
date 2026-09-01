@@ -41,7 +41,11 @@ from ..lerobot.rollout import (
     IKResetController,
     RolloutCaptureThread,
 )
-from ..recording import make_episode_durable, restore_dataset_ownership
+from ..recording import (
+    EpisodeDurabilityError,
+    make_episode_durable,
+    restore_dataset_ownership,
+)
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
 from ..teleop.config import VRTeleopConfig
@@ -2666,25 +2670,32 @@ def _run(
             # choice == "s"
             if dataset is not None:
                 dataset.save_episode()
+                # The write already happened, so finalization must preserve it
+                # even if the durability flush fails. Keep the acknowledgement
+                # below gated on a successful flush.
+                episodes_recorded += 1
                 # Flush the episode to disk so a kill can't lose it (mirrors
-                # collect-data — see make_episode_durable). Best-effort: on
-                # failure the episode is still saved and its remaining rows
-                # reach disk at the next save or finalize (make_episode_durable
-                # leaves the writers consistent either way).
+                # collect-data — see make_episode_durable). A failure is fatal:
+                # continuing could reuse uncertain writer state, so unwind to
+                # the dataset finalizer without reporting the episode saved.
                 try:
                     make_episode_durable(dataset)
-                except Exception:  # noqa: BLE001 - durability is best-effort
+                except Exception as error:
                     _logger.exception(
-                        "could not fully flush the saved episode to disk; it "
-                        "completes at the next save or finalize — do not kill "
-                        "this process"
+                        "rollout episode durability flush failed; terminating "
+                        "recording so orderly finalization can recover the dataset"
                     )
+                    raise EpisodeDurabilityError(
+                        "rollout episode was written but could not be made "
+                        "crash-durable; recording cannot continue safely"
+                    ) from error
                 # Keep hosted output root-owned/non-writable while exposing
                 # read-only operator-group access after every save. After
                 # the durable flush so the episode's freshly rotated files are
                 # all on disk and covered by the chown.
                 restore_dataset_ownership(dataset_root)
-            episodes_recorded += 1
+            else:
+                episodes_recorded += 1
             control.note_saved()
             log_say(f"Saved episode {episodes_recorded}.")
             log_say("Returning to rest pose.")

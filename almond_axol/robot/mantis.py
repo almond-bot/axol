@@ -26,8 +26,13 @@ import numpy as np
 
 from ..constants import ARM_JOINTS, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
 from ..motor import CanBus, ControlMode, Joint, Motor, MotorError
-from .axol import GRIPPER_TRAVEL, _validated_motion_target, calibrate_gripper_open_stop
-from .base import RobotBase
+from .axol import (
+    GRIPPER_TRAVEL,
+    _await_all_hardware_actions,
+    _validated_motion_target,
+    calibrate_gripper_open_stop,
+)
+from .base import RobotBase, mark_hardware_cleanup_uncertain
 from .config import AxolConfig, PositionForceConfig
 
 _logger = logging.getLogger(__name__)
@@ -360,29 +365,63 @@ class Mantis(RobotBase):
         )
         failures = [r for r in results if isinstance(r, BaseException)]
         if failures:
-            cleanup = await asyncio.gather(
-                *[a.force_disable() for a in arms], return_exceptions=True
+            primary_error = failures[0]
+            for additional in failures[1:]:
+                primary_error.add_note(
+                    "Additional Mantis gripper enable failure: "
+                    f"{type(additional).__name__}: {additional}"
+                )
+            await self._rollback_gripper_enable(
+                arms, primary_error, context="partial enable"
             )
-            for result in cleanup:
-                if isinstance(result, BaseException):
-                    _logger.error("Mantis partial-enable cleanup failed: %s", result)
             if telemetry is not None:
                 try:
                     await self._start_telemetry_unlocked(*telemetry)
-                except Exception:  # noqa: BLE001 - retain enable failure
+                except BaseException as telemetry_error:
                     _logger.exception(
                         "Could not restore Mantis telemetry after enable failure"
                     )
-            raise failures[0]
+                    primary_error.add_note(
+                        "Mantis telemetry restoration after enable failure also "
+                        f"failed: {type(telemetry_error).__name__}: "
+                        f"{telemetry_error}"
+                    )
+            raise primary_error
 
         if telemetry is not None:
             try:
                 await self._start_telemetry_unlocked(*telemetry)
-            except BaseException:
-                await asyncio.gather(
-                    *[a.force_disable() for a in arms], return_exceptions=True
+            except BaseException as telemetry_error:
+                await self._rollback_gripper_enable(
+                    arms, telemetry_error, context="telemetry restart"
                 )
                 raise
+
+    async def _rollback_gripper_enable(
+        self,
+        arms: list[MantisGripperArm],
+        primary_error: BaseException,
+        *,
+        context: str,
+    ) -> None:
+        """Force torque-off after group enable and retain uncertain ownership."""
+        cleanup = await asyncio.gather(
+            *(arm.force_disable() for arm in arms), return_exceptions=True
+        )
+        failures = [result for result in cleanup if isinstance(result, BaseException)]
+        if not failures:
+            return
+
+        self._shutdown_pending = True
+        primary_error.add_note(
+            f"Mantis {context} rollback did not confirm every gripper disabled"
+        )
+        mark_hardware_cleanup_uncertain(primary_error, failures[0])
+        for additional in failures[1:]:
+            primary_error.add_note(
+                "Additional Mantis gripper rollback failure: "
+                f"{type(additional).__name__}: {additional}"
+            )
 
     async def disable_grippers(self) -> None:
         """Force-disable both grippers while keeping buses and calibration."""
@@ -512,7 +551,9 @@ class Mantis(RobotBase):
                 (self.right, _validated_motion_target(right, label="right Mantis"))
             )
         if targets:
-            await asyncio.gather(*(arm.motion_control(q) for arm, q in targets))
+            await _await_all_hardware_actions(
+                *(arm.motion_control(q) for arm, q in targets)
+            )
 
     # -- Axol-surface stubs -----------------------------------------------------
 

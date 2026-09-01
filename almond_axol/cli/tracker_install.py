@@ -9,14 +9,15 @@ idempotent: an already-installed pinned build is a fast no-op.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
-from ..tracker.survive import is_available
-from ..utils.state_files import secure_atomic_write_text
+from ..utils.state_files import secure_atomic_write_json, secure_atomic_write_text
 from ..utils.sudo import prime_sudo, run_root
 
 _logger = logging.getLogger(__name__)
@@ -24,11 +25,15 @@ _logger = logging.getLogger(__name__)
 _REPO_URL = "https://github.com/collabora/libsurvive.git"
 _PINNED_REF = "f1e6eddb669320f2a30760f4b42936bdb4306da0"
 # Bump this whenever build options change so existing installations are rebuilt.
-_BUILD_REVISION = "libusb-v1"
+_BUILD_REVISION = "libusb-v2-runtime-attestation"
 _UDEV_RULE = Path("useful_files/81-vive.rules")
 _STAMP = ".axol-build-stamp"
 _MACHINE_STAMP = Path("/var/lib/almond/libsurvive-build-stamp")
 _INSTALLED_UDEV_RULE = Path("/etc/udev/rules.d/81-vive.rules")
+_INSTALL_PREFIX = Path("/usr/local")
+_SURVIVE_CLI = _INSTALL_PREFIX / "bin" / "survive-cli"
+_INSTALL_MANIFEST = Path("build/install_manifest.txt")
+_MANIFEST_SCHEMA = 1
 
 _APT_BUILD_DEPS = (
     "build-essential",
@@ -191,11 +196,160 @@ def _file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _runtime_install_paths(src: Path) -> tuple[Path, ...]:
+    """Return the executable and shared objects produced by this CMake build."""
+    try:
+        installed = (src / _INSTALL_MANIFEST).read_text().splitlines()
+    except OSError as exc:
+        raise RuntimeError("libsurvive's CMake install manifest is missing") from exc
+
+    runtime: set[Path] = set()
+    library_root = _INSTALL_PREFIX / "lib"
+    for raw_path in installed:
+        path = Path(raw_path.strip())
+        if path == _SURVIVE_CLI:
+            runtime.add(path)
+            continue
+        try:
+            relative = path.relative_to(library_root)
+        except ValueError:
+            continue
+        # libsurvive discovers its driver/poser plugins dynamically. Capture
+        # every shared object installed by the same build, including SONAME
+        # symlinks and cnkalman/mpfit dependencies linked into libsurvive.
+        if relative.name.endswith(".so") or ".so." in relative.name:
+            runtime.add(path)
+    if _SURVIVE_CLI not in runtime:
+        raise RuntimeError("the build did not install /usr/local/bin/survive-cli")
+    return tuple(sorted(runtime, key=str))
+
+
+def _safe_root_ancestry(path: Path, *, root: Path = _INSTALL_PREFIX) -> bool:
+    """Whether every directory from ``root`` through ``path`` is root-sealed."""
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    current = root
+    for part in ("", *relative.parts):
+        if part:
+            current /= part
+        try:
+            metadata = current.lstat()
+        except OSError:
+            return False
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            return False
+    return True
+
+
+def _safe_root_regular_file(path: Path) -> bool:
+    """Whether a file and its absolute directory chain are root-controlled."""
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        return False
+    for parent in path.parents:
+        try:
+            parent_metadata = parent.lstat()
+        except OSError:
+            return False
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or stat.S_ISLNK(parent_metadata.st_mode)
+            or parent_metadata.st_uid != 0
+            or parent_metadata.st_gid != 0
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+        ):
+            return False
+    return True
+
+
+def _runtime_artifact_record(
+    path: Path, *, require_root_control: bool
+) -> dict[str, str] | None:
+    """Describe one installed runtime artifact after validating its ownership."""
+    if not path.is_absolute():
+        return None
+    try:
+        logical_metadata = path.lstat()
+        link_target = (
+            os.readlink(path) if stat.S_ISLNK(logical_metadata.st_mode) else ""
+        )
+        resolved = path.resolve(strict=True)
+        resolved_metadata = resolved.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(resolved_metadata.st_mode):
+        return None
+    if path == _SURVIVE_CLI and (
+        stat.S_ISLNK(logical_metadata.st_mode)
+        or not stat.S_IMODE(resolved_metadata.st_mode) & 0o111
+    ):
+        return None
+    if require_root_control:
+        if (
+            logical_metadata.st_uid != 0
+            or logical_metadata.st_gid != 0
+            or resolved_metadata.st_uid != 0
+            or resolved_metadata.st_gid != 0
+            or stat.S_IMODE(resolved_metadata.st_mode) & 0o022
+            or not _safe_root_ancestry(path.parent)
+            or not _safe_root_ancestry(resolved.parent)
+        ):
+            return None
+    try:
+        digest = _file_digest(resolved)
+    except OSError:
+        return None
+    return {
+        "path": str(path),
+        "resolvedPath": str(resolved),
+        "linkTarget": link_target,
+        "sha256": digest,
+    }
+
+
+def _runtime_artifact_records(
+    paths: tuple[Path, ...], *, require_root_control: bool
+) -> list[dict[str, str]] | None:
+    records: list[dict[str, str]] = []
+    for path in paths:
+        record = _runtime_artifact_record(
+            path, require_root_control=require_root_control
+        )
+        if record is None:
+            return None
+        records.append(record)
+    return records
+
+
 def _install_machine_stamp(src: Path) -> bool:
-    """Publish one root-readable proof shared by serve and operator CLIs."""
+    """Publish a root-readable proof of the exact native runtime artifacts."""
     rule = src / _UDEV_RULE
     try:
         digest = _file_digest(rule)
+        runtime_paths = _runtime_install_paths(src)
+        artifacts = _runtime_artifact_records(runtime_paths, require_root_control=True)
+        if artifacts is None:
+            raise RuntimeError(
+                "installed libsurvive artifacts are not root-owned and sealed"
+            )
         local_stamp = src / _STAMP
         secure_atomic_write_text(
             local_stamp,
@@ -203,12 +357,19 @@ def _install_machine_stamp(src: Path) -> bool:
             mode=0o644,
         )
         manifest = src / ".axol-machine-install-manifest"
-        secure_atomic_write_text(
+        secure_atomic_write_json(
             manifest,
-            f"{_PINNED_REF}\n{_BUILD_REVISION}\n{digest}\n",
+            {
+                "schema": _MANIFEST_SCHEMA,
+                "pinnedRef": _PINNED_REF,
+                "buildRevision": _BUILD_REVISION,
+                "udevRuleSha256": digest,
+                "surviveCliPath": str(_SURVIVE_CLI),
+                "runtimeArtifacts": artifacts,
+            },
             mode=0o644,
         )
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         _logger.warning("could not prepare libsurvive install manifest: %s", exc)
         return False
     result = run_root(
@@ -217,83 +378,139 @@ def _install_machine_stamp(src: Path) -> bool:
     return result.returncode == 0
 
 
+def _verified_runtime_artifacts(
+    manifest: object, *, require_root_control: bool
+) -> tuple[bool, Path | None]:
+    if not isinstance(manifest, dict):
+        return False, None
+    raw_records = manifest.get("runtimeArtifacts")
+    cli_value = manifest.get("surviveCliPath")
+    if not isinstance(raw_records, list) or not raw_records:
+        return False, None
+    if not isinstance(cli_value, str):
+        return False, None
+    cli_path = Path(cli_value)
+    if not cli_path.is_absolute():
+        return False, None
+    if require_root_control and cli_path != _SURVIVE_CLI:
+        return False, None
+
+    recorded: list[dict[str, str]] = []
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for raw_record in raw_records:
+        if not isinstance(raw_record, dict):
+            return False, None
+        if set(raw_record) != {"path", "resolvedPath", "linkTarget", "sha256"}:
+            return False, None
+        if not all(isinstance(value, str) for value in raw_record.values()):
+            return False, None
+        path_value = raw_record["path"]
+        if path_value in seen:
+            return False, None
+        seen.add(path_value)
+        path = Path(path_value)
+        if not path.is_absolute():
+            return False, None
+        recorded.append(raw_record)
+        paths.append(path)
+    if str(cli_path) not in seen:
+        return False, None
+    actual = _runtime_artifact_records(
+        tuple(paths), require_root_control=require_root_control
+    )
+    return actual == recorded, cli_path if actual == recorded else None
+
+
 def lighthouse_readiness(
     *,
     src: Path | None = None,
     installed_udev_rule: Path = _INSTALLED_UDEV_RULE,
     manifest_path: Path | None = None,
 ) -> dict[str, object]:
-    """Inspect the supported Lighthouse runtime without opening USB devices.
+    """Inspect and hash-verify the supported Lighthouse native runtime.
 
-    Merely finding a ``survive-cli`` executable is not enough: Axol relies on
-    the pinned libusb build (the HIDAPI build cannot pair Watchman dongles) and
-    on its matching udev rule.  The installer-owned stamp records both the
-    upstream commit and Axol's build recipe revision.
+    ``PATH`` and importable Python modules are deliberately irrelevant. The
+    root installer records the exact executable, shared library, and plugin
+    files produced by the pinned build; every launch revalidates those files.
+    ``src`` remains accepted for API compatibility but cannot substitute a
+    per-user build-cache stamp for the machine-wide artifact proof.
     """
-    source = src if src is not None else _src_dir()
-    source_rule = source / _UDEV_RULE
-    expected_stamp = f"{_PINNED_REF}\n{_BUILD_REVISION}"
-
-    # An explicit source without a manifest is the hermetic/test form: verify
-    # that source's local two-line stamp and rule. Normal callers use the
-    # canonical machine manifest, so root serve, provisioning, and an operator
-    # CLI all inspect the same installation regardless of their build cache.
-    source_scoped = src is not None and manifest_path is None
-    stamp_path = source / _STAMP if source_scoped else (manifest_path or _MACHINE_STAMP)
-
+    del src
+    stamp_path = manifest_path or _MACHINE_STAMP
+    require_root_control = manifest_path is None
+    manifest_trusted = not require_root_control or _safe_root_regular_file(stamp_path)
     try:
-        actual_stamp = stamp_path.read_text().strip()
-    except OSError:
-        actual_stamp = ""
-    actual_stamp_lines = actual_stamp.splitlines()
-    stamp_valid = actual_stamp_lines[:2] == expected_stamp.splitlines()
+        manifest: object = (
+            json.loads(stamp_path.read_text()) if manifest_trusted else None
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        manifest = None
 
+    stamp_valid = bool(
+        isinstance(manifest, dict)
+        and manifest.get("schema") == _MANIFEST_SCHEMA
+        and manifest.get("pinnedRef") == _PINNED_REF
+        and manifest.get("buildRevision") == _BUILD_REVISION
+    )
+    runtime_valid, cli_path = _verified_runtime_artifacts(
+        manifest, require_root_control=require_root_control
+    )
+    recorded_digest = (
+        manifest.get("udevRuleSha256") if isinstance(manifest, dict) else None
+    )
     try:
-        if source_scoped:
-            rule_valid = (
-                source_rule.is_file()
-                and installed_udev_rule.is_file()
-                and source_rule.read_bytes() == installed_udev_rule.read_bytes()
+        rule_valid = bool(
+            isinstance(recorded_digest, str)
+            and len(recorded_digest) == 64
+            and installed_udev_rule.is_file()
+            and (
+                not require_root_control or _safe_root_regular_file(installed_udev_rule)
             )
-        else:
-            recorded_digest = (
-                actual_stamp_lines[2] if len(actual_stamp_lines) > 2 else ""
-            )
-            rule_valid = bool(
-                recorded_digest
-                and installed_udev_rule.is_file()
-                and _file_digest(installed_udev_rule) == recorded_digest
-            )
+            and _file_digest(installed_udev_rule) == recorded_digest
+        )
     except OSError:
         rule_valid = False
 
-    available = is_available()
-    pairing_cli = shutil.which("survive-cli") is not None
+    available = stamp_valid and runtime_valid
+    pairing_cli = cli_path is not None
     issues: list[str] = []
-    if not available:
-        issues.append("survive-cli/pysurvive is unavailable")
-    if not pairing_cli:
-        issues.append("survive-cli is unavailable, so Watchman pairing cannot run")
     if not stamp_valid:
-        issues.append("the pinned libsurvive build stamp is missing or stale")
+        issues.append("the pinned libsurvive build manifest is missing or stale")
+    if not runtime_valid:
+        issues.append("the pinned libsurvive runtime artifacts are missing or changed")
+    if not pairing_cli:
+        issues.append("the attested survive-cli is unavailable for tracking or pairing")
     if not rule_valid:
         issues.append("the pinned Vive USB udev rule is missing or stale")
+    installed = available and pairing_cli and rule_valid
     return {
-        "installed": available and pairing_cli and stamp_valid and rule_valid,
+        "installed": installed,
         "available": available,
         "pairingCli": pairing_cli,
         "pinnedBuild": stamp_valid,
+        "runtimeArtifacts": runtime_valid,
+        "surviveCliPath": str(cli_path) if cli_path is not None else None,
         "udevReady": rule_valid,
         "pinnedRef": _PINNED_REF,
         "buildRevision": _BUILD_REVISION,
-        "installedRef": actual_stamp_lines[0] if actual_stamp_lines else None,
+        "installedRef": (
+            manifest.get("pinnedRef") if isinstance(manifest, dict) else None
+        ),
         "installedBuildRevision": (
-            actual_stamp_lines[1] if len(actual_stamp_lines) > 1 else None
+            manifest.get("buildRevision") if isinstance(manifest, dict) else None
         ),
         "stampPath": str(stamp_path),
         "udevRulePath": str(installed_udev_rule),
         "issues": issues,
     }
+
+
+def verified_survive_cli() -> Path | None:
+    """Return the exact attested tracking executable, never a PATH candidate."""
+    readiness = lighthouse_readiness()
+    value = readiness.get("surviveCliPath")
+    return Path(value) if readiness["installed"] and isinstance(value, str) else None
 
 
 def ensure_installed() -> bool:
@@ -303,17 +520,6 @@ def ensure_installed() -> bool:
     if readiness["installed"]:
         print("Lighthouse tracking support is already installed.", flush=True)
         return True
-
-    # One-time upgrade from the former UID-scoped proof. Official root
-    # provisioning used /opt while an operator CLI used ~/.almond, so neither
-    # could trust the other's stamp. If this caller's old source and installed
-    # rule still match exactly, publish the canonical manifest without a rebuild.
-    legacy = lighthouse_readiness(src=src)
-    if legacy["installed"]:
-        print("Publishing the machine-wide Lighthouse install manifest…", flush=True)
-        if _install_machine_stamp(src) and lighthouse_readiness()["installed"]:
-            print("Lighthouse tracking support installed.", flush=True)
-            return True
 
     # A removed/drifted permissions rule does not require a native rebuild.
     if readiness["available"] and readiness["pinnedBuild"]:

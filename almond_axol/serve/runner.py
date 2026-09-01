@@ -478,13 +478,14 @@ class OperationRunner:
             "stopping",
         )
         worker_alive = self._thread is not None and self._thread.is_alive()
-        bridge_alive = (
-            self._bridge_process is not None and self._bridge_process.is_alive()
-        )
+        # A non-None bridge is owned until teardown has positively reaped it.
+        # In particular, Process.start() may fail after partially creating the
+        # child, and multiprocessing rejects is_alive() on an unstarted object.
+        bridge_owned = self._bridge_process is not None
         return (
             active_status
             or worker_alive
-            or bridge_alive
+            or bridge_owned
             or self._hardware_cleanup_uncertain
         )
 
@@ -1243,26 +1244,46 @@ class OperationRunner:
             name="tracker-bridge",
             daemon=True,
         )
-        process.start()
-        child_conn.close()
+        # Publish ownership before start(): multiprocessing can raise after a
+        # child has already inherited the tracker dongle, and an interrupt in
+        # that window must still leave an object the common teardown can reap.
         with self._lock:
             self._bridge_process = process
             self._bridge_stop_event = stop_event
             self._bridge_commands = command_queue
 
         try:
-            if not parent_conn.poll(_BRIDGE_READY_TIMEOUT_S):
-                raise RuntimeError(
-                    "tracker bridge did not initialize within "
-                    f"{_BRIDGE_READY_TIMEOUT_S:.0f}s"
+            process.start()
+            child_conn.close()
+            try:
+                if not parent_conn.poll(_BRIDGE_READY_TIMEOUT_S):
+                    raise RuntimeError(
+                        "tracker bridge did not initialize within "
+                        f"{_BRIDGE_READY_TIMEOUT_S:.0f}s"
+                    )
+                result = parent_conn.recv()
+                if not result.get("ok"):
+                    raise RuntimeError(result.get("error") or "tracker bridge failed")
+            except (EOFError, OSError) as exc:
+                raise RuntimeError("tracker bridge exited during startup") from exc
+        except BaseException as startup_error:
+            try:
+                self._stop_tracker_bridge(session)
+            except BaseException as cleanup_error:
+                startup_error.add_note(
+                    "additional tracker-bridge startup cleanup failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
                 )
-            result = parent_conn.recv()
-            if not result.get("ok"):
-                raise RuntimeError(result.get("error") or "tracker bridge failed")
-        except (EOFError, OSError) as exc:
-            raise RuntimeError("tracker bridge exited during startup") from exc
+            raise
         finally:
-            parent_conn.close()
+            try:
+                child_conn.close()
+            except OSError:
+                pass
+            try:
+                parent_conn.close()
+            except OSError:
+                pass
         session.emit(
             f"[serve] Mantis tracker bridge ready (pid {process.pid}, "
             f"backend {config.backend})"
@@ -1275,7 +1296,17 @@ class OperationRunner:
         )
         with self._lock:
             self._bridge_monitor = monitor
-        monitor.start()
+        try:
+            monitor.start()
+        except BaseException as startup_error:
+            try:
+                self._stop_tracker_bridge(session)
+            except BaseException as cleanup_error:
+                startup_error.add_note(
+                    "additional tracker-bridge monitor cleanup failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
 
     def _monitor_tracker_bridge(
         self, session: Session, process: multiprocessing.Process, stop_event: Any
@@ -1317,23 +1348,34 @@ class OperationRunner:
             return
         if stop_event is not None:
             stop_event.set()
-        process.join(timeout=_BRIDGE_STOP_TIMEOUT_S)
-        if process.is_alive():
+        # A Process whose start() failed before native creation has pid=None and
+        # rejects join()/is_alive(); it still owns the queue objects above.
+        process_started = getattr(process, "pid", object()) is not None
+        if process_started:
+            process.join(timeout=_BRIDGE_STOP_TIMEOUT_S)
+        process_alive = process_started and process.is_alive()
+        if process_alive:
             session.emit("[serve] tracker bridge did not stop cleanly; terminating")
             process.terminate()
             process.join(timeout=1.0)
-        if process.is_alive():
+            process_alive = process.is_alive()
+        if process_alive:
             session.emit("[serve] tracker bridge ignored terminate; killing")
             process.kill()
             process.join(timeout=1.0)
+            process_alive = process.is_alive()
         if command_queue is not None:
             command_queue.close()
             # Reset commands are disposable once this bridge is stopping.
             # Never let a stuck multiprocessing feeder wedge operation cleanup.
             command_queue.cancel_join_thread()
-        if monitor is not None and monitor is not threading.current_thread():
+        if (
+            monitor is not None
+            and monitor is not threading.current_thread()
+            and (monitor.ident is not None or monitor.is_alive())
+        ):
             monitor.join(timeout=1.0)
-        if process.is_alive():
+        if process_alive:
             # Retain ownership so is_running() keeps future operations out of
             # this process until the server is restarted and the native child
             # can no longer hold the tracker dongle.

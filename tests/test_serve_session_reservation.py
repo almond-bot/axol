@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
@@ -289,7 +289,7 @@ class _Updater:
             return None
         return "server maintenance is in progress"
 
-    def ensure_provisioned(self) -> None:
+    async def ensure_provisioned(self) -> None:
         self.provision_calls += 1
 
     async def status(self, *, force: bool = False) -> dict[str, Any]:
@@ -305,6 +305,9 @@ class _Updater:
         self.blocked = True
         self.active = True
         return True, None
+
+    async def shutdown(self) -> None:
+        pass
 
 
 class _FakeBridgeProcess:
@@ -412,6 +415,22 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
     ) -> httpx.AsyncClient:
         transport = httpx.ASGITransport(app=_test_app(manager, runner, robot))
         return httpx.AsyncClient(transport=transport, base_url="http://test")
+
+    async def test_shutdown_drains_updater_before_sessions_and_hardware(self) -> None:
+        events: list[str] = []
+        manager = _Manager()
+        runner = _Runner()
+        robot = _Robot()
+        updater = _Updater(lambda: True)
+        updater.shutdown = AsyncMock(side_effect=lambda: events.append("updater"))  # type: ignore[method-assign]
+        runner.shutdown = AsyncMock(side_effect=lambda: events.append("runner"))  # type: ignore[method-assign]
+        manager.shutdown = AsyncMock(side_effect=lambda: events.append("manager"))  # type: ignore[method-assign]
+        robot.shutdown = Mock(side_effect=lambda: events.append("robot"))  # type: ignore[method-assign]
+        app = _test_app(manager, runner, robot, updater=updater)
+
+        await app.router.on_shutdown[-1]()
+
+        self.assertEqual(events, ["updater", "runner", "manager", "robot"])
 
     async def test_operation_refuses_active_diagnostic_session(self) -> None:
         diagnostic = Session("tracker.identify", {})
@@ -697,6 +716,67 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update_response.status_code, 409)
         self.assertIn("busy", update_response.json()["error"])
         self.assertFalse(updater.blocked)
+
+    async def test_zed_cable_session_holds_camera_lease_until_watcher_cleanup(
+        self,
+    ) -> None:
+        manager = _Manager()
+        runner = _Runner()
+        robot = _Robot()
+        app = _test_app(manager, runner, robot)
+        transport = httpx.ASGITransport(app=app)
+        detected = {"devices": [], "error": None}
+        with patch.object(
+            app_module, "_detect_cameras", return_value=detected
+        ) as detect:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                launched = await client.post(
+                    "/api/run", json={"command": "diag.zed-cable", "args": {}}
+                )
+                blocked = (
+                    await client.get("/api/cameras/detect"),
+                    await client.get("/api/cameras/preview/123"),
+                    await client.post("/api/cameras/restart-daemon"),
+                )
+
+                self.assertEqual(launched.status_code, 200)
+                for response in blocked:
+                    self.assertEqual(response.status_code, 409, response.text)
+                    self.assertIn("in use", response.json()["error"])
+                detect.assert_not_called()
+                self.assertEqual(robot.releases, 0)
+
+                while not manager.queues:
+                    await asyncio.sleep(0)
+                manager.sessions[0].status = "exited"
+                manager.queues[0].put_nowait(None)
+                # The watcher clears the explicit post-terminal lease while it
+                # owns the same launch reservation as these camera endpoints.
+                for _ in range(3):
+                    await asyncio.sleep(0)
+
+                available = await client.get("/api/cameras/detect")
+
+        self.assertEqual(available.status_code, 200)
+        self.assertEqual(available.json(), detected)
+        detect.assert_called_once_with()
+
+    async def test_camera_detection_refuses_active_operation(self) -> None:
+        manager = _Manager()
+        runner = _Runner(running=True)
+        app = _test_app(manager, runner)
+        transport = httpx.ASGITransport(app=app)
+        with patch.object(app_module, "_detect_cameras") as detect:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                response = await client.get("/api/cameras/detect")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("in use", response.json()["error"])
+        detect.assert_not_called()
 
     async def test_hosted_dataset_listing_ignores_custom_root_and_symlink(self) -> None:
         boundary = Path("/var/lib/almond-axol/datasets")
@@ -1853,6 +1933,183 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         self.assertIn("could not be killed", session.error or "")
         self.assertIs(runner._bridge_process, process)
         self.assertTrue(runner.is_running())
+
+    def test_tracker_bridge_partial_process_start_is_reaped(self) -> None:
+        runner = OperationRunner()
+        session = Session("teleop", {})
+        stop_event = threading.Event()
+        command_queue = _FakeBridgeQueue()
+
+        class Connection:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        parent_conn = Connection()
+        child_conn = Connection()
+
+        class PartialProcess:
+            pid: int | None = None
+
+            def __init__(self) -> None:
+                self.alive = False
+                self.join_calls = 0
+
+            def start(self) -> None:
+                self.pid = 4321
+                self.alive = True
+                self.assert_published()
+                raise KeyboardInterrupt
+
+            def assert_published(self) -> None:
+                self_owner = runner._bridge_process
+                if self_owner is not self:
+                    raise AssertionError(
+                        "bridge ownership was not published before start"
+                    )
+
+            def join(self, timeout: float | None = None) -> None:
+                del timeout
+                self.join_calls += 1
+                if stop_event.is_set():
+                    self.alive = False
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+        process = PartialProcess()
+        context = SimpleNamespace(
+            Event=Mock(return_value=stop_event),
+            Queue=Mock(return_value=command_queue),
+            Pipe=Mock(return_value=(parent_conn, child_conn)),
+            Process=Mock(return_value=process),
+        )
+        config = SimpleNamespace(
+            backend="survive",
+            left="left",
+            right="right",
+            allow_single_side=False,
+        )
+        cfg = SimpleNamespace(
+            mantis_source="lighthouse",
+            left_channel="can_mantis_l",
+            right_channel="can_mantis_r",
+            vr_server=SimpleNamespace(
+                port=8000,
+                expected_pose_source_id="managed-token",
+            ),
+        )
+
+        with (
+            patch(
+                "almond_axol.tracker.load_tracker_config",
+                return_value=config,
+            ),
+            patch("almond_axol.tracker.config.select_tracker_backend"),
+            patch(
+                "almond_axol.serve.runner.multiprocessing.get_context",
+                return_value=context,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            runner._start_tracker_bridge(session, cfg, "teleop")
+
+        self.assertTrue(stop_event.is_set())
+        self.assertGreaterEqual(process.join_calls, 1)
+        self.assertFalse(process.alive)
+        self.assertTrue(command_queue.closed)
+        self.assertTrue(parent_conn.closed)
+        self.assertTrue(child_conn.closed)
+        self.assertIsNone(runner._bridge_process)
+
+    def test_tracker_bridge_monitor_start_failure_reaps_process(self) -> None:
+        runner = OperationRunner()
+        session = Session("teleop", {})
+        stop_event = threading.Event()
+        command_queue = _FakeBridgeQueue()
+
+        class Connection:
+            def __init__(self, result: dict[str, Any] | None = None) -> None:
+                self.result = result
+
+            def poll(self, _timeout: float) -> bool:
+                return True
+
+            def recv(self) -> dict[str, Any]:
+                assert self.result is not None
+                return self.result
+
+            def close(self) -> None:
+                pass
+
+        class Process:
+            pid = 4321
+
+            def __init__(self) -> None:
+                self.alive = False
+
+            def start(self) -> None:
+                self.alive = True
+
+            def join(self, timeout: float | None = None) -> None:
+                del timeout
+                if stop_event.is_set():
+                    self.alive = False
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+        process = Process()
+        parent_conn = Connection({"ok": True})
+        child_conn = Connection()
+        context = SimpleNamespace(
+            Event=Mock(return_value=stop_event),
+            Queue=Mock(return_value=command_queue),
+            Pipe=Mock(return_value=(parent_conn, child_conn)),
+            Process=Mock(return_value=process),
+        )
+        monitor = SimpleNamespace(
+            ident=None,
+            start=Mock(side_effect=KeyboardInterrupt),
+            is_alive=Mock(return_value=False),
+        )
+        config = SimpleNamespace(
+            backend="survive",
+            left="left",
+            right="right",
+            allow_single_side=False,
+        )
+        cfg = SimpleNamespace(
+            mantis_source="lighthouse",
+            left_channel="can_mantis_l",
+            right_channel="can_mantis_r",
+            vr_server=SimpleNamespace(
+                port=8000,
+                expected_pose_source_id="managed-token",
+            ),
+        )
+
+        with (
+            patch(
+                "almond_axol.tracker.load_tracker_config",
+                return_value=config,
+            ),
+            patch("almond_axol.tracker.config.select_tracker_backend"),
+            patch(
+                "almond_axol.serve.runner.multiprocessing.get_context",
+                return_value=context,
+            ),
+            patch("almond_axol.serve.runner.threading.Thread", return_value=monitor),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            runner._start_tracker_bridge(session, cfg, "teleop")
+
+        self.assertTrue(stop_event.is_set())
+        self.assertFalse(process.alive)
+        self.assertTrue(command_queue.closed)
+        self.assertIsNone(runner._bridge_process)
 
     def test_terminal_status_stays_busy_until_worker_cleanup_finishes(self) -> None:
         runner = OperationRunner()

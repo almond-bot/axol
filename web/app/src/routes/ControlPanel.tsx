@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Loader2, RefreshCw } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
   OPERATIONS,
@@ -58,13 +59,14 @@ import {
   autoConnectSignature,
   canDiscoveryAttemptSignature,
   canDiscoveryBlocksAutoConnect,
+  canServerEpoch,
   chooseAutoConnectTarget,
   nextAutoConnectAttempt,
   shouldStartCanDiscovery,
 } from "@/lib/can-auto-connect"
 import { InstallerMigrationBanner, UpdateBanner } from "@/components/update-banner"
 import { VersionMismatchBanner } from "@/components/version-mismatch-banner"
-import { requiresInstallerMigration } from "@/lib/update-migration"
+import { requiresInstallerMigration, showInstallerMigration } from "@/lib/update-migration"
 import { versionMismatch } from "@/lib/version"
 import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
@@ -73,6 +75,7 @@ import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection, type SettingsTab } from "@/components/settings/settings-section"
 import { SiteNav } from "@/components/site-nav"
 import { useToast } from "@/components/ui/toast"
+import { Button } from "@/components/ui/button"
 
 type OpSettings = Record<OperationId, Record<string, FormValue>>
 
@@ -172,6 +175,15 @@ export default function ControlPanel() {
   )
   const [canProfiles, setCanProfiles] = useState<CanProfileInventory | null>(null)
   const [canDiscovery, setCanDiscovery] = useState<CanDiscoveryState | null>(null)
+  const [canServerInstanceId, setCanServerInstanceId] = useState<string | null>(null)
+  const canServerInstanceIdRef = useRef<string | null>(null)
+  const previousCanServerInstanceIdRef = useRef<string | null>(null)
+  const canInventoryPollRequestRef = useRef(0)
+  const [canDiscoveryRetryBusy, setCanDiscoveryRetryBusy] = useState(false)
+  const currentCanServerEpoch = useCallback(
+    () => canServerEpoch(canServerInstanceIdRef.current, robotStatusRecoveryEpochRef.current),
+    []
+  )
   // The backend owns the real single-flight. This per-tab latch prevents the
   // 2s inventory poll from sending duplicate requests for one hardware epoch.
   const automaticCanDiscoveryAttemptsRef = useRef(new Set<string>())
@@ -180,6 +192,9 @@ export default function ControlPanel() {
   // retain its historical selected-profile auto-connect behavior.
   const [legacyCanInventory, setLegacyCanInventory] = useState(false)
   const installCanInventory = useCallback((inventory: CanInterfaceInventory) => {
+    const instanceId = inventory.serverInstanceId ?? null
+    canServerInstanceIdRef.current = instanceId
+    setCanServerInstanceId(instanceId)
     setCanDiscovery(inventory.discovery ?? null)
     if (inventory.profiles) {
       setCanProfiles(inventory.profiles)
@@ -323,6 +338,11 @@ export default function ControlPanel() {
       setRobotBusy(false)
       setCanProfiles(null)
       setCanDiscovery(null)
+      canServerInstanceIdRef.current = null
+      previousCanServerInstanceIdRef.current = null
+      setCanServerInstanceId(null)
+      setCanDiscoveryRetryBusy(false)
+      canInventoryPollRequestRef.current += 1
       setLegacyCanInventory(false)
       automaticCanDiscoveryAttemptsRef.current.clear()
       canDiscoveryNoticesRef.current.clear()
@@ -419,6 +439,7 @@ export default function ControlPanel() {
     if (conn.state !== "ok") {
       robotStatusKnownRef.current = false
       canInventoryKnownRef.current = false
+      canInventoryPollRequestRef.current += 1
       return
     }
     // Guard against in-flight polls landing after a disconnect (which flips
@@ -443,18 +464,21 @@ export default function ControlPanel() {
             setRobot(null)
           }
         })
+      const canRequest = ++canInventoryPollRequestRef.current
       fetchCanInterfaces()
         .then((inventory) => {
-          if (!active) return
+          if (!active || canRequest !== canInventoryPollRequestRef.current) return
           canInventoryKnownRef.current = true
           installCanInventory(inventory)
         })
         .catch((error) => {
-          if (!active) return
+          if (!active || canRequest !== canInventoryPollRequestRef.current) return
           if (String(error).includes("HTTP 404")) {
             canInventoryKnownRef.current = true
             setCanProfiles(null)
             setCanDiscovery(null)
+            canServerInstanceIdRef.current = null
+            setCanServerInstanceId(null)
             setLegacyCanInventory(true)
             return
           }
@@ -577,6 +601,20 @@ export default function ControlPanel() {
     }
   }, [resetAutoRobotRetry])
 
+  // A new backend process also clears its server-side manual-disconnect state.
+  // Drop this tab's old retry/manual latches as soon as inventory proves that
+  // the process changed, even when the restart fit between status polls.
+  useEffect(() => {
+    if (canServerInstanceId === null) return
+    const previous = previousCanServerInstanceIdRef.current
+    previousCanServerInstanceIdRef.current = canServerInstanceId
+    if (previous === null || previous === canServerInstanceId) return
+    resetAutoRobotRetry()
+    manualRobotOverrideRef.current = false
+    automaticCanDiscoveryAttemptsRef.current.clear()
+    canDiscoveryNoticesRef.current.clear()
+  }, [canServerInstanceId, resetAutoRobotRetry])
+
   // Auto-establish the Quest-over-USB tunnel as soon as an authorized headset
   // appears. The latch clears once the tunnel is up (so a later drop retries
   // once) or when the headset goes away, while preventing a per-poll retry loop
@@ -634,6 +672,11 @@ export default function ControlPanel() {
     setRobot(null)
     setCanProfiles(null)
     setCanDiscovery(null)
+    canServerInstanceIdRef.current = null
+    previousCanServerInstanceIdRef.current = null
+    setCanServerInstanceId(null)
+    setCanDiscoveryRetryBusy(false)
+    canInventoryPollRequestRef.current += 1
     setLegacyCanInventory(false)
     setUsb(null)
     setUsbBusy(false)
@@ -870,6 +913,38 @@ export default function ControlPanel() {
   const hostBusy = isLive || hardwareSessionBusy || !(update?.idle ?? true)
   // Reason shown in the banner; capitalized clause, no trailing period.
   const updateBusyReason = isLive ? "Stop the running operation" : "The server is busy"
+  const canDiscoveryNeedsRetry =
+    canDiscovery?.status === "partial" ||
+    canDiscovery?.status === "unidentified" ||
+    canDiscovery?.status === "error"
+
+  const retryCanIdentification = useCallback(async () => {
+    if (canDiscoveryRetryBusy) return
+    const hostGeneration = connectionGenerationRef.current
+    setCanDiscoveryRetryBusy(true)
+    try {
+      const inventory = await discoverCanHardware(true)
+      if (!autoRobotMountedRef.current || hostGeneration !== connectionGenerationRef.current) return
+      canInventoryKnownRef.current = true
+      installCanInventory(inventory)
+      const result = inventory.discovery
+      if (result?.status === "configured" || result?.status === "ready") {
+        toast.success("CAN hardware identified")
+      } else if (result?.status === "partial") {
+        toast.warning(result.message ?? "Some CAN hardware still needs identification")
+      } else {
+        toast.error(result?.message ?? "CAN hardware could not be identified")
+      }
+    } catch (error) {
+      if (hostGeneration === connectionGenerationRef.current) {
+        toast.error(`CAN identification failed: ${String(error)}`)
+      }
+    } finally {
+      if (hostGeneration === connectionGenerationRef.current) {
+        setCanDiscoveryRetryBusy(false)
+      }
+    }
+  }, [canDiscoveryRetryBusy, installCanInventory, toast])
 
   // A fresh Axol/Mantis hub initially appears only as anonymous canX devices.
   // Ask the server to probe and persist its role before the ordinary profile
@@ -890,18 +965,27 @@ export default function ControlPanel() {
       return
 
     const hostGeneration = connectionGenerationRef.current
-    const attemptKey = `${hostGeneration}:${robotStatusRecoveryEpochRef.current}:${signature}`
+    const serverEpoch = currentCanServerEpoch()
+    const attemptKey = `${hostGeneration}:${serverEpoch}:${signature}`
     if (automaticCanDiscoveryAttemptsRef.current.has(attemptKey)) return
     automaticCanDiscoveryAttemptsRef.current.add(attemptKey)
 
     void discoverCanHardware()
       .then((inventory) => {
-        if (!autoRobotMountedRef.current || hostGeneration !== connectionGenerationRef.current)
+        if (
+          !autoRobotMountedRef.current ||
+          hostGeneration !== connectionGenerationRef.current ||
+          serverEpoch !== currentCanServerEpoch()
+        )
           return
         installCanInventory(inventory)
       })
       .catch((error) => {
-        if (!autoRobotMountedRef.current || hostGeneration !== connectionGenerationRef.current)
+        if (
+          !autoRobotMountedRef.current ||
+          hostGeneration !== connectionGenerationRef.current ||
+          serverEpoch !== currentCanServerEpoch()
+        )
           return
         if (canDiscoveryRequestCanRetry(error)) {
           // Let the next coherent inventory poll retry after a session-launch
@@ -918,7 +1002,9 @@ export default function ControlPanel() {
     activeCommandSession,
     autoRobotPollStateKnown,
     canDiscovery,
+    canServerInstanceId,
     conn.state,
+    currentCanServerEpoch,
     hostBusy,
     installCanInventory,
     robot?.state,
@@ -938,16 +1024,16 @@ export default function ControlPanel() {
         canDiscovery.status !== "error")
     )
       return
-    const noticeKey = `${connectionGenerationRef.current}:${robotStatusRecoveryEpochRef.current}:${canDiscovery.generation}:${canDiscovery.status}`
+    const noticeKey = `${connectionGenerationRef.current}:${currentCanServerEpoch()}:${canDiscovery.generation}:${canDiscovery.status}`
     if (canDiscoveryNoticesRef.current.has(noticeKey)) return
     canDiscoveryNoticesRef.current.add(noticeKey)
     const fallback =
       canDiscovery.status === "unidentified"
-        ? "Power the attached hardware, then unplug and reconnect its USB hub to retry, or run axol can.setup in a terminal."
+        ? "Power the attached hardware, then use Retry CAN identification below."
         : "Run axol can.setup in a terminal if the problem continues."
     if (canDiscovery.status === "partial") toast.warning(canDiscovery.message ?? fallback)
     else toast.error(canDiscovery.message ?? fallback)
-  }, [canDiscovery, conn.state, toast])
+  }, [canDiscovery, canServerInstanceId, conn.state, currentCanServerEpoch, toast])
 
   // Pick from hardware actually present on the host. If only one configured
   // profile exists, connect it; if both exist, the selected operation wins.
@@ -1009,7 +1095,8 @@ export default function ControlPanel() {
     const profileSignature = targetPresence
       ? autoConnectSignature(target, targetPresence)
       : `legacy:${target}`
-    const signature = `${profileSignature}:host-${robotStatusRecoveryEpochRef.current}`
+    const serverEpoch = currentCanServerEpoch()
+    const signature = `${profileSignature}:host-${serverEpoch}`
     const mappingChanged =
       activeProfile === target &&
       targetPresence !== undefined &&
@@ -1041,6 +1128,7 @@ export default function ControlPanel() {
             connected !== false ||
             !autoRobotMountedRef.current ||
             generation !== connectionGenerationRef.current ||
+            serverEpoch !== currentCanServerEpoch() ||
             manualRobotOverrideRef.current
           )
             return
@@ -1060,6 +1148,7 @@ export default function ControlPanel() {
             autoRobotRetryTimerRef.current = null
             if (
               generation === connectionGenerationRef.current &&
+              serverEpoch === currentCanServerEpoch() &&
               autoRobotMountedRef.current &&
               !manualRobotOverrideRef.current &&
               autoRobotRef.current === signature
@@ -1082,6 +1171,7 @@ export default function ControlPanel() {
     autoRobotRetryRevision,
     canProfiles,
     canDiscovery,
+    canServerInstanceId,
     conn.state,
     desiredHardwareProfile,
     hardwareSessionBusy,
@@ -1090,6 +1180,7 @@ export default function ControlPanel() {
     robot,
     robotBusy,
     robotConnectClick,
+    currentCanServerEpoch,
     resetAutoRobotRetry,
     sessionInventoryReady,
   ])
@@ -1365,9 +1456,10 @@ export default function ControlPanel() {
   const connectedReleaseVersion = update?.version ?? hostInfo?.version ?? null
   const installerMigrationRequired =
     conn.state === "ok" &&
-    connectedReleaseVersion !== null &&
-    (hostInfo?.releaseInstall ?? update?.enabled ?? false) &&
-    requiresInstallerMigration(connectedReleaseVersion)
+    showInstallerMigration(
+      connectedReleaseVersion,
+      hostInfo?.releaseInstall ?? update?.enabled ?? false
+    )
   const mantisSource = String(settingsSnap?.values["teleop.mantis_source"] ?? "lighthouse")
   // Child settings actions can finish after their old-host tree unmounts.
   // Capture the generation represented by these callbacks so an old camera
@@ -1422,6 +1514,28 @@ export default function ControlPanel() {
           onRobotConnect={robotConnectClick}
           onRobotDisconnect={robotDisconnectClick}
         />
+
+        {conn.state === "ok" && canDiscoveryNeedsRetry && (
+          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
+            <p className="min-w-0 flex-1 text-xs text-amber-100/80">
+              {canDiscovery?.message ??
+                "CAN hardware is attached but its Axol or Mantis role is not yet proven."}{" "}
+              Power the hardware, then retry identification. An idle robot link may disconnect
+              briefly while it is probed.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void retryCanIdentification()}
+              disabled={
+                canDiscoveryRetryBusy || hostBusy || activeCommandSession !== null || robotBusy
+              }
+            >
+              {canDiscoveryRetryBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+              Retry CAN identification
+            </Button>
+          </div>
+        )}
 
         {conn.state === "ok" && (
           <div ref={settingsRef} className="scroll-mt-18 sm:scroll-mt-20">

@@ -1,12 +1,18 @@
 import type { RefObject } from "react"
 import { useEffect, useRef, useState } from "react"
+import {
+  controlPeerNeedsRetry,
+  controlRequestIsDue,
+  retireCurrentControlPeer,
+} from "./controlRetry"
 import { AxolConnectionStatus } from "./types"
 import { waitForIceGathering } from "./webrtc"
 
 const POLL_MS = 300
-// After a failed negotiation, wait this long before re-requesting the channel
-// (the WebSocket pose path covers us meanwhile, so don't hammer it).
-const RETRY_MS = 3000
+// Keep requesting until an offer arrives. A server-side createOffer task can
+// fail before it has anything to send, and an older server has no explicit
+// control-error reply. The WebSocket pose path covers this modest retry cadence.
+const REQUEST_RETRY_MS = 3000
 
 /**
  * Negotiates a low-latency WebRTC data channel for pose frames, multiplexing
@@ -33,30 +39,54 @@ export function useAxolControlChannel(
   const poseChannelRef = useRef<RTCDataChannel | null>(null)
   const attachedWsRef = useRef<WebSocket | null>(null)
   const listenerRef = useRef<((e: MessageEvent) => void) | null>(null)
-  const requestedRef = useRef(false)
-  // Timestamp (ms) at which a failed negotiation may be retried, or null.
-  const retryAtRef = useRef<number | null>(null)
+  const lastRequestAtRef = useRef(0)
+  const offerSeenRef = useRef(false)
 
   useEffect(() => {
     if (!enabled) return
 
     function closePc() {
-      if (poseChannelRef.current) {
+      const channel = poseChannelRef.current
+      const pc = pcRef.current
+      // Retire first: close() may synchronously dispatch a terminal callback,
+      // and intentional teardown must not schedule another negotiation.
+      poseChannelRef.current = null
+      pcRef.current = null
+      if (channel) {
         try {
-          poseChannelRef.current.close()
+          channel.close()
         } catch {
           // already closed
         }
-        poseChannelRef.current = null
       }
-      if (pcRef.current) {
+      if (pc) {
         try {
-          pcRef.current.close()
+          pc.close()
         } catch {
           // already closed
         }
-        pcRef.current = null
       }
+    }
+
+    function rearmPeer(signalingWs: WebSocket, pc: RTCPeerConnection) {
+      if (!retireCurrentControlPeer(attachedWsRef, pcRef, signalingWs, pc)) return
+      poseChannelRef.current = null
+      try {
+        pc.close()
+      } catch {
+        // already closed
+      }
+      setStatus(AxolConnectionStatus.Error)
+      offerSeenRef.current = false
+      lastRequestAtRef.current = 0
+    }
+
+    function rearmSocket(signalingWs: WebSocket) {
+      if (attachedWsRef.current !== signalingWs) return
+      closePc()
+      setStatus(AxolConnectionStatus.Error)
+      offerSeenRef.current = false
+      lastRequestAtRef.current = 0
     }
 
     function detach() {
@@ -64,8 +94,8 @@ export function useAxolControlChannel(
       if (ws && listenerRef.current) ws.removeEventListener("message", listenerRef.current)
       attachedWsRef.current = null
       listenerRef.current = null
-      requestedRef.current = false
-      retryAtRef.current = null
+      lastRequestAtRef.current = 0
+      offerSeenRef.current = false
       closePc()
       setStatus(AxolConnectionStatus.Idle)
     }
@@ -94,20 +124,16 @@ export function useAxolControlChannel(
           }
         }
         ch.onclose = () => {
-          if (isCurrent() && poseChannelRef.current === ch) poseChannelRef.current = null
+          // A data channel can close while its peer remains "connected". It
+          // cannot be recreated without a new server offer, so retire this peer.
+          if (isCurrent() && poseChannelRef.current === ch) rearmPeer(signalingWs, pc)
         }
       }
       pc.onconnectionstatechange = () => {
         // Ignore events from a superseded pc (e.g. closePc during a retry),
         // so intentionally tearing one down doesn't schedule a spurious retry.
         if (!isCurrent()) return
-        if (pc.connectionState === "failed" || pc.connectionState === "closed") {
-          poseChannelRef.current = null
-          setStatus(AxolConnectionStatus.Error)
-          // Let the poll loop re-request a fresh channel after a backoff; a
-          // transient ICE/SDP failure shouldn't permanently block the channel.
-          retryAtRef.current = Date.now() + RETRY_MS
-        }
+        if (controlPeerNeedsRetry(pc.connectionState)) rearmPeer(signalingWs, pc)
       }
 
       try {
@@ -125,9 +151,7 @@ export function useAxolControlChannel(
         signalingWs.send(JSON.stringify({ type: "control-answer", sdp: answerSdp }))
       } catch {
         if (!isCurrent()) return
-        closePc()
-        setStatus(AxolConnectionStatus.Error)
-        retryAtRef.current = Date.now() + RETRY_MS
+        rearmPeer(signalingWs, pc)
       }
     }
 
@@ -142,7 +166,12 @@ export function useAxolControlChannel(
       if (typeof msg !== "object" || msg === null) return
       const m = msg as { type?: string; sdp?: string; iceServers?: RTCIceServer[] }
       if (m.type === "control-offer" && typeof m.sdp === "string") {
+        offerSeenRef.current = true
         void handleOffer(signalingWs, m.sdp, m.iceServers ?? [])
+      } else if (m.type === "control-error") {
+        // Current servers report an offer task that failed before producing SDP.
+        // Older servers stay covered by the periodic no-offer retry below.
+        rearmSocket(signalingWs)
       }
     }
 
@@ -156,8 +185,8 @@ export function useAxolControlChannel(
           attachedWsRef.current.removeEventListener("message", listenerRef.current)
         attachedWsRef.current = null
         listenerRef.current = null
-        requestedRef.current = false
-        retryAtRef.current = null
+        lastRequestAtRef.current = 0
+        offerSeenRef.current = false
         closePc()
         setStatus(AxolConnectionStatus.Idle)
       }
@@ -168,17 +197,15 @@ export function useAxolControlChannel(
         attachedWsRef.current = ws
         ws.addEventListener("message", listener)
       }
-      // A prior negotiation failed; once the backoff elapses, allow a re-request.
-      if (retryAtRef.current !== null && Date.now() >= retryAtRef.current) {
-        retryAtRef.current = null
-        requestedRef.current = false
-      }
-      if (!requestedRef.current) {
-        requestedRef.current = true
+      const now = Date.now()
+      if (
+        controlRequestIsDue(offerSeenRef.current, lastRequestAtRef.current, now, REQUEST_RETRY_MS)
+      ) {
+        lastRequestAtRef.current = now
         try {
           ws.send(JSON.stringify({ type: "control-request" }))
         } catch {
-          requestedRef.current = false
+          lastRequestAtRef.current = 0
         }
       }
     }, POLL_MS)

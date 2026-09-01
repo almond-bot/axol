@@ -19,7 +19,7 @@ import sys
 import sysconfig
 import threading
 import time
-from importlib.metadata import PackageNotFoundError, distribution
+from importlib.metadata import PackageNotFoundError, distribution, distributions
 from pathlib import Path
 
 from ..tracker.config import TRACKER_CONFIG_FILE
@@ -235,16 +235,36 @@ def _clear_runtime_probe_cache() -> None:
 
 
 def _installed_pyvut() -> tuple[str | None, str | None]:
-    """Return installed version and VCS commit without importing pyvut."""
-    try:
-        dist = distribution("pyvut")
-    except PackageNotFoundError:
+    """Return installed version and a commit from the exact trusted VCS source.
+
+    Merely matching a commit id is insufficient: PEP 610 metadata can name a
+    credentialed mirror, another repository, or a non-git VCS.  Callers use a
+    ``None`` commit for every source that is not exactly the reviewed pyvut
+    GitHub repository, while retaining the non-``None`` version so update
+    preflight can distinguish an unsafe installed runtime from true absence.
+    """
+    installed = list(distributions(name="pyvut"))
+    if not installed:
         return None, None
+    if len(installed) != 1:
+        return "present-but-ambiguous", None
+    dist = installed[0]
     commit = None
     try:
         direct_url = json.loads(dist.read_text("direct_url.json") or "{}")
+        if (
+            not isinstance(direct_url, dict)
+            or set(direct_url) - {"url", "vcs_info"}
+            or direct_url.get("url")
+            not in {_PYVUT_REPO, _PYVUT_REPO.removesuffix(".git")}
+        ):
+            return dist.version, None
         vcs_info = direct_url.get("vcs_info", {})
-        if isinstance(vcs_info, dict):
+        if (
+            isinstance(vcs_info, dict)
+            and not set(vcs_info) - {"vcs", "requested_revision", "commit_id"}
+            and vcs_info.get("vcs") == "git"
+        ):
             value = vcs_info.get("commit_id")
             commit = value if isinstance(value, str) else None
     except (AttributeError, json.JSONDecodeError):
@@ -593,7 +613,9 @@ def ultimate_runtime_update_requirement() -> tuple[str | None, str | None]:
     Ultimate runtime is installed explicitly rather than declared in Axol's
     PyPI metadata, so the self-updater must carry the exact tested VCS
     requirement into that same transaction or uv will prune it.  A missing or
-    differently pinned runtime is not opted in and is left alone.
+    differently pinned runtime is still present and would be removed by
+    ``--force``.  It therefore blocks the hosted update rather than being
+    mistaken for an absent opt-in.
 
     Older manual setups sometimes put private Wi-Fi values directly in
     pyvut's package-local ``wifi_info.json``.  Rebuilding the environment
@@ -601,11 +623,16 @@ def ultimate_runtime_update_requirement() -> tuple[str | None, str | None]:
     moved to Axol's durable config.  The returned error never includes a
     credential value.
     """
-    _version, commit = _installed_pyvut()
-    if commit != _PYVUT_REF:
+    version, commit = _installed_pyvut()
+    if version is None:
         return None, None
+    if commit != _PYVUT_REF:
+        return None, _unsupported_pyvut_update_message()
 
-    if _packaged_wifi_status({}) == "customized":
+    packaged_wifi = _packaged_wifi_status({})
+    if packaged_wifi in {"missing", "unavailable"}:
+        return None, _unsupported_pyvut_update_message()
+    if packaged_wifi == "customized":
         config_error = ultimate_wifi_config_error(ULTIMATE_WIFI_CONFIG_FILE)
         if config_error is not None:
             return (
@@ -617,6 +644,19 @@ def ultimate_runtime_update_requirement() -> tuple[str | None, str | None]:
                 "were read into this error.",
             )
     return _PYVUT_SPEC, None
+
+
+def _unsupported_pyvut_update_message() -> str:
+    """Credential-safe refusal for a present runtime we cannot reconstruct."""
+    return (
+        "VIVE Ultimate update blocked: the installed pyvut runtime is not the "
+        "exact supported GitHub source and revision, or its package-local Wi-Fi "
+        "file cannot be inspected safely. A force update would remove that "
+        "runtime and could erase package-local credentials. Back up and migrate "
+        "any Wi-Fi values to Axol's durable tracker configuration, then install "
+        "the supported pinned pyvut runtime before retrying. No credential "
+        "values are included in this error."
+    )
 
 
 def run_update_preflight(_args: object = None) -> None:

@@ -13,7 +13,17 @@ axol serve --port 9000
 axol serve --open             # also open a browser window on startup
 axol serve --host 127.0.0.1   # localhost only
 axol serve --no-tls           # plain HTTP instead of HTTPS
+sudo "$(command -v axol)" serve              # hardware development; uses SUDO_USER
+axol serve --operator axoldev                 # explicit operator from a root shell
 ```
+
+The root development form lets the panel run CAN discovery/setup and restart
+the ZED daemon. It records into the same fixed
+`/var/lib/almond-axol/datasets` boundary as the installed service; `--operator`
+selects the non-root account/group that receives read-only dataset access while
+the store remains root-owned and non-writable. A normal `sudo` launch infers
+that account from `SUDO_USER`; passing it explicitly also works from a root
+shell. Custom dataset roots are intentionally unavailable to a root serve.
 
 <Tip>
   For a guided walkthrough of the control panel — connecting the Axol host and Axol, assigning the cameras, and running each operation — see the [Web Control Panel guide](/guides/control-panel).
@@ -25,6 +35,7 @@ axol serve --no-tls           # plain HTTP instead of HTTPS
 | `--port INT` | Port to listen on. Default `8001`. |
 | `--open` | Open a browser window on startup. Off by default. |
 | `--no-tls` | Serve plain HTTP instead of HTTPS. TLS is on by default. |
+| `--operator USER` | Non-root account that may read datasets written by a manual root serve. Defaults to `SUDO_USER`; required when starting directly from a root shell. Ignored for non-root serves. |
 
 <Warning>
   `axol serve` is a trusted-LAN control service, not a multi-user authenticated API. Keep ports 8000/8001 behind the robot network or a host firewall; do not expose them directly to the internet. Browser requests are limited to the hosted Axol UI, loopback development, and the exact local-interface IPs/local hostnames registered when `axol serve` starts; this includes secondary Ethernet/Wi-Fi, VPN, and routable IPv6 addresses. The server never trusts a request's `Host` header to grant access. Native clients on the LAN intentionally remain compatible without an `Origin` header. A custom hosted UI or DNS alias must be explicitly added with the comma-separated `AXOL_ALLOWED_BROWSER_ORIGINS` environment variable.

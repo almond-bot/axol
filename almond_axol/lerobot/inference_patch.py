@@ -195,9 +195,8 @@ def enable_action_schema_handshake() -> None:
             )
         # This mirrors LeRobot 0.6.1's handler but encodes the locally-created
         # TimedAction objects with Axol's numeric wire instead of pickle.
-        from queue import Empty
-
         import time
+        from queue import Empty
 
         try:
             started = time.perf_counter()

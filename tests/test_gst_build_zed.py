@@ -100,7 +100,7 @@ class ZedGstreamerBuildDependenciesTest(unittest.TestCase):
                 patch.object(build_zed, "_is_jetson", return_value=True),
                 patch.object(build_zed, "_ZED_SDK", sdk),  # noqa: SLF001
                 patch.object(build_zed, "_src_dir", return_value=src),  # noqa: SLF001
-                patch.object(build_zed, "_element_installed", return_value=False),  # noqa: SLF001
+                patch.object(build_zed, "_installed_plugins_ready", return_value=False),  # noqa: SLF001
                 patch.object(build_zed, "_apt_install_build_deps", return_value=False),
                 patch.object(build_zed, "_sync_source", sync_source),  # noqa: SLF001
                 redirect_stdout(output),
@@ -131,6 +131,199 @@ class ZedGstreamerBuildDependenciesTest(unittest.TestCase):
             commands[1],
             ["/usr/bin/cmake", "--build", str(source / "build"), "-j", "1"],
         )
+
+
+class ZedGstreamerInstalledIntegrityTest(unittest.TestCase):
+    @staticmethod
+    def _write_artifacts(root: Path) -> dict[str, Path]:
+        mono = root / "libgstzedxonesrc.so"
+        stereo = root / "libgstzedsrc.so"
+        mono.write_bytes(b"patched mono")
+        stereo.write_bytes(b"patched stereo")
+        return {"zedxonesrc": mono, "zedsrc": stereo}
+
+    @staticmethod
+    def _artifact_records(paths: dict[str, Path]) -> dict[str, dict[str, str]]:
+        return {
+            element: {
+                "path": str(path),
+                "sha256": build_zed._file_sha256(path),  # noqa: SLF001
+            }
+            for element, path in paths.items()
+        }
+
+    def test_gst_inspect_filename_is_canonicalized_and_root_checked(self) -> None:
+        inspected = subprocess.CompletedProcess(
+            [],
+            0,
+            "Plugin Details:\n  Filename                 /plugin/link.so\n",
+            "",
+        )
+        with (
+            patch.object(
+                build_zed.shutil, "which", return_value="/usr/bin/gst-inspect-1.0"
+            ),
+            patch.object(build_zed.subprocess, "run", return_value=inspected),
+            patch.object(
+                build_zed,
+                "_root_controlled_canonical_file",
+                return_value=Path("/usr/lib/gstreamer/libgstzed.so"),
+            ) as root_check,
+        ):
+            result = build_zed._inspect_element_artifact("zedsrc")  # noqa: SLF001
+
+        self.assertEqual(result, Path("/usr/lib/gstreamer/libgstzed.so"))
+        root_check.assert_called_once_with(
+            Path("/plugin/link.so"), allow_canonical_alias=True
+        )
+
+    def test_operator_controlled_artifact_path_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "libgstzed.so"
+            artifact.write_bytes(b"untrusted")
+            self.assertIsNone(  # noqa: SLF001
+                build_zed._root_controlled_canonical_file(
+                    artifact, allow_canonical_alias=True
+                )
+            )
+
+    def test_readiness_requires_both_current_paths_and_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._write_artifacts(root)
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                build_zed._manifest_payload(self._artifact_records(paths)),  # noqa: SLF001
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(
+                    build_zed,
+                    "_root_controlled_canonical_file",
+                    return_value=manifest,
+                ),
+                patch.object(
+                    build_zed,
+                    "_inspect_element_artifact",
+                    side_effect=lambda element: paths[element],
+                ),
+            ):
+                self.assertTrue(build_zed._installed_plugins_ready(manifest))  # noqa: SLF001
+
+                paths["zedsrc"].write_bytes(b"overwritten stock plugin")
+                self.assertFalse(build_zed._installed_plugins_ready(manifest))  # noqa: SLF001
+
+    def test_readiness_rejects_missing_or_unknown_element(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._write_artifacts(root)
+            records = self._artifact_records(paths)
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                build_zed._manifest_payload(records),  # noqa: SLF001
+                encoding="utf-8",
+            )
+            unknown = root / "libgststockzedsrc.so"
+            unknown.write_bytes(paths["zedsrc"].read_bytes())
+
+            with patch.object(
+                build_zed,
+                "_root_controlled_canonical_file",
+                return_value=manifest,
+            ):
+                with patch.object(
+                    build_zed,
+                    "_inspect_element_artifact",
+                    side_effect=(paths["zedxonesrc"], None),
+                ):
+                    self.assertFalse(build_zed._installed_plugins_ready(manifest))  # noqa: SLF001
+                with patch.object(
+                    build_zed,
+                    "_inspect_element_artifact",
+                    side_effect=(paths["zedxonesrc"], unknown),
+                ):
+                    self.assertFalse(build_zed._installed_plugins_ready(manifest))  # noqa: SLF001
+
+    def test_post_install_artifacts_must_be_in_cmake_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            (source / "build").mkdir(parents=True)
+            paths = self._write_artifacts(root)
+            records = self._artifact_records(paths)
+            install_manifest = source / "build" / "install_manifest.txt"
+            install_manifest.write_text(
+                f"{paths['zedxonesrc']}\n{paths['zedsrc']}\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(  # noqa: SLF001
+                build_zed._artifacts_came_from_build(source, records)
+            )
+
+            install_manifest.write_text(f"{paths['zedxonesrc']}\n", encoding="utf-8")
+            self.assertFalse(  # noqa: SLF001
+                build_zed._artifacts_came_from_build(source, records)
+            )
+
+    def test_partial_install_never_writes_source_stamp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "zed"
+            sdk.mkdir()
+            source = root / "source"
+            publish = Mock()
+            with (
+                patch.object(build_zed, "_is_jetson", return_value=True),
+                patch.object(build_zed, "_ZED_SDK", sdk),  # noqa: SLF001
+                patch.object(build_zed, "_src_dir", return_value=source),  # noqa: SLF001
+                patch.object(build_zed, "_installed_plugins_ready", return_value=False),  # noqa: SLF001
+                patch.object(build_zed, "_apt_install_build_deps", return_value=True),
+                patch.object(build_zed, "_sync_source", return_value=True),  # noqa: SLF001
+                patch.object(build_zed, "_apply_patch", return_value=True),  # noqa: SLF001
+                patch.object(build_zed, "_build_and_install", return_value=True),  # noqa: SLF001
+                patch.object(build_zed, "_collect_plugin_artifacts", return_value=None),  # noqa: SLF001
+                patch.object(build_zed, "_publish_machine_manifest", publish),  # noqa: SLF001
+                self.assertRaisesRegex(SystemExit, "must both be visible"),
+            ):
+                build_zed.run()
+
+            publish.assert_not_called()
+            self.assertFalse((source / ".axol-build-stamp").exists())
+
+    def test_manifest_publish_failure_never_writes_source_stamp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "zed"
+            sdk.mkdir()
+            source = root / "source"
+            paths = self._write_artifacts(root)
+            artifacts = self._artifact_records(paths)
+            stamp_write = Mock()
+            with (
+                patch.object(build_zed, "_is_jetson", return_value=True),
+                patch.object(build_zed, "_ZED_SDK", sdk),  # noqa: SLF001
+                patch.object(build_zed, "_src_dir", return_value=source),  # noqa: SLF001
+                patch.object(build_zed, "_installed_plugins_ready", return_value=False),  # noqa: SLF001
+                patch.object(build_zed, "_apt_install_build_deps", return_value=True),
+                patch.object(build_zed, "_sync_source", return_value=True),  # noqa: SLF001
+                patch.object(build_zed, "_apply_patch", return_value=True),  # noqa: SLF001
+                patch.object(build_zed, "_build_and_install", return_value=True),  # noqa: SLF001
+                patch.object(
+                    build_zed, "_collect_plugin_artifacts", return_value=artifacts
+                ),  # noqa: SLF001
+                patch.object(
+                    build_zed, "_artifacts_came_from_build", return_value=True
+                ),  # noqa: SLF001
+                patch.object(
+                    build_zed, "_publish_machine_manifest", return_value=False
+                ),  # noqa: SLF001
+                patch.object(build_zed, "secure_atomic_write_text", stamp_write),
+                self.assertRaisesRegex(SystemExit, "root-owned ZED plugin manifest"),
+            ):
+                build_zed.run()
+
+            stamp_write.assert_not_called()
 
 
 if __name__ == "__main__":

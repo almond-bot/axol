@@ -200,8 +200,11 @@ def run_configured_bridge(
 
     triggers: dict[str, TriggerReader] = {}
     source = create_source(config)
-    source.start()
     try:
+        # Enter the ownership guard before startup: source.start() can acquire
+        # USB/HID state before raising or receiving Ctrl+C, and stop() is its
+        # only chance to release a partially initialized backend.
+        source.start()
         for side, channel in (
             ("left", config.trigger_can_left),
             ("right", config.trigger_can_right),

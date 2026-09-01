@@ -369,6 +369,8 @@ function CameraPreview({
     setLoadedKey(key)
     setState("loading")
   }
+  // The hosted UI is cross-origin from the robot. CORS mode supplies its
+  // trusted Origin; the API rejects originless cross-site images.
   return (
     <div
       className={cn(
@@ -378,6 +380,7 @@ function CameraPreview({
     >
       {state !== "error" && (
         <img
+          crossOrigin="anonymous"
           src={apiUrl(`/api/cameras/preview/${serial}?v=${nonce}`)}
           alt={`Camera ${serial} preview`}
           className="size-full object-cover"

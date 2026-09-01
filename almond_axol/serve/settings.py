@@ -108,6 +108,51 @@ def _settings_op(op_id: str) -> str:
     return cmd.settings_like if cmd is not None and cmd.settings_like else op_id
 
 
+def _confine_hosted_runtime_paths(target_op: str, merged: dict[str, Any]) -> None:
+    """Remove privileged path overrides before an operation config is parsed.
+
+    The root control-panel service shares operator settings, but it must not
+    let either those saved values or one request redirect libraries that open
+    paths by name. VR certificate setup can create/replace both configured
+    files when one half of the pair is missing, while LeRobot constructors
+    create their calibration directory and read ``<id>.json``. Pin TLS to the
+    one managed pair and let LeRobot use its ordinary service-local defaults.
+
+    ``target_op`` deliberately follows :func:`_settings_op`, so operations such
+    as ``collect-dagger`` that alias the collect-data config shape inherit the
+    same boundary automatically. Direct CLI use and non-root embeddings never
+    call this helper.
+    """
+    tls_prefix = {
+        "teleop": "vr_server",
+        "collect-data": "teleop_config.vr_server_config",
+    }.get(target_op)
+    if tls_prefix is not None:
+        from ..utils.certs import CERTFILE, KEYFILE
+
+        merged[f"{tls_prefix}.certfile"] = CERTFILE
+        merged[f"{tls_prefix}.keyfile"] = KEYFILE
+
+    calibration_fields = {
+        "collect-data": (
+            "robot_config.calibration_dir",
+            "robot_config.id",
+            "teleop_config.calibration_dir",
+            "teleop_config.id",
+        ),
+        "run-policy": (
+            "robot_config.calibration_dir",
+            "robot_config.id",
+        ),
+        "replay-dataset": (
+            "robot_config.calibration_dir",
+            "robot_config.id",
+        ),
+    }.get(target_op, ())
+    for field_name in calibration_fields:
+        merged.pop(field_name, None)
+
+
 def _mantis_channels_from_values(
     values: dict[str, Any],
 ) -> tuple[str | None, str | None]:
@@ -1438,6 +1483,15 @@ class SettingsStore:
                 merged.pop(f"{_VRT}.tracker_key", None)
         merged.update(args)
 
+        # A hosted root process must never honor saved or per-request paths for
+        # TLS generation or LeRobot calibration state. Keep this after request
+        # precedence so the security boundary is the final authority.
+        from ..utils.state_files import privileged_service_active
+
+        hosted_service = privileged_service_active()
+        if hosted_service:
+            _confine_hosted_runtime_paths(target_op, merged)
+
         # ``diag.lift-cycle`` is argparse-backed: unlike draccus, the literal
         # string "null" would be treated as an interface name. Translate a
         # disabled saved/request channel into the diagnostic's explicit skip
@@ -1460,12 +1514,9 @@ class SettingsStore:
         # but cannot redirect (or merely break) panel operations. Aliases such
         # as collect-dagger resolve through ``target_op`` above.
         if target_op in {"collect-data", "run-policy", "replay-dataset"}:
-            from ..utils.state_files import (
-                privileged_service_active,
-                service_dataset_path_for_repo_id,
-            )
+            from ..utils.state_files import service_dataset_path_for_repo_id
 
-            if privileged_service_active():
+            if hosted_service:
                 repo_id = merged.get("repo_id")
                 if repo_id:
                     merged["root"] = str(service_dataset_path_for_repo_id(repo_id))

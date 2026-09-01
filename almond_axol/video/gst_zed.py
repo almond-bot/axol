@@ -42,6 +42,7 @@ gate use; without them callers fall back to the SDK ``ZedCamera``.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import queue
 import threading
@@ -396,10 +397,13 @@ def _dataset_enc_shmsink(socket_path: str, w: int, h: int, fps: int, name: str) 
     raw copy) — and the recorder only *muxes* it (see
     :class:`~almond_axol.lerobot.h264_mux_encoder.H264MuxStreamingEncoder`) rather
     than re-encoding. ``nvvidconv`` must output NVMM for ``nvv4l2h264enc``; the
-    AU-aligned byte-stream is what the recorder's
-    :class:`~almond_axol.video.shm_frames.EncodedAuReader` expects. Runs in VBR
-    with a peak cap so the recorded dataset stays bounded and uniformly sized
-    across cameras even when one sensor is very noisy (see ``dataset_vbr_bitrate``).
+    AU-aligned byte-stream is wrapped in GStreamer's Data Protocol before
+    ``shmsink``: bare shm transports bytes but drops GstBuffer PTS/flags, while
+    GDP serializes them so the recorder can recover the sensor-exposure PTS.
+    ``wait-for-connection`` keeps GDP's one-time caps header from being dropped
+    before the recorder attaches. Runs in VBR with a peak cap so the recorded
+    dataset stays bounded and uniformly sized across cameras even when one
+    sensor is very noisy (see ``dataset_vbr_bitrate``).
     """
     idr = max(1, round(fps * _DATASET_IDR_INTERVAL_S))
     target, peak = dataset_vbr_bitrate(w, h, fps)
@@ -409,7 +413,8 @@ def _dataset_enc_shmsink(socket_path: str, w: int, h: int, fps: int, name: str) 
         f"bitrate={target} peak-bitrate={peak} preset-level=1 "
         f"insert-sps-pps=true insert-aud=true idrinterval={idr} maxperf-enable=true "
         "! video/x-h264,stream-format=byte-stream,alignment=au "
-        f"! shmsink socket-path={socket_path} wait-for-connection=false "
+        "! gdppay "
+        f"! shmsink socket-path={socket_path} wait-for-connection=true "
         "sync=false async=false"
     )
 
@@ -502,6 +507,25 @@ class _GstPipelineBase:
         except Exception:  # noqa: BLE001 - latency query is best-effort
             pass
         return 1.0 / fps if fps else 0.0
+
+    def _pipeline_pts_origin_perf(self) -> float | None:
+        """Map this pipeline's running-time zero onto ``perf_counter``.
+
+        GDP preserves the relay pipeline's sensor PTS across shmsink/shmsrc.
+        The recorder is a separate pipeline with a different base time, so it
+        combines that PTS with this one co-sampled origin instead of comparing
+        against its own running clock.
+        """
+        if self._clock is None or self._pipeline is None:
+            return None
+        try:
+            before = time.perf_counter()
+            running_now = self._clock.get_time() - self._pipeline.get_base_time()
+            after = time.perf_counter()
+            origin = (before + after) * 0.5 - running_now / 1e9
+        except Exception:  # noqa: BLE001 - clock implementations vary
+            return None
+        return origin if math.isfinite(origin) and origin >= 0.0 else None
 
     def _start_pull(self, name: str, sink_name: str, handler: Any) -> None:
         sink = self._pipeline.get_by_name(sink_name)
@@ -686,9 +710,10 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         self._want_raw = want_raw
         self._raw_sink_override = raw_sink
         self._raw_socket_path = raw_socket_path
-        # Pipeline latency for the shmsink path's recorder-side frame stamps,
-        # measured once after the pipeline plays (see _measure_raw_latency_s).
+        # Sensor-PTS mapping for the GDP/shm recorder path. ``raw_latency_s`` is
+        # retained only as a fallback for a missing/corrupt recovered PTS.
         self.raw_latency_s = 0.0
+        self.raw_pts_origin_perf: float | None = None
         self._enc = _AUChannel(lambda: self.alive) if want_encoded else None
         self._raw = (
             _RawBuffer(self.raw_width, self.raw_height)
@@ -792,6 +817,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
             )
         if self._raw_socket_path is not None:
             self.raw_latency_s = self._measure_raw_latency_s(self.fps)
+            self.raw_pts_origin_perf = self._pipeline_pts_origin_perf()
         _logger.info(
             "ZedGstCamera connected (sn=%d %dx%d @ %dfps, encoded=%s raw=%s).",
             self.serial,
@@ -953,8 +979,10 @@ class ZedGstStereoCamera(_GstPipelineBase):
         self._right_raw_sink = right_raw_sink
         self._left_raw_socket_path = left_raw_socket_path
         self._right_raw_socket_path = right_raw_socket_path
-        # Pipeline latency for the shmsink path's recorder-side frame stamps.
+        # Sensor-PTS mapping for the GDP/shm recorder path. ``raw_latency_s`` is
+        # retained only as a fallback for a missing/corrupt recovered PTS.
         self.raw_latency_s = 0.0
+        self.raw_pts_origin_perf: float | None = None
 
         def eye(
             side: str, raw_sink: Any, socket_path: str | None
@@ -1163,6 +1191,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
             )
         if self._left_raw_socket_path or self._right_raw_socket_path:
             self.raw_latency_s = self._measure_raw_latency_s(self.fps)
+            self.raw_pts_origin_perf = self._pipeline_pts_origin_perf()
         _logger.info(
             "ZedGstStereoCamera connected (sn=%d %dx%d/eye @ %dfps).",
             self.serial,

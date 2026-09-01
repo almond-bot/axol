@@ -27,7 +27,6 @@ from almond_axol.lerobot.inference_wire import (
     receive_bounded_chunks,
 )
 
-
 STATE_SCHEMA = ("left.pos", "right.pos")
 ACTION_SCHEMA = ("left.target", "right.target")
 FEATURES = {

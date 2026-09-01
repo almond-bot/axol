@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from ...utils.sudo import run_root
@@ -31,8 +33,26 @@ _MODULES_LOAD_FILE = Path("/etc/modules-load.d/gs_usb.conf")
 _LOADED_MODULE = Path("/sys/module/gs_usb")
 _SIGNATURE_ENFORCEMENT = Path("/sys/module/module/parameters/sig_enforce")
 _LOCKDOWN_STATE = Path("/sys/kernel/security/lockdown")
+_USB_DEVICES = Path("/sys/bus/usb/devices")
+_NET_CLASS = Path("/sys/class/net")
 _MIN_NATIVE_HUB_KERNEL = (6, 13)
 _VENDORED_MODULE_VERSION = "almond-5.15.148-hub2"
+_ENUMERATION_TIMEOUT_S = 2.0
+_ENUMERATION_POLL_S = 0.05
+
+# Never resolve a command that will run as root through the invoking user's
+# PATH.  These are the standard root-owned locations used by Debian/Ubuntu;
+# aliases such as modprobe may be root-owned symlinks to the kmod multicall
+# binary, so execute the validated alias (rather than its resolved target) to
+# preserve argv[0].
+_ROOT_TOOL_PATHS: dict[str, tuple[Path, ...]] = {
+    "modinfo": (Path("/usr/sbin/modinfo"), Path("/sbin/modinfo")),
+    "modprobe": (Path("/usr/sbin/modprobe"), Path("/sbin/modprobe")),
+    "depmod": (Path("/usr/sbin/depmod"), Path("/sbin/depmod")),
+    "install": (Path("/usr/bin/install"), Path("/bin/install")),
+    "tee": (Path("/usr/bin/tee"), Path("/bin/tee")),
+    "rm": (Path("/usr/bin/rm"), Path("/bin/rm")),
+}
 
 # USB IDs the installed driver must claim (modinfo alias fragments). Both the
 # Axol and Mantis hubs use the dual-channel 1d50:606f board. A CANable 2.0 is
@@ -43,6 +63,15 @@ _HUB_ALIAS = "v1D50p606F"
 _CANDLELIGHT_ALIAS = "v1209p2323"
 _CANABLE2_ALIAS = "v16D0p117E"
 _OPTIONAL_USB_ALIASES = {("16d0", "117e"): _CANABLE2_ALIAS}
+_EXPECTED_USB_TOPOLOGIES = {
+    # The Axol/Mantis hubs and the generic single-channel cart/chest adapters
+    # intentionally share this candleLight VID/PID. Driver verification proves
+    # only that the complete hardware topology enumerated; can.setup performs
+    # the stricter channel-count + live-device role classification afterward.
+    ("1d50", "606f"): ((0,), (0, 1)),
+    ("1209", "2323"): ((0,),),
+    ("16d0", "117e"): ((0,),),
+}
 
 # Before the version marker above existed, Almond's vendored module could only
 # be distinguished from the upstream 5.15 module by this exact alias set and
@@ -56,37 +85,49 @@ class _DriverIdentityError(RuntimeError):
     """The active module cannot be proven to match modprobe's selection."""
 
 
-def _find_modinfo() -> str | None:
-    """Locate ``modinfo``, including the sbin dirs minimal PATHs often omit."""
-    found = shutil.which("modinfo")
-    if found:
-        return found
-    for candidate in ("/usr/sbin/modinfo", "/sbin/modinfo"):
-        if Path(candidate).exists():
-            return candidate
+def _trusted_root_executable(candidate: Path) -> bool:
+    """Whether a fixed command path and its resolved target are root-controlled."""
+    try:
+        link_info = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+        target_info = resolved.stat()
+        directories = set(candidate.parents) | set(resolved.parents)
+        directory_info = [directory.stat() for directory in directories]
+    except OSError:
+        return False
+    return (
+        link_info.st_uid == 0
+        and target_info.st_uid == 0
+        and stat.S_ISREG(target_info.st_mode)
+        and bool(target_info.st_mode & 0o111)
+        and not target_info.st_mode & 0o022
+        and all(
+            info.st_uid == 0 and not info.st_mode & 0o022 for info in directory_info
+        )
+    )
+
+
+def _find_root_tool(name: str) -> str | None:
+    """Return a fixed, root-owned executable path; never consult ``PATH``."""
+    for candidate in _ROOT_TOOL_PATHS[name]:
+        if _trusted_root_executable(candidate):
+            return str(candidate)
     return None
+
+
+def _find_modinfo() -> str | None:
+    """Locate a trusted system ``modinfo`` without consulting ``PATH``."""
+    return _find_root_tool("modinfo")
 
 
 def _find_modprobe() -> str | None:
-    """Locate ``modprobe``, including the sbin dirs minimal PATHs omit."""
-    found = shutil.which("modprobe")
-    if found:
-        return found
-    for candidate in ("/usr/sbin/modprobe", "/sbin/modprobe"):
-        if Path(candidate).exists():
-            return candidate
-    return None
+    """Locate a trusted system ``modprobe`` without consulting ``PATH``."""
+    return _find_root_tool("modprobe")
 
 
 def _find_depmod() -> str | None:
-    """Locate ``depmod``, including the sbin dirs minimal PATHs omit."""
-    found = shutil.which("depmod")
-    if found:
-        return found
-    for candidate in ("/usr/sbin/depmod", "/sbin/depmod"):
-        if Path(candidate).exists():
-            return candidate
-    return None
+    """Locate a trusted system ``depmod`` without consulting ``PATH``."""
+    return _find_root_tool("depmod")
 
 
 def is_driver_available() -> bool:
@@ -254,18 +295,19 @@ def _selected_driver_is_legacy_vendored() -> bool:
 def _loaded_matches_selected_without_srcversion() -> bool:
     """Conservative identity fallback for kernels without module srcversions.
 
-    Kernel module taint distinguishes in-tree from externally built code. For
-    an in-tree selection, an active non-out-of-tree module is the only possible
-    ``gs_usb`` supplied by that running kernel. For external code, require the
-    active and selected Almond version markers to match, or the tightly scoped
-    signed-legacy fingerprint above. Missing taint metadata remains an error.
+    Taint can distinguish in-tree from externally built code, but it cannot
+    prove that a loaded native module has the same bytes as the file modprobe
+    currently selects (the on-disk file may have changed after boot). Native
+    modules without source identity therefore fail closed. For external code,
+    require matching Almond version markers or the tightly scoped signed-
+    legacy fingerprint above. Missing taint metadata remains an error.
     """
     taint = _loaded_module_field("taint")
     if taint is None:
         return False
     selected_path = _selected_driver_path()
     if _selected_driver_is_native(selected_path):
-        return "O" not in taint
+        return False
     if "O" not in taint:
         return False
 
@@ -303,7 +345,13 @@ def _load_available_driver() -> None:
             "`sudo modprobe -r gs_usb && sudo modprobe gs_usb`, then retry "
             "(or reboot after removing any stale override)."
         )
-    loaded = run_root(["modprobe", "gs_usb"])
+    modprobe = _find_modprobe()
+    if modprobe is None:
+        raise RuntimeError(
+            "Trusted system `modprobe` not found. Install kmod first "
+            "(`sudo apt install kmod`)."
+        )
+    loaded = run_root([modprobe, "gs_usb"])
     if loaded.returncode == 0 and _LOADED_MODULE.exists():
         return
     error = (loaded.stderr or "").strip().splitlines()
@@ -317,7 +365,7 @@ def _load_available_driver() -> None:
 def _attached_usb_ids() -> set[tuple[str, str]]:
     """Lowercase ``(vendor, product)`` IDs for attached USB devices."""
     ids: set[tuple[str, str]] = set()
-    for vendor_file in Path("/sys/bus/usb/devices").glob("*/idVendor"):
+    for vendor_file in _USB_DEVICES.glob("*/idVendor"):
         try:
             vendor = vendor_file.read_text().strip().lower()
             product = (vendor_file.parent / "idProduct").read_text().strip().lower()
@@ -325,6 +373,94 @@ def _attached_usb_ids() -> set[tuple[str, str]]:
             continue
         ids.add((vendor, product))
     return ids
+
+
+def _attached_driver_devices() -> tuple[
+    tuple[str, str, str, tuple[tuple[int, ...], ...]], ...
+]:
+    """Snapshot attached USB devices whose live topology a new driver must prove."""
+    devices: list[tuple[str, str, str, tuple[int, ...]]] = []
+    for vendor_file in _USB_DEVICES.glob("*/idVendor"):
+        device = vendor_file.parent
+        try:
+            vendor = vendor_file.read_text().strip().lower()
+            product = device.joinpath("idProduct").read_text().strip().lower()
+        except OSError:
+            continue
+        expected = _EXPECTED_USB_TOPOLOGIES.get((vendor, product))
+        if expected is not None:
+            devices.append((device.name, vendor, product, expected))
+    return tuple(sorted(devices))
+
+
+def _bound_can_topology(device_name: str) -> tuple[bool, tuple[int, ...]]:
+    """Return gs_usb binding and CAN ``dev_id`` values below one USB device."""
+    bound = False
+    dev_ids: list[int] = []
+    for interface in _USB_DEVICES.glob(f"{device_name}:*"):
+        try:
+            if interface.joinpath("driver").resolve(strict=True).name != "gs_usb":
+                continue
+        except OSError:
+            continue
+        bound = True
+        try:
+            netdevs = tuple(interface.joinpath("net").iterdir())
+        except OSError:
+            continue
+        for netdev in netdevs:
+            dev_id_file = netdev / "dev_id"
+            if not dev_id_file.exists():
+                dev_id_file = _NET_CLASS / netdev.name / "dev_id"
+            try:
+                dev_ids.append(int(dev_id_file.read_text().strip(), 0))
+            except (OSError, ValueError):
+                continue
+    return bound, tuple(sorted(dev_ids))
+
+
+def _verify_attached_driver_devices(
+    expected: tuple[tuple[str, str, str, tuple[tuple[int, ...], ...]], ...],
+    *,
+    timeout: float = _ENUMERATION_TIMEOUT_S,
+    poll_interval: float = _ENUMERATION_POLL_S,
+) -> None:
+    """Require every snapshotted USB adapter to bind with its exact CAN topology."""
+    if not expected:
+        return
+    deadline = time.monotonic() + timeout
+    failures: list[str] = []
+    while True:
+        failures = []
+        for device_name, vendor, product, expected_topologies in expected:
+            device = _USB_DEVICES / device_name
+            try:
+                observed_id = (
+                    device.joinpath("idVendor").read_text().strip().lower(),
+                    device.joinpath("idProduct").read_text().strip().lower(),
+                )
+            except OSError:
+                observed_id = None
+            if observed_id != (vendor, product):
+                failures.append(f"{device_name} is no longer the expected USB device")
+                continue
+            bound, dev_ids = _bound_can_topology(device_name)
+            if not bound:
+                failures.append(f"{device_name} is not bound to gs_usb")
+            elif dev_ids not in expected_topologies:
+                failures.append(
+                    f"{device_name} exposed CAN dev_id values {dev_ids}, "
+                    f"expected one of {expected_topologies}"
+                )
+        if not failures:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "The newly installed gs_usb driver did not claim the attached "
+                "CAN hardware with the expected topology: " + "; ".join(failures)
+            )
+        time.sleep(min(poll_interval, remaining))
 
 
 def _required_aliases() -> set[str]:
@@ -437,16 +573,30 @@ def _install(ko: Path) -> None:
     """Install the module, register it for boot, and load it (requires sudo)."""
     depmod = _find_depmod()
     modprobe = _find_modprobe()
-    if depmod is None or modprobe is None:
-        missing = ", ".join(
-            name
-            for name, path in (("depmod", depmod), ("modprobe", modprobe))
-            if not path
-        )
+    install = _find_root_tool("install")
+    tee = _find_root_tool("tee")
+    rm = _find_root_tool("rm")
+    tools = {
+        "depmod": depmod,
+        "modprobe": modprobe,
+        "install": install,
+        "tee": tee,
+        "rm": rm,
+    }
+    if any(path is None for path in tools.values()):
+        missing = ", ".join(name for name, path in tools.items() if path is None)
         raise RuntimeError(
-            f"Required kernel-module tool(s) not found: {missing}. "
-            "Install kmod first (`sudo apt install kmod`)."
+            f"Required trusted system tool(s) not found: {missing}. "
+            "Install kmod and coreutils first."
         )
+    # The None case was rejected above; retain concrete names for command
+    # construction so no privileged invocation can fall back to PATH lookup.
+    assert depmod is not None
+    assert modprobe is not None
+    assert install is not None
+    assert tee is not None
+    assert rm is not None
+    expected_devices = _attached_driver_devices()
     dest = _vendored_driver_path()
     backup = _BUILD_DIR / f"gs_usb-installed-{os.getpid()}.ko"
     config_backup = _BUILD_DIR / f"gs_usb-conf-{os.getpid()}.backup"
@@ -465,7 +615,7 @@ def _install(ko: Path) -> None:
     load_attempted = False
     active_after_unload = False
     try:
-        run_root(["install", "-D", "-m", "644", str(ko), str(dest)], check=True)
+        run_root([install, "-D", "-m", "644", str(ko), str(dest)], check=True)
         run_root([depmod, "-a"], check=True)
         selected = _selected_driver_path()
         try:
@@ -530,7 +680,13 @@ def _install(ko: Path) -> None:
                     "The loaded gs_usb module exposes neither the built module's "
                     "source identity nor Almond's version marker."
                 )
-        run_root(["tee", str(_MODULES_LOAD_FILE)], input_text="gs_usb\n", check=True)
+        # Loading the module is not enough: retain the previous file/config
+        # backups until every adapter present before the replacement is bound
+        # to gs_usb and exposes its expected CAN channel IDs. With no attached
+        # supported hardware this is a deliberate no-op, while all other
+        # validation and rollback guarantees remain active.
+        _verify_attached_driver_devices(expected_devices)
+        run_root([tee, str(_MODULES_LOAD_FILE)], input_text="gs_usb\n", check=True)
     except (OSError, RuntimeError, KeyboardInterrupt) as exc:
         recovery_errors: list[str] = []
 
@@ -544,9 +700,9 @@ def _install(ko: Path) -> None:
         # hotplug races and autoloads the module during recovery, it can now
         # only select the restored driver.
         if had_override:
-            recover(["install", "-D", "-m", "644", str(backup), str(dest)])
+            recover([install, "-D", "-m", "644", str(backup), str(dest)])
         else:
-            recover(["rm", "-f", str(dest)])
+            recover([rm, "-f", str(dest)])
         recover([depmod, "-a"])
         if (
             load_attempted or new_loaded or active_after_unload
@@ -562,7 +718,7 @@ def _install(ko: Path) -> None:
         if had_config:
             recover(
                 [
-                    "install",
+                    install,
                     "-D",
                     "-m",
                     "644",
@@ -571,7 +727,7 @@ def _install(ko: Path) -> None:
                 ]
             )
         else:
-            recover(["rm", "-f", str(_MODULES_LOAD_FILE)])
+            recover([rm, "-f", str(_MODULES_LOAD_FILE)])
 
         if not recovery_errors:
             if had_override:

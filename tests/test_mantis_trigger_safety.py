@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -57,6 +57,24 @@ def _bridge() -> tuple[TrackerBridge, _Trigger, _Trigger]:
 
 
 class MantisTriggerSafetyTest(unittest.TestCase):
+    def test_reader_constructor_interrupt_releases_socket(self) -> None:
+        bus = Mock()
+        thread = Mock()
+        thread.start.side_effect = KeyboardInterrupt
+        thread.is_alive.return_value = False
+
+        with (
+            patch(
+                "almond_axol.tracker.trigger.threading.Thread",
+                return_value=thread,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            TriggerReader("can-test", bus=bus)
+
+        bus.shutdown.assert_called_once_with()
+        thread.start.assert_called_once_with()
+
     def test_reader_close_surfaces_lingering_thread_after_socket_shutdown(
         self,
     ) -> None:

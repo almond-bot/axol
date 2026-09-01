@@ -17,8 +17,8 @@ from .config import (
     JointConfig,
     PositionForceConfig,
 )
-from .sim import Sim
 from .mantis import Mantis, MantisGripperArm
+from .sim import Sim
 
 __all__ = [
     "RobotBase",

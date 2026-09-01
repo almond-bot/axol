@@ -44,6 +44,35 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  validate-release-provenance:
+    name: Validate release provenance
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the release commit to be on origin/main
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git check-ref-format "refs/tags/${RELEASE_TAG}"
+          git fetch --no-tags --prune origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          event_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+          if [ "${tag_commit}" != "${event_commit}" ]; then
+            echo "::error::Release event SHA does not dereference to ${RELEASE_TAG}."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor \
+              "${tag_commit}" refs/remotes/origin/main; then
+            echo "::error::Release tag ${RELEASE_TAG} points to ${tag_commit}, which is not contained in origin/main. Merge the exact reviewed commit before publishing."
+            exit 1
+          fi
+
   validate-python:
     name: Validate Python (${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -123,6 +152,22 @@ jobs:
         run: bash -n web/app/public/install
       - if: matrix.python-version == '3.13'
         run: uv build
+      - name: Verify the SDK wheel embeds the reviewed installer
+        if: matrix.python-version == '3.13'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = list(Path("dist").glob("almond_axol-*-py3-none-any.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one SDK wheel, found {wheels}")
+          expected = Path("web/app/public/install").read_bytes()
+          with ZipFile(wheels[0]) as archive:
+              embedded = archive.read("almond_axol/_installer.sh")
+          if embedded != expected:
+              raise SystemExit("SDK wheel installer differs from reviewed source")
+          PY
       - if: matrix.python-version == '3.13'
         run: uv build --project plugins/lerobot_robot_axol
       - if: matrix.python-version == '3.13'
@@ -151,7 +196,7 @@ jobs:
   publish-sdk:
     name: Publish SDK
     if: github.event_name == 'release'
-    needs: [validate-python, validate-web]
+    needs: [validate-release-provenance, validate-python, validate-web]
     runs-on: ubuntu-latest
     permissions:
       id-token: write # Required for PyPI trusted publishing (OIDC).
@@ -165,12 +210,27 @@ jobs:
           version: "0.12.3"
           enable-cache: false
       - run: uv build
+      - name: Verify the published wheel embeds the reviewed installer
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = list(Path("dist").glob("almond_axol-*-py3-none-any.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one SDK wheel, found {wheels}")
+          expected = Path("web/app/public/install").read_bytes()
+          with ZipFile(wheels[0]) as archive:
+              embedded = archive.read("almond_axol/_installer.sh")
+          if embedded != expected:
+              raise SystemExit("SDK wheel installer differs from reviewed source")
+          PY
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
 
   publish-plugin:
     name: Publish LeRobot plugin
     if: github.event_name == 'release'
-    needs: [validate-python, validate-web]
+    needs: [validate-release-provenance, validate-python, validate-web]
     runs-on: ubuntu-latest
     # Distinct OIDC environment claim; see the header comment.
     environment: pypi-plugin

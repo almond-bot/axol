@@ -63,6 +63,14 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
             "machine without mixed-content blocking."
         ),
     )
+    parser.add_argument(
+        "--operator",
+        metavar="USER",
+        help=(
+            "Non-root account that may read datasets recorded by a manual root "
+            "serve (default: SUDO_USER). Ignored by non-root serves."
+        ),
+    )
     parser.set_defaults(func=run)
 
 
@@ -104,7 +112,10 @@ def run(args: argparse.Namespace) -> None:
     """Start the control-panel server."""
     # Explicit process marker: security gates must remain active for a manual
     # root ``axol serve`` even when the installer did not set ALMOND_HOME.
-    from ..utils.state_files import mark_privileged_service
+    from ..utils.state_files import (
+        configure_root_service_dataset,
+        mark_privileged_service,
+    )
 
     mark_privileged_service()
     if os.geteuid() == 0:
@@ -112,6 +123,7 @@ def run(args: argparse.Namespace) -> None:
         # inside the immutable hosted store, including on manual serve runs
         # outside the installed systemd unit.
         os.umask(0o027)
+        configure_root_service_dataset(getattr(args, "operator", None))
 
     import uvicorn
 

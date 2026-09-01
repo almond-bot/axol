@@ -13,7 +13,6 @@ from almond_axol.recording.datasets import (
     require_dataset_resume_schema,
 )
 
-
 EXPECTED_FEATURES = {
     "action": {
         "dtype": "float32",

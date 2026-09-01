@@ -30,3 +30,8 @@ export function requiresInstallerMigration(version: string | null): boolean {
     installed === null || firstSafe === null || compareNumericVersions(installed, firstSafe) < 0
   )
 }
+
+/** Whether a connected release install needs the fail-closed migration notice. */
+export function showInstallerMigration(version: string | null, releaseInstall: boolean): boolean {
+  return releaseInstall && requiresInstallerMigration(version)
+}

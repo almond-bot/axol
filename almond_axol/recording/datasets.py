@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 # LeRobot adds these bookkeeping columns to every dataset independently of the
 # caller's hardware feature contract. Keep their fixed v3 contracts here so
 # they do not count as caller extras, while still rejecting corrupt metadata

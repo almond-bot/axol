@@ -54,7 +54,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from ...constants import Joint
 from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ...robot.cart import Cart
-from ...teleop.core import VRTeleopCore
+from ...teleop.core import TCPPoseSnapshot, VRTeleopCore
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VREpisodeOutcome, VRFrame, VRState
 from ...vr.server import VRServer
@@ -1050,7 +1050,18 @@ class AxolVRTeleop(Teleoperator):
         actions) independent of the joint solutions. ``None`` before the
         first solve or outside absolute mode.
         """
-        return self._core.last_tcp
+        snapshot = self._core.last_tcp_snapshot
+        if snapshot is None:
+            return None
+        return {"left": list(snapshot.left), "right": list(snapshot.right)}
+
+    def tcp_pose_snapshot(self) -> TCPPoseSnapshot | None:
+        """Atomically read the latest immutable TCP pose and capture time.
+
+        The returned reference contains tuple-backed poses, so neither the IK
+        thread nor a caller can mutate a sample while data collection uses it.
+        """
+        return self._core.last_tcp_snapshot
 
     def tcp_last_change_ts(self) -> float | None:
         """Monotonic time the tracked TCP pose last took a *new* value.

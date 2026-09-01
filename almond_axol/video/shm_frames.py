@@ -66,6 +66,90 @@ _SNAP_HEADER_BYTES = 16
 # Treat anything above this generous ceiling as corrupt metadata: subtracting an
 # arbitrary large value can select the oldest entry in the finite snapshot ring.
 _MAX_CAPTURE_LATENCY_S = 5.0
+# A pipeline/perf-clock co-sample can differ by a few microseconds. Keep a
+# generous bound for scheduler jitter, but never let a recovered timestamp make
+# dataset pairing meaningfully future-dated.
+_MAX_CAPTURE_FUTURE_S = 0.05
+_GST_CLOCK_TIME_NONE = (1 << 64) - 1
+# The snapshot ring holds about 0.5 s at the 120 Hz control rate. Abort an
+# encoded take before its oldest undelivered AU can age out of that history;
+# silently dropping an AU is not an option because later H.264 pictures may
+# reference it. This also puts a hard ceiling on memory if row processing
+# stalls while the GStreamer pull thread keeps draining shmsrc.
+_MAX_ENCODED_AU_BACKLOG_S = 0.25
+_GST_READER_STOP_TIMEOUT_S = 2.0
+
+
+def _set_gst_state_checked(pipeline: Any, gst: Any, state: Any, *, label: str) -> None:
+    """Change state and turn GStreamer's non-exception failure into an error."""
+    result = pipeline.set_state(state)
+    state_change_return = getattr(gst, "StateChangeReturn", None)
+    failure = (
+        getattr(state_change_return, "FAILURE", None)
+        if state_change_return is not None
+        else None
+    )
+    if failure is not None and result == failure:
+        raise RuntimeError(f"{label} GStreamer pipeline rejected state {state!s}")
+
+
+def _disconnect_gst_pull_reader(reader: Any, *, label: str) -> None:
+    """Stop one appsink pull owner without losing a live thread/pipeline.
+
+    Setting the pipeline to NULL first is the cancellation mechanism for a
+    native ``try-pull-sample`` call. Ownership fields are cleared only after
+    both that transition and thread exit are proved; retaining them lets the
+    recorder's second cleanup pass retry an uncertain teardown.
+    """
+    reader._stop.set()
+    pipeline = reader._pipeline
+    thread = reader._thread
+    primary_error: BaseException | None = None
+
+    def remember(error: BaseException) -> None:
+        nonlocal primary_error
+        if primary_error is None:
+            primary_error = error
+        else:
+            primary_error.add_note(
+                f"additional {label} teardown failure: {type(error).__name__}: {error}"
+            )
+
+    if pipeline is not None:
+        try:
+            _set_gst_state_checked(
+                pipeline,
+                reader._gst,
+                reader._gst.State.NULL,
+                label=label,
+            )
+        except BaseException as error:
+            remember(error)
+
+    if thread is not None:
+        try:
+            if thread.is_alive():
+                thread.join(timeout=_GST_READER_STOP_TIMEOUT_S)
+            thread_alive = thread.is_alive()
+        except BaseException as error:
+            remember(error)
+        else:
+            if thread_alive:
+                remember(
+                    RuntimeError(
+                        f"{label} pull thread did not stop within "
+                        f"{_GST_READER_STOP_TIMEOUT_S:g}s; reader ownership "
+                        "remains uncertain"
+                    )
+                )
+            else:
+                reader._thread = None
+
+    if primary_error is None:
+        reader._pipeline = None
+        reader._sink = None
+        return
+    raise primary_error
 
 
 def _capture_perf_from_receive(recv_perf: float, latency_s: object) -> float:
@@ -89,6 +173,48 @@ def _capture_perf_from_receive(recv_perf: float, latency_s: object) -> float:
     ):
         return recv_perf
     return recv_perf - latency
+
+
+def _capture_perf_from_gst_pts(
+    recv_perf: float,
+    pts_ns: object,
+    pts_origin_perf: object,
+    fallback_latency_s: object,
+) -> float:
+    """Map a GDP-preserved sensor PTS onto the shared ``perf_counter`` clock.
+
+    ``pts_ns`` is running time in the camera relay's GStreamer pipeline;
+    ``pts_origin_perf`` is that pipeline's running-time zero co-sampled on the
+    Linux monotonic/perf-counter timeline. Corrupt, absent, implausibly stale,
+    or future metadata falls back to the prior receipt-minus-latency estimate.
+    """
+    fallback = _capture_perf_from_receive(recv_perf, fallback_latency_s)
+    if isinstance(pts_ns, bool) or isinstance(pts_origin_perf, bool):
+        return fallback
+    try:
+        pts = float(pts_ns)
+        origin = float(pts_origin_perf)
+    except (TypeError, ValueError):
+        return fallback
+    if (
+        not math.isfinite(pts)
+        or not math.isfinite(origin)
+        or pts < 0.0
+        or pts >= _GST_CLOCK_TIME_NONE
+        or origin < 0.0
+    ):
+        return fallback
+    capture_perf = origin + pts / 1e9
+    if (
+        not math.isfinite(capture_perf)
+        or capture_perf < 0.0
+        or capture_perf > recv_perf + _MAX_CAPTURE_FUTURE_S
+        or recv_perf - capture_perf > _MAX_CAPTURE_LATENCY_S
+    ):
+        return fallback
+    # A tiny positive clock-sampling error is harmless, but never ask the joint
+    # snapshot ring for a frame that has not yet been received.
+    return min(capture_perf, recv_perf)
 
 
 def _block_size(width: int, height: int) -> int:
@@ -314,12 +440,35 @@ class GstShmFrameReader:
 
     def connect(self, warmup: bool = True) -> None:
         """Start the shmsrc pipeline + pull thread (relay owns the camera)."""
-        self._sink = self._pipeline.get_by_name("raw")
-        self._pipeline.set_state(self._gst.State.PLAYING)
-        self._thread = threading.Thread(
-            target=self._pull_loop, name="recorder-shmsrc", daemon=True
-        )
-        self._thread.start()
+        del warmup
+        if self._pipeline is None:
+            raise RuntimeError("shmsrc raw-frame reader has already been closed")
+        if self._thread is not None:
+            raise RuntimeError("shmsrc raw-frame reader is already connected")
+        self._stop.clear()
+        try:
+            self._sink = self._pipeline.get_by_name("raw")
+            if self._sink is None:
+                raise RuntimeError("shmsrc raw-frame pipeline has no appsink 'raw'")
+            _set_gst_state_checked(
+                self._pipeline,
+                self._gst,
+                self._gst.State.PLAYING,
+                label="shmsrc raw-frame reader",
+            )
+            self._thread = threading.Thread(
+                target=self._pull_loop, name="recorder-shmsrc", daemon=True
+            )
+            self._thread.start()
+        except BaseException as error:
+            try:
+                self.disconnect()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "shmsrc raw-frame reader startup cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
 
     def _pull_loop(self) -> None:
         Gst = self._gst
@@ -408,17 +557,7 @@ class GstShmFrameReader:
         return self.read_at_or_after(0.0, timeout_ms=10000)[0]
 
     def disconnect(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        if self._pipeline is not None:
-            try:
-                self._pipeline.set_state(self._gst.State.NULL)
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                pass
-            self._pipeline = None  # type: ignore[assignment]
-        self._sink = None
+        _disconnect_gst_pull_reader(self, label="shmsrc raw-frame reader")
 
     # camera-compatible alias.
     close = disconnect
@@ -433,8 +572,9 @@ def _au_has_coded_slice(au: bytes) -> bool:
     the dataset valve closes. Such an AU decodes to *no* picture, so muxing it as
     a dataset frame would occupy a PTS slot without yielding a retrievable frame
     and desync frame-count from row-count. Delivering only AUs with a coded slice
-    keeps them aligned (the capture loop re-muxes the previous real frame for a
-    starved row instead). VCL NAL types are 1-5 (non-IDR .. IDR).
+    keeps them aligned; if a coded picture is then missing, the capture loop
+    aborts the take rather than replaying another AU. VCL NAL types are 1-5
+    (non-IDR .. IDR).
 
     Note: this only guards the one-AU-per-row count. The separate per-row
     timestamp precision the dataset needs (frame *k* within LeRobot's tolerance
@@ -484,17 +624,14 @@ class EncodedAuReader:
     signal segfaults and force-key-unit events are ignored on L4T), so the dataset
     encoder runs a short ``idrinterval``; the episode's rows simply begin at the
     first IDR after the valve opens (a sub-``idrinterval`` start delay, no
-    misalignment — video and joints both start there). ``recv_ts`` is
-    ``perf_counter`` at pull time
-    (shared-clock across processes), used only to pair the frame with the nearest
-    joint snapshot. Because ``shmsrc`` does not preserve the sensor PTS, the
-    relay supplies its GStreamer-reported minimum pipeline latency and this
-    reader reports ``recv_perf - latency_s`` as a best-effort capture time. Only
-    elements that answer GStreamer's latency query contribute to that scalar,
-    and it excludes recorder-side ``shmsrc`` / Python scheduling latency;
-    invalid or unavailable measurements fall back to ``recv_perf``. The mp4's
-    own timeline is the constant-fps PTS the muxer assigns, independent of this
-    pairing timestamp.
+    misalignment — video and joints both start there). GDP restores each AU's
+    sensor PTS after ``shmsrc``. The relay also supplies the corresponding
+    pipeline-running-time origin on the shared ``perf_counter`` clock, so this
+    reader can pair the image with the nearest joint snapshot at exposure time
+    rather than Python receipt time. Missing or implausible PTS/origin metadata
+    falls back to ``recv_perf - latency_s`` (and ultimately receipt time). The
+    mp4's own timeline is the constant-fps PTS the muxer assigns, independent of
+    this pairing timestamp.
     """
 
     def __init__(
@@ -505,6 +642,7 @@ class EncodedAuReader:
         fps: int,
         name: str | None = None,
         latency_s: float = 0.0,
+        pts_origin_perf: float | None = None,
     ) -> None:
         from .gst_zed import _DATASET_IDR_INTERVAL_S, _require_gst
 
@@ -514,9 +652,11 @@ class EncodedAuReader:
         self.fps = fps
         self._name = name or socket_path
         self._latency_s = latency_s
+        self._pts_origin_perf = pts_origin_perf
         self._queue: deque[tuple[bytes, float]] = deque()
         self._cond = threading.Condition()
         self._await_keyframe = True
+        self._stream_error: str | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._sink: Any = None
@@ -524,29 +664,23 @@ class EncodedAuReader:
         # ``_DATASET_IDR_INTERVAL_S`` (see gst_zed), so a run of more than
         # ~1.5x that many frames without a keyframe means a *keyframe was lost
         # upstream* — and every frame muxed until the next IDR references that
-        # missing reference, so those dataset rows won't decode. We can't undo it
-        # here (the orphaned frames are already delivered), but logging it loudly
-        # turns a silent, train-time-only corruption into a diagnosable signal
-        # (which camera, which frame). ``_delivered`` is the running AU index for
-        # the log; ``_gap_warnings`` counts detections for the disconnect summary.
+        # missing reference, so those dataset rows won't decode. Latch a stream
+        # error that ``read_next_au`` raises into the capture loop; the whole take
+        # must be discarded because already-delivered orphaned pictures cannot be
+        # repaired. ``_delivered`` is the running AU index for diagnostics.
         self._expected_gop = max(1, round(fps * _DATASET_IDR_INTERVAL_S))
         self._gop_warn_at = self._expected_gop + max(2, self._expected_gop // 2)
+        self._max_pending_aus = max(2, round(fps * _MAX_ENCODED_AU_BACKLOG_S))
         self._since_keyframe = 0
         self._delivered = 0
-        self._gap_warnings = 0
         self._seen_first_au = False
-        # shmsrc carries no caps, so the downstream capsfilter must be fully fixed
-        # (width/height/framerate as well as the h264 layout) or it won't link;
-        # h264parse re-derives the real dimensions from the SPS regardless.
+        # GDP restores both the producer caps and GstBuffer timing/flags after
+        # shmsrc. h264parse re-derives the dimensions from the SPS as before.
         # drop=false: never discard an AU (it would break H.264 decode); the pull
         # thread keeps the appsink drained so it rarely back-pressures shmsrc.
-        caps = (
-            f"video/x-h264,stream-format=byte-stream,alignment=au,"
-            f"width={width},height={height},framerate={fps}/1"
-        )
         self._pipeline = self._gst.parse_launch(
             f"shmsrc socket-path={socket_path} is-live=true do-timestamp=false "
-            f"! {caps} ! h264parse "
+            "! application/x-gdp ! gdpdepay ! h264parse "
             "! appsink name=au emit-signals=false max-buffers=60 drop=false sync=false"
         )
 
@@ -562,12 +696,35 @@ class EncodedAuReader:
 
     def connect(self, warmup: bool = True) -> None:
         """Start the shmsrc pipeline + pull thread (relay owns the camera)."""
-        self._sink = self._pipeline.get_by_name("au")
-        self._pipeline.set_state(self._gst.State.PLAYING)
-        self._thread = threading.Thread(
-            target=self._pull_loop, name="recorder-au-shmsrc", daemon=True
-        )
-        self._thread.start()
+        del warmup
+        if self._pipeline is None:
+            raise RuntimeError("encoded-AU reader has already been closed")
+        if self._thread is not None:
+            raise RuntimeError("encoded-AU reader is already connected")
+        self._stop.clear()
+        try:
+            self._sink = self._pipeline.get_by_name("au")
+            if self._sink is None:
+                raise RuntimeError("encoded-AU pipeline has no appsink 'au'")
+            _set_gst_state_checked(
+                self._pipeline,
+                self._gst,
+                self._gst.State.PLAYING,
+                label="encoded-AU reader",
+            )
+            self._thread = threading.Thread(
+                target=self._pull_loop, name="recorder-au-shmsrc", daemon=True
+            )
+            self._thread.start()
+        except BaseException as error:
+            try:
+                self.disconnect()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "encoded-AU reader startup cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
 
     def flush(self) -> None:
         """Drop any queued AUs and re-arm keyframe-wait (call at episode start).
@@ -580,6 +737,72 @@ class EncodedAuReader:
             self._queue.clear()
             self._await_keyframe = True
             self._since_keyframe = 0
+            self._seen_first_au = False
+            self._stream_error = None
+
+    def _fail_stream_locked(self, message: str) -> None:
+        """Latch one episode-fatal bitstream error while ``_cond`` is held."""
+        if self._stream_error is None:
+            self._stream_error = message
+            self._queue.clear()
+            _logger.error(message)
+        self._cond.notify_all()
+
+    def _accept_access_unit(
+        self,
+        au: bytes,
+        capture_perf: float,
+        *,
+        is_keyframe: bool,
+        discont: bool,
+    ) -> None:
+        """Validate and queue one coded picture from the pull thread."""
+        with self._cond:
+            if self._stream_error is not None:
+                return
+            if self._await_keyframe:
+                if not is_keyframe:
+                    return  # wait for the episode's first IDR
+                self._await_keyframe = False
+                self._since_keyframe = 0
+            elif is_keyframe:
+                self._since_keyframe = 0
+            else:
+                self._since_keyframe += 1
+                if self._since_keyframe >= self._gop_warn_at:
+                    self._fail_stream_locked(
+                        f"encoded-AU keyframe gap on {self._name} near frame "
+                        f"{self._delivered}: {self._since_keyframe} frames since "
+                        f"the last keyframe (the relay emits one every "
+                        f"~{self._expected_gop}); episode aborted because the "
+                        "H.264 reference chain is no longer trustworthy"
+                    )
+                    return
+
+            # The first AU after every flush may legitimately carry DISCONT at
+            # the valve/segment boundary. Any later DISCONT proves shmsrc lost
+            # bytes inside this episode, so later P-frames cannot be trusted.
+            if discont and self._seen_first_au:
+                self._fail_stream_locked(
+                    f"encoded-AU discontinuity on {self._name} near frame "
+                    f"{self._delivered}; episode aborted because an upstream "
+                    "H.264 picture was dropped"
+                )
+                return
+
+            if len(self._queue) >= self._max_pending_aus:
+                self._fail_stream_locked(
+                    f"encoded-AU backlog on {self._name} exceeded "
+                    f"{self._max_pending_aus} pending pictures near frame "
+                    f"{self._delivered}; episode aborted before stale image/pose "
+                    "pairing or unbounded memory growth"
+                )
+                return
+
+            self._seen_first_au = True
+            self._queue.append((au, capture_perf))
+            self._delivered += 1
+            self._cond.notify()
 
     def _pull_loop(self) -> None:
         Gst = self._gst
@@ -588,8 +811,13 @@ class EncodedAuReader:
             if sample is None:
                 continue  # valve shut (not recording) or starting up — idle
             recv_perf = time.perf_counter()
-            capture_perf = _capture_perf_from_receive(recv_perf, self._latency_s)
             buf = sample.get_buffer()
+            capture_perf = _capture_perf_from_gst_pts(
+                recv_perf,
+                buf.pts,
+                self._pts_origin_perf,
+                self._latency_s,
+            )
             is_keyframe = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
             discont = buf.has_flags(Gst.BufferFlags.DISCONT)
             ok, mapinfo = buf.map(Gst.MapFlags.READ)
@@ -604,78 +832,38 @@ class EncodedAuReader:
             # frame short of the dataset rows. See _au_has_coded_slice.
             if not _au_has_coded_slice(au):
                 continue
-            with self._cond:
-                if self._await_keyframe:
-                    if not is_keyframe:
-                        continue  # wait for the episode's first IDR
-                    self._await_keyframe = False
-                    self._since_keyframe = 0
-                elif is_keyframe:
-                    self._since_keyframe = 0
-                else:
-                    self._since_keyframe += 1
-                    if self._since_keyframe == self._gop_warn_at:
-                        self._warn_keyframe_gap()
-                # A shmsrc DISCONT after the first AU means an upstream buffer was
-                # dropped between the relay and here — the following frames can lose
-                # their reference. Surface it (the first AU legitimately carries it).
-                if discont and self._seen_first_au:
-                    _logger.warning(
-                        "encoded-AU discontinuity on %s near frame %d — an upstream "
-                        "buffer was dropped; following frames may not decode",
-                        self._name,
-                        self._delivered,
-                    )
-                self._seen_first_au = True
-                self._queue.append((au, capture_perf))
-                self._delivered += 1
-                self._cond.notify()
-
-    def _warn_keyframe_gap(self) -> None:
-        """Log a suspected upstream keyframe drop (see the guard in __init__)."""
-        self._gap_warnings += 1
-        _logger.warning(
-            "encoded-AU keyframe gap on %s near frame %d: %d frames since the last "
-            "keyframe (the relay forces an IDR every ~%d) — a reference frame was "
-            "likely dropped upstream, so those dataset rows may not decode",
-            self._name,
-            self._delivered,
-            self._since_keyframe,
-            self._expected_gop,
-        )
+            self._accept_access_unit(
+                au,
+                capture_perf,
+                is_keyframe=is_keyframe,
+                discont=discont,
+            )
 
     def read_next_au(self, timeout_ms: float = 500) -> tuple[bytes, float]:
         """Pop the next access unit in order; block up to ``timeout_ms``.
 
-        Returns ``(au_bytes, capture_ts)``. ``capture_ts`` is receipt time minus
-        the relay-reported camera/encode pipeline latency, or receipt time when
-        that measurement is unavailable. Raises :class:`TimeoutError` if no AU
-        arrives in time (the caller re-muxes the previous AU to keep frame counts
-        aligned across cameras).
+        Returns ``(au_bytes, capture_ts)``. ``capture_ts`` is the GDP-preserved
+        sensor PTS mapped to ``perf_counter``; invalid metadata falls back to
+        receipt time minus the relay-reported pipeline latency (or receipt time
+        when that is unavailable). Raises :class:`TimeoutError` if no AU arrives
+        in time; the caller aborts the episode because skipping or replaying an
+        H.264 picture would break the decoder reference chain.
         """
         deadline = time.perf_counter() + timeout_ms / 1000.0
         with self._cond:
-            while not self._queue:
+            while not self._queue and self._stream_error is None:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
                     raise TimeoutError(
                         f"encoded-AU reader timed out after {timeout_ms:.1f}ms."
                     )
                 self._cond.wait(remaining)
+            if self._stream_error is not None:
+                raise RuntimeError(self._stream_error)
             return self._queue.popleft()
 
     def disconnect(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        if self._pipeline is not None:
-            try:
-                self._pipeline.set_state(self._gst.State.NULL)
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                pass
-            self._pipeline = None
-        self._sink = None
+        _disconnect_gst_pull_reader(self, label="encoded-AU reader")
 
     # camera-compatible alias.
     close = disconnect

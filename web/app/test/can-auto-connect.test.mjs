@@ -7,6 +7,7 @@ import {
   autoConnectSignature,
   canDiscoveryAttemptSignature,
   canDiscoveryBlocksAutoConnect,
+  canServerEpoch,
   chooseAutoConnectProfile,
   chooseAutoConnectTarget,
   chooseDiagnosticsAutoConnectProfile,
@@ -30,12 +31,13 @@ function discovery(status, generation = 4) {
   return { status, candidateCount: 1, generation }
 }
 
-test("CAN discovery blocks auto-connect while pending, running, or uncertain after error", () => {
+test("CAN discovery blocks auto-connect while pending, unidentified, or errored", () => {
   assert.equal(canDiscoveryBlocksAutoConnect(undefined), false)
   assert.equal(canDiscoveryBlocksAutoConnect(discovery("needed")), true)
   assert.equal(canDiscoveryBlocksAutoConnect(discovery("running")), true)
+  assert.equal(canDiscoveryBlocksAutoConnect(discovery("unidentified")), true)
   assert.equal(canDiscoveryBlocksAutoConnect(discovery("error")), true)
-  for (const status of ["ready", "configured", "partial", "unidentified"]) {
+  for (const status of ["ready", "configured", "partial"]) {
     assert.equal(canDiscoveryBlocksAutoConnect(discovery(status)), false)
   }
 })
@@ -57,6 +59,11 @@ test("CAN discovery latches by the opaque server hardware generation", () => {
   assert.equal(canDiscoveryAttemptSignature(discovery("needed", 17)), "17")
   assert.equal(canDiscoveryAttemptSignature(discovery("running", 17)), null)
   assert.equal(canDiscoveryAttemptSignature(undefined), null)
+})
+
+test("serve restarts produce a fresh CAN connection and discovery epoch", () => {
+  assert.notEqual(canServerEpoch("serve-a", 0), canServerEpoch("serve-b", 0))
+  assert.equal(canServerEpoch(undefined, 7), "legacy-recovery:7")
 })
 
 test("chooses the only configured hardware profile that is present", () => {
@@ -239,6 +246,20 @@ test("CAN discovery uses the dedicated non-interactive backend action", async (c
   assert.deepEqual(await discoverCanHardware(), inventory)
   assert.equal(fetchMock.mock.callCount(), 1)
   assert.equal(fetchMock.mock.calls[0].arguments[0], "/api/can/discover")
+  assert.deepEqual(fetchMock.mock.calls[0].arguments[1], { method: "POST" })
+})
+
+test("manual CAN discovery retry explicitly forces a fresh probe", async (context) => {
+  setServerBase("")
+  const inventory = {
+    interfaces: [],
+    profiles: {},
+    discovery: discovery("configured", 8),
+  }
+  const fetchMock = context.mock.method(globalThis, "fetch", async () => Response.json(inventory))
+
+  assert.deepEqual(await discoverCanHardware(true), inventory)
+  assert.equal(fetchMock.mock.calls[0].arguments[0], "/api/can/discover?force=true")
   assert.deepEqual(fetchMock.mock.calls[0].arguments[1], { method: "POST" })
 })
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import secrets
 import stat
@@ -26,6 +27,7 @@ _SERVICE_DATASET_ROOT_ENV = "AXOL_SERVICE_DATASET_ROOT"
 _SERVICE_OPERATOR_UID_ENV = "AXOL_OPERATOR_UID"
 _SERVICE_OPERATOR_GID_ENV = "AXOL_OPERATOR_GID"
 _SERVICE_REPO_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
+HOSTED_DATASET_ROOT = Path("/var/lib/almond-axol/datasets")
 
 
 class UnsafeStatePathError(OSError):
@@ -63,6 +65,110 @@ def service_operator_ids() -> tuple[int, int]:
 def service_operator_gid() -> int:
     """Return the installed service's read-only dataset group, fail closed."""
     return service_operator_ids()[1]
+
+
+def _existing_root_controlled_directory(path: Path, *, label: str) -> bool:
+    """Whether ``path`` exists as a root-owned, non-writable directory.
+
+    Missing directories are initialized by :func:`configure_root_service_dataset`.
+    An existing unsafe directory is never silently repaired: it may already
+    contain attacker-selected entries from when it was writable.
+    """
+    try:
+        metadata = secure_directory_stat(path)
+    except FileNotFoundError:
+        return False
+    if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise UnsafeStatePathError(
+            f"{label} is not root-controlled at {path}: expected root ownership "
+            "with no group/world write bits"
+        )
+    return True
+
+
+def _resolve_service_operator(operator: str | None) -> tuple[int, int, str]:
+    """Resolve the non-root account a manual root serve should expose data to."""
+    candidate = operator if operator is not None else os.environ.get("SUDO_USER")
+    if not candidate or candidate == "root":
+        raise UnsafeStatePathError(
+            "manual root `axol serve` needs a non-root operator account; run it "
+            "through `sudo` from that account or pass `--operator USER`"
+        )
+    try:
+        entry = pwd.getpwnam(candidate)
+    except KeyError as exc:
+        raise UnsafeStatePathError(
+            f"manual root `axol serve` operator does not exist: {candidate!r}"
+        ) from exc
+    if entry.pw_uid == 0:
+        raise UnsafeStatePathError(
+            "manual root `axol serve` operator must be a non-root account"
+        )
+    return entry.pw_uid, entry.pw_gid, entry.pw_name
+
+
+def configure_root_service_dataset(operator: str | None = None) -> Path:
+    """Initialize the fixed hosted dataset boundary for a root ``axol serve``.
+
+    Installed systemd services already provide the three service environment
+    variables. A manual ``sudo axol serve`` does not, so resolve its operator
+    from ``SUDO_USER`` (or ``--operator``), create the same immutable
+    ``/var/lib`` boundary as the installer, and export the exact environment
+    consumed by all dataset confinement and ownership helpers.
+
+    A caller-supplied dataset path is deliberately unsupported. Existing
+    directories must already be root-controlled before their modes/groups are
+    normalized, preventing a formerly writable tree with planted links from
+    being promoted into the privileged service boundary.
+    """
+    if os.geteuid() != 0:
+        raise UnsafeStatePathError(
+            "hosted dataset storage can only be initialized by root"
+        )
+
+    root = _absolute(HOSTED_DATASET_ROOT / ".directory-sentinel").parent
+    configured = os.environ.get(_SERVICE_DATASET_ROOT_ENV)
+    if configured is not None:
+        configured_root = _absolute(Path(configured) / ".directory-sentinel").parent
+        if configured_root != root:
+            raise UnsafeStatePathError(
+                "root `axol serve` dataset storage must use the fixed boundary "
+                f"{root}, not {configured_root}"
+            )
+
+    have_installed_identity = all(
+        os.environ.get(name)
+        for name in (_SERVICE_OPERATOR_UID_ENV, _SERVICE_OPERATOR_GID_ENV)
+    )
+    if operator is not None or not have_installed_identity:
+        uid, gid, _operator_name = _resolve_service_operator(operator)
+    else:
+        uid, gid = service_operator_ids()
+
+    parent = root.parent
+    # /var/lib (or the patched equivalent in a focused test) must already be an
+    # immutable root boundary. Only then may we safely create fixed child names.
+    _require_root_controlled_directory(parent.parent, label="service state root")
+    if not _existing_root_controlled_directory(parent, label="service state root"):
+        secure_ensure_directory(parent, mode=0o751)
+    if not _existing_root_controlled_directory(root, label="service dataset root"):
+        secure_ensure_directory(root, mode=0o2750)
+
+    # Operators receive read/traverse access through their primary group, never
+    # write access. Dataset saves apply the same group and modes to descendants.
+    # Keep the shared service-state parent root:root: the update lock and boot
+    # verifier require that exact ownership. Execute-only access lets the
+    # operator traverse to the group-restricted dataset child without exposing
+    # update markers or allowing directory enumeration.
+    secure_chown_directory(parent, 0, 0, mode=0o751)
+    secure_chown_directory(root, 0, gid, mode=0o2750)
+    _require_root_controlled_directory(root, label="service dataset root")
+
+    os.environ[_SERVICE_DATASET_ROOT_ENV] = str(root)
+    os.environ[_SERVICE_OPERATOR_UID_ENV] = str(uid)
+    os.environ[_SERVICE_OPERATOR_GID_ENV] = str(gid)
+    os.environ["HF_LEROBOT_HOME"] = str(root)
+    return root
 
 
 def _require_root_controlled_directory(path: str | Path, *, label: str) -> Path:

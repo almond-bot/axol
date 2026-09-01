@@ -38,7 +38,15 @@ the bypass list, or no matching active ruleset exists. Confirm the rule and
 credential remain active before every release. Existing legacy tags stay as
 historical version markers; do not update or delete them.
 
-Release checklist:
+The workflow also checks out the complete tag history, fetches `origin/main`
+again, dereferences the release tag, and requires that commit to be an ancestor
+of the fetched main branch. A tag created from an unmerged branch or rewritten
+commit cannot publish, even when its version is otherwise correct.
+
+## Mandatory release checklist
+
+Every item is required. Record the tested commit, artifact hashes, canary host,
+and smoke/drill results in the release issue before publishing.
 
 1. Complete the `v0.1.0`-`v0.1.2` fleet/cached-panel check above.
 2. Create the `SLACK_WEBHOOK_URLS` Actions secret as a JSON array containing
@@ -47,10 +55,28 @@ Release checklist:
    This keeps the customer/channel roster out of the public workflow.
 3. Merge only after the pull-request validation jobs pass.
 4. Bump `pyproject.toml` and `uv.lock` to the same version.
-5. Create a GitHub release tagged `release-vX.Y.Z` for that exact version.
-6. Wait for both PyPI publishes and web validation to pass. Customer
-   notifications run only after both packages publish successfully.
-7. For `0.1.37`, call out the one-time installer migration in the release notes:
+5. From the exact candidate commit, build both distributions, run `twine check`,
+   record SHA-256 hashes, install the generated wheels (not a source checkout)
+   into clean environments, and verify the exact SDK/plugin versions, imports,
+   dependency metadata, and `axol --help` entry point. Confirm that
+   `almond_axol/_installer.sh` in the SDK wheel is byte-for-byte identical to
+   `web/app/public/install`; the release workflow enforces this as well.
+6. Install those exact wheel bytes with the production extras on an ARM64
+   Jetson canary. Verify the expected Torch/CUDA choice and that the managed
+   `pyzed`, PyGObject/GStreamer, tracker, and LeRobot dependencies remain.
+7. On that canary, smoke-test real CAN discovery plus arm/gripper enable-disable,
+   both configured tracker inputs and Mantis triggers, and ZED capture through
+   the production GStreamer/NVENC recording path.
+8. Drill an update from the current production version to the candidate, then
+   roll the canary back with the approved recovery procedure. Verify service
+   recovery, version reporting, configuration, calibration, datasets, and
+   out-of-band Jetson dependencies.
+9. Create `release-vX.Y.Z` on the exact tested commit after it is contained in
+   `origin/main`, then publish the GitHub release. Never move the tag.
+10. Wait for provenance validation, web validation, and both PyPI publishes to
+    pass. Customer notifications run only after both packages publish
+    successfully.
+11. For `0.1.37`, call out the one-time installer migration in the release notes:
    hosts on `0.1.36` or earlier must run
    `curl https://axol.almond.bot/install -fsS | bash` instead of using the old
    control-panel Update button.

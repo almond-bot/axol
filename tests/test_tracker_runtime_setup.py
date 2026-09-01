@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -33,41 +34,58 @@ def _ultimate_probe(*, log_suppression: bool = True) -> dict[str, object]:
     }
 
 
+def _write_lighthouse_manifest(
+    manifest: Path,
+    *,
+    rule: Path,
+    cli: Path,
+    artifacts: tuple[Path, ...] = (),
+) -> None:
+    cli.write_text("#!/bin/sh\nexit 0\n")
+    cli.chmod(0o755)
+    records = tracker_install._runtime_artifact_records(  # noqa: SLF001
+        (cli, *artifacts), require_root_control=False
+    )
+    assert records is not None
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": tracker_install._MANIFEST_SCHEMA,  # noqa: SLF001
+                "pinnedRef": tracker_install._PINNED_REF,  # noqa: SLF001
+                "buildRevision": tracker_install._BUILD_REVISION,  # noqa: SLF001
+                "udevRuleSha256": tracker_install._file_digest(rule),  # noqa: SLF001
+                "surviveCliPath": str(cli),
+                "runtimeArtifacts": records,
+            }
+        )
+    )
+
+
 class LighthouseRuntimeReadinessTest(unittest.TestCase):
-    def test_requires_exact_stamp_and_matching_udev_rule(self) -> None:
+    def test_requires_exact_manifest_runtime_and_matching_udev_rule(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "libsurvive"
-            source_rule = source / "useful_files" / "81-vive.rules"
             installed_rule = root / "etc" / "81-vive.rules"
-            source_rule.parent.mkdir(parents=True)
+            manifest = root / "libsurvive-manifest.json"
+            cli = root / "usr" / "local" / "bin" / "survive-cli"
+            cli.parent.mkdir(parents=True)
             installed_rule.parent.mkdir(parents=True)
-            source_rule.write_text("vive permission rule\n")
             installed_rule.write_text("vive permission rule\n")
-            (source / tracker_install._STAMP).write_text(  # noqa: SLF001
-                f"{tracker_install._PINNED_REF}\n"  # noqa: SLF001
-                f"{tracker_install._BUILD_REVISION}\n"  # noqa: SLF001
-            )
+            _write_lighthouse_manifest(manifest, rule=installed_rule, cli=cli)
 
-            with (
-                patch.object(tracker_install, "is_available", return_value=True),
-                patch.object(
-                    tracker_install.shutil,
-                    "which",
-                    return_value="/usr/local/bin/survive-cli",
-                ),
-            ):
-                ready = tracker_install.lighthouse_readiness(
-                    src=source, installed_udev_rule=installed_rule
-                )
-                installed_rule.write_text("different rule\n")
-                stale_rule = tracker_install.lighthouse_readiness(
-                    src=source, installed_udev_rule=installed_rule
-                )
-                (source / tracker_install._STAMP).write_text("older-build\n")  # noqa: SLF001
-                stale_stamp = tracker_install.lighthouse_readiness(
-                    src=source, installed_udev_rule=source_rule
-                )
+            ready = tracker_install.lighthouse_readiness(
+                installed_udev_rule=installed_rule, manifest_path=manifest
+            )
+            installed_rule.write_text("different rule\n")
+            stale_rule = tracker_install.lighthouse_readiness(
+                installed_udev_rule=installed_rule, manifest_path=manifest
+            )
+            payload = json.loads(manifest.read_text())
+            payload["buildRevision"] = "older-build"
+            manifest.write_text(json.dumps(payload))
+            stale_stamp = tracker_install.lighthouse_readiness(
+                installed_udev_rule=installed_rule, manifest_path=manifest
+            )
 
         self.assertTrue(ready["installed"])
         self.assertTrue(ready["pinnedBuild"])
@@ -79,48 +97,29 @@ class LighthouseRuntimeReadinessTest(unittest.TestCase):
 
     def test_executable_alone_is_not_a_supported_install(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with (
-                patch.object(tracker_install, "is_available", return_value=True),
-                patch.object(
-                    tracker_install.shutil,
-                    "which",
-                    return_value="/usr/local/bin/survive-cli",
-                ),
-            ):
-                result = tracker_install.lighthouse_readiness(
-                    src=Path(directory),
-                    installed_udev_rule=Path(directory) / "81-vive.rules",
-                )
+            result = tracker_install.lighthouse_readiness(
+                installed_udev_rule=Path(directory) / "81-vive.rules",
+                manifest_path=Path(directory) / "missing-manifest",
+            )
 
-        self.assertTrue(result["available"])
+        self.assertFalse(result["available"])
         self.assertFalse(result["installed"])
 
-    def test_python_backend_without_pairing_cli_is_incomplete(self) -> None:
+    def test_importable_python_backend_cannot_replace_attested_cli(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "libsurvive"
-            source_rule = source / "useful_files" / "81-vive.rules"
             installed_rule = root / "etc" / "81-vive.rules"
-            source_rule.parent.mkdir(parents=True)
             installed_rule.parent.mkdir(parents=True)
-            source_rule.write_text("vive permission rule\n")
             installed_rule.write_text("vive permission rule\n")
-            (source / tracker_install._STAMP).write_text(  # noqa: SLF001
-                f"{tracker_install._PINNED_REF}\n"  # noqa: SLF001
-                f"{tracker_install._BUILD_REVISION}\n"  # noqa: SLF001
+            result = tracker_install.lighthouse_readiness(
+                installed_udev_rule=installed_rule,
+                manifest_path=root / "missing-manifest",
             )
-            with (
-                patch.object(tracker_install, "is_available", return_value=True),
-                patch.object(tracker_install.shutil, "which", return_value=None),
-            ):
-                result = tracker_install.lighthouse_readiness(
-                    src=source, installed_udev_rule=installed_rule
-                )
 
-        self.assertTrue(result["available"])
+        self.assertFalse(result["available"])
         self.assertFalse(result["pairingCli"])
         self.assertFalse(result["installed"])
-        self.assertIn("pairing", " ".join(result["issues"]))
+        self.assertIn("attested", " ".join(result["issues"]))
 
     def test_machine_manifest_is_independent_of_callers_build_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -130,28 +129,35 @@ class LighthouseRuntimeReadinessTest(unittest.TestCase):
             rule.parent.mkdir(parents=True)
             manifest.parent.mkdir(parents=True)
             rule.write_text("installed pinned rule\n")
-            digest = tracker_install._file_digest(rule)  # noqa: SLF001
-            manifest.write_text(
-                f"{tracker_install._PINNED_REF}\n"  # noqa: SLF001
-                f"{tracker_install._BUILD_REVISION}\n"  # noqa: SLF001
-                f"{digest}\n"
+            cli = root / "usr" / "local" / "bin" / "survive-cli"
+            cli.parent.mkdir(parents=True)
+            _write_lighthouse_manifest(manifest, rule=rule, cli=cli)
+            result = tracker_install.lighthouse_readiness(
+                src=root / "unrelated-operator-cache",
+                installed_udev_rule=rule,
+                manifest_path=manifest,
             )
-            with (
-                patch.object(tracker_install, "is_available", return_value=True),
-                patch.object(
-                    tracker_install.shutil,
-                    "which",
-                    return_value="/usr/local/bin/survive-cli",
-                ),
-            ):
-                result = tracker_install.lighthouse_readiness(
-                    src=root / "unrelated-operator-cache",
-                    installed_udev_rule=rule,
-                    manifest_path=manifest,
-                )
 
         self.assertTrue(result["installed"])
         self.assertEqual(result["stampPath"], str(manifest))
+
+    def test_runtime_byte_drift_invalidates_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rule = root / "81-vive.rules"
+            rule.write_text("installed pinned rule\n")
+            manifest = root / "manifest.json"
+            cli = root / "survive-cli"
+            _write_lighthouse_manifest(manifest, rule=rule, cli=cli)
+            cli.write_text("changed after installation\n")
+            cli.chmod(0o755)
+
+            result = tracker_install.lighthouse_readiness(
+                installed_udev_rule=rule, manifest_path=manifest
+            )
+
+        self.assertFalse(result["installed"])
+        self.assertFalse(result["runtimeArtifacts"])
 
 
 class UltimateRuntimeReadinessTest(unittest.TestCase):
@@ -370,7 +376,8 @@ class PersistentTrackerSetupGateTest(unittest.TestCase):
     def test_synthetic_identify_is_exempt_from_runtime_gate(self) -> None:
         config = SimpleNamespace(backend="synthetic")
         source = SimpleNamespace(
-            start=Mock(side_effect=RuntimeError("synthetic started"))
+            start=Mock(side_effect=RuntimeError("synthetic started")),
+            stop=Mock(),
         )
         with (
             patch("almond_axol.tracker.load_tracker_config", return_value=config),
@@ -383,6 +390,7 @@ class PersistentTrackerSetupGateTest(unittest.TestCase):
             tracker_identify.run(SimpleNamespace(backend=None, web_prompts=False))
 
         readiness.assert_not_called()
+        source.stop.assert_called_once_with()
 
     def test_lighthouse_pair_requires_pinned_runtime_before_spawning(self) -> None:
         with (
@@ -394,14 +402,16 @@ class PersistentTrackerSetupGateTest(unittest.TestCase):
                     "issues": ["the pinned build stamp is stale"],
                 },
             ) as readiness,
-            patch.object(tracker_pair.shutil, "which") as which,
+            patch.object(
+                tracker_install, "verified_survive_cli"
+            ) as verified_survive_cli,
             patch.object(tracker_pair.subprocess, "Popen") as popen,
             self.assertRaisesRegex(SystemExit, "axol tracker.install"),
         ):
             tracker_pair.run(SimpleNamespace(timeout=90.0))
 
         readiness.assert_called_once_with()
-        which.assert_not_called()
+        verified_survive_cli.assert_not_called()
         popen.assert_not_called()
 
 

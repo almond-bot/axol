@@ -9,9 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import grpc
 import numpy as np
 import torch
-import grpc
 from lerobot.async_inference.configs import PolicyServerConfig
 from lerobot.async_inference.helpers import TimedAction, TimedObservation
 from lerobot.transport import services_pb2
@@ -22,12 +22,12 @@ from almond_axol.cli.run_policy import _build_axol_robot_client
 from almond_axol.lerobot import action_schema as action_schema_module
 from almond_axol.lerobot.action_schema import (
     ACTION_SCHEMA_METADATA_KEY,
+    MAX_POLICY_SETUP_BYTES,
     ActionSchemaError,
     AxolRemotePolicyConfig,
-    MAX_POLICY_SETUP_BYTES,
     decode_axol_policy_setup,
-    encode_axol_policy_setup,
     encode_action_schema_confirmation,
+    encode_axol_policy_setup,
     require_exact_action_schema,
     resolve_policy_action_schema,
 )
@@ -40,7 +40,6 @@ from almond_axol.lerobot.inference_wire import (
     decode_timed_actions,
     encode_timed_observation,
 )
-
 
 JOINT_SCHEMA = tuple(f"joint_{index}.pos" for index in range(14))
 CARTESIAN_SCHEMA = tuple(

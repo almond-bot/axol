@@ -9,7 +9,6 @@ from typing import Any
 
 from ..utils.state_files import secure_atomic_write_json
 
-
 CARTESIAN_FRAME_ID = "flu-urdf-root-v0.1.32"
 """Forward-facing FLU world frame introduced by axol v0.1.32."""
 

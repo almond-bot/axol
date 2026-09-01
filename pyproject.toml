@@ -47,7 +47,16 @@ gamepad = ["pygame>=2.6,<3"]
 # rather than this repository's lock, so allowing a future LeRobot release
 # would make an unchanged Axol release pick up an untested private API.
 lerobot = [
-    "lerobot[dataset,viz,async,training,diffusion]==0.6.1",
+    # Spell out LeRobot's dataset/training extras except TorchCodec. LeRobot
+    # 0.6.1 selects TorchCodec 0.11 on Linux aarch64, whose ABI requires Torch
+    # 2.11, while JetPack hosts must remain on Torch 2.10. LeRobot's supported
+    # PyAV decoder is used on every platform instead.
+    "lerobot[viz,async,diffusion,av-dep,accelerate-dep]==0.6.1",
+    "datasets>=4.8,<5",
+    "jsonlines>=4,<5",
+    "pandas>=2,<3",
+    "pyarrow>=21,<30",
+    "wandb>=0.24,<0.28",
     # Keep hosted installs on the pair validated by this lock. PyTorch 2.11's
     # aarch64 wheel pulls a CUDA 13 runtime that is not compatible with the
     # JetPack generation deployed on customer robots.
@@ -67,6 +76,13 @@ axol = "almond_axol.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["almond_axol"]
 
+# The control-panel updater downloads the exact target wheel, verifies PyPI's
+# advertised SHA-256, and executes this reviewed installer from that immutable
+# artifact. Keeping the browser endpoint as the one source file prevents the
+# first-install and update transactions from drifting.
+[tool.hatch.build.targets.wheel.force-include]
+"web/app/public/install" = "almond_axol/_installer.sh"
+
 # Keep source releases reproducible and limited to SDK inputs. Hatch's default
 # repository walk does not honor web/.gitignore, so a developer build could
 # otherwise ingest web/node_modules (including generated development TLS
@@ -77,4 +93,5 @@ include = [
     "/LICENSE",
     "/README.md",
     "/pyproject.toml",
+    "/web/app/public/install",
 ]

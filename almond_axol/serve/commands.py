@@ -75,6 +75,7 @@ class CommandDef:
         entrypoint: Callable[[], Callable[..., Any]] | None = None,
         execution: str = "thread",
         requires_cameras: bool = False,
+        uses_cameras: bool = False,
         camera_mode: str = "none",
         streams_video: bool = False,
         sim_flag: str | None = None,
@@ -113,6 +114,11 @@ class CommandDef:
         self.execution = execution
         # Needs at least one camera serial configured before it can start.
         self.requires_cameras = requires_cameras
+        # Owns local camera hardware for its full lifetime. Operations are
+        # already globally exclusive; subprocess commands need this explicit
+        # declaration so preview, detection, and daemon restart stay blocked
+        # until their process exits.
+        self.uses_cameras = uses_cameras
         # How the operator's camera spec reaches the config: "argv" folds
         # serials into the argv-style args (the cameras are required draccus
         # inputs), "teleop" attaches them to a built config's camera dict
@@ -485,6 +491,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..diagnostics.zed.cable"),
         requires_hardware=True,
         uses_can_bus=False,
+        uses_cameras=True,
     ),
     "diag.mantis-trigger": CommandDef(
         "diag.mantis-trigger",
@@ -575,18 +582,6 @@ COMMANDS: dict[str, CommandDef] = {
         "Calibrate",
         "argparse",
         _argparse_loader("..cli.motor.set_config"),
-        requires_hardware=True,
-    ),
-    "motor.flash": CommandDef(
-        "motor.flash",
-        "motor.flash",
-        "Flash firmware",
-        "Overwrite a MyActuator motor's firmware from a .bin on the robot host. "
-        "Nothing else may use the bus while it runs, and an interrupted flash "
-        "leaves the motor in its bootloader until the flash is re-run.",
-        "Calibrate",
-        "argparse",
-        _argparse_loader("..cli.motor.flash"),
         requires_hardware=True,
     ),
     # -- Setup --------------------------------------------------------------
@@ -726,6 +721,7 @@ def command_specs() -> list[dict[str, Any]]:
             # back to their built-in list.
             "isOperation": cmd.is_operation,
             "requiresCameras": cmd.requires_cameras,
+            "usesCameras": cmd.uses_cameras,
             "perRunFields": list(cmd.per_run_fields),
             "episodeControl": cmd.has_episode_control,
             "simFlag": cmd.sim_flag,

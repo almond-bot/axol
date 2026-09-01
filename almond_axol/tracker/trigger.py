@@ -201,15 +201,57 @@ class TriggerReader:
                 ],
             )
         self._bus = bus
-
         self._lock = threading.Lock()
         self._grip: float | None = None
         self._last_rx: float | None = None
         self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._read_loop, daemon=True, name=f"trigger-{channel}"
-        )
-        self._thread.start()
+        self._thread: threading.Thread | None = None
+        try:
+            thread = threading.Thread(
+                target=self._read_loop, daemon=True, name=f"trigger-{channel}"
+            )
+            # Publish the owner before start(): a signal may arrive after the
+            # native thread starts but before Thread.start() returns.
+            self._thread = thread
+            thread.start()
+        except BaseException as start_error:
+            # The constructor never reaches its caller, so it must release the
+            # SocketCAN owner itself on every unwind, including Ctrl+C. Closing
+            # first also wakes a thread which did start inside an interrupted
+            # Thread.start().
+            self._stop.set()
+            cleanup_failures: list[BaseException] = []
+            try:
+                self._bus.shutdown()
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+            thread = self._thread
+            if thread is not None:
+                try:
+                    if thread.is_alive():
+                        thread.join(timeout=1.0)
+                        if thread.is_alive():
+                            raise RuntimeError(
+                                "trigger CAN reader thread did not stop after "
+                                "failed startup"
+                            )
+                except BaseException as exc:
+                    cleanup_failures.append(exc)
+            if cleanup_failures:
+                first = cleanup_failures[0]
+                for extra in cleanup_failures[1:]:
+                    first.add_note(
+                        "additional trigger startup cleanup failure: "
+                        f"{type(extra).__name__}: {extra}"
+                    )
+                first.add_note(
+                    "trigger startup originally failed with "
+                    f"{type(start_error).__name__}: {start_error}"
+                )
+                raise RuntimeError(
+                    "trigger reader startup cleanup failed; CAN ownership is uncertain"
+                ) from first
+            raise
 
     # -- Thread-safe accessors -------------------------------------------
 
@@ -242,13 +284,17 @@ class TriggerReader:
             self._bus.shutdown()
         except BaseException as exc:
             failures.append(exc)
-        try:
-            self._thread.join(timeout=1.0)
-        except BaseException as exc:
-            failures.append(exc)
-        else:
-            if self._thread.is_alive():
-                failures.append(RuntimeError("trigger CAN reader thread did not stop"))
+        thread = self._thread
+        if thread is not None:
+            try:
+                thread.join(timeout=1.0)
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                if thread.is_alive():
+                    failures.append(
+                        RuntimeError("trigger CAN reader thread did not stop")
+                    )
 
         if failures:
             first = failures[0]

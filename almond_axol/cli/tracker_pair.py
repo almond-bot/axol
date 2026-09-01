@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import selectors
-import shutil
 import subprocess
 import time
 
@@ -54,7 +53,9 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
 
-    executable = shutil.which("survive-cli")
+    from .tracker_install import verified_survive_cli
+
+    executable = verified_survive_cli()
     if executable is None:
         raise SystemExit(
             "Lighthouse tracking support is not installed; run `axol tracker.install`."
@@ -72,7 +73,7 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
     )
 
     proc = subprocess.Popen(
-        [executable, "--pair-device", "1", "--v", "100"],
+        [str(executable), "--pair-device", "1", "--v", "100"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

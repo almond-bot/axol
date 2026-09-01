@@ -139,6 +139,11 @@ class PoseInterpolator:
         self._outlier_floor = float(outlier_floor_m)
 
         self._lock = threading.Lock()
+        # Incremented whenever buffered timing/ownership state is invalidated.
+        # sample() performs its numpy work outside the lock; this generation
+        # prevents an in-flight render from committing or returning the old
+        # owner's pose after reset() has established a new domain.
+        self._generation = 0
         # Buffer of (capture_time_s, frame), kept sorted by capture time.
         self._caps: list[float] = []
         self._frames: list[VRFrame] = []
@@ -184,6 +189,7 @@ class PoseInterpolator:
     def reset(self) -> None:
         """Drop all buffered state (e.g. on reconnect)."""
         with self._lock:
+            self._generation += 1
             self._caps.clear()
             self._frames.clear()
             self._vecs.clear()
@@ -217,6 +223,7 @@ class PoseInterpolator:
             # Reset estimation if the capture-time source changes (e.g. the
             # client transport switched between USB and network).
             if self._t_is_client is not None and is_client != self._t_is_client:
+                self._generation += 1
                 self._caps.clear()
                 self._frames.clear()
                 self._vecs.clear()
@@ -323,10 +330,11 @@ class PoseInterpolator:
         to plain lerp/slerp between the two bracketing frames when the window
         is too sparse (startup, unstamped transports, ``smooth_window_s == 0``).
 
-        Returns ``None`` only before any frame has been received. The returned
-        object is *identity-stable*: when the rendered pose hasn't moved beyond
-        ``pos_eps`` and the control state is unchanged, the previous object is
-        returned so the IK loop can skip a redundant solve.
+        Returns ``None`` before any frame has been received, or when a concurrent
+        :meth:`reset` invalidates an in-flight render. The returned object is
+        *identity-stable*: when the rendered pose hasn't moved beyond ``pos_eps``
+        and the control state is unchanged, the previous object is returned so
+        the IK loop can skip a redundant solve.
         """
         if now is None:
             now = time.perf_counter()
@@ -334,6 +342,7 @@ class PoseInterpolator:
             latest = self._latest
             if latest is None:
                 return None
+            generation = self._generation
             loss_seq_l = self._tracking_loss_seq["left"]
             loss_seq_r = self._tracking_loss_seq["right"]
             force_untracked_l = (
@@ -415,6 +424,7 @@ class PoseInterpolator:
             last_pos = self._last_pos
             held_l = self._held["left"]
             held_r = self._held["right"]
+            t_is_client = self._t_is_client
             # The rendered pose corresponds to headset-time ``play``. Clamp
             # its timestamp to the available capture range: when input stops,
             # a held last frame must not acquire an ever-newer timestamp and
@@ -442,6 +452,8 @@ class PoseInterpolator:
             # available, never a fabricated time beyond the buffer.
             rendered.t = stamped_play * 1000.0
             with self._lock:
+                if generation != self._generation:
+                    return None
                 warn_l = self._update_hold("left", l_live, held_l, l_out, now)
                 warn_r = self._update_hold("right", r_live, held_r, r_out, now)
             for side, warn in (("left", warn_l), ("right", warn_r)):
@@ -461,7 +473,7 @@ class PoseInterpolator:
                 b,
                 alpha,
                 latest,
-                stamped_play if self._t_is_client else None,
+                stamped_play if t_is_client else None,
                 play_host,
                 force_untracked_l=force_untracked_l,
                 force_untracked_r=force_untracked_r,
@@ -476,6 +488,8 @@ class PoseInterpolator:
             and _same_motion(last_pos, pos, self._pos_eps)
         ):
             with self._lock:
+                if generation != self._generation:
+                    return None
                 # Preserve identity for the IK skip while advancing the
                 # capture heartbeat to this equal-valued rendered sample.
                 # Only timestamp/seq metadata changes; pose/control equality
@@ -492,6 +506,8 @@ class PoseInterpolator:
             return last_out
 
         with self._lock:
+            if generation != self._generation:
+                return None
             self._last_out = rendered
             self._last_pos = pos
             self._tracking_loss_delivered["left"] = max(

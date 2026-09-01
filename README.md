@@ -50,6 +50,7 @@ Install optional dependency groups as needed:
 |---|---|---|
 | `lerobot` | LeRobot (from PyPI, pinned to 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
+| `tracker` | Lighthouse/Ultimate bridge dependencies | `tracker.bridge`, Mantis tracking |
 
 ```bash
 uv sync --extra lerobot --extra sim --extra tracker   # hosted feature set

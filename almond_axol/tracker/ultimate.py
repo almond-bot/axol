@@ -44,6 +44,7 @@ from .base import (
     TrackerPose,
     TrackerSource,
     TrackerSourceError,
+    epoch_seconds_to_perf_counter,
     zup_to_yup_pos,
     zup_to_yup_quat,
 )
@@ -77,6 +78,7 @@ _ISO_ALPHA_2_COUNTRIES = frozenset(
 _GOOD_STATUS_STRINGS = {"tracking", "ok"}
 _MISSING = object()
 _READER_STOP_TIMEOUT_S = 1.0
+_PYVUT_CONSTRUCTOR_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, repr=False)
@@ -320,6 +322,126 @@ def _dongle_open_error(exc: BaseException) -> RuntimeError:
     )
 
 
+def _pyvut_hid_devices(api: object) -> tuple[object, ...]:
+    """Return the HID handles owned by the pinned pyvut tracker group."""
+    try:
+        group = getattr(api, "tracker_group")
+        comms = getattr(group, "comms")
+    except Exception:  # noqa: BLE001 - third-party properties may be dynamic
+        return ()
+    devices: list[object] = []
+    for name in ("device_hid1", "device_hid3"):
+        try:
+            device = getattr(comms, name, None)
+        except Exception:  # noqa: BLE001 - third-party properties may be dynamic
+            continue
+        if device is not None and all(device is not found for found in devices):
+            devices.append(device)
+    return tuple(devices)
+
+
+def _close_constructor_hid_devices(
+    devices: tuple[object, ...],
+) -> TrackerSourceError | None:
+    """Close handles captured before pyvut could publish an API object."""
+    failures: list[BaseException] = []
+    for device in devices:
+        close = getattr(device, "close", None)
+        if not callable(close):
+            failures.append(RuntimeError("pyvut HID device has no close method"))
+            continue
+        try:
+            close()
+        except BaseException as exc:
+            failures.append(exc)
+    if not failures:
+        return None
+    for extra in failures[1:]:
+        failures[0].add_note(
+            "additional Ultimate constructor cleanup failure: "
+            f"{type(extra).__name__}: {extra}"
+        )
+    failure = TrackerSourceError(
+        "Ultimate tracker constructor cleanup failed; HID ownership is uncertain"
+    )
+    failure.__cause__ = failures[0]
+    return failure
+
+
+def _construct_pyvut_api(
+    api_factory: object,
+    hid_module: object,
+    api_kwargs: dict[str, object],
+) -> tuple[
+    object | None, BaseException | None, tuple[object, ...], TrackerSourceError | None
+]:
+    """Construct pyvut while retaining every HID handle opened on failure.
+
+    Pinned pyvut creates ``hid.Device`` inside a nested constructor and only
+    assigns the tracker group to the API after that constructor returns. If a
+    feature-report or Wi-Fi read raises in between, ordinary partial-object
+    cleanup cannot reach the already-open handle. Temporarily wrapping the
+    exact ``hid.Device`` callable closes that ownership gap.
+    """
+    if not callable(api_factory):
+        return None, RuntimeError("installed pyvut API is not callable"), (), None
+    original_device = getattr(hid_module, "Device")
+    captured: list[object] = []
+    constructor_thread = threading.get_ident()
+
+    def tracked_device(*args: object, **kwargs: object) -> object:
+        device = original_device(*args, **kwargs)
+        # The module attribute is process-global during this narrow window.
+        # Do not claim an unrelated HID handle opened concurrently elsewhere.
+        if threading.get_ident() == constructor_thread and all(
+            device is not found for found in captured
+        ):
+            captured.append(device)
+        return device
+
+    api: object | None = None
+    error: BaseException | None = None
+    with _PYVUT_CONSTRUCTOR_LOCK:
+        setattr(hid_module, "Device", tracked_device)
+        try:
+            api = api_factory(**api_kwargs)
+        except BaseException as exc:  # close native ownership on every unwind
+            error = exc
+        finally:
+            setattr(hid_module, "Device", original_device)
+
+    devices = tuple(captured)
+    cleanup_failure = (
+        _close_constructor_hid_devices(devices) if error is not None else None
+    )
+    return api, error, devices, cleanup_failure
+
+
+def _configure_pyvut_hid_polling(api: object) -> None:
+    """Make the pinned pyvut read loop observe its stop event promptly.
+
+    Upstream calls ``Device.read()`` with no timeout, while ``stop()`` only
+    clears an event and joins. The pinned ``hid`` binding defaults that read to
+    blocking forever, so a quiet dongle can otherwise leave both the daemon
+    reader and its open HID handle behind. Nonblocking mode is supported by
+    the pinned binding and pyvut already applies a 1 ms poll interval.
+    """
+    devices = _pyvut_hid_devices(api)
+    if not devices:
+        raise RuntimeError(
+            "installed pyvut does not expose its HID device; run `axol "
+            "tracker.ultimate.install`"
+        )
+    for device in devices:
+        try:
+            setattr(device, "nonblocking", True)
+        except Exception as exc:  # noqa: BLE001 - hid binding errors vary
+            raise RuntimeError(
+                "installed pyvut HID device cannot enable nonblocking reads; "
+                "run `axol tracker.ultimate.install`"
+            ) from exc
+
+
 def _stop_api(api: object, *, uses_context_exit: bool) -> None:
     """Stop pyvut and prove its captured HID reader thread has exited."""
     # The pinned pyvut stop() drops ``api._thread`` after a bounded join even
@@ -329,6 +451,7 @@ def _stop_api(api: object, *, uses_context_exit: bool) -> None:
         reader = getattr(api, "_thread", None)
     except Exception:  # noqa: BLE001 - third-party properties may be dynamic
         reader = None
+    hid_devices = _pyvut_hid_devices(api)
 
     failures: list[BaseException] = []
     try:
@@ -345,6 +468,9 @@ def _stop_api(api: object, *, uses_context_exit: bool) -> None:
     except BaseException as exc:  # still verify/join the reader below
         failures.append(exc)
 
+    # Unknown reader state is not proof of exit. Only an absent reader or a
+    # successful is_alive() == False permits closing its HID handle.
+    reader_alive = reader is not None
     if reader is not None:
         join = getattr(reader, "join", None)
         is_alive = getattr(reader, "is_alive", None)
@@ -355,16 +481,32 @@ def _stop_api(api: object, *, uses_context_exit: bool) -> None:
                 failures.append(exc)
         if callable(is_alive):
             try:
-                alive = bool(is_alive())
+                reader_alive = bool(is_alive())
             except BaseException as exc:
                 failures.append(exc)
+                reader_alive = True
             else:
-                if alive:
+                if reader_alive:
                     failures.append(
                         RuntimeError(
                             "pyvut HID reader thread is still alive after stop"
                         )
                     )
+
+    # Never close a handle underneath a reader whose exit could not be proven;
+    # hidapi does not promise that close-vs-read from different threads is safe.
+    # Once polling has stopped, explicitly close it: pinned pyvut itself never
+    # does, and dropping its Python Device wrapper does not call hid_close().
+    if not reader_alive:
+        for device in hid_devices:
+            close = getattr(device, "close", None)
+            if not callable(close):
+                failures.append(RuntimeError("pyvut HID device has no close method"))
+                continue
+            try:
+                close()
+            except BaseException as exc:
+                failures.append(exc)
 
     if failures:
         for extra in failures[1:]:
@@ -381,8 +523,8 @@ def _note_start_cleanup_failure(
     api: object,
     *,
     uses_context_exit: bool,
-) -> None:
-    """Try cleanup after failed startup without replacing its useful error."""
+) -> TrackerSourceError | None:
+    """Try cleanup after failed startup and return uncertain ownership state."""
     try:
         _stop_api(api, uses_context_exit=uses_context_exit)
     except BaseException as cleanup_error:
@@ -391,6 +533,14 @@ def _note_start_cleanup_failure(
             "Ultimate startup cleanup also failed; HID ownership is uncertain: "
             f"{type(cleanup_error).__name__}: {cleanup_error}"
         )
+        if isinstance(cleanup_error, TrackerSourceError):
+            return cleanup_error
+        failure = TrackerSourceError(
+            "Ultimate tracker teardown failed; HID ownership is uncertain"
+        )
+        failure.__cause__ = cleanup_error
+        return failure
+    return None
 
 
 class UltimateSource(TrackerSource):
@@ -415,10 +565,24 @@ class UltimateSource(TrackerSource):
         self._api = None
         self._api_uses_context_exit = False
         self._wifi_material: tempfile.TemporaryDirectory[str] | None = None
+        # A failed native teardown may have stopped or closed only part of
+        # pyvut's state. Keep both the API object and the exact failure alive,
+        # and never call into that uncertain state a second time.
+        self._teardown_failure: TrackerSourceError | None = None
+        self._orphaned_hid_devices: tuple[object, ...] = ()
+        self._lifecycle_lock = threading.Lock()
 
     # -- Lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
+        with self._lifecycle_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
+        if self._teardown_failure is not None:
+            raise TrackerSourceError(
+                "Ultimate tracker cleanup is incomplete; HID ownership is uncertain"
+            ) from self._teardown_failure
         if self._api is not None:
             return
         wifi_info_path = None
@@ -465,7 +629,25 @@ class UltimateSource(TrackerSource):
             api_kwargs = {"mode": "DONGLE_USB"}
             if wifi_info_path is not None:
                 api_kwargs["wifi_info_path"] = wifi_info_path
-            api = UltimateTrackerAPI(**api_kwargs)
+            (
+                api,
+                constructor_error,
+                constructor_devices,
+                constructor_cleanup_failure,
+            ) = _construct_pyvut_api(UltimateTrackerAPI, hid, api_kwargs)
+            if constructor_error is not None:
+                if constructor_cleanup_failure is not None:
+                    self._orphaned_hid_devices = constructor_devices
+                    self._teardown_failure = constructor_cleanup_failure
+                    constructor_error.add_note(
+                        "Ultimate constructor cleanup failed; HID ownership is "
+                        "uncertain"
+                    )
+                if not isinstance(constructor_error, Exception):
+                    self._clear_wifi_material()
+                raise constructor_error
+            assert api is not None
+            _configure_pyvut_hid_polling(api)
             # ViveTrackerGroup's constructor currently turns verbose printing
             # back on, so suppress it again immediately after construction and
             # before start() launches the ACK polling thread.
@@ -493,23 +675,28 @@ class UltimateSource(TrackerSource):
                         "a complete context-manager lifecycle; run `axol "
                         "tracker.ultimate.install`"
                     )
-                enter()
+                # If __enter__ raises after partially acquiring the dongle,
+                # its matching __exit__ is the only available cleanup API.
                 uses_context_exit = True
-        except RuntimeError as exc:
+                enter()
+        except BaseException as exc:  # cleanup must also survive Ctrl+C/SystemExit
             if api is not None:
-                _note_start_cleanup_failure(
+                cleanup_failure = _note_start_cleanup_failure(
                     exc, api, uses_context_exit=uses_context_exit
                 )
+                if cleanup_failure is not None:
+                    self._api = api
+                    self._api_uses_context_exit = uses_context_exit
+                    self._teardown_failure = cleanup_failure
             self._clear_wifi_material()
-            if "installed pyvut" in str(exc):
+            # A process-control exception must retain its identity after native
+            # ownership has been released (or the uncertain cleanup latched).
+            # Ordinary pyvut/HID failures keep the actionable runtime error used
+            # by the CLI and control panel.
+            if not isinstance(exc, Exception):
                 raise
-            raise _dongle_open_error(exc) from exc
-        except Exception as exc:  # noqa: BLE001 - pyvut/HID error types vary
-            if api is not None:
-                _note_start_cleanup_failure(
-                    exc, api, uses_context_exit=uses_context_exit
-                )
-            self._clear_wifi_material()
+            if isinstance(exc, RuntimeError) and "installed pyvut" in str(exc):
+                raise
             raise _dongle_open_error(exc) from exc
 
         self._api = api
@@ -517,9 +704,29 @@ class UltimateSource(TrackerSource):
         _logger.info("ultimate backend: dongle opened, waiting for tracker poses")
 
     def stop(self) -> None:
+        with self._lifecycle_lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        if self._teardown_failure is not None:
+            raise self._teardown_failure
         if self._api is not None:
             api = self._api
-            _stop_api(api, uses_context_exit=self._api_uses_context_exit)
+            try:
+                _stop_api(api, uses_context_exit=self._api_uses_context_exit)
+            except TrackerSourceError as exc:
+                self._teardown_failure = exc
+                # The private Wi-Fi snapshot is ordinary filesystem material,
+                # not native pyvut state. Removing it is safe even when HID
+                # ownership cannot be proven, and avoids retaining credentials.
+                try:
+                    self._clear_wifi_material()
+                except BaseException as cleanup_error:
+                    exc.add_note(
+                        "additional Ultimate Wi-Fi snapshot cleanup failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                raise
             self._api = None
             self._api_uses_context_exit = False
             self._clear_wifi_material()
@@ -554,6 +761,7 @@ class UltimateSource(TrackerSource):
             pos = np.asarray(pose.position, dtype=np.float64)
             rot = np.asarray(pose.rotation, dtype=np.float64)
             status = getattr(pose, "tracking_status", None)
+            timestamp_ms = getattr(pose, "timestamp_ms", None)
         except (AttributeError, OverflowError, TypeError, ValueError):
             return
         if pos.shape != (3,) or rot.shape != (4,):
@@ -579,8 +787,26 @@ class UltimateSource(TrackerSource):
             # bool is an int subclass, but cannot be a protocol status.
             tracking = bool(not isinstance(status, bool) and status == 2)
 
+        receipt_epoch = time.time()
+        receipt_perf = time.perf_counter()
+        try:
+            timestamp_seconds = float(timestamp_ms) * 0.001
+        except (OverflowError, TypeError, ValueError):
+            timestamp_seconds = None
+        pyvut_receipt_perf = epoch_seconds_to_perf_counter(
+            timestamp_seconds,
+            receipt_perf=receipt_perf,
+            receipt_epoch=receipt_epoch,
+        )
         sample = TrackerPose(
-            pos=pos, quat=rot, t=time.perf_counter(), tracking=tracking
+            pos=pos,
+            quat=rot,
+            t=pyvut_receipt_perf if pyvut_receipt_perf is not None else receipt_perf,
+            tracking=tracking,
+            # The pinned pyvut assigns timestamp_ms with time.time() while
+            # parsing the HID packet; its raw tracker timestamp is not exposed
+            # through TrackerPose. This is the earliest receipt, not capture.
+            timestamp_is_capture=False,
         )
         with self._lock:
             self._poses[key] = sample

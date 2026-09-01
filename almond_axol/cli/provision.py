@@ -42,6 +42,7 @@ from pathlib import Path
 
 from ..robot import gyro
 from ..utils import adb
+from ..utils.host_update_lock import host_update_lock
 from ..utils.sudo import run_root
 from . import tracker_install
 from .gst import build_zed as gst_build_zed
@@ -195,6 +196,12 @@ def _step(label: str, fn: Callable[[], object]) -> bool:
 
 def run(_args: object = None) -> None:
     """Run every provisioning step in order; each self-gates and is idempotent."""
+    with host_update_lock():
+        _run_locked()
+
+
+def _run_locked() -> None:
+    """Provision while the caller owns the host-wide mutation lock."""
     # Security migration, not a best-effort dependency: if inspection or
     # removal fails, abort provisioning rather than silently leaving a root
     # scheduler pointed at an operator-writable executable.

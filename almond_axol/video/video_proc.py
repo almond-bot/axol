@@ -33,6 +33,7 @@ import multiprocessing
 import multiprocessing.connection
 import os
 import threading
+import time
 
 _logger = logging.getLogger(__name__)
 
@@ -41,6 +42,11 @@ _logger = logging.getLogger(__name__)
 _READY_TIMEOUT_S = 60.0
 
 _REQUEST_TIMEOUT_S = 15.0
+# ``Future.cancel()`` cannot stop a function already running in an executor.
+# Poll the pipe in short slices so cancellation of the owning asyncio task can
+# cooperatively release the signaling lock well inside VRTeleop's 5 s teardown
+# bound, even when the relay never answers the offer request.
+_REQUEST_CANCEL_POLL_S = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -91,18 +97,19 @@ def _gsth264_meta(
     height: int,
     fps: int,
     latency_s: float,
+    pts_origin_perf: float | None,
 ) -> dict:
     """Describe the encoded-H.264 shared-memory transport for one dataset source.
 
     The relay encodes the dataset stream on the GPU and writes AU-aligned H.264
-    to ``socket_path`` via ``shmsink``; the recorder attaches an
+    to ``socket_path`` via GDP + ``shmsink``; the recorder attaches an
     :class:`~almond_axol.video.shm_frames.EncodedAuReader` and muxes it. Shared
-    memory carries no caps, but H.264 dimensions come from the SPS, so only the
-    dims (to size the dataset observation feature), fps, and the relay's
-    best-effort pipeline latency need to cross. ``latency_s`` is the minimum
-    latency reported by GStreamer's pipeline query; it includes only elements
-    that implement that query and excludes recorder-side ``shmsrc`` / Python
-    scheduling latency.
+    memory alone carries no buffer metadata, so GDP preserves the H.264 caps and
+    sensor PTS. ``pts_origin_perf`` maps the relay pipeline's running-time zero
+    onto the cross-process ``perf_counter`` clock. ``latency_s`` is retained as
+    a conservative fallback when either value is missing or corrupt; it is the
+    minimum latency reported by GStreamer's pipeline query and excludes
+    recorder-side ``shmsrc`` / Python scheduling latency.
     """
     return {
         "transport": "gstshm-h264",
@@ -111,6 +118,7 @@ def _gsth264_meta(
         "height": height,
         "fps": fps,
         "latency_s": latency_s,
+        "pts_origin_perf": pts_origin_perf,
     }
 
 
@@ -122,6 +130,16 @@ def _pyshm_meta(shm_name: str, width: int, height: int, fps: int) -> dict:
         "height": height,
         "fps": fps,
     }
+
+
+def _gsth264_transport_available() -> bool:
+    """Whether both ends of the metadata-preserving shm path are installed."""
+    from .gst_zed import _element_available
+
+    return all(
+        _element_available(element)
+        for element in ("shmsink", "shmsrc", "gdppay", "gdpdepay")
+    )
 
 
 def _plan(name: str, eyes: list[str], suffix: bool) -> list[tuple[str, str]]:
@@ -176,13 +194,13 @@ def _open_gst_camera_raw(
 ) -> tuple[object, dict[str, object], list, dict[str, dict]] | None:
     """Open one camera via the gst pipeline with both encoded + raw branches.
 
-    Like :func:`_open_gst_camera`, but additionally exports each source's raw
-    frames to the recorder process for the dataset. Two transports:
+    Like :func:`_open_gst_camera`, but additionally exports each source's
+    dataset frames to the recorder process. Two transports:
 
-    * **gstshm** (``socket_dir`` set — gst's ``shm`` plugin is available): the raw
-      branch ends in a native ``shmsink`` (pure C), so the relay does **zero**
-      Python per raw frame and its interpreter stays free for the WebRTC send.
-      The recorder reads via ``shmsrc`` (:class:`GstShmFrameReader`).
+    * **gstshm-h264** (``socket_dir`` set — gst's shm + GDP elements are
+      available): the branch encodes H.264 and ends in native GDP + ``shmsink``
+      (pure C), so the relay does **zero** Python per frame and preserves sensor
+      PTS for the recorder's :class:`EncodedAuReader`.
     * **pyshm** (fallback): a Python pull loop copies each frame into a
       :class:`RawFrameWriter` shared-memory block (the older path; runs the copy
       in the relay's interpreter).
@@ -197,7 +215,7 @@ def _open_gst_camera_raw(
     path always had; the encoded headset branch is unaffected.
 
     Returns ``(owned_camera, {track: source}, [writers], {source: meta})`` — where
-    ``meta`` is the per-source dict from :func:`_gstshm_meta` / :func:`_pyshm_meta`
+    ``meta`` is the per-source dict from :func:`_gsth264_meta` / :func:`_pyshm_meta`
     — or ``None`` when the gst stack/camera is unavailable (the caller then falls
     back to the in-process camera pipeline).
     """
@@ -286,6 +304,7 @@ def _open_gst_camera_raw(
                         raw_h,
                         fps,
                         getattr(cam, "raw_latency_s", 0.0),
+                        getattr(cam, "raw_pts_origin_perf", None),
                     )
                     for side, src in raw_plan
                 }
@@ -349,6 +368,7 @@ def _open_gst_camera_raw(
                         raw_h,
                         fps,
                         getattr(cam, "raw_latency_s", 0.0),
+                        getattr(cam, "raw_pts_origin_perf", None),
                     )
                 }
                 return cam, ({name: cam} if wants_stream else {}), [], meta
@@ -501,16 +521,15 @@ def _relay_main(
     sources: dict[str, object] = {}
     writers: list[object] = []
     raw_meta: dict[str, dict] = {}
-    # Prefer the gst-native shmsink transport for raw frames: it exports each
-    # frame to the recorder in C, so the relay does zero Python per raw frame and
-    # the WebRTC send keeps the GIL it needs (the recording-feed fix). Falls back
-    # to the in-relay Python copy (RawFrameWriter) when gst's shm plugin is
-    # absent. A per-relay-PID dir holds one socket per source; removed on exit.
+    # Prefer the gst-native GDP/shm transport for dataset frames: it exports each
+    # encoded AU to the recorder in C, preserving its sensor PTS while the relay
+    # does zero Python per frame and WebRTC keeps the GIL it needs. Fall back to
+    # the in-relay Python copy (RawFrameWriter) unless every element on both ends
+    # is installed. A per-relay-PID dir holds one socket per source; removed on
+    # exit.
     socket_dir: str | None = None
     if want_raw:
-        from .gst_zed import _element_available
-
-        if _element_available("shmsink") and _element_available("shmsrc"):
+        if _gsth264_transport_available():
             import tempfile
 
             socket_dir = tempfile.mkdtemp(prefix="axol-raw-")
@@ -616,16 +635,16 @@ def _relay_main(
             kind = msg[0]
             try:
                 if kind == "offer":
-                    _, client_id = msg
+                    _, request_id, client_id = msg
                     if manager is None:
-                        conn.send(("offer_err", client_id, "no cameras"))
+                        conn.send(("offer_err", request_id, client_id, "no cameras"))
                         continue
                     try:
                         sdp, tracks = await manager.create_offer(client_id)
-                        conn.send(("offer_ok", client_id, sdp, tracks))
+                        conn.send(("offer_ok", request_id, client_id, sdp, tracks))
                     except Exception as exc:  # noqa: BLE001 - report upstream
                         _logger.error("video relay: offer failed: %s", exc)
-                        conn.send(("offer_err", client_id, str(exc)))
+                        conn.send(("offer_err", request_id, client_id, str(exc)))
                 elif kind == "answer" and manager is not None:
                     _, client_id, sdp = msg
                     await manager.set_answer(client_id, sdp)
@@ -752,9 +771,9 @@ class VideoRelayProcess:
             daemon=True,
             name="video-relay",
         )
-        self._proc.start()
-        child_conn.close()
         self._lock = threading.Lock()
+        self._next_offer_request_id = 0
+        self._shutdown_requested = threading.Event()
 
         self.sources: list[str] = []
         self.raw_cameras: dict[str, object] = {}
@@ -762,13 +781,33 @@ class VideoRelayProcess:
         # + caps, or pyshm block name) and dims — exposed (with :attr:`raw_cond`)
         # so the recorder subprocess can attach its own consumer per source.
         self.raw_meta: dict[str, dict] = {}
-        if self._conn.poll(_READY_TIMEOUT_S):
-            msg = self._conn.recv()
-            if isinstance(msg, tuple) and msg[0] == "ready":
-                self.sources = list(msg[1])
-                raw_meta = msg[2] if len(msg) > 2 else {}
-                self.raw_meta = dict(raw_meta)
-                self._attach_raw_readers(raw_meta)
+        try:
+            # Retain every field shutdown() needs before the fallible spawn. A
+            # Process.start() interruption can arrive after the child has already
+            # inherited all camera devices but before start() returns.
+            self._proc.start()
+            child_conn.close()
+            if self._conn.poll(_READY_TIMEOUT_S):
+                msg = self._conn.recv()
+                if isinstance(msg, tuple) and msg[0] == "ready":
+                    self.sources = list(msg[1])
+                    raw_meta = msg[2] if len(msg) > 2 else {}
+                    self.raw_meta = dict(raw_meta)
+                    self._attach_raw_readers(raw_meta)
+        except BaseException as startup_error:
+            try:
+                self.shutdown()
+            except BaseException as cleanup_error:
+                startup_error.add_note(
+                    "additional video-relay startup cleanup failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+        finally:
+            try:
+                child_conn.close()
+            except OSError:
+                pass
         if not self.sources and not self.raw_cameras:
             _logger.warning("video relay started no camera streams or raw sources")
         elif not self.sources:
@@ -823,16 +862,50 @@ class VideoRelayProcess:
     def has_sources(self) -> bool:
         return bool(self.sources)
 
-    def _request_offer(self, client_id: int) -> tuple[str, dict[str, str]]:
+    def _request_offer(
+        self, client_id: int, cancelled: threading.Event
+    ) -> tuple[str, dict[str, str]] | None:
         with self._lock:
-            self._conn.send(("offer", client_id))
-            # Replies are strictly ordered on the pipe; the only inbound
-            # messages are responses to "offer" requests.
-            if not self._conn.poll(_REQUEST_TIMEOUT_S):
-                raise TimeoutError("video relay did not answer the offer request")
-            msg = self._conn.recv()
-        if msg[0] == "offer_ok" and msg[1] == client_id:
-            return msg[2], msg[3]
+            self._next_offer_request_id += 1
+            request_id = self._next_offer_request_id
+            if self._shutdown_requested.is_set():
+                raise RuntimeError("video relay is shutting down")
+            self._conn.send(("offer", request_id, client_id))
+            deadline = time.monotonic() + _REQUEST_TIMEOUT_S
+            while True:
+                # The asyncio wrapper sets this before propagating cancellation.
+                # Returning releases ``_lock``; the result is discarded because
+                # its Future is already cancelled.
+                if cancelled.is_set():
+                    return None
+                if self._shutdown_requested.is_set():
+                    raise RuntimeError("video relay is shutting down")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("video relay did not answer the offer request")
+                if not self._conn.poll(min(_REQUEST_CANCEL_POLL_S, remaining)):
+                    continue
+                msg = self._conn.recv()
+                # A cancelled/timed-out request may receive its response after a
+                # replacement has started. Request IDs let the replacement drain
+                # that stale response instead of accepting the wrong SDP (the
+                # same client ID can legitimately reconnect).
+                if (
+                    isinstance(msg, tuple)
+                    and len(msg) >= 3
+                    and msg[0] in {"offer_ok", "offer_err"}
+                    and msg[1] != request_id
+                ):
+                    continue
+                break
+        if (
+            isinstance(msg, tuple)
+            and len(msg) == 5
+            and msg[0] == "offer_ok"
+            and msg[1] == request_id
+            and msg[2] == client_id
+        ):
+            return msg[3], msg[4]
         raise RuntimeError(f"video relay offer failed: {msg}")
 
     def _send(self, msg: object) -> None:
@@ -847,7 +920,16 @@ class VideoRelayProcess:
     async def create_offer(self, client_id: int) -> tuple[str, dict[str, str]]:
         """Build a peer connection in the relay; returns ``(sdp, tracks)``."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._request_offer, client_id)
+        cancelled = threading.Event()
+        request = loop.run_in_executor(None, self._request_offer, client_id, cancelled)
+        try:
+            result = await request
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        if result is None:  # only reachable if cancellation raced task delivery
+            raise asyncio.CancelledError
+        return result
 
     async def set_answer(self, client_id: int, sdp: str) -> None:
         """Forward the headset's SDP answer to the relay."""
@@ -883,23 +965,74 @@ class VideoRelayProcess:
     # -- Lifecycle ------------------------------------------------------------
 
     def shutdown(self) -> None:
-        """Stop the relay subprocess (cameras and peer connections included)."""
-        for reader in self.raw_cameras.values():
+        """Stop the relay subprocess and prove camera ownership was released."""
+        # Wake an executor thread polling for an offer response before taking
+        # its signaling lock. Some callers own the relay outside VRTeleop's
+        # context and shut it down just before VRServer cancels signaling tasks.
+        self._shutdown_requested.set()
+        failures: list[tuple[str, BaseException]] = []
+        remaining_readers: dict[str, object] = {}
+        for name, reader in self.raw_cameras.items():
             try:
                 reader.disconnect()  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001 - best-effort cleanup
-                pass
-        self.raw_cameras = {}
+            except BaseException as error:
+                failures.append((f"raw reader {name}", error))
+                remaining_readers[name] = reader
+        self.raw_cameras = remaining_readers
         try:
             with self._lock:
                 self._conn.send(None)
         except (OSError, ValueError):
-            pass
-        self._proc.join(timeout=5.0)
-        if self._proc.is_alive():
-            self._proc.terminate()
-            self._proc.join(timeout=2.0)
+            pass  # child exit is proved independently below
+
+        process_started = getattr(self._proc, "pid", object()) is not None
+        process_alive = False
+        if process_started:
+            try:
+                self._proc.join(timeout=5.0)
+                process_alive = self._proc.is_alive()
+            except BaseException as error:
+                failures.append(("initial process reap", error))
+                process_alive = True
+        if process_alive:
+            try:
+                self._proc.terminate()
+            except BaseException as error:
+                failures.append(("process terminate", error))
+            try:
+                self._proc.join(timeout=2.0)
+                process_alive = self._proc.is_alive()
+            except BaseException as error:
+                failures.append(("post-terminate reap", error))
+                process_alive = True
+        if process_alive:
+            try:
+                self._proc.kill()
+            except BaseException as error:
+                failures.append(("process kill", error))
+            try:
+                self._proc.join(timeout=2.0)
+                process_alive = self._proc.is_alive()
+            except BaseException as error:
+                failures.append(("post-kill reap", error))
+                process_alive = True
         try:
             self._conn.close()
-        except Exception:  # noqa: BLE001 - best-effort cleanup
-            pass
+        except BaseException as error:
+            failures.append(("parent pipe close", error))
+
+        if process_alive:
+            failure = RuntimeError(
+                "video relay did not stop after terminate and kill; camera "
+                "ownership remains uncertain"
+            )
+            for label, error in failures:
+                failure.add_note(
+                    f"additional {label} failure: {type(error).__name__}: {error}"
+                )
+            raise failure
+        if failures:
+            failure = RuntimeError("video relay cleanup did not complete safely")
+            for label, error in failures:
+                failure.add_note(f"{label}: {type(error).__name__}: {error}")
+            raise failure from failures[0][1]

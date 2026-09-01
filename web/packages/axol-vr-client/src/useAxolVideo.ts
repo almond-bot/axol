@@ -1,5 +1,6 @@
 import type { RefObject } from "react"
 import { useEffect, useRef, useState } from "react"
+import { retireCurrentVideoPeer, videoPeerNeedsRetry } from "./videoRetry"
 import { waitForIceGathering } from "./webrtc"
 
 /** Live camera streams keyed by camera name (e.g. "overhead", "left_arm"). */
@@ -72,14 +73,32 @@ export function useAxolVideo(
     if (!enabled) return
 
     function closePc() {
-      if (pcRef.current) {
+      const pc = pcRef.current
+      // Retire before close(): Chromium may dispatch "closed" synchronously,
+      // and that local teardown must not re-arm negotiation.
+      pcRef.current = null
+      if (pc) {
         try {
-          pcRef.current.close()
+          pc.close()
         } catch {
           // already closed
         }
-        pcRef.current = null
       }
+    }
+
+    function rearmPeer(signalingWs: WebSocket, pc: RTCPeerConnection) {
+      if (!retireCurrentVideoPeer(attachedWsRef, pcRef, signalingWs, pc)) return
+      try {
+        pc.close()
+      } catch {
+        // already closed
+      }
+      setStreams({})
+      setAvailable(null)
+      offerSeenRef.current = false
+      // Let the polling loop request immediately instead of waiting out the
+      // prior offer's retry interval.
+      lastRequestAtRef.current = 0
     }
 
     function detach() {
@@ -130,18 +149,15 @@ export function useAxolVideo(
         const mid = e.transceiver?.mid ?? null
         const name = mid != null ? trackMap[mid] : undefined
         if (!name) return
+        e.track.addEventListener("ended", () => rearmPeer(signalingWs, pc), {
+          once: true,
+        })
         acc[name] = new MediaStream([e.track])
         setStreams({ ...acc })
       }
       pc.onconnectionstatechange = () => {
         if (!isCurrent()) return
-        if (pc.connectionState === "failed" || pc.connectionState === "closed") {
-          setStreams({})
-          // Let the retry loop renegotiate a fresh connection. Only remotely
-          // caused failures land here — a local pc.close() (detach / socket
-          // swap / re-offer) doesn't fire this handler.
-          offerSeenRef.current = false
-        }
+        if (videoPeerNeedsRetry(pc.connectionState)) rearmPeer(signalingWs, pc)
       }
 
       try {
@@ -159,10 +175,8 @@ export function useAxolVideo(
         signalingWs.send(JSON.stringify({ type: "webrtc-answer", sdp: answerSdp }))
       } catch {
         if (!isCurrent()) return
-        closePc()
-        setStreams({})
         // Negotiation failed; let the retry loop request a fresh offer.
-        offerSeenRef.current = false
+        rearmPeer(signalingWs, pc)
       }
     }
 

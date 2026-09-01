@@ -11,11 +11,11 @@ from unittest.mock import AsyncMock, Mock, call, patch
 import numpy as np
 
 from almond_axol.kinematics.solver import KinematicsSolver
-from almond_axol.motor import Joint, MotorError
-from almond_axol.motor.damiao import _float_to_uint as damiao_float_to_uint
-from almond_axol.motor.myactuator import _float_to_uint as myactuator_float_to_uint
 from almond_axol.lerobot.robot.robot_axol import AxolRobot
 from almond_axol.lerobot.teleop.teleop_vr import AxolVRTeleop
+from almond_axol.motor import ControlMode, Joint, MotorError
+from almond_axol.motor.damiao import _float_to_uint as damiao_float_to_uint
+from almond_axol.motor.myactuator import _float_to_uint as myactuator_float_to_uint
 from almond_axol.robot.axol import Axol, AxolArm
 from almond_axol.robot.base import (
     HardwareCleanupError,
@@ -49,19 +49,32 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         sibling_started = asyncio.Event()
         release_sibling = asyncio.Event()
 
-        async def fail_enable(*, hold: bool) -> None:
+        async def fail_enable(
+            _held: list[Joint], _cold: list[Joint], *, hold: bool
+        ) -> None:
             del hold
             raise RuntimeError("left enable failed")
 
-        async def blocked_enable(*, hold: bool) -> None:
+        async def blocked_enable(
+            _held: list[Joint], _cold: list[Joint], *, hold: bool
+        ) -> None:
             del hold
             sibling_started.set()
             await release_sibling.wait()
 
         robot = object.__new__(Axol)
         robot.connect = AsyncMock()
-        robot.left = SimpleNamespace(enable=fail_enable)
-        robot.right = SimpleNamespace(enable=blocked_enable)
+        robot.left = SimpleNamespace(
+            _prepare_enable_state=AsyncMock(return_value=([], [])),
+            _enable_from_holding_state=fail_enable,
+            motors={},
+        )
+        robot.right = SimpleNamespace(
+            _prepare_enable_state=AsyncMock(return_value=([], [])),
+            _enable_from_holding_state=blocked_enable,
+            motors={},
+        )
+        robot._shutdown_pending = False
         robot._motors_disabled = True
 
         task = asyncio.create_task(robot.enable())
@@ -72,6 +85,170 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         release_sibling.set()
         with self.assertRaisesRegex(RuntimeError, "left enable failed"):
             await task
+
+    async def test_axol_enable_peer_failure_rolls_back_cold_motors_on_both_arms(
+        self,
+    ) -> None:
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        setup_error = RuntimeError("right arm enable failed")
+
+        async def blocked_disable() -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        held_motor = SimpleNamespace(disable=AsyncMock())
+        left_cold = SimpleNamespace(disable=AsyncMock(side_effect=blocked_disable))
+        right_cold = SimpleNamespace(disable=AsyncMock())
+        left = SimpleNamespace(
+            _prepare_enable_state=AsyncMock(
+                return_value=([Joint.WRIST_2], [Joint.SHOULDER_1])
+            ),
+            _enable_from_holding_state=AsyncMock(),
+            reset_command_state=Mock(),
+            motors={
+                Joint.WRIST_2: held_motor,
+                Joint.SHOULDER_1: left_cold,
+            },
+        )
+        right = SimpleNamespace(
+            _prepare_enable_state=AsyncMock(return_value=([], [Joint.GRIPPER])),
+            _enable_from_holding_state=AsyncMock(side_effect=setup_error),
+            reset_command_state=Mock(),
+            motors={Joint.GRIPPER: right_cold},
+        )
+        robot = object.__new__(Axol)
+        robot.connect = AsyncMock()
+        robot.left = left
+        robot.right = right
+        robot._shutdown_pending = False
+        robot._motors_disabled = False
+
+        task = asyncio.create_task(robot.enable())
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        held_motor.disable.assert_not_awaited()
+        right_cold.disable.assert_awaited_once_with()
+
+        release_cleanup.set()
+        with self.assertRaisesRegex(RuntimeError, "right arm enable failed") as raised:
+            await task
+
+        self.assertIs(raised.exception, setup_error)
+        self.assertFalse(is_hardware_cleanup_uncertain(raised.exception))
+        left_cold.disable.assert_awaited_once_with()
+        right_cold.disable.assert_awaited_once_with()
+        held_motor.disable.assert_not_awaited()
+        self.assertFalse(robot._shutdown_pending)
+        self.assertTrue(robot._motors_disabled)
+        left.reset_command_state.assert_called_once_with()
+        right.reset_command_state.assert_called_once_with()
+
+    async def test_axol_enable_failed_global_rollback_blocks_reenable(self) -> None:
+        setup_error = RuntimeError("right arm enable failed")
+        cleanup_error = RuntimeError("left motor torque-off timed out")
+        cold_motor = SimpleNamespace(
+            disable=AsyncMock(side_effect=[cleanup_error, None])
+        )
+        left = SimpleNamespace(
+            _prepare_enable_state=AsyncMock(return_value=([], [Joint.WRIST_2])),
+            _enable_from_holding_state=AsyncMock(),
+            reset_command_state=Mock(),
+            stop_telemetry=AsyncMock(),
+            disable=AsyncMock(),
+            motors={Joint.WRIST_2: cold_motor},
+        )
+        right = SimpleNamespace(
+            _prepare_enable_state=AsyncMock(return_value=([], [])),
+            _enable_from_holding_state=AsyncMock(side_effect=setup_error),
+            reset_command_state=Mock(),
+            stop_telemetry=AsyncMock(),
+            disable=AsyncMock(),
+            motors={},
+        )
+        robot = object.__new__(Axol)
+        robot.connect = AsyncMock()
+        robot.left = left
+        robot.right = right
+        robot._shutdown_pending = False
+        robot._motors_disabled = True
+        robot._left_bus = SimpleNamespace(close=AsyncMock())
+        robot._right_bus = SimpleNamespace(close=AsyncMock())
+
+        with self.assertRaisesRegex(RuntimeError, "right arm enable failed") as raised:
+            await robot.enable()
+
+        self.assertIs(raised.exception, setup_error)
+        self.assertTrue(is_hardware_cleanup_uncertain(raised.exception))
+        self.assertTrue(robot._shutdown_pending)
+        self.assertFalse(robot._motors_disabled)
+        cold_motor.disable.assert_awaited_once_with()
+        left.reset_command_state.assert_called_once_with()
+        right.reset_command_state.assert_not_called()
+
+        await robot.disable()
+
+        self.assertEqual(cold_motor.disable.await_count, 2)
+        left.disable.assert_not_awaited()
+        right.disable.assert_not_awaited()
+        robot._left_bus.close.assert_awaited_once_with()
+        robot._right_bus.close.assert_awaited_once_with()
+        self.assertFalse(robot._shutdown_pending)
+
+    async def test_axol_selective_startup_cleanup_stops_both_telemetry_loops(
+        self,
+    ) -> None:
+        left_stop_started = asyncio.Event()
+        right_stop_started = asyncio.Event()
+        release_telemetry = asyncio.Event()
+
+        async def stop_left() -> None:
+            left_stop_started.set()
+            await release_telemetry.wait()
+
+        async def stop_right() -> None:
+            right_stop_started.set()
+            await release_telemetry.wait()
+
+        cold_motor = SimpleNamespace(disable=AsyncMock())
+        left = SimpleNamespace(
+            stop_telemetry=AsyncMock(side_effect=stop_left),
+            disable=AsyncMock(),
+        )
+        right = SimpleNamespace(
+            stop_telemetry=AsyncMock(side_effect=stop_right),
+            disable=AsyncMock(),
+        )
+        robot = object.__new__(Axol)
+        robot.left = left
+        robot.right = right
+        robot._left_bus = SimpleNamespace(close=AsyncMock())
+        robot._right_bus = SimpleNamespace(close=AsyncMock())
+        robot._shutdown_pending = True
+        robot._motors_disabled = False
+        robot._startup_rollback_pending = [("left.wrist_2", cold_motor)]
+
+        task = asyncio.create_task(robot.disable())
+        await asyncio.wait_for(left_stop_started.wait(), timeout=1.0)
+        await asyncio.wait_for(right_stop_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+
+        cold_motor.disable.assert_not_awaited()
+        robot._left_bus.close.assert_not_awaited()
+        robot._right_bus.close.assert_not_awaited()
+
+        release_telemetry.set()
+        await task
+
+        left.stop_telemetry.assert_awaited_once_with()
+        right.stop_telemetry.assert_awaited_once_with()
+        cold_motor.disable.assert_awaited_once_with()
+        left.disable.assert_not_awaited()
+        right.disable.assert_not_awaited()
+        robot._left_bus.close.assert_awaited_once_with()
+        robot._right_bus.close.assert_awaited_once_with()
+        self.assertFalse(robot._shutdown_pending)
 
     async def test_axol_motion_waits_for_both_issued_arm_actions(self) -> None:
         sibling_started = asyncio.Event()
@@ -96,6 +273,31 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
 
         release_sibling.set()
         with self.assertRaisesRegex(RuntimeError, "left motion failed"):
+            await task
+
+    async def test_mantis_motion_waits_for_both_issued_arm_actions(self) -> None:
+        sibling_started = asyncio.Event()
+        release_sibling = asyncio.Event()
+
+        async def fail_motion(_q: np.ndarray) -> None:
+            raise RuntimeError("left Mantis motion failed")
+
+        async def blocked_motion(_q: np.ndarray) -> None:
+            sibling_started.set()
+            await release_sibling.wait()
+
+        robot = object.__new__(Mantis)
+        robot.left = SimpleNamespace(motion_control=fail_motion)
+        robot.right = SimpleNamespace(motion_control=blocked_motion)
+        target = np.zeros(len(Joint), dtype=np.float32)
+
+        task = asyncio.create_task(robot.motion_control(left=target, right=target))
+        await sibling_started.wait()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+
+        release_sibling.set()
+        with self.assertRaisesRegex(RuntimeError, "left Mantis motion failed"):
             await task
 
     async def test_axol_disconnect_waits_for_all_telemetry_before_bus_close(
@@ -141,6 +343,9 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             async def enable(self) -> None:
                 raise RuntimeError("motor enable failed")
 
+            async def disable(self) -> None:
+                pass
+
             async def set_control_mode(self, _mode: object) -> None:
                 mode_changes.append(Joint.SHOULDER_1)
 
@@ -148,6 +353,9 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             async def enable(self) -> None:
                 sibling_started.set()
                 await release_sibling.wait()
+
+            async def disable(self) -> None:
+                pass
 
             async def set_control_mode(self, _mode: object) -> None:
                 mode_changes.append(Joint.SHOULDER_2)
@@ -169,6 +377,89 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "motor enable failed"):
             await task
         self.assertEqual(mode_changes, [])
+
+    async def test_arm_failed_gripper_calibration_rolls_back_only_cold_motors(
+        self,
+    ) -> None:
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def blocked_disable() -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        held_motor = SimpleNamespace(
+            attach=AsyncMock(),
+            disable=AsyncMock(),
+        )
+        cold_arm_motor = SimpleNamespace(
+            enable=AsyncMock(),
+            set_control_mode=AsyncMock(),
+            disable=AsyncMock(side_effect=blocked_disable),
+        )
+        cold_gripper = SimpleNamespace(
+            enable=AsyncMock(),
+            set_control_mode=AsyncMock(),
+            get_position=AsyncMock(return_value=1.25),
+            set_impedance=AsyncMock(),
+            get_torque=AsyncMock(return_value=0.1),
+            disable=AsyncMock(),
+        )
+        arm = object.__new__(AxolArm)
+        arm.motors = {
+            Joint.WRIST_2: held_motor,
+            Joint.SHOULDER_1: cold_arm_motor,
+            Joint.GRIPPER: cold_gripper,
+        }
+        arm.resolve_joint_offsets = AsyncMock()
+        arm.get_holding = AsyncMock(return_value=[True, False, False])
+        arm._has_gripper = True
+        arm._gripper_i = list(Joint).index(Joint.GRIPPER)
+        arm._unverified_zeros = set()
+
+        with (
+            patch("almond_axol.robot.axol._GRIPPER_CALIB_MAX_STEPS", 3),
+            patch("almond_axol.robot.axol._GRIPPER_CALIB_SETTLE", 0.0),
+        ):
+            task = asyncio.create_task(arm.enable())
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            held_motor.disable.assert_not_awaited()
+            cold_gripper.disable.assert_awaited_once_with()
+
+            release_cleanup.set()
+            with self.assertRaisesRegex(
+                MotorError, "no hard stop was detected"
+            ) as raised:
+                await task
+
+        self.assertFalse(is_hardware_cleanup_uncertain(raised.exception))
+        cold_arm_motor.disable.assert_awaited_once_with()
+        cold_gripper.disable.assert_awaited_once_with()
+        held_motor.disable.assert_not_awaited()
+
+    async def test_arm_startup_marks_failed_cold_motor_rollback_uncertain(
+        self,
+    ) -> None:
+        setup_error = RuntimeError("motor enable failed")
+        cleanup_error = RuntimeError("motor torque-off timed out")
+        motor = SimpleNamespace(
+            enable=AsyncMock(side_effect=setup_error),
+            disable=AsyncMock(side_effect=cleanup_error),
+        )
+        arm = object.__new__(AxolArm)
+        arm.motors = {Joint.WRIST_2: motor}
+        arm.resolve_joint_offsets = AsyncMock()
+        arm.get_holding = AsyncMock(return_value=[False])
+        arm._has_gripper = False
+
+        with self.assertRaisesRegex(RuntimeError, "motor enable failed") as raised:
+            await arm.enable()
+
+        self.assertIs(raised.exception, setup_error)
+        self.assertTrue(is_hardware_cleanup_uncertain(raised.exception))
+        motor.disable.assert_awaited_once_with()
 
     async def test_ik_warmup_failure_prevents_false_ready_solver(self) -> None:
         solver = object.__new__(KinematicsSolver)
@@ -240,6 +531,40 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         arm._send_gripper_target.assert_not_awaited()
         np.testing.assert_array_equal(arm._virtual_arm, prior_virtual)
         self.assertEqual(arm._gripper_target, 0.25)
+
+    async def test_mantis_calibration_without_torque_stop_fails_closed(self) -> None:
+        motor = SimpleNamespace(
+            enable=AsyncMock(),
+            disable=AsyncMock(),
+            set_control_mode=AsyncMock(),
+            get_position=AsyncMock(return_value=1.25),
+            set_impedance=AsyncMock(),
+            get_torque=AsyncMock(return_value=0.1),
+            set_position_force=AsyncMock(),
+        )
+        with patch("almond_axol.robot.mantis.Motor", return_value=motor):
+            arm = MantisGripperArm(
+                Mock(), SimpleNamespace(max_speed=10.0, torque_limit=0.5)
+            )
+
+        with (
+            patch("almond_axol.robot.axol._GRIPPER_CALIB_MAX_STEPS", 3),
+            patch("almond_axol.robot.axol._GRIPPER_CALIB_SETTLE", 0.0),
+            self.assertRaisesRegex(MotorError, "no hard stop was detected"),
+        ):
+            await arm.enable()
+
+        self.assertFalse(arm.is_enabled)
+        self.assertFalse(arm.is_calibrated)
+        self.assertFalse(arm._disable_pending)
+        motor.disable.assert_awaited_once_with()
+        self.assertEqual(motor.set_impedance.await_count, 3)
+        self.assertEqual(motor.get_torque.await_count, 3)
+        motor.set_position_force.assert_not_awaited()
+        self.assertEqual(
+            [args.args[0] for args in motor.set_control_mode.await_args_list],
+            [ControlMode.IMPEDANCE],
+        )
 
     async def test_dual_arm_validation_prevents_partial_send(self) -> None:
         good = np.zeros(8)
@@ -700,6 +1025,65 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         right_bus.close.assert_awaited_once()
         self.assertFalse(robot._connected)
         self.assertFalse(robot._shutdown_pending)
+
+    async def test_mantis_partial_enable_failed_rollback_marks_uncertain(
+        self,
+    ) -> None:
+        setup_error = RuntimeError("left gripper enable failed")
+        cleanup_error = RuntimeError("right gripper torque-off timed out")
+        left = SimpleNamespace(
+            enable=AsyncMock(side_effect=setup_error),
+            force_disable=AsyncMock(),
+        )
+        right = SimpleNamespace(
+            enable=AsyncMock(),
+            force_disable=AsyncMock(side_effect=cleanup_error),
+        )
+        robot = object.__new__(Mantis)
+        robot.left = left
+        robot.right = right
+        robot._telemetry_settings = None
+        robot._shutdown_pending = False
+
+        with self.assertRaisesRegex(
+            RuntimeError, "left gripper enable failed"
+        ) as raised:
+            await robot._enable_grippers_unlocked()
+
+        self.assertIs(raised.exception, setup_error)
+        self.assertTrue(is_hardware_cleanup_uncertain(raised.exception))
+        self.assertTrue(robot._shutdown_pending)
+        left.force_disable.assert_awaited_once_with()
+        right.force_disable.assert_awaited_once_with()
+
+    async def test_mantis_telemetry_restart_failed_rollback_marks_uncertain(
+        self,
+    ) -> None:
+        telemetry_error = RuntimeError("telemetry restart failed")
+        cleanup_error = RuntimeError("left gripper torque-off timed out")
+        left = SimpleNamespace(
+            enable=AsyncMock(),
+            force_disable=AsyncMock(side_effect=cleanup_error),
+        )
+        right = SimpleNamespace(enable=AsyncMock(), force_disable=AsyncMock())
+        robot = object.__new__(Mantis)
+        robot.left = left
+        robot.right = right
+        robot._telemetry_settings = (50.0, True)
+        robot._shutdown_pending = False
+        robot._stop_telemetry_unlocked = AsyncMock()
+        robot._start_telemetry_unlocked = AsyncMock(side_effect=telemetry_error)
+
+        with self.assertRaisesRegex(RuntimeError, "telemetry restart failed") as raised:
+            await robot._enable_grippers_unlocked()
+
+        self.assertIs(raised.exception, telemetry_error)
+        self.assertTrue(is_hardware_cleanup_uncertain(raised.exception))
+        self.assertTrue(robot._shutdown_pending)
+        robot._stop_telemetry_unlocked.assert_awaited_once_with()
+        robot._start_telemetry_unlocked.assert_awaited_once_with(50.0, True)
+        left.force_disable.assert_awaited_once_with()
+        right.force_disable.assert_awaited_once_with()
 
     async def test_mantis_deferred_connect_disable_failure_retains_retry_path(
         self,

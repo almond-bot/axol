@@ -36,6 +36,7 @@ import multiprocessing.connection
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -50,6 +51,25 @@ _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 # nobody is left to press reset). Long enough to free a hooked gripper
 # calmly; then the hold settles into a position hold where the arms are.
 _HOLD_ORPHAN_GRACE_S = 30.0
+
+
+@dataclass(frozen=True)
+class TCPPoseSnapshot:
+    """One immutable, atomically published absolute-mode pose sample."""
+
+    pose_host_ts: float | None
+    left: tuple[float, ...]
+    right: tuple[float, ...]
+
+    @classmethod
+    def from_message(
+        cls, tcp: dict[str, list[float]], pose_host_ts: float | None
+    ) -> TCPPoseSnapshot:
+        return cls(
+            pose_host_ts=pose_host_ts,
+            left=tuple(tcp["left"]),
+            right=tuple(tcp["right"]),
+        )
 
 
 def recv_with_timeout(
@@ -135,14 +155,14 @@ class VRTeleopCore:
         # coords ({"pos": [x,y,z], "quat": [x,y,z,w]}), as reported by the IK
         # worker. ``None`` before the first engage / outside absolute mode.
         self.abs_base: dict | None = None
-        # Absolute (Mantis) mode: latest base-frame TCP target per side
-        # ({"left": [x,y,z,qx,qy,qz,qw], "right": [...]}), the tracked
-        # ground-truth pose behind the joint solution. ``None`` before the
-        # first solve / outside absolute mode.
-        self.last_tcp: dict | None = None
+        # Absolute (Mantis) mode: latest base-frame TCP target per side and its
+        # host capture timestamp, published with one reference assignment.
+        # Keeping the lists received over IPC out of shared state also prevents
+        # either thread from mutating a sample another thread is consuming.
+        self.last_tcp_snapshot: TCPPoseSnapshot | None = None
         # Monotonic (``time.perf_counter``) time of the last IK reply whose
-        # ``tcp_msg`` *differed* from the previous one — i.e. when
-        # ``last_tcp`` last took a new value. A frozen tracker / stalled IK
+        # ``tcp_msg`` *differed* from the previous one — i.e. when the
+        # published TCP last took a new value. A frozen tracker / stalled IK
         # keeps replying with an identical TCP, so consumers (Mantis data
         # collection) compare this against "now" to detect stale poses being
         # recorded under fresh row timestamps. ``None`` until the first
@@ -1116,6 +1136,9 @@ class VRTeleopCore:
                 pose_ts = getattr(frame, "t_host", None)
                 if pose_ts is not None:
                     self.last_pose_host_ts = pose_ts
+                    snapshot = self.last_tcp_snapshot
+                    if snapshot is not None:
+                        self.last_tcp_snapshot = replace(snapshot, pose_host_ts=pose_ts)
                 self._maybe_disengage_stale(conn, last_frame, process_alive)
                 time.sleep(0.001)
                 continue
@@ -1178,13 +1201,8 @@ class VRTeleopCore:
                         _, q_arr, base_msg, tcp_msg = result
                         self.set_target(q_arr)
                         self.abs_base = base_msg
-                        # Stamp the last *changed* TCP (cheap compare: two
-                        # 7-float lists per side) so recording can tell a
-                        # live pose stream from a frozen one — a dropout /
-                        # IK stall replays the same TCP forever.
-                        if tcp_msg is not None and tcp_msg != self.last_tcp:
-                            self.last_tcp_change_ts = time.perf_counter()
-                        self.last_tcp = tcp_msg
+                        pose_host_ts = getattr(frame, "t_host", None)
+                        self._publish_tcp_pose(tcp_msg, pose_host_ts)
                         self._maybe_broadcast_urdf_state()
                     else:
                         self.set_target(result)
@@ -1201,6 +1219,28 @@ class VRTeleopCore:
                 self._logger.error("IK dispatch error: %s", e)
 
             self._pace(t0, ik_interval)
+
+    def _publish_tcp_pose(
+        self, tcp_msg: dict[str, list[float]] | None, pose_host_ts: float | None
+    ) -> None:
+        """Publish an IK TCP result and its source timestamp as one sample."""
+        previous = self.last_tcp_snapshot
+        snapshot = (
+            TCPPoseSnapshot.from_message(tcp_msg, pose_host_ts)
+            if tcp_msg is not None
+            else None
+        )
+        # Stamp the last *changed* TCP (two seven-float tuples per side) so
+        # recording can tell a live pose stream from a frozen one. Timestamp
+        # heartbeat changes alone do not count as TCP motion.
+        if snapshot is not None and (
+            previous is None
+            or snapshot.left != previous.left
+            or snapshot.right != previous.right
+        ):
+            self.last_tcp_change_ts = time.perf_counter()
+        # This single reference write is the synchronization point for readers.
+        self.last_tcp_snapshot = snapshot
 
     def _maybe_broadcast_urdf_state(self) -> None:
         """Push the URDF overlay state to the headset, throttled to ~60 Hz.
