@@ -140,10 +140,20 @@ export function wsBaseUrl(): string {
   return `${proto}://${u.host}`
 }
 
+export class ApiRequestError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = "ApiRequestError"
+    this.status = status
+  }
+}
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
-    throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`)
+    throw new ApiRequestError((body as { error?: string }).error ?? `HTTP ${res.status}`, res.status)
   }
   // A non-JSON 200 means whatever answered isn't axol serve (typically the
   // static site itself when no host is configured, answering index.html for
@@ -364,14 +374,47 @@ export interface CanProfilePresence {
 
 export type CanProfileInventory = Record<HardwareProfile, CanProfilePresence>
 
+export type CanDiscoveryStatus =
+  | "ready"
+  | "needed"
+  | "running"
+  | "configured"
+  | "partial"
+  | "unidentified"
+  | "error"
+
+/** Server-owned discovery of an attached, not-yet-trusted Axol/Mantis hub. */
+export interface CanDiscoveryState {
+  status: CanDiscoveryStatus
+  candidateCount: number
+  /** Opaque server-local epoch; changes when unresolved attached hardware changes. */
+  generation: number
+  message?: string
+}
+
 export interface CanInterfaceInventory {
   interfaces: CanInterface[]
   /** Omitted by serve releases that predate hardware-aware auto-connect. */
   profiles?: CanProfileInventory
+  /** Omitted by serve releases that predate safe, non-interactive discovery. */
+  discovery?: CanDiscoveryState
 }
 
 export async function fetchCanInterfaces(): Promise<CanInterfaceInventory> {
   return json(await fetch(apiUrl("/api/can/interfaces")))
+}
+
+/** Identify and persist any attached, unassigned Axol/Mantis hub. */
+export async function discoverCanHardware(): Promise<CanInterfaceInventory> {
+  return json(await fetch(apiUrl("/api/can/discover"), { method: "POST" }))
+}
+
+/** A busy race, transport interruption, or server fault may retry on the next inventory poll. */
+export function canDiscoveryRequestCanRetry(error: unknown): boolean {
+  return (
+    error instanceof TypeError ||
+    (error instanceof ApiRequestError && (error.status === 409 || error.status >= 500))
+  )
 }
 
 // ---------------------------------------------------------------------------

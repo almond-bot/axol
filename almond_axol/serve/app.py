@@ -8,11 +8,13 @@ is available it is served too, with SPA-style fallback to ``index.html``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import socket
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -57,6 +59,8 @@ from .runner import OperationRunner
 from .settings import SettingsStore, advanced_schema, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
 from .update import SelfUpdater
+
+_logger = logging.getLogger(__name__)
 
 
 class RunRequest(BaseModel):
@@ -631,6 +635,77 @@ def _attached_configured_hub_profiles() -> set[str]:
     return attached_configured_hub_profiles()
 
 
+def _attached_hub_state() -> Any:
+    """Atomic configured/unresolved USB state; serials never leave the server."""
+    from ..cli.can.setup import attached_hub_state
+
+    return attached_hub_state()
+
+
+_CAN_DISCOVERY_STATUSES = {
+    "ready",
+    "needed",
+    "running",
+    "configured",
+    "partial",
+    "unidentified",
+    "error",
+}
+
+
+@dataclass
+class _CanDiscoveryCache:
+    """Process-local discovery result keyed by physical hardware/config epoch."""
+
+    generation: int = 0
+    status: str = "ready"
+    message: str | None = None
+    candidate_identities: tuple[tuple[str, str], ...] | None = None
+    validation_identity: tuple[tuple[str, ...], ...] | None = None
+    validated_identity: tuple[tuple[str, ...], ...] | None = None
+
+    def observe(self, state: Any, *, running: bool = False) -> None:
+        candidates = tuple(state.candidate_identities)
+        validation = tuple(state.validation_identity)
+        candidates_changed = candidates != self.candidate_identities
+        validation_changed = validation != self.validation_identity
+        if candidates_changed or validation_changed:
+            self.generation += 1
+        self.candidate_identities = candidates
+        self.validation_identity = validation
+
+        if running:
+            self.status = "running"
+            self.message = None
+            return
+
+        validation_needed = bool(validation) and validation != self.validated_identity
+        if candidates_changed or validation_changed or self.status == "running":
+            self.status = "needed" if candidates or validation_needed else "ready"
+            self.message = None
+        elif self.status == "ready" and (candidates or validation_needed):
+            self.status = "needed"
+
+    def finish(self, state: Any, *, status: str, message: str | None) -> None:
+        if status not in _CAN_DISCOVERY_STATUSES - {"needed", "running"}:
+            raise ValueError(f"invalid terminal CAN discovery status: {status}")
+        self.observe(state, running=True)
+        self.validated_identity = tuple(state.validation_identity)
+        self.status = status
+        self.message = message
+
+    def payload(self) -> dict[str, Any]:
+        candidates = self.candidate_identities or ()
+        result: dict[str, Any] = {
+            "status": self.status,
+            "candidateCount": len(candidates),
+            "generation": self.generation,
+        }
+        if self.message:
+            result["message"] = self.message
+        return result
+
+
 def _can_profile_presence(
     interfaces: list[dict[str, Any]],
     channels: tuple[str | None, str | None],
@@ -653,7 +728,25 @@ def _can_profile_presence(
         set(enabled)
     ) == len(enabled)
     by_name = {str(interface.get("name")): interface for interface in interfaces}
-    named_present = valid and all(channel in by_name for channel in enabled)
+    all_managed_names = {
+        CAN_LEFT,
+        CAN_RIGHT,
+        CAN_MANTIS_LEFT,
+        CAN_MANTIS_RIGHT,
+    }
+    uses_managed_name = any(channel in all_managed_names for channel in enabled)
+    managed_names_match_profile = profile_channels is not None and all(
+        channel not in all_managed_names or channel in profile_channels
+        for channel in enabled
+    )
+    named_present = (
+        valid
+        and all(channel in by_name for channel in enabled)
+        and (
+            not uses_managed_name
+            or (configured_usb_present and managed_names_match_profile)
+        )
+    )
     usb_bootstrap = (
         valid
         and configured_usb_present
@@ -747,6 +840,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     manually_disconnected_target: (
         tuple[Literal["axol", "mantis"], str | None, str | None] | None
     ) = None
+    can_discovery = _CanDiscoveryCache()
+    can_discovery_launch = asyncio.Lock()
+    can_discovery_task: asyncio.Task[None] | None = None
 
     def _diagnostic_session_active() -> bool:
         return bool(diagnostic_cleanup_pending) or any(
@@ -777,6 +873,176 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         if reason is None:
             return None
         return JSONResponse({"error": reason}, status_code=409)
+
+    def _discovery_running() -> bool:
+        return can_discovery_task is not None and not can_discovery_task.done()
+
+    def _observe_can_state(attached: Any, *, running: bool = False) -> None:
+        # Development serves commonly run unprivileged after the operator has
+        # completed interactive can.setup. A strict, non-conflicting profile
+        # with no unresolved hardware is safe to use, but this process cannot
+        # run the root-only validation pass. Production root serves still
+        # validate every newly attached configured hub once per epoch.
+        if (
+            os.geteuid() != 0
+            and attached.configured_profiles
+            and not attached.candidate_identities
+        ):
+            can_discovery.validated_identity = tuple(attached.validation_identity)
+        can_discovery.observe(attached, running=running)
+
+    async def _can_inventory(*, observe_discovery: bool = True) -> dict[str, Any]:
+        """Build one authoritative interface/profile/discovery snapshot."""
+        interfaces, attached = await asyncio.gather(
+            asyncio.to_thread(_list_can_interfaces),
+            asyncio.to_thread(_attached_hub_state),
+        )
+        if observe_discovery:
+            _observe_can_state(attached, running=_discovery_running())
+        usb_profiles = set(attached.configured_profiles)
+        axol_channels = settings.can_channels()
+        mantis_channels = settings.mantis_can_channels()
+        axol_presence = _can_profile_presence(
+            interfaces,
+            axol_channels,
+            require_both=False,
+            configured_usb_present="axol" in usb_profiles,
+            profile_channels=(CAN_LEFT, CAN_RIGHT),
+        )
+        mantis_presence = _can_profile_presence(
+            interfaces,
+            mantis_channels,
+            require_both=True,
+            configured_usb_present="mantis" in usb_profiles,
+            profile_channels=(CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT),
+        )
+        axol_presence["automaticConnectSuppressed"] = manually_disconnected_target == (
+            "axol",
+            axol_channels[0],
+            axol_channels[1],
+        )
+        mantis_presence["automaticConnectSuppressed"] = (
+            manually_disconnected_target
+            == ("mantis", mantis_channels[0], mantis_channels[1])
+        )
+        return {
+            "interfaces": interfaces,
+            "profiles": {
+                "axol": axol_presence,
+                "mantis": mantis_presence,
+            },
+            "discovery": can_discovery.payload(),
+        }
+
+    async def _run_can_discovery(initial_state: Any) -> None:
+        """Own the launch reservation until disconnect, setup, and rescan finish."""
+        try:
+            disconnected = await asyncio.to_thread(robot.disconnect)
+            confirmed = await asyncio.to_thread(robot.status)
+            if (
+                disconnected.get("state") != "disconnected"
+                or disconnected.get("connected") is not False
+                or confirmed.get("state") != "disconnected"
+                or confirmed.get("connected") is not False
+            ):
+                raise RuntimeError("robot link did not prove it released CAN")
+
+            from ..cli.can.setup import setup_detected_hubs
+
+            result = await asyncio.to_thread(setup_detected_hubs)
+            refreshed = await asyncio.to_thread(_attached_hub_state)
+            can_discovery.finish(
+                refreshed,
+                status=result.status,
+                message=result.message,
+            )
+        except Exception:  # noqa: BLE001 - terminal state is surfaced safely
+            _logger.exception("automatic CAN hardware discovery failed")
+            try:
+                refreshed = await asyncio.to_thread(_attached_hub_state)
+            except Exception:  # noqa: BLE001 - retain the launch snapshot
+                refreshed = initial_state
+            can_discovery.finish(
+                refreshed,
+                status="error",
+                message=(
+                    "Automatic CAN discovery could not safely identify the "
+                    "attached hardware. Run `axol can.setup` for details."
+                ),
+            )
+        finally:
+            session_launch_reservation.release()
+
+    async def _launch_or_join_can_discovery() -> asyncio.Task[None] | JSONResponse:
+        """Start one cancellation-safe discovery task or join the current one."""
+        nonlocal can_discovery_task
+        async with can_discovery_launch:
+            if _discovery_running():
+                assert can_discovery_task is not None
+                return can_discovery_task
+
+            await session_launch_reservation.acquire()
+            maintenance = _maintenance_launch_response()
+            busy_reason: str | None = None
+            if maintenance is not None:
+                busy_reason = "host maintenance is active; retry CAN discovery later"
+            elif runner.is_running() or _diagnostic_session_active():
+                busy_reason = (
+                    "an operation or setup/diagnostics session owns hardware; "
+                    "retry CAN discovery when it finishes"
+                )
+            if busy_reason is not None:
+                session_launch_reservation.release()
+                inventory = await _can_inventory()
+                inventory.update({"error": busy_reason, "retryable": True})
+                return JSONResponse(inventory, status_code=409)
+
+            try:
+                initial_state = await asyncio.to_thread(_attached_hub_state)
+            except BaseException:
+                session_launch_reservation.release()
+                raise
+            can_discovery.observe(initial_state)
+            if can_discovery.status != "needed":
+                session_launch_reservation.release()
+                inventory = await _can_inventory()
+                return JSONResponse(inventory)
+            can_discovery.observe(initial_state, running=True)
+            can_discovery_task = asyncio.create_task(
+                _run_can_discovery(initial_state),
+                name="can-hardware-discovery",
+            )
+            return can_discovery_task
+
+    def _uses_managed_name(channels: tuple[str | None, str | None]) -> bool:
+        managed = {
+            CAN_LEFT,
+            CAN_RIGHT,
+            CAN_MANTIS_LEFT,
+            CAN_MANTIS_RIGHT,
+        }
+        return any(channel in managed for channel in channels if channel is not None)
+
+    def _managed_names_match_profile(
+        profile: Literal["axol", "mantis"],
+        channels: tuple[str | None, str | None],
+    ) -> bool:
+        expected = (
+            (CAN_LEFT, CAN_RIGHT)
+            if profile == "axol"
+            else (CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT)
+        )
+        all_managed = {
+            CAN_LEFT,
+            CAN_RIGHT,
+            CAN_MANTIS_LEFT,
+            CAN_MANTIS_RIGHT,
+        }
+        return all(
+            channel not in all_managed or channel in expected
+            for channel in channels
+            if channel is not None
+        )
 
     def _find_session(session_id: str) -> tuple[Session | None, Any]:
         """Resolve a session id to (session, owner) across runner + manager."""
@@ -1050,6 +1316,29 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             if isinstance(target, JSONResponse):
                 return target
             profile, channels = target
+            if _uses_managed_name(channels):
+                if not _managed_names_match_profile(profile, channels):
+                    return JSONResponse(
+                        {
+                            "error": "the selected managed CAN interface belongs "
+                            "to a different hardware profile"
+                        },
+                        status_code=409,
+                    )
+                attached = await asyncio.to_thread(_attached_hub_state)
+                _observe_can_state(attached, running=_discovery_running())
+                if (
+                    profile not in attached.configured_profiles
+                    or can_discovery.status in {"needed", "running", "error"}
+                ):
+                    return JSONResponse(
+                        {
+                            "error": "the managed CAN profile has not passed "
+                            "hardware discovery for this attachment; retry after "
+                            "CAN discovery completes"
+                        },
+                        status_code=409,
+                    )
             target_key = (profile, channels[0], channels[1])
             automatic = req is not None and req.automatic
             if automatic and manually_disconnected_target == target_key:
@@ -1094,46 +1383,36 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/can/interfaces", response_model=None)
     async def can_interfaces() -> dict[str, Any] | JSONResponse:
-        """SocketCAN inventory plus configured Axol/Mantis presence."""
+        """SocketCAN inventory, trusted profiles, and discovery state."""
+        # The discovery worker owns the launch reservation across root
+        # mutation. Do not wait behind it: expose `running` so every tab
+        # suppresses connection while the interfaces are being renamed.
+        if _discovery_running():
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
+            return await _can_inventory(observe_discovery=False)
         async with session_launch_reservation:
             maintenance = _maintenance_launch_response()
             if maintenance is not None:
                 return maintenance
-            interfaces, usb_profiles = await asyncio.gather(
-                asyncio.to_thread(_list_can_interfaces),
-                asyncio.to_thread(_attached_configured_hub_profiles),
+            return await _can_inventory()
+
+    @app.post("/api/can/discover", response_model=None)
+    async def can_discover() -> dict[str, Any] | JSONResponse:
+        """Positively identify and persist fresh Axol/Mantis hub roles."""
+        if os.geteuid() != 0:
+            return JSONResponse(
+                {"error": "automatic CAN discovery requires root axol serve"},
+                status_code=403,
             )
-            axol_channels = settings.can_channels()
-            mantis_channels = settings.mantis_can_channels()
-            axol_presence = _can_profile_presence(
-                interfaces,
-                axol_channels,
-                require_both=False,
-                configured_usb_present="axol" in usb_profiles,
-                profile_channels=(CAN_LEFT, CAN_RIGHT),
-            )
-            mantis_presence = _can_profile_presence(
-                interfaces,
-                mantis_channels,
-                require_both=True,
-                configured_usb_present="mantis" in usb_profiles,
-                profile_channels=(CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT),
-            )
-            axol_presence["automaticConnectSuppressed"] = (
-                manually_disconnected_target
-                == ("axol", axol_channels[0], axol_channels[1])
-            )
-            mantis_presence["automaticConnectSuppressed"] = (
-                manually_disconnected_target
-                == ("mantis", mantis_channels[0], mantis_channels[1])
-            )
-            return {
-                "interfaces": interfaces,
-                "profiles": {
-                    "axol": axol_presence,
-                    "mantis": mantis_presence,
-                },
-            }
+        task = await _launch_or_join_can_discovery()
+        if isinstance(task, JSONResponse):
+            return task
+        # Request cancellation must not cancel a thread performing root setup.
+        # The process-owned task remains strongly referenced and shutdown joins it.
+        await asyncio.shield(task)
+        return await _can_inventory()
 
     @app.get("/api/robot/motors/{arm}/{joint}")
     async def robot_motor_details(arm: str, joint: str) -> JSONResponse:
@@ -2180,6 +2459,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        if can_discovery_task is not None and not can_discovery_task.done():
+            await asyncio.shield(can_discovery_task)
         await runner.shutdown()
         await manager.shutdown()
         await asyncio.to_thread(robot.shutdown)

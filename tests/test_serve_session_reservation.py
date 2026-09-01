@@ -12,22 +12,33 @@ from unittest.mock import Mock, patch
 
 import httpx
 
-from almond_axol.serve import app as app_module
 from almond_axol.robot.base import HardwareCleanupError
+from almond_axol.serve import app as app_module
 from almond_axol.serve.manager import Session
 from almond_axol.serve.robot_link import (
-    RobotLink,
     STATE_BUSY,
     STATE_CONNECTED,
     STATE_DISCONNECTED,
     STATE_ERROR,
+    RobotLink,
 )
 from almond_axol.serve.runner import OperationRunner
 from almond_axol.serve.settings import SettingsStore
 from almond_axol.utils import state_files
 
-
 _UNSET = object()
+
+
+def _hub_state(
+    profiles: set[str] | frozenset[str] = frozenset(),
+    candidates: tuple[tuple[str, str], ...] = (),
+    validation: tuple[tuple[str, ...], ...] = (),
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        configured_profiles=frozenset(profiles),
+        candidate_identities=candidates,
+        validation_identity=validation,
+    )
 
 
 class _Settings:
@@ -475,8 +486,8 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
                 patch.object(app_module, "_list_can_interfaces", return_value=[]),
                 patch.object(
                     app_module,
-                    "_attached_configured_hub_profiles",
-                    return_value={"axol", "mantis"},
+                    "_attached_hub_state",
+                    return_value=_hub_state({"axol", "mantis"}),
                 ),
             ):
                 async with httpx.AsyncClient(
@@ -551,6 +562,18 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
                 require_both=False,
                 configured_usb_present=True,
                 profile_channels=("default-left", "default-right"),
+            )["present"]
+        )
+        self.assertFalse(
+            app_module._can_profile_presence(
+                [
+                    {"name": app_module.CAN_MANTIS_LEFT, "up": True},
+                    {"name": app_module.CAN_MANTIS_RIGHT, "up": True},
+                ],
+                (app_module.CAN_MANTIS_LEFT, app_module.CAN_MANTIS_RIGHT),
+                require_both=False,
+                configured_usb_present=True,
+                profile_channels=(app_module.CAN_LEFT, app_module.CAN_RIGHT),
             )["present"]
         )
         self.assertTrue(
@@ -760,9 +783,7 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
                     {"name": "can-right", "up": True},
                 ],
             ),
-            patch.object(
-                app_module, "_attached_configured_hub_profiles", return_value=set()
-            ),
+            patch.object(app_module, "_attached_hub_state", return_value=_hub_state()),
         ):
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"
@@ -786,12 +807,17 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         robot = _Robot(channels=("can-left", "can-right"), profile="axol")
-        async with await self._client(_Manager(), _Runner(), robot) as client:
-            disconnected = await client.post("/api/robot/disconnect")
-            changed_target = await client.post(
-                "/api/robot/connect",
-                json={"profile": "mantis", "automatic": True},
-            )
+        with patch.object(
+            app_module,
+            "_attached_hub_state",
+            return_value=_hub_state({"mantis"}),
+        ):
+            async with await self._client(_Manager(), _Runner(), robot) as client:
+                disconnected = await client.post("/api/robot/disconnect")
+                changed_target = await client.post(
+                    "/api/robot/connect",
+                    json={"profile": "mantis", "automatic": True},
+                )
 
         self.assertEqual(disconnected.status_code, 200)
         self.assertEqual(changed_target.status_code, 200)

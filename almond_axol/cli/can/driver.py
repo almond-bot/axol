@@ -675,8 +675,15 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 def run(_args: object = None) -> None:
     """Ensure the gs_usb driver is available, building it when needed."""
+    # Imported lazily to avoid the module cycle (setup imports this module).
+    # The standalone driver command mutates the same live module/netdev
+    # topology as can.setup and hotplug bring-up, so it participates in their
+    # cross-process global lock too.
+    from .setup import _global_setup_lock
+
     try:
-        installed = ensure_driver()
+        with _global_setup_lock():
+            installed = ensure_driver()
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)

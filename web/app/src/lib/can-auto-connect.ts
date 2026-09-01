@@ -1,9 +1,49 @@
 import type {
+  CanDiscoveryState,
   CanProfileInventory,
   CanProfilePresence,
   HardwareProfile,
   RobotChannels,
+  RobotState,
 } from "./supervisor"
+
+/** Discovery must settle before any saved-profile auto-connect decision. */
+export function canDiscoveryBlocksAutoConnect(
+  discovery: CanDiscoveryState | null | undefined
+): boolean {
+  return (
+    discovery?.status === "needed" ||
+    discovery?.status === "running" ||
+    discovery?.status === "error"
+  )
+}
+
+/**
+ * Start discovery only from one coherent idle snapshot. A failed earlier
+ * connect may leave RobotLink in `error`; the backend retries disconnect and
+ * independently proves the link is fully released before touching setup.
+ * It also repeats the ownership checks and single-flights requests from tabs.
+ */
+export function shouldStartCanDiscovery(
+  discovery: CanDiscoveryState | null | undefined,
+  robotState: RobotState | undefined,
+  pollStateKnown: boolean,
+  hardwareIdle: boolean
+): boolean {
+  return (
+    discovery?.status === "needed" &&
+    (robotState === "disconnected" || robotState === "error") &&
+    pollStateKnown &&
+    hardwareIdle
+  )
+}
+
+/** One automatic request per server-owned unresolved-hardware generation. */
+export function canDiscoveryAttemptSignature(
+  discovery: CanDiscoveryState | null | undefined
+): string | null {
+  return discovery?.status === "needed" ? String(discovery.generation) : null
+}
 
 /**
  * Pick the one idle telemetry profile that should be connected automatically.

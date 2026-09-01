@@ -3,7 +3,9 @@ import { cn } from "@/lib/utils"
 import {
   OPERATIONS,
   cameraCount,
+  canDiscoveryRequestCanRetry,
   detectCameras,
+  discoverCanHardware,
   fetchCanInterfaces,
   fetchCommands,
   fetchInfo,
@@ -32,6 +34,8 @@ import {
   useSessionLogs,
   type CameraDevice,
   type CameraSpec,
+  type CanDiscoveryState,
+  type CanInterfaceInventory,
   type CanProfileInventory,
   type CommandSpec,
   type FormValue,
@@ -52,8 +56,11 @@ import {
   autoConnectPollStateKnown,
   autoConnectRetryDelay,
   autoConnectSignature,
+  canDiscoveryAttemptSignature,
+  canDiscoveryBlocksAutoConnect,
   chooseAutoConnectTarget,
   nextAutoConnectAttempt,
+  shouldStartCanDiscovery,
 } from "@/lib/can-auto-connect"
 import { InstallerMigrationBanner, UpdateBanner } from "@/components/update-banner"
 import { VersionMismatchBanner } from "@/components/version-mismatch-banner"
@@ -164,9 +171,24 @@ export default function ControlPanel() {
     []
   )
   const [canProfiles, setCanProfiles] = useState<CanProfileInventory | null>(null)
+  const [canDiscovery, setCanDiscovery] = useState<CanDiscoveryState | null>(null)
+  // The backend owns the real single-flight. This per-tab latch prevents the
+  // 2s inventory poll from sending duplicate requests for one hardware epoch.
+  const automaticCanDiscoveryAttemptsRef = useRef(new Set<string>())
+  const canDiscoveryNoticesRef = useRef(new Set<string>())
   // A successful response without profile summaries identifies an older host;
   // retain its historical selected-profile auto-connect behavior.
   const [legacyCanInventory, setLegacyCanInventory] = useState(false)
+  const installCanInventory = useCallback((inventory: CanInterfaceInventory) => {
+    setCanDiscovery(inventory.discovery ?? null)
+    if (inventory.profiles) {
+      setCanProfiles(inventory.profiles)
+      setLegacyCanInventory(false)
+    } else {
+      setCanProfiles(null)
+      setLegacyCanInventory(true)
+    }
+  }, [])
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
   const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
@@ -300,7 +322,10 @@ export default function ControlPanel() {
       setRobot(null)
       setRobotBusy(false)
       setCanProfiles(null)
+      setCanDiscovery(null)
       setLegacyCanInventory(false)
+      automaticCanDiscoveryAttemptsRef.current.clear()
+      canDiscoveryNoticesRef.current.clear()
       setUsb(null)
       setUsbBusy(false)
       setSession(null)
@@ -422,24 +447,20 @@ export default function ControlPanel() {
         .then((inventory) => {
           if (!active) return
           canInventoryKnownRef.current = true
-          if (inventory.profiles) {
-            setCanProfiles(inventory.profiles)
-            setLegacyCanInventory(false)
-          } else {
-            setCanProfiles(null)
-            setLegacyCanInventory(true)
-          }
+          installCanInventory(inventory)
         })
         .catch((error) => {
           if (!active) return
           if (String(error).includes("HTTP 404")) {
             canInventoryKnownRef.current = true
             setCanProfiles(null)
+            setCanDiscovery(null)
             setLegacyCanInventory(true)
             return
           }
           canInventoryKnownRef.current = false
           setCanProfiles(null)
+          setCanDiscovery(null)
           setLegacyCanInventory(false)
         })
       fetchUsbStatus()
@@ -454,7 +475,7 @@ export default function ControlPanel() {
       active = false
       clearInterval(t)
     }
-  }, [conn.state])
+  }, [conn.state, installCanInventory])
 
   useEffect(() => {
     if (conn.state !== "ok") {
@@ -612,6 +633,7 @@ export default function ControlPanel() {
     setHostInfo(null)
     setRobot(null)
     setCanProfiles(null)
+    setCanDiscovery(null)
     setLegacyCanInventory(false)
     setUsb(null)
     setUsbBusy(false)
@@ -635,6 +657,8 @@ export default function ControlPanel() {
     robotStatusKnownRef.current = false
     canInventoryKnownRef.current = false
     sessionInventoryKnownRef.current = false
+    automaticCanDiscoveryAttemptsRef.current.clear()
+    canDiscoveryNoticesRef.current.clear()
     resetAutoRobotRetry()
     manualRobotOverrideRef.current = false
     previousDesiredProfileRef.current = null
@@ -847,6 +871,84 @@ export default function ControlPanel() {
   // Reason shown in the banner; capitalized clause, no trailing period.
   const updateBusyReason = isLive ? "Stop the running operation" : "The server is busy"
 
+  // A fresh Axol/Mantis hub initially appears only as anonymous canX devices.
+  // Ask the server to probe and persist its role before the ordinary profile
+  // chooser runs. The server is the cross-tab single-flight authority; this
+  // latch merely keeps one tab's 2s poll from duplicating the request.
+  useEffect(() => {
+    if (conn.state !== "ok" || !canDiscovery) return
+    if (canDiscovery.status === "ready" && canDiscovery.candidateCount === 0) {
+      automaticCanDiscoveryAttemptsRef.current.clear()
+      return
+    }
+    const signature = canDiscoveryAttemptSignature(canDiscovery)
+    const idle = !hostBusy && !activeCommandSession && !robotBusy
+    if (
+      signature === null ||
+      !shouldStartCanDiscovery(canDiscovery, robot?.state, autoRobotPollStateKnown(), idle)
+    )
+      return
+
+    const hostGeneration = connectionGenerationRef.current
+    const attemptKey = `${hostGeneration}:${robotStatusRecoveryEpochRef.current}:${signature}`
+    if (automaticCanDiscoveryAttemptsRef.current.has(attemptKey)) return
+    automaticCanDiscoveryAttemptsRef.current.add(attemptKey)
+
+    void discoverCanHardware()
+      .then((inventory) => {
+        if (!autoRobotMountedRef.current || hostGeneration !== connectionGenerationRef.current)
+          return
+        installCanInventory(inventory)
+      })
+      .catch((error) => {
+        if (!autoRobotMountedRef.current || hostGeneration !== connectionGenerationRef.current)
+          return
+        if (canDiscoveryRequestCanRetry(error)) {
+          // Let the next coherent inventory poll retry after a session-launch
+          // race or transient transport/server failure. The backend remains
+          // the cross-tab single-flight and per-hardware rate-limit authority.
+          automaticCanDiscoveryAttemptsRef.current.delete(attemptKey)
+        }
+        const noticeKey = `request:${attemptKey}`
+        if (canDiscoveryNoticesRef.current.has(noticeKey)) return
+        canDiscoveryNoticesRef.current.add(noticeKey)
+        toast.error(`Automatic CAN discovery failed: ${String(error)}`)
+      })
+  }, [
+    activeCommandSession,
+    autoRobotPollStateKnown,
+    canDiscovery,
+    conn.state,
+    hostBusy,
+    installCanInventory,
+    robot?.state,
+    robotBusy,
+    toast,
+  ])
+
+  // Silent, ambiguous, or only partially identified hardware requires an
+  // operator decision. Surface the server's actionable result once per
+  // hardware generation, not every poll.
+  useEffect(() => {
+    if (
+      conn.state !== "ok" ||
+      !canDiscovery ||
+      (canDiscovery.status !== "partial" &&
+        canDiscovery.status !== "unidentified" &&
+        canDiscovery.status !== "error")
+    )
+      return
+    const noticeKey = `${connectionGenerationRef.current}:${robotStatusRecoveryEpochRef.current}:${canDiscovery.generation}:${canDiscovery.status}`
+    if (canDiscoveryNoticesRef.current.has(noticeKey)) return
+    canDiscoveryNoticesRef.current.add(noticeKey)
+    const fallback =
+      canDiscovery.status === "unidentified"
+        ? "Power the attached hardware, then unplug and reconnect its USB hub to retry, or run axol can.setup in a terminal."
+        : "Run axol can.setup in a terminal if the problem continues."
+    if (canDiscovery.status === "partial") toast.warning(canDiscovery.message ?? fallback)
+    else toast.error(canDiscovery.message ?? fallback)
+  }, [canDiscovery, conn.state, toast])
+
   // Pick from hardware actually present on the host. If only one configured
   // profile exists, connect it; if both exist, the selected operation wins.
   // Never guess arbitrary can0 devices or switch underneath a live operation.
@@ -869,6 +971,7 @@ export default function ControlPanel() {
 
     if (!robot || !sessionInventoryReady || (!canProfiles && !legacyCanInventory)) return
     if (
+      canDiscoveryBlocksAutoConnect(canDiscovery) ||
       isLive ||
       hardwareSessionBusy ||
       activeCommandSession ||
@@ -978,6 +1081,7 @@ export default function ControlPanel() {
     autoRobotPollStateKnown,
     autoRobotRetryRevision,
     canProfiles,
+    canDiscovery,
     conn.state,
     desiredHardwareProfile,
     hardwareSessionBusy,

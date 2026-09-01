@@ -19,6 +19,26 @@ class CanSetupAssignmentTest(unittest.TestCase):
     ) -> str | None:
         return "SERIAL" if profile is setup._AXOL_PROFILE else None
 
+    def test_global_setup_lock_is_reentrant_without_relocking(self) -> None:
+        with (
+            patch.object(setup, "_ensure_root_lock_file") as ensure,
+            patch.object(setup, "_open_root_lock_file", return_value=19) as open_lock,
+            patch.object(setup.fcntl, "flock") as flock,
+            patch.object(setup.os, "close") as close,
+        ):
+            with setup._global_setup_lock():
+                with setup._global_setup_lock():
+                    self.assertEqual(setup._LOCK_LOCAL.depth, 2)
+
+        ensure.assert_called_once_with(setup._GLOBAL_LOCK_FILE)
+        open_lock.assert_called_once_with(setup._GLOBAL_LOCK_FILE)
+        self.assertEqual(
+            flock.call_args_list,
+            [call(19, setup.fcntl.LOCK_EX), call(19, setup.fcntl.LOCK_UN)],
+        )
+        close.assert_called_once_with(19)
+        self.assertEqual(setup._LOCK_LOCAL.depth, 0)
+
     def test_setup_does_not_forget_an_unplugged_configured_hub(self) -> None:
         with (
             patch.object(setup, "_detect_serials", return_value=[]),
@@ -102,9 +122,11 @@ class CanSetupAssignmentTest(unittest.TestCase):
             ),
             patch.object(
                 setup,
-                "_attached_supported_usb_serials",
-                return_value={"AXOL"},
+                "_attached_supported_usb_devices",
+                return_value=(("1-1", "AXOL"),),
             ),
+            patch.object(setup, "_scan_adapters", return_value={}),
+            patch.object(setup, "_configured_named_serial", return_value=None),
         ):
             self.assertEqual(setup.attached_configured_hub_profiles(), {"axol"})
 
@@ -116,9 +138,11 @@ class CanSetupAssignmentTest(unittest.TestCase):
             ),
             patch.object(
                 setup,
-                "_attached_supported_usb_serials",
-                return_value={"SHARED"},
+                "_attached_supported_usb_devices",
+                return_value=(("1-1", "SHARED"),),
             ),
+            patch.object(setup, "_scan_adapters", return_value={}),
+            patch.object(setup, "_configured_named_serial", return_value=None),
         ):
             self.assertEqual(setup.attached_configured_hub_profiles(), set())
 
@@ -142,8 +166,22 @@ class CanSetupAssignmentTest(unittest.TestCase):
                 )
 
     def test_usb_bootstrap_waits_for_both_channels_of_exact_serial(self) -> None:
-        incomplete = {"SERIAL": {"vid": setup._VID, "pid": setup._PID, "dev_ids": {0}}}
-        complete = {"SERIAL": {"vid": setup._VID, "pid": setup._PID, "dev_ids": {0, 1}}}
+        incomplete = {
+            "SERIAL": {
+                "vid": setup._VID,
+                "pid": setup._PID,
+                "dev_ids": {0},
+                "interfaces": [("can0", 0)],
+            }
+        }
+        complete = {
+            "SERIAL": {
+                "vid": setup._VID,
+                "pid": setup._PID,
+                "dev_ids": {0, 1},
+                "interfaces": [("can0", 0), ("can1", 1)],
+            }
+        }
         with (
             patch.object(setup, "_scan_adapters", side_effect=[incomplete, complete]),
             patch.object(setup.time, "sleep") as sleep,
@@ -171,6 +209,9 @@ class CanSetupAssignmentTest(unittest.TestCase):
             return ["MANTIS"]
 
         with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
             patch.object(setup.driver, "ensure_driver", return_value=False),
             patch.object(
                 setup, "_attached_configured_hub_serials", return_value=configured
@@ -331,7 +372,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
             patch.object(setup, "_probe_axol_shoulder", return_value=False),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            self.assertIsNone(setup._identify_dual_adapter("SERIAL"))
+            self.assertEqual(setup._identify_dual_adapter("SERIAL"), "silent")
         self.assertEqual(bring_up.call_count, 3)
         self.assertEqual(
             [call.kwargs["force_cycle"] for call in bring_up.call_args_list],
@@ -341,6 +382,9 @@ class CanSetupAssignmentTest(unittest.TestCase):
     def test_paired_recovery_takes_both_channels_down_before_either_up(self) -> None:
         channels = [setup.CAN_LEFT, setup.CAN_RIGHT]
         with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
             patch.object(setup.Path, "exists", return_value=True),
             patch.object(setup, "run_root") as run_root,
             contextlib.redirect_stdout(io.StringIO()),
@@ -361,6 +405,10 @@ class CanSetupAssignmentTest(unittest.TestCase):
 
     def test_axol_rx_retry_does_not_reset_wheel_and_lift_buses_again(self) -> None:
         with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(setup._LOCK_LOCAL, "depth", 1, create=True),
             patch.object(setup.Path, "exists", return_value=True),
             patch.object(setup, "run_root") as run_root,
             patch.object(
@@ -374,7 +422,13 @@ class CanSetupAssignmentTest(unittest.TestCase):
             setup.bring_up_can(setup._AXOL_PROFILE)
 
         run_root.assert_called_once_with(
-            ["bash", str(setup._AXOL_PROFILE.cron_script)], check=True
+            [
+                "env",
+                f"{setup._GLOBAL_LOCK_ENV}=1",
+                "bash",
+                str(setup._AXOL_PROFILE.cron_script),
+            ],
+            check=True,
         )
         recover_pair.assert_called_once_with(
             [setup.CAN_LEFT, setup.CAN_RIGHT], force_cycle=True
@@ -392,6 +446,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
             return SimpleNamespace(stdout="")
 
         with (
+            patch.object(setup, "_ensure_root_lock_file"),
             patch.object(setup, "run_root", side_effect=run_root) as root,
             contextlib.redirect_stdout(io.StringIO()),
         ):
@@ -401,7 +456,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
             setup._MANTIS_PROFILE.cron_script,
             Path("/etc/almond-axol/can/startup_mantis.sh"),
         )
-        self.assertEqual(root.call_count, 2)
+        self.assertEqual(root.call_count, 5)
         self.assertEqual(
             root.call_args_list[0],
             unittest.mock.call(
@@ -424,7 +479,12 @@ class CanSetupAssignmentTest(unittest.TestCase):
             file_command[:7],
             ["install", "-o", "root", "-g", "root", "-m", "0755"],
         )
-        self.assertEqual(file_command[-1], str(setup._MANTIS_PROFILE.cron_script))
+        self.assertEqual(Path(file_command[-1]).parent, setup._CAN_DIR)
+        self.assertIn(".startup_mantis.sh.", Path(file_command[-1]).name)
+        self.assertEqual(
+            root.call_args_list[3].args[0][-1],
+            str(setup._MANTIS_PROFILE.cron_script),
+        )
         self.assertIn("can_mantis_l can_mantis_r", installed_script)
 
     def test_cron_migrates_exact_legacy_operator_script_to_privileged_path(
@@ -569,12 +629,13 @@ class CanSetupAssignmentTest(unittest.TestCase):
 
     def test_hotplug_unit_executes_only_privileged_script_path(self) -> None:
         with (
-            patch.object(setup, "run_root") as run_root,
+            patch.object(setup, "_publish_privileged_text") as publish,
+            patch.object(setup, "run_root"),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             setup._write_hotplug_unit(setup._MANTIS_PROFILE)
 
-        unit = run_root.call_args_list[0].kwargs["input_text"]
+        unit = publish.call_args.args[1]
         self.assertIn(
             "ExecStart=/bin/bash /etc/almond-axol/can/startup_mantis.sh",
             unit,
@@ -782,6 +843,9 @@ class CanSetupAssignmentTest(unittest.TestCase):
 
     def test_plain_run_migrates_recovered_mantis_out_of_axol_profile(self) -> None:
         with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
             patch.object(setup.driver, "ensure_driver", return_value=False),
             patch.object(
                 setup, "_configured_serial", side_effect=self._configured_axol_only
@@ -802,6 +866,9 @@ class CanSetupAssignmentTest(unittest.TestCase):
     def test_plain_run_clears_single_bus_pin_reclassified_as_mantis(self) -> None:
         configured_names = {setup.CAN_BASE: "SERIAL", setup.CAN_CHEST: None}
         with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
             patch.object(setup.driver, "ensure_driver", return_value=False),
             patch.object(setup, "_configured_serial", return_value=None),
             patch.object(
@@ -824,6 +891,9 @@ class CanSetupAssignmentTest(unittest.TestCase):
 
     def test_control_panel_can_recover_a_mantis_stale_pinned_as_axol(self) -> None:
         with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
             patch.object(setup.driver, "ensure_driver", return_value=False),
             patch.object(
                 setup, "_configured_serial", side_effect=self._configured_axol_only
@@ -847,6 +917,9 @@ class CanSetupAssignmentTest(unittest.TestCase):
             setup.CAN_CHEST: "CHEST",
         }
         with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
             patch.object(setup.driver, "ensure_driver", return_value=False),
             patch.object(setup, "_configured_serial", return_value=None),
             patch.object(setup, "_detect_serials", return_value=["SERIAL"]),
@@ -897,6 +970,9 @@ class CanSetupAssignmentTest(unittest.TestCase):
         stderr = io.StringIO()
         with (
             patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(
                 setup.driver, "ensure_driver", side_effect=RuntimeError("test failure")
             ),
             contextlib.redirect_stderr(stderr),
@@ -908,6 +984,19 @@ class CanSetupAssignmentTest(unittest.TestCase):
 
 
 class CanDriverIdentityTest(unittest.TestCase):
+    def test_standalone_driver_command_shares_setup_global_lock(self) -> None:
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ) as global_lock,
+            patch.object(driver, "ensure_driver", return_value=False) as ensure_driver,
+            redirect_stdout(io.StringIO()),
+        ):
+            driver.run()
+
+        global_lock.assert_called_once_with()
+        ensure_driver.assert_called_once_with()
+
     def test_install_requires_kmod_tools_before_mutating_driver(self) -> None:
         with (
             patch.object(driver, "_find_depmod", return_value=None),
@@ -1563,6 +1652,14 @@ class RenameInterfacesTest(unittest.TestCase):
             with (
                 patch.object(setup, "Path", side_effect=make_path),
                 patch.object(setup.subprocess, "run", side_effect=udev_info),
+                patch.object(
+                    setup,
+                    "_interface_usb_device_identity",
+                    side_effect=lambda path: (
+                        f"usb-{current[Path(path).name][0]}",
+                        current[Path(path).name][0],
+                    ),
+                ),
                 patch.object(setup, "run_root", side_effect=run_root),
                 redirect_stdout(io.StringIO()),
             ):
@@ -1676,9 +1773,43 @@ class RenameInterfacesTest(unittest.TestCase):
             with (
                 patch.object(setup, "Path", side_effect=make_path),
                 patch.object(setup.subprocess, "run", side_effect=udev_info),
+                patch.object(
+                    setup,
+                    "_interface_usb_device_identity",
+                    return_value=("usb-wheel", "wheel"),
+                ),
                 patch.object(setup, "run_root") as run_root,
                 redirect_stdout(io.StringIO()),
                 self.assertRaisesRegex(RuntimeError, "unrelated network interface"),
+            ):
+                setup._rename_interfaces(None, "wheel", None)
+            run_root.assert_not_called()
+
+    def test_duplicate_target_channel_fails_before_link_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            net_dir = Path(directory)
+            (net_dir / "can0").touch()
+            (net_dir / "can1").touch()
+
+            def make_path(value: str) -> Path:
+                return net_dir if value == "/sys/class/net" else Path(value)
+
+            def udev_info(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(
+                    stdout='ATTRS{serial}=="wheel"\nATTR{dev_id}=="0x0"\n'
+                )
+
+            with (
+                patch.object(setup, "Path", side_effect=make_path),
+                patch.object(setup.subprocess, "run", side_effect=udev_info),
+                patch.object(
+                    setup,
+                    "_interface_usb_device_identity",
+                    side_effect=[("usb-1", "wheel"), ("usb-2", "wheel")],
+                ),
+                patch.object(setup, "run_root") as run_root,
+                redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(RuntimeError, "same target serial/channel"),
             ):
                 setup._rename_interfaces(None, "wheel", None)
             run_root.assert_not_called()

@@ -5,17 +5,59 @@ import {
   autoConnectPollStateKnown,
   autoConnectRetryDelay,
   autoConnectSignature,
+  canDiscoveryAttemptSignature,
+  canDiscoveryBlocksAutoConnect,
   chooseAutoConnectProfile,
   chooseAutoConnectTarget,
   chooseDiagnosticsAutoConnectProfile,
   chooseUnambiguousAutoConnectProfile,
   nextAutoConnectAttempt,
+  shouldStartCanDiscovery,
 } from "../src/lib/can-auto-connect.ts"
-import { robotConnect, setServerBase } from "../src/lib/supervisor.ts"
+import {
+  ApiRequestError,
+  canDiscoveryRequestCanRetry,
+  discoverCanHardware,
+  robotConnect,
+  setServerBase,
+} from "../src/lib/supervisor.ts"
 
 function presence(left, right, present, up = present, automaticConnectSuppressed = false) {
   return { channels: { left, right }, present, up, automaticConnectSuppressed }
 }
+
+function discovery(status, generation = 4) {
+  return { status, candidateCount: 1, generation }
+}
+
+test("CAN discovery blocks auto-connect while pending, running, or uncertain after error", () => {
+  assert.equal(canDiscoveryBlocksAutoConnect(undefined), false)
+  assert.equal(canDiscoveryBlocksAutoConnect(discovery("needed")), true)
+  assert.equal(canDiscoveryBlocksAutoConnect(discovery("running")), true)
+  assert.equal(canDiscoveryBlocksAutoConnect(discovery("error")), true)
+  for (const status of ["ready", "configured", "partial", "unidentified"]) {
+    assert.equal(canDiscoveryBlocksAutoConnect(discovery(status)), false)
+  }
+})
+
+test("CAN discovery starts only from a known, idle, releasable link snapshot", () => {
+  const needed = discovery("needed")
+  assert.equal(shouldStartCanDiscovery(needed, "disconnected", true, true), true)
+  assert.equal(shouldStartCanDiscovery(needed, "error", true, true), true)
+  assert.equal(shouldStartCanDiscovery(needed, "connected", true, true), false)
+  assert.equal(shouldStartCanDiscovery(needed, "disconnected", false, true), false)
+  assert.equal(shouldStartCanDiscovery(needed, "disconnected", true, false), false)
+  assert.equal(
+    shouldStartCanDiscovery(discovery("unidentified"), "disconnected", true, true),
+    false
+  )
+})
+
+test("CAN discovery latches by the opaque server hardware generation", () => {
+  assert.equal(canDiscoveryAttemptSignature(discovery("needed", 17)), "17")
+  assert.equal(canDiscoveryAttemptSignature(discovery("running", 17)), null)
+  assert.equal(canDiscoveryAttemptSignature(undefined), null)
+})
 
 test("chooses the only configured hardware profile that is present", () => {
   const profiles = {
@@ -183,6 +225,29 @@ test("unknown inventory or session state never consumes an automatic retry", () 
   const priorAttempts = 1
   assert.equal(nextAutoConnectAttempt(priorAttempts, false), null)
   assert.equal(nextAutoConnectAttempt(priorAttempts, true), 2)
+})
+
+test("CAN discovery uses the dedicated non-interactive backend action", async (context) => {
+  setServerBase("")
+  const inventory = {
+    interfaces: [],
+    profiles: {},
+    discovery: discovery("configured", 8),
+  }
+  const fetchMock = context.mock.method(globalThis, "fetch", async () => Response.json(inventory))
+
+  assert.deepEqual(await discoverCanHardware(), inventory)
+  assert.equal(fetchMock.mock.callCount(), 1)
+  assert.equal(fetchMock.mock.calls[0].arguments[0], "/api/can/discover")
+  assert.deepEqual(fetchMock.mock.calls[0].arguments[1], { method: "POST" })
+})
+
+test("CAN discovery retries only transient request failures", () => {
+  assert.equal(canDiscoveryRequestCanRetry(new ApiRequestError("busy", 409)), true)
+  assert.equal(canDiscoveryRequestCanRetry(new ApiRequestError("failed", 500)), true)
+  assert.equal(canDiscoveryRequestCanRetry(new TypeError("network failed")), true)
+  assert.equal(canDiscoveryRequestCanRetry(new ApiRequestError("root required", 403)), false)
+  assert.equal(canDiscoveryRequestCanRetry(new Error("invalid response")), false)
 })
 
 test("robot connect identifies automatic and manual requests to the backend", async (context) => {

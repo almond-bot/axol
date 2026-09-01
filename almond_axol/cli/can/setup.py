@@ -48,15 +48,24 @@ udev rule files, startup scripts, and hotplug units, so a machine can have both
 configured at once.
 """
 
+import contextlib
+import fcntl
+import os
 import re
+import secrets
 import socket
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from ...constants import (
     CAN_BASE,
@@ -90,6 +99,20 @@ _CAN_DIR = CAN_BRINGUP_SCRIPT.parent
 _CRON_SCRIPT = CAN_BRINGUP_SCRIPT
 _LEGACY_CAN_DIRS = {almond_path("can"), Path("/root/.almond/can")}
 
+# All persistent CAN mutation and every generated hotplug bring-up share this
+# fixed lock before taking a profile lock.  Keeping the files under the
+# root-owned configuration directory avoids following predictable lock names
+# from the world-writable /run/lock directory.  The files themselves are 0644:
+# interactive non-root setup can take a read-only flock after sudo creates
+# them, while only root can replace or modify their paths.
+_GLOBAL_LOCK_FILE = _CAN_DIR / "setup.lock"
+_GLOBAL_LOCK_ENV = "AXOL_CAN_GLOBAL_LOCK_HELD"
+_LOCK_LOCAL = threading.local()
+
+_USB_SERIAL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}\Z")
+
+DualHubIdentity = Literal["axol", "mantis", "silent", "conflict"]
+
 
 @dataclass(frozen=True)
 class _Profile:
@@ -117,6 +140,10 @@ class _Profile:
     @property
     def hotplug_unit_file(self) -> Path:
         return Path("/etc/systemd/system") / self.hotplug_unit
+
+    @property
+    def lock_file(self) -> Path:
+        return _CAN_DIR / self.lock_name
 
 
 _AXOL_PROFILE = _Profile(
@@ -162,9 +189,144 @@ _RP1_QUIRK_UNIT_FILE = Path("/etc/systemd/system") / _RP1_QUIRK_UNIT
 _RP1_GUCTL1_REGS = ("0x1f0020c11c", "0x1f0030c11c")
 
 
+@dataclass(frozen=True)
+class AttachedHubState:
+    """Read-only snapshot used by the hosted CAN discovery API.
+
+    Physical identities and serials deliberately stay in the backend.  The API
+    exposes only their count plus an opaque generation maintained by the serve
+    process.
+    """
+
+    configured_profiles: frozenset[str]
+    candidate_identities: tuple[tuple[str, str], ...]
+    validation_identity: tuple[tuple[str, ...], ...]
+
+    @property
+    def candidate_count(self) -> int:
+        return len(self.candidate_identities)
+
+
+@dataclass(frozen=True)
+class HeadlessHubSetupResult:
+    """Outcome of one noninteractive, positive-identity setup pass."""
+
+    status: Literal["ready", "configured", "partial", "unidentified"]
+    configured_count: int
+    message: str | None = None
+
+
 def _die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def _validated_usb_serial(serial: str) -> str:
+    """Return one serial safe for generated udev syntax and comments.
+
+    USB strings are supplied by attached firmware.  Never interpolate quotes,
+    escapes, substitutions, control characters, or unbounded text into a
+    root-owned rule file merely because a device reported them.
+    """
+    if not isinstance(serial, str) or _USB_SERIAL_RE.fullmatch(serial) is None:
+        raise ValueError("CAN adapter serial is not a supported safe ASCII identifier")
+    return serial
+
+
+def _validate_root_directory(path: Path) -> None:
+    """Require every existing component of ``path`` to be root controlled."""
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise RuntimeError(f"CAN lock directory is not root controlled: {current}")
+
+
+def _open_root_lock_file(path: Path) -> int:
+    """Open and verify a fixed root-owned regular lock file without links."""
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise RuntimeError(f"CAN lock file is not root controlled: {path}")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _ensure_root_lock_file(path: Path) -> None:
+    """Create a persistent root-controlled lock file if it does not exist."""
+    _validate_root_directory(path.parent)
+    try:
+        descriptor = _open_root_lock_file(path)
+    except FileNotFoundError:
+        # The nearest existing ancestor was proven root-controlled above, so an
+        # unprivileged process cannot race these fixed descendants into links.
+        run_root(
+            [
+                "install",
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                "0755",
+                str(path.parent),
+            ],
+            check=True,
+        )
+        _validate_root_directory(path.parent)
+        run_root(["touch", str(path)], check=True)
+        run_root(["chown", "root:root", str(path)], check=True)
+        run_root(["chmod", "0644", str(path)], check=True)
+        descriptor = _open_root_lock_file(path)
+    os.close(descriptor)
+
+
+@contextlib.contextmanager
+def _global_setup_lock() -> Iterator[None]:
+    """Serialize every persistent setup and hub bring-up across processes.
+
+    The context is re-entrant within one thread.  This lets ``ensure_setup``
+    hold the global lock across all publication steps while ``bring_up_can``
+    takes the same logical lock and then the profile lock without deadlocking.
+    """
+    depth = int(getattr(_LOCK_LOCAL, "depth", 0))
+    if depth:
+        _LOCK_LOCAL.depth = depth + 1
+        try:
+            yield
+        finally:
+            _LOCK_LOCAL.depth -= 1
+        return
+
+    _ensure_root_lock_file(_GLOBAL_LOCK_FILE)
+    descriptor = _open_root_lock_file(_GLOBAL_LOCK_FILE)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _LOCK_LOCAL.depth = 1
+        yield
+    finally:
+        _LOCK_LOCAL.depth = 0
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _udev_attr(info: str, attr: str) -> str:
@@ -173,6 +335,29 @@ def _udev_attr(info: str, attr: str) -> str:
         (line.split('"')[1] for line in info.splitlines() if attr in line),
         "",
     )
+
+
+def _interface_usb_device_identity(iface_path: Path) -> tuple[str, str] | None:
+    """Physical USB parent ``(sysfs name, safe serial)`` for a netdev."""
+    try:
+        resolved = iface_path.resolve(strict=True)
+    except OSError:
+        return None
+    for device in (resolved, *resolved.parents):
+        try:
+            vendor = device.joinpath("idVendor").read_text().strip().lower()
+            product = device.joinpath("idProduct").read_text().strip().lower()
+            serial = device.joinpath("serial").read_text().strip()
+        except OSError:
+            continue
+        if not vendor or not product:
+            continue
+        try:
+            serial = _validated_usb_serial(serial)
+        except ValueError:
+            return None
+        return device.name, serial
+    return None
 
 
 def _scan_adapters() -> dict[str, dict]:
@@ -197,15 +382,91 @@ def _scan_adapters() -> dict[str, dict]:
         if 'DRIVERS=="gs_usb"' not in info and (vid, pid) != (_VID, _PID):
             continue
         serial = _udev_attr(info, "ATTRS{serial}")
-        if not serial:
+        try:
+            serial = _validated_usb_serial(serial)
+        except ValueError:
             continue
         try:
             dev_id = int(_udev_attr(info, "ATTR{dev_id}"), 16)
         except ValueError:
             continue
-        entry = adapters.setdefault(serial, {"vid": vid, "pid": pid, "dev_ids": set()})
+        entry = adapters.setdefault(
+            serial,
+            {
+                "vid": vid,
+                "pid": pid,
+                "dev_ids": set(),
+                "interfaces": [],
+                "physical_identities": [],
+            },
+        )
         entry["dev_ids"].add(dev_id)
+        entry["interfaces"].append((iface_path.name, dev_id))
+        physical = _interface_usb_device_identity(iface_path)
+        entry["physical_identities"].append(
+            (iface_path.name, dev_id, physical[0])
+            if physical is not None and physical[1] == serial
+            else (iface_path.name, dev_id, None)
+        )
     return adapters
+
+
+def _adapter_channel_records(adapter: dict) -> tuple[tuple[str, int], ...]:
+    """Validated ``(netdev, dev_id)`` records retained by one adapter scan."""
+    raw = adapter.get("interfaces")
+    if not isinstance(raw, list):
+        return ()
+    records: list[tuple[str, int]] = []
+    for record in raw:
+        if (
+            not isinstance(record, tuple)
+            or len(record) != 2
+            or not isinstance(record[0], str)
+            or not isinstance(record[1], int)
+        ):
+            return ()
+        records.append(record)
+    if len({name for name, _dev_id in records}) != len(records):
+        return ()
+    return tuple(sorted(records, key=lambda item: (item[1], item[0])))
+
+
+def _adapter_has_exact_channels(adapter: dict, expected: tuple[int, ...]) -> bool:
+    """True only for one non-duplicated netdev record per expected channel."""
+    records = _adapter_channel_records(adapter)
+    observed = tuple(dev_id for _name, dev_id in records)
+    return observed == expected and set(adapter.get("dev_ids", set())) == set(expected)
+
+
+def _adapter_belongs_to_physical_device(adapter: dict, identity: str) -> bool:
+    """True when every retained netdev descends from one supported USB node."""
+    sysfs_name = identity.partition("@dev")[0]
+    physical = adapter.get("physical_identities")
+    records = _adapter_channel_records(adapter)
+    if not isinstance(physical, list) or len(physical) != len(records):
+        return False
+    normalized = sorted(physical, key=lambda item: (item[1], item[0]))
+    return all(
+        isinstance(record, tuple) and len(record) == 3 and record[2] == sysfs_name
+        for record in normalized
+    )
+
+
+def _adapter_has_one_physical_device(adapter: dict) -> bool:
+    """True when all retained channels share one known physical USB parent."""
+    physical = adapter.get("physical_identities")
+    records = _adapter_channel_records(adapter)
+    if not isinstance(physical, list) or len(physical) != len(records):
+        return False
+    identities = {
+        record[2]
+        for record in physical
+        if isinstance(record, tuple) and len(record) == 3 and record[2] is not None
+    }
+    return len(identities) == 1 and all(
+        isinstance(record, tuple) and len(record) == 3 and record[2] in identities
+        for record in physical
+    )
 
 
 def _detect_serials() -> list[str]:
@@ -217,19 +478,35 @@ def _detect_serials() -> list[str]:
     never be either, so they are excluded rather than left to make the scan
     ambiguous.
     """
+    physical = _attached_supported_usb_devices()
+    physical_counts = Counter(serial for _identity, serial in physical)
+    physical_by_serial = {serial: identity for identity, serial in physical}
     return [
         serial
         for serial, a in _scan_adapters().items()
-        if len(a["dev_ids"]) >= 2 and (a["vid"], a["pid"]) == (_VID, _PID)
+        if physical_counts[serial] == 1
+        and _adapter_has_exact_channels(a, (0, 1))
+        and _adapter_belongs_to_physical_device(a, physical_by_serial[serial])
+        and (a["vid"], a["pid"]) == (_VID, _PID)
     ]
 
 
 def _detect_single_serials(exclude: set[str]) -> list[str]:
     """Serials of attached single-channel adapters — wheel/chest bus candidates."""
+    physical = _attached_supported_usb_devices()
+    physical_counts = Counter(serial for _identity, serial in physical)
+    physical_by_serial = {serial: identity for identity, serial in physical}
     return [
         serial
         for serial, a in _scan_adapters().items()
-        if len(a["dev_ids"]) == 1 and serial not in exclude
+        if physical_counts[serial] <= 1
+        and _adapter_has_exact_channels(a, (0,))
+        and (
+            _adapter_belongs_to_physical_device(a, physical_by_serial[serial])
+            if physical_counts[serial] == 1
+            else _adapter_has_one_physical_device(a)
+        )
+        and serial not in exclude
     ]
 
 
@@ -242,7 +519,11 @@ def _serials_in_rules(rules_file: Path) -> set[str]:
     serials: set[str] = set()
     for line in content.splitlines():
         if 'ATTRS{serial}=="' in line:
-            serials.add(line.split('ATTRS{serial}=="')[1].split('"')[0])
+            serial = line.split('ATTRS{serial}=="')[1].split('"')[0]
+            try:
+                serials.add(_validated_usb_serial(serial))
+            except ValueError:
+                continue
     return serials
 
 
@@ -256,10 +537,16 @@ def _serial_of_interface(iface: str) -> str | None:
         capture_output=True,
         text=True,
     ).stdout
-    return next(
+    serial = next(
         (line.split('"')[1] for line in info.splitlines() if "ATTRS{serial}" in line),
         None,
     )
+    if serial is None:
+        return None
+    try:
+        return _validated_usb_serial(serial)
+    except ValueError:
+        return None
 
 
 def _rules_serial_for(name: str, rules_file: Path | None = None) -> str | None:
@@ -271,7 +558,12 @@ def _rules_serial_for(name: str, rules_file: Path | None = None) -> str | None:
     match = re.search(
         r'ATTRS\{serial\}=="([^"]+)"[^\n]*NAME="' + re.escape(name) + '"', rules
     )
-    return match.group(1) if match else None
+    if match is None:
+        return None
+    try:
+        return _validated_usb_serial(match.group(1))
+    except ValueError:
+        return None
 
 
 def _dual_channel_rule_serial(
@@ -308,7 +600,10 @@ def _dual_channel_rule_serial(
                 matches.append(match.group(1))
         if len(matches) != 1:
             return None
-        serials.append(matches[0])
+        try:
+            serials.append(_validated_usb_serial(matches[0]))
+        except ValueError:
+            return None
     return serials[0] if serials[0] == serials[1] else None
 
 
@@ -329,9 +624,15 @@ def _configured_profile_usb_serials() -> dict[str, str | None]:
     return {"axol": axol, "mantis": mantis}
 
 
-def _attached_supported_usb_serials() -> set[str]:
-    """Attached supported hub serials, including before ``gs_usb`` is loaded."""
-    serials: set[str] = set()
+def _attached_supported_usb_devices() -> tuple[tuple[str, str], ...]:
+    """Attached ``(physical sysfs identity, serial)`` hub candidates.
+
+    Keep physical identities until role assignment: two malicious or broken
+    devices reporting the same serial must not collapse into one trusted hub.
+    The 1d50:606f USB identity is visible before ``gs_usb`` is loaded, although
+    only the driver-created netdev topology can later prove it has two channels.
+    """
+    devices: list[tuple[str, str]] = []
     for vendor_file in _USB_DEVICES.glob("*/idVendor"):
         device = vendor_file.parent
         try:
@@ -340,15 +641,32 @@ def _attached_supported_usb_serials() -> set[str]:
             serial = device.joinpath("serial").read_text().strip()
         except OSError:
             continue
-        if (vendor, product) == (_VID, _PID) and serial:
-            serials.add(serial)
-    return serials
+        if (vendor, product) != (_VID, _PID):
+            continue
+        try:
+            serial = _validated_usb_serial(serial)
+        except ValueError:
+            continue
+        try:
+            devnum = device.joinpath("devnum").read_text().strip()
+        except OSError:
+            devnum = ""
+        identity = f"{device.name}@dev{devnum}" if devnum.isdecimal() else device.name
+        devices.append((identity, serial))
+    return tuple(sorted(devices))
+
+
+def _attached_supported_usb_serials() -> set[str]:
+    """Unique serial values of attached supported USB candidates."""
+    return {serial for _identity, serial in _attached_supported_usb_devices()}
 
 
 def _attached_configured_hub_serials() -> dict[str, str]:
     """Exact persisted profile claims whose supported USB device is attached."""
     claims = _configured_profile_usb_serials()
-    attached = _attached_supported_usb_serials()
+    attached_counts = Counter(
+        serial for _identity, serial in _attached_supported_usb_devices()
+    )
     conflicts = {
         serial
         for serial in claims.values()
@@ -357,8 +675,146 @@ def _attached_configured_hub_serials() -> dict[str, str]:
     return {
         profile: serial
         for profile, serial in claims.items()
-        if serial is not None and serial in attached and serial not in conflicts
+        if serial is not None
+        and attached_counts[serial] == 1
+        and serial not in conflicts
     }
+
+
+def attached_hub_state() -> AttachedHubState:
+    """Atomic read-only USB snapshot for hosted discovery and inventory.
+
+    Candidates are physical devices not covered by one exact, non-conflicting
+    generated profile claim. Their identities remain process-local and are
+    used only to advance the API's opaque generation counter.
+    """
+    devices = _attached_supported_usb_devices()
+    claims = _configured_profile_usb_serials()
+    single_claim_values = (
+        _configured_named_serial(_CAN_B),
+        _configured_named_serial(_CAN_C),
+    )
+    single_claims = {serial for serial in single_claim_values if serial is not None}
+    adapters = _scan_adapters()
+    physical_by_serial = {serial: identity for identity, serial in devices}
+    profile_names = {
+        "axol": (_AXOL_PROFILE.left, _AXOL_PROFILE.right),
+        "mantis": (_MANTIS_PROFILE.left, _MANTIS_PROFILE.right),
+    }
+    live_name_owners = {
+        name: serial
+        for serial, adapter in adapters.items()
+        for name, _dev_id in _adapter_channel_records(adapter)
+    }
+    serial_counts = Counter(serial for _identity, serial in devices)
+    claim_counts = Counter(
+        serial
+        for serial in (*claims.values(), *single_claim_values)
+        if serial is not None
+    )
+    trusted = {
+        profile: serial
+        for profile, serial in claims.items()
+        if serial is not None
+        and serial_counts[serial] == 1
+        and claim_counts[serial] == 1
+        and (
+            (
+                serial not in adapters
+                and not any(name in live_name_owners for name in profile_names[profile])
+            )
+            or (
+                serial in adapters
+                and _adapter_has_exact_channels(adapters[serial], (0, 1))
+                and _adapter_belongs_to_physical_device(
+                    adapters[serial], physical_by_serial[serial]
+                )
+                and tuple(
+                    name for name, _dev_id in _adapter_channel_records(adapters[serial])
+                )
+                == profile_names[profile]
+            )
+        )
+    }
+    claimed_serials = set(trusted.values())
+    candidates: list[tuple[str, str]] = []
+    for identity in devices:
+        serial = identity[1]
+        # Duplicate physical devices reporting one serial can never inherit a
+        # persisted role. Keep every physical identity unresolved so the
+        # headless writer refuses to collapse them into one udev match.
+        if serial_counts[serial] != 1:
+            candidates.append(identity)
+            continue
+        if serial in claimed_serials:
+            continue
+
+        adapter = adapters.get(serial)
+        if adapter is None:
+            # Before gs_usb has created netdevs the supported USB identity is
+            # the only signal available. An explicit wheel/chest pin remains
+            # authoritative; a genuinely raw hub still starts discovery.
+            if serial not in single_claims or claim_counts[serial] != 1:
+                candidates.append(identity)
+            continue
+        if _adapter_has_exact_channels(
+            adapter, (0, 1)
+        ) and _adapter_belongs_to_physical_device(adapter, physical_by_serial[serial]):
+            # A live dual-channel topology overrides a stale single-bus pin;
+            # positive probing will decide whether it is Axol or Mantis.
+            candidates.append(identity)
+        elif serial in {value for value in claims.values() if value is not None}:
+            # A profile claiming a dual hub cannot be trusted when that exact
+            # attached serial now enumerates as a single/incomplete device or
+            # its channels descend from another USB parent.
+            candidates.append(identity)
+        elif not (
+            _adapter_has_exact_channels(adapter, (0,))
+            and _adapter_belongs_to_physical_device(adapter, physical_by_serial[serial])
+        ):
+            # More than two channels, duplicated IDs, or channels from another
+            # same-serial USB parent remain visibly unresolved. An exact raw
+            # single channel is a legitimate wheel/chest-class adapter and is
+            # intentionally not treated as a hub candidate.
+            candidates.append(identity)
+
+    claim_signature = tuple(
+        sorted(
+            (profile, serial or "")
+            for profile, serial in {
+                **claims,
+                "wheels": single_claim_values[0],
+                "chest": single_claim_values[1],
+            }.items()
+        )
+    )
+    topology_signature = tuple(
+        sorted(
+            (
+                serial,
+                ",".join(
+                    f"{name}:{dev_id}:{physical or ''}"
+                    for name, dev_id, physical in sorted(
+                        adapter.get("physical_identities", [])
+                    )
+                ),
+            )
+            for serial, adapter in adapters.items()
+            if serial_counts[serial]
+        )
+    )
+    validation_identity: tuple[tuple[str, ...], ...] = ()
+    if candidates or trusted:
+        validation_identity = (
+            tuple(("usb", identity, serial) for identity, serial in devices)
+            + tuple(("claim", *record) for record in claim_signature)
+            + tuple(("topology", *record) for record in topology_signature)
+        )
+    return AttachedHubState(
+        configured_profiles=frozenset(trusted),
+        candidate_identities=tuple(candidates),
+        validation_identity=validation_identity,
+    )
 
 
 def attached_configured_hub_profiles() -> set[str]:
@@ -368,7 +824,7 @@ def attached_configured_hub_profiles() -> set[str]:
     created or renamed netdevs. A raw ``can0`` is never classified. If stale
     rules claim one serial for both Axol and Mantis, neither claim is trusted.
     """
-    return set(_attached_configured_hub_serials())
+    return set(attached_hub_state().configured_profiles)
 
 
 def _wait_for_dual_channel_serial(
@@ -390,7 +846,7 @@ def _wait_for_dual_channel_serial(
         if (
             adapter is not None
             and (adapter.get("vid"), adapter.get("pid")) == (_VID, _PID)
-            and {0, 1} <= set(adapter.get("dev_ids", set()))
+            and _adapter_has_exact_channels(adapter, (0, 1))
         ):
             return True
         remaining = deadline - time.monotonic()
@@ -442,7 +898,11 @@ def _configured_named_serial(name: str) -> str | None:
     hardware without probing, so only a serial the operator has already
     confirmed — a live named interface or a written udev rule — counts here.
     """
-    return _serial_of_interface(name) or _rules_serial_for(name)
+    # Persisted rule authority wins over a transient live occupant. During a
+    # stale hub rename, a dual-channel interface can temporarily own a
+    # wheel/chest managed name; treating that occupant as the saved auxiliary
+    # adapter would erase the real unplugged pin on the next rewrite.
+    return _rules_serial_for(name) or _serial_of_interface(name)
 
 
 def _resolve_hub_serial() -> str | None:
@@ -470,10 +930,35 @@ def _resolve_hub_serial() -> str | None:
     configured = _configured_serial()
     claimed = _mantis_claimed_serials()
     attached = [s for s in _detect_serials() if s not in claimed]
-    if configured and (configured in attached or not attached):
+    if configured and not attached:
+        return configured
+    if configured and configured in attached:
+        identity = _identify_dual_adapter(configured)
+        if identity in {"mantis", "conflict"}:
+            raise RuntimeError(
+                "The configured Axol CAN hub did not have a safe Axol identity; "
+                "run `axol can.setup` to resolve its role"
+            )
+        # Silence does not erase an explicit operator assignment.
         return configured
     if len(attached) == 1:
-        return attached[0]
+        candidate = attached[0]
+        identity = _identify_dual_adapter(candidate, reset=True)
+        if identity == "axol":
+            return candidate
+        if identity == "mantis":
+            raise RuntimeError(
+                "Only a Mantis hub was detected; no Axol CAN role was written"
+            )
+        if identity == "conflict":
+            raise RuntimeError(
+                "The attached CAN hub reported both Axol and Mantis signals; "
+                "no role was written"
+            )
+        raise RuntimeError(
+            "Axol not identified — power its shoulder motors, then retry or run "
+            "`axol can.setup`"
+        )
     if not attached:
         return None
     raise RuntimeError(
@@ -496,8 +981,11 @@ def _find_dual_serials() -> tuple[str | None, str | None]:
     # full set too so a serial that now enumerates as (say) a wheel adapter is
     # not retained as an allegedly unplugged Axol hub as well.
     all_attached = set(_scan_adapters()) | attached
-    configured_axol = _configured_serial(_AXOL_PROFILE)
-    configured_mantis = _configured_serial(_MANTIS_PROFILE)
+    strict_before = _configured_profile_usb_serials()
+    configured_axol = strict_before.get("axol") or _configured_serial(_AXOL_PROFILE)
+    configured_mantis = strict_before.get("mantis") or _configured_serial(
+        _MANTIS_PROFILE
+    )
 
     # Probe configured adapters too. Otherwise an adapter incorrectly pinned
     # as Axol once is excluded forever and can.setup never sees its Mantis
@@ -525,10 +1013,17 @@ def _find_dual_serials() -> tuple[str | None, str | None]:
     axol = detected_for("axol", configured_axol)
     mantis = detected_for("mantis", configured_mantis)
 
+    for serial, role in sorted(roles.items()):
+        if role == "conflict":
+            print(
+                f"  {serial}: both Axol and Mantis identity signals answered; "
+                "leaving it unassigned. Disconnect mixed hardware and retry."
+            )
+
     unidentified = [
         serial
         for serial, role in sorted(roles.items())
-        if role is None and serial not in (axol, mantis)
+        if role in {None, "silent"} and serial not in (axol, mantis)
     ]
     for serial in unidentified:
         print(f"  {serial}: no identifying device answered.")
@@ -764,6 +1259,10 @@ def _probe_axol_shoulder(iface: str) -> bool:
 
 def _ifaces_for_serial(serial: str) -> list[str]:
     """Every live CAN interface belonging to ``serial``, ordered by dev_id."""
+    try:
+        serial = _validated_usb_serial(serial)
+    except ValueError:
+        return []
     found: list[tuple[int, str]] = []
     for iface_path in Path("/sys/class/net").glob("can*"):
         info = subprocess.run(
@@ -771,18 +1270,28 @@ def _ifaces_for_serial(serial: str) -> list[str]:
             capture_output=True,
             text=True,
         ).stdout
-        if _udev_attr(info, "ATTRS{serial}") != serial:
+        observed_serial = _udev_attr(info, "ATTRS{serial}")
+        try:
+            observed_serial = _validated_usb_serial(observed_serial)
+        except ValueError:
+            continue
+        if observed_serial != serial:
             continue
         try:
             dev_id = int(_udev_attr(info, "ATTR{dev_id}"), 16)
         except ValueError:
             continue
         found.append((dev_id, iface_path.name))
-    return [name for _, name in sorted(found)]
+    found.sort()
+    if [dev_id for dev_id, _name in found] != [0, 1]:
+        return []
+    if len({name for _dev_id, name in found}) != 2:
+        return []
+    return [name for _, name in found]
 
 
-def _identify_dual_adapter(serial: str, *, reset: bool = False) -> str | None:
-    """Probe a dual-channel hub: ``"axol"``, ``"mantis"``, or ``None``.
+def _identify_dual_adapter(serial: str, *, reset: bool = False) -> DualHubIdentity:
+    """Probe a dual hub: Axol, Mantis, silence/failure, or conflicting signals.
 
     Both products use identical USB hardware, so identity comes from the CAN
     devices behind it. Silence leaves the decision to the operator instead of
@@ -792,8 +1301,8 @@ def _identify_dual_adapter(serial: str, *, reset: bool = False) -> str | None:
     first pass while still receiving bounded recovery when it is silent.
     """
     ifaces = _ifaces_for_serial(serial)
-    if len(ifaces) < 2:
-        return None
+    if len(ifaces) != 2:
+        return "silent"
     try:
         # An UP gs_usb interface can still be TX-only with wedged RX. Preserve
         # a healthy first pass, but if either half is down recover the adapter
@@ -804,7 +1313,7 @@ def _identify_dual_adapter(serial: str, *, reset: bool = False) -> str | None:
             force_cycle=reset or not all(iface_up(iface) for iface in ifaces),
         )
     except RuntimeError:
-        return None
+        return "silent"
 
     # Initial probe plus two bounded pair recoveries. A powered Mantis/Axol
     # therefore corrects a stale udev role during ordinary ``can.setup``;
@@ -818,7 +1327,7 @@ def _identify_dual_adapter(serial: str, *, reset: bool = False) -> str | None:
                 f"  WARNING: both a Mantis trigger and an Axol shoulder answered "
                 f"behind {serial}; refusing to guess."
             )
-            return None
+            return "conflict"
         if mantis:
             return "mantis"
         if axol:
@@ -830,21 +1339,31 @@ def _identify_dual_adapter(serial: str, *, reset: bool = False) -> str | None:
             try:
                 bring_up_interfaces(ifaces, force_cycle=True)
             except RuntimeError:
-                return None
-    return None
+                return "silent"
+    return "silent"
 
 
 def _iface_for_serial(serial: str) -> str | None:
     """The current interface name of a single-channel adapter, or None."""
+    try:
+        serial = _validated_usb_serial(serial)
+    except ValueError:
+        return None
+    found: list[str] = []
     for iface_path in Path("/sys/class/net").glob("can*"):
         info = subprocess.run(
             ["udevadm", "info", "-a", "-p", str(iface_path)],
             capture_output=True,
             text=True,
         ).stdout
-        if _udev_attr(info, "ATTRS{serial}") == serial:
-            return iface_path.name
-    return None
+        observed_serial = _udev_attr(info, "ATTRS{serial}")
+        try:
+            observed_serial = _validated_usb_serial(observed_serial)
+        except ValueError:
+            continue
+        if observed_serial == serial:
+            found.append(iface_path.name)
+    return found[0] if len(found) == 1 else None
 
 
 def _identify_adapter(
@@ -906,6 +1425,7 @@ def _identify_adapter(
 
 def _dual_channel_rules(serial: str, profile: _Profile) -> str:
     """udev rules block for a profile's dual-channel adapter."""
+    serial = _validated_usb_serial(serial)
     return (
         f"# {profile.label} dual-channel CAN adapter\n"
         f"# Adapter serial: {serial}\n"
@@ -922,6 +1442,60 @@ def _dual_channel_rules(serial: str, profile: _Profile) -> str:
     )
 
 
+def _publish_privileged_text(path: Path, content: str, *, mode: str = "0644") -> None:
+    """Atomically publish root-owned text at one fixed privileged path."""
+    _validate_root_directory(path.parent)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", prefix="axol-root-text-", delete=False
+    ) as staged:
+        staged.write(content)
+        staged.flush()
+        os.fsync(staged.fileno())
+        staged_path = Path(staged.name)
+
+    destination_temp = path.parent / f".{path.name}.{secrets.token_hex(12)}.tmp"
+    published = False
+    try:
+        run_root(
+            [
+                "install",
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                "0755",
+                str(path.parent),
+            ],
+            check=True,
+        )
+        _validate_root_directory(path.parent)
+        run_root(
+            [
+                "install",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                mode,
+                str(staged_path),
+                str(destination_temp),
+            ],
+            check=True,
+        )
+        run_root(["sync", "-f", str(destination_temp)], check=True)
+        run_root(["mv", "-fT", str(destination_temp), str(path)], check=True)
+        _validate_root_directory(path.parent)
+        run_root(["sync", "-f", str(path.parent)], check=True)
+        published = True
+    finally:
+        staged_path.unlink(missing_ok=True)
+        if not published:
+            run_root(["rm", "-f", str(destination_temp)], check=False)
+
+
 def _write_udev_rules(
     hub_serial: str | None,
     wheels_serial: str | None = None,
@@ -929,6 +1503,9 @@ def _write_udev_rules(
     profile: _Profile = _AXOL_PROFILE,
 ) -> None:
     print(f"Writing udev rules to {profile.rules_file} (requires sudo)...")
+    for serial in (hub_serial, wheels_serial, chest_serial):
+        if serial is not None:
+            _validated_usb_serial(serial)
     content = ""
     if hub_serial:
         content += _dual_channel_rules(hub_serial, profile)
@@ -947,7 +1524,7 @@ def _write_udev_rules(
             f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{serial}}=="{serial}", NAME="{name}"\n'
             f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{serial}}=="{serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{profile.hotplug_unit}"\n'
         )
-    run_root(["tee", str(profile.rules_file)], input_text=content, check=True)
+    _publish_privileged_text(profile.rules_file, content)
     print("  Done.")
 
 
@@ -1037,6 +1614,7 @@ def _validate_adapter_assignments(
     ):
         if not serial:
             continue
+        _validated_usb_serial(serial)
         previous_role = seen.get(serial)
         if previous_role:
             raise RuntimeError(
@@ -1075,6 +1653,7 @@ def _rename_interfaces(
 
     net_dir = Path("/sys/class/net")
     records: list[tuple[str, str, int]] = []
+    physical_records: dict[tuple[str, str, int], tuple[str, str] | None] = {}
     for iface_path in list(net_dir.glob("can*")):
         iface = iface_path.name
         info = subprocess.run(
@@ -1084,13 +1663,50 @@ def _rename_interfaces(
         ).stdout
 
         iface_serial = _udev_attr(info, "ATTRS{serial}")
-        if not iface_serial:
+        try:
+            iface_serial = _validated_usb_serial(iface_serial)
+        except ValueError:
             continue
         try:
             dev_id = int(_udev_attr(info, "ATTR{dev_id}"), 16)
         except ValueError:
             continue
-        records.append((iface, iface_serial, dev_id))
+        record = (iface, iface_serial, dev_id)
+        records.append(record)
+        physical_records[record] = _interface_usb_device_identity(iface_path)
+
+    record_counts = Counter((serial, dev_id) for _name, serial, dev_id in records)
+    duplicated_targets = {
+        identity for identity in target if record_counts[identity] > 1
+    }
+    if duplicated_targets:
+        raise RuntimeError(
+            "Multiple live CAN interfaces report the same target serial/channel; "
+            "refusing to rename any interface"
+        )
+
+    for role, serial, expected_ids in (
+        ("dual-channel hub", hub_serial, {0, 1}),
+        ("wheel bus", wheels_serial, {0}),
+        ("chest bus", chest_serial, {0}),
+    ):
+        if serial is None:
+            continue
+        matched = [record for record in records if record[1] == serial]
+        if not matched:
+            continue
+        physical = {physical_records[record] for record in matched}
+        if (
+            {record[2] for record in matched} != expected_ids
+            or len(matched) != len(expected_ids)
+            or len(physical) != 1
+            or None in physical
+            or next(iter(physical))[1] != serial
+        ):
+            raise RuntimeError(
+                f"The configured {role} does not have one unambiguous physical "
+                "USB/channel topology; refusing to rename any interface"
+            )
 
     by_name = {name: (serial, dev_id) for name, serial, dev_id in records}
     existing_names = {path.name for path in net_dir.iterdir()}
@@ -1145,42 +1761,7 @@ def _install_privileged_script(path: Path, content: str) -> None:
     the operator and would turn the hotplug unit into a root-code-execution
     primitive.
     """
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", prefix="axol-can-", delete=False
-    ) as staged:
-        staged.write(content)
-        staged_path = Path(staged.name)
-    try:
-        run_root(
-            [
-                "install",
-                "-d",
-                "-o",
-                "root",
-                "-g",
-                "root",
-                "-m",
-                "0755",
-                str(path.parent),
-            ],
-            check=True,
-        )
-        run_root(
-            [
-                "install",
-                "-o",
-                "root",
-                "-g",
-                "root",
-                "-m",
-                "0755",
-                str(staged_path),
-                str(path),
-            ],
-            check=True,
-        )
-    finally:
-        staged_path.unlink(missing_ok=True)
+    _publish_privileged_text(path, content, mode="0755")
 
 
 def _legacy_profile_scripts(profile: _Profile) -> set[Path]:
@@ -1200,6 +1781,8 @@ def _write_cron_script(profile: _Profile = _AXOL_PROFILE) -> None:
     only, or all of them — and an unplugged adapter never blocks the rest.
     """
     print(f"Writing CAN startup script to {profile.cron_script}...")
+    _ensure_root_lock_file(_GLOBAL_LOCK_FILE)
+    _ensure_root_lock_file(profile.lock_file)
     script = (
         f"#!/bin/bash\n"
         f"# Bring up {profile.label} CAN interfaces\n"
@@ -1215,9 +1798,14 @@ def _write_cron_script(profile: _Profile = _AXOL_PROFILE) -> None:
         f"# delivered. Skipped entirely when the adapter is unplugged (other\n"
         f"# buses below must still come up).\n"
         f"set -euo pipefail\n\n"
-        f"# Boot and hotplug triggers can race (the hub's two channels fire one\n"
-        f"# udev add event each) — serialize whole runs.\n"
-        f'exec 9>"/run/lock/{profile.lock_name}"\n'
+        f"# Every setup/hotplug profile takes the global lock first, then its\n"
+        f"# profile lock. A Python setup that already owns the global lock marks\n"
+        f"# that inherited fact explicitly before invoking this script.\n"
+        f'if [ "${{{_GLOBAL_LOCK_ENV}:-}}" != "1" ]; then\n'
+        f'    exec 8<"{_GLOBAL_LOCK_FILE}"\n'
+        f"    flock 8\n"
+        f"fi\n"
+        f'exec 9<"{profile.lock_file}"\n'
         f"flock 9\n\n"
         f"# The two channels enumerate a beat apart, so the trigger for the\n"
         f"# first can run before the second exists. Give the pair a moment.\n"
@@ -1365,7 +1953,7 @@ def _write_hotplug_unit(profile: _Profile = _AXOL_PROFILE) -> None:
         f"Type=oneshot\n"
         f"ExecStart=/bin/bash {profile.cron_script}\n"
     )
-    run_root(["tee", str(profile.hotplug_unit_file)], input_text=content, check=True)
+    _publish_privileged_text(profile.hotplug_unit_file, content)
     run_root(["systemctl", "daemon-reload"], check=True)
     print("  Done.")
 
@@ -1452,7 +2040,7 @@ def _setup_rp1_usb_quirk() -> None:
         f"[Install]\n"
         f"WantedBy=multi-user.target\n"
     )
-    run_root(["tee", str(_RP1_QUIRK_UNIT_FILE)], input_text=unit, check=True)
+    _publish_privileged_text(_RP1_QUIRK_UNIT_FILE, unit)
     run_root(["systemctl", "daemon-reload"], check=True)
     run_root(["systemctl", "enable", "--now", _RP1_QUIRK_UNIT], check=True)
     print("  Done.")
@@ -1509,6 +2097,12 @@ def rx_alive(profile: _Profile = _AXOL_PROFILE) -> bool:
 
 
 def bring_up_can(profile: _Profile = _AXOL_PROFILE) -> None:
+    """Serialize and run one profile's complete bring-up/recovery sequence."""
+    with _global_setup_lock():
+        _bring_up_can_locked(profile)
+
+
+def _bring_up_can_locked(profile: _Profile = _AXOL_PROFILE) -> None:
     """Run the bring-up script, then verify RX and recover its hub pair.
 
     Every down/up cycle of the adapter's channels toggles it between a healthy
@@ -1523,6 +2117,11 @@ def bring_up_can(profile: _Profile = _AXOL_PROFILE) -> None:
     masked by it.
     """
     print("Bringing up CAN interfaces (requires sudo)...")
+    script_command = ["bash", str(profile.cron_script)]
+    if int(getattr(_LOCK_LOCAL, "depth", 0)):
+        # The generated script must still take its profile lock, but reopening
+        # the global flock while this thread owns it would deadlock.
+        script_command = ["env", f"{_GLOBAL_LOCK_ENV}=1", *script_command]
     noun = "arm" if profile is _AXOL_PROFILE else "gripper"
     adapter_present = (Path("/sys/class/net") / profile.left).exists() and (
         Path("/sys/class/net") / profile.right
@@ -1531,10 +2130,10 @@ def bring_up_can(profile: _Profile = _AXOL_PROFILE) -> None:
         # Adapter-less host state: the script still brings up the wheel/chest
         # buses; the RX-wedge probe/re-flap is adapter-specific, so there's
         # nothing to verify.
-        run_root(["bash", str(profile.cron_script)], check=True)
+        run_root(script_command, check=True)
         print(f"  Done — {profile.label} not attached, its interfaces skipped.")
         return
-    run_root(["bash", str(profile.cron_script)], check=True)
+    run_root(script_command, check=True)
     for attempt in range(3):
         if attempt:
             bring_up_interfaces([profile.left, profile.right], force_cycle=True)
@@ -1573,6 +2172,14 @@ def iface_up(channel: str) -> bool:
 
 
 def bring_up_interfaces(channels: list[str], *, force_cycle: bool = False) -> None:
+    """Serialize and configure arbitrary SocketCAN interfaces."""
+    with _global_setup_lock():
+        _bring_up_interfaces_locked(channels, force_cycle=force_cycle)
+
+
+def _bring_up_interfaces_locked(
+    channels: list[str], *, force_cycle: bool = False
+) -> None:
     """Configure and bring up arbitrary SocketCAN interfaces.
 
     The non-Axol-hub counterpart of :func:`bring_up_can`, for setups running
@@ -1680,6 +2287,21 @@ def ensure_setup(
     configures the robot-arm profile only; the interactive ``can.setup`` flow
     discovers both Axol and Mantis hubs.
     """
+    with _global_setup_lock():
+        _ensure_setup_locked(
+            hub_serial=hub_serial,
+            wheels_serial=wheels_serial,
+            chest_serial=chest_serial,
+        )
+
+
+def _ensure_setup_locked(
+    *,
+    hub_serial: str | None,
+    wheels_serial: str | None,
+    chest_serial: str | None,
+) -> None:
+    """Implementation of :func:`ensure_setup` with the global lock held."""
     driver.ensure_driver()
     configured_usb = _attached_configured_hub_serials().get("axol")
     if configured_usb is not None:
@@ -1701,6 +2323,12 @@ def ensure_mantis_setup() -> None:
     guessed. This is the Mantis counterpart to :func:`ensure_setup` used by
     the idle diagnostics link.
     """
+    with _global_setup_lock():
+        _ensure_mantis_setup_locked()
+
+
+def _ensure_mantis_setup_locked() -> None:
+    """Implementation of :func:`ensure_mantis_setup` with the global lock held."""
     installed = driver.ensure_driver()
     configured_usb = _attached_configured_hub_serials().get("mantis")
     if configured_usb is not None:
@@ -1740,6 +2368,350 @@ def ensure_mantis_setup() -> None:
             None if serial == configured_chest else configured_chest,
         )
     _configure_mantis(serial)
+
+
+def _headless_topology_snapshot() -> tuple[
+    tuple[tuple[str, str], ...],
+    tuple[tuple[str, str, str, tuple[tuple[str, int, str | None], ...]], ...],
+]:
+    """Exact supported-USB/netdev topology used to authorize rule publication."""
+    usb_devices = _attached_supported_usb_devices()
+    adapters = _scan_adapters()
+    topology: list[tuple[str, str, str, tuple[tuple[str, int, str | None], ...]]] = []
+    for serial, adapter in sorted(adapters.items()):
+        physical = adapter.get("physical_identities", [])
+        normalized = tuple(
+            sorted(
+                (
+                    record
+                    for record in physical
+                    if isinstance(record, tuple)
+                    and len(record) == 3
+                    and isinstance(record[0], str)
+                    and isinstance(record[1], int)
+                    and (isinstance(record[2], str) or record[2] is None)
+                ),
+                key=lambda record: (record[1], record[0], record[2] or ""),
+            )
+        )
+        topology.append(
+            (
+                serial,
+                str(adapter.get("vid", "")),
+                str(adapter.get("pid", "")),
+                normalized,
+            )
+        )
+    return usb_devices, tuple(topology)
+
+
+def _resolve_headless_hub_roles(
+    observed: dict[str, DualHubIdentity | None],
+    *,
+    attached_serials: set[str],
+    configured_axol: str | None,
+    configured_mantis: str | None,
+) -> tuple[str | None, str | None]:
+    """Conservatively resolve roles without prompts or first-match guessing."""
+    if any(identity == "conflict" for identity in observed.values()):
+        raise RuntimeError(
+            "A CAN hub reported both Axol and Mantis identity signals; no roles "
+            "were written. Disconnect mixed hardware behind that hub and retry."
+        )
+    if (
+        configured_axol is not None
+        and configured_mantis is not None
+        and configured_axol == configured_mantis
+    ):
+        role = observed.get(configured_axol)
+        if role not in {"axol", "mantis"}:
+            raise RuntimeError(
+                "The persisted Axol and Mantis profiles conflict; run "
+                "`axol can.setup` interactively to resolve them"
+            )
+
+    configured = {"axol": configured_axol, "mantis": configured_mantis}
+    selected: dict[str, str | None] = {"axol": None, "mantis": None}
+    for role in ("axol", "mantis"):
+        matches = sorted(serial for serial, found in observed.items() if found == role)
+        previous = configured[role]
+        opposite = "mantis" if role == "axol" else "axol"
+        previous_observed = observed.get(previous) if previous is not None else None
+
+        if (
+            previous is not None
+            and previous in attached_serials
+            and previous_observed != opposite
+        ):
+            # An attached explicit assignment owns its role while silent. A
+            # second same-role responder must not silently replace it; only a
+            # positive opposite identity can invalidate the old assignment.
+            selected[role] = previous
+        elif previous in matches:
+            selected[role] = previous
+        elif len(matches) == 1:
+            selected[role] = matches[0]
+        elif previous is not None and previous not in attached_serials:
+            # Preserve an unplugged explicit assignment when there is no
+            # unique positive replacement.
+            selected[role] = previous
+        # Multiple fresh devices reporting one role are deliberately left
+        # unresolved. Their serial ordering is not product identity.
+
+    if selected["axol"] is not None and selected["axol"] == selected["mantis"]:
+        detected = observed.get(selected["axol"])
+        if detected == "axol":
+            selected["mantis"] = None
+        elif detected == "mantis":
+            selected["axol"] = None
+        else:
+            raise RuntimeError(
+                "The persisted Axol and Mantis profiles conflict; run "
+                "`axol can.setup` interactively to resolve them"
+            )
+    return selected["axol"], selected["mantis"]
+
+
+def setup_detected_hubs() -> HeadlessHubSetupResult:
+    """Identify and persist attached Axol/Mantis hubs without prompting.
+
+    Only positive CAN signatures may create or change a role. The complete USB
+    and two-channel netdev topology is snapshotted after driver enumeration and
+    checked again after every probe, before the first root-owned rule is
+    published. Duplicate physical devices reporting one serial, incomplete
+    pairs, silence, conflicting signatures, and duplicate fresh roles stay
+    unassigned for the interactive setup flow.
+    """
+    with _global_setup_lock():
+        return _setup_detected_hubs_locked()
+
+
+def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
+    """Implementation of :func:`setup_detected_hubs` with the global lock held."""
+    before_driver = _attached_supported_usb_devices()
+    for _identity, serial in before_driver:
+        _validated_usb_serial(serial)
+
+    driver.ensure_driver()
+    for serial in sorted({serial for _identity, serial in before_driver}):
+        _wait_for_dual_channel_serial(serial)
+
+    topology_before = _headless_topology_snapshot()
+    usb_devices, adapter_topology = topology_before
+    for _identity, serial in usb_devices:
+        _validated_usb_serial(serial)
+    serial_counts = Counter(serial for _identity, serial in usb_devices)
+    physical_by_serial = {serial: identity for identity, serial in usb_devices}
+    eligible: dict[str, tuple[str, str]] = {}
+    for serial, vid, pid, records in adapter_topology:
+        if serial_counts[serial] != 1 or (vid, pid) != (_VID, _PID):
+            continue
+        expected_identity = physical_by_serial[serial].partition("@dev")[0]
+        if (
+            len(records) == 2
+            and tuple(dev_id for _name, dev_id, _identity in records) == (0, 1)
+            and len({name for name, _dev_id, _identity in records}) == 2
+            and all(
+                identity == expected_identity for _name, _dev_id, identity in records
+            )
+        ):
+            eligible[serial] = (records[0][0], records[1][0])
+
+    strict_before = _configured_profile_usb_serials()
+    configured_axol = strict_before.get("axol") or _configured_serial(_AXOL_PROFILE)
+    configured_mantis = strict_before.get("mantis") or _configured_serial(
+        _MANTIS_PROFILE
+    )
+    configured_wheels = _configured_named_serial(_CAN_B)
+    configured_chest = _configured_named_serial(_CAN_C)
+    for serial in (
+        configured_axol,
+        configured_mantis,
+        configured_wheels,
+        configured_chest,
+    ):
+        if serial is not None:
+            _validated_usb_serial(serial)
+
+    # Classify structural ambiguity before probing or publishing anything.
+    # An exact raw single channel is a legitimate wheel/chest-class adapter;
+    # every other attached supported device must be one unique, physically
+    # bound {0,1} pair. Persisted dual claims are stricter still.
+    if any(count != 1 for count in serial_counts.values()):
+        raise RuntimeError(
+            "Duplicate CAN adapter serials were detected; no roles were written"
+        )
+    topology_by_serial = {
+        serial: records for serial, _vid, _pid, records in adapter_topology
+    }
+    persisted_dual = {
+        serial for serial in (configured_axol, configured_mantis) if serial is not None
+    }
+    for identity, serial in usb_devices:
+        records = topology_by_serial.get(serial, ())
+        expected_identity = identity.partition("@dev")[0]
+        exact_single = (
+            len(records) == 1
+            and records[0][1] == 0
+            and records[0][2] == expected_identity
+        )
+        if serial in eligible or (exact_single and serial not in persisted_dual):
+            continue
+        raise RuntimeError(
+            "An attached CAN adapter has an incomplete or ambiguous channel "
+            "topology; no roles were written"
+        )
+
+    legacy_mantis_config = (
+        _dual_channel_rule_serial(
+            _MANTIS_PROFILE.rules_file,
+            _MANTIS_PROFILE.left,
+            _MANTIS_PROFILE.right,
+        )
+        is None
+        and _dual_channel_rule_serial(
+            _PRE_MANTIS_RULES_FILE,
+            _PRE_MANTIS_LEFT,
+            _PRE_MANTIS_RIGHT,
+        )
+        == configured_mantis
+    )
+    candidate_serials = {
+        serial
+        for _identity, serial in attached_hub_state().candidate_identities
+        if serial_counts[serial] == 1
+    }
+    observed: dict[str, DualHubIdentity | None] = {}
+    for serial in sorted(eligible):
+        print(f"  {serial}: probing Mantis trigger / Axol shoulder...")
+        observed[serial] = _identify_dual_adapter(
+            serial, reset=serial in candidate_serials
+        )
+
+    axol_name_mismatch = configured_axol in eligible and eligible[configured_axol] != (
+        _AXOL_PROFILE.left,
+        _AXOL_PROFILE.right,
+    )
+    mantis_name_mismatch = configured_mantis in eligible and eligible[
+        configured_mantis
+    ] != (_MANTIS_PROFILE.left, _MANTIS_PROFILE.right)
+    if (axol_name_mismatch and observed.get(configured_axol) in {None, "silent"}) or (
+        mantis_name_mismatch and observed.get(configured_mantis) in {None, "silent"}
+    ):
+        raise RuntimeError(
+            "A configured CAN profile's live interface names do not match its "
+            "persisted hardware identity; no roles were written"
+        )
+
+    # USB replacement, duplicate insertion, channel loss, or a rename racing
+    # the probe invalidates the association between the response and serial.
+    if _headless_topology_snapshot() != topology_before:
+        raise RuntimeError(
+            "CAN adapter topology changed during discovery; no roles were written"
+        )
+
+    attached_serials = {serial for _identity, serial in usb_devices}
+    desired_axol, desired_mantis = _resolve_headless_hub_roles(
+        observed,
+        attached_serials=attached_serials,
+        configured_axol=configured_axol,
+        configured_mantis=configured_mantis,
+    )
+
+    positive_axol = desired_axol is not None and observed.get(desired_axol) == "axol"
+    positive_mantis = (
+        desired_mantis is not None and observed.get(desired_mantis) == "mantis"
+    )
+    axol_changed = positive_axol and strict_before.get("axol") != desired_axol
+    mantis_changed = positive_mantis and (
+        strict_before.get("mantis") != desired_mantis or legacy_mantis_config
+    )
+    repair_axol_names = positive_axol and (
+        desired_axol in candidate_serials or axol_name_mismatch
+    )
+    repair_mantis_names = positive_mantis and (
+        desired_mantis in candidate_serials or mantis_name_mismatch
+    )
+
+    # Positive hub identity also overrides a stale single-channel claim for the
+    # same physical serial. Preserve every unrelated wheel/chest assignment.
+    positively_identified_hubs = {
+        serial
+        for serial, identity in observed.items()
+        if identity in {"axol", "mantis"}
+    }
+    stale_aux_hub_serials = positively_identified_hubs & {
+        configured_wheels,
+        configured_chest,
+    }
+    clear_axol_aux = bool(stale_aux_hub_serials)
+    if clear_axol_aux:
+        if configured_wheels in positively_identified_hubs:
+            configured_wheels = None
+        if configured_chest in positively_identified_hubs:
+            configured_chest = None
+
+    stale_axol_claim = (
+        configured_axol is not None and observed.get(configured_axol) == "mantis"
+    )
+    stale_mantis_claim = (
+        configured_mantis is not None and observed.get(configured_mantis) == "axol"
+    )
+    reapply_axol = positive_axol and stale_mantis_claim
+    reapply_mantis = positive_mantis and (
+        stale_axol_claim or desired_mantis in stale_aux_hub_serials
+    )
+
+    if (
+        axol_changed
+        or stale_axol_claim
+        or clear_axol_aux
+        or reapply_axol
+        or repair_axol_names
+    ):
+        if desired_axol or configured_wheels or configured_chest:
+            _apply_setup(desired_axol, configured_wheels, configured_chest)
+        else:
+            _write_udev_rules(None, None, None)
+            _reload_udev()
+            _rename_interfaces(None, None, None)
+
+    if mantis_changed or reapply_mantis or repair_mantis_names:
+        assert desired_mantis is not None
+        _configure_mantis(desired_mantis)
+    elif stale_mantis_claim:
+        _remove_pre_mantis_config()
+        _write_udev_rules(None, profile=_MANTIS_PROFILE)
+        _reload_udev()
+        _rename_interfaces(None, profile=_MANTIS_PROFILE)
+
+    configured_count = int(axol_changed) + int(mantis_changed)
+    remaining = attached_hub_state().candidate_count
+    if configured_count and remaining:
+        return HeadlessHubSetupResult(
+            status="partial",
+            configured_count=configured_count,
+            message=(
+                "Configured the identified hardware, but another attached CAN "
+                "adapter remains unassigned. Power its Axol motors or Mantis "
+                "triggers and retry discovery, or run `axol can.setup`."
+            ),
+        )
+    if configured_count:
+        return HeadlessHubSetupResult(
+            status="configured", configured_count=configured_count
+        )
+    if remaining:
+        return HeadlessHubSetupResult(
+            status="unidentified",
+            configured_count=0,
+            message=(
+                "No unique Axol or Mantis identity was detected. Ensure the Axol "
+                "motors or Mantis triggers are powered, then retry after reconnecting "
+                "the USB hub or run `axol can.setup`."
+            ),
+        )
+    return HeadlessHubSetupResult(status="ready", configured_count=0)
 
 
 def _find_single_serials(
@@ -1895,6 +2867,12 @@ def _find_single_serials(
 
 def run(args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
+    with _global_setup_lock():
+        _run_locked(args)
+
+
+def _run_locked(args: object = None) -> None:
+    """Implementation of :func:`run` with the global lock held."""
     try:
         installed = driver.ensure_driver()
     except RuntimeError as exc:

@@ -35,10 +35,15 @@ import {
   autoConnectPollStateKnown,
   autoConnectRetryDelay,
   autoConnectSignature,
+  canDiscoveryAttemptSignature,
+  canDiscoveryBlocksAutoConnect,
   chooseDiagnosticsAutoConnectProfile,
   nextAutoConnectAttempt,
+  shouldStartCanDiscovery,
 } from "@/lib/can-auto-connect"
 import {
+  canDiscoveryRequestCanRetry,
+  discoverCanHardware,
   fetchCanInterfaces,
   fetchCommands,
   fetchRobotStatus,
@@ -49,6 +54,8 @@ import {
   setServerBase,
   stopSession,
   useSessionLogs,
+  type CanDiscoveryState,
+  type CanInterfaceInventory,
   type CanProfileInventory,
   type CommandSpec,
   type FormValue,
@@ -148,10 +155,23 @@ export default function Diagnostics() {
     []
   )
   const [canProfiles, setCanProfiles] = useState<CanProfileInventory | null>(null)
+  const [canDiscovery, setCanDiscovery] = useState<CanDiscoveryState | null>(null)
+  const automaticCanDiscoveryAttemptsRef = useRef(new Set<string>())
+  const canDiscoveryNoticesRef = useRef(new Set<string>())
   // A successful response without profile summaries (or a 404) identifies an
   // older host. It cannot distinguish attached roles, so only retain the
   // historical profile already reported by that host's robot status.
   const [legacyCanInventory, setLegacyCanInventory] = useState(false)
+  const installCanInventory = useCallback((inventory: CanInterfaceInventory) => {
+    setCanDiscovery(inventory.discovery ?? null)
+    if (inventory.profiles) {
+      setCanProfiles(inventory.profiles)
+      setLegacyCanInventory(false)
+    } else {
+      setCanProfiles(null)
+      setLegacyCanInventory(true)
+    }
+  }, [])
 
   const [arm, setArm] = useState<ArmSide>(
     () => (localStorage.getItem("axolDiagArm") as ArmSide) || "left"
@@ -260,24 +280,20 @@ export default function Diagnostics() {
         .then((inventory) => {
           if (!active) return
           canInventoryKnownRef.current = true
-          if (inventory.profiles) {
-            setCanProfiles(inventory.profiles)
-            setLegacyCanInventory(false)
-          } else {
-            setCanProfiles(null)
-            setLegacyCanInventory(true)
-          }
+          installCanInventory(inventory)
         })
         .catch((error) => {
           if (!active) return
           if (String(error).includes("HTTP 404")) {
             canInventoryKnownRef.current = true
             setCanProfiles(null)
+            setCanDiscovery(null)
             setLegacyCanInventory(true)
             return
           }
           canInventoryKnownRef.current = false
           setCanProfiles(null)
+          setCanDiscovery(null)
           setLegacyCanInventory(false)
         })
     }
@@ -287,7 +303,7 @@ export default function Diagnostics() {
       active = false
       clearInterval(t)
     }
-  }, [serverOk])
+  }, [installCanInventory, serverOk])
 
   const refreshRuns = useCallback(() => {
     setRunsLoading(true)
@@ -483,6 +499,84 @@ export default function Diagnostics() {
     [resetAutoRobotRetry, toast]
   )
 
+  // Identify a fresh anonymous dual-channel hub before Diagnostics decides
+  // whether exactly one hardware profile is safe to connect. The backend
+  // coalesces requests across tabs; this latch avoids duplicates from this
+  // route's inventory poll.
+  useEffect(() => {
+    if (!serverOk) {
+      automaticCanDiscoveryAttemptsRef.current.clear()
+      canDiscoveryNoticesRef.current.clear()
+      return
+    }
+    if (!canDiscovery) return
+    if (canDiscovery.status === "ready" && canDiscovery.candidateCount === 0) {
+      automaticCanDiscoveryAttemptsRef.current.clear()
+      return
+    }
+    const signature = canDiscoveryAttemptSignature(canDiscovery)
+    const hardwareIdle = !activeRun && !hardwareSessionBusy && !launchBusy && !robotBusy
+    if (
+      signature === null ||
+      !shouldStartCanDiscovery(canDiscovery, robot?.state, autoRobotPollStateKnown(), hardwareIdle)
+    )
+      return
+
+    const hostEpoch = robotStatusRecoveryEpochRef.current
+    const attemptKey = `${hostEpoch}:${signature}`
+    if (automaticCanDiscoveryAttemptsRef.current.has(attemptKey)) return
+    automaticCanDiscoveryAttemptsRef.current.add(attemptKey)
+
+    void discoverCanHardware()
+      .then((inventory) => {
+        if (!autoRobotMountedRef.current || hostEpoch !== robotStatusRecoveryEpochRef.current)
+          return
+        installCanInventory(inventory)
+      })
+      .catch((error) => {
+        if (!autoRobotMountedRef.current || hostEpoch !== robotStatusRecoveryEpochRef.current)
+          return
+        if (canDiscoveryRequestCanRetry(error)) {
+          automaticCanDiscoveryAttemptsRef.current.delete(attemptKey)
+        }
+        const noticeKey = `request:${attemptKey}`
+        if (canDiscoveryNoticesRef.current.has(noticeKey)) return
+        canDiscoveryNoticesRef.current.add(noticeKey)
+        toast.error(`Automatic CAN discovery failed: ${String(error)}`)
+      })
+  }, [
+    activeRun,
+    autoRobotPollStateKnown,
+    canDiscovery,
+    hardwareSessionBusy,
+    installCanInventory,
+    launchBusy,
+    robot?.state,
+    robotBusy,
+    serverOk,
+    toast,
+  ])
+
+  useEffect(() => {
+    if (
+      !serverOk ||
+      !canDiscovery ||
+      (canDiscovery.status !== "partial" &&
+        canDiscovery.status !== "unidentified" &&
+        canDiscovery.status !== "error")
+    )
+      return
+    const noticeKey = `${robotStatusRecoveryEpochRef.current}:${canDiscovery.generation}:${canDiscovery.status}`
+    if (canDiscoveryNoticesRef.current.has(noticeKey)) return
+    canDiscoveryNoticesRef.current.add(noticeKey)
+    const fallback =
+      canDiscovery.status === "unidentified"
+        ? "Power the attached hardware, then unplug and reconnect its USB hub to retry, or run axol can.setup in a terminal."
+        : "Run axol can.setup in a terminal if the problem continues."
+    if (canDiscovery.status === "partial") toast.warning(canDiscovery.message ?? fallback)
+    else toast.error(canDiscovery.message ?? fallback)
+  }, [canDiscovery, serverOk, toast])
+
   // Direct navigation to Diagnostics still brings up an unambiguous host, but
   // this route is never a second profile-policy authority. With both profiles
   // attached it waits for an explicit choice, and an already-open link is only
@@ -495,6 +589,7 @@ export default function Diagnostics() {
     }
     if (!robot || (!canProfiles && !legacyCanInventory) || !sessionInventoryReady) return
     if (
+      canDiscoveryBlocksAutoConnect(canDiscovery) ||
       activeRun ||
       hardwareSessionBusy ||
       launchBusy ||
@@ -560,6 +655,7 @@ export default function Diagnostics() {
     activeRun,
     autoRobotPollStateKnown,
     autoRobotRetryRevision,
+    canDiscovery,
     canProfiles,
     connectRobot,
     hardwareSessionBusy,
