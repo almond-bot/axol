@@ -767,6 +767,13 @@ def _relay_main(
     # camera pipelines are PLAYING (their workers exist) and before this event
     # loop starts.
     affinity.isolate_relay_cpu()
+    # The capture chain (source streaming thread + SDK workers) must run every
+    # 60 Hz period or the SDK drops the exposure; a CFS slot behind the encode
+    # pool is not guaranteed once recording starts, so it gets a real-time
+    # class of its own (see prioritize_capture_threads).
+    from .gst_zed import _SOURCE_ELEMENT_NAME
+
+    affinity.prioritize_capture_threads(_SOURCE_ELEMENT_NAME)
 
     try:
         asyncio.run(serve())

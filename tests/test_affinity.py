@@ -1,8 +1,92 @@
+import io
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import call, patch
 
 from almond_axol.utils import affinity
+
+
+def _proc_files(comms: dict[str, str], process_comm: str = "python"):
+    """``open`` stand-in serving ``/proc/self/comm`` and per-task ``comm`` files."""
+
+    def _open(path, *args, **kwargs):
+        if path == "/proc/self/comm":
+            return io.StringIO(process_comm + "\n")
+        prefix = "/proc/self/task/"
+        if path.startswith(prefix) and path.endswith("/comm"):
+            tid = path[len(prefix) : -len("/comm")]
+            if tid in comms:
+                return io.StringIO(comms[tid] + "\n")
+            raise FileNotFoundError(path)
+        raise AssertionError(f"unexpected open({path!r})")
+
+    return _open
+
+
+class PrioritizeCaptureThreadsTest(TestCase):
+    comms = {
+        "101": "python",  # Python main thread (excluded via threading)
+        "201": "camsrc:src",  # zedsrc streaming thread
+        "202": "camsrc:src",  # a second camera's
+        "203": "python",  # ZED SDK worker: never renamed its comm
+        "204": "eye_l_cropq:src",  # gst VIC dispatch: stays CFS
+        "205": "V4L2_EncThread",  # NVENC: stays CFS
+        "206": "cuda-EvtHandlr",
+    }
+    python_threads = [SimpleNamespace(native_id=101)]
+
+    def test_elevates_source_and_sdk_threads_only(self) -> None:
+        # "999" is listed but exited before its comm is read; "x" isn't a tid.
+        with (
+            patch.object(
+                affinity.os, "listdir", return_value=[*self.comms, "999", "x"]
+            ),
+            patch.object(affinity.os, "sched_setscheduler", create=True) as setsched,
+            patch.object(
+                affinity.os,
+                "sched_param",
+                create=True,
+                side_effect=lambda p: ("param", p),
+            ),
+            patch.object(affinity.os, "SCHED_FIFO", 1, create=True),
+            patch("builtins.open", _proc_files(self.comms)),
+            patch("threading.enumerate", return_value=self.python_threads),
+        ):
+            moved = affinity.prioritize_capture_threads("camsrc")
+
+        self.assertEqual(moved, 3)
+        param = ("param", affinity.CAPTURE_FIFO_PRIORITY)
+        self.assertCountEqual(
+            setsched.call_args_list,
+            [call(201, 1, param), call(202, 1, param), call(203, 1, param)],
+        )
+
+    def test_permission_denied_leaves_threads_cfs(self) -> None:
+        with (
+            patch.object(affinity.os, "listdir", return_value=list(self.comms)),
+            patch.object(
+                affinity.os,
+                "sched_setscheduler",
+                create=True,
+                side_effect=PermissionError("EPERM"),
+            ) as setsched,
+            patch.object(
+                affinity.os, "sched_param", create=True, side_effect=lambda p: p
+            ),
+            patch.object(affinity.os, "SCHED_FIFO", 1, create=True),
+            patch("builtins.open", _proc_files(self.comms)),
+            patch("threading.enumerate", return_value=self.python_threads),
+            self.assertLogs(affinity._logger, level="INFO") as logs,
+        ):
+            moved = affinity.prioritize_capture_threads("camsrc")
+
+        self.assertEqual(moved, 0)
+        self.assertEqual(setsched.call_count, 1)  # stops at the first EPERM
+        self.assertTrue(any("CAP_SYS_NICE" in line for line in logs.output))
+
+    def test_noop_without_scheduler_api(self) -> None:
+        with patch.object(affinity, "os", SimpleNamespace(listdir=lambda _p: [])):
+            self.assertEqual(affinity.prioritize_capture_threads("camsrc"), 0)
 
 
 class IsolateRelayCpuTest(TestCase):

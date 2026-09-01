@@ -225,6 +225,95 @@ def isolate_relay_cpu() -> bool:
     return True
 
 
+# SCHED_FIFO priority for the camera capture threads. Well below the CAN loops
+# (`AXOL_RT_FIFO_PRIORITY`, 20) and on disjoint cores anyway; above every CFS
+# thread so a capture wake-up never queues behind the encode/mux workers.
+CAPTURE_FIFO_PRIORITY = 5
+
+
+def prioritize_capture_threads(source_thread_name: str) -> int:
+    """Move the camera *capture* threads to ``SCHED_FIFO`` so they never miss an exposure.
+
+    The relay's gst pool is ~80 CFS threads (VIC copies, NVENC dispatch, shm
+    writers) sharing a few cores with the dataset recorder. CFS hands them out
+    round-robin, so whenever a burst of them is runnable together a thread can
+    sit runnable-but-unscheduled for most of a scheduling period (~20 ms). For
+    the encode/mux threads that is harmless — queues absorb it. For the capture
+    chain it is not: the source streaming thread (``<source>:src``, the
+    SDK ``grab`` + rectify + push) and the ZED SDK's own worker threads (the
+    V4L2 dequeue / frame assembly it spawns unnamed) must run within one
+    60 Hz period or the SDK discards the exposure — seen on the robot as
+    ``skipped exposure(s)`` with ``CPU wait since previous frame`` of 14-26 ms
+    while every other attribution (SDK/link time, GPU clock, arm motion) was
+    clean. A real-time class fixes that at the root: a FIFO wake-up preempts
+    the CFS pool immediately and its CPU wait is ~0 regardless of how many
+    encoders are dispatching. Their combined load is small and bounded (a few
+    percent of a core per camera), so they cannot starve the recorder, and the
+    kernel's RT throttle caps a runaway at 95 % of a core anyway.
+
+    Elevates every thread whose ``comm`` is ``"<source_thread_name>:src"``
+    (GStreamer names task threads after their pad) plus every non-Python
+    thread that still carries the process's own ``comm`` — GStreamer, GLib,
+    NVENC and CUDA all rename theirs, so an unrenamed thread in the relay is
+    the SDK's. Call once after the pipelines are PLAYING (the threads exist
+    by then). Returns the number of threads moved; ``0`` when the platform
+    has no ``sched_setscheduler`` or the process lacks ``CAP_SYS_NICE`` (a
+    manual unprivileged run — the failure is logged once and the threads
+    stay CFS, exactly the previous behaviour).
+    """
+    if not hasattr(os, "sched_setscheduler") or not hasattr(os, "SCHED_FIFO"):
+        return 0
+    import threading
+
+    py_tids = {t.native_id for t in threading.enumerate() if t.native_id is not None}
+    try:
+        with open("/proc/self/comm") as fh:
+            process_comm = fh.read().strip()
+        tasks = os.listdir("/proc/self/task")
+    except OSError:
+        return 0
+    wanted = {f"{source_thread_name}:src", process_comm}
+    param = os.sched_param(CAPTURE_FIFO_PRIORITY)  # type: ignore[attr-defined]
+    moved = 0
+    denied: OSError | None = None
+    for entry in tasks:
+        try:
+            tid = int(entry)
+        except ValueError:
+            continue
+        if tid in py_tids:
+            continue
+        try:
+            with open(f"/proc/self/task/{tid}/comm") as fh:
+                comm = fh.read().strip()
+        except OSError:
+            continue  # exited between listdir and here
+        if comm not in wanted:
+            continue
+        try:
+            os.sched_setscheduler(tid, os.SCHED_FIFO, param)  # type: ignore[attr-defined]
+            moved += 1
+        except PermissionError as exc:
+            denied = exc
+            break
+        except OSError:
+            pass
+    if denied is not None:
+        _logger.info(
+            "camera capture threads stay SCHED_OTHER (no CAP_SYS_NICE: %s); "
+            "expect skipped exposures under recording load",
+            denied,
+        )
+    elif moved:
+        _logger.info(
+            "camera capture threads -> SCHED_FIFO %d (%d threads: %s:src + SDK workers)",
+            CAPTURE_FIFO_PRIORITY,
+            moved,
+            source_thread_name,
+        )
+    return moved
+
+
 def _pin(group: str) -> bool:
     groups = core_groups()
     if groups is None:
