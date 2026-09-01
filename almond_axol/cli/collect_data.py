@@ -65,6 +65,7 @@ from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..recording import (
     DatasetRecorderProcess,
     InProcessRecorder,
+    RecorderCaptureError,
     default_vcodec,
     restore_dataset_ownership,
 )
@@ -956,12 +957,13 @@ def _run(
     # interleaved with CAN telemetry on one thread, exactly like `axol teleop`.
     # The main thread drives the episode lifecycle (dataset writes, rest-pose
     # moves) and blocks on each coroutine until the episode (or reset) finishes.
-    async def _episode_loop() -> tuple[bool, bool, bool, int]:
+    async def _episode_loop() -> tuple[bool, bool, bool, int, str | None]:
         recording = False
         capture_ready = False
         rerecord = False
         contact = False
         captured_rows = 0
+        capture_failure: str | None = None
         # perf_counter deadline of a panel-started record countdown, or None.
         pending_start: float | None = None
         # Tracking-phase contact watchdog (opt-in — the threshold defaults
@@ -982,7 +984,7 @@ def _run(
 
         async def _tracking_tick() -> None:
             """Run one normal teleop tick without consuming boundary events."""
-            nonlocal last_robot_act, last_dataset_act
+            nonlocal capture_failure, last_robot_act, last_dataset_act
             if _stopped() and last_robot_act is not None:
                 # Ctrl+C/Stop during recorder startup must drain the bounded
                 # worker before teardown, but must not keep following a moving
@@ -1023,9 +1025,8 @@ def _run(
             if recording and capture_ready:
                 capture_error = recorder.poll_capture_error()
                 if capture_error is not None:
-                    raise RuntimeError(
-                        f"recorder capture failed: {capture_error}; episode discarded"
-                    )
+                    capture_failure = str(capture_error)
+                    return
 
             if watchdog is not None:
                 tripped = watchdog.update(robot.torque_residuals())
@@ -1058,10 +1059,16 @@ def _run(
             if relay is not None:
                 relay.set_raw_enabled(True)
 
-        def _finish_capture() -> int:
+        def _finish_capture() -> tuple[int, str | None]:
             try:
-                return recorder.finish_episode()
+                try:
+                    return recorder.finish_episode(), None
+                except RecorderCaptureError as exc:
+                    return 0, str(exc)
             finally:
+                # A relay-close failure is a camera lifecycle failure, not an
+                # episode rejection. Let it override the recoverable capture
+                # result so the session cannot continue with an open branch.
                 if relay is not None:
                     relay.set_raw_enabled(False)
 
@@ -1099,6 +1106,12 @@ def _run(
             except _TrackingContact:
                 contact = True
                 break
+            if capture_failure is not None:
+                # The capture thread has already stopped. End the take now
+                # instead of letting the operator finish an episode that is
+                # guaranteed to be discarded.
+                teleop.send_feedback_state(VRState.SAVING)
+                break
 
             events = teleop.get_teleop_events()
             panel_cmd = control.poll_command()
@@ -1126,10 +1139,10 @@ def _run(
             if start_requested and not recording:
                 pending_start = None
                 recording = True
-                # Arm recorder cutoffs before opening the poised-before-IDR
-                # dataset valves. Both calls can wait for transport/GOP
-                # boundaries, so run them off-loop while normal teleop ticks
-                # continue feeding the Rust target watchdog.
+                # Arm recorder cutoffs before opening the shared-timestamp
+                # dataset valves. Both calls can wait for transport boundaries,
+                # so run them off-loop while normal teleop ticks continue
+                # feeding the Rust target watchdog.
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
                 try:
                     await run_blocking_with_control_ticks(
@@ -1179,13 +1192,18 @@ def _run(
             # the bounded capture close drains. Keep the arm limp instead;
             # normal episode ends refresh the frozen command pose.
             boundary_tick = _guard_gravity_step if contact else _hold_tick
-            captured_rows = await run_blocking_with_control_ticks(
+            (
+                captured_rows,
+                finish_capture_failure,
+            ) = await run_blocking_with_control_ticks(
                 _finish_capture,
                 boundary_tick,
                 teleop_interval,
                 drain_tick=_guard_gravity_step,
             )
-        return recording, rerecord, contact, captured_rows
+            if finish_capture_failure is not None:
+                capture_failure = capture_failure or finish_capture_failure
+        return recording, rerecord, contact, captured_rows, capture_failure
 
     # Guarded return-to-rest: the sequencing (torque watchdog, gravity-comp
     # fallback, reset-press retry) lives in the shared engine
@@ -1313,10 +1331,24 @@ def _run(
             _drain_robot_future(fut)
             raise interrupted
 
-    def _wrap_up_episode(recording: bool, rerecord: bool, captured_rows: int) -> None:
+    def _wrap_up_episode(
+        recording: bool,
+        rerecord: bool,
+        captured_rows: int,
+        capture_failure: str | None,
+    ) -> None:
         """Save or discard the just-ended episode and announce the result."""
         nonlocal episodes_recorded
-        if rerecord:
+        if capture_failure is not None:
+            log_say(
+                f"Episode discarded because camera capture failed: {capture_failure}"
+            )
+            # finish_episode already joined capture and cleared the rejected
+            # buffer. cancel_episode is an idempotent lifecycle reset and also
+            # covers a future recorder implementation that reports the live
+            # poll before its finish reply carries the same rejection.
+            recorder.cancel_episode()
+        elif rerecord:
             log_say("Re-recording episode.")
             if recording:
                 recorder.cancel_episode()
@@ -1328,7 +1360,14 @@ def _run(
             recorder.cancel_episode()
         elif recording:
             log_say("Saving episode…")
-            recorder.save_episode()
+            try:
+                recorder.save_episode()
+            except RecorderCaptureError as exc:
+                # Encoder drops are detected only during the pre-commit save
+                # check on raw fallback transports. The typed contract means
+                # the buffer is already cleared and this take alone is invalid.
+                log_say(f"Episode NOT saved: {exc}")
+                return
             # The serve unit records as root into the operator's home; hand the
             # tree back after every save so a crash never leaves a root-owned
             # dataset behind (no-op off the root service).
@@ -1344,8 +1383,8 @@ def _run(
 
     try:
         # Keep the relay's dataset branch closed until an episode records. This
-        # lives inside the cleanup scope because an acknowledged IDR-alignment
-        # failure is now surfaced synchronously.
+        # lives inside the cleanup scope because an acknowledged camera-gate
+        # failure is surfaced synchronously.
         if relay is not None:
             relay.set_raw_enabled(False)
 
@@ -1361,9 +1400,13 @@ def _run(
                 f"Episode {episode_idx + 1}: robot is at rest pose. Press record on the VR controller when ready."
             )
 
-            recording, rerecord, contact, captured_rows = _run_on_robot_loop(
-                _episode_loop()
-            )
+            (
+                recording,
+                rerecord,
+                contact,
+                captured_rows,
+                capture_failure,
+            ) = _run_on_robot_loop(_episode_loop())
 
             if _stopped():
                 if recording:
@@ -1384,7 +1427,12 @@ def _run(
                 teleop.send_feedback_state(VRState.DATA_COLLECTION)
                 continue
 
-            if recording and not rerecord and captured_rows > 0:
+            if (
+                recording
+                and not rerecord
+                and capture_failure is None
+                and captured_rows > 0
+            ):
                 # Mirror the headset's SAVING state in the panel for the whole
                 # rest-pose + save stretch (recording controls are blocked).
                 control.note_saving()
@@ -1402,7 +1450,12 @@ def _run(
                 _return_home_loop(), robot.event_loop
             )
             try:
-                _wrap_up_episode(recording, rerecord, captured_rows)
+                _wrap_up_episode(
+                    recording,
+                    rerecord,
+                    captured_rows,
+                    capture_failure,
+                )
                 home_future.result()
             except BaseException:
                 # Ctrl+C or a failed save: unwind the guarded return so it

@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 from almond_axol.video.shm_frames import EncodedAuReader
 
-
 _IDR = b"\x00\x00\x00\x01\x65\x88"
 _P_FRAME = b"\x00\x00\x00\x01\x41\x9a"
 
@@ -91,8 +90,8 @@ class EncodedAuReaderDiscontinuityTest(unittest.TestCase):
             reader,
             [
                 _FakeBuffer(_IDR, 1_000_000_000),
-                _FakeBuffer(_P_FRAME, 1_016_000_000, discont=True),
-                _FakeBuffer(_P_FRAME, 1_032_000_000, discont=True),
+                _FakeBuffer(_IDR, 1_016_000_000, discont=True),
+                _FakeBuffer(_IDR, 1_032_000_000, discont=True),
             ],
         )
 
@@ -111,9 +110,8 @@ class EncodedAuReaderDiscontinuityTest(unittest.TestCase):
         _pull(
             reader,
             [
-                _FakeBuffer(_P_FRAME, 1_000_000_000, discont=True),
                 _FakeBuffer(_IDR, 1_016_000_000, discont=True),
-                _FakeBuffer(_P_FRAME, 1_032_000_000),
+                _FakeBuffer(_IDR, 1_032_000_000),
             ],
         )
 
@@ -123,7 +121,7 @@ class EncodedAuReaderDiscontinuityTest(unittest.TestCase):
 
         _pull(
             reader,
-            [_FakeBuffer(_P_FRAME, 1_048_000_000, discont=True)],
+            [_FakeBuffer(_IDR, 1_048_000_000, discont=True)],
         )
 
         self.assertEqual(reader.pending, 0)
@@ -131,6 +129,15 @@ class EncodedAuReaderDiscontinuityTest(unittest.TestCase):
             RuntimeError, "encoded-AU discontinuity.*near frame 2"
         ):
             reader.read_next_au(timeout_ms=0)
+
+    def test_predictive_frame_violates_all_intra_contract(self) -> None:
+        reader = _reader()
+
+        _pull(reader, [_FakeBuffer(_P_FRAME, 1_000_000_000)])
+
+        self.assertFalse(reader._first_sample.is_set())
+        self.assertEqual(reader.pending, 0)
+        self.assertIn("configured all-intra", reader._permanent_error or "")
 
     def test_invalid_startup_timestamp_remains_fatal(self) -> None:
         reader = _reader()

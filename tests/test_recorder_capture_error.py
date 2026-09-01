@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import multiprocessing
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
 from almond_axol.recording.record_proc import (
     DatasetRecorderProcess,
     InProcessRecorder,
+    RecorderCaptureError,
+    RecorderDatasetSaveError,
+    _align_independent_encoded_start,
+    run_encoded_capture_loop,
 )
 
 
@@ -26,7 +32,185 @@ class _FakeVerifier:
         self.events.append("verifier-close")
 
 
+class _ReplyConnection:
+    def __init__(self, reply: object) -> None:
+        self.reply = reply
+        self.sent: list[object] = []
+
+    def send(self, value: object) -> None:
+        self.sent.append(value)
+
+    def poll(self, _timeout: float) -> bool:
+        return True
+
+    def recv(self) -> object:
+        return self.reply
+
+
+class _EncodedCamera:
+    frames_are_independent = True
+    capture_fps = 60
+    pending = 0
+
+    def __init__(self, packets: list[tuple[bytes, float, float]]) -> None:
+        self.packets = packets
+
+    def begin_flush(self) -> None:
+        pass
+
+    def finish_flush(self) -> None:
+        pass
+
+    def read_next_au(self, timeout_ms: float) -> tuple[bytes, float, float]:
+        del timeout_ms
+        if not self.packets:
+            raise TimeoutError
+        return self.packets.pop(0)
+
+
+class _CaptureDataset:
+    features: dict = {}
+
+    def __init__(self, stop: threading.Event) -> None:
+        self.stop = stop
+        self.rows: list[dict] = []
+
+    def add_frame(self, row: dict) -> None:
+        self.rows.append(row)
+        self.stop.set()
+
+
 class DatasetRecorderCaptureErrorTest(unittest.TestCase):
+    def test_row_zero_alignment_advances_only_lagging_all_intra_streams(
+        self,
+    ) -> None:
+        packets = {
+            "overhead_left": (b"o0", 10.0000, 1.0),
+            "overhead_right": (b"o1", 10.0000, 1.0),
+            "left_arm": (b"l", 10.0333, 1.0),
+            "right_arm": (b"r0", 10.0000, 1.0),
+        }
+        queued = {
+            "overhead_left": [
+                (b"o2", 10.0167, 1.1),
+                (b"o4", 10.0334, 1.2),
+            ],
+            "overhead_right": [
+                (b"o3", 10.0167, 1.1),
+                (b"o5", 10.0334, 1.2),
+            ],
+            "right_arm": [
+                (b"r1", 10.0167, 1.1),
+                (b"r2", 10.0334, 1.2),
+            ],
+        }
+
+        def read_next(name: str) -> tuple[bytes, float, float] | None:
+            values = queued.get(name, [])
+            return values.pop(0) if values else None
+
+        aligned, dropped = _align_independent_encoded_start(
+            packets,
+            read_next,
+            fps=60,
+            capture_fps=dict.fromkeys(packets, 60),
+        )
+
+        times = [packet[1] for packet in aligned.values()]
+        self.assertLessEqual(max(times) - min(times), 0.025)
+        self.assertEqual(
+            dropped,
+            {"overhead_left": 2, "overhead_right": 2, "right_arm": 2},
+        )
+        self.assertEqual(aligned["left_arm"][0], b"l")
+
+    def test_row_zero_alignment_fails_if_lagging_stream_stalls(self) -> None:
+        packets = {"overhead": (b"o", 1.0, 1.0), "wrist": (b"w", 1.1, 1.0)}
+
+        with self.assertRaisesRegex(TimeoutError, "overhead.*did not catch up"):
+            _align_independent_encoded_start(
+                packets,
+                lambda _name: None,
+                fps=30,
+                capture_fps=dict.fromkeys(packets, 30),
+            )
+
+    def test_row_zero_alignment_rejects_a_dropped_prefix_frame(self) -> None:
+        packets = {"overhead": (b"o", 1.0, 1.0), "wrist": (b"w", 1.1, 1.0)}
+
+        with self.assertRaisesRegex(RuntimeError, "dropped an encoded frame"):
+            _align_independent_encoded_start(
+                packets,
+                lambda _name: (b"jump", 1.075, 1.1),
+                fps=30,
+                capture_fps=dict.fromkeys(packets, 60),
+            )
+
+    def test_encoded_capture_saves_the_aligned_access_units_verbatim(self) -> None:
+        stop = threading.Event()
+        dataset = _CaptureDataset(stop)
+        base = time.perf_counter() + 0.1
+        step = 1.0 / 60.0
+        cameras = {
+            "overhead_left": _EncodedCamera(
+                [
+                    (b"ol0", base, base),
+                    (b"ol1", base + step, base),
+                    (b"ol2", base + 2 * step, base),
+                ]
+            ),
+            "overhead_right": _EncodedCamera(
+                [
+                    (b"or0", base, base),
+                    (b"or1", base + step, base),
+                    (b"or2", base + 2 * step, base),
+                ]
+            ),
+            "left_arm": _EncodedCamera([(b"la2", base + 2 * step, base)]),
+            "right_arm": _EncodedCamera(
+                [
+                    (b"ra0", base, base),
+                    (b"ra1", base + step, base),
+                    (b"ra2", base + 2 * step, base),
+                ]
+            ),
+        }
+        errors: list[str] = []
+
+        def snapshot(ts: float) -> tuple[dict, dict, float, bool]:
+            return {"state": 1}, {"target": 2}, ts, False
+
+        def build_frame(_features: dict, values: dict, prefix: str) -> dict:
+            return {f"{prefix}.{name}": value for name, value in values.items()}
+
+        with (
+            patch(
+                "lerobot.utils.feature_utils.build_dataset_frame",
+                side_effect=build_frame,
+            ),
+            patch("lerobot.utils.visualization_utils.log_rerun_data"),
+        ):
+            run_encoded_capture_loop(
+                cameras=cameras,
+                read_snapshot=lambda: snapshot(time.perf_counter()),
+                read_snapshot_nearest=lambda ts: snapshot(ts),
+                dataset=dataset,
+                robot_obs_proc=lambda obs: obs,
+                fps=60,
+                task="test",
+                rerun_ip=None,
+                stop_event=stop,
+                on_error=errors.append,
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(dataset.rows), 1)
+        row = dataset.rows[0]
+        self.assertEqual(row["observation.overhead_left"], b"ol2")
+        self.assertEqual(row["observation.overhead_right"], b"or2")
+        self.assertEqual(row["observation.left_arm"], b"la2")
+        self.assertEqual(row["observation.right_arm"], b"ra2")
+
     def test_in_process_close_discards_normal_unsaved_episode_before_finalize(
         self,
     ) -> None:
@@ -50,6 +234,95 @@ class DatasetRecorderCaptureErrorTest(unittest.TestCase):
             recorder.close()
 
         self.assertEqual(events, ["clear", "finalize", "verifier-close"])
+
+    def test_in_process_finish_capture_error_clears_then_raises_typed(self) -> None:
+        events: list[str] = []
+        recorder = InProcessRecorder.__new__(InProcessRecorder)
+        recorder._thread = None
+        recorder._stop = None
+        recorder._capture_error = "camera alignment failed"
+        recorder._dataset = _FakeDataset(events)
+        recorder._frames = {"n": 4}
+
+        with self.assertRaisesRegex(RecorderCaptureError, "alignment failed"):
+            recorder.finish_episode()
+
+        self.assertEqual(events, ["clear"])
+
+    def test_in_process_finish_stop_failure_stays_fatal(self) -> None:
+        recorder = InProcessRecorder.__new__(InProcessRecorder)
+        with patch.object(
+            recorder,
+            "_stop_capture",
+            side_effect=RuntimeError("capture thread did not stop"),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                recorder.finish_episode()
+
+        self.assertNotIsInstance(raised.exception, RecorderCaptureError)
+
+    def test_in_process_save_dropped_frame_is_typed_precommit_rejection(self) -> None:
+        events: list[str] = []
+        recorder = InProcessRecorder.__new__(InProcessRecorder)
+        recorder._thread = None
+        recorder._stop = None
+        recorder._capture_error = None
+        recorder._dataset = _FakeDataset(events)
+
+        with (
+            patch(
+                "almond_axol.lerobot.nvenc_encoder.dropped_frames",
+                return_value=2,
+            ),
+            self.assertRaisesRegex(RecorderCaptureError, "2 video frame"),
+        ):
+            recorder.save_episode()
+
+        self.assertEqual(events, ["clear"])
+
+    def test_process_finish_uses_post_join_capture_error_reply(self) -> None:
+        conn = _ReplyConnection(("finished", 7, "camera alignment failed"))
+        recorder = DatasetRecorderProcess.__new__(DatasetRecorderProcess)
+        recorder._lock = threading.Lock()
+        recorder._conn = conn
+        recorder._capture_error = None
+
+        with self.assertRaisesRegex(RecorderCaptureError, "alignment failed"):
+            recorder.finish_episode()
+
+        self.assertEqual(conn.sent, [("finish_episode",)])
+        self.assertEqual(recorder._capture_error, "camera alignment failed")
+
+    def test_process_finish_non_capture_error_stays_fatal(self) -> None:
+        conn = _ReplyConnection(("error", "capture thread did not stop"))
+        recorder = DatasetRecorderProcess.__new__(DatasetRecorderProcess)
+        recorder._lock = threading.Lock()
+        recorder._conn = conn
+
+        with self.assertRaises(RuntimeError) as raised:
+            recorder.finish_episode()
+
+        self.assertNotIsInstance(raised.exception, RecorderCaptureError)
+
+    def test_process_save_distinguishes_capture_rejection_from_commit_failure(
+        self,
+    ) -> None:
+        recorder = DatasetRecorderProcess.__new__(DatasetRecorderProcess)
+        recorder._lock = threading.Lock()
+        recorder._capture_error = None
+
+        recorder._conn = _ReplyConnection(("capture_error", "2 dropped frames"))
+        with self.assertRaises(RecorderCaptureError):
+            recorder.save_episode()
+
+        recorder._conn = _ReplyConnection(("error", "mux prepare failed"))
+        with self.assertRaises(RuntimeError) as prepare_failure:
+            recorder.save_episode()
+        self.assertNotIsInstance(prepare_failure.exception, RecorderCaptureError)
+
+        recorder._conn = _ReplyConnection(("fatal", "parquet commit failed"))
+        with self.assertRaises(RecorderDatasetSaveError):
+            recorder.save_episode()
 
     def test_capture_error_uses_separate_nonblocking_channel(self) -> None:
         ctx = multiprocessing.get_context("spawn")
