@@ -897,6 +897,56 @@ class CanDriverIdentityTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "enough build identity"):
                     driver._load_available_driver()
 
+    def test_unverifiable_managed_override_is_rebuilt_automatically(self) -> None:
+        built = Path("/tmp/gs_usb-build/gs_usb.ko")
+        output = io.StringIO()
+        identity_error = driver._DriverIdentityError("cannot compare modules")
+        with (
+            patch.object(driver, "is_driver_available", return_value=True),
+            patch.object(driver, "_signature_enforced", return_value=False),
+            patch.object(driver, "_load_available_driver", side_effect=identity_error),
+            patch.object(driver, "_selected_driver_is_vendored", return_value=True),
+            patch.object(driver, "_driver_supports_required_ids") as supports_ids,
+            patch.object(driver, "_selected_driver_has_hub_fixes") as has_fixes,
+            patch.object(driver, "_build", return_value=built) as build,
+            patch.object(driver, "_install") as install,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertTrue(driver.ensure_driver())
+
+        build.assert_called_once_with()
+        install.assert_called_once_with(built)
+        supports_ids.assert_not_called()
+        has_fixes.assert_not_called()
+        self.assertIn("managed driver override", output.getvalue())
+
+    def test_unverifiable_unmanaged_driver_still_fails_closed(self) -> None:
+        identity_error = driver._DriverIdentityError("cannot compare modules")
+        with (
+            patch.object(driver, "is_driver_available", return_value=True),
+            patch.object(driver, "_signature_enforced", return_value=False),
+            patch.object(driver, "_load_available_driver", side_effect=identity_error),
+            patch.object(driver, "_selected_driver_is_vendored", return_value=False),
+            patch.object(driver, "_build") as build,
+            self.assertRaisesRegex(RuntimeError, "cannot compare modules"),
+        ):
+            driver.ensure_driver()
+        build.assert_not_called()
+
+    def test_unverifiable_signed_override_is_not_replaced(self) -> None:
+        identity_error = driver._DriverIdentityError("cannot compare modules")
+        with (
+            patch.object(driver, "is_driver_available", return_value=True),
+            patch.object(driver, "_unsigned_driver_is_blocked", return_value=False),
+            patch.object(driver, "_signature_enforced", return_value=True),
+            patch.object(driver, "_load_available_driver", side_effect=identity_error),
+            patch.object(driver, "_selected_driver_is_vendored", return_value=True),
+            patch.object(driver, "_build") as build,
+            self.assertRaisesRegex(RuntimeError, "cannot compare modules"),
+        ):
+            driver.ensure_driver()
+        build.assert_not_called()
+
     def test_signed_legacy_vendored_fingerprint_is_narrow(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

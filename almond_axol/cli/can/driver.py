@@ -52,6 +52,10 @@ _OPTIONAL_USB_ALIASES = {("16d0", "117e"): _CANABLE2_ALIAS}
 _LEGACY_VENDORED_ALIASES = (_HUB_ALIAS, _CANDLELIGHT_ALIAS, _CANABLE2_ALIAS)
 
 
+class _DriverIdentityError(RuntimeError):
+    """The active module cannot be proven to match modprobe's selection."""
+
+
 def _find_modinfo() -> str | None:
     """Locate ``modinfo``, including the sbin dirs minimal PATHs often omit."""
     found = shutil.which("modinfo")
@@ -155,6 +159,13 @@ def _resolved_path(path: str | Path) -> Path | None:
         return None
 
 
+def _selected_driver_is_vendored() -> bool:
+    """Whether modprobe selects Almond's canonical managed override path."""
+    selected = _resolved_path(_selected_driver_path())
+    destination = _resolved_path(_vendored_driver_path())
+    return selected is not None and destination is not None and selected == destination
+
+
 def _selected_driver_is_native(filename: str | None = None) -> bool:
     """Whether modprobe selects this kernel's in-tree module.
 
@@ -204,9 +215,7 @@ def _selected_driver_is_legacy_vendored() -> bool:
     module, and Almond-specific three-ID alias fingerprint must all agree. On
     ordinary unsigned hosts the old module is rebuilt once instead.
     """
-    selected = _resolved_path(_selected_driver_path())
-    destination = _resolved_path(_vendored_driver_path())
-    if selected is None or destination is None or selected != destination:
+    if not _selected_driver_is_vendored():
         return False
     taint = _loaded_module_field("taint")
     if (
@@ -269,14 +278,14 @@ def _load_available_driver() -> None:
         if loaded_srcversion and selected_srcversion:
             if loaded_srcversion == selected_srcversion:
                 return
-            raise RuntimeError(
+            raise _DriverIdentityError(
                 "The active gs_usb module differs from the module selected on disk "
                 f"({_selected_driver_path()}). Remove the stale override or reboot "
                 "into the intended driver, then retry."
             )
         if _loaded_matches_selected_without_srcversion():
             return
-        raise RuntimeError(
+        raise _DriverIdentityError(
             "The active gs_usb module and the module selected on disk do not "
             "expose enough build identity to prove they match "
             f"({_selected_driver_path()}). Unplug the CAN adapters, run "
@@ -576,20 +585,39 @@ def ensure_driver() -> bool:
             "`sudo depmod -a`, and retry."
         )
     if available:
-        _load_available_driver()
-        if _driver_supports_required_ids() and _selected_driver_has_hub_fixes():
-            return False
-        if _selected_driver_path() == "(builtin)":
-            raise RuntimeError(
-                "This kernel's built-in gs_usb driver lacks a required USB ID "
-                "or Axol Hub fix and cannot be replaced by a module. Use a "
-                "kernel whose driver supports the attached adapters, or rebuild "
-                "it with the Axol Hub fixes and CONFIG_CAN_GS_USB=m."
+        rebuild_for_identity = False
+        try:
+            _load_available_driver()
+        except _DriverIdentityError:
+            # Old Jetson installs predate MODULE_VERSION and often expose no
+            # srcversion in sysfs.  The active module is therefore impossible
+            # to compare with the selected file, even when both came from
+            # Almond.  The canonical override is ours to replace, so migrate
+            # it in place on hosts that permit unsigned modules.  Keep the
+            # strict failure for distro/arbitrary paths and Secure Boot hosts.
+            if _signature_enforced() or not _selected_driver_is_vendored():
+                raise
+            rebuild_for_identity = True
+
+        if not rebuild_for_identity:
+            if _driver_supports_required_ids() and _selected_driver_has_hub_fixes():
+                return False
+            if _selected_driver_path() == "(builtin)":
+                raise RuntimeError(
+                    "This kernel's built-in gs_usb driver lacks a required USB ID "
+                    "or Axol Hub fix and cannot be replaced by a module. Use a "
+                    "kernel whose driver supports the attached adapters, or rebuild "
+                    "it with the Axol Hub fixes and CONFIG_CAN_GS_USB=m."
+                )
+            print(
+                "Installed gs_usb driver lacks a required USB ID or Axol Hub "
+                "backport — rebuilding it."
             )
-        print(
-            "Installed gs_usb driver lacks a required USB ID or Axol Hub "
-            "backport — rebuilding it."
-        )
+        else:
+            print(
+                "Active gs_usb cannot be matched to Almond's managed driver "
+                "override — rebuilding it."
+            )
     else:
         print("Kernel does not ship the gs_usb driver — building it from source.")
     ko = _build()
