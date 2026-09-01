@@ -99,6 +99,17 @@ class RtLink:
         groups = core_groups()
         if groups is not None:
             can_cores = sorted(groups["can"])
+            background_cores = sorted(groups["background"])
+            if background_cores:
+                # The Rust trace writers are spawned by the CAN threads. Give
+                # them an explicit throughput-safe destination so trace file
+                # flush/truncate work runs with the dataset recorder instead
+                # of inheriting either a CAN core or this process's realtime
+                # core. Rust validates and applies the mask before opening or
+                # writing the trace.
+                env["AXOL_RT_BACKGROUND_CPUS"] = ",".join(
+                    str(core) for core in background_cores
+                )
             if len(can_cores) >= 2 and groups["can"].isdisjoint(groups["realtime"]):
                 env["AXOL_RT_CPU_LEFT"] = str(can_cores[0])
                 env["AXOL_RT_CPU_RIGHT"] = str(can_cores[1])
