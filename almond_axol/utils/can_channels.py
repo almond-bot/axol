@@ -5,6 +5,35 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 
+def require_distinct_axol_channels(
+    channels: Iterable[str | None],
+) -> tuple[str | None, str | None]:
+    """Normalize an Axol arm map and reject one interface reused by both arms.
+
+    Axol's two arms reuse the same motor IDs, so constructing two logical buses
+    on one SocketCAN interface makes commands ambiguous.  Either side may be
+    omitted for a one-arm bench setup; only two simultaneously active names
+    must be distinct.
+    """
+    values = tuple(channels)
+    if len(values) != 2:
+        raise ValueError("Axol requires exactly two CAN channel slots")
+
+    def normalize(value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return None if not text or text.lower() in ("null", "none") else text
+
+    left, right = (normalize(value) for value in values)
+    if left is not None and right is not None and left == right:
+        raise ValueError(
+            f"Axol left and right CAN channels are both {left!r}; choose two "
+            "distinct interfaces or disable one side"
+        )
+    return left, right
+
+
 def require_mantis_channels(
     channels: Iterable[str | None],
 ) -> tuple[str, str]:

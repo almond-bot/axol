@@ -98,7 +98,7 @@ from ..recording import (
     default_vcodec,
     restore_dataset_ownership,
 )
-from ..robot.base import HardwareCleanupError
+from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..utils.network import local_ip
 from .collect_data import (
     _existing_dataset_resolution,
@@ -110,7 +110,6 @@ from .run_policy import (
     _GATE_CONTACT,
     _QueuePolicyControl,
     _StdinPolicyControl,
-    _lingering_episode_thread_error,
 )
 
 if TYPE_CHECKING:
@@ -552,15 +551,26 @@ class _DaggerControlLoop(threading.Thread):
         except Exception as exc:  # noqa: BLE001
             _logger.warning("Observation failed (%s); skipping tick.", exc)
             return None
+        if self.shutdown_event.is_set():
+            return None
 
         action_dict = self.policy.act(obs)
         if action_dict is None:
+            return None
+        # Policy inference may block in a backend/native runtime.  A stop that
+        # arrived while it was running must prevent the returned action from
+        # reaching hardware or the recorder.
+        if self.shutdown_event.is_set():
             return None
 
         if self.limiter is not None:
             action_dict = self.limiter.apply(action_dict)
 
+        if self.shutdown_event.is_set():
+            return None
         performed = self.robot.send_action(action_dict)
+        if self.shutdown_event.is_set():
+            return None
         # obs carries the joint keys the snapshot needs (camera frames in the
         # same dict are simply ignored by the snapshot writer's key list).
         self.recorder.publish(
@@ -578,17 +588,20 @@ class _DaggerControlLoop(threading.Thread):
         loop_times: list[float] = []
         last_rate_log = time.perf_counter()
 
-        # Anchor the policy velocity envelope at the robot's measured pose so
-        # the episode's first action can't jump either.
-        if self.limiter is not None:
-            self.limiter.seed(*self.robot.positions)
-
         try:
+            # Anchor the policy velocity envelope at the robot's measured pose
+            # so the episode's first action can't jump either. Keep this inside
+            # the fault boundary so startup failures reach the supervisor.
+            if self.limiter is not None:
+                self.limiter.seed(*self.robot.positions)
+
             while not self.shutdown_event.is_set():
                 t0 = time.perf_counter()
 
                 # --- episode end requested from the VR record button?
                 events = self.teleop.get_teleop_events()
+                if self.shutdown_event.is_set():
+                    return
                 if events[TeleopEvents.TERMINATE_EPISODE]:
                     self.vr_choice = "s"
                     return
@@ -646,6 +659,8 @@ class _DaggerControlLoop(threading.Thread):
                 period = teleop_period if self.state == _STATE_TELEOP else policy_period
 
                 # --- command the robot from the selected source
+                if self.shutdown_event.is_set():
+                    return
                 if self.state == _STATE_POLICY:
                     sent = self._policy_tick(t0)
                     if sent is None:
@@ -655,7 +670,11 @@ class _DaggerControlLoop(threading.Thread):
                 elif self.state == _STATE_TELEOP:
                     joint_obs = self.robot.get_joint_observation()
                     action = self.teleop.get_action()
+                    if self.shutdown_event.is_set():
+                        return
                     performed = self.robot.send_action(action)
+                    if self.shutdown_event.is_set():
+                        return
                     # intervention=True: the recorder tags the rows this
                     # snapshot pairs with as human-driven (the dataset's
                     # per-frame ``intervention`` feature).
@@ -668,7 +687,11 @@ class _DaggerControlLoop(threading.Thread):
                     last_action = action
                 else:  # FROZEN — hold pose, keep the command cadence alive.
                     if last_action is not None:
+                        if self.shutdown_event.is_set():
+                            return
                         self.robot.send_action(last_action)
+                        if self.shutdown_event.is_set():
+                            return
                         # Keep the recorder's snapshot current with the live
                         # command: capture is gated in the recorder, but a row
                         # racing the takeover resume then pairs its frames
@@ -782,6 +805,167 @@ def _idle_teleop_until_record(
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
+
+
+def _stop_dagger_control_worker(
+    worker: _DaggerControlLoop | None,
+    *,
+    timeout: float = 5.0,
+) -> tuple[bool, BaseException | None]:
+    """Request stop and return ``True`` only after worker exit is proved."""
+    if worker is None:
+        return True, None
+    failures: list[tuple[str, BaseException]] = []
+    try:
+        worker.shutdown_event.set()
+    except BaseException as error:
+        failures.append(("stop signal", error))
+    try:
+        if getattr(worker, "ident", None) is not None or worker.is_alive():
+            worker.join(timeout=timeout)
+    except BaseException as error:
+        failures.append(("join", error))
+    try:
+        alive = bool(worker.is_alive())
+    except BaseException as error:
+        failures.append(("liveness check", error))
+        alive = True
+
+    if alive:
+        error = RuntimeError(
+            f"DAgger control loop did not stop within {timeout:g}s; deferring "
+            "recorder mutation and robot/teleop/relay teardown until a final "
+            "exit proof"
+        )
+    elif failures:
+        error = RuntimeError(
+            "DAgger control-loop cleanup encountered an error after exit was proved"
+        )
+    else:
+        return True, None
+    for label, failure in failures:
+        error.add_note(
+            f"additional DAgger control {label} failure: "
+            f"{type(failure).__name__}: {failure}"
+        )
+    return not alive, error
+
+
+def _cleanup_dagger_resource(
+    *,
+    control_stopped: bool,
+    label: str,
+    cleanup: Callable[[], Any],
+) -> BaseException | None:
+    """Clean a control-owned resource only after the loop's exit proof."""
+    if not control_stopped:
+        _logger.error(
+            "skipping %s because DAgger control-loop exit was not proved", label
+        )
+        return None
+    try:
+        cleanup()
+    except BaseException as error:
+        _logger.exception("%s cleanup failed", label)
+        return error
+    return None
+
+
+def _finish_dagger_cleanup(
+    *,
+    session_error: BaseException | None,
+    disconnect_failure: BaseException | None,
+    teleop_failure: BaseException | None,
+    reset_failure: BaseException | None,
+    relay_failure: BaseException | None,
+    additional_failures: tuple[tuple[str, BaseException], ...] = (),
+) -> None:
+    """Propagate teardown failures without replacing a session's primary error."""
+    failures = [
+        (label, failure)
+        for label, failure in (
+            ("robot disconnect", disconnect_failure),
+            ("teleop disconnect", teleop_failure),
+            ("IK reset worker", reset_failure),
+            *additional_failures,
+            ("video relay", relay_failure),
+        )
+        if failure is not None
+    ]
+    if session_error is not None:
+        for label, failure in failures:
+            session_error.add_note(
+                f"additional {label} cleanup failure: "
+                f"{type(failure).__name__}: {failure}"
+            )
+        uncertain = (
+            disconnect_failure
+            or teleop_failure
+            or reset_failure
+            or next(
+                (
+                    failure
+                    for _label, failure in additional_failures
+                    if isinstance(failure, HardwareCleanupError)
+                ),
+                None,
+            )
+        )
+        if uncertain is not None:
+            mark_hardware_cleanup_uncertain(session_error, uncertain)
+        return
+
+    def add_remaining_notes(error: BaseException, selected: BaseException) -> None:
+        for label, failure in failures:
+            if failure is selected:
+                continue
+            error.add_note(
+                f"additional {label} cleanup failure: "
+                f"{type(failure).__name__}: {failure}"
+            )
+
+    if disconnect_failure is not None:
+        error = HardwareCleanupError(
+            "robot disconnect failed; hardware ownership is uncertain"
+        )
+        add_remaining_notes(error, disconnect_failure)
+        raise error from disconnect_failure
+    if reset_failure is not None:
+        error = (
+            reset_failure
+            if isinstance(reset_failure, HardwareCleanupError)
+            else HardwareCleanupError(
+                "IK reset worker did not stop; background ownership is uncertain"
+            )
+        )
+        add_remaining_notes(error, reset_failure)
+        if error is reset_failure:
+            raise error
+        raise error from reset_failure
+    hardware_failure = next(
+        (
+            failure
+            for _label, failure in additional_failures
+            if isinstance(failure, HardwareCleanupError)
+        ),
+        None,
+    )
+    if hardware_failure is not None:
+        add_remaining_notes(hardware_failure, hardware_failure)
+        raise hardware_failure
+    if teleop_failure is not None:
+        add_remaining_notes(teleop_failure, teleop_failure)
+        if isinstance(teleop_failure, HardwareCleanupError):
+            raise teleop_failure
+        raise RuntimeError(
+            "teleop disconnect failed; background ownership is uncertain"
+        ) from teleop_failure
+    if additional_failures:
+        _label, failure = additional_failures[0]
+        add_remaining_notes(failure, failure)
+        raise failure
+    if relay_failure is not None:
+        raise relay_failure
 
 
 def _run(
@@ -1037,26 +1221,45 @@ def _run(
                 fps=fps,
                 allowed_extra_features=frozenset({"observation.pose_lag"}),
             )
-    except BaseException:
+    except BaseException as setup_error:
+        setup_failures: list[tuple[str, BaseException]] = []
         if relay is not None:
             try:
                 relay.shutdown()
-            except Exception:  # noqa: BLE001
+            except BaseException as cleanup_error:
                 _logger.exception("video relay setup cleanup failed")
+                setup_failures.append(("video relay", cleanup_error))
         if reset_controller is not None:
             try:
                 reset_controller.stop()
-            except Exception:  # noqa: BLE001
+            except BaseException as cleanup_error:
                 _logger.exception("IK reset setup cleanup failed")
+                setup_failures.append(("IK reset worker", cleanup_error))
         try:
             policy.close()
-        except Exception:  # noqa: BLE001
+        except BaseException as cleanup_error:
             _logger.exception("policy setup cleanup failed")
+            setup_failures.append(("policy", cleanup_error))
         if _orig_affinity is not None:
             try:
                 os.sched_setaffinity(0, _orig_affinity)
-            except OSError:
-                pass
+            except OSError as cleanup_error:
+                setup_failures.append(("CPU affinity restore", cleanup_error))
+        for label, cleanup_error in setup_failures:
+            setup_error.add_note(
+                f"additional {label} cleanup failure: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        reset_failure = next(
+            (
+                failure
+                for label, failure in setup_failures
+                if label == "IK reset worker"
+            ),
+            None,
+        )
+        if reset_failure is not None:
+            mark_hardware_cleanup_uncertain(setup_error, reset_failure)
         raise
 
     assert reset_controller is not None and relay is not None
@@ -1065,6 +1268,7 @@ def _run(
     episode_idx = 0
     recorder: DatasetRecorderProcess | None = None
     control_thread: _DaggerControlLoop | None = None
+    control_worker_stopped = True
 
     def _return_to_rest_guarded(wait_retry: Callable[[], bool]) -> bool:
         """Guarded ``IKResetController`` home; ``False`` when aborted.
@@ -1131,6 +1335,7 @@ def _run(
         finally:
             control.note_gate(_idle_gate_message())
 
+    session_error: BaseException | None = None
     try:
         log_say("Connecting robot...")
         robot.connect()
@@ -1271,6 +1476,10 @@ def _run(
                 )
 
             teleop.set_intervention_allowed(True)
+            # Retain the exact worker and mark its resources owned before
+            # start(), so a partial thread-start failure also reaches the
+            # final liveness gate.
+            control_worker_stopped = False
             control_thread.start()
             control.begin_episode(_switch_subtask, len(subtasks))
 
@@ -1302,20 +1511,29 @@ def _run(
             except KeyboardInterrupt:
                 interrupted = True
 
-            control.end_episode()
-            control_thread.shutdown_event.set()
-            control_thread.join(timeout=5.0)
-            lingering = _lingering_episode_thread_error(
-                [("DAgger control", control_thread)]
+            control_end_error: BaseException | None = None
+            try:
+                control.end_episode()
+            except BaseException as error:
+                control_end_error = error
+            control_worker_stopped, worker_stop_error = _stop_dagger_control_worker(
+                control_thread
             )
-            if lingering is not None:
+            if worker_stop_error is not None:
                 if control_thread.fatal_error is not None:
-                    lingering.add_note(
+                    worker_stop_error.add_note(
                         "The control loop had already reported: "
                         f"{type(control_thread.fatal_error).__name__}: "
                         f"{control_thread.fatal_error}"
                     )
-                control_thread.fatal_error = lingering
+                if control_end_error is not None:
+                    worker_stop_error.add_note(
+                        "additional episode-control cleanup failure: "
+                        f"{type(control_end_error).__name__}: {control_end_error}"
+                    )
+                raise worker_stop_error
+            if control_end_error is not None:
+                raise control_end_error
             teleop.set_intervention_allowed(False)
             teleop.force_disengage()
             # Freeze the recorder's capture at a known row count: stops rows
@@ -1393,6 +1611,9 @@ def _run(
 
     except KeyboardInterrupt:
         pass
+    except BaseException as error:
+        session_error = error
+        raise
     finally:
         import signal
 
@@ -1402,76 +1623,95 @@ def _run(
             pass
 
         log_say("Stopping.")
-        try:
-            policy.close()
-        except Exception:  # noqa: BLE001
-            pass
-        disconnect_failure: BaseException | None = None
-        try:
-            robot.disconnect()
-        except BaseException as exc:
-            _logger.exception("robot disconnect failed")
-            disconnect_failure = exc
-        teleop_failure: BaseException | None = None
-        try:
-            teleop.disconnect()
-        except BaseException as exc:
-            _logger.exception("teleop disconnect failed")
-            teleop_failure = exc
-        try:
-            reset_controller.stop()
-        except Exception:  # noqa: BLE001
-            pass
+        cleanup_failures: list[tuple[str, BaseException]] = []
+
+        if not control_worker_stopped:
+            control_worker_stopped, final_worker_error = _stop_dagger_control_worker(
+                control_thread
+            )
+            if not control_worker_stopped:
+                ownership_error = HardwareCleanupError(
+                    "DAgger control loop remained alive after the final join; "
+                    "recorder and robot/teleop/relay ownership are uncertain"
+                )
+                if final_worker_error is not None:
+                    ownership_error.add_note(
+                        "additional final DAgger worker cleanup failure: "
+                        f"{type(final_worker_error).__name__}: {final_worker_error}"
+                    )
+                cleanup_failures.append(("DAgger control loop", ownership_error))
+            elif final_worker_error is not None:
+                cleanup_failures.append(("DAgger control loop", final_worker_error))
+
+        def _cleanup(
+            label: str,
+            cleanup: Callable[[], Any],
+            *,
+            requires_control_exit: bool = True,
+        ) -> BaseException | None:
+            error = _cleanup_dagger_resource(
+                control_stopped=control_worker_stopped or not requires_control_exit,
+                label=label,
+                cleanup=cleanup,
+            )
+            if error is not None:
+                cleanup_failures.append((label, error))
+            return error
+
+        _cleanup("policy", policy.close)
+        disconnect_failure = _cleanup("robot disconnect", robot.disconnect)
+        teleop_failure = _cleanup("teleop disconnect", teleop.disconnect)
+        reset_failure = _cleanup(
+            "IK reset worker",
+            reset_controller.stop,
+            requires_control_exit=False,
+        )
         # Recorder owns the dataset: finalize (and empty-dataset cleanup)
         # happen in recorder.close(). Shut the relay down after it so the
         # recorder's shm readers never outlive their blocks.
         if recorder is not None:
-            try:
-                recorder.close()
-            except Exception:  # noqa: BLE001
-                _logger.exception("recorder close failed")
-            restore_dataset_ownership(dataset_root)
+            _cleanup("recorder", recorder.close)
+            _cleanup(
+                "dataset ownership restore",
+                lambda: restore_dataset_ownership(dataset_root),
+            )
         # Detach our own shared-memory readers (the robot's external cameras)
         # before their writer blocks go away with the relay, so the resource
         # tracker doesn't report them as leaked at exit.
-        for cam in relay.raw_cameras.values():
-            try:
-                cam.close()
-            except Exception:  # noqa: BLE001
-                pass
-        relay_failure: BaseException | None = None
-        try:
-            relay.shutdown()
-        except BaseException as exc:
-            _logger.exception("video relay shutdown failed")
-            relay_failure = exc
+        for name, cam in relay.raw_cameras.items():
+            _cleanup(f"raw camera {name}", cam.close)
+        relay_failure = _cleanup("video relay", relay.shutdown)
 
         # Restore the process's original CPU affinity (the process may run
         # other operations after this one).
         if _orig_affinity is not None:
-            try:
-                os.sched_setaffinity(0, _orig_affinity)
-            except OSError:
-                pass
+            _cleanup(
+                "CPU affinity restore",
+                lambda: os.sched_setaffinity(0, _orig_affinity),
+                requires_control_exit=False,
+            )
 
         try:
             signal.signal(signal.SIGINT, signal.SIG_DFL)
         except (ValueError, OSError):
             pass
-        if disconnect_failure is not None:
-            if teleop_failure is not None:
-                disconnect_failure.add_note(
-                    "teleop disconnect also failed: "
-                    f"{type(teleop_failure).__name__}: {teleop_failure}"
+        _finish_dagger_cleanup(
+            session_error=session_error,
+            disconnect_failure=disconnect_failure,
+            teleop_failure=teleop_failure,
+            reset_failure=reset_failure,
+            relay_failure=relay_failure,
+            additional_failures=tuple(
+                (label, failure)
+                for label, failure in cleanup_failures
+                if all(
+                    failure is not selected
+                    for selected in (
+                        disconnect_failure,
+                        teleop_failure,
+                        reset_failure,
+                        relay_failure,
+                    )
                 )
-            raise HardwareCleanupError(
-                "robot disconnect failed; hardware ownership is uncertain"
-            ) from disconnect_failure
-        if teleop_failure is not None:
-            if isinstance(teleop_failure, HardwareCleanupError):
-                raise teleop_failure
-            raise RuntimeError(
-                "teleop disconnect failed; background ownership is uncertain"
-            ) from teleop_failure
-        if relay_failure is not None:
-            raise relay_failure
+            ),
+        )

@@ -833,6 +833,9 @@ def _reload_udev() -> None:
 def _interface_rename_plan(
     records: list[tuple[str, str, int]],
     target: dict[tuple[str, int], str],
+    *,
+    managed_names: set[str] | None = None,
+    reserved_names: set[str] | None = None,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """Return collision-free ``(temporary, final)`` interface rename stages.
 
@@ -845,6 +848,9 @@ def _interface_rename_plan(
     The second stage includes only interfaces claimed by ``target``. An
     unclaimed stale occupant remains under its temporary name until a later
     profile pass gives it the right final name (or until it is replugged).
+    ``managed_names`` also evicts names whose role was removed entirely, and
+    ``reserved_names`` prevents temporary names colliding with unrelated live
+    network interfaces.
     """
     by_name = {name: (serial, dev_id) for name, serial, dev_id in records}
     final_by_source = {
@@ -852,20 +858,22 @@ def _interface_rename_plan(
         for name, serial, dev_id in records
         if (serial, dev_id) in target and target[(serial, dev_id)] != name
     }
-    if not final_by_source:
-        return [], []
-
     participants = set(final_by_source)
     participants.update(
         final
         for final in final_by_source.values()
         if final in by_name and final not in final_by_source
     )
+    for name in managed_names or set():
+        if name in by_name and target.get(by_name[name]) != name:
+            participants.add(name)
+    if not participants:
+        return [], []
 
     # Linux IFNAMSIZ leaves 15 visible characters. Keep the generated names
     # well below that and avoid every live/final name so a partial run remains
     # diagnosable and the second profile pass can still discover ``can*``.
-    used = set(by_name) | set(target.values())
+    used = set(by_name) | set(target.values()) | (reserved_names or set())
     temporary_by_source: dict[str, str] = {}
     next_index = 0
     for source in sorted(participants):
@@ -887,6 +895,29 @@ def _interface_rename_plan(
     return temporary_stage, final_stage
 
 
+def _validate_adapter_assignments(
+    hub_serial: str | None,
+    wheels_serial: str | None,
+    chest_serial: str | None,
+) -> None:
+    """Reject one physical adapter being assigned to incompatible roles."""
+    seen: dict[str, str] = {}
+    for role, serial in (
+        ("arm hub", hub_serial),
+        ("wheel bus", wheels_serial),
+        ("chest bus", chest_serial),
+    ):
+        if not serial:
+            continue
+        previous_role = seen.get(serial)
+        if previous_role:
+            raise RuntimeError(
+                f"Adapter {serial} cannot be assigned to both the "
+                f"{previous_role} and {role}."
+            )
+        seen[serial] = role
+
+
 def _rename_interfaces(
     hub_serial: str | None,
     wheels_serial: str | None = None,
@@ -895,11 +926,14 @@ def _rename_interfaces(
 ) -> None:
     """Rename existing CAN interfaces to their target names without replug.
 
-    All participants are staged through temporary names first. Direct renames
-    cannot recover a swapped Axol/Mantis pin because each desired final name is
-    still occupied by the other hub.
+    All participants are staged through temporary names first. This recovers a
+    swapped Axol/Mantis pin or wheel/chest pin even while each desired final
+    name is occupied by the other adapter. Stale managed-name occupants are
+    evicted even when their replacement is absent.
     """
     print("Renaming CAN interfaces (requires sudo)...")
+    _validate_adapter_assignments(hub_serial, wheels_serial, chest_serial)
+
     # (adapter serial, channel dev_id) -> persistent name. The wheel/chest
     # adapters are single-channel, so their only interface is dev_id 0.
     target: dict[tuple[str, int], str] = {}
@@ -911,8 +945,9 @@ def _rename_interfaces(
     if chest_serial:
         target[(chest_serial, 0)] = _CAN_C
 
+    net_dir = Path("/sys/class/net")
     records: list[tuple[str, str, int]] = []
-    for iface_path in Path("/sys/class/net").glob("can*"):
+    for iface_path in list(net_dir.glob("can*")):
         iface = iface_path.name
         info = subprocess.run(
             ["udevadm", "info", "-a", "-p", str(iface_path)],
@@ -921,14 +956,39 @@ def _rename_interfaces(
         ).stdout
 
         iface_serial = _udev_attr(info, "ATTRS{serial}")
+        if not iface_serial:
+            continue
         try:
             dev_id = int(_udev_attr(info, "ATTR{dev_id}"), 16)
         except ValueError:
             continue
-
         records.append((iface, iface_serial, dev_id))
 
-    temporary_stage, final_stage = _interface_rename_plan(records, target)
+    by_name = {name: (serial, dev_id) for name, serial, dev_id in records}
+    existing_names = {path.name for path in net_dir.iterdir()}
+
+    # Refuse to mutate anything if a requested destination is occupied by a
+    # network interface that is not one of the serial-bearing CAN adapters we
+    # scanned. This catches reserved-name collisions before the all-down phase.
+    for destination in set(target.values()):
+        if destination in existing_names and destination not in by_name:
+            raise RuntimeError(
+                f"Cannot rename a CAN interface to {destination}: that name "
+                "is already used by an unrelated network interface."
+            )
+
+    # A Mantis setup must never evict the Axol profile (or its wheel/chest
+    # buses), and vice versa. Wheel/chest names belong only to the Axol pass.
+    managed_names = {profile.left, profile.right}
+    if profile == _AXOL_PROFILE:
+        managed_names.update({_CAN_B, _CAN_C})
+
+    temporary_stage, final_stage = _interface_rename_plan(
+        records,
+        target,
+        managed_names=managed_names,
+        reserved_names=existing_names,
+    )
     final_by_temporary = dict(final_stage)
     for source, temporary in temporary_stage:
         final = final_by_temporary.get(temporary)
@@ -1450,6 +1510,7 @@ def _apply_setup(
     Each step is idempotent, so this is safe to re-run on a
     partially-configured machine.
     """
+    _validate_adapter_assignments(hub_serial, wheels_serial, chest_serial)
     _write_udev_rules(hub_serial, wheels_serial, chest_serial)
     _write_cron_script()
     _write_hotplug_unit()
@@ -1515,6 +1576,8 @@ def ensure_mantis_setup() -> None:
 
     configured_mantis = _configured_serial(_MANTIS_PROFILE)
     configured_axol = _configured_serial(_AXOL_PROFILE)
+    configured_wheels = _configured_named_serial(_CAN_B)
+    configured_chest = _configured_named_serial(_CAN_C)
     matches = [
         candidate
         for candidate in _detect_serials()
@@ -1531,14 +1594,15 @@ def ensure_mantis_setup() -> None:
         )
     serial = configured_mantis if configured_mantis in matches else matches[0]
 
-    if serial == configured_axol:
-        # A live trigger response proved that the old Axol pin is stale. Clear
-        # only that dual-hub match while preserving any wheel/chest rules; the
-        # Mantis setup below performs the shared udev reload and live rename.
+    if serial in {configured_axol, configured_wheels, configured_chest}:
+        # A live trigger response proved that any Axol role pinned to this
+        # serial is stale. Clear every such match before writing the Mantis
+        # profile; otherwise a former single-bus rule (which matches by serial
+        # alone) could try to rename both Mantis channels to one Axol name.
         _write_udev_rules(
-            None,
-            _configured_named_serial(_CAN_B),
-            _configured_named_serial(_CAN_C),
+            None if serial == configured_axol else configured_axol,
+            None if serial == configured_wheels else configured_wheels,
+            None if serial == configured_chest else configured_chest,
         )
     _configure_mantis(serial)
 
@@ -1552,118 +1616,145 @@ def _find_single_serials(
     chest/lift buses are reset first so stale assignments correct themselves;
     an unknown generic gs_usb adapter is probed without flapping it and gets
     reset in final setup only after a positive match or operator assignment.
-    One where nothing answers is offered to the operator with Enter preserving
-    its old role. Unplugged configured adapters keep their pins. Serials
-    claimed by a dual hub are excluded outright.
+    A positive response wins over a stale pin. A configured adapter that is
+    silent or unplugged remains as an explicitly unverified fallback, which a
+    newly attached silent adapter may replace by operator choice. Duplicate
+    unresolved pins are rejected. Serials claimed by a dual hub are excluded.
 
     Returns ``(wheels_serial, chest_serial)``, either of which may be None.
     """
-    configured_wheels = _configured_named_serial(_CAN_B)
-    configured_chest = _configured_named_serial(_CAN_C)
+    configured = {
+        "wheels": _configured_named_serial(_CAN_B),
+        "chest": _configured_named_serial(_CAN_C),
+    }
     selected_dual = {serial for serial in (hub_serial, mantis_serial) if serial}
     exclude = set(selected_dual)
     exclude |= _mantis_claimed_serials()
-    attached = set(_detect_single_serials(exclude))
-    all_attached = set(_scan_adapters()) | attached
+    attached = sorted(_detect_single_serials(exclude))
+    all_attached = set(_scan_adapters()) | set(attached)
 
     if attached:
-        print(
-            f"Identifying {len(attached)} single-channel CAN "
-            "adapter(s) (wheel motors / cart lift must be powered)..."
+        configured_note = (
+            ", including previously configured adapters"
+            if any(configured.values())
+            else ""
         )
-    roles: dict[str, str | None] = {}
-    for serial in sorted(attached):
+        print(
+            f"Identifying {len(attached)} single-channel CAN adapter(s) by "
+            f"probing{configured_note} (wheel motors / cart lift must be "
+            "powered)..."
+        )
+    detected: dict[str, str | None] = {}
+    for serial in attached:
         print(f"  {serial}: probing wheel drive / cart lift controller...")
-        known = serial in (configured_wheels, configured_chest)
-        roles[serial] = (
+        known = serial in configured.values()
+        detected[serial] = (
             _identify_adapter(serial, reset=True)
             if known
             else _identify_adapter(serial, recover_silence=False)
         )
 
-    def detected_for(role: str, configured: str | None) -> str | None:
-        matches = sorted(serial for serial, found in roles.items() if found == role)
+    conflicting = configured["wheels"]
+    if conflicting and conflicting == configured["chest"]:
+        observed = detected.get(conflicting)
+        live_roles = {role for role in detected.values() if role is not None}
+        if observed is None and not live_roles:
+            _die(
+                f"Adapter {conflicting} is pinned as both the wheel and chest "
+                "buses, and no device answered to resolve the conflict. Power "
+                "the cart hardware or remove the conflicting CAN udev rule, "
+                "then re-run setup."
+            )
+
+    def detected_for(role: str) -> str | None:
+        matches = sorted(serial for serial, found in detected.items() if found == role)
         if not matches:
             return None
-        selected = configured if configured in matches else matches[0]
+        configured_serial = configured[role]
+        selected = configured_serial if configured_serial in matches else matches[0]
         label = "Damiao wheel motors" if role == "wheels" else "cart lift controller"
         target = _CAN_B if role == "wheels" else _CAN_C
         print(f"  {selected}: {label} answered -> {target}")
         for serial in matches:
             if serial != selected:
                 print(
-                    f"  {serial}: also identified as {role}, but that role is "
-                    "already assigned — skipping."
+                    f"  {serial}: also identified as the {role} bus, but that "
+                    "role is already assigned — skipping."
                 )
         return selected
 
-    wheels = detected_for("wheels", configured_wheels)
-    chest = detected_for("chest", configured_chest)
+    assigned = {
+        "wheels": detected_for("wheels"),
+        "chest": detected_for("chest"),
+    }
+    source = {
+        role: ("detected" if serial else None) for role, serial in assigned.items()
+    }
+
+    # Keep old pins only when no live response contradicts them. A later
+    # operator choice may replace these unverified fallbacks.
+    for role, other_role, label in (
+        ("wheels", "chest", "Cart wheel bus"),
+        ("chest", "wheels", "Chest bus"),
+    ):
+        old_serial = configured[role]
+        if assigned[role] or not old_serial or old_serial == assigned[other_role]:
+            continue
+        # Do not preserve a single-bus pin when that serial is currently
+        # attached under a different topology (especially a selected hub).
+        if old_serial in selected_dual or (
+            old_serial in all_attached and old_serial not in detected
+        ):
+            continue
+        observed = detected.get(old_serial)
+        if old_serial in detected and observed is not None:
+            continue
+        assigned[role] = old_serial
+        source[role] = "configured"
+        if old_serial in detected:
+            print(
+                f"  {label}: no identifying device answered; keeping "
+                f"configured adapter (serial {old_serial}) unverified."
+            )
+        else:
+            print(
+                f"  {label}: configured adapter {old_serial} is not attached; "
+                "keeping its assignment for when it returns."
+            )
 
     unidentified = [
         serial
-        for serial, role in sorted(roles.items())
-        if role is None and serial not in (wheels, chest)
+        for serial, role in sorted(detected.items())
+        if role is None and serial not in assigned.values()
     ]
     for serial in unidentified:
         print(f"  {serial}: nothing answered on this adapter's bus.")
-        previous_roles = [
-            role
-            for role, configured in (
-                ("wheels", configured_wheels),
-                ("chest", configured_chest),
-            )
-            if serial == configured
-        ]
-        if len(previous_roles) == 1:
-            previous = previous_roles[0]
-            prompt = (
-                f"    Assign it to the [w]heel/cart bus or [c]hest/lift bus "
-                f"([Enter] keeps {previous}): "
-            )
-        elif len(previous_roles) > 1:
-            previous = None
-            prompt = (
-                "    It is currently assigned to both buses. Assign it to the "
-                "[w]heel/cart bus or [c]hest/lift bus (blank skips): "
-            )
-        else:
-            previous = None
-            prompt = (
+        choice = (
+            input(
                 f"    Assign it to the [w]heel/cart bus ({_CAN_B}), the "
                 f"[c]hest/lift bus ({_CAN_C}), or leave blank to skip: "
             )
-        choice = input(prompt).strip().lower()
-        if not choice and previous is not None:
-            choice = previous[0]
-        if choice == "w" and wheels is None:
-            wheels = serial
-        elif choice == "c" and chest is None:
-            chest = serial
-        elif choice in ("w", "c"):
+            .strip()
+            .lower()
+        )
+        selected_role = {"w": "wheels", "c": "chest"}.get(choice)
+        if selected_role is None:
+            continue
+        previous = assigned[selected_role]
+        if previous is not None and source[selected_role] != "configured":
             print("    That bus is already assigned — skipping.")
-
-    for role, configured in (
-        ("wheels", configured_wheels),
-        ("chest", configured_chest),
-    ):
-        current = wheels if role == "wheels" else chest
-        other = chest if role == "wheels" else wheels
-        if (
-            current is None
-            and configured is not None
-            and configured not in all_attached
-            and configured != other
-            and configured not in selected_dual
-        ):
-            if role == "wheels":
-                wheels = configured
-            else:
-                chest = configured
+            continue
+        if previous is not None:
             print(
-                f"  {role.capitalize()}: adapter {configured} is not attached; "
-                "keeping its configured assignment."
+                f"    Replacing unverified configured adapter {previous} with {serial}."
             )
+        assigned[selected_role] = serial
+        source[selected_role] = "operator"
+
+    wheels = assigned["wheels"]
+    chest = assigned["chest"]
+    if wheels and wheels == chest:
+        _die(f"Adapter {wheels} cannot be assigned to both wheel and chest buses.")
     return wheels, chest
 
 
@@ -1680,6 +1771,8 @@ def run(args: object = None) -> None:
 
     configured_axol = _configured_serial(_AXOL_PROFILE)
     configured_mantis = _configured_serial(_MANTIS_PROFILE)
+    configured_wheels = _configured_named_serial(_CAN_B)
+    configured_chest = _configured_named_serial(_CAN_C)
     hub_serial, mantis_serial = _find_dual_serials()
     wheels_serial, chest_serial = _find_single_serials(hub_serial, mantis_serial)
     if not (hub_serial or mantis_serial or wheels_serial or chest_serial):
@@ -1701,17 +1794,28 @@ def run(args: object = None) -> None:
                 f"({', '.join(claimed)}). Power the attached hardware and "
                 "re-run `axol can.setup` to resolve it before rules are written."
             )
-    axol_reclassified = configured_axol is not None and configured_axol == mantis_serial
+    axol_role_reclassified = mantis_serial is not None and mantis_serial in {
+        configured_axol,
+        configured_wheels,
+        configured_chest,
+    }
     mantis_reclassified = (
         configured_mantis is not None and configured_mantis == hub_serial
     )
     if hub_serial or wheels_serial or chest_serial:
         _apply_setup(hub_serial, wheels_serial, chest_serial)
-    elif axol_reclassified:
+    elif axol_role_reclassified:
         # _configure_mantis below reloads udev and renames the live interfaces;
-        # just erase the stale Axol serial match first. Running the full Axol
-        # bring-up here would pointlessly probe the Mantis grippers as shoulders.
-        _write_udev_rules(None)
+        # erase every stale Axol role for this serial first. In particular, a
+        # former single-bus rule matches by serial alone and would otherwise try
+        # to rename both Mantis channels to the same wheel/chest interface on the
+        # next hotplug. Running the full Axol bring-up here would pointlessly
+        # probe the Mantis grippers as shoulders.
+        _write_udev_rules(
+            None if configured_axol == mantis_serial else configured_axol,
+            None if configured_wheels == mantis_serial else configured_wheels,
+            None if configured_chest == mantis_serial else configured_chest,
+        )
     if mantis_serial:
         _configure_mantis(mantis_serial)
     elif mantis_reclassified:

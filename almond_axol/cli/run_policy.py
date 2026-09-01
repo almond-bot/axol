@@ -42,7 +42,7 @@ from ..lerobot.rollout import (
     RolloutCaptureThread,
 )
 from ..recording import make_episode_durable, restore_dataset_ownership
-from ..robot.base import HardwareCleanupError
+from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
 from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
@@ -834,6 +834,238 @@ def _lingering_episode_thread_error(
         "episode worker(s) did not stop: "
         f"{', '.join(alive)}; hardware access may still be active"
     )
+
+
+def _shutdown_policy_server_process(
+    process: Any,
+    *,
+    terminate_timeout: float = 5.0,
+    kill_timeout: float = 2.0,
+) -> None:
+    """Terminate, reap, and prove exit of the retained policy-server child.
+
+    ``terminate()`` and ``kill()`` only request shutdown.  Each request is
+    followed by a bounded join and liveness probe, including the final kill,
+    and failures never prevent the stronger remaining actions from running.
+    Any cleanup failure is propagated even when a later probe proves exit.
+    """
+    failures: list[tuple[str, BaseException]] = []
+
+    def join(label: str, timeout: float) -> None:
+        try:
+            process.join(timeout=timeout)
+        except BaseException as error:
+            failures.append((label, error))
+
+    def is_alive(label: str) -> bool:
+        try:
+            return bool(process.is_alive())
+        except BaseException as error:
+            failures.append((label, error))
+            # An unavailable liveness proof must receive the same escalation
+            # as a definitely-live server.
+            return True
+
+    alive = is_alive("initial liveness check")
+    if not alive:
+        # Reap an already-exited child as well; a liveness probe alone does not
+        # collect its process-table entry.
+        join("reap join", 0.0)
+        alive = is_alive("post-reap liveness check")
+    if alive:
+        try:
+            process.terminate()
+        except BaseException as error:
+            failures.append(("terminate", error))
+        join("post-terminate join", terminate_timeout)
+        alive = is_alive("post-terminate liveness check")
+    if alive:
+        try:
+            process.kill()
+        except BaseException as error:
+            failures.append(("kill", error))
+        join("post-kill join", kill_timeout)
+        alive = is_alive("post-kill liveness check")
+
+    if not alive and not failures:
+        return
+
+    if alive:
+        error = RuntimeError(
+            "policy server did not stop; background process ownership is uncertain"
+        )
+    else:
+        error = RuntimeError(
+            "policy server cleanup encountered an error after exit was proved"
+        )
+    for label, failure in failures:
+        error.add_note(
+            f"additional policy-server {label} failure: "
+            f"{type(failure).__name__}: {failure}"
+        )
+    if failures:
+        raise error from failures[0][1]
+    raise error
+
+
+def _stop_episode_workers(
+    *,
+    client: Any,
+    capture: RolloutCaptureThread | None,
+    workers: list[tuple[str, Any]],
+    join_timeout: float = 5.0,
+) -> tuple[bool, BaseException | None]:
+    """Stop and prove exit for every worker before its resources are mutated.
+
+    The first pass is graceful. If any started worker remains, close the gRPC
+    channel and disconnect capture cameras to unblock network/frame reads, then
+    retry the exact retained thread objects. ``False`` is returned unless every
+    final liveness probe proves exit; callers must then skip dataset buffer
+    mutation/finalization and robot disconnect entirely.
+    """
+    failures: list[tuple[str, BaseException]] = []
+
+    def remember(label: str, error: BaseException) -> None:
+        failures.append((label, error))
+
+    try:
+        client.shutdown_event.set()
+    except BaseException as error:
+        remember("client stop signal", error)
+    if capture is not None:
+        try:
+            capture.request_stop()
+        except BaseException as error:
+            remember("capture stop signal", error)
+    # A partial thread-start failure can leave one worker waiting forever for
+    # the other barrier parties. Abort is harmless after a completed rendezvous.
+    try:
+        client.start_barrier.abort()
+    except BaseException as error:
+        remember("episode start barrier abort", error)
+
+    def join_and_probe() -> list[str]:
+        for name, thread in workers:
+            if thread is None:
+                continue
+            try:
+                # join() raises for a thread whose start() never ran. Such a
+                # thread owns nothing and its final is_alive() proves that.
+                if getattr(thread, "ident", None) is not None or thread.is_alive():
+                    thread.join(timeout=join_timeout)
+            except BaseException as error:
+                remember(f"{name} join", error)
+
+        alive: list[str] = []
+        for name, thread in workers:
+            if thread is None:
+                continue
+            try:
+                if thread.is_alive():
+                    alive.append(name)
+            except BaseException as error:
+                remember(f"{name} liveness check", error)
+                # Failure to prove exit is indistinguishable from liveness for
+                # ownership purposes and must trigger the escalation/fail-close.
+                alive.append(name)
+        return alive
+
+    alive = join_and_probe()
+    escalated = bool(alive)
+    if alive:
+        # Closing the channel releases a receiver blocked in GetActions and
+        # makes the client unusable for another episode, so even a successful
+        # retry ends this run rather than silently continuing on a torn client.
+        try:
+            client.stop()
+        except BaseException as error:
+            remember("client channel close", error)
+        camera_reader_alive = any(name in {"capture", "observation"} for name in alive)
+        if capture is not None and camera_reader_alive:
+            try:
+                capture.unblock_inputs()
+            except BaseException as error:
+                remember("capture input unblock", error)
+        elif camera_reader_alive:
+            # Recording is optional, but the observation worker always reads
+            # cameras. With no capture object available, disconnect each
+            # camera directly so a native frame read still gets a chance to
+            # return. Motor/CAN teardown remains deferred until all workers
+            # have exited.
+            camera_error: BaseException | None = None
+            for name, camera in getattr(client.robot, "cameras", {}).items():
+                try:
+                    disconnect = getattr(camera, "disconnect", None)
+                    if callable(disconnect):
+                        disconnect()
+                except BaseException as error:
+                    if camera_error is None:
+                        camera_error = error
+                    else:
+                        camera_error.add_note(
+                            f"additional rollout camera {name} disconnect failure: "
+                            f"{type(error).__name__}: {error}"
+                        )
+            if camera_error is not None:
+                remember("observation input unblock", camera_error)
+        alive = join_and_probe()
+
+    if alive:
+        error = HardwareCleanupError(
+            "episode worker(s) did not stop after input unblocking: "
+            f"{', '.join(alive)}; dataset and robot ownership remain active"
+        )
+        for label, failure in failures:
+            error.add_note(
+                f"additional episode-worker {label} failure: "
+                f"{type(failure).__name__}: {failure}"
+            )
+        return False, error
+
+    if escalated or failures:
+        error = RuntimeError(
+            "episode workers required forced input unblocking; ending this run "
+            "after safe dataset and robot cleanup"
+        )
+        for label, failure in failures:
+            error.add_note(
+                f"additional episode-worker {label} failure: "
+                f"{type(failure).__name__}: {failure}"
+            )
+        return True, error
+    return True, None
+
+
+def _clear_episode_buffer_after_workers(
+    dataset: Any,
+    *,
+    workers_stopped: bool,
+) -> None:
+    """Clear a rollout buffer only after capture-thread exit is proven."""
+    if not workers_stopped:
+        raise HardwareCleanupError(
+            "refusing to clear the rollout buffer while an episode worker may "
+            "still be writing it"
+        )
+    dataset.clear_episode_buffer()
+
+
+def _cleanup_after_episode_workers(
+    *,
+    workers_stopped: bool,
+    label: str,
+    cleanup: Callable[[], None],
+) -> BaseException | None:
+    """Run one resource cleanup only when no episode worker can use it."""
+    if not workers_stopped:
+        _logger.error("skipping %s because episode-worker exit was not proved", label)
+        return None
+    try:
+        cleanup()
+    except BaseException as error:
+        _logger.exception("%s failed", label)
+        return error
+    return None
 
 
 def _ensemble_chunks(
@@ -2060,6 +2292,12 @@ def _run(
     reset_controller: IKResetController | None = None
     client = None
     episodes_recorded = 0
+    # The exact thread objects stay retained until every final liveness probe
+    # proves exit. Final cleanup consults the boolean before touching the robot
+    # or dataset, so an unkillable native read cannot race either resource.
+    episode_workers: list[tuple[str, Any]] = []
+    episode_workers_stopped = True
+    session_error: BaseException | None = None
     try:
         if rerun_ip:
             init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
@@ -2182,7 +2420,9 @@ def _run(
             time.sleep(1.0)
 
             if dataset is not None:
-                dataset.clear_episode_buffer()
+                _clear_episode_buffer_after_workers(
+                    dataset, workers_stopped=episode_workers_stopped
+                )
 
             client.reset_episode_state()
             publisher.reset()
@@ -2243,7 +2483,16 @@ def _run(
             gc.disable()
             timed_out = False
             interrupted = False
+            episode_error: BaseException | None = None
+            worker_stop_error: BaseException | None = None
             try:
+                episode_workers = [
+                    ("capture", capture),
+                    ("control", control_thread),
+                    ("receiver", receiver_thread),
+                    ("observation", obs_thread),
+                ]
+                episode_workers_stopped = False
                 receiver_thread.start()
                 control_thread.start()
                 obs_thread.start()
@@ -2276,34 +2525,26 @@ def _run(
                         time.sleep(0.1)
                 except KeyboardInterrupt:
                     interrupted = True
-
-                # Tear down per-episode threads (server + client stay alive).
-                control.end_episode()
-                client.shutdown_event.set()
-                if capture is not None:
-                    capture.stop_event.set()
-                    capture.join(timeout=5.0)
-                control_thread.join(timeout=5.0)
-                receiver_thread.join(timeout=5.0)
-                obs_thread.join(timeout=5.0)
-                lingering = _lingering_episode_thread_error(
-                    [
-                        ("capture", capture),
-                        ("control", control_thread),
-                        ("receiver", receiver_thread),
-                        ("observation", obs_thread),
-                    ]
-                )
-                if lingering is not None:
-                    if client.fatal_error is not None:
-                        lingering.add_note(
-                            "The client had already reported: "
-                            f"{type(client.fatal_error).__name__}: "
-                            f"{client.fatal_error}"
-                        )
-                    client.fatal_error = lingering
-                    log_say(f"Safety shutdown: {lingering}")
+            except BaseException as error:
+                episode_error = error
             finally:
+                try:
+                    control.end_episode()
+                except BaseException as error:
+                    if episode_error is None:
+                        episode_error = error
+                    else:
+                        episode_error.add_note(
+                            "additional episode-control cleanup failure: "
+                            f"{type(error).__name__}: {error}"
+                        )
+                episode_workers_stopped, worker_stop_error = _stop_episode_workers(
+                    client=client,
+                    capture=capture,
+                    workers=episode_workers,
+                )
+                if episode_workers_stopped:
+                    episode_workers = []
                 # Sweep the cyclic garbage deferred during the episode. The
                 # duration doubles as confirmation of the mid-episode GC stall
                 # diagnosis: a multi-hundred-ms sweep here is the pause that
@@ -2316,13 +2557,44 @@ def _run(
                     (time.perf_counter() - gc_t0) * 1000.0,
                 )
 
+            if worker_stop_error is not None:
+                if client.fatal_error is not None:
+                    worker_stop_error.add_note(
+                        "The client had already reported: "
+                        f"{type(client.fatal_error).__name__}: {client.fatal_error}"
+                    )
+                if episode_error is not None:
+                    worker_stop_error.add_note(
+                        "The episode had already reported: "
+                        f"{type(episode_error).__name__}: {episode_error}"
+                    )
+                if not episode_workers_stopped:
+                    log_say(f"Safety shutdown: {worker_stop_error}")
+                    raise worker_stop_error
+                if episode_error is not None:
+                    episode_error.add_note(
+                        "additional episode-worker cleanup failure: "
+                        f"{type(worker_stop_error).__name__}: {worker_stop_error}"
+                    )
+                    raise episode_error
+                client.fatal_error = worker_stop_error
+                log_say(
+                    f"Ending run after worker cleanup escalation: {worker_stop_error}"
+                )
+            elif episode_error is not None:
+                raise episode_error
+
             if interrupted or stop_event.is_set():
                 if dataset is not None:
-                    dataset.clear_episode_buffer()
+                    _clear_episode_buffer_after_workers(
+                        dataset, workers_stopped=episode_workers_stopped
+                    )
                 break
             if client.fatal_error is not None:
                 if dataset is not None:
-                    dataset.clear_episode_buffer()
+                    _clear_episode_buffer_after_workers(
+                        dataset, workers_stopped=episode_workers_stopped
+                    )
                 break
 
             if client.contact_tripped is not None:
@@ -2334,7 +2606,9 @@ def _run(
                 joint, _residual = client.contact_tripped
                 log_say(f"Contact on {joint} — episode aborted; arms are limp.")
                 if dataset is not None:
-                    dataset.clear_episode_buffer()
+                    _clear_episode_buffer_after_workers(
+                        dataset, workers_stopped=episode_workers_stopped
+                    )
                 if not reset_controller.hold_limp(
                     robot,
                     gravity_comp_kd=cfg.reset_gravity_comp_kd,
@@ -2357,13 +2631,17 @@ def _run(
 
             if choice == "q":
                 if dataset is not None:
-                    dataset.clear_episode_buffer()
+                    _clear_episode_buffer_after_workers(
+                        dataset, workers_stopped=episode_workers_stopped
+                    )
                 break
 
             if choice == "r":
                 log_say("Re-recording episode.")
                 if dataset is not None:
-                    dataset.clear_episode_buffer()
+                    _clear_episode_buffer_after_workers(
+                        dataset, workers_stopped=episode_workers_stopped
+                    )
                 # A discarded episode usually means the arms are somewhere they
                 # shouldn't be (hooked on the scene, mid-failure): drop them
                 # into a limp gravity-comp hold for hand-repositioning instead
@@ -2423,6 +2701,9 @@ def _run(
 
     except KeyboardInterrupt:
         pass
+    except BaseException as error:
+        session_error = error
+        raise
     finally:
         # Ignore SIGINT during cleanup so a second Ctrl+C can't abort
         # partway through disconnect/teardown. Restored at end of block.
@@ -2437,48 +2718,62 @@ def _run(
         if client is not None:
             try:
                 client.stop()
-            except Exception:  # noqa: BLE001
-                pass
+            except BaseException as exc:
+                _logger.exception("policy client cleanup failed")
+                cleanup_failures = [("policy client", exc)]
+            else:
+                cleanup_failures = []
+        else:
+            cleanup_failures = []
         # ``disconnect()`` is null-safe and idempotent; always call it so a
         # ``connect()`` that bailed mid-enable doesn't leak the asyncio
-        # event-loop thread or any already-opened CAN buses.
-        cleanup_failures: list[tuple[str, BaseException]] = []
-        try:
-            robot.disconnect()
-        except BaseException as exc:  # finish the remaining cleanup first
-            _logger.exception("robot disconnect failed")
-            cleanup_failures.append(("robot disconnect", exc))
+        # event-loop thread or any already-opened CAN buses. The one exception
+        # is an unproved episode-worker exit: a live control/observation thread
+        # may still be inside the robot, so disconnecting beneath it would race
+        # ownership. OperationRunner treats the HardwareCleanupError as a
+        # process-lifetime lockout instead.
+        robot_error = _cleanup_after_episode_workers(
+            workers_stopped=episode_workers_stopped,
+            label="robot disconnect",
+            cleanup=robot.disconnect,
+        )
+        if robot_error is not None:
+            cleanup_failures.append(("robot disconnect", robot_error))
 
         if reset_controller is not None:
             try:
                 reset_controller.stop()
-            except Exception:  # noqa: BLE001
-                pass
+            except BaseException as exc:
+                _logger.exception("IK reset worker cleanup failed")
+                cleanup_failures.append(("IK reset worker", exc))
 
-        if server_proc is not None and server_proc.is_alive():
+        if server_proc is not None:
             try:
-                server_proc.terminate()
-                server_proc.join(timeout=5.0)
-                if server_proc.is_alive():
-                    server_proc.kill()
-                    server_proc.join(timeout=2.0)
+                _shutdown_policy_server_process(server_proc)
             except BaseException as exc:
                 _logger.exception("policy server cleanup failed")
                 cleanup_failures.append(("policy server", exc))
 
         if dataset is not None:
-            try:
+
+            def _finalize_rollout_dataset() -> None:
                 dataset.finalize()
                 if push_to_hub and episodes_recorded > 0:
                     dataset.push_to_hub()
-            except BaseException as exc:
-                _logger.exception("dataset finalization failed")
-                cleanup_failures.append(("dataset finalization", exc))
+
+            dataset_error = _cleanup_after_episode_workers(
+                workers_stopped=episode_workers_stopped,
+                label="dataset finalization",
+                cleanup=_finalize_rollout_dataset,
+            )
+            if dataset_error is not None:
+                cleanup_failures.append(("dataset finalization", dataset_error))
 
         # Auto-wipe only a freshly-created, never-written dataset. Resumed
         # datasets already have saved rollouts on disk and must be kept.
         empty_fresh_dataset = (
             dataset_root is not None
+            and episode_workers_stopped
             and not resumed_dataset
             and episodes_recorded == 0
             and dataset_root.exists()
@@ -2505,7 +2800,11 @@ def _run(
                     _logger.warning(
                         "Failed to remove empty dataset at %s: %s", dataset_root, exc
                     )
-        if dataset_root is not None and dataset_root.exists():
+        if (
+            episode_workers_stopped
+            and dataset_root is not None
+            and dataset_root.exists()
+        ):
             # Finalize wrote the last meta/stats files as root; adopt them too.
             # After the optional wipe above, so a deleted dataset is skipped.
             try:
@@ -2532,9 +2831,44 @@ def _run(
             ),
             None,
         )
-        if robot_failure is not None:
-            raise HardwareCleanupError(
+        if session_error is not None:
+            for label, failure in cleanup_failures:
+                session_error.add_note(
+                    f"additional {label} cleanup failure: "
+                    f"{type(failure).__name__}: {failure}"
+                )
+                if label == "robot disconnect" or isinstance(
+                    failure, HardwareCleanupError
+                ):
+                    mark_hardware_cleanup_uncertain(session_error, failure)
+        elif robot_failure is not None:
+            error = HardwareCleanupError(
                 "robot disconnect failed; hardware ownership is uncertain"
-            ) from robot_failure
-        if cleanup_failures:
-            raise cleanup_failures[0][1]
+            )
+            for label, failure in cleanup_failures:
+                if failure is robot_failure:
+                    continue
+                error.add_note(
+                    f"additional {label} cleanup failure: "
+                    f"{type(failure).__name__}: {failure}"
+                )
+            raise error from robot_failure
+        elif cleanup_failures:
+            selected_index = next(
+                (
+                    index
+                    for index, (_label, failure) in enumerate(cleanup_failures)
+                    if isinstance(failure, HardwareCleanupError)
+                ),
+                0,
+            )
+            first_label, first_failure = cleanup_failures[selected_index]
+            for index, (label, failure) in enumerate(cleanup_failures):
+                if index == selected_index:
+                    continue
+                first_failure.add_note(
+                    f"additional {label} cleanup failure: "
+                    f"{type(failure).__name__}: {failure}"
+                )
+            _logger.error("%s cleanup failed", first_label)
+            raise first_failure

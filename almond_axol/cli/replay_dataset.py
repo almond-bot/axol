@@ -31,6 +31,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Any, Callable
 
 import numpy as np
 from lerobot.robots.config import RobotConfig
@@ -38,7 +39,7 @@ from lerobot.robots.config import RobotConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..mantis.relative import quat_xyzw_to_rotvec
 from ..mantis.smoothing import rotvec_to_quat_xyzw
-from ..robot.base import HardwareCleanupError
+from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from .config import LogLevel, parse
 
 _logger = logging.getLogger(__name__)
@@ -189,6 +190,101 @@ def main(argv: list[str]) -> None:
     except (MotorError, can.CanError) as exc:
         _logger.error("Robot hardware error: %s. Exiting.", exc)
         sys.exit(1)
+
+
+def _wait_for_replay_exit(
+    exit_event: threading.Event,
+    *,
+    timeout: float = 5.0,
+) -> tuple[bool, HardwareCleanupError | None]:
+    """Wait for the tracked robot-loop coroutine's own finalizer to run."""
+    if exit_event.wait(timeout=timeout):
+        return True, None
+    return False, HardwareCleanupError(
+        f"replay playback coroutine did not stop within {timeout:g}s; robot "
+        "hardware access may still be active"
+    )
+
+
+def _cleanup_replay_robot(
+    *,
+    playback_stopped: bool,
+    cleanup: Callable[[], None],
+) -> BaseException | None:
+    """Disconnect only after the robot-loop playback exit is proved."""
+    if not playback_stopped:
+        _logger.error(
+            "skipping robot disconnect because replay playback exit was not proved"
+        )
+        return None
+    try:
+        cleanup()
+    except BaseException as error:
+        _logger.exception("robot disconnect failed")
+        return error
+    return None
+
+
+def _finish_replay_cleanup(
+    *,
+    session_error: BaseException | None,
+    playback_failure: BaseException | None,
+    disconnect_failure: BaseException | None,
+    reset_failure: BaseException | None,
+) -> None:
+    """Propagate teardown failures without replacing a replay's primary error."""
+    if session_error is not None:
+        if playback_failure is not None:
+            session_error.add_note(
+                "additional replay playback cleanup failure: "
+                f"{type(playback_failure).__name__}: {playback_failure}"
+            )
+        if disconnect_failure is not None:
+            session_error.add_note(
+                "additional robot disconnect cleanup failure: "
+                f"{type(disconnect_failure).__name__}: {disconnect_failure}"
+            )
+        if reset_failure is not None:
+            session_error.add_note(
+                "additional IK reset worker cleanup failure: "
+                f"{type(reset_failure).__name__}: {reset_failure}"
+            )
+        uncertain = playback_failure or disconnect_failure or reset_failure
+        if uncertain is not None:
+            mark_hardware_cleanup_uncertain(session_error, uncertain)
+        return
+
+    if playback_failure is not None:
+        if disconnect_failure is not None:
+            playback_failure.add_note(
+                "additional robot disconnect cleanup failure: "
+                f"{type(disconnect_failure).__name__}: {disconnect_failure}"
+            )
+        if reset_failure is not None:
+            playback_failure.add_note(
+                "additional IK reset worker cleanup failure: "
+                f"{type(reset_failure).__name__}: {reset_failure}"
+            )
+        if isinstance(playback_failure, HardwareCleanupError):
+            raise playback_failure
+        raise HardwareCleanupError(
+            "replay playback did not stop; hardware ownership is uncertain"
+        ) from playback_failure
+
+    if disconnect_failure is not None:
+        error = HardwareCleanupError(
+            "robot disconnect failed; hardware ownership is uncertain"
+        )
+        if reset_failure is not None:
+            error.add_note(
+                "additional IK reset worker cleanup failure: "
+                f"{type(reset_failure).__name__}: {reset_failure}"
+            )
+        raise error from disconnect_failure
+    if reset_failure is not None:
+        raise HardwareCleanupError(
+            "IK reset worker did not stop; background ownership is uncertain"
+        ) from reset_failure
 
 
 def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) -> None:
@@ -422,6 +518,19 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
         return None
 
+    playback_done = threading.Event()
+    active_playback_future: Any | None = None
+    playback_stopped = True
+
+    async def _play_episode_tracked() -> tuple[str, float] | None:
+        try:
+            return await _play_episode()
+        finally:
+            # A concurrent Future can report cancellation before its event-loop
+            # task has actually unwound.  This finalizer, not Future.cancel(),
+            # is the ownership proof used by teardown.
+            playback_done.set()
+
     def _play_episode_blocking() -> tuple[str, float] | None:
         """Run the playback coroutine on the robot's loop; block until done.
 
@@ -430,17 +539,54 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         outer handler falls through to the return-to-rest teardown). Returns
         the playback watchdog's trip, or ``None``.
         """
-        fut = asyncio.run_coroutine_threadsafe(_play_episode(), robot.event_loop)
+        nonlocal active_playback_future, playback_stopped
+        playback_done.clear()
+        coroutine = _play_episode_tracked()
         try:
-            return fut.result()
+            fut = asyncio.run_coroutine_threadsafe(coroutine, robot.event_loop)
+        except BaseException:
+            coroutine.close()
+            raise
+        # Retain the exact Future until the tracked coroutine's finalizer
+        # proves exit. A timed-out interrupt deliberately does not cancel and
+        # discard it: teardown must stay away from the robot while it is live.
+        active_playback_future = fut
+        playback_stopped = False
+        try:
+            result = fut.result()
         except KeyboardInterrupt:
             stop_event.set()
             try:
                 fut.result(timeout=5.0)
-            except BaseException:  # noqa: BLE001 - best-effort unwind
-                fut.cancel()
+            except TimeoutError:
+                _logger.error(
+                    "replay playback did not acknowledge stop within 5s; "
+                    "retaining its Future and deferring robot teardown"
+                )
+            except BaseException as error:
+                # The operator's interrupt remains the primary outcome, but a
+                # completed playback fault is useful diagnostic context.
+                _logger.warning(
+                    "replay playback exited with an error while stopping: %s", error
+                )
+            if playback_done.is_set():
+                playback_stopped = True
+                active_playback_future = None
             raise
+        except BaseException:
+            if playback_done.is_set():
+                playback_stopped = True
+                active_playback_future = None
+            raise
+        if not playback_done.is_set():
+            raise HardwareCleanupError(
+                "replay Future completed before its coroutine exit could be proved"
+            )
+        playback_stopped = True
+        active_playback_future = None
+        return result
 
+    session_error: BaseException | None = None
     try:
         log_say("Connecting robot...")
         robot.connect()
@@ -508,6 +654,9 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
             _go_to_rest()
     except KeyboardInterrupt:
         pass
+    except BaseException as error:
+        session_error = error
+        raise
     finally:
         # Ignore SIGINT during cleanup so a second Ctrl+C can't abort partway
         # through the return-to-rest or teardown (mirrors run-policy).
@@ -518,34 +667,48 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         except (ValueError, OSError):
             pass
 
+        playback_failure: BaseException | None = None
+        if not playback_stopped:
+            playback_stopped, playback_failure = _wait_for_replay_exit(playback_done)
+            if playback_stopped:
+                active_playback_future = None
+
+        # Keep this exact reference reachable through the final ownership
+        # decision. When exit is unproved, the robot event loop also retains
+        # the submitted coroutine and OperationRunner locks the process after
+        # the HardwareCleanupError below.
+        _ = active_playback_future
+
         # Park the arm at rest before killing the operation, unless it's already
         # there (a loop iteration just ended at rest) or never moved (connect
         # failed). The reset is planned by the IK worker (a quick round-trip) and
         # then played locally, so it still completes if a slow stop's watchdog
         # force-kills the worker mid-move.
-        if robot.is_connected and not rested:
+        if playback_stopped and robot.is_connected and not rested:
             try:
                 _go_to_rest("Replay finished. Returning to rest pose.", final=True)
             except Exception:  # noqa: BLE001 - best-effort; still tear down
                 _logger.warning("return-to-rest during teardown failed", exc_info=True)
 
         log_say("Stopping.")
-        disconnect_failure: BaseException | None = None
-        try:
-            robot.disconnect()
-        except BaseException as exc:
-            _logger.exception("robot disconnect failed")
-            disconnect_failure = exc
+        disconnect_failure = _cleanup_replay_robot(
+            playback_stopped=playback_stopped,
+            cleanup=robot.disconnect,
+        )
+        reset_failure: BaseException | None = None
         try:
             reset_controller.stop()
-        except Exception:  # noqa: BLE001
-            pass
+        except BaseException as exc:
+            _logger.exception("IK reset worker cleanup failed")
+            reset_failure = exc
 
         try:
             signal.signal(signal.SIGINT, signal.SIG_DFL)
         except (ValueError, OSError):
             pass
-        if disconnect_failure is not None:
-            raise HardwareCleanupError(
-                "robot disconnect failed; hardware ownership is uncertain"
-            ) from disconnect_failure
+        _finish_replay_cleanup(
+            session_error=session_error,
+            playback_failure=playback_failure,
+            disconnect_failure=disconnect_failure,
+            reset_failure=reset_failure,
+        )

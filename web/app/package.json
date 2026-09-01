@@ -9,6 +9,7 @@
     "dev": "vite",
     "prebuild": "node scripts/sync-webxr-profiles.mjs",
     "build": "tsc -b && vite build",
+    "test": "node --experimental-strip-types --test test/*.test.mjs",
     "lint": "eslint .",
     "preview": "vite preview"
   },

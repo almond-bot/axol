@@ -13,6 +13,7 @@ import math
 import multiprocessing
 import multiprocessing.connection
 import os
+import signal
 import time
 
 import numpy as np
@@ -974,6 +975,13 @@ def run_ik_worker(
       stale, and engaging against it would drag the robot back toward it.
     - ``None``                         → exit
     """
+    # Ctrl-C is owned by the parent, which first disables physical outputs and
+    # then sends the pipe sentinel / terminate / kill sequence. Terminal and
+    # process-group SIGINT otherwise interrupts JAX startup in this child and
+    # emits a several-page traceback while racing the parent's ownership
+    # checks. SIGTERM/SIGKILL retain their defaults for the bounded fallback.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     # Confine the JAX solve to a single core's worth of compute. The per-arm IK
     # is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
     # core for each solve; combined with this process's nice(-10) boost, that

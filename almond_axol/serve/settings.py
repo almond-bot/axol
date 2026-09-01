@@ -35,9 +35,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from ..utils.can_channels import require_mantis_channels
+from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.paths import almond_path
 from ..utils.state_files import secure_atomic_write_json, secure_read_text
+from .commands import flag_enabled, normalize_boolean_args, parse_boolean
 
 _logger = logging.getLogger(__name__)
 
@@ -128,6 +129,29 @@ def _mantis_channels_from_values(
     )
 
 
+def _axol_channels_from_values(
+    values: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Resolve defaults/nulls and validate the persisted Axol arm map."""
+    from ..constants import CAN_LEFT, CAN_RIGHT
+
+    def norm(key: str, default: str) -> str | None:
+        value = values.get(key)
+        if value is None:
+            return default
+        text = str(value).strip()
+        if not text:
+            return default
+        return None if text.lower() in ("null", "none") else text
+
+    return require_distinct_axol_channels(
+        (
+            norm("robot.left_channel", CAN_LEFT),
+            norm("robot.right_channel", CAN_RIGHT),
+        )
+    )
+
+
 def _lerobot_dataset_root() -> str:
     """The directory datasets actually land in when ``root`` is unset."""
     try:
@@ -191,6 +215,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "collect-data": (f"{_ROBOT}.left_channel",),
                     "run-policy": (f"{_ROBOT}.left_channel",),
                     "replay-dataset": (f"{_ROBOT}.left_channel",),
+                    "diag.lift-cycle": ("left_channel",),
                 },
             ),
             SettingDef(
@@ -208,6 +233,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "collect-data": (f"{_ROBOT}.right_channel",),
                     "run-policy": (f"{_ROBOT}.right_channel",),
                     "replay-dataset": (f"{_ROBOT}.right_channel",),
+                    "diag.lift-cycle": ("right_channel",),
                 },
             ),
             SettingDef(
@@ -1173,14 +1199,34 @@ class SettingsStore:
             values = dict(values or {})
             values.setdefault("mantis.quest_tracker_key", legacy_key)
         if values is not None:
+            values = dict(values)
             unknown = [k for k in values if k not in _SETTINGS_BY_KEY]
             if unknown:
                 raise KeyError(f"unknown settings: {', '.join(sorted(unknown))}")
+            for key, value in values.items():
+                setting = _SETTINGS_BY_KEY[key]
+                if setting.type == "boolean" and value is not None:
+                    values[key] = parse_boolean(value, key=key)
         if advanced is not None:
             bad = [k for k in advanced if k.partition(".")[0] not in _ADVANCED_BY_KEY]
             if bad:
                 raise KeyError(f"unknown advanced settings: {', '.join(sorted(bad))}")
         with self._lock:
+            if (
+                values is not None
+                and {
+                    "robot.left_channel",
+                    "robot.right_channel",
+                }
+                & values.keys()
+            ):
+                proposed = dict(self._data["values"])
+                for key, value in values.items():
+                    if value is None:
+                        proposed.pop(key, None)
+                    else:
+                        proposed[key] = value
+                _axol_channels_from_values(proposed)
             if (
                 values is not None
                 and {
@@ -1243,27 +1289,47 @@ class SettingsStore:
         adapter chosen once (Settings, or the dashboard's CAN adapter picker)
         applies everywhere.
         """
-        from ..constants import CAN_LEFT, CAN_RIGHT
-
         with self._lock:
-            left = self._data["values"].get("robot.left_channel")
-            right = self._data["values"].get("robot.right_channel")
-
-        def norm(value: Any, default: str) -> str | None:
-            if value is None:
-                return default
-            text = str(value).strip()
-            if not text:
-                return default
-            return None if text.lower() in ("null", "none") else text
-
-        return norm(left, CAN_LEFT), norm(right, CAN_RIGHT)
+            values = dict(self._data["values"])
+        return _axol_channels_from_values(values)
 
     def mantis_can_channels(self) -> tuple[str | None, str | None]:
         """The handheld rig's persisted (left, right) SocketCAN mapping."""
         with self._lock:
             values = dict(self._data["values"])
         return _mantis_channels_from_values(values)
+
+    def effective_axol_can_channels(
+        self, op_id: str, args: dict[str, Any]
+    ) -> tuple[str | None, str | None]:
+        """Resolve the exact Axol arm channels an operation request will open."""
+        from ..constants import CAN_LEFT, CAN_RIGHT
+
+        merged = self.merged_args(op_id, args)
+        target_op = _settings_op(op_id)
+        if target_op in {"teleop", "gravity-comp"}:
+            keys = ("left_channel", "right_channel")
+        elif target_op in {
+            "collect-data",
+            "run-policy",
+            "replay-dataset",
+        }:
+            keys = (f"{_ROBOT}.left_channel", f"{_ROBOT}.right_channel")
+        else:
+            return self.can_channels()
+
+        def resolve(key: str, default: str) -> str | None:
+            # build_argv omits JSON null/blank values, so draccus then uses the
+            # config default. The literal string "null" is what decodes to None.
+            value = merged.get(key)
+            if value is None or not str(value).strip():
+                return default
+            text = str(value).strip()
+            return None if text.lower() in ("null", "none") else text
+
+        return require_distinct_axol_channels(
+            (resolve(keys[0], CAN_LEFT), resolve(keys[1], CAN_RIGHT))
+        )
 
     def effective_mantis_can_channels(
         self, op_id: str, args: dict[str, Any]
@@ -1313,9 +1379,7 @@ class SettingsStore:
             value = self._data["values"].get("robot.has_gripper")
         if value is None:
             return True
-        if isinstance(value, str):
-            return value.strip().lower() not in ("false", "0", "no", "null")
-        return bool(value)
+        return parse_boolean(value, key="robot.has_gripper")
 
     def merged_args(self, op_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Fold the shared settings into one op start's args.
@@ -1352,11 +1416,7 @@ class SettingsStore:
         # the rig map in only for a Mantis run and still leave request args as
         # the final override below.
         raw_mantis = args.get("mantis")
-        mantis = (
-            raw_mantis.strip().lower() in ("1", "true", "yes", "on")
-            if isinstance(raw_mantis, str)
-            else bool(raw_mantis)
-        )
+        mantis = flag_enabled(raw_mantis)
         if mantis:
             left, right = self.mantis_can_channels()
             if target_op == "teleop":
@@ -1377,6 +1437,22 @@ class SettingsStore:
             elif target_op == "collect-data":
                 merged.pop(f"{_VRT}.tracker_key", None)
         merged.update(args)
+
+        # ``diag.lift-cycle`` is argparse-backed: unlike draccus, the literal
+        # string "null" would be treated as an interface name. Translate a
+        # disabled saved/request channel into the diagnostic's explicit skip
+        # flag so its argv and the serve-side hardware preflight agree.
+        if target_op == "diag.lift-cycle":
+            for side in ("left", "right"):
+                channel_key = f"{side}_channel"
+                channel = merged.get(channel_key)
+                if channel is not None and str(channel).strip().lower() in (
+                    "",
+                    "null",
+                    "none",
+                ):
+                    merged.pop(channel_key, None)
+                    merged[f"no_{side}"] = True
 
         # Third-party dataset writers reopen names internally, so the hosted
         # root service must always use the installer-sealed store. Stale saved
@@ -1399,4 +1475,4 @@ class SettingsStore:
                     # dataset operation; required-repo operations will surface
                     # their normal config error after this sanitization.
                     merged.pop("root", None)
-        return merged
+        return normalize_boolean_args(op_id, merged)

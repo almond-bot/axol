@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import time
+from collections.abc import Awaitable
 
 import numpy as np
 
@@ -73,6 +74,20 @@ _GRIPPER_CALIB_PATH = almond_path("gripper_calibration.json")
 # A shaft position outside the range means the calibration no longer matches
 # the encoder (motor re-zeroed or power-cycled) and must not be trusted.
 _GRIPPER_CALIB_MARGIN = 0.35
+
+
+async def _await_all_hardware_actions(*actions: Awaitable[object]) -> None:
+    """Wait for every issued hardware action before surfacing a failure.
+
+    ``asyncio.gather`` normally raises as soon as one child fails while its
+    siblings keep running.  That is unsafe during bus/motor bring-up: cleanup
+    can otherwise close a transport underneath a still-running enable or mode
+    change.  Collect every result first, then raise the first failure.
+    """
+    results = await asyncio.gather(*actions, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
 
 
 def _validated_motion_target(q: np.ndarray, *, label: str) -> np.ndarray:
@@ -657,13 +672,15 @@ class AxolArm:
         # while telemetry runs, and the ``positions`` property needs the
         # offsets as soon as the cache fills.
         await self.resolve_joint_offsets()
-        await asyncio.gather(
+        await _await_all_hardware_actions(
             *[m.start_telemetry(hz, torque=torque) for m in self.motors.values()]
         )
 
     async def stop_telemetry(self) -> None:
         """Stop the background telemetry polling loop on all motors."""
-        await asyncio.gather(*[m.stop_telemetry() for m in self.motors.values()])
+        await _await_all_hardware_actions(
+            *[m.stop_telemetry() for m in self.motors.values()]
+        )
 
     async def wait_for_telemetry(self, timeout: float = 5.0) -> None:
         """Block until every motor has reported at least one position.
@@ -793,7 +810,7 @@ class AxolArm:
         held = [j for j, holding in flags.items() if holding]
         cold = [j for j, holding in flags.items() if not holding]
 
-        await asyncio.gather(
+        await _await_all_hardware_actions(
             *[
                 self.motors[j].attach(
                     ControlMode.POSITION_FORCE
@@ -804,7 +821,7 @@ class AxolArm:
             ],
             *[self.motors[j].enable() for j in cold],
         )
-        await asyncio.gather(
+        await _await_all_hardware_actions(
             *[self.motors[j].set_control_mode(ControlMode.IMPEDANCE) for j in cold]
         )
 
@@ -1215,7 +1232,7 @@ class AxolArm:
                     self._arm_config.gripper.torque_limit,
                 )
             )
-        await asyncio.gather(*tasks)
+        await _await_all_hardware_actions(*tasks)
         self._last_q_commanded = clipped
 
     async def gravity_compensate(
@@ -1447,6 +1464,15 @@ class Axol(RobotBase):
             raise ValueError(
                 "At least one of left_channel or right_channel must be specified."
             )
+        if (
+            left_channel is not None
+            and right_channel is not None
+            and left_channel == right_channel
+        ):
+            raise ValueError(
+                "left_channel and right_channel must name different CAN "
+                "interfaces; both arms reuse the same motor IDs"
+            )
 
         # Bake stiffness into the per-joint gains exactly once, here at the
         # single robot-construction boundary. ``resolved()`` is idempotent,
@@ -1547,7 +1573,7 @@ class Axol(RobotBase):
             bus_tasks.append(self._left_bus.start())
         if self.right is not None:
             bus_tasks.append(self._right_bus.start())
-        await asyncio.gather(*bus_tasks)
+        await _await_all_hardware_actions(*bus_tasks)
 
     async def enable(self, hold: bool = True) -> None:
         """Start CAN buses and bring every motor up, never dropping held joints.
@@ -1573,7 +1599,7 @@ class Axol(RobotBase):
             motor_tasks.append(self.left.enable(hold=hold))
         if self.right is not None:
             motor_tasks.append(self.right.enable(hold=hold))
-        await asyncio.gather(*motor_tasks)
+        await _await_all_hardware_actions(*motor_tasks)
         self._motors_disabled = False
 
     async def disconnect(self) -> None:
@@ -1593,15 +1619,28 @@ class Axol(RobotBase):
             tasks.append(self.left.stop_telemetry())
         if self.right is not None:
             tasks.append(self.right.stop_telemetry())
+        stop_error: BaseException | None = None
         try:
-            await asyncio.gather(*tasks)
-        finally:
-            close_tasks = []
-            if self.left is not None:
-                close_tasks.append(self._left_bus.close())
-            if self.right is not None:
-                close_tasks.append(self._right_bus.close())
-            await asyncio.gather(*close_tasks)
+            await _await_all_hardware_actions(*tasks)
+        except BaseException as exc:
+            stop_error = exc
+
+        close_tasks = []
+        if self.left is not None:
+            close_tasks.append(self._left_bus.close())
+        if self.right is not None:
+            close_tasks.append(self._right_bus.close())
+        try:
+            await _await_all_hardware_actions(*close_tasks)
+        except BaseException as close_error:
+            if stop_error is not None:
+                close_error.add_note(
+                    "telemetry shutdown also failed: "
+                    f"{type(stop_error).__name__}: {stop_error}"
+                )
+            raise
+        if stop_error is not None:
+            raise stop_error
 
     async def disable(self) -> None:
         """Disable every motor, then close both CAN buses.
@@ -1897,7 +1936,9 @@ class Axol(RobotBase):
                 (self.right, _validated_motion_target(right, label="right arm"))
             )
         if targets:
-            await asyncio.gather(*(arm.motion_control(q) for arm, q in targets))
+            await _await_all_hardware_actions(
+                *(arm.motion_control(q) for arm, q in targets)
+            )
 
     async def gravity_compensate(
         self,

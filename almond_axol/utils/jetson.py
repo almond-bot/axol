@@ -26,6 +26,7 @@ unit — not from teleop / serve.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -115,11 +116,14 @@ class _RootEscalator:
 
     def __init__(self, *, interactive: bool) -> None:
         self._interactive = interactive
-        self._primed = False
+        self._prime_attempted = False
 
     def _prime(self) -> None:
-        if self._interactive and not self._primed:
-            self._primed = prime_sudo()
+        if self._interactive and not self._prime_attempted:
+            # A declined/failed prompt must not be repeated for every clock
+            # or sysfs write in the same best-effort setup pass.
+            self._prime_attempted = True
+            prime_sudo()
 
     def write(self, path: Path, value: str) -> tuple[bool, str]:
         """Write ``value`` to ``path`` as root; return ``(ok, failure_detail)``.
@@ -133,13 +137,20 @@ class _RootEscalator:
             return True, ""
         except OSError as exc:
             detail = str(exc)
-        self._prime()
-        proc = subprocess.run(
-            ["sudo", "-n", "tee", str(path)],
-            input=value,
-            capture_output=True,
-            text=True,
-        )
+        # A root process cannot gain anything by retrying a failed system-file
+        # write through sudo (and minimal images may omit sudo entirely).
+        if os.geteuid() == 0:
+            return False, detail
+        try:
+            self._prime()
+            proc = subprocess.run(
+                ["sudo", "-n", "tee", str(path)],
+                input=value,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            return False, str(exc) or detail
         if proc.returncode == 0:
             return True, ""
         return False, (proc.stderr or "").strip() or detail
@@ -165,10 +176,21 @@ class _RootEscalator:
             detail = _combine_output(proc)
         except OSError as exc:
             detail = str(exc)
-        self._prime()
-        sudo = subprocess.run(
-            ["sudo", "-n", *argv], input=input_text, capture_output=True, text=True
-        )
+        # A root command's application failure is not a permission signal.
+        # Retrying it through sudo can repeat partial side effects; it can also
+        # raise on minimal images that correctly omit sudo for the root user.
+        if os.geteuid() == 0:
+            return False, detail
+        try:
+            self._prime()
+            sudo = subprocess.run(
+                ["sudo", "-n", *argv],
+                input=input_text,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            return False, str(exc) or detail
         if sudo.returncode == 0:
             return True, ""
         return False, _combine_output(sudo) or detail

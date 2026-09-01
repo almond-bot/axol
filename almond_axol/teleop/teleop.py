@@ -28,12 +28,14 @@ Or with custom components::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import multiprocessing
 import multiprocessing.connection
 import multiprocessing.context
 import os
+import signal
 import threading
 import time
 
@@ -56,6 +58,42 @@ from .core import VRTeleopCore
 from .worker import run_ik_worker
 
 _logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _defer_sigint_during_cleanup():
+    """Keep a repeated Ctrl-C from interrupting ownership teardown.
+
+    ``asyncio.run`` turns the first SIGINT into task cancellation and a second
+    one into an immediate ``KeyboardInterrupt``. The latter can otherwise land
+    inside a process/thread join and skip the remaining terminate/kill checks.
+    Once shutdown starts, finish its bounded teardown before restoring the
+    caller's handler.
+
+    ``VRTeleop`` can also be used from a non-main thread, where Python forbids
+    changing signal handlers. In that case teardown still runs, just without
+    the main-thread-only guard.
+    """
+
+    previous_handler: object | None = None
+    handler_installed = False
+    try:
+        previous_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        handler_installed = True
+    except (OSError, ValueError):
+        pass
+    try:
+        yield
+    finally:
+        if handler_installed:
+            try:
+                signal.signal(signal.SIGINT, previous_handler)
+            except (OSError, ValueError):
+                _logger.warning(
+                    "could not restore the SIGINT handler after teleop cleanup",
+                    exc_info=True,
+                )
 
 
 class VRTeleop:
@@ -136,6 +174,17 @@ class VRTeleop:
         self._vr_thread: threading.Thread | None = None
         self._vr_stop: threading.Event = threading.Event()
         self._vr_ready: threading.Event = threading.Event()
+        # Set by the VR thread before ``_vr_ready`` is signalled when server
+        # startup fails.  Without this side channel the caller waits forever
+        # when certificate creation or socket binding raises before the normal
+        # ready signal.  The value is reset for every enable attempt so a
+        # cleaned-up instance remains retryable.
+        self._vr_start_error: BaseException | None = None
+        # A failure while undoing a partial VR startup is distinct from the
+        # startup error itself: enable() preserves the useful primary error,
+        # while disable() reports uncertain background cleanup after it has
+        # attempted all other teardown.
+        self._vr_cleanup_error: BaseException | None = None
         # Event loop of the VR server thread, captured so the IK thread can
         # broadcast tracking-state changes to the headset.
         self._vr_loop: asyncio.AbstractEventLoop | None = None
@@ -153,13 +202,45 @@ class VRTeleop:
 
         async def _serve() -> None:
             self._vr_loop = asyncio.get_running_loop()
-            await self._vr_server.enable()
+            try:
+                await self._vr_server.enable()
+            except BaseException as startup_error:
+                self._vr_start_error = startup_error
+                # Wake enable() before attempting cleanup.  Teardown is meant
+                # to be bounded, but a third-party WebRTC close must not be
+                # able to turn a known bind/certificate failure back into an
+                # unbounded startup wait.
+                self._vr_ready.set()
+                # enable() may have opened a socket or created a background
+                # server task before a later setup step failed.  Release any
+                # partial state on this same event loop before the thread exits.
+                try:
+                    await self._vr_server.disable()
+                except BaseException as cleanup_error:
+                    self._vr_cleanup_error = cleanup_error
+                    startup_error.add_note(
+                        "VR server cleanup after failed startup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                return
             self._vr_ready.set()
-            while not self._vr_stop.is_set():
-                await asyncio.sleep(0.05)
-            await self._vr_server.disable()
+            try:
+                while not self._vr_stop.is_set():
+                    await asyncio.sleep(0.05)
+            finally:
+                await self._vr_server.disable()
 
-        asyncio.run(_serve())
+        try:
+            asyncio.run(_serve())
+        except BaseException as thread_error:
+            # A failure after readiness is a shutdown/serve failure.  A startup
+            # failure is handled inside _serve so its original exception is not
+            # replaced by a cleanup exception.
+            self._vr_cleanup_error = thread_error
+        finally:
+            # This must be unconditional: it is the completion signal for both
+            # successful startup and every failure before the listener is live.
+            self._vr_ready.set()
 
     def _broadcast_tracking(self, enabled: bool) -> None:
         """Push the engage-toggle state to the headset (fire-and-forget).
@@ -208,12 +289,16 @@ class VRTeleop:
             )
         self._vr_stop.clear()
         self._vr_ready.clear()
+        self._vr_start_error = None
+        self._vr_cleanup_error = None
         self._vr_thread = threading.Thread(
             target=self._run_vr_thread, daemon=True, name="vr-server"
         )
         self._vr_thread.start()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._vr_ready.wait)
+        if self._vr_start_error is not None:
+            raise self._vr_start_error
 
         await self._robot.enable()
         if self._cart is not None:
@@ -232,20 +317,43 @@ class VRTeleop:
         parent_conn, child_conn = ctx.Pipe()
         self._parent_conn = parent_conn
 
-        process = ctx.Process(
-            target=run_ik_worker,
-            args=(
-                child_conn,
-                self._config,
-                self._kinematics_config,
-                pos_l[:7] if pos_l is not None else None,
-                pos_r[:7] if pos_r is not None else None,
-            ),
-            daemon=True,
-        )
-        process.start()
-        child_conn.close()
+        try:
+            process = ctx.Process(
+                target=run_ik_worker,
+                args=(
+                    child_conn,
+                    self._config,
+                    self._kinematics_config,
+                    pos_l[:7] if pos_l is not None else None,
+                    pos_r[:7] if pos_r is not None else None,
+                ),
+                daemon=True,
+            )
+        except BaseException as process_error:
+            try:
+                child_conn.close()
+            except BaseException as close_error:
+                process_error.add_note(
+                    "additional IK child-pipe close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        # Retain the exact object before start: start() may create the child
+        # and then raise, and the following local pipe close can also fail.
+        # __aenter__'s unwind must be able to reap either partial startup.
         self._ik_process = process
+        try:
+            process.start()
+        except BaseException as start_error:
+            try:
+                child_conn.close()
+            except BaseException as close_error:
+                start_error.add_note(
+                    "additional IK child-pipe close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        child_conn.close()
 
         loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(None, parent_conn.recv)
@@ -265,6 +373,11 @@ class VRTeleop:
 
     async def disable(self) -> None:
         """Disable motors, stop IK subprocess, and stop VR server."""
+        with _defer_sigint_during_cleanup():
+            await self._disable()
+
+    async def _disable(self) -> None:
+        """Teardown implementation, called with repeated SIGINT deferred."""
         cleanup_failures: list[tuple[str, BaseException]] = []
         hardware_failures: list[tuple[str, BaseException]] = []
 
@@ -332,22 +445,71 @@ class VRTeleop:
 
         process = self._ik_process
         if process is not None:
+            # A control signal interrupting one blocking join is not evidence
+            # that the child remains live. Continue through liveness probes
+            # and stronger shutdown actions; report the interruption only if
+            # final ownership still cannot be proved.
+            process_interruptions: list[tuple[str, BaseException]] = []
+
+            def process_join(label: str, timeout: float) -> None:
+                try:
+                    process.join(timeout=timeout)
+                except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+                    process_interruptions.append((label, exc))
+                except BaseException as exc:
+                    cleanup_failures.append((label, exc))
+
+            def process_is_alive(label: str) -> bool:
+                try:
+                    return bool(process.is_alive())
+                except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+                    process_interruptions.append((label, exc))
+                    return True
+                except BaseException as exc:
+                    cleanup_failures.append((label, exc))
+                    return True
+
             try:
-                process.join(timeout=3.0)
-                if process.is_alive():
-                    process.terminate()
-                    process.join(timeout=2.0)
-                if process.is_alive():
-                    process.kill()
-                    process.join(timeout=2.0)
-                process_alive = process.is_alive()
+                process_started = process.pid is not None
             except BaseException as exc:
-                cleanup_failures.append(("IK process shutdown", exc))
-                process_alive = True
+                cleanup_failures.append(("IK process pid check", exc))
+                process_started = True
+
+            if process_started:
+                process_join("IK process graceful join", 3.0)
+                process_alive = process_is_alive("IK process post-join liveness check")
+            else:
+                # multiprocessing keeps pid at None until start succeeds. An
+                # unstarted child needs no join (which itself raises), but
+                # still probe rather than assuming a custom Process is inert.
+                process_alive = process_is_alive("unstarted IK process liveness check")
+
+            if process_alive:
+                try:
+                    process.terminate()
+                except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+                    process_interruptions.append(("IK process terminate", exc))
+                except BaseException as exc:
+                    cleanup_failures.append(("IK process terminate", exc))
+                process_join("IK process post-terminate join", 2.0)
+                process_alive = process_is_alive(
+                    "IK process post-terminate liveness check"
+                )
+            if process_alive:
+                try:
+                    process.kill()
+                except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+                    process_interruptions.append(("IK process kill", exc))
+                except BaseException as exc:
+                    cleanup_failures.append(("IK process kill", exc))
+                process_join("IK process post-kill join", 2.0)
+                process_alive = process_is_alive("IK process post-kill liveness check")
+
             if process_alive:
                 cleanup_failures.append(
                     ("IK process", RuntimeError("IK worker process did not stop"))
                 )
+                cleanup_failures.extend(process_interruptions)
             else:
                 self._ik_process = None
 
@@ -367,8 +529,29 @@ class VRTeleop:
                     ("VR thread", RuntimeError("VR server thread did not stop"))
                 )
             else:
-                self._vr_thread = None
                 self._vr_loop = None
+                vr_cleanup_error = getattr(self, "_vr_cleanup_error", None)
+                if vr_cleanup_error is not None:
+                    # The thread's same-loop cleanup failed.  Retry after the
+                    # thread has exited; if this still fails, retain its
+                    # reference so another disable() is required before enable
+                    # may start a replacement server against uncertain state.
+                    try:
+                        await self._vr_server.disable()
+                    except BaseException as retry_error:
+                        vr_cleanup_error.add_note(
+                            "VR server cleanup retry also failed: "
+                            f"{type(retry_error).__name__}: {retry_error}"
+                        )
+                        cleanup_failures.append(("VR server cleanup", vr_cleanup_error))
+                    else:
+                        self._vr_thread = None
+                        self._vr_start_error = None
+                        self._vr_cleanup_error = None
+                else:
+                    self._vr_thread = None
+                    self._vr_start_error = None
+                    self._vr_cleanup_error = None
 
         if hardware_failures:
             first_label, first_failure = hardware_failures[0]

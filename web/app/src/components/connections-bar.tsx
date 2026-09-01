@@ -162,9 +162,11 @@ export function ConnectionsBar({
       ? hostName || host || "Connected"
       : conn === "err"
         ? "Offline"
-        : conn === "idle"
-          ? "Not connected"
-          : "Connecting…"
+        : conn === "migration"
+          ? "Installer migration required"
+          : conn === "idle"
+            ? "Not connected"
+            : "Connecting…"
 
   // Axol and Mantis are two profiles of the same server-owned telemetry link.
   // Older hosts omit profile and are necessarily the original Axol profile.

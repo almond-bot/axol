@@ -8,9 +8,11 @@ is available it is served too, with SPA-style fallback to ``index.html``.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import socket
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,14 +21,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from ..constants import URDF_PATH
+from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, URDF_PATH
 from ..utils import adb, ports
 from ..utils.browser_origin import (
     LOOPBACK_ORIGIN_REGEX,
     allowed_browser_origins,
     browser_origin_allowed,
 )
-from ..utils.can_channels import require_mantis_channels
+from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
 from ..utils.state_files import (
     mark_privileged_service,
@@ -34,9 +36,16 @@ from ..utils.state_files import (
     validated_service_dataset_root,
 )
 from ..utils.sudo import prime_sudo
-from .commands import COMMANDS, command_specs, flag_enabled, operation_ids
+from .commands import (
+    COMMANDS,
+    command_specs,
+    flag_enabled,
+    get_schema,
+    normalize_boolean_args,
+    operation_ids,
+)
 from .manager import Session, SessionManager
-from .robot_link import RobotLink, scoped_motor_faults
+from .robot_link import STATE_ERROR, RobotLink, scoped_motor_faults
 from .runner import OperationRunner
 from .settings import SettingsStore, advanced_schema, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
@@ -167,6 +176,403 @@ def _lan_ip() -> str:
 
 # ARPHRD_CAN in /sys/class/net/<iface>/type — identifies CAN interfaces.
 _ARPHRD_CAN = "280"
+
+# The idle link surveys once per second.  A lift-cycle launch consumes its
+# arm/capability snapshot as a physical-hardware interlock, so more than three
+# missed survey intervals is stale rather than evidence that the requested
+# hardware is still attached.
+_ROBOT_SURVEY_MAX_AGE_S = 3.0
+
+
+def _lift_cycle_link_error(
+    status: dict[str, Any], args: dict[str, Any], *, now: float | None = None
+) -> str | None:
+    """Explain why the idle Axol survey cannot authorize ``diag.lift-cycle``."""
+    if status.get("profile") != "axol":
+        return "Lift cycle requires a connected Axol hardware profile."
+    if status.get("state") != "connected" or not status.get("connected"):
+        return "Connect the Axol robot link before starting Lift cycle."
+
+    last_ping = status.get("lastPing")
+    current = time.time() if now is None else now
+    if (
+        isinstance(last_ping, bool)
+        or not isinstance(last_ping, (int, float))
+        or not math.isfinite(float(last_ping))
+        or not 0 <= current - float(last_ping) <= _ROBOT_SURVEY_MAX_AGE_S
+    ):
+        return (
+            "The Axol robot survey is stale; reconnect the robot link and wait "
+            "for fresh motor status before starting Lift cycle."
+        )
+
+    left_selected = not flag_enabled(args.get("no_left"))
+    right_selected = not flag_enabled(args.get("no_right"))
+    if not left_selected and not right_selected:
+        return "Lift cycle must select at least one Axol arm."
+    left = args.get("left_channel", CAN_LEFT) if left_selected else None
+    right = args.get("right_channel", CAN_RIGHT) if right_selected else None
+    try:
+        selected = require_distinct_axol_channels((left, right))
+    except ValueError as exc:
+        return str(exc)
+    if (left_selected and selected[0] is None) or (
+        right_selected and selected[1] is None
+    ):
+        return "Lift cycle must assign a CAN channel to every selected Axol arm."
+    reported_channels = status.get("channels")
+    active = (
+        (
+            reported_channels.get("left"),
+            reported_channels.get("right"),
+        )
+        if isinstance(reported_channels, dict)
+        else (None, None)
+    )
+    selected_mismatches = (left_selected and active[0] != selected[0]) or (
+        right_selected and active[1] != selected[1]
+    )
+    if selected_mismatches:
+        return (
+            "Lift cycle's selected arm channels do not match the connected Axol "
+            f"survey (selected left={selected[0] or 'disabled'}, "
+            f"right={selected[1] or 'disabled'}; connected "
+            f"left={active[0] or 'disabled'}, right={active[1] or 'disabled'}). "
+            "Reconnect with the requested arm mapping before starting."
+        )
+
+    return None
+
+
+_ROM_COMMANDS = frozenset({"diag.rom-enable", "diag.rom-disable"})
+
+
+def _survey_timestamp_is_fresh(last_ping: Any, *, now: float | None = None) -> bool:
+    """Whether a link timestamp is recent enough to authorize physical motion."""
+    current = time.time() if now is None else now
+    return not (
+        isinstance(last_ping, bool)
+        or not isinstance(last_ping, (int, float))
+        or not math.isfinite(float(last_ping))
+        or not 0 <= current - float(last_ping) <= _ROBOT_SURVEY_MAX_AGE_S
+    )
+
+
+def _motor_survey_error(
+    status: dict[str, Any],
+    *,
+    expected_profile: str | None = None,
+    now: float | None = None,
+) -> str | None:
+    """Require a connected, recent survey for any impending motor motion."""
+    profile = status.get("profile")
+    profile_label = str(expected_profile or profile).capitalize()
+    if expected_profile is not None and profile != expected_profile:
+        return (
+            f"Connect the {profile_label} robot link before starting; the idle "
+            f"link currently represents {str(profile).capitalize() or 'another profile'}."
+        )
+    if status.get("state") != "connected" or not status.get("connected"):
+        return f"Connect the {profile_label} robot link before starting motor motion."
+    if not _survey_timestamp_is_fresh(status.get("lastPing"), now=now):
+        return (
+            f"The {profile_label} robot survey is stale; reconnect the robot link "
+            "and wait for fresh motor status before starting."
+        )
+    return None
+
+
+def _channel_override(args: dict[str, Any], key: str) -> str | None:
+    """Return a meaningful explicit channel value, preserving ``"null"``."""
+    if key not in args or args[key] is None:
+        return None
+    text = str(args[key]).strip()
+    return text or None
+
+
+def _prepare_two_side_motor_args(
+    args: dict[str, Any],
+    active: tuple[str | None, str | None],
+    *,
+    command_label: str,
+    validate_overrides: bool = True,
+) -> str | None:
+    """Bind a two-arm command to the surveyed buses, deriving omitted sides."""
+    selected = 0
+    for index, side in enumerate(("left", "right")):
+        channel_key = f"{side}_channel"
+        skip_key = f"no_{side}"
+        surveyed = active[index]
+        override = _channel_override(args, channel_key)
+        if validate_overrides and override is not None and override != surveyed:
+            return (
+                f"{command_label}'s {side} CAN channel override ({override}) does "
+                f"not match the connected survey ({surveyed or 'disabled'}). "
+                "Reconnect with the requested mapping before starting."
+            )
+
+        skip = flag_enabled(args.get(skip_key))
+        if surveyed is None:
+            if not validate_overrides and override is not None:
+                if not skip:
+                    selected += 1
+                continue
+            args.pop(channel_key, None)
+            if skip_key in args and not skip:
+                return (
+                    f"{command_label} selected the {side} side, but the connected "
+                    f"survey has no {side} CAN channel."
+                )
+            args[skip_key] = True
+            continue
+
+        # The subprocess must use the exact interface the idle link just surveyed,
+        # including custom adapters. An explicit skip still wins and leaves that
+        # surveyed side untouched.
+        if override is None:
+            args[channel_key] = surveyed
+        if not skip:
+            selected += 1
+
+    if selected == 0:
+        return f"{command_label} must select at least one connected side."
+    return None
+
+
+def _prepare_motor_launch_args(
+    command_id: str,
+    status: dict[str, Any],
+    args: dict[str, Any],
+    *,
+    now: float | None = None,
+) -> tuple[dict[str, Any], str | None]:
+    """Validate and bind one motor subprocess to the latest idle-link survey.
+
+    Browser-provided profile/channel fields are a convenience, not a safety
+    boundary. This pass runs for both launch endpoints while the shared launch
+    reservation is held, before the link releases its CAN sockets.
+    """
+    prepared = dict(args)
+    profile = status.get("profile")
+    profile_label = str(profile).capitalize() if profile else "Robot"
+    survey_error = _motor_survey_error(status, now=now)
+    if survey_error is not None:
+        return prepared, survey_error
+
+    reported = status.get("channels")
+    raw_channels = (
+        (reported.get("left"), reported.get("right"))
+        if isinstance(reported, dict)
+        else (None, None)
+    )
+    try:
+        if profile == "mantis":
+            active: tuple[str | None, str | None] = require_mantis_channels(
+                raw_channels
+            )
+        elif profile == "axol":
+            active = require_distinct_axol_channels(raw_channels)
+        else:
+            return prepared, "The connected robot survey has an unknown profile."
+    except ValueError as exc:
+        return prepared, f"The connected robot survey is unsafe: {exc}"
+
+    if command_id in _ROM_COMMANDS:
+        requested_target = prepared.get("target")
+        if requested_target is not None and str(requested_target).strip():
+            requested = str(requested_target).strip().lower()
+            if requested != profile:
+                return (
+                    prepared,
+                    f"ROM target {requested!r} does not match the connected "
+                    f"{profile_label} profile.",
+                )
+        prepared["target"] = profile
+
+        raw_joints = prepared.get("joints")
+        joint_names = (
+            {
+                part.strip().lower()
+                for part in str(raw_joints).split(",")
+                if part.strip()
+            }
+            if raw_joints is not None and str(raw_joints).strip()
+            else set()
+        )
+        if profile == "mantis":
+            if joint_names and joint_names != {"gripper"}:
+                return prepared, "Mantis ROM supports only the gripper joint."
+            prepared["joints"] = "gripper"
+        elif status.get("hasGripper") is False:
+            if "gripper" in joint_names:
+                return (
+                    prepared,
+                    "The connected Axol survey has no grippers; remove gripper "
+                    "from the ROM joint selection.",
+                )
+            if not joint_names:
+                prepared["joints"] = ",".join(joint.value for joint in ARM_JOINTS)
+
+        error = _prepare_two_side_motor_args(
+            prepared,
+            active,
+            command_label="ROM",
+        )
+        return prepared, error
+
+    if command_id == "diag.lift-cycle":
+        error = _prepare_two_side_motor_args(
+            prepared,
+            active,
+            command_label="Lift cycle",
+            validate_overrides=False,
+        )
+        if error is None:
+            error = _lift_cycle_link_error(status, prepared, now=now)
+        return prepared, error
+
+    if command_id == "diag.mantis-trigger":
+        for index, side in enumerate(("left", "right")):
+            key = f"{side}_channel"
+            override = _channel_override(prepared, key)
+            if override is not None and override != active[index]:
+                return (
+                    prepared,
+                    f"Mantis trigger's {side} CAN channel override ({override}) "
+                    f"does not match the connected survey ({active[index]}). "
+                    "Reconnect with the requested mapping before starting.",
+                )
+            prepared[key] = active[index]
+        return prepared, None
+
+    if command_id == "motor.set-zero-pos":
+        arm = str(prepared.get("arm") or "").strip().lower()
+        if arm not in ("left", "right"):
+            return prepared, "Set zero position requires a left or right arm."
+        channel = active[0 if arm == "left" else 1]
+        override = _channel_override(prepared, "channel")
+        if override is not None and override != channel:
+            return (
+                prepared,
+                f"Set zero position's {arm} CAN channel override ({override}) "
+                f"does not match the connected survey ({channel or 'disabled'}).",
+            )
+        if channel is None:
+            return (
+                prepared,
+                f"The connected survey has no {arm} CAN channel for zeroing.",
+            )
+        prepared["arm"] = arm
+        prepared["channel"] = channel
+
+    return prepared, None
+
+
+def _operation_channel_arg_keys(command_id: str) -> tuple[str, str] | None:
+    """The standard left/right channel fields in one operation's schema."""
+    emit = get_schema(command_id).emit
+    for keys in (
+        ("left_channel", "right_channel"),
+        ("robot_config.left_channel", "robot_config.right_channel"),
+    ):
+        if all(key in emit for key in keys):
+            return keys
+    return None
+
+
+def _operation_gripper_arg_key(command_id: str) -> str | None:
+    """The Axol SKU capability field in one operation's emitted schema."""
+    emit = get_schema(command_id).emit
+    for key in (
+        "axol.has_gripper",
+        "robot_config.axol_config.has_gripper",
+    ):
+        if key in emit:
+            return key
+    return None
+
+
+def _prepare_operation_launch_args(
+    command_id: str,
+    status: dict[str, Any],
+    args: dict[str, Any],
+    expected_channels: tuple[str | None, str | None],
+    *,
+    expected_profile: str,
+    now: float | None = None,
+) -> tuple[dict[str, Any], str | None]:
+    """Bind an in-process hardware operation to its fresh idle-link survey."""
+    prepared = dict(args)
+    survey_error = _motor_survey_error(
+        status,
+        expected_profile=expected_profile,
+        now=now,
+    )
+    if survey_error is not None:
+        return prepared, survey_error
+
+    reported = status.get("channels")
+    raw_channels = (
+        (reported.get("left"), reported.get("right"))
+        if isinstance(reported, dict)
+        else (None, None)
+    )
+    try:
+        if expected_profile == "mantis":
+            active: tuple[str | None, str | None] = require_mantis_channels(
+                raw_channels
+            )
+            expected = require_mantis_channels(expected_channels)
+        else:
+            active = require_distinct_axol_channels(raw_channels)
+            expected = require_distinct_axol_channels(expected_channels)
+    except ValueError as exc:
+        return prepared, str(exc)
+
+    if active != expected:
+        if expected_profile == "mantis":
+            return prepared, _mantis_channel_mismatch_message(active, expected)
+        return (
+            prepared,
+            "The effective Axol CAN mapping does not match the connected survey "
+            f"(requested left={expected[0] or 'disabled'}, "
+            f"right={expected[1] or 'disabled'}; connected "
+            f"left={active[0] or 'disabled'}, right={active[1] or 'disabled'}). "
+            "Reconnect with the requested arm mapping before starting.",
+        )
+
+    keys = _operation_channel_arg_keys(command_id)
+    if keys is not None:
+        for key, channel in zip(keys, active, strict=True):
+            # None would be omitted by build_argv and restore the config default;
+            # the literal null token is the draccus spelling for a disabled arm.
+            prepared[key] = channel if channel is not None else "null"
+
+    if expected_profile == "axol":
+        gripper_key = _operation_gripper_arg_key(command_id)
+        if gripper_key is not None:
+            surveyed_has_gripper = status.get("hasGripper")
+            if not isinstance(surveyed_has_gripper, bool):
+                return (
+                    prepared,
+                    "The connected Axol survey did not report the gripper SKU; "
+                    "reconnect before starting.",
+                )
+            if (
+                surveyed_has_gripper is False
+                and gripper_key in prepared
+                and flag_enabled(prepared[gripper_key])
+            ):
+                return (
+                    prepared,
+                    "The operation enables grippers, but the connected Axol "
+                    "survey is gripperless; disable has_gripper before starting.",
+                )
+            # Bind the parsed operation config to the surveyed SKU just like
+            # the channel fields. This explicit CLI layer also overrides a
+            # stale has_gripper value hidden inside config_path.
+            prepared[gripper_key] = surveyed_has_gripper
+    return prepared, None
 
 
 def _mantis_channel_mismatch_message(
@@ -302,6 +708,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # upgrades automatically. No-ops for dev checkouts.
     updater = SelfUpdater(_is_idle)
 
+    def _maintenance_launch_response() -> JSONResponse | None:
+        reason = updater.launch_block_reason()
+        if reason is None:
+            return None
+        return JSONResponse({"error": reason}, status_code=409)
+
     def _find_session(session_id: str) -> tuple[Session | None, Any]:
         """Resolve a session id to (session, owner) across runner + manager."""
         s = runner.get(session_id)
@@ -385,7 +797,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """Identify the serve host so the UI can build reachable links/hints."""
         # Self-heal a host that upgraded into this build from an older release
         # (the old code never ran `axol provision`); idempotent, once per process.
-        updater.ensure_provisioned()
+        # Startup provisioning mutates the same live tool environment as an
+        # update. Enter it through the global launch reservation so it cannot
+        # begin between another endpoint's idle check and hardware start.
+        async with camera_reservation, session_launch_reservation:
+            if _is_idle() and not updater.launches_blocked:
+                updater.ensure_provisioned()
         return {
             "hostname": socket.gethostname(),
             "lanIp": _lan_ip(),
@@ -414,7 +831,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.post("/api/update/start")
     async def update_start() -> JSONResponse:
         """Apply a user-initiated upgrade; the server restarts onto new code."""
-        started, reason = updater.start()
+        # Setting the updater's launch barrier and checking global idleness is
+        # atomic with every operation/session/camera launch below.
+        async with camera_reservation, session_launch_reservation:
+            started, reason = updater.start()
         if not started:
             return JSONResponse({"error": reason}, status_code=409)
         return JSONResponse({"started": True})
@@ -429,22 +849,29 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         escalates via ``sudo -n`` so a headless context fails fast instead of
         blocking on a password prompt.
         """
-        if not _is_idle():
-            return JSONResponse(
-                {"error": "an operation or session is running — stop it first"},
-                status_code=409,
-            )
+        async with session_launch_reservation:
+            maintenance_reason = updater.launch_block_reason()
+            if maintenance_reason is not None:
+                return JSONResponse(
+                    {"error": f"cannot request a host {verb}: {maintenance_reason}"},
+                    status_code=409,
+                )
+            if not _is_idle():
+                return JSONResponse(
+                    {"error": "an operation or session is running — stop it first"},
+                    status_code=409,
+                )
 
-        def _run() -> tuple[bool, str]:
-            cmd = ["shutdown", flag, "now"]
-            if os.geteuid() != 0:
-                if not prime_sudo():
-                    return False, "root required (no passwordless sudo)"
-                cmd = ["sudo", "-n", *cmd]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
+            def _run() -> tuple[bool, str]:
+                cmd = ["shutdown", flag, "now"]
+                if os.geteuid() != 0:
+                    if not prime_sudo():
+                        return False, "root required (no passwordless sudo)"
+                    cmd = ["sudo", "-n", *cmd]
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
 
-        ok, detail = await asyncio.to_thread(_run)
+            ok, detail = await asyncio.to_thread(_run)
         if not ok:
             return JSONResponse(
                 {"error": f"{verb} failed: {detail or 'unknown error'}"},
@@ -487,11 +914,16 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     channels = require_mantis_channels(channels)
                 except ValueError as exc:
                     return JSONResponse({"error": str(exc)}, status_code=400)
-            elif not req.leftChannel and not req.rightChannel:
-                return JSONResponse(
-                    {"error": "select a CAN interface for at least one side"},
-                    status_code=400,
-                )
+            else:
+                try:
+                    channels = require_distinct_axol_channels(channels)
+                except ValueError as exc:
+                    return JSONResponse({"error": str(exc)}, status_code=400)
+                if channels == (None, None):
+                    return JSONResponse(
+                        {"error": "select a CAN interface for at least one side"},
+                        status_code=400,
+                    )
             if robot.status()["state"] == "busy":
                 return JSONResponse(
                     {"error": "cannot change CAN interfaces while a task owns the bus"},
@@ -533,6 +965,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         req: RobotConnectRequest | None = None,
     ) -> dict[str, Any] | JSONResponse:
         async with session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
             if runner.is_running() or _diagnostic_session_active():
                 return JSONResponse(
                     {
@@ -546,6 +981,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.post("/api/robot/disconnect", response_model=None)
     async def robot_disconnect() -> dict[str, Any] | JSONResponse:
         async with session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
             if runner.is_running() or _diagnostic_session_active():
                 return JSONResponse(
                     {
@@ -556,20 +994,28 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 )
             return await asyncio.to_thread(robot.disconnect)
 
-    @app.get("/api/can/interfaces")
-    async def can_interfaces() -> dict[str, Any]:
+    @app.get("/api/can/interfaces", response_model=None)
+    async def can_interfaces() -> dict[str, Any] | JSONResponse:
         """SocketCAN interfaces on this host, for the CAN adapter picker."""
-        return {"interfaces": await asyncio.to_thread(_list_can_interfaces)}
+        async with session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
+            return {"interfaces": await asyncio.to_thread(_list_can_interfaces)}
 
     @app.get("/api/robot/motors/{arm}/{joint}")
     async def robot_motor_details(arm: str, joint: str) -> JSONResponse:
         """One-motor full readout (the ``motor.info`` set) over the idle link."""
-        try:
-            details = await asyncio.to_thread(robot.motor_details, arm, joint)
-        except KeyError:
-            return JSONResponse({"error": "unknown motor"}, status_code=404)
-        except RuntimeError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=409)
+        async with session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
+            try:
+                details = await asyncio.to_thread(robot.motor_details, arm, joint)
+            except KeyError:
+                return JSONResponse({"error": "unknown motor"}, status_code=404)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
         return JSONResponse(details)
 
     # -- motor telemetry (diagnostics dashboard) -----------------------------
@@ -657,6 +1103,21 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             )
 
         async with session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
+            # Subprocess-backed commands do not pass through OperationRunner,
+            # so fold their declared shared settings here. This stays inside
+            # the maintenance reservation: schema loading may import command
+            # code from the tool environment an update replaces. It also must
+            # happen before profile/fault scoping and argv construction so the
+            # checks, process, session, and history share one effective launch.
+            try:
+                launch_args = normalize_boolean_args(
+                    command_id, settings.merged_args(command_id, args)
+                )
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
             if runner.is_running():
                 return JSONResponse(
                     {"error": "an operation is running — stop it first"},
@@ -678,7 +1139,50 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     status_code=409,
                 )
             if command.drives_motors:
-                fault_response = await _motor_fault_response(scope_args=args)
+                status = robot.status()
+                if status.get("profile") != profile:
+                    return JSONResponse(
+                        {
+                            "error": "The robot link profile changed during launch; "
+                            "retry after reconnecting."
+                        },
+                        status_code=409,
+                    )
+                launch_args, link_error = _prepare_motor_launch_args(
+                    command_id,
+                    status,
+                    launch_args,
+                )
+                if link_error is not None:
+                    return JSONResponse({"error": link_error}, status_code=409)
+                # Session metadata retains the full submitted/effective mapping,
+                # while build_argv deliberately drops unknown keys. Apply the
+                # same schema boundary to safety scoping so an ignored key cannot
+                # hide a fault on hardware the spawned process will still drive.
+                valid_scope_keys = get_schema(command_id).emit
+                fault_scope_args = {
+                    key: value
+                    for key, value in launch_args.items()
+                    if key in valid_scope_keys
+                }
+                if command_id == "diag.lift-cycle":
+                    # Lift cycle never touches grippers. Keep its arm/side
+                    # scoping, but do not block it on an unrelated gripper
+                    # fault from the idle survey. Only the two side flags from
+                    # this command's schema may narrow the scope: arbitrary
+                    # request keys are dropped by build_argv and must not be
+                    # able to hide a fault on hardware the process will drive.
+                    fault_scope_args = {
+                        key: launch_args[key]
+                        for key in ("no_left", "no_right")
+                        if key in launch_args
+                    }
+                    fault_scope_args["joints"] = ",".join(
+                        joint.name for joint in ARM_JOINTS
+                    )
+                fault_response = await _motor_fault_response(
+                    scope_args=fault_scope_args
+                )
                 if fault_response is not None:
                     return fault_response
 
@@ -686,9 +1190,21 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # bus, so leave the idle motor telemetry streaming while it runs.
             uses_can_bus = command.uses_can_bus
             if uses_can_bus:
-                await asyncio.to_thread(robot.release)
+                try:
+                    await asyncio.to_thread(robot.release)
+                except Exception as exc:  # noqa: BLE001 - preserve safety lockout
+                    return JSONResponse(
+                        {
+                            "error": "Could not release the robot CAN link; the "
+                            "command was not started and hardware remains locked. "
+                            f"Reconnect the robot link before retrying: {exc}"
+                        },
+                        status_code=409,
+                    )
             try:
-                session = await manager.start(command_id, args, stdin_pipe=stdin_pipe)
+                session = await manager.start(
+                    command_id, launch_args, stdin_pipe=stdin_pipe
+                )
             except Exception:
                 if uses_can_bus:
                     await asyncio.to_thread(robot.reacquire)
@@ -719,7 +1235,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         # ad-hoc launches (CAN bring-up, motor calibration tools) still get
         # the bus handover + prompt plumbing but leave no record behind.
         record = command.category == "Diagnostics"
-        meta = runs.begin(session.id, req.command, req.args) if record else None
+        meta = runs.begin(session.id, req.command, session.args) if record else None
         if session.status == "error":
             if meta is not None:
                 await asyncio.to_thread(
@@ -751,17 +1267,24 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- local ZED cameras ---------------------------------------------------
 
-    @app.get("/api/cameras/detect")
-    async def cameras_detect() -> dict[str, Any]:
+    @app.get("/api/cameras/detect", response_model=None)
+    async def cameras_detect() -> dict[str, Any] | JSONResponse:
         """List locally connected ZED cameras (serial, model, mono/stereo)."""
-        return await asyncio.to_thread(_detect_cameras)
+        async with camera_reservation, session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
+            return await asyncio.to_thread(_detect_cameras)
 
     @app.get("/api/cameras/preview/{serial}", response_model=None)
     async def camera_preview(serial: int) -> Response | JSONResponse:
         """One live JPEG frame from a connected ZED, so operators can tell
         which physical camera a serial belongs to. Cameras are exclusive:
         refused while an operation may be using them."""
-        async with camera_reservation:
+        async with camera_reservation, session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
             if runner.is_running():
                 return JSONResponse(
                     {"error": "cannot preview cameras while an operation is running"},
@@ -795,7 +1318,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.post("/api/cameras/restart-daemon")
     async def cameras_restart_daemon() -> JSONResponse:
         """Restart the ZED X daemon so cameras plugged in after boot enumerate."""
-        async with camera_reservation:
+        async with camera_reservation, session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
             if runner.is_running():
                 return JSONResponse(
                     {
@@ -936,8 +1462,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             )
         return JSONResponse(result)
 
-    @app.get("/api/tracker/bindings")
-    async def get_tracker_bindings() -> dict[str, Any]:
+    @app.get("/api/tracker/bindings", response_model=None)
+    async def get_tracker_bindings() -> dict[str, Any] | JSONResponse:
         """Saved bindings plus non-invasive setup readiness for each source."""
 
         def inspect() -> dict[str, Any]:
@@ -956,6 +1482,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             )
             from ..tracker import load_tracker_config
             from ..vr.server import get_last_quest_pose_datum
+            from .tracker_setup import TrackerSetupError, calibration_snapshot
 
             config = load_tracker_config()
             saved_transforms = load_tcp_transforms()
@@ -1070,10 +1597,26 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "transforms": transform_status("survive", resolved["survive"]),
             }
             ultimate = ultimate_runtime_readiness()
+            try:
+                ultimate_calibration = calibration_snapshot("ultimate")
+            except (OSError, TrackerSetupError):
+                # Readiness remains a diagnostic endpoint when an operator-
+                # editable calibration file is malformed. The production CLI
+                # preflight still fails closed because no transform loads.
+                ultimate_transforms = {"left": "missing", "right": "missing"}
+            else:
+                ultimate_transforms = {
+                    side: (
+                        "missing"
+                        if ultimate_calibration[side]["status"] == "unbound"
+                        else ultimate_calibration[side]["status"]
+                    )
+                    for side in ("left", "right")
+                }
             source_status["ultimate"] = {
                 **ultimate,
                 "binding": bindings["ultimate"],
-                "transforms": transform_status("ultimate", resolved["ultimate"]),
+                "transforms": ultimate_transforms,
                 "quatOrder": config.ultimate_quat_order,
                 "upAxis": config.ultimate_up_axis,
             }
@@ -1084,7 +1627,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "channels": {"left": left_channel, "right": right_channel},
             }
 
-        return await asyncio.to_thread(inspect)
+        async with session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
+            return await asyncio.to_thread(inspect)
 
     # -- datasets on disk (the operation panels' shared repo-id picker) --------
 
@@ -1132,19 +1679,27 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- Quest-over-USB (adb reverse pose tunnel) ---------------------------
 
-    @app.get("/api/usb/status")
-    async def usb_status() -> dict[str, Any]:
+    @app.get("/api/usb/status", response_model=None)
+    async def usb_status() -> dict[str, Any] | JSONResponse:
         """adb device + reverse-tunnel status for the Quest-over-USB pose link."""
-        return _usb_status_dict(await asyncio.to_thread(adb.status))
+        async with session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
+            return _usb_status_dict(await asyncio.to_thread(adb.status))
 
-    @app.post("/api/usb/connect")
-    async def usb_connect() -> dict[str, Any]:
+    @app.post("/api/usb/connect", response_model=None)
+    async def usb_connect() -> dict[str, Any] | JSONResponse:
         """Forward the headset's localhost:VR_PORT to this host via `adb reverse`.
 
         The first adb command against a freshly plugged-in headset also triggers
         the USB-debugging authorization popup on the device.
         """
-        return _usb_status_dict(await asyncio.to_thread(adb.connect))
+        async with session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
+            return _usb_status_dict(await asyncio.to_thread(adb.connect))
 
     @app.post("/api/usb/proximity")
     async def usb_proximity(req: ProximityRequest) -> JSONResponse:
@@ -1155,7 +1710,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         The override holds until restored or the headset reboots. Needs an
         attached, authorized headset (same requirement as the pose tunnel).
         """
-        ok, error = await asyncio.to_thread(adb.set_proximity_disabled, req.disabled)
+        async with session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
+            ok, error = await asyncio.to_thread(
+                adb.set_proximity_disabled, req.disabled
+            )
         if not ok:
             return JSONResponse(
                 {"error": error or "adb broadcast failed"}, status_code=502
@@ -1180,6 +1741,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 {"error": f"unknown operation: {req.op}"}, status_code=400
             )
         async with camera_reservation, session_launch_reservation:
+            maintenance = _maintenance_launch_response()
+            if maintenance is not None:
+                return maintenance
             if _diagnostic_session_active():
                 return JSONResponse(
                     {
@@ -1193,7 +1757,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # the arm. A sim run never touches the motors, and a robot-free run
             # (teleop's cart_only) never touches the *arms*, so both stay allowed.
             cmd = COMMANDS[req.op]
-            requested_mantis = flag_enabled(req.args.get("mantis"))
+            try:
+                launch_args = normalize_boolean_args(
+                    req.op, settings.merged_args(req.op, req.args)
+                )
+                requested_mantis = flag_enabled(launch_args.get("mantis"))
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+
             if requested_mantis and not cmd.supports_mantis:
                 return JSONResponse(
                     {
@@ -1204,18 +1775,41 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 )
             mantis_mode = cmd.supports_mantis and requested_mantis
             is_sim = cmd.sim_flag is not None and flag_enabled(
-                req.args.get(cmd.sim_flag)
+                launch_args.get(cmd.sim_flag)
             )
             robot_free = is_sim or any(
-                flag_enabled(req.args.get(flag)) for flag in cmd.robot_free_flags
+                flag_enabled(launch_args.get(flag)) for flag in cmd.robot_free_flags
             )
             hardware_profile = "mantis" if mantis_mode else "axol"
-            link_matches_run = robot.profile() == hardware_profile
-            if mantis_mode:
+            needs_motor_survey = cmd.uses_can_bus and (
+                not robot_free or hardware_profile == "mantis"
+            )
+            if needs_motor_survey:
                 try:
-                    expected_channels = require_mantis_channels(
-                        settings.effective_mantis_can_channels(req.op, req.args)
-                    )
+                    if mantis_mode:
+                        expected_channels = require_mantis_channels(
+                            settings.effective_mantis_can_channels(req.op, launch_args)
+                        )
+                    else:
+                        expected_channels = settings.effective_axol_can_channels(
+                            req.op, launch_args
+                        )
+                except (KeyError, ValueError) as exc:
+                    return JSONResponse({"error": str(exc)}, status_code=400)
+
+                launch_args, link_error = _prepare_operation_launch_args(
+                    req.op,
+                    robot.status(),
+                    launch_args,
+                    expected_channels,
+                    expected_profile=hardware_profile,
+                )
+                if link_error is not None:
+                    return JSONResponse({"error": link_error}, status_code=409)
+
+            if mantis_mode and needs_motor_survey:
+                try:
+                    expected_channels = require_mantis_channels(expected_channels)
                 except ValueError as exc:
                     return JSONResponse({"error": str(exc)}, status_code=400)
                 interfaces = {
@@ -1249,37 +1843,38 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         },
                         status_code=409,
                     )
-                link = robot.status()
-                if not link_matches_run or not link["connected"]:
-                    return JSONResponse(
-                        {
-                            "error": "Connect the Mantis CAN link before starting. "
-                            "If left/right are reversed, swap the Mantis channels "
-                            "in Settings → Mantis and reconnect."
-                        },
-                        status_code=409,
-                    )
-                channel_error = _mantis_channel_mismatch_message(
-                    robot.channels(), expected_channels
-                )
-                if channel_error is not None:
-                    return JSONResponse(
-                        {"error": channel_error},
-                        status_code=409,
-                    )
-            if (not robot_free or hardware_profile == "mantis") and link_matches_run:
+            if needs_motor_survey:
                 fault_response = await _motor_fault_response()
                 if fault_response is not None:
                     return fault_response
             try:
                 session = runner.start(
                     req.op,
-                    req.args,
+                    launch_args,
                     cameras=req.cameras,
                     loop=asyncio.get_running_loop(),
                 )
             except RuntimeError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=409)
+            # OperationRunner records synchronous config failures in the
+            # session, but a RobotLink release failure is also a bus-ownership
+            # lockout. Surface that one as an actionable HTTP failure while
+            # retaining the terminal session for status/log inspection.
+            if (
+                session.status == "error"
+                and needs_motor_survey
+                and robot.status().get("state") == STATE_ERROR
+            ):
+                return JSONResponse(
+                    {
+                        "error": "Could not release the robot CAN link; the "
+                        "operation was not started and hardware remains locked. "
+                        "Reconnect the robot link before retrying: "
+                        f"{session.error or 'unknown release failure'}",
+                        "session": session.to_dict(),
+                    },
+                    status_code=409,
+                )
             return JSONResponse(session.to_dict())
 
     @app.post("/api/op/stop")

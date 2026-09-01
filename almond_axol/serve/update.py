@@ -63,8 +63,12 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
 import time
+import urllib.error
+import urllib.request
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from typing import Callable
@@ -83,10 +87,13 @@ _PYTHON_VERSION = "3.13"
 # so the release check falls back to this; git installs keep using their own
 # origin URL so forks still see their own releases.
 _REPO_URL = "https://github.com/almond-bot/axol"
-# Release tags look like ``v0.1.2``: a leading "v" plus dotted integers.
-# Anything else (pre-release suffixes, arbitrary tags) is ignored by the
-# updater, so cutting a release is what makes installs see an update.
-_TAG_RE = re.compile(r"^v(\d+(?:\.\d+)*)$")
+# New releases use ``release-v0.1.2``. Releases through v0.1.35 used the
+# legacy ``v0.1.2`` namespace, which the old destructive updater still polls.
+# Never publish another legacy-v tag: keeping all future releases under the
+# new namespace prevents an unmigrated old server (or cached old UI tab) from
+# invoking that updater. This updater accepts both namespaces so the first
+# hardened install can compare itself with the historical releases.
+_TAG_RE = re.compile(r"^(?:(?:release-)?v)?(\d+(?:\.\d+)*)$")
 # Minimum seconds between read-only `git ls-remote` checks. The status endpoint
 # is polled, so without this every poll would spawn a git process; the check is
 # cheap and the indicator does not need to be more current than this.
@@ -94,11 +101,100 @@ _REMOTE_DEBOUNCE_S = 60.0
 # systemd's Restart=always uses this code like any other; chosen to make the
 # intentional self-restart recognizable in `journalctl`.
 _RESTART_EXIT_CODE = 0
+_SERVICE_NAME = "axol.service"
+_UPDATE_GUARD_MARKER = Path("/var/lib/almond-axol/update-incomplete")
+_UPDATE_GUARD_DROPIN = Path("/etc/systemd/system/axol.service.d/20-update-guard.conf")
+_UPDATE_GUARD_CONTENT = f"[Unit]\nConditionPathExists=!{_UPDATE_GUARD_MARKER}\n"
+_PYPI_RELEASE_URL = "https://pypi.org/pypi/almond-axol/{version}/json"
+_MANAGED_UV_EXECUTABLE = "/usr/local/bin/uv"
+_MANAGED_UPDATE_ENV = {
+    "AXOL_PRIVILEGED_SERVICE": "1",
+    "UV_TOOL_DIR": "/opt/axol/uv/tools",
+    "UV_PYTHON_INSTALL_DIR": "/opt/axol/uv/python",
+    "UV_TOOL_BIN_DIR": "/usr/local/bin",
+}
+
+
+def _release_available_on_pypi(version: str) -> bool:
+    """Whether PyPI has at least one non-yanked artifact for an exact release."""
+    if parse_version(version) is None:
+        return False
+    request = urllib.request.Request(
+        _PYPI_RELEASE_URL.format(version=version),
+        headers={"User-Agent": "almond-axol-self-update"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+            if getattr(response, "status", 200) != 200:
+                return False
+            payload = json.loads(response.read())
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    info = payload.get("info")
+    artifacts = payload.get("urls")
+    return (
+        isinstance(info, dict)
+        and info.get("version") == version
+        and isinstance(artifacts, list)
+        and any(
+            isinstance(item, dict)
+            and item.get("packagetype") in {"bdist_wheel", "sdist"}
+            and item.get("yanked") is not True
+            for item in artifacts
+        )
+    )
+
+
+def _write_durable_root_file(path: Path, content: str, *, mode: int) -> None:
+    """Atomically write a root-owned guard file below a protected directory."""
+    parent = path.parent
+    parent.mkdir(parents=True, mode=0o755, exist_ok=True)
+    parent_stat = parent.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != 0
+        or parent_stat.st_mode & 0o022
+    ):
+        raise OSError(f"unsafe update-guard directory: {parent}")
+    if path.is_symlink():
+        raise OSError(f"update-guard path must not be a symlink: {path}")
+
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=parent)
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary_path.unlink(missing_ok=True)
+
+
+def _remove_durable_file(path: Path) -> None:
+    """Remove a guard marker and durably commit the directory entry change."""
+    path.unlink()
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def parse_version(text: str) -> tuple[int, ...] | None:
-    """``(0, 1, 2)`` for ``"0.1.2"`` or ``"v0.1.2"``; ``None`` when not a release version."""
-    match = _TAG_RE.match(text if text.startswith("v") else f"v{text}")
+    """Parse plain, historical ``v``, or hardened ``release-v`` versions."""
+    match = _TAG_RE.fullmatch(text)
     if match is None:
         return None
     return tuple(int(part) for part in match.group(1).split("."))
@@ -237,6 +333,21 @@ class SelfUpdater:
         # "restarting" (``None`` when not updating).
         self._phase: str | None = None
         self._update_task: asyncio.Task[None] | None = None
+        # A force reinstall mutates the environment that every subsequently
+        # spawned Axol command imports.  Once maintenance starts, hardware and
+        # session launches stay fail-closed until every install/provision/
+        # verification step succeeds and this process restarts.  On failure
+        # the old process remains alive for status/retry/reboot, but may not
+        # launch code from a potentially partial environment.
+        self._launches_blocked = (
+            _UPDATE_GUARD_MARKER.exists() or _UPDATE_GUARD_MARKER.is_symlink()
+        )
+        if self._launches_blocked:
+            self._state = "error"
+            self._error = (
+                "a previous update did not complete verification; retry the "
+                "update or repair the service"
+            )
         # Set when an upgrade landed but the server was busy; restart at the
         # next idle opportunity (a subsequent status poll re-checks).
         self._restart_pending = False
@@ -247,6 +358,7 @@ class SelfUpdater:
         # post-upgrade reinstall) -- so they can never rebuild/install into it
         # at the same time.
         self._provision_started = False
+        self._provision_task: asyncio.Task[None] | None = None
         self._env_lock = asyncio.Lock()
 
     @property
@@ -273,6 +385,140 @@ class SelfUpdater:
     def enabled(self) -> bool:
         """Updatable only for release installs with uv available."""
         return self.release_install and shutil.which("uv") is not None
+
+    @property
+    def maintenance_active(self) -> bool:
+        """Whether an install/provision task is actively mutating the host."""
+        update_active = self._state == "updating" or (
+            self._update_task is not None and not self._update_task.done()
+        )
+        provision_active = (
+            self._provision_task is not None and not self._provision_task.done()
+        )
+        return update_active or provision_active
+
+    @property
+    def launches_blocked(self) -> bool:
+        """Whether starting hardware or a new session is currently unsafe."""
+        return self._launches_blocked or self.maintenance_active
+
+    def launch_block_reason(self) -> str | None:
+        """A fixed, credential-safe launch rejection for the serve API."""
+        if not self.launches_blocked:
+            return None
+        if self.maintenance_active:
+            return (
+                "server maintenance is in progress — wait for it to finish "
+                "before starting hardware or a session"
+            )
+        return (
+            "server maintenance did not complete safely — retry the update or "
+            "restart/repair the service before starting hardware or a session"
+        )
+
+    @staticmethod
+    def _systemctl(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["systemctl", *args],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    @staticmethod
+    def _release_available(version: str) -> bool:
+        return _release_available_on_pypi(version)
+
+    def _arm_durable_update_guard(self) -> str | None:
+        """Prevent a partial new environment from starting after crash/reboot.
+
+        The currently running service must stay alive to finish the update and
+        report failures, so this deliberately disables without stopping it. A
+        permanent systemd condition observes the marker before every future
+        start, including ``Restart=always`` restarts of this same process.
+        """
+        systemctl = shutil.which("systemctl")
+        uv = shutil.which("uv")
+        if os.geteuid() != 0 or systemctl is None:
+            return "self-update requires the managed root axol.service"
+        mismatched_layout = [
+            name
+            for name, expected in _MANAGED_UPDATE_ENV.items()
+            if os.environ.get(name) != expected
+        ]
+        if uv != _MANAGED_UV_EXECUTABLE:
+            mismatched_layout.append("uv executable")
+        if mismatched_layout:
+            return (
+                "self-update requires the hosted installer layout; rerun the "
+                "hosted installer to repair " + ", ".join(mismatched_layout)
+            )
+        try:
+            active = self._systemctl("is-active", "--quiet", _SERVICE_NAME)
+            main_pid = self._systemctl(
+                "show", "--property=MainPID", "--value", _SERVICE_NAME
+            )
+        except (OSError, subprocess.SubprocessError):
+            return "could not verify the managed axol.service before updating"
+        if active.returncode != 0 or main_pid.returncode != 0:
+            return "self-update requires the active managed axol.service"
+        try:
+            service_pid = int(main_pid.stdout.strip())
+        except ValueError:
+            return "could not verify the managed axol.service process"
+        if service_pid != os.getpid():
+            return "self-update must run from the managed axol.service process"
+
+        try:
+            _write_durable_root_file(
+                _UPDATE_GUARD_DROPIN,
+                _UPDATE_GUARD_CONTENT,
+                mode=0o644,
+            )
+            reload_result = self._systemctl("daemon-reload")
+            if reload_result.returncode != 0:
+                return "could not activate the durable update restart guard"
+            loaded = self._systemctl(
+                "show", "--property=DropInPaths", "--value", _SERVICE_NAME
+            )
+            if loaded.returncode != 0 or str(_UPDATE_GUARD_DROPIN) not in loaded.stdout:
+                return "could not verify the durable update restart guard"
+
+            # The condition is live before the marker appears. A crash before
+            # this write can safely restart the untouched environment; every
+            # crash after it is condition-blocked.
+            _write_durable_root_file(
+                _UPDATE_GUARD_MARKER,
+                "Axol update incomplete; repair or retry before service start.\n",
+                mode=0o600,
+            )
+            disabled = self._systemctl("disable", _SERVICE_NAME)
+            if disabled.returncode != 0:
+                return "could not disable axol.service for the guarded update"
+        except (OSError, subprocess.SubprocessError):
+            return "could not establish the durable update restart guard"
+        return None
+
+    def _disarm_durable_update_guard(self) -> str | None:
+        """Re-enable verified code, then make its next service start eligible."""
+        if not _UPDATE_GUARD_MARKER.is_file():
+            return "the durable update restart guard disappeared during verification"
+        try:
+            # Keep the marker in place while enabling. If this process crashes
+            # at any earlier boundary, the permanent condition still refuses
+            # the service start. Only verified code reaches the final unlink.
+            enabled = self._systemctl("enable", _SERVICE_NAME)
+            if enabled.returncode != 0:
+                return (
+                    "updated Axol was verified, but axol.service could not be enabled"
+                )
+            is_enabled = self._systemctl("is-enabled", "--quiet", _SERVICE_NAME)
+            if is_enabled.returncode != 0:
+                return "updated Axol was verified, but axol.service is not enabled"
+            _remove_durable_file(_UPDATE_GUARD_MARKER)
+        except (OSError, subprocess.SubprocessError):
+            return "could not safely re-enable the verified axol.service"
+        return None
 
     def ensure_provisioned(self) -> None:
         """Run the once-per-process ``axol provision`` startup heal (see below)."""
@@ -316,10 +562,11 @@ class SelfUpdater:
             "version": self._version,
             "remoteVersion": self._remote_version,
             "updateAvailable": self._update_available(),
-            "idle": self._is_idle(),
+            "idle": self._is_idle() and not self.launches_blocked,
             "state": self._state,
             "phase": self._phase,
             "error": self._error,
+            "maintenanceActive": self.maintenance_active,
         }
 
     def start(self) -> tuple[bool, str | None]:
@@ -334,16 +581,15 @@ class SelfUpdater:
         """
         if not self.enabled:
             return False, "not a release install"
-        if self._state == "updating" or (
-            self._update_task is not None and not self._update_task.done()
-        ):
-            return False, "an update is already in progress"
+        if self.maintenance_active:
+            return False, "server maintenance is already in progress"
         if not self._update_available():
             return False, "no update available"
         if not self._is_idle():
             return False, "server is busy; stop the running operation first"
         self._state = "updating"
         self._error = None
+        self._launches_blocked = True
         self._update_task = asyncio.create_task(self._run_update())
         return True, None
 
@@ -396,6 +642,7 @@ class SelfUpdater:
                 "--tags",
                 url,
                 "refs/tags/v*",
+                "refs/tags/release-v*",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -422,9 +669,10 @@ class SelfUpdater:
             return None
         return best[1], ".".join(str(part) for part in best[0])
 
-    def _fail(self, message: str) -> None:
+    def _fail(self, message: str, *, launches_unsafe: bool = True) -> None:
         """Record an update failure for the UI and log it."""
         _logger.warning("self-update: %s", message)
+        self._launches_blocked = launches_unsafe
         self._error = message
         self._state = "error"
         self._phase = None
@@ -438,14 +686,27 @@ class SelfUpdater:
         # `_provision()` below, which re-acquires it (the lock is not reentrant).
         try:
             if not self.release_install or self._remote_tag is None:
-                self._fail("no release to install")
+                self._fail("no release to install", launches_unsafe=False)
                 return
             # Snapshot the release being installed: a background status poll
             # could refresh the cached remote mid-update.
             tag, target_version = self._remote_tag, self._remote_version
             update_requirements, update_preflight_error = release_update_requirements()
             if update_preflight_error is not None:
-                self._fail(update_preflight_error)
+                self._fail(update_preflight_error, launches_unsafe=False)
+                return
+            if target_version is None or not await asyncio.to_thread(
+                self._release_available, target_version
+            ):
+                self._fail(
+                    "the selected release is not yet available from PyPI; "
+                    "the current installation was not changed — retry later",
+                    launches_unsafe=False,
+                )
+                return
+            guard_error = await asyncio.to_thread(self._arm_durable_update_guard)
+            if guard_error is not None:
+                self._fail(guard_error)
                 return
             # Reinstall pinned to the newest release's version, from PyPI (the
             # release workflow publishes every release there; GitHub tags stay
@@ -512,6 +773,11 @@ class SelfUpdater:
                     self._fail(ultimate_error)
                     return
 
+            guard_error = await asyncio.to_thread(self._disarm_durable_update_guard)
+            if guard_error is not None:
+                self._fail(guard_error)
+                return
+
             # The install succeeded, so the target tag is what's on disk now.
             # Deliberately don't re-read the installed version through
             # importlib.metadata here: its path caches can still serve this
@@ -540,10 +806,36 @@ class SelfUpdater:
         needs it; ``axol provision`` is idempotent, so it's a cheap no-op once
         satisfied. Gated to real (git) tool installs, like the updater itself.
         """
-        if self._provision_started or not self.enabled:
+        if self._provision_started or self.launches_blocked or not self.enabled:
             return
         self._provision_started = True
-        asyncio.create_task(self._provision())
+        self._launches_blocked = True
+        self._provision_task = asyncio.create_task(self._run_startup_provision())
+
+    async def _run_startup_provision(self) -> None:
+        """Provision once while keeping every new hardware launch reserved."""
+        try:
+            guard_error = await asyncio.to_thread(self._arm_durable_update_guard)
+            if guard_error is not None:
+                self._fail(guard_error)
+                return
+            error = await self._provision()
+        except Exception as exc:  # noqa: BLE001 - fixed, credential-safe detail
+            self._fail(
+                "startup provisioning failed unexpectedly "
+                f"({type(exc).__name__}); restart or repair the service"
+            )
+            return
+        if error is not None:
+            self._fail(error)
+            return
+        guard_error = await asyncio.to_thread(self._disarm_durable_update_guard)
+        if guard_error is not None:
+            self._fail(guard_error)
+            return
+        # A user update cannot begin while this task is active.  Once startup
+        # healing has completed successfully, normal launches are safe again.
+        self._launches_blocked = False
 
     async def _provision(self) -> str | None:
         """Run ``axol provision`` in the background (the single provisioning path).

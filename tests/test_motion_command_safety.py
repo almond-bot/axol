@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import signal
 import threading
 import unittest
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 import numpy as np
 
 from almond_axol.kinematics.solver import KinematicsSolver
-from almond_axol.motor import MotorError
+from almond_axol.motor import Joint, MotorError
 from almond_axol.motor.damiao import _float_to_uint as damiao_float_to_uint
 from almond_axol.motor.myactuator import _float_to_uint as myactuator_float_to_uint
 from almond_axol.lerobot.robot.robot_axol import AxolRobot
@@ -35,6 +36,140 @@ class _RecordingArm:
 
 
 class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
+    async def test_axol_rejects_duplicate_arm_channel_before_bus_creation(self) -> None:
+        with (
+            patch("almond_axol.robot.axol.CanBus") as can_bus,
+            self.assertRaisesRegex(ValueError, "different CAN interfaces"),
+        ):
+            Axol(left_channel="can-shared", right_channel="can-shared")
+
+        can_bus.assert_not_called()
+
+    async def test_axol_enable_waits_for_both_issued_arm_actions(self) -> None:
+        sibling_started = asyncio.Event()
+        release_sibling = asyncio.Event()
+
+        async def fail_enable(*, hold: bool) -> None:
+            del hold
+            raise RuntimeError("left enable failed")
+
+        async def blocked_enable(*, hold: bool) -> None:
+            del hold
+            sibling_started.set()
+            await release_sibling.wait()
+
+        robot = object.__new__(Axol)
+        robot.connect = AsyncMock()
+        robot.left = SimpleNamespace(enable=fail_enable)
+        robot.right = SimpleNamespace(enable=blocked_enable)
+        robot._motors_disabled = True
+
+        task = asyncio.create_task(robot.enable())
+        await sibling_started.wait()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+
+        release_sibling.set()
+        with self.assertRaisesRegex(RuntimeError, "left enable failed"):
+            await task
+
+    async def test_axol_motion_waits_for_both_issued_arm_actions(self) -> None:
+        sibling_started = asyncio.Event()
+        release_sibling = asyncio.Event()
+
+        async def fail_motion(_q: np.ndarray) -> None:
+            raise RuntimeError("left motion failed")
+
+        async def blocked_motion(_q: np.ndarray) -> None:
+            sibling_started.set()
+            await release_sibling.wait()
+
+        robot = object.__new__(Axol)
+        robot.left = SimpleNamespace(motion_control=fail_motion)
+        robot.right = SimpleNamespace(motion_control=blocked_motion)
+        target = np.zeros(len(Joint), dtype=np.float32)
+
+        task = asyncio.create_task(robot.motion_control(left=target, right=target))
+        await sibling_started.wait()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+
+        release_sibling.set()
+        with self.assertRaisesRegex(RuntimeError, "left motion failed"):
+            await task
+
+    async def test_axol_disconnect_waits_for_all_telemetry_before_bus_close(
+        self,
+    ) -> None:
+        sibling_started = asyncio.Event()
+        release_sibling = asyncio.Event()
+
+        async def fail_stop() -> None:
+            raise RuntimeError("left telemetry stop failed")
+
+        async def blocked_stop() -> None:
+            sibling_started.set()
+            await release_sibling.wait()
+
+        robot = object.__new__(Axol)
+        robot._shutdown_pending = False
+        robot.left = SimpleNamespace(stop_telemetry=fail_stop)
+        robot.right = SimpleNamespace(stop_telemetry=blocked_stop)
+        robot._left_bus = SimpleNamespace(close=AsyncMock())
+        robot._right_bus = SimpleNamespace(close=AsyncMock())
+
+        task = asyncio.create_task(robot.disconnect())
+        await sibling_started.wait()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        robot._left_bus.close.assert_not_awaited()
+        robot._right_bus.close.assert_not_awaited()
+
+        release_sibling.set()
+        with self.assertRaisesRegex(RuntimeError, "left telemetry stop failed"):
+            await task
+
+        robot._left_bus.close.assert_awaited_once_with()
+        robot._right_bus.close.assert_awaited_once_with()
+
+    async def test_arm_enable_waits_for_every_issued_motor_action(self) -> None:
+        sibling_started = asyncio.Event()
+        release_sibling = asyncio.Event()
+        mode_changes: list[Joint] = []
+
+        class FailingMotor:
+            async def enable(self) -> None:
+                raise RuntimeError("motor enable failed")
+
+            async def set_control_mode(self, _mode: object) -> None:
+                mode_changes.append(Joint.SHOULDER_1)
+
+        class BlockedMotor:
+            async def enable(self) -> None:
+                sibling_started.set()
+                await release_sibling.wait()
+
+            async def set_control_mode(self, _mode: object) -> None:
+                mode_changes.append(Joint.SHOULDER_2)
+
+        arm = object.__new__(AxolArm)
+        arm.motors = {
+            Joint.SHOULDER_1: FailingMotor(),
+            Joint.SHOULDER_2: BlockedMotor(),
+        }
+        arm.resolve_joint_offsets = AsyncMock()
+        arm.get_holding = AsyncMock(return_value=[False, False])
+
+        task = asyncio.create_task(arm.enable())
+        await sibling_started.wait()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+
+        release_sibling.set()
+        with self.assertRaisesRegex(RuntimeError, "motor enable failed"):
+            await task
+        self.assertEqual(mode_changes, [])
+
     async def test_ik_warmup_failure_prevents_false_ready_solver(self) -> None:
         solver = object.__new__(KinematicsSolver)
         solver._pyroki_index = np.arange(14)
@@ -205,6 +340,60 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         process.terminate.assert_called_once_with()
         process.kill.assert_called_once_with()
         self.assertIsNone(teleop._ik_process)
+
+    async def test_teleop_process_join_interrupt_still_terminates_and_proves_exit(
+        self,
+    ) -> None:
+        process = Mock(pid=8126)
+        process.join.side_effect = (KeyboardInterrupt(), None)
+        process.is_alive.side_effect = (True, False)
+        teleop = object.__new__(VRTeleop)
+        teleop._ik_thread = None
+        teleop._ik_stop = threading.Event()
+        teleop._parent_conn = None
+        teleop._ik_process = process
+        teleop._vr_thread = None
+        teleop._cart = None
+        teleop._robot = SimpleNamespace(disable=AsyncMock())
+
+        await teleop.disable()
+
+        self.assertEqual(
+            process.join.call_args_list,
+            [call(timeout=3.0), call(timeout=2.0)],
+        )
+        process.terminate.assert_called_once_with()
+        process.kill.assert_not_called()
+        self.assertIsNone(teleop._ik_process)
+
+    async def test_teleop_disable_defers_and_restores_repeated_sigint(self) -> None:
+        previous_handler = object()
+        teleop = object.__new__(VRTeleop)
+        teleop._ik_thread = None
+        teleop._ik_stop = threading.Event()
+        teleop._parent_conn = None
+        teleop._ik_process = None
+        teleop._vr_thread = None
+        teleop._cart = None
+        teleop._robot = SimpleNamespace(disable=AsyncMock())
+
+        with (
+            patch(
+                "almond_axol.teleop.teleop.signal.getsignal",
+                return_value=previous_handler,
+            ),
+            patch("almond_axol.teleop.teleop.signal.signal") as install,
+        ):
+            await teleop.disable()
+
+        self.assertEqual(
+            install.call_args_list,
+            [
+                call(signal.SIGINT, signal.SIG_IGN),
+                call(signal.SIGINT, previous_handler),
+            ],
+        )
+        teleop._robot.disable.assert_awaited_once_with()
 
     async def test_teleop_retains_worker_reference_when_kill_is_unverified(
         self,

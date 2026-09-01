@@ -57,6 +57,10 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
         "almond_axol.diagnostics.rom.disable",
         "Open the grippers left clamped by the ROM test and power down.",
     ),
+    "diag.lift-cycle": (
+        "almond_axol.diagnostics.lift.cycle",
+        "Raise the arms for clearance, then cycle the base lift down and up.",
+    ),
     "diag.zed-cable": (
         "almond_axol.diagnostics.zed.cable",
         "Verify a ZED camera cable by validating captured frames.",

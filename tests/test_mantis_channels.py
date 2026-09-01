@@ -15,6 +15,7 @@ from almond_axol.cli.mantis_bridge import (
     managed_mantis_bridge,
 )
 from almond_axol.constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
+from almond_axol.robot.mantis import Mantis
 from almond_axol.serve.app import _mantis_channel_mismatch_message
 from almond_axol.serve.runner import (
     _bind_managed_mantis_trigger_channels,
@@ -25,6 +26,20 @@ from almond_axol.utils.can_channels import require_mantis_channels
 
 
 class MantisChannelFlowTest(unittest.TestCase):
+    def test_mantis_rejects_duplicate_channel_before_bus_creation(self) -> None:
+        for left, right in (
+            ("can-shared", "can-shared"),
+            (" can-shared ", "can-shared"),
+        ):
+            with (
+                self.subTest(left=left, right=right),
+                patch("almond_axol.robot.mantis.CanBus") as can_bus,
+                self.assertRaisesRegex(ValueError, "different CAN interfaces"),
+            ):
+                Mantis(left_channel=left, right_channel=right)
+
+            can_bus.assert_not_called()
+
     def test_direct_fallback_matches_saved_rig_source_channels_and_quest_key(
         self,
     ) -> None:

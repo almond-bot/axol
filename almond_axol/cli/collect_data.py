@@ -984,6 +984,45 @@ def _run(
     stop_event: "threading.Event | None" = None,
     control: "Control | None" = None,
 ) -> None:
+    """Run collection under one outer, exception-safe CPU-affinity guard."""
+    try:
+        original_affinity = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        # Never narrow a long-lived serve worker when its original mask cannot
+        # be captured for restoration.
+        original_affinity = None
+
+    if original_affinity is not None:
+        affinity.pin_realtime()
+
+    session_error: BaseException | None = None
+    try:
+        _run_session(cfg, stop_event=stop_event, control=control)
+    except BaseException as error:
+        session_error = error
+        raise
+    finally:
+        if original_affinity is not None:
+            try:
+                os.sched_setaffinity(0, original_affinity)
+            except (AttributeError, OSError) as restore_error:
+                if session_error is not None:
+                    session_error.add_note(
+                        "additional CPU-affinity restore failure: "
+                        f"{type(restore_error).__name__}: {restore_error}"
+                    )
+                else:
+                    raise RuntimeError(
+                        "collect-data completed but the original CPU affinity "
+                        "could not be restored"
+                    ) from restore_error
+
+
+def _run_session(
+    cfg: CollectDataConfig,
+    stop_event: "threading.Event | None" = None,
+    control: "Control | None" = None,
+) -> None:
     """Run the collection session until quit/stop.
 
     ``stop_event`` (optional) aborts the session from another thread (the
@@ -1048,18 +1087,6 @@ def _run(
             label="recording dataset root",
         )
         root = str(dataset_root)
-
-    # Pin the control process to its dedicated cores before any threads are
-    # created (the control loop, VR server, and IK dispatch threads inherit it on
-    # connect), so background recording work — relay, recorder, NVENC encoders,
-    # all pinned to the other cores — can't preempt the 120 Hz loop. Restored in
-    # the finally so a long-lived serve process isn't left pinned. No-op where
-    # affinity isn't available.
-    try:
-        _orig_affinity = os.sched_getaffinity(0)
-    except (AttributeError, OSError):
-        _orig_affinity = None
-    affinity.pin_realtime()
 
     # Flag physically-stereo ZED X before the relay/robot opens the cameras so
     # the relay and in-process fallback both use the stereo grab path. The pure
@@ -2026,6 +2053,7 @@ def _run(
         else:
             log_say("Episode ended before recording started, skipping.")
 
+    session_error: BaseException | None = None
     try:
         while not _stopped():
             episode_idx = recorder.episode_count()
@@ -2185,8 +2213,18 @@ def _run(
 
     except KeyboardInterrupt:
         pass
-    except Exception:
-        teleop.send_feedback_error()
+    except Exception as exc:
+        session_error = exc
+        try:
+            teleop.send_feedback_error()
+        except BaseException as feedback_error:
+            # The session/control failure is the actionable primary error.
+            # Headset feedback is independent and must not replace it while
+            # the full teardown below is still pending.
+            exc.add_note(
+                "additional headset error-feedback failure: "
+                f"{type(feedback_error).__name__}: {feedback_error}"
+            )
         raise
     finally:
         log_say("Stopping.")
@@ -2218,14 +2256,6 @@ def _run(
         if relay is not None:
             _cleanup("video relay", relay.shutdown)
 
-        # Restore the process's original CPU affinity (a serve process is
-        # long-lived and runs other operations after this one).
-        if _orig_affinity is not None:
-            try:
-                os.sched_setaffinity(0, _orig_affinity)
-            except OSError:
-                pass
-
         robot_failure = next(
             (
                 failure
@@ -2234,9 +2264,19 @@ def _run(
             ),
             None,
         )
-        if robot_failure is not None:
+        if session_error is not None:
+            for label, failure in cleanup_failures:
+                session_error.add_note(
+                    f"additional {label} cleanup failure: "
+                    f"{type(failure).__name__}: {failure}"
+                )
+                if label == "robot disconnect" or isinstance(
+                    failure, HardwareCleanupError
+                ):
+                    mark_hardware_cleanup_uncertain(session_error, failure)
+        elif robot_failure is not None:
             raise HardwareCleanupError(
                 "robot disconnect failed; hardware ownership is uncertain"
             ) from robot_failure
-        if cleanup_failures:
+        elif cleanup_failures:
             raise cleanup_failures[0][1]

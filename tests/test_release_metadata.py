@@ -55,6 +55,67 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertIn('UV_VERSION="0.12.3"', installer)
         self.assertIn("https://astral.sh/uv/${UV_VERSION}/install.sh", installer)
 
+    def test_web_validation_disables_package_manager_caching(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[1]
+            / ".github"
+            / "workflows"
+            / "publish.yml"
+        ).read_text()
+
+        self.assertIn(
+            "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
+            workflow,
+        )
+        self.assertIn("package-manager-cache: false", workflow)
+
+    def test_releases_use_the_namespace_invisible_to_the_legacy_updater(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "publish.yml").read_text()
+        release_guide = (root / ".github" / "RELEASING.md").read_text()
+        updater = (root / "almond_axol" / "serve" / "update.py").read_text()
+        installer = (root / "web" / "app" / "public" / "install").read_text()
+
+        self.assertIn('expected_tag="release-v$(uv version --short)"', workflow)
+        self.assertIn("rulesets?includes_parents=true", workflow)
+        self.assertIn('any(.type == "creation")', workflow)
+        self.assertIn(".conditions.ref_name.exclude | length == 0", workflow)
+        self.assertIn("secrets.RULESET_AUDIT_TOKEN", workflow)
+        self.assertIn('if [ -z "${GH_TOKEN}" ]', workflow)
+        self.assertIn('has("bypass_actors")', workflow)
+        self.assertIn('.bypass_actors | type == "array"', workflow)
+        self.assertIn(".bypass_actors | length == 0", workflow)
+        self.assertNotIn("GH_TOKEN: ${{ github.token }}", workflow)
+        self.assertIn('"refs/tags/release-v*"', updater)
+        self.assertIn('"refs/tags/v*" "refs/tags/release-v*"', installer)
+        self.assertIn("Never create or\npush another `vX.Y.Z` tag", release_guide)
+        self.assertIn("Versions `v0.1.0` through `v0.1.2`", release_guide)
+        self.assertIn("RULESET_AUDIT_TOKEN", release_guide)
+        self.assertIn("Administration/rulesets", release_guide)
+
+    def test_customer_notifications_wait_for_both_package_publishes(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "publish.yml").read_text()
+
+        self.assertFalse(
+            (root / ".github" / "workflows" / "release-notify.yml").exists()
+        )
+        notify_job = workflow.index("  notify-release:")
+        self.assertIn(
+            "needs: [publish-sdk, publish-plugin]",
+            workflow[notify_job:],
+        )
+        self.assertIn("if: github.event_name == 'release'", workflow[notify_job:])
+        self.assertNotIn("toJSON(secrets)", workflow)
+        self.assertEqual(workflow.count("secrets.SLACK_WEBHOOK_URLS"), 1)
+        self.assertNotIn("secrets.SLACK_WEBHOOK_URL_", workflow)
+        self.assertIn("SLACK_WEBHOOK_URLS must be a non-empty JSON array", workflow)
+        self.assertIn(
+            "SLACK_WEBHOOK_URLS",
+            release_guide := (root / ".github" / "RELEASING.md").read_text(),
+        )
+        self.assertIn("customer/channel roster", release_guide)
+
     def test_plugin_caps_the_sdk_api_line_and_has_a_publishable_version(self) -> None:
         root = Path(__file__).resolve().parents[1]
         plugin = tomllib.loads(

@@ -17,11 +17,18 @@ from typing import Any
 
 from ..cli.tracker_ultimate import is_ultimate_tracker_key
 from ..mantis.calibration import (
+    CURRENT_TRANSFORM_ENTRY,
     LEGACY_TRACKER_KEY,
     MANTIS_TCP_TRANSFORM_FILE,
+    STALE_TRANSFORM_ENTRY,
+    ULTIMATE_POSE_CONVENTION_FIELD,
     candidate_transform_for,
+    classify_tcp_transform_entry,
+    current_ultimate_pose_convention,
     design_transform_for,
     parse_quest_tracker_key,
+    ultimate_pose_convention_from_entry,
+    ultimate_pose_convention_metadata,
     validate_tcp_transform,
 )
 from ..tracker.config import TRACKER_CONFIG_FILE, load_tracker_config
@@ -222,26 +229,36 @@ def _read_calibration_document(path: Path) -> dict[str, Any]:
 
 
 def _saved_transform(
-    document: dict[str, Any], side: str, key: str | None
-) -> list[float] | None:
+    document: dict[str, Any],
+    side: str,
+    key: str | None,
+    ultimate_convention: tuple[str, str] | None,
+) -> tuple[list[float] | None, str, tuple[str, str] | None]:
     if key is None:
-        return None
+        return None, "missing", None
     side_entries = document.get(side)
     if not isinstance(side_entries, dict):
-        return None
+        return None, "missing", None
     # A legacy entry is itself {pos, quat}; it is not a measured value for an
     # exact active device and must never be shown as though it were one.
     entry = side_entries.get(key)
     if not isinstance(entry, dict):
+        return None, "missing", None
+    values, status = classify_tcp_transform_entry(
+        key,
+        entry,
+        ultimate_convention=ultimate_convention,
+    )
+    return values, status, ultimate_pose_convention_from_entry(entry)
+
+
+def _pose_convention_payload(
+    convention: tuple[str, str] | None,
+) -> dict[str, str] | None:
+    if convention is None:
         return None
-    pos = entry.get("pos")
-    quat = entry.get("quat")
-    if not isinstance(pos, list) or not isinstance(quat, list):
-        return None
-    try:
-        return validate_tcp_transform([*pos, *quat])
-    except ValueError:
-        return None
+    quat_order, up_axis = convention
+    return {"quatOrder": quat_order, "upAxis": up_axis}
 
 
 def _calibration_snapshot_locked(
@@ -249,15 +266,23 @@ def _calibration_snapshot_locked(
     keys: dict[str, str | None],
     document: dict[str, Any],
     path: Path,
+    ultimate_convention: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     sides: dict[str, dict[str, Any]] = {}
     for side in _SIDES:
         key = keys[side]
-        measured = _saved_transform(document, side, key)
+        measured, entry_status, stored_convention = _saved_transform(
+            document,
+            side,
+            key,
+            ultimate_convention,
+        )
         if key is None:
             status = "unbound"
-        elif measured is not None:
+        elif measured is not None and entry_status == CURRENT_TRANSFORM_ENTRY:
             status = "measured"
+        elif measured is not None and entry_status == STALE_TRANSFORM_ENTRY:
+            status = "stale"
         elif design_transform_for(side, key) is not None:
             status = "factory"
         elif candidate_transform_for(side, key) is not None:
@@ -267,16 +292,18 @@ def _calibration_snapshot_locked(
         sides[side] = {
             "key": key,
             "status": status,
-            # Only an entry actually stored under this exact key is editable
-            # current data.  Factory/CAD values are intentionally not
-            # presented as if the operator had measured them.
+            # A valid stale entry stays editable so the operator can bench-
+            # check and explicitly resave/adopt it for the active convention.
+            # Factory/CAD values are never presented as measured editor data.
             "pos": measured[:3] if measured is not None else None,
             "quat": measured[3:] if measured is not None else None,
+            "poseConvention": _pose_convention_payload(stored_convention),
         }
     return {
         "path": str(path),
         "source": source,
         "keys": dict(keys),
+        "activePoseConvention": _pose_convention_payload(ultimate_convention),
         **sides,
     }
 
@@ -291,12 +318,21 @@ def calibration_snapshot(
     with _SETUP_FILE_LOCK:
         keys = _exact_tracker_keys(source, quest_tracker_key)
         document = _read_calibration_document(path)
-        return _calibration_snapshot_locked(source, keys, document, path)
+        ultimate_convention = (
+            current_ultimate_pose_convention(TRACKER_CONFIG_FILE)
+            if source == "ultimate"
+            else None
+        )
+        return _calibration_snapshot_locked(
+            source,
+            keys,
+            document,
+            path,
+            ultimate_convention,
+        )
 
 
-def _validated_calibration_entry(
-    entry: object,
-) -> tuple[str, dict[str, list[float]]]:
+def _validated_calibration_entry(entry: object) -> tuple[str, dict[str, Any]]:
     if not isinstance(entry, dict) or set(entry) != {"key", "pos", "quat"}:
         raise TrackerSetupError("each side must contain exactly key, pos, and quat")
     key = entry.get("key")
@@ -340,6 +376,16 @@ def save_calibration(
 
     with _SETUP_FILE_LOCK:
         keys = _exact_tracker_keys(source, quest_tracker_key)
+        ultimate_convention = (
+            current_ultimate_pose_convention(TRACKER_CONFIG_FILE)
+            if source == "ultimate"
+            else None
+        )
+        if source == "ultimate" and ultimate_convention is None:
+            raise TrackerSetupError(
+                "Ultimate pose convention is invalid; set ultimate_quat_order "
+                "to xyzw or wxyz and ultimate_up_axis to y or z before saving"
+            )
         missing = [side for side in validated if keys[side] is None]
         if missing:
             if source == "quest":
@@ -369,6 +415,11 @@ def save_calibration(
 
         document = _read_calibration_document(path)
         for side, (_submitted_key, entry) in validated.items():
+            if source == "ultimate":
+                assert ultimate_convention is not None
+                entry[ULTIMATE_POSE_CONVENTION_FIELD] = (
+                    ultimate_pose_convention_metadata(ultimate_convention)
+                )
             existing = document.get(side)
             if existing is None:
                 side_entries: dict[str, Any] = {}
@@ -394,7 +445,13 @@ def save_calibration(
             document[side] = side_entries
 
         _atomic_write_json(path, document)
-        return _calibration_snapshot_locked(source, keys, document, path)
+        return _calibration_snapshot_locked(
+            source,
+            keys,
+            document,
+            path,
+            ultimate_convention,
+        )
 
 
 __all__ = [

@@ -23,9 +23,16 @@ REPO_URL="https://github.com/almond-bot/axol"
 EXTRAS="lerobot,sim,tracker"
 PYTHON_VERSION="3.13"
 UV_VERSION="0.12.3"
+MIN_SAFE_RELEASE_VERSION="0.1.36"
 BIN_DIR="/usr/local/bin"
 SERVICE_NAME="axol"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+# Shared with almond_axol.serve.update.  The permanent systemd condition makes
+# every future start fail closed while a package update is incomplete; the
+# marker survives crashes and reboots until a verified installer removes it.
+UPDATE_MARKER="/var/lib/almond-axol/update-incomplete"
+UPDATE_GUARD_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
+UPDATE_GUARD_FILE="${UPDATE_GUARD_DIR}/20-update-guard.conf"
 # We install as root (the systemd service runs as root), but operators log in
 # as their own user and expect `axol` to work there too. uv's default tool +
 # managed-Python locations live under /root (mode 0700), which only root can
@@ -122,31 +129,76 @@ systemd_environment_line() {
     printf 'Environment="%s=%s"' "${name}" "${value}"
 }
 
+# -- release resolution ------------------------------------------------------
+
+# Releases through v0.1.35 used vX.Y.Z; hardened releases use
+# release-vX.Y.Z so the unsafe updater in an unmigrated old service never sees
+# a future tag. Resolve both namespaces here because this installer is the one
+# safe migration path.
+say "Resolving the latest release..."
+LATEST_RELEASE="$(git ls-remote --tags "${REPO_URL}" \
+        "refs/tags/v*" "refs/tags/release-v*" \
+    | awk -F/ '{print $NF}' | sed 's/\^{}$//' \
+    | grep -E '^(release-)?v[0-9]+(\.[0-9]+)*$' | sort -u \
+    | awk '{ tag=$0; version=tag; sub(/^(release-)?v/, "", version); print version, tag }' \
+    | sort -k1,1V -k2,2 | tail -n1)"
+[ -n "${LATEST_RELEASE}" ] \
+    || die "No release tags (vX.Y.Z or release-vX.Y.Z) found on ${REPO_URL}."
+VERSION="${LATEST_RELEASE%% *}"
+LATEST_TAG="${LATEST_RELEASE#* }"
+say "Latest release: ${LATEST_TAG}."
+OLDEST_VERSION="$(printf '%s\n%s\n' "${MIN_SAFE_RELEASE_VERSION}" "${VERSION}" \
+    | sort -V | head -n1)"
+[ "${OLDEST_VERSION}" = "${MIN_SAFE_RELEASE_VERSION}" ] \
+    || die "The hardened migration release is not published yet (need release-v${MIN_SAFE_RELEASE_VERSION}, found ${LATEST_TAG}). The current Axol service and runtime were not changed. Retry after that release is available."
+
+# A GitHub release/tag becomes visible before its publish workflow necessarily
+# finishes uploading the matching wheel. Check the exact public artifact
+# before installing even the pinned uv bootstrap, stopping a service, arming
+# the durable marker, or mutating the Axol environment.
+say "Checking that almond-axol ${VERSION} is available on PyPI..."
+PYPI_METADATA=""
+if ! PYPI_METADATA="$(curl -fsSL --max-time 30 \
+        "https://pypi.org/pypi/almond-axol/${VERSION}/json")"; then
+    die "Release ${LATEST_TAG} is not available on PyPI yet; the current Axol service and runtime were not changed. Wait for release publishing to finish, then retry."
+fi
+printf '%s' "${PYPI_METADATA}" \
+    | grep -Eq "\"version\"[[:space:]]*:[[:space:]]*\"${VERSION}\"" \
+    || die "PyPI returned metadata for the wrong almond-axol version; the current Axol service and runtime were not changed."
+printf '%s' "${PYPI_METADATA}" \
+    | grep -Eq '"yanked"[[:space:]]*:[[:space:]]*false' \
+    || die "Release ${LATEST_TAG} has no non-yanked PyPI artifacts; the current Axol service and runtime were not changed."
+unset PYPI_METADATA
+
 # -- uv -----------------------------------------------------------------------
 
-if ! command -v uv >/dev/null 2>&1; then
+# The service PATH and plugin repair docs both use /usr/local/bin directly.
+# Do not accept a root/user-local uv elsewhere on PATH: that makes installation
+# appear successful while disabling the control-panel updater, and it bypasses
+# this installer's reviewed version pin.
+UV="${BIN_DIR}/uv"
+uv_version_matches() {
+    case "$1" in
+        "uv ${UV_VERSION}"|"uv ${UV_VERSION} "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+UV_CURRENT=""
+if [ -x "${UV}" ]; then
+    UV_CURRENT="$("${UV}" --version 2>/dev/null || true)"
+fi
+if ! uv_version_matches "${UV_CURRENT}"; then
     say "Installing uv ${UV_VERSION} to ${BIN_DIR}..."
     curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" \
         | env UV_INSTALL_DIR="${BIN_DIR}" sh
 else
-    say "uv already installed ($(command -v uv))."
+    say "uv ${UV_VERSION} already installed at ${UV}."
 fi
-UV="$(command -v uv || echo "${BIN_DIR}/uv")"
+[ -x "${UV}" ] || die "uv did not install at ${UV}."
+uv_version_matches "$("${UV}" --version 2>/dev/null || true)" \
+    || die "uv at ${UV} does not match required version ${UV_VERSION}."
 
 # -- axol ---------------------------------------------------------------------
-
-# Installs track releases, not main: resolve the newest release tag (vX.Y.Z)
-# and install that exact version from PyPI (the release workflow publishes
-# every release there). The `axol serve` self-updater performs the same
-# version-pinned reinstall when a newer release appears (serve/update.py) —
-# keep the requirement here and there in sync.
-say "Resolving the latest release..."
-LATEST_TAG="$(git ls-remote --tags "${REPO_URL}" "refs/tags/v*" \
-    | awk -F/ '{print $NF}' | sed 's/\^{}$//' \
-    | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -u -V | tail -n1)"
-[ -n "${LATEST_TAG}" ] || die "No release tags (vX.Y.Z) found on ${REPO_URL}."
-VERSION="${LATEST_TAG#v}"
-say "Latest release: ${LATEST_TAG}."
 
 # Ask the currently installed, root-owned Axol CLI for its machine-readable
 # preflight before --force rebuilds the environment. It returns only allowlisted
@@ -294,6 +346,43 @@ elif [ -x "${UV_TOOL_DIR}/almond-axol/bin/python" ]; then
     legacy_plugin_update_requirement "${UV_TOOL_DIR}/almond-axol/bin/python"
 fi
 
+# Arm a durable start guard before touching either the running service or its
+# interpreter. This also repairs a host left behind by a failed control-panel
+# update. Build both files through root-owned temporary names and atomic renames
+# so pre-existing symlinks are replaced rather than followed.
+[ ! -L "/var/lib/almond-axol" ] \
+    || die "/var/lib/almond-axol must not be a symlink."
+install -d -o root -g root -m 0750 /var/lib/almond-axol
+[ ! -L "${UPDATE_GUARD_DIR}" ] \
+    || die "${UPDATE_GUARD_DIR} must not be a symlink."
+install -d -o root -g root -m 0755 "${UPDATE_GUARD_DIR}"
+GUARD_TMP="$(mktemp "${UPDATE_GUARD_DIR}/.20-update-guard.XXXXXX")"
+printf '[Unit]\nConditionPathExists=!%s\n' "${UPDATE_MARKER}" > "${GUARD_TMP}"
+chown root:root "${GUARD_TMP}"
+chmod 0644 "${GUARD_TMP}"
+mv -fT -- "${GUARD_TMP}" "${UPDATE_GUARD_FILE}"
+systemctl daemon-reload
+MARKER_TMP="$(mktemp "/var/lib/almond-axol/.update-incomplete.XXXXXX")"
+printf 'Axol update has not completed verification.\n' > "${MARKER_TMP}"
+chown root:root "${MARKER_TMP}"
+chmod 0600 "${MARKER_TMP}"
+mv -fT -- "${MARKER_TMP}" "${UPDATE_MARKER}"
+
+# Never replace the interpreter or tool environment under a live root service.
+# `systemctl stop` waits for Axol's graceful shutdown (including recorder and
+# dataset finalization) before it returns. The marker above closes the
+# Restart=always window before disable/stop begins, while disabling the unit
+# also prevents a boot from launching an unverified environment. A successful
+# install enables and starts it again below.
+if systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    say "Stopping and disabling the ${SERVICE_NAME} service before updating its runtime..."
+    systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+        || die "Could not stop and disable the ${SERVICE_NAME} service; its runtime was not changed."
+    if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+        die "The ${SERVICE_NAME} service is still active; its runtime was not changed."
+    fi
+fi
+
 say "Installing axol ${VERSION} from PyPI (extras: ${EXTRAS}) — this can take a few minutes..."
 mkdir -p "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
@@ -341,7 +430,7 @@ REBOOT_REQUIRED=0
 if grep -q "REBOOT REQUIRED" "${PROVISION_LOG}"; then REBOOT_REQUIRED=1; fi
 rm -f "${PROVISION_LOG}"
 if [ "${PROVISION_STATUS}" -ne 0 ]; then
-    die "Axol was updated, but provisioning failed. The service was not restarted; repair the reported host dependencies and rerun this installer."
+    die "Axol was updated, but provisioning failed. The service remains blocked and disabled; repair the reported host dependencies and rerun this installer."
 fi
 
 # Verify with the newly installed CLI, which repairs system dependencies and
@@ -350,7 +439,7 @@ fi
 if [ "${ULTIMATE_PRESERVED}" -eq 1 ]; then
     say "Verifying the preserved VIVE Ultimate runtime..."
     axol tracker.ultimate.install \
-        || die "Axol was updated, but VIVE Ultimate restore failed. The service was not restarted; repair the runtime and rerun this installer."
+        || die "Axol was updated, but VIVE Ultimate restore failed. The service remains blocked and disabled; repair the runtime and rerun this installer."
 fi
 
 # -- Quest-over-USB operator access -------------------------------------------
@@ -564,7 +653,10 @@ say "Writing ${SERVICE_FILE}..."
 cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=Axol control panel (axol serve)
-After=network-online.target
+# The deferred nvpmodel selection is applied by NVIDIA's boot service before
+# this unit re-pins clocks at that mode's ceiling. After= does not pull the
+# vendor unit in, so it remains harmless on non-Jetson hosts.
+After=nvpmodel.service network-online.target
 Wants=network-online.target
 
 [Service]
@@ -617,7 +709,12 @@ EOF
 say "Enabling and starting the ${SERVICE_NAME} service..."
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
-systemctl restart "${SERVICE_NAME}"
+# Everything that can invalidate this runtime has now succeeded. Keep the unit
+# enabled-but-blocked until the last possible moment, then clear the durable
+# marker immediately before the explicit start. The condition drop-in remains
+# installed for future control-panel and curl-based updates.
+rm -f -- "${UPDATE_MARKER}"
+systemctl start "${SERVICE_NAME}"
 
 # -- done ---------------------------------------------------------------------
 

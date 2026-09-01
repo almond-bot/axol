@@ -30,6 +30,11 @@ from ..constants import (
     CAN_RIGHT,
 )
 from ..motor import CanBus, Joint, Motor, MotorError
+from ..utils.can_channels import (
+    require_distinct_axol_channels,
+    require_mantis_channels,
+)
+from .commands import flag_enabled
 from .telemetry import SAMPLE_HZ, TelemetryHub, motor_key
 
 _logger = logging.getLogger(__name__)
@@ -89,11 +94,6 @@ def motor_faults(
     return faults
 
 
-def _flag(value: Any) -> bool:
-    """A submitted form flag: real booleans or the string \"true\"."""
-    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
-
-
 def _joint_name_for_id(value: Any) -> str | None:
     """Joint name for a motor CAN id (0x01–0x08 in Joint order), else None."""
     try:
@@ -122,22 +122,22 @@ def scoped_motor_faults(
     arm = str(args.get("arm") or "").strip().lower()
     if arm in ("left", "right"):
         faults = [f for f in faults if f["arm"] == arm]
-    if _flag(args.get("no_left")):
+    if flag_enabled(args.get("no_left")):
         faults = [f for f in faults if f["arm"] != "left"]
-    if _flag(args.get("no_right")):
+    if flag_enabled(args.get("no_right")):
         faults = [f for f in faults if f["arm"] != "right"]
 
     joint_names: set[str] | None = None
     joints = args.get("joints")
     if isinstance(joints, str) and joints.strip():
         joint_names = {p.strip().upper() for p in joints.split(",") if p.strip()}
-    elif not _flag(args.get("guided")):
+    elif not flag_enabled(args.get("guided")):
         joint = _joint_name_for_id(args.get("id") or args.get("current_id"))
         if joint is not None:
             joint_names = {joint}
     if joint_names is not None:
         faults = [f for f in faults if f["joint"].upper() in joint_names]
-    elif _flag(args.get("guided")):
+    elif flag_enabled(args.get("guided")):
         # Guided zeroing without an explicit subset walks the seven arm
         # joints; the gripper is never touched (it has no zero to set), so
         # a gripper fault must not block the launch.
@@ -288,6 +288,14 @@ class RobotLink:
         """
         if profile not in ("axol", "mantis"):
             raise ValueError(f"unknown hardware profile: {profile}")
+        if profile == "axol":
+            left_channel, right_channel = require_distinct_axol_channels(
+                (left_channel, right_channel)
+            )
+        else:
+            left_channel, right_channel = require_mantis_channels(
+                (left_channel, right_channel)
+            )
         self._profile = profile
         self._has_gripper_provider = has_gripper
         self._arms: list[_ArmLink] = []
@@ -481,6 +489,14 @@ class RobotLink:
         """
         if profile not in ("axol", "mantis"):
             raise ValueError(f"unknown hardware profile: {profile}")
+        if profile == "axol":
+            left_channel, right_channel = require_distinct_axol_channels(
+                (left_channel, right_channel)
+            )
+        else:
+            left_channel, right_channel = require_mantis_channels(
+                (left_channel, right_channel)
+            )
         if (
             self.channels() == (left_channel, right_channel)
             and self._profile == profile
@@ -582,6 +598,13 @@ class RobotLink:
             with self._lock:
                 self._active_joints = joints
                 self._buses_may_be_open = bool(self._arms)
+                # A timestamp from before CAN ownership changed cannot
+                # authorize a new hardware operation. Only the ping loop's
+                # first complete post-open sweep makes this link fresh again.
+                self._last_ping = None
+            for arm in self._arms:
+                arm.health = {}
+            self.hub.clear_slow()
             for arm in self._arms:
                 await arm.open(joints)
             if self._ping_task is None or self._ping_task.done():
@@ -626,12 +649,12 @@ class RobotLink:
                     slow.update(sweep)
                 if slow:
                     self.hub.push_slow(slow)
+                with self._lock:
+                    self._last_ping = time.time()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep the loop alive
                 _logger.debug("ping sweep error: %s", exc)
-            with self._lock:
-                self._last_ping = time.time()
             elapsed = self._loop.time() - start
             await asyncio.sleep(max(0.0, _PING_INTERVAL_S - elapsed))
 

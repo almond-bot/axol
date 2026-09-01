@@ -9,6 +9,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 from almond_axol.cli import collect_dagger
+from almond_axol.robot.base import (
+    HardwareCleanupError,
+    is_hardware_cleanup_uncertain,
+)
 
 
 class DaggerResumeSchemaTest(unittest.TestCase):
@@ -144,6 +148,144 @@ class DaggerResumeSchemaTest(unittest.TestCase):
                 collect_dagger._run(cfg)  # noqa: SLF001
 
             self.assertEqual(seen, [False])
+
+    def test_session_error_is_preserved_and_marked_when_ik_cleanup_fails(
+        self,
+    ) -> None:
+        primary = ValueError("episode failed")
+        reset_failure = RuntimeError("IK child still alive")
+        relay_failure = RuntimeError("relay close failed")
+
+        collect_dagger._finish_dagger_cleanup(  # noqa: SLF001
+            session_error=primary,
+            disconnect_failure=None,
+            teleop_failure=None,
+            reset_failure=reset_failure,
+            relay_failure=relay_failure,
+        )
+
+        self.assertTrue(is_hardware_cleanup_uncertain(primary))
+        self.assertTrue(any("IK reset worker" in note for note in primary.__notes__))
+        self.assertTrue(any("video relay" in note for note in primary.__notes__))
+
+    def test_ik_cleanup_failure_is_hardware_cleanup_error_on_clean_exit(
+        self,
+    ) -> None:
+        reset_failure = RuntimeError("IK child still alive")
+
+        with self.assertRaisesRegex(
+            HardwareCleanupError, "background ownership is uncertain"
+        ) as raised:
+            collect_dagger._finish_dagger_cleanup(  # noqa: SLF001
+                session_error=None,
+                disconnect_failure=None,
+                teleop_failure=None,
+                reset_failure=reset_failure,
+                relay_failure=None,
+            )
+
+        self.assertIs(raised.exception.__cause__, reset_failure)
+
+    def test_ik_uncertainty_is_not_hidden_by_teleop_cleanup_failure(self) -> None:
+        teleop_failure = RuntimeError("VR loop close failed")
+        reset_failure = RuntimeError("IK child still alive")
+
+        with self.assertRaises(HardwareCleanupError) as raised:
+            collect_dagger._finish_dagger_cleanup(  # noqa: SLF001
+                session_error=None,
+                disconnect_failure=None,
+                teleop_failure=teleop_failure,
+                reset_failure=reset_failure,
+                relay_failure=None,
+            )
+
+        self.assertIs(raised.exception.__cause__, reset_failure)
+        self.assertTrue(
+            any("teleop disconnect" in note for note in raised.exception.__notes__)
+        )
+
+    def test_live_control_worker_blocks_all_owned_resource_cleanup(self) -> None:
+        release = threading.Event()
+        worker = threading.Thread(target=release.wait, daemon=True)
+        worker.shutdown_event = threading.Event()  # type: ignore[attr-defined]
+        worker.start()
+        owned_cleanups = [mock.Mock() for _ in range(4)]
+        try:
+            stopped, error = collect_dagger._stop_dagger_control_worker(  # noqa: SLF001
+                worker,  # type: ignore[arg-type]
+                timeout=0.01,
+            )
+
+            self.assertFalse(stopped)
+            self.assertIsInstance(error, RuntimeError)
+            for index, cleanup in enumerate(owned_cleanups):
+                self.assertIsNone(
+                    collect_dagger._cleanup_dagger_resource(  # noqa: SLF001
+                        control_stopped=stopped,
+                        label=f"owned-{index}",
+                        cleanup=cleanup,
+                    )
+                )
+                cleanup.assert_not_called()
+
+            # The exact worker remains available for a final retry. Only after
+            # that retry proves exit may its resources be touched.
+            release.set()
+            stopped, retry_error = collect_dagger._stop_dagger_control_worker(  # noqa: SLF001
+                worker,  # type: ignore[arg-type]
+                timeout=1.0,
+            )
+            self.assertTrue(stopped)
+            self.assertIsNone(retry_error)
+            collect_dagger._cleanup_dagger_resource(  # noqa: SLF001
+                control_stopped=stopped,
+                label="owned-0",
+                cleanup=owned_cleanups[0],
+            )
+            owned_cleanups[0].assert_called_once_with()
+        finally:
+            release.set()
+            worker.join(timeout=1.0)
+
+    def test_live_control_worker_error_propagates_hardware_uncertainty(self) -> None:
+        ownership_failure = HardwareCleanupError(
+            "DAgger control loop still owns hardware"
+        )
+
+        with self.assertRaises(HardwareCleanupError) as raised:
+            collect_dagger._finish_dagger_cleanup(  # noqa: SLF001
+                session_error=None,
+                disconnect_failure=None,
+                teleop_failure=None,
+                reset_failure=None,
+                relay_failure=None,
+                additional_failures=(("DAgger control loop", ownership_failure),),
+            )
+
+        self.assertIs(raised.exception, ownership_failure)
+
+    def test_policy_result_returning_after_stop_never_reaches_hardware(self) -> None:
+        control_loop = object.__new__(collect_dagger._DaggerControlLoop)  # noqa: SLF001
+        control_loop.shutdown_event = threading.Event()
+        control_loop.robot = SimpleNamespace(send_action=mock.Mock())
+        control_loop.policy = SimpleNamespace(
+            act=mock.Mock(
+                side_effect=lambda _obs: (
+                    control_loop.shutdown_event.set() or {"left.pos": 1.0}
+                )
+            )
+        )
+        control_loop.limiter = None
+        control_loop.recorder = SimpleNamespace(publish=mock.Mock())
+
+        with mock.patch.object(
+            collect_dagger, "latest_observation", return_value={"joint": 0.0}
+        ):
+            result = control_loop._policy_tick(1.0)  # noqa: SLF001
+
+        self.assertIsNone(result)
+        control_loop.robot.send_action.assert_not_called()
+        control_loop.recorder.publish.assert_not_called()
 
 
 if __name__ == "__main__":

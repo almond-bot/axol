@@ -183,15 +183,54 @@ class CanBus:
 
     async def close(self) -> None:
         """Stop the reader loop and shut down the socket."""
+        external_cancel: asyncio.CancelledError | None = None
+        reader_error: BaseException | None = None
         if self._reader_task is not None:
             self._reader_task.cancel()
             try:
-                await self._reader_task
-            except asyncio.CancelledError:
-                pass
+                (result,) = await asyncio.gather(
+                    self._reader_task,
+                    return_exceptions=True,
+                )
+            except asyncio.CancelledError as exc:
+                # Child cancellation is returned as a value by gather; only a
+                # cancellation of this close operation itself raises here.
+                external_cancel = exc
+                (result,) = await asyncio.gather(
+                    self._reader_task,
+                    return_exceptions=True,
+                )
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    reader_error = result
+            else:
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    reader_error = result
         if self._bus is not None:
-            self._bus.shutdown()
-            self._bus = None
+            try:
+                self._bus.shutdown()
+            except BaseException as shutdown_error:
+                if external_cancel is not None:
+                    external_cancel.add_note(
+                        "CAN socket shutdown also failed: "
+                        f"{type(shutdown_error).__name__}: {shutdown_error}"
+                    )
+                    raise external_cancel
+                raise
+            else:
+                self._bus = None
+        if external_cancel is not None:
+            if reader_error is not None:
+                external_cancel.add_note(
+                    "CAN reader shutdown also failed: "
+                    f"{type(reader_error).__name__}: {reader_error}"
+                )
+            raise external_cancel
+        if reader_error is not None:
+            raise reader_error
 
     async def __aenter__(self) -> CanBus:
         await self.start()
@@ -203,12 +242,19 @@ class CanBus:
     def _add_listener(self, listener: Callable[[can.Message], None]) -> None:
         self._listeners.append(listener)
 
-    async def _send(self, arbitration_id: int, data: bytes) -> None:
+    async def _send(self, arbitration_id: int, data: bytes) -> bool:
+        """Attempt one frame send and report whether it reached SocketCAN.
+
+        Most motor protocols prove delivery with their own reply/timeout and
+        intentionally tolerate a dropped frame during hotplug recovery.  The
+        boolean lets one-shot safety commands such as lift STOP fail closed
+        instead of mistaking that deliberate drop for a successful send.
+        """
         if self._lost or self._stalled or self._bus is None:
             # Interface is gone (USB drop) or the bus is stalled (e-stop) —
             # drop the frame; motor commands time out upstream and resume
             # once the reader has recovered the bus.
-            return
+            return False
         msg = can.Message(
             arbitration_id=arbitration_id, data=data, is_extended_id=False
         )
@@ -223,8 +269,10 @@ class CanBus:
                 self._mark_lost(exc)
             else:
                 raise
+            return False
         else:
             self._enobufs_since = None
+            return True
 
     def _on_tx_queue_full(self, exc: BaseException) -> None:
         """Classify an ``ENOBUFS`` send: transient congestion or a dead bus.

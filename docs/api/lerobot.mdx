@@ -5,6 +5,14 @@ description: "LeRobot-compatible Robot, Teleoperator, and Camera wrappers for th
 
 LeRobot-compatible wrappers for the Axol hardware. Requires the `lerobot` extra. These classes implement the LeRobot `Robot`, `Teleoperator`, and `Camera` interfaces so the Axol works with any LeRobot training or data-collection pipeline without modification. The [`collect-data`](/cli/collect-data) and [`run-policy`](/cli/run-policy) CLI commands are built on top of this layer.
 
+<Warning>
+  Treat policy checkpoints and existing LeRobot datasets as trusted input. The
+  pinned upstream runtime parses dataset metadata and deserializes model files;
+  it is not a sandbox for arbitrary Hub repositories or directories supplied by
+  someone else. Only load artifacts you created or obtained from a source you
+  trust, especially on a machine connected to robot hardware.
+</Warning>
+
 ```python
 from almond_axol.lerobot.robot import AxolRobot, AxolRobotConfig
 from almond_axol.lerobot.teleop import AxolVRTeleop, AxolVRTeleopConfig

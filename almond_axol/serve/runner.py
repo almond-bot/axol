@@ -43,7 +43,7 @@ from typing import Any
 
 from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
 from ..zed import stereo_serials
-from .commands import flag_enabled
+from .commands import flag_enabled, normalize_boolean_args
 from .manager import Session
 
 _logger = logging.getLogger(__name__)
@@ -528,6 +528,7 @@ class OperationRunner:
                 args = self._settings.merged_args(op_id, args)
                 if cameras is None:
                     cameras = self._settings.cameras()
+            args = normalize_boolean_args(op_id, args)
 
             requested_mantis = flag_enabled(args.get("mantis"))
             if requested_mantis and not cmd.supports_mantis:
@@ -551,6 +552,39 @@ class OperationRunner:
             session.args = dict(args)
 
             cfg = self._build_config(op_id, args)
+            # A whole-config file is lower priority than explicit argv, but it
+            # can still supply a safety-critical mode when the request omitted
+            # that field.  The API classified/surveyed the launch from
+            # ``args`` before entering the runner, so require the fully parsed
+            # config to describe exactly the same hardware/no-hardware mode.
+            # Otherwise (for example) ``mantis: true`` in config_path could
+            # borrow an Axol survey and then open the Mantis buses.
+            safety_flags = tuple(
+                dict.fromkeys(
+                    flag
+                    for flag in (cmd.sim_flag, *cmd.robot_free_flags)
+                    if flag is not None
+                )
+            )
+            parsed_flags: dict[str, bool] = {}
+            for flag in safety_flags:
+                requested = flag_enabled(args.get(flag))
+                parsed = flag_enabled(getattr(cfg, flag, False))
+                if parsed != requested:
+                    raise ValueError(
+                        f"{op_id}'s parsed {flag}={parsed} does not match the "
+                        f"submitted {flag}={requested}; safety modes in "
+                        "config_path must also be supplied explicitly"
+                    )
+                parsed_flags[flag] = parsed
+
+            parsed_mantis = flag_enabled(getattr(cfg, "mantis", False))
+            if parsed_mantis != mantis_mode:
+                raise ValueError(
+                    f"{op_id}'s parsed mantis={parsed_mantis} does not match "
+                    f"the submitted mantis={mantis_mode}; select Mantis only "
+                    "through the operation's Mantis toggle"
+                )
             if cmd.requires_cameras and not self._has_recording_camera(cfg):
                 raise ValueError(
                     f"{op_id} requires at least one assigned camera with "
@@ -584,13 +618,56 @@ class OperationRunner:
                 if str(cfg.mantis_source) != "quest":
                     set_managed_pose_source_id(cfg)
             robot_config = getattr(cfg, "robot_config", None)
-            if not cmd.supports_mantis and robot_config is not None:
+            if robot_config is not None:
                 from ..lerobot.robot.config_mantis import MantisRobotConfig
 
-                if isinstance(robot_config, MantisRobotConfig):
+                parsed_mantis_robot = isinstance(robot_config, MantisRobotConfig)
+                if parsed_mantis_robot != mantis_mode:
                     raise ValueError(
-                        f"{op_id} does not support Mantis hardware; "
-                        "use teleop or collect-data"
+                        f"{op_id}'s robot_config hardware profile does not match "
+                        f"mantis={mantis_mode}; select Mantis only through the "
+                        "operation's Mantis toggle"
+                    )
+
+            is_sim = cmd.sim_flag is not None and parsed_flags.get(cmd.sim_flag, False)
+            # A robot-free run (sim, or e.g. teleop's cart_only) never touches
+            # the arms, so the persistent robot link stays connected and its
+            # motor telemetry keeps streaming while the op runs.
+            robot_free = is_sim or any(
+                parsed_flags.get(flag, False) for flag in cmd.robot_free_flags
+            )
+            hardware_profile = "mantis" if mantis_mode else "axol"
+            link_matches_run = (
+                self._robot_link is not None
+                and self._robot_link.profile() == hardware_profile
+            )
+            # Only release an idle link whose buses this run will use. An Axol
+            # link and a Mantis run (or vice versa) own distinct CAN interfaces.
+            needs_robot = (
+                cmd.uses_can_bus
+                and link_matches_run
+                and (not robot_free or hardware_profile == "mantis")
+            )
+            if (
+                needs_robot
+                and hardware_profile == "axol"
+                and self._robot_link is not None
+            ):
+                axol_config = getattr(cfg, "axol", None)
+                if axol_config is None:
+                    robot_config = getattr(cfg, "robot_config", None)
+                    axol_config = getattr(robot_config, "axol_config", None)
+                configured_has_gripper = flag_enabled(
+                    getattr(axol_config, "has_gripper", True)
+                )
+                if (
+                    configured_has_gripper
+                    and self._robot_link.status().get("hasGripper") is not True
+                ):
+                    raise ValueError(
+                        "the operation config enables grippers, but the connected "
+                        "Axol survey is gripperless; disable has_gripper before "
+                        "starting"
                     )
         except Exception as exc:  # noqa: BLE001 - surface config errors to UI
             session.status = "error"
@@ -614,25 +691,6 @@ class OperationRunner:
                     "continuing without cameras"
                 )
 
-        is_sim = cmd.sim_flag is not None and flag_enabled(args.get(cmd.sim_flag))
-        # A robot-free run (sim, or e.g. teleop's cart_only) never touches the
-        # arms, so the persistent robot link stays connected and its motor
-        # telemetry keeps streaming while the op runs.
-        robot_free = is_sim or any(
-            flag_enabled(args.get(flag)) for flag in cmd.robot_free_flags
-        )
-        hardware_profile = "mantis" if mantis_mode else "axol"
-        link_matches_run = (
-            self._robot_link is not None
-            and self._robot_link.profile() == hardware_profile
-        )
-        # Only release an idle link whose buses this run will use. An Axol
-        # link and a Mantis run (or vice versa) own distinct CAN interfaces.
-        needs_robot = (
-            cmd.uses_can_bus
-            and link_matches_run
-            and (not robot_free or hardware_profile == "mantis")
-        )
         log_level = self._log_level(args)
 
         session.status = "running"
@@ -656,7 +714,7 @@ class OperationRunner:
             target = self._run_async
         else:
             target = self._run_thread
-        mantis_source = str(args.get("mantis_source", "lighthouse"))
+        mantis_source = str(getattr(cfg, "mantis_source", "lighthouse"))
         manage_bridge = mantis_mode and mantis_source != "quest"
         run_args = (session, op_id, cfg, log_level, needs_robot, manage_bridge)
         self._thread = threading.Thread(

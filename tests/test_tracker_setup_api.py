@@ -13,6 +13,7 @@ import httpx
 from almond_axol.serve import app as app_module
 from almond_axol.serve import tracker_setup
 from almond_axol.serve.commands import COMMANDS, get_schema
+from almond_axol.mantis.calibration import ULTIMATE_POSE_CONVENTION_FIELD
 from almond_axol.tracker.config import TrackerConfig, save_tracker_config
 from almond_axol.tracker.ultimate import ultimate_wifi_config_error
 
@@ -209,6 +210,10 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                 saved["left"]["survive:OTHER"],
                 original["left"]["survive:OTHER"],
             )
+            self.assertNotIn(
+                ULTIMATE_POSE_CONVENTION_FIELD,
+                saved["left"]["survive:LHR-LEFT"],
+            )
             self.assertEqual(saved["right"], original["right"])
             self.assertEqual(calibration_path.stat().st_mode & 0o777, 0o600)
 
@@ -253,6 +258,101 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                 )
                 self.assertEqual(quest["right"]["key"], quest_key)
                 self.assertEqual(quest["right"]["status"], "measured")
+                saved = json.loads(calibration_path.read_text())
+                self.assertNotIn(
+                    ULTIMATE_POSE_CONVENTION_FIELD,
+                    saved["right"][quest_key],
+                )
+
+    def test_ultimate_calibration_requires_explicit_convention_adoption(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "tracker.json"
+            calibration_path = root / "tcp.json"
+            self._tracker_config(config_path)
+            keys = {
+                "left": "ultimate:a:b:c:d:e:f",
+                "right": "ultimate:1:2:3:4:5:6",
+            }
+            calibration_path.write_text(
+                json.dumps({side: {key: dict(_IDENTITY)} for side, key in keys.items()})
+            )
+
+            with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
+                stale = tracker_setup.calibration_snapshot(
+                    "ultimate", path=calibration_path
+                )
+                self.assertEqual(
+                    stale["activePoseConvention"],
+                    {"quatOrder": "wxyz", "upAxis": "z"},
+                )
+                for side in ("left", "right"):
+                    self.assertEqual(stale[side]["status"], "stale")
+                    self.assertEqual(stale[side]["pos"], _IDENTITY["pos"])
+                    self.assertIsNone(stale[side]["poseConvention"])
+
+                adopted = tracker_setup.save_calibration(
+                    "ultimate",
+                    {"left": _keyed(keys["left"])},
+                    path=calibration_path,
+                )
+                self.assertEqual(adopted["left"]["status"], "measured")
+                self.assertEqual(adopted["right"]["status"], "stale")
+
+            saved = json.loads(calibration_path.read_text())
+            self.assertEqual(
+                saved["left"][keys["left"]][ULTIMATE_POSE_CONVENTION_FIELD],
+                {"quat_order": "wxyz", "up_axis": "z"},
+            )
+
+            config = TrackerConfig(
+                backend="ultimate",
+                left="a:b:c:d:e:f",
+                right="1:2:3:4:5:6",
+                bindings={"ultimate": {"left": "a:b:c:d:e:f", "right": "1:2:3:4:5:6"}},
+                ultimate_quat_order="wxyz",
+                ultimate_up_axis="y",
+            )
+            save_tracker_config(config, config_path)
+            with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
+                mismatched = tracker_setup.calibration_snapshot(
+                    "ultimate", path=calibration_path
+                )
+                self.assertEqual(mismatched["left"]["status"], "stale")
+                self.assertEqual(
+                    mismatched["left"]["poseConvention"],
+                    {"quatOrder": "wxyz", "upAxis": "z"},
+                )
+                self.assertEqual(
+                    mismatched["activePoseConvention"],
+                    {"quatOrder": "wxyz", "upAxis": "y"},
+                )
+
+                resaved = tracker_setup.save_calibration(
+                    "ultimate",
+                    {"left": _keyed(keys["left"])},
+                    path=calibration_path,
+                )
+                self.assertEqual(resaved["left"]["status"], "measured")
+                self.assertEqual(
+                    resaved["left"]["poseConvention"],
+                    {"quatOrder": "wxyz", "upAxis": "y"},
+                )
+
+            config.ultimate_up_axis = "invalid"
+            save_tracker_config(config, config_path)
+            with (
+                patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path),
+                self.assertRaisesRegex(
+                    tracker_setup.TrackerSetupError,
+                    "pose convention is invalid",
+                ),
+            ):
+                tracker_setup.save_calibration(
+                    "ultimate",
+                    {"left": _keyed(keys["left"])},
+                    path=calibration_path,
+                )
 
     def test_calibration_rejects_nonfinite_and_zero_quaternion(self) -> None:
         for entry in (
@@ -307,6 +407,9 @@ class _Settings:
     def can_channels(self) -> tuple[str, str]:
         return "can-left", "can-right"
 
+    def mantis_can_channels(self) -> tuple[str, str]:
+        return "can-mantis-left", "can-mantis-right"
+
     def has_gripper(self) -> bool:
         return True
 
@@ -334,6 +437,61 @@ def _test_app(settings: _Settings) -> Any:
 
 
 class TrackerSetupApiTest(unittest.IsolatedAsyncioTestCase):
+    async def test_bindings_readiness_surfaces_stale_ultimate_convention(
+        self,
+    ) -> None:
+        app = _test_app(_Settings())
+        transport = httpx.ASGITransport(app=app)
+        config = TrackerConfig(
+            backend="ultimate",
+            left="a:b:c:d:e:f",
+            right="1:2:3:4:5:6",
+            bindings={
+                "ultimate": {
+                    "left": "a:b:c:d:e:f",
+                    "right": "1:2:3:4:5:6",
+                }
+            },
+        )
+        calibration = {
+            "left": {"status": "stale"},
+            "right": {"status": "measured"},
+        }
+        with (
+            patch(
+                "almond_axol.cli.tracker_install.lighthouse_readiness",
+                return_value={},
+            ),
+            patch(
+                "almond_axol.cli.tracker_ultimate.ultimate_runtime_readiness",
+                return_value={},
+            ),
+            patch("almond_axol.tracker.load_tracker_config", return_value=config),
+            patch(
+                "almond_axol.mantis.calibration.load_tcp_transforms",
+                return_value={},
+            ),
+            patch(
+                "almond_axol.vr.server.get_last_quest_pose_datum",
+                return_value=None,
+            ),
+            patch.object(
+                tracker_setup,
+                "calibration_snapshot",
+                return_value=calibration,
+            ),
+        ):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                response = await client.get("/api/tracker/bindings")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["sources"]["ultimate"]["transforms"],
+            {"left": "stale", "right": "measured"},
+        )
+
     async def test_untrusted_browser_cannot_read_or_probe_api(self) -> None:
         app = _test_app(_Settings())
         transport = httpx.ASGITransport(app=app)

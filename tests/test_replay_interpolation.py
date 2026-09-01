@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import threading
 import unittest
+from unittest import mock
 
 import numpy as np
 
+from almond_axol.cli import replay_dataset
 from almond_axol.cli.replay_dataset import _interpolate_action_values
 from almond_axol.mantis.relative import quat_xyzw_to_matrix
 from almond_axol.mantis.smoothing import rotvec_to_quat_xyzw
+from almond_axol.robot.base import (
+    HardwareCleanupError,
+    is_hardware_cleanup_uncertain,
+)
 
 
 _ACTION_NAMES = [
@@ -64,6 +71,106 @@ class ReplayInterpolationTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(midpoint, [1.5, -1.0, 0.25])
+
+    def test_session_error_is_preserved_and_marked_when_ik_cleanup_fails(
+        self,
+    ) -> None:
+        primary = ValueError("playback failed")
+        reset_failure = RuntimeError("IK child still alive")
+
+        replay_dataset._finish_replay_cleanup(  # noqa: SLF001
+            session_error=primary,
+            playback_failure=None,
+            disconnect_failure=None,
+            reset_failure=reset_failure,
+        )
+
+        self.assertTrue(is_hardware_cleanup_uncertain(primary))
+        self.assertTrue(any("IK reset worker" in note for note in primary.__notes__))
+
+    def test_ik_cleanup_failure_is_hardware_cleanup_error_on_clean_exit(
+        self,
+    ) -> None:
+        reset_failure = RuntimeError("IK child still alive")
+
+        with self.assertRaisesRegex(
+            HardwareCleanupError, "background ownership is uncertain"
+        ) as raised:
+            replay_dataset._finish_replay_cleanup(  # noqa: SLF001
+                session_error=None,
+                playback_failure=None,
+                disconnect_failure=None,
+                reset_failure=reset_failure,
+            )
+
+        self.assertIs(raised.exception.__cause__, reset_failure)
+
+    def test_live_playback_future_blocks_robot_disconnect_until_exit_proof(
+        self,
+    ) -> None:
+        playback_done = threading.Event()
+        disconnect = mock.Mock()
+
+        stopped, failure = replay_dataset._wait_for_replay_exit(  # noqa: SLF001
+            playback_done,
+            timeout=0.01,
+        )
+
+        self.assertFalse(stopped)
+        self.assertIsInstance(failure, HardwareCleanupError)
+        self.assertIsNone(
+            replay_dataset._cleanup_replay_robot(  # noqa: SLF001
+                playback_stopped=stopped,
+                cleanup=disconnect,
+            )
+        )
+        disconnect.assert_not_called()
+
+        playback_done.set()
+        stopped, failure = replay_dataset._wait_for_replay_exit(  # noqa: SLF001
+            playback_done,
+            timeout=0.01,
+        )
+        self.assertTrue(stopped)
+        self.assertIsNone(failure)
+        replay_dataset._cleanup_replay_robot(  # noqa: SLF001
+            playback_stopped=stopped,
+            cleanup=disconnect,
+        )
+        disconnect.assert_called_once_with()
+
+    def test_live_playback_cleanup_error_is_propagated_as_hardware_uncertainty(
+        self,
+    ) -> None:
+        playback_failure = HardwareCleanupError("playback still owns the robot")
+        reset_failure = RuntimeError("IK reset child still alive")
+
+        with self.assertRaises(HardwareCleanupError) as raised:
+            replay_dataset._finish_replay_cleanup(  # noqa: SLF001
+                session_error=None,
+                playback_failure=playback_failure,
+                disconnect_failure=None,
+                reset_failure=reset_failure,
+            )
+
+        self.assertIs(raised.exception, playback_failure)
+        self.assertTrue(
+            any("IK reset worker" in note for note in playback_failure.__notes__)
+        )
+
+    def test_session_error_is_marked_when_playback_exit_is_unproved(self) -> None:
+        primary = ValueError("replay command failed")
+        playback_failure = HardwareCleanupError("playback still owns the robot")
+
+        replay_dataset._finish_replay_cleanup(  # noqa: SLF001
+            session_error=primary,
+            playback_failure=playback_failure,
+            disconnect_failure=None,
+            reset_failure=None,
+        )
+
+        self.assertTrue(is_hardware_cleanup_uncertain(primary))
+        self.assertTrue(any("replay playback" in note for note in primary.__notes__))
 
 
 if __name__ == "__main__":

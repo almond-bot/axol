@@ -14,11 +14,16 @@ import torch
 
 from almond_axol.cli.run_policy import (
     _align_action_chunk,
+    _clear_episode_buffer_after_workers,
+    _cleanup_after_episode_workers,
     _lingering_episode_thread_error,
+    _shutdown_policy_server_process,
     _snap_to_newest_indices,
+    _stop_episode_workers,
 )
 from almond_axol.cli import run_policy
 from almond_axol.lerobot import action_schema as action_schema_module
+from almond_axol.lerobot.rollout import IKResetController
 from almond_axol.robot.base import HardwareCleanupError
 
 
@@ -196,6 +201,255 @@ class RunPolicySafetyTest(unittest.TestCase):
 
         self.assertIsInstance(error, HardwareCleanupError)
         self.assertIn("control", str(error))
+
+    def test_live_capture_blocks_buffer_mutation_and_retains_worker(self) -> None:
+        release = threading.Event()
+        worker = threading.Thread(target=release.wait, daemon=True)
+        worker.start()
+        capture = SimpleNamespace(
+            request_stop=mock.Mock(),
+            unblock_inputs=mock.Mock(),
+        )
+        client = SimpleNamespace(
+            shutdown_event=threading.Event(),
+            start_barrier=mock.Mock(),
+            stop=mock.Mock(),
+        )
+        workers = [("capture", worker)]
+        dataset = mock.Mock()
+        try:
+            stopped, error = _stop_episode_workers(
+                client=client,
+                capture=capture,
+                workers=workers,
+                join_timeout=0.01,
+            )
+
+            self.assertFalse(stopped)
+            self.assertIsInstance(error, HardwareCleanupError)
+            self.assertIs(workers[0][1], worker)
+            client.stop.assert_called_once_with()
+            capture.unblock_inputs.assert_called_once_with()
+            with self.assertRaisesRegex(HardwareCleanupError, "refusing to clear"):
+                _clear_episode_buffer_after_workers(dataset, workers_stopped=stopped)
+            dataset.clear_episode_buffer.assert_not_called()
+
+            robot_cleanup = mock.Mock()
+            dataset_finalize = mock.Mock()
+            self.assertIsNone(
+                _cleanup_after_episode_workers(
+                    workers_stopped=stopped,
+                    label="robot disconnect",
+                    cleanup=robot_cleanup,
+                )
+            )
+            self.assertIsNone(
+                _cleanup_after_episode_workers(
+                    workers_stopped=stopped,
+                    label="dataset finalization",
+                    cleanup=dataset_finalize,
+                )
+            )
+            robot_cleanup.assert_not_called()
+            dataset_finalize.assert_not_called()
+        finally:
+            release.set()
+            worker.join(timeout=1.0)
+
+    def test_capture_exit_is_proved_before_buffer_clear_after_unblock(self) -> None:
+        events: list[str] = []
+        release = threading.Event()
+
+        class BlockingCapture(threading.Thread):
+            def __init__(self) -> None:
+                super().__init__(daemon=True)
+                self.stop_event = threading.Event()
+
+            def run(self) -> None:
+                release.wait()
+                events.append("worker-exit")
+
+            def request_stop(self) -> None:
+                events.append("stop-signal")
+                self.stop_event.set()
+
+            def unblock_inputs(self) -> None:
+                events.append("input-unblock")
+                release.set()
+
+        capture = BlockingCapture()
+        capture.start()
+        client = SimpleNamespace(
+            shutdown_event=threading.Event(),
+            start_barrier=mock.Mock(),
+            stop=mock.Mock(side_effect=lambda: events.append("client-close")),
+        )
+        dataset = SimpleNamespace(
+            clear_episode_buffer=lambda: events.append("buffer-clear")
+        )
+
+        stopped, error = _stop_episode_workers(
+            client=client,
+            capture=capture,
+            workers=[("capture", capture)],
+            join_timeout=0.01,
+        )
+        self.assertTrue(stopped)
+        self.assertIsInstance(error, RuntimeError)
+        _clear_episode_buffer_after_workers(dataset, workers_stopped=stopped)
+
+        self.assertFalse(capture.is_alive())
+        self.assertLess(events.index("worker-exit"), events.index("buffer-clear"))
+
+    def test_observation_camera_read_is_unblocked_without_recording(self) -> None:
+        release = threading.Event()
+        observation = threading.Thread(target=release.wait, daemon=True)
+        observation.start()
+        camera = SimpleNamespace(
+            disconnect=mock.Mock(side_effect=release.set),
+        )
+        client = SimpleNamespace(
+            shutdown_event=threading.Event(),
+            start_barrier=mock.Mock(),
+            stop=mock.Mock(),
+            robot=SimpleNamespace(cameras={"overhead": camera}),
+        )
+
+        stopped, error = _stop_episode_workers(
+            client=client,
+            capture=None,
+            workers=[("observation", observation)],
+            join_timeout=0.01,
+        )
+
+        self.assertTrue(stopped)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertFalse(observation.is_alive())
+        camera.disconnect.assert_called_once_with()
+
+    def test_ik_reset_stop_joins_after_kill_before_clearing_reference(self) -> None:
+        process = mock.Mock()
+        process.is_alive.side_effect = [True, True, False]
+        controller = object.__new__(IKResetController)
+        controller._conn = None
+        controller._proc = process
+        controller._ready = True
+
+        controller.stop()
+
+        self.assertEqual(
+            process.join.call_args_list,
+            [
+                mock.call(timeout=3.0),
+                mock.call(timeout=2.0),
+                mock.call(timeout=2.0),
+            ],
+        )
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertIsNone(controller._proc)
+        self.assertFalse(controller._ready)
+
+    def test_ik_reset_start_retains_and_reaps_child_after_pipe_failure(self) -> None:
+        startup = OSError("child pipe close failed")
+        parent_conn = mock.Mock()
+        child_conn = mock.Mock()
+        child_conn.close.side_effect = startup
+        process = mock.Mock(pid=9123)
+        process.is_alive.side_effect = [True, False]
+        context = mock.Mock()
+        context.Pipe.return_value = (parent_conn, child_conn)
+        context.Process.return_value = process
+        controller = object.__new__(IKResetController)
+        controller._vr_cfg = object()
+        controller._kin_cfg = object()
+        controller._proc = None
+        controller._conn = None
+        controller._ready = False
+
+        with (
+            mock.patch("multiprocessing.get_context", return_value=context),
+            self.assertRaisesRegex(OSError, "child pipe close failed") as raised,
+        ):
+            controller.start()
+
+        self.assertIs(raised.exception, startup)
+        process.start.assert_called_once_with()
+        process.terminate.assert_called_once_with()
+        self.assertEqual(
+            process.join.call_args_list,
+            [mock.call(timeout=3.0), mock.call(timeout=2.0)],
+        )
+        self.assertIsNone(controller._proc)
+        self.assertIsNone(controller._conn)
+        parent_conn.close.assert_called_once_with()
+
+    def test_ik_reset_stop_retains_process_when_post_kill_exit_is_unproved(
+        self,
+    ) -> None:
+        process = mock.Mock()
+        process.is_alive.return_value = True
+        controller = object.__new__(IKResetController)
+        controller._conn = None
+        controller._proc = process
+        controller._ready = True
+
+        with self.assertRaisesRegex(RuntimeError, "ownership is uncertain"):
+            controller.stop()
+
+        self.assertEqual(
+            process.join.call_args_list,
+            [
+                mock.call(timeout=3.0),
+                mock.call(timeout=2.0),
+                mock.call(timeout=2.0),
+            ],
+        )
+        self.assertIs(controller._proc, process)
+        self.assertTrue(controller._ready)
+
+    def test_policy_server_shutdown_joins_after_kill_and_proves_exit(self) -> None:
+        process = mock.Mock()
+        process.is_alive.side_effect = [True, True, False]
+
+        _shutdown_policy_server_process(process)
+
+        self.assertEqual(
+            process.join.call_args_list,
+            [mock.call(timeout=5.0), mock.call(timeout=2.0)],
+        )
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+
+    def test_policy_server_shutdown_propagates_error_after_exit_proof(self) -> None:
+        process = mock.Mock()
+        terminate_error = OSError("terminate syscall failed")
+        process.terminate.side_effect = terminate_error
+        process.is_alive.side_effect = [True, True, False]
+
+        with self.assertRaisesRegex(RuntimeError, "cleanup encountered") as raised:
+            _shutdown_policy_server_process(process)
+
+        self.assertIs(raised.exception.__cause__, terminate_error)
+        process.kill.assert_called_once_with()
+        self.assertEqual(
+            process.join.call_args_list,
+            [mock.call(timeout=5.0), mock.call(timeout=2.0)],
+        )
+
+    def test_policy_server_shutdown_fails_if_post_kill_exit_is_unproved(
+        self,
+    ) -> None:
+        process = mock.Mock()
+        process.is_alive.return_value = True
+
+        with self.assertRaisesRegex(RuntimeError, "ownership is uncertain"):
+            _shutdown_policy_server_process(process)
+
+        self.assertEqual(
+            process.join.call_args_list,
+            [mock.call(timeout=5.0), mock.call(timeout=2.0)],
+        )
 
     def test_chunk_alignment_never_offsets_equivalent_wrapped_rotvecs(self) -> None:
         features = [

@@ -35,6 +35,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable
 
 from ..constants import ARM_JOINTS
+from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -75,18 +76,39 @@ class IKResetController:
 
         from ..teleop.worker import run_ik_worker
 
+        if self._proc is not None or self._conn is not None:
+            raise RuntimeError(
+                "IK reset controller already owns startup resources; stop it "
+                "before starting another worker"
+            )
         ctx = mp.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe()
-        proc = ctx.Process(
-            target=run_ik_worker,
-            args=(child_conn, self._vr_cfg, self._kin_cfg, None, None),
-            name="axol-ik-worker",
-            daemon=True,
-        )
-        proc.start()
-        child_conn.close()
-        self._proc = proc
         self._conn = parent_conn
+        try:
+            proc = ctx.Process(
+                target=run_ik_worker,
+                args=(child_conn, self._vr_cfg, self._kin_cfg, None, None),
+                name="axol-ik-worker",
+                daemon=True,
+            )
+            # Retain before start so a successful spawn followed by any local
+            # setup failure remains reachable by stop()'s terminate/kill path.
+            self._proc = proc
+            proc.start()
+            child_conn.close()
+        except BaseException as setup_error:
+            try:
+                child_conn.close()
+            except BaseException as close_error:
+                setup_error.add_note(
+                    "additional IK reset child-pipe close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            try:
+                self.stop()
+            except BaseException as cleanup_error:
+                mark_hardware_cleanup_uncertain(setup_error, cleanup_error)
+            raise
 
     def wait_ready(self, timeout: float = 60.0) -> None:
         """Block until the IK worker has finished JIT compilation."""
@@ -327,25 +349,98 @@ class IKResetController:
             time.sleep(max(0.0, period - (time.perf_counter() - t0)))
 
     def stop(self) -> None:
-        """Signal shutdown, close the pipe, and reap the subprocess."""
+        """Signal shutdown, close the pipe, and prove subprocess exit.
+
+        The process reference is cleared only after a final post-kill
+        liveness check proves the worker exited.  A retained reference makes
+        a later cleanup retry possible and prevents callers from treating an
+        unverified kill request as ownership release.
+        """
+        failures: list[tuple[str, BaseException]] = []
+
         if self._conn is not None:
             try:
                 self._conn.send(None)
-            except Exception:  # noqa: BLE001
-                pass
+            except BaseException as error:
+                # A broken pipe is expected when the worker already died.  It
+                # is not authoritative either way; the process probes below
+                # are, so continue through the stronger shutdown actions.
+                failures.append(("shutdown signal", error))
             try:
                 self._conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._conn = None
-        if self._proc is not None:
-            self._proc.join(timeout=3.0)
-            if self._proc.is_alive():
-                self._proc.terminate()
-                self._proc.join(timeout=2.0)
-            if self._proc.is_alive():
-                self._proc.kill()
-            self._proc = None
+            except BaseException as error:
+                failures.append(("pipe close", error))
+            else:
+                self._conn = None
+
+        process = self._proc
+        process_alive = False
+        if process is not None:
+
+            def join(label: str, timeout: float) -> None:
+                try:
+                    process.join(timeout=timeout)
+                except BaseException as error:
+                    failures.append((label, error))
+
+            def is_alive(label: str) -> bool:
+                try:
+                    return bool(process.is_alive())
+                except BaseException as error:
+                    failures.append((label, error))
+                    # Failure to prove exit is ownership uncertainty.  Treat
+                    # it as live so terminate/kill are still attempted.
+                    return True
+
+            join("graceful join", 3.0)
+            process_alive = is_alive("post-join liveness check")
+            if process_alive:
+                try:
+                    process.terminate()
+                except BaseException as error:
+                    failures.append(("terminate", error))
+                join("post-terminate join", 2.0)
+                process_alive = is_alive("post-terminate liveness check")
+            if process_alive:
+                try:
+                    process.kill()
+                except BaseException as error:
+                    failures.append(("kill", error))
+                # kill() merely requests termination.  The following join and
+                # liveness probe are the ownership proof.
+                join("post-kill join", 2.0)
+                process_alive = is_alive("post-kill liveness check")
+            if not process_alive:
+                self._proc = None
+
+        if process_alive:
+            error = HardwareCleanupError(
+                "IK reset worker did not stop; background process ownership "
+                "is uncertain"
+            )
+            for label, failure in failures:
+                error.add_note(
+                    f"additional IK reset {label} failure: "
+                    f"{type(failure).__name__}: {failure}"
+                )
+            raise error
+
+        # Once exit is proven, a failed signal is harmless (the pipe may have
+        # broken precisely because the child exited).  A pipe that could not
+        # be closed remains a real local resource leak and stays retryable.
+        pipe_failure = next(
+            (failure for label, failure in failures if label == "pipe close"), None
+        )
+        if pipe_failure is not None:
+            error = RuntimeError("IK reset worker pipe cleanup failed")
+            for label, failure in failures:
+                error.add_note(
+                    f"additional IK reset {label} failure: "
+                    f"{type(failure).__name__}: {failure}"
+                )
+            raise error from pipe_failure
+
+        self._ready = False
 
 
 class ActionPublisher:
@@ -408,6 +503,35 @@ class RolloutCaptureThread(threading.Thread):
         self.task = task
         self.rerun_ip = rerun_ip
         self.stop_event = threading.Event()
+
+    def request_stop(self) -> None:
+        """Ask the capture loop to stop at its next safe boundary."""
+        self.stop_event.set()
+
+    def unblock_inputs(self) -> None:
+        """Disconnect every camera to wake a capture blocked in a frame read.
+
+        This is an escalation path used only after a normal bounded join has
+        expired. Camera disconnect is independent per source, so attempt all of
+        them and re-raise the first failure after annotating any others. The
+        robot's later disconnect remains responsible for motor/CAN teardown.
+        """
+        primary_error: BaseException | None = None
+        for name, camera in self.robot.cameras.items():
+            try:
+                disconnect = getattr(camera, "disconnect", None)
+                if callable(disconnect):
+                    disconnect()
+            except BaseException as error:
+                if primary_error is None:
+                    primary_error = error
+                else:
+                    primary_error.add_note(
+                        f"additional rollout camera {name} disconnect failure: "
+                        f"{type(error).__name__}: {error}"
+                    )
+        if primary_error is not None:
+            raise primary_error
 
     def run(self) -> None:
         from lerobot.utils.constants import ACTION, OBS_STR

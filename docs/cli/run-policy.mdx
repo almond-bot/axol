@@ -10,6 +10,12 @@ Runs a trained policy autonomously on the robot using locally attached ZED camer
   dataset boundary. Direct non-root CLI runs use the operator's normal cache.
 </Note>
 
+<Warning>
+  Load only policy checkpoints and existing rollout datasets that you created
+  or obtained from a trusted source. Upstream model deserialization and dataset
+  parsing are not sandboxed.
+</Warning>
+
 <Tip>
   For the end-to-end workflow — including offloading inference to a GPU machine — see the [Run Policy guide](/operations/run-policy).
 </Tip>

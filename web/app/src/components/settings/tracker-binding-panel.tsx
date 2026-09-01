@@ -823,7 +823,10 @@ function SourceReadinessBadges({
   const transforms = readiness[source].transforms
   const runtimeIssues = source === "quest" ? [] : readiness[source].issues
   const missingTransforms = (["left", "right"] as const).filter(
-    (side) => transforms[side] === "missing" || transforms[side] === "candidate"
+    (side) =>
+      transforms[side] === "missing" ||
+      transforms[side] === "candidate" ||
+      transforms[side] === "stale"
   )
 
   let sourceBadges: ReactNode
@@ -934,7 +937,7 @@ function SourceReadinessBadges({
               tone={
                 transform === "missing"
                   ? "error"
-                  : transform === "candidate"
+                  : transform === "candidate" || transform === "stale"
                     ? "warning"
                     : transform === "measured"
                       ? "ready"
@@ -955,9 +958,11 @@ function SourceReadinessBadges({
         <p className="text-[11px] leading-relaxed text-red-300/75">
           {missingTransforms.map((side) => side[0].toUpperCase()).join(" + ")} mount transform
           {missingTransforms.length === 1 ? " is" : "s are"}{" "}
-          {missingTransforms.some((side) => transforms[side] === "candidate")
-            ? "not bench-verified"
-            : "missing"}
+          {missingTransforms.some((side) => transforms[side] === "stale")
+            ? "stale for the active pose convention"
+            : missingTransforms.some((side) => transforms[side] === "candidate")
+              ? "not bench-verified"
+              : "missing"}
           . Teleop bring-up can warn and continue, but production data collection requires a
           measured or verified factory transform for both sides.
         </p>

@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "lerobot_robot_axol"
 version = "0.1.1"
 description = "LeRobot plugin for the Almond Axol dual-arm robot: robot `axol`, VR teleoperator `axol_vr`, camera `zed`."
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.12"
 # 0.1.24 is the first release published to PyPI (and the first with the

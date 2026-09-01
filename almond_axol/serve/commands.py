@@ -461,6 +461,19 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         drives_motors=True,
     ),
+    "diag.lift-cycle": CommandDef(
+        "diag.lift-cycle",
+        "diag.lift-cycle",
+        "Lift cycle",
+        "Raise the arm S1 joints for clearance, then cycle the telescoping "
+        "lift down and up for the requested number of repetitions.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..diagnostics.lift.cycle"),
+        requires_hardware=True,
+        drives_motors=True,
+        hardware_profiles=("axol",),
+    ),
     "diag.zed-cable": CommandDef(
         "diag.zed-cable",
         "diag.zed-cable",
@@ -503,6 +516,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.lift.home"),
         requires_hardware=True,
+        hardware_profiles=("axol",),
     ),
     "lift.goto": CommandDef(
         "lift.goto",
@@ -514,6 +528,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.lift.goto"),
         requires_hardware=True,
+        hardware_profiles=("axol",),
     ),
     # -- Calibrate ----------------------------------------------------------
     "motor.set-zero-pos": CommandDef(
@@ -526,6 +541,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.motor.set_zero_pos"),
         requires_hardware=True,
         drives_motors=True,
+        hardware_profiles=("axol",),
     ),
     "motor.set-can-id": CommandDef(
         "motor.set-can-id",
@@ -734,9 +750,64 @@ def command_specs() -> list[dict[str, Any]]:
     return specs
 
 
+_TRUE_STRINGS = frozenset({"true", "yes", "on"})
+_FALSE_STRINGS = frozenset({"false", "no", "off"})
+
+
+def parse_boolean(value: Any, *, key: str = "boolean") -> bool:
+    """Parse exactly the boolean spellings accepted by draccus.
+
+    JSON booleans are canonical. String spellings remain supported for older
+    clients and direct form submissions, but are normalized before any safety
+    decision or argv emission. Integers and arbitrary truthy objects are
+    deliberately rejected: treating (for example) ``1`` differently in the
+    API gate and config parser can change which hardware profile a run opens.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+    raise ValueError(
+        f"{key} must be a boolean (true/false, yes/no, or on/off), not {value!r}"
+    )
+
+
 def flag_enabled(value: Any) -> bool:
-    """Interpret a submitted boolean without treating the string ``false`` as true."""
-    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+    """Interpret an optional submitted boolean with strict shared semantics."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return False
+    return parse_boolean(value)
+
+
+def normalize_boolean_args(command_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize every schema-declared boolean in one launch argument map.
+
+    Missing, JSON-null, and blank form values retain the config default by
+    being omitted. Every supplied value is otherwise converted to a real
+    ``bool`` or rejected before profile selection, fault scoping, or parsing.
+    """
+    boolean_keys: set[str] = set()
+
+    def collect(nodes: list[dict[str, Any]]) -> None:
+        for node in nodes:
+            if node.get("kind") == "group":
+                collect(node.get("children", []))
+            elif node.get("type") == "boolean":
+                boolean_keys.add(str(node["key"]))
+
+    collect(get_schema(command_id).nodes)
+    normalized = dict(args)
+    for key in boolean_keys & normalized.keys():
+        value = normalized[key]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            normalized.pop(key)
+            continue
+        normalized[key] = parse_boolean(value, key=key)
+    return normalized
 
 
 def _format_value(value: Any) -> str | None:
@@ -763,6 +834,7 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
     """
     if command_id not in COMMANDS:
         raise KeyError(command_id)
+    args = normalize_boolean_args(command_id, args)
     emit = get_schema(command_id).emit
 
     options: list[str] = []

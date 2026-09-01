@@ -15,6 +15,12 @@ axol jetson.setup
 
 These pins reset on every reboot, so the [one-command install](/installation) wires this into the `axol.service` systemd unit as an `ExecStartPre`, re-pinning the clocks at every boot, and runs it once during install. It is **not** called from `teleop` / `collect-data` / `serve` — those entry points just run.
 
+If changing the power-gating configuration requires a reboot, Axol declines the immediate reboot so it cannot interrupt an installation or robot session. It records the selected mode for NVIDIA's `nvpmodel.service` to apply on the next natural boot; `axol.service` is explicitly ordered after that service before it re-pins the clocks.
+
+<Warning>
+  NVIDIA classifies MAXN and MAXN SUPER as experimental, unconstrained modes and does not recommend sustained heavy workloads in them unless the module was flashed with the corresponding `-maxn` configuration and its more conservative thermal settings. Ensure the robot has adequate power and cooling and monitor thermal throttling during sustained local inference or training. Axol normally selects a named mode exposed by the active BSP configuration; on legacy or unreadable configurations it attempts NVIDIA's conventional mode 0 and reports any rejection. It does not change the board's thermal policy.
+</Warning>
+
 <Note>
   Best-effort and a no-op on non-Jetson machines. Pinning needs root: run as root, or you'll be prompted for `sudo` once on a terminal; if escalation isn't possible it logs the manual command and continues.
 </Note>

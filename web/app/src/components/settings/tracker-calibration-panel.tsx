@@ -29,7 +29,7 @@ function message(error: unknown): string {
 }
 
 function draftFor(entry: TrackerCalibrationSide): TransformDraft {
-  if (!entry.pos || !entry.quat || entry.status !== "measured") {
+  if (!entry.pos || !entry.quat || !["measured", "stale"].includes(entry.status)) {
     return { pos: [...EMPTY_DRAFT.pos], quat: [...EMPTY_DRAFT.quat] }
   }
   return {
@@ -181,6 +181,12 @@ export function TrackerCalibrationPanel({
           Uncalibrated sides stay blank. The UI never inserts an identity placeholder or promotes an
           unverified CAD candidate; Save requires you to confirm a physical bench measurement.
         </p>
+        {snapshot?.activePoseConvention && (
+          <p>
+            Active Ultimate pose convention: {snapshot.activePoseConvention.quatOrder} quaternion ·{" "}
+            {snapshot.activePoseConvention.upAxis}-up.
+          </p>
+        )}
       </div>
 
       {!contextSaved && (
@@ -246,6 +252,7 @@ function CalibrationSideEditor({
   const complete = typeof parsed !== "string"
   const statusCopy = {
     measured: "Measured override saved",
+    stale: "Saved convention is stale — re-check required",
     factory: "Verified factory constant active",
     candidate: "CAD candidate only — not calibrated",
     missing: "Measurement required",
@@ -254,7 +261,7 @@ function CalibrationSideEditor({
   const statusClass =
     entry.status === "measured" || entry.status === "factory"
       ? "bg-emerald-400/10 text-emerald-300"
-      : entry.status === "candidate"
+      : entry.status === "candidate" || entry.status === "stale"
         ? "bg-amber-400/10 text-amber-300"
         : "bg-red-400/10 text-red-300"
 
@@ -272,6 +279,18 @@ function CalibrationSideEditor({
           {entry.status === "unbound"
             ? "Identify this tracker first. For Quest, connect WebXR, use its reported grip key, and save Settings."
             : "No active tracker datum is available for this side."}
+        </p>
+      )}
+
+      {entry.status === "stale" && (
+        <p className="text-[11px] leading-relaxed text-amber-200/75">
+          This saved value has no Ultimate pose-convention proof or was measured under a different
+          convention
+          {entry.poseConvention
+            ? ` (${entry.poseConvention.quatOrder} quaternion · ${entry.poseConvention.upAxis}-up)`
+            : ""}
+          . Re-check all axes and the physical overlay under the active convention before confirming
+          and resaving it. It cannot authorize production collection as-is.
         </p>
       )}
 
@@ -300,7 +319,10 @@ function CalibrationSideEditor({
           disabled={!entry.key || disabled || !complete}
           className="mt-0.5 size-3.5 accent-[#eff483]"
         />
-        <span>I bench-measured these values for this physical tracker mount.</span>
+        <span>
+          I bench-measured these values for this physical tracker mount under the active pose
+          convention.
+        </span>
       </label>
       {!complete && entry.key && (
         <p className="text-[10px] text-white/35">

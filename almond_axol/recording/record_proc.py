@@ -61,6 +61,12 @@ _SAVE_TIMEOUT_S = 180.0
 # How long a lightweight episode command (pause/resume/frame_count) may take —
 # these only flip an event / read a counter in the recorder's command thread.
 _CMD_TIMEOUT_S = 10.0
+# A capture read normally wakes at least every second.  Ten seconds leaves
+# generous room for a slow decoder without allowing one wedged reader to block
+# an episode command forever.  Exceeding this bound is an error: callers must
+# never save/clear a buffer or start a replacement thread while the old writer
+# can still mutate it.
+_CAPTURE_STOP_TIMEOUT_S = 10.0
 
 # --- Encoded (relay-side H.264) capture-loop tuning ---
 # How long the first row waits for each camera's first access unit (relay valve
@@ -78,6 +84,83 @@ _ENCODED_START_TIMEOUT_S = 15.0
 _ENCODED_ROW_TIMEOUT_S = 1.0
 # How often the blocking AU read wakes to re-check stop_event.
 _ENCODED_POLL_MS = 100
+
+
+def _stop_capture_thread(
+    thread: threading.Thread | None,
+    stop: threading.Event | None,
+    *,
+    timeout: float = _CAPTURE_STOP_TIMEOUT_S,
+) -> threading.Thread | None:
+    """Stop one capture thread, returning ``None`` only after proven exit.
+
+    The returned value is intentionally assignment-friendly: the recorder may
+    write ``thread = _stop_capture_thread(thread, stop)``.  If the join bound is
+    exceeded this raises before that assignment, so the live thread reference
+    is retained and every destructive episode operation can fail closed until
+    a later retry proves it has exited.
+    """
+    if thread is None:
+        return None
+    if stop is None:
+        raise RuntimeError("capture thread exists without its stop event")
+    stop.set()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        raise RuntimeError(
+            f"capture thread did not stop within {timeout:g}s; refusing to "
+            "save, clear, or replace its live episode buffer"
+        )
+    return None
+
+
+def _shutdown_process(
+    process: Any,
+    *,
+    graceful_timeout: float,
+) -> tuple[bool, bool, list[tuple[str, BaseException]]]:
+    """Stop a child process while completing every independent shutdown step.
+
+    Returns ``(still_alive, forced, failures)``.  A failed join, liveness
+    probe, or terminate call does not prevent a later kill attempt: teardown
+    code uses this precisely when process ownership is already uncertain.
+    """
+    failures: list[tuple[str, BaseException]] = []
+    forced = False
+
+    def join(label: str, timeout: float) -> None:
+        try:
+            process.join(timeout=timeout)
+        except BaseException as error:
+            failures.append((label, error))
+
+    def is_alive(label: str) -> bool:
+        try:
+            return bool(process.is_alive())
+        except BaseException as error:
+            failures.append((label, error))
+            # Failure to prove exit must be treated as live so the next,
+            # stronger shutdown action is still attempted.
+            return True
+
+    join("graceful join", graceful_timeout)
+    alive = is_alive("post-join liveness check")
+    if alive:
+        forced = True
+        try:
+            process.terminate()
+        except BaseException as error:
+            failures.append(("terminate", error))
+        join("post-terminate join", 5.0)
+        alive = is_alive("post-terminate liveness check")
+    if alive:
+        try:
+            process.kill()
+        except BaseException as error:
+            failures.append(("kill", error))
+        join("post-kill join", 5.0)
+        alive = is_alive("post-kill liveness check")
+    return alive, forced, failures
 
 
 # ---------------------------------------------------------------------------
@@ -1722,10 +1805,10 @@ class InProcessRecorder:
         return self._frames["n"]
 
     def _stop_capture(self) -> None:
-        if self._thread is not None and self._stop is not None:
-            self._stop.set()
-            self._thread.join()
-            self._thread = None
+        # Match the subprocess recorder's fail-closed lifecycle: never block
+        # forever on a wedged SDK camera read, and never forget the exact
+        # writer until a bounded retry proves it exited.
+        self._thread = _stop_capture_thread(self._thread, self._stop)
 
     def stop_capture(self) -> tuple[int, str | None]:
         """Stop the capture thread WITHOUT saving or clearing the buffer.
@@ -1782,14 +1865,136 @@ class InProcessRecorder:
         self._dataset.clear_episode_buffer()
 
     def close(self) -> None:
-        self._stop_capture()
-        _finalize_dataset(self._dataset, self._config, self._episodes_recorded)
-        self._verifier.close()
+        primary_error: BaseException | None = None
+        capture_stopped = False
+        try:
+            self._stop_capture()
+        except BaseException as error:
+            primary_error = error
+        else:
+            capture_stopped = True
+
+        if capture_stopped:
+            try:
+                _finalize_dataset(self._dataset, self._config, self._episodes_recorded)
+            except BaseException as error:
+                primary_error = error
+        elif primary_error is not None:
+            primary_error.add_note(
+                "dataset finalization was skipped because capture-thread exit "
+                "could not be proved"
+            )
+
+        try:
+            self._verifier.close()
+        except BaseException as error:
+            if primary_error is None:
+                primary_error = error
+            else:
+                primary_error.add_note(
+                    "additional recorder video verifier close failure: "
+                    f"{type(error).__name__}: {error}"
+                )
+        if primary_error is not None:
+            raise primary_error
 
 
 # ---------------------------------------------------------------------------
 # Recorder subprocess (relay path)
 # ---------------------------------------------------------------------------
+
+
+def _cleanup_recorder_session(
+    *,
+    stop_capture: Callable[[], None],
+    dataset: Any,
+    config: dict,
+    episodes_recorded: int,
+    verifier: Any,
+    cameras: dict[str, Any],
+    snap_reader: Any,
+) -> None:
+    """Finish a recorder session, preserving errors after complete cleanup.
+
+    A capture thread owns the mutable episode buffer, so dataset finalization is
+    permitted only after its exit is proven. If its normal stop bound expires,
+    close every input reader to unblock a wedged read and retry the join before
+    deciding whether finalization is safe. All independent resources are then
+    closed even when stop/finalize fails; the first failure is re-raised after
+    later failures have been attached as notes, making the child exit non-zero
+    for :class:`DatasetRecorderProcess.close` to propagate.
+    """
+    primary_error: BaseException | None = None
+
+    def remember(label: str, error: BaseException) -> None:
+        nonlocal primary_error
+        if primary_error is None:
+            primary_error = error
+        else:
+            primary_error.add_note(
+                f"additional recorder {label} failure: {type(error).__name__}: {error}"
+            )
+
+    def close_readers() -> None:
+        for name, camera in cameras.items():
+            try:
+                camera.close()
+            except BaseException as error:
+                remember(f"camera {name} close", error)
+        try:
+            snap_reader.close()
+        except BaseException as error:
+            remember("snapshot reader close", error)
+
+    capture_stopped = False
+    try:
+        stop_capture()
+    except BaseException as error:
+        _logger.exception("recorder capture thread did not stop cleanly")
+        remember("capture stop", error)
+        # Camera/snapshot readers are the only blocking inputs used by the
+        # capture loop. Closing them is the best chance to wake a stuck read;
+        # then retry the exact retained thread rather than losing ownership.
+        close_readers()
+        try:
+            stop_capture()
+        except BaseException as retry_error:
+            _logger.exception("recorder capture thread still alive after reader close")
+            remember("capture stop retry", retry_error)
+        else:
+            capture_stopped = True
+    else:
+        capture_stopped = True
+
+    if capture_stopped:
+        try:
+            _finalize_dataset(dataset, config, episodes_recorded)
+        except BaseException as error:
+            _logger.exception("recorder failed to finalize the dataset")
+            remember("dataset finalize", error)
+    else:
+        # Finalizing concurrently with a live dataset writer can corrupt the
+        # buffer/files. The retained stop error is already primary; make the
+        # deliberate skip explicit in its diagnostics.
+        assert primary_error is not None
+        primary_error.add_note(
+            "dataset finalization was skipped because the capture thread is "
+            "still alive and may still own the episode buffer"
+        )
+
+    try:
+        # Give the verifier its bounded chance to finish the last completed
+        # episode even when another teardown step failed.
+        verifier.close()
+    except BaseException as error:
+        remember("video verifier close", error)
+
+    # Idempotent reader closes complete the normal path and retry any close that
+    # was attempted early to wake a wedged capture thread.
+    close_readers()
+
+    if primary_error is not None:
+        raise primary_error
 
 
 def _recorder_main(
@@ -1901,11 +2106,12 @@ def _recorder_main(
 
     def stop_capture() -> None:
         nonlocal thread
-        if thread is not None and stop is not None:
-            stop.set()
-            thread.join(timeout=10.0)
-            thread = None
+        # Assignment happens only after _stop_capture_thread has proved exit.
+        # On timeout it raises and leaves ``thread`` pointing at the live
+        # writer, which makes every destructive command below fail closed.
+        thread = _stop_capture_thread(thread, stop)
 
+    session_error: BaseException | None = None
     try:
         while True:
             try:
@@ -1917,7 +2123,11 @@ def _recorder_main(
             kind = msg[0]
             if kind == "start_episode":
                 task = msg[1]
-                stop_capture()  # defensive: never overlap two capture threads
+                try:
+                    stop_capture()  # defensive: never overlap capture threads
+                except RuntimeError as exc:
+                    conn.send(("error", str(exc)))
+                    continue
                 dataset.clear_episode_buffer()
                 capture_error["v"] = None
                 record_event.set()
@@ -1950,6 +2160,7 @@ def _recorder_main(
                     daemon=True,
                 )
                 thread.start()
+                conn.send(("started",))
             elif kind == "pause_episode":
                 if encoded_mode:
                     conn.send(
@@ -1983,10 +2194,20 @@ def _recorder_main(
                 # buffered rows (and any capture_error) intact, so the caller
                 # can run post-episode robot motion (valve close, rest move)
                 # without junk rows being appended, then decide save/cancel.
-                stop_capture()
-                conn.send(("capture_stopped", frame_counter["n"], capture_error["v"]))
+                try:
+                    stop_capture()
+                except RuntimeError as exc:
+                    conn.send(("error", str(exc)))
+                else:
+                    conn.send(
+                        ("capture_stopped", frame_counter["n"], capture_error["v"])
+                    )
             elif kind == "save_episode":
-                stop_capture()
+                try:
+                    stop_capture()
+                except RuntimeError as exc:
+                    conn.send(("error", str(exc)))
+                    continue
                 from ..lerobot.nvenc_encoder import dropped_frames
 
                 n_dropped = dropped_frames()
@@ -2039,28 +2260,34 @@ def _recorder_main(
                         _logger.error("recorder save_episode failed: %s", exc)
                         conn.send(("error", str(exc)))
             elif kind == "cancel_episode":
-                stop_capture()
+                try:
+                    stop_capture()
+                except RuntimeError as exc:
+                    conn.send(("error", str(exc)))
+                    continue
                 dataset.clear_episode_buffer()
                 conn.send(("cancelled",))
+    except BaseException as error:
+        session_error = error
+        raise
     finally:
-        stop_capture()
         try:
-            _finalize_dataset(dataset, config, episodes_recorded)
-        except Exception:
-            # Never let this take the subprocess down before the cameras are
-            # released, but do not swallow it either: a failed finalize is how
-            # a session's episode metadata ends up unreadable, and suppressing
-            # it left the operator with only the downstream parquet error.
-            _logger.exception("recorder failed to finalize the dataset")
-        # After finalize (the dataset is already consistent on disk either
-        # way), give the verifier a bounded window to finish its ~1-episode
-        # backlog so a bad last take is still reported before exit.
-        verifier.close()
-        for cam in cameras.values():
-            with contextlib.suppress(Exception):
-                cam.close()
-        with contextlib.suppress(Exception):
-            snap_reader.close()
+            _cleanup_recorder_session(
+                stop_capture=stop_capture,
+                dataset=dataset,
+                config=config,
+                episodes_recorded=episodes_recorded,
+                verifier=verifier,
+                cameras=cameras,
+                snap_reader=snap_reader,
+            )
+        except BaseException as cleanup_error:
+            if session_error is None:
+                raise
+            session_error.add_note(
+                "additional recorder session cleanup failure: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
 
 
 class DatasetRecorderProcess:
@@ -2083,35 +2310,100 @@ class DatasetRecorderProcess:
     ) -> None:
         from ..video.shm_frames import SnapshotWriter
 
-        self._snap = SnapshotWriter(obs_keys, action_keys)
-        ctx = multiprocessing.get_context("spawn")
-        self._conn, child_conn = ctx.Pipe()
-        full_config = {
-            **config,
-            "raw_meta": raw_meta,
-            "obs_keys": obs_keys,
-            "action_keys": action_keys,
-            "snapshot_shm_name": self._snap.name,
-        }
-        self._proc = ctx.Process(
-            target=_recorder_main,
-            args=(child_conn, raw_cond, full_config),
-            daemon=True,
-            name="dataset-recorder",
-        )
-        self._proc.start()
-        child_conn.close()
-        self._lock = threading.Lock()
-        self._episode_count = 0
-
-        if self._conn.poll(_READY_TIMEOUT_S):
-            msg = self._conn.recv()
-            if isinstance(msg, tuple) and msg[0] == "ready":
-                self._episode_count = int(msg[1])
+        snap = SnapshotWriter(obs_keys, action_keys)
+        conn: Any | None = None
+        child_conn: Any | None = None
+        proc: Any | None = None
+        started = False
+        try:
+            ctx = multiprocessing.get_context("spawn")
+            conn, child_conn = ctx.Pipe()
+            full_config = {
+                **config,
+                "raw_meta": raw_meta,
+                "obs_keys": obs_keys,
+                "action_keys": action_keys,
+                "snapshot_shm_name": snap.name,
+            }
+            proc = ctx.Process(
+                target=_recorder_main,
+                args=(child_conn, raw_cond, full_config),
+                daemon=True,
+                name="dataset-recorder",
+            )
+            try:
+                proc.start()
+            except BaseException:
+                # multiprocessing normally publishes ``pid`` only once the
+                # child exists. If start failed after that boundary, treat it
+                # as started so the constructor still reaps it.
+                try:
+                    started = proc.pid is not None
+                except BaseException:
+                    started = True
+                raise
             else:
-                raise RuntimeError(f"recorder sent unexpected ready message: {msg!r}")
-        else:
-            raise RuntimeError("recorder subprocess did not become ready in time")
+                started = True
+            child_conn.close()
+            if conn.poll(_READY_TIMEOUT_S):
+                msg = conn.recv()
+                if not (isinstance(msg, tuple) and msg[0] == "ready"):
+                    raise RuntimeError(
+                        f"recorder sent unexpected ready message: {msg!r}"
+                    )
+                episode_count = int(msg[1])
+            else:
+                raise RuntimeError("recorder subprocess did not become ready in time")
+        except BaseException as setup_error:
+            cleanup_failures: list[tuple[str, BaseException]] = []
+
+            # A child that never completed the ready handshake cannot be
+            # adopted safely. Stop it before unlinking the snapshot shm; the
+            # process may already have attached to that block or opened the
+            # dataset near the end of initialization.
+            if started and proc is not None:
+                process_alive, _, process_failures = _shutdown_process(
+                    proc, graceful_timeout=0
+                )
+                cleanup_failures.extend(
+                    (f"subprocess {label}", error) for label, error in process_failures
+                )
+                if process_alive:
+                    cleanup_failures.append(
+                        (
+                            "subprocess",
+                            RuntimeError(
+                                "recorder subprocess remained alive after "
+                                "terminate/kill"
+                            ),
+                        )
+                    )
+            local_cleanups: list[tuple[str, Callable[[], None]]] = []
+            if child_conn is not None:
+                local_cleanups.append(("child pipe", child_conn.close))
+            if conn is not None:
+                local_cleanups.append(("parent pipe", conn.close))
+            local_cleanups.append(("snapshot shared memory", snap.close))
+            for label, cleanup in local_cleanups:
+                try:
+                    cleanup()
+                except BaseException as error:
+                    cleanup_failures.append((label, error))
+            for label, error in cleanup_failures:
+                setup_error.add_note(
+                    f"recorder constructor {label} cleanup failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+            raise
+
+        assert conn is not None
+        assert proc is not None
+        self._snap = snap
+        self._conn = conn
+        self._proc = proc
+        self._lock = threading.Lock()
+        self._episode_count = episode_count
+        self._closed = False
 
     @property
     def pid(self) -> int | None:
@@ -2128,6 +2420,12 @@ class DatasetRecorderProcess:
     def start_episode(self, task: str) -> None:
         with self._lock:
             self._conn.send(("start_episode", task))
+            if not self._conn.poll(_CMD_TIMEOUT_S):
+                raise RuntimeError("recorder did not answer start_episode in time")
+            msg = self._conn.recv()
+        if msg[0] != "started":
+            detail = msg[1] if len(msg) > 1 else repr(msg)
+            raise RuntimeError(f"recorder start_episode failed: {detail}")
 
     def _episode_gate(self, command: str, expect: str) -> int:
         """Send a pause/resume/frame-count command; return the row count.
@@ -2203,42 +2501,85 @@ class DatasetRecorderProcess:
     def cancel_episode(self) -> None:
         with self._lock:
             self._conn.send(("cancel_episode",))
-            if self._conn.poll(_SAVE_TIMEOUT_S):
-                self._conn.recv()  # ("cancelled",)
+            if not self._conn.poll(_SAVE_TIMEOUT_S):
+                raise RuntimeError("recorder did not answer cancel_episode in time")
+            msg = self._conn.recv()
+        if msg[0] != "cancelled":
+            detail = msg[1] if len(msg) > 1 else repr(msg)
+            raise RuntimeError(f"recorder cancel_episode failed: {detail}")
 
     def close(self) -> None:
+        if self._closed:
+            return
+        primary_error: BaseException | None = None
+
+        def remember(label: str, error: BaseException) -> None:
+            nonlocal primary_error
+            if primary_error is None:
+                primary_error = error
+            else:
+                primary_error.add_note(
+                    f"additional recorder parent {label} failure: "
+                    f"{type(error).__name__}: {error}"
+                )
+
         try:
             with self._lock:
                 self._conn.send(("shutdown",))
         except (OSError, ValueError):
+            # An already-dead child or closed pipe is diagnosed from exitcode
+            # after join; still finish every local cleanup.
             pass
-        self._proc.join(timeout=_SAVE_TIMEOUT_S)
-        if self._proc.is_alive():
-            # SIGTERM: the child dies where it stands, without running the
-            # finally that finalizes the dataset. Nothing here can recover from
-            # that, so at least say so — the alternative is an unreadable
-            # dataset with no explanation anywhere in the log.
-            _logger.error(
-                "recorder did not shut down within %.0fs — killing it; the "
-                "dataset was not finalized and its parquet files are likely "
-                "unreadable",
-                _SAVE_TIMEOUT_S,
+        except BaseException as error:
+            remember("shutdown request", error)
+
+        forced = False
+        process_alive, forced, process_failures = _shutdown_process(
+            self._proc, graceful_timeout=_SAVE_TIMEOUT_S
+        )
+        for label, error in process_failures:
+            remember(f"subprocess {label}", error)
+
+        if process_alive:
+            remember(
+                "subprocess shutdown",
+                RuntimeError(
+                    "recorder subprocess remained alive after shutdown, terminate, "
+                    "and kill; dataset ownership is uncertain"
+                ),
             )
-            self._proc.terminate()
-            self._proc.join(timeout=5.0)
+        elif forced:
+            remember(
+                "subprocess shutdown",
+                RuntimeError(
+                    f"recorder did not shut down within {_SAVE_TIMEOUT_S:.0f}s and "
+                    "was forcibly terminated; dataset finalization is unverified"
+                ),
+            )
         elif self._proc.exitcode:
-            # A child that died on its own (a crash, or the OOM killer) never
-            # ran its finalize either, and until now that was indistinguishable
-            # from a clean shutdown: join() returns instantly on an already-dead
-            # process, so the session went on to validate and upload as if all
-            # was well.
-            _logger.error(
-                "recorder subprocess exited with %s before shutdown — the "
-                "dataset was not finalized and its parquet files are likely "
-                "unreadable",
-                self._proc.exitcode,
+            remember(
+                "subprocess exit",
+                RuntimeError(
+                    f"recorder subprocess exited with {self._proc.exitcode}; "
+                    "dataset finalization failed or the recorder crashed"
+                ),
             )
-        with contextlib.suppress(Exception):
+
+        conn_closed = False
+        try:
             self._conn.close()
-        with contextlib.suppress(Exception):
+        except BaseException as error:
+            remember("pipe close", error)
+        else:
+            conn_closed = True
+        snap_closed = False
+        try:
             self._snap.close()
+        except BaseException as error:
+            remember("snapshot shared memory close", error)
+        else:
+            snap_closed = True
+
+        self._closed = not process_alive and conn_closed and snap_closed
+        if primary_error is not None:
+            raise primary_error

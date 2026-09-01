@@ -247,9 +247,24 @@ class Mantis(RobotBase):
         *,
         defer_gripper_enable: bool = False,
     ) -> None:
+        left_channel = (
+            str(left_channel).strip() if left_channel is not None else None
+        ) or None
+        right_channel = (
+            str(right_channel).strip() if right_channel is not None else None
+        ) or None
         if left_channel is None and right_channel is None:
             raise ValueError(
                 "At least one of left_channel or right_channel must be specified."
+            )
+        if (
+            left_channel is not None
+            and right_channel is not None
+            and left_channel == right_channel
+        ):
+            raise ValueError(
+                "left_channel and right_channel must name different CAN "
+                "interfaces; both Mantis grippers reuse the same motor ID"
             )
 
         self.left: MantisGripperArm | None = None

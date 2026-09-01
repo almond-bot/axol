@@ -52,7 +52,7 @@ from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...constants import Joint
-from ...robot.base import HardwareCleanupError
+from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ...robot.cart import Cart
 from ...teleop.core import VRTeleopCore
 from ...teleop.worker import run_ik_worker
@@ -94,6 +94,7 @@ class AxolVRTeleop(Teleoperator):
         # Async bridge
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
+        self._startup_done_event: threading.Event | None = None
         self._cleanup_pending = False
 
         # VR + IK
@@ -237,13 +238,81 @@ class AxolVRTeleop(Teleoperator):
         """
         loop = asyncio.new_event_loop()
         self._loop = loop
-        self._loop_thread = threading.Thread(
-            target=loop.run_forever, name="vr-axol-event-loop", daemon=True
-        )
-        self._loop_thread.start()
-        asyncio.run_coroutine_threadsafe(
-            self._connect_async(q_start_left, q_start_right), loop
-        ).result(timeout=120)
+        self._loop_thread = None
+        connect_future: Any | None = None
+        connect_done = threading.Event()
+
+        async def connect_tracked() -> None:
+            try:
+                await self._connect_async(q_start_left, q_start_right)
+            finally:
+                # concurrent.futures.Future.cancel() can report cancellation
+                # before the event-loop task has actually unwound.  Teardown
+                # uses this coroutine-owned signal as the exit proof instead.
+                connect_done.set()
+
+        try:
+            self._loop_thread = threading.Thread(
+                target=loop.run_forever,
+                name="vr-axol-event-loop",
+                daemon=True,
+            )
+            self._loop_thread.start()
+            self._startup_done_event = connect_done
+            connect_coroutine = connect_tracked()
+            try:
+                connect_future = asyncio.run_coroutine_threadsafe(
+                    connect_coroutine, loop
+                )
+            except BaseException:
+                self._startup_done_event = None
+                connect_coroutine.close()
+                raise
+            connect_future.result(timeout=120)
+            self._startup_done_event = None
+        except BaseException as setup_error:
+            cleanup_failures: list[tuple[str, BaseException]] = []
+            # A timeout or caller cancellation does not cancel the coroutine
+            # submitted to the dedicated loop.  Request cancellation before
+            # scheduling teardown so it cannot resume startup underneath the
+            # cleanup coroutine.
+            if connect_future is not None:
+                try:
+                    if not connect_future.done():
+                        connect_future.cancel()
+                except BaseException as cancel_error:
+                    cleanup_failures.append(
+                        ("startup-coroutine cancellation", cancel_error)
+                    )
+                # Give ordinary cancellation a brief graceful window. If it is
+                # blocked in the IK-ready pipe read, disconnect() closes the
+                # pipe/process and performs the authoritative final wait before
+                # stopping the event loop.
+                connect_done.wait(timeout=5.0)
+            try:
+                self.disconnect()
+            except BaseException as cleanup_error:
+                _logger.exception("AxolVRTeleop startup cleanup failed")
+                cleanup_failures.append(("resource teardown", cleanup_error))
+            if connect_future is not None and not connect_done.is_set():
+                cleanup_failures.append(
+                    (
+                        "startup coroutine",
+                        HardwareCleanupError(
+                            "teleop startup coroutine did not stop; background "
+                            "ownership is uncertain"
+                        ),
+                    )
+                )
+            if cleanup_failures:
+                _first_label, first_failure = cleanup_failures[0]
+                for label, failure in cleanup_failures:
+                    setup_error.add_note(
+                        f"additional teleop {label} cleanup failure: "
+                        f"{type(failure).__name__}: {failure}"
+                    )
+                mark_hardware_cleanup_uncertain(setup_error, first_failure)
+            raise
         _logger.info("AxolVRTeleop connected.")
 
     async def _connect_async(
@@ -273,20 +342,43 @@ class AxolVRTeleop(Teleoperator):
         parent_conn, child_conn = ctx.Pipe()
         self._parent_conn = parent_conn
 
-        process = ctx.Process(
-            target=run_ik_worker,
-            args=(
-                child_conn,
-                self.config.vr_teleop_config,
-                self.config.kinematics_config,
-                q_start_left,
-                q_start_right,
-            ),
-            daemon=True,
-        )
-        process.start()
-        child_conn.close()
+        try:
+            process = ctx.Process(
+                target=run_ik_worker,
+                args=(
+                    child_conn,
+                    self.config.vr_teleop_config,
+                    self.config.kinematics_config,
+                    q_start_left,
+                    q_start_right,
+                ),
+                daemon=True,
+            )
+        except BaseException as process_error:
+            try:
+                child_conn.close()
+            except BaseException as close_error:
+                process_error.add_note(
+                    "additional IK child-pipe close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        # Retain the exact object before start: if start succeeds but the
+        # following local pipe close raises, connect()'s internal unwind must
+        # still be able to terminate and reap the new child.
         self._ik_process = process
+        try:
+            process.start()
+        except BaseException as start_error:
+            try:
+                child_conn.close()
+            except BaseException as close_error:
+                start_error.add_note(
+                    "additional IK child-pipe close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        child_conn.close()
 
         # Receive ready message: ("ready", q_init, left_indices, right_indices, startup_traj)
         loop = asyncio.get_running_loop()
@@ -319,27 +411,163 @@ class AxolVRTeleop(Teleoperator):
         self._ik_thread = threading.Thread(
             target=self._ik_loop, daemon=True, name="vr-axol-ik-loop"
         )
-        self._ik_thread.start()
+        try:
+            self._ik_thread.start()
+        except BaseException as start_error:
+            # Thread.start() either completes and owns a native thread or
+            # fails before one exists.  Clear only after an explicit probe;
+            # otherwise connect()'s cleanup retains and handles it.
+            try:
+                thread_alive = self._ik_thread.is_alive()
+            except BaseException as probe_error:
+                start_error.add_note(
+                    "additional IK thread liveness-check failure: "
+                    f"{type(probe_error).__name__}: {probe_error}"
+                )
+                thread_alive = True
+            if not thread_alive:
+                self._ik_thread = None
+            raise
 
     def disconnect(self) -> None:
-        """Stop the IK subprocess and VR server."""
-        if self._loop is None:
-            return
-        asyncio.run_coroutine_threadsafe(self._disconnect_async(), self._loop).result(
-            timeout=15
-        )
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._loop_thread is not None:
-            self._loop_thread.join(timeout=5)
-            if self._loop_thread.is_alive():
-                self._cleanup_pending = True
+        """Stop owned resources and the dedicated event-loop thread.
+
+        Loop teardown runs even when asynchronous resource cleanup fails, so
+        a failed :meth:`connect` cannot leak the SDK's background thread.  The
+        cleanup-pending latch remains set whenever any ownership proof fails.
+        """
+        loop = self._loop
+        if loop is None:
+            if self._cleanup_pending:
                 raise RuntimeError(
-                    "VR event-loop thread did not stop; background ownership "
-                    "is uncertain"
+                    "AxolVRTeleop cleanup is incomplete; background ownership "
+                    "is uncertain and the process must not reconnect"
                 )
-        self._loop.close()
-        self._loop = None
-        self._loop_thread = None
+            return
+        failures: list[tuple[str, BaseException]] = []
+        loop_thread = self._loop_thread
+
+        try:
+            loop_thread_alive = bool(loop_thread is not None and loop_thread.is_alive())
+        except BaseException as error:
+            failures.append(("event-loop thread liveness check", error))
+            loop_thread_alive = True
+
+        cleanup_future: Any | None = None
+        if loop_thread_alive:
+            cleanup_coroutine = self._disconnect_async()
+            try:
+                cleanup_future = asyncio.run_coroutine_threadsafe(
+                    cleanup_coroutine, loop
+                )
+                cleanup_future.result(timeout=15)
+            except BaseException as error:
+                failures.append(("asynchronous cleanup", error))
+                if cleanup_future is None:
+                    cleanup_coroutine.close()
+                else:
+                    try:
+                        if not cleanup_future.done():
+                            cleanup_future.cancel()
+                    except BaseException as cancel_error:
+                        failures.append(
+                            ("asynchronous cleanup cancellation", cancel_error)
+                        )
+        elif any(
+            resource is not None
+            for resource in (
+                self._vr_server,
+                self._parent_conn,
+                self._ik_process,
+                self._ik_thread,
+            )
+        ):
+            failures.append(
+                (
+                    "asynchronous cleanup",
+                    RuntimeError(
+                        "event loop stopped before partial resources were released"
+                    ),
+                )
+            )
+
+        # A failed connect may have been cancelled while awaiting a blocking
+        # executor pipe read. Resource teardown above closes the pipe/process;
+        # now give the exact startup coroutine a final chance to run its
+        # finalizer before the loop is stopped. Future.cancel() alone is not an
+        # exit proof, and the event is retained when this check fails.
+        startup_done = getattr(self, "_startup_done_event", None)
+        if startup_done is not None:
+            if startup_done.wait(timeout=2.0):
+                self._startup_done_event = None
+            else:
+                failures.append(
+                    (
+                        "startup coroutine",
+                        HardwareCleanupError(
+                            "teleop startup coroutine did not stop after resource "
+                            "teardown"
+                        ),
+                    )
+                )
+
+        # The event loop is an independently-owned resource.  Always stop and
+        # join it, even if cart/VR/IK cleanup above raised, so direct SDK
+        # connect failures cannot strand a background thread or its port.
+        if loop_thread_alive:
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except BaseException as error:
+                failures.append(("event-loop stop", error))
+
+        thread_started = bool(
+            loop_thread is not None
+            and (getattr(loop_thread, "ident", None) is not None or loop_thread_alive)
+        )
+        if thread_started:
+            try:
+                loop_thread.join(timeout=5)
+            except BaseException as error:
+                failures.append(("event-loop thread join", error))
+        if loop_thread is not None:
+            try:
+                loop_thread_alive = loop_thread.is_alive()
+            except BaseException as error:
+                failures.append(("final event-loop thread liveness check", error))
+                loop_thread_alive = True
+        else:
+            loop_thread_alive = False
+
+        if loop_thread_alive:
+            failures.append(
+                (
+                    "event-loop thread",
+                    RuntimeError("VR event-loop thread did not stop"),
+                )
+            )
+        else:
+            try:
+                loop.close()
+            except BaseException as error:
+                failures.append(("event-loop close", error))
+            else:
+                self._loop = None
+                self._loop_thread = None
+
+        if failures:
+            self._cleanup_pending = True
+            label, first_failure = failures[0]
+            for extra_label, extra in failures[1:]:
+                first_failure.add_note(
+                    f"additional teleop {extra_label} cleanup failure: "
+                    f"{type(extra).__name__}: {extra}"
+                )
+            if isinstance(first_failure, HardwareCleanupError):
+                raise first_failure
+            raise RuntimeError(
+                f"teleop {label} failed; background ownership is uncertain"
+            ) from first_failure
+
         self._cleanup_pending = False
         _logger.info("AxolVRTeleop disconnected.")
 
@@ -360,6 +588,7 @@ class AxolVRTeleop(Teleoperator):
                 hardware_failures.append(("cart", exc))
 
         thread = self._ik_thread
+        thread_alive = False
         if thread is not None:
             try:
                 await asyncio.get_running_loop().run_in_executor(None, thread.join, 3.0)
@@ -370,11 +599,7 @@ class AxolVRTeleop(Teleoperator):
             except BaseException as exc:
                 cleanup_failures.append(("IK thread liveness check", exc))
                 thread_alive = True
-            if thread_alive:
-                cleanup_failures.append(
-                    ("IK thread", RuntimeError("IK dispatch thread did not stop"))
-                )
-            else:
+            if not thread_alive:
                 self._ik_thread = None
 
         if self._parent_conn is not None:
@@ -396,18 +621,75 @@ class AxolVRTeleop(Teleoperator):
 
         process = self._ik_process
         if process is not None:
+
+            def process_join(label: str, timeout: float) -> None:
+                try:
+                    process.join(timeout=timeout)
+                except BaseException as exc:
+                    cleanup_failures.append((label, exc))
+
+            def process_is_alive(label: str) -> bool:
+                try:
+                    return bool(process.is_alive())
+                except BaseException as exc:
+                    cleanup_failures.append((label, exc))
+                    return True
+
             try:
-                process.join(timeout=3.0)
-                if process.is_alive():
-                    process.terminate()
-                    process.join(timeout=2.0)
-                if process.is_alive():
-                    process.kill()
-                    process.join(timeout=2.0)
-                process_alive = process.is_alive()
+                process_started = process.pid is not None
             except BaseException as exc:
-                cleanup_failures.append(("IK process shutdown", exc))
-                process_alive = True
+                cleanup_failures.append(("IK process pid check", exc))
+                process_started = True
+
+            if not process_started:
+                # multiprocessing guarantees pid remains None until a child
+                # was actually spawned.  Still probe rather than assuming, so
+                # an unexpected Process implementation fails closed.
+                process_alive = process_is_alive("unstarted IK process liveness check")
+            else:
+                process_join("IK process graceful join", 3.0)
+                process_alive = process_is_alive("IK process post-join liveness check")
+                if process_alive:
+                    try:
+                        process.terminate()
+                    except BaseException as exc:
+                        cleanup_failures.append(("IK process terminate", exc))
+                    process_join("IK process post-terminate join", 2.0)
+                    process_alive = process_is_alive(
+                        "IK process post-terminate liveness check"
+                    )
+                if process_alive:
+                    try:
+                        process.kill()
+                    except BaseException as exc:
+                        cleanup_failures.append(("IK process kill", exc))
+                    process_join("IK process post-kill join", 2.0)
+                    process_alive = process_is_alive(
+                        "IK process post-kill liveness check"
+                    )
+
+            if process_alive and not process_started:
+                # A nonstandard Process reported live despite having no pid;
+                # try the same strongest shutdown sequence before declaring
+                # ownership uncertain.
+                try:
+                    process.terminate()
+                except BaseException as exc:
+                    cleanup_failures.append(("IK process terminate", exc))
+                process_join("IK process post-terminate join", 2.0)
+                process_alive = process_is_alive(
+                    "IK process post-terminate liveness check"
+                )
+                if process_alive:
+                    try:
+                        process.kill()
+                    except BaseException as exc:
+                        cleanup_failures.append(("IK process kill", exc))
+                    process_join("IK process post-kill join", 2.0)
+                    process_alive = process_is_alive(
+                        "IK process post-kill liveness check"
+                    )
+
             if process_alive:
                 cleanup_failures.append(
                     ("IK process", RuntimeError("IK worker process did not stop"))
@@ -415,7 +697,33 @@ class AxolVRTeleop(Teleoperator):
             else:
                 self._ik_process = None
 
-        if self._vr_server is not None:
+        # A dispatch blocked in the pipe can become runnable only after the
+        # child is killed or the parent endpoint is closed.  The initial join
+        # therefore is not the ownership proof: join and probe the exact
+        # retained thread once more after those unblock actions, and clear its
+        # reference only when that final probe proves exit.
+        if thread is not None and thread_alive:
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, thread.join, 2.0)
+            except BaseException as exc:
+                cleanup_failures.append(("IK thread final join", exc))
+            try:
+                thread_alive = thread.is_alive()
+            except BaseException as exc:
+                cleanup_failures.append(("IK thread final liveness check", exc))
+                thread_alive = True
+            if thread_alive:
+                cleanup_failures.append(
+                    ("IK thread", RuntimeError("IK dispatch thread did not stop"))
+                )
+            else:
+                self._ik_thread = None
+
+        # The live dispatch thread calls into the VR server for render frames.
+        # Retain that dependency when thread exit is unproved; disconnect()
+        # still unwinds the independently-owned event-loop thread and latches
+        # the instance fail-closed for the remainder of the process.
+        if self._vr_server is not None and self._ik_thread is None:
             try:
                 await self._vr_server.disable()
             except BaseException as exc:
