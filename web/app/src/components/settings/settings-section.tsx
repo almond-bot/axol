@@ -367,6 +367,8 @@ export function SettingsSection({
                   sourceSaved={mantisSourceSaved}
                   calibrationContextSaved={mantisCalibrationContextSaved}
                   onQuestKeySelect={(key) => setValue("mantis.quest_tracker_key", key)}
+                  onSaveSettings={dirty ? save : undefined}
+                  savingSettings={saving}
                   blockedReason={actionBlocker}
                   hostSession={activeCommandSession}
                   onHostSessionChange={onCommandSessionChange}
