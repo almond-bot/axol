@@ -464,6 +464,39 @@ _DATASET_GATE_TIMEOUT_S = 2.0
 _SOURCE_ELEMENT_NAME = "camsrc"
 _SOURCE_GAP_WARN_MS = 25.0
 _GPU_DEVFREQ_GLOB = "/sys/class/devfreq/*.gpu"
+# The Linux thread name (``comm``) is truncated to this many characters, so
+# gst task threads named ``<element>:<pad>`` may only be matched on a prefix.
+_COMM_MAX = 15
+# The named queues whose consumer thread still holds an *un-copied* camera
+# surface: the stereo eye crops and the dataset source queues in front of the
+# VIC copy. Argus owns only a handful of those surfaces, so these queues are
+# two buffers deep and an overrun there is a lost exposure; everything after
+# the VIC copy has its own (deeper) buffering.
+_EXPOSURE_CRITICAL_QUEUES = (
+    "eye_l_cropq",
+    "eye_r_cropq",
+    "dsenc_srcq",
+    "dsenc_l_srcq",
+    "dsenc_r_srcq",
+)
+
+
+def _task_thread_comm(element_name: str) -> str:
+    """The ``comm`` GStreamer gives the streaming thread of ``element_name``."""
+    return f"{element_name}:src"[:_COMM_MAX]
+
+
+def exposure_critical_thread_comms() -> frozenset[str]:
+    """``comm`` names of the relay threads that must run every capture period.
+
+    The camera source streaming thread plus the consumers of
+    :data:`_EXPOSURE_CRITICAL_QUEUES`. Used by the relay to give exactly this
+    chain real-time scheduling (see ``affinity.prioritize_capture_threads``).
+    """
+    return frozenset(
+        _task_thread_comm(name)
+        for name in (_SOURCE_ELEMENT_NAME, *_EXPOSURE_CRITICAL_QUEUES)
+    )
 
 
 def _thread_sched_wait_ns() -> int | None:
@@ -473,6 +506,75 @@ def _thread_sched_wait_ns() -> int | None:
             return int(f.read().split()[1])
     except (OSError, ValueError, IndexError):
         return None
+
+
+def _find_thread_by_comm(comm: str) -> int | None:
+    """TID of this process's thread named ``comm``, or ``None``."""
+    try:
+        entries = os.listdir("/proc/self/task")
+    except OSError:
+        return None
+    for entry in entries:
+        try:
+            with open(f"/proc/self/task/{entry}/comm") as f:
+                if f.read().strip() == comm:
+                    return int(entry)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _thread_sched_snapshot(tid: int) -> tuple[int, str, str] | None:
+    """``(runnable-wait ns, state letter, wchan)`` of a thread of this process.
+
+    ``state`` is ``R`` when the thread is runnable (running or waiting for a
+    CPU), ``S``/``D`` when it is blocked — for a VIC/NVENC dispatch thread that
+    means waiting on the hardware, and ``wchan`` names the kernel wait.
+    """
+    try:
+        with open(f"/proc/self/task/{tid}/schedstat") as f:
+            wait_ns = int(f.read().split()[1])
+        with open(f"/proc/self/task/{tid}/stat") as f:
+            state = f.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, ValueError, IndexError):
+        return None
+    try:
+        with open(f"/proc/self/task/{tid}/wchan") as f:
+            wchan = f.read().strip() or "-"
+    except OSError:
+        wchan = "-"
+    return wait_ns, state, wchan
+
+
+def _consumer_attribution(state: dict[str, Any], comm: str) -> str:
+    """Describe what a queue's consumer thread was doing at an overrun.
+
+    Sampled per overrun event (cheap: three procfs reads) and phrased so the
+    two causes read apart in the log: a consumer that is ``state=R`` with a CPU
+    wait close to the elapsed time was starved of a core; one that is
+    ``state=S``/``D`` in an ``nvhost``/fence wait with ~0 CPU wait was blocked
+    on the VIC/NVENC hardware or its memory path.
+    """
+    now = time.perf_counter()
+    tid = state.get("tid")
+    if tid is None:
+        tid = state["tid"] = _find_thread_by_comm(comm)
+        if tid is None:
+            return f"consumer {comm} not found"
+    snap = _thread_sched_snapshot(tid)
+    if snap is None:
+        state["tid"] = None
+        return f"consumer {comm} exited"
+    wait_ns, sched_state, wchan = snap
+    prev_t, prev_wait = state.get("t"), state.get("wait")
+    state["t"], state["wait"] = now, wait_ns
+    head = f"consumer {comm} state={sched_state} wchan={wchan}"
+    if prev_t is None or prev_wait is None or now - prev_t > 1.0:
+        return head
+    return (
+        f"{head}, CPU wait {(wait_ns - prev_wait) / 1e6:.1f}ms of the "
+        f"{(now - prev_t) * 1e3:.1f}ms since its previous overrun"
+    )
 
 
 def _gpu_clock_summary() -> str:
@@ -805,6 +907,7 @@ class _GstPipelineBase:
                 _logger.debug("dataset queue diagnostic missing %s", queue_name)
                 continue
             self._dataset_queue_overruns.setdefault(queue_name, 0)
+            consumer_state: dict[str, Any] = {}
 
             def on_overrun(
                 element: Any,
@@ -812,6 +915,7 @@ class _GstPipelineBase:
                 label: str = queue_name,
                 branch_valve: Any = valve,
                 source: str = owner,
+                consumer: dict[str, Any] = consumer_state,
             ) -> None:
                 # Source/crop queues are live before an episode. An overrun
                 # counts only after this branch's valve admits its first
@@ -823,6 +927,10 @@ class _GstPipelineBase:
                     return
                 count = self._dataset_queue_overruns.get(label, 0) + 1
                 self._dataset_queue_overruns[label] = count
+                # Sample the consumer on every overrun so the wait delta spans
+                # exactly the interval between two overruns, but log only the
+                # first and powers of two.
+                attribution = _consumer_attribution(consumer, _task_thread_comm(label))
                 if count != 1 and count & (count - 1):
                     return
                 try:
@@ -832,12 +940,13 @@ class _GstPipelineBase:
                     level = limit = -1
                 _logger.warning(
                     "dataset relay %s queue %s overrun #%d "
-                    "(level=%d, limit=%d); an encoded exposure may be lost",
+                    "(level=%d, limit=%d); %s; an encoded exposure may be lost",
                     source,
                     label,
                     count,
                     level,
                     limit,
+                    attribution,
                 )
 
             try:

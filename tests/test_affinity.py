@@ -29,13 +29,16 @@ class PrioritizeCaptureThreadsTest(TestCase):
         "201": "camsrc:src",  # zedsrc streaming thread
         "202": "camsrc:src",  # a second camera's
         "203": "python",  # ZED SDK worker: never renamed its comm
-        "204": "eye_l_cropq:src",  # gst VIC dispatch: stays CFS
+        "204": "eye_l_cropq:src",  # crop VIC dispatch: holds a camera surface
         "205": "V4L2_EncThread",  # NVENC: stays CFS
         "206": "cuda-EvtHandlr",
+        "207": "dsenc_l_srcq:sr",  # 15-char comm truncation of dsenc_l_srcq:src
+        "208": "dsenc_l_outq:sr",  # post-encode: stays CFS
     }
     python_threads = [SimpleNamespace(native_id=101)]
+    wanted = ("camsrc:src", "eye_l_cropq:src", "dsenc_l_srcq:sr")
 
-    def test_elevates_source_and_sdk_threads_only(self) -> None:
+    def test_elevates_capture_chain_and_sdk_threads_only(self) -> None:
         # "999" is listed but exited before its comm is read; "x" isn't a tid.
         with (
             patch.object(
@@ -52,13 +55,13 @@ class PrioritizeCaptureThreadsTest(TestCase):
             patch("builtins.open", _proc_files(self.comms)),
             patch("threading.enumerate", return_value=self.python_threads),
         ):
-            moved = affinity.prioritize_capture_threads("camsrc")
+            moved = affinity.prioritize_capture_threads(self.wanted)
 
-        self.assertEqual(moved, 3)
+        self.assertEqual(moved, 5)
         param = ("param", affinity.CAPTURE_FIFO_PRIORITY)
         self.assertCountEqual(
             setsched.call_args_list,
-            [call(201, 1, param), call(202, 1, param), call(203, 1, param)],
+            [call(tid, 1, param) for tid in (201, 202, 203, 204, 207)],
         )
 
     def test_permission_denied_leaves_threads_cfs(self) -> None:
@@ -78,7 +81,7 @@ class PrioritizeCaptureThreadsTest(TestCase):
             patch("threading.enumerate", return_value=self.python_threads),
             self.assertLogs(affinity._logger, level="INFO") as logs,
         ):
-            moved = affinity.prioritize_capture_threads("camsrc")
+            moved = affinity.prioritize_capture_threads(self.wanted)
 
         self.assertEqual(moved, 0)
         self.assertEqual(setsched.call_count, 1)  # stops at the first EPERM
@@ -86,7 +89,7 @@ class PrioritizeCaptureThreadsTest(TestCase):
 
     def test_noop_without_scheduler_api(self) -> None:
         with patch.object(affinity, "os", SimpleNamespace(listdir=lambda _p: [])):
-            self.assertEqual(affinity.prioritize_capture_threads("camsrc"), 0)
+            self.assertEqual(affinity.prioritize_capture_threads(self.wanted), 0)
 
 
 class IsolateRelayCpuTest(TestCase):
