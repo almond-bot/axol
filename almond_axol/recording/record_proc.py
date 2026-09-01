@@ -64,6 +64,7 @@ _SAVE_TIMEOUT_S = 180.0
 # How long a lightweight episode command (pause/resume/frame_count) may take —
 # these only flip an event / read a counter in the recorder's command thread.
 _CMD_TIMEOUT_S = 10.0
+_CAPTURE_STOP_TIMEOUT_S = 10.0
 
 # --- Encoded (relay-side H.264) capture-loop tuning ---
 # How long the first row waits for each camera's first access unit (relay valve
@@ -1845,13 +1846,27 @@ class InProcessRecorder:
     def _stop_capture(self) -> None:
         if self._thread is not None and self._stop is not None:
             self._stop.set()
-            self._thread.join()
+            self._thread.join(timeout=_CAPTURE_STOP_TIMEOUT_S)
+            if self._thread.is_alive():
+                raise RuntimeError(
+                    "capture thread did not stop within 10s; refusing to "
+                    "finalize while dataset writes may still be in flight"
+                )
             self._thread = None
 
     def finish_episode(self) -> int:
         """Freeze capture without saving and return the exact buffered rows."""
         self._stop_capture()
+        if self._capture_error is not None:
+            self._dataset.clear_episode_buffer()
+            raise RuntimeError(
+                f"recorder capture failed: {self._capture_error}; episode discarded"
+            )
         return self._frames["n"]
+
+    def poll_capture_error(self) -> str | None:
+        """Return an episode-local capture failure without blocking."""
+        return self._capture_error
 
     def save_episode(self) -> None:
         from ..lerobot.nvenc_encoder import dropped_frames
@@ -1898,8 +1913,16 @@ class InProcessRecorder:
 
     def close(self) -> None:
         self._stop_capture()
-        _finalize_dataset(self._dataset, self._config, self._episodes_recorded)
-        self._verifier.close()
+        try:
+            # close() is also the Ctrl+C / panel-Stop escape hatch. The caller
+            # may never have reached finish/cancel, so always tear down a live
+            # streaming encoder and discard uncommitted rows before dataset
+            # finalization. This is idempotent after save_episode(), which
+            # creates a fresh buffer.
+            self._dataset.clear_episode_buffer()
+            _finalize_dataset(self._dataset, self._config, self._episodes_recorded)
+        finally:
+            self._verifier.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1909,6 +1932,7 @@ class InProcessRecorder:
 
 def _recorder_main(
     conn: multiprocessing.connection.Connection,
+    error_conn: multiprocessing.connection.Connection,
     raw_cond: Any,
     config: dict,
 ) -> None:
@@ -2028,11 +2052,19 @@ def _recorder_main(
     record_event = threading.Event()
     frame_counter: dict[str, int] = {"n": 0}
 
+    def report_capture_error(message: str) -> None:
+        """Publish the first capture failure without corrupting command replies."""
+        if capture_error["v"] is not None:
+            return
+        capture_error["v"] = message
+        with contextlib.suppress(OSError, EOFError, ValueError):
+            error_conn.send(message)
+
     def stop_capture() -> None:
         nonlocal thread
         if thread is not None and stop is not None:
             stop.set()
-            thread.join(timeout=10.0)
+            thread.join(timeout=_CAPTURE_STOP_TIMEOUT_S)
             if thread.is_alive():
                 raise RuntimeError(
                     "capture thread did not stop within 10s; refusing to "
@@ -2074,7 +2106,7 @@ def _recorder_main(
                     task=task,
                     rerun_ip=config["rerun_ip"],
                     stop_event=stop,
-                    on_error=lambda m: capture_error.__setitem__("v", m),
+                    on_error=report_capture_error,
                 )
                 loop_kwargs["frame_counter"] = frame_counter
                 if not encoded_mode:
@@ -2104,6 +2136,8 @@ def _recorder_main(
                 except RuntimeError as exc:
                     conn.send(("error", str(exc)))
                 else:
+                    if capture_error["v"] is not None:
+                        dataset.clear_episode_buffer()
                     conn.send(("finished", frame_counter["n"]))
             elif kind == "pause_episode":
                 if encoded_mode:
@@ -2223,23 +2257,39 @@ def _recorder_main(
             stop.set()
             thread.join()
             thread = None
+        # EOF, shutdown, and KeyboardInterrupt may all bypass the explicit
+        # cancel command. Always discard any uncommitted rows and cancel a live
+        # streaming encoder before finalizing; after a successful save this is
+        # an idempotent clear of the newly-created empty episode buffer.
+        buffer_discarded = False
         try:
-            finalize_config = config
-            if save_poisoned:
-                # Preserve a fresh first-save failure for inspection/repair and
-                # never upload a dataset whose writer indices may be partial.
-                finalize_config = {
-                    **config,
-                    "is_complete": True,
-                    "push_to_hub": False,
-                }
-            _finalize_dataset(dataset, finalize_config, episodes_recorded)
+            dataset.clear_episode_buffer()
+            buffer_discarded = True
         except Exception:
-            # Never let this take the subprocess down before the cameras are
-            # released, but do not swallow it either: a failed finalize is how
-            # a session's episode metadata ends up unreadable, and suppressing
-            # it left the operator with only the downstream parquet error.
-            _logger.exception("recorder failed to finalize the dataset")
+            _logger.exception(
+                "recorder failed to discard its unsaved episode; refusing "
+                "dataset finalization"
+            )
+        if buffer_discarded:
+            try:
+                finalize_config = config
+                if save_poisoned:
+                    # Preserve a fresh first-save failure for inspection/repair
+                    # and never upload a dataset whose writer indices may be
+                    # partial.
+                    finalize_config = {
+                        **config,
+                        "is_complete": True,
+                        "push_to_hub": False,
+                    }
+                _finalize_dataset(dataset, finalize_config, episodes_recorded)
+            except Exception:
+                # Never let this take the subprocess down before the cameras are
+                # released, but do not swallow it either: a failed finalize is
+                # how a session's episode metadata ends up unreadable, and
+                # suppressing it left the operator with only the downstream
+                # parquet error.
+                _logger.exception("recorder failed to finalize the dataset")
         # After finalize (the dataset is already consistent on disk either
         # way), give the verifier a bounded window to finish its ~1-episode
         # backlog so a bad last take is still reported before exit.
@@ -2249,6 +2299,8 @@ def _recorder_main(
                 cam.close()
         with contextlib.suppress(Exception):
             snap_reader.close()
+        with contextlib.suppress(Exception):
+            error_conn.close()
 
 
 class DatasetRecorderProcess:
@@ -2278,6 +2330,10 @@ class DatasetRecorderProcess:
         self._snapshot_lock = ctx.Lock()
         self._snap = SnapshotWriter(obs_keys, action_keys, self._snapshot_lock)
         self._conn, child_conn = ctx.Pipe()
+        # Capture runs on a child thread while command/reply messages use
+        # ``_conn``. Keep failures on a dedicated one-way pipe so the hot
+        # control loop can poll them without stealing an expected command reply.
+        self._error_conn, child_error_conn = ctx.Pipe(duplex=False)
         full_config = {
             **config,
             "raw_meta": raw_meta,
@@ -2288,14 +2344,16 @@ class DatasetRecorderProcess:
         }
         self._proc = ctx.Process(
             target=_recorder_main,
-            args=(child_conn, raw_cond, full_config),
+            args=(child_conn, child_error_conn, raw_cond, full_config),
             daemon=True,
             name="dataset-recorder",
         )
         self._proc.start()
         child_conn.close()
+        child_error_conn.close()
         self._lock = threading.Lock()
         self._episode_count = 0
+        self._capture_error: str | None = None
         try:
             deadline = time.perf_counter() + _READY_TIMEOUT_S
             while True:
@@ -2328,6 +2386,8 @@ class DatasetRecorderProcess:
             with contextlib.suppress(Exception):
                 self._conn.close()
             with contextlib.suppress(Exception):
+                self._error_conn.close()
+            with contextlib.suppress(Exception):
                 self._snap.close()
             raise
 
@@ -2344,6 +2404,14 @@ class DatasetRecorderProcess:
         return self._episode_count
 
     def start_episode(self, task: str) -> None:
+        # Discard a failure already consumed by the previous episode. The child
+        # clears its matching local value before it starts this capture thread.
+        try:
+            while self._error_conn.poll():
+                self._error_conn.recv()
+        except (EOFError, OSError, ValueError):
+            pass
+        self._capture_error = None
         with self._lock:
             self._conn.send(("start_episode", task))
             if not self._conn.poll(_CMD_TIMEOUT_S):
@@ -2363,7 +2431,21 @@ class DatasetRecorderProcess:
         if msg[0] != "finished":
             detail = msg[1] if len(msg) > 1 else repr(msg)
             raise RuntimeError(f"recorder finish_episode failed: {detail}")
+        capture_error = self.poll_capture_error()
+        if capture_error is not None:
+            raise RuntimeError(
+                f"recorder capture failed: {capture_error}; episode discarded"
+            )
         return int(msg[1])
+
+    def poll_capture_error(self) -> str | None:
+        """Return the first capture-thread failure for this episode, if any."""
+        try:
+            while self._error_conn.poll():
+                self._capture_error = str(self._error_conn.recv())
+        except (EOFError, OSError, ValueError):
+            pass
+        return self._capture_error
 
     def _episode_gate(self, command: str, expect: str) -> int:
         """Send a pause/resume/frame-count command; return the row count.
@@ -2461,5 +2543,7 @@ class DatasetRecorderProcess:
             )
         with contextlib.suppress(Exception):
             self._conn.close()
+        with contextlib.suppress(Exception):
+            self._error_conn.close()
         with contextlib.suppress(Exception):
             self._snap.close()

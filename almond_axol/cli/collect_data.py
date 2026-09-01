@@ -72,6 +72,7 @@ from ..robot.control import ContactWatchdog
 from ..teleop.recorder import resolve_prefix
 from ..teleop_activity import TeleopActivityMarker
 from ..utils import affinity
+from ..utils.control_loop import run_blocking_with_control_ticks
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from .config import DatasetResolution, LogLevel, parse
@@ -955,9 +956,12 @@ def _run(
     # interleaved with CAN telemetry on one thread, exactly like `axol teleop`.
     # The main thread drives the episode lifecycle (dataset writes, rest-pose
     # moves) and blocks on each coroutine until the episode (or reset) finishes.
-    async def _episode_loop() -> tuple[bool, bool, bool]:
+    async def _episode_loop() -> tuple[bool, bool, bool, int]:
         recording = False
+        capture_ready = False
         rerecord = False
+        contact = False
+        captured_rows = 0
         # perf_counter deadline of a panel-started record countdown, or None.
         pending_start: float | None = None
         # Tracking-phase contact watchdog (opt-in — the threshold defaults
@@ -970,6 +974,96 @@ def _run(
             if vrt_cfg.teleop_torque_threshold > 0
             else None
         )
+        last_robot_act: dict[str, Any] | None = None
+        last_dataset_act: dict[str, Any] | None = None
+
+        class _TrackingContact(RuntimeError):
+            pass
+
+        async def _tracking_tick() -> None:
+            """Run one normal teleop tick without consuming boundary events."""
+            nonlocal last_robot_act, last_dataset_act
+            if _stopped() and last_robot_act is not None:
+                # Ctrl+C/Stop during recorder startup must drain the bounded
+                # worker before teardown, but must not keep following a moving
+                # controller while it does so.
+                await _hold_tick()
+                return
+            t0 = time.perf_counter()
+            _maybe_log_rate(t0)
+            # Keep a recording's trace open after the headset drops tracking:
+            # terminate/SAVING may arrive before the outer loop consumes it.
+            robot.set_control_trace_active(
+                recording or teleop.is_tracking or teleop.is_resetting
+            )
+
+            joint_obs = robot.get_joint_observation()
+            t_obs = time.perf_counter()
+            teleop.send_feedback(joint_obs)
+            act = teleop.get_action()
+            t_act = time.perf_counter()
+            act_processed = teleop_action_proc((act, joint_obs))
+            robot_act = robot_action_proc((act_processed, joint_obs))
+            dataset_act = robot.action_to_dataset(act_processed)
+            t_proc = time.perf_counter()
+            await robot.send_action_async(robot_act)
+            t_send = time.perf_counter()
+            sect["obs"] += t_obs - t0
+            sect["act"] += t_act - t_obs
+            sect["proc"] += t_proc - t_act
+            sect["send"] += t_send - t_proc
+
+            last_robot_act = robot_act
+            last_dataset_act = dataset_act
+            recorder.publish(joint_obs, dataset_act, t0)
+
+            # start_episode resets the subprocess's dedicated error pipe on a
+            # worker thread. Do not inspect that pipe from this event-loop
+            # heartbeat until the start transaction has completed.
+            if recording and capture_ready:
+                capture_error = recorder.poll_capture_error()
+                if capture_error is not None:
+                    raise RuntimeError(
+                        f"recorder capture failed: {capture_error}; episode discarded"
+                    )
+
+            if watchdog is not None:
+                tripped = watchdog.update(robot.torque_residuals())
+                if tripped is not None:
+                    joint, residual = tripped
+                    _logger.warning(
+                        "teleop contact: %s torque residual %.1f exceeds %.1f — going limp",
+                        joint,
+                        residual,
+                        vrt_cfg.teleop_torque_threshold,
+                    )
+                    raise _TrackingContact
+
+        async def _hold_tick() -> None:
+            """Refresh the last command while recorder/gate shutdown blocks."""
+            if last_robot_act is None or last_dataset_act is None:
+                return
+            t0 = time.perf_counter()
+            _maybe_log_rate(t0)
+            robot.set_control_trace_active(True)
+            joint_obs = robot.get_joint_observation()
+            teleop.send_feedback(joint_obs)
+            await robot.send_action_async(last_robot_act)
+            # Capture is already being stopped on the worker thread. Publishing
+            # keeps the nearest-state history fresh for any final in-flight AU.
+            recorder.publish(joint_obs, last_dataset_act, t0)
+
+        def _start_capture() -> None:
+            recorder.start_episode(task)
+            if relay is not None:
+                relay.set_raw_enabled(True)
+
+        def _finish_capture() -> int:
+            try:
+                return recorder.finish_episode()
+            finally:
+                if relay is not None:
+                    relay.set_raw_enabled(False)
 
         # Absolute-deadline pacing (mirrors `axol teleop`): late wakeups are
         # corrected on the next cycle instead of stretching the command interval.
@@ -1000,52 +1094,11 @@ def _run(
                 prev_t0["v"] = 0.0
                 continue
             deadline += teleop_interval
-            t0 = time.perf_counter()
-            _maybe_log_rate(t0)
-            # Keep a recording's trace open after the headset drops tracking:
-            # its terminate/SAVING state can arrive before we consume the event
-            # below. The outer guarded-return path then continues that same
-            # segment and closes it after the arm settles. Without ``recording``
-            # here, reopening for the return resets both RT/measured recorders
-            # and replaces the useful take with a tiny return/fault capture.
-            robot.set_control_trace_active(
-                recording or teleop.is_tracking or teleop.is_resetting
-            )
-
-            # Camera reads happen on the capture thread; the control loop only
-            # ever touches joint state.
-            joint_obs = robot.get_joint_observation()
-            t_obs = time.perf_counter()
-            teleop.send_feedback(joint_obs)
-            act = teleop.get_action()
-            t_act = time.perf_counter()
-            act_processed = teleop_action_proc((act, joint_obs))
-            robot_act = robot_action_proc((act_processed, joint_obs))
-            t_proc = time.perf_counter()
-            await robot.send_action_async(robot_act)
-            t_send = time.perf_counter()
-            sect["obs"] += t_obs - t0
-            sect["act"] += t_act - t_obs
-            sect["proc"] += t_proc - t_act
-            sect["send"] += t_send - t_proc
-
-            if watchdog is not None:
-                tripped = watchdog.update(robot.torque_residuals())
-                if tripped is not None:
-                    joint, residual = tripped
-                    _logger.warning(
-                        "teleop contact: %s torque residual %.1f exceeds %.1f — going limp",
-                        joint,
-                        residual,
-                        vrt_cfg.teleop_torque_threshold,
-                    )
-                    return recording, rerecord, True
-
-            # Record the action in the configured action space: identity for
-            # joint datasets, FK-to-Cartesian when observe_cartesian is set. The
-            # arm is still commanded with the teleop joint targets above, so its
-            # motion is unchanged — only the stored representation differs.
-            recorder.publish(joint_obs, robot.action_to_dataset(act_processed), t0)
+            try:
+                await _tracking_tick()
+            except _TrackingContact:
+                contact = True
+                break
 
             events = teleop.get_teleop_events()
             panel_cmd = control.poll_command()
@@ -1074,11 +1127,25 @@ def _run(
                 pending_start = None
                 recording = True
                 # Arm recorder cutoffs before opening the poised-before-IDR
-                # dataset valves. This preserves the first reopened IDR as row
-                # zero instead of flushing it in a startup race.
-                recorder.start_episode(task)
-                if relay is not None:
-                    relay.set_raw_enabled(True)
+                # dataset valves. Both calls can wait for transport/GOP
+                # boundaries, so run them off-loop while normal teleop ticks
+                # continue feeding the Rust target watchdog.
+                await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+                try:
+                    await run_blocking_with_control_ticks(
+                        _start_capture,
+                        _tracking_tick,
+                        teleop_interval,
+                        drain_tick=_guard_gravity_step,
+                    )
+                except _TrackingContact:
+                    contact = True
+                    break
+                capture_ready = True
+                # Do not repay the blocking worker's elapsed time with a burst
+                # of zero-sleep commands on the absolute-deadline scheduler.
+                deadline = time.perf_counter()
+                prev_t0["v"] = 0.0
                 control.note_recording()
                 log_say("Recording started.")
 
@@ -1107,7 +1174,18 @@ def _run(
             if slip > max_slip["v"]:
                 max_slip["v"] = slip
 
-        return recording, rerecord, False
+        if recording:
+            # A contact abort must never resume the last tracked target while
+            # the bounded capture close drains. Keep the arm limp instead;
+            # normal episode ends refresh the frozen command pose.
+            boundary_tick = _guard_gravity_step if contact else _hold_tick
+            captured_rows = await run_blocking_with_control_ticks(
+                _finish_capture,
+                boundary_tick,
+                teleop_interval,
+                drain_tick=_guard_gravity_step,
+            )
+        return recording, rerecord, contact, captured_rows
 
     # Guarded return-to-rest: the sequencing (torque watchdog, gravity-comp
     # fallback, reset-press retry) lives in the shared engine
@@ -1201,6 +1279,26 @@ def _run(
         finally:
             robot.set_control_trace_active(False)
 
+    def _drain_robot_future(fut: Any) -> None:
+        """Wait through repeated Ctrl+C until an on-robot coroutine is done.
+
+        Recorder boundary helpers deliberately keep their heartbeat alive until
+        their bounded worker finishes. Cancelling after an arbitrary timeout
+        would let that heartbeat race robot.disconnect() during teardown.
+        """
+        while True:
+            try:
+                fut.result()
+                return
+            except KeyboardInterrupt:
+                # A second Ctrl+C still must not make concurrent motor commands
+                # and teardown possible. The hardware e-stop remains immediate.
+                continue
+            except BaseException:
+                # The coroutine is done and its caller's original exception
+                # remains primary; only command quiescence matters here.
+                return
+
     def _run_on_robot_loop(coro: Any) -> Any:
         """Run ``coro`` on the robot's event loop and block until it returns.
 
@@ -1210,13 +1308,10 @@ def _run(
         fut = asyncio.run_coroutine_threadsafe(coro, robot.event_loop)
         try:
             return fut.result()
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as interrupted:
             loop_stop.set()
-            try:
-                fut.result(timeout=5.0)
-            except BaseException:
-                fut.cancel()
-            raise
+            _drain_robot_future(fut)
+            raise interrupted
 
     def _wrap_up_episode(recording: bool, rerecord: bool, captured_rows: int) -> None:
         """Save or discard the just-ended episode and announce the result."""
@@ -1266,15 +1361,9 @@ def _run(
                 f"Episode {episode_idx + 1}: robot is at rest pose. Press record on the VR controller when ready."
             )
 
-            recording, rerecord, contact = _run_on_robot_loop(_episode_loop())
-
-            # Freeze capture exactly at the operator boundary while the final
-            # state snapshot still brackets every accepted exposure. Only then
-            # wait for the relay's next natural IDR and close its dataset branch;
-            # tail AUs are drained and discarded at the next reader flush.
-            captured_rows = recorder.finish_episode() if recording else 0
-            if relay is not None:
-                relay.set_raw_enabled(False)
+            recording, rerecord, contact, captured_rows = _run_on_robot_loop(
+                _episode_loop()
+            )
 
             if _stopped():
                 if recording:
@@ -1319,10 +1408,7 @@ def _run(
                 # Ctrl+C or a failed save: unwind the guarded return so it
                 # stops commanding the robot before teardown.
                 loop_stop.set()
-                try:
-                    home_future.result(timeout=5.0)
-                except BaseException:
-                    home_future.cancel()
+                _drain_robot_future(home_future)
                 raise
             # Drain VR events fired during the return, then unblock the
             # headset for the next take.

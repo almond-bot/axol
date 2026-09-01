@@ -44,6 +44,7 @@ gate use; without them callers fall back to the SDK ``ZedCamera``.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import queue
 import threading
@@ -423,6 +424,19 @@ def _raw_shmsink(socket_path: str) -> str:
 # encoder immediately before a periodic IDR, so reopening emits that IDR as row
 # zero; the reader verifies this and defensively drops any leading P-frames.
 _DATASET_IDR_INTERVAL_S = 0.25
+# Before the recorder connects, a tiny leaky output queue is intentional: it
+# keeps NVENC returning its NVMM surfaces while shmsink parks GDP's one-shot
+# header. Once an episode opens, two seconds of bounded compressed-AU headroom
+# absorbs scheduler jitter without making predictive H.264 silently lossy.
+_DATASET_STARTUP_QUEUE_BUFFERS = 2
+_DATASET_ACTIVE_QUEUE_MIN_BUFFERS = 60
+_DATASET_ACTIVE_QUEUE_SECONDS = 2
+# Opening every camera with a sequence of host-side property writes can straddle
+# multiple source frames. Arm a timestamp probe on every branch first, then let
+# each one open itself on its first exposure at/after one shared future instant.
+# 100 ms is ample time to install the handful of probes without making a record
+# press feel sluggish; the relay caller performs this wait away from control.
+_DATASET_ENABLE_LEAD_S = 0.100
 # A disable observes a complete GOP and closes immediately before the following
 # IDR. Two seconds leaves a full-frame margin even at the supported 1 fps
 # minimum; a timeout therefore indicates a stalled encoder, not scheduler jitter.
@@ -495,8 +509,11 @@ def _dataset_enc_shmsink(
         f"bitrate={target} peak-bitrate={peak} preset-level=1 "
         f"insert-sps-pps=true insert-aud=true idrinterval={idr} maxperf-enable=true "
         "! video/x-h264,stream-format=byte-stream,alignment=au "
-        f"! {_QUEUE} ! gdppay "
-        f"! shmsink socket-path={socket_path} wait-for-connection=true "
+        f"! queue name={name}_outq leaky=downstream "
+        f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
+        "max-size-bytes=0 max-size-time=0 ! gdppay "
+        f"! shmsink name={name}_shmsink socket-path={socket_path} "
+        "wait-for-connection=true "
         "sync=false async=false"
     )
 
@@ -548,6 +565,23 @@ class _GstPipelineBase:
         # physical camera first, then waits for all of them, so their encoder
         # GOP counters restart from the same phase at the next episode.
         self._dataset_disable: list[tuple[Any, int, threading.Event, Any, str]] = []
+        # One ``(sink_pad, probe_id, opened, cancelled, lock, status, valve,
+        # label)`` per dataset branch waiting for a common exposure boundary.
+        # ``lock`` serializes an opening callback with fail-close so a callback
+        # can never reopen a valve after an aborted multi-camera transaction.
+        self._dataset_enable: list[
+            tuple[
+                Any,
+                int,
+                threading.Event,
+                threading.Event,
+                threading.Lock,
+                dict[str, str | None],
+                Any,
+                str,
+            ]
+        ] = []
+        self._dataset_enabled = False
 
     def _cancel_dataset_disable(self) -> None:
         """Remove any outstanding natural-IDR probes (best effort)."""
@@ -560,15 +594,236 @@ class _GstPipelineBase:
             except Exception:  # noqa: BLE001 - pipeline may be tearing down
                 pass
 
-    def _enable_dataset_valves(self, gates: tuple[tuple[str, str | None], ...]) -> None:
-        """Open every named dataset valve and cancel a pending close."""
-        self._cancel_dataset_disable()
+    def _cancel_dataset_enable(self) -> None:
+        """Cancel a pending common-frame open and leave every valve closed."""
+        pending, self._dataset_enable = self._dataset_enable, []
+        for pad, probe_id, opened, cancelled, lock, status, valve, label in pending:
+            # The callback checks ``cancelled`` and changes the valve under this
+            # same lock. If it won the race, fail-close runs second and closes
+            # the valve; if cancellation won, the callback cannot reopen it.
+            with lock:
+                cancelled.set()
+                if status["error"] is None:
+                    status["error"] = f"dataset source {label!r} opening was cancelled"
+                valve.set_property("drop", True)
+                # Wake a concurrent finish waiter so abort/disconnect never
+                # leaves it sleeping until the full gate timeout.
+                opened.set()
+            try:
+                pad.remove_probe(probe_id)
+            except Exception:  # noqa: BLE001 - callback/pipeline may be exiting
+                pass
+
+    def _abort_dataset_enable(self, gates: tuple[tuple[str, str | None], ...]) -> None:
+        """Fail a multi-camera open closed, including branches already opened."""
+        self._cancel_dataset_enable()
+        self._dataset_enabled = False
         if self._pipeline is None:
             return
         for valve_name, _encoder_name in gates:
             valve = self._pipeline.get_by_name(valve_name)
             if valve is not None:
-                valve.set_property("drop", False)
+                valve.set_property("drop", True)
+        self._set_dataset_output_queue_depth(gates, active=False)
+
+    def _set_dataset_output_queue_depth(
+        self,
+        gates: tuple[tuple[str, str | None], ...],
+        *,
+        active: bool,
+    ) -> None:
+        """Select bounded startup or active-episode H.264 queue headroom.
+
+        Startup must remain aggressively leaky because GDP's header is parked
+        at ``shmsink wait-for-connection=true`` before the recorder exists.
+        During an episode the reader is connected and flushed, so retain two
+        seconds of compressed AUs before failing with DISCONT. Keeping the
+        queue bounded and leaky still isolates camera capture/NVENC if the
+        recorder process dies outright.
+        """
+        if self._pipeline is None:
+            return
+        dataset_fps = max(1, int(getattr(self, "dataset_fps", 1)))
+        active_buffers = max(
+            _DATASET_ACTIVE_QUEUE_MIN_BUFFERS,
+            _DATASET_ACTIVE_QUEUE_SECONDS * dataset_fps,
+        )
+        depth = active_buffers if active else _DATASET_STARTUP_QUEUE_BUFFERS
+        for _valve_name, encoder_name in gates:
+            if encoder_name is None:
+                continue
+            output_queue = self._pipeline.get_by_name(f"{encoder_name}_outq")
+            if output_queue is None:
+                raise RuntimeError(
+                    f"missing dataset encoder output queue {encoder_name}_outq"
+                )
+            output_queue.set_property("leaky", 2)  # downstream
+            output_queue.set_property("max-size-buffers", depth)
+            # Explicitly disable the queue defaults (10 MB / 1 s); otherwise
+            # either can undercut the intended frame-count bound.
+            output_queue.set_property("max-size-bytes", 0)
+            output_queue.set_property("max-size-time", 0)
+
+    def _begin_dataset_enable(
+        self,
+        gates: tuple[tuple[str, str | None], ...],
+        target_perf_s: float,
+    ) -> None:
+        """Arm every branch to open on its first exposure at/after one instant.
+
+        Dataset valves receive sensor-exposure PTS even while dropping buffers.
+        Installing probes on all cameras before ``target_perf_s`` avoids the
+        one/two-frame phase error caused by sequential property writes. Each
+        camera has a different pipeline running-time origin, so the shared
+        system-wide ``perf_counter`` target is converted with that pipeline's
+        calibrated PTS offset.
+        """
+        self._cancel_dataset_disable()
+        if self._dataset_enabled:
+            # Relay commands are idempotent. Re-arming an already-open branch
+            # would close it until the next future boundary, dropping H.264 AUs
+            # from the live episode for no semantic state change.
+            return
+        self._cancel_dataset_enable()
+        if self._pipeline is None:
+            return
+        if not math.isfinite(target_perf_s):
+            raise ValueError("dataset enable target must be finite")
+        if self._pts_perf_offset_s is None:
+            raise RuntimeError(
+                "camera pipeline PTS/perf_counter mapping is unavailable"
+            )
+
+        # Round upward: a sub-nanosecond conversion error must not admit an
+        # exposure infinitesimally before the shared boundary.
+        target_pts = math.ceil((target_perf_s - self._pts_perf_offset_s) * 1e9)
+        armed: list[
+            tuple[
+                Any,
+                int,
+                threading.Event,
+                threading.Event,
+                threading.Lock,
+                dict[str, str | None],
+                Any,
+                str,
+            ]
+        ] = []
+        try:
+            self._set_dataset_output_queue_depth(gates, active=True)
+            for valve_name, encoder_name in gates:
+                valve = self._pipeline.get_by_name(valve_name)
+                if valve is None:
+                    raise RuntimeError(f"missing dataset valve {valve_name!r}")
+                # A common-frame open is valid only from the known closed state.
+                # Closing here also makes repeated/partially failed requests
+                # deterministic instead of leaking an already-open frame.
+                valve.set_property("drop", True)
+                pad = valve.get_static_pad("sink")
+                if pad is None:
+                    raise RuntimeError(f"missing dataset valve pad {valve_name!r}")
+                opened = threading.Event()
+                cancelled = threading.Event()
+                transition_lock = threading.Lock()
+                status: dict[str, str | None] = {"error": None}
+                label = encoder_name or valve_name
+
+                def open_at_common_exposure(
+                    _pad: Any,
+                    info: Any,
+                    *,
+                    branch_valve: Any = valve,
+                    branch_opened: threading.Event = opened,
+                    branch_cancelled: threading.Event = cancelled,
+                    branch_lock: threading.Lock = transition_lock,
+                    branch_status: dict[str, str | None] = status,
+                    branch_label: str = label,
+                    threshold_pts: int = target_pts,
+                ) -> Any:
+                    buf = info.get_buffer()
+                    if buf is None:
+                        return self._gst.PadProbeReturn.OK
+                    if buf.pts == self._gst.CLOCK_TIME_NONE:
+                        with branch_lock:
+                            if not branch_cancelled.is_set():
+                                branch_status["error"] = (
+                                    f"dataset source {branch_label!r} has no exposure PTS"
+                                )
+                                branch_opened.set()
+                        return self._gst.PadProbeReturn.REMOVE
+                    if int(buf.pts) < threshold_pts:
+                        return self._gst.PadProbeReturn.OK
+                    with branch_lock:
+                        if branch_cancelled.is_set():
+                            return self._gst.PadProbeReturn.REMOVE
+                        # This is a sink-pad probe: changing ``drop`` before the
+                        # valve handles the current buffer admits this exposure,
+                        # not merely the following one.
+                        branch_valve.set_property("drop", False)
+                        branch_opened.set()
+                    return self._gst.PadProbeReturn.REMOVE
+
+                probe_id = pad.add_probe(
+                    self._gst.PadProbeType.BUFFER, open_at_common_exposure
+                )
+                if not probe_id:
+                    raise RuntimeError(
+                        f"could not install dataset enable probe on {valve_name!r}"
+                    )
+                armed.append(
+                    (
+                        pad,
+                        probe_id,
+                        opened,
+                        cancelled,
+                        transition_lock,
+                        status,
+                        valve,
+                        label,
+                    )
+                )
+        except Exception:
+            self._dataset_enable = armed
+            self._abort_dataset_enable(gates)
+            raise
+        self._dataset_enable = armed
+
+    def _finish_dataset_enable(self, deadline: float) -> None:
+        """Wait for all common-frame probes, failing the whole camera closed."""
+        # Keep the list published while waiting so a concurrent abort/disconnect
+        # can mark every transition cancelled and close its valve. Swapping it
+        # out here would let a later streaming callback reopen after fail-close.
+        pending = self._dataset_enable
+        failures: list[str] = []
+        for (
+            _pad,
+            _probe_id,
+            opened,
+            cancelled,
+            _lock,
+            status,
+            _valve,
+            label,
+        ) in pending:
+            remaining = max(0.0, deadline - time.perf_counter())
+            if not opened.wait(remaining) and not opened.is_set():
+                failures.append(f"{label}: timed out waiting for exposure boundary")
+                continue
+            error = status["error"]
+            if error is not None:
+                failures.append(error)
+            elif cancelled.is_set():
+                failures.append(f"{label}: exposure-boundary opening was cancelled")
+        if failures:
+            # Cancel only if this is still the transaction we waited on. A
+            # concurrent abort already closed it; a later begin owns a new list
+            # which this failed waiter must not touch.
+            if self._dataset_enable is pending:
+                self._cancel_dataset_enable()
+            raise RuntimeError("; ".join(failures))
+        if self._dataset_enable is pending:
+            self._dataset_enable = []
+        self._dataset_enabled = True
 
     def _begin_dataset_disable(self, gates: tuple[tuple[str, str | None], ...]) -> None:
         """Arm every encoded branch to stop one frame before its next IDR.
@@ -578,6 +833,7 @@ class _GstPipelineBase:
         that GOP, and close after its final P-frame. Every encoder is therefore
         poised to emit an IDR on the first frame after the valve next opens.
         """
+        self._cancel_dataset_enable()
         self._cancel_dataset_disable()
         if self._pipeline is None:
             return
@@ -653,10 +909,12 @@ class _GstPipelineBase:
         except Exception:
             self._dataset_disable = armed
             self._cancel_dataset_disable()
+            self._dataset_enabled = False
             for valve_name, _encoder_name in gates:
                 valve = self._pipeline.get_by_name(valve_name)
                 if valve is not None:
                     valve.set_property("drop", True)
+            self._set_dataset_output_queue_depth(gates, active=False)
             raise
         self._dataset_disable = armed
 
@@ -678,10 +936,12 @@ class _GstPipelineBase:
                 valve.set_property("drop", True)
                 timed_out.append(label)
         if timed_out:
+            self._dataset_enabled = False
             raise RuntimeError(
                 "timed out aligning dataset encoder before IDR on "
                 + ", ".join(timed_out)
             )
+        self._dataset_enabled = False
 
     @property
     def alive(self) -> bool:
@@ -874,6 +1134,8 @@ class _GstPipelineBase:
 
     def disconnect(self) -> None:
         self._stop.set()
+        self._cancel_dataset_enable()
+        self._dataset_enabled = False
         self._cancel_dataset_disable()
         for thread in self._threads:
             thread.join(timeout=2.0)
@@ -1016,7 +1278,22 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
 
     def finish_raw_disable(self, deadline: float) -> None:
         """Complete a close previously armed by :meth:`begin_raw_disable`."""
-        self._finish_dataset_disable(deadline)
+        try:
+            self._finish_dataset_disable(deadline)
+        finally:
+            self._set_dataset_output_queue_depth(self._raw_gates(), active=False)
+
+    def begin_raw_enable(self, target_perf_s: float) -> None:
+        """Arm this camera to open on a shared future exposure boundary."""
+        self._begin_dataset_enable(self._raw_gates(), target_perf_s)
+
+    def finish_raw_enable(self, deadline: float) -> None:
+        """Wait for a common-boundary open armed by :meth:`begin_raw_enable`."""
+        self._finish_dataset_enable(deadline)
+
+    def abort_raw_enable(self) -> None:
+        """Cancel an opening transaction and immediately close every branch."""
+        self._abort_dataset_enable(self._raw_gates())
 
     def set_raw_enabled(self, enabled: bool) -> None:
         """Open or close the dataset branch at runtime (no pipeline reconfig).
@@ -1031,7 +1308,9 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         if not self._want_raw or self._pipeline is None:
             return
         if enabled:
-            self._enable_dataset_valves(self._raw_gates())
+            target = time.perf_counter() + _DATASET_ENABLE_LEAD_S
+            self.begin_raw_enable(target)
+            self.finish_raw_enable(target + _DATASET_GATE_TIMEOUT_S)
             return
         self.begin_raw_disable()
         self.finish_raw_disable(time.perf_counter() + _DATASET_GATE_TIMEOUT_S)
@@ -1384,7 +1663,22 @@ class ZedGstStereoCamera(_GstPipelineBase):
 
     def finish_raw_disable(self, deadline: float) -> None:
         """Complete a close previously armed by :meth:`begin_raw_disable`."""
-        self._finish_dataset_disable(deadline)
+        try:
+            self._finish_dataset_disable(deadline)
+        finally:
+            self._set_dataset_output_queue_depth(self._raw_gates(), active=False)
+
+    def begin_raw_enable(self, target_perf_s: float) -> None:
+        """Arm both eyes to open on a shared future exposure boundary."""
+        self._begin_dataset_enable(self._raw_gates(), target_perf_s)
+
+    def finish_raw_enable(self, deadline: float) -> None:
+        """Wait for a common-boundary open armed by :meth:`begin_raw_enable`."""
+        self._finish_dataset_enable(deadline)
+
+    def abort_raw_enable(self) -> None:
+        """Cancel an opening transaction and immediately close every eye."""
+        self._abort_dataset_enable(self._raw_gates())
 
     def set_raw_enabled(self, enabled: bool) -> None:
         """Open or close both eyes' dataset branches at runtime.
@@ -1396,7 +1690,9 @@ class ZedGstStereoCamera(_GstPipelineBase):
         if not self._want_raw or self._pipeline is None:
             return
         if enabled:
-            self._enable_dataset_valves(self._raw_gates())
+            target = time.perf_counter() + _DATASET_ENABLE_LEAD_S
+            self.begin_raw_enable(target)
+            self.finish_raw_enable(target + _DATASET_GATE_TIMEOUT_S)
             return
         self.begin_raw_disable()
         self.finish_raw_disable(time.perf_counter() + _DATASET_GATE_TIMEOUT_S)

@@ -1,14 +1,129 @@
 from __future__ import annotations
 
+import threading
+import time
+import types
 import unittest
+from unittest.mock import patch
 
-from almond_axol.video.gst_zed import ZedGstCamera, ZedGstStereoCamera
-
-
-_H264_OUTPUT = (
-    "video/x-h264,stream-format=byte-stream,alignment=au ! "
-    "queue leaky=downstream max-size-buffers=2 ! gdppay ! shmsink"
+from almond_axol.video.gst_zed import (
+    ZedGstCamera,
+    ZedGstStereoCamera,
+    _GstPipelineBase,
 )
+from almond_axol.video.video_proc import _set_dataset_branches_enabled
+
+
+class _FakeGst:
+    CLOCK_TIME_NONE = -1
+    PadProbeType = types.SimpleNamespace(BUFFER=1)
+    PadProbeReturn = types.SimpleNamespace(OK="ok", REMOVE="remove")
+
+
+class _FakePad:
+    def __init__(self, gst: _FakeGst) -> None:
+        self._gst = gst
+        self._next_probe = 1
+        self._probes: dict[int, object] = {}
+
+    def add_probe(self, _probe_type: int, callback: object) -> int:
+        probe_id = self._next_probe
+        self._next_probe += 1
+        self._probes[probe_id] = callback
+        return probe_id
+
+    def remove_probe(self, probe_id: int) -> None:
+        self._probes.pop(probe_id, None)
+
+    def push(self, pts: int) -> None:
+        buffer = types.SimpleNamespace(pts=pts)
+        info = types.SimpleNamespace(get_buffer=lambda: buffer)
+        for probe_id, callback in list(self._probes.items()):
+            result = callback(self, info)
+            if result == self._gst.PadProbeReturn.REMOVE:
+                self._probes.pop(probe_id, None)
+
+
+class _FakeValve:
+    def __init__(self, gst: _FakeGst) -> None:
+        self.drop = True
+        self.sink = _FakePad(gst)
+
+    def get_property(self, name: str) -> bool:
+        assert name == "drop"
+        return self.drop
+
+    def set_property(self, name: str, value: bool) -> None:
+        assert name == "drop"
+        self.drop = bool(value)
+
+    def get_static_pad(self, name: str) -> _FakePad | None:
+        return self.sink if name == "sink" else None
+
+
+class _FakeQueue:
+    def __init__(self) -> None:
+        self.properties = {
+            "leaky": 2,
+            "max-size-buffers": 2,
+            "max-size-bytes": 0,
+            "max-size-time": 0,
+        }
+
+    def set_property(self, name: str, value: int) -> None:
+        self.properties[name] = int(value)
+
+    def get_property(self, name: str) -> int:
+        return self.properties[name]
+
+
+class _FakePipeline:
+    def __init__(self, elements: dict[str, object]) -> None:
+        self._elements = elements
+
+    def get_by_name(self, name: str) -> object | None:
+        return self._elements.get(name)
+
+
+def _fake_gate_base(
+    *, offset_s: float = 90.0, valve_names: tuple[str, ...] = ("rawvalve",)
+) -> tuple[_GstPipelineBase, dict[str, _FakeValve]]:
+    gst = _FakeGst()
+    valves = {name: _FakeValve(gst) for name in valve_names}
+    queues = {
+        ("dsenc" if name == "rawvalve" else f"dsenc_{name.rsplit('_', 1)[1]}")
+        + "_outq": _FakeQueue()
+        for name in valve_names
+    }
+    base = _GstPipelineBase()
+    base._gst = gst
+    base._pipeline = _FakePipeline({**valves, **queues})
+    base._pts_perf_offset_s = offset_s
+    base.dataset_fps = 30
+    return base, valves
+
+
+class _FakeCoordinatedCamera:
+    def __init__(
+        self, name: str, calls: list[tuple], *, finish_error: str | None = None
+    ) -> None:
+        self.name = name
+        self.calls = calls
+        self.finish_error = finish_error
+
+    def __repr__(self) -> str:
+        return self.name
+
+    def begin_raw_enable(self, target: float) -> None:
+        self.calls.append(("begin", self.name, target))
+
+    def finish_raw_enable(self, deadline: float) -> None:
+        self.calls.append(("finish", self.name, deadline))
+        if self.finish_error is not None:
+            raise RuntimeError(self.finish_error)
+
+    def abort_raw_enable(self) -> None:
+        self.calls.append(("abort", self.name))
 
 
 class GstDatasetTransportTest(unittest.TestCase):
@@ -16,12 +131,20 @@ class GstDatasetTransportTest(unittest.TestCase):
         self, pipeline: str, valve_name: str, encoder_name: str, socket_path: str
     ) -> None:
         start = pipeline.index(f"valve name={valve_name} drop=false")
-        sink = f"shmsink socket-path={socket_path} wait-for-connection=true"
+        sink = (
+            f"shmsink name={encoder_name}_shmsink socket-path={socket_path} "
+            "wait-for-connection=true"
+        )
         end = pipeline.index(sink, start) + len(sink)
         branch = pipeline[start:end]
 
         self.assertIn(f"name={encoder_name}", branch)
-        self.assertIn(_H264_OUTPUT, branch)
+        self.assertIn(
+            "video/x-h264,stream-format=byte-stream,alignment=au ! "
+            f"queue name={encoder_name}_outq leaky=downstream "
+            "max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! gdppay",
+            branch,
+        )
         self.assertIn(sink, branch)
 
     def test_mono_dataset_encoder_drains_before_recorder_connects(self) -> None:
@@ -63,6 +186,171 @@ class GstDatasetTransportTest(unittest.TestCase):
             camera._raw_gates(),
             (("rawvalve_l", "dsenc_l"), ("rawvalve_r", "dsenc_r")),
         )
+
+
+class GstDatasetEnableBarrierTest(unittest.TestCase):
+    def test_valve_opens_on_first_exposure_at_or_after_shared_target(self) -> None:
+        base, valves = _fake_gate_base(offset_s=90.0)
+        valve = valves["rawvalve"]
+
+        base._begin_dataset_enable((("rawvalve", "dsenc"),), 100.0)
+        valve.sink.push(9_999_999_999)
+        self.assertTrue(valve.drop)
+
+        valve.sink.push(10_000_000_000)
+        self.assertFalse(valve.drop)
+        base._finish_dataset_enable(0.0)
+
+    def test_active_episode_expands_bounded_predictive_queue(self) -> None:
+        base, _valves = _fake_gate_base()
+        output_queue = base._pipeline.get_by_name("dsenc_outq")
+
+        base._begin_dataset_enable((("rawvalve", "dsenc"),), 100.0)
+
+        self.assertEqual(output_queue.get_property("leaky"), 2)
+        self.assertEqual(output_queue.get_property("max-size-buffers"), 60)
+        self.assertEqual(output_queue.get_property("max-size-bytes"), 0)
+        self.assertEqual(output_queue.get_property("max-size-time"), 0)
+
+        base._abort_dataset_enable((("rawvalve", "dsenc"),))
+        self.assertEqual(output_queue.get_property("max-size-buffers"), 2)
+
+    def test_active_queue_depth_scales_with_capture_rate(self) -> None:
+        base, _valves = _fake_gate_base()
+        base.dataset_fps = 60
+        output_queue = base._pipeline.get_by_name("dsenc_outq")
+
+        base._begin_dataset_enable((("rawvalve", "dsenc"),), 100.0)
+
+        self.assertEqual(output_queue.get_property("max-size-buffers"), 120)
+
+    def test_repeated_enable_does_not_reclose_live_episode(self) -> None:
+        base, valves = _fake_gate_base(offset_s=90.0)
+        gates = (("rawvalve", "dsenc"),)
+        valve = valves["rawvalve"]
+
+        base._begin_dataset_enable(gates, 100.0)
+        valve.sink.push(10_000_000_000)
+        base._finish_dataset_enable(0.0)
+        self.assertFalse(valve.drop)
+
+        base._begin_dataset_enable(gates, 101.0)
+        base._finish_dataset_enable(0.0)
+
+        self.assertFalse(valve.drop)
+        self.assertEqual(base._dataset_enable, [])
+
+    def test_failed_eye_recloses_sibling_which_already_opened(self) -> None:
+        base, valves = _fake_gate_base(
+            offset_s=90.0, valve_names=("rawvalve_l", "rawvalve_r")
+        )
+        gates = (("rawvalve_l", "dsenc_l"), ("rawvalve_r", "dsenc_r"))
+
+        base._begin_dataset_enable(gates, 100.0)
+        valves["rawvalve_l"].sink.push(10_000_000_000)
+        self.assertFalse(valves["rawvalve_l"].drop)
+
+        with self.assertRaisesRegex(RuntimeError, "dsenc_r.*timed out"):
+            base._finish_dataset_enable(0.0)
+        self.assertTrue(valves["rawvalve_l"].drop)
+        self.assertTrue(valves["rawvalve_r"].drop)
+
+    def test_missing_exposure_pts_fails_closed(self) -> None:
+        base, valves = _fake_gate_base()
+        valve = valves["rawvalve"]
+
+        base._begin_dataset_enable((("rawvalve", "dsenc"),), 100.0)
+        valve.sink.push(_FakeGst.CLOCK_TIME_NONE)
+
+        with self.assertRaisesRegex(RuntimeError, "dsenc.*has no exposure PTS"):
+            base._finish_dataset_enable(0.0)
+        self.assertTrue(valve.drop)
+
+    def test_abort_wakes_pending_finish_and_cannot_reopen(self) -> None:
+        base, valves = _fake_gate_base()
+        valve = valves["rawvalve"]
+        gates = (("rawvalve", "dsenc"),)
+
+        base._begin_dataset_enable(gates, 100.0)
+        opened = base._dataset_enable[0][2]
+        wait_entered = threading.Event()
+        original_wait = opened.wait
+
+        def tracked_wait(timeout: float | None = None) -> bool:
+            wait_entered.set()
+            return original_wait(timeout)
+
+        opened.wait = tracked_wait  # type: ignore[method-assign]
+        failures: list[BaseException] = []
+
+        def finish() -> None:
+            try:
+                base._finish_dataset_enable(time.perf_counter() + 1.0)
+            except BaseException as exc:
+                failures.append(exc)
+
+        waiter = threading.Thread(target=finish)
+        waiter.start()
+        self.assertTrue(wait_entered.wait(1.0))
+        base._abort_dataset_enable(gates)
+        waiter.join(1.0)
+
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertRegex(str(failures[0]), "opening was cancelled")
+        valve.sink.push(10_000_000_000)
+        self.assertTrue(valve.drop)
+
+    def test_relay_arms_every_camera_with_same_target_before_waiting(self) -> None:
+        calls: list[tuple] = []
+        cameras = [
+            _FakeCoordinatedCamera("overhead", calls),
+            _FakeCoordinatedCamera("left_arm", calls),
+            _FakeCoordinatedCamera("right_arm", calls),
+        ]
+
+        with patch("almond_axol.video.video_proc.time.perf_counter", return_value=50.0):
+            _set_dataset_branches_enabled(cameras, True)
+
+        self.assertEqual([call[0] for call in calls], ["begin"] * 3 + ["finish"] * 3)
+        targets = [call[2] for call in calls if call[0] == "begin"]
+        self.assertEqual(targets, [50.1, 50.1, 50.1])
+
+    def test_relay_failure_aborts_completed_peer_cameras(self) -> None:
+        calls: list[tuple] = []
+        cameras = [
+            _FakeCoordinatedCamera("overhead", calls),
+            _FakeCoordinatedCamera("left_arm", calls, finish_error="no exposure"),
+        ]
+
+        with (
+            patch("almond_axol.video.video_proc.time.perf_counter", return_value=50.0),
+            self.assertRaisesRegex(RuntimeError, "left_arm: no exposure"),
+        ):
+            _set_dataset_branches_enabled(cameras, True)
+
+        self.assertIn(("abort", "overhead"), calls)
+        self.assertIn(("abort", "left_arm"), calls)
+
+    def test_relay_fails_closed_if_arming_misses_future_boundary(self) -> None:
+        calls: list[tuple] = []
+        cameras = [
+            _FakeCoordinatedCamera("overhead", calls),
+            _FakeCoordinatedCamera("left_arm", calls),
+        ]
+
+        with (
+            patch(
+                "almond_axol.video.video_proc.time.perf_counter",
+                side_effect=(50.0, 50.11),
+            ),
+            self.assertRaisesRegex(RuntimeError, "missed the shared.*boundary"),
+        ):
+            _set_dataset_branches_enabled(cameras, True)
+
+        self.assertNotIn("finish", [call[0] for call in calls])
+        self.assertIn(("abort", "overhead"), calls)
+        self.assertIn(("abort", "left_arm"), calls)
 
 
 if __name__ == "__main__":
