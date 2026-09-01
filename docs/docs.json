@@ -71,6 +71,7 @@
               "cli/diag-rom-disable",
               "cli/diag-teleop-jitter",
               "cli/diag-offline",
+              "cli/diag-lift-cycle",
               "cli/diag-zed-cable",
               "cli/motor-set-can-id",
               "cli/motor-set-zero-pos",

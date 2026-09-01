@@ -459,6 +459,18 @@ COMMANDS: dict[str, CommandDef] = {
         drives_motors=True,
         section="test",
     ),
+    "diag.lift-cycle": CommandDef(
+        "diag.lift-cycle",
+        "diag.lift-cycle",
+        "Lift cycle",
+        "Raise the arm S1 joints for clearance, then cycle the telescoping "
+        "lift down and up for the requested number of repetitions.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..diagnostics.lift.cycle"),
+        requires_hardware=True,
+        drives_motors=True,
+    ),
     "diag.zed-cable": CommandDef(
         "diag.zed-cable",
         "diag.zed-cable",

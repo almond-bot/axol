@@ -20,8 +20,10 @@ README is the spec):
   jog every 100 ms while a direction is held.
 - The board stays silent until it has received at least one frame, and the
   CANable gs_usb adapters starve their own TX path while continuously
-  receiving the 50 ms status broadcast — so on connect the driver turns the
-  broadcast off (``SET_RATE 0``) and polls with ``GET_STATUS`` instead.
+  receiving the 50 ms status broadcast. By default the driver therefore turns
+  the broadcast off (``SET_RATE 0``) and polls with ``GET_STATUS`` instead. A
+  slower receive-only broadcast can be selected for diagnostics with
+  ``status_period_ms``.
 
 A leg stalling mid-move sets the ``stall fault`` status flag and aborts the
 move. Any new motion command clears the fault and retries, so a host must
@@ -34,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import time
 from dataclasses import dataclass
 
 from ..constants import CAN_CHEST
@@ -64,6 +67,8 @@ JOG_SPEED = 650
 _JOG_RESEND_S = 0.1
 # Status poll cadence (broadcast is off — see the module docstring).
 _STATUS_POLL_S = 0.2
+# Retry receive-only mode after this many missing broadcast intervals.
+_BROADCAST_STALE_FRAMES = 3
 # One warning if the board never answers (chest unpowered / unplugged).
 _SILENT_WARN_S = 2.0
 
@@ -83,6 +88,16 @@ class LiftStatus:
     at_upper: bool
     homing: bool
     jog: bool
+    # Firmware v0.4+ appends driver health in bytes 6-7; v0.8 defines bit 3 of
+    # byte 7 as save-pending. Keep these optional so a six-byte legacy status
+    # remains decodable. A v0.8 diagnostic additionally verifies save-pending
+    # behavior during motion because an older eight-byte frame looks the same
+    # while idle.
+    driver_fault_mask: int | None = None
+    drivers_enabled: bool | None = None
+    vm_present: bool | None = None
+    flash_interlock: bool | None = None
+    save_pending: bool | None = None
 
     @property
     def height_percent(self) -> float | None:
@@ -94,6 +109,11 @@ class LiftStatus:
 
 def _decode_status(data: bytes) -> LiftStatus:
     pos, vel, flags, drift = struct.unpack("<HhBb", data[:6])
+    # Treat driver health as one versioned extension: a short/legacy frame must
+    # not look like a healthy controller merely because its missing bits would
+    # otherwise decode as zero.
+    driver_fault_mask = data[6] if len(data) >= 8 else None
+    driver_state = data[7] if len(data) >= 8 else None
     return LiftStatus(
         position_permille=None if pos == 0xFFFF else pos,
         velocity=vel,
@@ -106,6 +126,15 @@ def _decode_status(data: bytes) -> LiftStatus:
         at_upper=bool(flags & 0x20),
         homing=bool(flags & 0x40),
         jog=bool(flags & 0x80),
+        driver_fault_mask=driver_fault_mask,
+        drivers_enabled=(
+            bool(driver_state & 0x01) if driver_state is not None else None
+        ),
+        vm_present=(bool(driver_state & 0x02) if driver_state is not None else None),
+        flash_interlock=(
+            bool(driver_state & 0x04) if driver_state is not None else None
+        ),
+        save_pending=(bool(driver_state & 0x08) if driver_state is not None else None),
     )
 
 
@@ -126,9 +155,26 @@ class Lift:
     :attr:`status` / :attr:`height_percent`.
     """
 
-    def __init__(self, channel: str = CAN_CHEST, jog_speed: int = JOG_SPEED) -> None:
+    def __init__(
+        self,
+        channel: str = CAN_CHEST,
+        jog_speed: int = JOG_SPEED,
+        status_period_ms: int = 0,
+    ) -> None:
+        """Create a lift driver.
+
+        Args:
+            channel: SocketCAN interface carrying the jelly_legs controller.
+            jog_speed: Held-jog speed in encoder counts/s.
+            status_period_ms: Firmware status broadcast period in milliseconds.
+                Zero (the default) disables broadcasts and explicitly polls at
+                5 Hz, preserving the interactive/cart behavior. Diagnostics
+                may use 200 ms to receive status without transmitting while
+                the motors are moving.
+        """
         self._channel = channel
         self._jog_speed = int(jog_speed)
+        self._status_period_ms = self._validate_status_period(status_period_ms)
         self._bus: CanBus | None = None
         self._task: asyncio.Task | None = None
         self._direction = STOP
@@ -142,11 +188,43 @@ class Lift:
         self._stall_dir = STOP
         self._stall_logged = False
         self._status: LiftStatus | None = None
+        self._last_status_monotonic: float | None = None
+
+    @staticmethod
+    def _validate_status_period(period_ms: int) -> int:
+        period_ms = int(period_ms)
+        if not 0 <= period_ms <= 0xFFFF:
+            raise ValueError("status_period_ms must be between 0 and 65535")
+        return period_ms
 
     @property
     def status(self) -> LiftStatus | None:
         """The latest status frame, or None before the board first answers."""
         return self._status
+
+    @property
+    def last_status_monotonic(self) -> float | None:
+        """Monotonic receive time of the latest status frame, if any."""
+        return self._last_status_monotonic
+
+    @property
+    def status_age(self) -> float | None:
+        """Seconds since the latest status frame, or None before any reply."""
+        if self._last_status_monotonic is None:
+            return None
+        return max(0.0, time.monotonic() - self._last_status_monotonic)
+
+    def status_is_fresh(self, max_age_s: float) -> bool:
+        """Whether a status frame arrived within ``max_age_s`` seconds."""
+        if max_age_s < 0:
+            raise ValueError("max_age_s must be non-negative")
+        age = self.status_age
+        return age is not None and age <= max_age_s
+
+    @property
+    def status_period_ms(self) -> int:
+        """Configured firmware status period; zero means explicit polling."""
+        return self._status_period_ms
 
     @property
     def height_percent(self) -> float | None:
@@ -161,16 +239,23 @@ class Lift:
         """
         from ..cli.can.setup import bring_up_interfaces, iface_up
 
+        # A Lift instance may be restarted; never let a previous connection's
+        # status satisfy a new connection's readiness/freshness checks.
+        self._status = None
+        self._last_status_monotonic = None
         if not iface_up(self._channel):
             bring_up_interfaces([self._channel])
         self._bus = CanBus(self._channel)
         self._bus._add_listener(self._on_message)
         await self._bus.start()
-        # Turn the status broadcast off and request one status: the CANable
-        # adapter's TX path starves under the 50 ms broadcast, and the board
-        # stays silent until it has received at least one frame.
+        # Quiesce the firmware's default 50 ms broadcast before doing any
+        # request/response traffic: the CANable adapter's TX path can starve
+        # while that stream is arriving. Request one immediate status, then
+        # opt into the caller's slower receive-only broadcast when configured.
         await self._send(_OP_SET_RATE, struct.pack("<H", 0))
         await self._send(_OP_GET_STATUS)
+        if self._status_period_ms:
+            await self._send(_OP_SET_RATE, struct.pack("<H", self._status_period_ms))
         self._task = asyncio.create_task(self._run(), name="lift-command")
         _logger.info("lift: jelly_legs driver on %s", self._channel)
 
@@ -191,6 +276,13 @@ class Lift:
                 try:
                     await self._send(_OP_JOG, struct.pack("<h", 0))
                 except Exception:  # noqa: BLE001 - best-effort stop before close
+                    pass
+                try:
+                    # A diagnostic may have enabled receive-only broadcasts.
+                    # Leave the shared CAN bus quiet for the next owner even
+                    # if stopping the legs above failed.
+                    await self._send(_OP_SET_RATE, struct.pack("<H", 0))
+                except Exception:  # noqa: BLE001 - best-effort bus cleanup
                     pass
                 await self._bus.close()
                 self._bus = None
@@ -230,6 +322,17 @@ class Lift:
         self._direction = self._last_jog_sent = STOP
         await self._send(_OP_STOP)
 
+    async def set_status_period(self, period_ms: int) -> None:
+        """Select firmware broadcasts, or zero to return to explicit polling.
+
+        The setting is retained if this instance is closed and restarted.
+        When connected, it is applied immediately; otherwise it takes effect
+        on the next :meth:`start`.
+        """
+        self._status_period_ms = self._validate_status_period(period_ms)
+        if self._bus is not None:
+            await self._send(_OP_SET_RATE, struct.pack("<H", self._status_period_ms))
+
     def command(self, direction: int) -> None:
         """Latch the commanded direction. +1 = up, 0 = stop, -1 = down.
 
@@ -247,13 +350,14 @@ class Lift:
     def _on_message(self, msg) -> None:  # noqa: ANN001 - can.Message, typed lazily
         if msg.arbitration_id == _ID_STATUS and len(msg.data) >= 6:
             self._status = _decode_status(bytes(msg.data))
+            self._last_status_monotonic = time.monotonic()
 
     async def _send(self, op: int, payload: bytes = b"") -> None:
         assert self._bus is not None
         await self._bus._send(_ID_CMD, bytes([op]) + payload)
 
     async def _run(self) -> None:
-        """Re-send the held jog inside the deadman and poll status."""
+        """Re-send jogs, poll in quiet mode, and recover stale broadcasts."""
         next_poll = 0.0
         started = asyncio.get_running_loop().time()
         warned_silent = False
@@ -291,8 +395,23 @@ class Lift:
                 await self._send(_OP_JOG, struct.pack("<h", 0))
             self._last_jog_sent = direction
 
-            if now >= next_poll:
+            broadcast_stale = False
+            if self._status_period_ms:
+                age = self.status_age
+                broadcast_stale = age is None or age > max(
+                    _STATUS_POLL_S * 2,
+                    _BROADCAST_STALE_FRAMES * self._status_period_ms / 1000,
+                )
+            if (self._status_period_ms == 0 or broadcast_stale) and now >= next_poll:
                 next_poll = now + _STATUS_POLL_S
+                if broadcast_stale:
+                    # CanBus deliberately drops sends while its interface is
+                    # lost/stalled. If SET_RATE was one of those drops, do not
+                    # stop monitoring forever: retry the requested rate and
+                    # solicit one status until periodic frames resume.
+                    await self._send(
+                        _OP_SET_RATE, struct.pack("<H", self._status_period_ms)
+                    )
                 await self._send(_OP_GET_STATUS)
 
             if (
@@ -303,7 +422,7 @@ class Lift:
                 warned_silent = True
                 _logger.warning(
                     "lift: no status from the jelly_legs board on %s after "
-                    "%.0fs — is the chest powered? (Polling continues.)",
+                    "%.0fs — is the chest powered? (Monitoring continues.)",
                     self._channel,
                     _SILENT_WARN_S,
                 )

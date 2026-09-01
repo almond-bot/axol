@@ -207,6 +207,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "collect-data": (f"{_AXOL}.has_gripper",),
                     "run-policy": (f"{_AXOL}.has_gripper",),
                     "replay-dataset": (f"{_AXOL}.has_gripper",),
+                    "diag.lift-cycle": ("has_gripper",),
                 },
             ),
             SettingDef(

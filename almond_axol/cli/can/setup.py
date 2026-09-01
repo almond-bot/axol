@@ -510,13 +510,44 @@ def _reload_udev() -> None:
     print("  Done.")
 
 
+def _validate_adapter_assignments(
+    hub_serial: str | None,
+    wheels_serial: str | None,
+    chest_serial: str | None,
+) -> None:
+    """Reject one physical adapter being assigned to incompatible roles."""
+    seen: dict[str, str] = {}
+    for role, serial in (
+        ("arm hub", hub_serial),
+        ("wheel bus", wheels_serial),
+        ("chest bus", chest_serial),
+    ):
+        if not serial:
+            continue
+        previous_role = seen.get(serial)
+        if previous_role:
+            raise RuntimeError(
+                f"Adapter {serial} cannot be assigned to both the "
+                f"{previous_role} and {role}."
+            )
+        seen[serial] = role
+
+
 def _rename_interfaces(
     hub_serial: str | None,
     wheels_serial: str | None = None,
     chest_serial: str | None = None,
 ) -> None:
-    """Rename existing canX interfaces to their target names without replug."""
+    """Rename existing canX interfaces to their target names without replug.
+
+    Every move is staged through a temporary ``can_*`` name before any final
+    name is assigned.  That extra phase matters when live probing corrects a
+    stale wheel/chest assignment: Linux will not directly rename B to C while
+    C still exists (or vice versa), even when both interfaces are down.
+    """
     print("Renaming CAN interfaces (requires sudo)...")
+    _validate_adapter_assignments(hub_serial, wheels_serial, chest_serial)
+
     # (adapter serial, channel dev_id) -> persistent name. The wheel/chest
     # adapters are single-channel, so their only interface is dev_id 0.
     target: dict[tuple[str, int], str] = {}
@@ -528,7 +559,10 @@ def _rename_interfaces(
     if chest_serial:
         target[(chest_serial, 0)] = _CAN_C
 
-    for iface_path in Path("/sys/class/net").glob("can*"):
+    net_dir = Path("/sys/class/net")
+    iface_paths = list(net_dir.glob("can*"))
+    records: dict[str, tuple[str, int]] = {}
+    for iface_path in iface_paths:
         iface = iface_path.name
         info = subprocess.run(
             ["udevadm", "info", "-a", "-p", str(iface_path)],
@@ -537,18 +571,74 @@ def _rename_interfaces(
         ).stdout
 
         iface_serial = _udev_attr(info, "ATTRS{serial}")
+        if not iface_serial:
+            continue
         try:
             dev_id = int(_udev_attr(info, "ATTR{dev_id}"), 16)
         except ValueError:
             continue
+        records[iface] = (iface_serial, dev_id)
 
-        new_name = target.get((iface_serial, dev_id))
-        if new_name is None or iface == new_name:
+    # Assigned adapters that are not already at their destination must move.
+    moves: dict[str, str] = {
+        iface: target[identity]
+        for iface, identity in records.items()
+        if identity in target and iface != target[identity]
+    }
+
+    # A stale adapter can still occupy a managed name after probing reassigns
+    # or removes that role. Stage the old occupant out of the way too; it stays
+    # down under a discoverable temporary name until replugged.
+    managed_names = {_CAN_L, _CAN_R, _CAN_B, _CAN_C}
+    for name in managed_names:
+        if name not in records or name in moves:
             continue
+        occupant = records[name]
+        if target.get(occupant) == name:
+            continue
+        moves[name] = ""
 
-        print(f"  {iface} -> {new_name}")
+    # Refuse to rename an unrelated interface. This should be impossible for
+    # the reserved can_alm_axol_* names, but detecting it before any mutation
+    # is much safer than failing halfway through the staging phase.
+    existing_names = {path.name for path in net_dir.iterdir()}
+    for destination in set(target.values()):
+        if (
+            destination in existing_names
+            and destination not in records
+            and destination not in moves
+        ):
+            raise RuntimeError(
+                f"Cannot rename a CAN interface to {destination}: that name "
+                "is already used by an unrelated network interface."
+            )
+
+    reserved_names = existing_names | set(target.values())
+
+    def temporary_name(index: int) -> str:
+        while True:
+            name = f"can_ax_tmp{index}"
+            index += 1
+            if name not in reserved_names:
+                reserved_names.add(name)
+                return name
+
+    staged: list[tuple[str, str]] = []
+    next_temp = 0
+    for iface, new_name in moves.items():
+        temp_name = temporary_name(next_temp)
+        next_temp += 1
+        if new_name:
+            print(f"  {iface} -> {new_name}")
+        else:
+            print(f"  {iface} -> {temp_name} (no longer assigned)")
         run_root(["ip", "link", "set", iface, "down"], check=True)
-        run_root(["ip", "link", "set", iface, "name", new_name], check=True)
+        run_root(["ip", "link", "set", iface, "name", temp_name], check=True)
+        staged.append((temp_name, new_name))
+
+    for temp_name, new_name in staged:
+        if new_name:
+            run_root(["ip", "link", "set", temp_name, "name", new_name], check=True)
 
     print("  Done.")
 
@@ -893,6 +983,7 @@ def _apply_setup(
     Each step is idempotent, so this is safe to re-run on a
     partially-configured machine.
     """
+    _validate_adapter_assignments(hub_serial, wheels_serial, chest_serial)
     _write_udev_rules(hub_serial, wheels_serial, chest_serial)
     _write_cron_script()
     _write_hotplug_unit()
@@ -944,69 +1035,107 @@ def _find_single_serials(
 ) -> tuple[str | None, str | None]:
     """Assign single-channel adapters to the wheel/chest buses.
 
-    A previously pinned adapter keeps its bus while it is *attached*. A pinned
-    but absent adapter is only a fallback: an attached adapter whose bus
-    probes as wheels/chest takes over the pin (the adapter was replaced, or a
-    different Axol was plugged into this host), while nothing claiming the bus
-    keeps the old pin so a temporarily unplugged Jelly/chest stays configured.
-
-    Every unpinned attached single-channel adapter is identified by probing
-    its bus (see :func:`_identify_adapter`); one where nothing answers —
-    devices unpowered, or unrelated hardware like a UMI rig — is offered to
-    the operator instead of guessed at, but only on an interactive tty run
-    (``interactive=False``, and non-tty runs like the web dashboard's, skip
-    the prompt).
+    Every attached adapter is probed, including adapters pinned by a previous
+    setup. A positive device response wins over a stale pin; an attached but
+    silent (or currently unplugged) configured adapter keeps its previous role
+    as an unverified fallback. A new silent adapter is offered to the operator
+    instead of being guessed at, and may explicitly replace such a fallback
+    when ``interactive`` is true. Headless callers pass ``interactive=False``
+    so an invisible prompt cannot block them.
 
     Returns ``(wheels_serial, chest_serial)``, either of which may be None.
     """
-    attached = set(_scan_adapters())
-    wheels = _configured_named_serial(_CAN_B)
-    chest = _configured_named_serial(_CAN_C)
-    # The serial that *owns* a bus (blocks reassignment): only a pin whose
-    # adapter is actually attached.
-    wheels_owner = wheels if wheels in attached else None
-    chest_owner = chest if chest in attached else None
-    for label, serial, owner in (
-        ("Jelly wheel bus", wheels, wheels_owner),
-        ("Chest bus", chest, chest_owner),
-    ):
-        if owner:
-            print(f"{label}: keeping configured adapter (serial {serial}).")
-        elif serial:
-            print(
-                f"{label}: configured adapter (serial {serial}) is not "
-                f"attached — an adapter probing as this bus will replace it."
+    configured = {
+        "wheels": _configured_named_serial(_CAN_B),
+        "chest": _configured_named_serial(_CAN_C),
+    }
+    exclude = {hub_serial} if hub_serial else set()
+    attached = sorted(_detect_single_serials(exclude))
+    detected: dict[str, str | None] = {}
+    if attached:
+        configured_note = (
+            ", including previously configured adapters"
+            if any(configured.values())
+            else ""
+        )
+        print(
+            f"Identifying {len(attached)} single-channel CAN adapter(s) by "
+            f"probing{configured_note} (wheel motors / jelly_legs board must "
+            "be powered)..."
+        )
+        for serial in attached:
+            detected[serial] = _identify_adapter(serial)
+
+    conflicting = configured["wheels"]
+    if conflicting and conflicting == configured["chest"]:
+        observed = detected.get(conflicting)
+        live_roles = {role for role in detected.values() if role is not None}
+        if observed is None and not live_roles:
+            _die(
+                f"Adapter {conflicting} is pinned as both the wheel and chest "
+                "buses, and no device answered to resolve the conflict. Power "
+                "the cart hardware or remove the conflicting CAN udev rule, "
+                "then re-run setup."
             )
 
-    exclude = {s for s in (hub_serial, wheels_owner, chest_owner) if s}
-    candidates = _detect_single_serials(exclude)
-    if not candidates:
-        return wheels, chest
+    response_labels = {
+        "wheels": f"Damiao wheel motors answered -> {_CAN_B}",
+        "chest": f"jelly_legs board answered -> {_CAN_C}",
+    }
 
-    print(
-        f"Identifying {len(candidates)} single-channel CAN adapter(s) by "
-        f"probing (wheel motors / jelly_legs board must be powered)..."
-    )
-    unidentified: list[str] = []
-    for serial in candidates:
-        role = _identify_adapter(serial)
-        if role == "wheels" and wheels_owner is None:
-            replaced = f" (replacing {wheels})" if wheels else ""
-            wheels = wheels_owner = serial
-            print(f"  {serial}: Damiao wheel motors answered -> {_CAN_B}{replaced}")
-        elif role == "chest" and chest_owner is None:
-            replaced = f" (replacing {chest})" if chest else ""
-            chest = chest_owner = serial
-            print(f"  {serial}: jelly_legs board answered -> {_CAN_C}{replaced}")
-        elif role is not None:
+    def detected_for(role: str) -> str | None:
+        matches = sorted(serial for serial, found in detected.items() if found == role)
+        if not matches:
+            return None
+        old_serial = configured[role]
+        selected = old_serial if old_serial in matches else matches[0]
+        print(f"  {selected}: {response_labels[role]}")
+        for serial in matches:
+            if serial != selected:
+                print(
+                    f"  {serial}: also identified as the {role} bus, but that "
+                    "role is already assigned — skipping."
+                )
+        return selected
+
+    assigned = {
+        "wheels": detected_for("wheels"),
+        "chest": detected_for("chest"),
+    }
+    source = {
+        role: ("detected" if serial else None) for role, serial in assigned.items()
+    }
+
+    # Keep old pins only when no live response contradicts them. A later
+    # operator choice may replace these unverified fallbacks.
+    for role, other_role, label in (
+        ("wheels", "chest", "Cart wheel bus"),
+        ("chest", "wheels", "Chest bus"),
+    ):
+        old_serial = configured[role]
+        if assigned[role] or not old_serial or old_serial == assigned[other_role]:
+            continue
+        observed = detected.get(old_serial) if old_serial in detected else None
+        if old_serial in detected and observed is not None:
+            continue
+        assigned[role] = old_serial
+        source[role] = "configured"
+        if old_serial in detected:
             print(
-                f"  {serial}: identified as the {role} bus, but an attached "
-                f"adapter already owns that bus — skipping."
+                f"  {label}: no identifying device answered; keeping "
+                f"configured adapter (serial {old_serial}) unverified."
             )
         else:
-            unidentified.append(serial)
+            print(
+                f"  {label}: configured adapter {old_serial} is not attached; "
+                "keeping its assignment for when it returns."
+            )
 
-    interactive = interactive and _stdin_is_tty()
+    unidentified = [
+        serial
+        for serial, role in sorted(detected.items())
+        if role is None and serial not in assigned.values()
+    ]
     for serial in unidentified:
         print(f"  {serial}: nothing answered on this adapter's bus.")
         if not interactive:
@@ -1024,12 +1153,24 @@ def _find_single_serials(
             .strip()
             .lower()
         )
-        if choice == "w" and wheels_owner is None:
-            wheels = wheels_owner = serial
-        elif choice == "c" and chest_owner is None:
-            chest = chest_owner = serial
-        elif choice in ("w", "c"):
+        selected_role = {"w": "wheels", "c": "chest"}.get(choice)
+        if selected_role is None:
+            continue
+        previous = assigned[selected_role]
+        if previous is not None and source[selected_role] != "configured":
             print("    That bus is already assigned — skipping.")
+            continue
+        if previous is not None:
+            print(
+                f"    Replacing unverified configured adapter {previous} with {serial}."
+            )
+        assigned[selected_role] = serial
+        source[selected_role] = "operator"
+
+    wheels = assigned["wheels"]
+    chest = assigned["chest"]
+    if wheels and wheels == chest:
+        _die(f"Adapter {wheels} cannot be assigned to both wheel and chest buses.")
     return wheels, chest
 
 
@@ -1074,7 +1215,9 @@ def run(_args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
     driver.ensure_driver()
     hub_serial = _find_serial()
-    wheels_serial, chest_serial = _find_single_serials(hub_serial)
+    wheels_serial, chest_serial = _find_single_serials(
+        hub_serial, interactive=_stdin_is_tty()
+    )
     if not (hub_serial or wheels_serial or chest_serial):
         _die(
             "No CAN adapters found or configured. Connect the arm hub, "
