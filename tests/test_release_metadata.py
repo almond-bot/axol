@@ -16,8 +16,8 @@ class ReleaseMetadataTest(unittest.TestCase):
             package for package in lock["package"] if package["name"] == "almond-axol"
         )
 
-        self.assertEqual(project["project"]["version"], "0.1.36")
-        self.assertEqual(locked_project["version"], "0.1.36")
+        self.assertEqual(project["project"]["version"], "0.1.37")
+        self.assertEqual(locked_project["version"], "0.1.37")
 
     def test_release_builds_pin_the_validated_backend(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -88,6 +88,7 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertNotIn("GH_TOKEN: ${{ github.token }}", workflow)
         self.assertIn('"refs/tags/release-v*"', updater)
         self.assertIn('"refs/tags/v*" "refs/tags/release-v*"', installer)
+        self.assertIn('is_hardened_release_tag "${LATEST_TAG}"', installer)
         self.assertIn("Never create or\npush another `vX.Y.Z` tag", release_guide)
         self.assertIn("Versions `v0.1.0` through `v0.1.2`", release_guide)
         self.assertIn("RULESET_AUDIT_TOKEN", release_guide)

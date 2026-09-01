@@ -87,13 +87,14 @@ _PYTHON_VERSION = "3.13"
 # so the release check falls back to this; git installs keep using their own
 # origin URL so forks still see their own releases.
 _REPO_URL = "https://github.com/almond-bot/axol"
-# New releases use ``release-v0.1.2``. Releases through v0.1.35 used the
+# New releases use ``release-v0.1.37``. Releases through v0.1.36 used the
 # legacy ``v0.1.2`` namespace, which the old destructive updater still polls.
 # Never publish another legacy-v tag: keeping all future releases under the
 # new namespace prevents an unmigrated old server (or cached old UI tab) from
 # invoking that updater. This updater accepts both namespaces so the first
 # hardened install can compare itself with the historical releases.
 _TAG_RE = re.compile(r"^(?:(?:release-)?v)?(\d+(?:\.\d+)*)$")
+_FIRST_HARDENED_RELEASE = (0, 1, 37)
 # Minimum seconds between read-only `git ls-remote` checks. The status endpoint
 # is polled, so without this every poll would spawn a git process; the check is
 # cheap and the indicator does not need to be more current than this.
@@ -800,6 +801,11 @@ class SelfUpdater:
             tag = parts[1][len("refs/tags/") :].removesuffix("^{}")
             version = parse_version(tag)
             if version is None:
+                continue
+            # Legacy tags remain visible as history, but a future numeric
+            # vX.Y.Z must never outrank the release-v namespace. Such a tag is
+            # exactly what unmigrated destructive updaters still watch.
+            if tag.startswith("v") and version >= _FIRST_HARDENED_RELEASE:
                 continue
             if best is None or version > best[0]:
                 best = (version, tag)

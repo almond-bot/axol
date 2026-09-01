@@ -66,7 +66,7 @@ When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to
 ### Staying up to date
 
 <Warning>
-  **One-time migration from v0.1.35 or earlier:** do not use that release's control-panel **Update** button. Its legacy updater cannot preserve the new tracker extra, a separately installed LeRobot plugin or Ultimate runtime, or a custom Jetson CUDA Torch build. Rerun the install command above instead; the hosted panel disables the unsafe button and shows the same command.
+  **One-time migration from v0.1.36 or earlier:** do not use that release's control-panel **Update** button. Its legacy updater cannot preserve the new tracker extra, a separately installed LeRobot plugin or Ultimate runtime, or a custom Jetson CUDA Torch build. Rerun the install command above instead; the hosted panel disables the unsafe button and shows the same command.
 </Warning>
 
 Installs track [GitHub releases](https://github.com/almond-bot/axol/releases), not individual commits. The server checks for a newer release in the background; when one exists, the control panel shows an update banner with the installed and latest versions (e.g. `v0.1.2 → v0.1.3`). Press **Update** to apply it — the server reinstalls at the new release tag, re-provisions, and restarts once idle. Nothing updates without that button press. Re-running the install command also upgrades to the latest release. On aarch64, either path checks for an existing CUDA/custom PyTorch only when the update is explicitly started and blocks before the force reinstall if it cannot preserve that deployment.

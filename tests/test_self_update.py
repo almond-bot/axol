@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -461,7 +462,7 @@ class InstallerUltimatePreservationTests(unittest.TestCase):
         self.assertIn('UV="${BIN_DIR}/uv"', installer)
         self.assertIn('"refs/tags/v*" "refs/tags/release-v*"', installer)
         self.assertIn("^(release-)?v", installer)
-        self.assertIn('MIN_SAFE_RELEASE_VERSION="0.1.36"', installer)
+        self.assertIn('MIN_SAFE_RELEASE_VERSION="0.1.37"', installer)
         self.assertLess(installer.index("OLDEST_VERSION="), pypi_check)
         self.assertIn("hardened migration release is not published yet", installer)
         self.assertIn('"uv ${UV_VERSION}"|"uv ${UV_VERSION} "*', installer)
@@ -487,6 +488,36 @@ class InstallerUltimatePreservationTests(unittest.TestCase):
         directory_sync = helper.index('sync -- "${parent}"')
         self.assertLess(payload_sync, atomic_replace)
         self.assertLess(atomic_replace, directory_sync)
+
+    def test_installer_accepts_only_hardened_release_tags(self) -> None:
+        installer = (
+            Path(__file__).resolve().parents[1] / "web" / "app" / "public" / "install"
+        ).read_text()
+        start = installer.index("is_hardened_release_tag() {")
+        end = installer.index("\n}\n", start) + len("\n}\n")
+        helper = installer[start:end]
+
+        for tag, accepted in (
+            ("release-v0.1.37", True),
+            ("release-v1.2.3", True),
+            ("v0.1.36", False),
+            ("v0.1.37", False),
+            ("release-v0.1.37rc1", False),
+        ):
+            with self.subTest(tag=tag):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        f'{helper}\nis_hardened_release_tag "$1"',
+                        "bash",
+                        tag,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode == 0, accepted)
 
         marker_commit = installer.index(
             "Could not durably arm the update restart guard"
@@ -697,6 +728,7 @@ class SelfUpdateSafetyBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 b"c refs/tags/release-v0.1.37^{}",
                 b"d refs/tags/release-v0.1.37",
                 b"e refs/tags/release-v0.1.37rc1",
+                b"f refs/tags/v0.1.99",
             )
         )
         create = AsyncMock(return_value=_Process(output=output))

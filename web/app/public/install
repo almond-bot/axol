@@ -23,7 +23,7 @@ REPO_URL="https://github.com/almond-bot/axol"
 EXTRAS="lerobot,sim,tracker"
 PYTHON_VERSION="3.13"
 UV_VERSION="0.12.3"
-MIN_SAFE_RELEASE_VERSION="0.1.36"
+MIN_SAFE_RELEASE_VERSION="0.1.37"
 BIN_DIR="/usr/local/bin"
 SERVICE_NAME="axol"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -185,9 +185,18 @@ systemd_environment_line() {
     printf 'Environment="%s=%s"' "${name}" "${value}"
 }
 
+# Only the release-v namespace is invisible to the destructive updater still
+# installed on legacy hosts. A numerically new vX.Y.Z tag is not a safe
+# migration release and must never be accepted merely because its version is
+# at or above the floor below.
+is_hardened_release_tag() {
+    local tag="${1:-}"
+    [[ "${tag}" =~ ^release-v[0-9]+(\.[0-9]+)*$ ]]
+}
+
 # -- release resolution ------------------------------------------------------
 
-# Releases through v0.1.35 used vX.Y.Z; hardened releases use
+# Releases through v0.1.36 used vX.Y.Z; hardened releases use
 # release-vX.Y.Z so the unsafe updater in an unmigrated old service never sees
 # a future tag. Resolve both namespaces here because this installer is the one
 # safe migration path.
@@ -203,6 +212,8 @@ LATEST_RELEASE="$(git ls-remote --tags "${REPO_URL}" \
 VERSION="${LATEST_RELEASE%% *}"
 LATEST_TAG="${LATEST_RELEASE#* }"
 say "Latest release: ${LATEST_TAG}."
+is_hardened_release_tag "${LATEST_TAG}" \
+    || die "The latest version is not a hardened release tag (need release-v${MIN_SAFE_RELEASE_VERSION} or newer, found ${LATEST_TAG}). The current Axol service and runtime were not changed."
 OLDEST_VERSION="$(printf '%s\n%s\n' "${MIN_SAFE_RELEASE_VERSION}" "${VERSION}" \
     | sort -V | head -n1)"
 [ "${OLDEST_VERSION}" = "${MIN_SAFE_RELEASE_VERSION}" ] \

@@ -4,7 +4,7 @@
  * Ultimate runtime, or the published LeRobot plugin while crossing into the
  * hardened installer layout.
  */
-export const FIRST_SAFE_SELF_UPDATE_VERSION = "0.1.36"
+export const FIRST_SAFE_SELF_UPDATE_VERSION = "0.1.37"
 
 function parseNumericVersion(version: string): number[] | null {
   const normalized = version.trim().replace(/^v/, "")

@@ -20,7 +20,7 @@
 #
 # The published almond-axol version is whatever `version` in pyproject.toml
 # says at the release tag — the release flow already bumps it per release.
-# SECURITY: releases after v0.1.35 must use `release-vX.Y.Z`, never the legacy
+# SECURITY: releases after v0.1.36 must use `release-vX.Y.Z`, never the legacy
 # `vX.Y.Z` namespace polled by the destructive updater on unmigrated hosts.
 # The hosted installer is the safe one-time migration into the new updater.
 # The plugin's version lives in plugins/lerobot_robot_axol/pyproject.toml and
@@ -98,7 +98,7 @@ jobs:
               --jq '.[] | select(.target == "tag" and .enforcement == "active") | .id'
           )
           if [ "${protected}" -ne 1 ]; then
-            echo "::error::An active tag ruleset must restrict creation of refs/tags/v* before publishing. Future releases use release-vX.Y.Z; an accidental legacy v-tag activates the unsafe updater on unmigrated <=0.1.35 hosts."
+            echo "::error::An active tag ruleset must restrict creation of refs/tags/v* before publishing. Future releases use release-vX.Y.Z; an accidental legacy v-tag activates the unsafe updater on unmigrated <=0.1.36 hosts."
             exit 1
           fi
       - name: Verify release tag matches the SDK version

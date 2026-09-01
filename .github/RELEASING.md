@@ -1,9 +1,13 @@
 # Release safety
 
-Axol releases after `v0.1.35` use tags named `release-vX.Y.Z`. Never create or
-push another `vX.Y.Z` tag: servers on `v0.1.3` through `v0.1.35` poll that
+Axol releases after `v0.1.36` use tags named `release-vX.Y.Z`. Never create or
+push another `vX.Y.Z` tag: servers on `v0.1.3` through `v0.1.36` poll that
 legacy namespace with an updater that cannot preserve the hosted tracker,
 plugin, Ultimate, or custom CUDA environment.
+
+`v0.1.36` was published in the legacy namespace before this migration landed,
+so treat it as a legacy release too. Do not delete, move, or recreate that tag;
+hosts on `0.1.36` or earlier must migrate through the installer below.
 
 Versions `v0.1.0` through `v0.1.2` are an earlier special case: their updater
 follows the repository's default branch and can run when an old UI reads
@@ -14,7 +18,7 @@ hosts. Current hosted UI probes `/api/update/status` first and will not touch
 the triggering endpoints when that route returns 404, but it cannot revoke an
 old tab that is already open.
 
-Before publishing `release-v0.1.36`, a repository or organization administrator
+Before publishing `release-v0.1.37`, a repository or organization administrator
 must create an active GitHub tag ruleset with all of these properties:
 
 - target tags matching `refs/tags/v*`;
@@ -46,7 +50,7 @@ Release checklist:
 5. Create a GitHub release tagged `release-vX.Y.Z` for that exact version.
 6. Wait for both PyPI publishes and web validation to pass. Customer
    notifications run only after both packages publish successfully.
-7. For `0.1.36`, call out the one-time installer migration in the release notes:
-   hosts on `0.1.35` or earlier must run
+7. For `0.1.37`, call out the one-time installer migration in the release notes:
+   hosts on `0.1.36` or earlier must run
    `curl https://axol.almond.bot/install -fsS | bash` instead of using the old
    control-panel Update button.
