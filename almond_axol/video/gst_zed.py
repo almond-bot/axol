@@ -52,7 +52,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from .constants import HEADSET_STREAM_FPS
-from .hw_video import _bitrate_for, dataset_vbr_bitrate, hw_h264_available
+from .hw_video import _bitrate_for, dataset_intra_vbr_bitrate, hw_h264_available
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -458,6 +458,139 @@ _DATASET_ENABLE_LEAD_S = 0.100
 # The shared gate still has a bounded acknowledgement wait. A timeout means a
 # source stopped producing exposure timestamps, not ordinary scheduler jitter.
 _DATASET_GATE_TIMEOUT_S = 2.0
+# Every camera source element carries this name so the source-gap diagnostic
+# can find its pad. A sensor-timestamp step of 1.5 periods at the fastest
+# supported capture rate (60 Hz) is already a whole missing exposure.
+_SOURCE_ELEMENT_NAME = "camsrc"
+_SOURCE_GAP_WARN_MS = 25.0
+_GPU_DEVFREQ_GLOB = "/sys/class/devfreq/*.gpu"
+# The Linux thread name (``comm``) is truncated to this many characters, so
+# gst task threads named ``<element>:<pad>`` may only be matched on a prefix.
+_COMM_MAX = 15
+# The named queues whose consumer thread still holds an *un-copied* camera
+# surface: the stereo eye crops and the dataset source queues in front of the
+# VIC copy. Argus owns only a handful of those surfaces, so these queues are
+# two buffers deep and an overrun there is a lost exposure; everything after
+# the VIC copy has its own (deeper) buffering.
+_EXPOSURE_CRITICAL_QUEUES = (
+    "eye_l_cropq",
+    "eye_r_cropq",
+    "dsenc_srcq",
+    "dsenc_l_srcq",
+    "dsenc_r_srcq",
+)
+
+
+def _task_thread_comm(element_name: str) -> str:
+    """The ``comm`` GStreamer gives the streaming thread of ``element_name``."""
+    return f"{element_name}:src"[:_COMM_MAX]
+
+
+def exposure_critical_thread_comms() -> frozenset[str]:
+    """``comm`` names of the relay threads that must run every capture period.
+
+    The camera source streaming thread plus the consumers of
+    :data:`_EXPOSURE_CRITICAL_QUEUES`. Used by the relay to give exactly this
+    chain real-time scheduling (see ``affinity.prioritize_capture_threads``).
+    """
+    return frozenset(
+        _task_thread_comm(name)
+        for name in (_SOURCE_ELEMENT_NAME, *_EXPOSURE_CRITICAL_QUEUES)
+    )
+
+
+def _thread_sched_wait_ns() -> int | None:
+    """Cumulative time this thread spent runnable-but-waiting (Linux only)."""
+    try:
+        with open("/proc/thread-self/schedstat") as f:
+            return int(f.read().split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _find_thread_by_comm(comm: str) -> int | None:
+    """TID of this process's thread named ``comm``, or ``None``."""
+    try:
+        entries = os.listdir("/proc/self/task")
+    except OSError:
+        return None
+    for entry in entries:
+        try:
+            with open(f"/proc/self/task/{entry}/comm") as f:
+                if f.read().strip() == comm:
+                    return int(entry)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _thread_sched_snapshot(tid: int) -> tuple[int, str, str] | None:
+    """``(runnable-wait ns, state letter, wchan)`` of a thread of this process.
+
+    ``state`` is ``R`` when the thread is runnable (running or waiting for a
+    CPU), ``S``/``D`` when it is blocked — for a VIC/NVENC dispatch thread that
+    means waiting on the hardware, and ``wchan`` names the kernel wait.
+    """
+    try:
+        with open(f"/proc/self/task/{tid}/schedstat") as f:
+            wait_ns = int(f.read().split()[1])
+        with open(f"/proc/self/task/{tid}/stat") as f:
+            state = f.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, ValueError, IndexError):
+        return None
+    try:
+        with open(f"/proc/self/task/{tid}/wchan") as f:
+            wchan = f.read().strip() or "-"
+    except OSError:
+        wchan = "-"
+    return wait_ns, state, wchan
+
+
+def _consumer_attribution(state: dict[str, Any], comm: str) -> str:
+    """Describe what a queue's consumer thread was doing at an overrun.
+
+    Sampled per overrun event (cheap: three procfs reads) and phrased so the
+    two causes read apart in the log: a consumer that is ``state=R`` with a CPU
+    wait close to the elapsed time was starved of a core; one that is
+    ``state=S``/``D`` in an ``nvhost``/fence wait with ~0 CPU wait was blocked
+    on the VIC/NVENC hardware or its memory path.
+    """
+    now = time.perf_counter()
+    tid = state.get("tid")
+    if tid is None:
+        tid = state["tid"] = _find_thread_by_comm(comm)
+        if tid is None:
+            return f"consumer {comm} not found"
+    snap = _thread_sched_snapshot(tid)
+    if snap is None:
+        state["tid"] = None
+        return f"consumer {comm} exited"
+    wait_ns, sched_state, wchan = snap
+    prev_t, prev_wait = state.get("t"), state.get("wait")
+    state["t"], state["wait"] = now, wait_ns
+    head = f"consumer {comm} state={sched_state} wchan={wchan}"
+    if prev_t is None or prev_wait is None or now - prev_t > 1.0:
+        return head
+    return (
+        f"{head}, CPU wait {(wait_ns - prev_wait) / 1e6:.1f}ms of the "
+        f"{(now - prev_t) * 1e3:.1f}ms since its previous overrun"
+    )
+
+
+def _gpu_clock_summary() -> str:
+    """``cur/max MHz`` of the Tegra GPU devfreq, or ``n/a`` off-Jetson."""
+    import glob
+
+    for node in glob.glob(_GPU_DEVFREQ_GLOB):
+        try:
+            with open(f"{node}/cur_freq") as f:
+                cur = int(f.read()) // 1_000_000
+            with open(f"{node}/max_freq") as f:
+                top = int(f.read()) // 1_000_000
+        except (OSError, ValueError):
+            continue
+        return f"{cur}/{top}MHz"
+    return "n/a"
 
 
 def _dataset_rate_limit(capture_fps: int, dataset_fps: int) -> str:
@@ -542,10 +675,12 @@ def _dataset_enc_shmsink(
     before the parent later closes the branch between episodes.
 
     Encoding runs in VBR with a peak cap so the recorded dataset stays bounded
-    and uniformly sized across cameras even when one sensor is very noisy (see
-    ``dataset_vbr_bitrate``).
+    and uniformly sized across cameras even when one sensor is very noisy. The
+    budget is the all-intra one (``dataset_intra_vbr_bitrate``): every frame is
+    an IDR here, so the predictive-GOP budget would leave each frame visibly
+    blocky.
     """
-    target, peak = dataset_vbr_bitrate(w, h, dataset_fps)
+    target, peak = dataset_intra_vbr_bitrate(w, h, dataset_fps)
     input_buffers = _dataset_active_input_buffers(dataset_fps)
     converter_buffers = input_buffers + _DATASET_VIC_INFLIGHT_SURFACES
     return (
@@ -772,6 +907,7 @@ class _GstPipelineBase:
                 _logger.debug("dataset queue diagnostic missing %s", queue_name)
                 continue
             self._dataset_queue_overruns.setdefault(queue_name, 0)
+            consumer_state: dict[str, Any] = {}
 
             def on_overrun(
                 element: Any,
@@ -779,6 +915,7 @@ class _GstPipelineBase:
                 label: str = queue_name,
                 branch_valve: Any = valve,
                 source: str = owner,
+                consumer: dict[str, Any] = consumer_state,
             ) -> None:
                 # Source/crop queues are live before an episode. An overrun
                 # counts only after this branch's valve admits its first
@@ -790,6 +927,10 @@ class _GstPipelineBase:
                     return
                 count = self._dataset_queue_overruns.get(label, 0) + 1
                 self._dataset_queue_overruns[label] = count
+                # Sample the consumer on every overrun so the wait delta spans
+                # exactly the interval between two overruns, but log only the
+                # first and powers of two.
+                attribution = _consumer_attribution(consumer, _task_thread_comm(label))
                 if count != 1 and count & (count - 1):
                     return
                 try:
@@ -799,12 +940,13 @@ class _GstPipelineBase:
                     level = limit = -1
                 _logger.warning(
                     "dataset relay %s queue %s overrun #%d "
-                    "(level=%d, limit=%d); an encoded exposure may be lost",
+                    "(level=%d, limit=%d); %s; an encoded exposure may be lost",
                     source,
                     label,
                     count,
                     level,
                     limit,
+                    attribution,
                 )
 
             try:
@@ -1183,6 +1325,66 @@ class _GstPipelineBase:
         self._gst = Gst
         _logger.info("gst zed pipeline: %s", pipeline_str)
         self._pipeline = Gst.parse_launch(pipeline_str)
+        self._attach_source_gap_diagnostic()
+
+    def _attach_source_gap_diagnostic(self) -> None:
+        """Log every exposure the camera source itself fails to deliver.
+
+        The dataset queues report their own overruns, and the recorder detects
+        a missing AU downstream, but neither can say *where* a frame vanished
+        when no queue overran: that leaves the source element (the ZED SDK's
+        grab loop) or the camera link. This probe sits on the source pad, so a
+        sensor-timestamp gap here is a frame the source never produced. It
+        also attributes the miss: the source's streaming thread cannot call
+        ``grab()`` while descheduled, so if its ``schedstat`` wait time grew by
+        most of the gap it was starved of CPU; otherwise the time went inside
+        the SDK (GPU work, or a link/sensor frame that never arrived), which is
+        why the GPU clock — the one camera-path engine ``jetson.setup`` does
+        not pin — is logged alongside.
+        """
+        Gst = self._gst
+        source = self._pipeline.get_by_name(_SOURCE_ELEMENT_NAME)
+        if source is None:
+            return
+        pad = source.get_static_pad("src")
+        if pad is None:
+            return
+        state: dict[str, Any] = {"pts": None, "wait_ns": None}
+        label = repr(self)
+
+        def on_buffer(_pad: Any, info: Any) -> Any:
+            buf = info.get_buffer()
+            if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
+                return Gst.PadProbeReturn.OK
+            previous = state["pts"]
+            previous_wait = state["wait_ns"]
+            wait_ns = _thread_sched_wait_ns()
+            state["pts"] = buf.pts
+            state["wait_ns"] = wait_ns
+            if previous is None or buf.pts <= previous:
+                return Gst.PadProbeReturn.OK
+            gap_ms = (buf.pts - previous) / 1e6
+            if gap_ms < _SOURCE_GAP_WARN_MS:
+                return Gst.PadProbeReturn.OK
+            starved_ms = (
+                (wait_ns - previous_wait) / 1e6
+                if wait_ns is not None and previous_wait is not None
+                else None
+            )
+            _logger.warning(
+                "camera source %s skipped exposure(s): sensor PTS gap %.2fms; "
+                "source thread CPU wait since previous frame %s; gpu %s",
+                label,
+                gap_ms,
+                "unknown" if starved_ms is None else f"{starved_ms:.2f}ms",
+                _gpu_clock_summary(),
+            )
+            return Gst.PadProbeReturn.OK
+
+        try:
+            pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+        except Exception as exc:  # diagnostics never gate capture
+            _logger.debug("could not attach source gap diagnostic: %s", exc)
 
     def _play_and_wait(self, channels: tuple[_AUChannel, ...]) -> bool:
         Gst = self._gst
@@ -1294,7 +1496,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
     def _pipeline_str(self) -> str:
         bitrate = _bitrate_for(self.width, self.height, self.stream_fps)
         src = (
-            f"zedxonesrc camera-sn={self.serial} "
+            f"zedxonesrc name={_SOURCE_ELEMENT_NAME} camera-sn={self.serial} "
             f"camera-resolution={_RESOLUTION_ENUM[self.resolution]} "
             f"camera-fps={self.fps} stream-type=1 do-timestamp=false "
             f"ctrl-auto-exposure-range-max={_MAX_AUTO_EXPOSURE_US} "
@@ -1787,7 +1989,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
 
     def _pipeline_str(self) -> str:
         src = (
-            f"zedsrc camera-sn={self.serial} "
+            f"zedsrc name={_SOURCE_ELEMENT_NAME} camera-sn={self.serial} "
             f"camera-resolution={_STEREO_RESOLUTION_ENUM[self.resolution]} "
             f"camera-fps={self.fps} stream-type=7 depth-mode=0 "
             "do-timestamp=false "
