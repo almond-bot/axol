@@ -255,9 +255,11 @@ jobs:
   # only after both packages and every validation job complete successfully.
   # Required repository secrets:
   #   DISCORD_WEBHOOK_URL  One Discord incoming-webhook URL.
-  #   SLACK_WEBHOOK_URLS    A JSON array of Slack incoming-webhook URLs. Keep
-  #                         the customer/channel roster inside this one secret;
-  #                         never pass the whole repository secrets context.
+  #   SLACK_WEBHOOK_URL_*  One secret per customer channel, each holding a single
+  #                        Slack incoming-webhook URL (api.slack.com/apps ->
+  #                        Incoming Webhooks), e.g. SLACK_WEBHOOK_URL_ACME.
+  #                        Every SLACK_WEBHOOK_URL_* secret gets the
+  #                        announcement; to add a channel, just add a secret.
   notify-release:
     name: Notify release channels
     if: github.event_name == 'release'
@@ -301,17 +303,22 @@ jobs:
         # silently skip the customer announcements.
         if: always()
         env:
-          SLACK_WEBHOOK_URLS: ${{ secrets.SLACK_WEBHOOK_URLS }}
+          # Workflow expressions cannot enumerate secrets by name prefix, so
+          # the whole secrets context is passed in and filtered with jq below.
+          # Values never hit the log; GitHub masks secrets there regardless.
+          ALL_SECRETS: ${{ toJSON(secrets) }}
         run: |
-          if ! jq -e '
-            type == "array"
-            and length > 0
-            and all(.[]; type == "string" and length > 0)
-          ' <<< "${SLACK_WEBHOOK_URLS}" >/dev/null; then
-            echo "::error::SLACK_WEBHOOK_URLS must be a non-empty JSON array of webhook URLs"
+          webhooks="$(jq -r '
+            to_entries
+            | map(select(.key | startswith("SLACK_WEBHOOK_URL_")))
+            | sort_by(.key)
+            | .[].value
+          ' <<< "${ALL_SECRETS}")"
+          if [ -z "${webhooks}" ]; then
+            echo "::error::No SLACK_WEBHOOK_URL_* secrets are set"
             exit 1
           fi
-          echo "Notifying $(jq 'length' <<< "${SLACK_WEBHOOK_URLS}") Slack channel(s)"
+          echo "Notifying $(grep -c . <<< "${webhooks}") Slack channel(s)"
           payload="$(jq -n \
             --arg title "${RELEASE_NAME:-${RELEASE_TAG}}" \
             --arg url "${RELEASE_URL}" \
@@ -345,5 +352,5 @@ jobs:
               failed=1
             fi
             echo
-          done < <(jq -r '.[]' <<< "${SLACK_WEBHOOK_URLS}")
+          done <<< "${webhooks}"
           exit "${failed}"

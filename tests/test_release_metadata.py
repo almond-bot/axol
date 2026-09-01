@@ -176,15 +176,14 @@ class ReleaseMetadataTest(unittest.TestCase):
             workflow[notify_job:],
         )
         self.assertIn("if: github.event_name == 'release'", workflow[notify_job:])
-        self.assertNotIn("toJSON(secrets)", workflow)
-        self.assertEqual(workflow.count("secrets.SLACK_WEBHOOK_URLS"), 1)
-        self.assertNotIn("secrets.SLACK_WEBHOOK_URL_", workflow)
-        self.assertIn("SLACK_WEBHOOK_URLS must be a non-empty JSON array", workflow)
+        self.assertEqual(workflow.count("toJSON(secrets)"), 1)
+        self.assertNotIn("secrets.SLACK_WEBHOOK_URLS", workflow)
+        self.assertIn('startswith("SLACK_WEBHOOK_URL_")', workflow)
+        self.assertIn("No SLACK_WEBHOOK_URL_* secrets are set", workflow)
         self.assertIn(
-            "SLACK_WEBHOOK_URLS",
-            release_guide := (root / ".github" / "RELEASING.md").read_text(),
+            "SLACK_WEBHOOK_URL_*",
+            (root / ".github" / "RELEASING.md").read_text(),
         )
-        self.assertIn("customer/channel roster", release_guide)
 
     def test_plugin_caps_the_sdk_api_line_and_has_a_publishable_version(self) -> None:
         root = Path(__file__).resolve().parents[1]

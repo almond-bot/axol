@@ -49,10 +49,9 @@ Every item is required. Record the tested commit, artifact hashes, canary host,
 and smoke/drill results in the release issue before publishing.
 
 1. Complete the `v0.1.0`-`v0.1.2` fleet/cached-panel check above.
-2. Create the `SLACK_WEBHOOK_URLS` Actions secret as a JSON array containing
-   the values of the existing per-channel Slack webhook secrets, then remove
-   those individually named secrets after the aggregate secret is verified.
-   This keeps the customer/channel roster out of the public workflow.
+2. Confirm the `DISCORD_WEBHOOK_URL` secret and one `SLACK_WEBHOOK_URL_*`
+   Actions secret per customer channel exist. The notification job announces to
+   every `SLACK_WEBHOOK_URL_*` secret; add a channel by adding a secret.
 3. Merge only after the pull-request validation jobs pass.
 4. Bump `pyproject.toml` and `uv.lock` to the same version.
 5. From the exact candidate commit, build both distributions, run `twine check`,
