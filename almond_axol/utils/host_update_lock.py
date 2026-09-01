@@ -6,6 +6,7 @@ import contextlib
 import fcntl
 import os
 import stat
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -118,3 +119,29 @@ def host_update_lock() -> Iterator[None]:
     finally:
         if owned_fd is not None:
             os.close(owned_fd)
+
+
+HOLDER_READY = "locked"
+
+
+def hold_until_stdin_closes() -> int:
+    """Own the lock for an unprivileged parent until it closes our stdin.
+
+    ``axol provision`` run from a terminal as an operator keeps its steps in
+    the operator's context (their ``uv``, caches, and venv) and escalates only
+    this holder with ``sudo``. The parent waits for :data:`HOLDER_READY` on
+    stdout before mutating the host and releases the lock by closing the pipe,
+    which also happens automatically if the parent dies.
+    """
+    try:
+        with host_update_lock():
+            print(HOLDER_READY, flush=True)
+            sys.stdin.buffer.read()
+    except HostUpdateLockError as exc:
+        print(f"Axol provisioning could not start: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(hold_until_stdin_closes())

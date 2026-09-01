@@ -35,18 +35,22 @@ tweak owned by the systemd ``ExecStartPre``, not an install step.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
-import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from ..robot import gyro
 from ..utils import adb
-from ..utils.host_update_lock import HostUpdateLockError, host_update_lock
+from ..utils.host_update_lock import (
+    HOLDER_READY,
+    HostUpdateLockError,
+    host_update_lock,
+)
 from ..utils.sudo import prime_sudo, run_root
 from . import tracker_install
 from .gst import build_zed as gst_build_zed
@@ -198,36 +202,46 @@ def _step(label: str, fn: Callable[[], object]) -> bool:
     return True
 
 
-def _root_command() -> list[str]:
-    """The same interpreter and CLI arguments, re-invoked as root."""
-    return [sys.executable, "-m", "almond_axol", *sys.argv[1:]]
+_HOLDER_COMMAND = [sys.executable, "-m", "almond_axol.utils.host_update_lock"]
 
 
-def _reexec_as_root() -> None:
-    """Escalate the whole command so it can own the host update lock.
+@contextlib.contextmanager
+def _sudo_held_update_lock() -> Iterator[None]:
+    """Own the root-only host update lock from an operator's terminal run.
 
-    The lock lives in a root-only state directory, and the hosted installer /
-    managed ``axol serve`` already run as root. A developer or operator running
-    this from a source checkout gets the usual one-time ``sudo`` prompt instead
-    of a traceback, and the child keeps this exact interpreter so it provisions
-    the same environment.
+    The hosted installer and the managed ``axol serve`` are root and take the
+    lock directly. From a source checkout the steps must keep running as the
+    operator — their ``uv``, download caches, and venv — so only a small
+    holder process escalates. It prints a ready line once it owns the lock and
+    releases it when this process closes the pipe (or exits).
     """
-    command = _root_command()
     if not prime_sudo():
-        raise SystemExit(
-            "Axol provisioning requires root. Rerun as:\n  sudo " + shlex.join(command)
+        raise HostUpdateLockError(
+            "the host update lock needs sudo; rerun from a terminal that can "
+            "authorize it, or as root"
         )
-    result = subprocess.run(["sudo", *command], check=False)
-    raise SystemExit(result.returncode)
+    holder = subprocess.Popen(
+        ["sudo", "-n", *_HOLDER_COMMAND],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdin is not None and holder.stdout is not None
+    try:
+        ready = holder.stdout.readline().strip()
+        if ready != HOLDER_READY:
+            raise HostUpdateLockError("the lock holder did not start")
+        yield
+    finally:
+        holder.stdin.close()
+        holder.wait()
 
 
 def run(_args: object = None) -> None:
     """Run every provisioning step in order; each self-gates and is idempotent."""
-    if os.geteuid() != 0:
-        _reexec_as_root()
-        return
+    lock = host_update_lock if os.geteuid() == 0 else _sudo_held_update_lock
     try:
-        with host_update_lock():
+        with lock():
             _run_locked()
     except HostUpdateLockError as exc:
         raise SystemExit(f"Axol provisioning could not start: {exc}") from exc

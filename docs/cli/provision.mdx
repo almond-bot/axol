@@ -19,7 +19,7 @@ axol provision
 
 Both the hosted installer and the [`axol serve`](/cli/serve) self-updater run **this** command, so the set of steps lives in exactly one place and can't drift between them. Every step is idempotent and best-effort — each self-gates on the ZED SDK / `apt` / NVENC and no-ops when unavailable — so `axol provision` is safe to run on any host and re-run anytime.
 
-Provisioning holds the host-wide update lock, which is root-only. When run from a terminal as a regular user, the command re-runs itself under `sudo` with the same Python interpreter (one password prompt); without a usable `sudo` it exits with the exact command to run instead of a traceback.
+Provisioning holds the host-wide update lock, which is root-only. Run from a terminal as a regular user, the steps still execute as that user (their `uv`, download caches, and Python environment) and only a small lock-holder process escalates via `sudo` (one password prompt, shared with the steps that need root). Without a usable `sudo` the command exits with a message instead of a traceback.
 
 <Note>
   `provision` does **not** pin the Jetson clocks — that's [`jetson.setup`](/cli/jetson-setup), a per-boot runtime tweak owned by the systemd `ExecStartPre`, not an install step.

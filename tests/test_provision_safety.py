@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from almond_axol.cli import provision
 
@@ -245,37 +245,64 @@ class ProvisionSafetyTest(unittest.TestCase):
 
 
 class ProvisionEscalationTest(unittest.TestCase):
-    def test_non_root_reexecs_same_interpreter_under_sudo(self) -> None:
+    def _holder(self, ready: str) -> Mock:
+        holder = Mock()
+        holder.stdout.readline.return_value = ready
+        return holder
+
+    def test_operator_run_keeps_steps_unprivileged_behind_a_sudo_lock(self) -> None:
+        events: list[str] = []
+        holder = self._holder("locked\n")
+        holder.stdin.close.side_effect = lambda: events.append("released")
         with (
             patch.object(provision.os, "geteuid", return_value=1000),
-            patch.object(provision.sys, "argv", ["/venv/bin/axol", "provision"]),
             patch.object(provision, "prime_sudo", return_value=True),
+            patch.object(provision.subprocess, "Popen", return_value=holder) as popen,
+            patch.object(provision, "host_update_lock") as direct_lock,
             patch.object(
-                provision.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 3),
-            ) as run,
-            patch.object(provision, "host_update_lock") as lock,
-            self.assertRaises(SystemExit) as raised,
+                provision, "_run_locked", side_effect=lambda: events.append("steps")
+            ),
         ):
             provision.run()
 
-        self.assertEqual(raised.exception.code, 3)
+        self.assertEqual(events, ["steps", "released"])
         self.assertEqual(
-            run.call_args.args[0],
-            ["sudo", provision.sys.executable, "-m", "almond_axol", "provision"],
+            popen.call_args.args[0],
+            [
+                "sudo",
+                "-n",
+                provision.sys.executable,
+                "-m",
+                "almond_axol.utils.host_update_lock",
+            ],
         )
-        lock.assert_not_called()
+        holder.wait.assert_called_once_with()
+        direct_lock.assert_not_called()
 
-    def test_non_root_without_sudo_explains_instead_of_tracebacking(self) -> None:
+    def test_holder_failure_stops_before_any_step(self) -> None:
+        holder = self._holder("")
+        with (
+            patch.object(provision.os, "geteuid", return_value=1000),
+            patch.object(provision, "prime_sudo", return_value=True),
+            patch.object(provision.subprocess, "Popen", return_value=holder),
+            patch.object(provision, "_run_locked") as locked,
+            self.assertRaisesRegex(SystemExit, "lock holder did not start"),
+        ):
+            provision.run()
+        locked.assert_not_called()
+        holder.stdin.close.assert_called_once_with()
+
+    def test_operator_without_sudo_gets_a_message_not_a_traceback(self) -> None:
         with (
             patch.object(provision.os, "geteuid", return_value=1000),
             patch.object(provision, "prime_sudo", return_value=False),
-            patch.object(provision.subprocess, "run") as run,
-            self.assertRaisesRegex(SystemExit, r"requires root[\s\S]*sudo "),
+            patch.object(provision.subprocess, "Popen") as popen,
+            patch.object(provision, "_run_locked") as locked,
+            self.assertRaisesRegex(SystemExit, "needs sudo"),
         ):
             provision.run()
-        run.assert_not_called()
+        popen.assert_not_called()
+        locked.assert_not_called()
 
     def test_lock_contention_is_reported_without_a_traceback(self) -> None:
         with (
