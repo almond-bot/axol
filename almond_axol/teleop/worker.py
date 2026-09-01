@@ -739,9 +739,9 @@ class IKWorker:
         # absorbed into the per-side engage offsets below).
         fk_l_anchor, fk_r_anchor = fk_l[0], fk_r[0]
 
-        # URDF base frame: +x = left, +y = forward, +z = up. Base up aligns
+        # URDF base frame is FLU: +x = forward, +y = left, +z = up. Base up aligns
         # with world up; the yaw is set so the base-frame anchor-separation
-        # direction (projected horizontal — pure ±x for the gripper origins)
+        # direction (projected horizontal — along ±y for the gripper origins)
         # maps onto the measured right→left direction.
         d = l_pos - r_pos
         d_h = d - np.dot(d, _VR_UP) * _VR_UP

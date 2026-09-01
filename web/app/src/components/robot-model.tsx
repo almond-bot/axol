@@ -9,41 +9,6 @@ const VR_WS_PORT = 8000
 const INITIAL_RETRY_MS = 3000
 const MAX_RETRY_MS = 30_000
 
-// The CAD-exported URDF references 53,413,444 bytes of unique STL files and
-// instantiates 2,060,598 triangles. Nearly all of that is fixed camera detail,
-// connectors, and fasteners that do not help an operator judge arm alignment.
-// Keep the base, articulated arm shells, wrists, and gripper body; together
-// they are 1,727,096 bytes / 49,570 instantiated triangles. The four animated
-// 114k-triangle finger-tip meshes are represented by boxes below (+48 tris).
-const OVERLAY_MESHES = new Set([
-  "Base.stl",
-  "Part_1.stl",
-  "S1.stl",
-  "Left_S2.stl",
-  "Left_S3.stl",
-  "Left_E1.stl",
-  "Left_E2.stl",
-  "Left_W0.stl",
-  "Left_W1.stl",
-  "Left_W2.stl",
-  "Right_S2.stl",
-  "Right_S3.stl",
-  "Right_E1.stl",
-  "Right_E2.stl",
-  "Right_W0.stl",
-  "Right_W1.stl",
-  "Right_W2.stl",
-  "Wrist_Mount.stl",
-  "Gripper_Base.stl",
-])
-
-const GRIPPER_TIP_MESH = "Gripper_Tip.stl"
-const GRIPPER_TIP_SIZE: [number, number, number] = [0.0721, 0.0958, 0.068]
-// BoxGeometry must carry the source STL's local vertex offset in its geometry:
-// URDFLoader intentionally resets a returned object's position to zero before
-// attaching it beneath the visual origin.
-const GRIPPER_TIP_CENTER: [number, number, number] = [-0.0123, -0.2095, 0.1641]
-
 // Overlay translucency: the operator must see the physical device *through*
 // the virtual robot to judge alignment.
 const OVERLAY_OPACITY = 0.55
@@ -110,32 +75,6 @@ function applyOverlayMaterials(root: THREE.Object3D) {
   for (const material of replaced) disposeMaterial(material)
 }
 
-/**
- * Retain the complete URDF link/joint tree while loading only geometry useful
- * for headset alignment. Empty groups preserve every fixed link transform;
- * the lightweight finger boxes remain children of the original prismatic
- * joints, so live gripper animation is unchanged.
- */
-function configureLightweightOverlayMeshes(loader: URDFLoader) {
-  const loadMesh = loader.defaultMeshLoader.bind(loader)
-  loader.loadMeshCb = (path, manager, material, done) => {
-    const filename = path.slice(path.lastIndexOf("/") + 1).split(/[?#]/, 1)[0]
-    if (filename === GRIPPER_TIP_MESH) {
-      const geometry = new THREE.BoxGeometry(...GRIPPER_TIP_SIZE)
-      geometry.translate(...GRIPPER_TIP_CENTER)
-      // urdf-loader's declaration resolves a second copy of Three's augmented
-      // Object3D type in this workspace; the runtime objects are identical.
-      done(new THREE.Mesh(geometry, material) as unknown as Parameters<typeof done>[0])
-      return
-    }
-    if (!OVERLAY_MESHES.has(filename)) {
-      done(new THREE.Group() as unknown as Parameters<typeof done>[0])
-      return
-    }
-    loadMesh(path, manager, material, done)
-  }
-}
-
 const _targetPos = new THREE.Vector3()
 const _targetQuat = new THREE.Quaternion()
 
@@ -144,10 +83,10 @@ const _targetQuat = new THREE.Quaternion()
  *
  * Fetches the robot URDF + meshes from the connected teleop server
  * (`https://host:8000/urdf/`) and renders it in the passthrough scene at the
- * base transform the server calibrated at engage, with arm joints and gripper
- * fingers driven by the live `urdf_state` stream (`useAxolUrdfState`). Hidden
- * until the first engage (the server sends `base: null` before calibration),
- * and while an external tracker world has not been registered to the viewer.
+ * base transform the server calibrated at engage, with arm joints driven by
+ * the live `urdf_state` stream (`useAxolUrdfState`). Hidden until the first
+ * engage (the server sends `base: null` before calibration), and while an
+ * external tracker world has not been registered to the viewer.
  *
  * This is the hardware↔URDF alignment check: at engage the virtual grippers
  * should coincide with the physical devices, and stay on them as you move —
@@ -163,10 +102,9 @@ export function RobotModel({
 }) {
   const urdfStateRef = useAxolUrdfState(wsRef)
   const [robot, setRobot] = useState<URDFRobot | null>(null)
-  // The source CAD model references roughly 52 MiB of meshes (the lightweight
-  // loader below requests only ~1.7 MiB). An ordinary Axol session never
-  // publishes urdf_state, so wait for the server to prove this is an
-  // overlay-capable Mantis session before starting even that download.
+  // An ordinary Axol session never publishes urdf_state, so wait for the
+  // server to prove this is an overlay-capable Mantis session before fetching
+  // the robot model.
   const [overlayRequested, setOverlayRequested] = useState(false)
   const overlayRequestedRef = useRef(false)
   const liveRobotRef = useRef<URDFRobot | null>(null)
@@ -233,11 +171,9 @@ export function RobotModel({
       const loader = new URDFLoader(manager)
       loader.fetchOptions = { signal: activeUrdfRequest.signal }
       loader.parseCollision = false
-      configureLightweightOverlayMeshes(loader)
-      // The URDF references meshes as package://axol_kit/meshes/<name>.stl
-      // (package://assembly/... in older exports); the server exposes the
-      // whole urdf directory at /urdf either way.
-      loader.packages = { axol_kit: `${origin}/urdf`, assembly: `${origin}/urdf` }
+      // The longstanding URDF uses package://assembly/meshes/<name>.stl; the
+      // server exposes the whole URDF directory at /urdf.
+      loader.packages = { assembly: `${origin}/urdf` }
       loader.load(
         `${origin}/urdf/axol.urdf`,
         (r) => {

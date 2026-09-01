@@ -160,10 +160,10 @@ class KinematicsConfig:
 
 # Solver values the Mantis profile forces (see
 # :func:`apply_mantis_kinematics_profile`). Tuned with ``scripts/mantis_ik_bench.py``
-# against the feasibility floor of a near-unconstrained solve: within the
-# reachable workspace this tracks the hand with ~2 mm mean / <6 mm p95 excess
-# jaw-tip error over that floor, with no null-space drift while the hand is
-# still and a per-tick solve that fits a 30 Hz collection tick on the Jetson.
+# against a convergence floor that preserves the same collision and joint-limit
+# objective: the shipping step/iteration bounds stay within 6 mm p95 jaw-tip
+# error of that floor, with no null-space drift while the hand is still and a
+# per-tick solve that fits a 30 Hz collection tick on the Jetson.
 #
 # Rationale per field:
 #   pos/ori weight   Raised ~4x/12x over the arm defaults so the pose target
@@ -174,11 +174,12 @@ class KinematicsConfig:
 #   manipulability   Off: it biases q away from the exact pose solution at
 #                    every tick (~7 mm at rest). Protecting a physical arm
 #                    from singular configs doesn't apply to a virtual one.
-#   collision margin The 10 cm default is already active at the folded rest
-#                    pose, shoving targets ~9 mm off; 2 cm still separates
-#                    the capsules while freeing exact tracking. The virtual
-#                    arms must stay collision-free (recorded joints replay on
-#                    the real robot), only the standoff shrinks.
+#   collision margin The classic URDF's conservative PCA capsules are already
+#                    near or slightly overlapping at known-safe folded poses.
+#                    Reducing the default 2.5 cm activation distance to 2 cm
+#                    trims that artificial standoff while retaining the full
+#                    collision penalty. Recorded joints replay on the real
+#                    robot, so the collision weight is deliberately unchanged.
 #   max_joint_delta  ~1.4x the fastest bench hand motion so tracking never
 #                    saturates the per-tick clamp; still bounded so a bad
 #                    frame can't teleport the solution.

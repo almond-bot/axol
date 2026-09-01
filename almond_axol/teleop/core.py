@@ -1207,11 +1207,9 @@ class VRTeleopCore:
 
         Only meaningful in absolute (Mantis) mode: the message carries the
         engage-calibrated base transform in VR world coords plus the current
-        IK joint solution keyed by URDF joint name (arm joints + the actuated
-        gripper finger joints from the live trigger values), so the web client
-        can render the virtual robot exactly where the calibration placed it.
-        The client hides the robot while ``base`` is null (before the first
-        engage).
+        IK arm solution keyed by URDF joint name, so the web client can render
+        the virtual robot exactly where the calibration placed it. The client
+        hides the robot while ``base`` is null (before the first engage).
         """
         if self._broadcast_json is None or self.q is None:
             return
@@ -1220,11 +1218,7 @@ class VRTeleopCore:
             return
         self._last_urdf_broadcast = now
 
-        from ..constants import (
-            GRIPPER_URDF_OPEN,
-            urdf_arm_joint_names,
-            urdf_gripper_joint_name,
-        )
+        from ..constants import urdf_arm_joint_names
 
         if self._urdf_joint_names is None:
             self._urdf_joint_names = urdf_arm_joint_names(
@@ -1234,11 +1228,6 @@ class VRTeleopCore:
         joints = {
             name: float(self.q[qi]) for name, qi in zip(self._urdf_joint_names, indices)
         }
-        # Animate the gripper fingers from the live trigger values: the grip
-        # scalar is [0 = closed, 1 = open]; the URDF finger joint is prismatic
-        # [0 = closed, GRIPPER_URDF_OPEN = open] and its opposing finger mimics.
-        joints[urdf_gripper_joint_name(is_left=True)] = self.l_grip * GRIPPER_URDF_OPEN
-        joints[urdf_gripper_joint_name(is_left=False)] = self.r_grip * GRIPPER_URDF_OPEN
         self._broadcast_json(
             {
                 "type": "urdf_state",

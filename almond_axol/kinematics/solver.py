@@ -594,20 +594,16 @@ class KinematicsSolver:
     # -- Joint-order conversion ----------------------------------------------
 
     def to_pyroki_order(self, q: np.ndarray) -> np.ndarray:
-        """Expand a public joint vector into the order ``self.robot`` uses.
+        """Reorder a public joint vector into the order ``self.robot`` uses.
 
         Only needed when driving the pyroki ``self.robot`` /
         ``self.robot_coll`` objects directly (their joint limits, forward
         kinematics, and collision pairs are indexed in pyroki's own actuated
         order); every method on this class converts internally.
 
-        The URDF may actuate joints beyond the two arms (the gripper finger
-        joints in the axol_kit export) — those are not part of the public
-        vector (teleop drives the fingers from the trigger values, not IK)
-        and are held at zero here.
         """
         q = np.asarray(q, dtype=np.float32)
-        out = np.zeros(self.robot.joints.num_actuated_joints, dtype=np.float32)
+        out = np.empty_like(q)
         out[self._pyroki_index] = q
         return out
 

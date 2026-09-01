@@ -7,12 +7,17 @@ measures what the dataset would contain: the residual between the solved
 joints' FK and where the physical hand-held gripper actually was.
 
 The primary metric is the JAW-TIP position error (position error plus the
-orientation error leveraged through the 14.7 cm tip protrusion), because the
+orientation error leveraged through the 14.5 cm tip protrusion), because the
 fingertips are what interact with the scene — a dataset is replayable on the
 robot only if FK(recorded joints) puts the tips where the camera saw them.
 
+This is a tracking/convergence gate. It preserves the production collision
+objective in its reference solve, but does not measure physical clearance or
+replace on-robot collision validation.
+
 Run:
-    uv run python scripts/mantis_ik_bench.py --configs default balanced
+    uv run python scripts/mantis_ik_bench.py --configs oracle_mantis mantis
+    uv run python scripts/mantis_ik_bench.py --configs default balanced  # diagnostics
     uv run python scripts/mantis_ik_bench.py --list
 """
 
@@ -36,6 +41,7 @@ for _var in (
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import logging
 import math
@@ -44,7 +50,7 @@ from pathlib import Path
 
 import numpy as np
 
-from almond_axol.constants import GRIPPER_TIP_IN_GRIPPER_FRAME
+from almond_axol.constants import GRIPPER_TIP_OFFSET, URDF_PATH
 from almond_axol.kinematics.config import (
     KinematicsConfig,
     apply_mantis_kinematics_profile,
@@ -55,7 +61,24 @@ from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
 
 logging.basicConfig(level=logging.WARNING)
 
-_TIP = np.asarray(GRIPPER_TIP_IN_GRIPPER_FRAME, dtype=np.float64)
+_TIP = np.asarray(GRIPPER_TIP_OFFSET, dtype=np.float64)
+_BENCHMARK_SCHEMA = 1
+
+
+def _model_sha256() -> str:
+    """Hash the URDF and meshes because both affect FK/collision results."""
+    digest = hashlib.sha256()
+    model_root = URDF_PATH.parent
+    for path in sorted(
+        candidate for candidate in model_root.rglob("*") if candidate.is_file()
+    ):
+        digest.update(path.relative_to(model_root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+_MODEL_SHA256 = _model_sha256()
 
 # Engage pose: operator standing at the origin of a WebXR local-floor space
 # (+x right, +y up, -z forward), hands at a comfortable start pose.
@@ -76,6 +99,15 @@ def _mantis_cfg() -> KinematicsConfig:
     cfg = KinematicsConfig()
     apply_mantis_kinematics_profile(cfg)
     return cfg
+
+
+def _mantis_oracle_cfg() -> KinematicsConfig:
+    """Convergence floor with the exact shipping Mantis objective intact."""
+    return dataclasses.replace(
+        _mantis_cfg(),
+        max_joint_delta=10.0,
+        max_iterations=64,
+    )
 
 
 PRESETS: dict[str, KinematicsConfig] = {
@@ -99,22 +131,16 @@ PRESETS: dict[str, KinematicsConfig] = {
     ),
     # The shipped Mantis profile (kinematics/config.py) — what --mantis runs.
     "mantis": _mantis_cfg(),
-    # Oracle counterpart with the same margin, for a fair floor.
-    "oracle_mantis": _cfg(
-        pos_weight=1000.0,
-        ori_weight=300.0,
-        rest_weight=1.0,
-        posture_weight=0.0,
-        manipulability_weight=0.0,
-        self_collision_margin=0.02,
-        max_joint_delta=10.0,
-        max_iterations=64,
-        cost_tolerance=1e-4,
-    ),
-    # Feasibility-floor solver: tracks the target as tightly as the hard
-    # constraints (joint limits, self-collision) allow. rest_weight=1 keeps
-    # the normal equations damped (near-zero regularization destabilises the
-    # solve — see the aggressive_fail preset). Not deployable (slow).
+    # Convergence counterpart with the exact shipping objective. Only the
+    # per-tick step bound and iteration count are relaxed. Raising the oracle's
+    # pose weights without raising its collision weight let it push much farther
+    # through the torso capsules and made a less conservative solution look
+    # feasible.
+    "oracle_mantis": _mantis_oracle_cfg(),
+    # Aggressive task-priority diagnostic. Unlike oracle_mantis this does not
+    # preserve the shipping pose/collision weight ratios, so it is neither a
+    # safety-matched floor nor production-scored. rest_weight=1 keeps the
+    # normal equations damped (near-zero regularization destabilises the solve).
     "oracle": _cfg(
         pos_weight=1000.0,
         ori_weight=300.0,
@@ -126,6 +152,22 @@ PRESETS: dict[str, KinematicsConfig] = {
         cost_tolerance=1e-4,
     ),
 }
+
+
+def _schedule_configs(
+    todo: dict[str, KinematicsConfig],
+) -> dict[str, KinematicsConfig]:
+    """Put a fresh reference first whenever production is benchmarked."""
+    scheduled = dict(todo)
+    reference = scheduled.pop("oracle_mantis", None)
+    if "mantis" in scheduled:
+        return {
+            "oracle_mantis": reference or PRESETS["oracle_mantis"],
+            **scheduled,
+        }
+    if reference is not None:
+        return {"oracle_mantis": reference, **scheduled}
+    return scheduled
 
 
 # ---------------------------------------------------------------------------
@@ -186,11 +228,11 @@ def _segments_to_stream(
 def make_trajectories(fps: float) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """Named (T,3) displacement / (T,3,3) rotation streams (VR world frame).
 
-    Amplitudes are sized to the Axol's workspace (gripper rest FK is only
-    ~0.21 m out / 0.21 m up from base): displacements stay within ~±8 cm so a
-    near-unconstrained solve can track them — validated by the ORACLE config,
-    which must show ~0 error on every spec trajectory. Both hands move
-    together (constant separation), like carrying a rigidly-held object.
+    Amplitudes exercise both the comfortable workspace and collision/reach
+    boundaries around it. The objective-matched reference separates error
+    imposed by the shipping objective from lag caused by the production
+    step/iteration budget. Both hands move together (constant separation),
+    like carrying a rigidly-held object.
     """
     out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
@@ -275,6 +317,22 @@ def make_trajectories(fps: float) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     return out
 
 
+def _trajectory_signatures(
+    trajs: dict[str, tuple[np.ndarray, np.ndarray]],
+) -> dict[str, str]:
+    """Content hashes that identify the generated paths in saved results."""
+    signatures: dict[str, str] = {}
+    for name, arrays in trajs.items():
+        digest = hashlib.sha256()
+        for array in arrays:
+            contiguous = np.ascontiguousarray(array)
+            digest.update(str(contiguous.shape).encode())
+            digest.update(contiguous.dtype.str.encode())
+            digest.update(contiguous.tobytes())
+        signatures[name] = digest.hexdigest()
+    return signatures
+
+
 def _tremor(n: int, fps: float, rms_m: float, seed: int) -> np.ndarray:
     """(n,3) physiological-tremor-like positional noise (8–11 Hz sinusoids)."""
     rng = np.random.default_rng(seed)
@@ -287,6 +345,12 @@ def _tremor(n: int, fps: float, rms_m: float, seed: int) -> np.ndarray:
             )
     out *= rms_m / max(1e-9, np.sqrt(np.mean(out**2)))
     return out
+
+
+def _trajectory_seed(name: str) -> int:
+    """Stable tremor seed; Python's randomized ``hash()`` is not reproducible."""
+    digest = hashlib.sha256(name.encode()).digest()
+    return int.from_bytes(digest[:4], "little") & 0x7FFFFFFF
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +406,22 @@ def _summ(a: np.ndarray) -> dict[str, float]:
     }
 
 
+def _benchmark_teleop_config(fps: float) -> VRTeleopConfig:
+    """Build a host-independent Mantis config for synthetic tracker poses."""
+    identity_transform = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    config = VRTeleopConfig(
+        tcp_transform_left=identity_transform.copy(),
+        tcp_transform_right=identity_transform.copy(),
+    )
+    apply_mantis_teleop_profile(config)
+    config.frequency = fps
+    # Use engage-relative controller motion, independent of any machine-local
+    # or factory tracker-to-gripper transform.
+    config.tcp_transform_left = None
+    config.tcp_transform_right = None
+    return config
+
+
 def run_config(
     name: str,
     kcfg: KinematicsConfig,
@@ -349,24 +429,29 @@ def run_config(
     fps: float,
     tremor_rms: float,
 ) -> dict:
-    tcfg = VRTeleopConfig()
-    apply_mantis_teleop_profile(tcfg)
-    tcfg.frequency = fps
-    # Deterministic bench: don't pick up a machine-local pivot calibration.
-    tcfg.tcp_offset_left = None
-    tcfg.tcp_offset_right = None
+    tcfg = _benchmark_teleop_config(fps)
 
     t0 = time.perf_counter()
     worker = IKWorker(tcfg, kcfg)
     init_s = time.perf_counter() - t0
     solver = worker._solver
 
-    results: dict = {"config": dataclasses.asdict(kcfg), "init_s": init_s, "trajs": {}}
+    results: dict = {
+        "benchmark_schema": _BENCHMARK_SCHEMA,
+        "config": dataclasses.asdict(kcfg),
+        "fps": fps,
+        "tremor_rms": tremor_rms,
+        "model_sha256": _MODEL_SHA256,
+        "trajectory_sha256": _trajectory_signatures(trajs),
+        "init_s": init_s,
+        "trajs": {},
+    }
 
     for traj_name, (disp, rots) in trajs.items():
         n = len(disp)
+        tremor_seed = _trajectory_seed(traj_name)
         noise = (
-            _tremor(n, fps, tremor_rms, seed=hash(traj_name) % 2**31)
+            _tremor(n, fps, tremor_rms, seed=tremor_seed)
             if tremor_rms > 0
             else np.zeros((n, 3))
         )
@@ -412,7 +497,7 @@ def run_config(
             tgt_r = worker._absolute_target("right", r_pos, R)
             import jaxlie  # local import keeps module import light
 
-            fk = solver.robot.forward_kinematics(np.asarray(q))
+            fk = solver.robot.forward_kinematics(np.asarray(solver.to_pyroki_order(q)))
             poses = {}
             for side, idx in (("l", solver.l_ee_idx), ("r", solver.r_ee_idx)):
                 T = jaxlie.SE3(fk[idx])
@@ -454,6 +539,7 @@ def run_config(
 
         r: dict = {
             "ticks": n,
+            "tremor_seed": tremor_seed,
             "tip_mm": _summ(tip_ss),
             "pos_mm": _summ(np.concatenate([m["pos_l"][s:], m["pos_r"][s:]])),
             "ori_deg": _summ(ori_ss),
@@ -486,11 +572,11 @@ def run_config(
 # ---------------------------------------------------------------------------
 
 SPEC = {
-    # Solver excess over the feasibility floor (the oracle solve): the part
-    # of the tip error the config choice is responsible for. Trajectories the
-    # arm physically can't follow inflate absolute error identically for
-    # every config, and during collection the URDF overlay makes the operator
-    # steer away from those regions.
+    # Solver excess over the objective-matched convergence floor: the part of
+    # the tip error caused by the shipping iteration and per-tick step bounds.
+    # The reference solve keeps the production pose/collision/limit weight
+    # ratios, so lower tracking error cannot be bought by weakening that
+    # objective. This benchmark does not assert physical collision clearance.
     "tip_excess_mm_p95": 6.0,
     "tip_excess_mm_max": 15.0,
     # Absolute bounds, enforced where the floor itself is small (feasible).
@@ -506,43 +592,97 @@ SPEC = {
 SPEC_TRAJS = ("hold", "slow_wave", "reach", "wrist_twist", "pick_place")
 
 
+def _is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
 def check_spec(res: dict, oracle: dict | None) -> tuple[bool, list[str]]:
     fails: list[str] = []
+    if oracle is None:
+        return False, ["objective-matched reference floor is missing"]
+
+    trajectories = res.get("trajs")
+    floor_trajectories = oracle.get("trajs")
+    if not isinstance(trajectories, dict):
+        return False, ["production trajectory results are missing"]
+    if not isinstance(floor_trajectories, dict):
+        return False, ["reference trajectory results are missing"]
+
+    def metric(trajectory: object, group: str, name: str, label: str) -> float | None:
+        if not isinstance(trajectory, dict):
+            fails.append(f"{label}: result is missing")
+            return None
+        summary = trajectory.get(group)
+        value = summary.get(name) if isinstance(summary, dict) else None
+        if not _is_finite_number(value):
+            fails.append(f"{label}: {group}.{name} is missing or non-finite")
+            return None
+        return float(value)
+
+    scored = 0
     for tname in SPEC_TRAJS:
-        if tname not in res["trajs"]:
+        if tname not in trajectories:
+            fails.append(f"{tname}: production result is missing")
             continue
-        t = res["trajs"][tname]
-        floor = (
-            oracle["trajs"][tname]["tip_mm"]
-            if oracle and tname in oracle.get("trajs", {})
-            else None
-        )
-        if floor is not None:
-            excess_p95 = t["tip_mm"]["p95"] - floor["p95"]
-            excess_max = t["tip_mm"]["max"] - floor["max"]
+        scored += 1
+        trajectory = trajectories[tname]
+        floor_trajectory = floor_trajectories.get(tname)
+        tip_p95 = metric(trajectory, "tip_mm", "p95", tname)
+        tip_max = metric(trajectory, "tip_mm", "max", tname)
+        floor_p95 = metric(floor_trajectory, "tip_mm", "p95", f"{tname} floor")
+        floor_max = metric(floor_trajectory, "tip_mm", "max", f"{tname} floor")
+        ori_p95 = metric(trajectory, "ori_deg", "p95", tname)
+        solve_p95 = metric(trajectory, "solve_ms", "p95", tname)
+
+        if None not in (tip_p95, tip_max, floor_p95, floor_max):
+            assert tip_p95 is not None
+            assert tip_max is not None
+            assert floor_p95 is not None
+            assert floor_max is not None
+            excess_p95 = tip_p95 - floor_p95
+            excess_max = tip_max - floor_max
             if excess_p95 > SPEC["tip_excess_mm_p95"]:
                 fails.append(f"{tname}: tip excess p95 {excess_p95:.1f}mm over floor")
             if excess_max > SPEC["tip_excess_mm_max"]:
                 fails.append(f"{tname}: tip excess max {excess_max:.1f}mm over floor")
-            feasible = floor["p95"] < SPEC["feasible_floor_mm"]
-        else:
-            feasible = True
-        if feasible and t["tip_mm"]["p95"] > SPEC["tip_mm_p95"]:
-            fails.append(f"{tname}: tip p95 {t['tip_mm']['p95']:.1f}mm")
-        if feasible and t["tip_mm"]["max"] > SPEC["tip_mm_max"]:
-            fails.append(f"{tname}: tip max {t['tip_mm']['max']:.1f}mm")
-        if t["ori_deg"]["p95"] > SPEC["ori_deg_p95"]:
-            fails.append(f"{tname}: ori p95 {t['ori_deg']['p95']:.2f}°")
-        if t["solve_ms"]["p95"] > SPEC["solve_ms_p95"]:
-            fails.append(f"{tname}: solve p95 {t['solve_ms']['p95']:.1f}ms")
-    if "hold" in res["trajs"]:
-        h = res["trajs"]["hold"].get("hold_drift_rad_s", 0.0)
-        if h > SPEC["hold_drift_rad_s"]:
-            fails.append(f"hold: null-space drift {h:.3f}rad/s")
+            if floor_p95 < SPEC["feasible_floor_mm"]:
+                if tip_p95 > SPEC["tip_mm_p95"]:
+                    fails.append(f"{tname}: tip p95 {tip_p95:.1f}mm")
+                if tip_max > SPEC["tip_mm_max"]:
+                    fails.append(f"{tname}: tip max {tip_max:.1f}mm")
+        if ori_p95 is not None and ori_p95 > SPEC["ori_deg_p95"]:
+            fails.append(f"{tname}: ori p95 {ori_p95:.2f}°")
+        if solve_p95 is not None and solve_p95 > SPEC["solve_ms_p95"]:
+            fails.append(f"{tname}: solve p95 {solve_p95:.1f}ms")
+
+        if tname == "hold":
+            hold_drift = (
+                trajectory.get("hold_drift_rad_s")
+                if isinstance(trajectory, dict)
+                else None
+            )
+            if not _is_finite_number(hold_drift):
+                fails.append("hold: hold_drift_rad_s is missing or non-finite")
+            elif float(hold_drift) > SPEC["hold_drift_rad_s"]:
+                fails.append(f"hold: null-space drift {float(hold_drift):.3f}rad/s")
+
+    if scored == 0:
+        fails.append("no scored production trajectories were run")
     return (not fails), fails
 
 
-def print_report(name: str, res: dict, oracle: dict | None) -> None:
+def print_report(
+    name: str,
+    res: dict,
+    oracle: dict | None,
+    *,
+    score: bool = False,
+    unscored_label: str = "DIAGNOSTIC CONFIG",
+) -> bool | None:
     print(f"\n=== {name} (init {res['init_s']:.1f}s) ===")
     hdr = (
         f"{'trajectory':<12} {'tip mm (mean/p95/max)':>24} {'floor p95':>10}"
@@ -560,13 +700,17 @@ def print_report(name: str, res: dict, oracle: dict | None) -> None:
             f"{tname:<12} {tip['mean']:>7.1f} /{tip['p95']:>6.1f} /{tip['max']:>7.1f}"
             f" {fl} {t['ori_deg']['p95']:>9.2f} {t['solve_ms']['p95']:>13.1f}"
         )
-    ok, fails = check_spec(res, oracle)
-    print("SPEC:", "PASS" if ok else "FAIL — " + "; ".join(fails))
+    if score:
+        ok, fails = check_spec(res, oracle)
+        print("SPEC:", "PASS" if ok else "FAIL — " + "; ".join(fails))
+        return ok
+    print(f"SPEC: {unscored_label} (not production-scored)")
+    return None
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--configs", nargs="*", default=["default"], help="Preset names")
+    ap.add_argument("--configs", nargs="*", default=["mantis"], help="Preset names")
     ap.add_argument(
         "--set",
         nargs="*",
@@ -600,26 +744,40 @@ def main() -> None:
             k, v = kv.split("=")
             kw[k] = int(v) if k == "max_iterations" else float(v)
         todo["adhoc"] = _cfg(**kw)
+    if not todo:
+        ap.error("select at least one --configs preset or provide --set overrides")
 
     trajs = make_trajectories(args.fps)
     if args.trajs:
         trajs = {k: trajs[k] for k in args.trajs}
     args.out.mkdir(parents=True, exist_ok=True)
 
-    # The oracle floor (feasibility baseline) for excess-error scoring: use a
-    # previously saved run when available so it isn't recomputed every time.
+    # Always compute a fresh objective-matched convergence floor in the same
+    # process as the production run. Reusing a saved floor could compare
+    # results produced by different solver, transform, dependency, or runtime
+    # implementations even when the serialized config and model are unchanged.
     oracle: dict | None = None
-    oracle_path = args.out / "oracle_mantis.json"
-    if oracle_path.exists():
-        oracle = json.loads(oracle_path.read_text())
-
+    todo = _schedule_configs(todo)
+    production_failed = False
     for name, kcfg in todo.items():
         res = run_config(name, kcfg, trajs, args.fps, args.tremor_mm * 1e-3)
         if name == "oracle_mantis":
             oracle = res
-        print_report(name, res, oracle if name != "oracle_mantis" else None)
+        outcome = print_report(
+            name,
+            res,
+            oracle if name != "oracle_mantis" else None,
+            score=name == "mantis",
+            unscored_label=(
+                "REFERENCE FLOOR" if name == "oracle_mantis" else "DIAGNOSTIC CONFIG"
+            ),
+        )
+        production_failed |= outcome is False
         (args.out / f"{name}.json").write_text(json.dumps(res, indent=1))
         print(f"(saved {args.out / (name + '.json')})")
+
+    if production_failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
