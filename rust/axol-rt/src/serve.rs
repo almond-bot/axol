@@ -317,6 +317,15 @@ impl TimingHealth {
         }
         self.consecutive_late >= 3 || self.recent_late.count_ones() >= MAX_RECENT_LATE_TICKS
     }
+
+    /// Record this tick before applying the immediate full-cycle limit.  The
+    /// ordering matters: the fault diagnostic must include the tick that
+    /// triggered it, even when `lateness >= period` is already sufficient to
+    /// stop the loop.
+    fn record_lateness(&mut self, lateness: Duration, period: Duration) -> bool {
+        let clustered_lateness = self.record(lateness <= LATE_TICK);
+        lateness >= period || clustered_lateness
+    }
 }
 
 type BusStartGate = (Mutex<Option<Instant>>, Condvar);
@@ -442,6 +451,66 @@ fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::R
     )
 }
 
+fn parse_cpu_set(raw: &str, source: &str) -> io::Result<libc::cpu_set_t> {
+    if raw.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {source}: CPU set is empty"),
+        ));
+    }
+    let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    unsafe { libc::CPU_ZERO(&mut set) };
+    for item in raw.split(',') {
+        let item = item.trim();
+        let cpu: usize = item.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid {source}={raw:?}: expected comma-separated CPU numbers"),
+            )
+        })?;
+        if cpu >= libc::CPU_SETSIZE as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid {source}={raw:?}: CPU {cpu} is out of range"),
+            ));
+        }
+        unsafe { libc::CPU_SET(cpu, &mut set) };
+    }
+    Ok(set)
+}
+
+/// A trace writer is throughput work, never realtime work. Writer threads
+/// are spawned before their parent bus thread changes its affinity, and this
+/// is a second fail-safe against a future call-site move: shed any inherited
+/// realtime policy and move to the launcher's background cores before opening
+/// or writing the trace file.
+fn configure_trace_writer_scheduling(affinity: Option<&libc::cpu_set_t>) -> io::Result<()> {
+    let param = libc::sched_param { sched_priority: 0 };
+    let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &param) };
+    if rc != 0 {
+        return Err(io::Error::other(format!(
+            "could not put trace writer under SCHED_OTHER: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    if let Some(set) = affinity {
+        let rc = unsafe {
+            libc::sched_setaffinity(
+                0,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                set as *const libc::cpu_set_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::other(format!(
+                "could not pin trace writer to background CPUs: {}",
+                io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn start_trace_writer(
     side: u8,
 ) -> io::Result<Option<(mpsc::SyncSender<TraceMsg>, TraceHandle, PathBuf)>> {
@@ -456,11 +525,32 @@ fn start_trace_writer(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let affinity = match std::env::var("AXOL_RT_BACKGROUND_CPUS") {
+        Ok(raw) => Some(parse_cpu_set(&raw, "AXOL_RT_BACKGROUND_CPUS")?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AXOL_RT_BACKGROUND_CPUS is not valid UTF-8",
+            ));
+        }
+    };
     // About 17 seconds of headroom per arm at 240 Hz x 7 joints. A full
     // channel never blocks the control loop: samples are dropped and counted.
     let (tx, rx) = mpsc::sync_channel::<TraceMsg>(28_000);
+    // Do not report tracing as active until the writer has shed any inherited
+    // realtime policy and moved off the control CPUs. Failure disables the
+    // optional trace rather than weakening motor-loop isolation.
+    let (setup_tx, setup_rx) = mpsc::sync_channel::<io::Result<()>>(0);
     let writer_path = path.clone();
     let handle = std::thread::spawn(move || -> io::Result<()> {
+        if let Err(err) = configure_trace_writer_scheduling(affinity.as_ref()) {
+            let _ = setup_tx.send(Err(err));
+            return Ok(());
+        }
+        if setup_tx.send(Ok(())).is_err() {
+            return Ok(());
+        }
         let mut out = trace_file(&writer_path)?;
         for msg in rx {
             match msg {
@@ -473,6 +563,24 @@ fn start_trace_writer(
         }
         out.flush()
     });
+    match setup_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let _ = handle.join();
+            return Err(err);
+        }
+        Err(_) => {
+            return match handle.join() {
+                Ok(Err(err)) => Err(err),
+                Ok(Ok(())) => Err(io::Error::other(
+                    "trace writer exited before configuring its scheduler",
+                )),
+                Err(_) => Err(io::Error::other(
+                    "trace writer panicked while configuring its scheduler",
+                )),
+            };
+        }
+    }
     Ok(Some((tx, handle, path)))
 }
 
@@ -757,6 +865,48 @@ mod tests {
             assert!(!health.record(true));
         }
         assert!(health.record(false));
+    }
+
+    #[test]
+    fn timing_health_counts_immediate_full_cycle_fault() {
+        let mut health = TimingHealth::default();
+        let period = Duration::from_micros(4_167);
+        assert!(health.record_lateness(period, period));
+        assert_eq!(health.recent_late.count_ones(), 1);
+        assert_eq!(health.consecutive_late, 1);
+    }
+
+    #[test]
+    fn trace_writer_forces_normal_scheduling_and_requested_affinity() {
+        let (policy, affinity_ok) = std::thread::spawn(|| {
+            let mut available = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+            let rc = unsafe {
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut available)
+            };
+            assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+            let cpu = (0..libc::CPU_SETSIZE as usize)
+                .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &available) })
+                .expect("test thread has no available CPU");
+            let requested = parse_cpu_set(&cpu.to_string(), "test CPU set").unwrap();
+
+            configure_trace_writer_scheduling(Some(&requested)).unwrap();
+
+            let mut applied = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+            let rc = unsafe {
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut applied)
+            };
+            assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+            let only_requested_cpu = (0..libc::CPU_SETSIZE as usize)
+                .filter(|&candidate| unsafe { libc::CPU_ISSET(candidate, &applied) })
+                .eq(std::iter::once(cpu));
+            (unsafe { libc::sched_getscheduler(0) }, only_requested_cpu)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(policy, libc::SCHED_OTHER);
+        assert!(affinity_ok);
+        assert!(parse_cpu_set("", "test CPU set").is_err());
+        assert!(parse_cpu_set("0,nope", "test CPU set").is_err());
     }
 
     /// Live stall-detection check against a real interface whose bus has no
@@ -1162,6 +1312,29 @@ fn bus_loop(
     ready_tx: &mpsc::Sender<io::Result<()>>,
     start_gate: &BusStartGate,
 ) -> io::Result<()> {
+    // Spawn throughput helpers before this thread pins itself to the CAN CPU
+    // and enters SCHED_FIFO. Linux threads inherit their creator's scheduler
+    // and affinity, so moving this below `configure_bus_scheduling` would let
+    // trace flush/truncate work contend directly with the control loop.
+    let (trace_tx, trace_handle) = match start_trace_writer(side) {
+        Ok(Some((tx, handle, path))) => {
+            send_text(
+                out_tx,
+                b'L',
+                &format!("{iface}: RT control trace -> {}", path.display()),
+            );
+            (Some(tx), Some(handle))
+        }
+        Ok(None) => (None, None),
+        Err(err) => {
+            send_text(
+                out_tx,
+                b'L',
+                &format!("{iface}: RT control trace disabled: {err}"),
+            );
+            (None, None)
+        }
+    };
     if let Err(err) = configure_bus_scheduling(iface, side, out_tx) {
         let _ = ready_tx.send(Err(err));
         return Ok(());
@@ -1185,25 +1358,6 @@ fn bus_loop(
         let _ = ready_tx.send(Err(err));
         return Ok(());
     }
-    let (trace_tx, trace_handle) = match start_trace_writer(side) {
-        Ok(Some((tx, handle, path))) => {
-            send_text(
-                out_tx,
-                b'L',
-                &format!("{iface}: RT control trace -> {}", path.display()),
-            );
-            (Some(tx), Some(handle))
-        }
-        Ok(None) => (None, None),
-        Err(err) => {
-            send_text(
-                out_tx,
-                b'L',
-                &format!("{iface}: RT control trace disabled: {err}"),
-            );
-            (None, None)
-        }
-    };
     let _ = ready_tx.send(Ok(()));
 
     // Play state, indexed by target slot: the latest adopted command per
@@ -1341,7 +1495,7 @@ fn bus_loop(
             // has been lost. Stop before issuing another impedance command.
             // Smaller isolated late ticks are tolerated with host damping
             // suppressed below; clustered lateness also fails closed.
-            if lateness >= period || timing_health.record(timing_on_time) {
+            if timing_health.record_lateness(lateness, period) {
                 fault.store(1, Ordering::SeqCst);
                 stop.store(true, Ordering::SeqCst);
                 return Err(io::Error::other(format!(

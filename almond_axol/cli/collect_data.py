@@ -1002,11 +1002,15 @@ def _run(
             deadline += teleop_interval
             t0 = time.perf_counter()
             _maybe_log_rate(t0)
-            # Record only robot-driving windows, never camera/JAX startup or
-            # an idle pre-record wait. Keeping the gate open across the last
-            # tracking command and a following reset captures the transition
-            # that previously oscillated during collection.
-            robot.set_control_trace_active(teleop.is_tracking or teleop.is_resetting)
+            # Keep a recording's trace open after the headset drops tracking:
+            # its terminate/SAVING state can arrive before we consume the event
+            # below. The outer guarded-return path then continues that same
+            # segment and closes it after the arm settles. Without ``recording``
+            # here, reopening for the return resets both RT/measured recorders
+            # and replaces the useful take with a tiny return/fault capture.
+            robot.set_control_trace_active(
+                recording or teleop.is_tracking or teleop.is_resetting
+            )
 
             # Camera reads happen on the capture thread; the control loop only
             # ever touches joint state.

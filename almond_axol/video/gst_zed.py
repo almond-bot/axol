@@ -471,8 +471,11 @@ def _dataset_enc_shmsink(
     header only once; if shmsink discarded that header before the recorder's
     late ``gdpdepay`` connection, the consumer could never parse the stream.
     Waiting parks this branch's first GDP packet until the recorder attaches.
-    The branch has its own leaky queue before its rate limiter/valve/encoder, so
-    this wait cannot block camera capture or the independent headset branch.
+    A leaky queue after the encoder keeps NVENC draining (and releases its NVMM
+    input surfaces) while that packet is parked; the queue must stay before
+    ``gdppay`` so it can never discard GDP's one-shot stream/caps header. The
+    branch's earlier queue still decouples it from camera capture and the
+    independent headset branch.
     The rate limiter deliberately stays upstream of the valve: it must continue
     tracking the source timeline between episodes, otherwise reopening a stale
     ``videorate`` can briefly pass capture-rate frames into a lower-rate dataset.
@@ -492,7 +495,7 @@ def _dataset_enc_shmsink(
         f"bitrate={target} peak-bitrate={peak} preset-level=1 "
         f"insert-sps-pps=true insert-aud=true idrinterval={idr} maxperf-enable=true "
         "! video/x-h264,stream-format=byte-stream,alignment=au "
-        "! gdppay "
+        f"! {_QUEUE} ! gdppay "
         f"! shmsink socket-path={socket_path} wait-for-connection=true "
         "sync=false async=false"
     )
