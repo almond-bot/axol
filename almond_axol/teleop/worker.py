@@ -27,15 +27,15 @@ from .trajectory import plan_collision_aware_trajectory
 
 _logger = logging.getLogger(__name__)
 
-# Freeze detection (see IKWorker._note_solve): warn when the solver keeps
-# returning its seed unchanged while the tracked targets move away — the
-# operator experiences the arm as stuck, then lurching once the solve breaks
-# free. Thresholds: how long the output must be frozen before warning, how far
-# the targets must have moved (so a still hand doesn't warn), and how often to
-# re-warn while the freeze persists.
+# Freeze handling (see IKWorker._note_solve): when one arm's solver output keeps
+# returning its seed unchanged while that arm's tracked target moves away, the
+# operator experiences a hold followed by a catch-up lurch. After a confirmed
+# run, automatically clutch that controller at the held IK pose: the snap frame
+# itself cannot move, future hand deltas retain the normal relative mapping, and
+# only the unexecuted motion accumulated during the freeze is discarded.
 _FREEZE_WARN_AFTER_S = 0.5
 _FREEZE_MIN_TARGET_DRIFT_M = 0.005
-_FREEZE_REWARN_EVERY_S = 2.0
+_FREEZE_MIN_TARGET_DRIFT_RAD = math.radians(5.0)
 
 # Tracking glitch rejection (see IKWorker._frame_snap_verdict): the VR pose
 # stream carries two kinds of both-hand discontinuity that the operator's
@@ -210,14 +210,14 @@ class IKWorker:
         self._active: dict[str, bool] = {"left": False, "right": False}
         self._hold_fk: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._hold_elbow_fk: dict[str, np.ndarray] = {}
-        # Freeze detection state: when the last solve returned its seed
-        # unchanged, `_freeze_since` holds the wall time the freeze started and
-        # `_freeze_targets` the EE/elbow target positions at that moment, so a
-        # warning fires only when the targets kept moving away (a still hand
-        # legitimately produces an unchanged solution).
-        self._freeze_since: float | None = None
-        self._freeze_targets: np.ndarray | None = None
-        self._freeze_next_warn: float = _FREEZE_WARN_AFTER_S
+        # Per-arm freeze state. A bimanual solve can leave one arm's joint slice
+        # bit-identical while the other progresses, so whole-vector detection
+        # both misses real freezes and cannot clutch only the affected mapping.
+        # Each target snapshot is (EE position, EE rotation, optional elbow).
+        self._freeze_since: dict[str, float] = {}
+        self._freeze_targets: dict[
+            str, tuple[np.ndarray, np.ndarray, np.ndarray | None]
+        ] = {}
         # Snap poses as (pos_3, rot_3x3) numpy tuples — no jaxlie overhead
         self._snap_ctrl: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._snap_fk: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -553,13 +553,88 @@ class IKWorker:
             q_new[self._solver.left_indices] = q_current[self._solver.left_indices]
         if not self._active["right"]:
             q_new[self._solver.right_indices] = q_current[self._solver.right_indices]
-        targets = [tl_pos, tr_pos]
-        if elbow_l is not None and elbow_r is not None:
-            targets += [elbow_l, elbow_r]
-        self._note_solve(
-            bool(np.array_equal(q_new, q_current)),
-            np.concatenate(targets),
-        )
+        # Detect and resolve seed-return stalls per arm. Re-snapshot only a
+        # stalled arm whose target actually moved: a still controller can
+        # legitimately sit at a collision or joint boundary, and the healthy
+        # arm must retain both its solved output and its controller mapping.
+        #
+        # Re-anchoring uses the *current filtered* controller pose and FK of the
+        # unchanged joint slice. At this sample _relative_target_np therefore
+        # returns that FK exactly (zero translation, identity rotation), so the
+        # clutch cannot introduce a command step. Motion after this sample is
+        # once again relative 1:1 (or with the configured multipliers); motion
+        # accumulated while the solver was unable to move is deliberately
+        # discarded instead of being released later as a lurch.
+        reanchor: list[
+            tuple[
+                str,
+                np.ndarray,
+                np.ndarray,
+                np.ndarray | None,
+                list[int],
+            ]
+        ] = []
+        for (
+            side,
+            ctrl_pos,
+            ctrl_rot,
+            ctrl_e,
+            target_pos,
+            target_rot,
+            target_e,
+            indices,
+        ) in (
+            (
+                "left",
+                left_pos,
+                left_rot,
+                left_e,
+                tl_pos,
+                tl_rot,
+                elbow_l,
+                self._solver.left_indices,
+            ),
+            (
+                "right",
+                right_pos,
+                right_rot,
+                right_e,
+                tr_pos,
+                tr_rot,
+                elbow_r,
+                self._solver.right_indices,
+            ),
+        ):
+            if not self._active[side]:
+                self._clear_freeze(side)
+                continue
+            arm_frozen = bool(np.array_equal(q_new[indices], q_current[indices]))
+            if self._note_solve(
+                side,
+                arm_frozen,
+                target_pos,
+                target_rot,
+                target_e,
+            ):
+                reanchor.append((side, ctrl_pos, ctrl_rot, ctrl_e, indices))
+
+        if reanchor:
+            # Keep the persistent posture attractor consistent with the new
+            # clutch origin, but update only re-anchored joint slices. Re-pinning
+            # the whole vector would unnecessarily perturb a healthy arm that
+            # made progress in this same bimanual solve.
+            posture = self._solver.posture_pose
+            for side, ctrl_pos, ctrl_rot, ctrl_e, indices in reanchor:
+                self._snap_arm(
+                    side,
+                    ctrl_pos,
+                    ctrl_rot,
+                    ctrl_e,
+                    _ee(side),
+                    _elbow(side) if self._use_elbow else None,
+                )
+                posture[indices] = q_current[indices]
+            self._solver.set_posture_pose(posture)
         if self._rec is not None:
             self._rec.record(
                 raw_l=np.array(
@@ -756,48 +831,89 @@ class IKWorker:
         self._note_raw(raw_l, raw_r, t_eff)
         return ("ok", None, None)
 
-    def _clear_freeze(self) -> None:
-        """Forget any in-progress freeze run (disengage / engage / reset)."""
-        self._freeze_since = None
-        self._freeze_targets = None
-        self._freeze_next_warn = _FREEZE_WARN_AFTER_S
+    def _clear_freeze(self, side: str | None = None) -> None:
+        """Forget one or all in-progress freeze runs."""
+        if side is None:
+            self._freeze_since.clear()
+            self._freeze_targets.clear()
+            return
+        self._freeze_since.pop(side, None)
+        self._freeze_targets.pop(side, None)
 
-    def _note_solve(self, frozen: bool, targets: np.ndarray) -> None:
-        """Track seed-returning solves; WARN when the output freezes.
+    def _note_solve(
+        self,
+        side: str,
+        frozen: bool,
+        target_pos: np.ndarray,
+        target_rot: np.ndarray,
+        target_elbow: np.ndarray | None,
+    ) -> bool:
+        """Track one arm's seed-returning solves; request a safe clutch.
 
         A single unchanged solution is normal (e.g. the hand is still, or the
-        target is held against a constraint). The failure mode worth flagging is
-        a *run* of solves that return the seed while the EE/elbow targets keep
-        moving away — the operator sees the arm stop responding, and the
-        accumulated error is released as a lurch once a solve finally makes
-        progress (see ``KinematicsConfig`` for the tuning that minimises this).
+        target is held against a constraint). The failure mode worth handling
+        is a *run* of solves that returns this arm's seed while its EE/elbow
+        target keeps moving away. Once confirmed, the caller re-snapshots the
+        controller against FK of the held joints, acting like an automatic
+        clutch: no command step now, no accumulated catch-up later.
 
         Args:
-            frozen: True when this solve returned ``q_current`` bit-identically.
-            targets: Concatenated EE + elbow target positions (m) of this solve,
-                used to measure how far the targets drifted during the freeze.
+            side: ``"left"`` or ``"right"``.
+            frozen: True when this arm's solved joint slice returned its
+                ``q_current`` slice bit-identically.
+            target_pos: Current EE target position in metres.
+            target_rot: Current EE target rotation matrix.
+            target_elbow: Optional elbow target position in metres.
+
+        Returns:
+            True once the freeze duration and target-motion thresholds are met;
+            the caller should re-anchor this arm at the current sample.
         """
         if not frozen:
-            self._clear_freeze()
-            return
+            self._clear_freeze(side)
+            return False
         now = time.monotonic()
-        if self._freeze_since is None or self._freeze_targets is None:
-            self._freeze_since = now
-            self._freeze_targets = targets
-            return
-        duration = now - self._freeze_since
-        drift = float(np.max(np.abs(targets - self._freeze_targets)))
-        if duration >= self._freeze_next_warn and drift >= _FREEZE_MIN_TARGET_DRIFT_M:
-            _logger.warning(
-                "IK frozen for %.1fs: solver keeps returning its seed while the "
-                "EE/elbow targets moved %.0f mm — it cannot make progress "
-                "(target likely conflicts with the self-collision margin or "
-                "joint limits); the arm holds, then catches up in a lurch when "
-                "the solve breaks free.",
-                duration,
-                drift * 1e3,
+        start = self._freeze_targets.get(side)
+        if side not in self._freeze_since or start is None:
+            self._freeze_since[side] = now
+            self._freeze_targets[side] = (
+                target_pos.copy(),
+                target_rot.copy(),
+                None if target_elbow is None else target_elbow.copy(),
             )
-            self._freeze_next_warn = duration + _FREEZE_REWARN_EVERY_S
+            return False
+
+        duration = now - self._freeze_since[side]
+        start_pos, start_rot, start_elbow = start
+        pos_drift = float(np.linalg.norm(target_pos - start_pos))
+        if target_elbow is not None and start_elbow is not None:
+            pos_drift = max(
+                pos_drift,
+                float(np.linalg.norm(target_elbow - start_elbow)),
+            )
+        relative_rot = start_rot.T @ target_rot
+        cos_angle = float(np.clip((np.trace(relative_rot) - 1.0) * 0.5, -1.0, 1.0))
+        rot_drift = math.acos(cos_angle)
+        moved = (
+            pos_drift >= _FREEZE_MIN_TARGET_DRIFT_M
+            or rot_drift >= _FREEZE_MIN_TARGET_DRIFT_RAD
+        )
+        if duration < _FREEZE_WARN_AFTER_S or not moved:
+            return False
+
+        _logger.warning(
+            "IK %s arm frozen for %.1fs: its solver output stayed at the seed "
+            "while the EE/elbow target moved %.0f mm / %.1f deg (likely a "
+            "self-collision or joint-limit conflict). Re-anchoring the "
+            "controller at the held pose; motion accumulated during the "
+            "freeze is discarded to prevent a catch-up lurch.",
+            side,
+            duration,
+            pos_drift * 1e3,
+            math.degrees(rot_drift),
+        )
+        self._clear_freeze(side)
+        return True
 
     def _reset_pose_filters(self) -> None:
         """Clear the pose-filter state for every controller and elbow stream."""
