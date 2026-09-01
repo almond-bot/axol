@@ -20,6 +20,7 @@ saved by ``axol tracker.identify`` survives restarts.
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import threading
 import time
@@ -55,6 +56,29 @@ def _convert(
     return zup_to_yup_pos(pos_zup), zup_to_yup_quat(quat_xyzw)
 
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+# libsurvive prints these while it is still acquiring each device; they are
+# not a setup problem, unlike a persistent base-station channel clash.
+_TRANSIENT_WARNINGS = ("Could not lighthouse more to",)
+_MAX_WARNINGS = 20
+
+
+def _setup_warning(line: str) -> str | None:
+    """Return the message when ``line`` is a libsurvive ``Warning:`` entry.
+
+    ``--record-stdout`` interleaves the coloured log stream with recording
+    lines. Recording copies of the same entries arrive as ``INFO LOG`` records
+    and are ignored here so each warning is captured once.
+    """
+    text = _ANSI_ESCAPE.sub("", line).strip()
+    if not text.startswith("Warning:"):
+        return None
+    message = text[len("Warning:") :].strip()
+    if not message or message.startswith(_TRANSIENT_WARNINGS):
+        return None
+    return message
+
+
 class SurviveSource(TrackerSource):
     """Poses for every lighthouse-tracked object libsurvive sees.
 
@@ -71,6 +95,7 @@ class SurviveSource(TrackerSource):
         self._proc: subprocess.Popen | None = None
         self._cli_executable: Path | None = None
         self._failure: TrackerSourceError | None = None
+        self._warnings: list[str] = []
         # ``SimpleContext`` owns native USB/libsurvive state.  Keep a strong
         # reference until its polling loop has exited and the generated close
         # function has returned successfully.  A failed native call is
@@ -209,6 +234,21 @@ class SurviveSource(TrackerSource):
             if self._failure is not None:
                 raise self._failure
             return dict(self._poses)
+
+    def warnings(self) -> list[str]:
+        """Distinct libsurvive setup warnings seen so far (oldest first).
+
+        libsurvive reports base-station and pairing problems only in its log
+        stream, for example two base stations sharing a channel; poses can keep
+        flowing while that silently degrades tracking.
+        """
+        with self._lock:
+            return list(self._warnings)
+
+    def _note_warning(self, message: str) -> None:
+        with self._lock:
+            if message not in self._warnings and len(self._warnings) < _MAX_WARNINGS:
+                self._warnings.append(message)
 
     # -- Internal ---------------------------------------------------------------
 
@@ -373,6 +413,10 @@ class SurviveSource(TrackerSource):
                 break
             # Format: "<run_ts> <codename> POSE x y z qw qx qy qz"
             parts = line.split()
+            warning = _setup_warning(line)
+            if warning is not None:
+                self._note_warning(warning)
+                continue
             if len(parts) < 10 or parts[2] != "POSE":
                 continue
             key = parts[1]

@@ -1114,6 +1114,55 @@ class BridgeFatalityTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(bridge.run(), timeout=1.0)
 
 
+class IdentifyDiagnosticsTest(unittest.TestCase):
+    def test_libsurvive_warnings_are_captured_once_without_transients(self) -> None:
+        from almond_axol.tracker import survive
+
+        clash = (
+            "\x1b[0;31mWarning: Two or more lighthouses are on channel 0; "
+            "tracking is most likely going to fail.\x1b[0m\n"
+        )
+        self.assertEqual(
+            survive._setup_warning(clash),  # noqa: SLF001
+            "Two or more lighthouses are on channel 0; tracking is most likely "
+            "going to fail.",
+        )
+        self.assertIsNone(
+            survive._setup_warning(  # noqa: SLF001
+                "\x1b[0;31mWarning: Could not lighthouse more to T20 (5)\n"
+            )
+        )
+        self.assertIsNone(
+            survive._setup_warning(  # noqa: SLF001
+                "1.018921 INFO LOG Two or more lighthouses are on channel 0\n"
+            )
+        )
+        self.assertIsNone(
+            survive._setup_warning("0.1 T20 POSE 0 0 0 1 0 0 0\n")  # noqa: SLF001
+        )
+
+        source = SurviveSource()
+        source._note_warning("clash")  # noqa: SLF001
+        source._note_warning("clash")  # noqa: SLF001
+        source._note_warning("other")  # noqa: SLF001
+        self.assertEqual(source.warnings(), ["clash", "other"])
+
+    def test_failed_capture_names_every_device_and_its_motion(self) -> None:
+        summary = tracker_identify._motion_summary(  # noqa: SLF001
+            {"T20": 0.4123, "T21": 0.01},
+            {"T20", "T21", "T22"},
+            {"left": "T20"},
+        )
+        self.assertEqual(
+            summary,
+            "T20 0.41 m (already left), T21 0.01 m, T22 no fresh poses",
+        )
+        self.assertEqual(
+            tracker_identify._motion_summary({}, set(), {}),  # noqa: SLF001
+            "no devices reported",
+        )
+
+
 class BridgeCleanupTest(unittest.TestCase):
     def test_identify_start_interrupt_still_stops_partial_backend(self) -> None:
         source = SimpleNamespace(

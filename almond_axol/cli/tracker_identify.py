@@ -60,13 +60,19 @@ def _confirm(instruction: str, web_prompts: bool) -> None:
         input(f"{instruction} Press Enter to begin ... ")
 
 
-def _motion(source, window_s: float) -> dict[str, float]:
-    """Fresh, fully-tracked position path length per device over a window."""
+def _motion(source, window_s: float) -> tuple[dict[str, float], set[str]]:
+    """Fresh, fully-tracked position path length per device over a window.
+
+    Also returns the keys that reported at all, so a device whose poses went
+    stale mid-capture can be named rather than silently dropping out.
+    """
     last: dict[str, np.ndarray] = {}
     travelled: dict[str, float] = {}
+    seen: set[str] = set()
     deadline = time.perf_counter() + window_s
     while time.perf_counter() < deadline:
         for key, sample in source.poses().items():
+            seen.add(key)
             if (
                 not valid_tracker_pose(sample)
                 or not sample.tracking
@@ -81,7 +87,34 @@ def _motion(source, window_s: float) -> dict[str, float]:
                 )
             last[key] = sample.pos
         time.sleep(0.01)
-    return travelled
+    return travelled, seen
+
+
+def _motion_summary(
+    travelled: dict[str, float], seen: set[str], assigned: dict[str, str]
+) -> str:
+    """One line per device: how far it moved, or that it was stale/bound."""
+    bound = {key: side for side, key in assigned.items()}
+    parts = []
+    for key in sorted(seen):
+        if key in bound:
+            parts.append(
+                f"{key} {travelled.get(key, 0.0):.2f} m (already {bound[key]})"
+            )
+        elif key in travelled:
+            parts.append(f"{key} {travelled[key]:.2f} m")
+        else:
+            parts.append(f"{key} no fresh poses")
+    return ", ".join(parts) if parts else "no devices reported"
+
+
+def _report_backend_warnings(source) -> None:  # type: ignore[no-untyped-def]
+    """Surface backend setup warnings (libsurvive logs them, poses still flow)."""
+    warnings = getattr(source, "warnings", None)
+    if warnings is None:
+        return
+    for message in warnings():
+        print(f"  backend warning: {message}")
 
 
 def run(args) -> None:  # type: ignore[no-untyped-def]
@@ -145,7 +178,9 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
             time.sleep(0.2)
         # Give stragglers a moment to appear too.
         time.sleep(2.0)
-        print(f"Discovered and tracking: {', '.join(live)}\n")
+        print(f"Discovered and tracking: {', '.join(live)}")
+        _report_backend_warnings(source)
+        print()
 
         assigned: dict[str, str] = {}
         for side in ("left", "right"):
@@ -155,7 +190,8 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
                     f"Mantis for {_CAPTURE_S:.0f} seconds.",
                     args.web_prompts,
                 )
-                travelled = _motion(source, _CAPTURE_S)
+                travelled, seen = _motion(source, _CAPTURE_S)
+                summary = _motion_summary(travelled, seen, assigned)
                 candidates = {
                     k: v
                     for k, v in travelled.items()
@@ -163,9 +199,11 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
                 }
                 if not candidates:
                     print(
-                        "  no unassigned, fully tracked device moved enough — "
-                        "restore tracking and try again."
+                        "  no unassigned, fully tracked device moved at least "
+                        f"{_MIN_MOTION_M:.2f} m ({summary}) — restore tracking "
+                        "and try again."
                     )
+                    _report_backend_warnings(source)
                     continue
                 key = max(candidates, key=candidates.get)  # type: ignore[arg-type]
                 others = sorted(
@@ -173,8 +211,8 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
                 )
                 if others and others[0] > 0.5 * candidates[key]:
                     print(
-                        "  two trackers moved a similar amount — hold the other "
-                        "rig still and try again."
+                        f"  two trackers moved a similar amount ({summary}) — "
+                        "hold the other rig still and try again."
                     )
                     continue
                 print(f"  {side} = {key} ({candidates[key]:.2f} m of motion)")
