@@ -350,6 +350,25 @@ export function TrackerBindingPanel({
       : bindingsError
         ? "Status unavailable"
         : "Not configured"
+  // VIVE trackers on the standard flat-back mount use the built-in factory
+  // tracker→gripper transform; the editor exists only for per-unit overrides
+  // or to clear a saved override that is blocking the factory value. Quest
+  // has no factory constant and always needs the bench measurement.
+  const sourceTransforms =
+    source === "lighthouse"
+      ? readiness?.lighthouse.transforms
+      : source === "ultimate"
+        ? readiness?.ultimate.transforms
+        : null
+  const factoryTransformsOnly =
+    sourceTransforms !== null &&
+    sourceTransforms !== undefined &&
+    sourceTransforms.left === "factory" &&
+    sourceTransforms.right === "factory"
+  const showCalibrationEditor =
+    source === "quest" ||
+    ((source === "lighthouse" || source === "ultimate") &&
+      (bindingsError || (sourceTransforms !== undefined && !factoryTransformsOnly)))
 
   return (
     <div className="flex flex-col gap-3">
@@ -580,12 +599,21 @@ export function TrackerBindingPanel({
         </div>
       )}
 
-      {(source === "quest" || source === "lighthouse" || source === "ultimate") && (
+      {showCalibrationEditor ? (
         <TrackerCalibrationPanel
           key={`${source}:${calibrationContextSaved ? "saved" : "draft"}:${binding?.left ?? ""}:${binding?.right ?? ""}:${readiness?.quest.calibrationKey ?? ""}`}
           source={source as MantisTrackerSource}
           contextSaved={calibrationContextSaved}
         />
+      ) : (
+        factoryTransformsOnly && (
+          <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-4 text-sm text-white/75">
+            <Check className="size-4 shrink-0 text-emerald-400" />
+            Tracker → gripper offset: using the built-in factory transform for the{" "}
+            {source === "ultimate" ? "Ultimate" : "Tracker 3.0"} flat-back mount on both sides. No
+            calibration step is needed.
+          </div>
+        )
       )}
 
       <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-4">
@@ -740,8 +768,8 @@ function SourceChecklist({
         <SetupStep number={5}>
           Run the readiness check, then a short Mantis teleop run: hold both rigs at the rest pose,
           release both triggers, then squeeze them together to align and engage. Repeat that gesture
-          after Reset or tracking loss. The flat-back mount uses the factory transform; the editor
-          below is only for overrides.
+          after Reset or tracking loss. The tracker → gripper offset comes from the built-in factory
+          transform for the flat-back mount.
         </SetupStep>
       </Checklist>
     )
@@ -768,8 +796,8 @@ function SourceChecklist({
       <SetupStep number={4}>
         Run a short Mantis teleop: hold both rigs at the rest pose with both trackers visible,
         release both triggers, then squeeze them together to align and engage. Repeat that gesture
-        after Reset or occlusion. The flat-back mount uses the factory transform; the editor below
-        is only for overrides.
+        after Reset or occlusion. The tracker → gripper offset comes from the built-in factory
+        transform for the flat-back mount.
       </SetupStep>
     </Checklist>
   )
