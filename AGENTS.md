@@ -23,7 +23,9 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 
 ### Testing
 
-- No automated test suite exists in this repository. Validate changes by importing the package and exercising the `Sim`-based code paths.
+- Run the Python unit/integration suite with `uv run pytest`. It covers hardware-independent behavior and mocks or contracts the robot/CAN/ZED boundaries.
+- Run the web unit/component suite from `web/` with `npm test`; use `npm run lint`, `npm run format:check`, and `npm run build` for the remaining front-end gates.
+- For hardware-facing behavior that cannot be automated in the VM, also import the package and exercise the `Sim`-based code paths.
 
 ### Dependency extras
 

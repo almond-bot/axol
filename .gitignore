@@ -11,6 +11,11 @@ wheels/
 
 # Test logs
 logs/
+.coverage
+coverage.json
+coverage.xml
+htmlcov/
+pytest.xml
 
 # macOS
 .DS_Store

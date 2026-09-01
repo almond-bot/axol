@@ -1,5 +1,7 @@
 # Almond Axol SDK
 
+[![CI](https://github.com/almond-bot/axol/actions/workflows/ci.yml/badge.svg)](https://github.com/almond-bot/axol/actions/workflows/ci.yml)
+
 <img src="assets/axol.png" width="400" alt="Axol dual-arm robot" />
 
 Command-line interface and Python SDK for the Almond Axol dual-arm robot. CLI invoked as `axol <command> [flags]`.
@@ -83,6 +85,29 @@ npm run build --workspace=app                        # → web/app/dist
 ```
 
 See the [installation guide](https://docs.almond.bot/installation) for the full walkthrough.
+
+## Testing
+
+The automated suite is hardware-independent: robot, CAN, ZED, and headset boundaries are exercised through protocol and API contracts, while simulation-capable code is imported with the `sim` extra. CI enforces aggregate coverage floors of 30% for the Python package and 75% for the tested browser libraries.
+
+```bash
+# Python unit/integration tests, coverage, lint, and package builds
+uv sync --extra sim --dev
+uv run pytest
+uvx --from ruff==0.9.7 ruff check .
+uvx --from ruff==0.9.7 ruff format --check .
+uv build
+
+# React/TypeScript tests, lint, formatting, and production build
+cd web
+npm ci
+npm test
+npm run lint
+npm run format:check
+npm run build
+```
+
+Pull requests must pass the `Python` and `Web` GitHub Actions checks before merging to `main`.
 
 ## Sitemap
 

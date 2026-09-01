@@ -52,16 +52,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setToasts((prev) => prev.filter((t) => t.id !== id))
   }, [])
 
-  const show = useCallback(
-    (message: string, variant: ToastVariant = "info", duration?: number) => {
-      const id = nextId.current++
-      setToasts((prev) => [
-        ...prev,
-        { id, message, variant, duration: duration ?? DEFAULT_DURATION[variant] },
-      ])
-    },
-    []
-  )
+  const show = useCallback((message: string, variant: ToastVariant = "info", duration?: number) => {
+    const id = nextId.current++
+    setToasts((prev) => [
+      ...prev,
+      { id, message, variant, duration: duration ?? DEFAULT_DURATION[variant] },
+    ])
+  }, [])
 
   const api = useMemo<ToastApi>(
     () => ({
@@ -88,10 +85,7 @@ export function useToast(): ToastApi {
   return ctx
 }
 
-const VARIANT_STYLES: Record<
-  ToastVariant,
-  { wrap: string; icon: ReactNode }
-> = {
+const VARIANT_STYLES: Record<ToastVariant, { wrap: string; icon: ReactNode }> = {
   error: {
     wrap: "border-red-400/30 bg-red-400/[0.08] text-red-100",
     icon: <AlertTriangle className="size-4 shrink-0 text-red-400" />,
