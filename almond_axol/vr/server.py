@@ -46,7 +46,6 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..constants import URDF_PATH
-from ..utils.browser_origin import browser_origin_allowed
 from ..utils.certs import (
     ACCEPT_PAGE_HTML,
     CERTFILE,
@@ -1341,13 +1340,6 @@ class VRServer:
 
         @app.websocket("/ws")
         async def _ws(websocket: WebSocket) -> None:
-            if not browser_origin_allowed(
-                websocket.headers.get("origin"),
-                scheme=websocket.url.scheme,
-                host=websocket.headers.get("host", websocket.url.netloc),
-            ):
-                await websocket.close(code=1008, reason="browser origin is not allowed")
-                return
             await websocket.accept()
             _logger.info("client connected %s", websocket.client)
             server._client_count += 1

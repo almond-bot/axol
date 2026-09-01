@@ -4,7 +4,6 @@ import asyncio
 import json
 import math
 import multiprocessing
-import os
 import threading
 import unittest
 from unittest import mock
@@ -12,10 +11,6 @@ from unittest import mock
 from pydantic import ValidationError
 from starlette.testclient import TestClient
 
-from almond_axol.utils.browser_origin import (
-    browser_origin_allowed,
-    configure_self_hosted_browser_origins,
-)
 from almond_axol.video.video_proc import VideoRelayProcess
 from almond_axol.vr.config import VRServerConfig
 from almond_axol.vr.interp import PoseInterpolator
@@ -259,101 +254,6 @@ class VRFrameValidationTest(unittest.TestCase):
         frame["r_ee"]["quaternion"] = {"x": 0.0, "y": 0.0, "z": 0.0, "w": 0.0}
         with self.assertRaises(ValidationError):
             VRFrame.model_validate(frame)
-
-    def test_browser_origin_policy_allows_expected_clients_only(self) -> None:
-        self.assertTrue(
-            browser_origin_allowed(
-                "https://axol.almond.bot", scheme="wss", host="robot.local:8000"
-            )
-        )
-        self.assertFalse(
-            browser_origin_allowed(
-                "https://robot.local:8000",
-                scheme="wss",
-                host="robot.local:8000",
-            )
-        )
-        self.assertFalse(
-            browser_origin_allowed(
-                "https://robot.local:8001",
-                scheme="wss",
-                host="robot.local:8000",
-            )
-        )
-        self.assertFalse(
-            browser_origin_allowed(
-                "https://robot.local:8443",
-                scheme="wss",
-                host="robot.local:8000",
-            )
-        )
-        self.assertTrue(
-            browser_origin_allowed(
-                "http://localhost:5173", scheme="https", host="robot.local:8000"
-            )
-        )
-        self.assertTrue(
-            browser_origin_allowed(None, scheme="wss", host="robot.local:8000")
-        )
-        self.assertFalse(
-            browser_origin_allowed(
-                "https://attacker.example", scheme="wss", host="robot.local:8000"
-            )
-        )
-        with mock.patch.dict(
-            os.environ,
-            {"AXOL_ALLOWED_BROWSER_ORIGINS": "https://preview.example"},
-        ):
-            self.assertTrue(
-                browser_origin_allowed(
-                    "https://preview.example",
-                    scheme="wss",
-                    host="robot.local:8000",
-                )
-            )
-
-    def test_browser_origin_policy_uses_actual_self_hosted_ui_scope(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=False):
-            configure_self_hosted_browser_origins(
-                scheme="http", port=9000, hosts={"robot.local", "192.0.2.10"}
-            )
-            self.assertTrue(
-                browser_origin_allowed(
-                    "http://robot.local:9000",
-                    scheme="wss",
-                    host="robot.local:8000",
-                )
-            )
-            self.assertTrue(
-                browser_origin_allowed(
-                    "http://192.0.2.10:9000",
-                    scheme="wss",
-                    host="192.0.2.10:8000",
-                )
-            )
-            self.assertFalse(
-                browser_origin_allowed(
-                    "https://robot.local:9000",
-                    scheme="wss",
-                    host="robot.local:8000",
-                )
-            )
-            self.assertFalse(
-                browser_origin_allowed(
-                    "http://robot.local:9001",
-                    scheme="wss",
-                    host="robot.local:8000",
-                )
-            )
-
-    def test_request_host_cannot_grant_dns_rebinding_origin(self) -> None:
-        self.assertFalse(
-            browser_origin_allowed(
-                "http://attacker.example:8001",
-                scheme="http",
-                host="attacker.example:8001",
-            )
-        )
 
 
 class VRServerPoseModeTest(unittest.TestCase):

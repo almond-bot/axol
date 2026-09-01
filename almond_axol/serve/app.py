@@ -35,11 +35,6 @@ from ..constants import (
     URDF_PATH,
 )
 from ..utils import adb, ports
-from ..utils.browser_origin import (
-    LOOPBACK_ORIGIN_REGEX,
-    allowed_browser_origins,
-    browser_origin_allowed,
-)
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
 from ..utils.state_files import (
@@ -1152,44 +1147,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             status_code=409,
         )
 
-    # The hosted UI and loopback Vite dev servers call this LAN API from a
-    # different origin. Do not grant arbitrary websites browser access to
-    # robot motion, host-power, calibration, or protected Wi-Fi writes.
+    # Allow the Vite dev server (different origin) to call the API directly.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=sorted(allowed_browser_origins()),
-        allow_origin_regex=LOOPBACK_ORIGIN_REGEX,
+        allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    @app.middleware("http")
-    async def reject_untrusted_browser_api_requests(
-        request: Request, call_next: Any
-    ) -> Response:
-        origin = request.headers.get("origin")
-        # GET is not uniformly passive here: camera previews open hardware,
-        # motor details query CAN, update status can hit the network, and
-        # /api/info starts one-time provisioning. Protect the whole API rather
-        # than only write verbs. Native SDK/CLI clients omit both browser-only
-        # headers and remain compatible. Fetch Metadata closes the remaining
-        # top-level navigation / image-tag case, where browsers can omit Origin.
-        untrusted_origin = not browser_origin_allowed(
-            origin,
-            scheme=request.url.scheme,
-            host=request.headers.get("host", request.url.netloc),
-        )
-        originless_cross_site_browser = (
-            origin is None
-            and request.headers.get("sec-fetch-site", "").lower() == "cross-site"
-        )
-        if request.url.path.startswith("/api/") and (
-            untrusted_origin or originless_cross_site_browser
-        ):
-            return JSONResponse(
-                {"error": "browser origin is not allowed"}, status_code=403
-            )
-        return await call_next(request)
 
     @app.get("/__accept")
     async def accept_cert() -> HTMLResponse:
@@ -1561,13 +1525,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.websocket("/api/telemetry/ws")
     async def telemetry_ws(ws: WebSocket) -> None:
         """Live telemetry stream: frame / slow / state messages (see telemetry.py)."""
-        if not browser_origin_allowed(
-            ws.headers.get("origin"),
-            scheme=ws.url.scheme,
-            host=ws.headers.get("host", ws.url.netloc),
-        ):
-            await ws.close(code=1008, reason="browser origin is not allowed")
-            return
         await ws.accept()
         queue = hub.subscribe()
         try:
@@ -2558,13 +2515,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.websocket("/api/sessions/{session_id}/logs")
     async def logs(ws: WebSocket, session_id: str) -> None:
-        if not browser_origin_allowed(
-            ws.headers.get("origin"),
-            scheme=ws.url.scheme,
-            host=ws.headers.get("host", ws.url.netloc),
-        ):
-            await ws.close(code=1008, reason="browser origin is not allowed")
-            return
         await ws.accept()
         session, owner = _find_session(session_id)
         if session is None:
