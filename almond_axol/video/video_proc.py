@@ -86,6 +86,100 @@ def _open_sdk_camera(name: str, spec: dict) -> object | None:
     return None
 
 
+def _set_dataset_branches_enabled(owned: list[object], enabled: bool) -> None:
+    """Gate every dataset branch as one fail-closed camera transaction.
+
+    Opening uses one future ``perf_counter`` instant for every physical camera.
+    Each gst camera installs all of its valve probes before any caller waits, so
+    the first admitted exposure is selected by sensor PTS instead of by a series
+    of host-side property writes which can straddle multiple 60 Hz frames.
+    """
+    if enabled:
+        from .gst_zed import _DATASET_ENABLE_LEAD_S, _DATASET_GATE_TIMEOUT_S
+
+        target = time.perf_counter() + _DATASET_ENABLE_LEAD_S
+        armed: list[object] = []
+        legacy: list[object] = []
+        errors: list[str] = []
+        for cam in owned:
+            if hasattr(cam, "begin_raw_enable") and hasattr(cam, "finish_raw_enable"):
+                try:
+                    cam.begin_raw_enable(target)
+                    armed.append(cam)
+                except Exception as exc:  # noqa: BLE001 - fail all branches below
+                    errors.append(f"{cam}: {exc}")
+            elif hasattr(cam, "set_raw_enabled"):
+                legacy.append(cam)
+
+        if not errors and armed and time.perf_counter() >= target:
+            errors.append(
+                "missed the shared dataset exposure boundary while arming cameras"
+            )
+
+        # A begin failure means the common barrier was not installed everywhere;
+        # do not admit frames on the cameras which did arm successfully.
+        if not errors:
+            for cam in legacy:
+                try:
+                    cam.set_raw_enabled(True)
+                except Exception as exc:  # noqa: BLE001 - fail all branches below
+                    errors.append(f"{cam}: {exc}")
+
+        if not errors:
+            deadline = target + _DATASET_GATE_TIMEOUT_S
+            for cam in armed:
+                try:
+                    cam.finish_raw_enable(deadline)
+                except Exception as exc:  # noqa: BLE001 - collect every failure
+                    errors.append(f"{cam}: {exc}")
+
+        if errors:
+            # Some peers may already have crossed the timestamp boundary. Abort
+            # all cameras, including completed ones whose local pending list is
+            # now empty, so the relay never acknowledges a partially open set.
+            close_errors: list[str] = []
+            for cam in owned:
+                try:
+                    if hasattr(cam, "abort_raw_enable"):
+                        cam.abort_raw_enable()
+                    elif hasattr(cam, "set_raw_enabled"):
+                        cam.set_raw_enabled(False)
+                except Exception as exc:  # noqa: BLE001 - report original too
+                    close_errors.append(f"{cam}: fail-close failed: {exc}")
+            raise RuntimeError("; ".join([*errors, *close_errors]))
+        return
+
+    # Two phases are intentional: install the IDR probes on every physical
+    # camera before waiting on any one of them. Sequential arm+wait would stop
+    # cameras at different GOP phases and their episode-opening IDRs could be
+    # hundreds of milliseconds apart.
+    armed = []
+    errors = []
+    for cam in owned:
+        if hasattr(cam, "begin_raw_disable") and hasattr(cam, "finish_raw_disable"):
+            try:
+                cam.begin_raw_disable()
+                armed.append(cam)
+            except Exception as exc:  # noqa: BLE001 - finish other cameras
+                errors.append(f"{cam}: {exc}")
+        elif hasattr(cam, "set_raw_enabled"):
+            try:
+                cam.set_raw_enabled(False)
+            except Exception as exc:  # noqa: BLE001 - finish other cameras
+                errors.append(f"{cam}: {exc}")
+    # Matches gst_zed's gate bound. At the supported 1 fps minimum a valid next
+    # encoder output can arrive almost exactly one second later, so a 1.0 s
+    # deadline spuriously fails under any scheduling load.
+    deadline = time.perf_counter() + 2.0
+    for cam in armed:
+        try:
+            cam.finish_raw_disable(deadline)
+        except Exception as exc:  # noqa: BLE001 - collect every failure
+            errors.append(f"{cam}: {exc}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
 def _gsth264_meta(
     socket_path: str,
     width: int,
@@ -612,48 +706,7 @@ def _relay_main(
 
     def _set_raw_enabled(enabled: bool) -> None:
         """Gate every dataset branch, coordinating encoded GOP phase."""
-        if enabled:
-            errors: list[str] = []
-            for cam in owned:
-                if not hasattr(cam, "set_raw_enabled"):
-                    continue
-                try:
-                    cam.set_raw_enabled(True)
-                except Exception as exc:  # noqa: BLE001 - report all branches
-                    errors.append(f"{cam}: {exc}")
-            if errors:
-                raise RuntimeError("; ".join(errors))
-            return
-
-        # Two phases are intentional: install the IDR probes on every physical
-        # camera before waiting on any one of them. Sequential arm+wait would
-        # stop cameras at different GOP phases and their episode-opening IDRs
-        # could be hundreds of milliseconds apart.
-        armed: list[object] = []
-        errors = []
-        for cam in owned:
-            if hasattr(cam, "begin_raw_disable") and hasattr(cam, "finish_raw_disable"):
-                try:
-                    cam.begin_raw_disable()
-                    armed.append(cam)
-                except Exception as exc:  # noqa: BLE001 - finish other cameras
-                    errors.append(f"{cam}: {exc}")
-            elif hasattr(cam, "set_raw_enabled"):
-                try:
-                    cam.set_raw_enabled(False)
-                except Exception as exc:  # noqa: BLE001 - finish other cameras
-                    errors.append(f"{cam}: {exc}")
-        # Matches gst_zed's gate bound. At the supported 1 fps minimum a valid
-        # next encoder output can arrive almost exactly one second later, so a
-        # 1.0 s deadline spuriously fails under any scheduling load.
-        deadline = time.perf_counter() + 2.0
-        for cam in armed:
-            try:
-                cam.finish_raw_disable(deadline)
-            except Exception as exc:  # noqa: BLE001 - collect every failure
-                errors.append(f"{cam}: {exc}")
-        if errors:
-            raise RuntimeError("; ".join(errors))
+        _set_dataset_branches_enabled(owned, bool(enabled))
 
     async def serve() -> None:
         loop = asyncio.get_running_loop()
