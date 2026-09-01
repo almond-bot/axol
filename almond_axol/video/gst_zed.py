@@ -424,6 +424,13 @@ def _raw_shmsink(socket_path: str) -> str:
 # encoder immediately before a periodic IDR, so reopening emits that IDR as row
 # zero; the reader verifies this and defensively drops any leading P-frames.
 _DATASET_IDR_INTERVAL_S = 0.25
+# Before the recorder connects, a tiny leaky output queue is intentional: it
+# keeps NVENC returning its NVMM surfaces while shmsink parks GDP's one-shot
+# header. Once an episode opens, two seconds of bounded compressed-AU headroom
+# absorbs scheduler jitter without making predictive H.264 silently lossy.
+_DATASET_STARTUP_QUEUE_BUFFERS = 2
+_DATASET_ACTIVE_QUEUE_MIN_BUFFERS = 60
+_DATASET_ACTIVE_QUEUE_SECONDS = 2
 # Opening every camera with a sequence of host-side property writes can straddle
 # multiple source frames. Arm a timestamp probe on every branch first, then let
 # each one open itself on its first exposure at/after one shared future instant.
@@ -502,8 +509,11 @@ def _dataset_enc_shmsink(
         f"bitrate={target} peak-bitrate={peak} preset-level=1 "
         f"insert-sps-pps=true insert-aud=true idrinterval={idr} maxperf-enable=true "
         "! video/x-h264,stream-format=byte-stream,alignment=au "
-        f"! {_QUEUE} ! gdppay "
-        f"! shmsink socket-path={socket_path} wait-for-connection=true "
+        f"! queue name={name}_outq leaky=downstream "
+        f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
+        "max-size-bytes=0 max-size-time=0 ! gdppay "
+        f"! shmsink name={name}_shmsink socket-path={socket_path} "
+        "wait-for-connection=true "
         "sync=false async=false"
     )
 
@@ -571,6 +581,7 @@ class _GstPipelineBase:
                 str,
             ]
         ] = []
+        self._dataset_enabled = False
 
     def _cancel_dataset_disable(self) -> None:
         """Remove any outstanding natural-IDR probes (best effort)."""
@@ -606,12 +617,52 @@ class _GstPipelineBase:
     def _abort_dataset_enable(self, gates: tuple[tuple[str, str | None], ...]) -> None:
         """Fail a multi-camera open closed, including branches already opened."""
         self._cancel_dataset_enable()
+        self._dataset_enabled = False
         if self._pipeline is None:
             return
         for valve_name, _encoder_name in gates:
             valve = self._pipeline.get_by_name(valve_name)
             if valve is not None:
                 valve.set_property("drop", True)
+        self._set_dataset_output_queue_depth(gates, active=False)
+
+    def _set_dataset_output_queue_depth(
+        self,
+        gates: tuple[tuple[str, str | None], ...],
+        *,
+        active: bool,
+    ) -> None:
+        """Select bounded startup or active-episode H.264 queue headroom.
+
+        Startup must remain aggressively leaky because GDP's header is parked
+        at ``shmsink wait-for-connection=true`` before the recorder exists.
+        During an episode the reader is connected and flushed, so retain two
+        seconds of compressed AUs before failing with DISCONT. Keeping the
+        queue bounded and leaky still isolates camera capture/NVENC if the
+        recorder process dies outright.
+        """
+        if self._pipeline is None:
+            return
+        dataset_fps = max(1, int(getattr(self, "dataset_fps", 1)))
+        active_buffers = max(
+            _DATASET_ACTIVE_QUEUE_MIN_BUFFERS,
+            _DATASET_ACTIVE_QUEUE_SECONDS * dataset_fps,
+        )
+        depth = active_buffers if active else _DATASET_STARTUP_QUEUE_BUFFERS
+        for _valve_name, encoder_name in gates:
+            if encoder_name is None:
+                continue
+            output_queue = self._pipeline.get_by_name(f"{encoder_name}_outq")
+            if output_queue is None:
+                raise RuntimeError(
+                    f"missing dataset encoder output queue {encoder_name}_outq"
+                )
+            output_queue.set_property("leaky", 2)  # downstream
+            output_queue.set_property("max-size-buffers", depth)
+            # Explicitly disable the queue defaults (10 MB / 1 s); otherwise
+            # either can undercut the intended frame-count bound.
+            output_queue.set_property("max-size-bytes", 0)
+            output_queue.set_property("max-size-time", 0)
 
     def _begin_dataset_enable(
         self,
@@ -628,6 +679,11 @@ class _GstPipelineBase:
         calibrated PTS offset.
         """
         self._cancel_dataset_disable()
+        if self._dataset_enabled:
+            # Relay commands are idempotent. Re-arming an already-open branch
+            # would close it until the next future boundary, dropping H.264 AUs
+            # from the live episode for no semantic state change.
+            return
         self._cancel_dataset_enable()
         if self._pipeline is None:
             return
@@ -654,6 +710,7 @@ class _GstPipelineBase:
             ]
         ] = []
         try:
+            self._set_dataset_output_queue_depth(gates, active=True)
             for valve_name, encoder_name in gates:
                 valve = self._pipeline.get_by_name(valve_name)
                 if valve is None:
@@ -766,6 +823,7 @@ class _GstPipelineBase:
             raise RuntimeError("; ".join(failures))
         if self._dataset_enable is pending:
             self._dataset_enable = []
+        self._dataset_enabled = True
 
     def _begin_dataset_disable(self, gates: tuple[tuple[str, str | None], ...]) -> None:
         """Arm every encoded branch to stop one frame before its next IDR.
@@ -851,10 +909,12 @@ class _GstPipelineBase:
         except Exception:
             self._dataset_disable = armed
             self._cancel_dataset_disable()
+            self._dataset_enabled = False
             for valve_name, _encoder_name in gates:
                 valve = self._pipeline.get_by_name(valve_name)
                 if valve is not None:
                     valve.set_property("drop", True)
+            self._set_dataset_output_queue_depth(gates, active=False)
             raise
         self._dataset_disable = armed
 
@@ -876,10 +936,12 @@ class _GstPipelineBase:
                 valve.set_property("drop", True)
                 timed_out.append(label)
         if timed_out:
+            self._dataset_enabled = False
             raise RuntimeError(
                 "timed out aligning dataset encoder before IDR on "
                 + ", ".join(timed_out)
             )
+        self._dataset_enabled = False
 
     @property
     def alive(self) -> bool:
@@ -1073,6 +1135,7 @@ class _GstPipelineBase:
     def disconnect(self) -> None:
         self._stop.set()
         self._cancel_dataset_enable()
+        self._dataset_enabled = False
         self._cancel_dataset_disable()
         for thread in self._threads:
             thread.join(timeout=2.0)
@@ -1215,7 +1278,10 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
 
     def finish_raw_disable(self, deadline: float) -> None:
         """Complete a close previously armed by :meth:`begin_raw_disable`."""
-        self._finish_dataset_disable(deadline)
+        try:
+            self._finish_dataset_disable(deadline)
+        finally:
+            self._set_dataset_output_queue_depth(self._raw_gates(), active=False)
 
     def begin_raw_enable(self, target_perf_s: float) -> None:
         """Arm this camera to open on a shared future exposure boundary."""
@@ -1597,7 +1663,10 @@ class ZedGstStereoCamera(_GstPipelineBase):
 
     def finish_raw_disable(self, deadline: float) -> None:
         """Complete a close previously armed by :meth:`begin_raw_disable`."""
-        self._finish_dataset_disable(deadline)
+        try:
+            self._finish_dataset_disable(deadline)
+        finally:
+            self._set_dataset_output_queue_depth(self._raw_gates(), active=False)
 
     def begin_raw_enable(self, target_perf_s: float) -> None:
         """Arm both eyes to open on a shared future exposure boundary."""

@@ -7,17 +7,11 @@ import unittest
 from unittest.mock import patch
 
 from almond_axol.video.gst_zed import (
-    _GstPipelineBase,
     ZedGstCamera,
     ZedGstStereoCamera,
+    _GstPipelineBase,
 )
 from almond_axol.video.video_proc import _set_dataset_branches_enabled
-
-
-_H264_OUTPUT = (
-    "video/x-h264,stream-format=byte-stream,alignment=au ! "
-    "queue leaky=downstream max-size-buffers=2 ! gdppay ! shmsink"
-)
 
 
 class _FakeGst:
@@ -67,6 +61,22 @@ class _FakeValve:
         return self.sink if name == "sink" else None
 
 
+class _FakeQueue:
+    def __init__(self) -> None:
+        self.properties = {
+            "leaky": 2,
+            "max-size-buffers": 2,
+            "max-size-bytes": 0,
+            "max-size-time": 0,
+        }
+
+    def set_property(self, name: str, value: int) -> None:
+        self.properties[name] = int(value)
+
+    def get_property(self, name: str) -> int:
+        return self.properties[name]
+
+
 class _FakePipeline:
     def __init__(self, elements: dict[str, object]) -> None:
         self._elements = elements
@@ -80,10 +90,16 @@ def _fake_gate_base(
 ) -> tuple[_GstPipelineBase, dict[str, _FakeValve]]:
     gst = _FakeGst()
     valves = {name: _FakeValve(gst) for name in valve_names}
+    queues = {
+        ("dsenc" if name == "rawvalve" else f"dsenc_{name.rsplit('_', 1)[1]}")
+        + "_outq": _FakeQueue()
+        for name in valve_names
+    }
     base = _GstPipelineBase()
     base._gst = gst
-    base._pipeline = _FakePipeline(valves)
+    base._pipeline = _FakePipeline({**valves, **queues})
     base._pts_perf_offset_s = offset_s
+    base.dataset_fps = 30
     return base, valves
 
 
@@ -115,12 +131,20 @@ class GstDatasetTransportTest(unittest.TestCase):
         self, pipeline: str, valve_name: str, encoder_name: str, socket_path: str
     ) -> None:
         start = pipeline.index(f"valve name={valve_name} drop=false")
-        sink = f"shmsink socket-path={socket_path} wait-for-connection=true"
+        sink = (
+            f"shmsink name={encoder_name}_shmsink socket-path={socket_path} "
+            "wait-for-connection=true"
+        )
         end = pipeline.index(sink, start) + len(sink)
         branch = pipeline[start:end]
 
         self.assertIn(f"name={encoder_name}", branch)
-        self.assertIn(_H264_OUTPUT, branch)
+        self.assertIn(
+            "video/x-h264,stream-format=byte-stream,alignment=au ! "
+            f"queue name={encoder_name}_outq leaky=downstream "
+            "max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! gdppay",
+            branch,
+        )
         self.assertIn(sink, branch)
 
     def test_mono_dataset_encoder_drains_before_recorder_connects(self) -> None:
@@ -176,6 +200,45 @@ class GstDatasetEnableBarrierTest(unittest.TestCase):
         valve.sink.push(10_000_000_000)
         self.assertFalse(valve.drop)
         base._finish_dataset_enable(0.0)
+
+    def test_active_episode_expands_bounded_predictive_queue(self) -> None:
+        base, _valves = _fake_gate_base()
+        output_queue = base._pipeline.get_by_name("dsenc_outq")
+
+        base._begin_dataset_enable((("rawvalve", "dsenc"),), 100.0)
+
+        self.assertEqual(output_queue.get_property("leaky"), 2)
+        self.assertEqual(output_queue.get_property("max-size-buffers"), 60)
+        self.assertEqual(output_queue.get_property("max-size-bytes"), 0)
+        self.assertEqual(output_queue.get_property("max-size-time"), 0)
+
+        base._abort_dataset_enable((("rawvalve", "dsenc"),))
+        self.assertEqual(output_queue.get_property("max-size-buffers"), 2)
+
+    def test_active_queue_depth_scales_with_capture_rate(self) -> None:
+        base, _valves = _fake_gate_base()
+        base.dataset_fps = 60
+        output_queue = base._pipeline.get_by_name("dsenc_outq")
+
+        base._begin_dataset_enable((("rawvalve", "dsenc"),), 100.0)
+
+        self.assertEqual(output_queue.get_property("max-size-buffers"), 120)
+
+    def test_repeated_enable_does_not_reclose_live_episode(self) -> None:
+        base, valves = _fake_gate_base(offset_s=90.0)
+        gates = (("rawvalve", "dsenc"),)
+        valve = valves["rawvalve"]
+
+        base._begin_dataset_enable(gates, 100.0)
+        valve.sink.push(10_000_000_000)
+        base._finish_dataset_enable(0.0)
+        self.assertFalse(valve.drop)
+
+        base._begin_dataset_enable(gates, 101.0)
+        base._finish_dataset_enable(0.0)
+
+        self.assertFalse(valve.drop)
+        self.assertEqual(base._dataset_enable, [])
 
     def test_failed_eye_recloses_sibling_which_already_opened(self) -> None:
         base, valves = _fake_gate_base(
