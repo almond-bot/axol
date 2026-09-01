@@ -78,6 +78,15 @@ _ENCODED_START_TIMEOUT_S = 15.0
 _ENCODED_ROW_TIMEOUT_S = 1.0
 # How often the blocking AU read wakes to re-check stop_event.
 _ENCODED_POLL_MS = 100
+# A relay/source hiccup occasionally omits one or two all-intra AUs even while
+# the rest of the camera/control stack remains healthy.  Holding the last IDR
+# for those missing cadence slots is bounded corruption (at most 33 ms at
+# 60 Hz) and, unlike accepting the future AU early, does not shift that camera
+# against every subsequent robot-state/dataset row.  More than one event or two
+# frames on a camera is evidence of an unhealthy stream and remains fatal.
+_ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA = 2
+_ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA = 1
+_ENCODED_GAP_GRID_TOLERANCE_FRAMES = 0.25
 # A just-arrived exposure can precede the newest control snapshot by one control
 # tick. Briefly poll the state ring for the upper bracket; never clamp outside
 # its retained range.
@@ -924,6 +933,44 @@ def _validate_encoded_cadence_step(
         )
 
 
+def _concealable_encoded_gap_frames(
+    *,
+    previous_ts: float,
+    capture_ts: float,
+    fps: int,
+    capture_fps: int,
+    frames_are_independent: bool,
+) -> int:
+    """Return the number of bounded missing cadence slots, else zero.
+
+    This is intentionally narrower than the cadence validator.  A repair is
+    safe for the encoded transport only when every source frame is a standalone
+    IDR and the dataset consumes every captured exposure.  Rate-converted
+    streams can legitimately alternate source-frame spacings, so they retain
+    the exact/fail-closed path rather than having that selection pattern
+    mistaken for loss.
+    """
+    if (
+        not frames_are_independent
+        or fps <= 0
+        or capture_fps != fps
+        or not math.isfinite(previous_ts)
+        or not math.isfinite(capture_ts)
+    ):
+        return 0
+    delta = capture_ts - previous_ts
+    if delta <= 0:
+        return 0
+    periods = round(delta * fps)
+    missing = periods - 1
+    if not 1 <= missing <= _ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA:
+        return 0
+    residual = abs(delta - periods / fps)
+    if residual > _ENCODED_GAP_GRID_TOLERANCE_FRAMES / capture_fps:
+        return 0
+    return missing
+
+
 def _align_independent_encoded_start(
     packets: dict[str, tuple[bytes, float, float]],
     read_next: Callable[[str], tuple[bytes, float, float] | None],
@@ -1273,6 +1320,7 @@ def run_encoded_capture_loop(
     rerun_ip: str | None,
     stop_event: threading.Event,
     frame_counter: "dict[str, int] | None" = None,
+    repair_events: "list[dict[str, Any]] | None" = None,
     on_error: Callable[[str], None] | None = None,
     on_armed: Callable[[], None] | None = None,
 ) -> None:
@@ -1290,8 +1338,13 @@ def run_encoded_capture_loop(
     is paired with the joint/action snapshot nearest the median camera exposure,
     independent of encoder, shm, and scheduler latency. The blocking per-camera
     read naturally paces the loop to the dataset cadence. A timeout, missing PTS,
-    dropped frame, cross-camera phase error, or excessive state skew aborts the
-    episode; exposures are never duplicated or silently omitted mid-episode.
+    cross-camera phase error, or excessive state skew aborts the episode.  The
+    sole exception is one bounded one/two-frame hole per equal-rate all-intra
+    camera: the prior IDR is repeated on the missing cadence slots while the
+    future AU is held, preserving all subsequent image/camera/state alignment.
+    The repair is warned and returned through ``repair_events`` for a save-time
+    audit log; larger, repeated, predictive, rate-converted, transport, or
+    non-grid losses remain fatal.
 
     The muxer assigns each AU a constant-fps PTS (``k / fps``), so the mp4
     timeline is exact regardless of arrival jitter; its physical exposure PTS is
@@ -1361,10 +1414,21 @@ def run_encoded_capture_loop(
             return None
 
         previous_capture_ts: dict[str, float] = {}
+        previous_packets: dict[str, tuple[bytes, float, float]] = {}
         first_capture_ts: dict[str, float] = {}
         capture_intervals: dict[str, int] = {}
+        # A detected future AU stays here until every missing logical cadence
+        # slot has emitted the previous independently-decodable IDR.  Reading
+        # peers continues normally, so the existing cross-camera validator
+        # proves every repaired row is still synchronized.
+        held_packets: dict[
+            str, tuple[tuple[bytes, float, float], int, dict[str, Any]]
+        ] = {}
+        concealed_frames: dict[str, int] = {}
+        concealment_events: dict[str, int] = {}
         primed = False
         rows_added = 0
+        total_rows = 0
         max_pending = 0
         snapshot_skew_sum = 0.0
         snapshot_skew_max = 0.0
@@ -1380,8 +1444,25 @@ def run_encoded_capture_loop(
             # non-blocking attempt still accepts an AU already queued.
             row_deadline = time.perf_counter() + budget
             packets: dict[str, tuple[bytes, float, float]] = {}
+            synthetic_repairs: dict[str, dict[str, Any]] = {}
             for cam_key, cam in cameras.items():
-                packet = read_au(cam, row_deadline)
+                held = held_packets.get(cam_key)
+                if held is not None:
+                    future, remaining, event = held
+                    if remaining > 0:
+                        previous = previous_packets[cam_key]
+                        packet = (
+                            previous[0],
+                            previous[1] + 1.0 / fps,
+                            future[2],
+                        )
+                        held_packets[cam_key] = (future, remaining - 1, event)
+                        synthetic_repairs[cam_key] = event
+                    else:
+                        packet = future
+                        del held_packets[cam_key]
+                else:
+                    packet = read_au(cam, row_deadline)
                 if packet is None:
                     if stop_event.is_set():
                         return
@@ -1450,6 +1531,68 @@ def run_encoded_capture_loop(
                     for cam in cameras.values():
                         max_pending = max(max_pending, cam.pending)
 
+            # Do not accept a future AU early: mux re-stamping would shift this
+            # camera against every later row.  For the one explicitly bounded
+            # all-IDR case, hold it and fill the missing logical exposure slots
+            # from the prior IDR.  This decision belongs here (with all cameras
+            # visible), not inside an individual EncodedAuReader.
+            if primed:
+                for cam_key, packet in tuple(packets.items()):
+                    if cam_key in held_packets:
+                        continue  # already emitting a planned synthetic slot
+                    previous = previous_packets[cam_key]
+                    camera = cameras[cam_key]
+                    capture_fps = int(getattr(camera, "capture_fps", fps))
+                    missing = _concealable_encoded_gap_frames(
+                        previous_ts=previous[1],
+                        capture_ts=packet[1],
+                        fps=fps,
+                        capture_fps=capture_fps,
+                        frames_are_independent=bool(
+                            getattr(camera, "frames_are_independent", False)
+                        ),
+                    )
+                    already_concealed = concealed_frames.get(cam_key, 0)
+                    prior_events = concealment_events.get(cam_key, 0)
+                    if (
+                        missing == 0
+                        or prior_events >= _ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA
+                        or already_concealed + missing
+                        > _ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA
+                    ):
+                        continue
+                    event: dict[str, Any] = {
+                        "camera": cam_key,
+                        "frame_index": total_rows,
+                        # Updated only after each synthetic dataset row commits.
+                        # This keeps a save that lands midway through a two-row
+                        # repair honest, and records nothing if add_frame fails.
+                        "missing_frames": 0,
+                        "gap_ms": 1e3 * (packet[1] - previous[1]),
+                        "concealed_ms": 0.0,
+                        "method": "repeat_previous_idr",
+                    }
+                    held_packets[cam_key] = (packet, missing - 1, event)
+                    packets[cam_key] = (
+                        previous[0],
+                        previous[1] + 1.0 / fps,
+                        packet[2],
+                    )
+                    synthetic_repairs[cam_key] = event
+                    concealed_frames[cam_key] = already_concealed + missing
+                    concealment_events[cam_key] = prior_events + 1
+                    _logger.warning(
+                        "camera %r omitted %d all-intra frame(s) at dataset "
+                        "row %d (PTS gap %.2fms); repeating the prior IDR for "
+                        "%.2fms and holding the future AU to preserve camera/"
+                        "state alignment",
+                        cam_key,
+                        missing,
+                        total_rows,
+                        event["gap_ms"],
+                        1e3 * missing / fps,
+                    )
+
             aus = {name: packet[0] for name, packet in packets.items()}
             capture_ts = {name: packet[1] for name, packet in packets.items()}
             primed = True
@@ -1475,6 +1618,7 @@ def run_encoded_capture_loop(
                     first_capture_ts[cam_key] = cap_ts
                     capture_intervals[cam_key] = 0
                 previous_capture_ts[cam_key] = cap_ts
+                previous_packets[cam_key] = packets[cam_key]
 
             exposure_times = list(capture_ts.values())
             row_capture_ts = float(median(exposure_times))
@@ -1538,9 +1682,15 @@ def run_encoded_capture_loop(
             if tag_intervention:
                 row["intervention"] = np.array([intervention], dtype=bool)
             dataset.add_frame(row)
+            for event in synthetic_repairs.values():
+                if event["missing_frames"] == 0 and repair_events is not None:
+                    repair_events.append(event)
+                event["missing_frames"] += 1
+                event["concealed_ms"] = 1e3 * event["missing_frames"] / fps
             if frame_counter is not None:
                 frame_counter["n"] += 1
             rows_added += 1
+            total_rows += 1
 
             if rerun_ip:
                 # No decoded frames on this path; log joints/action only.
@@ -2167,6 +2317,7 @@ def _recorder_main(
     thread: threading.Thread | None = None
     stop: threading.Event | None = None
     capture_error: dict[str, str | None] = {"v": None}
+    capture_repairs: list[dict[str, Any]] = []
     episodes_recorded = 0
     save_poisoned = False
     # Mid-episode capture gate + row counter (see run_capture_loop). The gate
@@ -2214,6 +2365,7 @@ def _recorder_main(
                     continue
                 dataset.clear_episode_buffer()
                 capture_error["v"] = None
+                capture_repairs.clear()
                 record_event.set()
                 frame_counter["n"] = 0
                 from ..lerobot.nvenc_encoder import reset_dropped_frames
@@ -2238,6 +2390,7 @@ def _recorder_main(
                 armed = threading.Event()
                 if encoded_mode:
                     loop_kwargs["on_armed"] = armed.set
+                    loop_kwargs["repair_events"] = capture_repairs
                 thread = threading.Thread(
                     target=(
                         run_encoded_capture_loop if encoded_mode else run_capture_loop
@@ -2360,6 +2513,19 @@ def _recorder_main(
                         )
                         if episode_row is not None:
                             verifier.submit(episode_row)
+                        if capture_repairs:
+                            _logger.warning(
+                                "saved episode %d with bounded camera-gap "
+                                "repair(s): %s",
+                                dataset.num_episodes - 1,
+                                ", ".join(
+                                    f"{event['camera']}@row "
+                                    f"{event['frame_index']}="
+                                    f"{event['missing_frames']} frame(s)"
+                                    for event in capture_repairs
+                                ),
+                            )
+                        capture_repairs.clear()
                         episodes_recorded += 1
                         conn.send(("saved", dataset.num_episodes))
                     except Exception as exc:  # irreversible writer state possible
@@ -2377,6 +2543,7 @@ def _recorder_main(
                     conn.send(("error", str(exc)))
                     continue
                 dataset.clear_episode_buffer()
+                capture_repairs.clear()
                 conn.send(("cancelled",))
     finally:
         # Never close/finalize the dataset while its capture thread may still

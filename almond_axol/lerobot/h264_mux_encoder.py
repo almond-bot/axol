@@ -29,10 +29,11 @@ exactly ``i / fps``, with exactly as many frames as dataset rows. GDP preserves
 the physical capture PTS across ``shmsink``/``shmsrc`` for state association;
 this muxer independently assigns the dataset timeline: the *k*-th access unit is
 muxed at ``pts = k / fps`` (``dts`` and ``duration`` match). The caller
-(:func:`~almond_axol.recording.record_proc.run_encoded_capture_loop`) requires
-one fresh AU per camera per row and aborts on a stall—encoded exposures are
-never replayed—so frame-count == row-count by construction. The concat step reasserts
-that exact grid across episodes (see
+(:func:`~almond_axol.recording.record_proc.run_encoded_capture_loop`) ordinarily
+requires one fresh AU per camera per row. It may explicitly repeat an all-intra
+AU for one bounded one/two-frame source hole, while retaining the future AU, so
+frame-count and subsequent exposure/row alignment remain exact. The concat step
+reasserts that grid across episodes (see
 :func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`).
 
 Because the frames arrive pre-encoded, the first muxed AU of an episode must be
