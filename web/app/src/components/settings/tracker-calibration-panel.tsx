@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react"
-import { Check, Loader2, RefreshCw, Ruler, Save } from "lucide-react"
+import { Check, Loader2, RefreshCw, Ruler, Save, Trash2 } from "lucide-react"
 import {
   fetchTrackerCalibration,
+  removeTrackerCalibration,
   saveTrackerCalibration,
   type MantisTrackerSource,
   type TrackerCalibrationSide,
@@ -11,8 +12,14 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useToast } from "@/components/ui/toast"
+import { hasApprovedTrackerFactoryTransform } from "@/lib/tracker-calibration"
 
 type Side = "left" | "right"
+
+interface RemovalTarget {
+  side: Side
+  key: string
+}
 
 interface TransformDraft {
   pos: [string, string, string]
@@ -80,6 +87,8 @@ export function TrackerCalibrationPanel({
   })
   const [loading, setLoading] = useState(true)
   const [savingSide, setSavingSide] = useState<Side | null>(null)
+  const [removingSide, setRemovingSide] = useState<Side | null>(null)
+  const [removalTarget, setRemovalTarget] = useState<RemovalTarget | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   function load() {
@@ -90,6 +99,7 @@ export function TrackerCalibrationPanel({
         setSnapshot(found)
         setDrafts({ left: draftFor(found.left), right: draftFor(found.right) })
         setConfirmed({ left: false, right: false })
+        setRemovalTarget(null)
       })
       .catch((reason) => setError(message(reason)))
       .finally(() => setLoading(false))
@@ -104,6 +114,7 @@ export function TrackerCalibrationPanel({
         setSnapshot(found)
         setDrafts({ left: draftFor(found.left), right: draftFor(found.right) })
         setConfirmed({ left: false, right: false })
+        setRemovalTarget(null)
       })
       .catch((reason) => {
         if (!cancelled) setError(message(reason))
@@ -126,6 +137,7 @@ export function TrackerCalibrationPanel({
       } as Record<Side, TransformDraft>
     })
     setConfirmed((current) => ({ ...current, [side]: false }))
+    setRemovalTarget(null)
   }
 
   async function save(side: Side) {
@@ -145,12 +157,53 @@ export function TrackerCalibrationPanel({
       setSnapshot(saved)
       setDrafts((current) => ({ ...current, [side]: draftFor(saved[side]) }))
       setConfirmed((current) => ({ ...current, [side]: false }))
+      setRemovalTarget(null)
       toast.success(`${side === "left" ? "Left" : "Right"} tracker mount saved as measured.`)
     } catch (reason) {
       setError(message(reason))
       toast.error(`Could not save tracker calibration: ${message(reason)}`)
     } finally {
       setSavingSide(null)
+    }
+  }
+
+  async function remove(side: Side, overrideKey: string) {
+    const activeKey = snapshot?.[side].key
+    const revision = snapshot?.[side].overrideRevisions?.[overrideKey]
+    if (
+      !activeKey ||
+      !revision ||
+      removalTarget?.side !== side ||
+      removalTarget.key !== overrideKey ||
+      !contextSaved
+    )
+      return
+    setRemovingSide(side)
+    setError(null)
+    try {
+      const saved = await removeTrackerCalibration(source, side, overrideKey, activeKey, revision)
+      setSnapshot(saved)
+      setDrafts((current) => ({ ...current, [side]: draftFor(saved[side]) }))
+      setConfirmed((current) => ({ ...current, [side]: false }))
+      setRemovalTarget(null)
+      if (saved[side].status === "factory") {
+        toast.success(
+          `${side === "left" ? "Left" : "Right"} override removed; factory transform restored.`
+        )
+      } else if ((saved[side].overrideKeys?.length ?? 0) > 0) {
+        toast.success(
+          `${side === "left" ? "Left" : "Right"} override removed; review the remaining saved override.`
+        )
+      } else {
+        toast.success(
+          `${side === "left" ? "Left" : "Right"} override removed; this side is now uncalibrated.`
+        )
+      }
+    } catch (reason) {
+      setError(message(reason))
+      toast.error(`Could not remove tracker calibration: ${message(reason)}`)
+    } finally {
+      setRemovingSide(null)
     }
   }
 
@@ -167,7 +220,7 @@ export function TrackerCalibrationPanel({
           size="sm"
           className="ml-auto"
           onClick={load}
-          disabled={loading || savingSide !== null}
+          disabled={loading || savingSide !== null || removingSide !== null}
         >
           <RefreshCw className={loading ? "animate-spin" : ""} /> Refresh
         </Button>
@@ -207,16 +260,25 @@ export function TrackerCalibrationPanel({
             <CalibrationSideEditor
               key={`${source}:${side}:${snapshot[side].key ?? "unbound"}`}
               side={side}
+              factoryBacked={hasApprovedTrackerFactoryTransform(
+                source,
+                snapshot.activePoseConvention
+              )}
               entry={snapshot[side]}
               draft={drafts[side]}
               confirmed={confirmed[side]}
               saving={savingSide === side}
-              disabled={!contextSaved || savingSide !== null}
+              removing={removingSide === side}
+              removeKey={removalTarget?.side === side ? removalTarget.key : null}
+              disabled={!contextSaved || savingSide !== null || removingSide !== null}
               onPartChange={(part, index, value) => setPart(side, part, index, value)}
               onConfirmedChange={(value) =>
                 setConfirmed((current) => ({ ...current, [side]: value }))
               }
               onSave={() => save(side)}
+              onRequestRemove={(key) => setRemovalTarget({ side, key })}
+              onCancelRemove={() => setRemovalTarget(null)}
+              onRemove={(key) => remove(side, key)}
             />
           ))}
         </div>
@@ -229,34 +291,52 @@ export function TrackerCalibrationPanel({
 
 function CalibrationSideEditor({
   side,
+  factoryBacked,
   entry,
   draft,
   confirmed,
   saving,
+  removing,
+  removeKey,
   disabled,
   onPartChange,
   onConfirmedChange,
   onSave,
+  onRequestRemove,
+  onCancelRemove,
+  onRemove,
 }: {
   side: Side
+  factoryBacked: boolean
   entry: TrackerCalibrationSide
   draft: TransformDraft
   confirmed: boolean
   saving: boolean
+  removing: boolean
+  removeKey: string | null
   disabled: boolean
   onPartChange: (part: "pos" | "quat", index: number, value: string) => void
   onConfirmedChange: (value: boolean) => void
   onSave: () => void
+  onRequestRemove: (key: string) => void
+  onCancelRemove: () => void
+  onRemove: (key: string) => void
 }) {
   const label = side === "left" ? "Left Mantis" : "Right Mantis"
   const parsed = parseDraft(draft)
   const complete = typeof parsed !== "string"
+  // Older serve hosts do not expose the revision-guarded DELETE contract.
+  // Only offer removal when the snapshot explicitly advertises removable
+  // keys; synthesizing one from a measured entry would lead to a guaranteed
+  // 404 against those hosts.
+  const overrideKeys = entry.overrideKeys ?? []
+  const overrideNeedsAttention = entry.status === "missing" && overrideKeys.length > 0
   const statusCopy = {
     measured: "Measured override saved",
     stale: "Saved convention is stale — re-check required",
     factory: "Verified factory constant active",
     candidate: "CAD candidate only — not calibrated",
-    missing: "Measurement required",
+    missing: overrideNeedsAttention ? "Saved override needs attention" : "Measurement required",
     unbound: "Active tracker key unavailable",
   }[entry.status]
   const statusClass =
@@ -347,6 +427,92 @@ function CalibrationSideEditor({
         )}
         Save {side} as measured
       </Button>
+
+      {overrideKeys.length > 0 && removeKey === null && (
+        <div className="space-y-2">
+          {overrideNeedsAttention && (
+            <p className="text-[11px] leading-relaxed text-red-200/75">
+              {factoryBacked
+                ? "A malformed, legacy, or different-device override is preventing the approved factory transform from becoming active."
+                : "The active tracker override is malformed and cannot authorize collection."}{" "}
+              Verify the physical mount before removing a saved entry.
+            </p>
+          )}
+          {overrideKeys.map((key) => {
+            const ordinaryActiveOverride =
+              key === entry.key && (entry.status === "measured" || entry.status === "stale")
+            const description =
+              key === entry.key
+                ? ordinaryActiveOverride
+                  ? "Active tracker override"
+                  : "Malformed active tracker override"
+                : key === "legacy"
+                  ? "Legacy unkeyed override"
+                  : "Different-device override blocking factory fallback"
+            return (
+              <div
+                key={key}
+                className={
+                  ordinaryActiveOverride
+                    ? "flex flex-col items-start gap-1.5"
+                    : "space-y-1.5 rounded-md border border-white/10 bg-black/15 p-2"
+                }
+              >
+                {!ordinaryActiveOverride && (
+                  <>
+                    <p className="text-[10px] text-white/45">{description}</p>
+                    <code className="block break-all text-[10px] text-white/35">{key}</code>
+                  </>
+                )}
+                <Button
+                  type="button"
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => onRequestRemove(key)}
+                  disabled={disabled || removing}
+                >
+                  <Trash2 />
+                  {ordinaryActiveOverride ? "Remove saved override" : "Remove this override"}
+                </Button>
+              </div>
+            )
+          })}
+        </div>
+      )}
+      {removeKey !== null && (
+        <div className="space-y-2 rounded-md border border-red-400/25 bg-red-400/[0.05] p-3">
+          <p className="text-[11px] leading-relaxed text-red-200/80">
+            Remove exactly this saved override? The active tracker identity will be checked again
+            before deletion.{" "}
+            {factoryBacked
+              ? "The approved factory transform will become active only after every blocking entry is gone."
+              : "This side will become uncalibrated until a new measured override is saved."}{" "}
+            Other tracker families and the other side will not change.
+          </p>
+          <code className="block break-all text-[10px] text-red-100/65">{removeKey}</code>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={onCancelRemove}
+              disabled={disabled || removing}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              size="sm"
+              onClick={() => onRemove(removeKey)}
+              disabled={disabled || removing}
+            >
+              {removing ? <Loader2 className="animate-spin" /> : <Trash2 />}
+              Yes, remove override
+            </Button>
+          </div>
+        </div>
+      )}
     </fieldset>
   )
 }

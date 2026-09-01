@@ -27,13 +27,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
+import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
 from ..utils.paths import almond_path
+from ..utils.state_files import secure_atomic_write_json, secure_open_text_read
 from .base import (
     TrackerPose,
     TrackerSource,
@@ -71,6 +77,19 @@ _ISO_ALPHA_2_COUNTRIES = frozenset(
 _GOOD_STATUS_STRINGS = {"tracking", "ok"}
 _MISSING = object()
 _READER_STOP_TIMEOUT_S = 1.0
+
+
+@dataclass(frozen=True, repr=False)
+class UltimateWifiConfigState:
+    """One descriptor-pinned, secret-safe view of the Wi-Fi config."""
+
+    status: Literal["valid", "missing", "invalid"]
+    error: str | None
+    mode: int | None = None
+    # Never include credentials in the representation of readiness/debug
+    # state.  The values exist only so the runtime can publish a private copy
+    # for pyvut without reopening the operator-controlled source path.
+    values: dict[str, object] | None = field(default=None, repr=False)
 
 
 def _reader_health_error(api: object) -> str | None:
@@ -184,19 +203,71 @@ def ultimate_wifi_values_error(value: object) -> str | None:
     return None
 
 
+def ultimate_wifi_config_state(
+    path: Path = ULTIMATE_WIFI_CONFIG_FILE,
+) -> UltimateWifiConfigState:
+    """Read and validate the shared-map Wi-Fi file through one pinned fd.
+
+    Every path component and the final file are opened without following
+    symlinks.  File mode comes from that same descriptor, so readiness never
+    validates one inode and reports permissions from another.  Returned error
+    text is deliberately credential-free.
+    """
+    try:
+        with secure_open_text_read(path) as stream:
+            mode = stat.S_IMODE(os.fstat(stream.fileno()).st_mode)
+            raw = stream.read()
+    except FileNotFoundError:
+        return UltimateWifiConfigState("missing", "file is missing")
+    except OSError as exc:
+        return UltimateWifiConfigState("invalid", f"file cannot be read ({exc})")
+    except UnicodeError:
+        return UltimateWifiConfigState("invalid", "file is not valid UTF-8")
+
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return UltimateWifiConfigState(
+            "invalid",
+            f"file is not valid JSON (line {exc.lineno}, column {exc.colno})",
+            mode=mode,
+        )
+    error = ultimate_wifi_values_error(value)
+    if error is not None:
+        return UltimateWifiConfigState(
+            "invalid",
+            error,
+            mode=mode,
+            values=value if isinstance(value, dict) else None,
+        )
+    assert isinstance(value, dict)
+    return UltimateWifiConfigState("valid", None, mode=mode, values=value)
+
+
 def ultimate_wifi_config_error(
     path: Path = ULTIMATE_WIFI_CONFIG_FILE,
 ) -> str | None:
     """Return a redacted validation error for pyvut's shared-map Wi-Fi file."""
+    state = ultimate_wifi_config_state(path)
+    return None if state.status == "valid" else state.error
+
+
+def _private_wifi_snapshot(
+    state: UltimateWifiConfigState,
+) -> tuple[tempfile.TemporaryDirectory[str], str]:
+    """Publish validated values where pyvut cannot be redirected by an operator."""
+    assert state.status == "valid" and state.values is not None
+    # `/tmp` is explicit: a root service must not honor an operator-provided
+    # TMPDIR for credential material. TemporaryDirectory creates mode 0700;
+    # the file inside is additionally fixed at 0600.
+    temporary = tempfile.TemporaryDirectory(prefix="axol-ultimate-wifi-", dir="/tmp")
+    destination = Path(temporary.name) / "wifi_info.json"
     try:
-        value = json.loads(path.read_text())
-    except FileNotFoundError:
-        return "file is missing"
-    except OSError as exc:
-        return f"file cannot be read ({exc})"
-    except json.JSONDecodeError as exc:
-        return f"file is not valid JSON (line {exc.lineno}, column {exc.colno})"
-    return ultimate_wifi_values_error(value)
+        secure_atomic_write_json(destination, state.values, mode=0o600)
+    except BaseException:
+        temporary.cleanup()
+        raise
+    return temporary, str(destination)
 
 
 def ultimate_dongle_present() -> bool | None:
@@ -343,6 +414,7 @@ class UltimateSource(TrackerSource):
         self._lock = threading.Lock()
         self._api = None
         self._api_uses_context_exit = False
+        self._wifi_material: tempfile.TemporaryDirectory[str] | None = None
 
     # -- Lifecycle -----------------------------------------------------------
 
@@ -350,14 +422,14 @@ class UltimateSource(TrackerSource):
         if self._api is not None:
             return
         wifi_info_path = None
-        if ULTIMATE_WIFI_CONFIG_FILE.exists():
-            config_error = ultimate_wifi_config_error(ULTIMATE_WIFI_CONFIG_FILE)
-            if config_error is not None:
-                raise RuntimeError(
-                    f"invalid Ultimate shared-map Wi-Fi config at "
-                    f"{ULTIMATE_WIFI_CONFIG_FILE}: {config_error}"
-                )
-            wifi_info_path = str(ULTIMATE_WIFI_CONFIG_FILE)
+        wifi_state = ultimate_wifi_config_state(ULTIMATE_WIFI_CONFIG_FILE)
+        if wifi_state.status == "invalid":
+            raise RuntimeError(
+                f"invalid Ultimate shared-map Wi-Fi config at "
+                f"{ULTIMATE_WIFI_CONFIG_FILE}: {wifi_state.error}"
+            )
+        if wifi_state.status == "valid":
+            self._wifi_material, wifi_info_path = _private_wifi_snapshot(wifi_state)
         else:
             _logger.warning(
                 "Ultimate shared-map Wi-Fi config %s is absent; pyvut will use "
@@ -369,8 +441,10 @@ class UltimateSource(TrackerSource):
             from pyvut import UltimateTrackerAPI
             from pyvut.tracker_core import set_tracker_core_verbose
         except (ImportError, OSError) as exc:
+            self._clear_wifi_material()
             raise _dependency_error(exc) from exc
         if not callable(getattr(hid, "Device", None)):
+            self._clear_wifi_material()
             raise RuntimeError(
                 "the Ultimate backend requires the PyPI package `hid` with its "
                 "`hid.Device` API; the similarly named `hidapi` package is not "
@@ -426,6 +500,7 @@ class UltimateSource(TrackerSource):
                 _note_start_cleanup_failure(
                     exc, api, uses_context_exit=uses_context_exit
                 )
+            self._clear_wifi_material()
             if "installed pyvut" in str(exc):
                 raise
             raise _dongle_open_error(exc) from exc
@@ -434,6 +509,7 @@ class UltimateSource(TrackerSource):
                 _note_start_cleanup_failure(
                     exc, api, uses_context_exit=uses_context_exit
                 )
+            self._clear_wifi_material()
             raise _dongle_open_error(exc) from exc
 
         self._api = api
@@ -446,6 +522,15 @@ class UltimateSource(TrackerSource):
             _stop_api(api, uses_context_exit=self._api_uses_context_exit)
             self._api = None
             self._api_uses_context_exit = False
+            self._clear_wifi_material()
+        else:
+            self._clear_wifi_material()
+
+    def _clear_wifi_material(self) -> None:
+        material = self._wifi_material
+        self._wifi_material = None
+        if material is not None:
+            material.cleanup()
 
     def poses(self) -> dict[str, TrackerPose]:
         api = self._api

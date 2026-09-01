@@ -186,7 +186,7 @@ class UltimateRuntimeReadinessTest(unittest.TestCase):
             patch.object(
                 tracker_ultimate,
                 "_wifi_config_status",
-                return_value=("OK", "redacted valid config"),
+                return_value=("OK", "redacted valid config", "valid"),
             ),
         ):
             return tracker_ultimate.ultimate_runtime_readiness(cached=False)

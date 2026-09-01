@@ -24,6 +24,12 @@ export type AxolMode = "teleop" | "data_collection"
 export type AxolPoseMode = "relative" | "absolute"
 
 /**
+ * Pose producer selected by the host. A tracker-owned session keeps connected
+ * Quest clients view-only; null preserves the unrestricted legacy policy.
+ */
+export type AxolPoseSourceKind = "webxr" | "tracker" | null
+
+/**
  * Which episode action a HUD confirmation popup is gating while recording:
  * stopping to save the episode ("save", armed by A) or discarding it to
  * re-record ("discard", armed by X). Null when no confirmation is pending.

@@ -25,7 +25,8 @@ import webbrowser
 from pathlib import Path
 
 from ..utils.browser_origin import configure_self_hosted_browser_origins
-from ..utils.certs import CERTFILE, KEYFILE, create_self_signed_cert
+from ..utils.certs import CERTFILE, KEYFILE, PreparedTLSFiles, prepare_tls_files
+from ..utils.network import local_interface_ips
 
 # The VR server and this control-panel API share one self-signed certificate
 # (see ``almond_axol.utils.certs``) so a single browser cert acceptance covers both.
@@ -82,6 +83,23 @@ def _local_ip() -> str:
             return "127.0.0.1"
 
 
+def _self_hosted_origin_hosts(*, bind_host: str, lan_ip: str) -> set[str]:
+    """Server-owned hostnames/IPs on which this exact UI can be reached."""
+    hosts = {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        lan_ip,
+        socket.gethostname(),
+        socket.getfqdn(),
+    }
+    if bind_host in {"0.0.0.0", "::"}:
+        hosts.update(local_interface_ips())
+    else:
+        hosts.add(bind_host)
+    return hosts
+
+
 def run(args: argparse.Namespace) -> None:
     """Start the control-panel server."""
     # Explicit process marker: security gates must remain active for a manual
@@ -100,23 +118,12 @@ def run(args: argparse.Namespace) -> None:
     from ..serve import create_app
 
     tls = not args.no_tls
-    ssl_kwargs: dict[str, str] = {}
-    if tls:
-        _ensure_cert()
-        ssl_kwargs = {"ssl_certfile": CERTFILE, "ssl_keyfile": KEYFILE}
     scheme = "https" if tls else "http"
     lan_ip = _local_ip() if args.host in {"0.0.0.0", "::"} else args.host
     configure_self_hosted_browser_origins(
         scheme=scheme,
         port=args.port,
-        hosts={
-            "localhost",
-            "127.0.0.1",
-            "::1",
-            lan_ip,
-            socket.gethostname(),
-            socket.getfqdn(),
-        },
+        hosts=_self_hosted_origin_hosts(bind_host=args.host, lan_ip=lan_ip),
     )
 
     static_dir = _find_static_dir()
@@ -149,23 +156,27 @@ def run(args: argparse.Namespace) -> None:
     # and closes the adopted socket on exit.
     from ..utils.ports import open_listen_socket
 
+    tls_files: PreparedTLSFiles | None = None
     sock = open_listen_socket(args.host, args.port)
-    config = uvicorn.Config(
-        app, host=args.host, port=args.port, log_level="info", **ssl_kwargs
-    )
-    server = uvicorn.Server(config)
     try:
+        ssl_kwargs: dict[str, str] = {}
+        if tls:
+            tls_files = prepare_tls_files(CERTFILE, KEYFILE)
+            if tls_files.generated:
+                print("Generating self-signed TLS certificate ...")
+            ssl_kwargs = {
+                "ssl_certfile": tls_files.certfile,
+                "ssl_keyfile": tls_files.keyfile,
+            }
+        config = uvicorn.Config(
+            app, host=args.host, port=args.port, log_level="info", **ssl_kwargs
+        )
+        server = uvicorn.Server(config)
         server.run(sockets=[sock])
     finally:
         sock.close()
-
-
-def _ensure_cert() -> None:
-    """Generate the shared self-signed cert on first use (idempotent)."""
-    if os.path.isfile(CERTFILE) and os.path.isfile(KEYFILE):
-        return
-    print("Generating self-signed TLS certificate ...")
-    create_self_signed_cert(CERTFILE, KEYFILE)
+        if tls_files is not None:
+            tls_files.close()
 
 
 def _open_browser_when_ready(url: str) -> None:

@@ -4,6 +4,7 @@ import {
   OPERATIONS,
   cameraCount,
   detectCameras,
+  fetchCanInterfaces,
   fetchCommands,
   fetchInfo,
   fetchOpStatus,
@@ -31,6 +32,7 @@ import {
   useSessionLogs,
   type CameraDevice,
   type CameraSpec,
+  type CanProfileInventory,
   type CommandSpec,
   type FormValue,
   type HardwareProfile,
@@ -46,6 +48,13 @@ import {
   type UpdateStatus,
   type UsbStatus,
 } from "@/lib/supervisor"
+import {
+  autoConnectPollStateKnown,
+  autoConnectRetryDelay,
+  autoConnectSignature,
+  chooseAutoConnectTarget,
+  nextAutoConnectAttempt,
+} from "@/lib/can-auto-connect"
 import { InstallerMigrationBanner, UpdateBanner } from "@/components/update-banner"
 import { VersionMismatchBanner } from "@/components/version-mismatch-banner"
 import { requiresInstallerMigration } from "@/lib/update-migration"
@@ -137,9 +146,27 @@ export default function ControlPanel() {
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [robotBusy, setRobotBusy] = useState(false)
-  // Bumped when the persisted Mantis left/right mapping changes. It wakes the
-  // idle-link effect even though the selected hardware profile did not change.
-  const [mantisChannelRevision, setMantisChannelRevision] = useState(0)
+  // A backend restart can leave the tab's old auto-connect latch intact. A
+  // failed status poll followed by recovery starts a new connection epoch,
+  // without treating a remote browser's ordinary disconnect as a restart.
+  const robotStatusPollFailedRef = useRef(false)
+  const robotStatusRecoveryEpochRef = useRef(0)
+  const robotStatusKnownRef = useRef(false)
+  const canInventoryKnownRef = useRef(false)
+  const sessionInventoryKnownRef = useRef(false)
+  const autoRobotPollStateKnown = useCallback(
+    () =>
+      autoConnectPollStateKnown(
+        robotStatusKnownRef.current,
+        canInventoryKnownRef.current,
+        sessionInventoryKnownRef.current
+      ),
+    []
+  )
+  const [canProfiles, setCanProfiles] = useState<CanProfileInventory | null>(null)
+  // A successful response without profile summaries identifies an older host;
+  // retain its historical selected-profile auto-connect behavior.
+  const [legacyCanInventory, setLegacyCanInventory] = useState(false)
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
   const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
@@ -163,6 +190,8 @@ export default function ControlPanel() {
   const [settingsByOp, setSettingsByOp] = useState<OpSettings>({})
 
   const [session, setSession] = useState<SessionInfo | null>(null)
+  const [sessionInventoryReady, setSessionInventoryReady] = useState(false)
+  const [hardwareSessionBusy, setHardwareSessionBusy] = useState(false)
   // Generic setup/diagnostic owner (Pair, Identify, installers, etc.). The
   // server serializes it against operations; mirror that owner in the UI so
   // opposite actions disable instead of optimistically ending in HTTP 409.
@@ -270,9 +299,13 @@ export default function ControlPanel() {
       setUpdatePhase(null)
       setRobot(null)
       setRobotBusy(false)
+      setCanProfiles(null)
+      setLegacyCanInventory(false)
       setUsb(null)
       setUsbBusy(false)
       setSession(null)
+      setSessionInventoryReady(false)
+      setHardwareSessionBusy(false)
       setActiveCommandSession(null)
       setPolicy(null)
       setBusy(false)
@@ -323,9 +356,17 @@ export default function ControlPanel() {
         .catch(() => {})
       fetchRobotStatus()
         .then((value) => {
-          if (generation === connectionGenerationRef.current) setRobot(value)
+          if (generation === connectionGenerationRef.current) {
+            robotStatusKnownRef.current = true
+            setRobot(value)
+          }
         })
-        .catch(() => {})
+        .catch(() => {
+          if (generation === connectionGenerationRef.current) {
+            robotStatusKnownRef.current = false
+            setRobot(null)
+          }
+        })
       fetchOpStatus()
         .then((op) => {
           if (generation !== connectionGenerationRef.current) return
@@ -346,9 +387,15 @@ export default function ControlPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Poll the robot connection + Quest-USB status while online.
+  // Poll the robot connection, configured CAN presence, and Quest-USB status
+  // while online. CAN presence makes startup hardware-aware and also catches a
+  // hub that enumerates shortly after the page loads.
   useEffect(() => {
-    if (conn.state !== "ok") return
+    if (conn.state !== "ok") {
+      robotStatusKnownRef.current = false
+      canInventoryKnownRef.current = false
+      return
+    }
     // Guard against in-flight polls landing after a disconnect (which flips
     // conn.state and tears this effect down): a late response must not
     // repopulate a tile while the host tile shows disconnected.
@@ -356,9 +403,45 @@ export default function ControlPanel() {
     const poll = () => {
       fetchRobotStatus()
         .then((r) => {
-          if (active) setRobot(r)
+          if (!active) return
+          if (robotStatusPollFailedRef.current) {
+            robotStatusPollFailedRef.current = false
+            robotStatusRecoveryEpochRef.current += 1
+          }
+          robotStatusKnownRef.current = true
+          setRobot(r)
         })
-        .catch(() => {})
+        .catch(() => {
+          if (active) {
+            robotStatusPollFailedRef.current = true
+            robotStatusKnownRef.current = false
+            setRobot(null)
+          }
+        })
+      fetchCanInterfaces()
+        .then((inventory) => {
+          if (!active) return
+          canInventoryKnownRef.current = true
+          if (inventory.profiles) {
+            setCanProfiles(inventory.profiles)
+            setLegacyCanInventory(false)
+          } else {
+            setCanProfiles(null)
+            setLegacyCanInventory(true)
+          }
+        })
+        .catch((error) => {
+          if (!active) return
+          if (String(error).includes("HTTP 404")) {
+            canInventoryKnownRef.current = true
+            setCanProfiles(null)
+            setLegacyCanInventory(true)
+            return
+          }
+          canInventoryKnownRef.current = false
+          setCanProfiles(null)
+          setLegacyCanInventory(false)
+        })
       fetchUsbStatus()
         .then((u) => {
           if (active) setUsb(u)
@@ -375,6 +458,7 @@ export default function ControlPanel() {
 
   useEffect(() => {
     if (conn.state !== "ok") {
+      sessionInventoryKnownRef.current = false
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setActiveCommandSession(null)
       return
@@ -388,15 +472,24 @@ export default function ControlPanel() {
       fetchSessions()
         .then((sessions) => {
           if (!active) return
+          const liveSessions = sessions.filter(
+            (candidate) =>
+              candidate.status === "starting" ||
+              candidate.status === "running" ||
+              candidate.status === "stopping"
+          )
+          sessionInventoryKnownRef.current = true
+          setSessionInventoryReady(true)
+          setHardwareSessionBusy(liveSessions.length > 0)
           setActiveCommandSession(
-            sessions.find(
-              (candidate) =>
-                !operationIds.has(candidate.command) &&
-                (candidate.status === "starting" || candidate.status === "running")
-            ) ?? null
+            liveSessions.find((candidate) => !operationIds.has(candidate.command)) ?? null
           )
         })
-        .catch(() => {})
+        .catch(() => {
+          if (!active) return
+          sessionInventoryKnownRef.current = false
+          setSessionInventoryReady(false)
+        })
     }
     poll()
     const timer = window.setInterval(poll, 1500)
@@ -437,13 +530,31 @@ export default function ControlPanel() {
     }
   }, [conn.state, updating])
 
-  // Last automatically selected idle telemetry profile. Keeping this latched
-  // means a manual disconnect is not immediately undone.
-  const autoRobotRef = useRef<HardwareProfile | null>(null)
-  // A settings save can happen while an operation owns the link. Defer the
-  // reconnect until it becomes idle instead of letting the old-bus link look
-  // ready for the next Mantis run.
-  const reconnectMantisRef = useRef(false)
+  // A failed profile + mapping gets two delayed retries without being hammered
+  // by the 2s presence poll. A mapping change creates a fresh signature.
+  const autoRobotRef = useRef<string | null>(null)
+  const autoRobotAttemptsRef = useRef(new Map<string, number>())
+  const autoRobotRetryTimerRef = useRef<number | null>(null)
+  const autoRobotMountedRef = useRef(true)
+  const [autoRobotRetryRevision, setAutoRobotRetryRevision] = useState(0)
+  // Manual connect/disconnect wins until the selected operation changes.
+  const manualRobotOverrideRef = useRef(false)
+  const previousDesiredProfileRef = useRef<HardwareProfile | null>(null)
+  const resetAutoRobotRetry = useCallback(() => {
+    autoRobotRef.current = null
+    autoRobotAttemptsRef.current.clear()
+    if (autoRobotRetryTimerRef.current !== null) {
+      window.clearTimeout(autoRobotRetryTimerRef.current)
+      autoRobotRetryTimerRef.current = null
+    }
+  }, [])
+  useEffect(() => {
+    autoRobotMountedRef.current = true
+    return () => {
+      autoRobotMountedRef.current = false
+      resetAutoRobotRetry()
+    }
+  }, [resetAutoRobotRetry])
 
   // Auto-establish the Quest-over-USB tunnel as soon as an authorized headset
   // appears. The latch clears once the tunnel is up (so a later drop retries
@@ -500,9 +611,13 @@ export default function ControlPanel() {
     setCommands([])
     setHostInfo(null)
     setRobot(null)
+    setCanProfiles(null)
+    setLegacyCanInventory(false)
     setUsb(null)
     setUsbBusy(false)
     setSession(null)
+    setSessionInventoryReady(false)
+    setHardwareSessionBusy(false)
     setActiveCommandSession(null)
     setPolicy(null)
     setBusy(false)
@@ -517,7 +632,12 @@ export default function ControlPanel() {
     setUpdateAbandoned(false)
     setUpdatePhase(null)
     setRobotBusy(false)
-    autoRobotRef.current = null
+    robotStatusKnownRef.current = false
+    canInventoryKnownRef.current = false
+    sessionInventoryKnownRef.current = false
+    resetAutoRobotRetry()
+    manualRobotOverrideRef.current = false
+    previousDesiredProfileRef.current = null
   }
 
   function updateServerHost(value: string) {
@@ -539,9 +659,16 @@ export default function ControlPanel() {
     generation = connectionGenerationRef.current
   ) {
     if (generation !== connectionGenerationRef.current) return
-    const mantisChannelsChanged = ["mantis.left_channel", "mantis.right_channel"].some((key) =>
-      Object.prototype.hasOwnProperty.call(patch.values ?? {}, key)
+    const changedChannelProfiles = (
+      [
+        ["axol", ["robot.left_channel", "robot.right_channel"]],
+        ["mantis", ["mantis.left_channel", "mantis.right_channel"]],
+      ] as const
     )
+      .filter(([, keys]) =>
+        keys.some((key) => Object.prototype.hasOwnProperty.call(patch.values ?? {}, key))
+      )
+      .map(([profile]) => profile)
     if (patch.cameras) {
       setCameras(patch.cameras)
       persistLocalCameras(patch.cameras)
@@ -558,16 +685,20 @@ export default function ControlPanel() {
       advancedSchema: prev?.advancedSchema ?? snap.advancedSchema,
     }))
     if (snap.cameras) setCameras(snap.cameras)
-    if (mantisChannelsChanged) {
-      reconnectMantisRef.current = true
-      autoRobotRef.current = null
-      setMantisChannelRevision((revision) => revision + 1)
-      if (desiredHardwareProfile !== "mantis") {
-        toast.info("Mantis CAN mapping saved. It will apply the next time Mantis connects.")
+    if (changedChannelProfiles.length > 0) {
+      resetAutoRobotRetry()
+      const changedDesiredProfile = changedChannelProfiles.includes(desiredHardwareProfile)
+      if (changedDesiredProfile) manualRobotOverrideRef.current = false
+      const label =
+        changedChannelProfiles.length === 2
+          ? "CAN mappings"
+          : `${changedChannelProfiles[0] === "mantis" ? "Mantis" : "Axol"} CAN mapping`
+      if (!changedDesiredProfile) {
+        toast.info(`${label} saved. It will apply the next time that hardware connects.`)
       } else if (isLive || robot?.state === "busy") {
-        toast.info("Mantis CAN mapping saved. The link will reconnect when this run stops.")
+        toast.info(`${label} saved. The link will reconnect when this run stops.`)
       } else {
-        toast.info("Mantis CAN mapping saved. Reconnecting the Mantis link now…")
+        toast.info(`${label} saved. Reconnecting the link when its configured bus is detected…`)
       }
     }
   }
@@ -613,28 +744,39 @@ export default function ControlPanel() {
 
   // -- robot connection --
   const robotConnectClick = useCallback(
-    async (profile: HardwareProfile) => {
+    async (profile: HardwareProfile, automatic = false): Promise<boolean | null> => {
+      if (!autoRobotMountedRef.current) return null
       const generation = connectionGenerationRef.current
+      if (!automatic) {
+        resetAutoRobotRetry()
+      }
       setRobotBusy(true)
       try {
-        const status = await robotConnect(undefined, profile)
-        if (generation !== connectionGenerationRef.current) return
+        const status = await robotConnect(undefined, profile, automatic)
+        if (!autoRobotMountedRef.current || generation !== connectionGenerationRef.current)
+          return null
         setRobot(status)
         if (!status.connected) {
           throw new Error(status.error ?? `Could not connect the ${profile} CAN link`)
         }
+        if (!automatic) manualRobotOverrideRef.current = true
+        return true
       } catch (e) {
-        if (generation !== connectionGenerationRef.current) return
-        toast.error(String(e))
+        if (!autoRobotMountedRef.current || generation !== connectionGenerationRef.current)
+          return null
+        if (!automatic) toast.error(String(e))
+        return false
       } finally {
-        if (generation === connectionGenerationRef.current) setRobotBusy(false)
+        if (autoRobotMountedRef.current && generation === connectionGenerationRef.current)
+          setRobotBusy(false)
       }
     },
-    [toast]
+    [resetAutoRobotRetry, toast]
   )
 
   async function robotDisconnectClick() {
     const generation = connectionGenerationRef.current
+    resetAutoRobotRetry()
     setRobotBusy(true)
     try {
       // Kill any running task and wait for it to exit before releasing the
@@ -644,6 +786,10 @@ export default function ControlPanel() {
       const status = await robotDisconnect()
       if (generation !== connectionGenerationRef.current) return
       setRobot(status)
+      if (status.state !== "disconnected") {
+        throw new Error(status.error ?? "Could not disconnect the robot CAN link")
+      }
+      manualRobotOverrideRef.current = true
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
       toast.error(String(e))
@@ -691,53 +837,157 @@ export default function ControlPanel() {
   const selectedStopping = isStopping && runningOp === opId
 
   // Whether the host is currently unsafe to restart / power off / update.
-  // `isLive` is the immediate, local signal (reacts the instant an op starts/
-  // stops) so the UI blocks without waiting for the slow status poll; the
-  // server's `update.idle` is the backstop for any other non-idle reason —
-  // e.g. a diagnostics run launched from another page or browser — (and the
-  // server guards each request regardless). Mirrors the server's _is_idle:
-  // only a running operation/session blocks (a connected robot is fine).
+  // `isLive` is the immediate local operation signal and the shared session
+  // inventory catches setup/diagnostics from other pages; `update.idle` is the
+  // backstop for any remaining non-idle reason. The server guards each request
+  // regardless. Mirrors _is_idle: only an operation/session blocks (a merely
+  // connected robot is fine).
   // Shared by the update banner and the host tile's power confirmations.
-  const hostBusy = isLive || !(update?.idle ?? true)
+  const hostBusy = isLive || hardwareSessionBusy || !(update?.idle ?? true)
   // Reason shown in the banner; capitalized clause, no trailing period.
   const updateBusyReason = isLive ? "Stop the running operation" : "The server is busy"
 
-  // Connect the hardware represented by the selected run. The default path
-  // still auto-connects Axol on host load; enabling Mantis switches the shared
-  // idle telemetry link to its two grippers, and disabling it switches back.
-  // Never switch underneath a live operation. The profile latch preserves a
-  // deliberate manual disconnect until the selected profile changes.
+  // Pick from hardware actually present on the host. If only one configured
+  // profile exists, connect it; if both exist, the selected operation wins.
+  // Never guess arbitrary can0 devices or switch underneath a live operation.
   useEffect(() => {
     if (conn.state !== "ok") {
-      autoRobotRef.current = null
+      resetAutoRobotRetry()
+      manualRobotOverrideRef.current = false
+      previousDesiredProfileRef.current = null
       return
     }
-    if (isLive || !robot || robotBusy || robot.state === "busy") return
-    const activeProfile = robot.profile ?? "axol"
-    const mappingReconnect = reconnectMantisRef.current && desiredHardwareProfile === "mantis"
-    if (autoRobotRef.current === desiredHardwareProfile && !mappingReconnect) return
+
+    const desiredChanged =
+      previousDesiredProfileRef.current !== null &&
+      previousDesiredProfileRef.current !== desiredHardwareProfile
+    previousDesiredProfileRef.current = desiredHardwareProfile
+    if (desiredChanged) {
+      resetAutoRobotRetry()
+      manualRobotOverrideRef.current = false
+    }
+
+    if (!robot || !sessionInventoryReady || (!canProfiles && !legacyCanInventory)) return
     if (
-      activeProfile !== desiredHardwareProfile ||
+      isLive ||
+      hardwareSessionBusy ||
+      activeCommandSession ||
+      robotBusy ||
+      robot.state === "busy" ||
+      manualRobotOverrideRef.current ||
+      !autoRobotPollStateKnown()
+    )
+      return
+
+    const activeProfile = robot.profile ?? "axol"
+    // A saved mapping can move away from every currently attached interface.
+    // Do one normal connect onto that new mapping while the old link is still
+    // open: the server first closes the stale buses, then returns an explicit
+    // error for the absent replacement. This keeps Connected/Start from
+    // continuing to describe the old mapping. Ordinary absence never triggers
+    // a connect attempt.
+    const target = canProfiles
+      ? chooseAutoConnectTarget(
+          canProfiles,
+          desiredHardwareProfile,
+          activeProfile,
+          robot.channels,
+          robot.state === "connected"
+        )
+      : desiredHardwareProfile
+    if (target === null) {
+      // Do not latch genuine absence: a later physical replug gets a fresh
+      // bounded attempt budget. Driver/netdev cycling for a configured hub
+      // remains present through its persisted USB identity.
+      resetAutoRobotRetry()
+      return
+    }
+    const targetPresence = canProfiles?.[target]
+    const profileSignature = targetPresence
+      ? autoConnectSignature(target, targetPresence)
+      : `legacy:${target}`
+    const signature = `${profileSignature}:host-${robotStatusRecoveryEpochRef.current}`
+    const mappingChanged =
+      activeProfile === target &&
+      targetPresence !== undefined &&
+      robot.channels !== undefined &&
+      (robot.channels.left !== targetPresence.channels.left ||
+        robot.channels.right !== targetPresence.channels.right)
+    if (autoRobotRef.current === signature) return
+    if (
+      activeProfile !== target ||
       robot.state === "disconnected" ||
       robot.state === "error" ||
-      mappingReconnect
+      mappingChanged
     ) {
+      const attempts = nextAutoConnectAttempt(
+        autoRobotAttemptsRef.current.get(signature) ?? 0,
+        autoRobotPollStateKnown()
+      )
+      if (attempts === null) {
+        // A down/up inventory oscillation can revisit an old signature. Keep
+        // its exhausted budget latched instead of starting attempt 4+.
+        autoRobotRef.current = signature
+        return
+      }
       const timer = window.setTimeout(() => {
-        autoRobotRef.current = desiredHardwareProfile
-        if (mappingReconnect) reconnectMantisRef.current = false
-        robotConnectClick(desiredHardwareProfile)
+        autoRobotRef.current = signature
+        const generation = connectionGenerationRef.current
+        void robotConnectClick(target, true).then((connected) => {
+          if (
+            connected !== false ||
+            !autoRobotMountedRef.current ||
+            generation !== connectionGenerationRef.current ||
+            manualRobotOverrideRef.current
+          )
+            return
+          if (!autoRobotPollStateKnown()) {
+            // A request that settles while inventory/session authority is
+            // unknown is not evidence that this hardware target failed.
+            autoRobotRef.current = null
+            return
+          }
+          autoRobotAttemptsRef.current.set(signature, attempts)
+          const delay = autoConnectRetryDelay(attempts)
+          if (delay === null) return
+          if (autoRobotRetryTimerRef.current !== null) {
+            window.clearTimeout(autoRobotRetryTimerRef.current)
+          }
+          autoRobotRetryTimerRef.current = window.setTimeout(() => {
+            autoRobotRetryTimerRef.current = null
+            if (
+              generation === connectionGenerationRef.current &&
+              autoRobotMountedRef.current &&
+              !manualRobotOverrideRef.current &&
+              autoRobotRef.current === signature
+            ) {
+              autoRobotRef.current = null
+              // Recovery itself causes the rerender. Do not spend or schedule
+              // an attempt while one of the authoritative polls is unknown.
+              if (!autoRobotPollStateKnown()) return
+              setAutoRobotRetryRevision((revision) => revision + 1)
+            }
+          }, delay)
+        })
       }, 0)
       return () => window.clearTimeout(timer)
     }
-    autoRobotRef.current = desiredHardwareProfile
+    autoRobotRef.current = signature
   }, [
+    activeCommandSession,
+    autoRobotPollStateKnown,
+    autoRobotRetryRevision,
+    canProfiles,
     conn.state,
     desiredHardwareProfile,
+    hardwareSessionBusy,
     isLive,
-    mantisChannelRevision,
+    legacyCanInventory,
     robot,
     robotBusy,
     robotConnectClick,
+    resetAutoRobotRetry,
+    sessionInventoryReady,
   ])
 
   // While an op is live (including the "stopping" window), poll the server's
@@ -1064,6 +1314,7 @@ export default function ControlPanel() {
           opRunning={hostBusy}
           robot={robot}
           robotBusy={robotBusy}
+          canProfiles={canProfiles}
           onRobotConnect={robotConnectClick}
           onRobotDisconnect={robotDisconnectClick}
         />

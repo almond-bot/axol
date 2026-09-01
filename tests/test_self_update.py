@@ -394,8 +394,17 @@ class InstallerUltimatePreservationTests(unittest.TestCase):
         uv_install = installer.index(
             'curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh"'
         )
-        guard_write = installer.index('mv -fT -- "${GUARD_TMP}" "${UPDATE_GUARD_FILE}"')
-        marker_write = installer.index('mv -fT -- "${MARKER_TMP}" "${UPDATE_MARKER}"')
+        guard_write = installer.index(
+            'durable_replace "${GUARD_TMP}" "${UPDATE_GUARD_FILE}"'
+        )
+        mantis_guard_write = installer.index(
+            'durable_replace "${MANTIS_GUARD_TMP}" "${MANTIS_UPDATE_GUARD_FILE}"'
+        )
+        guard_reload = installer.index("systemctl daemon-reload", mantis_guard_write)
+        marker_write = installer.index(
+            "Could not durably arm the update restart guard", guard_reload
+        )
+        stop_mantis = installer.index('systemctl stop "${MANTIS_SERVICE_NAME}.service"')
         stop = installer.index('systemctl disable --now "${SERVICE_NAME}.service"')
         inactive_check = installer.index(
             'systemctl is-active --quiet "${SERVICE_NAME}.service"'
@@ -403,12 +412,19 @@ class InstallerUltimatePreservationTests(unittest.TestCase):
         force_install = installer.index('"${UV}" tool install')
         verify = installer.index("axol tracker.ultimate.install", force_install)
         enable = installer.index('systemctl enable "${SERVICE_NAME}"')
-        clear_marker = installer.index('rm -f -- "${UPDATE_MARKER}"')
+        clear_marker = installer.index('durable_remove "${UPDATE_MARKER}"')
         start = installer.index('systemctl start "${SERVICE_NAME}"')
+        restore_mantis = installer.index(
+            'systemctl start "${MANTIS_SERVICE_NAME}.service"'
+        )
         self.assertLess(pypi_check, uv_install)
         self.assertLess(uv_install, preflight)
         self.assertLess(preflight, guard_write)
-        self.assertLess(guard_write, marker_write)
+        self.assertLess(guard_write, mantis_guard_write)
+        self.assertLess(mantis_guard_write, guard_reload)
+        self.assertLess(guard_reload, marker_write)
+        self.assertLess(marker_write, stop_mantis)
+        self.assertLess(stop_mantis, stop)
         self.assertLess(marker_write, stop)
         self.assertLess(stop, inactive_check)
         self.assertLess(inactive_check, force_install)
@@ -416,6 +432,22 @@ class InstallerUltimatePreservationTests(unittest.TestCase):
         self.assertLess(verify, enable)
         self.assertLess(enable, clear_marker)
         self.assertLess(clear_marker, start)
+        self.assertLess(start, restore_mantis)
+        self.assertIn("MANTIS_SERVICE_SHOULD_RUN=1", installer)
+        self.assertIn(
+            'MANTIS_UPDATE_GUARD_DIR="/etc/systemd/system/${MANTIS_SERVICE_NAME}.service.d"',
+            installer,
+        )
+        self.assertIn(
+            '[ ! -L "${MANTIS_UPDATE_GUARD_DIR}" ]',
+            installer,
+        )
+        self.assertEqual(
+            installer.count(
+                "printf '[Unit]\\nConditionPathExists=!%s\\n' \"${UPDATE_MARKER}\""
+            ),
+            2,
+        )
         self.assertIn(
             'ConditionPathExists=!%s\\n\' "${UPDATE_MARKER}"',
             installer,
@@ -440,6 +472,118 @@ class InstallerUltimatePreservationTests(unittest.TestCase):
         self.assertIn('20)\n            die "${UPDATE_PREFLIGHT_OUTPUT}"', installer)
         self.assertLess(installer.index("LEGACY_TORCH_STATUS"), force_install)
         self.assertIn("PyPI torch 2.10 is CPU-only on aarch64", installer)
+
+    def test_installer_fsyncs_guard_payloads_and_directory_entries(self) -> None:
+        installer = (
+            Path(__file__).resolve().parents[1] / "web" / "app" / "public" / "install"
+        ).read_text()
+        helper = installer[
+            installer.index("durable_replace() {") : installer.index(
+                "durable_remove() {"
+            )
+        ]
+        payload_sync = helper.index('sync -- "${temporary}"')
+        atomic_replace = helper.index('mv -fT -- "${temporary}" "${destination}"')
+        directory_sync = helper.index('sync -- "${parent}"')
+        self.assertLess(payload_sync, atomic_replace)
+        self.assertLess(atomic_replace, directory_sync)
+
+        marker_commit = installer.index(
+            "Could not durably arm the update restart guard"
+        )
+        stop_service = installer.index(
+            'systemctl disable --now "${SERVICE_NAME}.service"'
+        )
+        mutate_runtime = installer.index('"${UV}" tool install')
+        self.assertLess(marker_commit, stop_service)
+        self.assertLess(marker_commit, mutate_runtime)
+        self.assertIn("command -v sync >/dev/null 2>&1", installer)
+
+        directory_helper = installer[
+            installer.index("durable_install_directory() {") : installer.index(
+                "durable_replace() {"
+            )
+        ]
+        create_directory = directory_helper.index(
+            'install -d -o "${owner}" -g "${group}" -m "${mode}" "${path}"'
+        )
+        persist_parent = directory_helper.index('sync -- "${parent}"')
+        self.assertLess(create_directory, persist_parent)
+
+        state_directory = installer.index(
+            'durable_install_directory "/var/lib/almond-axol" root root 0750'
+        )
+        axol_dropin_directory = installer.index(
+            'durable_install_directory "${UPDATE_GUARD_DIR}" root root 0755'
+        )
+        mantis_dropin_directory = installer.index(
+            'durable_install_directory "${MANTIS_UPDATE_GUARD_DIR}" root root 0755'
+        )
+        first_guard_payload = installer.index('GUARD_TMP="$(mktemp', state_directory)
+        cleanup_trap = installer.index(
+            "trap cleanup_update_guard_temporaries EXIT", state_directory
+        )
+        cleanup_disarm = installer.index("trap - EXIT", first_guard_payload)
+        self.assertLess(state_directory, axol_dropin_directory)
+        self.assertLess(axol_dropin_directory, mantis_dropin_directory)
+        self.assertLess(mantis_dropin_directory, cleanup_trap)
+        self.assertLess(cleanup_trap, first_guard_payload)
+        self.assertLess(first_guard_payload, cleanup_disarm)
+        self.assertIn('rm -f -- "${GUARD_TMP}" || true', installer)
+        self.assertIn('rm -f -- "${MANTIS_GUARD_TMP}" || true', installer)
+
+        marker_helper = installer[
+            installer.index("write_update_marker() {") : installer.index(
+                '[ "$(uname -s)" = "Linux"'
+            )
+        ]
+        self.assertIn('rm -f -- "${marker_tmp}" || true', marker_helper)
+
+        remove_helper = installer[
+            installer.index("durable_remove() {") : installer.index(
+                '[ "$(uname -s)" = "Linux"'
+            )
+        ]
+        self.assertLess(
+            remove_helper.index('rm -f -- "${path}"'),
+            remove_helper.index('sync -- "${parent}"'),
+        )
+
+    def test_installer_restores_guard_when_verified_service_fails_to_start(
+        self,
+    ) -> None:
+        installer = (
+            Path(__file__).resolve().parents[1] / "web" / "app" / "public" / "install"
+        ).read_text()
+        clear_marker = installer.index('durable_remove "${UPDATE_MARKER}"')
+        remove_guard = installer.index('if ! durable_remove "${UPDATE_MARKER}"; then')
+        remove_failure_rearm = installer.index(
+            "write_update_marker || MARKER_RESTORED=0", remove_guard
+        )
+        remove_failure_disable = installer.index(
+            'systemctl disable --now "${SERVICE_NAME}.service"', remove_guard
+        )
+        start_guard = installer.index(
+            'if ! systemctl start "${SERVICE_NAME}"; then', clear_marker
+        )
+        restore_marker = installer.index(
+            "write_update_marker || MARKER_RESTORED=0", start_guard
+        )
+        disable_failed_service = installer.index(
+            'systemctl disable --now "${SERVICE_NAME}.service"', start_guard
+        )
+        failed_start_exit = installer.index(
+            "Axol was verified but failed to start; the service is blocked and disabled",
+            start_guard,
+        )
+        self.assertLess(clear_marker, start_guard)
+        self.assertLess(remove_guard, remove_failure_rearm)
+        self.assertLess(remove_failure_rearm, remove_failure_disable)
+        self.assertLess(remove_failure_disable, start_guard)
+        self.assertLess(start_guard, restore_marker)
+        self.assertLess(start_guard, disable_failed_service)
+        self.assertLess(restore_marker, failed_start_exit)
+        self.assertLess(disable_failed_service, failed_start_exit)
 
     def test_installer_allowlists_and_legacy_preserves_the_published_plugin(
         self,
@@ -648,15 +792,31 @@ class SelfUpdateSafetyBoundaryTests(unittest.IsolatedAsyncioTestCase):
     def test_durable_guard_is_live_before_marker_and_disable(self) -> None:
         updater = _updater()
         events: list[tuple[str, object]] = []
+        mantis_stopped = False
 
         def systemctl(*args: str) -> Mock:
+            nonlocal mantis_stopped
             events.append(("systemctl", args))
+            if args == ("stop", update._MANTIS_SERVICE_NAME):  # noqa: SLF001
+                mantis_stopped = True
+            if (
+                args == ("is-active", "--quiet", update._MANTIS_SERVICE_NAME)  # noqa: SLF001
+                and mantis_stopped
+            ):
+                return Mock(returncode=3, stdout="inactive\n")
             if args[:2] == ("show", "--property=MainPID"):
                 return Mock(returncode=0, stdout=str(os.getpid()))
+            if args[:2] == ("show", "--property=LoadState"):
+                return Mock(returncode=0, stdout="loaded\n")
             if args[:2] == ("show", "--property=DropInPaths"):
+                dropin = (
+                    update._MANTIS_UPDATE_GUARD_DROPIN  # noqa: SLF001
+                    if args[-1] == update._MANTIS_SERVICE_NAME  # noqa: SLF001
+                    else update._UPDATE_GUARD_DROPIN  # noqa: SLF001
+                )
                 return Mock(
                     returncode=0,
-                    stdout=str(update._UPDATE_GUARD_DROPIN),  # noqa: SLF001
+                    stdout=str(dropin),
                 )
             return Mock(returncode=0, stdout="")
 
@@ -682,14 +842,28 @@ class SelfUpdateSafetyBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(error)
         reload_index = events.index(("systemctl", ("daemon-reload",)))
+        mantis_dropin_index = events.index(
+            (
+                "write",
+                (update._MANTIS_UPDATE_GUARD_DROPIN, 0o644),  # noqa: SLF001
+            )
+        )
         marker_index = events.index(
             ("write", (update._UPDATE_GUARD_MARKER, 0o600))  # noqa: SLF001
+        )
+        stop_mantis_index = events.index(
+            ("systemctl", ("stop", update._MANTIS_SERVICE_NAME))  # noqa: SLF001
         )
         disable_index = events.index(
             ("systemctl", ("disable", update._SERVICE_NAME))  # noqa: SLF001
         )
+        self.assertLess(mantis_dropin_index, reload_index)
         self.assertLess(reload_index, marker_index)
+        self.assertLess(marker_index, stop_mantis_index)
+        self.assertLess(stop_mantis_index, disable_index)
         self.assertLess(marker_index, disable_index)
+        self.assertTrue(updater._mantis_restore_requested)  # noqa: SLF001
+        self.assertTrue(updater._mantis_enable_requested)  # noqa: SLF001
 
     def test_durable_guard_rejects_an_unmanaged_uv_layout_before_mutation(self) -> None:
         updater = _updater()
@@ -719,6 +893,52 @@ class SelfUpdateSafetyBoundaryTests(unittest.IsolatedAsyncioTestCase):
         updater._systemctl.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
         write.assert_not_called()
 
+    def test_durable_guard_allows_an_absent_optional_mantis_service(self) -> None:
+        updater = _updater()
+        writes: list[Path] = []
+
+        def systemctl(*args: str) -> Mock:
+            if args[:2] == ("show", "--property=MainPID"):
+                return Mock(returncode=0, stdout=str(os.getpid()))
+            if args[:2] == ("show", "--property=LoadState"):
+                return Mock(returncode=0, stdout="not-found\n")
+            if args[:2] == ("show", "--property=DropInPaths"):
+                return Mock(
+                    returncode=0,
+                    stdout=str(update._UPDATE_GUARD_DROPIN),  # noqa: SLF001
+                )
+            return Mock(returncode=0, stdout="")
+
+        updater._systemctl = Mock(side_effect=systemctl)  # type: ignore[method-assign]  # noqa: SLF001
+        with (
+            patch.object(update.os, "geteuid", return_value=0),
+            patch.object(
+                update.shutil,
+                "which",
+                side_effect=lambda name: (
+                    "/usr/bin/systemctl"
+                    if name == "systemctl"
+                    else update._MANAGED_UV_EXECUTABLE  # noqa: SLF001
+                ),
+            ),
+            patch.dict(os.environ, update._MANAGED_UPDATE_ENV, clear=False),  # noqa: SLF001
+            patch.object(
+                update,
+                "_write_durable_root_file",
+                side_effect=lambda path, *_args, **_kwargs: writes.append(path),
+            ),
+        ):
+            error = update.SelfUpdater._arm_durable_update_guard(updater)  # noqa: SLF001
+
+        self.assertIsNone(error)
+        self.assertIn(update._MANTIS_UPDATE_GUARD_DROPIN, writes)  # noqa: SLF001
+        self.assertFalse(updater._mantis_restore_requested)  # noqa: SLF001
+        self.assertFalse(updater._mantis_enable_requested)  # noqa: SLF001
+        self.assertNotIn(
+            call("stop", update._MANTIS_SERVICE_NAME),  # noqa: SLF001
+            updater._systemctl.call_args_list,  # type: ignore[attr-defined]
+        )
+
     def test_verified_update_enables_before_removing_marker(self) -> None:
         updater = _updater()
         events: list[tuple[str, object]] = []
@@ -745,6 +965,88 @@ class SelfUpdateSafetyBoundaryTests(unittest.IsolatedAsyncioTestCase):
             ("remove", update._UPDATE_GUARD_MARKER)  # noqa: SLF001
         )
         self.assertLess(enable_index, remove_index)
+
+    def test_verified_update_restores_mantis_before_axol_process_exits(self) -> None:
+        updater = _updater()
+        updater._mantis_restore_requested = True  # noqa: SLF001
+        updater._mantis_enable_requested = True  # noqa: SLF001
+        events: list[tuple[str, object]] = []
+
+        def systemctl(*args: str) -> Mock:
+            events.append(("systemctl", args))
+            return Mock(returncode=0, stdout="enabled")
+
+        def remove(path: Path) -> None:
+            events.append(("remove", path))
+
+        updater._systemctl = Mock(side_effect=systemctl)  # type: ignore[method-assign]  # noqa: SLF001
+        with (
+            patch.object(update.Path, "is_file", return_value=True),
+            patch.object(update, "_remove_durable_file", side_effect=remove),
+        ):
+            error = update.SelfUpdater._disarm_durable_update_guard(updater)  # noqa: SLF001
+
+        self.assertIsNone(error)
+        remove_index = events.index(
+            ("remove", update._UPDATE_GUARD_MARKER)  # noqa: SLF001
+        )
+        enable_index = events.index(
+            ("systemctl", ("enable", update._MANTIS_SERVICE_NAME))  # noqa: SLF001
+        )
+        start_index = events.index(
+            ("systemctl", ("start", update._MANTIS_SERVICE_NAME))  # noqa: SLF001
+        )
+        active_index = events.index(
+            (
+                "systemctl",
+                ("is-active", "--quiet", update._MANTIS_SERVICE_NAME),  # noqa: SLF001
+            )
+        )
+        self.assertLess(enable_index, remove_index)
+        self.assertLess(remove_index, start_index)
+        self.assertLess(start_index, active_index)
+        self.assertIsNone(updater._mantis_restore_requested)  # noqa: SLF001
+        self.assertIsNone(updater._mantis_enable_requested)  # noqa: SLF001
+
+    def test_mantis_restore_failure_rearms_guard_and_stops_helper(self) -> None:
+        updater = _updater()
+        updater._mantis_restore_requested = True  # noqa: SLF001
+        updater._mantis_enable_requested = True  # noqa: SLF001
+        events: list[tuple[str, object]] = []
+
+        def systemctl(*args: str) -> Mock:
+            events.append(("systemctl", args))
+            if args == ("start", update._MANTIS_SERVICE_NAME):  # noqa: SLF001
+                return Mock(returncode=1, stdout="")
+            return Mock(returncode=0, stdout="enabled")
+
+        def write(path: Path, _content: str, *, mode: int) -> None:
+            events.append(("write", (path, mode)))
+
+        updater._systemctl = Mock(side_effect=systemctl)  # type: ignore[method-assign]  # noqa: SLF001
+        with (
+            patch.object(update.Path, "is_file", return_value=True),
+            patch.object(update, "_remove_durable_file"),
+            patch.object(update, "_write_durable_root_file", side_effect=write),
+        ):
+            error = update.SelfUpdater._disarm_durable_update_guard(updater)  # noqa: SLF001
+
+        self.assertIn("axol-mantis.service could not be started", error or "")
+        marker_index = events.index(
+            ("write", (update._UPDATE_GUARD_MARKER, 0o600))  # noqa: SLF001
+        )
+        stop_index = events.index(
+            ("systemctl", ("stop", update._MANTIS_SERVICE_NAME))  # noqa: SLF001
+        )
+        disable_index = events.index(
+            ("systemctl", ("disable", update._SERVICE_NAME))  # noqa: SLF001
+        )
+        self.assertLess(marker_index, stop_index)
+        self.assertLess(stop_index, disable_index)
+        self.assertNotIn(
+            ("systemctl", ("disable", update._MANTIS_SERVICE_NAME)),  # noqa: SLF001
+            events,
+        )
 
     async def test_startup_provision_holds_launch_barrier_until_complete(self) -> None:
         updater = _updater()

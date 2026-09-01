@@ -585,6 +585,7 @@ class _DaggerControlLoop(threading.Thread):
         policy_period = 1.0 / float(self.fps)
         teleop_period = 1.0 / float(self.teleop_hz)
         last_action: dict[str, float] | None = None
+        last_dataset_action: dict[str, float] | None = None
         loop_times: list[float] = []
         last_rate_log = time.perf_counter()
 
@@ -667,12 +668,22 @@ class _DaggerControlLoop(threading.Thread):
                         time.sleep(period)
                         continue
                     last_action = sent
+                    last_dataset_action = sent
                 elif self.state == _STATE_TELEOP:
                     joint_obs = self.robot.get_joint_observation()
                     action = self.teleop.get_action()
                     if self.shutdown_event.is_set():
                         return
-                    performed = self.robot.send_action(action)
+                    self.robot.send_action(action)
+                    if self.shutdown_event.is_set():
+                        return
+                    # Teleop always commands joint targets, even when the
+                    # policy/dataset action space is Cartesian. Keep those
+                    # exact joints on the hardware path, but convert the
+                    # recorder snapshot to the configured dataset space so a
+                    # Cartesian DAgger intervention has the same schema as the
+                    # surrounding policy rows.
+                    dataset_action = self.robot.action_to_dataset(action)
                     if self.shutdown_event.is_set():
                         return
                     # intervention=True: the recorder tags the rows this
@@ -680,13 +691,14 @@ class _DaggerControlLoop(threading.Thread):
                     # per-frame ``intervention`` feature).
                     self.recorder.publish(
                         joint_obs,
-                        performed if performed is not None else action,
+                        dataset_action,
                         t0,
                         intervention=True,
                     )
                     last_action = action
+                    last_dataset_action = dataset_action
                 else:  # FROZEN — hold pose, keep the command cadence alive.
-                    if last_action is not None:
+                    if last_action is not None and last_dataset_action is not None:
                         if self.shutdown_event.is_set():
                             return
                         self.robot.send_action(last_action)
@@ -698,7 +710,7 @@ class _DaggerControlLoop(threading.Thread):
                         # with the action actually commanding the robot (the
                         # held action) instead of a stale pre-freeze snapshot.
                         self.recorder.publish(
-                            self.robot.get_joint_observation(), last_action, t0
+                            self.robot.get_joint_observation(), last_dataset_action, t0
                         )
 
                 # --- once-a-second rate readout (parity with collect-data)

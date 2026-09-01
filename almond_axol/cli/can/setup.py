@@ -75,6 +75,9 @@ from . import driver
 
 _VID = "1d50"
 _PID = "606f"
+_USB_DEVICES = Path("/sys/bus/usb/devices")
+_HUB_ENUMERATION_TIMEOUT_S = 2.0
+_HUB_ENUMERATION_POLL_S = 0.05
 _CAN_L = CAN_LEFT
 _CAN_R = CAN_RIGHT
 _CAN_B = CAN_BASE
@@ -269,6 +272,131 @@ def _rules_serial_for(name: str, rules_file: Path | None = None) -> str | None:
         r'ATTRS\{serial\}=="([^"]+)"[^\n]*NAME="' + re.escape(name) + '"', rules
     )
     return match.group(1) if match else None
+
+
+def _dual_channel_rule_serial(
+    rules_file: Path, left_name: str, right_name: str
+) -> str | None:
+    """Serial claimed by one complete, generated dual-channel rule block.
+
+    This is intentionally narrower than :func:`_rules_serial_for`: load-time
+    hardware discovery may use it as authority while the driver is unloaded
+    and no netdev exists yet, so both expected names, VID/PID, and dev IDs must
+    agree on one serial. Partial or hand-written rules fail closed.
+    """
+    try:
+        lines = rules_file.read_text().splitlines()
+    except OSError:
+        return None
+
+    serials: list[str] = []
+    for dev_id, name in (("0x0", left_name), ("0x1", right_name)):
+        matches: list[str] = []
+        generated_rule = re.compile(
+            r'\s*SUBSYSTEM=="net",\s*ACTION=="add",\s*'
+            rf'ATTRS\{{idVendor\}}=="{re.escape(_VID)}",\s*'
+            rf'ATTRS\{{idProduct\}}=="{re.escape(_PID)}",\s*'
+            r'ATTRS\{serial\}=="([^"\r\n]+)",\s*'
+            rf'ATTR\{{dev_id\}}=="{re.escape(dev_id)}",\s*'
+            rf'NAME="{re.escape(name)}"\s*'
+        )
+        for line in lines:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            match = generated_rule.fullmatch(line)
+            if match is not None:
+                matches.append(match.group(1))
+        if len(matches) != 1:
+            return None
+        serials.append(matches[0])
+    return serials[0] if serials[0] == serials[1] else None
+
+
+def _configured_profile_usb_serials() -> dict[str, str | None]:
+    """Strict persisted USB identity for each dual-channel hardware profile."""
+    axol = _dual_channel_rule_serial(
+        _AXOL_PROFILE.rules_file, _AXOL_PROFILE.left, _AXOL_PROFILE.right
+    )
+    mantis = _dual_channel_rule_serial(
+        _MANTIS_PROFILE.rules_file, _MANTIS_PROFILE.left, _MANTIS_PROFILE.right
+    )
+    if mantis is None and not _MANTIS_PROFILE.rules_file.exists():
+        # A legacy Mantis install is still an explicit operator-confirmed role.
+        # Its next normal setup migrates the retired names to the current ones.
+        mantis = _dual_channel_rule_serial(
+            _PRE_MANTIS_RULES_FILE, _PRE_MANTIS_LEFT, _PRE_MANTIS_RIGHT
+        )
+    return {"axol": axol, "mantis": mantis}
+
+
+def _attached_supported_usb_serials() -> set[str]:
+    """Attached supported hub serials, including before ``gs_usb`` is loaded."""
+    serials: set[str] = set()
+    for vendor_file in _USB_DEVICES.glob("*/idVendor"):
+        device = vendor_file.parent
+        try:
+            vendor = vendor_file.read_text().strip().lower()
+            product = device.joinpath("idProduct").read_text().strip().lower()
+            serial = device.joinpath("serial").read_text().strip()
+        except OSError:
+            continue
+        if (vendor, product) == (_VID, _PID) and serial:
+            serials.add(serial)
+    return serials
+
+
+def _attached_configured_hub_serials() -> dict[str, str]:
+    """Exact persisted profile claims whose supported USB device is attached."""
+    claims = _configured_profile_usb_serials()
+    attached = _attached_supported_usb_serials()
+    conflicts = {
+        serial
+        for serial in claims.values()
+        if serial is not None and list(claims.values()).count(serial) > 1
+    }
+    return {
+        profile: serial
+        for profile, serial in claims.items()
+        if serial is not None and serial in attached and serial not in conflicts
+    }
+
+
+def attached_configured_hub_profiles() -> set[str]:
+    """Profiles whose exact persisted dual-channel USB hub is attached.
+
+    This supports hosted ``axol serve`` recovery before the CAN driver has
+    created or renamed netdevs. A raw ``can0`` is never classified. If stale
+    rules claim one serial for both Axol and Mantis, neither claim is trusted.
+    """
+    return set(_attached_configured_hub_serials())
+
+
+def _wait_for_dual_channel_serial(
+    serial: str,
+    *,
+    timeout: float = _HUB_ENUMERATION_TIMEOUT_S,
+    poll_interval: float = _HUB_ENUMERATION_POLL_S,
+) -> bool:
+    """Wait boundedly for both gs_usb netdevs of one attached hub serial.
+
+    ``modprobe`` may return before the USB probe and udev add events have
+    exposed both channels. Polling the exact persisted serial avoids a blind
+    delay and, crucially, cannot mistake another newly-enumerated hub for the
+    requested Axol/Mantis profile.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        adapter = _scan_adapters().get(serial)
+        if (
+            adapter is not None
+            and (adapter.get("vid"), adapter.get("pid")) == (_VID, _PID)
+            and {0, 1} <= set(adapter.get("dev_ids", set()))
+        ):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(poll_interval, remaining))
 
 
 def _configured_serial(profile: _Profile = _AXOL_PROFILE) -> str | None:
@@ -1553,6 +1681,9 @@ def ensure_setup(
     discovers both Axol and Mantis hubs.
     """
     driver.ensure_driver()
+    configured_usb = _attached_configured_hub_serials().get("axol")
+    if configured_usb is not None:
+        _wait_for_dual_channel_serial(configured_usb)
     hub_serial = hub_serial or _resolve_hub_serial()
     wheels_serial = wheels_serial or _configured_named_serial(_CAN_B)
     chest_serial = chest_serial or _configured_named_serial(_CAN_C)
@@ -1571,7 +1702,11 @@ def ensure_mantis_setup() -> None:
     the idle diagnostics link.
     """
     installed = driver.ensure_driver()
-    if installed:
+    configured_usb = _attached_configured_hub_serials().get("mantis")
+    if configured_usb is not None:
+        _wait_for_dual_channel_serial(configured_usb)
+    elif installed:
+        # First-time setup has no persisted serial to poll deterministically.
         time.sleep(2.0)
 
     configured_mantis = _configured_serial(_MANTIS_PROFILE)

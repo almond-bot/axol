@@ -452,6 +452,95 @@ class StateWriterIntegrationTest(unittest.TestCase):
             self.assertEqual(victim.read_text(), "keep")
             self.assertFalse(key.exists())
 
+    def test_root_tls_snapshot_rejects_symlinks_before_uvicorn_can_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            victim = root / "operator-target"
+            victim.write_text("not a certificate")
+            cert = root / "cert.pem"
+            key = root / "key.pem"
+            cert.symlink_to(victim)
+            key.write_text("private key")
+
+            with (
+                patch.object(certs, "privileged_service_active", return_value=True),
+                self.assertRaises(OSError),
+            ):
+                certs.prepare_tls_files(str(cert), str(key))
+
+            self.assertTrue(cert.is_symlink())
+            self.assertEqual(victim.read_text(), "not a certificate")
+
+    def test_root_tls_snapshot_pins_bytes_until_server_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cert = root / "cert.pem"
+            key = root / "key.pem"
+            cert.write_bytes(b"original certificate")
+            key.write_bytes(b"original private key")
+
+            with patch.object(certs, "privileged_service_active", return_value=True):
+                prepared = certs.prepare_tls_files(str(cert), str(key))
+            prepared_cert = Path(prepared.certfile)
+            prepared_key = Path(prepared.keyfile)
+            self.assertNotEqual(prepared_cert, cert)
+            self.assertNotEqual(prepared_key, key)
+            self.assertEqual(prepared_cert.read_bytes(), b"original certificate")
+            self.assertEqual(prepared_key.read_bytes(), b"original private key")
+            self.assertEqual(prepared_key.stat().st_mode & 0o777, 0o600)
+
+            cert.write_bytes(b"replacement certificate")
+            key.write_bytes(b"replacement private key")
+            self.assertEqual(prepared_cert.read_bytes(), b"original certificate")
+            self.assertEqual(prepared_key.read_bytes(), b"original private key")
+
+            snapshot_directory = prepared_cert.parent
+            prepared.close()
+            self.assertFalse(snapshot_directory.exists())
+
+    def test_direct_caller_retains_custom_certificate_symlink_compatibility(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_cert = root / "archive-cert.pem"
+            real_key = root / "archive-key.pem"
+            real_cert.write_text("certificate")
+            real_key.write_text("private key")
+            cert = root / "cert.pem"
+            key = root / "key.pem"
+            cert.symlink_to(real_cert)
+            key.symlink_to(real_key)
+
+            with (
+                patch.object(certs, "privileged_service_active", return_value=False),
+                patch.object(certs.os, "geteuid", return_value=0),
+            ):
+                prepared = certs.prepare_tls_files(str(cert), str(key))
+
+            self.assertEqual(prepared.certfile, str(cert))
+            self.assertEqual(prepared.keyfile, str(key))
+            prepared.close()
+
+    def test_direct_root_vr_snapshots_the_shared_default_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cert = Path(directory) / "cert.pem"
+            key = Path(directory) / "key.pem"
+            cert.write_text("certificate")
+            key.write_text("private key")
+
+            with (
+                patch.object(certs, "CERTFILE", str(cert)),
+                patch.object(certs, "KEYFILE", str(key)),
+                patch.object(certs, "privileged_service_active", return_value=False),
+                patch.object(certs.os, "geteuid", return_value=0),
+            ):
+                prepared = certs.prepare_tls_files(str(cert), str(key))
+
+            self.assertNotEqual(prepared.certfile, str(cert))
+            self.assertNotEqual(prepared.keyfile, str(key))
+            prepared.close()
+
     def test_diagnostics_clear_never_unlinks_forged_external_capture(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

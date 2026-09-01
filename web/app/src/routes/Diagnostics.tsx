@@ -32,6 +32,14 @@ import {
 } from "@/components/diagnostics/telemetry-chart"
 import { cn } from "@/lib/utils"
 import {
+  autoConnectPollStateKnown,
+  autoConnectRetryDelay,
+  autoConnectSignature,
+  chooseDiagnosticsAutoConnectProfile,
+  nextAutoConnectAttempt,
+} from "@/lib/can-auto-connect"
+import {
+  fetchCanInterfaces,
   fetchCommands,
   fetchRobotStatus,
   fetchSessions,
@@ -41,6 +49,7 @@ import {
   setServerBase,
   stopSession,
   useSessionLogs,
+  type CanProfileInventory,
   type CommandSpec,
   type FormValue,
   type HardwareProfile,
@@ -124,6 +133,25 @@ export default function Diagnostics() {
   const [commands, setCommands] = useState<CommandSpec[]>([])
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [robotBusy, setRobotBusy] = useState(false)
+  const robotStatusPollFailedRef = useRef(false)
+  const robotStatusRecoveryEpochRef = useRef(0)
+  const robotStatusKnownRef = useRef(false)
+  const canInventoryKnownRef = useRef(false)
+  const sessionInventoryKnownRef = useRef(false)
+  const autoRobotPollStateKnown = useCallback(
+    () =>
+      autoConnectPollStateKnown(
+        robotStatusKnownRef.current,
+        canInventoryKnownRef.current,
+        sessionInventoryKnownRef.current
+      ),
+    []
+  )
+  const [canProfiles, setCanProfiles] = useState<CanProfileInventory | null>(null)
+  // A successful response without profile summaries (or a 404) identifies an
+  // older host. It cannot distinguish attached roles, so only retain the
+  // historical profile already reported by that host's robot status.
+  const [legacyCanInventory, setLegacyCanInventory] = useState(false)
 
   const [arm, setArm] = useState<ArmSide>(
     () => (localStorage.getItem("axolDiagArm") as ArmSide) || "left"
@@ -142,6 +170,8 @@ export default function Diagnostics() {
     command: string
     session: SessionInfo
   } | null>(null)
+  const [sessionInventoryReady, setSessionInventoryReady] = useState(false)
+  const [hardwareSessionBusy, setHardwareSessionBusy] = useState(false)
   const [launchBusy, setLaunchBusy] = useState(false)
   const { lines: activeLines, status: activeStatus } = useSessionLogs(activeRun?.session.id ?? null)
   // Hands-on steps (the ROM tests' gripper prompts) print a "[prompt] …" marker
@@ -198,16 +228,58 @@ export default function Diagnostics() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Robot status poll (reachability counts, connect gating).
+  // Observe the server-owned link and configured CAN presence. Diagnostics may
+  // bootstrap a disconnected host only when exactly one profile is detected;
+  // it never chooses between two profiles or switches an open link.
   useEffect(() => {
-    if (!serverOk) return
+    if (!serverOk) {
+      robotStatusKnownRef.current = false
+      canInventoryKnownRef.current = false
+      return
+    }
     let active = true
     const poll = () => {
       fetchRobotStatus()
         .then((r) => {
-          if (active) setRobot(r)
+          if (!active) return
+          if (robotStatusPollFailedRef.current) {
+            robotStatusPollFailedRef.current = false
+            robotStatusRecoveryEpochRef.current += 1
+          }
+          robotStatusKnownRef.current = true
+          setRobot(r)
         })
-        .catch(() => {})
+        .catch(() => {
+          if (active) {
+            robotStatusPollFailedRef.current = true
+            robotStatusKnownRef.current = false
+            setRobot(null)
+          }
+        })
+      fetchCanInterfaces()
+        .then((inventory) => {
+          if (!active) return
+          canInventoryKnownRef.current = true
+          if (inventory.profiles) {
+            setCanProfiles(inventory.profiles)
+            setLegacyCanInventory(false)
+          } else {
+            setCanProfiles(null)
+            setLegacyCanInventory(true)
+          }
+        })
+        .catch((error) => {
+          if (!active) return
+          if (String(error).includes("HTTP 404")) {
+            canInventoryKnownRef.current = true
+            setCanProfiles(null)
+            setLegacyCanInventory(true)
+            return
+          }
+          canInventoryKnownRef.current = false
+          setCanProfiles(null)
+          setLegacyCanInventory(false)
+        })
     }
     poll()
     const t = setInterval(poll, 2000)
@@ -339,16 +411,52 @@ export default function Diagnostics() {
   }, [activeRun, toast])
 
   const activeProfile = robot?.profile ?? "axol"
-  const connectRobot = useCallback(async () => {
-    setRobotBusy(true)
-    try {
-      setRobot(await robotConnect(undefined, activeProfile))
-    } catch (e) {
-      toast.error(String(e))
-    } finally {
-      setRobotBusy(false)
+  const manualRobotOverrideRef = useRef(false)
+  const autoRobotRef = useRef<string | null>(null)
+  const autoRobotAttemptsRef = useRef(new Map<string, number>())
+  const autoRobotRetryTimerRef = useRef<number | null>(null)
+  const autoRobotMountedRef = useRef(true)
+  const [autoRobotRetryRevision, setAutoRobotRetryRevision] = useState(0)
+  const resetAutoRobotRetry = useCallback(() => {
+    autoRobotRef.current = null
+    autoRobotAttemptsRef.current.clear()
+    if (autoRobotRetryTimerRef.current !== null) {
+      window.clearTimeout(autoRobotRetryTimerRef.current)
+      autoRobotRetryTimerRef.current = null
     }
-  }, [toast, activeProfile])
+  }, [])
+  useEffect(() => {
+    autoRobotMountedRef.current = true
+    return () => {
+      autoRobotMountedRef.current = false
+      resetAutoRobotRetry()
+    }
+  }, [resetAutoRobotRetry])
+  const connectRobot = useCallback(
+    async (profile = activeProfile, automatic = false): Promise<boolean> => {
+      if (!automatic) {
+        resetAutoRobotRetry()
+      }
+      setRobotBusy(true)
+      try {
+        const status = await robotConnect(undefined, profile, automatic)
+        if (!autoRobotMountedRef.current) return false
+        setRobot(status)
+        if (!status.connected) {
+          throw new Error(status.error ?? `Could not connect the ${profile} CAN link`)
+        }
+        if (!automatic) manualRobotOverrideRef.current = true
+        return true
+      } catch (e) {
+        if (!autoRobotMountedRef.current) return false
+        if (!automatic) toast.error(String(e))
+        return false
+      } finally {
+        if (autoRobotMountedRef.current) setRobotBusy(false)
+      }
+    },
+    [toast, activeProfile, resetAutoRobotRetry]
+  )
 
   // Manual CAN interface selection — the fallback when the Axol hub adapter
   // (and its auto-named interfaces) can't be found. The server persists the
@@ -356,9 +464,15 @@ export default function Diagnostics() {
   const [adapterOpen, setAdapterOpen] = useState(false)
   const connectWithChannels = useCallback(
     async (profile: HardwareProfile, channels: RobotChannels) => {
+      resetAutoRobotRetry()
       setRobotBusy(true)
       try {
-        setRobot(await robotConnect(channels, profile))
+        const status = await robotConnect(channels, profile)
+        setRobot(status)
+        if (!status.connected) {
+          throw new Error(status.error ?? `Could not connect the ${profile} CAN link`)
+        }
+        manualRobotOverrideRef.current = true
         setAdapterOpen(false)
       } catch (e) {
         toast.error(String(e))
@@ -366,25 +480,97 @@ export default function Diagnostics() {
         setRobotBusy(false)
       }
     },
-    [toast]
+    [resetAutoRobotRetry, toast]
   )
 
-  // Auto-connect the robot link once after the host comes online if it's
-  // sitting idle — same one-shot latch as the control panel, so a manual
-  // disconnect elsewhere isn't immediately undone.
-  const autoRobotRef = useRef(false)
+  // Direct navigation to Diagnostics still brings up an unambiguous host, but
+  // this route is never a second profile-policy authority. With both profiles
+  // attached it waits for an explicit choice, and an already-open link is only
+  // observed (even if another control panel selected a different operation).
   useEffect(() => {
     if (!serverOk) {
-      autoRobotRef.current = false
+      resetAutoRobotRetry()
+      manualRobotOverrideRef.current = false
       return
     }
-    if (autoRobotRef.current || !robot) return
-    autoRobotRef.current = true
-    if (robot.state === "disconnected" && !robotBusy) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot auto-connect on host online
-      connectRobot()
+    if (!robot || (!canProfiles && !legacyCanInventory) || !sessionInventoryReady) return
+    if (
+      activeRun ||
+      hardwareSessionBusy ||
+      launchBusy ||
+      robotBusy ||
+      (robot.state !== "disconnected" && robot.state !== "error") ||
+      manualRobotOverrideRef.current ||
+      !autoRobotPollStateKnown()
+    )
+      return
+
+    const target = chooseDiagnosticsAutoConnectProfile(
+      canProfiles,
+      legacyCanInventory,
+      activeProfile
+    )
+    if (target === null) {
+      resetAutoRobotRetry()
+      return
     }
-  }, [serverOk, robot, robotBusy, connectRobot])
+    const profileSignature = canProfiles
+      ? autoConnectSignature(target, canProfiles[target])
+      : `legacy:${target}`
+    const signature = `${profileSignature}:host-${robotStatusRecoveryEpochRef.current}`
+    if (autoRobotRef.current === signature) return
+    const attempts = nextAutoConnectAttempt(
+      autoRobotAttemptsRef.current.get(signature) ?? 0,
+      autoRobotPollStateKnown()
+    )
+    if (attempts === null) {
+      autoRobotRef.current = signature
+      return
+    }
+    autoRobotRef.current = signature
+    void connectRobot(target, true).then((connected) => {
+      if (connected || !autoRobotMountedRef.current || manualRobotOverrideRef.current) return
+      if (!autoRobotPollStateKnown()) {
+        autoRobotRef.current = null
+        return
+      }
+      autoRobotAttemptsRef.current.set(signature, attempts)
+      const delay = autoConnectRetryDelay(attempts)
+      if (delay === null) return
+      if (autoRobotRetryTimerRef.current !== null) {
+        window.clearTimeout(autoRobotRetryTimerRef.current)
+      }
+      autoRobotRetryTimerRef.current = window.setTimeout(() => {
+        autoRobotRetryTimerRef.current = null
+        if (
+          autoRobotMountedRef.current &&
+          !manualRobotOverrideRef.current &&
+          autoRobotRef.current === signature
+        ) {
+          autoRobotRef.current = null
+          // A later successful poll causes the rerender and retains the same
+          // attempt count; unknown authority never spends a retry.
+          if (!autoRobotPollStateKnown()) return
+          setAutoRobotRetryRevision((revision) => revision + 1)
+        }
+      }, delay)
+    })
+  }, [
+    activeProfile,
+    activeRun,
+    autoRobotPollStateKnown,
+    autoRobotRetryRevision,
+    canProfiles,
+    connectRobot,
+    hardwareSessionBusy,
+    launchBusy,
+    legacyCanInventory,
+    robot,
+    robotBusy,
+    resetAutoRobotRetry,
+    serverOk,
+    sessionInventoryReady,
+  ])
 
   function selectArm(a: ArmSide) {
     setArm(a)
@@ -421,7 +607,8 @@ export default function Diagnostics() {
   // The CAN bus is owned by something we didn't launch (an in-process
   // operation like teleop) — the server would reject a diagnostic launch, so
   // gray out the launchers rather than let a click bounce off a 409.
-  const busyElsewhere = linkState === "busy" && activeRun == null
+  const busyElsewhere =
+    activeRun == null && (linkState === "busy" || hardwareSessionBusy || launchBusy)
 
   const diagCommands = useMemo(
     () =>
@@ -461,7 +648,11 @@ export default function Diagnostics() {
   // this stops. The completion effect clears activeRun when the run ends, which
   // re-arms the poll (the finished session is then no longer "live").
   useEffect(() => {
-    if (!serverOk || activeRun != null) return
+    if (!serverOk) {
+      sessionInventoryKnownRef.current = false
+      return
+    }
+    if (activeRun != null) return
     const ours = (command: string) =>
       PAGE_COMMAND_IDS.includes(command) || diagCommands.some((c) => c.id === command)
     let active = true
@@ -469,16 +660,25 @@ export default function Diagnostics() {
       fetchSessions()
         .then((sessions) => {
           if (!active) return
-          const live = sessions
-            .filter(
-              (s) =>
-                (s.status === "starting" || s.status === "running" || s.status === "stopping") &&
-                ours(s.command)
-            )
+          const liveSessions = sessions.filter(
+            (session) =>
+              session.status === "starting" ||
+              session.status === "running" ||
+              session.status === "stopping"
+          )
+          sessionInventoryKnownRef.current = true
+          setSessionInventoryReady(true)
+          setHardwareSessionBusy(liveSessions.length > 0)
+          const live = liveSessions
+            .filter((session) => ours(session.command))
             .sort((a, b) => b.startedAt - a.startedAt)[0]
           if (live) setActiveRun({ command: live.command, session: live })
         })
-        .catch(() => {})
+        .catch(() => {
+          if (!active) return
+          sessionInventoryKnownRef.current = false
+          setSessionInventoryReady(false)
+        })
     }
     poll()
     const t = setInterval(poll, 2000)
@@ -634,12 +834,16 @@ export default function Diagnostics() {
                 variant="outline"
                 size="sm"
                 onClick={() => setAdapterOpen(true)}
-                disabled={robotBusy}
+                disabled={robotBusy || hardwareSessionBusy || launchBusy}
                 title="Choose Axol or Mantis and the CAN interface(s) to inspect."
               >
                 <Cable /> CAN adapter…
               </Button>
-              <Button size="sm" onClick={connectRobot} disabled={robotBusy}>
+              <Button
+                size="sm"
+                onClick={() => void connectRobot()}
+                disabled={robotBusy || hardwareSessionBusy || launchBusy}
+              >
                 {robotBusy ? <Loader2 className="animate-spin" /> : null} Connect{" "}
                 {robot.profile === "mantis" ? "Mantis" : "robot"}
               </Button>
@@ -654,12 +858,16 @@ export default function Diagnostics() {
                 variant="outline"
                 size="sm"
                 onClick={() => setAdapterOpen(true)}
-                disabled={robotBusy}
+                disabled={robotBusy || hardwareSessionBusy || launchBusy}
                 title="Choose Axol or Mantis and the CAN interfaces to inspect."
               >
                 <Cable /> Choose CAN adapter
               </Button>
-              <Button size="sm" onClick={connectRobot} disabled={robotBusy}>
+              <Button
+                size="sm"
+                onClick={() => void connectRobot()}
+                disabled={robotBusy || hardwareSessionBusy || launchBusy}
+              >
                 {robotBusy ? <Loader2 className="animate-spin" /> : null} Retry
               </Button>
             </div>
@@ -890,7 +1098,7 @@ export default function Diagnostics() {
           running={activeRun?.command === openTool.command}
           blocked={activeRun != null && activeRun.command !== openTool.command}
           busy={launchBusy}
-          disabled={!serverOk}
+          disabled={!serverOk || busyElsewhere}
           onLaunch={(args) => {
             launch(openTool.command, args)
             setMotorTool(null)
@@ -905,7 +1113,7 @@ export default function Diagnostics() {
         <CanAdapterDialog
           profile={robot?.profile ?? "axol"}
           channels={robot?.channels}
-          busy={robotBusy}
+          busy={robotBusy || hardwareSessionBusy || launchBusy}
           onConnect={connectWithChannels}
           onClose={() => setAdapterOpen(false)}
         />

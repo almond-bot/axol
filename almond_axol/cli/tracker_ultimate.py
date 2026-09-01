@@ -29,6 +29,7 @@ from ..tracker.ultimate import (
     ULTIMATE_WIFI_CONFIG_FILE,
     ultimate_dongle_present,
     ultimate_wifi_config_error,
+    ultimate_wifi_config_state,
 )
 from ..utils.sudo import prime_sudo, run_root
 
@@ -634,39 +635,55 @@ def run_update_preflight(_args: object = None) -> None:
         print(requirement)
 
 
-def _wifi_config_status(probe: dict[str, object]) -> tuple[str, str]:
+def _wifi_config_status(probe: dict[str, object]) -> tuple[str, str, str]:
     """Describe shared-map Wi-Fi readiness without returning credential data."""
-    if ULTIMATE_WIFI_CONFIG_FILE.exists():
-        error = ultimate_wifi_config_error(ULTIMATE_WIFI_CONFIG_FILE)
-        if error is not None:
-            return "FAIL", f"{ULTIMATE_WIFI_CONFIG_FILE}: {error}"
-        try:
-            exposed_bits = ULTIMATE_WIFI_CONFIG_FILE.stat().st_mode & 0o077
-        except OSError as exc:
-            return "FAIL", f"cannot inspect {ULTIMATE_WIFI_CONFIG_FILE}: {exc}"
+    state = ultimate_wifi_config_state(ULTIMATE_WIFI_CONFIG_FILE)
+    if state.status == "valid":
+        assert state.mode is not None
+        exposed_bits = state.mode & 0o077
         detail = (
             f"Axol config {ULTIMATE_WIFI_CONFIG_FILE} is valid "
             "(credential values redacted)"
         )
         if exposed_bits:
-            return "WARN", detail + "; use mode 0600 to protect the password"
-        return "OK", detail
+            return (
+                "WARN",
+                detail + "; use mode 0600 to protect the password",
+                "permissions-warning",
+            )
+        return "OK", detail, "valid"
+    if state.status == "invalid":
+        return (
+            "FAIL",
+            f"{ULTIMATE_WIFI_CONFIG_FILE}: {state.error}",
+            "invalid",
+        )
 
     packaged = _packaged_wifi_status(probe)
     if packaged == "placeholder":
         return (
             "WARN",
             "Axol config is missing; pyvut's packaged public placeholder is active",
+            "missing",
         )
     if packaged == "customized":
         return (
             "WARN",
             "Axol config is missing; a customized package-local config is active "
             "(credential values redacted, upgrade-fragile)",
+            "missing",
         )
     if packaged == "missing":
-        return "FAIL", "both the Axol and pyvut package-local configs are missing"
-    return "FAIL", "Wi-Fi config cannot be checked until pyvut is importable"
+        return (
+            "FAIL",
+            "both the Axol and pyvut package-local configs are missing",
+            "missing",
+        )
+    return (
+        "FAIL",
+        "Wi-Fi config cannot be checked until pyvut is importable",
+        "missing",
+    )
 
 
 def ultimate_runtime_readiness(*, cached: bool = True) -> dict[str, object]:
@@ -692,18 +709,7 @@ def ultimate_runtime_readiness(*, cached: bool = True) -> dict[str, object]:
     pinned = api_compatible and commit == _PYVUT_REF
     log_suppression = bool(probe.get("log_suppression_api"))
 
-    wifi_level, wifi_detail = _wifi_config_status(probe)
-    if wifi_level == "OK":
-        wifi_status = "valid"
-    elif (
-        ULTIMATE_WIFI_CONFIG_FILE.exists()
-        and ultimate_wifi_config_error(ULTIMATE_WIFI_CONFIG_FILE) is None
-    ):
-        wifi_status = "permissions-warning"
-    elif wifi_level == "WARN":
-        wifi_status = "missing"
-    else:
-        wifi_status = "invalid"
+    wifi_level, wifi_detail, wifi_status = _wifi_config_status(probe)
 
     raw_interfaces = probe.get("interfaces")
     interfaces = [
@@ -789,9 +795,9 @@ def ultimate_runtime_readiness(*, cached: bool = True) -> dict[str, object]:
 
 
 def _print_wifi_action(probe: dict[str, object]) -> tuple[str, str]:
-    level, detail = _wifi_config_status(probe)
+    level, detail, status = _wifi_config_status(probe)
     _result(level, "shared-map Wi-Fi", detail)
-    if not ULTIMATE_WIFI_CONFIG_FILE.exists():
+    if status == "missing":
         print(
             f"Operator action: create {ULTIMATE_WIFI_CONFIG_FILE} with JSON keys "
             "ssid, pass, country, and freq, then set mode 0600. The installer "
@@ -822,8 +828,7 @@ def run_install(_args: object = None) -> None:
         python_ok = True
     else:
         durable_wifi_ok = (
-            ULTIMATE_WIFI_CONFIG_FILE.exists()
-            and ultimate_wifi_config_error(ULTIMATE_WIFI_CONFIG_FILE) is None
+            ultimate_wifi_config_state(ULTIMATE_WIFI_CONFIG_FILE).status == "valid"
         )
         if _packaged_wifi_status(initial) == "customized" and not durable_wifi_ok:
             print(
@@ -942,7 +947,7 @@ def run_check(_args: object = None) -> None:
     wifi_status = readiness["wifiConfig"]
     wifi_level = "OK" if wifi_status == "valid" else "FAIL"
     _result(wifi_level, "shared-map Wi-Fi", str(readiness["wifiDetail"]))
-    if not ULTIMATE_WIFI_CONFIG_FILE.exists():
+    if wifi_status == "missing":
         print(
             f"Operator action: create {ULTIMATE_WIFI_CONFIG_FILE} with JSON keys "
             "ssid, pass, country, and freq, then set mode 0600. The installer "

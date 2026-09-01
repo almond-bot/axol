@@ -9,6 +9,7 @@ and every validation error in this module.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import stat
 import threading
@@ -274,6 +275,70 @@ def _pose_convention_payload(
     return {"quatOrder": quat_order, "upAxis": up_axis}
 
 
+def _removable_override_keys(
+    side_document: object,
+    active_key: str | None,
+) -> list[str]:
+    """Relevant exact entries an operator may explicitly remove.
+
+    Unrelated tracker families are deliberately absent. For hardware sources,
+    old same-family and legacy entries are included because they suppress the
+    approved family fallback after a rebind. ``LEGACY_TRACKER_KEY`` also names
+    the pre-keyed top-level ``{pos, quat}`` representation.
+    """
+    if active_key is None or not isinstance(side_document, dict):
+        return []
+
+    removable: list[str] = []
+    if active_key in side_document:
+        removable.append(active_key)
+    if (
+        "pos" in side_document
+        or "quat" in side_document
+        or LEGACY_TRACKER_KEY in side_document
+    ):
+        removable.append(LEGACY_TRACKER_KEY)
+
+    family = active_key.split(":", 1)[0]
+    if family in {"survive", "ultimate"}:
+        for key in sorted(key for key in side_document if isinstance(key, str)):
+            same_family = key == family or key.startswith(f"{family}:")
+            if same_family and key != active_key:
+                removable.append(key)
+    return list(dict.fromkeys(removable))
+
+
+def _override_revision(side_document: object, override_key: str) -> str | None:
+    """Stable content revision for exactly the fields one removal would erase."""
+    if not isinstance(side_document, dict):
+        return None
+    if override_key == LEGACY_TRACKER_KEY:
+        selected = {
+            key: side_document[key]
+            for key in ("pos", "quat", LEGACY_TRACKER_KEY)
+            if key in side_document
+        }
+        if ("pos" in side_document or "quat" in side_document) and (
+            ULTIMATE_POSE_CONVENTION_FIELD in side_document
+        ):
+            selected[ULTIMATE_POSE_CONVENTION_FIELD] = side_document[
+                ULTIMATE_POSE_CONVENTION_FIELD
+            ]
+        if not selected:
+            return None
+    elif override_key in side_document:
+        selected = side_document[override_key]
+    else:
+        return None
+    canonical = json.dumps(
+        selected,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _calibration_snapshot_locked(
     source: str,
     keys: dict[str, str | None],
@@ -335,9 +400,22 @@ def _calibration_snapshot_locked(
             status = "candidate"
         else:
             status = "missing"
+        override_keys = _removable_override_keys(side_document, key)
         sides[side] = {
             "key": key,
             "status": status,
+            # Only the exact active entry and entries that can suppress its
+            # hardware-family fallback are exposed for confirmation-gated
+            # removal. Unrelated devices/families stay intentionally hidden.
+            "overrideKeys": override_keys,
+            # A stale confirmation may delete only the exact content the
+            # operator reviewed, never a same-key value another browser saved.
+            "overrideRevisions": {
+                override_key: revision
+                for override_key in override_keys
+                if (revision := _override_revision(side_document, override_key))
+                is not None
+            },
             # A valid stale entry stays editable so the operator can bench-
             # check and explicitly resave/adopt it for the active convention.
             # Factory/CAD values are never presented as measured editor data.
@@ -500,9 +578,108 @@ def save_calibration(
         )
 
 
+def remove_calibration(
+    source: str,
+    side: str,
+    override_key: object,
+    expected_active_key: object,
+    expected_revision: object,
+    quest_tracker_key: object = None,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """Remove one explicitly selected relevant override for a Mantis side.
+
+    The separately submitted active key and content revision are optimistic-
+    concurrency guards: if identification, the selected Quest datum, or that
+    exact saved entry changed after the UI loaded, every entry is left
+    untouched. The selected key must be the exact active entry or a legacy/
+    same-family entry that suppresses its factory fallback; unrelated sides,
+    families, devices, and metadata cannot be selected.
+    """
+    path = MANTIS_TCP_TRANSFORM_FILE if path is None else path
+    if side not in _SIDES:
+        raise TrackerSetupError("side must be left or right")
+    if not isinstance(override_key, str) or not override_key:
+        raise TrackerSetupError("`key` must be a non-empty string")
+    if not isinstance(expected_active_key, str) or not expected_active_key:
+        raise TrackerSetupError("`active_key` must be a non-empty string")
+    if not isinstance(expected_revision, str) or not expected_revision:
+        raise TrackerSetupError("`revision` must be a non-empty string")
+
+    with _SETUP_FILE_LOCK:
+        keys = _exact_tracker_keys(source, quest_tracker_key)
+        active_key = keys[side]
+        if active_key is None:
+            if source == "quest":
+                action = (
+                    "configure a valid mantis.quest_tracker_key "
+                    "(quest:<profile>:<pose-space>) first"
+                )
+            else:
+                action = f"identify the {source} tracker for that side first"
+            raise TrackerSetupError(
+                f"no exact active calibration key for {side}; {action}"
+            )
+        if expected_active_key != active_key:
+            raise TrackerSetupError(
+                f"tracker identity changed for {side}; "
+                "refresh the setup status and retry"
+            )
+
+        document = _read_calibration_document(path)
+        existing = document.get(side)
+        if not isinstance(existing, dict):
+            raise TrackerSetupError(
+                f"no removable override for the active {side} tracker"
+            )
+        if override_key not in _removable_override_keys(existing, active_key):
+            raise TrackerSetupError(
+                "the selected override no longer applies to the active "
+                f"{side} tracker; refresh the setup status and retry"
+            )
+        current_revision = _override_revision(existing, override_key)
+        if current_revision != expected_revision:
+            raise TrackerSetupError(
+                f"the selected override changed for {side}; "
+                "refresh the setup status and review it again"
+            )
+
+        side_entries = dict(existing)
+        if override_key == LEGACY_TRACKER_KEY:
+            # Remove both serialized forms of the same logical legacy entry.
+            # Any other keyed values mixed into a hand-edited side survive.
+            had_top_level_transform = "pos" in side_entries or "quat" in side_entries
+            side_entries.pop("pos", None)
+            side_entries.pop("quat", None)
+            side_entries.pop(LEGACY_TRACKER_KEY, None)
+            if had_top_level_transform:
+                side_entries.pop(ULTIMATE_POSE_CONVENTION_FIELD, None)
+        else:
+            del side_entries[override_key]
+        if side_entries:
+            document[side] = side_entries
+        else:
+            del document[side]
+        _atomic_write_json(path, document)
+
+        ultimate_convention = (
+            current_ultimate_pose_convention(TRACKER_CONFIG_FILE)
+            if source == "ultimate"
+            else None
+        )
+        return _calibration_snapshot_locked(
+            source,
+            keys,
+            document,
+            path,
+            ultimate_convention,
+        )
+
+
 __all__ = [
     "TrackerSetupError",
     "calibration_snapshot",
+    "remove_calibration",
     "save_calibration",
     "save_ultimate_wifi",
     "ultimate_wifi_snapshot",

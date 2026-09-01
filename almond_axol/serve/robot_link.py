@@ -20,6 +20,7 @@ import asyncio
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from ..constants import (
@@ -686,6 +687,12 @@ class RobotLink:
             return False
         return all(iface_up(arm.channel) for arm in self._arms)
 
+    def _configured_interfaces_present(self) -> bool:
+        """True when every interface selected for this link currently exists."""
+        return bool(self._arms) and all(
+            (Path("/sys/class/net") / arm.channel).exists() for arm in self._arms
+        )
+
     def _uses_axol_hub(self) -> bool:
         """True when the link runs on the Axol hub's persistently-named pair.
 
@@ -764,8 +771,14 @@ class RobotLink:
         if not self._arms:
             raise RuntimeError("No CAN interfaces configured")
         if self._uses_mantis_hub():
-            if not _MANTIS_PROFILE.cron_script.exists():
-                _logger.info("Mantis CAN profile missing; running automatic setup.")
+            if (
+                not _MANTIS_PROFILE.cron_script.exists()
+                or not self._configured_interfaces_present()
+            ):
+                _logger.info(
+                    "Mantis CAN profile or named interfaces missing; running "
+                    "automatic setup."
+                )
                 ensure_mantis_setup()
                 return
             if self._can_already_up() and rx_alive(_MANTIS_PROFILE):

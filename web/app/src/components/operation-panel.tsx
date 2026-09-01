@@ -200,6 +200,7 @@ export function OperationPanel({
   // signal.
   const robotFree = isRobotFreeRun(meta, effectiveSettings)
   const robotOk = robot?.state === "connected"
+  const axolOk = robotOk && (robot?.profile ?? "axol") === "axol"
   const mantisOk = robotOk && robot?.profile === "mantis"
   const cartOnly = meta.fields.includes("cart_only") && Boolean(effectiveSettings.cart_only)
   // `usesHeadset` also identifies operations that run the camera relay. The
@@ -219,14 +220,18 @@ export function OperationPanel({
         ? "Connect Mantis (the current hardware link is Axol)"
         : "Connect Mantis"
     )
-  } else if (meta.requiresRobot && !robotFree && !robotOk) {
-    blockers.push("Connect Axol")
+  } else if (meta.requiresRobot && !robotFree && !axolOk) {
+    blockers.push(
+      robotOk && robot?.profile === "mantis"
+        ? "Connect Axol (the current hardware link is Mantis)"
+        : "Connect Axol"
+    )
   }
   // A faulted motor on the active hardware profile blocks the run (the server
   // refuses it too). A Mantis run ignores stale Axol-arm faults while the Axol
   // profile is showing, but once the Mantis link is selected its own gripper
   // faults remain actionable.
-  const checkActiveProfileFaults = !robotFree || (mantisMode && robot?.profile === "mantis")
+  const checkActiveProfileFaults = mantisMode ? mantisOk : !robotFree && axolOk
   if (checkActiveProfileFaults) {
     for (const f of robot?.faults ?? []) {
       blockers.push(`Fix motor fault: ${motorFaultLabel(f)}`)

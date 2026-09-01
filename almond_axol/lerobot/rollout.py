@@ -549,6 +549,7 @@ class RolloutCaptureThread(threading.Thread):
         frame_interval = 1.0 / self.fps
         recording_start = time.perf_counter()
         tick = 0
+        record_pose_lag = "observation.pose_lag" in self.dataset.features
 
         while not self.stop_event.is_set():
             target_perf_ts = recording_start + tick * frame_interval
@@ -558,7 +559,10 @@ class RolloutCaptureThread(threading.Thread):
                 return
 
             try:
-                obs = self.robot.get_observation()
+                if record_pose_lag:
+                    obs, pose_lag = self.robot.get_observation_with_pose_lag()
+                else:
+                    obs = self.robot.get_observation()
             except Exception as exc:  # noqa: BLE001
                 _logger.warning(
                     "Capture tick %d: get_observation failed (%s).", tick, exc
@@ -572,13 +576,12 @@ class RolloutCaptureThread(threading.Thread):
                 continue
 
             obs_processed = self.robot_obs_proc(obs)
-            # Mantis-collected datasets declare observation.pose_lag (pose↔image
-            # capture skew, filled by the collect-data recorder). Rollouts have
-            # no separate pose stream — state and images are sampled together
-            # in get_observation — so the skew is 0 by construction. Provide it
-            # so run-policy can record into (resume) a Mantis dataset.
-            if "observation.pose_lag" in self.dataset.features:
-                obs_processed.setdefault("pose_lag", 0.0)
+            # Mantis-created datasets carry the signed pose↔image capture
+            # skew. AxolRobot returns it alongside (not inside) the observation
+            # so policy inputs keep their negotiated feature schema and this
+            # row cannot race with an inference thread's simultaneous read.
+            if record_pose_lag:
+                obs_processed["pose_lag"] = pose_lag
             obs_frame = build_dataset_frame(
                 self.dataset.features, obs_processed, prefix=OBS_STR
             )

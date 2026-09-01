@@ -21,7 +21,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, URDF_PATH
+from ..constants import (
+    ARM_JOINTS,
+    CAN_LEFT,
+    CAN_MANTIS_LEFT,
+    CAN_MANTIS_RIGHT,
+    CAN_RIGHT,
+    URDF_PATH,
+)
 from ..utils import adb, ports
 from ..utils.browser_origin import (
     LOOPBACK_ORIGIN_REGEX,
@@ -112,6 +119,10 @@ class RobotConnectRequest(BaseModel):
     rightChannel: str | None = None
     channelsSet: bool = False
     profile: Literal["axol", "mantis"] = "axol"
+    # Old clients omit this and therefore remain explicit/manual connects.
+    # Browser startup sets it so a successful manual Disconnect can remain
+    # authoritative across every tab connected to this serve process.
+    automatic: bool = False
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -613,6 +624,52 @@ def _list_can_interfaces() -> list[dict[str, Any]]:
     return interfaces
 
 
+def _attached_configured_hub_profiles() -> set[str]:
+    """Persisted Axol/Mantis USB identities attached before netdev creation."""
+    from ..cli.can.setup import attached_configured_hub_profiles
+
+    return attached_configured_hub_profiles()
+
+
+def _can_profile_presence(
+    interfaces: list[dict[str, Any]],
+    channels: tuple[str | None, str | None],
+    *,
+    require_both: bool,
+    configured_usb_present: bool = False,
+    profile_channels: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    """Describe whether one configured hardware profile is connectable.
+
+    Interface identity comes from the persisted Axol/Mantis mapping, never from
+    guessing what an arbitrary ``can0`` might be. A persisted profile's exact
+    USB serial also counts before its driver/netdevs exist, allowing
+    :meth:`RobotLink.connect` to restore them. Such a profile and an ordinary
+    present-but-down interface both report ``up=False``.
+    """
+    left, right = channels
+    enabled = [channel for channel in channels if channel is not None]
+    valid = (len(enabled) == 2 if require_both else bool(enabled)) and len(
+        set(enabled)
+    ) == len(enabled)
+    by_name = {str(interface.get("name")): interface for interface in interfaces}
+    named_present = valid and all(channel in by_name for channel in enabled)
+    usb_bootstrap = (
+        valid
+        and configured_usb_present
+        and profile_channels is not None
+        and len(enabled) == 2
+        and set(enabled) == set(profile_channels)
+    )
+    present = named_present or usb_bootstrap
+    up = named_present and all(bool(by_name[channel].get("up")) for channel in enabled)
+    return {
+        "channels": {"left": left, "right": right},
+        "present": present,
+        "up": up,
+    }
+
+
 def _detect_cameras() -> dict[str, Any]:
     """Enumerate locally connected ZED cameras; never raises.
 
@@ -683,6 +740,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # reopened the idle RobotLink.  Keep that small cleanup window reserved so
     # a new operation cannot start against a link that is still being restored.
     diagnostic_cleanup_pending: set[str] = set()
+    # A successful manual Disconnect pauses only the exact profile + channel
+    # map that was disconnected.  This lives on the server so opening another
+    # browser cannot immediately undo the operator's choice.  It is deliberately
+    # process-local: a serve restart starts a fresh hardware-detection epoch.
+    manually_disconnected_target: (
+        tuple[Literal["axol", "mantis"], str | None, str | None] | None
+    ) = None
 
     def _diagnostic_session_active() -> bool:
         return bool(diagnostic_cleanup_pending) or any(
@@ -895,14 +959,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def robot_status() -> dict[str, Any]:
         return robot.status()
 
-    async def _connect_robot(
+    def _resolve_robot_connect_target(
         req: RobotConnectRequest | None = None,
-    ) -> dict[str, Any] | JSONResponse:
-        """Connect the robot link, optionally onto explicit CAN interfaces.
-
-        Axol and Mantis channel selections are persisted independently and
-        reused by operations for that hardware profile.
-        """
+    ) -> tuple[Literal["axol", "mantis"], tuple[str | None, str | None]] | JSONResponse:
+        """Validate and resolve the exact profile + channels a connect targets."""
         profile = req.profile if req is not None else "axol"
         if req is not None and req.channelsSet:
             channels: tuple[str | None, str | None] = (
@@ -924,6 +984,22 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         {"error": "select a CAN interface for at least one side"},
                         status_code=400,
                     )
+        elif profile == "mantis":
+            try:
+                channels = require_mantis_channels(settings.mantis_can_channels())
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+        else:
+            channels = settings.can_channels()
+        return profile, channels
+
+    async def _connect_robot(
+        req: RobotConnectRequest | None,
+        target: tuple[Literal["axol", "mantis"], tuple[str | None, str | None]],
+    ) -> dict[str, Any] | JSONResponse:
+        """Connect the link to a validated profile + channel target."""
+        profile, channels = target
+        if req is not None and req.channelsSet:
             if robot.status()["state"] == "busy":
                 return JSONResponse(
                     {"error": "cannot change CAN interfaces while a task owns the bus"},
@@ -943,13 +1019,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         "mantis.right_channel": channels[1],
                     }
                 )
-        elif profile == "mantis":
-            try:
-                channels = require_mantis_channels(settings.mantis_can_channels())
-            except ValueError as exc:
-                return JSONResponse({"error": str(exc)}, status_code=400)
-        else:
-            channels = settings.can_channels()
         if channels != robot.channels() or profile != robot.profile():
             if robot.status()["state"] == "busy":
                 return JSONResponse(
@@ -964,6 +1033,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def robot_connect(
         req: RobotConnectRequest | None = None,
     ) -> dict[str, Any] | JSONResponse:
+        nonlocal manually_disconnected_target
         async with session_launch_reservation:
             maintenance = _maintenance_launch_response()
             if maintenance is not None:
@@ -976,10 +1046,34 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     },
                     status_code=409,
                 )
-            return await _connect_robot(req)
+            target = _resolve_robot_connect_target(req)
+            if isinstance(target, JSONResponse):
+                return target
+            profile, channels = target
+            target_key = (profile, channels[0], channels[1])
+            automatic = req is not None and req.automatic
+            if automatic and manually_disconnected_target == target_key:
+                return JSONResponse(
+                    {
+                        "error": "automatic connection paused after manual disconnect",
+                        "automaticConnectSuppressed": True,
+                    },
+                    status_code=409,
+                )
+            if automatic and manually_disconnected_target != target_key:
+                # A different selected profile or a changed saved map is new
+                # automatic intent and releases the old, narrowly scoped pause.
+                manually_disconnected_target = None
+            result = await _connect_robot(req, target)
+            if not automatic and not isinstance(result, JSONResponse):
+                # An actionable manual Connect supersedes a prior Disconnect.
+                # A validation/ownership rejection above does not.
+                manually_disconnected_target = None
+            return result
 
     @app.post("/api/robot/disconnect", response_model=None)
     async def robot_disconnect() -> dict[str, Any] | JSONResponse:
+        nonlocal manually_disconnected_target
         async with session_launch_reservation:
             maintenance = _maintenance_launch_response()
             if maintenance is not None:
@@ -992,16 +1086,54 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     },
                     status_code=409,
                 )
-            return await asyncio.to_thread(robot.disconnect)
+            target_key = (robot.profile(), *robot.channels())
+            result = await asyncio.to_thread(robot.disconnect)
+            if result.get("state") == "disconnected":
+                manually_disconnected_target = target_key
+            return result
 
     @app.get("/api/can/interfaces", response_model=None)
     async def can_interfaces() -> dict[str, Any] | JSONResponse:
-        """SocketCAN interfaces on this host, for the CAN adapter picker."""
+        """SocketCAN inventory plus configured Axol/Mantis presence."""
         async with session_launch_reservation:
             maintenance = _maintenance_launch_response()
             if maintenance is not None:
                 return maintenance
-            return {"interfaces": await asyncio.to_thread(_list_can_interfaces)}
+            interfaces, usb_profiles = await asyncio.gather(
+                asyncio.to_thread(_list_can_interfaces),
+                asyncio.to_thread(_attached_configured_hub_profiles),
+            )
+            axol_channels = settings.can_channels()
+            mantis_channels = settings.mantis_can_channels()
+            axol_presence = _can_profile_presence(
+                interfaces,
+                axol_channels,
+                require_both=False,
+                configured_usb_present="axol" in usb_profiles,
+                profile_channels=(CAN_LEFT, CAN_RIGHT),
+            )
+            mantis_presence = _can_profile_presence(
+                interfaces,
+                mantis_channels,
+                require_both=True,
+                configured_usb_present="mantis" in usb_profiles,
+                profile_channels=(CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT),
+            )
+            axol_presence["automaticConnectSuppressed"] = (
+                manually_disconnected_target
+                == ("axol", axol_channels[0], axol_channels[1])
+            )
+            mantis_presence["automaticConnectSuppressed"] = (
+                manually_disconnected_target
+                == ("mantis", mantis_channels[0], mantis_channels[1])
+            )
+            return {
+                "interfaces": interfaces,
+                "profiles": {
+                    "axol": axol_presence,
+                    "mantis": mantis_presence,
+                },
+            }
 
     @app.get("/api/robot/motors/{arm}/{joint}")
     async def robot_motor_details(arm: str, joint: str) -> JSONResponse:
@@ -1458,6 +1590,32 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         except OSError:
             return JSONResponse(
                 {"error": "could not write the tracker calibration"},
+                status_code=400,
+            )
+        return JSONResponse(result)
+
+    @app.delete("/api/tracker/calibration/{source}/{side}", response_model=None)
+    async def delete_tracker_calibration(
+        source: str, side: str, key: str, active_key: str, revision: str
+    ) -> JSONResponse:
+        """Remove one selected relevant override under an active-key guard."""
+        from .tracker_setup import TrackerSetupError, remove_calibration
+
+        try:
+            result = await asyncio.to_thread(
+                remove_calibration,
+                source,
+                side,
+                key,
+                active_key,
+                revision,
+                quest_calibration_key(),
+            )
+        except TrackerSetupError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError:
+            return JSONResponse(
+                {"error": "could not remove the tracker calibration"},
                 status_code=400,
             )
         return JSONResponse(result)

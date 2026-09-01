@@ -4,6 +4,7 @@ import type { ConnState } from "@/components/setup-dialog"
 import {
   restartHost,
   shutdownHost,
+  type CanProfileInventory,
   type HardwareProfile,
   type MotorHealth,
   type RobotStatus,
@@ -113,6 +114,7 @@ export function ConnectionsBar({
   opRunning = false,
   robot,
   robotBusy,
+  canProfiles,
   onRobotConnect,
   onRobotDisconnect,
 }: {
@@ -128,6 +130,8 @@ export function ConnectionsBar({
   opRunning?: boolean
   robot: RobotStatus | null
   robotBusy: boolean
+  /** Configured profiles whose CAN netdevs or exact persisted USB hub exist. */
+  canProfiles?: CanProfileInventory | null
   onRobotConnect: (profile: HardwareProfile) => void
   onRobotDisconnect: () => void
 }) {
@@ -173,6 +177,7 @@ export function ConnectionsBar({
   const activeProfile = robot?.profile ?? "axol"
   const hardwareTile = (profile: HardwareProfile, title: string) => {
     const active = activeProfile === profile
+    const detected = canProfiles?.[profile].present ?? false
     const state = active ? (robot?.state ?? "disconnected") : "disconnected"
     const faults = active ? (robot?.faults ?? []) : []
     const dot: Dot =
@@ -186,7 +191,9 @@ export function ConnectionsBar({
             ? "warn"
             : state === "error"
               ? "err"
-              : "idle"
+              : detected
+                ? "warn"
+                : "idle"
     const label =
       state === "connected"
         ? "Connected"
@@ -196,7 +203,11 @@ export function ConnectionsBar({
             ? "Connecting…"
             : state === "error"
               ? robot?.error || "Error"
-              : "Disconnected"
+              : detected
+                ? "CAN detected"
+                : canProfiles
+                  ? "Not detected"
+                  : "Disconnected"
 
     return (
       <Tile
@@ -219,9 +230,13 @@ export function ConnectionsBar({
             variant="outline"
             size="icon"
             onClick={onRobotDisconnect}
-            disabled={robotBusy}
+            disabled={robotBusy || opRunning}
             aria-label={`Disconnect ${title}`}
-            title={`Release the ${title} link (CAN). The hardware stays powered.`}
+            title={
+              opRunning
+                ? "Wait for the active operation or setup session to finish."
+                : `Release the ${title} link (CAN). The hardware stays powered.`
+            }
             className="size-8"
           >
             <Unplug />
@@ -231,7 +246,10 @@ export function ConnectionsBar({
             variant="outline"
             size="sm"
             onClick={() => onRobotConnect(profile)}
-            disabled={!online || robotBusy}
+            disabled={!online || robotBusy || opRunning}
+            title={
+              opRunning ? "Wait for the active operation or setup session to finish." : undefined
+            }
           >
             {robotBusy ? <Loader2 className="animate-spin" /> : <Plug />}
             Connect

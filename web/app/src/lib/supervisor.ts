@@ -324,7 +324,8 @@ export async function fetchRobotStatus(): Promise<RobotStatus> {
  */
 export async function robotConnect(
   channels?: RobotChannels,
-  profile: HardwareProfile = "axol"
+  profile: HardwareProfile = "axol",
+  automatic = false
 ): Promise<RobotStatus> {
   const init: RequestInit = {
     method: "POST",
@@ -334,6 +335,7 @@ export async function robotConnect(
       rightChannel: channels?.right ?? null,
       channelsSet: channels != null,
       profile,
+      automatic,
     }),
   }
   return json(await fetch(apiUrl("/api/robot/connect"), init))
@@ -349,7 +351,26 @@ export interface CanInterface {
   up: boolean
 }
 
-export async function fetchCanInterfaces(): Promise<{ interfaces: CanInterface[] }> {
+/** Presence of one configured hardware profile in the host's CAN inventory. */
+export interface CanProfilePresence {
+  channels: RobotChannels
+  /** Configured channels exist, or their exact persisted USB hub is attached. */
+  present: boolean
+  /** Every configured channel netdev exists and is administratively up. */
+  up: boolean
+  /** This exact profile/map was manually disconnected on the serve host. */
+  automaticConnectSuppressed?: boolean
+}
+
+export type CanProfileInventory = Record<HardwareProfile, CanProfilePresence>
+
+export interface CanInterfaceInventory {
+  interfaces: CanInterface[]
+  /** Omitted by serve releases that predate hardware-aware auto-connect. */
+  profiles?: CanProfileInventory
+}
+
+export async function fetchCanInterfaces(): Promise<CanInterfaceInventory> {
   return json(await fetch(apiUrl("/api/can/interfaces")))
 }
 
@@ -764,6 +785,10 @@ export type TrackerCalibrationStatus = TrackerTransformStatus | "unbound"
 export interface TrackerCalibrationSide {
   key: string | null
   status: TrackerCalibrationStatus
+  /** Exact active and legacy/same-family entries eligible for explicit removal. */
+  overrideKeys?: string[]
+  /** Content revisions guarding confirmation-gated removal against stale tabs. */
+  overrideRevisions?: Record<string, string>
   /** Measured and stale saved values are returned; factory/candidate values stay null. */
   pos: [number, number, number] | null
   quat: [number, number, number, number] | null
@@ -809,6 +834,21 @@ export async function saveTrackerCalibration(
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(update),
+    })
+  )
+}
+
+export async function removeTrackerCalibration(
+  source: MantisTrackerSource,
+  side: "left" | "right",
+  key: string,
+  activeKey: string,
+  revision: string
+): Promise<TrackerCalibrationSnapshot> {
+  const query = new URLSearchParams({ key, active_key: activeKey, revision })
+  return json(
+    await fetch(apiUrl(`/api/tracker/calibration/${source}/${side}?${query.toString()}`), {
+      method: "DELETE",
     })
   )
 }

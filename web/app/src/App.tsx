@@ -16,6 +16,7 @@ import {
   AxolConnectionStatus,
   type AxolMode,
   type AxolPoseMode,
+  type AxolPoseSourceKind,
   AxolVRClient,
   AxolState,
   type ConfirmAction,
@@ -882,12 +883,18 @@ const STATUS_DISPLAY: Partial<Record<AxolState | "pending", { color: string; lab
 function StateDisplay({
   state,
   isRecordingPending,
+  viewOnly,
 }: {
   state: AxolState
   isRecordingPending: boolean
+  viewOnly: boolean
 }) {
   const displayState: AxolState | "pending" = isRecordingPending ? "pending" : state
-  const { color, label } = STATUS_DISPLAY[displayState] ?? { color: "white", label: "• Teleop" }
+  const { color, label: stateLabel } = STATUS_DISPLAY[displayState] ?? {
+    color: "white",
+    label: "• Teleop",
+  }
+  const label = viewOnly ? `${stateLabel} • Quest view only` : stateLabel
 
   return (
     <HudText
@@ -929,15 +936,27 @@ function EpisodeDisplay({ episode }: { episode: number | null }) {
   )
 }
 
-function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode | null }) {
+function HelpPanel({
+  onDismiss,
+  mode,
+  poseSourceKind,
+}: {
+  onDismiss: () => void
+  mode: AxolMode | null
+  poseSourceKind: AxolPoseSourceKind
+}) {
   const W = 0.44
   const H = 0.133
   const col = 0.11
+  const viewOnly = poseSourceKind === "tracker"
   // Recording only exists in data collection; teleop drops the [A] hint.
   const rightRows =
-    mode === "teleop"
+    mode === "teleop" || viewOnly
       ? "[Trigger]  Move Screen\n[2× Trigger]  Resize\n[B]  Reset Screens"
       : "[A]  Start / Stop Rec\n[Trigger]  Move Screen\n[2× Trigger]  Resize\n[B]  Reset Screens"
+  const leftRows = viewOnly
+    ? "[Y]  Exit VR\n[Tracker]  Robot Control"
+    : "[Y]  Exit VR\n[X]  Reset Pose"
 
   return (
     <group position={[0, -0.038, 0]}>
@@ -999,7 +1018,7 @@ function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode 
         material-depthTest={false}
         lineHeight={1.6}
       >
-        {`[Y]  Exit VR\n[X]  Reset Pose`}
+        {leftRows}
       </HudText>
       {/* Right buttons */}
       <HudText
@@ -1018,7 +1037,13 @@ function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode 
   )
 }
 
-function HelpIcon({ mode }: { mode: AxolMode | null }) {
+function HelpIcon({
+  mode,
+  poseSourceKind,
+}: {
+  mode: AxolMode | null
+  poseSourceKind: AxolPoseSourceKind
+}) {
   const [open, setOpen] = useState(false)
 
   return (
@@ -1036,7 +1061,9 @@ function HelpIcon({ mode }: { mode: AxolMode | null }) {
       >
         ?
       </HudText>
-      {open && <HelpPanel onDismiss={() => setOpen(false)} mode={mode} />}
+      {open && (
+        <HelpPanel onDismiss={() => setOpen(false)} mode={mode} poseSourceKind={poseSourceKind} />
+      )}
     </group>
   )
 }
@@ -1207,6 +1234,7 @@ export default function App() {
   // Controller space is independent of the HUD mode. It defaults to the
   // legacy-safe relative mapping until the host's replayable announcement.
   const [poseMode, setPoseMode] = useState<AxolPoseMode>("relative")
+  const [poseSourceKind, setPoseSourceKind] = useState<AxolPoseSourceKind>(null)
   // Current 1-based episode number during data collection (null until the
   // server announces one; stays null in plain teleop).
   const [episode, setEpisode] = useState<number | null>(null)
@@ -1397,15 +1425,22 @@ export default function App() {
               <div className="grid grid-cols-2 gap-3 text-left text-xs">
                 <ControlHints
                   title="Left"
-                  rows={[
-                    ["Y", "Exit VR"],
-                    ["X", "Reset pose"],
-                  ]}
+                  rows={
+                    poseSourceKind === "tracker"
+                      ? [
+                          ["Y", "Exit VR"],
+                          ["View only", "Tracker controls robot"],
+                        ]
+                      : [
+                          ["Y", "Exit VR"],
+                          ["X", "Reset pose"],
+                        ]
+                  }
                 />
                 <ControlHints
                   title="Right"
                   rows={[
-                    ...(vrMode === "teleop"
+                    ...(vrMode === "teleop" || poseSourceKind === "tracker"
                       ? []
                       : ([["A", "Start / stop rec"]] as [string, string][])),
                     ["Trigger", "Move screen"],
@@ -1458,14 +1493,19 @@ export default function App() {
               onPendingConfirm={setPendingConfirm}
               onMode={setVrMode}
               onPoseMode={setPoseMode}
+              onPoseSourceKind={setPoseSourceKind}
               onEpisode={setEpisode}
               onExit={() => store.getState().session?.end()}
             />
             <ImmersiveCameraFeed wsRef={wsRef} />
             <XRHud>
               <ExitButton />
-              <HelpIcon mode={vrMode} />
-              <StateDisplay state={vrState} isRecordingPending={recordingPendingAt !== null} />
+              <HelpIcon mode={vrMode} poseSourceKind={poseSourceKind} />
+              <StateDisplay
+                state={vrState}
+                isRecordingPending={recordingPendingAt !== null}
+                viewOnly={poseSourceKind === "tracker"}
+              />
               <EpisodeDisplay episode={episode} />
               <CountdownDisplay recordingPendingAt={recordingPendingAt} />
               <ConfirmDisplay action={pendingConfirm} />

@@ -217,6 +217,229 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
             self.assertEqual(saved["right"], original["right"])
             self.assertEqual(calibration_path.stat().st_mode & 0o777, 0o600)
 
+    def test_calibration_remove_preserves_unrelated_entries_and_restores_factory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "tracker.json"
+            calibration_path = root / "tcp.json"
+            self._tracker_config(config_path)
+            active_key = "survive:LHR-LEFT"
+            quest_key = "quest:meta-quest-touch-plus:grip"
+            original = {
+                "metadata": {"fixture": "bench-a", "revision": 4},
+                "left": {
+                    active_key: dict(_IDENTITY),
+                    quest_key: {
+                        "pos": [0.1, 0.2, 0.3],
+                        "quat": [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+                "right": {"ultimate:1:2:3:4:5:6": dict(_IDENTITY)},
+            }
+            calibration_path.write_text(json.dumps(original))
+
+            with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
+                before = tracker_setup.calibration_snapshot(
+                    "lighthouse", path=calibration_path
+                )
+                result = tracker_setup.remove_calibration(
+                    "lighthouse",
+                    "left",
+                    active_key,
+                    active_key,
+                    before["left"]["overrideRevisions"][active_key],
+                    path=calibration_path,
+                )
+
+            self.assertEqual(result["left"]["status"], "factory")
+            self.assertIsNone(result["left"]["pos"])
+            self.assertIsNone(result["left"]["quat"])
+            saved = json.loads(calibration_path.read_text())
+            self.assertEqual(saved["metadata"], original["metadata"])
+            self.assertNotIn(active_key, saved["left"])
+            self.assertEqual(saved["left"][quest_key], original["left"][quest_key])
+            self.assertEqual(saved["right"], original["right"])
+            self.assertEqual(calibration_path.stat().st_mode & 0o777, 0o600)
+
+    def test_calibration_remove_rejects_stale_identity_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "tracker.json"
+            calibration_path = root / "tcp.json"
+            self._tracker_config(config_path)
+            original = {
+                "left": {"survive:LHR-LEFT": dict(_IDENTITY)},
+                "right": {"survive:LHR-RIGHT": dict(_IDENTITY)},
+            }
+            calibration_path.write_text(json.dumps(original))
+
+            with (
+                patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path),
+                self.assertRaisesRegex(
+                    tracker_setup.TrackerSetupError,
+                    "identity changed.*refresh",
+                ),
+            ):
+                tracker_setup.remove_calibration(
+                    "lighthouse",
+                    "left",
+                    "survive:LHR-LEFT",
+                    "survive:OLD-TRACKER",
+                    "identity-check-runs-first",
+                    path=calibration_path,
+                )
+
+            self.assertEqual(json.loads(calibration_path.read_text()), original)
+
+    def test_calibration_remove_exposes_malformed_active_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "tracker.json"
+            calibration_path = root / "tcp.json"
+            self._tracker_config(config_path)
+            active_key = "survive:LHR-LEFT"
+            quest_key = "quest:meta-quest-touch-plus:grip"
+            calibration_path.write_text(
+                json.dumps(
+                    {
+                        "left": {
+                            active_key: ["malformed"],
+                            quest_key: dict(_IDENTITY),
+                        }
+                    }
+                )
+            )
+
+            with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
+                before = tracker_setup.calibration_snapshot(
+                    "lighthouse", path=calibration_path
+                )
+                self.assertEqual(before["left"]["status"], "missing")
+                self.assertEqual(before["left"]["overrideKeys"], [active_key])
+                after = tracker_setup.remove_calibration(
+                    "lighthouse",
+                    "left",
+                    active_key,
+                    active_key,
+                    before["left"]["overrideRevisions"][active_key],
+                    path=calibration_path,
+                )
+
+            self.assertEqual(after["left"]["status"], "factory")
+            saved = json.loads(calibration_path.read_text())
+            self.assertEqual(saved["left"], {quest_key: dict(_IDENTITY)})
+
+    def test_calibration_remove_cleans_only_selected_legacy_and_family_blockers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "tracker.json"
+            calibration_path = root / "tcp.json"
+            self._tracker_config(config_path)
+            active_key = "survive:LHR-LEFT"
+            old_key = "survive:OLD-TRACKER"
+            quest_key = "quest:meta-quest-touch-plus:grip"
+            original = {
+                "metadata": {"fixture": "bench-b"},
+                "left": {
+                    **_IDENTITY,
+                    old_key: dict(_IDENTITY),
+                    quest_key: dict(_IDENTITY),
+                },
+                "right": {"ultimate:1:2:3:4:5:6": dict(_IDENTITY)},
+            }
+            calibration_path.write_text(json.dumps(original))
+
+            with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
+                before = tracker_setup.calibration_snapshot(
+                    "lighthouse", path=calibration_path
+                )
+                self.assertEqual(
+                    before["left"]["overrideKeys"],
+                    ["legacy", old_key],
+                )
+                with self.assertRaisesRegex(
+                    tracker_setup.TrackerSetupError,
+                    "selected override no longer applies",
+                ):
+                    tracker_setup.remove_calibration(
+                        "lighthouse",
+                        "left",
+                        quest_key,
+                        active_key,
+                        "not-a-removable-entry",
+                        path=calibration_path,
+                    )
+                after_old = tracker_setup.remove_calibration(
+                    "lighthouse",
+                    "left",
+                    old_key,
+                    active_key,
+                    before["left"]["overrideRevisions"][old_key],
+                    path=calibration_path,
+                )
+                self.assertEqual(after_old["left"]["overrideKeys"], ["legacy"])
+                after_legacy = tracker_setup.remove_calibration(
+                    "lighthouse",
+                    "left",
+                    "legacy",
+                    active_key,
+                    after_old["left"]["overrideRevisions"]["legacy"],
+                    path=calibration_path,
+                )
+
+            self.assertEqual(after_legacy["left"]["status"], "factory")
+            saved = json.loads(calibration_path.read_text())
+            self.assertEqual(saved["metadata"], original["metadata"])
+            self.assertEqual(saved["left"], {quest_key: dict(_IDENTITY)})
+            self.assertEqual(saved["right"], original["right"])
+
+    def test_calibration_remove_rejects_same_key_concurrent_resave(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "tracker.json"
+            calibration_path = root / "tcp.json"
+            self._tracker_config(config_path)
+            active_key = "survive:LHR-LEFT"
+            calibration_path.write_text(
+                json.dumps({"left": {active_key: dict(_IDENTITY)}})
+            )
+
+            with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
+                before = tracker_setup.calibration_snapshot(
+                    "lighthouse", path=calibration_path
+                )
+                old_revision = before["left"]["overrideRevisions"][active_key]
+                tracker_setup.save_calibration(
+                    "lighthouse",
+                    {
+                        "left": {
+                            "key": active_key,
+                            "pos": [0.1, 0.2, 0.3],
+                            "quat": [0.0, 0.0, 0.0, 1.0],
+                        }
+                    },
+                    path=calibration_path,
+                )
+                with self.assertRaisesRegex(
+                    tracker_setup.TrackerSetupError,
+                    "selected override changed.*refresh",
+                ):
+                    tracker_setup.remove_calibration(
+                        "lighthouse",
+                        "left",
+                        active_key,
+                        active_key,
+                        old_revision,
+                        path=calibration_path,
+                    )
+
+            saved = json.loads(calibration_path.read_text())
+            self.assertEqual(saved["left"][active_key]["pos"], [0.1, 0.2, 0.3])
+
     def test_calibration_resolves_ultimate_binding_and_quest_configured_key(
         self,
     ) -> None:
@@ -705,6 +928,19 @@ class TrackerSetupApiTest(unittest.IsolatedAsyncioTestCase):
                     response = await client.get("/api/tracker/calibration/quest")
                     self.assertEqual(response.status_code, 200)
                     self.assertEqual(response.json()["left"]["pos"], [0.0, 0.0, 0.0])
+
+                    response = await client.delete(
+                        "/api/tracker/calibration/quest/left",
+                        params={
+                            "key": quest_key,
+                            "active_key": quest_key,
+                            "revision": value["left"]["overrideRevisions"][quest_key],
+                        },
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.json()["left"]["status"], "missing")
+                    self.assertIsNone(response.json()["left"]["pos"])
+                    self.assertNotIn("left", json.loads(path.read_text()))
 
     async def test_calibration_api_rejects_unknown_source(self) -> None:
         app = _test_app(_Settings())

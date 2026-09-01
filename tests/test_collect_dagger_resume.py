@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 import unittest
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -286,6 +287,112 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         self.assertIsNone(result)
         control_loop.robot.send_action.assert_not_called()
         control_loop.recorder.publish.assert_not_called()
+
+    def test_cartesian_dagger_intervention_records_converted_joint_action(self) -> None:
+        control_loop = object.__new__(collect_dagger._DaggerControlLoop)  # noqa: SLF001
+        control_loop.shutdown_event = threading.Event()
+        human_joint_action = {"left_shoulder_pitch.pos": 0.25}
+        cartesian_action = {"left_ee.x": 0.47}
+        joint_observation = {"left_ee.x": 0.46}
+        robot = SimpleNamespace(
+            get_joint_observation=mock.Mock(return_value=joint_observation),
+            send_action=mock.Mock(return_value=human_joint_action),
+            action_to_dataset=mock.Mock(return_value=cartesian_action),
+        )
+        recorder = SimpleNamespace(publish=mock.Mock())
+        recorder.publish.side_effect = (
+            lambda *_args, **_kwargs: control_loop.shutdown_event.set()
+        )
+        control_loop.robot = robot
+        control_loop.policy = mock.Mock()
+        control_loop.teleop = SimpleNamespace(
+            get_teleop_events=mock.Mock(return_value=defaultdict(bool)),
+            consume_freeze=mock.Mock(return_value=False),
+            teleop_engaged=True,
+            get_action=mock.Mock(return_value=human_joint_action),
+            vr_hz=mock.Mock(return_value=0.0),
+            ik_hz=mock.Mock(return_value=0.0),
+        )
+        control_loop.recorder = recorder
+        control_loop.limiter = None
+        control_loop.fps = 60
+        control_loop.teleop_hz = 120
+        control_loop.vr_choice = None
+        control_loop.state = collect_dagger._STATE_TELEOP  # noqa: SLF001
+        control_loop.interventions = 1
+        control_loop.intervention_spans = []
+        control_loop.open_span_start = 0.0
+
+        control_loop.run()
+
+        robot.send_action.assert_called_once_with(human_joint_action)
+        robot.action_to_dataset.assert_called_once_with(human_joint_action)
+        recorder.publish.assert_called_once_with(
+            joint_observation,
+            cartesian_action,
+            mock.ANY,
+            intervention=True,
+        )
+
+    def test_cartesian_frozen_hold_keeps_hardware_and_dataset_actions_separate(
+        self,
+    ) -> None:
+        control_loop = object.__new__(collect_dagger._DaggerControlLoop)  # noqa: SLF001
+        control_loop.shutdown_event = threading.Event()
+        human_joint_action = {"left_shoulder_pitch.pos": 0.25}
+        cartesian_action = {"left_ee.x": 0.47}
+        joint_observation = {"left_ee.x": 0.46}
+        robot = SimpleNamespace(
+            get_joint_observation=mock.Mock(return_value=joint_observation),
+            send_action=mock.Mock(return_value=human_joint_action),
+            action_to_dataset=mock.Mock(return_value=cartesian_action),
+        )
+        recorder = SimpleNamespace(
+            publish=mock.Mock(),
+            frame_count=mock.Mock(return_value=1),
+            pause_episode=mock.Mock(),
+            resume_episode=mock.Mock(return_value=0),
+        )
+        recorder.publish.side_effect = lambda *_args, **_kwargs: (
+            control_loop.shutdown_event.set()
+            if recorder.publish.call_count == 2
+            else None
+        )
+        teleop = mock.Mock()
+        type(teleop).teleop_engaged = mock.PropertyMock(
+            side_effect=[True, False, False]
+        )
+        teleop.get_teleop_events.return_value = defaultdict(bool)
+        teleop.consume_freeze.side_effect = [False, False, True]
+        teleop.get_action.return_value = human_joint_action
+        teleop.vr_hz.return_value = 0.0
+        teleop.ik_hz.return_value = 0.0
+        control_loop.robot = robot
+        control_loop.policy = SimpleNamespace(reset=mock.Mock())
+        control_loop.teleop = teleop
+        control_loop.recorder = recorder
+        control_loop.limiter = None
+        control_loop.fps = 60
+        control_loop.teleop_hz = 120
+        control_loop.vr_choice = None
+        control_loop.state = collect_dagger._STATE_TELEOP  # noqa: SLF001
+        control_loop.interventions = 1
+        control_loop.intervention_spans = []
+        control_loop.open_span_start = 0.0
+        control_loop._policy_tick = mock.Mock(return_value=None)  # noqa: SLF001
+
+        control_loop.run()
+
+        self.assertEqual(
+            robot.send_action.call_args_list,
+            [mock.call(human_joint_action), mock.call(human_joint_action)],
+        )
+        self.assertEqual(recorder.publish.call_count, 2)
+        self.assertEqual(recorder.publish.call_args_list[0].args[1], cartesian_action)
+        self.assertEqual(recorder.publish.call_args_list[1].args[1], cartesian_action)
+        self.assertNotIn(
+            "left_shoulder_pitch.pos", recorder.publish.call_args_list[1].args[1]
+        )
 
 
 if __name__ == "__main__":

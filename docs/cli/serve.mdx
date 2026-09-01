@@ -27,7 +27,7 @@ axol serve --no-tls           # plain HTTP instead of HTTPS
 | `--no-tls` | Serve plain HTTP instead of HTTPS. TLS is on by default. |
 
 <Warning>
-  `axol serve` is a trusted-LAN control service, not a multi-user authenticated API. Keep ports 8000/8001 behind the robot network or a host firewall; do not expose them directly to the internet. Browser requests are limited to the hosted Axol UI, loopback development, and the exact LAN IP/local hostnames registered when `axol serve` starts; the server never trusts a request's `Host` header to grant access. Native clients on the LAN intentionally remain compatible without an `Origin` header. A custom hosted UI or DNS alias must be explicitly added with the comma-separated `AXOL_ALLOWED_BROWSER_ORIGINS` environment variable.
+  `axol serve` is a trusted-LAN control service, not a multi-user authenticated API. Keep ports 8000/8001 behind the robot network or a host firewall; do not expose them directly to the internet. Browser requests are limited to the hosted Axol UI, loopback development, and the exact local-interface IPs/local hostnames registered when `axol serve` starts; this includes secondary Ethernet/Wi-Fi, VPN, and routable IPv6 addresses. The server never trusts a request's `Host` header to grant access. Native clients on the LAN intentionally remain compatible without an `Origin` header. A custom hosted UI or DNS alias must be explicitly added with the comma-separated `AXOL_ALLOWED_BROWSER_ORIGINS` environment variable.
 </Warning>
 
 ## TLS

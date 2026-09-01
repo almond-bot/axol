@@ -647,15 +647,50 @@ class AxolRobot(Robot):
         fall back to ``read_latest()`` so a single stale camera doesn't stall
         inference.
         """
+        observation, _pose_lag = self._get_observation_with_pose_lag(
+            require_camera_timestamps=False
+        )
+        return observation
+
+    @check_if_not_connected
+    def get_observation_with_pose_lag(self) -> tuple[RobotObservation, float]:
+        """Return one observation and its signed pose-to-image capture skew.
+
+        The lag is the freshest camera exposure timestamp minus the timestamp
+        immediately before the cached joint sample, on the shared
+        ``perf_counter`` timeline.  It is returned out-of-band rather than
+        inserted into the observation so policy feature dictionaries remain
+        unchanged.  Keeping the metadata in the return value also binds it to
+        this exact call when inference and rollout capture read concurrently.
+
+        A timestamped ``read_latest_with_ts`` fallback is required here: a
+        rollout row that declares ``observation.pose_lag`` must never silently
+        substitute zero when a camera timed out and supplied a stale frame.
+        """
+        observation, pose_lag = self._get_observation_with_pose_lag(
+            require_camera_timestamps=True
+        )
+        if pose_lag is None:
+            raise RuntimeError(
+                "one or more cameras did not report a capture timestamp; "
+                "refusing to fabricate pose_lag"
+            )
+        return observation, pose_lag
+
+    def _get_observation_with_pose_lag(
+        self, *, require_camera_timestamps: bool
+    ) -> tuple[RobotObservation, float | None]:
+        """Read an observation, optionally requiring complete camera timing."""
         target_ts = time.perf_counter()
 
         obs = self._joint_state()
+        camera_capture_timestamps: list[float] = []
 
         for cam_key, cam in self.cameras.items():
             cam_fps = getattr(cam, "fps", None) or 30
             timeout_ms = int(2 * 1000.0 / cam_fps + 200)
             try:
-                frame, _cap_ts, _recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
+                frame, cap_ts, _recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
                     target_ts, timeout_ms=timeout_ms
                 )
             except (TimeoutError, RuntimeError) as exc:
@@ -666,10 +701,44 @@ class AxolRobot(Robot):
                     target_ts,
                     exc,
                 )
-                frame = cam.read_latest()
+                if not require_camera_timestamps:
+                    frame = cam.read_latest()
+                    cap_ts = None
+                else:
+                    read_latest_with_ts = getattr(cam, "read_latest_with_ts", None)
+                    if not callable(read_latest_with_ts):
+                        raise RuntimeError(
+                            f"camera {cam_key!r} cannot report the capture "
+                            "timestamp of its fallback frame; refusing to "
+                            "fabricate pose_lag"
+                        ) from exc
+                    frame, cap_ts, recv_ts = read_latest_with_ts()
+                    # Preserve read_latest()'s normal stale-frame guard while
+                    # retaining the timestamp belonging to this exact copy.
+                    recv_ts = float(recv_ts)
+                    if not np.isfinite(recv_ts):
+                        raise RuntimeError(
+                            f"camera {cam_key!r} returned a non-finite receive "
+                            "timestamp for its fallback frame"
+                        )
+                    age_ms = (time.perf_counter() - recv_ts) * 1e3
+                    if age_ms > 500:
+                        raise TimeoutError(
+                            f"latest {cam_key!r} frame is {age_ms:.0f}ms old (> 500ms)"
+                        )
             obs[cam_key] = frame
+            if cap_ts is not None:
+                capture_ts = float(cap_ts)
+                if not np.isfinite(capture_ts):
+                    raise RuntimeError(
+                        f"camera {cam_key!r} returned a non-finite capture timestamp"
+                    )
+                camera_capture_timestamps.append(capture_ts)
 
-        return obs
+        if len(camera_capture_timestamps) != len(self.cameras):
+            return obs, None
+        freshest_capture_ts = max(camera_capture_timestamps, default=target_ts)
+        return obs, freshest_capture_ts - target_ts
 
     def _ensure_ik(self) -> KinematicsSolver:
         """Lazily build the IK solver used to resolve Cartesian action targets.

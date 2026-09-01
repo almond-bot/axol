@@ -23,6 +23,8 @@ after that, sessions are hands-free.
 
 from __future__ import annotations
 
+import os
+import pwd
 import shutil
 import socket
 import subprocess
@@ -36,6 +38,9 @@ _VR_PORT = 8000
 _SERVE_PORT = 8001
 _BROWSER_URL = f"https://localhost:{_SERVE_PORT}/vr?host=localhost&autoconnect=1"
 _SERVICE_PATH = Path("/etc/systemd/system/axol-mantis.service")
+_MANAGED_SERVE_SERVICE = "axol.service"
+_SYSTEMD_RUNTIME = Path("/run/systemd/system")
+_UPDATE_GUARD_MARKER = Path("/var/lib/almond-axol/update-incomplete")
 _PRE_MANTIS_SERVICE_NAME = f"axol-{'u' + 'mi'}.service"
 _PRE_MANTIS_SERVICE_PATH = Path("/etc/systemd/system") / _PRE_MANTIS_SERVICE_NAME
 
@@ -122,6 +127,69 @@ def _serve_is_up() -> bool:
         return False
 
 
+def _managed_serve_is_installed() -> bool:
+    """Whether systemd owns ``axol serve`` on this host.
+
+    A helper fallback must never race the managed service's startup/restart or
+    bypass its durable interrupted-update condition. Treat an inspection
+    failure on a systemd boot as managed (fail closed); non-systemd development
+    hosts can still use the standalone fallback.
+    """
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        return _SYSTEMD_RUNTIME.is_dir()
+    try:
+        result = subprocess.run(
+            [
+                systemctl,
+                "show",
+                "--property=LoadState",
+                "--value",
+                _MANAGED_SERVE_SERVICE,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return _SYSTEMD_RUNTIME.is_dir()
+    if result.returncode != 0:
+        return _SYSTEMD_RUNTIME.is_dir()
+    load_state = result.stdout.strip()
+    if load_state == "not-found":
+        return False
+    if not load_state:
+        return _SYSTEMD_RUNTIME.is_dir()
+    return True
+
+
+def _update_is_incomplete() -> bool:
+    """Fail closed when the durable update marker exists or cannot be read."""
+    try:
+        os.lstat(_UPDATE_GUARD_MARKER)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _fallback_serve_block_reason() -> str | None:
+    if _update_is_incomplete():
+        return "an Axol update has not completed verification"
+    if _managed_serve_is_installed():
+        return f"{_MANAGED_SERVE_SERVICE} owns the control-panel server"
+    return None
+
+
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
 def _session() -> None:
     """Keep the control panel available and bootstrap any Quest that appears."""
     axol = shutil.which("axol") or sys.argv[0]
@@ -132,13 +200,33 @@ def _session() -> None:
             "(install android-tools-adb)."
         )
 
-    serve = None if _serve_is_up() else _spawn("serve", [axol, "serve"])
+    serve = None
+    block_reason = _fallback_serve_block_reason()
+    if block_reason is not None:
+        print(f"serve fallback disabled: {block_reason}")
+    elif not _serve_is_up():
+        serve = _spawn("serve", [axol, "serve"])
     bootstrapped: set[str] = set()
     try:
         while True:
+            next_block_reason = _fallback_serve_block_reason()
+            if next_block_reason != block_reason:
+                block_reason = next_block_reason
+                if block_reason is not None:
+                    print(f"serve fallback disabled: {block_reason}")
+                else:
+                    print("serve fallback is available")
+            if serve is not None and block_reason is not None:
+                _stop_process(serve)
+                serve = None
             if serve is not None and serve.poll() is not None:
                 print(f"serve exited ({serve.returncode}); restarting in 5s")
                 time.sleep(5)
+                if _fallback_serve_block_reason() is None:
+                    serve = _spawn("serve", [axol, "serve"])
+                else:
+                    serve = None
+            elif serve is None and block_reason is None and not _serve_is_up():
                 serve = _spawn("serve", [axol, "serve"])
             if adb is not None:
                 serial = _quest_serial(adb)
@@ -151,11 +239,31 @@ def _session() -> None:
             time.sleep(3)
     finally:
         if serve is not None:
-            serve.terminate()
-            try:
-                serve.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                serve.kill()
+            _stop_process(serve)
+
+
+def _operator_user() -> str:
+    """Resolve the non-root operator that invoked the service installer."""
+    if os.geteuid() == 0:
+        raw_uid = os.environ.get("SUDO_UID", "")
+        if not raw_uid.isascii() or not raw_uid.isdecimal():
+            raise SystemExit(
+                "Run `axol mantis.session --install` as the non-root operator; "
+                "it will request sudo only for system changes."
+            )
+        uid = int(raw_uid)
+    else:
+        uid = os.geteuid()
+    if uid == 0:
+        raise SystemExit("The Mantis session service must not run as root.")
+    try:
+        account = pwd.getpwuid(uid)
+    except (KeyError, OverflowError) as exc:
+        raise SystemExit(f"No local account exists for operator uid {uid}.") from exc
+    sudo_user = os.environ.get("SUDO_USER") if os.geteuid() == 0 else None
+    if sudo_user and sudo_user != account.pw_name:
+        raise SystemExit("SUDO_USER does not match SUDO_UID; refusing to install.")
+    return account.pw_name
 
 
 def _install() -> None:
@@ -164,10 +272,12 @@ def _install() -> None:
     if not axol:
         raise SystemExit("Cannot resolve the `axol` executable to bake into the unit.")
     repo_root = Path(__file__).resolve().parents[2]
-    user = subprocess.run(["whoami"], capture_output=True, text=True).stdout.strip()
+    user = _operator_user()
     unit = f"""[Unit]
 Description=Almond Mantis Quest USB/browser bootstrap
-After=network-online.target axol.service
+Wants={_MANAGED_SERVE_SERVICE}
+After=network-online.target {_MANAGED_SERVE_SERVICE}
+ConditionPathExists=!{_UPDATE_GUARD_MARKER}
 
 [Service]
 Type=simple

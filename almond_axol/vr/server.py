@@ -32,7 +32,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import socket
 import threading
 import time
@@ -47,7 +46,13 @@ from fastapi.staticfiles import StaticFiles
 
 from ..constants import URDF_PATH
 from ..utils.browser_origin import browser_origin_allowed
-from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
+from ..utils.certs import (
+    ACCEPT_PAGE_HTML,
+    CERTFILE,
+    KEYFILE,
+    PreparedTLSFiles,
+    prepare_tls_files,
+)
 from ..utils.ports import open_listen_socket
 from .config import VRServerConfig
 from .control_channel import ControlChannelManager
@@ -186,6 +191,7 @@ class VRServer:
         self._on_frame: Callable[[VRFrame], None] | None = None
         self._certfile = config.certfile or CERTFILE
         self._keyfile = config.keyfile or KEYFILE
+        self._tls_files: PreparedTLSFiles | None = None
         if config.pose_source_kind not in (None, "webxr", "tracker"):
             raise ValueError(
                 "pose_source_kind must be None, 'webxr', or 'tracker'; got "
@@ -238,6 +244,13 @@ class VRServer:
         # cleared — with a null broadcast — when the publisher disconnects.
         self._hud: dict[str, Any] | None = None
         self._hud_client: int | None = None
+        # Latest pose sequence carried by the signaling client that published
+        # HUD state.  One logical Quest source can span an old and replacement
+        # socket briefly during reconnect; their TCP streams have no ordering
+        # relative to each other.  Keep HUD updates monotonic with the source's
+        # pose stream so a delayed old-socket popup cannot overwrite the new
+        # socket's replay and then be cleared when that old socket disconnects.
+        self._hud_pose_seq: int | None = None
 
         # The source-wide sequence high-water deduplicates one logical Quest
         # producer copied over USB, WebRTC, and network. Per-client high-water
@@ -511,6 +524,50 @@ class VRServer:
             except Exception as exc:
                 _logger.warning("Failed to relay hud to client: %s", exc)
 
+    def _clear_hud_for_pose_owner_change(self) -> None:
+        """Invalidate controls published by the previous pose owner.
+
+        Pose ingestion is synchronous for both WebSocket and WebRTC data-
+        channel transports. In the live server both run on its event loop, so
+        schedule the null broadcast without delaying the new owner's pose. A
+        direct synchronous caller (notably unit tests) still gets the fail-
+        closed state clear even when no loop is running.
+        """
+        if self._hud is None and self._hud_client is None:
+            return
+        should_broadcast = self._hud is not None
+        self._hud = None
+        self._hud_client = None
+        self._hud_pose_seq = None
+        if not should_broadcast:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn(self._broadcast_hud())
+
+    def _client_can_publish_hud(self, client_id: int, obj: dict[str, Any]) -> bool:
+        """Whether this socket carries the active WebXR pose producer.
+
+        HUD countdowns and confirmations are controls, not passive viewer
+        metadata. A Quest that is connected only for cameras during a managed
+        tracker run must therefore be unable to overwrite the operator panel's
+        state. Requiring an already established pose owner also keeps dashboard
+        and signaling-only clients read-only.
+        """
+        owner = self._pose_owner
+        if owner is None or self._pose_owner_kind not in ("webxr", "legacy"):
+            return False
+        if owner not in self._client_sources.get(client_id, set()):
+            return False
+
+        declared_id = obj.get("pose_source_id")
+        if declared_id is not None and declared_id != owner:
+            return False
+        declared_kind = obj.get("pose_source_kind")
+        return declared_kind in (None, "webxr")
+
     async def enable(self) -> None:
         """Start the WSS server in the background.
 
@@ -526,34 +583,42 @@ class VRServer:
         # schedule the pending-request flush onto this loop.
         self._loop = asyncio.get_running_loop()
 
-        if not os.path.isfile(self._certfile) or not os.path.isfile(self._keyfile):
+        tls_files = prepare_tls_files(self._certfile, self._keyfile)
+        if tls_files.generated:
             _logger.info("creating self-signed certificate")
-            create_self_signed_cert(self._certfile, self._keyfile)
+        sock: socket.socket | None = None
+        try:
+            sock = await asyncio.to_thread(open_listen_socket, "0.0.0.0", self._port)
+            self._listen_socket = sock
 
-        sock = await asyncio.to_thread(open_listen_socket, "0.0.0.0", self._port)
-        self._listen_socket = sock
-
-        app = self._build_app()
-        config = uvicorn.Config(
-            app,
-            host="0.0.0.0",
-            port=self._port,
-            log_level="info",
-            ssl_certfile=self._certfile,
-            ssl_keyfile=self._keyfile,
-            # Keepalives stay at uvicorn's defaults (20s ping / 20s timeout).
-            # Tighter pings were tried for faster dead-peer detection, but
-            # with the camera RTP saturating the operator's WiFi a pong can
-            # take >5s on a perfectly healthy link, and killing the pose
-            # socket then tears down video and teleop with it. Prompt
-            # dead-peer detection isn't needed for safety: pose silence
-            # force-disengages teleop within VRTeleopConfig.disengage_timeout
-            # and the arms hold position until the operator acts.
-        )
-        self._uvicorn_server = uvicorn.Server(config)
-        self._server_task = asyncio.create_task(
-            self._uvicorn_server.serve(sockets=[sock])
-        )
+            app = self._build_app()
+            config = uvicorn.Config(
+                app,
+                host="0.0.0.0",
+                port=self._port,
+                log_level="info",
+                ssl_certfile=tls_files.certfile,
+                ssl_keyfile=tls_files.keyfile,
+                # Keepalives stay at uvicorn's defaults (20s ping / 20s timeout).
+                # Tighter pings were tried for faster dead-peer detection, but
+                # with the camera RTP saturating the operator's WiFi a pong can
+                # take >5s on a perfectly healthy link, and killing the pose
+                # socket then tears down video and teleop with it. Prompt
+                # dead-peer detection isn't needed for safety: pose silence
+                # force-disengages teleop within VRTeleopConfig.disengage_timeout
+                # and the arms hold position until the operator acts.
+            )
+            self._uvicorn_server = uvicorn.Server(config)
+            self._server_task = asyncio.create_task(
+                self._uvicorn_server.serve(sockets=[sock])
+            )
+        except BaseException:
+            if sock is not None:
+                sock.close()
+            self._listen_socket = None
+            tls_files.close()
+            raise
+        self._tls_files = tls_files
         _logger.info("listening on wss://0.0.0.0:%d/ws", self._port)
 
     async def disable(self) -> None:
@@ -591,6 +656,10 @@ class VRServer:
                 pass
             self._listen_socket = None
 
+        if self._tls_files is not None:
+            self._tls_files.close()
+            self._tls_files = None
+
         self._client_count = 0
         self._active_clients.clear()
         self._video_pending.clear()
@@ -605,6 +674,9 @@ class VRServer:
         self._client_sources.clear()
         self._client_last_seq.clear()
         self._client_last_seq_seen.clear()
+        self._hud = None
+        self._hud_client = None
+        self._hud_pose_seq = None
         self._loop = None
         # Fresh session next enable(): don't gate a reloaded headset's restarted
         # seq counter against a stale high-water mark.
@@ -670,8 +742,10 @@ class VRServer:
             return None
         previous_kind = self._source_kind.setdefault(source_id, source_kind)
         if previous_kind != source_kind:
-            # A logical id cannot change privilege/kind mid-session.
-            source_kind = previous_kind
+            # A logical id cannot change privilege/kind mid-session. Reject
+            # instead of coercing to the first kind: coercion could let a
+            # WebXR frame reuse a tracker owner's id and inherit its authority.
+            return None
         self._source_clients.setdefault(source_id, set()).add(client_id)
         self._client_sources.setdefault(client_id, set()).add(source_id)
         return source_id, source_kind
@@ -717,6 +791,7 @@ class VRServer:
         )
         if same_source_family and owner_stale:
             previous = self._pose_owner
+            self._clear_hud_for_pose_owner_change()
             self._pose_owner = source_id
             self._pose_owner_kind = source_kind
             self._pose_owner_last_seen = now
@@ -738,6 +813,7 @@ class VRServer:
                 source_id,
                 self._pose_owner,
             )
+            self._clear_hud_for_pose_owner_change()
             self._pose_owner = source_id
             self._pose_owner_kind = source_kind
             self._pose_owner_last_seen = now
@@ -864,6 +940,15 @@ class VRServer:
                 active_max = max(active) if active else seq
                 if active_max < last:
                     self._last_seq[source_id] = active_max
+                    if (
+                        self._hud_pose_seq is not None
+                        and self._hud_pose_seq > active_max
+                    ):
+                        # The higher-range tab/transport stopped publishing and
+                        # this lower range is now the live timing domain.  Its
+                        # future HUD updates must not remain pinned below the
+                        # departed publisher's sequence watermark.
+                        self._clear_hud_for_pose_owner_change()
                     self._reset_pose_buffer()
                     if seq < active_max:
                         return True
@@ -934,13 +1019,31 @@ class VRServer:
                 await self._control.set_answer(client_id, sdp)
             return
 
-        # Headset HUD state (armed confirmation popup, record countdown):
-        # store it and relay to every other client so a dashboard can mirror
-        # the in-headset popups (see ``self._hud``).
+        # Headset HUD state (armed confirmation popup, record countdown): only
+        # the active WebXR pose producer may store and relay it. Camera viewers
+        # in a tracker-owned session stay read-only.
         if msg_type == "hud":
+            if not self._client_can_publish_hud(client_id, obj):
+                return
+            owner = self._pose_owner
+            publisher_pose_seq = (
+                self._client_last_seq.get((client_id, owner))
+                if owner is not None
+                else None
+            )
+            if (
+                publisher_pose_seq is not None
+                and self._hud_pose_seq is not None
+                and publisher_pose_seq < self._hud_pose_seq
+            ):
+                # A replacement signaling socket already replayed newer HUD
+                # state for this logical pose source.  Messages delayed on the
+                # superseded socket must not win the cross-socket race.
+                return
             value = obj.get("value")
             self._hud = value if isinstance(value, dict) else None
             self._hud_client = client_id
+            self._hud_pose_seq = publisher_pose_seq
             await self._broadcast_hud(exclude=websocket)
             return
 
@@ -1060,6 +1163,11 @@ class VRServer:
         announcements: list[tuple[str, Any]] = []
         if self._mode is not None:
             announcements.append(("mode", self._mode))
+        # The WebXR client uses this to suppress local record controls when a
+        # Lighthouse/Ultimate bridge owns poses. Announce null as well so a
+        # current client can distinguish unrestricted policy from an older
+        # server that does not expose this contract.
+        announcements.append(("pose_source_kind", self._expected_pose_source_kind))
         announcements.append(("pose_mode", self._pose_mode))
         if self._tracking is not None:
             announcements.append(("tracking", self._tracking))
@@ -1138,6 +1246,7 @@ class VRServer:
                 # every mirror so a dashboard doesn't show a stale dialog.
                 if server._hud_client == client_id:
                     server._hud_client = None
+                    server._hud_pose_seq = None
                     if server._hud is not None:
                         server._hud = None
                         await server._broadcast_hud()

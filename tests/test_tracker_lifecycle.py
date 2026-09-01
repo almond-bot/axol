@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import subprocess
+import sys
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from types import ModuleType
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
@@ -23,6 +28,7 @@ from almond_axol.tracker.bridge import (
     TrackerBridge,
 )
 from almond_axol.tracker.survive import SurviveSource
+from almond_axol.tracker import ultimate as tracker_ultimate
 from almond_axol.tracker.ultimate import UltimateSource
 
 
@@ -262,6 +268,94 @@ class SurviveLifecycleTest(unittest.TestCase):
 
 
 class UltimateLifecycleTest(unittest.TestCase):
+    def test_runtime_passes_pyvut_a_private_pinned_wifi_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "ultimate_wifi.json"
+            original = {
+                "ssid": "private-map",
+                "pass": "never-log-this-password",
+                "country": "US",
+                "freq": 5180,
+            }
+            config.write_text(json.dumps(original))
+            config.chmod(0o600)
+            captured: dict[str, object] = {}
+
+            class FakeAPI:
+                def __init__(self, **kwargs: object) -> None:
+                    path = Path(str(kwargs["wifi_info_path"]))
+                    captured["path"] = path
+                    captured["values"] = json.loads(path.read_text())
+                    self._thread = None
+
+                def add_pose_callback(self, callback: object) -> None:
+                    captured["callback"] = callback
+
+                def start(self) -> None:
+                    captured["started"] = True
+
+                def stop(self) -> None:
+                    captured["stopped"] = True
+
+            hid = ModuleType("hid")
+            hid.Device = object  # type: ignore[attr-defined]
+            pyvut = ModuleType("pyvut")
+            pyvut.UltimateTrackerAPI = FakeAPI  # type: ignore[attr-defined]
+            tracker_core = ModuleType("pyvut.tracker_core")
+            tracker_core.set_tracker_core_verbose = Mock()  # type: ignore[attr-defined]
+
+            source = UltimateSource()
+            with (
+                patch.object(tracker_ultimate, "ULTIMATE_WIFI_CONFIG_FILE", config),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "hid": hid,
+                        "pyvut": pyvut,
+                        "pyvut.tracker_core": tracker_core,
+                    },
+                ),
+            ):
+                source.start()
+
+            snapshot = captured["path"]
+            assert isinstance(snapshot, Path)
+            self.assertNotEqual(snapshot, config)
+            self.assertEqual(captured["values"], original)
+            self.assertEqual(snapshot.stat().st_mode & 0o777, 0o600)
+
+            config.write_text(json.dumps({**original, "pass": "replacement-password"}))
+            self.assertEqual(json.loads(snapshot.read_text()), original)
+
+            source.stop()
+            self.assertTrue(captured["stopped"])
+            self.assertFalse(snapshot.exists())
+
+    def test_wifi_state_rejects_symlink_without_exposing_credential(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            victim = root / "victim.json"
+            secret = "do-not-return-this-secret"
+            victim.write_text(
+                json.dumps(
+                    {
+                        "ssid": "private-map",
+                        "pass": secret,
+                        "country": "US",
+                        "freq": 5180,
+                    }
+                )
+            )
+            config = root / "ultimate_wifi.json"
+            config.symlink_to(victim)
+
+            state = tracker_ultimate.ultimate_wifi_config_state(config)
+
+            self.assertEqual(state.status, "invalid")
+            self.assertIn("cannot be read", state.error or "")
+            self.assertNotIn(secret, state.error or "")
+            self.assertNotIn(secret, repr(state))
+
     def test_pose_callback_converts_axes_and_preserves_tracking_status(self) -> None:
         source = UltimateSource(quat_order="wxyz", up_axis="z")
         half = np.sqrt(0.5)

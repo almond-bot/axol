@@ -42,6 +42,9 @@ class _Settings:
     def can_channels(self) -> tuple[str, str]:
         return "can-left", "can-right"
 
+    def mantis_can_channels(self) -> tuple[str, str]:
+        return "can_mantis_l", "can_mantis_r"
+
     def has_gripper(self) -> bool:
         return True
 
@@ -413,6 +416,162 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("setup or diagnostics session", response.json()["error"])
         self.assertEqual(runner.starts, 0)
 
+    async def test_can_inventory_reports_configured_profile_presence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsStore(Path(directory) / "settings.json")
+            settings.update(
+                values={
+                    "robot.left_channel": "bench-axol",
+                    "robot.right_channel": "null",
+                    "mantis.left_channel": "rig-left",
+                    "mantis.right_channel": "rig-right",
+                }
+            )
+            interfaces = [
+                {"name": "bench-axol", "up": False},
+                {"name": "rig-left", "up": True},
+                {"name": "rig-right", "up": False},
+                {"name": "can0", "up": True},
+            ]
+            app = _test_app(_Manager(), _Runner(), settings=settings)
+            transport = httpx.ASGITransport(app=app)
+            with patch.object(
+                app_module, "_list_can_interfaces", return_value=interfaces
+            ):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    response = await client.get("/api/can/interfaces")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["interfaces"], interfaces)
+        self.assertEqual(
+            body["profiles"],
+            {
+                "axol": {
+                    "channels": {"left": "bench-axol", "right": None},
+                    "present": True,
+                    "up": False,
+                    "automaticConnectSuppressed": False,
+                },
+                "mantis": {
+                    "channels": {"left": "rig-left", "right": "rig-right"},
+                    "present": True,
+                    "up": False,
+                    "automaticConnectSuppressed": False,
+                },
+            },
+        )
+
+    async def test_can_inventory_bootstraps_only_exact_persisted_usb_profiles(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsStore(Path(directory) / "settings.json")
+            app = _test_app(_Manager(), _Runner(), settings=settings)
+            transport = httpx.ASGITransport(app=app)
+            with (
+                patch.object(app_module, "_list_can_interfaces", return_value=[]),
+                patch.object(
+                    app_module,
+                    "_attached_configured_hub_profiles",
+                    return_value={"axol", "mantis"},
+                ),
+            ):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    response = await client.get("/api/can/interfaces")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["profiles"],
+            {
+                "axol": {
+                    "channels": {
+                        "left": "can_alm_axol_l",
+                        "right": "can_alm_axol_r",
+                    },
+                    "present": True,
+                    "up": False,
+                    "automaticConnectSuppressed": False,
+                },
+                "mantis": {
+                    "channels": {
+                        "left": "can_mantis_l",
+                        "right": "can_mantis_r",
+                    },
+                    "present": True,
+                    "up": False,
+                    "automaticConnectSuppressed": False,
+                },
+            },
+        )
+
+    def test_can_profile_presence_requires_the_complete_configured_map(self) -> None:
+        interfaces = [{"name": "left", "up": True}]
+
+        self.assertEqual(
+            app_module._can_profile_presence(
+                interfaces, ("left", "right"), require_both=False
+            )["present"],
+            False,
+        )
+        self.assertEqual(
+            app_module._can_profile_presence(
+                interfaces, ("left", None), require_both=False
+            )["present"],
+            True,
+        )
+        self.assertEqual(
+            app_module._can_profile_presence(
+                interfaces, ("left", None), require_both=True
+            )["present"],
+            False,
+        )
+        self.assertEqual(
+            app_module._can_profile_presence(
+                [{"name": "can0", "up": True}],
+                ("configured-left", None),
+                require_both=False,
+            )["present"],
+            False,
+        )
+        self.assertEqual(
+            app_module._can_profile_presence(
+                interfaces, ("left", "left"), require_both=True
+            )["present"],
+            False,
+        )
+        self.assertFalse(
+            app_module._can_profile_presence(
+                [],
+                ("default-left", None),
+                require_both=False,
+                configured_usb_present=True,
+                profile_channels=("default-left", "default-right"),
+            )["present"]
+        )
+        self.assertTrue(
+            app_module._can_profile_presence(
+                [],
+                ("default-left", "default-right"),
+                require_both=False,
+                configured_usb_present=True,
+                profile_channels=("default-left", "default-right"),
+            )["present"]
+        )
+        self.assertFalse(
+            app_module._can_profile_presence(
+                [],
+                ("custom-left", None),
+                require_both=False,
+                configured_usb_present=True,
+                profile_channels=("default-left", "default-right"),
+            )["present"]
+        )
+
     async def test_gripperless_survey_rejects_gripper_enabled_request(self) -> None:
         manager = _Manager()
         runner = _Runner()
@@ -585,6 +744,143 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(disconnect.status_code, 409)
         self.assertEqual(robot.connects, 0)
         self.assertEqual(robot.disconnects, 0)
+
+    async def test_manual_disconnect_suppresses_same_automatic_target_server_wide(
+        self,
+    ) -> None:
+        robot = _Robot(channels=("can-left", "can-right"), profile="axol")
+        app = _test_app(_Manager(), _Runner(), robot)
+        transport = httpx.ASGITransport(app=app)
+        with (
+            patch.object(
+                app_module,
+                "_list_can_interfaces",
+                return_value=[
+                    {"name": "can-left", "up": True},
+                    {"name": "can-right", "up": True},
+                ],
+            ),
+            patch.object(
+                app_module, "_attached_configured_hub_profiles", return_value=set()
+            ),
+        ):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                disconnected = await client.post("/api/robot/disconnect")
+                automatic = await client.post(
+                    "/api/robot/connect",
+                    json={"profile": "axol", "automatic": True},
+                )
+                inventory = await client.get("/api/can/interfaces")
+
+        self.assertEqual(disconnected.status_code, 200)
+        self.assertEqual(automatic.status_code, 409)
+        self.assertTrue(automatic.json()["automaticConnectSuppressed"])
+        self.assertTrue(
+            inventory.json()["profiles"]["axol"]["automaticConnectSuppressed"]
+        )
+        self.assertEqual(robot.connects, 0)
+
+    async def test_changed_automatic_target_releases_manual_disconnect_pause(
+        self,
+    ) -> None:
+        robot = _Robot(channels=("can-left", "can-right"), profile="axol")
+        async with await self._client(_Manager(), _Runner(), robot) as client:
+            disconnected = await client.post("/api/robot/disconnect")
+            changed_target = await client.post(
+                "/api/robot/connect",
+                json={"profile": "mantis", "automatic": True},
+            )
+
+        self.assertEqual(disconnected.status_code, 200)
+        self.assertEqual(changed_target.status_code, 200)
+        self.assertTrue(changed_target.json()["connected"])
+        self.assertEqual(changed_target.json()["profile"], "mantis")
+        self.assertEqual(robot.connects, 1)
+
+    async def test_changed_saved_map_releases_manual_disconnect_pause(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsStore(Path(directory) / "settings.json")
+            robot = _Robot(channels=settings.can_channels(), profile="axol")
+            app = _test_app(_Manager(), _Runner(), robot, settings)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                await client.post("/api/robot/disconnect")
+                settings.update(
+                    values={
+                        "robot.left_channel": "replacement-left",
+                        "robot.right_channel": "replacement-right",
+                    }
+                )
+                changed_map = await client.post(
+                    "/api/robot/connect",
+                    json={"profile": "axol", "automatic": True},
+                )
+
+        self.assertEqual(changed_map.status_code, 200)
+        self.assertEqual(
+            changed_map.json()["channels"],
+            {"left": "replacement-left", "right": "replacement-right"},
+        )
+        self.assertEqual(robot.connects, 1)
+
+    async def test_explicit_connect_releases_manual_disconnect_pause(self) -> None:
+        robot = _Robot(channels=("can-left", "can-right"), profile="axol")
+        async with await self._client(_Manager(), _Runner(), robot) as client:
+            await client.post("/api/robot/disconnect")
+            manual = await client.post("/api/robot/connect", json={"profile": "axol"})
+            automatic = await client.post(
+                "/api/robot/connect",
+                json={"profile": "axol", "automatic": True},
+            )
+
+        self.assertEqual(manual.status_code, 200)
+        self.assertEqual(automatic.status_code, 200)
+        self.assertEqual(robot.connects, 2)
+
+    async def test_rejected_manual_connect_does_not_clear_disconnect_pause(
+        self,
+    ) -> None:
+        robot = _Robot(channels=("can-left", "can-right"), profile="axol")
+        async with await self._client(_Manager(), _Runner(), robot) as client:
+            await client.post("/api/robot/disconnect")
+            rejected = await client.post(
+                "/api/robot/connect",
+                json={
+                    "profile": "axol",
+                    "channelsSet": True,
+                    "leftChannel": "can-same",
+                    "rightChannel": "can-same",
+                },
+            )
+            automatic = await client.post(
+                "/api/robot/connect",
+                json={"profile": "axol", "automatic": True},
+            )
+
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(automatic.status_code, 409)
+        self.assertEqual(robot.connects, 0)
+
+    async def test_rejected_manual_disconnect_does_not_pause_automatic_connect(
+        self,
+    ) -> None:
+        runner = _Runner(running=True)
+        robot = _Robot(channels=("can-left", "can-right"), profile="axol")
+        async with await self._client(_Manager(), runner, robot) as client:
+            rejected = await client.post("/api/robot/disconnect")
+            runner.running = False
+            automatic = await client.post(
+                "/api/robot/connect",
+                json={"profile": "axol", "automatic": True},
+            )
+
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(automatic.status_code, 200)
+        self.assertEqual(robot.connects, 1)
 
     async def test_duplicate_axol_channels_are_rejected_without_bus_actions(
         self,
@@ -1205,6 +1501,27 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
 
 
 class OperationRunnerOwnershipTest(unittest.TestCase):
+    def test_mantis_link_rebinds_when_saved_script_exists_but_netdevs_do_not(
+        self,
+    ) -> None:
+        link = object.__new__(RobotLink)
+        link._profile = "mantis"
+        link._arms = [
+            SimpleNamespace(channel="can_mantis_l"),
+            SimpleNamespace(channel="can_mantis_r"),
+        ]
+
+        with (
+            patch.object(link, "_configured_interfaces_present", return_value=False),
+            patch.object(Path, "exists", return_value=True),
+            patch("almond_axol.cli.can.setup.ensure_mantis_setup") as ensure_setup,
+            patch("almond_axol.cli.can.setup.bring_up_can") as bring_up,
+        ):
+            link._enable_can()
+
+        ensure_setup.assert_called_once_with()
+        bring_up.assert_not_called()
+
     def test_robot_link_rejects_duplicate_axol_channels_before_arm_creation(
         self,
     ) -> None:

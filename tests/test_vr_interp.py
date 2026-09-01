@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 import os
 import unittest
@@ -349,6 +351,10 @@ class VRServerPoseModeTest(unittest.TestCase):
             )
             self.assertEqual(
                 websocket.receive_json(),
+                {"type": "pose_source_kind", "value": None},
+            )
+            self.assertEqual(
+                websocket.receive_json(),
                 {"type": "pose_mode", "value": "absolute"},
             )
             self.assertEqual(
@@ -370,6 +376,10 @@ class VRServerPoseModeTest(unittest.TestCase):
             )
             self.assertEqual(
                 websocket.receive_json(),
+                {"type": "pose_source_kind", "value": None},
+            )
+            self.assertEqual(
+                websocket.receive_json(),
                 {"type": "pose_mode", "value": "absolute"},
             )
             self.assertEqual(
@@ -387,6 +397,186 @@ class VRServerPoseModeTest(unittest.TestCase):
 
 
 class PoseSourceArbitrationTest(unittest.TestCase):
+    def test_pose_source_id_cannot_inherit_a_different_source_kind(self) -> None:
+        server = VRServer(VRServerConfig(pose_source_kind="tracker"))
+        tracker = _frame(1, source_id="owned-source", source_kind="tracker")
+        impersonating_quest = _frame(
+            2,
+            source_id="owned-source",
+            source_kind="webxr",
+        )
+
+        self.assertTrue(server._ingest_frame_obj(tracker, "bridge", 20))
+        self.assertFalse(server._ingest_frame_obj(impersonating_quest, "network", 21))
+        self.assertNotIn("owned-source", server._client_sources.get(21, set()))
+        self.assertEqual(server.get_frame().pose_source_kind, "tracker")  # type: ignore[union-attr]
+
+    def test_tracker_pose_policy_is_announced_to_viewers(self) -> None:
+        server = VRServer(VRServerConfig(pose_source_kind="tracker"))
+        with TestClient(server._build_app()).websocket_connect(
+            "/ws", headers={"origin": "https://axol.almond.bot"}
+        ) as websocket:
+            self.assertEqual(
+                websocket.receive_json(),
+                {"type": "pose_source_kind", "value": "tracker"},
+            )
+
+    def test_only_active_webxr_owner_can_publish_hud_controls(self) -> None:
+        server = VRServer(VRServerConfig(pose_source_kind="webxr"))
+        owner_id = 10
+
+        self.assertTrue(
+            server._ingest_frame_obj(
+                _frame(1, source_id="quest", source_kind="webxr"),
+                "network",
+                owner_id,
+            )
+        )
+        asyncio.run(
+            server._handle_signaling(
+                mock.AsyncMock(),
+                owner_id,
+                {
+                    "type": "hud",
+                    "pose_source_id": "quest",
+                    "pose_source_kind": "webxr",
+                    "value": {"confirm": "save"},
+                },
+            )
+        )
+        self.assertEqual(server._hud, {"confirm": "save"})
+
+        asyncio.run(
+            server._handle_signaling(
+                mock.AsyncMock(),
+                11,
+                {
+                    "type": "hud",
+                    "pose_source_id": "viewer",
+                    "pose_source_kind": "webxr",
+                    "value": {"confirm": "discard"},
+                },
+            )
+        )
+        self.assertEqual(server._hud, {"confirm": "save"})
+
+    def test_delayed_old_socket_hud_cannot_overwrite_reconnect_replay(self) -> None:
+        async def scenario() -> None:
+            server = VRServer(VRServerConfig(pose_source_kind="webxr"))
+            old_client = 10
+            new_client = 11
+            source_id = "quest"
+
+            self.assertTrue(
+                server._ingest_frame_obj(
+                    _frame(1, source_id=source_id, source_kind="webxr"),
+                    "old-socket",
+                    old_client,
+                )
+            )
+            old_hud = {
+                "type": "hud",
+                "pose_source_id": source_id,
+                "pose_source_kind": "webxr",
+                "value": {"confirm": "discard"},
+            }
+            await server._handle_signaling(mock.AsyncMock(), old_client, old_hud)
+
+            # The replacement socket carries a fresh pose before replaying its
+            # HUD snapshot, exactly as AxolVRClient does on reconnect.
+            self.assertTrue(
+                server._ingest_frame_obj(
+                    _frame(2, source_id=source_id, source_kind="webxr"),
+                    "new-socket",
+                    new_client,
+                )
+            )
+            new_hud = {
+                "type": "hud",
+                "pose_source_id": source_id,
+                "pose_source_kind": "webxr",
+                "value": {"confirm": "save"},
+            }
+            await server._handle_signaling(mock.AsyncMock(), new_client, new_hud)
+
+            # TCP preserves order only within one socket.  A HUD packet that
+            # was already in flight on the old socket can arrive after the new
+            # socket's replay; it must neither replace the replay nor reclaim
+            # publisher identity (which would clear the good HUD on teardown).
+            await server._handle_signaling(mock.AsyncMock(), old_client, old_hud)
+            self.assertEqual(server._hud, {"confirm": "save"})
+            self.assertEqual(server._hud_client, new_client)
+
+            server._drop_pose_client(old_client)
+            self.assertEqual(server._hud, {"confirm": "save"})
+            self.assertEqual(server._pose_owner, source_id)
+
+        asyncio.run(scenario())
+
+    def test_tracker_takeover_clears_the_previous_quest_hud(self) -> None:
+        async def scenario() -> None:
+            server = VRServer()
+            mirror = mock.AsyncMock()
+            server._active_clients.add(mirror)
+            owner_id = 10
+            self.assertTrue(
+                server._ingest_frame_obj(
+                    _frame(1, source_id="quest", source_kind="webxr"),
+                    "network",
+                    owner_id,
+                )
+            )
+            await server._handle_signaling(
+                mock.AsyncMock(),
+                owner_id,
+                {
+                    "type": "hud",
+                    "pose_source_id": "quest",
+                    "pose_source_kind": "webxr",
+                    "value": {"countdownRemainingMs": 3000},
+                },
+            )
+            self.assertEqual(server._hud, {"countdownRemainingMs": 3000})
+
+            self.assertTrue(
+                server._ingest_frame_obj(
+                    _frame(1, source_id="bridge", source_kind="tracker"),
+                    "bridge",
+                    20,
+                )
+            )
+            await asyncio.sleep(0)
+
+            self.assertIsNone(server._hud)
+            self.assertIsNone(server._hud_client)
+            messages = [
+                json.loads(call.args[0]) for call in mirror.send_text.await_args_list
+            ]
+            self.assertEqual(messages[-1], {"type": "hud", "value": None})
+
+        asyncio.run(scenario())
+
+    def test_tracker_session_rejects_view_only_quest_hud_controls(self) -> None:
+        server = VRServer(VRServerConfig(pose_source_kind="tracker"))
+        tracker = _frame(1, source_id="bridge", source_kind="tracker")
+        quest = _frame(1, source_id="quest", source_kind="webxr")
+
+        self.assertTrue(server._ingest_frame_obj(tracker, "bridge", 20))
+        self.assertFalse(server._ingest_frame_obj(quest, "network", 21))
+        asyncio.run(
+            server._handle_signaling(
+                mock.AsyncMock(),
+                21,
+                {
+                    "type": "hud",
+                    "pose_source_id": "quest",
+                    "pose_source_kind": "webxr",
+                    "value": {"countdownRemainingMs": 3000},
+                },
+            )
+        )
+        self.assertIsNone(server._hud)
+
     def test_one_client_cannot_retain_unbounded_pose_source_ids(self) -> None:
         server = VRServer()
         client_id = 17
@@ -520,6 +710,69 @@ class PoseSourceArbitrationTest(unittest.TestCase):
             )
         self.assertEqual(received, [5, 1_000_001, 7, 1_000_002])
         self.assertEqual(len(server._interp._frames), 1)
+
+    def test_hud_watermark_recovers_with_lower_sequence_surviving_tab(self) -> None:
+        async def scenario() -> None:
+            server = VRServer(VRServerConfig(pose_source_kind="webxr"))
+            source = "copied-session-storage-source"
+            low_client = 10
+            high_client = 11
+
+            with mock.patch("almond_axol.vr.server.time.monotonic", return_value=9.9):
+                self.assertTrue(
+                    server._ingest_frame_obj(
+                        _frame(5, source_id=source, source_kind="webxr"),
+                        "low-tab",
+                        low_client,
+                    )
+                )
+            with mock.patch("almond_axol.vr.server.time.monotonic", return_value=10.0):
+                self.assertTrue(
+                    server._ingest_frame_obj(
+                        _frame(1_000_001, source_id=source, source_kind="webxr"),
+                        "high-tab",
+                        high_client,
+                    )
+                )
+            await server._handle_signaling(
+                mock.AsyncMock(),
+                high_client,
+                {
+                    "type": "hud",
+                    "pose_source_id": source,
+                    "pose_source_kind": "webxr",
+                    "value": {"confirm": "save"},
+                },
+            )
+
+            # The high-range tab remains connected but stops posing.  Once its
+            # sequence domain is stale, the lower tab resumes both pose and HUD
+            # publication instead of staying below a stale HUD watermark.
+            with mock.patch("almond_axol.vr.server.time.monotonic", return_value=11.1):
+                self.assertTrue(
+                    server._ingest_frame_obj(
+                        _frame(6, source_id=source, source_kind="webxr"),
+                        "low-tab",
+                        low_client,
+                    )
+                )
+            self.assertIsNone(server._hud)
+            self.assertIsNone(server._hud_pose_seq)
+
+            await server._handle_signaling(
+                mock.AsyncMock(),
+                low_client,
+                {
+                    "type": "hud",
+                    "pose_source_id": source,
+                    "pose_source_kind": "webxr",
+                    "value": {"countdownRemainingMs": 3000},
+                },
+            )
+            self.assertEqual(server._hud, {"countdownRemainingMs": 3000})
+            self.assertEqual(server._hud_client, low_client)
+
+        asyncio.run(scenario())
 
     def test_tracker_policy_keeps_quest_frames_view_only(self) -> None:
         server = VRServer(VRServerConfig(pose_source_kind="tracker"))

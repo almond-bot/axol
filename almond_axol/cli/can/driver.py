@@ -78,6 +78,17 @@ def _find_modprobe() -> str | None:
     return None
 
 
+def _find_depmod() -> str | None:
+    """Locate ``depmod``, including the sbin dirs minimal PATHs omit."""
+    found = shutil.which("depmod")
+    if found:
+        return found
+    for candidate in ("/usr/sbin/depmod", "/sbin/depmod"):
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
 def is_driver_available() -> bool:
     """True when the running kernel has a resolvable ``gs_usb`` module."""
     modinfo = _find_modinfo()
@@ -424,6 +435,18 @@ def _build() -> Path:
 
 def _install(ko: Path) -> None:
     """Install the module, register it for boot, and load it (requires sudo)."""
+    depmod = _find_depmod()
+    modprobe = _find_modprobe()
+    if depmod is None or modprobe is None:
+        missing = ", ".join(
+            name
+            for name, path in (("depmod", depmod), ("modprobe", modprobe))
+            if not path
+        )
+        raise RuntimeError(
+            f"Required kernel-module tool(s) not found: {missing}. "
+            "Install kmod first (`sudo apt install kmod`)."
+        )
     dest = _vendored_driver_path()
     backup = _BUILD_DIR / f"gs_usb-installed-{os.getpid()}.ko"
     config_backup = _BUILD_DIR / f"gs_usb-conf-{os.getpid()}.backup"
@@ -439,10 +462,11 @@ def _install(ko: Path) -> None:
 
     print(f"Installing {dest} (requires sudo)...")
     new_loaded = False
+    load_attempted = False
     active_after_unload = False
     try:
         run_root(["install", "-D", "-m", "644", str(ko), str(dest)], check=True)
-        run_root(["depmod", "-a"], check=True)
+        run_root([depmod, "-a"], check=True)
         selected = _selected_driver_path()
         try:
             selected_is_dest = Path(selected).resolve() == dest.resolve()
@@ -458,7 +482,7 @@ def _install(ko: Path) -> None:
         # effect now — a bare modprobe is a no-op when an older gs_usb is
         # already loaded. Verify both transitions so an untested override can
         # never be left to shadow a working distro module on the next boot.
-        unloaded = run_root(["modprobe", "-r", "gs_usb"])
+        unloaded = run_root([modprobe, "-r", "gs_usb"])
         if _LOADED_MODULE.exists():
             # A failed unload of the previously-active module needs no second
             # unload during rollback. A successful unload (or a module that
@@ -472,7 +496,12 @@ def _install(ko: Path) -> None:
                 "programs using the CAN interfaces, unplug the adapter, and retry."
             )
 
-        loaded = run_root(["modprobe", "gs_usb"])
+        # Mark the attempt before entering the subprocess wrapper.  A SIGINT can
+        # arrive after modprobe inserted the replacement but before run_root
+        # returns, in which case ``new_loaded`` below is never sampled.  Rollback
+        # must still conservatively unload whatever that attempt left active.
+        load_attempted = True
+        loaded = run_root([modprobe, "gs_usb"])
         new_loaded = _LOADED_MODULE.exists()
         if loaded.returncode != 0 or not new_loaded:
             error = (loaded.stderr or "").strip().splitlines()
@@ -502,13 +531,13 @@ def _install(ko: Path) -> None:
                     "source identity nor Almond's version marker."
                 )
         run_root(["tee", str(_MODULES_LOAD_FILE)], input_text="gs_usb\n", check=True)
-    except RuntimeError as exc:
+    except (OSError, RuntimeError, KeyboardInterrupt) as exc:
         recovery_errors: list[str] = []
 
         def recover(cmd: list[str]) -> None:
             try:
                 run_root(cmd, check=True)
-            except RuntimeError as recovery_exc:
+            except (OSError, RuntimeError) as recovery_exc:
                 recovery_errors.append(str(recovery_exc))
 
         # Restore the selected file before unloading a bad replacement. If
@@ -518,11 +547,13 @@ def _install(ko: Path) -> None:
             recover(["install", "-D", "-m", "644", str(backup), str(dest)])
         else:
             recover(["rm", "-f", str(dest)])
-        recover(["depmod", "-a"])
-        if (new_loaded or active_after_unload) and _LOADED_MODULE.exists():
-            recover(["modprobe", "-r", "gs_usb"])
+        recover([depmod, "-a"])
+        if (
+            load_attempted or new_loaded or active_after_unload
+        ) and _LOADED_MODULE.exists():
+            recover([modprobe, "-r", "gs_usb"])
         if was_loaded and not _LOADED_MODULE.exists():
-            recover(["modprobe", "gs_usb"])
+            recover([modprobe, "gs_usb"])
             if not _LOADED_MODULE.exists():
                 recovery_errors.append("the previous gs_usb module is not loaded")
         elif not was_loaded and _LOADED_MODULE.exists():
@@ -547,6 +578,8 @@ def _install(ko: Path) -> None:
                 backup.unlink(missing_ok=True)
             if had_config:
                 config_backup.unlink(missing_ok=True)
+            if isinstance(exc, KeyboardInterrupt):
+                raise
             raise RuntimeError(
                 f"{exc} The previous gs_usb driver state was restored."
             ) from exc

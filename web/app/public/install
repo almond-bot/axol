@@ -27,12 +27,16 @@ MIN_SAFE_RELEASE_VERSION="0.1.36"
 BIN_DIR="/usr/local/bin"
 SERVICE_NAME="axol"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+MANTIS_SERVICE_NAME="axol-mantis"
+MANTIS_SERVICE_SHOULD_RUN=0
 # Shared with almond_axol.serve.update.  The permanent systemd condition makes
 # every future start fail closed while a package update is incomplete; the
 # marker survives crashes and reboots until a verified installer removes it.
 UPDATE_MARKER="/var/lib/almond-axol/update-incomplete"
 UPDATE_GUARD_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
 UPDATE_GUARD_FILE="${UPDATE_GUARD_DIR}/20-update-guard.conf"
+MANTIS_UPDATE_GUARD_DIR="/etc/systemd/system/${MANTIS_SERVICE_NAME}.service.d"
+MANTIS_UPDATE_GUARD_FILE="${MANTIS_UPDATE_GUARD_DIR}/20-update-guard.conf"
 # We install as root (the systemd service runs as root), but operators log in
 # as their own user and expect `axol` to work there too. uv's default tool +
 # managed-Python locations live under /root (mode 0700), which only root can
@@ -46,6 +50,57 @@ export UV_TOOL_DIR UV_PYTHON_INSTALL_DIR
 
 say() { printf "\033[1;36m[axol]\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31m[axol]\033[0m %s\n" "$*" >&2; exit 1; }
+
+# A new directory is not crash-durable until its entry has been committed in
+# the existing parent. Each guarded file later syncs the new directory itself.
+durable_install_directory() {
+    local path="$1"
+    local owner="$2"
+    local group="$3"
+    local mode="$4"
+    local parent
+    parent="$(dirname -- "${path}")"
+    install -d -o "${owner}" -g "${group}" -m "${mode}" "${path}" || return 1
+    sync -- "${parent}"
+}
+
+# Commit a prepared file and its directory entry before returning. GNU
+# coreutils `sync FILE` issues fsync(2) for that file; syncing the containing
+# directory after the atomic rename makes the new name survive a power loss.
+# Callers prepare ownership and mode on the root-owned temporary file first.
+durable_replace() {
+    local temporary="$1"
+    local destination="$2"
+    local parent
+    parent="$(dirname -- "${destination}")"
+    sync -- "${temporary}" || return 1
+    mv -fT -- "${temporary}" "${destination}" || return 1
+    sync -- "${parent}"
+}
+
+# Removing the verified-update marker is safe only once the unlink is durable;
+# otherwise a reboot can unexpectedly restore the guard after a successful
+# install and leave the service unavailable.
+durable_remove() {
+    local path="$1"
+    local parent
+    parent="$(dirname -- "${path}")"
+    rm -f -- "${path}" || return 1
+    sync -- "${parent}"
+}
+
+write_update_marker() {
+    local marker_tmp
+    marker_tmp="$(mktemp "/var/lib/almond-axol/.update-incomplete.XXXXXX")" \
+        || return 1
+    if ! printf 'Axol update has not completed verification.\n' > "${marker_tmp}" \
+        || ! chown root:root "${marker_tmp}" \
+        || ! chmod 0600 "${marker_tmp}" \
+        || ! durable_replace "${marker_tmp}" "${UPDATE_MARKER}"; then
+        rm -f -- "${marker_tmp}" || true
+        return 1
+    fi
+}
 
 [ "$(uname -s)" = "Linux" ] || die "This installer only supports Linux."
 AARCH64_HOST=0
@@ -63,6 +118,7 @@ fi
 command -v systemctl >/dev/null 2>&1 || die "systemd is required."
 command -v curl >/dev/null 2>&1 || die "curl is required."
 command -v realpath >/dev/null 2>&1 || die "coreutils realpath is required."
+command -v sync >/dev/null 2>&1 || die "coreutils sync is required."
 # git resolves the latest release tag and restores the pinned Ultimate VCS
 # requirement when that runtime was explicitly configured.
 command -v git >/dev/null 2>&1 || die "git is required."
@@ -352,21 +408,58 @@ fi
 # so pre-existing symlinks are replaced rather than followed.
 [ ! -L "/var/lib/almond-axol" ] \
     || die "/var/lib/almond-axol must not be a symlink."
-install -d -o root -g root -m 0750 /var/lib/almond-axol
+durable_install_directory "/var/lib/almond-axol" root root 0750
 [ ! -L "${UPDATE_GUARD_DIR}" ] \
     || die "${UPDATE_GUARD_DIR} must not be a symlink."
-install -d -o root -g root -m 0755 "${UPDATE_GUARD_DIR}"
+durable_install_directory "${UPDATE_GUARD_DIR}" root root 0755
+[ ! -L "${MANTIS_UPDATE_GUARD_DIR}" ] \
+    || die "${MANTIS_UPDATE_GUARD_DIR} must not be a symlink."
+durable_install_directory "${MANTIS_UPDATE_GUARD_DIR}" root root 0755
+GUARD_TMP=""
+MANTIS_GUARD_TMP=""
+cleanup_update_guard_temporaries() {
+    if [ -n "${GUARD_TMP}" ]; then
+        rm -f -- "${GUARD_TMP}" || true
+    fi
+    if [ -n "${MANTIS_GUARD_TMP}" ]; then
+        rm -f -- "${MANTIS_GUARD_TMP}" || true
+    fi
+}
+trap cleanup_update_guard_temporaries EXIT
 GUARD_TMP="$(mktemp "${UPDATE_GUARD_DIR}/.20-update-guard.XXXXXX")"
 printf '[Unit]\nConditionPathExists=!%s\n' "${UPDATE_MARKER}" > "${GUARD_TMP}"
 chown root:root "${GUARD_TMP}"
 chmod 0644 "${GUARD_TMP}"
-mv -fT -- "${GUARD_TMP}" "${UPDATE_GUARD_FILE}"
+durable_replace "${GUARD_TMP}" "${UPDATE_GUARD_FILE}"
+GUARD_TMP=""
+MANTIS_GUARD_TMP="$(mktemp "${MANTIS_UPDATE_GUARD_DIR}/.20-update-guard.XXXXXX")"
+printf '[Unit]\nConditionPathExists=!%s\n' "${UPDATE_MARKER}" > "${MANTIS_GUARD_TMP}"
+chown root:root "${MANTIS_GUARD_TMP}"
+chmod 0644 "${MANTIS_GUARD_TMP}"
+durable_replace "${MANTIS_GUARD_TMP}" "${MANTIS_UPDATE_GUARD_FILE}"
+MANTIS_GUARD_TMP=""
 systemctl daemon-reload
-MARKER_TMP="$(mktemp "/var/lib/almond-axol/.update-incomplete.XXXXXX")"
-printf 'Axol update has not completed verification.\n' > "${MARKER_TMP}"
-chown root:root "${MARKER_TMP}"
-chmod 0600 "${MARKER_TMP}"
-mv -fT -- "${MARKER_TMP}" "${UPDATE_MARKER}"
+write_update_marker \
+    || die "Could not durably arm the update restart guard; the runtime was not changed."
+trap - EXIT
+
+# The optional Quest bootstrap helper uses this same Python environment. Stop
+# it before replacing that environment, including on upgrades from versions
+# that predate its marker-aware loop. Preserve both enabled and manually-active
+# state so a verified install can restore it below; a failed install leaves it
+# safely stopped behind the durable marker.
+if systemctl cat "${MANTIS_SERVICE_NAME}.service" >/dev/null 2>&1; then
+    if systemctl is-enabled --quiet "${MANTIS_SERVICE_NAME}.service" 2>/dev/null \
+        || systemctl is-active --quiet "${MANTIS_SERVICE_NAME}.service"; then
+        MANTIS_SERVICE_SHOULD_RUN=1
+    fi
+    say "Stopping the ${MANTIS_SERVICE_NAME} helper before updating its runtime..."
+    systemctl stop "${MANTIS_SERVICE_NAME}.service" >/dev/null 2>&1 \
+        || die "Could not stop the ${MANTIS_SERVICE_NAME} helper; its runtime was not changed."
+    if systemctl is-active --quiet "${MANTIS_SERVICE_NAME}.service"; then
+        die "The ${MANTIS_SERVICE_NAME} helper is still active; its runtime was not changed."
+    fi
+fi
 
 # Never replace the interpreter or tool environment under a live root service.
 # `systemctl stop` waits for Axol's graceful shutdown (including recorder and
@@ -713,8 +806,38 @@ systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
 # enabled-but-blocked until the last possible moment, then clear the durable
 # marker immediately before the explicit start. The condition drop-in remains
 # installed for future control-panel and curl-based updates.
-rm -f -- "${UPDATE_MARKER}"
-systemctl start "${SERVICE_NAME}"
+if ! durable_remove "${UPDATE_MARKER}"; then
+    MARKER_RESTORED=1
+    SERVICE_DISABLED=1
+    write_update_marker || MARKER_RESTORED=0
+    systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+        || SERVICE_DISABLED=0
+    if [ "${MARKER_RESTORED}" -ne 1 ] || [ "${SERVICE_DISABLED}" -ne 1 ]; then
+        die "Axol was verified, but the update guard could not be disarmed or fully restored; keep the host offline and repair ${SERVICE_NAME}.service manually."
+    fi
+    die "Axol was verified, but its update guard could not be removed durably; the service remains blocked and disabled. Repair the filesystem error and rerun this installer."
+fi
+if ! systemctl start "${SERVICE_NAME}"; then
+    # A start can fail after the condition marker has been removed. Restore the
+    # fail-closed state before exiting so Restart=always or a reboot cannot keep
+    # retrying a service that failed its first verified launch.
+    MARKER_RESTORED=1
+    SERVICE_DISABLED=1
+    write_update_marker || MARKER_RESTORED=0
+    systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+        || SERVICE_DISABLED=0
+    if [ "${MARKER_RESTORED}" -ne 1 ] || [ "${SERVICE_DISABLED}" -ne 1 ]; then
+        die "Axol was verified but failed to start, and its update guard could not be fully restored; keep the host offline and repair ${SERVICE_NAME}.service manually."
+    fi
+    die "Axol was verified but failed to start; the service is blocked and disabled. Repair the reported startup error and rerun this installer."
+fi
+# A boot that happened while the marker existed skipped this helper, and an
+# update stopped any already-running copy above. Restore its prior intended
+# state explicitly; multi-user.target is already active and will not do so.
+if [ "${MANTIS_SERVICE_SHOULD_RUN}" = "1" ]; then
+    systemctl start "${MANTIS_SERVICE_NAME}.service" \
+        || die "Axol updated, but the ${MANTIS_SERVICE_NAME} helper could not be started."
+fi
 
 # -- done ---------------------------------------------------------------------
 

@@ -29,6 +29,178 @@ class CanSetupAssignmentTest(unittest.TestCase):
         ):
             self.assertEqual(setup._find_dual_serials(), ("SERIAL", None))
 
+    def test_usb_bootstrap_requires_one_complete_consistent_profile_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            rules = Path(directory) / "profile.rules"
+            rules.write_text(setup._dual_channel_rules("SERIAL", setup._AXOL_PROFILE))
+            self.assertEqual(
+                setup._dual_channel_rule_serial(
+                    rules, setup._AXOL_PROFILE.left, setup._AXOL_PROFILE.right
+                ),
+                "SERIAL",
+            )
+
+            rules.write_text(
+                "\n".join(
+                    f"  # {line}" if line.startswith("SUBSYSTEM") else line
+                    for line in rules.read_text().splitlines()
+                )
+                + "\n"
+            )
+            self.assertIsNone(
+                setup._dual_channel_rule_serial(
+                    rules, setup._AXOL_PROFILE.left, setup._AXOL_PROFILE.right
+                )
+            )
+
+            rules.write_text(
+                setup._dual_channel_rules("SERIAL", setup._AXOL_PROFILE).replace(
+                    ', ACTION=="add"', ""
+                )
+            )
+            self.assertIsNone(
+                setup._dual_channel_rule_serial(
+                    rules, setup._AXOL_PROFILE.left, setup._AXOL_PROFILE.right
+                )
+            )
+
+            rules.write_text(
+                setup._dual_channel_rules("SERIAL", setup._AXOL_PROFILE).replace(
+                    ', NAME="', ', ENV{DISABLED}=="1", NAME="'
+                )
+            )
+            self.assertIsNone(
+                setup._dual_channel_rule_serial(
+                    rules, setup._AXOL_PROFILE.left, setup._AXOL_PROFILE.right
+                )
+            )
+
+            rules.write_text(setup._dual_channel_rules("SERIAL", setup._AXOL_PROFILE))
+
+            lines = rules.read_text().splitlines()
+            rules.write_text(
+                "\n".join(
+                    line.replace('ATTRS{serial}=="SERIAL"', 'ATTRS{serial}=="OTHER"')
+                    if 'ATTR{dev_id}=="0x1"' in line
+                    else line
+                    for line in lines
+                )
+                + "\n"
+            )
+            self.assertIsNone(
+                setup._dual_channel_rule_serial(
+                    rules, setup._AXOL_PROFILE.left, setup._AXOL_PROFILE.right
+                )
+            )
+
+    def test_usb_bootstrap_only_returns_attached_nonconflicting_claims(self) -> None:
+        with (
+            patch.object(
+                setup,
+                "_configured_profile_usb_serials",
+                return_value={"axol": "AXOL", "mantis": "MANTIS"},
+            ),
+            patch.object(
+                setup,
+                "_attached_supported_usb_serials",
+                return_value={"AXOL"},
+            ),
+        ):
+            self.assertEqual(setup.attached_configured_hub_profiles(), {"axol"})
+
+        with (
+            patch.object(
+                setup,
+                "_configured_profile_usb_serials",
+                return_value={"axol": "SHARED", "mantis": "SHARED"},
+            ),
+            patch.object(
+                setup,
+                "_attached_supported_usb_serials",
+                return_value={"SHARED"},
+            ),
+        ):
+            self.assertEqual(setup.attached_configured_hub_profiles(), set())
+
+    def test_usb_bootstrap_scans_supported_usb_serial_without_netdevs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            supported = root / "1-1"
+            supported.mkdir()
+            supported.joinpath("idVendor").write_text(setup._VID.upper())
+            supported.joinpath("idProduct").write_text(setup._PID.upper())
+            supported.joinpath("serial").write_text("AXOL-SERIAL\n")
+            unrelated = root / "1-2"
+            unrelated.mkdir()
+            unrelated.joinpath("idVendor").write_text("28de")
+            unrelated.joinpath("idProduct").write_text("2300")
+            unrelated.joinpath("serial").write_text("VIVE\n")
+
+            with patch.object(setup, "_USB_DEVICES", root):
+                self.assertEqual(
+                    setup._attached_supported_usb_serials(), {"AXOL-SERIAL"}
+                )
+
+    def test_usb_bootstrap_waits_for_both_channels_of_exact_serial(self) -> None:
+        incomplete = {"SERIAL": {"vid": setup._VID, "pid": setup._PID, "dev_ids": {0}}}
+        complete = {"SERIAL": {"vid": setup._VID, "pid": setup._PID, "dev_ids": {0, 1}}}
+        with (
+            patch.object(setup, "_scan_adapters", side_effect=[incomplete, complete]),
+            patch.object(setup.time, "sleep") as sleep,
+        ):
+            self.assertTrue(
+                setup._wait_for_dual_channel_serial(
+                    "SERIAL", timeout=1.0, poll_interval=0.01
+                )
+            )
+
+        sleep.assert_called_once_with(0.01)
+
+    def test_headless_profile_setup_waits_after_driver_load_before_detection(
+        self,
+    ) -> None:
+        configured = {"axol": "AXOL", "mantis": "MANTIS"}
+        events: list[tuple[str, str]] = []
+
+        def wait(serial: str) -> bool:
+            events.append(("wait", serial))
+            return True
+
+        def detect() -> list[str]:
+            events.append(("detect", "MANTIS"))
+            return ["MANTIS"]
+
+        with (
+            patch.object(setup.driver, "ensure_driver", return_value=False),
+            patch.object(
+                setup, "_attached_configured_hub_serials", return_value=configured
+            ),
+            patch.object(setup, "_wait_for_dual_channel_serial", side_effect=wait),
+            patch.object(
+                setup,
+                "_configured_serial",
+                side_effect=lambda profile=setup._AXOL_PROFILE: configured[
+                    "mantis" if profile is setup._MANTIS_PROFILE else "axol"
+                ],
+            ),
+            patch.object(setup, "_configured_named_serial", return_value=None),
+            patch.object(setup, "_resolve_hub_serial", return_value="AXOL") as resolve,
+            patch.object(setup, "_detect_serials", side_effect=detect),
+            patch.object(setup, "_identify_dual_adapter", return_value="mantis"),
+            patch.object(setup, "_apply_setup") as apply_setup,
+            patch.object(setup, "_configure_mantis") as configure_mantis,
+        ):
+            setup.ensure_setup()
+            setup.ensure_mantis_setup()
+
+        self.assertEqual(
+            events,
+            [("wait", "AXOL"), ("wait", "MANTIS"), ("detect", "MANTIS")],
+        )
+        resolve.assert_called_once_with()
+        apply_setup.assert_called_once_with("AXOL", None, None)
+        configure_mantis.assert_called_once_with("MANTIS")
+
     def test_axol_pin_is_not_preserved_when_serial_now_enumerates_single(self) -> None:
         with (
             patch.object(setup, "_detect_serials", return_value=[]),
@@ -736,6 +908,161 @@ class CanSetupAssignmentTest(unittest.TestCase):
 
 
 class CanDriverIdentityTest(unittest.TestCase):
+    def test_install_requires_kmod_tools_before_mutating_driver(self) -> None:
+        with (
+            patch.object(driver, "_find_depmod", return_value=None),
+            patch.object(driver, "_find_modprobe", return_value="/sbin/modprobe"),
+            patch.object(driver, "run_root") as run_root,
+            self.assertRaisesRegex(RuntimeError, "depmod"),
+        ):
+            driver._install(Path("/tmp/gs_usb.ko"))
+        run_root.assert_not_called()
+
+    def test_install_rolls_back_oserror_and_keyboard_interrupt(self) -> None:
+        for failure in (OSError("could not execute modprobe"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    ko = root / "built.ko"
+                    ko.write_bytes(b"new driver")
+                    destination = root / "modules" / "updates" / "gs_usb.ko"
+                    destination.parent.mkdir(parents=True)
+                    destination.write_bytes(b"previous driver")
+                    loaded = root / "loaded"
+                    loaded.mkdir()
+                    modules_load = root / "modules-load.d" / "gs_usb.conf"
+                    depmod = "/sbin/depmod"
+                    modprobe = "/sbin/modprobe"
+                    failed_once = False
+
+                    def run_root(
+                        command: list[str], **kwargs: object
+                    ) -> SimpleNamespace:
+                        nonlocal failed_once
+                        executable = Path(command[0]).name
+                        if executable == "install":
+                            source, target = map(Path, command[-2:])
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(source.read_bytes())
+                        elif command == [modprobe, "-r", "gs_usb"]:
+                            loaded.rmdir()
+                        elif command == [modprobe, "gs_usb"]:
+                            if not failed_once:
+                                failed_once = True
+                                raise failure
+                            loaded.mkdir()
+                        elif executable == "rm":
+                            Path(command[-1]).unlink(missing_ok=True)
+                        elif executable == "tee":
+                            target = Path(command[-1])
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_text(str(kwargs.get("input_text", "")))
+                        return SimpleNamespace(returncode=0, stderr="")
+
+                    patches = (
+                        patch.object(driver, "_BUILD_DIR", root / "build"),
+                        patch.object(driver, "_MODULES_LOAD_FILE", modules_load),
+                        patch.object(driver, "_LOADED_MODULE", loaded),
+                        patch.object(
+                            driver, "_vendored_driver_path", return_value=destination
+                        ),
+                        patch.object(
+                            driver,
+                            "_selected_driver_path",
+                            return_value=str(destination),
+                        ),
+                        patch.object(driver, "_find_depmod", return_value=depmod),
+                        patch.object(driver, "_find_modprobe", return_value=modprobe),
+                        patch.object(driver, "run_root", side_effect=run_root),
+                    )
+                    expected = (
+                        KeyboardInterrupt
+                        if isinstance(failure, KeyboardInterrupt)
+                        else RuntimeError
+                    )
+                    with (
+                        patches[0],
+                        patches[1],
+                        patches[2],
+                        patches[3],
+                        patches[4],
+                        patches[5],
+                        patches[6],
+                        patches[7],
+                        redirect_stdout(io.StringIO()),
+                        self.assertRaises(expected),
+                    ):
+                        driver._install(ko)
+
+                    self.assertEqual(destination.read_bytes(), b"previous driver")
+                    self.assertTrue(loaded.is_dir())
+                    self.assertFalse(modules_load.exists())
+
+    def test_install_rolls_back_interrupt_after_replacement_module_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ko = root / "built.ko"
+            ko.write_bytes(b"new driver")
+            destination = root / "modules" / "updates" / "gs_usb.ko"
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"previous driver")
+            loaded = root / "loaded"
+            loaded.mkdir()
+            modules_load = root / "modules-load.d" / "gs_usb.conf"
+            depmod = "/sbin/depmod"
+            modprobe = "/sbin/modprobe"
+            commands: list[list[str]] = []
+            load_calls = 0
+
+            def run_root(command: list[str], **kwargs: object) -> SimpleNamespace:
+                nonlocal load_calls
+                commands.append(command)
+                executable = Path(command[0]).name
+                if executable == "install":
+                    source, target = map(Path, command[-2:])
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(source.read_bytes())
+                elif command == [modprobe, "-r", "gs_usb"]:
+                    loaded.rmdir()
+                elif command == [modprobe, "gs_usb"]:
+                    load_calls += 1
+                    loaded.mkdir()
+                    if load_calls == 1:
+                        # Model Ctrl-C after modprobe has inserted the new module
+                        # but before the wrapper can return to sample sysfs.
+                        raise KeyboardInterrupt
+                elif executable == "rm":
+                    Path(command[-1]).unlink(missing_ok=True)
+                elif executable == "tee":
+                    target = Path(command[-1])
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(str(kwargs.get("input_text", "")))
+                return SimpleNamespace(returncode=0, stderr="")
+
+            with (
+                patch.object(driver, "_BUILD_DIR", root / "build"),
+                patch.object(driver, "_MODULES_LOAD_FILE", modules_load),
+                patch.object(driver, "_LOADED_MODULE", loaded),
+                patch.object(driver, "_vendored_driver_path", return_value=destination),
+                patch.object(
+                    driver,
+                    "_selected_driver_path",
+                    return_value=str(destination),
+                ),
+                patch.object(driver, "_find_depmod", return_value=depmod),
+                patch.object(driver, "_find_modprobe", return_value=modprobe),
+                patch.object(driver, "run_root", side_effect=run_root),
+                redirect_stdout(io.StringIO()),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                driver._install(ko)
+
+            self.assertEqual(destination.read_bytes(), b"previous driver")
+            self.assertTrue(loaded.is_dir())
+            self.assertFalse(modules_load.exists())
+            self.assertEqual(commands.count([modprobe, "-r", "gs_usb"]), 2)
+            self.assertEqual(commands.count([modprobe, "gs_usb"]), 2)
+
     def test_lockdown_also_counts_as_signature_enforcement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

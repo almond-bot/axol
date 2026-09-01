@@ -2248,8 +2248,8 @@ def _run(
                 dataset_root,
                 recording_features,
                 fps=fps,
-                # RolloutCaptureThread fills this with zero when appending
-                # robot rollouts to a Mantis-created Cartesian dataset.
+                # RolloutCaptureThread measures the state-to-camera capture
+                # skew when appending to a Mantis-created Cartesian dataset.
                 allowed_extra_features=frozenset({"observation.pose_lag"}),
             )
             # Avoid mutating/truncating an incompatible dataset while checking

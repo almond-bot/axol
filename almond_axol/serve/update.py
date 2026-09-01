@@ -102,9 +102,13 @@ _REMOTE_DEBOUNCE_S = 60.0
 # intentional self-restart recognizable in `journalctl`.
 _RESTART_EXIT_CODE = 0
 _SERVICE_NAME = "axol.service"
+_MANTIS_SERVICE_NAME = "axol-mantis.service"
 _UPDATE_GUARD_MARKER = Path("/var/lib/almond-axol/update-incomplete")
 _UPDATE_GUARD_DROPIN = Path("/etc/systemd/system/axol.service.d/20-update-guard.conf")
 _UPDATE_GUARD_CONTENT = f"[Unit]\nConditionPathExists=!{_UPDATE_GUARD_MARKER}\n"
+_MANTIS_UPDATE_GUARD_DROPIN = Path(
+    "/etc/systemd/system/axol-mantis.service.d/20-update-guard.conf"
+)
 _PYPI_RELEASE_URL = "https://pypi.org/pypi/almond-axol/{version}/json"
 _MANAGED_UV_EXECUTABLE = "/usr/local/bin/uv"
 _MANAGED_UPDATE_ENV = {
@@ -351,6 +355,14 @@ class SelfUpdater:
         # Set when an upgrade landed but the server was busy; restart at the
         # next idle opportunity (a subsequent status poll re-checks).
         self._restart_pending = False
+        # The optional Quest bootstrap helper imports from the same uv tool
+        # environment.  An update must stop it before replacing that runtime,
+        # then restore its prior enabled/active intent only after verification.
+        # ``None`` means the next guard arm must snapshot systemd; retaining a
+        # bool across a failed attempt preserves a disabled-but-manually-active
+        # helper while this server process remains alive.
+        self._mantis_restore_requested: bool | None = None
+        self._mantis_enable_requested: bool | None = None
         # The GStreamer camera stack is provisioned once per process (covers a
         # host that upgraded into this build from an older release). ``_env_lock``
         # serializes everything that mutates the uv tool environment -- the
@@ -458,6 +470,12 @@ class SelfUpdater:
             main_pid = self._systemctl(
                 "show", "--property=MainPID", "--value", _SERVICE_NAME
             )
+            mantis_load_state = self._systemctl(
+                "show",
+                "--property=LoadState",
+                "--value",
+                _MANTIS_SERVICE_NAME,
+            )
         except (OSError, subprocess.SubprocessError):
             return "could not verify the managed axol.service before updating"
         if active.returncode != 0 or main_pid.returncode != 0:
@@ -468,6 +486,31 @@ class SelfUpdater:
             return "could not verify the managed axol.service process"
         if service_pid != os.getpid():
             return "self-update must run from the managed axol.service process"
+        if mantis_load_state.returncode != 0 or not mantis_load_state.stdout.strip():
+            return "could not inspect the optional axol-mantis.service before updating"
+        mantis_installed = mantis_load_state.stdout.strip() != "not-found"
+
+        if self._mantis_restore_requested is None:
+            if mantis_installed:
+                try:
+                    mantis_enabled = self._systemctl(
+                        "is-enabled", "--quiet", _MANTIS_SERVICE_NAME
+                    )
+                    mantis_active = self._systemctl(
+                        "is-active", "--quiet", _MANTIS_SERVICE_NAME
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    return (
+                        "could not inspect the optional axol-mantis.service state "
+                        "before updating"
+                    )
+                self._mantis_enable_requested = mantis_enabled.returncode == 0
+                self._mantis_restore_requested = (
+                    self._mantis_enable_requested or mantis_active.returncode == 0
+                )
+            else:
+                self._mantis_enable_requested = False
+                self._mantis_restore_requested = False
 
         try:
             _write_durable_root_file(
@@ -475,14 +518,28 @@ class SelfUpdater:
                 _UPDATE_GUARD_CONTENT,
                 mode=0o644,
             )
+            # Write this even before the optional unit exists. If it is later
+            # installed while a failed update marker remains, its first start
+            # is protected too.
+            _write_durable_root_file(
+                _MANTIS_UPDATE_GUARD_DROPIN,
+                _UPDATE_GUARD_CONTENT,
+                mode=0o644,
+            )
             reload_result = self._systemctl("daemon-reload")
             if reload_result.returncode != 0:
                 return "could not activate the durable update restart guard"
-            loaded = self._systemctl(
-                "show", "--property=DropInPaths", "--value", _SERVICE_NAME
-            )
-            if loaded.returncode != 0 or str(_UPDATE_GUARD_DROPIN) not in loaded.stdout:
-                return "could not verify the durable update restart guard"
+            guarded_services = [(_SERVICE_NAME, _UPDATE_GUARD_DROPIN)]
+            if mantis_installed:
+                guarded_services.append(
+                    (_MANTIS_SERVICE_NAME, _MANTIS_UPDATE_GUARD_DROPIN)
+                )
+            for service_name, dropin in guarded_services:
+                loaded = self._systemctl(
+                    "show", "--property=DropInPaths", "--value", service_name
+                )
+                if loaded.returncode != 0 or str(dropin) not in loaded.stdout:
+                    return "could not verify the durable update restart guard"
 
             # The condition is live before the marker appears. A crash before
             # this write can safely restart the untouched environment; every
@@ -492,6 +549,21 @@ class SelfUpdater:
                 "Axol update incomplete; repair or retry before service start.\n",
                 mode=0o600,
             )
+            if mantis_installed:
+                stopped = self._systemctl("stop", _MANTIS_SERVICE_NAME)
+                if stopped.returncode != 0:
+                    return (
+                        "could not stop axol-mantis.service before updating its "
+                        "shared runtime"
+                    )
+                still_active = self._systemctl(
+                    "is-active", "--quiet", _MANTIS_SERVICE_NAME
+                )
+                if still_active.returncode == 0:
+                    return (
+                        "axol-mantis.service remained active; the shared runtime "
+                        "was not changed"
+                    )
             disabled = self._systemctl("disable", _SERVICE_NAME)
             if disabled.returncode != 0:
                 return "could not disable axol.service for the guarded update"
@@ -500,7 +572,7 @@ class SelfUpdater:
         return None
 
     def _disarm_durable_update_guard(self) -> str | None:
-        """Re-enable verified code, then make its next service start eligible."""
+        """Re-enable verified code and restore the optional bootstrap helper."""
         if not _UPDATE_GUARD_MARKER.is_file():
             return "the durable update restart guard disappeared during verification"
         try:
@@ -515,9 +587,75 @@ class SelfUpdater:
             is_enabled = self._systemctl("is-enabled", "--quiet", _SERVICE_NAME)
             if is_enabled.returncode != 0:
                 return "updated Axol was verified, but axol.service is not enabled"
+            if self._mantis_enable_requested:
+                mantis_enabled = self._systemctl("enable", _MANTIS_SERVICE_NAME)
+                if mantis_enabled.returncode != 0:
+                    return (
+                        "updated Axol was verified, but axol-mantis.service could "
+                        "not be enabled"
+                    )
+                mantis_is_enabled = self._systemctl(
+                    "is-enabled", "--quiet", _MANTIS_SERVICE_NAME
+                )
+                if mantis_is_enabled.returncode != 0:
+                    return (
+                        "updated Axol was verified, but axol-mantis.service is not "
+                        "enabled"
+                    )
             _remove_durable_file(_UPDATE_GUARD_MARKER)
         except (OSError, subprocess.SubprocessError):
             return "could not safely re-enable the verified axol.service"
+
+        if self._mantis_restore_requested:
+            restore_error: str | None = None
+            try:
+                started = self._systemctl("start", _MANTIS_SERVICE_NAME)
+                if started.returncode != 0:
+                    restore_error = "axol-mantis.service could not be started"
+                else:
+                    active = self._systemctl(
+                        "is-active", "--quiet", _MANTIS_SERVICE_NAME
+                    )
+                    if active.returncode != 0:
+                        restore_error = "axol-mantis.service did not become active"
+            except (OSError, subprocess.SubprocessError):
+                restore_error = "axol-mantis.service could not be verified"
+
+            if restore_error is not None:
+                recovery_errors: list[str] = []
+                try:
+                    _write_durable_root_file(
+                        _UPDATE_GUARD_MARKER,
+                        "Axol update incomplete; repair or retry before service start.\n",
+                        mode=0o600,
+                    )
+                except OSError:
+                    recovery_errors.append("the durable marker could not be restored")
+                try:
+                    stopped = self._systemctl("stop", _MANTIS_SERVICE_NAME)
+                    if stopped.returncode != 0:
+                        recovery_errors.append(
+                            "axol-mantis.service could not be stopped"
+                        )
+                except (OSError, subprocess.SubprocessError):
+                    recovery_errors.append(
+                        "axol-mantis.service stop could not be verified"
+                    )
+                try:
+                    disabled = self._systemctl("disable", _SERVICE_NAME)
+                    if disabled.returncode != 0:
+                        recovery_errors.append("axol.service could not be disabled")
+                except (OSError, subprocess.SubprocessError):
+                    recovery_errors.append("axol.service disable could not be verified")
+                detail = (
+                    f"; recovery incomplete: {', '.join(recovery_errors)}"
+                    if recovery_errors
+                    else "; services remain update-guarded"
+                )
+                return f"updated Axol was verified, but {restore_error}{detail}"
+
+        self._mantis_restore_requested = None
+        self._mantis_enable_requested = None
         return None
 
     def ensure_provisioned(self) -> None:
