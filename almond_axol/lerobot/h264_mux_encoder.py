@@ -306,9 +306,22 @@ class _CameraH264Muxer:
             f"! h264parse ! {mux}"
         )
         src = pipeline.get_by_name("src")
+        # The framerate is load-bearing: h264parse re-stamps each frame's
+        # duration from the caps framerate (the encoder's SPS carries no
+        # timing, so without it the duration we set on the appsrc buffer is
+        # dropped). mp4mux derives a sample's duration from the *next*
+        # buffer's PTS and, for the final sample at EOS, from the buffer's
+        # duration — so without a framerate the last sample is written with
+        # duration 0, the track/edit list ends one frame early, and ffmpeg
+        # (honouring the edit list) never yields that frame: a file with
+        # ``n`` advertised samples that demuxes to ``n - 1``, which
+        # ``_validate_finalized_file`` rightly rejects.
         src.set_property(
             "caps",
-            Gst.Caps.from_string("video/x-h264,stream-format=byte-stream,alignment=au"),
+            Gst.Caps.from_string(
+                "video/x-h264,stream-format=byte-stream,alignment=au,"
+                f"framerate={self._fps}/1"
+            ),
         )
         # Bound appsrc so a wedged pipeline surfaces as back-pressure, not
         # unbounded memory; block so we never silently drop a (dependency-bearing)

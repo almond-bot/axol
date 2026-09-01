@@ -82,10 +82,20 @@ _ENCODED_POLL_MS = 100
 # the rest of the camera/control stack remains healthy.  Holding the last IDR
 # for those missing cadence slots is bounded corruption (at most 33 ms at
 # 60 Hz) and, unlike accepting the future AU early, does not shift that camera
-# against every subsequent robot-state/dataset row.  More than one event or two
-# frames on a camera is evidence of an unhealthy stream and remains fatal.
-_ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA = 2
-_ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA = 1
+# against every subsequent robot-state/dataset row.  A single hole longer than
+# two frames is fatal, and so is a camera that is losing frames faster than a
+# rare hiccup: the ZED sources have been observed dropping one exposure every
+# one to four seconds during a teleoperated take (both stereo eyes together,
+# so the loss is in the source, not the relay's queues or transport), and a
+# fixed handful of events per episode aborted every take within seconds and
+# homed the arms mid-teleop.  The budget is therefore a rate: a burst of
+# events inside a short window, or concealed frames above a small fraction of
+# the episode, means the stream is unhealthy and still fails closed.
+_ENCODED_MAX_CONCEALED_FRAMES_PER_EVENT = 2
+_ENCODED_MAX_CONCEALMENT_EVENTS_PER_WINDOW = 3
+_ENCODED_CONCEALMENT_WINDOW_S = 2.0
+_ENCODED_MIN_CONCEALED_FRAMES_PER_CAMERA = 6
+_ENCODED_MAX_CONCEALED_FRACTION = 0.02
 _ENCODED_GAP_GRID_TOLERANCE_FRAMES = 0.25
 # A just-arrived exposure can precede the newest control snapshot by one control
 # tick. Briefly poll the state ring for the upper bracket; never clamp outside
@@ -963,12 +973,40 @@ def _concealable_encoded_gap_frames(
         return 0
     periods = round(delta * fps)
     missing = periods - 1
-    if not 1 <= missing <= _ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA:
+    if not 1 <= missing <= _ENCODED_MAX_CONCEALED_FRAMES_PER_EVENT:
         return 0
     residual = abs(delta - periods / fps)
     if residual > _ENCODED_GAP_GRID_TOLERANCE_FRAMES / capture_fps:
         return 0
     return missing
+
+
+def _concealment_within_budget(
+    *,
+    event_rows: list[int],
+    row: int,
+    concealed_frames: int,
+    missing: int,
+    total_rows: int,
+    fps: int,
+) -> bool:
+    """Decide whether one more repair keeps this camera inside its rate budget.
+
+    ``event_rows`` holds the dataset rows of this camera's earlier repairs in
+    this episode. A burst (too many events inside a short window) or a stream
+    whose concealed frames exceed a small fraction of the episode so far is
+    unhealthy and must fail closed; an isolated hiccup every few seconds is
+    repaired and audited.
+    """
+    window_rows = max(1, int(round(_ENCODED_CONCEALMENT_WINDOW_S * fps)))
+    recent = sum(1 for prior in event_rows if row - prior < window_rows)
+    if recent >= _ENCODED_MAX_CONCEALMENT_EVENTS_PER_WINDOW:
+        return False
+    allowance = max(
+        _ENCODED_MIN_CONCEALED_FRAMES_PER_CAMERA,
+        int(_ENCODED_MAX_CONCEALED_FRACTION * total_rows),
+    )
+    return concealed_frames + missing <= allowance
 
 
 def _align_independent_encoded_start(
@@ -1339,12 +1377,14 @@ def run_encoded_capture_loop(
     independent of encoder, shm, and scheduler latency. The blocking per-camera
     read naturally paces the loop to the dataset cadence. A timeout, missing PTS,
     cross-camera phase error, or excessive state skew aborts the episode.  The
-    sole exception is one bounded one/two-frame hole per equal-rate all-intra
-    camera: the prior IDR is repeated on the missing cadence slots while the
-    future AU is held, preserving all subsequent image/camera/state alignment.
-    The repair is warned and returned through ``repair_events`` for a save-time
-    audit log; larger, repeated, predictive, rate-converted, transport, or
-    non-grid losses remain fatal.
+    sole exception is a bounded one/two-frame hole on an equal-rate all-intra
+    camera, within a per-camera rate budget (no burst of events inside a short
+    window, concealed frames a small fraction of the episode): the prior IDR is
+    repeated on the missing cadence slots while the future AU is held,
+    preserving all subsequent image/camera/state alignment. The repair is
+    warned and returned through ``repair_events`` for a save-time audit log;
+    larger holes, a camera past its budget, predictive, rate-converted,
+    transport, or non-grid losses remain fatal.
 
     The muxer assigns each AU a constant-fps PTS (``k / fps``), so the mp4
     timeline is exact regardless of arrival jitter; its physical exposure PTS is
@@ -1425,7 +1465,7 @@ def run_encoded_capture_loop(
             str, tuple[tuple[bytes, float, float], int, dict[str, Any]]
         ] = {}
         concealed_frames: dict[str, int] = {}
-        concealment_events: dict[str, int] = {}
+        concealment_rows: dict[str, list[int]] = {}
         primed = False
         rows_added = 0
         total_rows = 0
@@ -1553,12 +1593,14 @@ def run_encoded_capture_loop(
                         ),
                     )
                     already_concealed = concealed_frames.get(cam_key, 0)
-                    prior_events = concealment_events.get(cam_key, 0)
-                    if (
-                        missing == 0
-                        or prior_events >= _ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA
-                        or already_concealed + missing
-                        > _ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA
+                    prior_rows = concealment_rows.setdefault(cam_key, [])
+                    if missing == 0 or not _concealment_within_budget(
+                        event_rows=prior_rows,
+                        row=total_rows,
+                        concealed_frames=already_concealed,
+                        missing=missing,
+                        total_rows=total_rows,
+                        fps=fps,
                     ):
                         continue
                     event: dict[str, Any] = {
@@ -1580,7 +1622,7 @@ def run_encoded_capture_loop(
                     )
                     synthetic_repairs[cam_key] = event
                     concealed_frames[cam_key] = already_concealed + missing
-                    concealment_events[cam_key] = prior_events + 1
+                    prior_rows.append(total_rows)
                     _logger.warning(
                         "camera %r omitted %d all-intra frame(s) at dataset "
                         "row %d (PTS gap %.2fms); repeating the prior IDR for "

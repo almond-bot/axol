@@ -9,8 +9,12 @@ from unittest.mock import patch
 from almond_axol.video.gst_zed import (
     ZedGstCamera,
     ZedGstStereoCamera,
+    _consumer_attribution,
     _GstPipelineBase,
+    _task_thread_comm,
+    exposure_critical_thread_comms,
 )
+from almond_axol.video.hw_video import dataset_intra_vbr_bitrate, dataset_vbr_bitrate
 from almond_axol.video.video_proc import _set_dataset_branches_enabled
 
 
@@ -191,6 +195,10 @@ class GstDatasetTransportTest(unittest.TestCase):
         )
         self.assertIn(f"name={encoder_name}", branch)
         self.assertIn("iframeinterval=1 idrinterval=1", branch)
+        # All-IDR frames need the intra budget, not the predictive-GOP one.
+        target, peak = dataset_intra_vbr_bitrate(960, 600, 60)
+        self.assertGreater(target, dataset_vbr_bitrate(960, 600, 60)[0] * 3)
+        self.assertIn(f"bitrate={target} peak-bitrate={peak} ", branch)
         self.assertIn(
             "video/x-h264,stream-format=byte-stream,alignment=au ! "
             f"queue name={encoder_name}_outq leaky=downstream "
@@ -503,6 +511,63 @@ class GstDatasetEnableBarrierTest(unittest.TestCase):
         self.assertNotIn("finish", [call[0] for call in calls])
         self.assertIn(("abort", "overhead"), calls)
         self.assertIn(("abort", "left_arm"), calls)
+
+
+class ExposureCriticalThreadsTest(unittest.TestCase):
+    def test_comms_cover_source_crop_and_dataset_source_queues(self) -> None:
+        comms = exposure_critical_thread_comms()
+
+        # Every name is a valid Linux comm (<= 15 chars) and the ones that
+        # would overflow are truncated the way the kernel does it.
+        self.assertTrue(all(len(c) <= 15 for c in comms))
+        self.assertEqual(
+            comms,
+            {
+                "camsrc:src",
+                "eye_l_cropq:src",
+                "eye_r_cropq:src",
+                "dsenc_srcq:src",
+                "dsenc_l_srcq:sr",
+                "dsenc_r_srcq:sr",
+            },
+        )
+        # Post-copy stages keep CFS: they have their own deeper buffering.
+        self.assertNotIn(_task_thread_comm("dsenc_l_inq"), comms)
+        self.assertNotIn(_task_thread_comm("dsenc_outq"), comms)
+
+    def test_consumer_attribution_reports_wait_between_overruns(self) -> None:
+        snapshots = iter([(1_000_000, "R", "0"), (21_000_000, "R", "0")])
+        state: dict = {}
+        with (
+            patch("almond_axol.video.gst_zed._find_thread_by_comm", return_value=4242),
+            patch(
+                "almond_axol.video.gst_zed._thread_sched_snapshot",
+                side_effect=lambda tid: next(snapshots),
+            ),
+            patch(
+                "almond_axol.video.gst_zed.time.perf_counter",
+                side_effect=(100.0, 100.0334),
+            ),
+        ):
+            first = _consumer_attribution(state, "eye_l_cropq:src")
+            second = _consumer_attribution(state, "eye_l_cropq:src")
+
+        self.assertEqual(first, "consumer eye_l_cropq:src state=R wchan=0")
+        self.assertEqual(
+            second,
+            "consumer eye_l_cropq:src state=R wchan=0, CPU wait 20.0ms of the "
+            "33.4ms since its previous overrun",
+        )
+        self.assertEqual(state["tid"], 4242)
+
+    def test_consumer_attribution_forgets_an_exited_thread(self) -> None:
+        state: dict = {"tid": 7}
+        with patch(
+            "almond_axol.video.gst_zed._thread_sched_snapshot", return_value=None
+        ):
+            text = _consumer_attribution(state, "dsenc_srcq:src")
+        self.assertEqual(text, "consumer dsenc_srcq:src exited")
+        self.assertIsNone(state["tid"])
 
 
 if __name__ == "__main__":

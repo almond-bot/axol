@@ -1,20 +1,33 @@
 """Jetson system tweaks for the real-time teleop / data-collection loops.
 
-Two Tegra defaults trade latency for power/throughput and hurt us:
+Tegra defaults trade latency for power/throughput and hurt us:
 
 * **Engine devfreq** — the camera relay's hardware encode path
   (``almond_axol.video.hw_video``) depends on NVENC (the H.264 encoder) and
   the VIC (``nvvidconv``'s colorspace conversion). The default
   ``tegra_wmark`` governor grants just enough clock to keep up with the
   frame rate, so each frame takes nearly a full frame-time to encode
-  (~3x worse per-frame latency at the ~25% clock it settles on).
+  (~3x worse per-frame latency at the ~25% clock it settles on). The GPU is
+  in the same boat: the ZED SDK does its per-frame image processing in CUDA,
+  and the default ``nvhost_podgov`` governor parks the GPU at its floor
+  (306 of 918 MHz on Orin) and only ramps after the load is already late —
+  every camera frame drop we attributed on a station happened at that floor.
 
 * **CPU cpufreq** — the IK solver (JAX/XLA) is a bursty, sleep-heavy
   workload. The default ``schedutil`` governor reads that idle and
   underclocks the cores to ~40-70% of max, which drops the IK rate by a
   matching ~30% (measured 79 Hz vs 113 Hz pinned).
 
-Both ceilings are themselves capped by the ``nvpmodel`` power mode, so
+* **Capture daemon scheduling** — on ZED X (GMSL2) every camera's frames
+  flow through NVIDIA's Argus daemon, whose capture-request loop runs per
+  frame for all sensors in one process. It ships as a plain CFS service, so
+  under load it is descheduled behind the control / IK / recorder work the
+  cameras feed, and all cameras miss the same frames at once (the relay's
+  own capture threads then report ~0 ms CPU wait: they are waiting on the
+  daemon, not on the scheduler). :func:`pin_realtime_clocks` runs it
+  ``SCHED_FIFO`` one notch above those relay capture threads.
+
+The clock ceilings are themselves capped by the ``nvpmodel`` power mode, so
 :func:`pin_realtime_clocks` first selects MAXN (mode 0) to uncap them, then
 pins the engine and CPU clocks to that max — fixing the latency / rate.
 Best-effort and cleared on reboot, so ``axol jetson.setup`` (which calls
@@ -29,12 +42,34 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .affinity import CAPTURE_FIFO_PRIORITY
 from .sudo import prime_sudo
 
 _logger = logging.getLogger(__name__)
 
-# Hardware engines whose devfreq clocks the encode path depends on.
-_ENGINE_CLOCK_GLOBS = ("*.nvenc", "*.vic")
+# Tegra-only encode engines; their presence identifies a Jetson when the L4T
+# release file is missing (see :func:`_is_jetson`).
+_JETSON_ENGINE_GLOBS = ("*.nvenc", "*.vic")
+
+# Hardware engines whose devfreq clocks the camera path depends on: the
+# encode engines plus the GPU the ZED SDK's CUDA processing runs on. The GPU
+# is deliberately not a Jetson marker — other ARM SoCs expose a ``*.gpu``
+# devfreq node too.
+_ENGINE_CLOCK_GLOBS = (*_JETSON_ENGINE_GLOBS, "*.gpu")
+
+# The camera capture daemon(s) in every ZED X frame's path, and the systemd
+# drop-in that makes their realtime scheduling survive a daemon restart. The
+# live instance is re-scheduled in place with ``chrt`` (threads it spawns
+# later inherit), so the daemon is never restarted under running cameras.
+_CAPTURE_DAEMON_UNITS = ("nvargus-daemon.service",)
+_CAPTURE_DAEMON_DROPIN = "50-axol-realtime.conf"
+# One notch above the relay's capture threads (they block on the daemon),
+# far below the axol-rt CAN loops (SCHED_FIFO 20).
+_CAPTURE_DAEMON_FIFO_PRIORITY = CAPTURE_FIFO_PRIORITY + 1
+_SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
+
+# ``/proc/<tid>/stat`` policy value for SCHED_FIFO (sched.h SCHED_FIFO == 1).
+_SCHED_FIFO = 1
 
 # cpufreq governor that holds the cores at their max clock. The ceiling it
 # holds them at is whatever the active ``nvpmodel`` power mode allows, so we
@@ -76,7 +111,8 @@ def _is_jetson() -> bool:
     # (``glob`` returns a generator that is always truthy, so it must be
     # consumed — ``any(glob(...))`` — to test whether it actually matched.)
     return any(
-        any(Path("/sys/class/devfreq").glob(pattern)) for pattern in _ENGINE_CLOCK_GLOBS
+        any(Path("/sys/class/devfreq").glob(pattern))
+        for pattern in _JETSON_ENGINE_GLOBS
     )
 
 
@@ -238,7 +274,7 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
 
 
 def _pin_engines(writer: _RootEscalator) -> None:
-    """Set ``min_freq = max_freq`` on the NVENC/VIC devfreq nodes."""
+    """Set ``min_freq = max_freq`` on the NVENC/VIC/GPU devfreq nodes."""
     for pattern in _ENGINE_CLOCK_GLOBS:
         for node in Path("/sys/class/devfreq").glob(pattern):
             try:
@@ -253,14 +289,138 @@ def _pin_engines(writer: _RootEscalator) -> None:
                 _logger.info("pinned %s clock to %s Hz", node.name, max_freq)
             else:
                 _logger.warning(
-                    "cannot pin %s to its max clock (%s) — hardware encode "
-                    "latency will be ~3x worse. Fix manually with: "
-                    "echo %s | sudo tee %s",
+                    "cannot pin %s to its max clock (%s) — the camera path "
+                    "(hardware encode, ZED SDK CUDA processing) runs at the "
+                    "governor's floor and drops frames under load. Fix manually "
+                    "with: echo %s | sudo tee %s",
                     node.name,
                     detail or "write failed",
                     max_freq,
                     node / "min_freq",
                 )
+
+
+def _service_main_pid(unit: str) -> int:
+    """The unit's MainPID per systemd, 0 when inactive/unknown."""
+    try:
+        proc = subprocess.run(
+            ["systemctl", "show", "-p", "MainPID", "--value", unit],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return 0
+    try:
+        return int(proc.stdout.strip() or 0)
+    except ValueError:
+        return 0
+
+
+def _threads_at_fifo(
+    pid: int, priority: int, *, proc_root: Path = Path("/proc")
+) -> bool | None:
+    """True when every thread of ``pid`` already runs SCHED_FIFO at ``priority``.
+
+    ``None`` when the process cannot be inspected (gone, or unreadable).
+    """
+    tasks = sorted((proc_root / str(pid) / "task").glob("*"))
+    if not tasks:
+        return None
+    for task in tasks:
+        try:
+            stat = (task / "stat").read_text()
+        except OSError:
+            return None
+        # Fields after the parenthesised comm (which may contain spaces):
+        # index 37 is rt_priority, 38 the scheduling policy (0-based from
+        # the field following ")", i.e. proc(5) fields 40 and 41).
+        fields = stat.rsplit(")", 1)[1].split()
+        try:
+            rt_priority, policy = int(fields[37]), int(fields[38])
+        except (IndexError, ValueError):
+            return None
+        if policy != _SCHED_FIFO or rt_priority != priority:
+            return False
+    return True
+
+
+def _prioritize_capture_daemons(escalator: _RootEscalator) -> None:
+    """Run the camera capture daemon(s) SCHED_FIFO, now and after restarts.
+
+    Jetson-only and best-effort. Two halves per unit: a systemd drop-in so
+    the policy applies whenever the daemon (re)starts, and ``chrt -a`` on the
+    live process so it applies right now without restarting the daemon under
+    running cameras (threads it creates later inherit the policy).
+    """
+    if not _is_jetson():
+        _logger.debug("not a Jetson; leaving the camera daemons' scheduling alone")
+        return
+    dropin_text = (
+        "# Installed by `axol jetson.setup`: every ZED X camera frame passes\n"
+        "# through this daemon, so it must not be descheduled behind the\n"
+        "# control/IK/recorder load the cameras feed.\n"
+        "[Service]\n"
+        "CPUSchedulingPolicy=fifo\n"
+        f"CPUSchedulingPriority={_CAPTURE_DAEMON_FIFO_PRIORITY}\n"
+    )
+    for unit in _CAPTURE_DAEMON_UNITS:
+        pid = _service_main_pid(unit)
+        dropin = _SYSTEMD_UNIT_DIR / f"{unit}.d" / _CAPTURE_DAEMON_DROPIN
+        if pid == 0 and not dropin.exists():
+            # Not installed on this station (no Argus daemon => not ZED X).
+            _logger.debug("%s not running; skipping its realtime drop-in", unit)
+            continue
+        try:
+            dropin_current = dropin.read_text() == dropin_text
+        except OSError:
+            dropin_current = False
+        if not dropin_current:
+            ok, detail = escalator.run(["mkdir", "-p", str(dropin.parent)])
+            if ok:
+                ok, detail = escalator.write(dropin, dropin_text)
+            if ok:
+                ok, detail = escalator.run(["systemctl", "daemon-reload"])
+            if ok:
+                _logger.info(
+                    "%s: SCHED_FIFO %d on future starts (%s)",
+                    unit,
+                    _CAPTURE_DAEMON_FIFO_PRIORITY,
+                    dropin,
+                )
+            else:
+                _logger.warning(
+                    "cannot install the realtime drop-in for %s (%s) — the "
+                    "capture daemon stays CFS after its next restart and all "
+                    "cameras drop the same frames under load. Fix manually "
+                    "with: sudo systemctl edit %s (CPUSchedulingPolicy=fifo, "
+                    "CPUSchedulingPriority=%d)",
+                    unit,
+                    detail or "failed",
+                    unit,
+                    _CAPTURE_DAEMON_FIFO_PRIORITY,
+                )
+        if pid == 0:
+            continue
+        if _threads_at_fifo(pid, _CAPTURE_DAEMON_FIFO_PRIORITY):
+            continue
+        ok, detail = escalator.run(
+            ["chrt", "-f", "-a", "-p", str(_CAPTURE_DAEMON_FIFO_PRIORITY), str(pid)]
+        )
+        if ok:
+            _logger.info(
+                "%s (pid %d) -> SCHED_FIFO %d", unit, pid, _CAPTURE_DAEMON_FIFO_PRIORITY
+            )
+        else:
+            _logger.warning(
+                "cannot re-schedule the running %s (pid %d) SCHED_FIFO (%s) — it "
+                "stays CFS until its next restart picks up the drop-in. Fix "
+                "manually with: sudo chrt -f -a -p %d %d",
+                unit,
+                pid,
+                detail or "chrt failed",
+                _CAPTURE_DAEMON_FIFO_PRIORITY,
+                pid,
+            )
 
 
 def _pin_cpu(writer: _RootEscalator) -> None:
@@ -327,16 +487,18 @@ def pin_engine_clocks(*, interactive: bool = False) -> None:
 
 
 def pin_realtime_clocks(*, interactive: bool = False) -> None:
-    """Select MAXN and pin engine **and** CPU clocks for the control loops.
+    """Select MAXN, pin engine **and** CPU clocks, and make the capture daemon RT.
 
     Selects the MAXN ``nvpmodel`` power mode (uncaps the clock ceiling), pins
-    NVENC/VIC (encode latency), and switches the CPUs to the ``performance``
-    governor (IK rate). All three are Jetson-only: MAXN selection and
-    CPU-governor pinning are gated on :func:`_is_jetson` so they never alter a
-    non-Tegra host, and engine pinning is a no-op without the Tegra devfreq
-    nodes. MAXN is selected first because it sets the ceiling the governor and
-    engine pins reach. Same best-effort / ``interactive`` escalation semantics
-    as :func:`pin_engine_clocks`; sudo is primed at most once across all of
+    NVENC/VIC/GPU (encode latency, ZED SDK processing), switches the CPUs to
+    the ``performance`` governor (IK rate), and schedules the Argus camera
+    daemon ``SCHED_FIFO`` (all-camera frame drops under load). All are
+    Jetson-only: MAXN selection, CPU-governor pinning and the daemon step are
+    gated on :func:`_is_jetson` so they never alter a non-Tegra host, and
+    engine pinning is a no-op without the Tegra devfreq nodes. MAXN is
+    selected first because it sets the ceiling the governor and engine pins
+    reach. Same best-effort / ``interactive`` escalation semantics as
+    :func:`pin_engine_clocks`; sudo is primed at most once across all of
     them. Invoked via ``axol jetson.setup`` (host installer + boot service),
     not from the teleop / collect-data / serve entry points.
     """
@@ -344,3 +506,4 @@ def pin_realtime_clocks(*, interactive: bool = False) -> None:
     _set_max_power_mode(escalator)
     _pin_engines(escalator)
     _pin_cpu(escalator)
+    _prioritize_capture_daemons(escalator)
