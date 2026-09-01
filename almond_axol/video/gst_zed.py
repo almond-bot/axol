@@ -428,13 +428,23 @@ def _raw_shmsink(socket_path: str) -> str:
 # Both ``iframeinterval`` and ``idrinterval`` must be one: nvv4l2h264enc exposes
 # them as separate READY-only controls.
 _DATASET_GOP_FRAMES = 1
-# Before the recorder connects, a tiny leaky output queue is intentional: it
-# keeps NVENC returning its NVMM surfaces while shmsink parks GDP's one-shot
-# header. Once an episode opens, two seconds of bounded compressed-AU headroom
-# absorbs scheduler jitter without silently losing encoded exposures.
+# Before the recorder connects, tiny leaky queues around the dataset encoder are
+# intentional: the upstream branch queue keeps the camera tee fresh while the
+# valve is closed, and the output queue keeps NVENC returning its NVMM surfaces
+# while shmsink parks GDP's one-shot header. During an episode a short input
+# queue *after* a forced VIC copy absorbs NVENC startup jitter without retaining
+# a large pool of camera-owned/crop surfaces; the compressed output keeps a
+# longer cushion for recorder scheduling jitter. Both remain bounded and leaky
+# so a dead recorder cannot back-pressure Argus or the independent headset path.
 _DATASET_STARTUP_QUEUE_BUFFERS = 2
-_DATASET_ACTIVE_QUEUE_MIN_BUFFERS = 60
-_DATASET_ACTIVE_QUEUE_SECONDS = 2
+_DATASET_ACTIVE_INPUT_QUEUE_MIN_BUFFERS = 15
+_DATASET_ACTIVE_INPUT_QUEUE_SECONDS = 0.5
+_DATASET_ACTIVE_OUTPUT_QUEUE_MIN_BUFFERS = 60
+_DATASET_ACTIVE_OUTPUT_QUEUE_SECONDS = 2
+# The VIC pool must exceed the downstream queue capacity so NVENC can retain a
+# few input surfaces while a new buffer still reaches the queue and triggers its
+# downstream-leaky policy instead of blocking back into the camera tee.
+_DATASET_VIC_INFLIGHT_SURFACES = 8
 # Opening every camera with a sequence of host-side property writes can straddle
 # multiple source frames. Arm a timestamp probe on every branch first, then let
 # each one open itself on its first exposure at/after one shared future instant.
@@ -461,6 +471,23 @@ def _dataset_rate_limit(capture_fps: int, dataset_fps: int) -> str:
         f"videorate drop-only=true max-rate={dataset_fps} ! "
         "video/x-raw(memory:NVMM),format=NV12,"
         f"framerate={dataset_fps}/1 ! "
+    )
+
+
+def _dataset_input_queue(name: str) -> str:
+    """Named bounded queue between the dataset VIC copy and NVENC."""
+    return (
+        f"queue name={name}_inq leaky=downstream "
+        f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
+        "max-size-bytes=0 max-size-time=0"
+    )
+
+
+def _dataset_active_input_buffers(dataset_fps: int) -> int:
+    """Short converted-surface cushion for an active dataset encoder."""
+    return max(
+        _DATASET_ACTIVE_INPUT_QUEUE_MIN_BUFFERS,
+        math.ceil(_DATASET_ACTIVE_INPUT_QUEUE_SECONDS * max(1, dataset_fps)),
     )
 
 
@@ -491,8 +518,10 @@ def _dataset_enc_shmsink(
     A leaky queue after the encoder keeps NVENC draining (and releases its NVMM
     input surfaces) while that packet is parked; the queue must stay before
     ``gdppay`` so it can never discard GDP's one-shot stream/caps header. The
-    branch's earlier queue still decouples it from camera capture and the
-    independent headset branch.
+    short named queue between a forced VIC copy and NVENC decouples encoder
+    startup stalls from camera capture and the independent headset branch
+    without retaining the source camera's buffers. Both named queues grow only
+    while an episode is active.
     The rate limiter deliberately stays upstream of the valve: it must continue
     tracking the source timeline between episodes, otherwise reopening a stale
     ``videorate`` can briefly pass capture-rate frames into a lower-rate dataset.
@@ -504,9 +533,12 @@ def _dataset_enc_shmsink(
     ``dataset_vbr_bitrate``).
     """
     target, peak = dataset_vbr_bitrate(w, h, dataset_fps)
+    input_buffers = _dataset_active_input_buffers(dataset_fps)
+    converter_buffers = input_buffers + _DATASET_VIC_INFLIGHT_SURFACES
     return (
-        "nvvidconv ! "
-        f"video/x-raw(memory:NVMM),format=NV12,width={w},height={h} "
+        f"nvvidconv output-buffers={converter_buffers} ! "
+        f"video/x-raw(memory:NVMM),format=I420,width={w},height={h} "
+        f"! {_dataset_input_queue(name)} "
         f"! nvv4l2h264enc name={name} control-rate=0 "
         f"bitrate={target} peak-bitrate={peak} preset-level=1 "
         f"insert-sps-pps=true insert-aud=true "
@@ -627,45 +659,66 @@ class _GstPipelineBase:
             valve = self._pipeline.get_by_name(valve_name)
             if valve is not None:
                 valve.set_property("drop", True)
-        self._set_dataset_output_queue_depth(gates, active=False)
+        # Shrink only after every input valve is closed. Reducing a live input
+        # queue first could itself discard an exposure from the episode we are
+        # trying to fail closed.
+        self._set_dataset_queue_depths(gates, active=False)
 
-    def _set_dataset_output_queue_depth(
+    def _set_dataset_queue_depths(
         self,
         gates: tuple[tuple[str, str | None], ...],
         *,
         active: bool,
     ) -> None:
-        """Select bounded startup or active-episode H.264 queue headroom.
+        """Select bounded startup or active-episode encoder queue headroom.
 
-        Startup must remain aggressively leaky because GDP's header is parked
-        at ``shmsink wait-for-connection=true`` before the recorder exists.
-        During an episode the reader is connected and flushed, so retain two
-        seconds of compressed AUs before failing with DISCONT. Keeping the
-        queue bounded and leaky still isolates camera capture/NVENC if the
-        recorder process dies outright.
+        Startup must remain aggressively leaky: the ordinary pre-valve branch
+        queue keeps the camera tee current while capture is disabled, and GDP's
+        header is parked behind the post-encoder output queue at
+        ``shmsink wait-for-connection=true`` before the recorder exists. During
+        an episode the reader is connected and flushed, so retain a short queue
+        of copied NVMM frames before NVENC and two seconds of compressed AUs
+        after it. Both queues stay bounded and downstream-leaky; exhausting
+        either still surfaces as a PTS/DISCONT capture failure.
         """
         if self._pipeline is None:
             return
         dataset_fps = max(1, int(getattr(self, "dataset_fps", 1)))
-        active_buffers = max(
-            _DATASET_ACTIVE_QUEUE_MIN_BUFFERS,
-            _DATASET_ACTIVE_QUEUE_SECONDS * dataset_fps,
+        active_input_buffers = _dataset_active_input_buffers(dataset_fps)
+        active_output_buffers = max(
+            _DATASET_ACTIVE_OUTPUT_QUEUE_MIN_BUFFERS,
+            _DATASET_ACTIVE_OUTPUT_QUEUE_SECONDS * dataset_fps,
         )
-        depth = active_buffers if active else _DATASET_STARTUP_QUEUE_BUFFERS
         for _valve_name, encoder_name in gates:
             if encoder_name is None:
                 continue
-            output_queue = self._pipeline.get_by_name(f"{encoder_name}_outq")
-            if output_queue is None:
-                raise RuntimeError(
-                    f"missing dataset encoder output queue {encoder_name}_outq"
+            queue_depths = (
+                (
+                    f"{encoder_name}_inq",
+                    active_input_buffers,
+                    "input",
+                ),
+                (
+                    f"{encoder_name}_outq",
+                    active_output_buffers,
+                    "output",
+                ),
+            )
+            for queue_name, active_depth, side in queue_depths:
+                queue = self._pipeline.get_by_name(queue_name)
+                if queue is None:
+                    raise RuntimeError(
+                        f"missing dataset encoder {side} queue {queue_name}"
+                    )
+                queue.set_property("leaky", 2)  # downstream
+                queue.set_property(
+                    "max-size-buffers",
+                    active_depth if active else _DATASET_STARTUP_QUEUE_BUFFERS,
                 )
-            output_queue.set_property("leaky", 2)  # downstream
-            output_queue.set_property("max-size-buffers", depth)
-            # Explicitly disable the queue defaults (10 MB / 1 s); otherwise
-            # either can undercut the intended frame-count bound.
-            output_queue.set_property("max-size-bytes", 0)
-            output_queue.set_property("max-size-time", 0)
+                # Explicitly disable the queue defaults (10 MB / 1 s);
+                # otherwise either can undercut the frame-count bound.
+                queue.set_property("max-size-bytes", 0)
+                queue.set_property("max-size-time", 0)
 
     def _begin_dataset_enable(
         self,
@@ -713,7 +766,10 @@ class _GstPipelineBase:
             ]
         ] = []
         try:
-            self._set_dataset_output_queue_depth(gates, active=True)
+            # Expand both sides before any valve can admit the shared-boundary
+            # exposure. A partial property-update failure is caught below;
+            # abort closes all valves before restoring startup depths.
+            self._set_dataset_queue_depths(gates, active=True)
             for valve_name, encoder_name in gates:
                 valve = self._pipeline.get_by_name(valve_name)
                 if valve is None:
@@ -851,7 +907,7 @@ class _GstPipelineBase:
                 valve = self._pipeline.get_by_name(valve_name)
                 if valve is not None:
                     valve.set_property("drop", True)
-            self._set_dataset_output_queue_depth(gates, active=False)
+            self._set_dataset_queue_depths(gates, active=False)
             raise
         self._dataset_disable = []
 
@@ -1199,7 +1255,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         try:
             self._finish_dataset_disable(deadline)
         finally:
-            self._set_dataset_output_queue_depth(self._raw_gates(), active=False)
+            self._set_dataset_queue_depths(self._raw_gates(), active=False)
 
     def begin_raw_enable(self, target_perf_s: float) -> None:
         """Arm this camera to open on a shared future exposure boundary."""
@@ -1207,7 +1263,13 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
 
     def finish_raw_enable(self, deadline: float) -> None:
         """Wait for a common-boundary open armed by :meth:`begin_raw_enable`."""
-        self._finish_dataset_enable(deadline)
+        try:
+            self._finish_dataset_enable(deadline)
+        except Exception:
+            # Local callers do not have the relay's outer multi-camera abort.
+            # Preserve the same fail-closed queue/valve state either way.
+            self._abort_dataset_enable(self._raw_gates())
+            raise
 
     def abort_raw_enable(self) -> None:
         """Cancel an opening transaction and immediately close every branch."""
@@ -1584,7 +1646,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         try:
             self._finish_dataset_disable(deadline)
         finally:
-            self._set_dataset_output_queue_depth(self._raw_gates(), active=False)
+            self._set_dataset_queue_depths(self._raw_gates(), active=False)
 
     def begin_raw_enable(self, target_perf_s: float) -> None:
         """Arm both eyes to open on a shared future exposure boundary."""
@@ -1592,7 +1654,11 @@ class ZedGstStereoCamera(_GstPipelineBase):
 
     def finish_raw_enable(self, deadline: float) -> None:
         """Wait for a common-boundary open armed by :meth:`begin_raw_enable`."""
-        self._finish_dataset_enable(deadline)
+        try:
+            self._finish_dataset_enable(deadline)
+        except Exception:
+            self._abort_dataset_enable(self._raw_gates())
+            raise
 
     def abort_raw_enable(self) -> None:
         """Cancel an opening transaction and immediately close every eye."""
