@@ -11,10 +11,12 @@ from almond_axol.recording.record_proc import (
     InProcessRecorder,
     RecorderCaptureError,
     RecorderDatasetSaveError,
-    _ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA,
-    _ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA,
+    _ENCODED_CONCEALMENT_WINDOW_S,
+    _ENCODED_MAX_CONCEALMENT_EVENTS_PER_WINDOW,
+    _ENCODED_MIN_CONCEALED_FRAMES_PER_CAMERA,
     _align_independent_encoded_start,
     _concealable_encoded_gap_frames,
+    _concealment_within_budget,
     run_encoded_capture_loop,
 )
 
@@ -280,12 +282,12 @@ class DatasetRecorderCaptureErrorTest(unittest.TestCase):
         self.assertEqual([event["missing_frames"] for event in repairs], [1, 1])
         self.assertEqual([event["frame_index"] for event in repairs], [1, 3])
 
-    def test_gap_past_per_episode_budget_is_fatal(self) -> None:
+    def test_gap_burst_inside_window_is_fatal(self) -> None:
         base = time.perf_counter() + 0.1
         step = 1.0 / 60.0
         packets = [(b"a0", base, base)]
-        # One event over the per-camera budget, each a single missing frame.
-        for i in range(_ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA + 1):
+        # One event over the burst budget, back to back, each a single frame.
+        for i in range(_ENCODED_MAX_CONCEALMENT_EVENTS_PER_WINDOW + 1):
             ts = base + 2 * (i + 1) * step
             packets.append((f"a{2 * (i + 1)}".encode(), ts, base))
         cameras = {"camera": _EncodedCamera(packets)}
@@ -294,31 +296,84 @@ class DatasetRecorderCaptureErrorTest(unittest.TestCase):
             cameras, fps=60, rows=len(packets) * 2
         )
 
-        self.assertEqual(len(repairs), _ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA)
+        self.assertEqual(len(repairs), _ENCODED_MAX_CONCEALMENT_EVENTS_PER_WINDOW)
         self.assertEqual(
-            len(dataset.rows), 2 * _ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA + 1
+            len(dataset.rows), 2 * _ENCODED_MAX_CONCEALMENT_EVENTS_PER_WINDOW + 1
         )
         self.assertRegex(errors[0], "dropped an encoded frame")
 
-    def test_gap_past_per_episode_frame_budget_is_fatal(self) -> None:
+    def test_isolated_gaps_every_few_seconds_survive_a_long_take(self) -> None:
+        # Today's overhead pattern: one exposure lost every 1-4 s for the whole
+        # take. Spaced past the burst window and well under the fraction cap,
+        # every hole is repaired.
         base = time.perf_counter() + 0.1
         step = 1.0 / 60.0
-        # Two-frame holes exhaust the frame budget before the event budget.
-        events = _ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA // 2
-        self.assertLess(events, _ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA)
-        packets = [(b"a0", base, base)]
-        for i in range(events + 1):
-            ts = base + 3 * (i + 1) * step
-            packets.append((f"a{3 * (i + 1)}".encode(), ts, base))
+        spacing = 90  # frames between the lost exposures (1.5 s at 60 Hz)
+        packets = []
+        frame = 0
+        for _ in range(8):
+            for _ in range(spacing - 1):
+                packets.append((f"a{frame}".encode(), base + frame * step, base))
+                frame += 1
+            frame += 1  # the lost exposure
         cameras = {"camera": _EncodedCamera(packets)}
 
         dataset, errors, repairs, _ = self._run_encoded(
-            cameras, fps=60, rows=len(packets) * 3
+            cameras, fps=60, rows=8 * spacing - 1
         )
 
-        self.assertEqual(len(repairs), events)
-        self.assertEqual(len(dataset.rows), 3 * events + 1)
-        self.assertRegex(errors[0], "dropped an encoded frame")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(repairs), 7)
+        self.assertEqual({event["missing_frames"] for event in repairs}, {1})
+
+    def test_concealment_budget_rules(self) -> None:
+        fps = 60
+        window = int(_ENCODED_CONCEALMENT_WINDOW_S * fps)
+        kwargs = dict(concealed_frames=0, missing=1, total_rows=1000, fps=fps)
+        # Two earlier events inside the window leave room for a third only.
+        self.assertTrue(
+            _concealment_within_budget(event_rows=[10, 50], row=100, **kwargs)
+        )
+        self.assertFalse(
+            _concealment_within_budget(event_rows=[10, 50, 90], row=100, **kwargs)
+        )
+        # Once the oldest event ages out of the window a new one fits again.
+        self.assertTrue(
+            _concealment_within_budget(
+                event_rows=[10, 50, 90], row=10 + window, **kwargs
+            )
+        )
+        # The frame allowance is the larger of the floor and the fraction.
+        self.assertTrue(
+            _concealment_within_budget(
+                event_rows=[],
+                row=10,
+                concealed_frames=_ENCODED_MIN_CONCEALED_FRAMES_PER_CAMERA - 1,
+                missing=1,
+                total_rows=10,
+                fps=fps,
+            )
+        )
+        self.assertFalse(
+            _concealment_within_budget(
+                event_rows=[],
+                row=10,
+                concealed_frames=_ENCODED_MIN_CONCEALED_FRAMES_PER_CAMERA,
+                missing=1,
+                total_rows=10,
+                fps=fps,
+            )
+        )
+        self.assertTrue(
+            _concealment_within_budget(
+                event_rows=[],
+                row=10_000,
+                concealed_frames=_ENCODED_MIN_CONCEALED_FRAMES_PER_CAMERA,
+                missing=2,
+                total_rows=10_000,
+                fps=fps,
+            )
+        )
 
     def test_row_zero_alignment_advances_only_lagging_all_intra_streams(
         self,

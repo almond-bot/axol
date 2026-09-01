@@ -458,6 +458,37 @@ _DATASET_ENABLE_LEAD_S = 0.100
 # The shared gate still has a bounded acknowledgement wait. A timeout means a
 # source stopped producing exposure timestamps, not ordinary scheduler jitter.
 _DATASET_GATE_TIMEOUT_S = 2.0
+# Every camera source element carries this name so the source-gap diagnostic
+# can find its pad. A sensor-timestamp step of 1.5 periods at the fastest
+# supported capture rate (60 Hz) is already a whole missing exposure.
+_SOURCE_ELEMENT_NAME = "camsrc"
+_SOURCE_GAP_WARN_MS = 25.0
+_GPU_DEVFREQ_GLOB = "/sys/class/devfreq/*.gpu"
+
+
+def _thread_sched_wait_ns() -> int | None:
+    """Cumulative time this thread spent runnable-but-waiting (Linux only)."""
+    try:
+        with open("/proc/thread-self/schedstat") as f:
+            return int(f.read().split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _gpu_clock_summary() -> str:
+    """``cur/max MHz`` of the Tegra GPU devfreq, or ``n/a`` off-Jetson."""
+    import glob
+
+    for node in glob.glob(_GPU_DEVFREQ_GLOB):
+        try:
+            with open(f"{node}/cur_freq") as f:
+                cur = int(f.read()) // 1_000_000
+            with open(f"{node}/max_freq") as f:
+                top = int(f.read()) // 1_000_000
+        except (OSError, ValueError):
+            continue
+        return f"{cur}/{top}MHz"
+    return "n/a"
 
 
 def _dataset_rate_limit(capture_fps: int, dataset_fps: int) -> str:
@@ -1185,6 +1216,66 @@ class _GstPipelineBase:
         self._gst = Gst
         _logger.info("gst zed pipeline: %s", pipeline_str)
         self._pipeline = Gst.parse_launch(pipeline_str)
+        self._attach_source_gap_diagnostic()
+
+    def _attach_source_gap_diagnostic(self) -> None:
+        """Log every exposure the camera source itself fails to deliver.
+
+        The dataset queues report their own overruns, and the recorder detects
+        a missing AU downstream, but neither can say *where* a frame vanished
+        when no queue overran: that leaves the source element (the ZED SDK's
+        grab loop) or the camera link. This probe sits on the source pad, so a
+        sensor-timestamp gap here is a frame the source never produced. It
+        also attributes the miss: the source's streaming thread cannot call
+        ``grab()`` while descheduled, so if its ``schedstat`` wait time grew by
+        most of the gap it was starved of CPU; otherwise the time went inside
+        the SDK (GPU work, or a link/sensor frame that never arrived), which is
+        why the GPU clock — the one camera-path engine ``jetson.setup`` does
+        not pin — is logged alongside.
+        """
+        Gst = self._gst
+        source = self._pipeline.get_by_name(_SOURCE_ELEMENT_NAME)
+        if source is None:
+            return
+        pad = source.get_static_pad("src")
+        if pad is None:
+            return
+        state: dict[str, Any] = {"pts": None, "wait_ns": None}
+        label = repr(self)
+
+        def on_buffer(_pad: Any, info: Any) -> Any:
+            buf = info.get_buffer()
+            if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
+                return Gst.PadProbeReturn.OK
+            previous = state["pts"]
+            previous_wait = state["wait_ns"]
+            wait_ns = _thread_sched_wait_ns()
+            state["pts"] = buf.pts
+            state["wait_ns"] = wait_ns
+            if previous is None or buf.pts <= previous:
+                return Gst.PadProbeReturn.OK
+            gap_ms = (buf.pts - previous) / 1e6
+            if gap_ms < _SOURCE_GAP_WARN_MS:
+                return Gst.PadProbeReturn.OK
+            starved_ms = (
+                (wait_ns - previous_wait) / 1e6
+                if wait_ns is not None and previous_wait is not None
+                else None
+            )
+            _logger.warning(
+                "camera source %s skipped exposure(s): sensor PTS gap %.2fms; "
+                "source thread CPU wait since previous frame %s; gpu %s",
+                label,
+                gap_ms,
+                "unknown" if starved_ms is None else f"{starved_ms:.2f}ms",
+                _gpu_clock_summary(),
+            )
+            return Gst.PadProbeReturn.OK
+
+        try:
+            pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+        except Exception as exc:  # diagnostics never gate capture
+            _logger.debug("could not attach source gap diagnostic: %s", exc)
 
     def _play_and_wait(self, channels: tuple[_AUChannel, ...]) -> bool:
         Gst = self._gst
@@ -1296,7 +1387,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
     def _pipeline_str(self) -> str:
         bitrate = _bitrate_for(self.width, self.height, self.stream_fps)
         src = (
-            f"zedxonesrc camera-sn={self.serial} "
+            f"zedxonesrc name={_SOURCE_ELEMENT_NAME} camera-sn={self.serial} "
             f"camera-resolution={_RESOLUTION_ENUM[self.resolution]} "
             f"camera-fps={self.fps} stream-type=1 do-timestamp=false "
             f"ctrl-auto-exposure-range-max={_MAX_AUTO_EXPOSURE_US} "
@@ -1789,7 +1880,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
 
     def _pipeline_str(self) -> str:
         src = (
-            f"zedsrc camera-sn={self.serial} "
+            f"zedsrc name={_SOURCE_ELEMENT_NAME} camera-sn={self.serial} "
             f"camera-resolution={_STEREO_RESOLUTION_ENUM[self.resolution]} "
             f"camera-fps={self.fps} stream-type=7 depth-mode=0 "
             "do-timestamp=false "
