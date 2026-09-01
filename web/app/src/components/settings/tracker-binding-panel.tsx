@@ -624,26 +624,19 @@ function SourceChecklist({
         status={<SourceReadinessBadges source="quest" readiness={readiness} />}
       >
         <SetupStep number={1}>
-          Put the Quest and this host on the same LAN. For lower-latency controller poses, enable
-          Quest Developer Mode, attach USB-C, accept the USB-debugging prompt in-headset, then use
-          the Quest USB tab. USB carries poses only; the page and camera video still use the LAN.
+          Put the Quest and this host on the same LAN. For lower-latency poses, connect USB-C with
+          Developer Mode enabled and use the Quest USB tab.
         </SetupStep>
         <SetupStep number={2}>
-          Save this source, connect the Mantis hardware tile, and start a Mantis teleop or data
-          collection run.
+          Save this source, then start a Mantis teleop or data collection run.
         </SetupStep>
         <SetupStep number={3}>
           In the Quest browser open <span className="text-white/70">axol.almond.bot</span>, enter
-          this host, and connect. If prompted, choose Authorize certificate, approve the local
-          certificate page, then return and reconnect.
+          this host, connect (authorize the local certificate if prompted), and choose Enter VR.
         </SetupStep>
         <SetupStep number={4}>
-          Choose Enter VR and allow the immersive session. Hold both Touch controllers; WebXR
-          supplies left/right handedness automatically, so no Identify step is needed. The current
-          client also reports each controller&apos;s WebXR profile and whether its pose came from
-          gripSpace or the incompatible target-ray fallback. At the start pose, release both side
-          grip buttons and then press them together to align and engage. Repeat that complete
-          release→together-press after Reset, an occlusion, or SLAM recovery.
+          Hold both Touch controllers. At the start pose, release both grip buttons, then press them
+          together to align and engage. Repeat that gesture after Reset or tracking loss.
           {readiness?.quest.liveDatum && (
             <div className="mt-2 flex flex-col gap-2 rounded-md border border-white/10 bg-black/20 p-2">
               <span className="text-[11px] text-white/55">
@@ -698,12 +691,10 @@ function SourceChecklist({
           )}
         </SetupStep>
         <SetupStep number={5}>
-          For production data, enter both bench measurements in the tracker → gripper calibration
-          editor below. They are saved under the exact reported
-          <code className="text-white/65"> quest:&lt;profile&gt;:grip</code> datum. The host refuses
-          a different Touch generation, missing profile, or target-ray datum instead of silently
-          applying the wrong offset. Teleop bring-up can run without this calibration, but
-          collection remains blocked unless explicitly marked uncalibrated.
+          For production data, enter both bench measurements in the calibration editor below. They
+          are saved under the reported
+          <code className="text-white/65"> quest:&lt;profile&gt;:grip</code> datum; teleop can run
+          without them, but collection stays blocked until they exist.
         </SetupStep>
       </Checklist>
     )
@@ -716,13 +707,9 @@ function SourceChecklist({
         status={<SourceReadinessBadges source="ultimate" readiness={readiness} />}
       >
         <SetupStep number={1}>
-          On Windows, first install SteamVR, enable its null/virtual-headset driver, install VIVE
-          Streaming Hub, and install the VIVE Ultimate Tracker service from VIVE Hub. Those
-          prerequisites are required to create the tracker map even though this Mantis flow uses no
-          headset. Connect the wireless dongle and open Settings → VIVE Ultimate Tracker → Trackers
-          → Pair new. After powering on each tracker, wait through its green/blue startup flashes
-          until the LED is solid blue; only then hold Power for about two seconds until blue flashes
-          again and pair it. Pair both trackers to this dongle.
+          On a Windows PC with SteamVR (null driver), VIVE Streaming Hub, and the VIVE Ultimate
+          Tracker service installed, connect the wireless dongle and pair both trackers to it in
+          VIVE Hub.
           <div className="mt-2">
             <ExternalSetupLink href="https://business.vive.com/us/support/ultimate-tracker/category_howto/pairing-ultimate-tracker-with-the-dongle.html">
               HTC pairing guide
@@ -730,11 +717,9 @@ function SourceChecklist({
           </div>
         </SetupStep>
         <SetupStep number={2}>
-          In VIVE Hub choose Start setup → Create map. Establish the center, then scan the complete
-          operating area from low/kneeling and standing heights while facing all four directions.
-          Let the map auto-save, refine/save it if offered, and confirm both trackers relocalize.
-          The map remains on the trackers; only the final physical SteamVR-headset connection step
-          is skipped—not the Windows software/service prerequisites above.
+          In VIVE Hub choose Start setup → Create map, scan the whole operating area from low and
+          standing heights facing all directions, and confirm both trackers relocalize. The map
+          stays on the trackers.
           <div className="mt-2 flex flex-wrap gap-3">
             <ExternalSetupLink href="https://business.vive.com/eu/support/ultimate-tracker/category_howto/creating-a-tracking-map.html">
               HTC tracking-map guide
@@ -745,29 +730,18 @@ function SourceChecklist({
           </div>
         </SetupStep>
         <SetupStep number={3}>
-          On this Linux/Jetson host, use Install or Repair below for the pinned runtime and USB
-          rule, then fill in pyvut&apos;s protected shared-map AP configuration/fallback below. It
-          is not router Wi-Fi, and dongle firmware may supply the active host credentials. The UI
-          writes the file with mode 0600, never reads the saved password back, and preserves it when
-          the password field is blank.
+          If the runtime badges above are not green, use Install or Repair below. Then save the
+          shared-map Wi-Fi configuration below (the trackers&apos; private AP, not router Wi-Fi).
         </SetupStep>
         <SetupStep number={4}>
-          Connect the HTC wireless dongle, power both trackers in the mapped area, and let their
-          inside-out tracking converge. Use Identify trackers below as the live pose test, moving
-          only the requested rig during each capture.
+          Connect the dongle, power both trackers in the mapped area, and use Identify trackers,
+          moving only the requested rig during each capture.
         </SetupStep>
         <SetupStep number={5}>
-          Run the final readiness check after binding, then test with a short Mantis teleop run.
-          Hold both rigs at the configured rest pose; when both trackers and trigger channels are
-          live, release both triggers, then squeeze them together to align and engage. Before
-          re-engaging after tracking loss or Reset, restore both inputs and repeat that full
-          release→together-squeeze gesture. The standard flat-back mount uses the built-in Ultimate
-          factory transform; use the editor below only for a non-standard or per-unit override. A
-          connected Quest can still show cameras and server-driven recording status, but its
-          controllers are view-only and cannot start, save, or discard tracker-owned takes. Its SLAM
-          world is unrelated to the Ultimate map. The 3D robot overlay stays hidden unless those
-          origins and yaw have been explicitly co-registered; do not use an unregistered overlay to
-          approve a mount transform.
+          Run the readiness check, then a short Mantis teleop run: hold both rigs at the rest pose,
+          release both triggers, then squeeze them together to align and engage. Repeat that gesture
+          after Reset or tracking loss. The flat-back mount uses the factory transform; the editor
+          below is only for overrides.
         </SetupStep>
       </Checklist>
     )
@@ -779,36 +753,23 @@ function SourceChecklist({
       status={<SourceReadinessBadges source="lighthouse" readiness={readiness} />}
     >
       <SetupStep number={1}>
-        Provision this Linux host with pinned libsurvive and Vive USB permissions.
-        <div className="mt-2">
-          <CopyableCommand command="axol provision" />
-        </div>
+        Power the base stations, connect both Watchman dongles, and place both Tracker 3.0 units
+        where they can see the base stations.
       </SetupStep>
       <SetupStep number={2}>
-        Power the Lighthouse base stations, connect the Watchman dongles, and place both Tracker 3.0
-        units where they can see the base stations.
-      </SetupStep>
-      <SetupStep number={3}>
-        Pair each tracker with its intended dongle: connect only that dongle, unplug the tracker USB
+        Pair each tracker to its dongle: connect only that dongle, unplug the tracker&apos;s USB
         cable, power it on, hold its button until the LED blinks blue, then use Pair tracker below.
         Repeat for the other side.
       </SetupStep>
-      <SetupStep number={4}>
-        Power both paired trackers and use Identify trackers. Move only the requested Mantis during
-        each three-second capture.
+      <SetupStep number={3}>
+        Power both trackers and use Identify trackers, moving only the requested Mantis during each
+        capture.
       </SetupStep>
-      <SetupStep number={5}>
-        Test with a short Mantis teleop run: leave both trackers visible and hold both rigs at the
-        configured rest pose. Once both trackers and trigger channels are live, release both
-        triggers, then squeeze them together to confirm the start-pose alignment and engage. Before
-        re-engaging after occlusion or Reset, restore both trackers and repeat the full
-        release→together-squeeze gesture. The standard flat-back mount uses the built-in Tracker 3.0
-        factory transform; use the editor below only for a non-standard or per-unit override. A
-        connected Quest can still show cameras and server-driven recording status, but its
-        controllers are view-only and cannot start, save, or discard tracker-owned takes. Its
-        local-floor world is unrelated to Lighthouse. The 3D robot overlay stays hidden unless the
-        two worlds have been explicitly co-registered; do not use an unregistered overlay to approve
-        a transform.
+      <SetupStep number={4}>
+        Run a short Mantis teleop: hold both rigs at the rest pose with both trackers visible,
+        release both triggers, then squeeze them together to align and engage. Repeat that gesture
+        after Reset or occlusion. The flat-back mount uses the factory transform; the editor below
+        is only for overrides.
       </SetupStep>
     </Checklist>
   )
@@ -953,7 +914,11 @@ function SourceReadinessBadges({
       </div>
       {runtimeIssues.length > 0 && (
         <p className="text-[11px] leading-relaxed text-red-300/75">
-          {runtimeIssues.slice(0, 2).join(" · ")}
+          {runtimeIssues.slice(0, 2).join(" · ")}. Use{" "}
+          {source === "lighthouse" ? "Install Lighthouse support" : "Install or Repair"} below
+          {source === "lighthouse"
+            ? " (or run axol tracker.install); an existing pinned build is re-attested without rebuilding."
+            : "."}
         </p>
       )}
       {missingTransforms.length > 0 && (

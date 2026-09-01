@@ -130,7 +130,7 @@ The control panel's **Identify trackers** button runs this command on the serve 
 axol tracker.install
 ```
 
-The command installs build dependencies, builds `survive-cli` with Eigen and the native Linux libusb backend (not OpenBLAS or HIDAPI), installs the Vive udev rule, and is safe to rerun. The libusb backend is required for `survive-cli --pair-device 1` to pair a tracker with its HTC dongle. Then mount 1–2 SteamVR base stations (1.0 or 2.0) with the workspace in view and connect each tracker over USB-C or its HTC dongle.
+The command installs build dependencies, builds `survive-cli` with Eigen and the native Linux libusb backend (not OpenBLAS or HIDAPI), installs the Vive udev rule, and is safe to rerun. When the machine-wide install proof under `/var/lib/almond/` is missing or in an older format but the local build cache already holds the pinned build with the same options (for example after updating Axol), the command only refreshes the udev rule and re-attests the installed files instead of rebuilding. The libusb backend is required for `survive-cli --pair-device 1` to pair a tracker with its HTC dongle. Then mount 1–2 SteamVR base stations (1.0 or 2.0) with the workspace in view and connect each tracker over USB-C or its HTC dongle.
 
 Pairing and left/right assignment are both available in **Settings → Mantis**. Use **Pair tracker** once for each tracker/dongle pair (the tracker must be unplugged from USB and blinking blue), then use **Identify trackers** to move each Mantis and save its side assignment. The equivalent pairing command is `axol tracker.pair`.
 

@@ -36,14 +36,18 @@ tweak owned by the systemd ``ExecStartPre``, not an install step.
 from __future__ import annotations
 
 import logging
+import os
+import shlex
 import shutil
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
 from ..robot import gyro
 from ..utils import adb
-from ..utils.host_update_lock import host_update_lock
-from ..utils.sudo import run_root
+from ..utils.host_update_lock import HostUpdateLockError, host_update_lock
+from ..utils.sudo import prime_sudo, run_root
 from . import tracker_install
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
@@ -194,10 +198,39 @@ def _step(label: str, fn: Callable[[], object]) -> bool:
     return True
 
 
+def _root_command() -> list[str]:
+    """The same interpreter and CLI arguments, re-invoked as root."""
+    return [sys.executable, "-m", "almond_axol", *sys.argv[1:]]
+
+
+def _reexec_as_root() -> None:
+    """Escalate the whole command so it can own the host update lock.
+
+    The lock lives in a root-only state directory, and the hosted installer /
+    managed ``axol serve`` already run as root. A developer or operator running
+    this from a source checkout gets the usual one-time ``sudo`` prompt instead
+    of a traceback, and the child keeps this exact interpreter so it provisions
+    the same environment.
+    """
+    command = _root_command()
+    if not prime_sudo():
+        raise SystemExit(
+            "Axol provisioning requires root. Rerun as:\n  sudo " + shlex.join(command)
+        )
+    result = subprocess.run(["sudo", *command], check=False)
+    raise SystemExit(result.returncode)
+
+
 def run(_args: object = None) -> None:
     """Run every provisioning step in order; each self-gates and is idempotent."""
-    with host_update_lock():
-        _run_locked()
+    if os.geteuid() != 0:
+        _reexec_as_root()
+        return
+    try:
+        with host_update_lock():
+            _run_locked()
+    except HostUpdateLockError as exc:
+        raise SystemExit(f"Axol provisioning could not start: {exc}") from exc
 
 
 def _run_locked() -> None:

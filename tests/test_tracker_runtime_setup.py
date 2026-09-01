@@ -160,6 +160,84 @@ class LighthouseRuntimeReadinessTest(unittest.TestCase):
         self.assertFalse(result["runtimeArtifacts"])
 
 
+class LighthouseReattestationTest(unittest.TestCase):
+    def _cache(self, root: Path, revision: str) -> Path:
+        src = root / "libsurvive"
+        (src / "build").mkdir(parents=True)
+        (src / tracker_install._STAMP).write_text(  # noqa: SLF001
+            f"{tracker_install._PINNED_REF}\n{revision}\nold-digest\n"  # noqa: SLF001
+        )
+        (src / tracker_install._INSTALL_MANIFEST).write_text(  # noqa: SLF001
+            "/usr/local/bin/survive-cli\n"
+        )
+        return src
+
+    def test_stale_manifest_format_reattests_without_rebuilding(self) -> None:
+        readiness = [
+            {"installed": False, "available": False, "pinnedBuild": False},
+            {"installed": True, "available": True, "pinnedBuild": True},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            src = self._cache(Path(directory), "libusb-v1")
+            with (
+                patch.object(tracker_install, "_src_dir", return_value=src),
+                patch.object(
+                    tracker_install, "lighthouse_readiness", side_effect=readiness
+                ),
+                patch.object(tracker_install, "prime_sudo", return_value=True),
+                patch.object(
+                    tracker_install, "_install_udev_rule", return_value=True
+                ) as udev,
+                patch.object(
+                    tracker_install, "_install_machine_stamp", return_value=True
+                ) as stamp,
+                patch.object(tracker_install, "_install_build_deps") as deps,
+                patch.object(tracker_install, "_build_and_install") as build,
+            ):
+                self.assertTrue(tracker_install.ensure_installed())
+
+        udev.assert_called_once_with(src)
+        stamp.assert_called_once_with(src)
+        deps.assert_not_called()
+        build.assert_not_called()
+
+    def test_root_run_via_sudo_considers_the_operators_cache(self) -> None:
+        operator = SimpleNamespace(pw_dir="/home/operator")
+        with (
+            patch.object(tracker_install.os, "geteuid", return_value=0),
+            patch.dict(tracker_install.os.environ, {"SUDO_USER": "operator"}),
+            patch.object(tracker_install.pwd, "getpwnam", return_value=operator),
+        ):
+            caches = tracker_install._build_caches()  # noqa: SLF001
+        with (
+            patch.object(tracker_install.os, "geteuid", return_value=0),
+            patch.dict(tracker_install.os.environ, {}, clear=True),
+        ):
+            service_caches = tracker_install._build_caches()  # noqa: SLF001
+
+        self.assertEqual(
+            caches,
+            (
+                Path("/opt/almond/libsurvive"),
+                Path("/home/operator/.almond/libsurvive"),
+            ),
+        )
+        self.assertEqual(service_caches, (Path("/opt/almond/libsurvive"),))
+
+    def test_different_options_or_unfinished_build_are_not_reattestable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            other_options = self._cache(Path(directory) / "a", "hidapi-v0")
+            unfinished = self._cache(Path(directory) / "b", "libusb-v1")
+            (unfinished / tracker_install._INSTALL_MANIFEST).unlink()  # noqa: SLF001
+
+            self.assertFalse(
+                tracker_install._reattestable_build(other_options)  # noqa: SLF001
+            )
+            self.assertFalse(
+                tracker_install._reattestable_build(unfinished)  # noqa: SLF001
+            )
+
+
 class UltimateRuntimeReadinessTest(unittest.TestCase):
     def _inspect(
         self,

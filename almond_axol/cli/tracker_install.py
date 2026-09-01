@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import pwd
 import shutil
 import stat
 import subprocess
@@ -26,6 +27,10 @@ _REPO_URL = "https://github.com/collabora/libsurvive.git"
 _PINNED_REF = "f1e6eddb669320f2a30760f4b42936bdb4306da0"
 # Bump this whenever build options change so existing installations are rebuilt.
 _BUILD_REVISION = "libusb-v2-runtime-attestation"
+# Earlier revisions compiled with the same CMake options as the current one.
+# A build cache stamped with any of these holds byte-identical artifacts, so a
+# stale machine manifest only needs re-attesting rather than a native rebuild.
+_REATTESTABLE_BUILD_REVISIONS = frozenset({_BUILD_REVISION, "libusb-v1"})
 _UDEV_RULE = Path("useful_files/81-vive.rules")
 _STAMP = ".axol-build-stamp"
 _MACHINE_STAMP = Path("/var/lib/almond/libsurvive-build-stamp")
@@ -60,6 +65,25 @@ def _src_dir() -> Path:
     if os.geteuid() == 0:
         return Path("/opt/almond/libsurvive")
     return Path.home() / ".almond" / "libsurvive"
+
+
+def _build_caches() -> tuple[Path, ...]:
+    """Build caches that may already hold the pinned build, preferred first.
+
+    ``sudo axol provision`` runs as root, but a host provisioned earlier by the
+    operator keeps its finished build in that operator's cache. Consider it
+    before rebuilding into the root cache from scratch.
+    """
+    caches = [_src_dir()]
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user:
+        try:
+            home = Path(pwd.getpwnam(sudo_user).pw_dir)
+        except KeyError:
+            home = None
+        if home is not None:
+            caches.append(home / ".almond" / "libsurvive")
+    return tuple(dict.fromkeys(caches))
 
 
 def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 1800) -> bool:
@@ -378,6 +402,19 @@ def _install_machine_stamp(src: Path) -> bool:
     return result.returncode == 0
 
 
+def _reattestable_build(src: Path) -> bool:
+    """Whether ``src`` holds a finished pinned build with the current options."""
+    try:
+        lines = (src / _STAMP).read_text().splitlines()
+    except OSError:
+        return False
+    if len(lines) < 2 or lines[0].strip() != _PINNED_REF:
+        return False
+    if lines[1].strip() not in _REATTESTABLE_BUILD_REVISIONS:
+        return False
+    return (src / _INSTALL_MANIFEST).is_file()
+
+
 def _verified_runtime_artifacts(
     manifest: object, *, require_root_control: bool
 ) -> tuple[bool, Path | None]:
@@ -527,6 +564,24 @@ def ensure_installed() -> bool:
         if _install_udev_rule(src) and lighthouse_readiness()["installed"]:
             print("Lighthouse tracking support installed.", flush=True)
             return True
+
+    # A machine manifest that is missing or written in an older format does
+    # not require a native rebuild when this cache already holds the pinned
+    # build: refresh the permissions rule and re-attest the installed files.
+    for cache in _build_caches():
+        if not _reattestable_build(cache):
+            continue
+        print("Re-attesting the installed pinned libsurvive build…", flush=True)
+        if (
+            prime_sudo()
+            and _install_udev_rule(cache)
+            and _install_machine_stamp(cache)
+            and lighthouse_readiness()["installed"]
+        ):
+            print("Lighthouse tracking support installed.", flush=True)
+            return True
+        _logger.warning("re-attestation failed; rebuilding the pinned libsurvive")
+        break
 
     print("Installing Lighthouse tracking build dependencies…", flush=True)
     if not _install_build_deps():

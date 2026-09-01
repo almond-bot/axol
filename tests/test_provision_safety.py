@@ -168,6 +168,7 @@ class ProvisionSafetyTest(unittest.TestCase):
 
     def test_migration_failure_aborts_before_best_effort_steps(self) -> None:
         with (
+            patch.object(provision.os, "geteuid", return_value=0),
             patch.object(
                 provision, "host_update_lock", return_value=contextlib.nullcontext()
             ),
@@ -194,6 +195,7 @@ class ProvisionSafetyTest(unittest.TestCase):
 
         with (
             tempfile.TemporaryDirectory() as zed_sdk,
+            patch.object(provision.os, "geteuid", return_value=0),
             patch.object(
                 provision, "host_update_lock", return_value=contextlib.nullcontext()
             ),
@@ -240,6 +242,54 @@ class ProvisionSafetyTest(unittest.TestCase):
         self.assertIn("Lighthouse tracking (tracker.install)", message)
         self.assertIn("pyzed (zed.install)", message)
         self.assertNotIn("GStreamer + PyGObject", message)
+
+
+class ProvisionEscalationTest(unittest.TestCase):
+    def test_non_root_reexecs_same_interpreter_under_sudo(self) -> None:
+        with (
+            patch.object(provision.os, "geteuid", return_value=1000),
+            patch.object(provision.sys, "argv", ["/venv/bin/axol", "provision"]),
+            patch.object(provision, "prime_sudo", return_value=True),
+            patch.object(
+                provision.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 3),
+            ) as run,
+            patch.object(provision, "host_update_lock") as lock,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            provision.run()
+
+        self.assertEqual(raised.exception.code, 3)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["sudo", provision.sys.executable, "-m", "almond_axol", "provision"],
+        )
+        lock.assert_not_called()
+
+    def test_non_root_without_sudo_explains_instead_of_tracebacking(self) -> None:
+        with (
+            patch.object(provision.os, "geteuid", return_value=1000),
+            patch.object(provision, "prime_sudo", return_value=False),
+            patch.object(provision.subprocess, "run") as run,
+            self.assertRaisesRegex(SystemExit, r"requires root[\s\S]*sudo "),
+        ):
+            provision.run()
+        run.assert_not_called()
+
+    def test_lock_contention_is_reported_without_a_traceback(self) -> None:
+        with (
+            patch.object(provision.os, "geteuid", return_value=0),
+            patch.object(
+                provision,
+                "host_update_lock",
+                side_effect=provision.HostUpdateLockError("another transaction"),
+            ),
+            patch.object(provision, "_run_locked") as locked,
+            self.assertRaisesRegex(SystemExit, "another transaction"),
+        ):
+            provision.run()
+        locked.assert_not_called()
 
 
 if __name__ == "__main__":
