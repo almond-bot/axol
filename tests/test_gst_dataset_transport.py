@@ -90,17 +90,30 @@ def _fake_gate_base(
 ) -> tuple[_GstPipelineBase, dict[str, _FakeValve]]:
     gst = _FakeGst()
     valves = {name: _FakeValve(gst) for name in valve_names}
-    queues = {
-        ("dsenc" if name == "rawvalve" else f"dsenc_{name.rsplit('_', 1)[1]}")
-        + "_outq": _FakeQueue()
-        for name in valve_names
-    }
+    queues: dict[str, _FakeQueue] = {}
+    for name in valve_names:
+        encoder = "dsenc" if name == "rawvalve" else f"dsenc_{name.rsplit('_', 1)[1]}"
+        queues[f"{encoder}_inq"] = _FakeQueue()
+        queues[f"{encoder}_outq"] = _FakeQueue()
     base = _GstPipelineBase()
     base._gst = gst
     base._pipeline = _FakePipeline({**valves, **queues})
     base._pts_perf_offset_s = offset_s
     base.dataset_fps = 30
     return base, valves
+
+
+def _fake_mono_camera() -> tuple[ZedGstCamera, dict[str, _FakeValve]]:
+    base, valves = _fake_gate_base()
+    camera = ZedGstCamera(
+        serial=1,
+        resolution="SVGA",
+        raw_socket_path="/tmp/mono-dataset.sock",
+    )
+    camera._gst = base._gst
+    camera._pipeline = base._pipeline
+    camera._pts_perf_offset_s = base._pts_perf_offset_s
+    return camera, valves
 
 
 class _FakeCoordinatedCamera:
@@ -130,7 +143,19 @@ class GstDatasetTransportTest(unittest.TestCase):
     def assert_dataset_branch_is_backpressure_safe(
         self, pipeline: str, valve_name: str, encoder_name: str, socket_path: str
     ) -> None:
+        input_queue = (
+            f"queue name={encoder_name}_inq leaky=downstream "
+            "max-size-buffers=2 max-size-bytes=0 max-size-time=0"
+        )
         start = pipeline.index(f"valve name={valve_name} drop=false")
+        self.assertNotEqual(
+            pipeline.rfind(
+                "queue leaky=downstream max-size-buffers=2",
+                0,
+                start,
+            ),
+            -1,
+        )
         sink = (
             f"shmsink name={encoder_name}_shmsink socket-path={socket_path} "
             "wait-for-connection=true"
@@ -138,6 +163,20 @@ class GstDatasetTransportTest(unittest.TestCase):
         end = pipeline.index(sink, start) + len(sink)
         branch = pipeline[start:end]
 
+        self.assertIn(input_queue, branch)
+        self.assertIn(
+            "nvvidconv output-buffers=38 ! "
+            "video/x-raw(memory:NVMM),format=I420,width=960,height=600",
+            branch,
+        )
+        self.assertLess(
+            branch.index("nvvidconv output-buffers=38"),
+            branch.index(input_queue),
+        )
+        self.assertLess(
+            branch.index(input_queue),
+            branch.index(f"nvv4l2h264enc name={encoder_name}"),
+        )
         self.assertIn(f"name={encoder_name}", branch)
         self.assertIn("iframeinterval=1 idrinterval=1", branch)
         self.assertIn(
@@ -215,28 +254,68 @@ class GstDatasetEnableBarrierTest(unittest.TestCase):
         self.assertFalse(valve.drop)
         base._finish_dataset_enable(0.0)
 
-    def test_active_episode_expands_bounded_encoded_queue(self) -> None:
+    def test_active_episode_expands_both_bounded_encoder_queues(self) -> None:
         base, _valves = _fake_gate_base()
+        input_queue = base._pipeline.get_by_name("dsenc_inq")
         output_queue = base._pipeline.get_by_name("dsenc_outq")
 
         base._begin_dataset_enable((("rawvalve", "dsenc"),), 100.0)
 
+        self.assertEqual(input_queue.get_property("leaky"), 2)
+        self.assertEqual(input_queue.get_property("max-size-buffers"), 15)
         self.assertEqual(output_queue.get_property("leaky"), 2)
         self.assertEqual(output_queue.get_property("max-size-buffers"), 60)
-        self.assertEqual(output_queue.get_property("max-size-bytes"), 0)
-        self.assertEqual(output_queue.get_property("max-size-time"), 0)
+        for queue in (input_queue, output_queue):
+            self.assertEqual(queue.get_property("max-size-bytes"), 0)
+            self.assertEqual(queue.get_property("max-size-time"), 0)
 
         base._abort_dataset_enable((("rawvalve", "dsenc"),))
+        self.assertEqual(input_queue.get_property("max-size-buffers"), 2)
         self.assertEqual(output_queue.get_property("max-size-buffers"), 2)
 
-    def test_active_queue_depth_scales_with_capture_rate(self) -> None:
+    def test_active_queue_depths_scale_with_dataset_rate(self) -> None:
         base, _valves = _fake_gate_base()
+        base.fps = 60
         base.dataset_fps = 60
+        input_queue = base._pipeline.get_by_name("dsenc_inq")
         output_queue = base._pipeline.get_by_name("dsenc_outq")
 
         base._begin_dataset_enable((("rawvalve", "dsenc"),), 100.0)
 
+        self.assertEqual(input_queue.get_property("max-size-buffers"), 30)
         self.assertEqual(output_queue.get_property("max-size-buffers"), 120)
+
+    def test_normal_close_shrinks_both_queues_only_after_valve_closes(self) -> None:
+        camera, valves = _fake_mono_camera()
+        valve = valves["rawvalve"]
+        input_queue = camera._pipeline.get_by_name("dsenc_inq")
+        output_queue = camera._pipeline.get_by_name("dsenc_outq")
+        camera._set_dataset_queue_depths(camera._raw_gates(), active=True)
+        valve.set_property("drop", False)
+        camera._dataset_enabled = True
+
+        camera.begin_raw_disable()
+
+        self.assertTrue(valve.drop)
+        self.assertEqual(input_queue.get_property("max-size-buffers"), 30)
+        self.assertEqual(output_queue.get_property("max-size-buffers"), 120)
+
+        camera.finish_raw_disable(time.perf_counter() + 1.0)
+        self.assertEqual(input_queue.get_property("max-size-buffers"), 2)
+        self.assertEqual(output_queue.get_property("max-size-buffers"), 2)
+
+    def test_failed_open_closes_valve_and_shrinks_both_queues(self) -> None:
+        camera, valves = _fake_mono_camera()
+        input_queue = camera._pipeline.get_by_name("dsenc_inq")
+        output_queue = camera._pipeline.get_by_name("dsenc_outq")
+
+        camera.begin_raw_enable(100.0)
+        with self.assertRaisesRegex(RuntimeError, "dsenc.*timed out"):
+            camera.finish_raw_enable(0.0)
+
+        self.assertTrue(valves["rawvalve"].drop)
+        self.assertEqual(input_queue.get_property("max-size-buffers"), 2)
+        self.assertEqual(output_queue.get_property("max-size-buffers"), 2)
 
     def test_repeated_enable_does_not_reclose_live_episode(self) -> None:
         base, valves = _fake_gate_base(offset_s=90.0)

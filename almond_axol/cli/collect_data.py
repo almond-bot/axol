@@ -538,6 +538,18 @@ def main(argv: list[str]) -> None:
     _run(cfg)
 
 
+def _resolve_control_trace_prefix(record: str | None) -> str | None:
+    """Resolve an explicitly requested flight-recorder prefix.
+
+    ``VRTeleopConfig.record`` is an opt-in diagnostic. In particular, keep its
+    documented ``None`` default disabled during data collection instead of
+    silently turning every production session into a flight recording.
+    """
+    if not record:
+        return None
+    return resolve_prefix(record)
+
+
 def _run(
     cfg: CollectDataConfig,
     stop_event: "threading.Event | None" = None,
@@ -609,21 +621,17 @@ def _run(
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
 
-        # Always retain a synchronized control trace for hardware collection.
-        # Camera/recorder load is exactly where timing-only faults can appear,
-        # and without the Rust rows a dangerous oscillation leaves only a
-        # five-second aggregate lateness counter. Honour an explicit recorder
-        # name; otherwise create a unique per-session prefix. The IK/cmd taps
-        # still gate themselves to actual tracking, while the Rust/measured
-        # trace is enabled below only after PyRoKi startup and remains active
-        # through guarded returns so recovery-path faults are captured too.
+        # Keep the optional teleop flight recorder coherent across Python and
+        # Rust. An explicit name enables every stage; the documented ``None``
+        # default stays off so production collection does not incur diagnostic
+        # snapshot/compression work unless the operator asks for it. When
+        # enabled, the IK/cmd taps gate themselves to actual tracking, while the
+        # Rust/measured trace is enabled below only after PyRoKi startup and
+        # remains active through guarded returns.
         vrt_cfg = cfg.teleop_config.vr_teleop_config
-        trace_name = vrt_cfg.record or (
-            time.strftime("collect_data_%Y%m%d_%H%M%S")
-            + f"_{time.time_ns() % 1_000_000_000:09d}"
-        )
-        trace_prefix = resolve_prefix(trace_name)
-        vrt_cfg.record = trace_prefix
+        trace_prefix = _resolve_control_trace_prefix(vrt_cfg.record)
+        if trace_prefix is not None:
+            vrt_cfg.record = trace_prefix
     else:
         trace_prefix = None
 

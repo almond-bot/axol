@@ -1404,8 +1404,8 @@ def run_encoded_capture_loop(
                 return
 
             # Trust but verify the raw-valve barrier using the timestamps that
-            # actually reached the recorder. A two-buffer leaky input queue or
-            # a stale NVENC tail can make one first AU later/earlier even though
+            # actually reached the recorder. A bounded leaky input queue or a
+            # stale NVENC tail can make one first AU later/earlier even though
             # every valve crossed the same target. All-intra makes it safe to
             # advance only the lagging streams until their first retained
             # exposures form one valid camera cluster.
