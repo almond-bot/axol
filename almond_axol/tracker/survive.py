@@ -37,6 +37,7 @@ from .base import (
     zup_to_yup_pos,
     zup_to_yup_quat,
 )
+from .lighthouse_survey import LighthouseSurvey
 
 _logger = logging.getLogger(__name__)
 
@@ -61,6 +62,24 @@ _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 # not a setup problem, unlike a persistent base-station channel clash.
 _TRANSIENT_WARNINGS = ("Could not lighthouse more to",)
 _MAX_WARNINGS = 20
+_CHANNEL_CLASH = re.compile(r"Two or more lighthouses are on channel (\d+)")
+
+
+def _lighthouse_record(parts: list[str]) -> tuple[int, str | None] | None:
+    """Base-station (channel, serial) from an ``LH_UP`` / ``LH_POSE`` record.
+
+    ``LH_UP <channel> ax ay az`` marks a station coming up; ``<channel> LH_POSE
+    x y z qw qx qy qz <BaseStationID>`` follows once it is solved and names the
+    station, so two serials on one channel can be reported by name.
+    """
+    try:
+        if len(parts) >= 2 and parts[0] == "LH_UP":
+            return int(parts[1]), None
+        if len(parts) >= 10 and parts[1] == "LH_POSE":
+            return int(parts[0]), f"{int(parts[9]):08x}"
+    except ValueError:
+        return None
+    return None
 
 
 def _setup_warning(line: str) -> str | None:
@@ -96,6 +115,7 @@ class SurviveSource(TrackerSource):
         self._cli_executable: Path | None = None
         self._failure: TrackerSourceError | None = None
         self._warnings: list[str] = []
+        self._survey = LighthouseSurvey()
         # ``SimpleContext`` owns native USB/libsurvive state.  Keep a strong
         # reference until its polling loop has exited and the generated close
         # function has returned successfully.  A failed native call is
@@ -245,10 +265,27 @@ class SurviveSource(TrackerSource):
         with self._lock:
             return list(self._warnings)
 
-    def _note_warning(self, message: str) -> None:
+    def lighthouse_survey(self) -> LighthouseSurvey:
+        """Base stations seen so far (by channel and serial) and any clash."""
         with self._lock:
+            survey = LighthouseSurvey(
+                channels={ch: set(s) for ch, s in self._survey.channels.items()},
+                conflicts=set(self._survey.conflicts),
+                trackers=set(self._poses),
+            )
+        return survey
+
+    def _note_warning(self, message: str) -> None:
+        clash = _CHANNEL_CLASH.match(message)
+        with self._lock:
+            if clash is not None:
+                self._survey.note_conflict(int(clash.group(1)))
             if message not in self._warnings and len(self._warnings) < _MAX_WARNINGS:
                 self._warnings.append(message)
+
+    def _note_lighthouse(self, channel: int, serial: str | None) -> None:
+        with self._lock:
+            self._survey.note_channel(channel, serial)
 
     # -- Internal ---------------------------------------------------------------
 
@@ -416,6 +453,10 @@ class SurviveSource(TrackerSource):
             warning = _setup_warning(line)
             if warning is not None:
                 self._note_warning(warning)
+                continue
+            lighthouse = _lighthouse_record(parts)
+            if lighthouse is not None:
+                self._note_lighthouse(*lighthouse)
                 continue
             if len(parts) < 10 or parts[2] != "POSE":
                 continue
