@@ -18,6 +18,7 @@ from typing import Any
 from ..cli.tracker_ultimate import is_ultimate_tracker_key
 from ..mantis.calibration import (
     CURRENT_TRANSFORM_ENTRY,
+    INVALID_TRANSFORM_ENTRY,
     LEGACY_TRACKER_KEY,
     MANTIS_TCP_TRANSFORM_FILE,
     STALE_TRANSFORM_ENTRY,
@@ -26,6 +27,7 @@ from ..mantis.calibration import (
     classify_tcp_transform_entry,
     current_ultimate_pose_convention,
     design_transform_for,
+    has_conflicting_transform_override,
     parse_quest_tracker_key,
     ultimate_pose_convention_from_entry,
     ultimate_pose_convention_metadata,
@@ -236,14 +238,25 @@ def _saved_transform(
 ) -> tuple[list[float] | None, str, tuple[str, str] | None]:
     if key is None:
         return None, "missing", None
-    side_entries = document.get(side)
+    if side not in document:
+        return None, "missing", None
+    side_entries = document[side]
     if not isinstance(side_entries, dict):
+        return None, INVALID_TRANSFORM_ENTRY, None
+    if ("pos" in side_entries) != ("quat" in side_entries):
+        return None, INVALID_TRANSFORM_ENTRY, None
+    if "pos" in side_entries and "quat" in side_entries:
+        # Match load_tcp_transforms: a complete top-level pos/quat pair makes
+        # the whole side a legacy unkeyed entry, even if hand-edited keys were
+        # mixed into the same object.
         return None, "missing", None
     # A legacy entry is itself {pos, quat}; it is not a measured value for an
     # exact active device and must never be shown as though it were one.
-    entry = side_entries.get(key)
-    if not isinstance(entry, dict):
+    if key not in side_entries:
         return None, "missing", None
+    entry = side_entries[key]
+    if not isinstance(entry, dict):
+        return None, INVALID_TRANSFORM_ENTRY, None
     values, status = classify_tcp_transform_entry(
         key,
         entry,
@@ -277,13 +290,46 @@ def _calibration_snapshot_locked(
             key,
             ultimate_convention,
         )
+        side_document = document.get(side)
+        legacy_unknown = isinstance(side_document, dict) and (
+            ("pos" in side_document and "quat" in side_document)
+            or LEGACY_TRACKER_KEY in side_document
+        )
+        conflicting_hardware_override = (
+            isinstance(side_document, dict)
+            and key is not None
+            and has_conflicting_transform_override(
+                side,
+                key,
+                {side: side_document},
+            )
+        )
         if key is None:
             status = "unbound"
         elif measured is not None and entry_status == CURRENT_TRANSFORM_ENTRY:
             status = "measured"
         elif measured is not None and entry_status == STALE_TRANSFORM_ENTRY:
             status = "stale"
-        elif design_transform_for(side, key) is not None:
+        elif entry_status == INVALID_TRANSFORM_ENTRY:
+            # An exact malformed override suppresses the family default until
+            # the operator fixes or replaces it; report it as not ready.
+            status = "missing"
+        elif legacy_unknown:
+            # Its tracker family and physical mount are unknown, so silently
+            # replacing it with a family default could move the TCP frame.
+            status = "missing"
+        elif conflicting_hardware_override:
+            # Another same-family key may describe a non-standard mount. Keep
+            # it visible instead of hiding it behind the factory value.
+            status = "missing"
+        elif (
+            design_transform_for(
+                side,
+                key,
+                tracker_config_path=TRACKER_CONFIG_FILE,
+            )
+            is not None
+        ):
             status = "factory"
         elif candidate_transform_for(side, key) is not None:
             status = "candidate"

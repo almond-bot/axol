@@ -3,7 +3,9 @@ title: "Data Collection"
 description: "Record VR teleoperation episodes to a LeRobot dataset — from the web control panel or the CLI."
 ---
 
-Data collection records teleoperation episodes plus synchronized camera frames into a [LeRobot](/api/lerobot) dataset you can later train on. Axol records joint trajectories; **Mantis** records Cartesian TCP poses from Quest, Lighthouse, or Ultimate tracking. Everything runs on **one machine**: the computer wired to the hardware with the ZED cameras attached (typically a ZED Box / Jetson), so images and actions share one clock.
+Data collection records teleoperation episodes plus synchronized camera frames into a [LeRobot](/api/lerobot) dataset you can later train on. Axol records joint trajectories by default and can record Cartesian TCP poses with **Observe Cartesian**; **Mantis** records Cartesian TCP poses from Quest, Lighthouse, or Ultimate tracking. Everything runs on **one machine**: the computer wired to the hardware with the ZED cameras attached (typically a ZED Box / Jetson), so images and actions share one clock.
+
+Axol and Mantis episodes can share one dataset. For each on-robot run, enable **Observe Cartesian** so its state/action schema matches Mantis, and keep the gripper capability, camera slots, image resolution, and FPS identical. A dataset created by Mantis may contain `observation.pose_lag`; on-robot recording fills that column automatically. If the dataset began on Axol without it, later Mantis recording keeps the original schema and omits that optional column.
 
 You can launch either profile from the **web control panel** or the **CLI** (`axol collect-data`). Quest uses the **A** button for recording. Managed Lighthouse/Ultimate Mantis runs use a triple rig-trigger gesture, and the control panel can drive every source with on-screen episode buttons.
 
@@ -17,7 +19,7 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
 
 - **Axol installed** ([one-command install](/installation)), CAN up, and the active hardware profile verified. Mantis needs two distinct trigger/gripper channels, normally `can_mantis_l/r`.
 - **At least one ZED camera connected** over GMSL. Axol has overhead / left arm / right arm slots; Mantis has the separately stored Left Mantis / Right Mantis layout.
-- **The selected pose source set up.** Quest needs the VR TLS certificate authorized once. Lighthouse/Ultimate need their Linux runtime, two identified devices, and live trigger nodes. Production Mantis collection also requires measured or bench-verified tracker→TCP transforms for both sides.
+- **The selected pose source set up.** Quest needs the VR TLS certificate authorized once. Lighthouse/Ultimate need their Linux runtime, two identified devices, and live trigger nodes. Production Mantis collection also requires an approved factory or measured tracker→TCP transform for both sides.
 
 <Tip>
   List the connected cameras and their serials from Python:
@@ -74,7 +76,7 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
 
 ## Mantis collection: end-to-end
 
-Complete the matching [Mantis teleop acceptance](/operations/teleop#mantis-teleop-end-to-end) before creating training data. A CAD candidate, legacy unkeyed offset, generic absolute-mode sim, or start-pose-only alignment is not production calibration.
+Complete the matching [Mantis teleop acceptance](/operations/teleop#mantis-teleop-end-to-end) before creating training data. An unapproved CAD candidate, legacy unkeyed offset, generic absolute-mode sim, or start-pose-only alignment is not production calibration; the built-in VIVE factory transforms are approved values.
 
 <Steps>
   <Step title="Select Mantis and assign its cameras">
@@ -90,11 +92,11 @@ Complete the matching [Mantis teleop acceptance](/operations/teleop#mantis-teleo
       </Tab>
 
       <Tab title="Lighthouse">
-        Select **Lighthouse** after installing libsurvive, pairing both VIVE Tracker 3.0 units, and completing **Identify trackers** in Settings → Mantis. Save the measured mounts in that tab's transform editor under the displayed `survive:&lt;codename&gt;` keys; the Tracker 3.0 CAD candidate does not count. Start and wait for two fresh tracker poses **and** two trigger heartbeats. At the start pose, release both rig triggers and squeeze them together once to align/engage.
+        Select **Lighthouse** after installing libsurvive, pairing both VIVE Tracker 3.0 units, and completing **Identify trackers** in Settings → Mantis. The standard flat-back mount uses its factory transform automatically; save a per-device override only for a non-standard mount or refinement. Start and wait for two fresh tracker poses **and** two trigger heartbeats. At the start pose, release both rig triggers and squeeze them together once to align/engage.
       </Tab>
 
       <Tab title="Ultimate">
-        Select **Ultimate** after the one-time Windows pair/map flow. In Settings → Mantis, install the runtime, save the private shared-map AP configuration (not the Windows or robot LAN), physically connect/power the dongle and trackers, complete guided **Identify trackers**, save the measured mounts under the displayed `ultimate:&lt;mac&gt;` keys, and choose **Run readiness check**. The bundled 11 mm origin-adjusted transform remains a candidate and does not satisfy the production calibration gate. Windows VIVE pairing/map creation and the requested physical movement remain operator steps; the rest is available in the panel. Start only with both trackers localized in the shared map and both trigger nodes live. At the start pose, release both rig triggers and squeeze them together once. See the [UI and CLI setup routes](/cli/tracker#vive-ultimate-tracker-setup-dongle--pyvut).
+        Select **Ultimate** after the one-time Windows pair/map flow. In Settings → Mantis, install the runtime, save the private shared-map AP configuration, connect/power the dongle and trackers, complete guided **Identify trackers**, and choose **Run readiness check**. The standard flat-back mount automatically uses the approved 11 mm origin-adjusted factory transform under the pinned `wxyz` / z-up convention; measured entries are optional overrides. Start only with both trackers localized in the shared map and both trigger nodes live. At the start pose, release both rig triggers and squeeze them together once. See the [UI and CLI setup routes](/cli/tracker#vive-ultimate-tracker-setup-dongle--pyvut).
       </Tab>
     </Tabs>
   </Step>

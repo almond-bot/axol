@@ -761,12 +761,12 @@ function SourceChecklist({
           Hold both rigs at the configured rest pose; when both trackers and trigger channels are
           live, release both triggers, then squeeze them together to align and engage. Before
           re-engaging after tracking loss or Reset, restore both inputs and repeat that full
-          release→together-squeeze gesture. Before production collection, enter each bench-verified
-          mount transform in the calibration editor below; it is attached to the Ultimate MAC
-          identified for that side. A connected Quest can still show cameras and the recording HUD,
-          but its SLAM world is unrelated to the Ultimate map. The 3D robot overlay stays hidden
-          unless those origins and yaw have been explicitly co-registered; do not use an
-          unregistered overlay to approve a mount transform.
+          release→together-squeeze gesture. The standard flat-back mount uses the built-in Ultimate
+          factory transform; use the editor below only for a non-standard or per-unit override. A
+          connected Quest can still show cameras and the recording HUD, but its SLAM world is
+          unrelated to the Ultimate map. The 3D robot overlay stays hidden unless those origins and
+          yaw have been explicitly co-registered; do not use an unregistered overlay to approve a
+          mount transform.
         </SetupStep>
       </Checklist>
     )
@@ -801,12 +801,11 @@ function SourceChecklist({
         configured rest pose. Once both trackers and trigger channels are live, release both
         triggers, then squeeze them together to confirm the start-pose alignment and engage. Before
         re-engaging after occlusion or Reset, restore both trackers and repeat the full
-        release→together-squeeze gesture. Before production collection, enter each bench-verified
-        mount transform in the calibration editor below; it is attached to the libsurvive tracker ID
-        identified for that side. A connected Quest can still show cameras and the recording HUD,
-        but its local-floor world is unrelated to Lighthouse. The 3D robot overlay stays hidden
-        unless the two worlds have been explicitly co-registered; do not use an unregistered overlay
-        to approve a transform.
+        release→together-squeeze gesture. The standard flat-back mount uses the built-in Tracker 3.0
+        factory transform; use the editor below only for a non-standard or per-unit override. A
+        connected Quest can still show cameras and the recording HUD, but its local-floor world is
+        unrelated to Lighthouse. The 3D robot overlay stays hidden unless the two worlds have been
+        explicitly co-registered; do not use an unregistered overlay to approve a transform.
       </SetupStep>
     </Checklist>
   )
@@ -939,7 +938,7 @@ function SourceReadinessBadges({
                   ? "error"
                   : transform === "candidate" || transform === "stale"
                     ? "warning"
-                    : transform === "measured"
+                    : transform === "measured" || transform === "factory"
                       ? "ready"
                       : "neutral"
               }

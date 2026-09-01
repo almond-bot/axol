@@ -175,14 +175,12 @@ class VRTeleopConfig:
             start-pose-only engage alignment, which is useful for bring-up but
             not production Cartesian data.
         tcp_transform_right: Same for the right rig.
-        tracker_key: Identity key of the active tracker (e.g.
-            ``"quest:meta-quest-touch-plus:grip"``, ``"survive:T20"``, or
-            ``"ultimate:<mac>"``) used to select the matching per-tracker
-            entry from the saved calibration file when
-            ``tcp_transform_left`` / ``tcp_transform_right`` are unset.
-            ``None`` (default) uses the operation's explicit Mantis source when
-            available; legacy callers infer it from the saved tracker config
-            (file present → its backend/devices, absent → ``"quest"``).
+        tracker_key: Quest controller datum key (for example
+            ``"quest:meta-quest-touch-plus:grip"``). Hardware sources always
+            resolve their distinct left/right ``survive:<id>`` or
+            ``ultimate:<mac>`` bindings from tracker config; one singular key
+            cannot safely identify both devices. ``None`` (default) selects a
+            sole saved Quest profile when unambiguous.
         quest_controller_profile: Expected WebXR controller profile for a
             calibrated Quest rig (for example ``"oculus-touch-v3"``). A
             profile-scoped transform key of the form
@@ -283,7 +281,8 @@ def apply_mantis_teleop_profile(
     Also resolves the tracker→gripper transform per side into
     ``tcp_transform_left`` / ``tcp_transform_right``, first match wins:
     explicitly set config values; the override-file entry for the active
-    tracker (``config.tracker_key``, or derived from ``tracker_source`` — see
+    tracker (the Quest ``config.tracker_key`` or the hardware source's distinct
+    per-side binding — see
     :func:`almond_axol.mantis.calibration.tracker_key_for_side`); the rig's
     factory design transform for the tracker family
     (:data:`~almond_axol.mantis.calibration.DESIGN_TCP_TRANSFORMS` — a design
@@ -329,16 +328,24 @@ def apply_mantis_teleop_profile(
 
     if config.tcp_transform_left is None or config.tcp_transform_right is None:
         from ..mantis.calibration import (
+            INVALID_TRANSFORM_ENTRY,
             LEGACY_TRACKER_KEY,
             MANTIS_TCP_TRANSFORM_FILE,
+            STALE_TRANSFORM_ENTRY,
             design_transform_for,
+            has_conflicting_transform_override,
             load_tcp_transforms,
             parse_quest_tracker_key,
             select_quest_transform_key,
             tracker_key_for_side,
         )
 
-        saved = load_tcp_transforms()
+        entry_statuses: dict[tuple[str, str], str] = {}
+        document_errors: list[str] = []
+        saved = load_tcp_transforms(
+            entry_statuses=entry_statuses,
+            document_errors=document_errors,
+        )
         if tracker_source == "quest" and config.tracker_key is None:
             config.tracker_key = select_quest_transform_key(saved)
             if config.tracker_key is not None:
@@ -364,18 +371,45 @@ def apply_mantis_teleop_profile(
                     )
                 config.quest_controller_profile = profile
                 config.quest_pose_space = pose_space
+        # Quest has one profile/pose-space datum shared by handedness. Hardware
+        # sources bind two distinct device IDs, so a singular override must not
+        # make the left device's calibration authorize the right rig.
+        tracker_override = (
+            config.tracker_key
+            if tracker_source == "quest"
+            or (
+                tracker_source is None
+                and config.tracker_key is not None
+                and config.tracker_key.split(":", 1)[0] == "quest"
+            )
+            else None
+        )
         for side in ("left", "right"):
             attr = f"tcp_transform_{side}"
             if getattr(config, attr) is not None:
                 continue
             key, reason = tracker_key_for_side(
                 side,
-                override=config.tracker_key,
+                override=tracker_override,
                 source=tracker_source,
             )
             entries = saved.get(side, {})
             design = design_transform_for(side, key)
             scoped_quest_key = parse_quest_tracker_key(key)
+            blocked_override = (
+                bool(document_errors)
+                or entry_statuses.get((side, key))
+                in {
+                    STALE_TRANSFORM_ENTRY,
+                    INVALID_TRANSFORM_ENTRY,
+                }
+                or has_conflicting_transform_override(
+                    side,
+                    key,
+                    saved,
+                    entry_statuses,
+                )
+            )
             if key in entries and not (
                 tracker_source == "quest" and scoped_quest_key is None
             ):
@@ -386,17 +420,6 @@ def apply_mantis_teleop_profile(
                     key,
                     reason,
                 )
-            elif design is not None:
-                setattr(config, attr, design)
-                _logger.info(
-                    "Mantis %s: using the rig's factory tracker→gripper transform "
-                    "for tracker %r (%s) — a design constant of the standard "
-                    "mount. A per-unit entry in %s overrides it.",
-                    side,
-                    key,
-                    reason,
-                    MANTIS_TCP_TRANSFORM_FILE,
-                )
             elif tracker_source is None and LEGACY_TRACKER_KEY in entries:
                 setattr(config, attr, entries[LEGACY_TRACKER_KEY])
                 _logger.warning(
@@ -404,6 +427,27 @@ def apply_mantis_teleop_profile(
                     "falling back to a LEGACY entry measured with an unknown "
                     "tracker. If the tracker changed since, this transform "
                     "is wrong; re-key or delete the entry in %s.",
+                    side,
+                    key,
+                    reason,
+                    MANTIS_TCP_TRANSFORM_FILE,
+                )
+            elif blocked_override:
+                _logger.warning(
+                    "Mantis %s: calibration state for tracker %r is unreadable, "
+                    "stale, invalid, or scoped to another device of this family. "
+                    "Refusing to hide it with the standard factory transform; "
+                    "fix, re-key, or remove the conflicting state in %s.",
+                    side,
+                    key,
+                    MANTIS_TCP_TRANSFORM_FILE,
+                )
+            elif design is not None:
+                setattr(config, attr, design)
+                _logger.info(
+                    "Mantis %s: using the rig's factory tracker→gripper transform "
+                    "for tracker %r (%s) — a design constant of the standard "
+                    "mount. A per-unit entry in %s overrides it.",
                     side,
                     key,
                     reason,

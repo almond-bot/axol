@@ -273,7 +273,7 @@ export function OperationPanel({
       )
       if (!transformReady) {
         blockers.push(
-          "Add measured or verified tracker-to-TCP transforms to ~/.almond/mantis/tcp_transform.json"
+          "Provide approved factory or measured tracker-to-TCP transforms in Mantis settings"
         )
       }
       if (

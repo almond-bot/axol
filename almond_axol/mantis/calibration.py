@@ -1,9 +1,9 @@
-"""The Mantis rig's tracker→TCP transforms: verified constants + overrides.
+"""The Mantis rig's tracker→TCP transforms: factory constants + overrides.
 
-The rig's tracker mounts are a fixed design, so a bench-verified rigid
+The rig's tracker mounts are a fixed design, so an approved rigid
 tracker→gripper transform can be shipped per tracker family in
 :data:`DESIGN_TCP_TRANSFORMS` and applied out of the box. CAD-derived values
-that have not been checked against the live tracker datum remain in
+that have not been approved for the live tracker datum remain in
 :data:`CANDIDATE_TCP_TRANSFORMS`; they are never applied automatically or
 accepted for production collection. A per-unit override
 file at ``~/.almond/mantis/tcp_transform.json`` takes precedence when present
@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
 
@@ -74,6 +75,10 @@ QUEST_POSE_SPACES = frozenset({"grip", "target-ray"})
 ULTIMATE_POSE_CONVENTION_FIELD = "ultimate_pose_convention"
 ULTIMATE_QUAT_ORDERS = frozenset({"xyzw", "wxyz"})
 ULTIMATE_UP_AXES = frozenset({"y", "z"})
+# Convention under which the approved Ultimate factory transform is expressed.
+# A different parser basis needs its own approved transform instead of silently
+# reusing these numbers in a differently reported tracker frame.
+ULTIMATE_FACTORY_POSE_CONVENTION = ("wxyz", "z")
 CURRENT_TRANSFORM_ENTRY = "current"
 STALE_TRANSFORM_ENTRY = "stale"
 INVALID_TRANSFORM_ENTRY = "invalid"
@@ -98,7 +103,7 @@ _ULTIMATE_CAD_ORIGIN_DELTA_Z_M = (
 #     delta_p_TG = -R_TG @ delta_O.
 #
 # Rx(+90 deg) maps CAD +z to tracker -y, so negating the +11 mm origin shift
-# produces +11 mm on the candidate's tracker-y TCP component. This is a mount-
+# produces +11 mm on the Ultimate tracker-y TCP component. This is a mount-
 # frame derivation, not the bridge's z-up-world -> y-up-world basis relabel.
 _ULTIMATE_TRACKER_Y_TCP_DELTA_M = _ULTIMATE_CAD_ORIGIN_DELTA_Z_M
 # A tracker mounted to a hand-held gripper cannot plausibly be farther than a
@@ -106,8 +111,8 @@ _ULTIMATE_TRACKER_Y_TCP_DELTA_M = _ULTIMATE_CAD_ORIGIN_DELTA_Z_M
 # example entering 47 instead of 0.047) before it can authorize collection.
 MAX_TCP_TRANSLATION_M = 1.0
 
-# Tracker→gripper transform candidates and eventual bench-verified factory
-# values for the Mantis rig's standard mounts are keyed by tracker backend
+# Tracker→gripper transform candidates and approved factory values for the
+# Mantis rig's standard mounts are keyed by tracker backend
 # family — the part of a tracker key before the ":" (``"survive:T20"`` →
 # ``"survive"``). Only entries promoted into ``DESIGN_TCP_TRANSFORMS`` below
 # are factory values that apply out of the box; a per-unit measured entry in
@@ -118,10 +123,8 @@ MAX_TCP_TRANSLATION_M = 1.0
 # gripper flange 92 mm forward / 35.5 mm below the tracker's mounting plane,
 # gripper pointing forward, jaw travel lateral. Expressed in the bridge's
 # tracker frame (libsurvive head frame with the z-up→y-up body relabel).
-# The jaw-travel sign gives a 180°-roll alternate candidate
-# ([0, 0.7071068, 0.7071068, 0]); the shipped choice is pending the one-time
-# URDF-overlay bench check — flip here if the overlay shows the virtual
-# gripper rolled half a turn.
+# The tracker and Mantis CAD frames use the approved standard mounting
+# orientation; no additional axis flip or 180° correction is applied.
 #
 # Each entry is ``[x, y, z, qx, qy, qz, qw]``: the gripper TCP frame
 # expressed in that tracker's device-local frame as the bridge/headset
@@ -141,16 +144,16 @@ MAX_TCP_TRANSLATION_M = 1.0
 # mount-dependent, so production collection rejects the missing transform.
 #
 # ultimate (Vive Ultimate Tracker, standard mount): starts from the Tracker 3.0
-# candidate above. :data:`VIVE_TRACKER_CAD_ORIGINS_MM` records their respective
-# [47, 0, 35] mm and [47, 0, 46] mm reference origins. The common 47/0
+# factory transform above. :data:`VIVE_TRACKER_CAD_ORIGINS_MM` records their
+# respective [47, 0, 35] mm and [47, 0, 46] mm reference origins. The common 47/0
 # coordinates cancel and establish delta_O = [0, 0, +11] mm in the shared
 # gripper/CAD frame. With the inherited R_TG = Rx(+90 deg),
 # delta_p_TG = -R_TG @ delta_O = [0, +11, 0] mm. Applying that tracker-y delta
-# to the V3 candidate's independently derived 35.5 mm component gives 46.5 mm;
-# the -92 mm forward offset and mount rotation are inherited. pyvut's axes and
-# quaternion still require a physical bench overlay, so this remains a
-# candidate and must not be promoted to DESIGN_TCP_TRANSFORMS yet.
-CANDIDATE_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
+# to the V3 transform's independently derived 35.5 mm component gives 46.5 mm;
+# the -92 mm forward offset and mount rotation are inherited. The two tracker
+# families use the same local axis directions and the same flat-back mounting
+# orientation, so Ultimate needs no additional rotation.
+DESIGN_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
     "survive": {
         "left": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
         "right": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
@@ -177,10 +180,10 @@ CANDIDATE_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
     },
 }
 
-# Only values promoted after a live URDF-overlay bench check belong here.
-# Collection treats absence from this mapping as uncalibrated even when a CAD
-# candidate exists above.
-DESIGN_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {}
+# Unapproved CAD starting points may be exposed here without making them
+# usable for production collection. All currently known Vive transforms above
+# are approved factory constants, so there are no remaining candidates.
+CANDIDATE_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {}
 
 
 def validate_tcp_transform(transform: object) -> list[float]:
@@ -228,12 +231,19 @@ def validate_tcp_transform(transform: object) -> list[float]:
     return values
 
 
-def design_transform_for(side: str, tracker_key: str) -> list[float] | None:
-    """The rig's bench-verified transform for ``side``, or ``None``.
+def design_transform_for(
+    side: str,
+    tracker_key: str,
+    *,
+    tracker_config_path: Path | None = None,
+) -> list[float] | None:
+    """The rig's approved factory transform for ``side``, or ``None``.
 
     ``tracker_key`` is matched by backend family only (device identity does
-    not change the design constant — every Tracker 3.0 sits on the same
-    mount). Returns ``[x, y, z, qx, qy, qz, qw]`` like a calibration entry.
+    not change the design constant — every hardware tracker of one family
+    sits on the same mount). Ultimate's factory value is returned only under
+    the pose-parser convention for which it was approved. Returns
+    ``[x, y, z, qx, qy, qz, qw]`` like a calibration entry.
     """
     family = tracker_key.split(":", 1)[0]
     # Quest controller frames are profile- and pose-space-specific. A future
@@ -243,6 +253,12 @@ def design_transform_for(side: str, tracker_key: str) -> list[float] | None:
     # datum, so their family default remains appropriate.
     lookup = tracker_key if family == "quest" else family
     if family == "quest" and parse_quest_tracker_key(tracker_key) is None:
+        return None
+    if (
+        family == "ultimate"
+        and current_ultimate_pose_convention(tracker_config_path)
+        != ULTIMATE_FACTORY_POSE_CONVENTION
+    ):
         return None
     return DESIGN_TCP_TRANSFORMS.get(lookup, {}).get(side)
 
@@ -254,6 +270,40 @@ def candidate_transform_for(side: str, tracker_key: str) -> list[float] | None:
     if family == "quest" and parse_quest_tracker_key(tracker_key) is None:
         return None
     return CANDIDATE_TCP_TRANSFORMS.get(lookup, {}).get(side)
+
+
+def has_conflicting_transform_override(
+    side: str,
+    tracker_key: str,
+    transforms: Mapping[str, Mapping[str, object]],
+    entry_statuses: Mapping[tuple[str, str], str] | None = None,
+) -> bool:
+    """Whether saved state must suppress a hardware factory fallback.
+
+    An exact active-device entry is handled by the caller. Legacy, bare-family,
+    and same-family entries for a different device may describe a non-standard
+    mount, so silently replacing them after a rebind would be unsafe. Overrides
+    for another tracker family do not conflict.
+    """
+    saved_keys: set[str] = {
+        key for key in transforms.get(side, {}) if isinstance(key, str)
+    }
+    if entry_statuses is not None:
+        saved_keys.update(
+            key
+            for (entry_side, key) in entry_statuses
+            if entry_side == side and isinstance(key, str)
+        )
+    if LEGACY_TRACKER_KEY in saved_keys:
+        return True
+    family = tracker_key.split(":", 1)[0]
+    if family not in {"survive", "ultimate"}:
+        return False
+    for saved_key in saved_keys:
+        same_family = saved_key == family or saved_key.startswith(f"{family}:")
+        if same_family and (saved_key != tracker_key or tracker_key == family):
+            return True
+    return False
 
 
 def parse_quest_tracker_key(tracker_key: str) -> tuple[str, str] | None:
@@ -366,6 +416,8 @@ def load_tcp_transforms(
     path: Path | None = None,
     *,
     tracker_config_path: Path | None = None,
+    entry_statuses: dict[tuple[str, str], str] | None = None,
+    document_errors: list[str] | None = None,
 ) -> dict[str, dict[str, list[float]]]:
     """Load saved transforms as ``{side: {tracker_key: [x, y, z, qx..qw]}}``.
 
@@ -374,7 +426,12 @@ def load_tcp_transforms(
     per-tracker keying, so which tracker they were measured with is unknown.
     Ultimate entries are returned only when their saved pose convention exactly
     matches the active tracker config; convention-less and mismatched entries
-    remain on disk for explicit adoption but are not authoritative.
+    remain on disk for explicit adoption but are not authoritative. When
+    ``entry_statuses`` is supplied, it receives the classification of every
+    string-keyed entry so callers do not silently fall back to a factory value
+    over an exact stale or malformed per-device override. ``document_errors``
+    receives a safe diagnostic when a present file cannot be trusted; only an
+    actually absent file permits an unconditional factory fallback.
 
     Returns an empty dict when no calibration exists or the file is invalid
     (teleop may use its explicitly warned, start-pose-only fallback; production
@@ -400,19 +457,33 @@ def load_tcp_transforms(
         data = json.loads(secure_read_text(path))
     except (OSError, ValueError) as exc:
         _logger.warning("could not read %s: %s", path, exc)
+        if document_errors is not None:
+            document_errors.append("calibration file is unreadable or invalid JSON")
         return {}
     if not isinstance(data, dict):
+        if document_errors is not None:
+            document_errors.append("calibration file root is not an object")
         return {}
     out: dict[str, dict[str, list[float]]] = {}
     legacy_seen = False
     ultimate_convention_loaded = False
     ultimate_convention: tuple[str, str] | None = None
     for side in ("left", "right"):
+        if side not in data:
+            continue
         side_entries = data.get(side)
         if _is_legacy_side_entry(side_entries):
             side_entries = {LEGACY_TRACKER_KEY: side_entries}
             legacy_seen = True
         if not isinstance(side_entries, dict):
+            if document_errors is not None:
+                document_errors.append(f"calibration `{side}` section is not an object")
+            continue
+        if ("pos" in side_entries) != ("quat" in side_entries):
+            if document_errors is not None:
+                document_errors.append(
+                    f"calibration `{side}` legacy section is incomplete"
+                )
             continue
         for key, entry in side_entries.items():
             if _is_ultimate_transform_key(key) and not ultimate_convention_loaded:
@@ -425,6 +496,8 @@ def load_tcp_transforms(
                 entry,
                 ultimate_convention=ultimate_convention,
             )
+            if entry_statuses is not None and isinstance(key, str):
+                entry_statuses[(side, key)] = status
             if flat is not None and status == CURRENT_TRANSFORM_ENTRY:
                 out.setdefault(side, {})[key] = flat
             elif flat is not None and status == STALE_TRANSFORM_ENTRY:

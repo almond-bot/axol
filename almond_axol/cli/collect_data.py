@@ -202,8 +202,11 @@ def _prepare_mantis_collection(cfg: "CollectDataConfig") -> None:
 def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
     """Reject transforms whose tracker identity/datum is not production-safe."""
     from ..mantis.calibration import (
+        INVALID_TRANSFORM_ENTRY,
         MANTIS_TCP_TRANSFORM_FILE,
+        STALE_TRANSFORM_ENTRY,
         design_transform_for,
+        has_conflicting_transform_override,
         load_tcp_transforms,
         parse_quest_tracker_key,
         tracker_key_for_side,
@@ -261,7 +264,12 @@ def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
     # the authoritative measured/factory value for each active tracker and
     # require the final value sent to IK to match it. This also keeps the
     # server's readiness gate and the last CLI preflight equivalent.
-    saved = load_tcp_transforms()
+    entry_statuses: dict[tuple[str, str], str] = {}
+    document_errors: list[str] = []
+    saved = load_tcp_transforms(
+        entry_statuses=entry_statuses,
+        document_errors=document_errors,
+    )
     missing: list[tuple[str, str]] = []
     mismatched: list[tuple[str, str]] = []
     for side in ("left", "right"):
@@ -279,7 +287,21 @@ def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
         # allowed to cover a whole hardware family.
         device_scoped = cfg.mantis_source == "quest" or bool(key.partition(":")[2])
         authoritative = entries.get(key) if device_scoped else None
-        if authoritative is None:
+        blocked_override = (
+            bool(document_errors)
+            or entry_statuses.get((side, key))
+            in {
+                STALE_TRANSFORM_ENTRY,
+                INVALID_TRANSFORM_ENTRY,
+            }
+            or has_conflicting_transform_override(
+                side,
+                key,
+                saved,
+                entry_statuses,
+            )
+        )
+        if authoritative is None and not blocked_override:
             authoritative = design_transform_for(side, key)
         if authoritative is None:
             missing.append((side, key))

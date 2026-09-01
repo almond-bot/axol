@@ -199,9 +199,9 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
             self.assertEqual(result["keys"]["left"], "survive:LHR-LEFT")
             self.assertEqual(result["left"]["status"], "measured")
             self.assertEqual(result["left"]["quat"], [0.0, 0.0, 0.0, 1.0])
-            # The CAD candidate is status-only; it must not appear as current
-            # measured editor values for the untouched side.
-            self.assertEqual(result["right"]["status"], "candidate")
+            # The factory value applies without appearing as measured editor
+            # data for the untouched side.
+            self.assertEqual(result["right"]["status"], "factory")
             self.assertIsNone(result["right"]["pos"])
             self.assertIsNone(result["right"]["quat"])
             saved = json.loads(calibration_path.read_text())
@@ -237,7 +237,7 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                     },
                 )
                 for side in ("left", "right"):
-                    self.assertEqual(ultimate[side]["status"], "candidate")
+                    self.assertEqual(ultimate[side]["status"], "factory")
                     self.assertIsNone(ultimate[side]["pos"])
                     self.assertIsNone(ultimate[side]["quat"])
 
@@ -263,6 +263,78 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                     ULTIMATE_POSE_CONVENTION_FIELD,
                     saved["right"][quest_key],
                 )
+
+    def test_malformed_exact_override_suppresses_factory_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "tracker.json"
+            calibration_path = root / "tcp.json"
+            self._tracker_config(config_path)
+            calibration_path.write_text(
+                json.dumps(
+                    {
+                        "left": {"ultimate:a:b:c:d:e:f": []},
+                        "right": {"ultimate:1:2:3:4:5:6": "invalid"},
+                    }
+                )
+            )
+            with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
+                snapshot = tracker_setup.calibration_snapshot(
+                    "ultimate", path=calibration_path
+                )
+            self.assertEqual(snapshot["left"]["status"], "missing")
+            self.assertEqual(snapshot["right"]["status"], "missing")
+
+            mixed = dict(_IDENTITY)
+            mixed["ultimate:a:b:c:d:e:f"] = dict(_IDENTITY)
+            calibration_path.write_text(
+                json.dumps(
+                    {
+                        "left": mixed,
+                        "right": dict(_IDENTITY),
+                    }
+                )
+            )
+            with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
+                snapshot = tracker_setup.calibration_snapshot(
+                    "ultimate", path=calibration_path
+                )
+            self.assertEqual(snapshot["left"]["status"], "missing")
+            self.assertEqual(snapshot["right"]["status"], "missing")
+
+            for override_key in ("ultimate", "ultimate:previous-device"):
+                with self.subTest(override_key=override_key):
+                    calibration_path.write_text(
+                        json.dumps(
+                            {
+                                "left": {override_key: dict(_IDENTITY)},
+                                "right": {override_key: dict(_IDENTITY)},
+                            }
+                        )
+                    )
+                    with patch.object(
+                        tracker_setup, "TRACKER_CONFIG_FILE", config_path
+                    ):
+                        snapshot = tracker_setup.calibration_snapshot(
+                            "ultimate", path=calibration_path
+                        )
+                    self.assertEqual(snapshot["left"]["status"], "missing")
+                    self.assertEqual(snapshot["right"]["status"], "missing")
+
+            calibration_path.write_text(
+                json.dumps(
+                    {
+                        "left": dict(_IDENTITY),
+                        "right": dict(_IDENTITY),
+                    }
+                )
+            )
+            with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
+                snapshot = tracker_setup.calibration_snapshot(
+                    "ultimate", path=calibration_path
+                )
+            self.assertEqual(snapshot["left"]["status"], "missing")
+            self.assertEqual(snapshot["right"]["status"], "missing")
 
     def test_ultimate_calibration_requires_explicit_convention_adoption(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

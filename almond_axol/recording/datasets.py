@@ -34,6 +34,8 @@ _LEROBOT_DEFAULT_FEATURES: dict[str, dict[str, Any]] = {
 # Existing features a recording flow may explicitly opt into carrying. Their
 # exact contracts are still checked: accepting an arbitrary extra column would
 # make LeRobot reject every new row because the recorder cannot populate it.
+# An allowlisted feature may also be absent from an older compatible dataset;
+# the current writer then omits it instead of changing LeRobot's fixed schema.
 RESUME_FILLABLE_FEATURES: dict[str, dict[str, Any]] = {
     "observation.pose_lag": {
         "dtype": "float32",
@@ -152,7 +154,10 @@ def require_dataset_resume_schema(
     fresh feature mapping supplied by the caller. Exact ordered state/action
     names, camera keys/shapes, and frame rate therefore form a safety contract;
     width alone is insufficient because Cartesian and gripperless joint layouts
-    can both contain fourteen values with entirely different meanings.
+    can both contain fourteen values with entirely different meanings. Known
+    ``allowed_extra_features`` are symmetric compatibility columns: the writer
+    can populate them when the stored schema has them and omit them when an
+    older compatible dataset does not.
     """
     unknown_allowlist = allowed_extra_features - RESUME_FILLABLE_FEATURES.keys()
     if unknown_allowlist:
@@ -199,6 +204,8 @@ def require_dataset_resume_schema(
     stored_keys = set(stored) - default_keys
     expected_keys = set(expected_features)
     missing = expected_keys - stored_keys
+    optional_missing = missing & allowed_extra_features
+    missing -= allowed_extra_features
     extras = stored_keys - expected_keys
     unsupported_extras = extras - allowed_extra_features
     problems: list[str] = []
@@ -240,6 +247,16 @@ def require_dataset_resume_schema(
             problems.append(str(exc))
             continue
         if actual_contract != allowed_contract:
+            problems.append(f"mismatched optional {key}")
+
+    for key in sorted(optional_missing):
+        try:
+            expected_contract = _feature_contract(key, expected_features[key])
+            allowed_contract = _feature_contract(key, RESUME_FILLABLE_FEATURES[key])
+        except ValueError as exc:
+            problems.append(str(exc))
+            continue
+        if expected_contract != allowed_contract:
             problems.append(f"mismatched optional {key}")
 
     if problems:

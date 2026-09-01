@@ -1474,8 +1474,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             )
             from ..mantis.calibration import (
                 DESIGN_TCP_TRANSFORMS,
+                INVALID_TRANSFORM_ENTRY,
+                STALE_TRANSFORM_ENTRY,
                 candidate_transform_for,
                 design_transform_for,
+                has_conflicting_transform_override,
                 load_tcp_transforms,
                 parse_quest_tracker_key,
                 select_quest_transform_key,
@@ -1485,7 +1488,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             from .tracker_setup import TrackerSetupError, calibration_snapshot
 
             config = load_tracker_config()
-            saved_transforms = load_tcp_transforms()
+            transform_entry_statuses: dict[tuple[str, str], str] = {}
+            transform_document_errors: list[str] = []
+            saved_transforms = load_tcp_transforms(
+                entry_statuses=transform_entry_statuses,
+                document_errors=transform_document_errors,
+            )
             bindings: dict[str, dict[str, Any]] = {}
             source_status: dict[str, dict[str, Any]] = {}
 
@@ -1496,8 +1504,27 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 for side in ("left", "right"):
                     device = devices.get(side)
                     key = f"{family}:{device}" if device else family
-                    if key in saved_transforms.get(side, {}):
+                    if transform_document_errors:
+                        result[side] = "missing"
+                    elif key in saved_transforms.get(side, {}):
                         result[side] = "measured"
+                    elif (
+                        transform_entry_statuses.get((side, key))
+                        == STALE_TRANSFORM_ENTRY
+                    ):
+                        result[side] = "stale"
+                    elif (
+                        transform_entry_statuses.get((side, key))
+                        == INVALID_TRANSFORM_ENTRY
+                    ):
+                        result[side] = "missing"
+                    elif has_conflicting_transform_override(
+                        side,
+                        key,
+                        saved_transforms,
+                        transform_entry_statuses,
+                    ):
+                        result[side] = "missing"
                     elif design_transform_for(side, key) is not None:
                         result[side] = "factory"
                     elif candidate_transform_for(side, key) is not None:

@@ -178,8 +178,9 @@ export function TrackerCalibrationPanel({
           quaternion in <span className="font-mono text-white/60">qx, qy, qz, qw</span> order.
         </p>
         <p className="text-amber-200/75">
-          Uncalibrated sides stay blank. The UI never inserts an identity placeholder or promotes an
-          unverified CAD candidate; Save requires you to confirm a physical bench measurement.
+          Factory-backed VIVE sides may stay blank; saved values are optional overrides. Other blank
+          sides are uncalibrated. The UI never inserts an identity placeholder, and Save requires
+          you to confirm a physical bench measurement.
         </p>
         {snapshot?.activePoseConvention && (
           <p>

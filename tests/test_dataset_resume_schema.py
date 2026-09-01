@@ -175,6 +175,22 @@ class DatasetResumeSchemaTest(unittest.TestCase):
         }
         self._require(expected_with_pose_lag, allowed=allowed)
 
+        # Axol Cartesian -> Mantis is the reverse direction: the established
+        # dataset has no pose-lag column, so Mantis keeps that fixed schema.
+        self._write_info()
+        self._require(expected_with_pose_lag, allowed=allowed)
+        with self.assertRaisesRegex(ValueError, "missing observation.pose_lag"):
+            self._require(expected_with_pose_lag)
+
+        malformed_expected_pose_lag = deepcopy(expected_with_pose_lag)
+        malformed_expected_pose_lag["observation.pose_lag"]["shape"] = (2,)
+        with self.assertRaisesRegex(
+            ValueError, "mismatched optional observation.pose_lag"
+        ):
+            self._require(malformed_expected_pose_lag, allowed=allowed)
+
+        features = {**deepcopy(EXPECTED_FEATURES), **deepcopy(LEROBOT_DEFAULT_FEATURES)}
+        features.update(deepcopy(RESUME_FILLABLE_FEATURES))
         features["intervention"]["shape"] = (2,)  # type: ignore[index]
         self._write_info(features=features)
         with self.assertRaisesRegex(ValueError, "mismatched optional intervention"):
