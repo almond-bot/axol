@@ -52,7 +52,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from .constants import HEADSET_STREAM_FPS
-from .hw_video import _bitrate_for, dataset_vbr_bitrate, hw_h264_available
+from .hw_video import _bitrate_for, dataset_intra_vbr_bitrate, hw_h264_available
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -542,10 +542,12 @@ def _dataset_enc_shmsink(
     before the parent later closes the branch between episodes.
 
     Encoding runs in VBR with a peak cap so the recorded dataset stays bounded
-    and uniformly sized across cameras even when one sensor is very noisy (see
-    ``dataset_vbr_bitrate``).
+    and uniformly sized across cameras even when one sensor is very noisy. The
+    budget is the all-intra one (``dataset_intra_vbr_bitrate``): every frame is
+    an IDR here, so the predictive-GOP budget would leave each frame visibly
+    blocky.
     """
-    target, peak = dataset_vbr_bitrate(w, h, dataset_fps)
+    target, peak = dataset_intra_vbr_bitrate(w, h, dataset_fps)
     input_buffers = _dataset_active_input_buffers(dataset_fps)
     converter_buffers = input_buffers + _DATASET_VIC_INFLIGHT_SURFACES
     return (

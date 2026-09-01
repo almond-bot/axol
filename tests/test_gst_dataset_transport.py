@@ -11,6 +11,7 @@ from almond_axol.video.gst_zed import (
     ZedGstStereoCamera,
     _GstPipelineBase,
 )
+from almond_axol.video.hw_video import dataset_intra_vbr_bitrate, dataset_vbr_bitrate
 from almond_axol.video.video_proc import _set_dataset_branches_enabled
 
 
@@ -191,6 +192,10 @@ class GstDatasetTransportTest(unittest.TestCase):
         )
         self.assertIn(f"name={encoder_name}", branch)
         self.assertIn("iframeinterval=1 idrinterval=1", branch)
+        # All-IDR frames need the intra budget, not the predictive-GOP one.
+        target, peak = dataset_intra_vbr_bitrate(960, 600, 60)
+        self.assertGreater(target, dataset_vbr_bitrate(960, 600, 60)[0] * 3)
+        self.assertIn(f"bitrate={target} peak-bitrate={peak} ", branch)
         self.assertIn(
             "video/x-h264,stream-format=byte-stream,alignment=au ! "
             f"queue name={encoder_name}_outq leaky=downstream "
