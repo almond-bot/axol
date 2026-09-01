@@ -82,10 +82,15 @@ _ENCODED_POLL_MS = 100
 # the rest of the camera/control stack remains healthy.  Holding the last IDR
 # for those missing cadence slots is bounded corruption (at most 33 ms at
 # 60 Hz) and, unlike accepting the future AU early, does not shift that camera
-# against every subsequent robot-state/dataset row.  More than one event or two
-# frames on a camera is evidence of an unhealthy stream and remains fatal.
-_ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA = 2
-_ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA = 1
+# against every subsequent robot-state/dataset row.  A single hole longer than
+# two frames is fatal, and so is a camera that keeps hiccuping: the ZED
+# sources drop isolated frames in clusters around a record start (both stereo
+# eyes together, or one wrist), so one event per episode aborted nearly every
+# take and homed the arms mid-teleop, but a stream past the per-episode budget
+# below is genuinely unhealthy and still fails closed.
+_ENCODED_MAX_CONCEALED_FRAMES_PER_EVENT = 2
+_ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA = 6
+_ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA = 4
 _ENCODED_GAP_GRID_TOLERANCE_FRAMES = 0.25
 # A just-arrived exposure can precede the newest control snapshot by one control
 # tick. Briefly poll the state ring for the upper bracket; never clamp outside
@@ -963,7 +968,7 @@ def _concealable_encoded_gap_frames(
         return 0
     periods = round(delta * fps)
     missing = periods - 1
-    if not 1 <= missing <= _ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA:
+    if not 1 <= missing <= _ENCODED_MAX_CONCEALED_FRAMES_PER_EVENT:
         return 0
     residual = abs(delta - periods / fps)
     if residual > _ENCODED_GAP_GRID_TOLERANCE_FRAMES / capture_fps:
@@ -1339,12 +1344,13 @@ def run_encoded_capture_loop(
     independent of encoder, shm, and scheduler latency. The blocking per-camera
     read naturally paces the loop to the dataset cadence. A timeout, missing PTS,
     cross-camera phase error, or excessive state skew aborts the episode.  The
-    sole exception is one bounded one/two-frame hole per equal-rate all-intra
-    camera: the prior IDR is repeated on the missing cadence slots while the
-    future AU is held, preserving all subsequent image/camera/state alignment.
-    The repair is warned and returned through ``repair_events`` for a save-time
-    audit log; larger, repeated, predictive, rate-converted, transport, or
-    non-grid losses remain fatal.
+    sole exception is a bounded one/two-frame hole on an equal-rate all-intra
+    camera, within a small per-episode budget of events and frames per camera:
+    the prior IDR is repeated on the missing cadence slots while the future AU
+    is held, preserving all subsequent image/camera/state alignment. The repair
+    is warned and returned through ``repair_events`` for a save-time audit log;
+    larger holes, a camera past its budget, predictive, rate-converted,
+    transport, or non-grid losses remain fatal.
 
     The muxer assigns each AU a constant-fps PTS (``k / fps``), so the mp4
     timeline is exact regardless of arrival jitter; its physical exposure PTS is

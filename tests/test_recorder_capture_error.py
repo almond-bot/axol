@@ -11,6 +11,8 @@ from almond_axol.recording.record_proc import (
     InProcessRecorder,
     RecorderCaptureError,
     RecorderDatasetSaveError,
+    _ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA,
+    _ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA,
     _align_independent_encoded_start,
     _concealable_encoded_gap_frames,
     run_encoded_capture_loop,
@@ -252,7 +254,10 @@ class DatasetRecorderCaptureErrorTest(unittest.TestCase):
         self.assertEqual(repairs, [])
         self.assertRegex(errors[0], "dropped an encoded frame")
 
-    def test_second_gap_event_remains_fatal(self) -> None:
+    def test_repeated_isolated_gaps_within_budget_are_concealed(self) -> None:
+        # The ZED sources drop isolated frames in clusters around a record
+        # start (this session: both overhead eyes at row 12, then again half a
+        # second later). Each hole stays bounded, so the take survives.
         base = time.perf_counter() + 0.1
         step = 1.0 / 60.0
         cameras = {
@@ -267,9 +272,52 @@ class DatasetRecorderCaptureErrorTest(unittest.TestCase):
 
         dataset, errors, repairs, _ = self._run_encoded(cameras, fps=60, rows=5)
 
-        self.assertEqual(len(dataset.rows), 3)
-        self.assertEqual(len(repairs), 1)
-        self.assertEqual(repairs[0]["missing_frames"], 1)
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [row["observation.camera"] for row in dataset.rows],
+            [b"a0", b"a0", b"a2", b"a2", b"a4"],
+        )
+        self.assertEqual([event["missing_frames"] for event in repairs], [1, 1])
+        self.assertEqual([event["frame_index"] for event in repairs], [1, 3])
+
+    def test_gap_past_per_episode_budget_is_fatal(self) -> None:
+        base = time.perf_counter() + 0.1
+        step = 1.0 / 60.0
+        packets = [(b"a0", base, base)]
+        # One event over the per-camera budget, each a single missing frame.
+        for i in range(_ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA + 1):
+            ts = base + 2 * (i + 1) * step
+            packets.append((f"a{2 * (i + 1)}".encode(), ts, base))
+        cameras = {"camera": _EncodedCamera(packets)}
+
+        dataset, errors, repairs, _ = self._run_encoded(
+            cameras, fps=60, rows=len(packets) * 2
+        )
+
+        self.assertEqual(len(repairs), _ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA)
+        self.assertEqual(
+            len(dataset.rows), 2 * _ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA + 1
+        )
+        self.assertRegex(errors[0], "dropped an encoded frame")
+
+    def test_gap_past_per_episode_frame_budget_is_fatal(self) -> None:
+        base = time.perf_counter() + 0.1
+        step = 1.0 / 60.0
+        # Two-frame holes exhaust the frame budget before the event budget.
+        events = _ENCODED_MAX_CONCEALED_FRAMES_PER_CAMERA // 2
+        self.assertLess(events, _ENCODED_MAX_CONCEALMENT_EVENTS_PER_CAMERA)
+        packets = [(b"a0", base, base)]
+        for i in range(events + 1):
+            ts = base + 3 * (i + 1) * step
+            packets.append((f"a{3 * (i + 1)}".encode(), ts, base))
+        cameras = {"camera": _EncodedCamera(packets)}
+
+        dataset, errors, repairs, _ = self._run_encoded(
+            cameras, fps=60, rows=len(packets) * 3
+        )
+
+        self.assertEqual(len(repairs), events)
+        self.assertEqual(len(dataset.rows), 3 * events + 1)
         self.assertRegex(errors[0], "dropped an encoded frame")
 
     def test_row_zero_alignment_advances_only_lagging_all_intra_streams(
