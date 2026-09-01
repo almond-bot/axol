@@ -619,6 +619,18 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=False,
         uses_can_bus=False,
     ),
+    "tracker.lighthouse.check": CommandDef(
+        "tracker.lighthouse.check",
+        "tracker.lighthouse.check",
+        "Check Lighthouse base stations",
+        "Listen to libsurvive briefly and verify every base station uses a "
+        "different channel and both trackers report.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_lighthouse"),
+        requires_hardware=True,
+        uses_can_bus=False,
+    ),
     "tracker.ultimate.install": CommandDef(
         "tracker.ultimate.install",
         "tracker.ultimate.install",

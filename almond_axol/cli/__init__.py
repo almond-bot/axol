@@ -11,6 +11,7 @@ from . import (
     tracker_bridge,
     tracker_identify,
     tracker_install,
+    tracker_lighthouse,
     tracker_pair,
     tracker_ultimate,
 )
@@ -140,6 +141,7 @@ def main() -> None:
     tracker_bridge.add_parser(subparsers)
     tracker_identify.add_parser(subparsers)
     tracker_install.add_parser(subparsers)
+    tracker_lighthouse.add_parser(subparsers)
     tracker_pair.add_parser(subparsers)
     tracker_ultimate.add_parser(subparsers)
     lift_home.add_parser(subparsers)

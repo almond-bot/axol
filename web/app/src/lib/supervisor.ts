@@ -747,6 +747,21 @@ export interface LighthouseTrackerReadiness {
   installedBuildRevision: string | null
   issues: string[]
   transforms: TrackerTransformReadiness
+  /**
+   * Last base-station survey from Check base stations or Identify trackers.
+   * `null` until one has run on this host; absent on older serve hosts.
+   */
+  baseStations?: LighthouseBaseStationSurvey | null
+}
+
+export interface LighthouseBaseStationSurvey {
+  checkedAt: number
+  /** Base-station serials keyed by the channel number shown on the station (1–16). */
+  channels: Record<string, string[]>
+  clashingChannels: number[]
+  baseStationCount: number
+  trackers: string[]
+  problems: string[]
 }
 
 export interface UltimateTrackerReadiness {

@@ -1163,6 +1163,165 @@ class IdentifyDiagnosticsTest(unittest.TestCase):
         )
 
 
+class LighthouseChannelCheckTest(unittest.TestCase):
+    def test_survey_collects_channels_serials_and_clashes_from_the_stream(self) -> None:
+        from almond_axol.tracker import survive
+
+        self.assertEqual(
+            survive._lighthouse_record(  # noqa: SLF001
+                "LH_UP 0 +1.000000e+00 +1.270000e+02 +3.900000e+01".split()
+            ),
+            (0, None),
+        )
+        self.assertEqual(
+            survive._lighthouse_record(  # noqa: SLF001
+                "0 LH_POSE 0.1 0.2 0.3 1 0 0 0 2113888890".split()
+            ),
+            (0, "7dff627a"),
+        )
+        self.assertIsNone(
+            survive._lighthouse_record("0.1 T20 POSE 0 0 0 1 0 0 0".split())  # noqa: SLF001
+        )
+        self.assertIsNone(survive._lighthouse_record(["LH_UP", "x"]))  # noqa: SLF001
+
+        source = SurviveSource()
+        source._note_lighthouse(0, None)  # noqa: SLF001
+        source._note_lighthouse(0, "7dff627a")  # noqa: SLF001
+        source._note_lighthouse(0, "406494d9")  # noqa: SLF001
+        source._note_warning(  # noqa: SLF001
+            "Two or more lighthouses are on channel 0; tracking is most likely going to fail."
+        )
+        survey = source.lighthouse_survey()
+        self.assertEqual(survey.channels, {0: {"7dff627a", "406494d9"}})
+        self.assertEqual(survey.conflicts, {0})
+        self.assertEqual(survey.clashing_channels(), [0])
+        self.assertEqual(survey.base_station_count, 2)
+        # Operators read the number shown on the station, not libsurvive's index.
+        self.assertEqual(
+            survey.clash_problems(),
+            [
+                "base stations 406494D9 and 7DFF627A share channel 1; press the "
+                "channel button on the back of one station until it shows a "
+                "different number"
+            ],
+        )
+        published = survey.to_dict()
+        self.assertEqual(published["channels"], {"1": ["406494D9", "7DFF627A"]})
+        self.assertEqual(published["clashingChannels"], [1])
+
+    def test_two_different_serials_on_one_channel_clash_without_the_warning(
+        self,
+    ) -> None:
+        from almond_axol.tracker.lighthouse_survey import LighthouseSurvey
+
+        survey = LighthouseSurvey()
+        survey.note_channel(2, "aaaaaaaa")
+        survey.note_channel(2, "bbbbbbbb")
+        survey.note_channel(5, "cccccccc")
+        self.assertEqual(survey.clashing_channels(), [2])
+
+        healthy = LighthouseSurvey()
+        healthy.note_channel(0, "aaaaaaaa")
+        healthy.note_channel(1, "bbbbbbbb")
+        self.assertEqual(healthy.problems(), [])
+        self.assertEqual(
+            LighthouseSurvey().problems(),
+            [
+                "no base station was detected; power the base stations and give "
+                "the trackers a clear view of them"
+            ],
+        )
+
+    def test_identify_refuses_to_bind_while_base_stations_share_a_channel(self) -> None:
+        from almond_axol.tracker.lighthouse_survey import LighthouseSurvey
+
+        clashing = LighthouseSurvey()
+        clashing.note_channel(0, "7dff627a")
+        clashing.note_conflict(0)
+        # libsurvive flagged the clash before the second serial was decoded.
+        self.assertEqual(clashing.base_station_count, 2)
+        source = SimpleNamespace(lighthouse_survey=lambda: clashing)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "lighthouse_survey.json"
+            with (
+                patch(
+                    "almond_axol.tracker.lighthouse_survey.LIGHTHOUSE_SURVEY_FILE", path
+                ),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                tracker_identify._check_lighthouse_channels(  # noqa: SLF001
+                    source, ["T20", "T21"]
+                )
+            self.assertIn("channel 1", str(raised.exception))
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved["clashingChannels"], [1])
+            self.assertEqual(saved["trackers"], ["T20", "T21"])
+
+        # Backends without a survey (Ultimate, synthetic) are left alone.
+        tracker_identify._check_lighthouse_channels(  # noqa: SLF001
+            SimpleNamespace(), ["A", "B"]
+        )
+
+    def test_check_command_reports_and_persists_the_survey(self) -> None:
+        from almond_axol.cli import tracker_lighthouse
+        from almond_axol.tracker.lighthouse_survey import LighthouseSurvey
+
+        healthy = LighthouseSurvey()
+        healthy.note_channel(0, "7dff627a")
+        healthy.note_channel(1, "406494d9")
+        healthy.trackers = {"T20", "T21"}
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            failures = tracker_lighthouse.report_survey(healthy)
+        self.assertEqual(failures, 0)
+        self.assertIn("OK   Channel 1          base station 7DFF627A", out.getvalue())
+        self.assertIn("OK   Channel 2          base station 406494D9", out.getvalue())
+        self.assertIn("OK   Trackers           2 reporting (T20, T21)", out.getvalue())
+
+        clashing = LighthouseSurvey()
+        clashing.note_channel(0, "7dff627a")
+        clashing.note_channel(0, "406494d9")
+        clashing.trackers = {"T20"}
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            failures = tracker_lighthouse.report_survey(clashing)
+        self.assertEqual(failures, 2)
+        self.assertIn("FAIL Channel 1", out.getvalue())
+        self.assertIn("FAIL Trackers           1 of 2 reporting (T20)", out.getvalue())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "lighthouse_survey.json"
+            with (
+                patch(
+                    "almond_axol.tracker.lighthouse_survey.LIGHTHOUSE_SURVEY_FILE", path
+                ),
+                patch(
+                    "almond_axol.cli.tracker_lighthouse.LIGHTHOUSE_SURVEY_FILE", path
+                ),
+                patch("almond_axol.cli.mantis_bridge.require_mantis_tracker_readiness"),
+                patch(
+                    "almond_axol.tracker.survive.SurviveSource",
+                    return_value=SimpleNamespace(
+                        start=Mock(), stop=Mock(), poses=Mock(return_value={})
+                    ),
+                ),
+                patch(
+                    "almond_axol.cli.tracker_lighthouse.survey_lighthouses",
+                    return_value=clashing,
+                ),
+                patch("sys.stdout", io.StringIO()),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                tracker_lighthouse.run_check()
+            self.assertEqual(raised.exception.code, 1)
+            from almond_axol.tracker.lighthouse_survey import load_lighthouse_survey
+
+            loaded = load_lighthouse_survey(path)
+            assert loaded is not None
+            self.assertEqual(loaded["clashingChannels"], [1])
+            self.assertEqual(loaded["problems"], clashing.problems())
+
+
 class BridgeCleanupTest(unittest.TestCase):
     def test_identify_start_interrupt_still_stops_partial_backend(self) -> None:
         source = SimpleNamespace(

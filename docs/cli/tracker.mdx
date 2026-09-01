@@ -134,6 +134,16 @@ The command installs build dependencies, builds `survive-cli` with Eigen and the
 
 Pairing and left/right assignment are both available in **Settings → Mantis**. Use **Pair tracker** once for each tracker/dongle pair (the tracker must be unplugged from USB and blinking blue), then use **Identify trackers** to move each Mantis and save its side assignment. The equivalent pairing command is `axol tracker.pair`.
 
+### `axol tracker.lighthouse.check`
+
+Every Base Station 2.0 in view must be on a different channel (the button on its back cycles 1–16). Two stations on the same channel make libsurvive's poses jump or stall as soon as a rig moves, and libsurvive only reports the clash in its log. **Check base stations** in the panel, or:
+
+```bash
+axol tracker.lighthouse.check
+```
+
+listens to libsurvive for about 12 seconds with both trackers powered and in view, then reports one line per base-station channel (with the station serials once decoded) and the trackers that are reporting. It fails when two stations share a channel, no base station is seen, or fewer than two trackers report. The survey is saved to `~/.almond/tracker/lighthouse_survey.json` and gates the **Trackers** step of the panel's setup flow. `axol tracker.identify` performs the same channel check after discovery and refuses to bind while a clash is present.
+
 For a manual fallback, use the same upstream source:
 
 ```bash

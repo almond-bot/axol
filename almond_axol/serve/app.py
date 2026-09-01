@@ -1993,6 +1993,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
         def inspect() -> dict[str, Any]:
             from ..cli.tracker_install import lighthouse_readiness
+            from ..tracker.lighthouse_survey import load_lighthouse_survey
             from ..cli.tracker_ultimate import (
                 is_ultimate_tracker_key,
                 ultimate_runtime_readiness,
@@ -2147,6 +2148,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 **lighthouse,
                 "binding": bindings["survive"],
                 "transforms": transform_status("survive", resolved["survive"]),
+                # Last base-station survey (Check base stations / Identify):
+                # libsurvive only logs a shared channel, so this is the panel's
+                # sole view of it. None until a survey has run on this host.
+                "baseStations": load_lighthouse_survey(),
             }
             ultimate = ultimate_runtime_readiness()
             try:

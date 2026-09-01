@@ -117,6 +117,30 @@ def _report_backend_warnings(source) -> None:  # type: ignore[no-untyped-def]
         print(f"  backend warning: {message}")
 
 
+def _check_lighthouse_channels(source, live: list[str]) -> None:  # type: ignore[no-untyped-def]
+    """Refuse to bind while base stations share a channel.
+
+    A clash makes tracker poses jump or stall as soon as a rig moves, so the
+    motion capture would either fail repeatedly or bind the wrong device. The
+    survey is persisted either way so the control panel can show it.
+    """
+    lighthouse_survey = getattr(source, "lighthouse_survey", None)
+    if lighthouse_survey is None:
+        return
+    from ..tracker.lighthouse_survey import save_lighthouse_survey
+
+    survey = lighthouse_survey()
+    survey.trackers = set(live)
+    save_lighthouse_survey(survey)
+    clashes = survey.clash_problems()
+    if clashes:
+        raise SystemExit(
+            "Base-station channel clash: " + "; ".join(clashes) + ". Identify "
+            "cannot bind trackers reliably until every base station is on its "
+            "own channel."
+        )
+
+
 def run(args) -> None:  # type: ignore[no-untyped-def]
     """Discover trackers, capture per-side motion, save the binding."""
     from ..tracker import create_source, load_tracker_config
@@ -180,6 +204,7 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
         time.sleep(2.0)
         print(f"Discovered and tracking: {', '.join(live)}")
         _report_backend_warnings(source)
+        _check_lighthouse_channels(source, live)
         print()
 
         assigned: dict[str, str] = {}
