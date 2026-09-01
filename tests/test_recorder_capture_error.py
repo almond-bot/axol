@@ -11,7 +11,12 @@ from almond_axol.recording.record_proc import (
     InProcessRecorder,
     RecorderCaptureError,
     RecorderDatasetSaveError,
+    _ENCODED_CONCEALMENT_WINDOW_S,
+    _ENCODED_MAX_CONCEALMENT_EVENTS_PER_WINDOW,
+    _ENCODED_MIN_CONCEALED_FRAMES_PER_CAMERA,
     _align_independent_encoded_start,
+    _concealable_encoded_gap_frames,
+    _concealment_within_budget,
     run_encoded_capture_loop,
 )
 
@@ -52,8 +57,17 @@ class _EncodedCamera:
     capture_fps = 60
     pending = 0
 
-    def __init__(self, packets: list[tuple[bytes, float, float]]) -> None:
+    def __init__(
+        self,
+        packets: list[tuple[bytes, float, float]],
+        *,
+        independent: bool = True,
+        capture_fps: int = 60,
+    ) -> None:
         self.packets = packets
+        self.frames_are_independent = independent
+        self.capture_fps = capture_fps
+        self.reads = 0
 
     def begin_flush(self) -> None:
         pass
@@ -65,22 +79,302 @@ class _EncodedCamera:
         del timeout_ms
         if not self.packets:
             raise TimeoutError
+        self.reads += 1
         return self.packets.pop(0)
 
 
 class _CaptureDataset:
     features: dict = {}
 
-    def __init__(self, stop: threading.Event) -> None:
+    def __init__(self, stop: threading.Event, stop_after: int = 1) -> None:
         self.stop = stop
+        self.stop_after = stop_after
         self.rows: list[dict] = []
 
     def add_frame(self, row: dict) -> None:
         self.rows.append(row)
-        self.stop.set()
+        if len(self.rows) >= self.stop_after:
+            self.stop.set()
 
 
 class DatasetRecorderCaptureErrorTest(unittest.TestCase):
+    def _run_encoded(
+        self,
+        cameras: dict[str, _EncodedCamera],
+        *,
+        fps: int,
+        rows: int,
+    ) -> tuple[_CaptureDataset, list[str], list[dict], list[float]]:
+        stop = threading.Event()
+        dataset = _CaptureDataset(stop, stop_after=rows)
+        errors: list[str] = []
+        repairs: list[dict] = []
+        snapshot_times: list[float] = []
+
+        def snapshot(ts: float) -> tuple[dict, dict, float, bool]:
+            snapshot_times.append(ts)
+            return {"state": 1}, {"target": 2}, ts, False
+
+        def build_frame(_features: dict, values: dict, prefix: str) -> dict:
+            return {f"{prefix}.{name}": value for name, value in values.items()}
+
+        with (
+            patch(
+                "lerobot.utils.feature_utils.build_dataset_frame",
+                side_effect=build_frame,
+            ),
+            patch("lerobot.utils.visualization_utils.log_rerun_data"),
+        ):
+            run_encoded_capture_loop(
+                cameras=cameras,
+                read_snapshot=lambda: (
+                    {"state": 1},
+                    {"target": 2},
+                    time.perf_counter(),
+                    False,
+                ),
+                read_snapshot_nearest=snapshot,
+                dataset=dataset,
+                robot_obs_proc=lambda obs: obs,
+                fps=fps,
+                task="test",
+                rerun_ip=None,
+                stop_event=stop,
+                repair_events=repairs,
+                on_error=errors.append,
+            )
+        return dataset, errors, repairs, snapshot_times
+
+    def test_bounded_gap_concealment_holds_future_au_and_state_grid(self) -> None:
+        base = time.perf_counter() + 0.1
+        step = 1.0 / 60.0
+        cameras = {
+            "camera_a": _EncodedCamera(
+                [(b"a0", base, base), (b"a3", base + 3 * step, base)]
+            ),
+            "camera_b": _EncodedCamera(
+                [
+                    (b"b0", base, base),
+                    (b"b1", base + step, base),
+                    (b"b2", base + 2 * step, base),
+                    (b"b3", base + 3 * step, base),
+                ]
+            ),
+        }
+
+        dataset, errors, repairs, snapshot_times = self._run_encoded(
+            cameras, fps=60, rows=4
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [row["observation.camera_a"] for row in dataset.rows],
+            [b"a0", b"a0", b"a0", b"a3"],
+        )
+        self.assertEqual(
+            [row["observation.camera_b"] for row in dataset.rows],
+            [b"b0", b"b1", b"b2", b"b3"],
+        )
+        self.assertEqual(cameras["camera_a"].reads, 2)
+        self.assertEqual(cameras["camera_b"].reads, 4)
+        self.assertEqual(len(snapshot_times), 4)
+        for actual, expected in zip(
+            snapshot_times, [base + i * step for i in range(4)]
+        ):
+            self.assertAlmostEqual(actual, expected, places=6)
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(repairs[0]["camera"], "camera_a")
+        self.assertEqual(repairs[0]["frame_index"], 1)
+        self.assertEqual(repairs[0]["missing_frames"], 2)
+
+    def test_stop_mid_repair_reports_only_committed_synthetic_rows(self) -> None:
+        base = time.perf_counter() + 0.1
+        step = 1.0 / 60.0
+        cameras = {
+            "camera_a": _EncodedCamera(
+                [(b"a0", base, base), (b"a3", base + 3 * step, base)]
+            ),
+            "camera_b": _EncodedCamera(
+                [(b"b0", base, base), (b"b1", base + step, base)]
+            ),
+        }
+
+        dataset, errors, repairs, _ = self._run_encoded(cameras, fps=60, rows=2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(dataset.rows), 2)
+        self.assertEqual(repairs[0]["frame_index"], 1)
+        self.assertEqual(repairs[0]["missing_frames"], 1)
+        self.assertAlmostEqual(repairs[0]["concealed_ms"], 1000 / 60)
+
+    def test_only_small_equal_rate_independent_grid_gaps_are_concealable(self) -> None:
+        step = 1.0 / 60.0
+
+        self.assertEqual(
+            _concealable_encoded_gap_frames(
+                previous_ts=1.0,
+                capture_ts=1.0 + 3 * step - 0.0002,
+                fps=60,
+                capture_fps=60,
+                frames_are_independent=True,
+            ),
+            2,
+        )
+        for kwargs in (
+            {"capture_ts": 1.0 + 4 * step},
+            {"capture_ts": 1.0 + 2.5 * step},
+            {"capture_ts": 1.0 + 2 * step, "capture_fps": 120},
+            {"capture_ts": 1.0 + 2 * step, "capture_fps": 30},
+            {
+                "capture_ts": 1.0 + 2 * step,
+                "frames_are_independent": False,
+            },
+        ):
+            args = dict(
+                previous_ts=1.0,
+                capture_ts=1.0 + 2 * step,
+                fps=60,
+                capture_fps=60,
+                frames_are_independent=True,
+            )
+            args.update(kwargs)
+            self.assertEqual(_concealable_encoded_gap_frames(**args), 0)
+
+    def test_invalid_lower_capture_rate_cannot_enable_concealment(self) -> None:
+        base = time.perf_counter() + 0.1
+        step = 1.0 / 60.0
+        cameras = {
+            "camera": _EncodedCamera(
+                [(b"a0", base, base), (b"a2", base + 2 * step, base)],
+                capture_fps=30,
+            )
+        }
+
+        dataset, errors, repairs, _ = self._run_encoded(cameras, fps=60, rows=3)
+
+        self.assertEqual(len(dataset.rows), 1)
+        self.assertEqual(repairs, [])
+        self.assertRegex(errors[0], "dropped an encoded frame")
+
+    def test_repeated_isolated_gaps_within_budget_are_concealed(self) -> None:
+        # The ZED sources drop isolated frames in clusters around a record
+        # start (this session: both overhead eyes at row 12, then again half a
+        # second later). Each hole stays bounded, so the take survives.
+        base = time.perf_counter() + 0.1
+        step = 1.0 / 60.0
+        cameras = {
+            "camera": _EncodedCamera(
+                [
+                    (b"a0", base, base),
+                    (b"a2", base + 2 * step, base),
+                    (b"a4", base + 4 * step, base),
+                ]
+            )
+        }
+
+        dataset, errors, repairs, _ = self._run_encoded(cameras, fps=60, rows=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [row["observation.camera"] for row in dataset.rows],
+            [b"a0", b"a0", b"a2", b"a2", b"a4"],
+        )
+        self.assertEqual([event["missing_frames"] for event in repairs], [1, 1])
+        self.assertEqual([event["frame_index"] for event in repairs], [1, 3])
+
+    def test_gap_burst_inside_window_is_fatal(self) -> None:
+        base = time.perf_counter() + 0.1
+        step = 1.0 / 60.0
+        packets = [(b"a0", base, base)]
+        # One event over the burst budget, back to back, each a single frame.
+        for i in range(_ENCODED_MAX_CONCEALMENT_EVENTS_PER_WINDOW + 1):
+            ts = base + 2 * (i + 1) * step
+            packets.append((f"a{2 * (i + 1)}".encode(), ts, base))
+        cameras = {"camera": _EncodedCamera(packets)}
+
+        dataset, errors, repairs, _ = self._run_encoded(
+            cameras, fps=60, rows=len(packets) * 2
+        )
+
+        self.assertEqual(len(repairs), _ENCODED_MAX_CONCEALMENT_EVENTS_PER_WINDOW)
+        self.assertEqual(
+            len(dataset.rows), 2 * _ENCODED_MAX_CONCEALMENT_EVENTS_PER_WINDOW + 1
+        )
+        self.assertRegex(errors[0], "dropped an encoded frame")
+
+    def test_isolated_gaps_every_few_seconds_survive_a_long_take(self) -> None:
+        # Today's overhead pattern: one exposure lost every 1-4 s for the whole
+        # take. Spaced past the burst window and well under the fraction cap,
+        # every hole is repaired.
+        base = time.perf_counter() + 0.1
+        step = 1.0 / 60.0
+        spacing = 90  # frames between the lost exposures (1.5 s at 60 Hz)
+        packets = []
+        frame = 0
+        for _ in range(8):
+            for _ in range(spacing - 1):
+                packets.append((f"a{frame}".encode(), base + frame * step, base))
+                frame += 1
+            frame += 1  # the lost exposure
+        cameras = {"camera": _EncodedCamera(packets)}
+
+        dataset, errors, repairs, _ = self._run_encoded(
+            cameras, fps=60, rows=8 * spacing - 1
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(repairs), 7)
+        self.assertEqual({event["missing_frames"] for event in repairs}, {1})
+
+    def test_concealment_budget_rules(self) -> None:
+        fps = 60
+        window = int(_ENCODED_CONCEALMENT_WINDOW_S * fps)
+        kwargs = dict(concealed_frames=0, missing=1, total_rows=1000, fps=fps)
+        # Two earlier events inside the window leave room for a third only.
+        self.assertTrue(
+            _concealment_within_budget(event_rows=[10, 50], row=100, **kwargs)
+        )
+        self.assertFalse(
+            _concealment_within_budget(event_rows=[10, 50, 90], row=100, **kwargs)
+        )
+        # Once the oldest event ages out of the window a new one fits again.
+        self.assertTrue(
+            _concealment_within_budget(
+                event_rows=[10, 50, 90], row=10 + window, **kwargs
+            )
+        )
+        # The frame allowance is the larger of the floor and the fraction.
+        self.assertTrue(
+            _concealment_within_budget(
+                event_rows=[],
+                row=10,
+                concealed_frames=_ENCODED_MIN_CONCEALED_FRAMES_PER_CAMERA - 1,
+                missing=1,
+                total_rows=10,
+                fps=fps,
+            )
+        )
+        self.assertFalse(
+            _concealment_within_budget(
+                event_rows=[],
+                row=10,
+                concealed_frames=_ENCODED_MIN_CONCEALED_FRAMES_PER_CAMERA,
+                missing=1,
+                total_rows=10,
+                fps=fps,
+            )
+        )
+        self.assertTrue(
+            _concealment_within_budget(
+                event_rows=[],
+                row=10_000,
+                concealed_frames=_ENCODED_MIN_CONCEALED_FRAMES_PER_CAMERA,
+                missing=2,
+                total_rows=10_000,
+                fps=fps,
+            )
+        )
+
     def test_row_zero_alignment_advances_only_lagging_all_intra_streams(
         self,
     ) -> None:

@@ -26,10 +26,12 @@ class _FakeBuffer:
 class _FakeSource:
     def __init__(self) -> None:
         self.pushed = 0
+        self.buffers: list[_FakeBuffer] = []
 
-    def emit(self, signal: str, _buffer: _FakeBuffer) -> str:
+    def emit(self, signal: str, buffer: _FakeBuffer) -> str:
         assert signal == "push-buffer"
         self.pushed += 1
+        self.buffers.append(buffer)
         return "ok"
 
 
@@ -94,6 +96,32 @@ class H264MuxStatsSamplingTest(unittest.TestCase):
         self.assertEqual(muxer._src.pushed, 60)
         self.assertEqual(muxer._count, 60)
         self.assertEqual(len(muxer._stats_worker.samples), 4)
+
+    def test_repeated_idr_still_advances_mux_timeline(self) -> None:
+        muxer = _CameraH264Muxer.__new__(_CameraH264Muxer)
+        muxer._gst = types.SimpleNamespace(
+            SECOND=1_000_000_000,
+            Buffer=_FakeBuffer,
+            FlowReturn=types.SimpleNamespace(OK="ok"),
+        )
+        muxer.video_path = Path("camera.mp4")
+        muxer._dur = muxer._gst.SECOND // 60
+        muxer._count = 0
+        muxer._stats_stride = 15
+        muxer._src = _FakeSource()
+        muxer._stats_worker = None
+
+        muxer.feed(_IDR)
+        muxer.feed(_IDR)
+
+        self.assertEqual(
+            [buffer.pts for buffer in muxer._src.buffers],
+            [0, muxer._dur],
+        )
+        self.assertEqual(
+            [buffer.duration for buffer in muxer._src.buffers],
+            [muxer._dur, muxer._dur],
+        )
 
     def test_fallback_decodes_only_the_stats_stride(self) -> None:
         packets = [_FakePacket(index) for index in range(60)]

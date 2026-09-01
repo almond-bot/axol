@@ -253,8 +253,7 @@ fn collect_feedback(
         if now >= deadline {
             break;
         }
-        sock.set_recv_timeout(deadline - now)?;
-        let Some(f) = sock.recv()? else {
+        let Some(f) = sock.recv_timeout(deadline - now)? else {
             break;
         };
         if !(0x11..=0x14).contains(&f.id) {

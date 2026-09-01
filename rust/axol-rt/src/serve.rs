@@ -1442,6 +1442,7 @@ fn bus_loop(
     let watchdog = Duration::from_secs_f64(cfg.watchdog_ms / 1e3);
     let mut rejected: u64 = 0;
     let mut late: u64 = 0;
+    let mut missed: u64 = 0;
     let mut trace_dropped: u64 = 0;
     let mut ticks: u64 = 0;
     let mut watchdog_frozen = false;
@@ -1733,6 +1734,9 @@ fn bus_loop(
             // window begins when this tick actually began, not at its nominal
             // schedule point: a late wake must not discard shoulder feedback
             // simply because the old absolute deadline has already elapsed.
+            // The wait is hrtimer-precise (`recv_timeout`): a missing reply
+            // must end the window at `reply_deadline`, never a jiffy or two
+            // later, or the overrun lands on the next tick as lateness.
             let reply_deadline = began + period.saturating_sub(REPLY_GUARD);
             let mut seen = vec![false; motors.len()];
             let mut pending = expected.iter().filter(|&&value| value).count();
@@ -1741,8 +1745,9 @@ fn bus_loop(
                 if now >= reply_deadline {
                     break;
                 }
-                sock.set_recv_timeout(reply_deadline - now)?;
-                let Some(frame) = sock.recv()? else { break };
+                let Some(frame) = sock.recv_timeout(reply_deadline - now)? else {
+                    break;
+                };
                 let (idx, pos, vel, tau) = match frame.id {
                     id if (0x501..=0x505).contains(&id) => {
                         let motor_id = (id - 0x500) as u8;
@@ -1826,6 +1831,11 @@ fn bus_loop(
                 }
             }
 
+            // Replies still outstanding at the window's end. Counted into the
+            // periodic stats so a rare miss is visible in the log even when it
+            // stays far below the fail-closed thresholds.
+            missed += pending as u64;
+
             // Never continue phase-sensitive host damping when an arm motor
             // has stopped producing fresh feedback. A single miss suppresses
             // host damping on the next tick; sustained or bursty degradation
@@ -1861,7 +1871,7 @@ fn bus_loop(
                     out_tx,
                     b'L',
                     &format!(
-                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {rejected} rejected targets, {trace_dropped} trace drops, seq {:?}",
+                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {missed} missed replies, {rejected} rejected targets, {trace_dropped} trace drops, seq {:?}",
                         late as f64 / ticks as f64 * 100.0,
                         last_seq,
                     ),

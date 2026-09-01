@@ -15,8 +15,9 @@ During ``collect-data`` the box runs five kinds of work that contend for cores:
   feed is clean; once recording starts, the dataset raw-branch piles onto the
   same cores and starves the send — packets go out late and bursty (0% loss but
   rising jitter), so the live feed gets laggy + grainy.
-* **background** — the dataset recorder + its per-camera NVENC encoders. Pure
-  throughput; tolerant of an occasional dropped frame.
+* **background** — the dataset recorder plus throughput-oriented relay
+  GStreamer work. It may share CPU with camera/VIC/NVENC dispatch, but never
+  with control, IK, CAN, or the latency-sensitive WebRTC Python loop.
 
 Partitioning the cores by role keeps each group off the others': the control
 loop never gets preempted (no jerk), IK solves at full rate, and the relay's send
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 
 _logger = logging.getLogger(__name__)
 
@@ -61,16 +63,15 @@ def core_groups() -> dict[str, set[int]] | None:
     camera/WebRTC bookkeeping made 5-15% of nominal 240 Hz motor ticks late.
     ``ik`` remains a dedicated core so it cannot deschedule CAN or Python.
 
-    The relay gets *two* cores so :func:`isolate_relay_cpu` can split its Python
-    work (the aiortc WebRTC send + encoded-AU pull loops, all GIL-serialized) onto
-    one core and GStreamer's C thread pool (camera capture, NVENC dispatch, and the
-    dataset raw-branch VIC resize + shmsink copy) onto the other. That split is the
-    whole point: naively handing the relay a second *roaming* core does nothing —
-    the Python side is GIL-bound and just ping-pongs the GIL across cores — but
-    physically moving the lock-free C threads off the send's core stops the
-    recording raw-branch from preempting the send (which otherwise starves it:
-    event-loop maxlag 100-385ms, send collapsing ~5000->~1400 pkt/s at 0% loss).
-    The dataset recorder keeps the remaining cores.
+    The relay gets *two* private cores so :func:`isolate_relay_cpu` can keep its
+    Python work (the aiortc WebRTC send + encoded-AU pull loops, all
+    GIL-serialized) on one. GStreamer's much wider C thread pool may use the
+    other relay core **and** the background cores. That split is the whole point:
+    naively letting Python roam just ping-pongs the GIL, while restricting the
+    ~70-80 camera/VIC/NVENC/shm tasks to one CPU can deschedule a dataset branch
+    for multiple 60 Hz exposures. Sharing throughput cores with the mux-only
+    recorder preserves the WebRTC/control isolation without creating that
+    single-core bottleneck.
 
     Below 8 cores there's no room to dedicate an IK core, so ``ik`` shares the
     control group; on 4-5 cores the relay also shares the background group (still
@@ -153,7 +154,7 @@ def pin_background() -> bool:
 
 
 def isolate_relay_cpu() -> bool:
-    """Split the relay's Python threads and GStreamer C threads onto separate cores.
+    """Separate relay Python from GStreamer and give gst throughput headroom.
 
     The relay's latency-critical work — the aiortc WebRTC send (SRTP + sendto for
     every stream) and the encoded-AU pull loops — is all Python, so the GIL
@@ -164,16 +165,15 @@ def isolate_relay_cpu() -> bool:
     moment recording starts, and the feed stutters (event-loop maxlag 100-385ms,
     send ~5000->~1400 pkt/s at 0% loss).
 
-    So pin every Python thread — enumerated via :mod:`threading`, and kept together
-    so the GIL never crosses cores — to ``relay[0]``, and every other thread in the
-    process (GStreamer's C workers, which don't surface as Python threads but do
-    appear under ``/proc/self/task``) to ``relay[1]``. The send then owns a core
-    the recording raw-branch can't touch, so it stays as clean under recording as
-    in teleop. Call once from the relay's event-loop (main) thread after the gst
-    pipelines are PLAYING (all their threads exist) and before the send loop runs;
-    Python threads spawned later (aiortc helpers) inherit this thread's ``relay[0]``
-    affinity. Best-effort: a no-op without ``sched_setaffinity`` or ``/proc``, or
-    when the relay group has fewer than two cores.
+    Pin every Python thread — enumerated via :mod:`threading`, and kept together
+    so the GIL never crosses cores — to ``relay[0]``. Pin every other thread in
+    the process (GStreamer's C workers, which do not surface as Python threads)
+    to the remaining relay cores plus ``background``. The send owns a core the
+    recording branch cannot touch, while dozens of gst tasks can make forward
+    progress through a short scheduler stall instead of overflowing a two-frame
+    source queue. Call once after the gst pipelines are PLAYING and before the
+    send loop runs. Best-effort: a no-op without ``sched_setaffinity`` or
+    ``/proc``, or when the relay group has fewer than two cores.
     """
     if not hasattr(os, "sched_setaffinity"):
         return False
@@ -184,7 +184,13 @@ def isolate_relay_cpu() -> bool:
     if len(relay) < 2:
         return False
     py_core = {relay[0]}
-    gst_core = {relay[1]}
+    # The recorder is mux-only on the production H.264 transport, so sharing
+    # its throughput CPUs is far safer than serializing ~80 gst workers onto
+    # relay[1].  Exclude py_core for small-host layouts where relay/background
+    # intentionally overlap.
+    gst_cores = (set(relay[1:]) | groups["background"]) - py_core
+    if not gst_cores:
+        return False
     import threading
 
     py_tids = {t.native_id for t in threading.enumerate() if t.native_id is not None}
@@ -207,17 +213,111 @@ def isolate_relay_cpu() -> bool:
         if tid in py_tids:
             continue
         try:
-            os.sched_setaffinity(tid, gst_core)  # type: ignore[attr-defined]
+            os.sched_setaffinity(tid, gst_cores)  # type: ignore[attr-defined]
             moved += 1
         except OSError:
             pass  # thread may have exited between listdir and the pin
     _logger.info(
-        "isolated relay CPU: python threads -> core %d, %d gst threads -> core %d",
+        "isolated relay CPU: python threads -> core %d, %d gst threads -> cores %s",
         relay[0],
         moved,
-        relay[1],
+        sorted(gst_cores),
     )
     return True
+
+
+# SCHED_FIFO priority for the camera capture threads. Well below the CAN loops
+# (`AXOL_RT_FIFO_PRIORITY`, 20) and on disjoint cores anyway; above every CFS
+# thread so a capture wake-up never queues behind the encode/mux workers.
+CAPTURE_FIFO_PRIORITY = 5
+
+
+def prioritize_capture_threads(thread_comms: Iterable[str]) -> int:
+    """Move the camera *capture* chain to ``SCHED_FIFO`` so it never misses an exposure.
+
+    The relay's gst pool is ~80 CFS threads (VIC copies, NVENC dispatch, shm
+    writers) sharing a few cores with the dataset recorder. CFS hands them out
+    round-robin, so whenever a burst of them is runnable together a thread can
+    sit runnable-but-unscheduled for most of a scheduling period (~20 ms). For
+    the encode/mux threads that is harmless — queues absorb it. For the capture
+    chain it is not: the source streaming thread (the SDK ``grab`` + rectify +
+    push), the ZED SDK's own worker threads (the V4L2 dequeue / frame assembly
+    it spawns unnamed), and the consumers of the two-buffer queues that still
+    hold un-copied camera surfaces (the stereo eye crops and the dataset VIC
+    copies) must each run within one 60 Hz period or the exposure is gone —
+    seen on the robot as ``skipped exposure(s)`` with ``CPU wait since
+    previous frame`` of 14-26 ms while every other attribution (SDK/link
+    time, GPU clock, arm motion) was clean. A real-time class fixes that at
+    the root: a FIFO wake-up preempts the CFS pool immediately and its CPU
+    wait is ~0 regardless of how many encoders are dispatching. Their combined
+    load is small and bounded (a few percent of a core per camera; the VIC
+    consumers mostly sleep on the hardware fence), so they cannot starve the
+    recorder, and the kernel's RT throttle caps a runaway at 95 % of a core
+    anyway.
+
+    Elevates every thread whose ``comm`` is in ``thread_comms`` (GStreamer
+    names task threads ``<element>:<pad>``, truncated to the kernel's 15-char
+    limit — the caller passes them already truncated; see
+    ``gst_zed.exposure_critical_thread_comms``) plus every non-Python thread
+    that still carries the process's own ``comm`` — GStreamer, GLib, NVENC and
+    CUDA all rename theirs, so an unrenamed thread in the relay is the SDK's.
+    Call once after the pipelines are PLAYING (the threads exist by then).
+    Returns the number of threads moved; ``0`` when the platform has no
+    ``sched_setscheduler`` or the process lacks ``CAP_SYS_NICE`` (a manual
+    unprivileged run — the failure is logged once and the threads stay CFS,
+    exactly the previous behaviour).
+    """
+    if not hasattr(os, "sched_setscheduler") or not hasattr(os, "SCHED_FIFO"):
+        return 0
+    import threading
+
+    py_tids = {t.native_id for t in threading.enumerate() if t.native_id is not None}
+    try:
+        with open("/proc/self/comm") as fh:
+            process_comm = fh.read().strip()
+        tasks = os.listdir("/proc/self/task")
+    except OSError:
+        return 0
+    wanted = set(thread_comms) | {process_comm}
+    param = os.sched_param(CAPTURE_FIFO_PRIORITY)  # type: ignore[attr-defined]
+    moved = 0
+    denied: OSError | None = None
+    for entry in tasks:
+        try:
+            tid = int(entry)
+        except ValueError:
+            continue
+        if tid in py_tids:
+            continue
+        try:
+            with open(f"/proc/self/task/{tid}/comm") as fh:
+                comm = fh.read().strip()
+        except OSError:
+            continue  # exited between listdir and here
+        if comm not in wanted:
+            continue
+        try:
+            os.sched_setscheduler(tid, os.SCHED_FIFO, param)  # type: ignore[attr-defined]
+            moved += 1
+        except PermissionError as exc:
+            denied = exc
+            break
+        except OSError:
+            pass
+    if denied is not None:
+        _logger.info(
+            "camera capture threads stay SCHED_OTHER (no CAP_SYS_NICE: %s); "
+            "expect skipped exposures under recording load",
+            denied,
+        )
+    elif moved:
+        _logger.info(
+            "camera capture threads -> SCHED_FIFO %d (%d threads: %s + SDK workers)",
+            CAPTURE_FIFO_PRIORITY,
+            moved,
+            ", ".join(sorted(wanted - {process_comm})),
+        )
+    return moved
 
 
 def _pin(group: str) -> bool:
