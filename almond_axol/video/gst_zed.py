@@ -441,10 +441,14 @@ _DATASET_ACTIVE_INPUT_QUEUE_MIN_BUFFERS = 15
 _DATASET_ACTIVE_INPUT_QUEUE_SECONDS = 0.5
 _DATASET_ACTIVE_OUTPUT_QUEUE_MIN_BUFFERS = 60
 _DATASET_ACTIVE_OUTPUT_QUEUE_SECONDS = 2
-# The VIC pool must exceed the downstream queue capacity so NVENC can retain a
-# few input surfaces while a new buffer still reaches the queue and triggers its
-# downstream-leaky policy instead of blocking back into the camera tee.
-_DATASET_VIC_INFLIGHT_SURFACES = 8
+# The VIC pool must exceed the downstream queue capacity so NVENC can retain its
+# input surfaces while a new buffer still reaches the queue and triggers its
+# downstream-leaky policy instead of blocking back into the camera tee. Eight
+# spare surfaces is a thin, undocumented allowance for NVENC retention across
+# four simultaneous all-intra 60 Hz encoders. Thirty-two provides bounded
+# headroom (about 28 MiB beyond the queue itself per SVGA branch) and keeps
+# backpressure behind the copied-surface boundary.
+_DATASET_VIC_INFLIGHT_SURFACES = 32
 # Opening every camera with a sequence of host-side property writes can straddle
 # multiple source frames. Arm a timestamp probe on every branch first, then let
 # each one open itself on its first exposure at/after one shared future instant.
@@ -478,6 +482,15 @@ def _dataset_input_queue(name: str) -> str:
     """Named bounded queue between the dataset VIC copy and NVENC."""
     return (
         f"queue name={name}_inq leaky=downstream "
+        f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
+        "max-size-bytes=0 max-size-time=0"
+    )
+
+
+def _dataset_source_queue(name: str) -> str:
+    """Shallow named queue before the dataset valve/VIC ownership boundary."""
+    return (
+        f"queue name={name}_srcq leaky=downstream "
         f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
         "max-size-bytes=0 max-size-time=0"
     )
@@ -617,6 +630,10 @@ class _GstPipelineBase:
             ]
         ] = []
         self._dataset_enabled = False
+        # Named gst queue overruns are the missing stage-level evidence when a
+        # later reader sees only a PTS hole. Values are reset at each episode;
+        # callbacks log only active/opening dataset branches.
+        self._dataset_queue_overruns: dict[str, int] = {}
 
     def _cancel_dataset_disable(self) -> None:
         """Remove any outstanding legacy dataset-close probes (best effort)."""
@@ -720,6 +737,85 @@ class _GstPipelineBase:
                 queue.set_property("max-size-bytes", 0)
                 queue.set_property("max-size-time", 0)
 
+    def _attach_dataset_queue_diagnostics(
+        self, gates: tuple[tuple[str, str | None], ...]
+    ) -> None:
+        """Log the exact relay queue that sheds an active-episode frame.
+
+        Queue callbacks are event-only (no per-buffer Python probe), so they add
+        no steady-state GIL work to the relay. Counts are rate-limited to the
+        first and powers of two in case a failed recorder leaves a branch
+        overflowing until teardown.
+        """
+        if self._pipeline is None:
+            return
+        queue_valves: dict[str, Any] = {}
+        for valve_name, encoder_name in gates:
+            if encoder_name is None:
+                continue
+            valve = self._pipeline.get_by_name(valve_name)
+            if valve is None:
+                _logger.debug("dataset queue diagnostic missing valve %s", valve_name)
+                continue
+            for queue_name in (
+                f"{encoder_name}_srcq",
+                f"{encoder_name}_inq",
+                f"{encoder_name}_outq",
+            ):
+                queue_valves[queue_name] = valve
+            if encoder_name.startswith("dsenc_"):
+                queue_valves[f"eye_{encoder_name.rsplit('_', 1)[1]}_cropq"] = valve
+        owner = repr(self)
+        for queue_name, valve in sorted(queue_valves.items()):
+            queue = self._pipeline.get_by_name(queue_name)
+            if queue is None:
+                _logger.debug("dataset queue diagnostic missing %s", queue_name)
+                continue
+            self._dataset_queue_overruns.setdefault(queue_name, 0)
+
+            def on_overrun(
+                element: Any,
+                *,
+                label: str = queue_name,
+                branch_valve: Any = valve,
+                source: str = owner,
+            ) -> None:
+                # Source/crop queues are live before an episode. An overrun
+                # counts only after this branch's valve admits its first
+                # dataset exposure; one stereo eye can open before its sibling.
+                try:
+                    if bool(branch_valve.get_property("drop")):
+                        return
+                except Exception:  # noqa: BLE001 - diagnostics only
+                    return
+                count = self._dataset_queue_overruns.get(label, 0) + 1
+                self._dataset_queue_overruns[label] = count
+                if count != 1 and count & (count - 1):
+                    return
+                try:
+                    level = int(element.get_property("current-level-buffers"))
+                    limit = int(element.get_property("max-size-buffers"))
+                except Exception:  # noqa: BLE001 - diagnostics only
+                    level = limit = -1
+                _logger.warning(
+                    "dataset relay %s queue %s overrun #%d "
+                    "(level=%d, limit=%d); an encoded exposure may be lost",
+                    source,
+                    label,
+                    count,
+                    level,
+                    limit,
+                )
+
+            try:
+                queue.connect("overrun", on_overrun)
+            except Exception as exc:  # noqa: BLE001 - diagnostics only
+                _logger.debug(
+                    "could not attach overrun diagnostic to %s: %s",
+                    queue_name,
+                    exc,
+                )
+
     def _begin_dataset_enable(
         self,
         gates: tuple[tuple[str, str | None], ...],
@@ -766,6 +862,8 @@ class _GstPipelineBase:
             ]
         ] = []
         try:
+            for queue_name in self._dataset_queue_overruns:
+                self._dataset_queue_overruns[queue_name] = 0
             # Expand both sides before any valve can admit the shared-boundary
             # exposure. A partial property-update failure is caught below;
             # abort closes all valves before restoring startup depths.
@@ -1220,7 +1318,8 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         if self._raw_socket_path:
             dataset_rate = _dataset_rate_limit(self.fps, self.dataset_fps)
             raw = (
-                f"{_QUEUE} ! {dataset_rate}valve name=rawvalve drop=false ! "
+                f"{_dataset_source_queue('dsenc')} ! {dataset_rate}"
+                "valve name=rawvalve drop=false ! "
                 + _dataset_enc_shmsink(
                     self._raw_socket_path,
                     self.raw_width,
@@ -1298,6 +1397,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
     def connect(self, warmup: bool = True) -> None:
         """Open the camera, start the pipeline, and block until it streams."""
         self._launch(self._pipeline_str())
+        self._attach_dataset_queue_diagnostics(self._raw_gates())
         if self._enc is not None:
             self._start_pull(
                 f"zedgst-{self.serial}-enc",
@@ -1562,7 +1662,11 @@ class ZedGstStereoCamera(_GstPipelineBase):
             f"video/x-raw(memory:NVMM),format=NV12,width={eye_w},height={eye_h},"
             "pixel-aspect-ratio=1/1"
         )
-        crop = f"{_QUEUE} ! nvvidconv left={left} right={right} top=0 bottom={eye_h} ! {caps}"
+        crop = (
+            f"queue name=eye_{sink_suffix}_cropq leaky=downstream "
+            "max-size-buffers=2 ! "
+            f"nvvidconv left={left} right={right} top=0 bottom={eye_h} ! {caps}"
+        )
         sock = (
             self._left_raw_socket_path
             if sink_suffix == "l"
@@ -1575,7 +1679,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         if sock:
             dataset_rate = _dataset_rate_limit(self.fps, self.dataset_fps)
             raw = (
-                f"{_QUEUE} ! {dataset_rate}"
+                f"{_dataset_source_queue('dsenc_' + sink_suffix)} ! {dataset_rate}"
                 f"valve name=rawvalve_{sink_suffix} drop=false ! "
                 + _dataset_enc_shmsink(
                     sock,
@@ -1697,6 +1801,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
 
     def connect(self, warmup: bool = True) -> None:
         self._launch(self._pipeline_str())
+        self._attach_dataset_queue_diagnostics(self._raw_gates())
         eye_specs = [
             (
                 "left",

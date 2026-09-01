@@ -15,8 +15,9 @@ During ``collect-data`` the box runs five kinds of work that contend for cores:
   feed is clean; once recording starts, the dataset raw-branch piles onto the
   same cores and starves the send — packets go out late and bursty (0% loss but
   rising jitter), so the live feed gets laggy + grainy.
-* **background** — the dataset recorder + its per-camera NVENC encoders. Pure
-  throughput; tolerant of an occasional dropped frame.
+* **background** — the dataset recorder plus throughput-oriented relay
+  GStreamer work. It may share CPU with camera/VIC/NVENC dispatch, but never
+  with control, IK, CAN, or the latency-sensitive WebRTC Python loop.
 
 Partitioning the cores by role keeps each group off the others': the control
 loop never gets preempted (no jerk), IK solves at full rate, and the relay's send
@@ -61,16 +62,15 @@ def core_groups() -> dict[str, set[int]] | None:
     camera/WebRTC bookkeeping made 5-15% of nominal 240 Hz motor ticks late.
     ``ik`` remains a dedicated core so it cannot deschedule CAN or Python.
 
-    The relay gets *two* cores so :func:`isolate_relay_cpu` can split its Python
-    work (the aiortc WebRTC send + encoded-AU pull loops, all GIL-serialized) onto
-    one core and GStreamer's C thread pool (camera capture, NVENC dispatch, and the
-    dataset raw-branch VIC resize + shmsink copy) onto the other. That split is the
-    whole point: naively handing the relay a second *roaming* core does nothing —
-    the Python side is GIL-bound and just ping-pongs the GIL across cores — but
-    physically moving the lock-free C threads off the send's core stops the
-    recording raw-branch from preempting the send (which otherwise starves it:
-    event-loop maxlag 100-385ms, send collapsing ~5000->~1400 pkt/s at 0% loss).
-    The dataset recorder keeps the remaining cores.
+    The relay gets *two* private cores so :func:`isolate_relay_cpu` can keep its
+    Python work (the aiortc WebRTC send + encoded-AU pull loops, all
+    GIL-serialized) on one. GStreamer's much wider C thread pool may use the
+    other relay core **and** the background cores. That split is the whole point:
+    naively letting Python roam just ping-pongs the GIL, while restricting the
+    ~70-80 camera/VIC/NVENC/shm tasks to one CPU can deschedule a dataset branch
+    for multiple 60 Hz exposures. Sharing throughput cores with the mux-only
+    recorder preserves the WebRTC/control isolation without creating that
+    single-core bottleneck.
 
     Below 8 cores there's no room to dedicate an IK core, so ``ik`` shares the
     control group; on 4-5 cores the relay also shares the background group (still
@@ -153,7 +153,7 @@ def pin_background() -> bool:
 
 
 def isolate_relay_cpu() -> bool:
-    """Split the relay's Python threads and GStreamer C threads onto separate cores.
+    """Separate relay Python from GStreamer and give gst throughput headroom.
 
     The relay's latency-critical work — the aiortc WebRTC send (SRTP + sendto for
     every stream) and the encoded-AU pull loops — is all Python, so the GIL
@@ -164,16 +164,15 @@ def isolate_relay_cpu() -> bool:
     moment recording starts, and the feed stutters (event-loop maxlag 100-385ms,
     send ~5000->~1400 pkt/s at 0% loss).
 
-    So pin every Python thread — enumerated via :mod:`threading`, and kept together
-    so the GIL never crosses cores — to ``relay[0]``, and every other thread in the
-    process (GStreamer's C workers, which don't surface as Python threads but do
-    appear under ``/proc/self/task``) to ``relay[1]``. The send then owns a core
-    the recording raw-branch can't touch, so it stays as clean under recording as
-    in teleop. Call once from the relay's event-loop (main) thread after the gst
-    pipelines are PLAYING (all their threads exist) and before the send loop runs;
-    Python threads spawned later (aiortc helpers) inherit this thread's ``relay[0]``
-    affinity. Best-effort: a no-op without ``sched_setaffinity`` or ``/proc``, or
-    when the relay group has fewer than two cores.
+    Pin every Python thread — enumerated via :mod:`threading`, and kept together
+    so the GIL never crosses cores — to ``relay[0]``. Pin every other thread in
+    the process (GStreamer's C workers, which do not surface as Python threads)
+    to the remaining relay cores plus ``background``. The send owns a core the
+    recording branch cannot touch, while dozens of gst tasks can make forward
+    progress through a short scheduler stall instead of overflowing a two-frame
+    source queue. Call once after the gst pipelines are PLAYING and before the
+    send loop runs. Best-effort: a no-op without ``sched_setaffinity`` or
+    ``/proc``, or when the relay group has fewer than two cores.
     """
     if not hasattr(os, "sched_setaffinity"):
         return False
@@ -184,7 +183,13 @@ def isolate_relay_cpu() -> bool:
     if len(relay) < 2:
         return False
     py_core = {relay[0]}
-    gst_core = {relay[1]}
+    # The recorder is mux-only on the production H.264 transport, so sharing
+    # its throughput CPUs is far safer than serializing ~80 gst workers onto
+    # relay[1].  Exclude py_core for small-host layouts where relay/background
+    # intentionally overlap.
+    gst_cores = (set(relay[1:]) | groups["background"]) - py_core
+    if not gst_cores:
+        return False
     import threading
 
     py_tids = {t.native_id for t in threading.enumerate() if t.native_id is not None}
@@ -207,15 +212,15 @@ def isolate_relay_cpu() -> bool:
         if tid in py_tids:
             continue
         try:
-            os.sched_setaffinity(tid, gst_core)  # type: ignore[attr-defined]
+            os.sched_setaffinity(tid, gst_cores)  # type: ignore[attr-defined]
             moved += 1
         except OSError:
             pass  # thread may have exited between listdir and the pin
     _logger.info(
-        "isolated relay CPU: python threads -> core %d, %d gst threads -> core %d",
+        "isolated relay CPU: python threads -> core %d, %d gst threads -> cores %s",
         relay[0],
         moved,
-        relay[1],
+        sorted(gst_cores),
     )
     return True
 

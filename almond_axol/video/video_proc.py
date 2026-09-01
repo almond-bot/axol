@@ -761,12 +761,11 @@ def _relay_main(
         if manager is not None:
             await manager.close_all()
 
-    # Split the relay across its two cores: all Python threads (this WebRTC-send
-    # main thread + the encoded-AU pull loops) onto one, GStreamer's C threads
-    # (camera/NVENC and the recording raw-branch shm copy) onto the other, so the
-    # recording workload can't preempt the send. Done here — after the cameras'
-    # gst pipelines are PLAYING (all their threads exist) and right before the
-    # event loop runs on this thread.
+    # Keep all Python threads (this WebRTC-send main thread + encoded-AU pull
+    # loops) on one relay core, and spread GStreamer's much wider C thread pool
+    # over the other relay/background throughput cores. Done here — after the
+    # camera pipelines are PLAYING (their workers exist) and before this event
+    # loop starts.
     affinity.isolate_relay_cpu()
 
     try:
