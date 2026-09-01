@@ -506,9 +506,10 @@ class EncodedAuReader:
     stream cannot drop frames: every P-frame depends on its predecessors. So this
     reader delivers **every** AU strictly **in order** via :meth:`read_next_au`,
     and the capture loop is frame-driven (one AU consumed per dataset row). A
-    dedicated pull thread drains the (non-leaky) appsink into an in-process queue
-    so a momentarily slow consumer grows the queue rather than dropping AUs and
-    corrupting the stream.
+    dedicated pull thread drains the (non-leaky) appsink. Before the first
+    episode flush it discards validated startup AUs; afterwards it fills an
+    in-process queue so a momentarily slow consumer grows the queue rather than
+    dropping AUs and corrupting the stream.
 
     Each episode's mp4 must start on a keyframe (a leading P-frame is
     undecodable), so after :meth:`flush` the reader drops AUs until the next IDR.
@@ -787,6 +788,17 @@ class EncodedAuReader:
                     or capture_perf <= self._minimum_capture_perf
                     or self._error is not None
                 ):
+                    continue
+                # Before the first episode boundary, the relay's output queue
+                # may intentionally shed AUs while shmsink waits for this late
+                # reader. GStreamer marks the resumed stream DISCONT, and there
+                # may be more than one such buffer. These startup AUs are never
+                # recorded: the initial closed-valve flush below establishes a
+                # strictly newer PTS cutoff and re-arms the first-IDR gate. Drain
+                # them here so their expected discontinuities and volume cannot
+                # fail connect() or overflow the bounded episode queue. Transport
+                # and timestamp validation above remains fail-closed.
+                if not self._episode_cutoff_active:
                     continue
                 if self._await_keyframe:
                     if not is_idr:
