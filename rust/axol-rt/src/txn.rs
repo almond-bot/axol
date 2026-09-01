@@ -18,8 +18,7 @@ fn wait_for(
         if now >= deadline {
             return Ok(None);
         }
-        sock.set_recv_timeout(deadline - now)?;
-        match sock.recv()? {
+        match sock.recv_timeout(deadline - now)? {
             None => return Ok(None),
             Some(frame) if accept(&frame) => return Ok(Some(frame)),
             Some(_) => continue,

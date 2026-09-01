@@ -6,7 +6,7 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::RawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Classic CAN frame as the kernel defines it (`struct can_frame`).
 #[repr(C)]
@@ -76,9 +76,45 @@ impl CanSock {
         Ok(Self { fd })
     }
 
-    /// Set the blocking-receive timeout (`SO_RCVTIMEO`).
+    /// Set the blocking-receive timeout (`SO_RCVTIMEO`) for coarse,
+    /// stop-flag-polling receive loops (the proxy).
+    ///
+    /// Never use this for a deadline the control loop must honour: the kernel
+    /// rounds a socket timeout up to whole scheduler jiffies and the timer
+    /// wheel then expires it one to two jiffies late. Measured on the Jetson's
+    /// HZ=250 kernel, a 3.7 ms `SO_RCVTIMEO` blocked 4-12 ms (6.7 ms on
+    /// average), and a `Duration` under 1 µs disables the timeout entirely
+    /// (blocks forever). Use [`Self::recv_timeout`] for deadlines.
     pub fn set_recv_timeout(&self, timeout: Duration) -> io::Result<()> {
         self.set_timeout(libc::SO_RCVTIMEO, timeout)
+    }
+
+    /// Wait up to `timeout` for one frame; `Ok(None)` when nothing arrived.
+    ///
+    /// Built on `ppoll` + a non-blocking `recv` so the wait ends within
+    /// microseconds of the deadline: `ppoll` timeouts are hrtimer-based
+    /// (with zero slack for a SCHED_FIFO caller), unlike `SO_RCVTIMEO`'s
+    /// jiffy-granular timer-wheel timeout. This is what lets the 240 Hz bus
+    /// loop bound its reply window inside the cycle — with `SO_RCVTIMEO`, one
+    /// missing motor reply stretched a 4.17 ms tick to ~9 ms and the next
+    /// tick tripped the whole-cycle timing fault. A zero `timeout` is a plain
+    /// non-blocking probe.
+    pub fn recv_timeout(&self, timeout: Duration) -> io::Result<Option<Frame>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !wait_readable(self.fd, deadline)? {
+                return Ok(None);
+            }
+            // Readiness can be spurious (or signal a socket error, which the
+            // receive surfaces); never block here, and re-check the deadline
+            // rather than spinning if nothing was actually queued.
+            if let Some(frame) = self.recv_nonblocking()? {
+                return Ok(Some(frame));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
     }
 
     /// Set the blocking-send timeout (`SO_SNDTIMEO`). A dead bus (e-stop —
@@ -197,5 +233,97 @@ impl CanSock {
 impl Drop for CanSock {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd) };
+    }
+}
+
+/// Block until `fd` is readable or `deadline` passes; `Ok(false)` on expiry.
+///
+/// `ppoll` with an absolute-deadline-derived timeout: hrtimer-precise, and a
+/// deadline already in the past is a non-blocking probe (unlike a zero
+/// `SO_RCVTIMEO`, which the kernel reads as "no timeout"). `EINTR` re-arms
+/// against the same deadline.
+fn wait_readable(fd: RawFd, deadline: Instant) -> io::Result<bool> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let ts = libc::timespec {
+            tv_sec: remaining.as_secs() as libc::time_t,
+            tv_nsec: remaining.subsec_nanos() as libc::c_long,
+        };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::ppoll(&mut pfd, 1, &ts, std::ptr::null()) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(rc > 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::UdpSocket;
+    use std::os::unix::io::AsRawFd;
+
+    fn idle_socket() -> UdpSocket {
+        UdpSocket::bind("127.0.0.1:0").expect("bind loopback udp socket")
+    }
+
+    #[test]
+    fn wait_readable_expires_close_to_the_deadline() {
+        // The whole point of ppoll over SO_RCVTIMEO: a sub-jiffy wait must end
+        // near the requested instant, not one or two scheduler ticks later
+        // (4-12 ms measured for a 3.7 ms socket timeout on an HZ=250 kernel).
+        // Use a median so one preempted iteration cannot fail the test.
+        let sock = idle_socket();
+        let timeout = Duration::from_micros(2_000);
+        let mut waits: Vec<Duration> = (0..15)
+            .map(|_| {
+                let started = Instant::now();
+                let ready = wait_readable(sock.as_raw_fd(), started + timeout).unwrap();
+                assert!(!ready);
+                started.elapsed()
+            })
+            .collect();
+        waits.sort();
+        let median = waits[waits.len() / 2];
+        assert!(median >= timeout, "returned early: {median:?}");
+        assert!(
+            median < timeout + Duration::from_millis(1),
+            "wait overran its deadline: {median:?} for {timeout:?}"
+        );
+    }
+
+    #[test]
+    fn wait_readable_treats_a_past_deadline_as_a_probe() {
+        // A sub-microsecond remaining window used to become SO_RCVTIMEO = 0,
+        // which the kernel treats as "block forever".
+        let sock = idle_socket();
+        let started = Instant::now();
+        let ready = wait_readable(sock.as_raw_fd(), started + Duration::from_nanos(500)).unwrap();
+        assert!(!ready);
+        assert!(started.elapsed() < Duration::from_millis(50));
+        let ready = wait_readable(sock.as_raw_fd(), started).unwrap();
+        assert!(!ready);
+    }
+
+    #[test]
+    fn wait_readable_returns_as_soon_as_data_arrives() {
+        let sock = idle_socket();
+        let sender = idle_socket();
+        sender
+            .send_to(b"x", sock.local_addr().unwrap())
+            .expect("loopback send");
+        let started = Instant::now();
+        let ready = wait_readable(sock.as_raw_fd(), started + Duration::from_secs(5)).unwrap();
+        assert!(ready);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

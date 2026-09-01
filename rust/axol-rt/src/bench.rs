@@ -112,8 +112,9 @@ fn tick_pipelined(sock: &CanSock, timeout: Duration) -> io::Result<usize> {
         if now >= deadline {
             break;
         }
-        sock.set_recv_timeout(deadline - now)?;
-        let Some(frame) = sock.recv()? else { break };
+        let Some(frame) = sock.recv_timeout(deadline - now)? else {
+            break;
+        };
         let motor_id = match frame.id {
             id if (0x241..=0x245).contains(&id) && frame.data[0] == proto::MA_MULTI_TURN_ANGLE => {
                 (id - 0x240) as usize

@@ -300,8 +300,9 @@ fn stream(
             if now >= reply_deadline {
                 break;
             }
-            sock.set_recv_timeout(reply_deadline - now)?;
-            let Some(frame) = sock.recv()? else { break };
+            let Some(frame) = sock.recv_timeout(reply_deadline - now)? else {
+                break;
+            };
             let (idx, pos) = match frame.id {
                 id if (0x501..=0x505).contains(&id) => {
                     let motor_id = (id - 0x500) as u8;
