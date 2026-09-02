@@ -522,7 +522,9 @@ def _steer_can_irq(escalator: _RootEscalator) -> None:
         return
     for irq, action in sorted(irqs.items()):
         if _irq_affinity(irq, proc_root=_PROC_ROOT) == {target}:
-            _logger.debug("irq %d (%s) already on CPU %d", irq, action, target)
+            _logger.info(
+                "irq %d (%s) already on CPU %d (a CAN core)", irq, action, target
+            )
             continue
         path = _PROC_ROOT / "irq" / str(irq) / "smp_affinity_list"
         ok, detail = escalator.write(path, f"{target}\n")

@@ -98,6 +98,10 @@ def _step(label: str, fn: Callable[[], object]) -> bool:
 
 def run(_args: object = None) -> None:
     """Run every provisioning step in order; each self-gates and is idempotent."""
+    # Surface each step's INFO outcome (what was granted/installed, or already
+    # in place) so a run at a customer site is verifiable from its output alone;
+    # force=True in case an imported dependency already installed a handler.
+    logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
     # adb + the Oculus udev rule (which hands the headset to the `dialout`
     # group operators already have, so adb needs no extra group or re-login)
     # and adds the operator to that group — for streaming Quest controller
