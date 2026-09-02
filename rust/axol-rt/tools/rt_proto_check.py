@@ -56,7 +56,7 @@ async def session(name, actions):
 cfg = (
     b"C"
     + b"loop_hz 240\n"
-    + b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+    + b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 inf\n"
 )
 
 

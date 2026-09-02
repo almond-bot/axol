@@ -66,13 +66,14 @@ pub fn parse_params(path: &str) -> io::Result<Vec<JointParams>> {
                     kd: fields.get(4)?.parse().ok()?,
                     gripper: false, // hold never touches the gripper
                     slot: 0,        // unused: hold has no target stream
-                    // Tracker/friction params are serve-only.
+                    // Tracker/friction params and the torque cap are serve-only.
                     max_vel: 0.0,
                     max_accel: 0.0,
                     fc: 0.0,
                     k: 0.0,
                     fv: 0.0,
                     fo: 0.0,
+                    tau_cap: f64::INFINITY,
                 },
                 t_ff: fields.get(5)?.parse().ok()?,
             })
