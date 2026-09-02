@@ -109,8 +109,11 @@
 //!   the deviation abort only ever sees the window, and a runaway is
 //!   bounded by `tau_cap` rather than caught.
 //! - Every command batch accepts exactly one fresh reply per motor. A missed
-//!   sample suppresses host damping; repeated/bursty feedback loss disables
-//!   both buses. Late ticks follow the same fail-closed rule, and a full-cycle
+//!   sample suppresses host damping for that tick; bursty loss (4 of the last
+//!   32 ticks) marks the joint *degraded* — host damping stays off until a
+//!   clean 32-tick window, the transition is logged, and the loop keeps
+//!   running on firmware kd. Only a motor silent for a full second faults
+//!   both buses. Clustered late ticks still fail closed, and a full-cycle
 //!   overrun is an immediate fault.
 //! - The gripper is not commanded at all until the first target arrives
 //!   (matching classic mode, where it sits idle until motion_control).
@@ -149,15 +152,25 @@ const VEL_CUTOFF: f64 = 80.0;
 /// Target-tuple slots per arm: 7 arm joints + the gripper.
 const N_SLOTS: usize = 8;
 const GRIPPER_SLOT: usize = 7;
-/// Three absent samples is 12.5 ms at 240 Hz. Continuing impedance control
-/// beyond this point would let the host-damping term act on stale velocity,
-/// so fail closed and require a fresh arm instead.
-const MAX_CONSECUTIVE_MISSED_FEEDBACK: u8 = 3;
-/// Also reject bursty loss that never happens on consecutive ticks. Four
-/// misses in 32 ticks is 12.5% loss over 133 ms at 240 Hz; the failing
-/// collection capture reached nine, while healthy operation should remain
-/// comfortably below this after stale-frame isolation.
-const MAX_RECENT_MISSED_FEEDBACK: u32 = 4;
+/// Rolling feedback loss at or above this many misses in the last 32 ticks
+/// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
+/// stays off until a full clean window has passed, and the transition is
+/// logged. It is not a fault. Host damping is already suppressed on every
+/// tick without a fresh sample, so a missed frame can never feed stale
+/// velocity into the damping term; the arm simply runs on firmware kd for
+/// the lossy stretch. Bursty loss is routine while cameras, IK compilation,
+/// and the dataset writer boot on the same host and USB fabric as the CAN
+/// adapters — disabling both arms for it ended otherwise healthy sessions.
+const DEGRADED_RECENT_MISSED_FEEDBACK: u32 = 4;
+/// A motor that has not replied for this long is treated as gone rather than
+/// lossy. Commanding it blind leaves the deviation abort inactive for that
+/// joint, so past this point the core fails closed. Matches the TX-stall
+/// e-stop detection window rather than the old 12.5 ms.
+const SILENT_FEEDBACK_FAULT: Duration = Duration::from_secs(1);
+/// Degraded/recovered transitions are logged at most this often per bus so a
+/// joint flapping across the threshold during boot cannot flood the log; the
+/// five-second stats line carries the cumulative count regardless.
+const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// Leave a small slice of each cycle for telemetry handoff and the next
 /// absolute sleep. The rest is valid reply time; the old 80% window discarded
 /// delayed USB-CAN replies despite there still being cycle headroom.
@@ -288,25 +301,66 @@ fn mark_unique_expected_reply(expected: &[bool], seen: &mut [bool], idx: usize) 
     true
 }
 
+/// Outcome of one feedback opportunity for one arm joint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedbackVerdict {
+    /// Nothing to report: healthy, an isolated miss, or an ongoing degraded
+    /// stretch that has neither cleared nor gone silent.
+    Steady,
+    /// Rolling loss just crossed the degraded threshold.
+    Degraded,
+    /// A full clean window just closed out a degraded stretch.
+    Recovered,
+    /// The motor has not replied for the silent-fault interval: treat it as
+    /// gone and fail closed.
+    Silent,
+}
+
 #[derive(Clone, Copy, Default)]
 struct FeedbackHealth {
-    consecutive_misses: u8,
+    consecutive_misses: u32,
     recent_misses: u32,
+    degraded: bool,
 }
 
 impl FeedbackHealth {
-    /// Record one 240 Hz feedback opportunity. Returns true once either the
-    /// consecutive-loss or rolling-loss safety limit has been reached.
-    fn record(&mut self, received: bool) -> bool {
+    /// Record one 240 Hz feedback opportunity. `silent_limit` is the
+    /// consecutive-miss count that turns loss into a fault.
+    ///
+    /// Degradation has hysteresis: it starts at
+    /// `DEGRADED_RECENT_MISSED_FEEDBACK` misses in the 32-tick window and only
+    /// clears once that window is entirely clean, so a joint flapping around
+    /// the threshold does not toggle host damping every few ticks.
+    fn record(&mut self, received: bool, silent_limit: u32) -> FeedbackVerdict {
         self.recent_misses = (self.recent_misses << 1) | u32::from(!received);
         if received {
             self.consecutive_misses = 0;
         } else {
             self.consecutive_misses = self.consecutive_misses.saturating_add(1);
         }
-        self.consecutive_misses >= MAX_CONSECUTIVE_MISSED_FEEDBACK
-            || self.recent_misses.count_ones() >= MAX_RECENT_MISSED_FEEDBACK
+        if self.consecutive_misses >= silent_limit {
+            return FeedbackVerdict::Silent;
+        }
+        let lossy = self.recent_misses.count_ones() >= DEGRADED_RECENT_MISSED_FEEDBACK;
+        match (self.degraded, lossy) {
+            (false, true) => {
+                self.degraded = true;
+                FeedbackVerdict::Degraded
+            }
+            (true, false) if self.recent_misses == 0 => {
+                self.degraded = false;
+                FeedbackVerdict::Recovered
+            }
+            _ => FeedbackVerdict::Steady,
+        }
     }
+}
+
+/// Consecutive missed replies that constitute a silent motor at `loop_hz`.
+fn silent_feedback_limit(loop_hz: f64) -> u32 {
+    (loop_hz * SILENT_FEEDBACK_FAULT.as_secs_f64())
+        .ceil()
+        .max(1.0) as u32
 }
 
 #[derive(Clone, Copy, Default)]
@@ -854,22 +908,50 @@ mod tests {
     }
 
     #[test]
-    fn feedback_health_catches_consecutive_and_bursty_loss() {
-        let mut consecutive = FeedbackHealth::default();
-        assert!(!consecutive.record(false));
-        assert!(!consecutive.record(false));
-        assert!(consecutive.record(false));
+    fn feedback_health_degrades_on_bursty_loss_and_recovers_after_clean_window() {
+        let limit = silent_feedback_limit(240.0);
+        assert_eq!(limit, 240);
 
+        // The startup pattern from the field: isolated single-tick misses.
+        // Three of them stay quiet; the fourth degrades the joint, and it
+        // remains degraded (Steady, not re-announced) while lossy.
         let mut bursty = FeedbackHealth::default();
         for _ in 0..3 {
-            assert!(!bursty.record(false));
-            assert!(!bursty.record(true));
+            assert_eq!(bursty.record(false, limit), FeedbackVerdict::Steady);
+            assert_eq!(bursty.record(true, limit), FeedbackVerdict::Steady);
         }
-        assert!(bursty.record(false));
+        assert_eq!(bursty.record(false, limit), FeedbackVerdict::Degraded);
+        assert!(bursty.degraded);
+        assert_eq!(bursty.record(false, limit), FeedbackVerdict::Steady);
+        assert!(bursty.degraded);
+
+        // Hysteresis: dropping below four misses is not enough; the window
+        // must be entirely clean before damping is allowed back on.
+        for _ in 0..31 {
+            assert_eq!(bursty.record(true, limit), FeedbackVerdict::Steady);
+            assert!(bursty.degraded);
+        }
+        assert_eq!(bursty.record(true, limit), FeedbackVerdict::Recovered);
+        assert!(!bursty.degraded);
+
+        // The old 3-consecutive trip is now just a degraded stretch...
+        let mut consecutive = FeedbackHealth::default();
+        for _ in 0..3 {
+            assert_ne!(consecutive.record(false, limit), FeedbackVerdict::Silent);
+        }
+        // ...and only a motor silent for the whole interval faults.
+        for _ in 3..limit - 1 {
+            assert_ne!(consecutive.record(false, limit), FeedbackVerdict::Silent);
+        }
+        assert_eq!(consecutive.record(false, limit), FeedbackVerdict::Silent);
 
         let mut healthy = FeedbackHealth::default();
         for tick in 0..128 {
-            assert!(!healthy.record(tick % 32 != 0));
+            assert_eq!(
+                healthy.record(tick % 32 != 0, limit),
+                FeedbackVerdict::Steady
+            );
+            assert!(!healthy.degraded);
         }
     }
 
@@ -1487,6 +1569,11 @@ fn bus_loop(
     let mut enobufs_since: Option<Instant> = None;
     let mut bus_dead = false;
     let mut feedback_health = [FeedbackHealth::default(); N_SLOTS];
+    let silent_limit = silent_feedback_limit(cfg.loop_hz);
+    let mut degraded_ticks: u64 = 0;
+    let mut degraded_episodes: u64 = 0;
+    let mut degraded_announced = [false; N_SLOTS];
+    let mut next_degraded_log = Instant::now();
     let mut timing_health = TimingHealth::default();
     // Belt-and-braces: sends on a dead bus normally fail fast with ENOBUFS,
     // but if the socket sndbuf fills first a blocking write would hang the
@@ -1687,12 +1774,18 @@ fn bus_loop(
                         let v_cmd_fast = d.v_cmd_fast.update(p_cmd, tick_dt);
                         let friction_ff = filter::friction(v_cmd, m.fc, m.k, m.fv, m.fo);
                         let inertia_ff = c.j_eff * a_cmd;
-                        let v_damp = if feedback_fresh[m.slot] && timing_on_time {
+                        let damp_ok = feedback_fresh[m.slot]
+                            && timing_on_time
+                            && !feedback_health[m.slot].degraded;
+                        let v_damp = if damp_ok {
                             d.bp.update(v_cmd_fast - d.vel_meas, c.damp_w0, c.damp_q, tick_dt)
                         } else {
                             // A missing frame makes measured velocity stale.
                             // Reset rather than carrying band-pass energy into
-                            // the first tick after feedback recovers.
+                            // the first tick after feedback recovers. While the
+                            // joint is degraded, damping stays off for the whole
+                            // stretch: re-engaging a freshly reset band-pass
+                            // every few ticks is a torque transient, not damping.
                             d.bp.reset();
                             0.0
                         };
@@ -1889,26 +1982,66 @@ fn bus_loop(
             // stays far below the fail-closed thresholds.
             missed += pending as u64;
 
-            // Never continue phase-sensitive host damping when an arm motor
-            // has stopped producing fresh feedback. A single miss suppresses
-            // host damping on the next tick; sustained or bursty degradation
-            // faults both buses and forces a clean re-arm. The gripper is
-            // intentionally excluded.
+            // Never run phase-sensitive host damping on stale feedback. A
+            // single miss suppresses host damping on the next tick; bursty
+            // loss marks the joint degraded (damping off until a clean
+            // window, logged) and the loop keeps running on firmware kd. Only
+            // a motor that falls silent for `SILENT_FEEDBACK_FAULT` faults
+            // both buses — the deviation abort has been blind on it for too
+            // long to keep commanding it. The gripper is intentionally
+            // excluded.
+            let mut any_degraded = false;
             for (idx, motor) in motors.iter().enumerate() {
                 if motor.gripper {
                     continue;
                 }
                 feedback_fresh[motor.slot] = seen[idx];
-                if feedback_health[motor.slot].record(seen[idx]) {
-                    fault.store(1, Ordering::SeqCst);
-                    stop.store(true, Ordering::SeqCst);
-                    return Err(io::Error::other(format!(
-                        "{iface}: {} feedback unhealthy ({} consecutive, {} of the last 32 ticks missing); stopping before damping can use stale velocity",
-                        motor.joint,
-                        feedback_health[motor.slot].consecutive_misses,
-                        feedback_health[motor.slot].recent_misses.count_ones(),
-                    )));
+                let health = &mut feedback_health[motor.slot];
+                match health.record(seen[idx], silent_limit) {
+                    FeedbackVerdict::Steady => {}
+                    FeedbackVerdict::Degraded => {
+                        degraded_episodes += 1;
+                        degraded_announced[motor.slot] = began >= next_degraded_log;
+                        if degraded_announced[motor.slot] {
+                            next_degraded_log = began + DEGRADED_LOG_INTERVAL;
+                            send_text(
+                                out_tx,
+                                b'L',
+                                &format!(
+                                    "{iface}: {} feedback degraded ({} of the last 32 ticks missing) — host damping off on this joint until a clean window; firmware kd holds",
+                                    motor.joint,
+                                    health.recent_misses.count_ones(),
+                                ),
+                            );
+                        }
+                    }
+                    FeedbackVerdict::Recovered => {
+                        if std::mem::take(&mut degraded_announced[motor.slot]) {
+                            send_text(
+                                out_tx,
+                                b'L',
+                                &format!(
+                                    "{iface}: {} feedback recovered — host damping resumed",
+                                    motor.joint,
+                                ),
+                            );
+                        }
+                    }
+                    FeedbackVerdict::Silent => {
+                        fault.store(1, Ordering::SeqCst);
+                        stop.store(true, Ordering::SeqCst);
+                        return Err(io::Error::other(format!(
+                            "{iface}: {} silent for {} consecutive ticks ({:.1} s) — motor unreachable; stopping rather than commanding it blind",
+                            motor.joint,
+                            health.consecutive_misses,
+                            health.consecutive_misses as f64 / cfg.loop_hz,
+                        )));
+                    }
                 }
+                any_degraded |= health.degraded;
+            }
+            if any_degraded {
+                degraded_ticks += 1;
             }
 
             // Ship this tick's telemetry to Python (non-blocking mpsc; the
@@ -1924,7 +2057,7 @@ fn bus_loop(
                     out_tx,
                     b'L',
                     &format!(
-                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {missed} missed replies, {rejected} rejected targets, {trace_dropped} trace drops, seq {:?}",
+                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {missed} missed replies, {degraded_ticks} degraded ticks in {degraded_episodes} episodes, {rejected} rejected targets, {trace_dropped} trace drops, seq {:?}",
                         late as f64 / ticks as f64 * 100.0,
                         last_seq,
                     ),

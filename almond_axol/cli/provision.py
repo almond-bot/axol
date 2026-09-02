@@ -23,6 +23,12 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       via rustup if needed; sources fetched at the installed
                       package's ref for tool installs), required by hardware
                       control (see :mod:`almond_axol.rt`).
+* rtprio grant      — a ``limits.d`` drop-in letting the operator's login run
+                      the camera relay's capture chain ``SCHED_FIFO`` from a
+                      manual ``axol serve`` (the systemd unit already has
+                      ``LimitRTPRIO``); without it the relay silently runs
+                      CFS and drops exposures under recording load (see
+                      :mod:`almond_axol.utils.rtprio`).
 
 Both the hosted installer (``web/app/public/install``) and the ``axol serve``
 self-updater (:mod:`almond_axol.serve.update`) run *this* command, so the set
@@ -32,8 +38,9 @@ on the ZED SDK / apt / NVENC), so it is safe to run on any host. The hosted
 installer and post-upgrade path add ``--require-rt``: optional hardware remains
 best-effort, but a failed required control-core install makes the command fail.
 
-It does NOT pin Jetson clocks — that's ``axol jetson.setup``, a per-boot runtime
-tweak owned by the systemd ``ExecStartPre``, not an install step.
+It does NOT pin Jetson clocks or steer the CAN adapters' interrupt — that's
+``axol jetson.setup``, a per-boot runtime tweak owned by the systemd
+``ExecStartPre``, not an install step.
 """
 
 from __future__ import annotations
@@ -44,7 +51,7 @@ from pathlib import Path
 
 from ..robot import gyro
 from ..rt import install as rt_install
-from ..utils import adb
+from ..utils import adb, rtprio
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
 from .zed import driver as zed_driver
@@ -63,7 +70,8 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         "provision",
         help=(
             "Install/refresh the non-PyPI + system pieces "
-            "(cameras, adb, board access, and the axol-rt control core)."
+            "(cameras, adb, board access, the operator's real-time scheduling "
+            "grant, and the axol-rt control core)."
         ),
     )
     parser.add_argument(
@@ -90,6 +98,10 @@ def _step(label: str, fn: Callable[[], object]) -> bool:
 
 def run(_args: object = None) -> None:
     """Run every provisioning step in order; each self-gates and is idempotent."""
+    # Surface each step's INFO outcome (what was granted/installed, or already
+    # in place) so a run at a customer site is verifiable from its output alone;
+    # force=True in case an imported dependency already installed a handler.
+    logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
     # adb + the Oculus udev rule (which hands the headset to the `dialout`
     # group operators already have, so adb needs no extra group or re-login)
     # and adds the operator to that group — for streaming Quest controller
@@ -105,6 +117,10 @@ def run(_args: object = None) -> None:
     # Group access to the board IMU's sampling timer, so teleop can start the
     # Jelly's yaw reference without root. Self-gates on the driver's presence.
     _step("board IMU (gyro.install)", gyro.install)
+    # Persistent rtprio allowance for the operator's login, so a manual
+    # `axol serve` can run the camera relay's capture chain SCHED_FIFO like
+    # the systemd unit does (LimitRTPRIO). Applies at the next login.
+    _step("rtprio grant (utils.rtprio)", rtprio.install)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
         _step("pyzed (zed.install)", zed_install.run)

@@ -195,7 +195,13 @@ write them, and the regular five-second status line reports any trace drops.
 `scan` and `bench` are strictly read-only — safe against a powered robot
 at rest. `hold` requires `--yes` to actuate. `serve` only actuates after
 the explicit config/prep/arm handshake, and every exit path (disarm,
-fault, signal, client loss) runs the disable sequence. `proxy` is the sole
+fault, signal, client loss) runs the disable sequence. Missed CAN replies
+degrade rather than fault: host damping is never computed from a stale
+sample, a joint missing 4 of the last 32 replies runs on firmware kd (logged,
+counted in the five-second stats line) until a clean window, and only a motor
+silent for a full second stops the session — bursty loss is expected while
+cameras and IK compilation contend for the same host and USB fabric during
+startup. `proxy` is the sole
 frame transport for maintenance, tuning, firmware, and arm diagnostics;
 `jelly` owns Jelly's wheel bus, while the proxy carries its lift bus. Both use
 the realtime core's persistent-TX-stall detection and queue purge, aborting

@@ -771,7 +771,9 @@ def _relay_main(
     # consumers of the two-buffer queues that still hold camera surfaces) must
     # run every 60 Hz period or the exposure is lost; a CFS slot behind the
     # encode pool is not guaranteed once recording starts, so it gets a
-    # real-time class of its own (see prioritize_capture_threads).
+    # real-time class of its own — confined to the camera cores, never the
+    # CPU that delivers the CAN adapters' replies (see
+    # prioritize_capture_threads / realtime_camera_cores).
     from .gst_zed import exposure_critical_thread_comms
 
     affinity.prioritize_capture_threads(exposure_critical_thread_comms())
