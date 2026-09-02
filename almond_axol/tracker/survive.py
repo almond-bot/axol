@@ -68,15 +68,17 @@ _CHANNEL_CLASH = re.compile(r"Two or more lighthouses are on channel (\d+)")
 def _lighthouse_record(parts: list[str]) -> tuple[int, str | None] | None:
     """Base-station (channel, serial) from an ``LH_UP`` / ``LH_POSE`` record.
 
-    ``LH_UP <channel> ax ay az`` marks a station coming up; ``<channel> LH_POSE
-    x y z qw qx qy qz <BaseStationID>`` follows once it is solved and names the
-    station, so two serials on one channel can be reported by name.
+    Like every ``--record-stdout`` line, both carry the run timestamp first:
+    ``<ts> LH_UP <channel> ax ay az`` marks a station coming up; ``<ts>
+    <channel> LH_POSE x y z qw qx qy qz <BaseStationID>`` follows once it is
+    solved and names the station, so two serials on one channel can be
+    reported by name.
     """
     try:
-        if len(parts) >= 2 and parts[0] == "LH_UP":
-            return int(parts[1]), None
-        if len(parts) >= 10 and parts[1] == "LH_POSE":
-            return int(parts[0]), f"{int(parts[9]):08x}"
+        if len(parts) >= 3 and parts[1] == "LH_UP":
+            return int(parts[2]), None
+        if len(parts) >= 11 and parts[2] == "LH_POSE":
+            return int(parts[1]), f"{int(parts[10]):08x}"
     except ValueError:
         return None
     return None

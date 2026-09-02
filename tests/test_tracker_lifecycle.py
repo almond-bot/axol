@@ -1167,22 +1167,28 @@ class LighthouseChannelCheckTest(unittest.TestCase):
     def test_survey_collects_channels_serials_and_clashes_from_the_stream(self) -> None:
         from almond_axol.tracker import survive
 
+        # Real ``--record-stdout`` lines, run timestamp first.
         self.assertEqual(
             survive._lighthouse_record(  # noqa: SLF001
-                "LH_UP 0 +1.000000e+00 +1.270000e+02 +3.900000e+01".split()
+                "0.007361 LH_UP 0 -1.000000e+00 +1.270000e+02 +4.000000e+01".split()
             ),
             (0, None),
         )
         self.assertEqual(
             survive._lighthouse_record(  # noqa: SLF001
-                "0 LH_POSE 0.1 0.2 0.3 1 0 0 0 2113888890".split()
+                "0.008126 0 LH_POSE 0.0 1.327 0.864 -0.229 -0.194 0.557 0.774 "
+                "2113888890".split()
             ),
             (0, "7dff627a"),
         )
         self.assertIsNone(
             survive._lighthouse_record("0.1 T20 POSE 0 0 0 1 0 0 0".split())  # noqa: SLF001
         )
-        self.assertIsNone(survive._lighthouse_record(["LH_UP", "x"]))  # noqa: SLF001
+        self.assertIsNone(
+            survive._lighthouse_record(["0.007361", "LH_UP", "x"])  # noqa: SLF001
+        )
+        # Timestamp-less lines never occur in the stream and must not match.
+        self.assertIsNone(survive._lighthouse_record(["LH_UP", "0"]))  # noqa: SLF001
 
         source = SurviveSource()
         source._note_lighthouse(0, None)  # noqa: SLF001
