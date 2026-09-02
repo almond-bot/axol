@@ -193,15 +193,18 @@ class RtLink:
             slots[i] = (pos, vel, tau, now - age_us / 1e6)
         return side, slots
 
-    def _send(self, payload: bytes) -> None:
-        if self._fault is not None:
+    def _send(self, payload: bytes, *, allow_faulted: bool = False) -> None:
+        if self._fault is not None and not allow_faulted:
             raise RtLinkError(f"axol-rt: {self._fault}")
         if self._writer is None or self._writer.is_closing():
             raise RtLinkError("axol-rt link is not connected")
         self._writer.write(struct.pack("<I", len(payload)) + payload)
 
-    async def _await_state(self, expected: str, timeout: float) -> None:
-        """Wait for a state message; a ``fault:`` state raises."""
+    async def _await_state(
+        self, expected: str, timeout: float, *, tolerate_fault: bool = False
+    ) -> None:
+        """Wait for a state message; a ``fault:`` state raises unless
+        ``tolerate_fault`` (teardown after a fault still wants the ack)."""
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
@@ -215,7 +218,7 @@ class RtLink:
                 ) from None
             if state == expected:
                 return
-            if state.startswith("fault:"):
+            if state.startswith("fault:") and not tolerate_fault:
                 raise RtLinkError(f"axol-rt: {state}")
             # Unrelated state (e.g. a stats line routed as state) — keep waiting.
 
@@ -232,8 +235,11 @@ class RtLink:
         await self._await_state("armed", _ARM_TIMEOUT_S)
 
     async def disarm(self) -> None:
-        self._send(b"D")
-        await self._await_state("disarmed", 5.0)
+        # Always deliverable, fault or not: after a fault the core has already
+        # disabled the motors, and `D` lets it join its bus threads and ack
+        # instead of treating our socket close as an orphaned-client crash.
+        self._send(b"D", allow_faulted=True)
+        await self._await_state("disarmed", 5.0, tolerate_fault=True)
 
     def send_target(
         self,

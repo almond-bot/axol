@@ -8,6 +8,7 @@ Installs and refreshes the pieces `uv tool install` can't manage on its own:
 - **adb** + the Quest udev rule — for the [Quest-over-USB](/guides/quest-over-usb) controller transport (the `adb reverse` tunnel that streams poses over the cable). Self-gates on `apt`.
 - [`zed.driver`](/cli/zed-driver) — replaces the ZED Box Duo's known-bad factory **GMSL camera driver** (`stereolabs-zedbox-duo`) with the pinned release. Takes effect on the next reboot (prints a notice; never reboots itself). A no-op off a factory-flashed ZED Box Duo.
 - **board IMU** (`gyro.install`) — grants the `imu` group access to the carrier board's BMI088 sampling timer, [Jelly](/guides/vr-interface#jelly)'s heading-hold yaw reference, so teleop can start it without root. Self-gates on the board driver's presence.
+- **real-time scheduling grant** — writes `/etc/security/limits.d/50-axol-rtprio.conf` so your login can run the camera relay's capture chain `SCHED_FIFO` from a manual `axol serve` (the systemd unit already has `LimitRTPRIO`). Login shells otherwise start with an `rtprio` limit of zero, the relay silently falls back to CFS (`camera capture threads stay SCHED_OTHER` at startup), and recordings under load discard episodes on skipped exposures. Takes effect at your **next login**; check with `ulimit -r` (should print `20`).
 - [`zed.install`](/cli/zed-install) — the **pyzed** bindings (not on PyPI; needs the ZED SDK).
 - [`gst.install`](/cli/gst-install) — the **GStreamer + PyGObject** `appsink` stack (PyGObject builds against the system gobject-introspection and is dropped whenever the tool environment is rebuilt, e.g. by a release upgrade).
 - [`gst.build-zed`](/cli/gst-build-zed) — the patched **`zedxonesrc` / `zedsrc`** plugins (sensor-accurate PTS so collected images line up with joint samples).
@@ -36,11 +37,11 @@ code. Both still share this single provisioning path, keeping their steps in
 lockstep.
 
 <Note>
-  `provision` does **not** pin the Jetson clocks — that's [`jetson.setup`](/cli/jetson-setup), a per-boot runtime tweak owned by the systemd `ExecStartPre`, not an install step.
+  `provision` does **not** pin the Jetson clocks or steer the CAN adapters' interrupt — that's [`jetson.setup`](/cli/jetson-setup), a per-boot runtime tweak owned by the systemd `ExecStartPre`, not an install step. After pulling a fix that touches either, run both: `axol provision` then `axol jetson.setup`, and log in again for the scheduling grant.
 </Note>
 
 When there's no ZED SDK at `/usr/local/zed`, only the pyzed and zed-gstreamer
-build steps are skipped; adb, board access, GStreamer/PyGObject, and `axol-rt`
-are still provisioned.
+build steps are skipped; adb, board access, the scheduling grant,
+GStreamer/PyGObject, and `axol-rt` are still provisioned.
 
 See [Development install → Headset-video stack](/advanced/development-install#headset-video-stack) for when you'd run this by hand.
