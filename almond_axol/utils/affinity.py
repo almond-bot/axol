@@ -46,7 +46,7 @@ _MIN_CORES = 4
 
 
 def core_groups() -> dict[str, set[int]] | None:
-    """``{"can", "realtime", "ik", "relay", "background"}`` → core sets.
+    """``{"can", "realtime", "ik", "relay", "background", "irq"}`` → core sets.
 
     Based on the machine's *physical* core count, NOT the process's current
     affinity: the control process pins itself before spawning the relay/recorder,
@@ -62,6 +62,21 @@ def core_groups() -> dict[str, set[int]] | None:
     interrupts. This also avoids the old shared ``realtime`` layout where
     camera/WebRTC bookkeeping made 5-15% of nominal 240 Hz motor ticks late.
     ``ik`` remains a dedicated core so it cannot deschedule CAN or Python.
+
+    ``irq`` names the CPU the kernel delivers that interrupt to by default
+    (CPU0 on every Jetson seen so far). Only *CFS* work may run there: a CAN
+    reply reaches the socket through the interrupt's bottom half (URB
+    giveback + NET_RX softirq) on that CPU, and any ``SCHED_FIFO`` userspace
+    thread runnable there delays it for as long as it runs — measured
+    2026-09-02 on a customer robot: the FIFO camera capture set on CPU0
+    pushed *both arms'* replies past the 240 Hz reply window and faulted the
+    core within 10 s of arming, and raising ``ksoftirqd/0`` above the camera
+    priorities did not help. What did was moving the interrupt itself onto a
+    CAN core (:func:`can_irq_cpu`), which ``jetson.setup`` does at every boot:
+    the whole receive path then runs where its consumer already is and no
+    camera thread is allowed. :func:`realtime_camera_cores` additionally
+    keeps real-time camera work off the ``irq`` CPU, so the two subsystems
+    stay decoupled even when that steering has not (yet) been applied.
 
     The relay gets *two* private cores so :func:`isolate_relay_cpu` can keep its
     Python work (the aiortc WebRTC send + encoded-AU pull loops, all
@@ -80,11 +95,15 @@ def core_groups() -> dict[str, set[int]] | None:
     n = os.cpu_count()
     if not n or n < _MIN_CORES:
         return None
+    # The Jetson's xHCI interrupt lands on CPU0 until jetson.setup steers it
+    # (its nominal mask says all CPUs; the GIC picks CPU0); every layout keeps
+    # SCHED_FIFO camera work off it.
+    irq = {0}
     if n >= 8:
-        # CPU0 services the Jetson's xHCI interrupt (both USB CAN adapters and
-        # cameras) and is therefore a poor place for a motor deadline. Put the
-        # Rust bus loops on the last two cores and leave the housekeeping CPUs
-        # to throughput-tolerant dataset work.
+        # CPU0 takes the Jetson's xHCI interrupt by default (both USB CAN
+        # adapters and cameras) and is therefore a poor place for a motor
+        # deadline. Put the Rust bus loops on the last two cores and leave the
+        # housekeeping CPUs to throughput-tolerant dataset work.
         can = {n - 2, n - 1}
         rt = {2}
         ik = {3}
@@ -104,7 +123,52 @@ def core_groups() -> dict[str, set[int]] | None:
         "ik": ik,
         "relay": relay,
         "background": bg,
+        "irq": irq,
     }
+
+
+def realtime_camera_cores() -> set[int] | None:
+    """Cores where ``SCHED_FIFO`` camera work is allowed to run.
+
+    The relay's throughput cores (everything but its Python core) plus the
+    background cores — the same pool :func:`isolate_relay_cpu` gives the CFS
+    GStreamer workers — **minus** the ``irq`` CPU. The capture chain the relay
+    elevates (:func:`prioritize_capture_threads`) and the Argus daemon
+    ``jetson.setup`` elevates both live here, so neither can ever sit on the
+    CPU the CAN adapters' interrupt is delivered to before ``jetson.setup``
+    steers it away (see :func:`core_groups`), nor land on a control, IK, or
+    CAN core. ``None`` when partitioning isn't applicable or the pool would be
+    empty.
+    """
+    groups = core_groups()
+    if groups is None:
+        return None
+    relay = sorted(groups["relay"])
+    py_core = {relay[0]} if relay else set()
+    cores = (set(relay[1:]) | groups["background"]) - py_core - groups["irq"]
+    return cores or None
+
+
+def can_irq_cpu() -> int | None:
+    """CPU the CAN adapters' USB-controller interrupt should be delivered to.
+
+    The highest CAN core: the bus loop pinned there is the interrupt's
+    consumer, so the hardirq, URB giveback, NET_RX softirq and socket wake-up
+    all run on a core that carries nothing but an ``axol-rt`` ``SCHED_FIFO``
+    thread and its own idle time. That thread spends most of each 4.17 ms
+    period blocked on exactly this interrupt, so it and the bottom half never
+    compete, and no camera or dataset thread is ever scheduled there (see
+    :func:`core_groups`). ``None`` when the host has no CAN partition.
+
+    This is the placement that ended the camera-versus-CAN coupling in the
+    field (2026-09-02: 160 s of full-load recording with zero missed replies
+    beyond load transitions, versus a fault 10 s after arming with the
+    interrupt on CPU0). ``jetson.setup`` applies it per boot.
+    """
+    groups = core_groups()
+    if groups is None or not groups["can"]:
+        return None
+    return max(groups["can"])
 
 
 def pin_realtime() -> bool:
@@ -226,10 +290,16 @@ def isolate_relay_cpu() -> bool:
     return True
 
 
-# SCHED_FIFO priority for the camera capture threads. Well below the CAN loops
-# (`AXOL_RT_FIFO_PRIORITY`, 20) and on disjoint cores anyway; above every CFS
-# thread so a capture wake-up never queues behind the encode/mux workers.
+# The SCHED_FIFO ladder across the stack, lowest to highest:
+#   CAPTURE_FIFO_PRIORITY  (5)  relay camera capture chain
+#   capture daemon         (6)  nvargus-daemon, see utils.jetson
+#   axol-rt CAN loops     (20)  AXOL_RT_FIFO_PRIORITY, rt.link
+# Camera work sits above every CFS thread so a capture wake-up never queues
+# behind the encode/mux workers; the CAN loops outrank everything and run on
+# disjoint cores anyway. The top rung is also what the persistent rtprio grant
+# (utils.rtprio, LimitRTPRIO in the service unit) allows a non-root launcher.
 CAPTURE_FIFO_PRIORITY = 5
+MAX_FIFO_PRIORITY = 20
 
 
 def prioritize_capture_threads(thread_comms: Iterable[str]) -> int:
@@ -261,11 +331,19 @@ def prioritize_capture_threads(thread_comms: Iterable[str]) -> int:
     ``gst_zed.exposure_critical_thread_comms``) plus every non-Python thread
     that still carries the process's own ``comm`` — GStreamer, GLib, NVENC and
     CUDA all rename theirs, so an unrenamed thread in the relay is the SDK's.
-    Call once after the pipelines are PLAYING (the threads exist by then).
-    Returns the number of threads moved; ``0`` when the platform has no
-    ``sched_setscheduler`` or the process lacks ``CAP_SYS_NICE`` (a manual
-    unprivileged run — the failure is logged once and the threads stay CFS,
-    exactly the previous behaviour).
+
+    Every thread it elevates is also confined to :func:`realtime_camera_cores`.
+    :func:`isolate_relay_cpu` leaves the gst pool free to use the CPU the CAN
+    adapters' interrupt lands on by default, which is fine for CFS work but
+    not for a FIFO thread: one runnable there delays the interrupt's bottom
+    half and with it both arms' CAN feedback (see :func:`core_groups`). Call
+    once after the pipelines are PLAYING (the threads exist by then). Returns
+    the number of threads moved; ``0`` when the platform has no
+    ``sched_setscheduler`` or the process lacks ``CAP_SYS_NICE`` / an rtprio
+    allowance — a manual run from a shell without the ``axol provision``
+    rtprio grant. That case is logged as a warning (it is the whole story
+    behind an otherwise puzzling run of skipped exposures) and the threads
+    stay CFS, exactly the previous behaviour.
     """
     if not hasattr(os, "sched_setscheduler") or not hasattr(os, "SCHED_FIFO"):
         return 0
@@ -280,6 +358,7 @@ def prioritize_capture_threads(thread_comms: Iterable[str]) -> int:
         return 0
     wanted = set(thread_comms) | {process_comm}
     param = os.sched_param(CAPTURE_FIFO_PRIORITY)  # type: ignore[attr-defined]
+    cores = realtime_camera_cores() if hasattr(os, "sched_setaffinity") else None
     moved = 0
     denied: OSError | None = None
     for entry in tasks:
@@ -303,17 +382,28 @@ def prioritize_capture_threads(thread_comms: Iterable[str]) -> int:
             denied = exc
             break
         except OSError:
-            pass
+            continue
+        if cores is not None:
+            try:
+                os.sched_setaffinity(tid, cores)  # type: ignore[attr-defined]
+            except OSError:
+                pass  # exited; the FIFO call above already succeeded
     if denied is not None:
-        _logger.info(
+        _logger.warning(
             "camera capture threads stay SCHED_OTHER (no CAP_SYS_NICE: %s); "
-            "expect skipped exposures under recording load",
+            "expect skipped exposures under recording load. Run `axol provision` "
+            "and log in again (or `sudo prlimit --pid $$ --rtprio=%d:%d` in this "
+            "shell) so a manual `axol serve` may use SCHED_FIFO",
             denied,
+            MAX_FIFO_PRIORITY,
+            MAX_FIFO_PRIORITY,
         )
     elif moved:
         _logger.info(
-            "camera capture threads -> SCHED_FIFO %d (%d threads: %s + SDK workers)",
+            "camera capture threads -> SCHED_FIFO %d on cores %s (%d threads: %s "
+            "+ SDK workers)",
             CAPTURE_FIFO_PRIORITY,
+            sorted(cores) if cores is not None else "(unpinned)",
             moved,
             ", ".join(sorted(wanted - {process_comm})),
         )

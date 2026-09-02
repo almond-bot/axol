@@ -1,20 +1,29 @@
 ---
 title: "jetson.setup"
-description: "Pin the Jetson NVENC/VIC and CPU clocks for the real-time loops."
+description: "Pin the Jetson clocks and real-time scheduling for the control and camera loops."
 ---
 
 Pins the Jetson clocks the real-time loops depend on:
 
 - the **MAXN power mode** (`nvpmodel -m 0`), which uncaps the clock ceiling the other two pins reach (`nvpmodel` otherwise caps how high the governor and engine clocks can go),
-- the **NVENC / VIC engine** devfreq nodes, so the camera relay's hardware H.264 encode stays low-latency (the default devfreq governor scales them for throughput, which roughly triples per-frame encode time), and
+- the **NVENC / VIC / GPU engine** devfreq nodes, so the camera relay's hardware H.264 encode and the ZED SDK's CUDA processing stay low-latency (the default devfreq governor scales them for throughput, which roughly triples per-frame encode time), and
 - the **CPU governor**, so the bursty IK loop isn't underclocked.
+
+And the real-time scheduling that keeps the camera and motor paths from contending:
+
+- **The CAN adapters' USB-controller interrupt** is steered onto a CAN core. Both USB CAN adapters hang off one xHCI controller whose interrupt the Jetson otherwise delivers to CPU0 — a core the camera relay's worker pool shares. Every motor reply crosses that CPU's interrupt bottom half, and a real-time camera thread runnable there delays it: with the relay's capture chain `SCHED_FIFO`, both arms faulted on missing feedback within seconds of arming. Moving the interrupt beside its consumer (the `axol-rt` bus loop pinned to that core, where no camera or dataset thread is ever scheduled) ends the coupling. The interrupt is resolved from the CAN interfaces' USB bus each boot, never hard-coded; a warning names the manual `echo N | sudo tee /proc/irq/<irq>/smp_affinity_list` if it can't be applied, and another if `irqbalance` is running and could undo it.
+- **The Argus capture daemon** (`nvargus-daemon`, every ZED X frame passes through it) runs `SCHED_FIFO` one notch above the relay's capture threads, confined to the camera cores so it never lands on a control, IK, CAN, or interrupt core.
 
 ```bash
 axol jetson.setup
 ```
 
-These pins reset on every reboot, so the [one-command install](/installation) wires this into the `axol.service` systemd unit as an `ExecStartPre`, re-pinning the clocks at every boot, and runs it once during install. It is **not** called from `teleop` / `collect-data` / `serve` — those entry points just run.
+These settings reset on every reboot, so the [one-command install](/installation) wires this into the `axol.service` systemd unit as an `ExecStartPre`, re-applying them at every boot, and runs it once during install. It is **not** called from `teleop` / `collect-data` / `serve` — those entry points just run.
 
 <Note>
-  Best-effort and a no-op on non-Jetson machines. Pinning needs root: run as root, or you'll be prompted for `sudo` once on a terminal; if escalation isn't possible it logs the manual command and continues.
+  Best-effort and a no-op on non-Jetson machines. Everything here needs root: run as root, or you'll be prompted for `sudo` once on a terminal; if escalation isn't possible it logs the manual command and continues.
+</Note>
+
+<Note>
+  `jetson.setup` is the per-boot half. The install-time half is [`axol provision`](/cli/provision), which grants your login the `rtprio` allowance a manual `axol serve` needs before the camera relay can run its capture chain `SCHED_FIFO` at all. Without both, the relay logs `camera capture threads stay SCHED_OTHER` at startup and recordings drop exposures under load.
 </Note>
