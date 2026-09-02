@@ -59,7 +59,7 @@ asyncio.run(main())
 
 If a controlling process dies (or disconnects) while the robot is torqued on, the motors keep holding their last commanded pose. Startup code does not need to know whether that happened: `enable()` queries each motor and converges —
 
-- joints that are **already holding** are attached to with reads only (never reset — a reset reboots MyActuator motors and drops the arm for ~2 s), and a holding gripper keeps its grasp: its open-stop calibration is restored from the values persisted by the last full bring-up instead of re-running the sweep that forces the jaws open;
+- joints that are **already holding** are attached to with reads only (never reset — a reset reboots MyActuator motors and drops the arm for ~2 s), and a holding gripper keeps its grasp: its end-stop calibration is restored from the values persisted by the last full bring-up instead of re-running the sweep that closes and then opens the jaws;
 - **cold** joints get the classic full bring-up;
 - a mixed robot (e.g. the previous session died mid-`enable`) simply gets the cold joints brought up while the holding ones are left alone;
 - with `hold=True` (the default) `enable()` finishes by commanding the measured pose once (configured gains + gravity feedforward — the arm is already there, so nothing moves), so "enabled" always means *actively holding*.
@@ -95,7 +95,7 @@ Notes:
 - `connect()` is optional — `enable()` opens the buses itself. Call it when you want to inspect state (`get_holding()`, positions, temperatures) before acting. A process that must never actuate can `connect()`, check `get_holding()`, and only proceed when every joint is already holding.
 - Custom control modes: pass `enable(hold=False)` to leave freshly brought-up joints enabled but limp, then pick your mode with `set_control_mode()` (position/velocity/force). The reconnect machinery targets the impedance workflow — a session that died in another control mode is asked to `disable()` and re-enable rather than being reattached.
 - To force a fresh bring-up of a live robot (re-run gripper calibration, reset motors), call `disable()` first, then `enable()`.
-- One corner intentionally raises `MotorError`: a gripper that is holding but has no valid persisted calibration — re-measuring would sweep the jaws open and drop whatever it grips. Empty the gripper, then `disable()` and `enable()`.
+- One corner intentionally raises `MotorError`: a gripper that is holding but has no valid persisted calibration — re-measuring would sweep the jaws closed and open and drop whatever it grips. Empty the gripper, then `disable()` and `enable()`.
 - `enable()` also refuses (raising `MotorError`) if any arm joint's encoder reading is implausible for a zero at its calibration end stop — the zero was never set, or is stale, and bringing the robot up on garbage joint-frame values is unsafe. The gate runs **before anything is actuated** (`connect()` and the read APIs still work, for inspecting such a robot); run `axol motor.set-zero-pos --guided` to (re)zero. See [`motor.set-zero-pos`](/cli/motor-set-zero-pos).
 - `disconnect()` closes the buses without touching torque, so the robot keeps holding and a later process can reconnect. Use `disable()` only when you actually want to torque off (with the arms in a safe pose).
 
@@ -210,7 +210,9 @@ left = replace(
 
 Gravity feedforward is computed centrally from the URDF — see [Gravity compensation](#gravity-compensation) — and uses the per-joint `mass` and `com` directly.
 
-`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s); the gripper's mass is already lumped into `wrist_3.mass` (the gripper joint is fixed).
+`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm), `max_speed` (rad/s), and `close_direction` (`+1` or `-1`: the sign of the motor rotation that closes the jaw — the grippers are a mirrored pair: the left defaults to `-1`, the right to `+1`); the gripper's mass is already lumped into `wrist_3.mass` (the gripper joint is fixed).
+
+The gripper has no fixed stroke. On every cold `enable()` it is calibrated against its own hardware: the jaw is swept closed (in `close_direction`) until it stalls on the closed stop, then swept back until it stalls on the open stop, so it finishes **open**. The two measured stops define the `[0 = closed, 1 = open]` normalisation for that session and are persisted for reconnects. If a gripper comes up *closed* after calibration, its `close_direction` is inverted for that unit — flip it, e.g. `--axol.left.gripper.close_direction 1`.
 
 `AxolConfig` also exposes top-level parameters:
 

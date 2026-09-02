@@ -32,7 +32,7 @@ import time
 
 from ...constants import CAN_LEFT, CAN_RIGHT, Joint
 from ...motor import ControlMode
-from ...robot.axol import GRIPPER_TRAVEL, Axol, AxolArm
+from ...robot.axol import Axol, AxolArm
 
 # Marker prefix a --web-prompts step prints before blocking on stdin, matching
 # rom.enable; the dashboard turns it into a Continue button.
@@ -72,19 +72,21 @@ async def open_gripper(arm: AxolArm, side: str) -> None:
     still holding its grasp in POSITION_FORCE mode. We re-assert ``enable`` on
     just this motor — which only clears errors and reads the motor's
     position/torque limits so scaling is correct, sending no motion — then
-    smoothstep the position-force setpoint from the current shaft position
-    toward open. Opening is the negative direction, and a full ``GRIPPER_TRAVEL``
-    guarantees the jaw reaches the open stop regardless of how far it had closed
-    onto the item; the torque cap keeps it gentle against the stop.
+    smoothstep the position-force setpoint from the current shaft position to
+    the open stop. The stop comes from the end-stop calibration ``rom.enable``
+    persisted (which side of the closed stop it lies on differs between the
+    mirrored grippers), validated against the current shaft position; the
+    torque cap keeps the jaw gentle against it.
     """
     motor = arm.motors[Joint.GRIPPER]
     await motor.enable()
     await motor.set_control_mode(ControlMode.POSITION_FORCE)
+    await arm._restore_gripper_calibration()
 
     start = await motor.get_position()  # raw motor rad
-    target = start - GRIPPER_TRAVEL
+    target = arm._gripper_open
 
-    duration = max(GRIPPER_TRAVEL / OPEN_SPEED, 0.1)  # seconds
+    duration = max(abs(target - start) / OPEN_SPEED, 0.1)  # seconds
     dt = 1.0 / RATE_HZ  # seconds
     t0 = time.monotonic()
     print(f"Opening {side} gripper ...")

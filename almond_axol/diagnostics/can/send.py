@@ -26,7 +26,7 @@ import numpy as np
 
 from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
 from ...motor import CanBus, ControlMode
-from ...robot.axol import GRIPPER_TRAVEL, AxolArm, arm_limits
+from ...robot.axol import AxolArm, arm_limits
 from ...robot.config import AxolConfig
 from ...robot.gravity import GravityCompensator
 
@@ -64,8 +64,7 @@ def _parse_joints(spec: str | None) -> set[Joint]:
 def _joint_frame(arm: AxolArm, idx: int, joint: Joint, raw: float) -> float:
     """Convert a raw motor-frame reading to the public joint-frame value."""
     if joint == Joint.GRIPPER:
-        gi = arm._gripper_i
-        return (raw - arm._limits_hi[gi]) / (arm._limits_lo[gi] - arm._limits_hi[gi])
+        return arm._gripper_from_raw(raw)
     return raw + float(arm._joint_offsets[idx])
 
 
@@ -149,10 +148,7 @@ async def _command(arm: AxolArm, q: np.ndarray, present: set[Joint]) -> None:
             )
         )
     if Joint.GRIPPER in present:
-        gi = arm._gripper_i
-        gripper_pos = arm._limits_hi[gi] + float(q[gi]) * (
-            arm._limits_lo[gi] - arm._limits_hi[gi]
-        )
+        gripper_pos = arm._gripper_to_raw(float(q[arm._gripper_i]))
         tasks.append(
             arm.motors[Joint.GRIPPER].set_position_force(
                 gripper_pos,
@@ -311,10 +307,10 @@ async def _display_both(left: _SendSnapshot, right: _SendSnapshot) -> None:
         print("\033[?25h", end="", flush=True)
 
 
-def _cycle_dist_rad(dist_api: float, joint: Joint) -> float:
+def _cycle_dist_rad(dist_api: float, joint: Joint, arm: AxolArm) -> float:
     """Convert an API-unit distance to radians for speed/duration calculations."""
     if joint == Joint.GRIPPER:
-        return abs(dist_api) * GRIPPER_TRAVEL
+        return abs(dist_api) * arm.gripper_travel
     return abs(dist_api)
 
 
@@ -410,7 +406,7 @@ async def _run(
             target_idx = 0
             segment_start = cycle_start
             segment_target = targets[0]
-            dist_rad = _cycle_dist_rad(segment_target - segment_start, cycle_joint)
+            dist_rad = _cycle_dist_rad(segment_target - segment_start, cycle_joint, arm)
             duration = max(dist_rad / _SPEED, 0.05)
             t_seg = time.perf_counter()
 
@@ -513,7 +509,7 @@ async def _run(
                         target_idx += 1
                         segment_target = targets[target_idx % 2]
                         dist_rad = _cycle_dist_rad(
-                            segment_target - segment_start, cycle_joint
+                            segment_target - segment_start, cycle_joint, arm
                         )
                         duration = max(dist_rad / _SPEED, 0.05)
                         t_seg = time.perf_counter()

@@ -126,8 +126,7 @@ def parse_joints(spec: str | None) -> set[Joint]:
 def _joint_frame(arm: AxolArm, idx: int, joint: Joint, raw: float) -> float:
     """Convert a raw motor-frame reading to the public joint-frame value."""
     if joint == Joint.GRIPPER:
-        gi = arm._gripper_i
-        return (raw - arm._limits_hi[gi]) / (arm._limits_lo[gi] - arm._limits_hi[gi])
+        return arm._gripper_from_raw(raw)
     return raw + float(arm._joint_offsets[idx])
 
 
@@ -257,10 +256,7 @@ class HardwareController:
                 )
             )
         if Joint.GRIPPER in self._present:
-            gi = arm._gripper_i
-            gripper_pos = arm._limits_hi[gi] + float(q[gi]) * (
-                arm._limits_lo[gi] - arm._limits_hi[gi]
-            )
+            gripper_pos = arm._gripper_to_raw(float(q[arm._gripper_i]))
             tasks.append(
                 arm.motors[Joint.GRIPPER].set_position_force(
                     gripper_pos,
