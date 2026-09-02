@@ -1190,10 +1190,37 @@ class LighthouseChannelCheckTest(unittest.TestCase):
         # Timestamp-less lines never occur in the stream and must not match.
         self.assertIsNone(survive._lighthouse_record(["LH_UP", "0"]))  # noqa: SLF001
 
+        # Log entries that prove a tracker received light from a station.
+        self.assertEqual(
+            survive._live_lighthouse(  # noqa: SLF001
+                "OOTX not set for LH in channel 3; attaching ootx decoder using device WM1"
+            ),
+            (3, None),
+        )
+        self.assertEqual(
+            survive._live_lighthouse("Adding lighthouse ch 5 (idx: 1, cnt: 2)"),  # noqa: SLF001
+            (5, None),
+        )
+        self.assertEqual(
+            survive._live_lighthouse("Got OOTX packet 0 406494d9"),  # noqa: SLF001
+            (0, "406494d9"),
+        )
+        self.assertIsNone(
+            survive._live_lighthouse("Adding tracked object WM0 from HTC")  # noqa: SLF001
+        )
+        self.assertEqual(
+            survive._setup_info("\x1b[0mInfo: Got OOTX packet 0 406494d9\n"),  # noqa: SLF001
+            "Got OOTX packet 0 406494d9",
+        )
+        self.assertIsNone(survive._setup_info("1.45 INFO LOG Got OOTX packet 0 1"))  # noqa: SLF001
+
         source = SurviveSource()
+        source._note_info(  # noqa: SLF001
+            "OOTX not set for LH in channel 0; attaching ootx decoder using device WM0"
+        )
         source._note_lighthouse(0, None)  # noqa: SLF001
         source._note_lighthouse(0, "7dff627a")  # noqa: SLF001
-        source._note_lighthouse(0, "406494d9")  # noqa: SLF001
+        source._note_info("Got OOTX packet 0 406494d9")  # noqa: SLF001
         source._note_warning(  # noqa: SLF001
             "Two or more lighthouses are on channel 0; tracking is most likely going to fail."
         )
@@ -1202,18 +1229,74 @@ class LighthouseChannelCheckTest(unittest.TestCase):
         self.assertEqual(survey.conflicts, {0})
         self.assertEqual(survey.clashing_channels(), [0])
         self.assertEqual(survey.base_station_count, 2)
-        # Operators read the number shown on the station, not libsurvive's index.
-        self.assertEqual(
-            survey.clash_problems(),
-            [
-                "base stations 406494D9 and 7DFF627A share channel 1; press the "
-                "channel button on the back of one station until it shows a "
-                "different number"
-            ],
+        # Operators read the number shown on the station, not libsurvive's index,
+        # and every problem ends with the fix.
+        [problem] = survey.clash_problems()
+        self.assertTrue(
+            problem.startswith(
+                "base stations 406494D9 and 7DFF627A are both set to channel 1"
+            ),
+            problem,
         )
+        self.assertIn("press the channel button on the back of one station", problem)
         published = survey.to_dict()
         self.assertEqual(published["channels"], {"1": ["406494D9", "7DFF627A"]})
         self.assertEqual(published["clashingChannels"], [1])
+        self.assertEqual(published["expectedBaseStations"], 2)
+
+    def test_saved_calibration_is_not_mistaken_for_a_live_station(self) -> None:
+        """Replay of a real run: two stations both set to channel 1.
+
+        libsurvive replayed its saved station (7DFF627A) on channel 0 a few
+        milliseconds after startup, then a tracker received channel 0 and the
+        OOTX frame named a different station (406494D9). The old check
+        reported "1 base station 7DFF627A" and passed.
+        """
+        from almond_axol.tracker import survive
+
+        source = SurviveSource()
+        stream = [
+            "0.007361 LH_UP 0 -1.000000e+00   +1.270000e+02   +4.000000e+01",
+            "0.008126 0 LH_POSE 0.000000 1.327329 0.864123 -0.229106 -0.193808 "
+            "0.557371 0.774136  2113888890",
+            "Info: Adding tracked object \x1b[0;31mWM0\x1b[0m from \x1b[0;34mHTC\x1b[0m",
+            "Info: OOTX not set for LH in channel 0; attaching ootx decoder using device WM1",
+            "1.453803 INFO LOG OOTX not set for LH in channel 0; attaching ootx decoder",
+            "Info: Got OOTX packet 0 406494d9",
+            "10.420106 LH_UP 0 +1.800000e+01   +1.270000e+02   +4.600000e+01",
+            "13.397101 0 LH_POSE 0.000000 1.442819 0.969140 -0.091456 -0.081995 "
+            "0.571672 0.811236  1080333529",
+        ]
+        for line in stream:
+            warning = survive._setup_warning(line)  # noqa: SLF001
+            info = survive._setup_info(line)  # noqa: SLF001
+            record = survive._lighthouse_record(line.split())  # noqa: SLF001
+            if warning is not None:
+                source._note_warning(warning)  # noqa: SLF001
+            elif info is not None:
+                source._note_info(info)  # noqa: SLF001
+            elif record is not None:
+                source._note_lighthouse(*record)  # noqa: SLF001
+
+        survey = source.lighthouse_survey()
+        self.assertEqual(survey.channels, {0: {"406494d9"}})
+        self.assertEqual(survey.saved, {0: {"7dff627a"}})
+        self.assertEqual(survey.base_station_count, 1)
+        self.assertEqual(survey.replaced_channels(), [0])
+        [problem] = survey.problems()
+        self.assertIn(
+            "only 1 of 2 base stations was seen (channel 1 (406494D9))", problem
+        )
+        self.assertIn(
+            "the station now on channel 1 (406494D9) is not the one saved there "
+            "last time (7DFF627A), which means both are set to channel 1",
+            problem,
+        )
+        self.assertIn("press the channel button", problem)
+        published = survey.to_dict()
+        self.assertEqual(published["channels"], {"1": ["406494D9"]})
+        self.assertEqual(published["savedChannels"], {"1": ["7DFF627A"]})
+        self.assertEqual(published["baseStationCount"], 1)
 
     def test_two_different_serials_on_one_channel_clash_without_the_warning(
         self,
@@ -1230,13 +1313,29 @@ class LighthouseChannelCheckTest(unittest.TestCase):
         healthy.note_channel(0, "aaaaaaaa")
         healthy.note_channel(1, "bbbbbbbb")
         self.assertEqual(healthy.problems(), [])
-        self.assertEqual(
-            LighthouseSurvey().problems(),
-            [
-                "no base station was detected; power the base stations and give "
-                "the trackers a clear view of them"
-            ],
-        )
+        # A healthy station whose saved identity matches is not "replaced".
+        healthy.note_saved(0, "aaaaaaaa")
+        self.assertEqual(healthy.replaced_channels(), [])
+        self.assertEqual(healthy.problems(), [])
+
+        [none_seen] = LighthouseSurvey().problems()
+        self.assertTrue(none_seen.startswith("no base station was seen"), none_seen)
+
+        # One station, no saved calibration to compare against: still point at
+        # the channel, since that is almost always the cause with two stations.
+        lonely = LighthouseSurvey()
+        lonely.note_channel(0)
+        [problem] = lonely.problems()
+        self.assertIn("only 1 of 2 base stations was seen (channel 1)", problem)
+        self.assertIn("set to the same channel as the one that was seen", problem)
+        self.assertIn("press the channel button", problem)
+
+        # A saved station on a channel nobody received tonight is not counted.
+        stale = LighthouseSurvey()
+        stale.note_saved(0, "aaaaaaaa")
+        stale.note_saved(1, "bbbbbbbb")
+        self.assertEqual(stale.base_station_count, 0)
+        self.assertTrue(stale.problems()[0].startswith("no base station was seen"))
 
     def test_identify_refuses_to_bind_while_base_stations_share_a_channel(self) -> None:
         from almond_axol.tracker.lighthouse_survey import LighthouseSurvey
@@ -1294,6 +1393,19 @@ class LighthouseChannelCheckTest(unittest.TestCase):
         self.assertEqual(failures, 2)
         self.assertIn("FAIL Channel 1", out.getvalue())
         self.assertIn("FAIL Trackers           1 of 2 reporting (T20)", out.getvalue())
+        self.assertIn("press the channel button", out.getvalue())
+
+        lonely = LighthouseSurvey()
+        lonely.note_channel(0, "406494d9")
+        lonely.note_saved(0, "7dff627a")
+        lonely.trackers = {"T20", "T21"}
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            failures = tracker_lighthouse.report_survey(lonely)
+        self.assertEqual(failures, 1)
+        self.assertIn("OK   Channel 1          base station 406494D9", out.getvalue())
+        self.assertIn("FAIL Base stations      1 of 2 seen", out.getvalue())
+        self.assertIn("is not the one saved there last time (7DFF627A)", out.getvalue())
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "lighthouse_survey.json"

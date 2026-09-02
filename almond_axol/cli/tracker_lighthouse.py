@@ -1,10 +1,13 @@
 """
 axol tracker.lighthouse.check
 
-Survey the Lighthouse base stations and trackers libsurvive can see. The one
-setup fault libsurvive only reports in its log — two Base Station 2.0 units on
-the same channel — is surfaced here as a failing check, and the survey is
-persisted so the control panel's Mantis readiness badges can show it.
+Survey the Lighthouse base stations and trackers libsurvive can see. The setup
+fault libsurvive only reports in its log — two Base Station 2.0 units on the
+same channel — is surfaced here as a failing check, as is a powered station
+the trackers never receive (with two stations that almost always means the
+same fault: libsurvive can only lock onto one station per channel). The survey
+is persisted so the control panel's Mantis readiness badges can show it along
+with the fix.
 """
 
 from __future__ import annotations
@@ -19,10 +22,11 @@ from ..tracker.lighthouse_survey import (
     save_lighthouse_survey,
 )
 
-# The channel-clash warning repeats about once a second and the first LH_POSE
-# (which names a station) follows the initial solve a few seconds in, so hold
-# the survey open long enough for both before deciding.
-_SURVEY_S = 12.0
+# A live channel is logged within about two seconds of a tracker seeing it, but
+# the station's serial only arrives with its OOTX frame, which takes 10–17 s to
+# decode; the channel-clash warning repeats about once a second. Hold the survey
+# open long enough to name the stations before deciding.
+_SURVEY_S = 20.0
 _EXPECTED_TRACKERS = 2
 
 
@@ -30,7 +34,8 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``tracker.lighthouse.check`` subcommand."""
     subparsers.add_parser(
         "tracker.lighthouse.check",
-        help="Check Lighthouse base-station channels and tracker visibility.",
+        help="Check that every Lighthouse base station is seen on its own channel "
+        "and both trackers report.",
     ).set_defaults(func=run_check)
 
 
@@ -58,12 +63,10 @@ def report_survey(survey: LighthouseSurvey) -> int:
     """Print the survey as check lines; return the number of failures."""
     failures = 0
     if not survey.channels:
-        _result("FAIL", "Base stations", "none detected")
+        _result("FAIL", "Base stations", "none seen")
         failures += 1
     for channel, serials in sorted(survey.channels.items()):
-        names = (
-            ", ".join(s.upper() for s in sorted(serials)) or "serial not yet decoded"
-        )
+        names = ", ".join(s.upper() for s in sorted(serials)) or "serial not decoded"
         if channel in survey.clashing_channels():
             _result(
                 "FAIL",
@@ -75,13 +78,19 @@ def report_survey(survey: LighthouseSurvey) -> int:
             _result(
                 "OK", f"Channel {display_channel(channel)}", f"base station {names}"
             )
-    if survey.clashing_channels():
-        print(
-            "     Every base station must use a different channel: press the "
-            "channel button on the back of one station until its display "
-            "shows an unused number, then rerun this check.",
-            flush=True,
+    if (
+        survey.channels
+        and not survey.clashing_channels()
+        and survey.base_station_count < survey.expected
+    ):
+        _result(
+            "FAIL",
+            "Base stations",
+            f"{survey.base_station_count} of {survey.expected} seen",
         )
+        failures += 1
+    for problem in survey.problems():
+        print(f"     {problem}.", flush=True)
     trackers = ", ".join(sorted(survey.trackers)) or "none"
     if len(survey.trackers) >= _EXPECTED_TRACKERS:
         _result("OK", "Trackers", f"{len(survey.trackers)} reporting ({trackers})")

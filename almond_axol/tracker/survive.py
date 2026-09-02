@@ -62,7 +62,18 @@ _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 # not a setup problem, unlike a persistent base-station channel clash.
 _TRANSIENT_WARNINGS = ("Could not lighthouse more to",)
 _MAX_WARNINGS = 20
+# The tracker firmware flags this in its light packets when it receives sync
+# pulses from two stations set to the same channel.
 _CHANNEL_CLASH = re.compile(r"Two or more lighthouses are on channel (\d+)")
+# Logged once per channel on the first sync pulse a tracker receives from it in
+# this process, whether or not the saved calibration already knows the station:
+# the definitive "a station is live on this channel" signal.
+_LIVE_CHANNEL = re.compile(
+    r"(?:OOTX not set for LH in channel|Adding lighthouse ch) (\d+)"
+)
+# Logged when a station's OOTX frame decodes and it is not the station the saved
+# calibration expected on that channel (or none was saved), naming it.
+_OOTX_PACKET = re.compile(r"Got OOTX packet (\d+) ([0-9a-fA-F]{1,8})\b")
 
 
 def _lighthouse_record(parts: list[str]) -> tuple[int, str | None] | None:
@@ -73,6 +84,10 @@ def _lighthouse_record(parts: list[str]) -> tuple[int, str | None] | None:
     <channel> LH_POSE x y z qw qx qy qz <BaseStationID>`` follows once it is
     solved and names the station, so two serials on one channel can be
     reported by name.
+
+    Both are also replayed from the saved calibration a few milliseconds after
+    startup, before any tracker has received light, so the caller must decide
+    whether the channel is live (see :meth:`SurviveSource._note_lighthouse`).
     """
     try:
         if len(parts) >= 3 and parts[1] == "LH_UP":
@@ -98,6 +113,34 @@ def _setup_warning(line: str) -> str | None:
     if not message or message.startswith(_TRANSIENT_WARNINGS):
         return None
     return message
+
+
+def _setup_info(line: str) -> str | None:
+    """Return the message when ``line`` is a libsurvive ``Info:`` log entry.
+
+    As with warnings, the ``INFO LOG`` recording copies are ignored so each
+    entry is seen once.
+    """
+    text = _ANSI_ESCAPE.sub("", line).strip()
+    if not text.startswith("Info:"):
+        return None
+    message = text[len("Info:") :].strip()
+    return message or None
+
+
+def _live_lighthouse(message: str) -> tuple[int, str | None] | None:
+    """Base-station (channel, serial) named by a libsurvive ``Info:`` entry.
+
+    Only entries caused by light a tracker actually received qualify, so a
+    match proves the station is powered and in view right now.
+    """
+    packet = _OOTX_PACKET.search(message)
+    if packet is not None:
+        return int(packet.group(1)), f"{int(packet.group(2), 16):08x}"
+    live = _LIVE_CHANNEL.search(message)
+    if live is not None:
+        return int(live.group(1)), None
+    return None
 
 
 class SurviveSource(TrackerSource):
@@ -274,6 +317,7 @@ class SurviveSource(TrackerSource):
                 channels={ch: set(s) for ch, s in self._survey.channels.items()},
                 conflicts=set(self._survey.conflicts),
                 trackers=set(self._poses),
+                saved={ch: set(s) for ch, s in self._survey.saved.items()},
             )
         return survey
 
@@ -285,9 +329,27 @@ class SurviveSource(TrackerSource):
             if message not in self._warnings and len(self._warnings) < _MAX_WARNINGS:
                 self._warnings.append(message)
 
-    def _note_lighthouse(self, channel: int, serial: str | None) -> None:
+    def _note_info(self, message: str) -> None:
+        live = _live_lighthouse(message)
+        if live is None:
+            return
+        channel, serial = live
         with self._lock:
             self._survey.note_channel(channel, serial)
+
+    def _note_lighthouse(self, channel: int, serial: str | None) -> None:
+        """File an ``LH_UP`` / ``LH_POSE`` record as live or saved calibration.
+
+        A tracker must receive sync on a channel (which logs the live-channel
+        entry) before libsurvive can solve or refresh a station there, so a
+        record for a channel not yet seen live can only be the saved
+        calibration replayed at startup.
+        """
+        with self._lock:
+            if channel in self._survey.channels:
+                self._survey.note_channel(channel, serial)
+            else:
+                self._survey.note_saved(channel, serial)
 
     # -- Internal ---------------------------------------------------------------
 
@@ -455,6 +517,10 @@ class SurviveSource(TrackerSource):
             warning = _setup_warning(line)
             if warning is not None:
                 self._note_warning(warning)
+                continue
+            info = _setup_info(line)
+            if info is not None:
+                self._note_info(info)
                 continue
             lighthouse = _lighthouse_record(parts)
             if lighthouse is not None:

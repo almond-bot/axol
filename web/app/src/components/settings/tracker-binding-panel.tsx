@@ -890,12 +890,19 @@ export function TrackerBindingPanel({
     const l = readiness.lighthouse
     const survey = l.baseStations ?? null
     const surveySupported = l.baseStations !== undefined
+    const expectedStations = survey?.expectedBaseStations ?? 2
+    const stationsMissing =
+      survey !== null &&
+      survey.clashingChannels.length === 0 &&
+      survey.baseStationCount > 0 &&
+      survey.baseStationCount < expectedStations
     const stationsDone = surveySupported
       ? survey !== null &&
         survey.clashingChannels.length === 0 &&
-        survey.baseStationCount > 0 &&
+        survey.baseStationCount >= expectedStations &&
         survey.trackers.length >= 2
       : true
+    const stationChannels = survey ? Object.keys(survey.channels) : []
     steps = [
       saveStep(),
       {
@@ -959,13 +966,17 @@ export function TrackerBindingPanel({
               ? `Move one base station off channel ${survey.clashingChannels.join(", ")} and check again`
               : survey.baseStationCount === 0
                 ? "No base station was seen; power them and check again"
-                : "Both trackers must report; pair the missing one and check again",
+                : stationsMissing
+                  ? `Only ${survey.baseStationCount} of ${expectedStations} base stations seen; put the other on its own channel and check again`
+                  : "Both trackers must report; pair the missing one and check again",
         body: (
           <StepBody>
             <ol className="flex flex-col gap-2">
               <SetupStep number={1}>
                 Power the base stations. Every Base Station 2.0 must show a different channel
-                number; the button on its back cycles 1–16.
+                number on the display on its back; the button next to it cycles 1–16. Two stations
+                on the same number cancel each other out, and libsurvive can only receive one of
+                them.
               </SetupStep>
               <SetupStep number={2}>
                 Pair each Tracker 3.0 to its own Watchman dongle: connect only that dongle, unplug
@@ -975,7 +986,8 @@ export function TrackerBindingPanel({
               </SetupStep>
               <SetupStep number={3}>
                 Connect both dongles, power both trackers in view of the base stations, and use
-                Check base stations. It listens to libsurvive for 12 seconds.
+                Check base stations. It listens to libsurvive for 20 seconds and must see every
+                base station on its own channel.
               </SetupStep>
             </ol>
             <div className="flex flex-wrap gap-2">
@@ -1005,7 +1017,7 @@ export function TrackerBindingPanel({
                     tone={
                       survey.clashingChannels.length > 0
                         ? "error"
-                        : survey.baseStationCount === 0
+                        : survey.baseStationCount === 0 || stationsMissing
                           ? "warning"
                           : "ready"
                     }
@@ -1014,7 +1026,9 @@ export function TrackerBindingPanel({
                       ? `Base stations share channel ${survey.clashingChannels.join(", ")}`
                       : survey.baseStationCount === 0
                         ? "No base station seen"
-                        : `${survey.baseStationCount} base station${survey.baseStationCount === 1 ? "" : "s"} on channel${Object.keys(survey.channels).length === 1 ? "" : "s"} ${Object.keys(survey.channels).join(", ")}`}
+                        : stationsMissing
+                          ? `Only ${survey.baseStationCount} of ${expectedStations} base stations seen (channel ${stationChannels.join(", ")})`
+                          : `${survey.baseStationCount} base station${survey.baseStationCount === 1 ? "" : "s"} on channel${stationChannels.length === 1 ? "" : "s"} ${stationChannels.join(", ")}`}
                   </ReadinessBadge>
                   <ReadinessBadge tone={survey.trackers.length >= 2 ? "ready" : "warning"}>
                     {survey.trackers.length >= 2
@@ -1026,9 +1040,11 @@ export function TrackerBindingPanel({
                   <ReadinessBadge tone="neutral">Checked {ago(survey.checkedAt)}</ReadinessBadge>
                 </div>
                 {survey.problems.length > 0 && (
-                  <p className="text-[11px] leading-relaxed text-red-300/75">
-                    {survey.problems.join(" · ")}.
-                  </p>
+                  <ul className="flex flex-col gap-1 text-[11px] leading-relaxed text-red-300/75">
+                    {survey.problems.map((problem) => (
+                      <li key={problem}>{problem}.</li>
+                    ))}
+                  </ul>
                 )}
               </div>
             )}

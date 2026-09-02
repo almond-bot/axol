@@ -756,11 +756,19 @@ export interface LighthouseTrackerReadiness {
 
 export interface LighthouseBaseStationSurvey {
   checkedAt: number
-  /** Base-station serials keyed by the channel number shown on the station (1–16). */
+  /**
+   * Serials of the base stations a tracker actually received during the check,
+   * keyed by the channel number shown on the station (1–16).
+   */
   channels: Record<string, string[]>
+  /** Stations libsurvive replayed from its saved calibration; not counted as seen. */
+  savedChannels?: Record<string, string[]>
   clashingChannels: number[]
   baseStationCount: number
+  /** How many stations the rig is expected to have; absent in older surveys. */
+  expectedBaseStations?: number
   trackers: string[]
+  /** Operator-facing problems, each ending with the fix. */
   problems: string[]
 }
 

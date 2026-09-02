@@ -142,7 +142,7 @@ Every Base Station 2.0 in view must be on a different channel (the button on its
 axol tracker.lighthouse.check
 ```
 
-listens to libsurvive for about 12 seconds with both trackers powered and in view, then reports one line per base-station channel (with the station serials once decoded) and the trackers that are reporting. It fails when two stations share a channel, no base station is seen, or fewer than two trackers report. The survey is saved to `~/.almond/tracker/lighthouse_survey.json` and gates the **Trackers** step of the panel's setup flow. `axol tracker.identify` performs the same channel check after discovery and refuses to bind while a clash is present.
+listens to libsurvive for about 20 seconds with both trackers powered and in view, then reports one line per base-station channel a tracker actually received (with the station serials once decoded) and the trackers that are reporting. It fails when two stations share a channel, fewer than two base stations are seen, or fewer than two trackers report, and each failure line ends with the fix. Stations replayed from libsurvive's saved calibration are not counted as seen, so a station that was re-channelled or unplugged since the last session cannot mask the problem; if the station now on a channel is not the one saved there last time, the check says so — with two stations that means both are on that channel, since libsurvive can only lock onto one station per channel. The survey is saved to `~/.almond/tracker/lighthouse_survey.json` and gates the **Trackers** step of the panel's setup flow. `axol tracker.identify` performs the same channel check after discovery and refuses to bind while a clash is present.
 
 For a manual fallback, use the same upstream source:
 
