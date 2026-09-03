@@ -1936,6 +1936,15 @@ class _EpisodeVideoVerifier:
             )
 
     def _run(self) -> None:
+        # A software re-decode of four 60 fps files takes longer than the
+        # episode did, so this thread (and the libav workers it spawns, which
+        # inherit its priority) is CPU-bound for most of a session on the same
+        # background cores as the capture thread. Yield to that thread: it
+        # holds the snapshot lock the 120 Hz control loop waits on.
+        try:
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)
+        except (AttributeError, OSError):
+            pass
         while True:
             paths = self._queue.get()
             if paths is None:
