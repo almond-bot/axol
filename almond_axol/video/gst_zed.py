@@ -161,13 +161,50 @@ def zed_stereo_gst_available() -> bool:
     return ok
 
 
+# Elements whose stale-plugin warning has already been logged in this process.
+_stale_plugin_warned: set[str] = set()
+
+
 def _element_available(element: str) -> bool:
-    """True when GStreamer can find ``element`` in its registry."""
+    """True when GStreamer can find ``element`` *and* load its plugin.
+
+    ``ElementFactory.find`` answers from the registry cache, which keeps
+    listing an element for as long as its plugin file is unchanged -- even when
+    the plugin can no longer be loaded because a library it links against was
+    replaced underneath it. That is exactly what an in-place ZED SDK upgrade
+    does to the ``zedxonesrc`` / ``zedsrc`` build (``undefined symbol:
+    sl::CameraOne::isOpened...``), and ``parse_launch`` then fails with
+    ``no element "zedxonesrc"`` after we already committed to the gst path.
+    Loading the feature here is what ``parse_launch`` would do, so the answer
+    matches, and a stale plugin degrades to the SDK camera path with a fix
+    instead of aborting the session.
+    """
     try:
         Gst, _ = _require_gst()
     except Exception:  # noqa: BLE001 - no PyGObject
         return False
-    return Gst.ElementFactory.find(element) is not None
+    factory = Gst.ElementFactory.find(element)
+    if factory is None:
+        return False
+    try:
+        loaded = factory.load()
+    except Exception as exc:  # noqa: BLE001 - loader raised instead of None
+        _logger.debug("loading GStreamer element %s raised: %s", element, exc)
+        loaded = None
+    if loaded is None:
+        # Availability is probed per camera and per fps attempt; say it once.
+        if element not in _stale_plugin_warned:
+            _stale_plugin_warned.add(element)
+            _logger.warning(
+                "GStreamer lists the %s element but its zed-gstreamer plugin "
+                "failed to load (usually a stale build after a ZED SDK upgrade). "
+                "Run `axol gst.build-zed` (or `axol provision`) to rebuild it "
+                "against the installed SDK; falling back to the ZED SDK camera "
+                "path.",
+                element,
+            )
+        return False
+    return True
 
 
 def _split_nals(data: bytes) -> list[bytes]:

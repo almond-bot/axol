@@ -23,10 +23,16 @@ Two reasons this exists rather than relying on a stock plugin install:
 We pin upstream to the exact commit the patch was generated against so the
 unified diff always applies cleanly. Idempotence is based on a root-owned
 manifest of the exact plugin paths and bytes GStreamer resolves, not merely a
-source-tree stamp. The command remains best-effort on machines without the ZED
-SDK / Jetson toolchain (callers then fall back to the SDK ``ZedCamera``). The
-hosted installer (``web/app/public/install``) runs it once after
-``axol gst.install``.
+source-tree stamp. The manifest also records the ZED SDK version the plugins
+were compiled against, and readiness additionally requires GStreamer to
+*load* each plugin: the plugins link ``libsl_zed.so`` directly, so upgrading
+the SDK in place leaves byte-identical plugins that fail to load (``undefined
+symbol: sl::CameraOne::isOpened...``) while the registry still lists their
+elements. Either signal (SDK version drift, or a load failure) triggers a
+clean rebuild against the installed SDK. The command remains best-effort on
+machines without the ZED SDK / Jetson toolchain (callers then fall back to the
+SDK ``ZedCamera``). The hosted installer (``web/app/public/install``) and the
+``axol serve`` self-updater run it via ``axol provision``.
 """
 
 from __future__ import annotations
@@ -57,13 +63,25 @@ _PATCH = Path(__file__).parent / "patches" / "zed-gstreamer-sensor-timestamp.pat
 
 # ZED SDK install (find_package(ZED) + the headers the plugins compile against).
 _ZED_SDK = Path("/usr/local/zed")
+# Where the SDK publishes its version macros (5.x, then the legacy 4.x layout).
+_ZED_SDK_VERSION_HEADERS = (
+    _ZED_SDK / "include" / "sl" / "Camera.hpp",
+    _ZED_SDK / "include" / "sl_zed" / "defines.hpp",
+)
+_ZED_SDK_VERSION_RE = {
+    part: re.compile(rf"ZED_SDK_{part}_VERSION\s+(\d+)")
+    for part in ("MAJOR", "MINOR", "PATCH")
+}
 
 # This is the authority for an installed patched build.  The source-tree stamp
 # is only a convenience: an operator-owned checkout cannot attest to the bytes
 # GStreamer will actually load.  Keep the manifest in machine state so an
 # unprivileged caller cannot bless a stock or subsequently replaced plugin.
 _MACHINE_MANIFEST = Path("/var/lib/almond-axol/zed-gstreamer-manifest.json")
-_MANIFEST_SCHEMA = 1
+# Schema 2 added ``zedSdk`` (the SDK version the plugins were built against).
+# A schema-1 manifest never matches the recomputed payload, so hosts upgraded
+# from that release rebuild once and record their SDK version going forward.
+_MANIFEST_SCHEMA = 2
 _ZED_ELEMENTS = ("zedxonesrc", "zedsrc")
 _GST_FILENAME_RE = re.compile(r"^\s*Filename\s+(.+?)\s*$", re.MULTILINE)
 
@@ -105,6 +123,30 @@ def _desired_stamp() -> str:
     """Pinned ref + patch digest; changes whenever either is bumped."""
     patch_sha = hashlib.sha256(_PATCH.read_bytes()).hexdigest()
     return f"{_PINNED_REF}\n{patch_sha}\n"
+
+
+def _zed_sdk_version() -> str | None:
+    """Installed ZED SDK version (``major.minor.patch``) from its headers.
+
+    The plugins compile against these headers and link ``libsl_zed.so``
+    directly, so this is the ABI they were built for. ``None`` when the SDK
+    layout is unrecognised; the manifest then records the SDK as unknown and a
+    later readable version is treated as a change.
+    """
+    for header in _ZED_SDK_VERSION_HEADERS:
+        try:
+            text = header.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        parts = [_ZED_SDK_VERSION_RE[key].search(text) for key in ("MAJOR", "MINOR")]
+        if not all(parts):
+            continue
+        version = ".".join(match.group(1) for match in parts if match)
+        patch = _ZED_SDK_VERSION_RE["PATCH"].search(text)
+        if patch:
+            version += f".{patch.group(1)}"
+        return version
+    return None
 
 
 def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 1800) -> bool:
@@ -175,23 +217,54 @@ def _root_controlled_canonical_file(
     return canonical
 
 
-def _inspect_element_artifact(name: str) -> Path | None:
-    """Resolve the root-controlled shared object GStreamer loads for an element."""
+def _gst_inspect(target: str) -> subprocess.CompletedProcess[str] | None:
+    """Run ``gst-inspect-1.0 <target>`` (an element name or a plugin path)."""
     inspect = shutil.which("gst-inspect-1.0")
     if inspect is None:
         return None
     try:
-        result = subprocess.run(
-            [inspect, name],
+        return subprocess.run(
+            [inspect, target],
             capture_output=True,
             text=True,
             timeout=60,
             env={**os.environ, "LC_ALL": "C"},
         )
     except Exception as exc:  # noqa: BLE001 - command missing / timed out
-        _logger.warning("could not inspect GStreamer element %s: %s", name, exc)
+        _logger.warning("could not run gst-inspect on %s: %s", target, exc)
         return None
+
+
+def _plugin_loads(artifact: Path) -> bool:
+    """True when GStreamer can actually load the plugin shared object.
+
+    The registry cache keeps listing an element for as long as its plugin file
+    is unchanged, and ``gst-inspect-1.0 <element>`` answers from that cache. So
+    a plugin whose *dependencies* changed underneath it (the ZED SDK upgraded
+    in place, leaving ``undefined symbol`` relocations against the new
+    ``libsl_zed.so``) still looks installed until a pipeline tries to
+    instantiate it. Inspecting the file itself forces ``dlopen`` and fails
+    with a non-zero exit on every GStreamer release.
+    """
+    result = _gst_inspect(str(artifact))
+    if result is None:
+        return False
     if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        _logger.warning(
+            "GStreamer cannot load the ZED plugin %s (it is stale relative to the "
+            "installed ZED SDK or its libraries): %s",
+            artifact,
+            detail[-600:] or f"exit {result.returncode}",
+        )
+        return False
+    return True
+
+
+def _inspect_element_artifact(name: str) -> Path | None:
+    """Resolve the root-controlled, *loadable* shared object behind an element."""
+    result = _gst_inspect(name)
+    if result is None or result.returncode != 0:
         return None
     match = _GST_FILENAME_RE.search(result.stdout)
     if match is None:
@@ -202,6 +275,9 @@ def _inspect_element_artifact(name: str) -> Path | None:
     )
     if artifact is None:
         _logger.warning("%s resolved to an unsafe or unknown plugin artifact", name)
+        return None
+    if not _plugin_loads(artifact):
+        return None
     return artifact
 
 
@@ -238,6 +314,7 @@ def _manifest_payload(artifacts: dict[str, dict[str, str]]) -> str:
                 "schema": _MANIFEST_SCHEMA,
                 "pinnedRef": _PINNED_REF,
                 "patchSha256": hashlib.sha256(_PATCH.read_bytes()).hexdigest(),
+                "zedSdk": _zed_sdk_version(),
                 "plugins": artifacts,
             },
             indent=2,
@@ -248,7 +325,13 @@ def _manifest_payload(artifacts: dict[str, dict[str, str]]) -> str:
 
 
 def _installed_plugins_ready(manifest_path: Path = _MACHINE_MANIFEST) -> bool:
-    """Recompute installed paths/digests and compare with the root manifest."""
+    """Recompute installed paths/digests and compare with the root manifest.
+
+    Ready means: the root manifest exists, every ZED element resolves to a
+    root-controlled plugin that GStreamer can load, the plugin bytes are the
+    ones this build published, and they were built against the ZED SDK that is
+    installed now. Anything else is logged and triggers a rebuild.
+    """
     safe_manifest = _root_controlled_canonical_file(
         manifest_path, allow_canonical_alias=False
     )
@@ -262,7 +345,19 @@ def _installed_plugins_ready(manifest_path: Path = _MACHINE_MANIFEST) -> bool:
         expected = json.loads(_manifest_payload(current))
     except (OSError, ValueError, TypeError):
         return False
-    return saved == expected
+    if saved == expected:
+        return True
+    if isinstance(saved, dict):
+        built_against = saved.get("zedSdk")
+        installed = expected["zedSdk"]
+        if built_against != installed:
+            _logger.info(
+                "zed-gstreamer plugins were built against ZED SDK %s but SDK %s "
+                "is installed; rebuilding them against the installed SDK",
+                built_against or "unknown",
+                installed or "unknown",
+            )
+    return False
 
 
 def _installed_paths_from_build(src: Path) -> set[Path] | None:
@@ -406,6 +501,11 @@ def _build_and_install(src: Path) -> bool:
         _logger.warning("cmake not found; cannot build zed-gstreamer")
         return False
     build = src / "build"
+    # Upstream's .gitignore covers ``*build*``, so ``git clean`` in _sync_source
+    # leaves a previous build tree behind. Start from scratch: after a ZED SDK
+    # upgrade the cached configure results and objects describe the old SDK,
+    # and the whole point of the rebuild is to link against the new one.
+    shutil.rmtree(build, ignore_errors=True)
     build.mkdir(parents=True, exist_ok=True)
     configured = _run(
         [cmake, "-DCMAKE_BUILD_TYPE=Release", "-S", str(src), "-B", str(build)]
@@ -442,9 +542,17 @@ def run(_args: object = None) -> None:
     stamp_file = src / ".axol-build-stamp"
     desired = _desired_stamp()
 
+    sdk_version = _zed_sdk_version()
     if _installed_plugins_ready():
-        print("Patched zed-gstreamer plugins already installed (pinned ref + patch).")
+        print(
+            "Patched zed-gstreamer plugins already installed (pinned ref + patch, "
+            f"built against ZED SDK {sdk_version or 'unknown'})."
+        )
         return
+    print(
+        "Building the patched zed-gstreamer plugins against ZED SDK "
+        f"{sdk_version or 'unknown'}..."
+    )
 
     print("Installing zed-gstreamer build dependencies (apt)...")
     if not _apt_install_build_deps():
@@ -474,8 +582,9 @@ def run(_args: object = None) -> None:
     artifacts = _collect_plugin_artifacts()
     if artifacts is None:
         raise SystemExit(
-            "zedxonesrc and zedsrc must both be visible to gst-inspect after "
-            "install; check the GStreamer plugin path."
+            "zedxonesrc and zedsrc must both be visible to gst-inspect and "
+            "loadable after install; check the GStreamer plugin path and the "
+            "log above."
         )
     if not _artifacts_came_from_build(src, artifacts):
         raise SystemExit(
