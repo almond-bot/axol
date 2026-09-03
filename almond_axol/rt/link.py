@@ -78,12 +78,14 @@ class RtLink:
         self._reader_task: asyncio.Task[None] | None = None
         self._states: asyncio.Queue[str] = asyncio.Queue()
         self._fault: str | None = None
+        self._limp: str | None = None
         # Called for each telemetry packet: (side, {slot: FeedbackSlot}).
         self.on_feedback: Callable[[int, dict[int, FeedbackSlot]], None] | None = None
 
     async def start(self) -> None:
         """Launch the core and connect. The core is idle until configured."""
         self._fault = None
+        self._limp = None
         # stdout/stderr inherit the console: the core logs little, and what
         # it does log (bring-up, faults) belongs in the teleop output.
         env = dict(os.environ)
@@ -154,13 +156,27 @@ class RtLink:
                     continue
                 body = payload[1:].decode("utf-8", errors="replace")
                 if tag == b"S":
-                    _logger.info("axol-rt: %s", body)
-                    if body.startswith("fault:"):
-                        # The core has already stopped both buses. Latch the
-                        # reason so the next target/control action fails too,
-                        # instead of leaving a UI operation apparently alive
-                        # after its motor owner has failed closed.
+                    if body.startswith("limp:"):
+                        # Loss-of-trust fault (timing, silent motor): the
+                        # core is still serving, but every arm joint is at
+                        # kp = 0 with the streamed gravity feedforward, and
+                        # stays that way for the session. Sends remain open —
+                        # RtAxol turns motion_control into gravity comp so
+                        # the t_ff keeps tracking the hand-guided pose.
+                        _logger.warning("axol-rt: %s", body)
+                        if self._limp is None:
+                            self._limp = body
+                    elif body.startswith("fault:"):
+                        # The core has stopped streaming on both buses and
+                        # left the motors on their last command (it never
+                        # disables on a fault). Latch the reason so the next
+                        # target/control action fails too, instead of
+                        # leaving a UI operation apparently alive after its
+                        # motor owner has stopped.
+                        _logger.info("axol-rt: %s", body)
                         self._fault = body
+                    else:
+                        _logger.info("axol-rt: %s", body)
                     self._states.put_nowait(body)
                 elif tag == b"L":
                     _logger.info("axol-rt: %s", body)
@@ -192,6 +208,28 @@ class RtLink:
             pos, vel, tau, age_us = vals[2 + i * 4 : 6 + i * 4]
             slots[i] = (pos, vel, tau, now - age_us / 1e6)
         return side, slots
+
+    @property
+    def fault(self) -> str | None:
+        """The latched ``fault: ...`` state from the core, if any.
+
+        Set once the core reports a fault; the bus threads have stopped
+        streaming and the motors are holding their last command. Teardown
+        consults this to leave them holding rather than disabling.
+        """
+        return self._fault
+
+    @property
+    def limp(self) -> str | None:
+        """The latched ``limp: ...`` state from the core, if any.
+
+        Set once the core has dropped every arm joint to kp = 0 with gravity
+        feedforward after a loss-of-trust fault. The link stays open — the
+        core still wants gravity-comp targets — but the session is over as
+        far as motion is concerned; teardown leaves the motors limp rather
+        than disabling.
+        """
+        return self._limp
 
     def _send(self, payload: bytes, *, allow_faulted: bool = False) -> None:
         if self._fault is not None and not allow_faulted:
@@ -235,9 +273,12 @@ class RtLink:
         await self._await_state("armed", _ARM_TIMEOUT_S)
 
     async def disarm(self) -> None:
-        # Always deliverable, fault or not: after a fault the core has already
-        # disabled the motors, and `D` lets it join its bus threads and ack
-        # instead of treating our socket close as an orphaned-client crash.
+        # Always deliverable, fault or not. On a healthy session `D` is the
+        # deliberate stop and the core disables the motors. After a fault the
+        # core's bus threads have already stopped *without* disabling, and
+        # while limp they are serving gravity comp; in both cases `D` only
+        # stops the threads and acks so teardown proceeds in order — torque
+        # stays as it is.
         self._send(b"D", allow_faulted=True)
         await self._await_state("disarmed", 5.0, tolerate_fault=True)
 
@@ -286,7 +327,10 @@ class RtLink:
             self._writer = None
         if self._proc is not None:
             if self._proc.poll() is None:
-                self._proc.terminate()  # SIGTERM → the core disables and exits
+                # SIGTERM → the core stops streaming and exits. It does not
+                # disable on a signal; a disarm (`D`) must already have run
+                # if torque-off was wanted.
+                self._proc.terminate()
                 try:
                     await asyncio.to_thread(self._proc.wait, 5.0)
                 except subprocess.TimeoutExpired:

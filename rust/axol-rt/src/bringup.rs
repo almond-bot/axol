@@ -24,7 +24,8 @@ pub struct MotorSpec {
     pub kd: f64,
     /// The gripper is special-cased throughout: POSITION_FORCE mode instead
     /// of MIT, brought up (enabled + calibrated) by the Python side before
-    /// the core arms, exempt from the deviation abort (contact is its job).
+    /// the core arms, exempt from the max-step gate and feedback-health
+    /// tracking (stalling against an object is its job).
     pub gripper: bool,
     /// Target-tuple index this motor plays (arm joints 0-6, gripper 7);
     /// decouples the wire layout from bring-up iteration order.
