@@ -103,9 +103,9 @@ Mantis teleop enables only the two physical grippers; the Axol arms are an IK-dr
   </Step>
 
   <Step title="Start, align, and test recovery">
-    For Quest, hold the rigs at the agreed start pose, release both controller grip buttons, then press both grips together to align/engage. For managed Lighthouse/Ultimate, wait for **both tracker poses and both trigger heartbeats**, hold the rigs at the start pose, fully release both rig triggers, then squeeze both together once. The alignment squeeze is consumed and does not count toward an episode gesture.
+    For Quest, hold the rigs at the agreed start pose, release both controller grip buttons, then press both grips together to align/engage. For managed Lighthouse/Ultimate, wait for **both tracker poses and both trigger heartbeats**, hold the rigs at the start pose, then **squeeze both rig triggers together and release both**; the world→base transform is fitted at the rigs' pose on that release. The start gesture is consumed and does not count toward an episode gesture.
 
-    If either pose source drops, both sides freeze. Recovery is deliberately inert: restore both sides, return to the alignment pose, release both controls, then press/squeeze both together again. Reset returns to rest and requires the same fresh gesture. It never re-anchors and moves automatically.
+    If either pose source drops, both sides freeze. Recovery is deliberately inert: restore both sides, then repeat the start gesture (Quest: release then press both grips; Lighthouse/Ultimate: squeeze both triggers then release). Reset returns to rest and requires the same fresh gesture. It never re-anchors and moves automatically.
   </Step>
 
   <Step title="Accept the live source before collection">

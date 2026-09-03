@@ -1603,9 +1603,10 @@ def _run_session(
         if mantis_mode and cfg.mantis_source != "quest":
             message = (
                 f"Episode {episode}: Mantis is ready. Keep both trackers live; "
-                "at the start pose release then squeeze both triggers together "
-                "to align, then rapidly squeeze either trigger three times to "
-                "start" + (" (or select Start recording here)." if panel else ".")
+                "squeeze both triggers together, then release both, to engage "
+                "at the rigs' pose and start recording"
+                + (" (or select Start recording here)." if panel else ".")
+                + " While recording: trigger x3 saves, x4 discards."
             )
         elif mantis_mode:
             message = (
@@ -1686,9 +1687,12 @@ def _run_session(
                     )
                     return False
                 if not teleop.is_engaged():
+                    # Reachable from the control panel's Start button: the
+                    # trigger start gesture engages before it opens the take.
                     log_say(
-                        "Cannot start recording: Mantis is not aligned and engaged. "
-                        "Hold both rigs at the start pose and engage, then try again."
+                        "Cannot start recording: Mantis is not engaged. Squeeze "
+                        "both triggers together, then release both, to engage "
+                        "and start recording."
                     )
                     return False
                 log_say("Preparing Mantis grippers.")
@@ -1733,8 +1737,8 @@ def _run_session(
                         "Cannot start recording: "
                         + "; ".join(failures)
                         + " while the grippers were preparing. Restore both "
-                        "inputs, release both triggers, re-align, squeeze "
-                        "together, and try again."
+                        "inputs, then squeeze both triggers together and "
+                        "release to try again."
                     )
                     return False
             if _stopped():

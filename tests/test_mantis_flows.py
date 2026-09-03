@@ -40,6 +40,7 @@ from almond_axol.tracker.config import (
     select_tracker_backend,
 )
 from almond_axol.tracker.trigger import decode_trigger_payload, parse_trigger_frame
+from almond_axol.vr.models import VREpisodeOutcome, VRState
 
 
 class _Source:
@@ -62,12 +63,13 @@ class _Source:
 class _Trigger:
     def __init__(self, grip: float = 1.0) -> None:
         self.value = grip
+        self.stale = False
 
     def grip(self) -> float:
         return self.value
 
     def is_stale(self) -> bool:
-        return False
+        return self.stale
 
 
 class _SkewedSource:
@@ -300,7 +302,7 @@ class MantisFlowTest(unittest.TestCase):
         self.assertIsNone(decode_trigger_payload(struct.pack("<fH", math.nan, 0)))
         self.assertAlmostEqual(parse_trigger_frame(core + b"\x00").position, 0.25)
 
-    def test_managed_engage_requires_release_then_both_squeeze(self) -> None:
+    def test_managed_engage_requires_both_squeeze_then_release(self) -> None:
         source = _Source()
         left = _Trigger()
         right = _Trigger()
@@ -318,14 +320,158 @@ class MantisFlowTest(unittest.TestCase):
         released = bridge.compose_frame()
         self.assertFalse(released["l_lock"])
         self.assertTrue(released["l_tracked"])
+        # One hand squeezing and releasing is an ordinary grip, not a start.
         left.value = 0.0
         self.assertFalse(bridge.compose_frame()["l_lock"])
-        right.value = 0.0
-        confirmed = bridge.compose_frame()
-        self.assertTrue(confirmed["l_lock"] and confirmed["r_lock"])
+        left.value = 1.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        # Both squeezed together only arms the gesture; the engage (and the
+        # base-transform snapshot) happens when both are released again.
+        left.value = right.value = 0.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        left.value = 1.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        right.value = 1.0
+        engaged = bridge.compose_frame()
+        self.assertTrue(engaged["l_lock"] and engaged["r_lock"])
+        # Plain teleop: the gesture engages but never opens a take.
+        self.assertEqual(engaged["state"], VRState.TELEOP.value)
         for recognizer in bridge._gesture.values():
-            self.assertTrue(recognizer._pressed)
+            self.assertFalse(recognizer._pressed)
             self.assertEqual(recognizer._presses, 0)
+
+    def _collection_bridge(self) -> tuple[TrackerBridge, _Trigger, _Trigger]:
+        left = _Trigger()
+        right = _Trigger()
+        bridge = TrackerBridge(
+            _Source(),
+            left="left",
+            right="right",
+            controls=StopEventControls(threading.Event()),
+            left_trigger=left,
+            right_trigger=right,
+            auto_engage=True,
+            confirm_auto_engage=True,
+        )
+        bridge._state = VRState.DATA_COLLECTION
+        return bridge, left, right
+
+    @staticmethod
+    def _press(
+        bridge: TrackerBridge, trigger: _Trigger, now: list[float], count: int
+    ) -> dict:
+        """Issue ``count`` rapid full presses on one trigger; return last frame."""
+        frame: dict = {}
+        for _ in range(count):
+            trigger.value = 0.0
+            now[0] += 0.05
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                frame = bridge.compose_frame()
+            trigger.value = 1.0
+            now[0] += 0.05
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                frame = bridge.compose_frame()
+        return frame
+
+    def test_start_gesture_opens_take_only_after_engage_ack(self) -> None:
+        bridge, left, right = self._collection_bridge()
+
+        left.value = right.value = 0.0
+        bridge.compose_frame()
+        left.value = right.value = 1.0
+        requested = bridge.compose_frame()
+        self.assertTrue(requested["l_lock"] and requested["r_lock"])
+        # The server must never see RECORDING before the core is engaged:
+        # collect-data refuses a take while disengaged.
+        self.assertEqual(requested["state"], VRState.DATA_COLLECTION.value)
+        self.assertEqual(bridge.compose_frame()["state"], VRState.DATA_COLLECTION.value)
+
+        bridge._handle_tracking_state(True)
+        recording = bridge.compose_frame()
+        self.assertEqual(recording["state"], VRState.RECORDING.value)
+        self.assertFalse(recording["reset"])
+
+    def test_start_gesture_while_engaged_opens_take_immediately(self) -> None:
+        bridge, left, right = self._collection_bridge()
+        bridge._handle_tracking_state(True)  # already-engaged core
+
+        left.value = right.value = 0.0
+        bridge.compose_frame()
+        left.value = right.value = 1.0
+        self.assertEqual(bridge.compose_frame()["state"], VRState.RECORDING.value)
+
+    def test_dropout_before_engage_ack_cancels_pending_take(self) -> None:
+        bridge, left, right = self._collection_bridge()
+
+        left.value = right.value = 0.0
+        bridge.compose_frame()
+        left.value = right.value = 1.0
+        self.assertTrue(bridge.compose_frame()["l_lock"])
+        left.stale = True
+        withdrawn = bridge.compose_frame()
+        self.assertFalse(withdrawn["l_lock"])
+        left.stale = False
+        bridge._handle_lock_release(withdrawn["lock_release_id"])
+
+        # A late engage ack for the withdrawn request must not open a take.
+        bridge._handle_tracking_state(True)
+        self.assertEqual(bridge.compose_frame()["state"], VRState.DATA_COLLECTION.value)
+
+    def test_triple_press_saves_and_quadruple_press_discards(self) -> None:
+        bridge, left, right = self._collection_bridge()
+        now = [100.0]
+
+        # Idle: a triple press is not a start any more.
+        self._press(bridge, left, now, 3)
+        now[0] += 1.0
+        with mock.patch("almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]):
+            idle = bridge.compose_frame()
+        self.assertEqual(idle["state"], VRState.DATA_COLLECTION.value)
+
+        def start_take() -> None:
+            left.value = right.value = 0.0
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                bridge.compose_frame()
+            left.value = right.value = 1.0
+            now[0] += 0.05
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                bridge.compose_frame()
+            bridge._handle_tracking_state(True)
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                frame = bridge.compose_frame()
+            self.assertEqual(frame["state"], VRState.RECORDING.value)
+            if "lock_release_id" in frame:
+                bridge._handle_lock_release(frame["lock_release_id"])
+
+        start_take()
+        # Three presses resolve after the inter-press timeout: end + save.
+        self._press(bridge, right, now, 3)
+        now[0] += 1.0
+        with mock.patch("almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]):
+            saved = bridge.compose_frame()
+        self.assertEqual(saved["state"], VRState.DATA_COLLECTION.value)
+        self.assertEqual(saved["episode_outcome"], VREpisodeOutcome.SUCCESS.value)
+        self.assertFalse(saved["reset"])
+
+        # Back to idle in collection (the server re-announces this state).
+        bridge._state = VRState.DATA_COLLECTION
+        start_take()
+        # Four presses resolve on the fourth press edge: end + discard, which
+        # is the RECORDING→DATA_COLLECTION transition with a reset edge.
+        discarded = self._press(bridge, left, now, 4)
+        self.assertEqual(discarded["state"], VRState.DATA_COLLECTION.value)
+        self.assertIsNone(discarded["episode_outcome"])
+        self.assertTrue(discarded["reset"])
 
     def test_managed_bridge_uses_operation_pose_source_token(self) -> None:
         bridge = TrackerBridge(
@@ -378,15 +524,17 @@ class MantisFlowTest(unittest.TestCase):
             confirm_auto_engage=True,
         )
 
-        bridge.compose_frame()  # both released: arm confirmation
-        source.tracking = False
         left.value = right.value = 0.0
+        bridge.compose_frame()  # both squeezed: start gesture is half done
+        source.tracking = False
         self.assertFalse(bridge.compose_frame()["l_lock"])
         source.tracking = True
-        self.assertFalse(bridge.compose_frame()["l_lock"])
+        # Releasing after the dropout cannot complete the pre-dropout squeeze.
         left.value = right.value = 1.0
         self.assertFalse(bridge.compose_frame()["l_lock"])
         left.value = right.value = 0.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        left.value = right.value = 1.0
         self.assertTrue(bridge.compose_frame()["l_lock"])
 
     def test_managed_confirmation_requires_two_distinct_inputs(self) -> None:

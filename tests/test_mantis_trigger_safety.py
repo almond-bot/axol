@@ -104,12 +104,12 @@ class MantisTriggerSafetyTest(unittest.TestCase):
 
         reader._thread.join.assert_called_once_with(timeout=1.0)
 
-    def test_stale_trigger_clears_armed_alignment_confirmation(self) -> None:
+    def test_stale_trigger_clears_start_gesture_squeeze(self) -> None:
         bridge, left, right = _bridge()
 
-        bridge.compose_frame()  # both released: confirmation is armed
-        left.stale = True
         left.value = right.value = 0.0
+        bridge.compose_frame()  # both squeezed: start gesture is half done
+        left.stale = True
         lost = bridge.compose_frame()
         self.assertFalse(lost["l_trigger_live"])
         self.assertTrue(lost["r_trigger_live"])
@@ -119,19 +119,23 @@ class MantisTriggerSafetyTest(unittest.TestCase):
         parsed = VRFrame.model_validate(lost)
         self.assertFalse(parsed.l_trigger_live)
 
-        # Recovering while still squeezed cannot reuse the release seen before
-        # the dropout. A complete new release→squeeze is mandatory.
-        left.stale = False
-        self.assertFalse(bridge.compose_frame()["l_lock"])
+        # A release during the dropout, or right after recovery, cannot
+        # complete the squeeze seen before it. A complete new squeeze→release
+        # is mandatory.
         left.value = right.value = 1.0
         self.assertFalse(bridge.compose_frame()["l_lock"])
+        left.stale = False
+        self.assertFalse(bridge.compose_frame()["l_lock"])
         left.value = right.value = 0.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        left.value = right.value = 1.0
         self.assertTrue(bridge.compose_frame()["l_lock"])
 
     def test_mid_engagement_dropout_disengages_and_requires_realign(self) -> None:
         bridge, left, right = _bridge()
-        bridge.compose_frame()
         left.value = right.value = 0.0
+        bridge.compose_frame()
+        left.value = right.value = 1.0
         self.assertTrue(bridge.compose_frame()["l_lock"])
         bridge._handle_tracking_state(True)
 
@@ -146,17 +150,17 @@ class MantisTriggerSafetyTest(unittest.TestCase):
         self.assertTrue(lost["l_lock"] and lost["r_lock"])
         bridge._handle_tracking_state(False)
 
-        # Even after CAN recovers, held squeezes cannot re-engage. The bridge
+        # Even after CAN recovers, nothing re-engages by itself. The bridge
         # first proves the core consumed a low lock level, then requires a new
-        # physical release→squeeze at the alignment pose.
+        # physical squeeze→release of both triggers.
         left.stale = False
         low = bridge.compose_frame()
         self.assertFalse(low["l_lock"])
         bridge._handle_lock_release(low["lock_release_id"])
         self.assertFalse(bridge.compose_frame()["l_lock"])
-        left.value = right.value = 1.0
-        self.assertFalse(bridge.compose_frame()["l_lock"])
         left.value = right.value = 0.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        left.value = right.value = 1.0
         self.assertTrue(bridge.compose_frame()["l_lock"])
 
     def test_recording_qa_rejects_any_declared_trigger_dropout(self) -> None:

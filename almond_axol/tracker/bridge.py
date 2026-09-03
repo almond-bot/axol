@@ -10,26 +10,29 @@ server's self-signed certificate is not verified).
 Grip comes from the Mantis trigger node's CAN messages when one is
 configured per side (see :class:`~almond_axol.tracker.trigger.TriggerReader`):
 the analog trigger position drives ``l_grip``/``r_grip`` proportionally
-(fully squeezed = closed, released = open). Rapid full squeeze/release
-sequences also control data collection: three presses starts a take when idle
-or ends one successfully; four presses ends one as a failure. A managed
-plain-teleop/data-collection bridge waits for both trackers and triggers,
-then requires both triggers released and squeezed together to align and
-engage. Other flows use :class:`StdinControls` (the trigger frame carries no
-buttons — session controls arrive with a later PCB revision): Enter toggles
-tracking engage, ``r`` triggers a reset. A manual toggle is realised as a
-short pulse of both lock bits — the shared teleop core enables on a rising
-edge of both locks together and disables on a rising edge of either.
+(fully squeezed = closed, released = open). The triggers also drive the
+session: squeezing both together and then releasing both is the *start*
+gesture — it aligns/engages tracking at the rigs' current pose (when not
+already engaged) and, in data collection, opens a take once the teleop core
+acknowledges the engage. While recording, three rapid presses on either
+trigger end the take and save it; four rapid presses end it and discard it.
+Triple presses while idle are ignored. A managed plain-teleop bridge uses
+the same start gesture purely to engage. Other flows use
+:class:`StdinControls` (the trigger frame carries no buttons — session
+controls arrive with a later PCB revision): Enter toggles tracking engage,
+``r`` triggers a reset. A manual toggle is realised as a short pulse of both
+lock bits — the shared teleop core enables on a rising edge of both locks
+together and disables on a rising edge of either.
 
 A side whose tracker stops reporting (occlusion, SLAM relocalising)
 holds its last good pose rather than going quiet, so IK never chases a
 glitch. Managed bridges freeze and wait for both sides to recover; the
-operator must then release and squeeze both triggers together to re-anchor.
-Standalone bridges retain manual engage control.
+operator then repeats the start gesture to re-anchor. Standalone bridges
+retain manual engage control.
 A stale trigger node likewise holds its last grip command, never jumping
 on a dropout. Managed bridges treat trigger freshness as a safety input:
 either trigger dropping out disengages tracking and recovery requires a new
-two-trigger release→squeeze at the alignment pose.
+start gesture.
 """
 
 from __future__ import annotations
@@ -95,7 +98,7 @@ class TriggerGestureRecognizer:
     Each rig side owns one recognizer, so the free hand can issue a gesture
     while the other trigger remains squeezed around an object. Four presses
     resolve immediately; three resolve after the inter-press timeout so they
-    cannot steal the prefix of a four-press failure gesture.
+    cannot steal the prefix of a four-press discard gesture.
     """
 
     def __init__(self) -> None:
@@ -231,7 +234,7 @@ class ManagedStdinControls:
     """Reset/quit controls for a direct managed Mantis operation.
 
     Unlike :class:`StdinControls`, Enter never toggles engagement: the managed
-    release→squeeze safety handshake owns that state.  ``q`` sets the bridge's
+    two-trigger start gesture owns that state.  ``q`` sets the bridge's
     shared stop event and asks the context manager to interrupt the owning
     teleop/collection loop, while EOF is ignored so redirected stdin does not
     unexpectedly stop a robot operation.
@@ -319,10 +322,11 @@ class TrackerBridge:
             and every release stays low until the core echoes its transaction
             ID, so slow startup/reset/IK handling cannot miss either edge.
         confirm_auto_engage: When ``auto_engage`` is enabled and both trigger
-            readers exist, require a deliberate release then simultaneous
-            squeeze before each engage/re-engage. This makes the operator hold
-            both rigs at the intended rest/alignment pose before the absolute
-            world→base transform is fitted.
+            readers exist, require the deliberate start gesture — both
+            triggers squeezed together, then both released — before each
+            engage/re-engage. The absolute world→base transform is fitted at
+            the rigs' pose on that release, so the operator chooses where the
+            virtual robot is anchored for the take.
         pose_source_id: Logical producer ID placed on every frame. Managed
             operations supply the server's one-run token; standalone bridges
             generate their own stable ID.
@@ -411,8 +415,13 @@ class TrackerBridge:
                 "managed Mantis engagement requires fresh left and right trigger "
                 "inputs; configure both trigger CAN channels"
             )
-        self._engage_confirmation_needed = self._confirm_auto_engage
-        self._engage_confirmation_armed = False
+        # Start-gesture latch: both triggers seen squeezed together; the
+        # gesture completes when both are released again.
+        self._start_gesture_squeezed = False
+        # A completed start gesture in DATA_COLLECTION while disengaged: open
+        # the take once the core acknowledges the engage it triggered, so the
+        # server never sees RECORDING before the operation is engaged.
+        self._record_after_engage = False
         self._auto_engage_pending = auto_engage and not self._confirm_auto_engage
         self._auto_engage_waiting_ack = False
         self._auto_engage_withdrawn = False
@@ -439,13 +448,21 @@ class TrackerBridge:
             self._auto_lock_release_id = self._auto_lock_release_seq
 
     def _require_engage_confirmation(self) -> None:
-        """Require a fresh two-trigger release→squeeze before auto-engaging."""
+        """Require a fresh start gesture (both squeezed→released) to engage."""
+        self._record_after_engage = False
         if self._confirm_auto_engage:
-            self._engage_confirmation_needed = True
-            self._engage_confirmation_armed = False
+            self._start_gesture_squeezed = False
             self._auto_engage_pending = False
         else:
             self._auto_engage_pending = True
+
+    def _begin_recording(self, reason: str) -> None:
+        """Open a take if the session is idle in data collection."""
+        self._record_after_engage = False
+        if self._state != VRState.DATA_COLLECTION:
+            return
+        self._state = VRState.RECORDING
+        _logger.info("%s → start recording", reason)
 
     # -- Frame composition ---------------------------------------------------
 
@@ -635,33 +652,54 @@ class TrackerBridge:
             if self._triggers[side] is not None and not self._trigger_fresh[side]:
                 recognizer.cancel_sequence()
 
-        confirmation_press = False
-        if not all_required_inputs_fresh and self._engage_confirmation_needed:
-            # A release observed before a tracker or trigger dropout cannot
-            # authorize a later engage. Recovery starts a new cycle.
-            self._engage_confirmation_armed = False
-        if (
-            self._auto_engage_enabled
-            and self._engage_confirmation_needed
-            and not self._engaged
-            and all_required_inputs_fresh
-        ):
-            if all(value >= _GESTURE_RELEASE_GRIP for value in grips.values()):
-                self._engage_confirmation_armed = True
-            elif self._engage_confirmation_armed and all(
-                value <= _GESTURE_PRESS_GRIP for value in grips.values()
+        # Start gesture: both triggers squeezed together, then both released.
+        # Only a bridge with two trigger readers can see it; a side without a
+        # reader streams 1.0 and never squeezes.
+        start_gesture = False
+        if all(reader is not None for reader in self._triggers.values()):
+            if not (all_required_fresh and all_required_triggers_fresh):
+                # A squeeze observed before a tracker or trigger dropout cannot
+                # authorize a later engage/start. Recovery starts a new cycle.
+                self._start_gesture_squeezed = False
+            elif all(value <= _GESTURE_PRESS_GRIP for value in grips.values()):
+                self._start_gesture_squeezed = True
+            elif self._start_gesture_squeezed and all(
+                value >= _GESTURE_RELEASE_GRIP for value in grips.values()
             ):
-                self._engage_confirmation_needed = False
-                self._engage_confirmation_armed = False
+                self._start_gesture_squeezed = False
+                start_gesture = True
+        if start_gesture:
+            for side, recognizer in self._gesture.items():
+                # Let each recognizer see the release, then forget the start
+                # squeeze so it cannot linger as press #1 of a later
+                # triple/quadruple gesture.
+                recognizer.update(grips[side], now)
+                recognizer.cancel_sequence()
+            if self._auto_disengage_pending or self._auto_disengage_waiting_ack:
+                # A freshness-loss disengage is still in flight; its
+                # acknowledgement would wipe any request made now.
+                _logger.info(
+                    "start gesture ignored while Mantis is freezing after an "
+                    "input dropout — repeat it once both sides are stable"
+                )
+            elif self._auto_engage_enabled and not self._engaged:
+                # Engage at the rigs' current pose; in data collection the
+                # take opens once the core acknowledges (see
+                # _handle_tracking_state).
                 self._auto_engage_pending = True
-                confirmation_press = True
-                for side, recognizer in self._gesture.items():
-                    # Consume the alignment squeeze in each recognizer so a
-                    # still-held trigger cannot become press #1 of the episode
-                    # triple-click gesture on the next frame.
-                    recognizer.update(grips[side], now)
-                    recognizer.cancel_sequence()
-                _logger.info("alignment confirmed with both triggers — engaging Mantis")
+                self._record_after_engage = self._state == VRState.DATA_COLLECTION
+                _logger.info(
+                    "start gesture (both triggers squeezed then released) — "
+                    "engaging Mantis%s",
+                    " and starting a take" if self._record_after_engage else "",
+                )
+            elif self._engaged:
+                self._begin_recording("start gesture")
+            elif self._state == VRState.DATA_COLLECTION:
+                _logger.info(
+                    "start gesture ignored — tracking is not engaged and this "
+                    "bridge does not manage engagement"
+                )
         if self._auto_engage_waiting_ack and not all_required_inputs_fresh:
             # Withdraw an unacknowledged engage request if tracking drops in
             # the meantime. Keeping the level asserted would let the core
@@ -727,15 +765,11 @@ class TrackerBridge:
         frame["l_lock"] = lock
         frame["r_lock"] = lock
 
-        frame["reset"] = self._reset_pulse > 0
-        if self._reset_pulse > 0:
-            self._reset_pulse -= 1
-
-        # A gesture may be issued on either side. Failure wins if two sides
-        # happen to complete different gestures on the same frame.
+        # A gesture may be issued on either side. The four-press discard wins
+        # if two sides happen to complete different gestures on the same frame.
         outcomes = (
             []
-            if confirmation_press
+            if start_gesture
             or (self._confirm_auto_engage and not all_required_inputs_fresh)
             else [
                 self._gesture[side].update(grips[side], now)
@@ -754,23 +788,35 @@ class TrackerBridge:
             # The operator commonly squeezes both Mantis triggers together.
             # Their CAN samples can cross the 0.6 s resolution deadline one
             # frame apart: without consuming both pending sequences, the
-            # first triple starts an episode and the other immediately ends
-            # it. Treat contemporaneous two-handed presses as one gesture.
+            # first triple ends an episode and the other would act on the
+            # next state. Treat contemporaneous two-handed presses as one
+            # gesture.
             for recognizer in self._gesture.values():
                 recognizer.cancel_sequence()
         episode_outcome: VREpisodeOutcome | None = None
-        if gesture == VREpisodeOutcome.SUCCESS:
-            if self._state == VRState.DATA_COLLECTION:
-                self._state = VRState.RECORDING
-                _logger.info("triple trigger press → start recording")
-            elif self._state == VRState.RECORDING:
+        if self._state == VRState.RECORDING:
+            if gesture == VREpisodeOutcome.SUCCESS:
                 self._state = VRState.DATA_COLLECTION
                 episode_outcome = VREpisodeOutcome.SUCCESS
-                _logger.info("triple trigger press → end episode successfully")
-        elif gesture == VREpisodeOutcome.FAILURE and self._state == VRState.RECORDING:
-            self._state = VRState.DATA_COLLECTION
-            episode_outcome = VREpisodeOutcome.FAILURE
-            _logger.info("quadruple trigger press → end episode as failure")
+                _logger.info("triple trigger press → end episode and save")
+            elif gesture == VREpisodeOutcome.FAILURE:
+                # Discard is the RECORDING→DATA_COLLECTION transition carrying
+                # a reset rising edge — the same wire protocol as the Quest
+                # reset+record discard — so the collector re-records instead
+                # of saving. The pulse is raised here, before ``frame["reset"]``
+                # is written, so the edge lands on the transition frame.
+                self._state = VRState.DATA_COLLECTION
+                self._reset_pulse = _PULSE_FRAMES
+                _logger.info("quadruple trigger press → discard episode")
+        elif gesture is not None and self._state == VRState.DATA_COLLECTION:
+            _logger.info(
+                "trigger press gesture ignored while idle — squeeze both "
+                "triggers together, then release both, to start a take"
+            )
+
+        frame["reset"] = self._reset_pulse > 0
+        if self._reset_pulse > 0:
+            self._reset_pulse -= 1
 
         if episode_outcome is not None:
             # Repeat the transition tag just like reset/lock pulses: if the
@@ -825,6 +871,10 @@ class TrackerBridge:
                 self._auto_engage_waiting_ack = False
                 self._auto_engage_pending = False
                 self._auto_engage_withdrawn = False
+                if self._record_after_engage:
+                    # The core is engaged at the start-gesture pose; the
+                    # take can open now.
+                    self._begin_recording("engage acknowledged")
             elif self._auto_engage_withdrawn:
                 # The core consumed an engage just before freshness loss made
                 # us withdraw it. Complete a deliberate off→on cycle even if
@@ -836,6 +886,8 @@ class TrackerBridge:
                 # Seed from an already-engaged core (for example after bridge
                 # reconnect). Adopt it instead of toggling it off.
                 self._auto_engage_pending = False
+                if self._record_after_engage:
+                    self._begin_recording("engage acknowledged")
             self._request_auto_lock_release()
             return
 
@@ -881,29 +933,32 @@ class TrackerBridge:
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE  # the VR server's cert is self-signed
 
+        gesture_help = (
+            "squeeze both triggers together then release = start a take; "
+            "while recording, trigger x3 = save, x4 = discard."
+        )
         if isinstance(self._controls, StdinControls):
             print(
                 "Streaming tracker poses. Controls: Enter = engage/disengage, "
-                "r = reset, q = quit; trigger x3 = start/success, "
-                "trigger x4 = failure."
+                f"r = reset, q = quit; {gesture_help}"
             )
         elif isinstance(self._controls, ManagedStdinControls):
             print(
                 "Streaming managed Mantis tracker poses. Controls: r = reset, "
-                "q = stop; engagement uses the two-trigger alignment handshake; "
-                "trigger x3 = start/success, x4 = failure."
+                "q = stop; squeeze both triggers together then release to "
+                f"engage at the rigs' current pose; {gesture_help}"
             )
         else:
             if self._confirm_auto_engage:
                 print(
-                    "Streaming tracker poses. Hold both rigs at the alignment "
-                    "pose, release both triggers, then squeeze both together "
-                    "to engage; trigger x3 = start/success, x4 = failure."
+                    "Streaming tracker poses. Squeeze both triggers together "
+                    "then release to engage at the rigs' current pose; "
+                    f"{gesture_help}"
                 )
             else:
                 print(
                     "Streaming tracker poses (tracking managed automatically); "
-                    "trigger x3 = start/success, trigger x4 = failure."
+                    f"{gesture_help}"
                 )
         while not self._controls.quit.is_set():
             try:

@@ -276,7 +276,8 @@ def managed_mantis_bridge(
             ) from bridge_failure
         print(
             f"Mantis {source} inputs are live; r = reset, q = stop; "
-            "starting the operation and waiting for the alignment gesture..."
+            "starting the operation — squeeze both triggers together, then "
+            "release both, to engage..."
         )
         try:
             owner_active.set()

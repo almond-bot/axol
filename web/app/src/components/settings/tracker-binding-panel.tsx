@@ -588,9 +588,11 @@ export function TrackerBindingPanel({
         </p>
         <p>
           Run a short Mantis teleop with the workspace clear: hold both rigs at the rest pose with
-          both {source === "quest" ? "controllers" : "trackers"} visible, release both{" "}
-          {source === "quest" ? "grip buttons" : "triggers"}, then squeeze them together to align
-          and engage. Repeat that gesture after Reset or tracking loss.
+          both {source === "quest" ? "controllers" : "trackers"} visible, then{" "}
+          {source === "quest"
+            ? "release both grip buttons and press them together"
+            : "squeeze both triggers together and release them"}{" "}
+          to align and engage. Repeat that gesture after Reset or tracking loss.
         </p>
         {extra}
         <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">

@@ -915,19 +915,18 @@ function RunningHints({
         <div className="flex flex-col gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
           <p>
             This run uses headset-free {trackerLabel} tracking. Power both bound trackers and keep
-            them tracking. Once both trackers and trigger channels are live, release both triggers,
-            hold both Mantis rigs at the configured rest/start pose, then squeeze both triggers
-            together to confirm the alignment and engage.
+            them tracking. Once both trackers and trigger channels are live, hold both Mantis rigs
+            where the session should begin, squeeze both triggers together, then release both to
+            engage at that pose{dataCollection ? " and start a take" : ""}.
           </p>
           <p>
-            If either tracker loses lock, motion holds. After both sides recover, return the rigs to
-            the rest pose and repeat the release-then-both-squeeze confirmation to re-engage; Reset
-            above explicitly returns to rest.
+            If either tracker loses lock, motion holds. After both sides recover, repeat the
+            both-squeeze-then-release gesture to re-engage; Reset above explicitly returns to rest.
           </p>
           {dataCollection && (
             <p className="text-white/65">
-              Rapidly fully squeeze and release either Mantis trigger 3 times to start a take; 3
-              presses while recording saves success, and 4 presses while recording saves failure.
+              While recording, rapidly fully squeeze and release either Mantis trigger 3 times to
+              save the take, or 4 times to discard it. Start recording above requires an engaged rig.
             </p>
           )}
         </div>

@@ -7,7 +7,7 @@ Data collection records teleoperation episodes plus synchronized camera frames i
 
 Axol and Mantis episodes can share one dataset. For each on-robot run, enable **Observe Cartesian** so its state/action schema matches Mantis, and keep the gripper capability, camera slots, image resolution, and FPS identical. A dataset created by Mantis may contain `observation.pose_lag`; on-robot recording fills that column automatically. If the dataset began on Axol without it, later Mantis recording keeps the original schema and omits that optional column.
 
-You can launch either profile from the **web control panel** or the **CLI** (`axol collect-data`). Quest uses the **A** button for recording. Managed Lighthouse/Ultimate Mantis runs use a triple rig-trigger gesture, and the control panel can drive every source with on-screen episode buttons.
+You can launch either profile from the **web control panel** or the **CLI** (`axol collect-data`). Quest uses the **A** button for recording. Managed Lighthouse/Ultimate Mantis runs use rig-trigger gestures (both squeezed then released to engage and start; x3 to save, x4 to discard), and the control panel can drive every source with on-screen episode buttons.
 
 <Note>
   Panel recordings use `/var/lib/almond-axol/datasets`, a root-owned store the
@@ -92,23 +92,23 @@ Complete the matching [Mantis teleop acceptance](/operations/teleop#mantis-teleo
       </Tab>
 
       <Tab title="Lighthouse">
-        Select **Lighthouse** after installing libsurvive, pairing both VIVE Tracker 3.0 units, and completing **Identify trackers** in Settings → Mantis. The standard flat-back mount uses its factory transform automatically; save a per-device override only for a non-standard mount or refinement. Start and wait for two fresh tracker poses **and** two trigger heartbeats. At the start pose, release both rig triggers and squeeze them together once to align/engage.
+        Select **Lighthouse** after installing libsurvive, pairing both VIVE Tracker 3.0 units, and completing **Identify trackers** in Settings → Mantis. The standard flat-back mount uses its factory transform automatically; save a per-device override only for a non-standard mount or refinement. Start and wait for two fresh tracker poses **and** two trigger heartbeats. Engagement is part of the start gesture below; there is no separate alignment step.
       </Tab>
 
       <Tab title="Ultimate">
-        Select **Ultimate** after the one-time Windows pair/map flow. In Settings → Mantis, install the runtime, save the private shared-map AP configuration, connect/power the dongle and trackers, complete guided **Identify trackers**, and choose **Run readiness check**. The standard flat-back mount automatically uses the approved 11 mm origin-adjusted factory transform under the pinned `wxyz` / z-up convention; measured entries are optional overrides. Start only with both trackers localized in the shared map and both trigger nodes live. At the start pose, release both rig triggers and squeeze them together once. See the [UI and CLI setup routes](/cli/tracker#vive-ultimate-tracker-setup-dongle--pyvut).
+        Select **Ultimate** after the one-time Windows pair/map flow. In Settings → Mantis, install the runtime, save the private shared-map AP configuration, connect/power the dongle and trackers, complete guided **Identify trackers**, and choose **Run readiness check**. The standard flat-back mount automatically uses the approved 11 mm origin-adjusted factory transform under the pinned `wxyz` / z-up convention; measured entries are optional overrides. Start only with both trackers localized in the shared map and both trigger nodes live. Engagement is part of the start gesture below. See the [UI and CLI setup routes](/cli/tracker#vive-ultimate-tracker-setup-dongle--pyvut).
       </Tab>
     </Tabs>
   </Step>
 
   <Step title="Record with the source-appropriate control">
-    Quest uses **A** (or the panel's **Start recording**). With managed Lighthouse/Ultimate, rapidly fully squeeze and release either rig trigger **three times**; the take starts after the short gesture-resolution delay. The physical grippers enable only for the take and are force-disabled again after every save, discard, stop, or error.
+    Quest uses **A** (or the panel's **Start recording**). With managed Lighthouse/Ultimate, hold the rigs where you want the take to begin, **squeeze both rig triggers together, then release both**. That one gesture fits the world→robot base transform at the rigs' current pose, engages tracking, and — once the teleop core acknowledges the engage — starts the take. The physical grippers enable only for the take and are force-disabled again after every save, discard, stop, or error. A triple press while idle does nothing; the panel's **Start recording** still requires an engaged rig.
 
-    While recording, another trigger x3 ends and saves. Trigger x4 also ends and saves while logging that the operator marked a failure, but that mark is **not yet persisted as a LeRobot dataset outcome field**. Use the panel's **Discard episode** when the take should not be saved, or keep failures in separate task/dataset bookkeeping if you need them retained and labeled.
+    While recording, rapidly fully squeeze and release either trigger **three times** to end and save, or **four times** to end and discard (the same outcome as the panel's **Discard episode**). Three presses resolve after a short pause so a fourth can still select discard.
   </Step>
 
   <Step title="Treat any tracking/input break as a failed take">
-    A pose loss, stale trigger heartbeat, disengagement, or stale pose freezes the rig and fails the in-flight Mantis quality check. Restore both sides, return to the alignment pose, fully release both controls, and deliberately press/squeeze both together again before starting a clean take. Reset likewise returns to rest and requires this fresh alignment gesture; nothing re-anchors and resumes automatically.
+    A pose loss, stale trigger heartbeat, disengagement, or stale pose freezes the rig and fails the in-flight Mantis quality check. Restore both sides, then repeat the start gesture (both triggers squeezed together, then released) to re-anchor and open a clean take. After every take the virtual arms return to rest and tracking disengages, so each take starts with this gesture — wherever the rigs are at that moment. Nothing re-anchors and resumes automatically.
   </Step>
 </Steps>
 
