@@ -108,6 +108,29 @@ def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 1800) -> boo
     return True
 
 
+def _run_root(cmd: list[str]) -> bool:
+    """Run ``cmd`` as root and log its captured output when it fails.
+
+    ``run_root`` captures the child's stdout/stderr, so a bare return-code check
+    would silently discard the only explanation of what went wrong (a 404 from
+    apt, a cmake install error, a udev reload failure, …).
+    """
+    try:
+        result = run_root(cmd)
+    except Exception as exc:  # noqa: BLE001 - missing sudo/command
+        _logger.warning("root command failed (%s): %s", " ".join(cmd), exc)
+        return False
+    if result.returncode != 0:
+        _logger.warning(
+            "root command failed (%s, exit %d): %s",
+            " ".join(cmd),
+            result.returncode,
+            (result.stderr or result.stdout or "").strip()[-1200:],
+        )
+        return False
+    return True
+
+
 def _install_build_deps() -> bool:
     if shutil.which("apt-get") is None:
         _logger.warning(
@@ -120,9 +143,29 @@ def _install_build_deps() -> bool:
             " ".join(_APT_BUILD_DEPS),
         )
         return False
-    update = run_root(["apt-get", "update"])
-    install = run_root(["apt-get", "install", "-y", *_APT_BUILD_DEPS])
-    return update.returncode == 0 and install.returncode == 0
+    # An update failure need not block an install from an already-populated apt
+    # cache. The install result itself is authoritative.
+    if not _run_root(["apt-get", "update"]):
+        _logger.warning("apt-get update failed; trying the existing package cache")
+    # Output is captured, so a debconf/needrestart prompt would otherwise block
+    # invisibly with no way for the operator to answer it.
+    if not _run_root(
+        [
+            "env",
+            "DEBIAN_FRONTEND=noninteractive",
+            "apt-get",
+            "install",
+            "-y",
+            *_APT_BUILD_DEPS,
+        ]
+    ):
+        _logger.warning(
+            "could not install libsurvive build dependencies; run: "
+            "sudo apt-get install -y %s",
+            " ".join(_APT_BUILD_DEPS),
+        )
+        return False
+    return True
 
 
 def _sync_source(src: Path) -> bool:
@@ -180,10 +223,10 @@ def _build_and_install(src: Path) -> bool:
     # small companion applications as well as survive-cli.
     if not _run([cmake, "--build", str(build), "-j", jobs]):
         return False
-    if run_root([cmake, "--install", str(build)]).returncode != 0:
+    if not _run_root([cmake, "--install", str(build)]):
         return False
     ldconfig = shutil.which("ldconfig")
-    if ldconfig is not None and run_root([ldconfig]).returncode != 0:
+    if ldconfig is not None and not _run_root([ldconfig]):
         return False
     return True
 
@@ -193,25 +236,15 @@ def _install_udev_rule(src: Path) -> bool:
     if not rule.exists():
         _logger.warning("libsurvive udev rule is missing: %s", rule)
         return False
-    if (
-        run_root(
-            [
-                "install",
-                "-D",
-                "-m",
-                "0644",
-                str(rule),
-                str(_INSTALLED_UDEV_RULE),
-            ]
-        ).returncode
-        != 0
+    if not _run_root(
+        ["install", "-D", "-m", "0644", str(rule), str(_INSTALLED_UDEV_RULE)]
     ):
         return False
     udevadm = shutil.which("udevadm")
     if udevadm is not None:
-        if run_root([udevadm, "control", "--reload-rules"]).returncode != 0:
+        if not _run_root([udevadm, "control", "--reload-rules"]):
             return False
-        if run_root([udevadm, "trigger"]).returncode != 0:
+        if not _run_root([udevadm, "trigger"]):
             return False
     return True
 
@@ -396,10 +429,9 @@ def _install_machine_stamp(src: Path) -> bool:
     except (OSError, RuntimeError) as exc:
         _logger.warning("could not prepare libsurvive install manifest: %s", exc)
         return False
-    result = run_root(
+    return _run_root(
         ["install", "-D", "-m", "0644", str(manifest), str(_MACHINE_STAMP)]
     )
-    return result.returncode == 0
 
 
 def _reattestable_build(src: Path) -> bool:
