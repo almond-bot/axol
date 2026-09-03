@@ -38,6 +38,7 @@ start gesture.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import queue
@@ -68,6 +69,15 @@ _logger = logging.getLogger(__name__)
 # Keep direct ``q`` shutdown inside the managed context's five-second join
 # budget even if a local server is stuck mid-handshake or close handshake.
 _SOCKET_LIFECYCLE_TIMEOUT_S = 2.0
+# ``axol serve`` deliberately starts the bridge *before* the operation that
+# owns the VR server, so tracker readiness gates the run: the server only
+# starts listening after the operation's robot/IK warm-up (tens of seconds).
+# Until the first connection succeeds, a refused connection is that expected
+# startup gap, not a lost link: poll it quickly and quietly so the bridge
+# attaches within a fraction of a second of the server coming up.
+_SERVER_STARTUP_POLL_S = 0.5
+# After a link existed, a drop is a real fault; back off before reconnecting.
+_RECONNECT_DELAY_S = 2.0
 # Lock/reset pulses span this many frames so the server-side edge
 # detection can't miss them across interpolation or a dropped frame.
 _PULSE_FRAMES = 10
@@ -90,6 +100,23 @@ _DEFAULT_POSE = {
 
 class TrackerBridgeError(RuntimeError):
     """A non-network bridge failure that cannot be fixed by reconnecting."""
+
+
+def _server_not_listening(exc: BaseException) -> bool:
+    """True when a connect attempt failed because nothing accepts on the port.
+
+    asyncio surfaces a refused connect as ``ConnectionRefusedError`` (``[Errno
+    111] Connect call failed``) or, when the host resolves to several
+    addresses, as a plain ``OSError("Multiple exceptions: ...")`` whose text
+    carries each refusal's errno.
+    """
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return exc.errno == errno.ECONNREFUSED or f"[Errno {errno.ECONNREFUSED}]" in str(
+        exc
+    )
 
 
 class TriggerGestureRecognizer:
@@ -960,6 +987,8 @@ class TrackerBridge:
                     "Streaming tracker poses (tracking managed automatically); "
                     f"{gesture_help}"
                 )
+        connected_once = False
+        waiting_logged = False
         while not self._controls.quit.is_set():
             try:
                 async with websockets.connect(
@@ -969,6 +998,7 @@ class TrackerBridge:
                     open_timeout=_SOCKET_LIFECYCLE_TIMEOUT_S,
                     close_timeout=_SOCKET_LIFECYCLE_TIMEOUT_S,
                 ) as ws:
+                    connected_once = True
                     _logger.info("connected to %s", uri)
                     await self._stream(ws)
             except asyncio.CancelledError:
@@ -989,8 +1019,24 @@ class TrackerBridge:
                     raise TrackerBridgeError(
                         "tracker backend health check failed"
                     ) from source_exc
-                _logger.warning("connection to %s lost (%s); retrying in 2s", uri, exc)
-                await asyncio.sleep(2.0)
+                if not connected_once and _server_not_listening(exc):
+                    # Expected while the operation is still bringing its VR
+                    # server up (see _SERVER_STARTUP_POLL_S): say so once, then
+                    # poll quietly instead of warning every attempt.
+                    if not waiting_logged:
+                        waiting_logged = True
+                        _logger.info(
+                            "waiting for the VR server at %s to start listening", uri
+                        )
+                    await asyncio.sleep(_SERVER_STARTUP_POLL_S)
+                    continue
+                _logger.warning(
+                    "connection to %s lost (%s); retrying in %.0fs",
+                    uri,
+                    exc,
+                    _RECONNECT_DELAY_S,
+                )
+                await asyncio.sleep(_RECONNECT_DELAY_S)
 
     async def _stream(self, ws) -> None:
         """Send frames at the configured rate over one connection."""

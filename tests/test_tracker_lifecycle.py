@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import subprocess
 import sys
 import tempfile
@@ -1112,6 +1113,88 @@ class BridgeFatalityTest(unittest.IsolatedAsyncioTestCase):
             self.assertRaisesRegex(TrackerSourceError, "hardware reader died"),
         ):
             await asyncio.wait_for(bridge.run(), timeout=1.0)
+
+
+class _HealthySource:
+    def poses(self):  # type: ignore[no-untyped-def]
+        return {}
+
+
+class BridgeServerStartupTest(unittest.IsolatedAsyncioTestCase):
+    """The bridge starts before the operation's VR server is listening."""
+
+    def _bridge(self, stop: threading.Event) -> TrackerBridge:
+        return TrackerBridge(
+            _HealthySource(),  # type: ignore[arg-type]
+            left="left",
+            right="right",
+            controls=StopEventControls(stop),
+        )
+
+    async def test_refused_connects_before_first_link_are_quiet_polls(self) -> None:
+        stop = threading.Event()
+        bridge = self._bridge(stop)
+        refused = ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 8000)")
+        connect = Mock(side_effect=[refused, refused, refused, _FakeConnection()])
+
+        async def stream(_ws: object) -> None:
+            stop.set()
+
+        with (
+            patch("websockets.connect", connect),
+            patch.object(bridge, "_stream", stream),
+            patch("almond_axol.tracker.bridge._SERVER_STARTUP_POLL_S", 0.001),
+            self.assertLogs("almond_axol.tracker.bridge", level="INFO") as logs,
+        ):
+            await asyncio.wait_for(bridge.run(), timeout=2.0)
+
+        self.assertEqual(connect.call_count, 4)
+        warnings = [r for r in logs.records if r.levelno >= logging.WARNING]
+        self.assertEqual(warnings, [])
+        waiting = [r for r in logs.records if "waiting for the VR server" in r.msg]
+        self.assertEqual(len(waiting), 1, logs.output)
+
+    async def test_refused_connect_after_a_link_existed_is_a_warning(self) -> None:
+        stop = threading.Event()
+        bridge = self._bridge(stop)
+        refused = ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 8000)")
+        connect = Mock(side_effect=[_FakeConnection(), refused, _FakeConnection()])
+        streams = 0
+
+        async def stream(_ws: object) -> None:
+            nonlocal streams
+            streams += 1
+            if streams == 1:
+                raise ConnectionResetError("server went away")
+            stop.set()
+
+        with (
+            patch("websockets.connect", connect),
+            patch.object(bridge, "_stream", stream),
+            patch("almond_axol.tracker.bridge._RECONNECT_DELAY_S", 0.001),
+            self.assertLogs("almond_axol.tracker.bridge", level="WARNING") as logs,
+        ):
+            await asyncio.wait_for(bridge.run(), timeout=2.0)
+
+        self.assertEqual(connect.call_count, 3)
+        self.assertEqual(len(logs.records), 2, logs.output)
+        self.assertTrue(all("lost" in r.getMessage() for r in logs.records))
+
+    def test_multi_address_refusal_counts_as_not_listening(self) -> None:
+        from almond_axol.tracker.bridge import _server_not_listening
+
+        self.assertTrue(_server_not_listening(ConnectionRefusedError(111, "refused")))
+        self.assertTrue(
+            _server_not_listening(
+                OSError(
+                    "Multiple exceptions: [Errno 111] Connect call failed "
+                    "('::1', 8000, 0, 0), [Errno 111] Connect call failed "
+                    "('127.0.0.1', 8000)"
+                )
+            )
+        )
+        self.assertFalse(_server_not_listening(TimeoutError("handshake")))
+        self.assertFalse(_server_not_listening(ConnectionResetError(104, "reset")))
 
 
 class IdentifyDiagnosticsTest(unittest.TestCase):
