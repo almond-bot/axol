@@ -64,7 +64,7 @@ Relaying the ZED cameras to the headset grabs and **NVENC**-encodes frames on th
 axol provision
 ```
 
-This runs the [Quest-over-USB](/guides/quest-over-usb) adb setup, the [`zed.driver`](/cli/zed-driver) ZED Box Duo camera-driver upgrade, the board-IMU group access (`gyro.install`, the [powered cart](/guides/vr-interface#powered-cart)'s heading-hold yaw source), [`zed.install`](/cli/zed-install), [`gst.install`](/cli/gst-install), and [`gst.build-zed`](/cli/gst-build-zed) in order; each self-gates and no-ops off the target hardware (no ZED SDK / `apt` / factory ZED Box Duo driver / board IMU). You can also run them individually.
+This runs the [Quest-over-USB](/guides/quest-over-usb) adb setup, the [`zed.driver`](/cli/zed-driver) ZED Box (Duo / Mini) camera-driver upgrade, the board-IMU group access (`gyro.install`, the [powered cart](/guides/vr-interface#powered-cart)'s heading-hold yaw source), [`zed.install`](/cli/zed-install), [`gst.install`](/cli/gst-install), and [`gst.build-zed`](/cli/gst-build-zed) in order; each self-gates and no-ops off the target hardware (no ZED SDK / `apt` / factory ZED Box driver / board IMU). You can also run them individually.
 
 On a Jetson, pin the NVENC/VIC and CPU clocks for low-latency encode and a steady IK loop (the install script wires this into the systemd unit so it re-runs at every boot):
 

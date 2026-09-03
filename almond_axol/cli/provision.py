@@ -7,9 +7,10 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
 * ``adb``           — Android Debug Bridge + the Oculus udev rule, for
                       streaming Quest controller poses over a USB
                       ``adb reverse`` tunnel (see :mod:`almond_axol.utils.adb`).
-* ``zed.driver``    — replaces the ZED Box Duo's known-bad factory GMSL
-                      capture driver with the pinned release (takes effect on
-                      the next reboot; never reboots itself).
+* ``zed.driver``    — replaces a ZED Box's (Duo or Mini) outdated factory
+                      GMSL capture driver with the release pinned for the
+                      ZED SDK (takes effect on the next reboot; never reboots
+                      itself).
 * ``zed.install``   — the pyzed bindings (not on PyPI; needs the ZED SDK).
 * ``gst.install``   — the GStreamer + PyGObject ``appsink`` stack (PyGObject
                       builds against the system gobject-introspection and is
@@ -267,11 +268,12 @@ def _run_locked() -> None:
     # on apt-get.
     step("adb (Quest-over-USB)", adb.install)
     step("Lighthouse tracking (tracker.install)", tracker_install.run)
-    # ZED Box Duo units ship with a known-bad factory GMSL capture driver;
-    # replace it with the pinned release. Self-gates on the factory package
-    # being present (ensure_driver, not run: a *quiet* no-op everywhere else)
-    # and never reboots — the new kernel driver loads on the next reboot, so
-    # it just prints a notice.
+    # ZED Box units (Duo and Mini) ship with whatever GMSL capture driver was
+    # current at flash time, and the ZED SDK needs a matching one; replace an
+    # outdated driver with the pinned release. Self-gates on a stereolabs-zed*
+    # package being present (ensure_driver, not run: a *quiet* no-op everywhere
+    # else) and never reboots — the new kernel driver loads on the next reboot,
+    # so it just prints a notice.
     step("ZED Box camera driver (zed.driver)", zed_driver.ensure_driver)
     # Group access to the board IMU's sampling timer, so teleop can start the
     # cart's yaw reference without root. Self-gates on the driver's presence.

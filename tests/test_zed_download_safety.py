@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import stat
@@ -155,40 +156,181 @@ class AtomicDownloadTests(unittest.TestCase):
             self.assertFalse(destination.exists())
 
 
+_DUO = driver._VARIANTS_BY_PACKAGE["stereolabs-zedbox-duo"]  # noqa: SLF001
+_MINI = driver._VARIANTS_BY_PACKAGE["stereolabs-zedbox-mini"]  # noqa: SLF001
+
+
+class DriverVariantTests(unittest.TestCase):
+    """Every ZED carrier we ship must have its GMSL driver kept in step."""
+
+    def test_pins_cover_duo_and_mini_consistently(self) -> None:
+        self.assertEqual(
+            {v.package for v in driver._VARIANTS},  # noqa: SLF001
+            {"stereolabs-zedbox-duo", "stereolabs-zedbox-mini"},
+        )
+        for variant in driver._VARIANTS:  # noqa: SLF001
+            with self.subTest(variant.package):
+                self.assertRegex(variant.sha256, r"^[0-9a-f]{64}$")
+                self.assertTrue(variant.deb_version.startswith(variant.target_version))
+                self.assertEqual(
+                    variant.deb_name,
+                    f"{variant.package}_{variant.deb_version}_"
+                    f"{driver._DEB_ARCHITECTURE}.deb",  # noqa: SLF001
+                )
+                self.assertIn(
+                    f"L4T{driver._L4T_RELEASE}.{driver._L4T_REVISION_MAJOR}.",  # noqa: SLF001
+                    variant.deb_version,
+                )
+                self.assertIn(
+                    f"/R{driver._L4T_RELEASE}.{driver._L4T_REVISION_MAJOR}/",  # noqa: SLF001
+                    variant.url,
+                )
+
+    @staticmethod
+    def _dpkg_query(lines: str) -> Mock:
+        return Mock(return_value=SimpleNamespace(returncode=0, stdout=lines))
+
+    def test_only_installed_stereolabs_packages_count(self) -> None:
+        listing = (
+            "stereolabs-zedbox-mini installed 1.4.0-SL-MAX9296-ZEDBOX-MINI-L4T36.4.0\n"
+            "stereolabs-zedbox-duo config-files 1.3.0-LI-MAX96712-ZEDBOX-L4T36.4.0\n"
+        )
+        with patch.object(driver.subprocess, "run", self._dpkg_query(listing)) as run:
+            installed = driver._installed_driver_packages()  # noqa: SLF001
+
+        self.assertEqual(
+            installed,
+            {"stereolabs-zedbox-mini": "1.4.0-SL-MAX9296-ZEDBOX-MINI-L4T36.4.0"},
+        )
+        self.assertEqual(run.call_args.args[0][-1], "stereolabs-zed*")
+
+    def test_outdated_mini_driver_is_upgraded(self) -> None:
+        # The customer case: a ZED Box Mini flashed with driver 1.4.0 running
+        # SDK 5.4.1. The Duo-only check used to return False silently here.
+        upgrade = Mock()
+        with (
+            patch.object(
+                driver,
+                "_installed_driver_packages",
+                return_value={
+                    "stereolabs-zedbox-mini": "1.4.0-SL-MAX9296-ZEDBOX-MINI-L4T36.4.0"
+                },
+            ),
+            patch.object(driver, "_is_older", return_value=True),
+            patch.object(driver, "_l4t_matches", return_value=True),
+            patch.object(driver, "_upgrade", upgrade),
+            patch.object(driver.sys, "stdout") as stdout,
+        ):
+            self.assertTrue(driver.ensure_driver())
+
+        upgrade.assert_called_once_with(_MINI)
+        printed = "".join(c.args[0] for c in stdout.write.call_args_list)
+        self.assertIn("REBOOT REQUIRED: stereolabs-zedbox-mini 1.4.3", printed)
+
+    def test_current_duo_driver_is_left_alone(self) -> None:
+        upgrade = Mock()
+        with (
+            patch.object(
+                driver,
+                "_installed_driver_packages",
+                return_value={"stereolabs-zedbox-duo": _DUO.deb_version},
+            ),
+            patch.object(driver, "_is_older", return_value=False),
+            patch.object(driver, "_upgrade", upgrade),
+            patch.object(driver.sys, "stdout"),
+        ):
+            self.assertFalse(driver.ensure_driver())
+
+        upgrade.assert_not_called()
+
+    def test_unpinned_stereolabs_driver_is_reported_not_ignored(self) -> None:
+        upgrade = Mock()
+        with (
+            patch.object(
+                driver,
+                "_installed_driver_packages",
+                return_value={"stereolabs-zedlink-quad": "1.2.0-L4T36.4.0"},
+            ),
+            patch.object(driver, "_upgrade", upgrade),
+            patch.object(driver.sys, "stderr") as stderr,
+        ):
+            self.assertFalse(driver.ensure_driver())
+
+        upgrade.assert_not_called()
+        warned = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn("stereolabs-zedlink-quad 1.2.0-L4T36.4.0", warned)
+        self.assertIn("no pinned driver", warned)
+
+    def test_not_a_zed_box_is_a_quiet_noop(self) -> None:
+        with (
+            patch.object(driver, "_installed_driver_packages", return_value={}),
+            patch.object(driver, "_upgrade") as upgrade,
+        ):
+            self.assertFalse(driver.ensure_driver())
+        upgrade.assert_not_called()
+
+
 class DriverArtifactTests(unittest.TestCase):
     def test_exact_digest_and_package_metadata_are_required(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "driver.deb"
             artifact.write_bytes(b"reviewed artifact")
             digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            variant = dataclasses.replace(_MINI, sha256=digest)
             fields = {
-                "Package": driver._PACKAGE,  # noqa: SLF001
-                "Version": driver._DEB_VERSION,  # noqa: SLF001
+                "Package": variant.package,
+                "Version": variant.deb_version,
                 "Architecture": driver._DEB_ARCHITECTURE,  # noqa: SLF001
             }
-            with (
-                patch.object(driver, "_DEB_SHA256", digest),
-                patch.object(
-                    driver,
-                    "_deb_field",
-                    side_effect=lambda _path, field: fields[field],
-                ) as deb_field,
-            ):
-                driver._validate_deb(artifact)  # noqa: SLF001
+            with patch.object(
+                driver,
+                "_deb_field",
+                side_effect=lambda _path, field: fields[field],
+            ) as deb_field:
+                driver._validate_deb(artifact, variant)  # noqa: SLF001
 
             self.assertEqual(deb_field.call_count, 3)
+
+    def test_artifact_is_validated_against_its_own_variant_pin(self) -> None:
+        # Mini bytes must never be accepted under the Duo pin (or vice versa).
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / _MINI.deb_name
+            artifact.write_bytes(b"mini artifact")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            mini = dataclasses.replace(_MINI, sha256=digest)
+            duo = dataclasses.replace(_DUO, sha256=digest)
+            fields = {
+                "Package": _MINI.package,
+                "Version": _MINI.deb_version,
+                "Architecture": driver._DEB_ARCHITECTURE,  # noqa: SLF001
+            }
+            with patch.object(
+                driver, "_deb_field", side_effect=lambda _path, field: fields[field]
+            ):
+                driver._validate_deb(artifact, mini)  # noqa: SLF001
+                with self.assertRaisesRegex(RuntimeError, "Package is"):
+                    driver._validate_deb(artifact, duo)  # noqa: SLF001
+
+    def test_root_stage_rejects_unknown_artifact_names(self) -> None:
+        with (
+            patch.object(driver.os, "geteuid", return_value=0),
+            patch.object(driver, "secure_ensure_directory") as ensure_dir,
+            self.assertRaisesRegex(RuntimeError, "unexpected ZED driver artifact"),
+        ):
+            driver._stage_deb_as_root(Path("/operator/.almond/drivers/evil.deb"))  # noqa: SLF001
+        ensure_dir.assert_not_called()
 
     def test_changed_vendor_bytes_fail_before_metadata_and_are_not_cached(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory)
-            artifact = cache / driver._DEB_URL.rsplit("/", 1)[-1]  # noqa: SLF001
+            artifact = cache / _DUO.deb_name
             artifact.write_bytes(b"changed upstream")
             with (
                 patch.object(driver, "_CACHE_DIR", cache),
                 patch.object(driver, "_deb_field") as deb_field,
                 self.assertRaisesRegex(RuntimeError, "reviewed artifact"),
             ):
-                driver._download_deb()  # noqa: SLF001
+                driver._download_deb(_DUO)  # noqa: SLF001
 
             deb_field.assert_not_called()
             self.assertFalse(artifact.exists())
@@ -196,7 +338,7 @@ class DriverArtifactTests(unittest.TestCase):
     def test_operator_cache_is_copied_and_revalidated_before_root_consumes_it(
         self,
     ) -> None:
-        artifact_name = driver._DEB_URL.rsplit("/", 1)[-1]  # noqa: SLF001
+        artifact_name = _DUO.deb_name
         cached = Path("/operator/.almond/drivers") / artifact_name
         run_root = Mock()
         validate = Mock()
@@ -223,7 +365,7 @@ class DriverArtifactTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            artifact_name = driver._DEB_URL.rsplit("/", 1)[-1]  # noqa: SLF001
+            artifact_name = _MINI.deb_name
             operator_cache = root / "operator"
             operator_cache.mkdir()
             victim = root / "root-secret"
@@ -247,7 +389,7 @@ class DriverArtifactTests(unittest.TestCase):
     def test_failed_root_stage_validation_removes_private_cached_copy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            artifact_name = driver._DEB_URL.rsplit("/", 1)[-1]  # noqa: SLF001
+            artifact_name = _DUO.deb_name
             source = root / artifact_name
             source.write_bytes(b"changed bytes")
             root_cache = root / "root-cache"
@@ -279,7 +421,7 @@ class DriverArtifactTests(unittest.TestCase):
             patch.object(driver, "run_root") as run_root,
             self.assertRaisesRegex(RuntimeError, "invalid staged bytes"),
         ):
-            driver._upgrade()  # noqa: SLF001
+            driver._upgrade(_MINI)  # noqa: SLF001
 
         run_root.assert_not_called()
 

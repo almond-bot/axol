@@ -1898,8 +1898,8 @@ fi
 # upgrade, so there is exactly one provisioning path. Each step self-gates
 # (a no-op without the ZED SDK / apt / NVENC).
 # Also installs adb + the Oculus udev rule (Quest-over-USB controller transport)
-# and, on a factory-flashed ZED Box Duo, replaces the known-bad factory GMSL
-# camera driver with the pinned release (`axol zed.driver`); the new driver
+# and, on a factory-flashed ZED Box (Duo or Mini), replaces an outdated GMSL
+# camera driver with the release pinned for the ZED SDK (`axol zed.driver`); the new driver
 # only loads at boot, so provision prints a REBOOT REQUIRED notice we surface
 # in the summary below rather than rebooting the box mid-install.
 say "Provisioning system dependencies (pyzed + GStreamer camera stack + adb)..."

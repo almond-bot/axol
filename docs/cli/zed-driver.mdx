@@ -1,17 +1,24 @@
 ---
 title: "zed.driver"
-description: "Upgrade the ZED Box Duo camera driver (stereolabs-zedbox-duo) to the pinned known-good release."
+description: "Upgrade a ZED Box's GMSL camera driver (stereolabs-zedbox-duo / stereolabs-zedbox-mini) to the release pinned for the ZED SDK."
 ---
 
-Replaces the ZED Box Duo's factory-flashed GMSL capture driver (`stereolabs-zedbox-duo`) with the pinned known-good release from Stereolabs. ZED Box Duo units ship with a buggy driver version, which this command upgrades in place (`dpkg -r` the factory package, then `dpkg -i` the pinned `.deb`).
+Replaces a ZED Box's factory-flashed GMSL capture driver with the pinned known-good release from Stereolabs. Stereolabs ships one driver package per carrier board and pins each to the ZED SDK it supports; this command covers the carriers Almond ships:
 
-The download is pinned to the exact reviewed SHA-256 and package/version/architecture metadata and is staged through an exclusive temporary file before installation. Stereolabs does not publish an independent signature or checksum for this artifact, so the committed digest protects against later server changes but is not independent proof of the original artifact's provenance. Any changed vendor artifact is rejected until its bytes are reviewed and the code pin is deliberately updated.
+| Carrier | Package | Pinned release |
+|---------|---------|----------------|
+| ZED Box Duo | `stereolabs-zedbox-duo` | 1.4.3 (L4T 36.4) |
+| ZED Box Mini | `stereolabs-zedbox-mini` | 1.4.3 (L4T 36.4) |
+
+Units leave the factory with whichever driver was current when they were flashed, and the ZED SDK is tightly coupled to it (SDK 5.3+ needs ≥ 1.4.2; Stereolabs pairs SDK 5.4.1 with 1.4.3). Running a newer SDK on an older driver is not a benign mismatch: the old `ZEDX_Daemon` restarts `nvargus-daemon` underneath a live capture, which kills the camera relay mid-session. The upgrade follows Stereolabs' procedure (`dpkg -r` the factory package, then `dpkg -i` the pinned `.deb`).
+
+The download is pinned to the exact reviewed SHA-256 and package/version/architecture metadata for each variant and is staged through an exclusive temporary file before installation. Stereolabs does not publish an independent signature or checksum for these artifacts, so the committed digests protect against later server changes but are not independent proof of the original artifact's provenance. Any changed vendor artifact is rejected until its bytes are reviewed and the code pin is deliberately updated.
 
 ```bash
 axol zed.driver
 ```
 
-On any machine that isn't a factory-flashed ZED Box Duo — the `stereolabs-zedbox-duo` package isn't installed — this is a no-op. It also refuses to act when the installed driver is already at (or newer than) the pinned version, or when the running L4T release differs from the one the pinned `.deb` was built for.
+On any machine that isn't a factory-flashed ZED Box — no `stereolabs-zed*` package is installed — this is a no-op. It also refuses to act when the installed driver is already at (or newer than) the pinned version, or when the running L4T release differs from the one the pinned `.deb` was built for. A Stereolabs driver package that is installed but has no pin here (another carrier) is reported as a warning rather than silently skipped, since that box's SDK/driver pairing is then unmanaged.
 
 <Note>
   [`provision`](/cli/provision) runs this automatically (the hosted installer and the `axol serve` self-updater both run `provision`), so you normally never need to invoke it directly.

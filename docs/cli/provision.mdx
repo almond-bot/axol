@@ -7,7 +7,7 @@ Installs and refreshes the pieces `uv tool install` can't manage on its own:
 
 - **adb** + the Quest udev rule — for the [Quest-over-USB](/guides/quest-over-usb) controller transport (the `adb reverse` tunnel that streams poses over the cable). Self-gates on `apt`.
 - [`tracker.install`](/cli/tracker) — a pinned **libsurvive** build and Vive USB permissions for Mantis Lighthouse tracking.
-- [`zed.driver`](/cli/zed-driver) — replaces the ZED Box Duo's known-bad factory **GMSL camera driver** (`stereolabs-zedbox-duo`) with the pinned release. Takes effect on the next reboot (prints a notice; never reboots itself). A no-op off a factory-flashed ZED Box Duo.
+- [`zed.driver`](/cli/zed-driver) — replaces a ZED Box's outdated factory **GMSL camera driver** (`stereolabs-zedbox-duo` on the Duo, `stereolabs-zedbox-mini` on the Mini) with the release pinned for the ZED SDK. Takes effect on the next reboot (prints a notice; never reboots itself). A no-op off a factory-flashed ZED Box; warns about a Stereolabs driver package it has no pin for.
 - **board IMU** (`gyro.install`) — grants the `imu` group access to the carrier board's BMI088 sampling timer, the [powered cart](/guides/vr-interface#powered-cart)'s heading-hold yaw reference, so teleop can start it without root. Self-gates on the board driver's presence.
 - [`zed.install`](/cli/zed-install) — the **pyzed** bindings (not on PyPI; needs the ZED SDK).
 - [`gst.install`](/cli/gst-install) — the **GStreamer + PyGObject** `appsink` stack (PyGObject builds against the system gobject-introspection and is dropped whenever the tool environment is rebuilt, e.g. by a release upgrade).

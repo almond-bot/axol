@@ -1,19 +1,27 @@
 """
 axol zed.driver
 
-Upgrades the ZED Box Duo's factory-flashed GMSL capture driver
-(``stereolabs-zedbox-duo``) to the pinned known-good release. ZED Box Duo
-units ship with a buggy driver version, so this replaces it with the pinned
-release from Stereolabs' download server.
+Upgrades a ZED Box's factory-flashed GMSL capture driver to the pinned
+known-good release for its carrier board. Stereolabs ships one driver package
+per carrier (``stereolabs-zedbox-duo`` for the ZED Box Duo, ``stereolabs-
+zedbox-mini`` for the ZED Box Mini, ...), and units leave the factory with
+whichever version was current when they were flashed. The ZED SDK is tightly
+coupled to that driver: SDK 5.3+ needs driver >= 1.4.2, and Stereolabs pairs
+SDK 5.4.1 with driver 1.4.3. Running a newer SDK on an older ``ZEDX_Daemon``
+is not a benign mismatch -- the daemon restarts ``nvargus-daemon`` underneath
+a live capture, which kills the video relay mid-session.
 
-Gated hard on the target hardware: it only acts when the
-``stereolabs-zedbox-duo`` package is already installed (i.e. the host is a
-factory-flashed ZED Box Duo) *and* the running L4T release matches the one the
-pinned .deb was built for — so it is a quiet no-op on any other machine and
-can never downgrade a newer driver (``dpkg --compare-versions`` guards that).
+Gated hard on the target hardware: it only acts on a host where one of the
+pinned ``stereolabs-zed*`` packages is already installed (i.e. a factory-
+flashed ZED Box) *and* the running L4T release matches the one the pinned
+.deb was built for -- so it is a quiet no-op on any other machine and can
+never downgrade a newer driver (``dpkg --compare-versions`` guards that). A
+``stereolabs-zed*`` package we have no pin for is reported loudly rather than
+ignored, because "no pin" means the SDK/driver pairing on that box is
+unmanaged.
 
 The new driver is a kernel module + device-tree update, so it only takes
-effect after a reboot. This command NEVER reboots the box itself — it runs
+effect after a reboot. This command NEVER reboots the box itself -- it runs
 from ``axol provision`` (over the operator's SSH session during install, and
 from the running ``axol serve`` process after a self-update), where an
 in-place reboot would drop the session or kill the robot mid-use. It prints a
@@ -27,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from ...utils.state_files import (
@@ -37,25 +46,66 @@ from ...utils.state_files import (
 from ...utils.sudo import run_root
 from .download import atomic_https_download
 
-_PACKAGE = "stereolabs-zedbox-duo"
-_TARGET_VERSION = "1.4.2"
-_DEB_VERSION = "1.4.2-LI-MAX96712-ZEDBOX-L4T36.4.0"
-_DEB_URL = (
-    "https://download.stereolabs.com/drivers/zedx/1.4.2/R36.4/"
-    "stereolabs-zedbox-duo_1.4.2-LI-MAX96712-ZEDBOX-L4T36.4.0_arm64.deb"
+
+@dataclass(frozen=True)
+class _Variant:
+    """One carrier board's pinned GMSL driver package."""
+
+    package: str
+    carrier: str
+    target_version: str
+    deb_version: str
+    url: str
+    # Stereolabs does not publish a detached signature or authoritative
+    # checksum for these fixed downloads.  Each value is the SHA-256 of the
+    # artifact reviewed when its pin was added: it provides immutability from
+    # that point forward, but is not independent proof of the first artifact's
+    # provenance.  A mismatch must fail closed until a replacement has been
+    # reviewed and the value updated.
+    sha256: str
+
+    @property
+    def deb_name(self) -> str:
+        return self.url.rsplit("/", 1)[-1]
+
+
+_DRIVER_BASE_URL = "https://download.stereolabs.com/drivers/zedx"
+# Every pin below is the 1.4.3 release Stereolabs pairs with ZED SDK 5.4.1,
+# built for L4T 36.4 (JetPack 6.x). Bump a variant's four fields together.
+_VARIANTS: tuple[_Variant, ...] = (
+    _Variant(
+        package="stereolabs-zedbox-duo",
+        carrier="ZED Box Duo",
+        target_version="1.4.3",
+        deb_version="1.4.3-LI-MAX96712-ZEDBOX-L4T36.4.0",
+        url=(
+            f"{_DRIVER_BASE_URL}/1.4.3/R36.4/"
+            "stereolabs-zedbox-duo_1.4.3-LI-MAX96712-ZEDBOX-L4T36.4.0_arm64.deb"
+        ),
+        sha256="54eb75f4f3d8dc5e562a0b3bd0d373b5bb1931f1994be3c4d346d535070e2c6b",
+    ),
+    _Variant(
+        package="stereolabs-zedbox-mini",
+        carrier="ZED Box Mini",
+        target_version="1.4.3",
+        deb_version="1.4.3-SL-MAX9296-ZEDBOX-MINI-L4T36.4.0",
+        url=(
+            f"{_DRIVER_BASE_URL}/1.4.3/R36.4/"
+            "stereolabs-zedbox-mini_1.4.3-SL-MAX9296-ZEDBOX-MINI-L4T36.4.0_arm64.deb"
+        ),
+        sha256="5d6751be41375cd081766b5c5f4201d58e2d2b64a610d493cd5bb282e235bf09",
+    ),
 )
-# Stereolabs does not publish a detached signature or authoritative checksum
-# for this fixed download.  This is the SHA-256 of the artifact reviewed when
-# the pin was added: it provides immutability from that point forward, but is
-# not independent proof of the first artifact's provenance.  A mismatch must
-# fail closed until a replacement has been reviewed and this value updated.
-_DEB_SHA256 = "40be96cb0223c92be353793b0d5a747b2f5ff2d414c06b61134960d08425c784"
+_VARIANTS_BY_PACKAGE = {variant.package: variant for variant in _VARIANTS}
+_VARIANTS_BY_DEB_NAME = {variant.deb_name: variant for variant in _VARIANTS}
+# dpkg glob for every Stereolabs GMSL driver package, pinned or not.
+_MANAGED_PACKAGE_GLOB = "stereolabs-zed*"
 _DEB_ARCHITECTURE = "arm64"
 _DEB_MAX_BYTES = 16 * 1024 * 1024
-# The pinned .deb is built against L4T 36.4.x (JetPack 6.x on the ZED Box
-# Duo). Installing it on any other L4T would leave the cameras dead, so the
-# upgrade is skipped (with a warning) when the running release differs —
-# bump _DEB_URL/_TARGET_VERSION together with this when moving to a new L4T.
+# The pinned .debs are built against L4T 36.4.x (JetPack 6.x). Installing them
+# on any other L4T would leave the cameras dead, so the upgrade is skipped
+# (with a warning) when the running release differs — bump the variant table
+# together with this when moving to a new L4T.
 _L4T_RELEASE = "36"
 _L4T_REVISION_MAJOR = "4"
 _L4T_RELEASE_FILE = Path("/etc/nv_tegra_release")
@@ -66,22 +116,41 @@ _CACHE_DIR = Path.home() / ".almond" / "drivers"
 _ROOT_CACHE_DIR = Path("/var/cache/almond-axol/drivers")
 
 
-def _installed_version() -> str | None:
-    """Installed ``stereolabs-zedbox-duo`` dpkg version, or None when absent."""
+def _installed_driver_packages() -> dict[str, str]:
+    """Installed ``stereolabs-zed*`` packages as ``{package: version}``.
+
+    Only packages in dpkg's *installed* state count: a removed package whose
+    configuration lingers (``rc``) still answers ``dpkg-query`` with its old
+    version but no longer provides a driver, so it must not be treated as a
+    factory install to upgrade.
+    """
     try:
         proc = subprocess.run(
-            ["dpkg-query", "-W", "-f", "${Version}", _PACKAGE],
+            [
+                "dpkg-query",
+                "-W",
+                "-f",
+                "${Package} ${db:Status-Status} ${Version}\\n",
+                _MANAGED_PACKAGE_GLOB,
+            ],
             capture_output=True,
             text=True,
         )
     except OSError:
-        return None
-    version = proc.stdout.strip()
-    return version if proc.returncode == 0 and version else None
+        return {}
+    if proc.returncode != 0:
+        # "no packages found matching" — not a ZED Box (or a dpkg-less host).
+        return {}
+    installed: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[1] == "installed":
+            installed[parts[0]] = parts[2]
+    return installed
 
 
 def _l4t_matches() -> bool:
-    """True when the running L4T release matches the pinned .deb's target."""
+    """True when the running L4T release matches the pinned .debs' target."""
     try:
         first_line = _L4T_RELEASE_FILE.read_text().splitlines()[0]
     except (OSError, IndexError):
@@ -93,11 +162,11 @@ def _l4t_matches() -> bool:
     return match.group(1) == _L4T_RELEASE and match.group(2) == _L4T_REVISION_MAJOR
 
 
-def _is_older(installed: str) -> bool:
-    """True when ``installed`` is strictly older than the pinned target."""
+def _is_older(installed: str, target: str) -> bool:
+    """True when ``installed`` is strictly older than ``target``."""
     return (
         subprocess.run(
-            ["dpkg", "--compare-versions", installed, "lt", _TARGET_VERSION],
+            ["dpkg", "--compare-versions", installed, "lt", target],
             capture_output=True,
         ).returncode
         == 0
@@ -117,23 +186,24 @@ def _deb_field(deb: Path, field: str) -> str:
     return value
 
 
-def _validate_deb(deb: Path) -> None:
+def _validate_deb(deb: Path, variant: _Variant) -> None:
     """Verify the pinned bytes and the package identity they encode."""
     if deb.is_symlink() or not deb.is_file():
         raise RuntimeError("downloaded .deb is not a regular file")
 
     with deb.open("rb") as artifact:
         digest = hashlib.file_digest(artifact, "sha256").hexdigest()
-    if digest != _DEB_SHA256:
+    if digest != variant.sha256:
         raise RuntimeError(
-            "ZED driver SHA-256 does not match the reviewed artifact; refusing "
-            "to install changed vendor bytes. Review the replacement and update "
-            "_DEB_SHA256 in almond_axol/cli/zed/driver.py"
+            f"{variant.carrier} driver SHA-256 does not match the reviewed "
+            "artifact; refusing to install changed vendor bytes. Review the "
+            f"replacement and update the {variant.package} pin in "
+            "almond_axol/cli/zed/driver.py"
         )
 
     expected_fields = {
-        "Package": _PACKAGE,
-        "Version": _DEB_VERSION,
+        "Package": variant.package,
+        "Version": variant.deb_version,
         "Architecture": _DEB_ARCHITECTURE,
     }
     for field, expected in expected_fields.items():
@@ -144,7 +214,15 @@ def _validate_deb(deb: Path) -> None:
             )
 
 
-def _download_deb() -> Path:
+def _variant_for_artifact(deb: Path) -> _Variant:
+    """The pinned variant a cached artifact name belongs to (fail closed)."""
+    variant = _VARIANTS_BY_DEB_NAME.get(deb.name)
+    if variant is None:
+        raise RuntimeError(f"unexpected ZED driver artifact name: {deb.name!r}")
+    return variant
+
+
+def _download_deb(variant: _Variant) -> Path:
     """Download the pinned .deb into the cache and verify it is a valid archive.
 
     Everything that can fail without root — the download and the archive check
@@ -154,19 +232,19 @@ def _download_deb() -> Path:
     command) work offline.
     """
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    deb = _CACHE_DIR / _DEB_URL.rsplit("/", 1)[-1]
+    deb = _CACHE_DIR / variant.deb_name
     if not deb.exists():
-        print(f"Downloading {_DEB_URL}")
+        print(f"Downloading {variant.url}")
         atomic_https_download(
-            _DEB_URL,
+            variant.url,
             deb,
             max_bytes=_DEB_MAX_BYTES,
-            validate=_validate_deb,
+            validate=lambda path: _validate_deb(path, variant),
         )
     else:
         print(f"Already downloaded: {deb}")
     try:
-        _validate_deb(deb)
+        _validate_deb(deb, variant)
     except Exception:
         # Never retain unreviewed bytes under the trusted cache name.  A
         # changed upstream artifact will fail the same pin on the next run and
@@ -180,11 +258,11 @@ def _stage_deb_as_root(deb: Path) -> Path:
     """No-follow copy into a private root cache and validate the pinned fd bytes."""
     if os.geteuid() != 0:
         raise PermissionError("reviewed ZED driver staging must run as root")
-    expected_name = _DEB_URL.rsplit("/", 1)[-1]
-    if deb.name != expected_name:
-        raise RuntimeError(f"unexpected ZED driver artifact name: {deb.name!r}")
+    # The artifact name selects the pin it is validated against, so only a
+    # reviewed artifact name can ever be staged at the trusted path.
+    variant = _variant_for_artifact(deb)
 
-    staged = _ROOT_CACHE_DIR / expected_name
+    staged = _ROOT_CACHE_DIR / variant.deb_name
     secure_ensure_directory(_ROOT_CACHE_DIR, mode=0o700)
     try:
         # The source is opened descriptor-relative with O_NOFOLLOW and copied
@@ -192,7 +270,7 @@ def _stage_deb_as_root(deb: Path) -> Path:
         # readable file into the cache, and an in-place mutation makes the
         # post-copy reviewed digest fail.
         secure_atomic_copy_file(deb, staged, mode=0o600)
-        _validate_deb(staged)
+        _validate_deb(staged, variant)
     except Exception:
         # Never leave mismatched or partially trusted bytes readable at the
         # predictable recovery path.
@@ -213,7 +291,7 @@ def _stage_deb_for_root(deb: Path) -> Path:
     root helper; the hosted root service calls the same implementation
     directly. The fixed cache is root-only and validation happens after copy.
     """
-    staged = _ROOT_CACHE_DIR / _DEB_URL.rsplit("/", 1)[-1]
+    staged = _ROOT_CACHE_DIR / deb.name
     if os.geteuid() == 0:
         return _stage_deb_as_root(deb)
     run_root(
@@ -229,14 +307,14 @@ def _stage_deb_for_root(deb: Path) -> Path:
     return staged
 
 
-def _upgrade() -> None:
+def _upgrade(variant: _Variant) -> None:
     """Replace the installed factory package with the pinned .deb (needs root)."""
-    deb = _stage_deb_for_root(_download_deb())
+    deb = _stage_deb_for_root(_download_deb(variant))
     # Remove the factory package first (per Stereolabs' upgrade procedure)
     # rather than upgrading in place; best-effort since a half-removed
     # package still gets replaced by the install below.
-    print(f"Removing the factory {_PACKAGE} package (requires sudo)...")
-    run_root(["dpkg", "-r", _PACKAGE])
+    print(f"Removing the factory {variant.package} package (requires sudo)...")
+    run_root(["dpkg", "-r", variant.package])
     print(f"Installing {deb.name}...")
     try:
         run_root(["dpkg", "-i", str(deb)], check=True)
@@ -253,42 +331,66 @@ def _upgrade() -> None:
         raise
 
 
-def ensure_driver() -> bool:
-    """Upgrade the ZED Box Duo camera driver when the factory one is outdated.
-
-    Returns True when the driver was upgraded (a reboot is then required for
-    it to load), False when there was nothing to do. Idempotent and self-gating
-    (a no-op on anything that isn't a ZED Box Duo on the pinned L4T), so it is
-    safe to run from ``axol provision`` on every host.
-    """
-    installed = _installed_version()
-    if installed is None:
-        # Not a factory-flashed ZED Box Duo (or dpkg-less host) — nothing to do.
-        return False
-    if not _is_older(installed):
-        print(f"{_PACKAGE} {installed} already >= {_TARGET_VERSION}.")
+def _ensure_variant(variant: _Variant, installed: str) -> bool:
+    """Upgrade one installed variant when it is older than its pin."""
+    if not _is_older(installed, variant.target_version):
+        print(f"{variant.package} {installed} already >= {variant.target_version}.")
         return False
     if not _l4t_matches():
         print(
-            f"WARNING: {_PACKAGE} {installed} is outdated, but the pinned "
-            f"{_TARGET_VERSION} driver targets L4T {_L4T_RELEASE}."
+            f"WARNING: {variant.package} {installed} is outdated, but the pinned "
+            f"{variant.target_version} driver targets L4T {_L4T_RELEASE}."
             f"{_L4T_REVISION_MAJOR} and this host runs a different release — "
             "skipping. Update the pin in almond_axol/cli/zed/driver.py.",
             file=sys.stderr,
         )
         return False
     print(
-        f"{_PACKAGE} {installed} is the known-bad factory driver — "
-        f"upgrading to {_TARGET_VERSION}."
+        f"{variant.package} {installed} is an outdated {variant.carrier} "
+        f"camera driver — upgrading to {variant.target_version}."
     )
-    _upgrade()
+    _upgrade(variant)
     print()
     print(
-        f"REBOOT REQUIRED: {_PACKAGE} {_TARGET_VERSION} is installed but the "
-        "new kernel driver only loads at boot. Reboot when convenient "
-        "(sudo reboot)."
+        f"REBOOT REQUIRED: {variant.package} {variant.target_version} is "
+        "installed but the new kernel driver only loads at boot. Reboot when "
+        "convenient (sudo reboot)."
     )
     return True
+
+
+def ensure_driver() -> bool:
+    """Upgrade the ZED Box camera driver when the installed one is outdated.
+
+    Covers every pinned carrier variant (ZED Box Duo, ZED Box Mini). Returns
+    True when a driver was upgraded (a reboot is then required for it to
+    load), False when there was nothing to do. Idempotent and self-gating (a
+    no-op on anything that isn't a ZED Box on the pinned L4T), so it is safe
+    to run from ``axol provision`` on every host. An installed Stereolabs
+    driver package without a pin is reported on stderr: that box's SDK/driver
+    pairing is unmanaged, which is exactly the state that lets a newer SDK
+    fight an older ``ZEDX_Daemon``.
+    """
+    installed = _installed_driver_packages()
+    if not installed:
+        # Not a factory-flashed ZED Box (or dpkg-less host) — nothing to do.
+        return False
+    upgraded = False
+    for package, version in sorted(installed.items()):
+        variant = _VARIANTS_BY_PACKAGE.get(package)
+        if variant is None:
+            print(
+                f"WARNING: {package} {version} is installed but axol has no "
+                "pinned driver for this ZED carrier, so it cannot verify the "
+                "driver matches the ZED SDK. Add a pin in "
+                "almond_axol/cli/zed/driver.py or upgrade it by hand from "
+                "https://www.stereolabs.com/developers/drivers",
+                file=sys.stderr,
+            )
+            continue
+        if _ensure_variant(variant, version):
+            upgraded = True
+    return upgraded
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
@@ -296,23 +398,23 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     subparsers.add_parser(
         "zed.driver",
         help=(
-            "Upgrade the ZED Box Duo camera driver (stereolabs-zedbox-duo) "
-            "to the pinned release."
+            "Upgrade the ZED Box camera driver (stereolabs-zedbox-duo / "
+            "stereolabs-zedbox-mini) to the pinned release."
         ),
     ).set_defaults(func=run)
 
 
 def run(_args: object = None) -> None:
-    """Ensure the pinned ZED Box Duo camera driver is installed."""
+    """Ensure the pinned ZED Box camera driver is installed."""
     try:
         upgraded = ensure_driver()
     except Exception as exc:  # noqa: BLE001 - network/dpkg failures land here
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
-    if not upgraded and _installed_version() is None:
+    if not upgraded and not _installed_driver_packages():
         print(
-            f"{_PACKAGE} is not installed — not a factory-flashed ZED Box Duo; "
-            "nothing to do."
+            "No stereolabs-zed* driver package is installed — not a "
+            "factory-flashed ZED Box; nothing to do."
         )
 
 
