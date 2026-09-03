@@ -100,14 +100,25 @@ ERR:          0
 """
 
 
-def _fake_proc(interrupts: str | None, affinity: dict[int, str] = {}) -> Path:
-    """A ``/proc`` stand-in: an interrupts table plus per-irq affinity files."""
+def _fake_proc(
+    interrupts: str | None,
+    affinity: dict[int, str] = {},
+    effective: dict[int, str] = {},
+) -> Path:
+    """A ``/proc`` stand-in: an interrupts table plus per-irq affinity files.
+
+    ``effective`` adds ``effective_affinity_list`` nodes (the CPU the GIC
+    actually picked out of the nominal mask) for the given irqs.
+    """
     root = Path(tempfile.mkdtemp())
     if interrupts is not None:
         (root / "interrupts").write_text(interrupts)
     for irq, cpus in affinity.items():
-        (root / "irq" / str(irq)).mkdir(parents=True)
+        (root / "irq" / str(irq)).mkdir(parents=True, exist_ok=True)
         (root / "irq" / str(irq) / "smp_affinity_list").write_text(cpus + "\n")
+    for irq, cpus in effective.items():
+        (root / "irq" / str(irq)).mkdir(parents=True, exist_ok=True)
+        (root / "irq" / str(irq) / "effective_affinity_list").write_text(cpus + "\n")
     return root
 
 
@@ -158,6 +169,59 @@ class CanUsbIrqsTest(TestCase):
         root = _fake_proc(None, {123: "0-7"})
         self.assertEqual(jetson._irq_affinity(123, proc_root=root), set(range(8)))
         self.assertIsNone(jetson._irq_affinity(9, proc_root=root))
+
+    def test_effective_affinity_prefers_the_gic_choice(self) -> None:
+        # Nominal mask says "anywhere"; the GIC actually delivers to CPU0.
+        root = _fake_proc(None, {123: "0-7"}, {123: "0"})
+        self.assertEqual(jetson._irq_effective_affinity(123, proc_root=root), {0})
+        # No effective node (or an empty one): fall back to the nominal mask.
+        root = _fake_proc(None, {124: "0-7"}, {124: ""})
+        self.assertEqual(
+            jetson._irq_effective_affinity(124, proc_root=root), set(range(8))
+        )
+        self.assertIsNone(jetson._irq_effective_affinity(9, proc_root=root))
+
+
+class CanIrqCpusTest(TestCase):
+    """Live placement of the CAN adapters' interrupt, as the camera pool sees it."""
+
+    def setUp(self) -> None:
+        self.sys_root = _fake_sys({jetson.CAN_LEFT: "1-2.2:1.0"})
+
+    def test_unsteered_interrupt_reports_cpu0(self) -> None:
+        root = _fake_proc(_INTERRUPTS, {123: "0-7", 124: "0-7"}, {123: "0"})
+        self.assertEqual(
+            jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root), {0}
+        )
+
+    def test_nominal_mask_when_the_kernel_tracks_no_effective_one(self) -> None:
+        root = _fake_proc(_INTERRUPTS, {123: "0-7", 124: "0-7"})
+        self.assertEqual(
+            jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root),
+            set(range(8)),
+        )
+
+    def test_steered_interrupt_reports_the_can_core_only(self) -> None:
+        # The other controller (usb2) stays on CPU0 but is not the CAN one.
+        root = _fake_proc(_INTERRUPTS, {123: "7", 124: "0-7"}, {123: "7", 124: "0"})
+        self.assertEqual(
+            jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root), {7}
+        )
+
+    def test_every_xhci_row_counts_when_no_interface_resolves(self) -> None:
+        root = _fake_proc(_INTERRUPTS, {123: "7", 124: "0-7"}, {123: "7", 124: "0"})
+        self.assertEqual(
+            jetson.can_irq_cpus(proc_root=root, sys_root=Path(tempfile.mkdtemp())),
+            {0, 7},
+        )
+
+    def test_unknown_when_no_row_or_no_affinity(self) -> None:
+        root = _fake_proc("           CPU0\n 11:   1   GICv3  arch_timer\n")
+        self.assertIsNone(jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root))
+        root = _fake_proc(_INTERRUPTS)  # row present, affinity files missing
+        self.assertIsNone(jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root))
+        root = _fake_proc(None)
+        self.assertIsNone(jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root))
 
 
 class SteerCanIrqTest(TestCase):

@@ -33,6 +33,12 @@ class _FakeVerifier:
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
+    def suspend(self) -> None:
+        self.events.append("verifier-suspend")
+
+    def resume(self) -> None:
+        self.events.append("verifier-resume")
+
     def close(self) -> None:
         self.events.append("verifier-close")
 
@@ -527,7 +533,9 @@ class DatasetRecorderCaptureErrorTest(unittest.TestCase):
         ):
             recorder.close()
 
-        self.assertEqual(events, ["clear", "finalize", "verifier-close"])
+        self.assertEqual(
+            events, ["verifier-resume", "clear", "finalize", "verifier-close"]
+        )
 
     def test_in_process_finish_capture_error_clears_then_raises_typed(self) -> None:
         events: list[str] = []
@@ -537,11 +545,13 @@ class DatasetRecorderCaptureErrorTest(unittest.TestCase):
         recorder._capture_error = "camera alignment failed"
         recorder._dataset = _FakeDataset(events)
         recorder._frames = {"n": 4}
+        recorder._verifier = _FakeVerifier(events)
 
         with self.assertRaisesRegex(RecorderCaptureError, "alignment failed"):
             recorder.finish_episode()
 
-        self.assertEqual(events, ["clear"])
+        # Capture stopped: the verifier is released before the buffer is cleared.
+        self.assertEqual(events, ["verifier-resume", "clear"])
 
     def test_in_process_finish_stop_failure_stays_fatal(self) -> None:
         recorder = InProcessRecorder.__new__(InProcessRecorder)
@@ -562,6 +572,7 @@ class DatasetRecorderCaptureErrorTest(unittest.TestCase):
         recorder._stop = None
         recorder._capture_error = None
         recorder._dataset = _FakeDataset(events)
+        recorder._verifier = _FakeVerifier(events)
 
         with (
             patch(
@@ -572,7 +583,7 @@ class DatasetRecorderCaptureErrorTest(unittest.TestCase):
         ):
             recorder.save_episode()
 
-        self.assertEqual(events, ["clear"])
+        self.assertEqual(events, ["verifier-resume", "clear"])
 
     def test_process_finish_uses_post_join_capture_error_reply(self) -> None:
         conn = _ReplyConnection(("finished", 7, "camera alignment failed"))
