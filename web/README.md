@@ -157,7 +157,7 @@ Box mode is for carrying something with both hands: the grippers clamp the box b
 | Leader's thumbstick | Jog the pair horizontally in the pair's own frame (forward = away from the chest, perpendicular to the gripper-to-gripper line; left/right along it). Hold the stick **clicked** to jog **up/down** (y) or **yaw** the pair about its centre (x) instead — dominant axis only |
 | Other thumbstick | Jog the pair **up/down** (y) or change the **width** between the grippers (x, push right = wider) — dominant axis only, so a width change never lifts the pair. Hold it **clicked** and push left/right to **tilt** the fingertips inward / outward instead (the **Box** button shows the tilt) |
 
-Jogging is additive to the controller's motion (both apply while engaged) and Jelly is inert while box mode is on — the thumbsticks belong to the arms. Leaving box mode (same gesture, or the **Box** button) disengages the arms; both grips together engage again as usual.
+Jogging is additive to the controller's motion (both apply while engaged). The thumbsticks belong to the arms only *while a grip is leading*: press the leader's grip again to **freeze** the pair (the arms hold the box where it is) and the sticks drive Jelly with the normal mapping — so carrying is grab, freeze, drive, lead again to adjust. The hand-over waits until both sticks are released, so a jog in progress can't become base motion; squeeze the trigger before taking the lead back, since the grippers follow it. Leaving box mode (same gesture, or the **Box** button) disengages the arms; both grips together engage again as usual.
 
 ### Session settings
 

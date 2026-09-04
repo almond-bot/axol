@@ -118,8 +118,11 @@ class VRTeleopConfig:
             first blend into the parallel configuration over
             ``box_align_duration`` (from wherever they were, e.g. after
             someone hand-guided the arms), then track the leader controller.
-            The thumbsticks stop driving Jelly and become a **jog** instead:
-            the leader stick translates the pair in the horizontal plane
+            While a grip is leading, the thumbsticks stop driving Jelly and
+            become a **jog** instead (freeze the pair — click the leader's
+            grip again — and they drive Jelly as usual, so the box can be
+            carried across the room): the leader stick translates the pair
+            in the horizontal plane
             (pushed forward = away from the torso, sideways = along the line
             between the grippers); with the leader stick clicked in the same
             axes become up/down and yaw. The other controller's stick moves

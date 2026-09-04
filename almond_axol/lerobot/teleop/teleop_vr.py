@@ -705,10 +705,10 @@ class AxolVRTeleop(Teleoperator):
         if self._jelly is not None:
             # Shared stick → Jelly mapping (see Jelly.apply_vr_frame). Resets
             # force a stop so the base doesn't creep during return-to-rest;
-            # in box mode the sticks jog the arm pair instead, so Jelly is
-            # held stopped the same way.
+            # while a box-mode leader is jogging the arm pair with the sticks
+            # Jelly is held stopped the same way (frozen pair: sticks drive).
             self._jelly.apply_vr_frame(
-                frame, resetting=self._core.is_resetting or self._core.box_mode
+                frame, resetting=self._core.is_resetting or self._core.sticks_jog_pair
             )
 
         # Episode state transitions

@@ -71,7 +71,8 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         type="boolean",
         help=(
             "One controller drives both arms as a parallel-gripper pair; the "
-            "thumbsticks jog the pair. Also toggled by clicking both "
+            "thumbsticks jog the pair while a grip leads and drive Jelly "
+            "once it's frozen. Also toggled by clicking both "
             "thumbsticks together. Switching disengages the arms first."
         ),
     ),

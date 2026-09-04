@@ -1219,7 +1219,7 @@ function HelpPanel({
     "[2x Trigger]  Resize",
     "[B]  Reset Screens",
     ...(boxMode
-      ? ["[Grip]  Lead Both Arms", "[Lead Stick]  Jog Pair", "[Lead Click+Stick]  Up / Yaw"]
+      ? ["[Grip]  Lead / Freeze Pair", "[Lead Stick]  Jog Pair", "[Lead Click+Stick]  Up / Yaw"]
       : ["[Grip]  Engage / Freeze Arm", "[Both Clicks]  Box Mode"]),
   ].join("\n")
   const leftRows = [
@@ -1227,9 +1227,10 @@ function HelpPanel({
     "[X]  Reset Pose",
     ...(boxMode
       ? [
-          "[Grip]  Lead Both Arms",
+          "[Grip]  Lead / Freeze Pair",
           "[Other Stick]  Up / Width",
           "[Other Click+Stick]  Tilt In / Out",
+          "[Frozen: Sticks]  Drive Jelly",
           "[Both Clicks]  Box Mode",
         ]
       : ["[Grip]  Engage / Freeze Arm", "[Ramp]  Arm Comes To Hand", "[Settings]  Live Tuning"]),

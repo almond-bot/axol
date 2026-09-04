@@ -52,6 +52,22 @@ _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 # calmly; then the hold settles into a position hold where the arms are.
 _HOLD_ORPHAN_GRACE_S = 30.0
 
+# Thumbstick deflection below which a stick counts as released — the same
+# deadzone the jog and Jelly apply, so "neutral" here means neither would act.
+_STICK_NEUTRAL = 0.15
+
+
+def _sticks_neutral(frame: object) -> bool:
+    """True when both thumbsticks are centred and neither is clicked."""
+    return (
+        abs(float(frame.l_stick_x)) < _STICK_NEUTRAL
+        and abs(float(frame.l_stick_y)) < _STICK_NEUTRAL
+        and abs(float(frame.r_stick_x)) < _STICK_NEUTRAL
+        and abs(float(frame.r_stick_y)) < _STICK_NEUTRAL
+        and not frame.l_stick_click
+        and not frame.r_stick_click
+    )
+
 
 def recv_with_timeout(
     conn: multiprocessing.connection.Connection,
@@ -175,6 +191,13 @@ class VRTeleopCore:
         # engage state.
         self.box_mode: bool = bool(config.box_mode)
         self._box_leader: str | None = None
+        # Box mode hands the thumbsticks back to Jelly while nobody leads
+        # (the pair is frozen holding the box) — but not until the operator
+        # has let the sticks go after the freeze, so a jog that was in
+        # progress when the leader's grip was clicked can't turn into a base
+        # command. Set when the lead drops, cleared by the first neutral
+        # frame; see :attr:`sticks_jog_pair`.
+        self._box_sticks_held: bool = False
 
         # Re-engage behaviour ("clutch": the controller matches the arm,
         # "ramp": the arm ramps out to the controller — see
@@ -465,6 +488,22 @@ class VRTeleopCore:
         """True while at least one arm is engaged (tracking)."""
         return self.left_enabled or self.right_enabled
 
+    @property
+    def sticks_jog_pair(self) -> bool:
+        """True while the thumbsticks belong to the arm pair, not to Jelly.
+
+        In :attr:`box_mode` the sticks jog the pair whenever a grip is
+        leading it. Once the leader freezes the pair (nobody leads), they go
+        back to driving the base with the ordinary mapping — so the operator
+        grabs the box, freezes, drives across the room, and leads again to
+        adjust — after one frame with every stick released (see
+        ``_box_sticks_held``). Outside box mode the sticks are always
+        Jelly's. Read by the frame handler (VR thread) to gate
+        ``Jelly.apply_vr_frame``; a frame of lag against the IK thread that
+        writes the state is harmless.
+        """
+        return self.box_mode and (self._box_leader is not None or self._box_sticks_held)
+
     def _disengage_all(self, log_message: str | None = None) -> None:
         """Disengage both arms and clear the edge/ramp state (IK thread).
 
@@ -480,6 +519,8 @@ class VRTeleopCore:
         self._prev_r_lock = False
         self._require_both_engage = True
         self._engage_time = None
+        if self._box_leader is not None:
+            self._box_sticks_held = True
         self._box_leader = None
         if log_message is not None and was_enabled:
             self._logger.info(log_message)
@@ -647,11 +688,18 @@ class VRTeleopCore:
         led by the held hand (a hand-over happens when the leader lets go
         while the other still holds). Both grippers follow the leader's
         trigger.
+
+        The thumbsticks jog the pair while someone leads and drive Jelly
+        while nobody does (:attr:`sticks_jog_pair`); the switch to Jelly
+        waits for a frame with the sticks released so a jog can't carry over
+        into base motion.
         """
         l_lock = bool(frame.l_lock)
         r_lock = bool(frame.r_lock)
         was_enabled = self.teleop_enabled
         leader = self._box_leader
+        if leader is None and self._box_sticks_held and _sticks_neutral(frame):
+            self._box_sticks_held = False
 
         if self.config.hold_to_engage:
             if l_lock or r_lock:
@@ -699,8 +747,10 @@ class VRTeleopCore:
                 self._engage_time = time.perf_counter()
                 self._at_rest = False
         elif was_enabled and not enabled:
-            self._logger.info("Teleop disabled")
+            self._logger.info("Teleop disabled (box pair frozen)")
             self._broadcast(False)
+            # Hand the sticks to Jelly only once they've been released.
+            self._box_sticks_held = not _sticks_neutral(frame)
 
         self._prev_both = l_lock and r_lock
         self._prev_l_lock = l_lock

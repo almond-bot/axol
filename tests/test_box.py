@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import types
 import unittest
@@ -21,6 +22,8 @@ from almond_axol.teleop.box import (
     side_clamp_rotation,
     snap_box,
 )
+from almond_axol.teleop.config import VRTeleopConfig
+from almond_axol.teleop.core import VRTeleopCore
 from almond_axol.teleop.live import LiveSettings
 from almond_axol.teleop.worker import IKWorker, _dominant_axis
 from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
@@ -281,7 +284,9 @@ def _box_state(width: float = 0.3) -> BoxState:
     )
 
 
-def _stick_frame(**sticks: float | bool) -> VRFrame:
+def _stick_frame(
+    l_lock: bool = True, r_lock: bool = True, **sticks: float | bool
+) -> VRFrame:
     identity = VRQuaternion(x=0.0, y=0.0, z=0.0, w=1.0)
     zero = VRPosition(x=0.0, y=0.0, z=0.0)
     return VRFrame(
@@ -289,10 +294,79 @@ def _stick_frame(**sticks: float | bool) -> VRFrame:
         r_ee=VRPose(position=zero, quaternion=identity),
         l_elbow=zero,
         r_elbow=zero,
-        l_lock=True,
-        r_lock=True,
+        l_lock=l_lock,
+        r_lock=r_lock,
         **sticks,
     )
+
+
+class SticksDriveJellyTest(unittest.TestCase):
+    """Box mode hands the thumbsticks to Jelly while nobody leads the pair."""
+
+    def _core(self) -> VRTeleopCore:
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+        )
+        return core
+
+    def _lead(self, core: VRTeleopCore) -> None:
+        # Right grip rising edge: the right hand leads the pair.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.teleop_enabled)
+
+    def test_off_box_mode_sticks_are_jellys(self) -> None:
+        core = VRTeleopCore(
+            VRTeleopConfig(),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _e: None,
+        )
+        self.assertFalse(core.sticks_jog_pair)
+
+    def test_unled_pair_drives_led_pair_jogs(self) -> None:
+        core = self._core()
+        self.assertFalse(core.sticks_jog_pair)  # box mode, nobody leading yet
+        self._lead(core)
+        self.assertTrue(core.sticks_jog_pair)
+
+    def test_freeze_with_sticks_released_hands_over_at_once(self) -> None:
+        core = self._core()
+        self._lead(core)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(
+            _stick_frame(l_lock=False, r_lock=True)
+        )  # leader again: freeze
+        self.assertFalse(core.teleop_enabled)
+        self.assertFalse(core.sticks_jog_pair)
+
+    def test_freeze_mid_jog_waits_for_neutral_sticks(self) -> None:
+        core = self._core()
+        self._lead(core)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False, r_stick_y=-0.8))
+        # Freeze while the jog stick is still pushed: Jelly must not inherit it.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True, r_stick_y=-0.8))
+        self.assertFalse(core.teleop_enabled)
+        self.assertTrue(core.sticks_jog_pair)
+        # Still deflected (or clicked): still held back.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True, r_stick_y=-0.5))
+        self.assertTrue(core.sticks_jog_pair)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True, l_stick_click=True))
+        self.assertTrue(core.sticks_jog_pair)
+        # Released: the sticks are Jelly's from here on.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.sticks_jog_pair)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True, l_stick_y=-1.0))
+        self.assertFalse(core.sticks_jog_pair)
+
+    def test_forced_disengage_waits_for_neutral_sticks(self) -> None:
+        core = self._core()
+        self._lead(core)
+        core._disengage_all("stale")
+        self.assertTrue(core.sticks_jog_pair)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertFalse(core.sticks_jog_pair)
 
 
 class JogAxisLockTest(unittest.TestCase):
