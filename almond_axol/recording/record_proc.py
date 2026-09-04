@@ -2415,7 +2415,6 @@ def _recorder_main(
         config["snapshot_shm_name"],
         config["obs_keys"],
         config["action_keys"],
-        config["snapshot_lock"],
     )
 
     if config["rerun_ip"]:
@@ -2742,11 +2741,10 @@ class DatasetRecorderProcess:
         from ..video.shm_frames import SnapshotWriter
 
         ctx = multiprocessing.get_context("spawn")
-        # The same SemLock is inherited by writer and reader. Unlike a NumPy
-        # seqlock alone, this provides formal release/acquire ordering on the
-        # Jetson's ARM cores as well as x86.
-        self._snapshot_lock = ctx.Lock()
-        self._snap = SnapshotWriter(obs_keys, action_keys, self._snapshot_lock)
+        # Lock-free SPSC ring: the control loop's write never waits on the
+        # recorder, however long the recorder is descheduled (see
+        # shm_frames._SNAP_READ_ATTEMPTS for the history behind that).
+        self._snap = SnapshotWriter(obs_keys, action_keys)
         self._conn, child_conn = ctx.Pipe()
         # Capture runs on a child thread while command/reply messages use
         # ``_conn``. Keep failures on a dedicated one-way pipe so the hot
@@ -2758,7 +2756,6 @@ class DatasetRecorderProcess:
             "obs_keys": obs_keys,
             "action_keys": action_keys,
             "snapshot_shm_name": self._snap.name,
-            "snapshot_lock": self._snapshot_lock,
         }
         self._proc = ctx.Process(
             target=_recorder_main,

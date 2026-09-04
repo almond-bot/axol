@@ -745,10 +745,33 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- local ZED cameras ---------------------------------------------------
 
+    # Last successful enumeration, served while an operation is running.
+    last_detect: dict[str, Any] | None = None
+
     @app.get("/api/cameras/detect")
     async def cameras_detect() -> dict[str, Any]:
-        """List locally connected ZED cameras (serial, model, mono/stereo)."""
-        return await asyncio.to_thread(_detect_cameras)
+        """List locally connected ZED cameras (serial, model, mono/stereo).
+
+        Deferred while an operation is running: enumeration spawns a fresh
+        interpreter that imports the ZED SDK and round-trips to the daemon
+        feeding the live cameras — a burst that competes with the 120 Hz control
+        loop and the recorder (a page load mid-episode on 2026-09-03 dropped the
+        loop to 65 Hz and lost the episode). The panel gets the last known
+        result with a note instead; it re-detects when the operation ends.
+        """
+        nonlocal last_detect
+        if runner.is_running():
+            return {
+                "devices": list(last_detect["devices"]) if last_detect else [],
+                "error": (
+                    "camera detection is paused while an operation is running"
+                    + (" (showing the last result)" if last_detect else "")
+                ),
+            }
+        result = await asyncio.to_thread(_detect_cameras)
+        if result["error"] is None:
+            last_detect = result
+        return result
 
     @app.get("/api/cameras/preview/{serial}", response_model=None)
     async def camera_preview(serial: int) -> Response | JSONResponse:
