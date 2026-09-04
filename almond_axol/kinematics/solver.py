@@ -834,6 +834,16 @@ class KinematicsSolver:
         """Total number of actuated joints across both arms."""
         return self.robot.joints.num_actuated_joints
 
+    @property
+    def shoulder_positions(self) -> tuple[np.ndarray, np.ndarray]:
+        """World-frame ``(left, right)`` shoulder positions, ``(3,)`` each.
+
+        Fixed in the world frame (the shoulders are on the torso), so no
+        joint state is needed — the centres of the spheres the elbows move
+        on.
+        """
+        return self._left_shoulder_pos.copy(), self._right_shoulder_pos.copy()
+
     # -- Joint-order conversion ----------------------------------------------
 
     def to_pyroki_order(self, q: np.ndarray) -> np.ndarray:
@@ -903,6 +913,7 @@ class KinematicsSolver:
         left_elbow_pos: np.ndarray | None = None,
         right_elbow_pos: np.ndarray | None = None,
         delta_scale: float = 1.0,
+        elbow_weight: float | None = None,
     ) -> np.ndarray:
         """Compute joint positions for absolute Cartesian end-effector targets.
 
@@ -930,6 +941,13 @@ class KinematicsSolver:
                 the effective joint speed silently collapses (a 30 ms solve
                 under the default clamp allows only ~1.1 rad/s instead of
                 4 rad/s) and the accumulated error releases as a lurch.
+            elbow_weight: Per-call weight on the elbow hints, replacing
+                ``config.elbow_weight`` for this solve and applied *without*
+                the overhead fade — for hints the caller synthesises (box
+                mode's outward elbow bias, see
+                :func:`almond_axol.teleop.box.elbow_swivel_hint`) rather than
+                the headset's inferred elbow the fade exists for. ``None``
+                keeps the configured behaviour.
 
         Returns:
             Updated full ``(N,)`` joint array in radians.
@@ -982,8 +1000,13 @@ class KinematicsSolver:
         # elbow is inferred rather than tracked and degrades sharply once the
         # hand rises to shoulder height, exactly where the shoulder nears its
         # joint limits and bad swivel targets do the most damage.
-        elbow_w_l = cfg.elbow_weight * self._elbow_fade(lp, self._left_shoulder_pos)
-        elbow_w_r = cfg.elbow_weight * self._elbow_fade(rp, self._right_shoulder_pos)
+        if elbow_weight is not None:
+            elbow_w_l = elbow_w_r = float(elbow_weight)
+        else:
+            elbow_w_l = cfg.elbow_weight * self._elbow_fade(lp, self._left_shoulder_pos)
+            elbow_w_r = cfg.elbow_weight * self._elbow_fade(
+                rp, self._right_shoulder_pos
+            )
 
         q_prev = self._q_prev if self._q_prev is not None else q_current
         self._q_prev = np.asarray(q_current, dtype=np.float32).copy()
@@ -1098,21 +1121,30 @@ class KinematicsSolver:
     # -- Internal ------------------------------------------------------------
 
     def _warmup(self) -> None:
-        """Trigger JIT compilation with a dummy solve."""
+        """Trigger JIT compilation with dummy solves.
+
+        Both graph shapes are compiled — with and without elbow hints — so
+        neither the plain teleop solve nor box mode's first frame (which adds
+        synthetic elbow hints, see ``ik(elbow_weight=...)``) stalls on a
+        compile mid-session. The persistent compilation cache
+        (:mod:`almond_axol.kinematics.jax_cache`) makes the second one a
+        disk load on every run but the first.
+        """
         _logger.info("Warming up IK solver (JIT compile)...")
         dummy_q = np.zeros(self.num_joints, dtype=np.float32)
         dummy_pos = np.array([0.0, 0.0, 0.3], dtype=np.float32)
         dummy_rot = np.eye(3, dtype=np.float32)
         dummy_pose = (dummy_pos, dummy_rot)
-        kwargs: dict = dict(
-            q_current=dummy_q, left_pose=dummy_pose, right_pose=dummy_pose
-        )
-        if self.config.elbow_weight > 0:
-            dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
-            kwargs["left_elbow_pos"] = dummy_elbow
-            kwargs["right_elbow_pos"] = dummy_elbow
-        try:
-            self.ik(**kwargs)
-        except Exception:
-            pass
+        dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
+        for with_elbows in (False, True):
+            kwargs: dict = dict(
+                q_current=dummy_q, left_pose=dummy_pose, right_pose=dummy_pose
+            )
+            if with_elbows:
+                kwargs["left_elbow_pos"] = dummy_elbow
+                kwargs["right_elbow_pos"] = dummy_elbow
+            try:
+                self.ik(**kwargs)
+            except Exception:
+                pass
         _logger.info("IK solver ready.")

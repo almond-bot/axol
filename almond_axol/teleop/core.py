@@ -387,6 +387,8 @@ class VRTeleopCore:
             "box_grip_tilt",
             "box_tilt_speed",
             "box_tilt_max",
+            "box_elbow_out",
+            "box_elbow_weight",
         }
     )
 

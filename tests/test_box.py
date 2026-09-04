@@ -14,6 +14,7 @@ from almond_axol.teleop.box import (
     approach_axis,
     box_frame,
     box_targets,
+    elbow_swivel_hint,
     ideal_gripper_poses,
     pair_aligned,
     parallel_grip_rel,
@@ -266,9 +267,117 @@ def _jog_worker(leader: str = "left") -> IKWorker:
         box_grip_tilt=0.0,
         box_tilt_speed=30.0,
         box_tilt_max=45.0,
+        box_elbow_out=40.0,
+        box_elbow_weight=10.0,
     )
     worker._box_leader = leader
     return worker
+
+
+_SHOULDER_L = np.array((0.0, 0.2, 0.5), np.float32)
+_SHOULDER_R = np.array((0.0, -0.2, 0.5), np.float32)
+
+
+class ElbowSwivelHintTest(unittest.TestCase):
+    """Box mode's synthetic 'elbows out' hint: same radius, same elbow angle,
+    only the swing about the shoulder-wrist line changes."""
+
+    # Left arm reaching straight forward at shoulder height, elbow currently
+    # folded *inward* (toward -y, the torso side) and a little below the axis.
+    wrist = np.array((0.5, 0.2, 0.5), np.float32)
+    elbow_in = np.array((0.25, 0.05, 0.42), np.float32)
+
+    def _decompose(self, p: np.ndarray, shoulder: np.ndarray, wrist: np.ndarray):
+        a = (wrist - shoulder) / np.linalg.norm(wrist - shoulder)
+        e = p - shoulder
+        along = float(e @ a)
+        radial = e - along * a
+        return along, radial
+
+    def test_moves_elbow_outboard_keeping_geometry(self) -> None:
+        hint = elbow_swivel_hint(
+            _SHOULDER_L, self.elbow_in, self.wrist, 1.0, math.radians(40.0)
+        )
+        along0, rad0 = self._decompose(self.elbow_in, _SHOULDER_L, self.wrist)
+        along1, rad1 = self._decompose(hint, _SHOULDER_L, self.wrist)
+        # Reachable: same distance along the axis and the same swing radius.
+        self.assertAlmostEqual(along0, along1, places=5)
+        self.assertAlmostEqual(np.linalg.norm(rad0), np.linalg.norm(rad1), places=5)
+        # Outboard (+y for the left arm) and below the axis, 40° from down.
+        self.assertGreater(hint[1], _SHOULDER_L[1])
+        self.assertLess(hint[2], _SHOULDER_L[2])
+        angle = math.degrees(math.atan2(rad1[1], -rad1[2]))
+        self.assertAlmostEqual(angle, 40.0, places=3)
+
+    def test_zero_hangs_elbow_straight_down(self) -> None:
+        hint = elbow_swivel_hint(_SHOULDER_L, self.elbow_in, self.wrist, 1.0, 0.0)
+        _, rad = self._decompose(hint, _SHOULDER_L, self.wrist)
+        self.assertAlmostEqual(float(rad[1]), 0.0, places=6)
+        self.assertLess(float(rad[2]), 0.0)
+
+    def test_right_arm_mirrors(self) -> None:
+        wrist = self.wrist * np.array((1, -1, 1), np.float32)
+        elbow = self.elbow_in * np.array((1, -1, 1), np.float32)
+        hint_l = elbow_swivel_hint(
+            _SHOULDER_L, self.elbow_in, self.wrist, 1.0, math.radians(40.0)
+        )
+        hint_r = elbow_swivel_hint(_SHOULDER_R, elbow, wrist, -1.0, math.radians(40.0))
+        np.testing.assert_allclose(hint_r, hint_l * np.array((1, -1, 1)), atol=1e-6)
+        self.assertLess(hint_r[1], _SHOULDER_R[1])  # outboard = -y on the right
+
+    def test_degenerate_inputs_return_current_elbow(self) -> None:
+        # Wrist on the shoulder: no axis.
+        np.testing.assert_allclose(
+            elbow_swivel_hint(_SHOULDER_L, self.elbow_in, _SHOULDER_L, 1.0, 0.5),
+            self.elbow_in,
+        )
+        # Straight arm: elbow on the axis, no swing to steer.
+        on_axis = _SHOULDER_L + 0.5 * (self.wrist - _SHOULDER_L)
+        np.testing.assert_allclose(
+            elbow_swivel_hint(_SHOULDER_L, on_axis, self.wrist, 1.0, 0.5), on_axis
+        )
+        # Wanted direction parallel to the axis: nothing to project.
+        wrist_down = _SHOULDER_L + np.array((0.0, 0.0, -0.5), np.float32)
+        elbow = _SHOULDER_L + np.array((0.1, 0.0, -0.25), np.float32)
+        np.testing.assert_allclose(
+            elbow_swivel_hint(_SHOULDER_L, elbow, wrist_down, 1.0, 0.0), elbow
+        )
+
+
+class BoxElbowHintsTest(unittest.TestCase):
+    def _worker(self, weight: float = 10.0) -> IKWorker:
+        worker = _jog_worker()
+        worker._config.box_elbow_weight = weight
+        worker._solver = types.SimpleNamespace(
+            shoulder_positions=(_SHOULDER_L, _SHOULDER_R),
+            elbow_positions=lambda q: (
+                np.array((0.25, 0.05, 0.42), np.float32),
+                np.array((0.25, -0.05, 0.42), np.float32),
+            ),
+        )
+        return worker
+
+    def _targets(self):
+        eye = np.eye(3, dtype=np.float32)
+        return {
+            "left": (np.array((0.5, 0.15, 0.5), np.float32), eye),
+            "right": (np.array((0.5, -0.15, 0.5), np.float32), eye),
+        }
+
+    def test_hints_for_both_arms_point_outboard(self) -> None:
+        hints = self._worker()._box_elbow_hints(
+            np.zeros(14, np.float32), self._targets()
+        )
+        self.assertIsNotNone(hints)
+        self.assertGreater(hints["left"][1], _SHOULDER_L[1])
+        self.assertLess(hints["right"][1], _SHOULDER_R[1])
+
+    def test_zero_weight_disables(self) -> None:
+        self.assertIsNone(
+            self._worker(0.0)._box_elbow_hints(
+                np.zeros(14, np.float32), self._targets()
+            )
+        )
 
 
 def _box_state(width: float = 0.3) -> BoxState:
@@ -498,6 +607,7 @@ class _FakeCore:
             "position_multiplier": 1.0,
             "teleop_max_vel": 6.283185307179586,
             "box_jog_speed": 0.15,
+            "box_elbow_out": 40.0,
         }
         self.set_calls: list[tuple[str, object]] = []
 
@@ -533,6 +643,15 @@ class LiveToggleTest(unittest.TestCase):
             live.apply("reengage", "toggle")
         with self.assertRaises(ValueError):
             live.apply("box_jog_speed", "toggle")
+
+    def test_elbows_out_is_published_and_range_checked(self) -> None:
+        core = _FakeCore()
+        live = LiveSettings(core, robot=object(), publish=lambda snapshot: None)
+        self.assertEqual(live.snapshot()["values"]["box_elbow_out"], 40.0)
+        live.apply("box_elbow_out", 55)
+        self.assertEqual(core.set_calls[-1], ("box_elbow_out", 55.0))
+        with self.assertRaises(ValueError):
+            live.apply("box_elbow_out", 120)
 
 
 if __name__ == "__main__":

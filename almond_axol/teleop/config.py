@@ -159,6 +159,18 @@ class VRTeleopConfig:
         box_align_duration: Seconds over which a box-mode engage blends the
             grippers from their current poses into the parallel
             configuration before the leader controller takes over 1:1.
+        box_elbow_out: Where box mode holds the elbows, in degrees from
+            straight down toward each arm's outboard side. The parallel,
+            fingers-forward gripper poses of box mode leave each arm's elbow
+            swivel free, and from a normal reach the solver's nearest
+            solution folds the elbows inward into the torso as the grippers
+            close on the box; this pins the swivel like a person carrying a
+            box with the elbows out. ``0`` hangs the elbows under the
+            shoulder-wrist line, ``90`` holds them out level. Live-adjustable
+            (headset settings panel / control panel).
+        box_elbow_weight: IK weight on that elbow hint (compare
+            ``KinematicsConfig.pos_weight`` 50 for the grippers and
+            ``posture_weight`` 5). ``0`` disables the hint.
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest
@@ -299,6 +311,8 @@ class VRTeleopConfig:
     box_width_min: float = 0.10
     box_width_max: float = 0.70
     box_align_duration: float = 1.5
+    box_elbow_out: float = 40.0
+    box_elbow_weight: float = 10.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi

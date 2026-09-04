@@ -161,7 +161,7 @@ Jogging is additive to the controller's motion (both apply while engaged). The t
 
 ### Session settings
 
-The HUD's **Settings** button opens a panel of **live session settings** — box mode, re-engage behaviour, hold-to-engage, grip force (hardware only), reach scale, arm speed, box jog speed — with `[-]` / `[+]` steppers. The same list appears as a **Session settings** card in the control panel next to the camera feeds. Both are rendered generically from the schema the server publishes (`{"type":"settings"}`) and change values with `{"type":"set","key","value"}` on the VR socket, so a change from either side shows up on both and the server's echo is the single source of truth (a rejected value never echoes). Adding a knob is one entry in `almond_axol/teleop/live.py`.
+The HUD's **Settings** button opens a panel of **live session settings** — box mode, re-engage behaviour, hold-to-engage, grip force (hardware only), reach scale, arm speed, box jog speed, box elbows-out angle — with `[-]` / `[+]` steppers. The same list appears as a **Session settings** card in the control panel next to the camera feeds. Both are rendered generically from the schema the server publishes (`{"type":"settings"}`) and change values with `{"type":"set","key","value"}` on the VR socket, so a change from either side shows up on both and the server's echo is the single source of truth (a rejected value never echoes). Adding a knob is one entry in `almond_axol/teleop/live.py`.
 
 ## State machine
 

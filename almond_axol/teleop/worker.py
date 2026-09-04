@@ -22,8 +22,10 @@ from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
 from .box import (
     BoxState,
+    Pose,
     blend_pose,
     box_targets,
+    elbow_swivel_hint,
     pair_aligned,
     rodrigues,
     rotation_angle,
@@ -977,14 +979,22 @@ class IKWorker:
         if box.jog_yaw:
             rot = rodrigues(_UP, box.jog_yaw) @ rot
         rot = rot.astype(np.float32)
-        if not box.aligned:
-            # The posture attractor is pinned at the engage pose, and the
-            # align blend may need a large wrist turn away from it; with a
-            # fixed attractor the pose and posture terms balance well short
-            # of parallel. Let the attractor follow q while aligning so the
-            # blend actually lands; it stays pinned where it ended afterwards.
-            self._solver.set_posture_pose(q_current)
         targets = box_targets(box, center, rot, now)
+        elbows = self._box_elbow_hints(q_current, targets)
+        if not box.aligned or elbows is not None:
+            # The posture attractor is pinned at the engage pose. The align
+            # blend may need a large wrist turn away from it, and with a fixed
+            # attractor the pose and posture terms balance well short of the
+            # target (tens of mm at posture_weight 5 vs pos_weight 50) — so
+            # let the attractor follow q while aligning. With the elbow hints
+            # on, keep it following afterwards too: the hints take over the
+            # attractor's job of steering the arms' free swivel, and a pinned
+            # attractor would fight both them and the gripper targets
+            # (measured offline: a weight-10 hint moved the elbows not at all
+            # against the pinned pose, and the whole way with it following).
+            # Without hints it stays pinned where the blend ended, as the
+            # nullspace anchor.
+            self._solver.set_posture_pose(q_current)
 
         delta_scale = 1.0
         if self._last_solve_t is not None:
@@ -997,7 +1007,10 @@ class IKWorker:
             q_current,
             left_pose=targets["left"],
             right_pose=targets["right"],
+            left_elbow_pos=elbows["left"] if elbows else None,
+            right_elbow_pos=elbows["right"] if elbows else None,
             delta_scale=delta_scale,
+            elbow_weight=cfg.box_elbow_weight if elbows else None,
         )
         solve_ms = (time.perf_counter() - solve_t0) * 1000.0
         q_new = np.asarray(q_new, dtype=np.float32).copy()
@@ -1026,6 +1039,33 @@ class IKWorker:
                 solve_ms=solve_ms,
             )
         return q_new
+
+    def _box_elbow_hints(
+        self, q_current: np.ndarray, targets: dict[str, Pose]
+    ) -> dict[str, np.ndarray] | None:
+        """Outward elbow hints for the box-mode solve, or ``None`` if disabled.
+
+        Box mode's gripper targets fix each wrist but leave the elbow swivel
+        free, and as the grippers close on the box the nearest solution
+        swings the elbows into the torso. Each hint is the arm's current
+        elbow rotated about its shoulder-wrist line to ``config.box_elbow_out``
+        degrees outboard of straight down (:func:`elbow_swivel_hint`), fed to
+        the solver at ``config.box_elbow_weight``. The wrist used is the
+        gripper *target*, not the measured pose, so the hint leads the motion
+        the same way the pose target does.
+        """
+        cfg = self._config
+        if cfg.box_elbow_weight <= 0.0:
+            return None
+        angle = math.radians(cfg.box_elbow_out)
+        shoulders = dict(zip(("left", "right"), self._solver.shoulder_positions))
+        elbows = dict(zip(("left", "right"), self._solver.elbow_positions(q_current)))
+        return {
+            side: elbow_swivel_hint(
+                shoulders[side], elbows[side], targets[side][0], sign, angle
+            )
+            for side, sign in (("left", 1.0), ("right", -1.0))
+        }
 
     def _integrate_jog(
         self, frame: VRFrame, box: BoxState, rot: np.ndarray, now: float

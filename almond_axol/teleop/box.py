@@ -324,3 +324,52 @@ def box_targets(
         )
         out[side] = blend_pose(start, ideal[side], alpha)
     return out
+
+
+def elbow_swivel_hint(
+    shoulder: np.ndarray,
+    elbow: np.ndarray,
+    wrist: np.ndarray,
+    side_sign: float,
+    out_angle: float,
+) -> np.ndarray:
+    """Where the elbow should be for an "elbows out" carry of the box.
+
+    An arm with a fixed shoulder and wrist still has one free motion: the
+    elbow swings on a circle about the shoulder-to-wrist line. Box mode's
+    gripper poses — parallel, fingers forward, pulled toward each other — are
+    ones a person never makes with a controller in hand, and from an ordinary
+    reach the solver's nearest solution folds the elbows *inward*, into the
+    torso. This hint pins the swivel instead: it is the current elbow
+    position rotated about the shoulder-wrist axis so that it sits
+    ``out_angle`` radians from straight down toward the arm's outboard side
+    (``side_sign`` +1 for the left arm, whose outboard is +y, -1 for the
+    right). ``0`` hangs the elbow directly under the axis like a relaxed arm;
+    ``pi/2`` holds it out level with the shoulder. Because only the swivel
+    changes — same shoulder-to-elbow radius, same elbow angle — the hint is
+    exactly reachable, so the IK's elbow cost pulls the free motion without
+    fighting the gripper pose (see ``KinematicsSolver.ik(elbow_weight=...)``).
+
+    Degenerate cases return the current elbow: a wrist at the shoulder, a
+    perfectly straight arm (no swivel to speak of), or an axis parallel to the
+    wanted direction (no outboard component to project).
+    """
+    shoulder = np.asarray(shoulder, dtype=np.float64)
+    elbow = np.asarray(elbow, dtype=np.float64)
+    axis = np.asarray(wrist, dtype=np.float64) - shoulder
+    n = float(np.linalg.norm(axis))
+    if n < 1e-6:
+        return elbow.astype(np.float32)
+    a = axis / n
+    e = elbow - shoulder
+    along = float(e @ a)
+    radial = e - along * a
+    r = float(np.linalg.norm(radial))
+    if r < 1e-6:
+        return elbow.astype(np.float32)
+    want = math.cos(out_angle) * -_UP + math.sin(out_angle) * side_sign * _LEFT
+    want = want - float(want @ a) * a
+    w = float(np.linalg.norm(want))
+    if w < 1e-6:
+        return elbow.astype(np.float32)
+    return (shoulder + along * a + r * (want / w)).astype(np.float32)

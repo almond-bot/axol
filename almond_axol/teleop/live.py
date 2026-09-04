@@ -148,6 +148,21 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         unit="m/s",
         help="Box-mode thumbstick jog speed of the arm pair at full deflection.",
     ),
+    LiveSettingDef(
+        key="box_elbow_out",
+        label="Elbows out",
+        type="number",
+        min=0.0,
+        max=90.0,
+        step=5.0,
+        unit="°",
+        help=(
+            "Box mode: how far out the elbows are held, in degrees from "
+            "straight down toward each arm's side. 0 hangs them under the "
+            "shoulder-wrist line, 90 holds them level. Keeps the elbows off "
+            "the torso as the grippers close on the box."
+        ),
+    ),
 )
 
 _DEFS = {d.key: d for d in LIVE_SETTINGS}
