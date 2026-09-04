@@ -600,8 +600,12 @@ def _packaged_wifi_status(probe: dict[str, object]) -> str:
         package_file = Path(dist.locate_file(entry))
         try:
             digest = hashlib.sha256(package_file.read_bytes()).hexdigest()
-        except OSError:
+        except FileNotFoundError:
             return "missing"
+        except OSError:
+            # Present but unreadable: it may hold credentials, so never let the
+            # update preflight mistake it for an absent file.
+            return "unavailable"
         return "placeholder" if digest == _PYVUT_DEFAULT_WIFI_SHA256 else "customized"
     return "missing"
 
@@ -612,25 +616,25 @@ def ultimate_runtime_update_requirement() -> tuple[str | None, str | None]:
     ``uv tool install --force`` rebuilds the complete Axol environment.  An
     Ultimate runtime is installed explicitly rather than declared in Axol's
     PyPI metadata, so the self-updater must carry the exact tested VCS
-    requirement into that same transaction or uv will prune it.  A missing or
-    differently pinned runtime is still present and would be removed by
-    ``--force``.  It therefore blocks the hosted update rather than being
-    mistaken for an absent opt-in.
+    requirement into that same transaction or uv will prune it.  Any present
+    runtime is an opt-in: one at the pin is preserved as-is, and one at a
+    different, ambiguous, or untrusted revision is re-pinned to the supported
+    revision in that same transaction (the same repair ``axol
+    tracker.ultimate.install`` performs) rather than silently pruned.
 
     Older manual setups sometimes put private Wi-Fi values directly in
     pyvut's package-local ``wifi_info.json``.  Rebuilding the environment
-    overwrites that file, so refuse the update until those values have been
-    moved to Axol's durable config.  The returned error never includes a
-    credential value.
+    overwrites that file, so that is the one case that refuses the update:
+    until those values have been moved to Axol's durable config, or when the
+    package-local file cannot be inspected at all.  The returned error never
+    includes a credential value.
     """
-    version, commit = _installed_pyvut()
+    version, _commit = _installed_pyvut()
     if version is None:
         return None, None
-    if commit != _PYVUT_REF:
-        return None, _unsupported_pyvut_update_message()
 
     packaged_wifi = _packaged_wifi_status({})
-    if packaged_wifi in {"missing", "unavailable"}:
+    if packaged_wifi == "unavailable":
         return None, _unsupported_pyvut_update_message()
     if packaged_wifi == "customized":
         config_error = ultimate_wifi_config_error(ULTIMATE_WIFI_CONFIG_FILE)
@@ -640,22 +644,24 @@ def ultimate_runtime_update_requirement() -> tuple[str | None, str | None]:
                 "VIVE Ultimate update preflight failed: pyvut has a customized "
                 "package-local Wi-Fi config, but the durable Axol config is "
                 f"not usable ({config_error}). Save it in "
-                f"{ULTIMATE_WIFI_CONFIG_FILE}, then retry; no credential values "
+                f"{ULTIMATE_WIFI_CONFIG_FILE} (or run `axol "
+                "tracker.ultimate.install`), then retry; no credential values "
                 "were read into this error.",
             )
+    # ``placeholder`` and ``missing`` carry no operator data, so re-pinning the
+    # runtime cannot erase anything; a mismatched commit is repaired in place.
     return _PYVUT_SPEC, None
 
 
 def _unsupported_pyvut_update_message() -> str:
-    """Credential-safe refusal for a present runtime we cannot reconstruct."""
+    """Credential-safe refusal for a present runtime we cannot inspect."""
     return (
-        "VIVE Ultimate update blocked: the installed pyvut runtime is not the "
-        "exact supported GitHub source and revision, or its package-local Wi-Fi "
-        "file cannot be inspected safely. A force update would remove that "
-        "runtime and could erase package-local credentials. Back up and migrate "
-        "any Wi-Fi values to Axol's durable tracker configuration, then install "
-        "the supported pinned pyvut runtime before retrying. No credential "
-        "values are included in this error."
+        "VIVE Ultimate update blocked: a pyvut runtime is installed, but its "
+        "package-local Wi-Fi file cannot be inspected safely, so a force update "
+        "could erase package-local credentials. Back up and migrate any Wi-Fi "
+        "values to Axol's durable tracker configuration, then run `axol "
+        "tracker.ultimate.install` to restore the supported pinned runtime "
+        "before retrying. No credential values are included in this error."
     )
 
 

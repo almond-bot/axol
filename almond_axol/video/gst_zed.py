@@ -425,7 +425,95 @@ def _raw_shmsink(socket_path: str) -> str:
 _DATASET_IDR_INTERVAL_S = 0.25
 
 
-def _dataset_enc_shmsink(socket_path: str, w: int, h: int, fps: int, name: str) -> str:
+# The shmsink dataset branch's valve starts dropping. ``shmsink
+# wait-for-connection=true`` (below) BLOCKS until the recorder's ``shmsrc``
+# attaches, and everything upstream of it (queue -> VIC -> NVENC) then holds
+# the camera's NVMM capture buffers. Argus's buffer pool is small: ~15 s of
+# that starves the capture, Argus times out, and the ZED SDK's recovery
+# restarts ``nvargus-daemon`` underneath the live relay (heap corruption,
+# dead headset feed, recorder EOF). With the branch closed from the first
+# frame nothing reaches the sink until ``set_raw_enabled(True)`` opens it for
+# an episode -- by which time the recorder has attached. The opener is the
+# recorder-side owner (collect-data / collect-dagger), never pipeline start.
+_SHMSINK_VALVE_STARTS_CLOSED = "true"
+
+
+class _DatasetSinkGuard:
+    """Keep a dataset branch's valve open only while its ``shmsink`` has a reader.
+
+    ``shmsink wait-for-connection=true`` blocks in render whenever it has *zero*
+    clients -- not just before the first one attaches. So the startup gate
+    above is only half the story: if the recorder detaches while the valve is
+    open (recorder crash / OOM / SIGKILL mid-episode, or a session teardown that
+    closes the readers before it closes the valve), the branch blocks again
+    and Argus goes down the same way. This guard makes the valve state a pure
+    function of two inputs -- "the owner wants the branch open"
+    (:meth:`set_wanted`, driven by ``set_raw_enabled``) and "a client is
+    attached" (the sink's ``client-connected`` / ``client-disconnected``
+    signals) -- so the branch closes itself the instant its reader goes away,
+    and an open requested before the reader attached takes effect when it
+    does. The signals fire on GStreamer streaming threads; a GObject property
+    write on the valve is thread-safe, and the lock only orders the bookkeeping.
+    """
+
+    def __init__(self, pipeline: Any, valve_name: str, sink_name: str, label: str):
+        self._label = label
+        self._lock = threading.Lock()
+        self._wanted = False
+        self._clients = 0
+        self._valve = pipeline.get_by_name(valve_name)
+        sink = pipeline.get_by_name(sink_name)
+        if sink is not None:
+            sink.connect("client-connected", self._on_client_connected)
+            sink.connect("client-disconnected", self._on_client_disconnected)
+        else:
+            _logger.warning(
+                "%s: dataset shmsink %r not found; the branch cannot self-close "
+                "when its reader detaches",
+                label,
+                sink_name,
+            )
+
+    @property
+    def clients(self) -> int:
+        with self._lock:
+            return self._clients
+
+    def set_wanted(self, wanted: bool) -> None:
+        with self._lock:
+            self._wanted = wanted
+            if wanted and self._clients == 0:
+                _logger.warning(
+                    "%s: dataset branch opened with no recorder attached; "
+                    "holding it closed until one connects",
+                    self._label,
+                )
+            self._apply_locked()
+
+    def _on_client_connected(self, _sink: Any, _fd: int) -> None:
+        with self._lock:
+            self._clients += 1
+            self._apply_locked()
+
+    def _on_client_disconnected(self, _sink: Any, _fd: int) -> None:
+        with self._lock:
+            self._clients = max(0, self._clients - 1)
+            if self._wanted and self._clients == 0:
+                _logger.warning(
+                    "%s: recorder detached while the dataset branch was open; "
+                    "closing it so the blocking sink cannot pin the camera",
+                    self._label,
+                )
+            self._apply_locked()
+
+    def _apply_locked(self) -> None:
+        if self._valve is not None:
+            self._valve.set_property("drop", not (self._wanted and self._clients > 0))
+
+
+def _dataset_enc_shmsink(
+    socket_path: str, w: int, h: int, fps: int, name: str, sink_name: str = "dssink"
+) -> str:
     """Encode the dataset stream on the GPU and ship H.264 AUs over ``shmsink``.
 
     This replaces the raw-NV12 shmsink on the relay's dataset branch: the relay
@@ -438,9 +526,13 @@ def _dataset_enc_shmsink(socket_path: str, w: int, h: int, fps: int, name: str) 
     ``shmsink``: bare shm transports bytes but drops GstBuffer PTS/flags, while
     GDP serializes them so the recorder can recover the sensor-exposure PTS.
     ``wait-for-connection`` keeps GDP's one-time caps header from being dropped
-    before the recorder attaches. Runs in VBR with a peak cap so the recorded
-    dataset stays bounded and uniformly sized across cameras even when one
-    sensor is very noisy (see ``dataset_vbr_bitrate``).
+    before the recorder attaches -- and is exactly why the branch's valve must
+    start closed (``_SHMSINK_VALVE_STARTS_CLOSED``) and is guarded by client
+    count at runtime (:class:`_DatasetSinkGuard`, which needs the sink named):
+    a blocked sink with the valve open pins the camera's capture buffers and
+    takes Argus down. Runs in VBR with a peak cap so the recorded dataset stays
+    bounded and uniformly sized across cameras even when one sensor is very
+    noisy (see ``dataset_vbr_bitrate``).
     """
     idr = max(1, round(fps * _DATASET_IDR_INTERVAL_S))
     target, peak = dataset_vbr_bitrate(w, h, fps)
@@ -451,8 +543,8 @@ def _dataset_enc_shmsink(socket_path: str, w: int, h: int, fps: int, name: str) 
         f"insert-sps-pps=true insert-aud=true idrinterval={idr} maxperf-enable=true "
         "! video/x-h264,stream-format=byte-stream,alignment=au "
         "! gdppay "
-        f"! shmsink socket-path={socket_path} wait-for-connection=true "
-        "sync=false async=false"
+        f"! shmsink name={sink_name} socket-path={socket_path} "
+        "wait-for-connection=true sync=false async=false"
     )
 
 
@@ -491,6 +583,9 @@ class _GstPipelineBase:
         self._clock: Any = None
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
+        # One per shmsink dataset branch, attached in connect() (see
+        # _DatasetSinkGuard); empty on the in-process appsink path.
+        self._dataset_guards: list[_DatasetSinkGuard] = []
 
     @property
     def alive(self) -> bool:
@@ -681,6 +776,28 @@ class _GstPipelineBase:
             time.sleep(0.05)
         return all(ch.first_au.is_set() for ch in channels)
 
+    def _guard_dataset_sink(self, valve_name: str, sink_name: str, label: str) -> None:
+        """Attach a :class:`_DatasetSinkGuard` to one shmsink dataset branch."""
+        self._dataset_guards.append(
+            _DatasetSinkGuard(self._pipeline, valve_name, sink_name, label)
+        )
+
+    def _set_dataset_valves(self, enabled: bool, valve_names: list[str]) -> None:
+        """Open/close dataset valves, through the sink guards when they exist.
+
+        With guards (the shmsink path, after ``connect``), the valve only opens
+        while a reader is attached; without them (in-process appsink path) the
+        valve is toggled directly.
+        """
+        if self._dataset_guards:
+            for guard in self._dataset_guards:
+                guard.set_wanted(enabled)
+            return
+        for name in valve_names:
+            valve = self._pipeline.get_by_name(name)
+            if valve is not None:
+                valve.set_property("drop", not enabled)
+
     def disconnect(self) -> None:
         self._stop.set()
         for thread in self._threads:
@@ -689,6 +806,7 @@ class _GstPipelineBase:
         if self._pipeline is not None and self._gst is not None:
             self._pipeline.set_state(self._gst.State.NULL)
         self._pipeline = None
+        self._dataset_guards = []
 
     # ZedCamera-compatible alias.
     close = disconnect
@@ -775,17 +893,19 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         enc = f"{_QUEUE} ! {_enc_branch(bitrate, self.fps)} ! {_enc_appsink('enc')}"
         # The dataset branch sits behind a `valve` so it can be gated shut at
         # runtime (see set_raw_enabled): its work is only needed while recording.
-        # Defaults open so the SDK-less consumers (inference/run-policy) are
-        # unchanged; `collect-data` explicitly closes it until an episode records.
         # nvvidconv (the VIC) resizes for free on the GPU, so the smaller dataset
         # dims downscale here without touching the CPU or the headset branch.
         # Recorder (shmsink) path: encode the dataset stream on the GPU and ship
         # H.264 AUs — no raw copy, no recorder re-encode (see
-        # _dataset_enc_shmsink). In-process raw consumers (inference/run-policy,
-        # or the pyshm RawFrameWriter fallback) still take RGBA off an appsink.
+        # _dataset_enc_shmsink). Its valve starts CLOSED (see
+        # _SHMSINK_VALVE_STARTS_CLOSED); the recorder opens it per episode.
+        # In-process raw consumers (inference/run-policy, or the pyshm
+        # RawFrameWriter fallback) still take RGBA off an appsink and default
+        # open so SDK-less consumers are unchanged; `collect-data` closes that
+        # path explicitly until an episode records.
         if self._raw_socket_path:
             raw = (
-                f"{_QUEUE} ! valve name=rawvalve drop=false ! "
+                f"{_QUEUE} ! valve name=rawvalve drop={_SHMSINK_VALVE_STARTS_CLOSED} ! "
                 + _dataset_enc_shmsink(
                     self._raw_socket_path,
                     self.raw_width,
@@ -816,12 +936,14 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         recording. While open, the headset encoder's bitrate is also scaled down
         (see ``_RECORDING_ENC_BITRATE_SCALE``) to free send-loop CPU; it is
         restored to full quality when recording stops.
+
+        On the shmsink path the open is conditional: the valve actually opens
+        only while the recorder's reader is attached (see
+        :class:`_DatasetSinkGuard`), and closes itself if the reader goes away.
         """
         if not self._want_raw or self._pipeline is None:
             return
-        valve = self._pipeline.get_by_name("rawvalve")
-        if valve is not None:
-            valve.set_property("drop", not enabled)
+        self._set_dataset_valves(enabled, ["rawvalve"])
         if self._want_encoded:
             scale = _RECORDING_ENC_BITRATE_SCALE if enabled else 1.0
             _set_enc_bitrate(self._pipeline, "venc", self._enc_bitrate * scale)
@@ -829,6 +951,8 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
     def connect(self, warmup: bool = True) -> None:
         """Open the camera, start the pipeline, and block until it streams."""
         self._launch(self._pipeline_str())
+        if self._want_raw and self._raw_socket_path is not None:
+            self._guard_dataset_sink("rawvalve", "dssink", f"sn{self.serial}")
         if self._enc is not None:
             self._start_pull(
                 f"zedgst-{self.serial}-enc",
@@ -1092,13 +1216,15 @@ class ZedGstStereoCamera(_GstPipelineBase):
         # recording. See the mono _pipeline_str note.
         if sock:
             raw = (
-                f"{_QUEUE} ! valve name=rawvalve_{sink_suffix} drop=false ! "
+                f"{_QUEUE} ! valve name=rawvalve_{sink_suffix} "
+                f"drop={_SHMSINK_VALVE_STARTS_CLOSED} ! "
                 + _dataset_enc_shmsink(
                     sock,
                     self.raw_width,
                     self.raw_height,
                     self.fps,
                     "dsenc_" + sink_suffix,
+                    sink_name="dssink_" + sink_suffix,
                 )
             )
         else:
@@ -1147,10 +1273,9 @@ class ZedGstStereoCamera(_GstPipelineBase):
         """
         if not self._want_raw or self._pipeline is None:
             return
-        for side in self._raw_sides:
-            valve = self._pipeline.get_by_name(f"rawvalve_{side[0]}")
-            if valve is not None:
-                valve.set_property("drop", not enabled)
+        self._set_dataset_valves(
+            enabled, [f"rawvalve_{side[0]}" for side in self._raw_sides]
+        )
         scale = _RECORDING_ENC_BITRATE_SCALE if enabled else 1.0
         for side in self._encoded_sides:
             _set_enc_bitrate(
@@ -1196,6 +1321,12 @@ class ZedGstStereoCamera(_GstPipelineBase):
         for side, enc, raw, raw_sink, sock, suffix in eye_specs:
             if side not in self._sides:
                 continue
+            if side in self._raw_sides and sock is not None:
+                self._guard_dataset_sink(
+                    f"rawvalve_{suffix}",
+                    f"dssink_{suffix}",
+                    f"sn{self.serial}-{suffix}",
+                )
             if enc is not None:
                 self._start_pull(
                     f"zedgst-{self.serial}-enc{suffix}",

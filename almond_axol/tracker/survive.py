@@ -24,12 +24,14 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
 
 from .base import (
+    TRACKER_POSE_MAX_AGE_S,
     TrackerPose,
     TrackerSource,
     TrackerSourceError,
@@ -97,6 +99,92 @@ def _lighthouse_record(parts: list[str]) -> tuple[int, str | None] | None:
     except ValueError:
         return None
     return None
+
+
+# survive-cli stamps every ``--record-stdout`` line with its run time
+# (``survive_run_time()``: gettimeofday-based wall clock minus process start)
+# while the rest of the pipeline uses ``perf_counter`` (CLOCK_MONOTONIC). NTP
+# slew moves both clocks alike, but a wall-clock *step* — chrony ``makestep``,
+# a systemd-timesyncd correction, a Jetson without an RTC battery getting the
+# network mid-session — moves only the stamps. The mapper must therefore not
+# trust any single historical offset forever: offsets older than this window
+# are forgotten, and a jump of more than one pose lifetime that persists for
+# the confirmation span is taken as a step rather than a pipe stall.
+_OUTPUT_CLOCK_WINDOW_S = 5.0
+_OUTPUT_CLOCK_RESET_JUMP_S = TRACKER_POSE_MAX_AGE_S
+_OUTPUT_CLOCK_STEP_CONFIRM_S = 0.5
+
+
+class _OutputClockMapper:
+    """Map survive-cli output stamps onto ``perf_counter`` at receipt.
+
+    The offset between the two clocks is estimated as the *smallest* observed
+    ``receipt - output_time``, i.e. the least pipe/buffer delay seen, so
+    mapping a stamp through it removes that delay from later samples. A plain
+    running minimum can only shrink, so after a backward wall-clock step of
+    ``Δ`` every later sample would map to ``receipt - Δ`` and read as stale
+    for the rest of the session. Two guards bound the recovery time instead:
+
+    * the minimum is taken over a sliding window (:data:`_OUTPUT_CLOCK_WINDOW_S`)
+      keyed on receipt time, so any stale offset expires by itself;
+    * when every sample for :data:`_OUTPUT_CLOCK_STEP_CONFIRM_S` has sat more
+      than :data:`_OUTPUT_CLOCK_RESET_JUMP_S` above the current minimum, the
+      clock has stepped and the window is restarted from the new offset. A
+      single late line (a pipe stall) does not qualify: its burst of buffered
+      successors brings the candidate straight back down, and meanwhile the
+      genuinely old samples stay labelled old.
+
+    A forward step needs no special case: its smaller candidate becomes the
+    new minimum on the very next sample. Mapped times never exceed receipt.
+    """
+
+    def __init__(
+        self,
+        *,
+        window_s: float = _OUTPUT_CLOCK_WINDOW_S,
+        reset_jump_s: float = _OUTPUT_CLOCK_RESET_JUMP_S,
+        step_confirm_s: float = _OUTPUT_CLOCK_STEP_CONFIRM_S,
+    ) -> None:
+        self._window_s = window_s
+        self._reset_jump_s = reset_jump_s
+        self._step_confirm_s = step_confirm_s
+        # (receipt, candidate offset) pairs with strictly increasing candidates
+        # — a sliding-window minimum: the leftmost entry is the window's min.
+        self._window: deque[tuple[float, float]] = deque()
+        # Receipt of the first sample in the current run of jumped candidates.
+        self._jump_since: float | None = None
+
+    @property
+    def offset(self) -> float | None:
+        """Current ``perf_counter - output_time`` estimate, if any sample yet."""
+        return self._window[0][1] if self._window else None
+
+    def map(self, output_time: float, receipt: float) -> float:
+        """Return the sample time on ``perf_counter``'s clock for one line.
+
+        ``receipt`` is ``perf_counter()`` taken when the line was read. Stamps
+        that are non-finite or negative are not mapped: the sample is labelled
+        with its receipt time.
+        """
+        if not (np.isfinite(output_time) and output_time >= 0.0):
+            return receipt
+        candidate = receipt - output_time
+        current = self.offset
+        if current is not None and candidate - current > self._reset_jump_s:
+            if self._jump_since is None:
+                self._jump_since = receipt
+            elif receipt - self._jump_since >= self._step_confirm_s:
+                self._window.clear()
+                self._jump_since = None
+        else:
+            self._jump_since = None
+        while self._window and self._window[-1][1] >= candidate:
+            self._window.pop()
+        self._window.append((receipt, candidate))
+        expiry = receipt - self._window_s
+        while self._window[0][0] < expiry:
+            self._window.popleft()
+        return min(receipt, output_time + self._window[0][1])
 
 
 def _setup_warning(line: str) -> str | None:
@@ -508,7 +596,7 @@ class SurviveSource(TrackerSource):
         # Recording lines carry libsurvive run time at output, not the pose's
         # sensor time. Mapping its relative clock still removes pipe/buffering
         # delay; label it receipt/output time rather than true capture time.
-        output_clock_offset: float | None = None
+        output_clock = _OutputClockMapper()
         for line in self._proc.stdout:
             if self._stop.is_set():
                 break
@@ -534,17 +622,7 @@ class SurviveSource(TrackerSource):
                 vals = [float(v) for v in parts[3:10]]
             except ValueError:
                 continue
-            receipt = time.perf_counter()
-            if np.isfinite(output_time) and output_time >= 0.0:
-                candidate_offset = receipt - output_time
-                output_clock_offset = (
-                    candidate_offset
-                    if output_clock_offset is None
-                    else min(output_clock_offset, candidate_offset)
-                )
-                sample_time = min(receipt, output_time + output_clock_offset)
-            else:
-                sample_time = receipt
+            sample_time = output_clock.map(output_time, time.perf_counter())
             self._publish(
                 key,
                 np.array(vals[0:3]),

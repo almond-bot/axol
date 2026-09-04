@@ -31,7 +31,10 @@ _UPDATE_MARKER = _STATE_DIR / "update-incomplete"
 _VERIFYING_MARKER = _STATE_DIR / "update-verifying"
 _HEALTH_URL = "https://127.0.0.1:8001/api/health"
 _VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
-_HEALTH_TIMEOUT_S = 45.0
+# A cold candidate imports torch/lerobot and the camera stack on a Jetson
+# before it answers ``/api/health``. The service unit's ``TimeoutStartSec``
+# (hosted installer) must stay above this dwell plus ExecStartPre.
+_HEALTH_TIMEOUT_S = 120.0
 _HEALTH_DWELL_S = 2.0
 _POLL_S = 0.25
 

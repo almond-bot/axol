@@ -746,6 +746,22 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
                     ):
                         record_proc.make_episode_durable(dataset)
 
+    def test_episode_durability_follows_links_above_the_dataset_root(self) -> None:
+        # ``~/datasets -> /mnt/ssd/datasets`` is a normal operator layout; the
+        # no-follow discipline is for paths *inside* the dataset, not for the
+        # configured root itself, or every save on such a host fails durability.
+        with tempfile.TemporaryDirectory() as directory:
+            real_parent = Path(directory) / "ssd"
+            real_parent.mkdir()
+            linked_parent = Path(directory) / "datasets"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            dataset, expected = self._durability_dataset(linked_parent / "dataset")
+
+            episode = record_proc.make_episode_durable(dataset)
+
+            self.assertEqual(episode["data/chunk_index"], 1)
+            self.assertTrue(all(path.exists() for path in expected))
+
     def test_episode_durability_requires_every_referenced_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             dataset, expected = self._durability_dataset(Path(directory) / "dataset")

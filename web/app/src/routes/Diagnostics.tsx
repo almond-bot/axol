@@ -39,8 +39,12 @@ import {
   canDiscoveryBlocksAutoConnect,
   canServerEpoch,
   chooseDiagnosticsAutoConnectProfile,
+  claimCanInventoryPollResponse,
+  issueCanInventoryPoll,
+  newCanInventoryPollSequence,
   nextAutoConnectAttempt,
   shouldStartCanDiscovery,
+  voidCanInventoryPolls,
 } from "@/lib/can-auto-connect"
 import {
   canDiscoveryRequestCanRetry,
@@ -159,7 +163,7 @@ export default function Diagnostics() {
   const [canServerInstanceId, setCanServerInstanceId] = useState<string | null>(null)
   const canServerInstanceIdRef = useRef<string | null>(null)
   const previousCanServerInstanceIdRef = useRef<string | null>(null)
-  const canInventoryPollRequestRef = useRef(0)
+  const canInventoryPollRef = useRef(newCanInventoryPollSequence())
   const [canDiscoveryRetryBusy, setCanDiscoveryRetryBusy] = useState(false)
   const currentCanServerEpoch = useCallback(
     () => canServerEpoch(canServerInstanceIdRef.current, robotStatusRecoveryEpochRef.current),
@@ -267,7 +271,7 @@ export default function Diagnostics() {
     if (!serverOk) {
       robotStatusKnownRef.current = false
       canInventoryKnownRef.current = false
-      canInventoryPollRequestRef.current += 1
+      voidCanInventoryPolls(canInventoryPollRef.current)
       return
     }
     let active = true
@@ -289,15 +293,20 @@ export default function Diagnostics() {
             setRobot(null)
           }
         })
-      const canRequest = ++canInventoryPollRequestRef.current
+      // Drop only responses older than the last one applied (not every response
+      // superseded by a newer *request*): the endpoint can take longer than the
+      // 2 s cadence during CAN discovery, and inventory must still land.
+      const canRequest = issueCanInventoryPoll(canInventoryPollRef.current)
       fetchCanInterfaces()
         .then((inventory) => {
-          if (!active || canRequest !== canInventoryPollRequestRef.current) return
+          if (!active || !claimCanInventoryPollResponse(canInventoryPollRef.current, canRequest))
+            return
           canInventoryKnownRef.current = true
           installCanInventory(inventory)
         })
         .catch((error) => {
-          if (!active || canRequest !== canInventoryPollRequestRef.current) return
+          if (!active || !claimCanInventoryPollResponse(canInventoryPollRef.current, canRequest))
+            return
           if (String(error).includes("HTTP 404")) {
             canInventoryKnownRef.current = true
             setCanProfiles(null)

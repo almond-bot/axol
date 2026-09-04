@@ -655,6 +655,12 @@ class EncodedAuReader:
         self._pts_origin_perf = pts_origin_perf
         self._queue: deque[tuple[bytes, float]] = deque()
         self._cond = threading.Condition()
+        # Parked until the capture loop arms it with ``flush()``: the relay's
+        # valve opens (and its first IDR lands) before the recorder has its
+        # muxers up and its loop draining, so anything that arrives while no
+        # consumer exists is dropped silently instead of being counted as a
+        # backlog fault. ``disarm()`` parks it again when the loop exits.
+        self._armed = False
         self._await_keyframe = True
         self._stream_error: str | None = None
         self._stop = threading.Event()
@@ -674,6 +680,7 @@ class EncodedAuReader:
         self._since_keyframe = 0
         self._delivered = 0
         self._seen_first_au = False
+        self._discont_count = 0
         # GDP restores both the producer caps and GstBuffer timing/flags after
         # shmsrc. h264parse re-derives the dimensions from the SPS as before.
         # drop=false: never discard an AU (it would break H.264 decode); the pull
@@ -727,18 +734,41 @@ class EncodedAuReader:
             raise
 
     def flush(self) -> None:
-        """Drop any queued AUs and re-arm keyframe-wait (call at episode start).
+        """Arm the reader for an episode: drop stragglers, wait for an IDR.
 
-        Between episodes the relay's valve is shut so nothing is produced; on the
-        next episode it opens the valve and forces an IDR. Clearing here discards
-        any stragglers so the episode's first delivered AU is that fresh IDR.
+        Call from the capture loop right before it starts draining. Between
+        episodes the reader is parked (see :meth:`disarm`) and the relay's
+        valve is shut; on the next episode the valve opens and the encoder's
+        short ``idrinterval`` yields a keyframe within a fraction of a second.
+        Clearing here discards anything that slipped in before the loop was
+        ready so the episode's first delivered AU is a fresh IDR, and from this
+        point on every accepted AU must be consumed (the backlog guard applies).
         """
         with self._cond:
-            self._queue.clear()
-            self._await_keyframe = True
-            self._since_keyframe = 0
-            self._seen_first_au = False
-            self._stream_error = None
+            self._reset_sequence_locked()
+            self._armed = True
+
+    def disarm(self) -> None:
+        """Park the reader: drop what is queued and ignore AUs until :meth:`flush`.
+
+        The capture loop calls this when it exits (save, discard, or failure).
+        The relay closes its valve moments later, but AUs keep arriving until
+        it does -- and nobody is draining -- so without parking, the backlog
+        guard would latch a spurious "episode aborted" against a take that has
+        already ended (or, at construction, one that has not started yet).
+        """
+        with self._cond:
+            self._reset_sequence_locked()
+            self._armed = False
+
+    def _reset_sequence_locked(self) -> None:
+        self._queue.clear()
+        self._await_keyframe = True
+        self._since_keyframe = 0
+        self._seen_first_au = False
+        self._discont_count = 0
+        self._stream_error = None
+        self._cond.notify_all()
 
     def _fail_stream_locked(self, message: str) -> None:
         """Latch one episode-fatal bitstream error while ``_cond`` is held."""
@@ -758,7 +788,7 @@ class EncodedAuReader:
     ) -> None:
         """Validate and queue one coded picture from the pull thread."""
         with self._cond:
-            if self._stream_error is not None:
+            if not self._armed or self._stream_error is not None:
                 return
             if self._await_keyframe:
                 if not is_keyframe:
@@ -780,15 +810,25 @@ class EncodedAuReader:
                     return
 
             # The first AU after every flush may legitimately carry DISCONT at
-            # the valve/segment boundary. Any later DISCONT proves shmsrc lost
-            # bytes inside this episode, so later P-frames cannot be trusted.
+            # the valve/segment boundary. A later DISCONT is *not* proof that a
+            # coded picture was lost: the relay's ``queue leaky=downstream``
+            # sits upstream of the dataset encoder, so a raw frame it sheds
+            # under load marks the next buffer DISCONT while the H.264
+            # reference chain (built after that point) stays intact, and
+            # shmsrc itself never drops bytes. Aborting the take here threw
+            # away good episodes; the keyframe-cadence guard above is what
+            # catches a genuinely broken bitstream. Log it (rate-limited) and
+            # keep the picture.
             if discont and self._seen_first_au:
-                self._fail_stream_locked(
-                    f"encoded-AU discontinuity on {self._name} near frame "
-                    f"{self._delivered}; episode aborted because an upstream "
-                    "H.264 picture was dropped"
-                )
-                return
+                self._discont_count += 1
+                if self._discont_count in (1, 10) or self._discont_count % 100 == 0:
+                    _logger.warning(
+                        "encoded-AU discontinuity on %s near frame %d (%d this "
+                        "episode); upstream frame shed, bitstream still valid",
+                        self._name,
+                        self._delivered,
+                        self._discont_count,
+                    )
 
             if len(self._queue) >= self._max_pending_aus:
                 self._fail_stream_locked(

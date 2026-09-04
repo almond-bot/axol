@@ -1,6 +1,7 @@
 import type { RefObject } from "react"
 import { useEffect, useRef, useState } from "react"
 import {
+  controlDisconnectRearmDelay,
   controlPeerNeedsRetry,
   controlRequestIsDue,
   retireCurrentControlPeer,
@@ -13,6 +14,15 @@ const POLL_MS = 300
 // fail before it has anything to send, and an older server has no explicit
 // control-error reply. The WebSocket pose path covers this modest retry cadence.
 const REQUEST_RETRY_MS = 3000
+// After a *failed* negotiation (rejected SDP, control-error from the server, a
+// data channel that closed, a peer that went failed/closed) hold the next
+// request back by this much — don't hammer the server with a create_offer/close
+// cycle every poll tick. A fresh socket still requests immediately.
+const FAILURE_BACKOFF_MS = REQUEST_RETRY_MS
+// "disconnected" is transient per the WebRTC spec (TURN hiccup, Wi-Fi roam) and
+// usually returns to "connected" within a few seconds; only tear the peer down
+// if it hasn't recovered by then. The WebSocket pose path covers the gap.
+const DISCONNECT_GRACE_MS = 3000
 
 /**
  * Negotiates a low-latency WebRTC data channel for pose frames, multiplexing
@@ -41,11 +51,23 @@ export function useAxolControlChannel(
   const listenerRef = useRef<((e: MessageEvent) => void) | null>(null)
   const lastRequestAtRef = useRef(0)
   const offerSeenRef = useRef(false)
+  // Earliest time the next control-request may go out (failure backoff).
+  const requestNotBeforeRef = useRef(0)
+  // Pending grace timer for the current peer's "disconnected" state.
+  const disconnectGraceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     if (!enabled) return
 
+    function clearDisconnectGrace() {
+      if (disconnectGraceRef.current !== null) {
+        clearTimeout(disconnectGraceRef.current)
+        disconnectGraceRef.current = null
+      }
+    }
+
     function closePc() {
+      clearDisconnectGrace()
       const channel = poseChannelRef.current
       const pc = pcRef.current
       // Retire first: close() may synchronously dispatch a terminal callback,
@@ -68,8 +90,11 @@ export function useAxolControlChannel(
       }
     }
 
+    // Both rearm paths are *failure* paths: schedule the next request after the
+    // backoff rather than on the next poll tick.
     function rearmPeer(signalingWs: WebSocket, pc: RTCPeerConnection) {
       if (!retireCurrentControlPeer(attachedWsRef, pcRef, signalingWs, pc)) return
+      clearDisconnectGrace()
       poseChannelRef.current = null
       try {
         pc.close()
@@ -79,6 +104,7 @@ export function useAxolControlChannel(
       setStatus(AxolConnectionStatus.Error)
       offerSeenRef.current = false
       lastRequestAtRef.current = 0
+      requestNotBeforeRef.current = Date.now() + FAILURE_BACKOFF_MS
     }
 
     function rearmSocket(signalingWs: WebSocket) {
@@ -87,6 +113,7 @@ export function useAxolControlChannel(
       setStatus(AxolConnectionStatus.Error)
       offerSeenRef.current = false
       lastRequestAtRef.current = 0
+      requestNotBeforeRef.current = Date.now() + FAILURE_BACKOFF_MS
     }
 
     function detach() {
@@ -95,6 +122,7 @@ export function useAxolControlChannel(
       attachedWsRef.current = null
       listenerRef.current = null
       lastRequestAtRef.current = 0
+      requestNotBeforeRef.current = 0
       offerSeenRef.current = false
       closePc()
       setStatus(AxolConnectionStatus.Idle)
@@ -129,11 +157,40 @@ export function useAxolControlChannel(
           if (isCurrent() && poseChannelRef.current === ch) rearmPeer(signalingWs, pc)
         }
       }
+      // "disconnected" gets DISCONNECT_GRACE_MS to recover before the peer is
+      // renegotiated. Any state change cancels the pending timer; if the state
+      // is still "disconnected" when it fires, rearm.
+      const scheduleDisconnectRearm = (disconnectedAt: number, delayMs: number) => {
+        disconnectGraceRef.current = setTimeout(() => {
+          disconnectGraceRef.current = null
+          if (!isCurrent()) return
+          const remaining = controlDisconnectRearmDelay(
+            pc.connectionState,
+            disconnectedAt,
+            Date.now(),
+            DISCONNECT_GRACE_MS
+          )
+          if (remaining === null) return
+          if (remaining > 0) {
+            scheduleDisconnectRearm(disconnectedAt, remaining)
+            return
+          }
+          rearmPeer(signalingWs, pc)
+        }, delayMs)
+      }
       pc.onconnectionstatechange = () => {
         // Ignore events from a superseded pc (e.g. closePc during a retry),
         // so intentionally tearing one down doesn't schedule a spurious retry.
         if (!isCurrent()) return
-        if (controlPeerNeedsRetry(pc.connectionState)) rearmPeer(signalingWs, pc)
+        clearDisconnectGrace()
+        const state = pc.connectionState
+        if (controlPeerNeedsRetry(state)) {
+          rearmPeer(signalingWs, pc)
+          return
+        }
+        const now = Date.now()
+        const delay = controlDisconnectRearmDelay(state, now, now, DISCONNECT_GRACE_MS)
+        if (delay !== null) scheduleDisconnectRearm(now, delay)
       }
 
       try {
@@ -185,7 +242,9 @@ export function useAxolControlChannel(
           attachedWsRef.current.removeEventListener("message", listenerRef.current)
         attachedWsRef.current = null
         listenerRef.current = null
+        // A fresh socket requests right away: no failure backoff applies.
         lastRequestAtRef.current = 0
+        requestNotBeforeRef.current = 0
         offerSeenRef.current = false
         closePc()
         setStatus(AxolConnectionStatus.Idle)
@@ -199,7 +258,13 @@ export function useAxolControlChannel(
       }
       const now = Date.now()
       if (
-        controlRequestIsDue(offerSeenRef.current, lastRequestAtRef.current, now, REQUEST_RETRY_MS)
+        controlRequestIsDue(
+          offerSeenRef.current,
+          lastRequestAtRef.current,
+          now,
+          REQUEST_RETRY_MS,
+          requestNotBeforeRef.current
+        )
       ) {
         lastRequestAtRef.current = now
         try {

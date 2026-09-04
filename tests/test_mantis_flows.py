@@ -473,6 +473,118 @@ class MantisFlowTest(unittest.TestCase):
         self.assertIsNone(discarded["episode_outcome"])
         self.assertTrue(discarded["reset"])
 
+    def test_two_handed_presses_end_a_take_instead_of_restarting_it(self) -> None:
+        """Operators squeeze both triggers together for x3 / x4.
+
+        Each two-handed squeeze+release matches the start-gesture pattern; the
+        bridge used to consume it as a (no-op) start and reset both press
+        counters, so a two-handed triple/quadruple could never accumulate.
+        """
+        bridge, left, right = self._collection_bridge()
+        now = [200.0]
+
+        def frame() -> dict:
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                return bridge.compose_frame()
+
+        def both(value: float) -> dict:
+            left.value = right.value = value
+            now[0] += 0.05
+            return frame()
+
+        def start_take() -> None:
+            both(0.0)
+            both(1.0)
+            bridge._handle_tracking_state(True)
+            opened = frame()
+            self.assertEqual(opened["state"], VRState.RECORDING.value)
+            if "lock_release_id" in opened:
+                bridge._handle_lock_release(opened["lock_release_id"])
+
+        start_take()
+        # Two-handed triple: three squeeze/release cycles, then the timeout.
+        for _ in range(3):
+            self.assertEqual(both(0.0)["state"], VRState.RECORDING.value)
+            self.assertEqual(both(1.0)["state"], VRState.RECORDING.value)
+        now[0] += 1.0
+        saved = frame()
+        self.assertEqual(saved["state"], VRState.DATA_COLLECTION.value)
+        self.assertEqual(saved["episode_outcome"], VREpisodeOutcome.SUCCESS.value)
+        self.assertFalse(saved["reset"])
+        # ...and the second hand's pending sequence was consumed with it, so
+        # it cannot resolve on its own later.
+        for recognizer in bridge._gesture.values():
+            self.assertEqual(recognizer._presses, 0)
+        now[0] += 1.0
+        self.assertEqual(frame()["state"], VRState.DATA_COLLECTION.value)
+
+        # The next start gesture still opens a take (recognizers are clean).
+        bridge._state = VRState.DATA_COLLECTION
+        start_take()
+
+        # Two-handed quadruple resolves on the fourth press edge with both
+        # triggers still squeezed: discard, then the release that follows
+        # must not read as a start that reopens a take.
+        for _ in range(3):
+            both(0.0)
+            both(1.0)
+        fourth = both(0.0)
+        self.assertEqual(fourth["state"], VRState.DATA_COLLECTION.value)
+        self.assertTrue(fourth["reset"])
+        released = both(1.0)
+        self.assertEqual(released["state"], VRState.DATA_COLLECTION.value)
+        now[0] += 1.0
+        self.assertEqual(frame()["state"], VRState.DATA_COLLECTION.value)
+
+        # A fresh two-handed squeeze/release after that is a start again.
+        both(0.0)
+        self.assertEqual(both(1.0)["state"], VRState.RECORDING.value)
+
+    def test_start_gesture_still_reanchors_after_mid_take_dropout(self) -> None:
+        bridge, left, right = self._collection_bridge()
+        now = [300.0]
+
+        def frame() -> dict:
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                return bridge.compose_frame()
+
+        def both(value: float) -> dict:
+            left.value = right.value = value
+            now[0] += 0.05
+            return frame()
+
+        both(0.0)
+        both(1.0)
+        bridge._handle_tracking_state(True)
+        opened = frame()
+        self.assertEqual(opened["state"], VRState.RECORDING.value)
+        if "lock_release_id" in opened:
+            bridge._handle_lock_release(opened["lock_release_id"])
+
+        # Tracker dropout mid-take: the bridge freezes and toggles the core
+        # out of tracking; the core acknowledges and the low-frame handshake
+        # completes once the trigger is fresh again.
+        left.stale = True
+        frozen = frame()
+        self.assertTrue(frozen["l_lock"] and frozen["r_lock"])  # disengage edge
+        bridge._handle_tracking_state(False)
+        left.stale = False
+        low = frame()
+        self.assertFalse(low["l_lock"])
+        bridge._handle_lock_release(low["lock_release_id"])
+        self.assertFalse(frame()["l_lock"])
+
+        # The take is still nominally open, but tracking is not engaged, so
+        # repeating the start gesture re-anchors (requests a new engage)
+        # instead of being swallowed as an in-take two-handed press.
+        both(0.0)
+        reanchor = both(1.0)
+        self.assertTrue(reanchor["l_lock"] and reanchor["r_lock"])
+
     def test_managed_bridge_uses_operation_pose_source_token(self) -> None:
         bridge = TrackerBridge(
             _Source(),

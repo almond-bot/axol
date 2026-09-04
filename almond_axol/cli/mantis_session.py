@@ -273,11 +273,15 @@ def _install() -> None:
         raise SystemExit("Cannot resolve the `axol` executable to bake into the unit.")
     repo_root = Path(__file__).resolve().parents[2]
     user = _operator_user()
+    # The condition must be *triggering* (``|``): the self-updater's drop-in
+    # adds ``ConditionPathExists=|<one-shot token>`` to admit exactly one start
+    # while the marker is armed, and systemd ANDs any non-triggering condition
+    # with that OR group, which would make the token useless.
     unit = f"""[Unit]
 Description=Almond Mantis Quest USB/browser bootstrap
 Wants={_MANAGED_SERVE_SERVICE}
 After=network-online.target {_MANAGED_SERVE_SERVICE}
-ConditionPathExists=!{_UPDATE_GUARD_MARKER}
+ConditionPathExists=|!{_UPDATE_GUARD_MARKER}
 
 [Service]
 Type=simple

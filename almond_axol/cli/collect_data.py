@@ -713,6 +713,11 @@ class EpisodeQAStats:
     # Worst pose-stream age (tick time minus pose capture time) seen while
     # recording, in seconds. Reported in the QA summary; not itself a gate.
     max_pose_lag_s: float = 0.0
+    # Host perf_counter instant the episode's data should end at, when the
+    # operator ended it with the trigger x3 gesture: the moment the first
+    # click began. Rows captured after it are trimmed before the save so the
+    # clicks (gripper commands) stay out of the dataset. None keeps every row.
+    end_t_host: float | None = None
 
     @property
     def stale_fraction(self) -> float:
@@ -1041,6 +1046,56 @@ def _run(
                     ) from restore_error
 
 
+_PREOPEN_POLL_S = 0.05
+
+
+def _preopen_mantis_grippers(
+    robot: Any,
+    stop_event: "threading.Event | None",
+    announce: Any,
+) -> None:
+    """Open both Mantis grippers all the way, then release torque, pre-record.
+
+    Runs once right after ``robot.connect()`` in Mantis mode, before any take.
+    The first gripper activation is the hard-stop calibration sweep, which
+    physically drives the jaws open over a few seconds; doing it here (rather
+    than inside the first take's ``_start_recording``) means the first episode
+    starts with the grippers already wide open and its "Preparing Mantis
+    grippers" step is instant, because the calibration is retained across the
+    torque-off. Torque is dropped again so the handheld rig stays limp until an
+    episode records, exactly as before.
+
+    A Stop while the jaws are moving cancels the move, which force-disables
+    both grippers on its way out (the same rollback ``_start_recording`` relies
+    on), and returns once torque is confirmed off; the session then unwinds
+    through its normal stop path. A hardware failure propagates as-is: a
+    gripper that cannot open now could not have recorded either.
+    """
+
+    async def _open_unless_stopped() -> bool:
+        task = asyncio.ensure_future(robot.open_grippers_async())
+        while not task.done():
+            if stop_event is not None and stop_event.is_set():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                return False
+            await asyncio.sleep(_PREOPEN_POLL_S)
+        await task  # surfaces a calibration / open / disable failure
+        return True
+
+    announce("Opening Mantis grippers.")
+    opened = asyncio.run_coroutine_threadsafe(
+        _open_unless_stopped(), robot.event_loop
+    ).result()
+    if opened:
+        _logger.info("Mantis grippers opened fully and released (torque off).")
+    else:
+        _logger.info("stopped while opening the Mantis grippers; torque released.")
+
+
 def _run_session(
     cfg: CollectDataConfig,
     stop_event: "threading.Event | None" = None,
@@ -1338,6 +1393,12 @@ def _run_session(
 
     try:
         robot.connect()
+        if mantis_mode:
+            # Open both grippers all the way (this is also the one-time
+            # hard-stop calibration), then drop torque again, so the jaws are
+            # already wide when the first take starts instead of finishing
+            # their sweep in-shot. See _preopen_mantis_grippers.
+            _preopen_mantis_grippers(robot, stop_event, log_say)
 
         # The dataset lives in the recorder (subprocess or in-process), not here.
         # Its features come from the robot's joint features + the camera image
@@ -1969,6 +2030,9 @@ def _run_session(
                     log_say("Episode ended as failure.")
                 else:
                     log_say("Episode ended successfully.")
+                    # A trigger-gesture end names when the first click began;
+                    # the recorder cuts the take there (see stop_capture).
+                    stats.end_t_host = events.get("episode_end_t_host")
                 teleop.send_feedback_state(VRState.SAVING)
                 break
             if events[TeleopEvents.RERECORD_EPISODE]:
@@ -2096,16 +2160,39 @@ def _run_session(
             robot.disable_grippers_async(), robot.event_loop
         )
 
+    def _discard_episode() -> None:
+        """Drop the buffered take; a failed discard is logged, not fatal.
+
+        The recorder's discard also cancels the streaming encoder, which can
+        refuse when a camera writer will not stop. The recorder stays usable
+        (it retries that cleanup on the next start), so one stubborn discard
+        must not unwind the whole session.
+        """
+        try:
+            recorder.cancel_episode()
+        except RuntimeError as exc:
+            _logger.error("episode discard failed; continuing: %s", exc)
+
     def _wrap_up_episode(recording: bool, rerecord: bool) -> None:
         """Save or discard the just-ended episode and announce the result."""
         nonlocal episodes_recorded
         if rerecord:
             log_say("Re-recording episode.")
             if recording:
-                recorder.cancel_episode()
+                _discard_episode()
         elif recording:
             log_say("Saving episode…")
-            recorder.save_episode()
+            try:
+                recorder.save_episode()
+            except RuntimeError as exc:
+                # A per-episode refusal (capture fault, encoder frame drops,
+                # a video segment that would not mux): the recorder has
+                # discarded the take and is still usable, so keep the session
+                # up like collect-dagger does instead of tearing everything
+                # down over one lost episode. Durability failures are a
+                # different type (EpisodeDurabilityError) and still unwind.
+                log_say(f"Episode NOT saved: {exc}")
+                return
             # Hosted saves remain root-owned inside the immutable service
             # store; normalize read-only operator-group access after each take.
             restore_dataset_ownership(dataset_root)
@@ -2150,7 +2237,12 @@ def _run_session(
             disable_future = _begin_disable_mantis_grippers()
             try:
                 if recording:
-                    captured_rows, capture_error = recorder.stop_capture()
+                    # Freeze the buffer; when the take ended on the trigger
+                    # x3 gesture, also drop the rows captured after its first
+                    # click began so the clicks stay out of the dataset.
+                    captured_rows, capture_error = recorder.stop_capture(
+                        trim_after=qa.end_t_host
+                    )
                 else:
                     captured_rows, capture_error = 0, None
             finally:
@@ -2164,7 +2256,7 @@ def _run_session(
 
             if _stopped():
                 if recording:
-                    recorder.cancel_episode()
+                    _discard_episode()
                 break
 
             if contact:
@@ -2172,7 +2264,7 @@ def _run_session(
                 # is unusable (the arms went limp mid-take), so discard it,
                 # then run the limp hold + guarded return on the robot loop.
                 if recording:
-                    recorder.cancel_episode()
+                    _discard_episode()
                     log_say("Episode discarded (contact).")
                 _run_on_robot_loop(_contact_hold_loop())
                 # Drain VR events fired during the hold/return, then unblock
@@ -2192,6 +2284,13 @@ def _run_session(
                     log_say(
                         "Episode capture failed — discarding and re-recording. "
                         + capture_error
+                    )
+                    rerecord = True
+                elif captured_rows == 0 and qa.end_t_host is not None:
+                    log_say(
+                        "Episode has no dataset rows before the end gesture "
+                        "began — it was ended as soon as it started. Discarding "
+                        "and re-recording."
                     )
                     rerecord = True
                 elif captured_rows == 0:
@@ -2310,6 +2409,13 @@ def _run_session(
             _cleanup("board gyro", imu_src.close)
         _cleanup("robot disconnect", robot.disconnect)
         _cleanup("teleop disconnect", teleop.disconnect)
+        # Close the relay's dataset branch BEFORE the recorder detaches its
+        # readers: a session error mid-episode leaves the valve open, and the
+        # blocking dataset shmsink with no reader would pin the camera's
+        # capture buffers (the relay also self-closes on reader loss, but
+        # ordering it here keeps the headset feed from even a transient stall).
+        if relay is not None:
+            _cleanup("video relay dataset branch", lambda: relay.set_raw_enabled(False))
         # Recorder owns the dataset: finalize, optional push, and empty-dataset
         # cleanup all happen in recorder.close().
         _cleanup("recorder", recorder.close)

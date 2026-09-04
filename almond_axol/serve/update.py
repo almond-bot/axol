@@ -125,13 +125,25 @@ _UPDATE_GUARD_CONTENT = (
 )
 _MANTIS_START_DIR = Path("/run/almond-axol")
 _MANTIS_START_TOKEN = _MANTIS_START_DIR / "mantis-update-start-once"
+# Keep in sync with the hosted installer's Mantis guard drop-in. The empty
+# assignment first resets the unit body's own condition list: an older body
+# carries a *non-triggering* ``ConditionPathExists=!marker`` that systemd would
+# AND with the triggering ``|`` group below, so the one-shot token could never
+# admit a start while the marker is armed. The helper runs as the operator
+# while ``/run/almond-axol`` is root-only, so the token consume needs ``+``
+# (full privileges); ``rm -f`` only ignores a missing file, not EACCES.
 _MANTIS_UPDATE_GUARD_CONTENT = (
     "[Unit]\n"
+    "ConditionPathExists=\n"
     f"ConditionPathExists=|!{_UPDATE_GUARD_MARKER}\n"
     f"ConditionPathExists=|{_MANTIS_START_TOKEN}\n"
     "\n[Service]\n"
-    f"ExecStartPre=/usr/bin/rm -f -- {_MANTIS_START_TOKEN}\n"
+    f"ExecStartPre=+/usr/bin/rm -f -- {_MANTIS_START_TOKEN}\n"
 )
+# Written after the once-per-process startup heal succeeds so later processes
+# of the same release skip re-arming the durable guard (and the Mantis restart
+# that implies) for a provision that already ran for this exact version.
+_PROVISIONED_STAMP = Path("/var/lib/almond-axol/provisioned-version")
 _MANTIS_UPDATE_GUARD_DROPIN = Path(
     "/etc/systemd/system/axol-mantis.service.d/20-update-guard.conf"
 )
@@ -157,6 +169,10 @@ _MANAGED_UPDATE_ENV = {
     "UV_PYTHON_INSTALL_DIR": "/opt/axol/uv/python",
     "UV_TOOL_BIN_DIR": "/usr/local/bin",
 }
+_MANAGED_TOOL_ENVIRONMENT = Path(_MANAGED_UPDATE_ENV["UV_TOOL_DIR"]) / _PACKAGE
+# The hosted installer publishes this recovery slot before it moves any runtime
+# bytes and keeps it until the candidate is verified (see web/app/public/install).
+_PENDING_ROLLBACK = Path("/opt/axol/rollback/pending")
 
 
 @dataclass(frozen=True)
@@ -525,6 +541,81 @@ def _write_mantis_start_token(version: str) -> None:
     _write_durable_root_file(
         _MANTIS_START_TOKEN,
         f"target-version={version}\n",
+        mode=0o600,
+    )
+
+
+def _durable_mutation_evidence() -> bool:
+    """Whether a hosted update transaction left any durable trace on the host.
+
+    The installer arms the durable marker before it stops either service and
+    publishes the pending rollback slot before it moves runtime bytes; the
+    managed tool environment and wrapper only disappear once retention has
+    begun. A worker that exited leaving none of these behind died in its
+    preflight (GitHub unreachable, tool layout validation, operator identity,
+    legacy datasets, ...) and never changed the host. Any inspection error
+    counts as evidence so the caller stays fail-closed.
+    """
+    try:
+        for path in (
+            _UPDATE_GUARD_MARKER,
+            _UPDATE_START_TOKEN,
+            _UPDATE_VERIFYING_MARKER,
+            _PENDING_ROLLBACK,
+        ):
+            if path.exists() or path.is_symlink():
+                return True
+        return not (
+            _MANAGED_TOOL_ENVIRONMENT.is_dir()
+            and not _MANAGED_TOOL_ENVIRONMENT.is_symlink()
+            and Path(_MANAGED_AXOL_EXECUTABLE).exists()
+        )
+    except OSError:
+        return True
+
+
+def _read_provisioned_stamp() -> str | None:
+    """The release whose startup provision last completed here, if recorded.
+
+    Only a root-owned, mode 0600 regular file with the exact expected shape
+    counts; anything else is treated as "never provisioned" so the heal runs.
+    """
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(_PROVISIONED_STAMP, flags)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            return None
+        payload = os.read(fd, 257)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    prefix = "provisioned-version="
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if len(payload) > 256 or not text.startswith(prefix) or not text.endswith("\n"):
+        return None
+    version = text[len(prefix) : -1]
+    return version if parse_version(version) is not None else None
+
+
+def _write_provisioned_stamp(version: str) -> None:
+    """Durably record that this release's startup provision succeeded."""
+    _write_durable_root_file(
+        _PROVISIONED_STAMP,
+        f"provisioned-version={version}\n",
         mode=0o600,
     )
 
@@ -956,10 +1047,22 @@ class SelfUpdater:
                 self._error = None
                 self._phase = None
                 return
+            # The installer leaves durable evidence before it mutates anything.
+            # Without any of it the worker died in its preflight and this
+            # process may keep launching hardware (and the host may reboot);
+            # ``_fail`` still preserves a barrier inherited from an earlier
+            # transaction. With evidence, stay fail-closed until repaired.
+            if await asyncio.to_thread(_durable_mutation_evidence):
+                self._fail(
+                    "the hosted update worker stopped before replacing the "
+                    "server; retry the update or inspect the system journal",
+                    launches_unsafe=True,
+                )
+                return
             self._fail(
-                "the hosted update worker stopped before replacing the server; "
-                "retry the update or inspect the system journal",
-                launches_unsafe=True,
+                "the hosted update worker stopped before changing the host; "
+                "inspect the system journal, then retry the update",
+                launches_unsafe=False,
             )
             return
 
@@ -1809,6 +1912,12 @@ class SelfUpdater:
         Gated to the exact managed service process before raising the launch
         barrier. In particular, a release-installed CLI may also be run
         manually as root for development and must remain able to use hardware.
+
+        The heal arms the same durable guard as an update (it mutates the live
+        tool environment), which stops the Mantis helper and disables the unit
+        until verification. That is only worth doing once per installed
+        release: a durable stamp records the last release whose heal completed
+        and later processes of that exact release skip it entirely.
         """
         async with self._provision_launch_lock:
             if (
@@ -1834,6 +1943,14 @@ class SelfUpdater:
                 )
                 return
             if self._shutting_down:
+                return
+            if self._version is not None and self._version == await asyncio.to_thread(
+                _read_provisioned_stamp
+            ):
+                _logger.info(
+                    "self-update: startup provisioning already completed for v%s",
+                    self._version,
+                )
                 return
 
             self._launches_blocked = True
@@ -1864,6 +1981,13 @@ class SelfUpdater:
         if guard_error is not None:
             self._fail(guard_error)
             return
+        # Best effort: a missing stamp only means the next process repeats the
+        # (idempotent) heal, so it must never turn a verified heal into an error.
+        if self._version is not None:
+            try:
+                await asyncio.to_thread(_write_provisioned_stamp, self._version)
+            except OSError:
+                _logger.warning("self-update: could not record the provisioned release")
         # A user update cannot begin while this task is active.  Once startup
         # healing has completed successfully, normal launches are safe again.
         self._inherited_launch_barrier = False

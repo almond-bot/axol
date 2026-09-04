@@ -142,6 +142,9 @@ class AxolVRTeleop(Teleoperator):
         self._rerecord_latch: bool = False
         self._terminate_latch: bool = False
         self._failure_latch: bool = False
+        # Host perf_counter instant the terminated episode's data should end
+        # at (see VRFrame.episode_end_t_host); None keeps every row.
+        self._episode_end_t_host: float | None = None
         self._start_recording_latch: bool = False
 
         # Rolling ~2s windows of IK-solve and VR-frame timestamps, for the
@@ -1110,10 +1113,12 @@ class AxolVRTeleop(Teleoperator):
             rerecord = self._rerecord_latch
             terminate = self._terminate_latch
             failure = self._failure_latch
+            episode_end_t_host = self._episode_end_t_host
             start_recording = self._start_recording_latch
             self._rerecord_latch = False
             self._terminate_latch = False
             self._failure_latch = False
+            self._episode_end_t_host = None
             self._start_recording_latch = False
         return {
             TeleopEvents.IS_INTERVENTION: False,
@@ -1122,6 +1127,9 @@ class AxolVRTeleop(Teleoperator):
             TeleopEvents.FAILURE: failure,
             TeleopEvents.RERECORD_EPISODE: rerecord,
             "start_recording": start_recording,
+            # Where the terminated episode's data should be cut (host
+            # perf_counter seconds), or None to keep every captured row.
+            "episode_end_t_host": episode_end_t_host if terminate else None,
         }
 
     # ------------------------------------------------------------------
@@ -1168,6 +1176,9 @@ class AxolVRTeleop(Teleoperator):
                     self._terminate_latch = True
                     self._failure_latch = (
                         frame.episode_outcome == VREpisodeOutcome.FAILURE
+                    )
+                    self._episode_end_t_host = (
+                        None if self._failure_latch else frame.episode_end_t_host
                     )
         self._prev_state = curr
 

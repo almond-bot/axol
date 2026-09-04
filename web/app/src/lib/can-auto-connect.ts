@@ -144,6 +144,48 @@ export function nextAutoConnectAttempt(
   return previousAttempts < 3 ? previousAttempts + 1 : null
 }
 
+/**
+ * Ordering guard for the 2 s CAN inventory poll. `issued` is the id of the
+ * latest request sent; `applied` is the id of the latest response applied to
+ * state (or a watermark below which every outstanding request is void).
+ *
+ * The poll is a fixed interval that does not wait for in-flight requests, and
+ * `/api/can/interfaces` shells out to `udevadm` per netdev — slow exactly
+ * during CAN discovery. Dropping every response that isn't the *newest issued*
+ * request would starve inventory forever once latency exceeds the cadence, so
+ * only responses older than the last *applied* one are discarded.
+ */
+export type CanInventoryPollSequence = { issued: number; applied: number }
+
+export function newCanInventoryPollSequence(): CanInventoryPollSequence {
+  return { issued: 0, applied: 0 }
+}
+
+/** Issue a new request id for one poll. */
+export function issueCanInventoryPoll(sequence: CanInventoryPollSequence): number {
+  sequence.issued += 1
+  return sequence.issued
+}
+
+/**
+ * Claim the right to apply `requestId`'s response. True (and records it as
+ * applied) unless a newer response has already landed or the request was
+ * voided by `voidCanInventoryPolls`; false means drop the response.
+ */
+export function claimCanInventoryPollResponse(
+  sequence: CanInventoryPollSequence,
+  requestId: number
+): boolean {
+  if (requestId <= sequence.applied) return false
+  sequence.applied = requestId
+  return true
+}
+
+/** Void every outstanding request, e.g. after a disconnect or host change. */
+export function voidCanInventoryPolls(sequence: CanInventoryPollSequence): void {
+  sequence.applied = sequence.issued
+}
+
 /** Auto-connect requires one coherent successful snapshot of all authorities. */
 export function autoConnectPollStateKnown(
   robotStatusKnown: boolean,

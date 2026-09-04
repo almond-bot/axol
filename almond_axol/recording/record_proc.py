@@ -308,9 +308,16 @@ def _concat_constant_fps(
     advertises (the trailing sample of an mp4mux file is sometimes not
     surfaced), which would leave the chunk one frame short of its dataset rows
     and silently shift every later episode's timestamp lookup. A short input is
-    rejected. Re-muxing its last H.264 packet again is not a valid freeze-frame:
-    when that packet is a P-frame, replay changes the decoder reference chain
-    and can corrupt every subsequent picture.
+    padded back to its advertised count by re-muxing its last packet, with a
+    loud log. Replaying a P-frame is not an exact freeze-frame -- the decoder
+    applies its prediction to its own output, so the padded picture(s) can
+    carry small artifacts -- but the damage is confined to those trailing
+    frames: every segment begins with an IDR (the recorder's AU reader waits
+    for one, and each in-process encode starts a fresh stream), which resets
+    the reference chain before the next episode's first picture. Rejecting the
+    segment instead threw away the whole episode *after* its parquet rows were
+    already written (LeRobot saves data before video), which is strictly worse
+    for the dataset than one imperfect final frame.
 
     The temp file lives next to the output (rename, never a cross-fs copy) and
     is muxed without ``faststart``: this runs once per camera on *every*
@@ -345,6 +352,7 @@ def _concat_constant_fps(
                         out_stream.time_base = time_base
                     expected = in_stream.frames or 0
                     demuxed = 0
+                    last_payload: bytes | None = None
                     for packet in src.demux(in_stream):
                         if packet.dts is None:  # demux flushing packet
                             continue
@@ -354,6 +362,7 @@ def _concat_constant_fps(
                             # The probe only samples leading packets; this is
                             # the full-stream check.
                             raise _BFramesDetected(str(input_path))
+                        last_payload = bytes(packet)
                         packet.pts = frame_idx * step
                         packet.dts = frame_idx * step
                         packet.duration = step
@@ -369,13 +378,27 @@ def _concat_constant_fps(
                         dst.mux(packet)
                         frame_idx += 1
                         demuxed += 1
-                    if expected > demuxed:
-                        raise RuntimeError(
-                            f"video segment {Path(str(input_path)).name!r} "
-                            f"demuxed {demuxed} of {expected} advertised H.264 "
-                            "pictures; refusing to replay an encoded packet to "
-                            "hide the missing picture"
+                    if expected > demuxed and last_payload is not None:
+                        _logger.error(
+                            "concat: %s demuxed %d of %d advertised samples; "
+                            "padding %d duplicate trailing frame(s) to keep "
+                            "frame-count == row-count (the padded picture may "
+                            "carry artifacts; the next segment's IDR resets "
+                            "the reference chain)",
+                            Path(str(input_path)).name,
+                            demuxed,
+                            expected,
+                            expected - demuxed,
                         )
+                        for _ in range(expected - demuxed):
+                            pad = av.Packet(last_payload)
+                            pad.pts = frame_idx * step
+                            pad.dts = frame_idx * step
+                            pad.duration = step
+                            pad.time_base = time_base
+                            pad.stream = out_stream
+                            dst.mux(pad)
+                            frame_idx += 1
         from ..utils.state_files import secure_atomic_copy_file
 
         secure_atomic_copy_file(tmp_output_video_path, output_video_path)
@@ -561,10 +584,10 @@ def _video_duration_exact(video_path: "Path | str") -> float:
     ``from_timestamp`` short by ``k/fps``, so its rows silently resolve to
     frames up to *k* ticks stale (no error — the exact-fps grid always has *a*
     frame within tolerance). Deriving the duration from the packets themselves
-    (count x per-frame duration) makes ``to - from`` exactly ``rows / fps`` for
-    every episode. If the container advertises more pictures than can be
-    demuxed, fail closed: trusting the advertised count would hide the same
-    short stream that concat must reject.
+    (count x per-frame duration, using the advertised sample count when demux
+    comes up short — the concat pads the segment back to that count, see
+    :func:`_concat_constant_fps`) makes ``to - from`` exactly ``rows / fps``
+    for every episode.
     """
     import av
 
@@ -580,13 +603,7 @@ def _video_duration_exact(video_path: "Path | str") -> float:
             last = packet
         if last is None or tb is None:
             return 0.0
-        advertised = stream.frames or 0
-        if advertised > demuxed:
-            raise RuntimeError(
-                f"video {Path(str(video_path)).name!r} demuxed {demuxed} of "
-                f"{advertised} advertised H.264 pictures"
-            )
-        n = demuxed
+        n = max(demuxed, stream.frames or 0)
         if last.duration:
             return float(n * last.duration * tb)
         if stream.average_rate:
@@ -931,6 +948,7 @@ def run_capture_loop(
     record_event: "threading.Event | None" = None,
     frame_counter: "dict[str, int] | None" = None,
     on_error: Callable[[str], None] | None = None,
+    row_times: "list[float] | None" = None,
 ) -> None:
     """Capture dataset rows at ``fps`` Hz until ``stop_event`` is set.
 
@@ -957,6 +975,11 @@ def run_capture_loop(
     ``frame_counter`` (optional) is a mutable ``{"n": int}`` incremented after
     every appended row, so the owner can convert instants into dataset time
     (``n / fps``) — e.g. to annotate intervention spans.
+
+    ``row_times`` (optional) receives one append per row: the row's freshest
+    camera capture time on the system-wide ``perf_counter`` clock. It lets the
+    owner map a host instant back to a row index after the fact — see
+    :func:`trim_episode_after`.
 
     When the dataset declares an ``intervention`` feature (LeRobot's native
     DAgger annotation: a per-frame bool, see ``lerobot.rollout``'s DAgger
@@ -1119,6 +1142,8 @@ def run_capture_loop(
             if tag_intervention:
                 row["intervention"] = np.array([intervention], dtype=bool)
             dataset.add_frame(row)
+            if row_times is not None:
+                row_times.append(row_cap_ts)
             if frame_counter is not None:
                 frame_counter["n"] += 1
             frames_added += 1
@@ -1153,13 +1178,15 @@ def run_encoded_capture_loop(
     stop_event: threading.Event,
     frame_counter: "dict[str, int] | None" = None,
     on_error: Callable[[str], None] | None = None,
+    row_times: "list[float] | None" = None,
 ) -> None:
     """Frame-driven capture for the relay-encoded (gstshm-h264) transport.
 
-    ``frame_counter`` mirrors :func:`run_capture_loop`'s (a mutable
-    ``{"n": int}`` incremented per appended row). There is no ``record_event``
-    on this path: an encoded stream cannot gate mid-episode — every dropped
-    access unit is referenced by later P-frames.
+    ``frame_counter`` and ``row_times`` mirror :func:`run_capture_loop`'s (a
+    mutable ``{"n": int}`` incremented per appended row, and one capture-time
+    append per row). There is no ``record_event`` on this path: an encoded
+    stream cannot gate mid-episode — every dropped access unit is referenced by
+    later P-frames.
 
     Unlike :func:`run_capture_loop` (real-time paced, *selecting* the camera
     frame nearest each tick and dropping the rest), an encoded stream cannot drop
@@ -1326,6 +1353,8 @@ def run_encoded_capture_loop(
             if tag_intervention:
                 row["intervention"] = np.array([intervention], dtype=bool)
             dataset.add_frame(row)
+            if row_times is not None:
+                row_times.append(pair_ts)
             if frame_counter is not None:
                 frame_counter["n"] += 1
             rows_added += 1
@@ -1352,22 +1381,27 @@ def run_encoded_capture_loop(
                 max_pending = 0
                 last_log = now
     except BaseException as exc:
-        # A failed encoded episode may have consumed only a prefix of its next
-        # multi-camera row. Drop every remaining AU and re-arm keyframe wait now,
-        # so no partial reference chain can leak into a replacement episode. The
-        # next start flushes again after the relay valve opens; this immediate
-        # reset also makes the reader safe while the failed take is discarded.
-        for cam_key, cam in cameras.items():
-            try:
-                cam.flush()
-            except BaseException:
-                _logger.exception(
-                    "failed to reset encoded camera %s after capture error",
-                    cam_key,
-                )
         _logger.error("encoded capture loop failed: %s", exc)
         if on_error is not None:
             on_error(str(exc))
+    finally:
+        # Park every reader the moment this loop stops draining -- on save,
+        # discard, stop, or failure. A failed episode may have consumed only a
+        # prefix of its next multi-camera row; dropping every remaining AU here
+        # keeps a partial reference chain from leaking into a replacement take.
+        # And the relay's valve closes only after the control process hears the
+        # episode ended, so AUs keep arriving for a few frames with nobody
+        # consuming them: parked, the reader ignores them instead of latching a
+        # spurious backlog fault against a take that is already over. The next
+        # episode's flush() re-arms it.
+        for cam_key, cam in cameras.items():
+            try:
+                cam.disarm()
+            except BaseException:
+                _logger.exception(
+                    "failed to park encoded camera %s after the capture loop",
+                    cam_key,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1439,6 +1473,52 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
     return dataset
 
 
+def trim_episode_after(
+    dataset: "LeRobotDataset", row_times: list[float], cutoff: float
+) -> int:
+    """Drop the buffered rows captured after ``cutoff``; return how many.
+
+    Used when the operator ends a take with the trigger x3 gesture: the
+    bridge reports when the first click *began* (host ``perf_counter``), and
+    every row captured from that instant on shows the clicks — three gripper
+    close/open commands and the hand motion that goes with them — rather than
+    the task. ``row_times`` is the per-row capture-time list the capture loop
+    filled (see ``run_capture_loop``); the cut lands before the first row whose
+    capture time is past ``cutoff``, so a late row can never survive on the
+    strength of an earlier neighbour.
+
+    Only the row buffer is cut. The streamed video already holds the trailing
+    frames, and that is fine: LeRobot indexes each row's frame at
+    ``from_timestamp + k / fps`` and takes the episode's video span from the
+    file's real duration, so the extra pictures are simply never referenced,
+    and the next episode's span still starts where this file actually ends.
+
+    Call only after the capture thread has been stopped (the buffer must be
+    quiescent). Mutates ``row_times`` to match.
+    """
+    total = len(row_times)
+    keep = next((i for i, t in enumerate(row_times) if t > cutoff), total)
+    if keep >= total:
+        return 0
+    buffer = dataset.writer.episode_buffer
+    if buffer is None:
+        return 0
+    for values in buffer.values():
+        if isinstance(values, list):
+            del values[keep:]
+    buffer["size"] = keep
+    del row_times[keep:]
+    removed = total - keep
+    _logger.info(
+        "trimmed %d row(s) captured after the end gesture began (%.2f s at the "
+        "end of the take); %d row(s) kept",
+        removed,
+        removed / max(1, dataset.fps),
+        keep,
+    )
+    return removed
+
+
 def _maybe_smooth_episode(dataset: "LeRobotDataset", config: dict) -> None:
     """Zero-phase low-pass the buffered episode's EE pose track before save.
 
@@ -1482,7 +1562,14 @@ def _episode_durability_files(
     meta: Any, episode_row: dict[str, Any]
 ) -> tuple[Path, list[Path]]:
     """Resolve every file that makes the just-saved episode readable."""
-    root = Path(os.path.abspath(Path(meta.root).expanduser()))
+    # The dataset root is *our* configured location, and operators routinely
+    # reach it through a link (``~/datasets -> /mnt/ssd/datasets``, a linked
+    # ``/home``). The barrier walks the root's ancestors with O_NOFOLLOW, so a
+    # lexical path would hit ELOOP on that link and every save would fail as
+    # "not durable". Resolve the root once here; the no-follow discipline then
+    # applies to everything *inside* the dataset, which is what the metadata
+    # (untrusted-ish, rewritten each save) can influence.
+    root = Path(os.path.realpath(Path(meta.root).expanduser()))
     if root == Path(root.anchor):
         raise UnsafeStatePathError("dataset root may not be a filesystem root")
 
@@ -1685,6 +1772,26 @@ def _fsync_episode_files(meta: Any, episode_row: dict[str, Any]) -> None:
         for descriptor in reversed(tuple(directory_fds.values())):
             with contextlib.suppress(OSError):
                 os.close(descriptor)
+
+
+def _discard_episode_buffer(dataset: Any) -> str | None:
+    """Drop the buffered episode; return an error string instead of raising.
+
+    ``clear_episode_buffer`` also cancels the streaming encoder's in-flight
+    episode, and the H.264 muxer's ``cancel_episode`` raises when a camera's
+    pipeline refuses to stop or its staging cannot be removed. In the recorder
+    subprocess that exception would escape the command loop and take the whole
+    recorder (and session) down over a discard of data nobody wanted -- so
+    log it and hand the caller a message to attach to its reply instead. The
+    encoder keeps the cameras it could not cancel and retries on the next
+    ``start_episode``.
+    """
+    try:
+        dataset.clear_episode_buffer()
+    except Exception as error:  # noqa: BLE001 - keep the recorder alive
+        _logger.exception("discarding the buffered episode failed")
+        return f"episode discard failed: {type(error).__name__}: {error}"
+    return None
 
 
 def make_episode_durable(dataset: "LeRobotDataset") -> dict[str, Any]:
@@ -1993,6 +2100,8 @@ class InProcessRecorder:
         # DatasetRecorderProcess.pause_episode/resume_episode/frame_count.
         self._record = threading.Event()
         self._frames: dict[str, int] = {"n": 0}
+        # Per-row capture times for the current episode (see trim_episode_after).
+        self._row_times: list[float] = []
         # Fatal capture-thread failure for the current episode, surfaced at
         # save_episode — same contract as the recorder subprocess's
         # ``capture_error`` (an episode whose capture died must not save).
@@ -2022,6 +2131,7 @@ class InProcessRecorder:
         self._dataset.clear_episode_buffer()
         self._record.set()
         self._frames["n"] = 0
+        self._row_times.clear()
         self._capture_error["v"] = None
         reset_dropped_frames()
         self._stop = threading.Event()
@@ -2040,6 +2150,7 @@ class InProcessRecorder:
                 record_event=self._record,
                 frame_counter=self._frames,
                 on_error=lambda m: self._capture_error.__setitem__("v", m),
+                row_times=self._row_times,
             ),
             name="axol-capture",
             daemon=True,
@@ -2069,7 +2180,7 @@ class InProcessRecorder:
         # writer until a bounded retry proves it exited.
         self._thread = _stop_capture_thread(self._thread, self._stop)
 
-    def stop_capture(self) -> tuple[int, str | None]:
+    def stop_capture(self, trim_after: float | None = None) -> tuple[int, str | None]:
         """Stop the capture thread WITHOUT saving or clearing the buffer.
 
         Call the moment an episode terminates — before any post-episode robot
@@ -2080,9 +2191,16 @@ class InProcessRecorder:
         afterwards and operate on the buffer as frozen here. Returns the exact
         number of buffered rows and any fatal capture error so callers can
         reject a bad take before asking LeRobot to save it. Idempotent.
+
+        ``trim_after`` (host ``perf_counter`` seconds) additionally drops the
+        rows captured after that instant — the operator's end gesture — see
+        :func:`trim_episode_after`. The returned row count is post-trim.
         """
         self._require_usable()
         self._stop_capture()
+        if trim_after is not None:
+            trim_episode_after(self._dataset, self._row_times, trim_after)
+            self._frames["n"] = len(self._row_times)
         return self._frames["n"], self._capture_error["v"]
 
     def save_episode(self) -> None:
@@ -2431,6 +2549,8 @@ def _recorder_main(
     # P-frames reference, corrupting the mp4.
     record_event = threading.Event()
     frame_counter: dict[str, int] = {"n": 0}
+    # Per-row capture times for the current episode (see trim_episode_after).
+    row_times: list[float] = []
 
     def stop_capture() -> None:
         nonlocal thread
@@ -2456,10 +2576,14 @@ def _recorder_main(
                 except RuntimeError as exc:
                     conn.send(("error", str(exc)))
                     continue
-                dataset.clear_episode_buffer()
+                discard_error = _discard_episode_buffer(dataset)
+                if discard_error is not None:
+                    conn.send(("error", discard_error))
+                    continue
                 capture_error["v"] = None
                 record_event.set()
                 frame_counter["n"] = 0
+                row_times.clear()
                 from ..lerobot.nvenc_encoder import reset_dropped_frames
 
                 reset_dropped_frames()
@@ -2475,6 +2599,7 @@ def _recorder_main(
                     rerun_ip=config["rerun_ip"],
                     stop_event=stop,
                     on_error=lambda m: capture_error.__setitem__("v", m),
+                    row_times=row_times,
                 )
                 loop_kwargs["frame_counter"] = frame_counter
                 if not encoded_mode:
@@ -2522,11 +2647,17 @@ def _recorder_main(
                 # buffered rows (and any capture_error) intact, so the caller
                 # can run post-episode robot motion (valve close, rest move)
                 # without junk rows being appended, then decide save/cancel.
+                # An optional cutoff (host perf_counter) drops the rows
+                # captured after the operator's end gesture began.
+                trim_after = msg[1] if len(msg) > 1 else None
                 try:
                     stop_capture()
                 except RuntimeError as exc:
                     conn.send(("error", str(exc)))
                 else:
+                    if trim_after is not None:
+                        trim_episode_after(dataset, row_times, float(trim_after))
+                        frame_counter["n"] = len(row_times)
                     conn.send(
                         ("capture_stopped", frame_counter["n"], capture_error["v"])
                     )
@@ -2544,11 +2675,12 @@ def _recorder_main(
                     # Never leave its partial rows/video buffered for a retry:
                     # encoded capture in particular may have consumed only a
                     # prefix of one multi-camera row before reporting failure.
-                    dataset.clear_episode_buffer()
+                    discard_error = _discard_episode_buffer(dataset)
                     conn.send(
                         (
                             "error",
-                            f"{capture_error['v']}; episode discarded",
+                            f"{capture_error['v']}; episode discarded"
+                            + (f" ({discard_error})" if discard_error else ""),
                         )
                     )
                 elif n_dropped:
@@ -2556,14 +2688,15 @@ def _recorder_main(
                     # the episode's video is misaligned with its rows (and
                     # with the other cameras) — refuse to save silently
                     # corrupted data. The caller should discard and re-record.
-                    dataset.clear_episode_buffer()
+                    discard_error = _discard_episode_buffer(dataset)
                     conn.send(
                         (
                             "error",
                             f"{n_dropped} video frame(s) were dropped by the "
                             "encoder (feed queue overflow) — the episode's "
                             "video is misaligned with its rows; episode "
-                            "discarded. Check recorder-core load.",
+                            "discarded. Check recorder-core load."
+                            + (f" ({discard_error})" if discard_error else ""),
                         )
                     )
                 else:
@@ -2611,7 +2744,10 @@ def _recorder_main(
                 except RuntimeError as exc:
                     conn.send(("error", str(exc)))
                     continue
-                dataset.clear_episode_buffer()
+                discard_error = _discard_episode_buffer(dataset)
+                if discard_error is not None:
+                    conn.send(("error", discard_error))
+                    continue
                 conn.send(("cancelled",))
     except BaseException as error:
         session_error = error
@@ -2818,7 +2954,7 @@ class DatasetRecorderProcess:
         """Rows captured in the current episode (dataset time = n / fps)."""
         return self._episode_gate("frame_count", "frame_count")
 
-    def stop_capture(self) -> tuple[int, str | None]:
+    def stop_capture(self, trim_after: float | None = None) -> tuple[int, str | None]:
         """Stop the capture thread WITHOUT saving or clearing the buffer.
 
         Call the moment an episode terminates — before any post-episode robot
@@ -2831,6 +2967,10 @@ class DatasetRecorderProcess:
         stops, so callers can reject a bad take before asking LeRobot to save
         it. Idempotent.
 
+        ``trim_after`` (host ``perf_counter`` seconds) additionally drops the
+        rows captured after that instant — the operator's end gesture — see
+        :func:`trim_episode_after`. The returned row count is post-trim.
+
         Uses the save timeout rather than the lightweight command timeout:
         the reply waits for the capture thread to join, which can take up to
         its 10 s join budget on a wedged camera read.
@@ -2838,7 +2978,7 @@ class DatasetRecorderProcess:
         self._require_usable()
         with self._lock:
             self._require_usable()
-            self._conn.send(("stop_capture",))
+            self._conn.send(("stop_capture", trim_after))
             if not self._conn.poll(_SAVE_TIMEOUT_S):
                 raise RuntimeError("recorder did not answer stop_capture in time")
             msg = self._conn.recv()

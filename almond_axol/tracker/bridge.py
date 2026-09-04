@@ -16,7 +16,10 @@ gesture — it aligns/engages tracking at the rigs' current pose (when not
 already engaged) and, in data collection, opens a take once the teleop core
 acknowledges the engage. While recording, three rapid presses on either
 trigger end the take and save it; four rapid presses end it and discard it.
-Triple presses while idle are ignored. A managed plain-teleop bridge uses
+Both hands pressing together count as one gesture (while a take is open and
+tracking is engaged, a two-handed squeeze/release is *not* a start gesture,
+so two-handed x3/x4 work the same as one-handed). Triple presses while idle
+are ignored. A managed plain-teleop bridge uses
 the same start gesture purely to engage. Other flows use
 :class:`StdinControls` (the trigger frame carries no buttons — session
 controls arrive with a later PCB revision): Enter toggles tracking engage,
@@ -89,6 +92,11 @@ _GESTURE_RELEASE_GRIP = 0.8
 # Maximum quiet time between press edges. A three-press gesture resolves only
 # after this expires, because a fourth press in the window changes the outcome.
 _GESTURE_TIMEOUT_S = 0.6
+# Grip decrease between consecutive samples that counts as the trigger
+# travelling toward a press (above CAN/ADC jitter). Used to place a gesture's
+# start at the moment the first squeeze *began*, not where it crossed the
+# press threshold, so none of the click's motion ends up in a saved episode.
+_GESTURE_SQUEEZE_EPS = 0.02
 
 # Placeholder pose streamed for a side with no tracker assigned (teleop can
 # run one-armed, but VRFrame carries both sides).
@@ -132,9 +140,39 @@ class TriggerGestureRecognizer:
         self._pressed = False
         self._presses = 0
         self._last_press_at: float | None = None
+        # Previous sample, to spot the trigger starting to travel.
+        self._prev_grip: float | None = None
+        self._prev_at: float | None = None
+        # Sample time at which the trigger began its current descent (None
+        # while it is steady or opening).
+        self._squeeze_started_at: float | None = None
+        # When the pending sequence's first squeeze began.
+        self._sequence_started_at: float | None = None
+        #: When the most recently *completed* gesture's first squeeze began.
+        #: Set alongside a non-None return from :meth:`update`.
+        self.last_gesture_started_at: float | None = None
+
+    @property
+    def sequence_started_at(self) -> float | None:
+        """Start of the press sequence in progress, or ``None``."""
+        return self._sequence_started_at
 
     def update(self, grip: float, now: float) -> VREpisodeOutcome | None:
         """Consume one analog grip sample and return a completed gesture."""
+        # Track where a squeeze began before evaluating the press edge, so
+        # the edge can be attributed to the sample the trigger left rest at.
+        if (
+            self._prev_grip is not None
+            and grip < self._prev_grip - _GESTURE_SQUEEZE_EPS
+        ):
+            if self._squeeze_started_at is None:
+                self._squeeze_started_at = self._prev_at
+        else:
+            self._squeeze_started_at = None
+        squeeze_started_at = self._squeeze_started_at
+        self._prev_grip = grip
+        self._prev_at = now
+
         if self._pressed:
             if grip >= _GESTURE_RELEASE_GRIP:
                 self._pressed = False
@@ -147,8 +185,12 @@ class TriggerGestureRecognizer:
                 self._presses = 0
             self._presses += 1
             self._last_press_at = now
+            if self._presses == 1:
+                self._sequence_started_at = (
+                    squeeze_started_at if squeeze_started_at is not None else now
+                )
             if self._presses == 4:
-                self._clear_sequence()
+                self._complete_sequence()
                 return VREpisodeOutcome.FAILURE
 
         if (
@@ -156,7 +198,10 @@ class TriggerGestureRecognizer:
             and now - self._last_press_at > _GESTURE_TIMEOUT_S
         ):
             outcome = VREpisodeOutcome.SUCCESS if self._presses == 3 else None
-            self._clear_sequence()
+            if outcome is not None:
+                self._complete_sequence()
+            else:
+                self._clear_sequence()
             return outcome
         return None
 
@@ -169,9 +214,14 @@ class TriggerGestureRecognizer:
         """
         self._clear_sequence()
 
+    def _complete_sequence(self) -> None:
+        self.last_gesture_started_at = self._sequence_started_at
+        self._clear_sequence()
+
     def _clear_sequence(self) -> None:
         self._presses = 0
         self._last_press_at = None
+        self._sequence_started_at = None
 
 
 class StdinControls:
@@ -445,6 +495,10 @@ class TrackerBridge:
         # Start-gesture latch: both triggers seen squeezed together; the
         # gesture completes when both are released again.
         self._start_gesture_squeezed = False
+        # Set when a take ends on a trigger gesture; the latch stays disarmed
+        # until both triggers have been seen released, so the tail of the
+        # ending gesture cannot double as the next start.
+        self._start_gesture_disarmed = False
         # A completed start gesture in DATA_COLLECTION while disengaged: open
         # the take once the core acknowledges the engage it triggered, so the
         # server never sees RECORDING before the operation is engaged.
@@ -460,6 +514,9 @@ class TrackerBridge:
         self._reset_pulse = 0
         self._outcome_pulse = 0
         self._episode_outcome: VREpisodeOutcome | None = None
+        # Host perf_counter instant the saved take's data should end at (the
+        # first squeeze of the x3 gesture); sent with the outcome pulse.
+        self._episode_end_t_host: float | None = None
         self._held: dict[str, TrackerPose] = {}
         self._fresh: dict[str, bool] = {"left": False, "right": False}
         self._warned_stale: dict[str, bool] = {"left": False, "right": False}
@@ -683,16 +740,31 @@ class TrackerBridge:
         # Only a bridge with two trigger readers can see it; a side without a
         # reader streams 1.0 and never squeezes.
         start_gesture = False
+        all_squeezed = all(value <= _GESTURE_PRESS_GRIP for value in grips.values())
+        all_released = all(value >= _GESTURE_RELEASE_GRIP for value in grips.values())
         if all(reader is not None for reader in self._triggers.values()):
             if not (all_required_fresh and all_required_triggers_fresh):
                 # A squeeze observed before a tracker or trigger dropout cannot
                 # authorize a later engage/start. Recovery starts a new cycle.
                 self._start_gesture_squeezed = False
-            elif all(value <= _GESTURE_PRESS_GRIP for value in grips.values()):
+            elif self._state == VRState.RECORDING and self._engaged:
+                # Mid-take there is nothing for the start gesture to do (the
+                # take is open and tracking is engaged), and operators press
+                # both triggers together: consuming each squeeze/release as a
+                # start would reset the recognizers and make a two-handed
+                # x3 save / x4 discard impossible. Let the presses through.
+                # If tracking drops mid-take, ``_engaged`` clears and the
+                # start gesture is honoured again — repeating it re-anchors.
+                self._start_gesture_squeezed = False
+            elif self._start_gesture_disarmed:
+                # A two-handed x4 resolves on its fourth press edge with both
+                # triggers still squeezed; that release must not read as a
+                # start that reopens a take while the arms return to rest.
+                if all_released:
+                    self._start_gesture_disarmed = False
+            elif all_squeezed:
                 self._start_gesture_squeezed = True
-            elif self._start_gesture_squeezed and all(
-                value >= _GESTURE_RELEASE_GRIP for value in grips.values()
-            ):
+            elif self._start_gesture_squeezed and all_released:
                 self._start_gesture_squeezed = False
                 start_gesture = True
         if start_gesture:
@@ -794,24 +866,38 @@ class TrackerBridge:
 
         # A gesture may be issued on either side. The four-press discard wins
         # if two sides happen to complete different gestures on the same frame.
-        outcomes = (
-            []
+        outcomes: dict[str, VREpisodeOutcome | None] = (
+            {}
             if start_gesture
             or (self._confirm_auto_engage and not all_required_inputs_fresh)
-            else [
-                self._gesture[side].update(grips[side], now)
+            else {
+                side: self._gesture[side].update(grips[side], now)
                 for side in ("left", "right")
                 if self._triggers[side] is not None and self._trigger_fresh[side]
-            ]
+            }
         )
         gesture = (
             VREpisodeOutcome.FAILURE
-            if VREpisodeOutcome.FAILURE in outcomes
+            if VREpisodeOutcome.FAILURE in outcomes.values()
             else VREpisodeOutcome.SUCCESS
-            if VREpisodeOutcome.SUCCESS in outcomes
+            if VREpisodeOutcome.SUCCESS in outcomes.values()
             else None
         )
+        gesture_started_at: float | None = None
         if gesture is not None:
+            # When did the operator start this gesture? The earliest first
+            # squeeze across the side(s) that resolved and any contemporaneous
+            # sequence still pending on the other hand (see below): a saved
+            # take is cut there, so none of the clicks reach the dataset.
+            starts = [
+                self._gesture[side].last_gesture_started_at
+                for side, outcome in outcomes.items()
+                if outcome is not None
+            ] + [
+                recognizer.sequence_started_at for recognizer in self._gesture.values()
+            ]
+            known = [t for t in starts if t is not None]
+            gesture_started_at = min(known) if known else now
             # The operator commonly squeezes both Mantis triggers together.
             # Their CAN samples can cross the 0.6 s resolution deadline one
             # frame apart: without consuming both pending sequences, the
@@ -821,11 +907,27 @@ class TrackerBridge:
             for recognizer in self._gesture.values():
                 recognizer.cancel_sequence()
         episode_outcome: VREpisodeOutcome | None = None
+        if self._state == VRState.RECORDING and gesture is not None:
+            # Whatever the operator is still squeezing belongs to the gesture
+            # that just ended the take, not to a new start (see the start
+            # latch above). A triple resolves on the timeout with both hands
+            # already open, so there is nothing to disarm in that case.
+            self._start_gesture_disarmed = not all_released
         if self._state == VRState.RECORDING:
             if gesture == VREpisodeOutcome.SUCCESS:
                 self._state = VRState.DATA_COLLECTION
                 episode_outcome = VREpisodeOutcome.SUCCESS
-                _logger.info("triple trigger press → end episode and save")
+                # The take really ended when the first click began; the
+                # collector trims the rows captured after this instant so the
+                # three clicks (and their gripper commands) stay out of the data.
+                self._episode_end_t_host = gesture_started_at
+                _logger.info(
+                    "triple trigger press → end episode and save (data cut "
+                    "%.0f ms before the gesture resolved)",
+                    (now - gesture_started_at) * 1000.0
+                    if gesture_started_at is not None
+                    else 0.0,
+                )
             elif gesture == VREpisodeOutcome.FAILURE:
                 # Discard is the RECORDING→DATA_COLLECTION transition carrying
                 # a reset rising edge — the same wire protocol as the Quest
@@ -855,10 +957,16 @@ class TrackerBridge:
         frame["episode_outcome"] = (
             self._episode_outcome.value if self._outcome_pulse > 0 else None
         )
+        # Rides along with the outcome pulse; the bridge is local to the
+        # host, so its perf_counter is the recorder's row-capture clock.
+        frame["episode_end_t_host"] = (
+            self._episode_end_t_host if self._outcome_pulse > 0 else None
+        )
         if self._outcome_pulse > 0:
             self._outcome_pulse -= 1
             if self._outcome_pulse == 0:
                 self._episode_outcome = None
+                self._episode_end_t_host = None
 
         self._seq += 1
         frame["seq"] = self._seq

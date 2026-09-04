@@ -186,19 +186,53 @@ class UltimateUpdateRequirementTests(unittest.TestCase):
                 ("present-but-ambiguous", None),
             )
 
-    def test_present_non_exact_runtime_blocks_force_replacement(self) -> None:
+    def test_present_non_exact_runtime_is_repinned_in_the_same_transaction(
+        self,
+    ) -> None:
+        # A mismatched, ambiguous, or untrusted-source runtime with no operator
+        # data in the package-local Wi-Fi file is still an opt-in: carry the
+        # supported pin into the force update instead of blocking it.
+        for installed in (
+            ("0.0.test", "different-pin"),
+            ("0.0.test", None),
+            ("present-but-ambiguous", None),
+        ):
+            for wifi in ("placeholder", "missing"):
+                with (
+                    self.subTest(installed=installed, wifi=wifi),
+                    patch.object(
+                        tracker_ultimate, "_installed_pyvut", return_value=installed
+                    ),
+                    patch.object(
+                        tracker_ultimate, "_packaged_wifi_status", return_value=wifi
+                    ),
+                ):
+                    self.assertEqual(
+                        tracker_ultimate.ultimate_runtime_update_requirement(),
+                        (tracker_ultimate._PYVUT_SPEC, None),  # noqa: SLF001
+                    )
+
+    def test_present_non_exact_runtime_still_blocks_on_credentials(self) -> None:
         with (
+            tempfile.TemporaryDirectory() as directory,
             patch.object(
                 tracker_ultimate,
                 "_installed_pyvut",
                 return_value=("0.0.test", "different-pin"),
             ),
-            patch.object(tracker_ultimate, "_packaged_wifi_status") as wifi_status,
+            patch.object(
+                tracker_ultimate, "_packaged_wifi_status", return_value="customized"
+            ),
+            patch.object(
+                tracker_ultimate,
+                "ULTIMATE_WIFI_CONFIG_FILE",
+                Path(directory, "ultimate_wifi.json"),
+            ),
         ):
             requirement, error = tracker_ultimate.ultimate_runtime_update_requirement()
-            self.assertIsNone(requirement)
-            self.assertIn("VIVE Ultimate update blocked", error or "")
-        wifi_status.assert_not_called()
+        self.assertIsNone(requirement)
+        self.assertIn("package-local Wi-Fi", error or "")
+        self.assertIn("axol tracker.ultimate.install", error or "")
 
     def test_absent_runtime_needs_no_preservation_requirement(self) -> None:
         with (
@@ -225,12 +259,38 @@ class UltimateUpdateRequirementTests(unittest.TestCase):
             patch.object(
                 tracker_ultimate,
                 "_packaged_wifi_status",
-                return_value="missing",
+                return_value="unavailable",
             ),
         ):
             requirement, error = tracker_ultimate.ultimate_runtime_update_requirement()
         self.assertIsNone(requirement)
         self.assertIn("cannot be inspected safely", error or "")
+        self.assertIn("axol tracker.ultimate.install", error or "")
+
+    def test_unreadable_package_wifi_is_uninspectable_not_missing(self) -> None:
+        # A present-but-unreadable package-local file may hold credentials; the
+        # metadata fallback must not report it as absent (which would re-pin).
+        entry = Mock()
+        entry.__str__ = Mock(return_value="pyvut/wifi_info.json")  # type: ignore[method-assign]
+        dist = Mock(files=[entry])
+        dist.locate_file.return_value = "/nonexistent/pyvut/wifi_info.json"
+        with (
+            patch.object(tracker_ultimate, "distribution", return_value=dist),
+            patch.object(
+                tracker_ultimate.Path,
+                "read_bytes",
+                side_effect=PermissionError("denied"),
+            ),
+        ):
+            self.assertEqual(
+                tracker_ultimate._packaged_wifi_status({}),  # noqa: SLF001
+                "unavailable",
+            )
+        with patch.object(tracker_ultimate, "distribution", return_value=dist):
+            self.assertEqual(
+                tracker_ultimate._packaged_wifi_status({}),  # noqa: SLF001
+                "missing",
+            )
 
     def test_current_pin_returns_the_exact_vcs_requirement(self) -> None:
         with (
@@ -773,10 +833,15 @@ class InstallerUltimatePreservationTests(unittest.TestCase):
             "ConditionPathExists=|!%s\\nConditionPathExists=|%s",
             installer,
         )
+        # The Mantis drop-in resets a legacy non-triggering body condition and
+        # consumes the root-only token with full privileges.
         self.assertIn(
-            "ExecStartPre=/usr/bin/rm -f -- %s",
+            "[Unit]\\nConditionPathExists=\\nConditionPathExists=|!%s\\n"
+            "ConditionPathExists=|%s\\n\\n[Service]\\n"
+            "ExecStartPre=+/usr/bin/rm -f -- %s\\n",
             installer,
         )
+        self.assertNotIn("ExecStartPre=/usr/bin/rm", installer)
         self.assertIn("ExecStartPost=${BIN_DIR}/axol update-healthcheck", installer)
         self.assertIn("/usr/bin/mv -fT -- ${UPDATE_START_TOKEN}", installer)
         self.assertIn(
@@ -1308,7 +1373,30 @@ printf continued
         self.assertLess(provision, fatal)
         self.assertLess(fatal, start)
         self.assertIn('PROVISION_STATUS="${PIPESTATUS[0]}"', installer)
-        self.assertIn("service remains blocked and disabled", installer)
+        # A provisioning (or Ultimate restore) failure after the new runtime is
+        # installed is rejected like a failed health check -- block the
+        # candidate, retain the pending rollback, and print the restore command
+        # -- rather than a bare die that leaves no service and no guidance.
+        fatal_end = installer.index("\nfi\n", fatal)
+        self.assertIn(
+            'reject_candidate_after_provision_failure "${VERSION}" "system provisioning"',
+            installer[fatal:fatal_end],
+        )
+        self.assertNotIn("die ", installer[fatal:fatal_end])
+        ultimate_verify = installer.index(
+            '"${AXOL}" tracker.ultimate.install', force_install
+        )
+        self.assertIn(
+            'reject_candidate_after_provision_failure "${VERSION}" '
+            '"the VIVE Ultimate runtime restore"',
+            installer[ultimate_verify : installer.index("\nfi\n", ultimate_verify)],
+        )
+        reject_start = installer.index("reject_candidate_after_provision_failure() {")
+        reject_end = installer.index("\n}\n", reject_start)
+        self.assertIn(
+            "reject_candidate_after_failure", installer[reject_start:reject_end]
+        )
+        self.assertLess(reject_end, fatal)
 
     def test_recovered_candidate_cannot_fall_back_to_legacy_info_health(self) -> None:
         installer = (
@@ -1915,6 +2003,106 @@ class SelfUpdateSafetyBoundaryTests(unittest.IsolatedAsyncioTestCase):
             updater._systemctl.call_args_list,  # type: ignore[attr-defined]
         )
 
+    @staticmethod
+    def _effective_path_conditions(*unit_fragments: str) -> list[str]:
+        """``ConditionPathExists=`` values as systemd merges body + drop-ins.
+
+        An empty assignment resets every earlier condition (systemd.unit(5)).
+        """
+        conditions: list[str] = []
+        for fragment in unit_fragments:
+            for line in fragment.splitlines():
+                key, separator, value = line.partition("=")
+                if not separator or key.strip() != "ConditionPathExists":
+                    continue
+                if value == "":
+                    conditions.clear()
+                else:
+                    conditions.append(value)
+        return conditions
+
+    def _rendered_mantis_unit_body(self) -> str:
+        from almond_axol.cli import mantis_session
+
+        with (
+            patch.object(
+                mantis_session,
+                "_PRE_MANTIS_SERVICE_PATH",
+                Path("/nonexistent/retired.service"),
+            ),
+            patch.object(mantis_session.shutil, "which", return_value="/opt/axol"),
+            patch.object(mantis_session, "_operator_user", return_value="robot"),
+            patch.object(mantis_session, "run_root") as run_root,
+        ):
+            mantis_session._install()  # noqa: SLF001
+        return run_root.call_args_list[0].kwargs["input_text"]
+
+    def _rendered_installer_mantis_dropin(self) -> str:
+        installer = (
+            Path(__file__).resolve().parents[1] / "web" / "app" / "public" / "install"
+        ).read_text()
+        start = installer.index("printf '[Unit]\\nConditionPathExists=\\n")
+        end = installer.index('> "${MANTIS_GUARD_TMP}"', start)
+        rendered = subprocess.run(
+            [
+                "bash",
+                "-c",
+                "set -euo pipefail\n"
+                f'UPDATE_MARKER="{update._UPDATE_GUARD_MARKER}"\n'  # noqa: SLF001
+                f'MANTIS_START_TOKEN="{update._MANTIS_START_TOKEN}"\n'  # noqa: SLF001
+                + installer[start:end],
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return rendered.stdout
+
+    def test_mantis_one_shot_token_can_admit_a_start_while_marker_is_armed(
+        self,
+    ) -> None:
+        marker = str(update._UPDATE_GUARD_MARKER)  # noqa: SLF001
+        token = str(update._MANTIS_START_TOKEN)  # noqa: SLF001
+        body = self._rendered_mantis_unit_body()
+        # Hosts whose unit body predates the triggering condition keep it until
+        # ``mantis.session --install`` is rerun; the drop-in must cover them.
+        legacy_body = body.replace(
+            f"ConditionPathExists=|!{marker}", f"ConditionPathExists=!{marker}"
+        )
+        self.assertNotEqual(body, legacy_body)
+        self.assertEqual(
+            self._rendered_installer_mantis_dropin(),
+            update._MANTIS_UPDATE_GUARD_CONTENT,  # noqa: SLF001
+        )
+
+        for name, unit_body in (("current", body), ("legacy", legacy_body)):
+            with self.subTest(unit_body=name):
+                conditions = self._effective_path_conditions(
+                    unit_body,
+                    update._MANTIS_UPDATE_GUARD_CONTENT,  # noqa: SLF001
+                )
+                # systemd ANDs any non-triggering condition with the ``|``
+                # group, which would make the one-shot token useless.
+                self.assertTrue(conditions)
+                self.assertTrue(
+                    all(condition.startswith("|") for condition in conditions),
+                    conditions,
+                )
+                self.assertIn(f"|!{marker}", conditions)
+                self.assertIn(f"|{token}", conditions)
+
+        # The helper runs as the operator while /run/almond-axol is root-only
+        # 0700; without ``+`` the consume fails with EACCES and the unit never
+        # starts (``rm -f`` only ignores a missing file).
+        consume_lines = [
+            line
+            for line in update._MANTIS_UPDATE_GUARD_CONTENT.splitlines()  # noqa: SLF001
+            if line.startswith("ExecStartPre=") and token in line
+        ]
+        self.assertEqual(len(consume_lines), 1)
+        self.assertTrue(consume_lines[0].startswith("ExecStartPre=+/usr/bin/rm -f "))
+        self.assertIn("User=robot\n", body)
+
     def test_verified_update_enables_before_removing_marker(self) -> None:
         updater = _updater()
         events: list[tuple[str, object]] = []
@@ -2133,16 +2321,86 @@ class SelfUpdateSafetyBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
         updater._managed_service_error = Mock(return_value=None)  # type: ignore[method-assign]  # noqa: SLF001
         updater._provision = AsyncMock(side_effect=provision)  # type: ignore[method-assign]  # noqa: SLF001
-        await updater.ensure_provisioned()
-        await asyncio.sleep(0)
-        self.assertTrue(updater.maintenance_active)
-        self.assertTrue(updater.launches_blocked)
+        with (
+            patch.object(update, "_read_provisioned_stamp", return_value=None),
+            patch.object(update, "_write_provisioned_stamp") as write_stamp,
+        ):
+            await updater.ensure_provisioned()
+            await asyncio.sleep(0)
+            self.assertTrue(updater.maintenance_active)
+            self.assertTrue(updater.launches_blocked)
+            write_stamp.assert_not_called()
 
-        gate.set()
-        assert updater._provision_task is not None  # noqa: SLF001
-        await updater._provision_task  # noqa: SLF001
+            gate.set()
+            assert updater._provision_task is not None  # noqa: SLF001
+            await updater._provision_task  # noqa: SLF001
         self.assertFalse(updater.maintenance_active)
         self.assertFalse(updater.launches_blocked)
+        updater._arm_durable_update_guard.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        updater._disarm_durable_update_guard.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        # Recorded only after the guard was disarmed on a verified heal.
+        write_stamp.assert_called_once_with("0.1.36")
+
+    async def test_startup_provision_is_skipped_once_this_release_is_stamped(
+        self,
+    ) -> None:
+        updater = _updater()
+        updater._state = "idle"  # noqa: SLF001
+        updater._launches_blocked = False  # noqa: SLF001
+        updater._managed_service_error = Mock(return_value=None)  # type: ignore[method-assign]  # noqa: SLF001
+        updater._provision = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        with patch.object(update, "_read_provisioned_stamp", return_value="0.1.36"):
+            await updater.ensure_provisioned()
+
+        self.assertTrue(updater._provision_started)  # noqa: SLF001
+        self.assertIsNone(updater._provision_task)  # noqa: SLF001
+        self.assertFalse(updater.maintenance_active)
+        self.assertFalse(updater.launches_blocked)
+        # No guard arm means no Mantis stop / unit disable on an ordinary boot.
+        updater._arm_durable_update_guard.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        updater._provision.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+
+        # A different (older) release's stamp does not satisfy this release.
+        other = _updater()
+        other._state = "idle"  # noqa: SLF001
+        other._launches_blocked = False  # noqa: SLF001
+        other._managed_service_error = Mock(return_value=None)  # type: ignore[method-assign]  # noqa: SLF001
+        other._provision = AsyncMock(return_value=None)  # type: ignore[method-assign]  # noqa: SLF001
+        with (
+            patch.object(update, "_read_provisioned_stamp", return_value="0.1.35"),
+            patch.object(update, "_write_provisioned_stamp"),
+        ):
+            await other.ensure_provisioned()
+            assert other._provision_task is not None  # noqa: SLF001
+            await other._provision_task  # noqa: SLF001
+        other._provision.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+
+    def test_provisioned_stamp_requires_exact_root_only_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stamp = Path(directory) / "provisioned-version"
+            with (
+                patch.object(update, "_PROVISIONED_STAMP", stamp),
+                patch.object(update.os, "fstat") as fstat,
+            ):
+                self.assertIsNone(update._read_provisioned_stamp())  # noqa: SLF001
+
+                fstat.return_value = Mock(st_mode=stat.S_IFREG | 0o600, st_uid=0)
+                stamp.write_text("provisioned-version=0.1.36\n")
+                self.assertEqual(update._read_provisioned_stamp(), "0.1.36")  # noqa: SLF001
+
+                stamp.write_text("provisioned-version=0.1.36")
+                self.assertIsNone(update._read_provisioned_stamp())  # noqa: SLF001
+                stamp.write_text("target-version=0.1.36\n")
+                self.assertIsNone(update._read_provisioned_stamp())  # noqa: SLF001
+                stamp.write_text("provisioned-version=release\n")
+                self.assertIsNone(update._read_provisioned_stamp())  # noqa: SLF001
+
+                stamp.write_text("provisioned-version=0.1.36\n")
+                fstat.return_value = Mock(st_mode=stat.S_IFREG | 0o644, st_uid=0)
+                self.assertIsNone(update._read_provisioned_stamp())  # noqa: SLF001
+                fstat.return_value = Mock(st_mode=stat.S_IFREG | 0o600, st_uid=1000)
+                self.assertIsNone(update._read_provisioned_stamp())  # noqa: SLF001
 
     async def test_startup_provision_skips_manual_root_release_serve(self) -> None:
         updater = _updater()
@@ -2224,6 +2482,7 @@ class SelfUpdaterShutdownTests(unittest.IsolatedAsyncioTestCase):
                     "release_update_requirements",
                     return_value=([], None),
                 ),
+                patch.object(update, "_durable_mutation_evidence", return_value=True),
                 patch.object(update.Path, "is_file", return_value=True),
                 patch.object(
                     asyncio,
@@ -2237,10 +2496,59 @@ class SelfUpdaterShutdownTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(updater._state, "error")  # noqa: SLF001
         self.assertTrue(updater.launches_blocked)
+        self.assertIsNotNone(updater.launch_block_reason())
         updater._systemctl.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
 
-    async def test_failed_handoff_without_marker_still_stays_fail_closed(self) -> None:
+    async def test_confirmed_handoff_preflight_exit_is_a_soft_failure(self) -> None:
+        # The worker died before the installer left any durable trace (GitHub
+        # unreachable, tool layout validation, operator identity, ...). The
+        # panel must keep launching hardware and allow a host reboot.
         updater = _updater()
+        updater._state = "idle"  # noqa: SLF001
+        updater._launches_blocked = False  # noqa: SLF001
+        updater._managed_service_error = Mock(return_value=None)  # type: ignore[method-assign]  # noqa: SLF001
+        updater._systemctl = Mock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=Mock(
+                returncode=0,
+                stdout=("LoadState=loaded\nActiveState=failed\nSubState=failed\n"),
+            )
+        )
+
+        with (
+            patch.object(update, "_UPDATE_MONITOR_INTERVAL_S", 0.0),
+            patch.object(
+                update, "release_update_requirements", return_value=([], None)
+            ),
+            patch.object(update, "_durable_mutation_evidence", return_value=False),
+            patch.object(update.shutil, "which", return_value="/usr/local/bin/uv"),
+            patch.object(update.Path, "is_file", return_value=True),
+            patch.object(
+                asyncio,
+                "create_subprocess_exec",
+                AsyncMock(return_value=_Process()),
+            ),
+        ):
+            started, reason = updater.start()
+            self.assertTrue(started, reason)
+            self.assertTrue(updater.launches_blocked)
+            assert updater._update_task is not None  # noqa: SLF001
+            await updater._update_task  # noqa: SLF001
+            assert updater._update_monitor_task is not None  # noqa: SLF001
+            await updater._update_monitor_task  # noqa: SLF001
+
+        self.assertEqual(updater._state, "error")  # noqa: SLF001
+        self.assertIn("before changing the host", updater._error or "")  # noqa: SLF001
+        self.assertFalse(updater.launches_blocked)
+        self.assertFalse(updater.maintenance_active)
+        # ``/api/host/restart`` and shutdown consult this; a soft failure must
+        # never gate them.
+        self.assertIsNone(updater.launch_block_reason())
+
+    async def test_failed_handoff_without_marker_still_stays_fail_closed(self) -> None:
+        # A prior transaction's barrier (inherited at start) is never cleared by
+        # a later attempt that merely failed early.
+        updater = _updater()
+        updater._inherited_launch_barrier = True  # noqa: SLF001
         status = Mock(
             returncode=0,
             stdout="LoadState=loaded\nActiveState=failed\nSubState=failed\n",
@@ -2252,12 +2560,55 @@ class SelfUpdaterShutdownTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(update, "_UPDATE_GUARD_MARKER", marker),
                 patch.object(update, "_UPDATE_MONITOR_INTERVAL_S", 0.0),
+                patch.object(update, "_durable_mutation_evidence", return_value=False),
             ):
                 await updater._monitor_update_worker("axol-update-test.service")  # noqa: SLF001
 
         self.assertEqual(updater._state, "error")  # noqa: SLF001
         self.assertTrue(updater.launches_blocked)
-        self.assertIn("worker stopped before replacing", updater._error or "")  # noqa: SLF001
+        self.assertIn("before changing the host", updater._error or "")  # noqa: SLF001
+
+    def test_durable_mutation_evidence_covers_every_installer_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "update-incomplete"
+            token = root / "update-start-once"
+            verifying = root / "update-verifying"
+            pending = root / "rollback" / "pending"
+            tool = root / "tools" / "almond-axol"
+            wrapper = root / "bin" / "axol"
+            tool.mkdir(parents=True)
+            wrapper.parent.mkdir()
+            wrapper.write_text("#!/bin/sh\n")
+            with (
+                patch.object(update, "_UPDATE_GUARD_MARKER", marker),
+                patch.object(update, "_UPDATE_START_TOKEN", token),
+                patch.object(update, "_UPDATE_VERIFYING_MARKER", verifying),
+                patch.object(update, "_PENDING_ROLLBACK", pending),
+                patch.object(update, "_MANAGED_TOOL_ENVIRONMENT", tool),
+                patch.object(update, "_MANAGED_AXOL_EXECUTABLE", str(wrapper)),
+            ):
+                # Untouched host: no transaction state, runtime in place.
+                self.assertFalse(update._durable_mutation_evidence())  # noqa: SLF001
+
+                for path in (marker, token, verifying):
+                    path.write_text("target-version=0.1.37\n")
+                    self.assertTrue(update._durable_mutation_evidence(), path)  # noqa: SLF001
+                    path.unlink()
+                # The recovery descriptor is published before bytes move.
+                pending.mkdir(parents=True)
+                self.assertTrue(update._durable_mutation_evidence())  # noqa: SLF001
+                pending.rmdir()
+                # A dangling symlink is still evidence.
+                marker.symlink_to(root / "nowhere")
+                self.assertTrue(update._durable_mutation_evidence())  # noqa: SLF001
+                marker.unlink()
+                # Retention moved the tool environment or removed the wrapper.
+                wrapper.unlink()
+                self.assertTrue(update._durable_mutation_evidence())  # noqa: SLF001
+                wrapper.write_text("#!/bin/sh\n")
+                tool.rmdir()
+                self.assertTrue(update._durable_mutation_evidence())  # noqa: SLF001
 
     async def test_failed_handoff_with_durable_marker_stays_fail_closed(self) -> None:
         updater = _updater()

@@ -395,15 +395,25 @@ class EncoderShutdownTest(unittest.TestCase):
                 self.assertTrue(encoder._episode_active)
                 self.assertEqual(encoder._cams, {"left": camera})
 
-    def test_concat_rejects_short_h264_stream_without_replaying_packet(self) -> None:
+    def test_concat_pads_short_h264_segment_to_its_advertised_count(self) -> None:
+        # A gst-muxed segment intermittently demuxes one sample short of its
+        # stsz count. Rejecting it lost the whole episode *after* its parquet
+        # rows were written; padding keeps frame-count == row-count and the
+        # imperfection stays confined to the trailing frame (the next segment
+        # begins with an IDR).
         in_stream = SimpleNamespace(type="video", frames=2)
-        packet = SimpleNamespace(
-            dts=0,
-            pts=0,
-            duration=1,
-            time_base=Fraction(1, 60),
-            stream=in_stream,
-        )
+
+        class _Packet:
+            dts = 0
+            pts = 0
+            duration = 1
+            time_base = Fraction(1, 60)
+            stream = in_stream
+
+            def __bytes__(self) -> bytes:
+                return b"last-picture"
+
+        packet = _Packet()
         source = SimpleNamespace(
             streams=[in_stream],
             demux=lambda _stream: [packet],
@@ -415,7 +425,8 @@ class EncoderShutdownTest(unittest.TestCase):
         source_context.__enter__.return_value = source
         destination_context = mock.MagicMock()
         destination_context.__enter__.return_value = destination
-        fake_av = SimpleNamespace(Packet=mock.Mock())
+        pad = mock.Mock()
+        fake_av = SimpleNamespace(Packet=mock.Mock(return_value=pad))
 
         def open_container(_path, *, mode):
             return destination_context if mode == "w" else source_context
@@ -424,7 +435,13 @@ class EncoderShutdownTest(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as directory,
             mock.patch.dict(sys.modules, {"av": fake_av}),
-            self.assertRaisesRegex(RuntimeError, "refusing to replay"),
+            mock.patch.object(
+                record_proc, "secure_atomic_copy_file", create=True
+            ) as copy_file,
+            mock.patch(
+                "almond_axol.utils.state_files.secure_atomic_copy_file", copy_file
+            ),
+            self.assertLogs(record_proc._logger, level="ERROR") as logs,
         ):
             record_proc._concat_constant_fps(
                 [Path(directory) / "short.mp4"],
@@ -432,8 +449,14 @@ class EncoderShutdownTest(unittest.TestCase):
                 Fraction(60, 1),
             )
 
-        destination.mux.assert_called_once_with(packet)
-        fake_av.Packet.assert_not_called()
+        self.assertEqual(
+            [c.args[0] for c in destination.mux.call_args_list], [packet, pad]
+        )
+        fake_av.Packet.assert_called_once_with(b"last-picture")
+        self.assertEqual(pad.pts, 1000)
+        self.assertEqual(pad.dts, 1000)
+        self.assertIn("demuxed 1 of 2 advertised samples", logs.output[0])
+        copy_file.assert_called_once()
 
     def test_encoded_capture_failure_is_discarded_before_save_reply(self) -> None:
         dataset = mock.Mock(num_episodes=0)
@@ -518,6 +541,89 @@ class EncoderShutdownTest(unittest.TestCase):
             ],
         )
         dataset.save_episode.assert_not_called()
+
+    def test_recorder_survives_a_failing_episode_discard(self) -> None:
+        # clear_episode_buffer cancels the streaming encoder, whose
+        # cancel_episode raises when a camera writer will not stop. That must
+        # come back as an error reply, not escape the command loop and kill the
+        # recorder (and with it the whole collection session).
+        dataset = mock.Mock(num_episodes=0)
+        dataset.clear_episode_buffer.side_effect = [
+            None,  # start_episode's defensive clear
+            RuntimeError("writer remains alive"),  # cancel_episode
+            None,  # the next start_episode recovers
+        ]
+        camera = mock.Mock()
+        conn = mock.Mock()
+        conn.recv.side_effect = [
+            ("start_episode", "test"),
+            ("cancel_episode",),
+            ("start_episode", "test"),
+            None,
+        ]
+        config = {
+            "log_level": "INFO",
+            "raw_meta": {
+                "left": {
+                    "transport": "gstshm-h264",
+                    "socket_path": "/tmp/left.sock",
+                    "width": 640,
+                    "height": 480,
+                    "fps": 60,
+                }
+            },
+            "snapshot_shm_name": "snapshot-test",
+            "obs_keys": [],
+            "action_keys": [],
+            "rerun_ip": None,
+            "dataset_root": "/tmp/unused-recorder-test",
+            "smooth_ee_hz": 0.0,
+            "fps": 60,
+        }
+
+        def idle_capture(**kwargs) -> None:
+            kwargs["stop_event"].wait(5.0)
+
+        with (
+            mock.patch(
+                "lerobot.processor.make_default_processors",
+                return_value=(None, None, mock.Mock()),
+            ),
+            mock.patch(
+                "almond_axol.video.shm_frames.EncodedAuReader",
+                return_value=camera,
+            ),
+            mock.patch(
+                "almond_axol.video.shm_frames.SnapshotReader",
+                return_value=mock.Mock(),
+            ),
+            mock.patch("almond_axol.utils.affinity.pin_background", return_value=True),
+            mock.patch.object(record_proc, "install_encoded_dataset_encoder"),
+            mock.patch.object(record_proc, "_open_dataset", return_value=dataset),
+            mock.patch.object(
+                record_proc, "_EpisodeVideoVerifier", return_value=mock.Mock()
+            ),
+            mock.patch.object(
+                record_proc, "run_encoded_capture_loop", side_effect=idle_capture
+            ),
+            mock.patch.object(record_proc, "_cleanup_recorder_session"),
+        ):
+            record_proc._recorder_main(conn, object(), config)
+
+        self.assertEqual(
+            conn.send.call_args_list,
+            [
+                mock.call(("ready", 0)),
+                mock.call(("started",)),
+                mock.call(
+                    (
+                        "error",
+                        "episode discard failed: RuntimeError: writer remains alive",
+                    )
+                ),
+                mock.call(("started",)),
+            ],
+        )
 
 
 if __name__ == "__main__":

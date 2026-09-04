@@ -20,6 +20,7 @@ from almond_axol.cli.tracker_bridge import run_configured_bridge
 from almond_axol.cli import tracker_identify
 from almond_axol.tracker import ultimate as tracker_ultimate
 from almond_axol.tracker.base import (
+    TRACKER_POSE_MAX_AGE_S,
     TrackerSourceError,
     zup_to_yup_pos,
     zup_to_yup_quat,
@@ -29,7 +30,7 @@ from almond_axol.tracker.bridge import (
     StopEventControls,
     TrackerBridge,
 )
-from almond_axol.tracker.survive import SurviveSource
+from almond_axol.tracker.survive import SurviveSource, _OutputClockMapper
 from almond_axol.tracker.ultimate import UltimateSource
 
 
@@ -458,6 +459,152 @@ class SurviveLifecycleTest(unittest.TestCase):
         poses = source.poses()
         self.assertAlmostEqual(poses["T20"].t, 13.03)
         self.assertAlmostEqual(poses["T21"].t, 12.03)
+        self.assertFalse(poses["T20"].timestamp_is_capture)
+
+    @staticmethod
+    def _survive_cli_stream(
+        *, samples: int, step_at: int, step_s: float, receipt_start: float = 11.0
+    ) -> tuple[list[float], list[float]]:
+        """100 Hz survive-cli stamps and the perf_counter receipt of each.
+
+        Pipe delay alternates 5 ms / 20 ms so the offset estimate has real
+        work to do. From ``step_at`` on, the wall clock that survive-cli's run
+        time is derived from has stepped by ``step_s``; perf_counter has not.
+        """
+        output_times = []
+        receipts = []
+        for k in range(samples):
+            output_times.append(1.0 + 0.01 * k + (step_s if k >= step_at else 0.0))
+            receipts.append(receipt_start + 0.01 * k + (0.005 if k % 2 else 0.02))
+        return output_times, receipts
+
+    def test_output_clock_mapper_recovers_from_backward_wall_clock_step(
+        self,
+    ) -> None:
+        output_times, receipts = self._survive_cli_stream(
+            samples=400, step_at=200, step_s=-0.5
+        )
+        mapper = _OutputClockMapper()
+        ages = [
+            receipt - mapper.map(output_time, receipt)
+            for output_time, receipt in zip(output_times, receipts)
+        ]
+
+        # Before the step the least-delayed samples (5 ms) map to receipt and
+        # the 20 ms ones are dated 15 ms earlier; nothing is in the future.
+        self.assertTrue(all(age >= 0.0 for age in ages))
+        self.assertAlmostEqual(ages[199], 0.0)
+        self.assertAlmostEqual(ages[198], 0.015)
+        # A running minimum would leave every later sample 0.5 s old. Here the
+        # persistent jump is confirmed as a clock step within the 0.5 s
+        # confirmation span (50 samples at 100 Hz), after which every sample is
+        # fresh again.
+        stale = [k for k, age in enumerate(ages) if age > TRACKER_POSE_MAX_AGE_S]
+        self.assertEqual(stale[0], 200)
+        self.assertEqual(stale, list(range(200, stale[-1] + 1)))
+        self.assertLessEqual(len(stale), 52)
+        self.assertAlmostEqual(ages[200], 0.515)
+        self.assertAlmostEqual(ages[201], 0.5)
+        recovered = stale[-1] + 1
+        self.assertAlmostEqual(ages[recovered], 0.0)
+        self.assertTrue(all(age <= 0.015 + 1e-9 for age in ages[recovered:]))
+
+    def test_output_clock_mapper_absorbs_forward_wall_clock_step(self) -> None:
+        output_times, receipts = self._survive_cli_stream(
+            samples=400, step_at=200, step_s=0.5
+        )
+        mapper = _OutputClockMapper()
+        ages = [
+            receipt - mapper.map(output_time, receipt)
+            for output_time, receipt in zip(output_times, receipts)
+        ]
+
+        # A forward step makes the stamps look fresher: the receipt clamp
+        # keeps them out of the future and the smaller offset wins at once.
+        self.assertTrue(all(0.0 <= age <= TRACKER_POSE_MAX_AGE_S for age in ages))
+        self.assertAlmostEqual(ages[200], 0.0)
+        self.assertAlmostEqual(ages[201], 0.0)
+        self.assertAlmostEqual(ages[202], 0.015)
+
+    def test_output_clock_mapper_window_expires_a_small_backward_step(self) -> None:
+        # A backward step below the reset threshold cannot be told apart from
+        # pipe delay, so it is not reset — but the windowed minimum forgets the
+        # pre-step offset within one window instead of keeping it forever.
+        output_times, receipts = self._survive_cli_stream(
+            samples=400, step_at=100, step_s=-0.1
+        )
+        mapper = _OutputClockMapper(window_s=1.0)
+        ages = [
+            receipt - mapper.map(output_time, receipt)
+            for output_time, receipt in zip(output_times, receipts)
+        ]
+
+        self.assertAlmostEqual(ages[101], 0.1)
+        self.assertAlmostEqual(ages[201], 0.0)
+        self.assertTrue(all(age < 0.02 for age in ages[201:]))
+
+    def test_output_clock_mapper_keeps_a_pipe_stall_stale(self) -> None:
+        # One late line followed by its buffered successors is a stall, not a
+        # step: the stalled samples stay labelled old and the offset holds.
+        mapper = _OutputClockMapper()
+        self.assertAlmostEqual(mapper.map(1.00, 11.005), 11.005)
+        self.assertAlmostEqual(mapper.map(1.01, 11.015), 11.015)
+        self.assertAlmostEqual(mapper.map(1.02, 11.225), 11.025)  # 200 ms late
+        self.assertAlmostEqual(mapper.map(1.03, 11.226), 11.035)  # burst
+        self.assertAlmostEqual(mapper.map(1.04, 11.227), 11.045)
+        self.assertAlmostEqual(mapper.map(1.05, 11.055), 11.055)  # caught up
+        self.assertAlmostEqual(mapper.offset, 10.005)
+
+    def test_output_clock_mapper_labels_unusable_stamps_at_receipt(self) -> None:
+        mapper = _OutputClockMapper()
+        self.assertEqual(mapper.map(float("nan"), 5.0), 5.0)
+        self.assertEqual(mapper.map(-1.0, 6.0), 6.0)
+        self.assertIsNone(mapper.offset)
+        self.assertEqual(mapper.map(2.0, 7.0), 7.0)
+        self.assertEqual(mapper.offset, 5.0)
+
+    def test_survive_cli_poses_recover_after_backward_wall_clock_step(self) -> None:
+        source = SurviveSource()
+        source._cli_executable = Path("/attested/survive-cli")
+        output_times, receipts = self._survive_cli_stream(
+            samples=120, step_at=30, step_s=-0.5
+        )
+
+        def lines():  # type: ignore[no-untyped-def]
+            for k, output_time in enumerate(output_times):
+                yield f"{output_time:.3f} T2{k % 2} POSE 0 0 0 1 0 0 0\n"
+            source._stop.set()
+
+        process = SimpleNamespace(stdout=lines(), poll=lambda: 0)
+        with (
+            patch(
+                "almond_axol.tracker.survive.subprocess.Popen",
+                return_value=process,
+            ),
+            patch(
+                "almond_axol.tracker.survive.time.perf_counter",
+                side_effect=receipts,
+            ),
+            patch.object(source, "_publish", wraps=source._publish) as publish,
+        ):
+            source._run_cli()
+
+        published = [
+            receipt - call.kwargs["timestamp"]
+            for receipt, call in zip(receipts, publish.call_args_list)
+        ]
+        self.assertEqual(len(published), 120)
+        stale = [k for k, age in enumerate(published) if age > TRACKER_POSE_MAX_AGE_S]
+        # Stale only during the step confirmation span right after the step,
+        # then fresh for good — a running minimum would keep every later
+        # sample 0.5 s old until survive-cli restarted.
+        self.assertEqual(stale[0], 30)
+        self.assertEqual(stale, list(range(30, stale[-1] + 1)))
+        self.assertLessEqual(len(stale), 52)
+        self.assertTrue(all(age <= 0.015 + 1e-9 for age in published[stale[-1] + 1 :]))
+        poses = source.poses()
+        self.assertLessEqual(receipts[-1] - poses["T20"].t, TRACKER_POSE_MAX_AGE_S)
+        self.assertLessEqual(receipts[-1] - poses["T21"].t, TRACKER_POSE_MAX_AGE_S)
         self.assertFalse(poses["T20"].timestamp_is_capture)
 
     def test_start_selects_only_manifest_attested_cli(self) -> None:

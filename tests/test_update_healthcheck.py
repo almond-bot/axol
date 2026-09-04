@@ -1,12 +1,32 @@
 from __future__ import annotations
 
+import re
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 from almond_axol.cli import update_healthcheck
 
 
 class UpdateHealthcheckTest(unittest.TestCase):
+    def test_cold_candidate_dwell_fits_inside_the_service_start_timeout(self) -> None:
+        # A first boot imports torch/lerobot and the camera stack before it can
+        # answer /api/health; 45s was not enough on a Jetson.
+        self.assertGreaterEqual(update_healthcheck._HEALTH_TIMEOUT_S, 120.0)  # noqa: SLF001
+
+        installer = (
+            Path(__file__).resolve().parents[1] / "web" / "app" / "public" / "install"
+        ).read_text()
+        unit_start = installer.index("Description=Axol control panel (axol serve)")
+        unit_end = installer.index("\nEOF\n", unit_start)
+        unit = installer[unit_start:unit_end]
+        self.assertIn("ExecStartPost=${BIN_DIR}/axol update-healthcheck", unit)
+        match = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
+        self.assertIsNotNone(match, "the unit must not rely on systemd's 90s default")
+        assert match is not None
+        # ExecStartPost is part of the start job; leave headroom for ExecStartPre.
+        self.assertGreater(int(match.group(1)), update_healthcheck._HEALTH_TIMEOUT_S)  # noqa: SLF001
+
     def test_ordinary_start_without_candidate_state_is_a_noop(self) -> None:
         read = Mock(return_value=None)
         with (

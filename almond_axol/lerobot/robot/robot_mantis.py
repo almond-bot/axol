@@ -61,6 +61,16 @@ class MantisRobot(AxolRobot):
             defer_gripper_enable=self._defer_gripper_enable,
         )
 
+    async def open_grippers_async(self) -> None:
+        """Open both grippers fully, then release torque (pre-record prep).
+
+        See :meth:`~almond_axol.robot.mantis.Mantis.open_grippers`: this also
+        performs the one-time hard-stop calibration, so the later
+        :meth:`enable_grippers_async` at take start is immediate.
+        """
+        assert isinstance(self._axol, Mantis), "connect() first"
+        await self._axol.open_grippers()
+
     async def enable_grippers_async(self) -> None:
         """Enable and, on first use, calibrate both Mantis grippers."""
         assert isinstance(self._axol, Mantis), "connect() first"

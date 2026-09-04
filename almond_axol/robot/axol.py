@@ -1576,10 +1576,16 @@ class Axol(RobotBase):
         # particular, never close either bus after an unverified motor disable:
         # retaining both transports is the only way to retry safely.
         self._shutdown_pending = False
+        # True only after disable() has verified an arm-wide torque-off. A
+        # failed enable() never sets it: its rollback covers only the motors
+        # that transaction brought up, while disable() is the documented
+        # torque-off for every motor on both arms — including joints left
+        # holding by a previous session that the failed enable() attached to.
         self._motors_disabled = False
-        # A failed coordinated enable retries only the entry-cold motors that
-        # did not confirm rollback. Entry-held motors must never be swept into
-        # the ordinary arm-wide disable path merely because their peer failed.
+        # Entry-cold motors of a failed coordinated enable that did not
+        # confirm rollback. While set, the robot is in shutdown-pending state:
+        # connect()/enable()/disconnect() refuse until disable() verifies
+        # torque-off (arm-wide, which covers these motors) and clears it.
         self._startup_rollback_pending: list[tuple[str, Motor]] | None = None
 
     # ------------------------------------------------------------------ #
@@ -1672,6 +1678,10 @@ class Axol(RobotBase):
         details and failure modes.
         """
         await self.connect()
+        # From here on motor state is no longer known to be off: the robot may
+        # already be holding from a previous session and this call may bring
+        # more joints up. Only a verified disable() sets the flag again.
+        self._motors_disabled = False
 
         arms = [
             (side, arm)
@@ -1688,9 +1698,10 @@ class Axol(RobotBase):
         prepared: list[tuple[str, AxolArm, list[Joint], list[Joint]]] = []
         for (side, arm), result in zip(arms, prepared_results):
             if isinstance(result, BaseException):
-                # No arm has actuated yet. A later disconnect should close
-                # transports without disabling motors that predated this call.
-                self._motors_disabled = True
+                # No arm has actuated yet, so there is nothing to roll back.
+                # Motor state is left exactly as found: disconnect() keeps any
+                # pre-existing hold, while disable() still torques off every
+                # motor on both arms as documented.
                 raise result
             held, cold = result
             prepared.append((side, arm, held, cold))
@@ -1722,22 +1733,21 @@ class Axol(RobotBase):
                             f"{type(state_error).__name__}: {state_error}"
                         )
             if cleanup_failures:
-                # Retain both buses and block another enable until disable()
-                # retries torque-off for the uncertain motor set.
+                # Retain both buses and block another enable/disconnect until
+                # disable() verifies torque-off for the uncertain motor set.
                 self._startup_rollback_pending = [
                     (label, motor) for label, motor, _ in cleanup_failures
                 ]
                 self._shutdown_pending = True
-                self._motors_disabled = False
             else:
-                # All entry-cold motors are off. Mark the motor phase complete
-                # so a caller's cleanup closes buses without disabling the
-                # pre-held motors that this failed transaction did not own.
+                # All entry-cold motors are off; the pre-held motors keep
+                # holding. Nothing is marked disabled: only this transaction's
+                # own motors were rolled back, so a caller's disable() must
+                # still torque off both arms in full rather than merely close
+                # the buses and abandon the held joints.
                 self._startup_rollback_pending = None
-                self._motors_disabled = True
             raise
         self._startup_rollback_pending = None
-        self._motors_disabled = False
 
     async def disconnect(self) -> None:
         """Close the CAN buses, leaving motor torque exactly as it is.
@@ -1782,6 +1792,13 @@ class Axol(RobotBase):
     async def disable(self) -> None:
         """Disable every motor, then close both CAN buses.
 
+        This is the torque-off for every motor on both arms, unconditionally —
+        including joints that were already holding from a previous session
+        and joints whose bring-up failed part-way through :meth:`enable`. A
+        failed ``enable()`` only rolls back the motors it brought up itself,
+        so a caller's cleanup must reach here to leave no arm torqued with
+        nobody supervising it. Use :meth:`disconnect` to keep a hold instead.
+
         If any arm cannot verify torque-off, both buses remain open so the
         caller can retry.  Once torque-off has been verified, a close failure
         is likewise retained and retryable without sending motor commands over
@@ -1801,31 +1818,11 @@ class Axol(RobotBase):
         ]
 
         motor_failures: list[BaseException] = []
-        startup_pending = getattr(self, "_startup_rollback_pending", None)
-        if startup_pending:
-            # This is cleanup for an enable transaction that never committed.
-            # Retry only its uncertain entry-cold motors; arm-wide disable
-            # would incorrectly drop motors that were already holding before
-            # the failed startup.
-            pending_results = await asyncio.gather(
-                *(motor.disable() for _, motor in startup_pending),
-                return_exceptions=True,
-            )
-            pending_failures = [
-                (label, motor, result)
-                for (label, motor), result in zip(startup_pending, pending_results)
-                if isinstance(result, BaseException)
-            ]
-            if pending_failures:
-                self._startup_rollback_pending = [
-                    (label, motor) for label, motor, _ in pending_failures
-                ]
-                motor_failures = [failure for _, _, failure in pending_failures]
-            else:
-                self._startup_rollback_pending = None
-                self._motors_disabled = True
-
-        elif not self._motors_disabled:
+        if not self._motors_disabled:
+            # Arm-wide torque-off. This also covers the entry-cold motors of a
+            # failed enable() whose rollback did not confirm
+            # (_startup_rollback_pending): every motor on each arm is
+            # commanded, so a verified pass here settles them too.
             tasks = []
             if self.left is not None:
                 tasks.append(self.left.disable())
@@ -1837,6 +1834,14 @@ class Axol(RobotBase):
             ]
             if not motor_failures:
                 self._motors_disabled = True
+                self._startup_rollback_pending = None
+            else:
+                startup_pending = getattr(self, "_startup_rollback_pending", None)
+                if startup_pending:
+                    labels = ", ".join(label for label, _ in startup_pending)
+                    motor_failures[0].add_note(
+                        f"startup rollback is still unconfirmed for: {labels}"
+                    )
 
         if motor_failures:
             if telemetry_failures:

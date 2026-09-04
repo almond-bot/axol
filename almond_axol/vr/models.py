@@ -97,6 +97,14 @@ class VRFrame(BaseModel):
             transition. ``None`` keeps the legacy controller behavior (success
             unless ``reset`` requests re-recording); tracker trigger gestures
             set this explicitly so failure remains distinct from re-record.
+        episode_end_t_host: Host ``time.perf_counter`` instant (seconds) at
+            which a saved episode's data should end, sent alongside a
+            successful ``episode_outcome``. A local tracker bridge sets it to
+            the moment the operator *began* the end gesture (the first of the
+            three trigger clicks) so the collector can trim the rows captured
+            after it — otherwise the clicks, and the gripper commands they
+            are, would close every saved take. ``None`` keeps every row (Quest
+            and older clients).
         lock_release_id: Internal managed-tracker handshake. When set on a
             frame whose lock bits are both false, the teleop core echoes the
             identifier after it has consumed that release. This lets the
@@ -176,6 +184,7 @@ class VRFrame(BaseModel):
     reset: bool = False
     state: VRState = VRState.TELEOP
     episode_outcome: VREpisodeOutcome | None = None
+    episode_end_t_host: FiniteFloat | None = None
     lock_release_id: int | None = None
     t: FiniteFloat | None = None
     seq: int | None = None

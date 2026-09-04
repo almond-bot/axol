@@ -104,7 +104,7 @@ Complete the matching [Mantis teleop acceptance](/operations/teleop#mantis-teleo
   <Step title="Record with the source-appropriate control">
     Quest uses **A** (or the panel's **Start recording**). With managed Lighthouse/Ultimate, hold the rigs where you want the take to begin, **squeeze both rig triggers together, then release both**. That one gesture fits the world→robot base transform at the rigs' current pose, engages tracking, and — once the teleop core acknowledges the engage — starts the take. The physical grippers enable only for the take and are force-disabled again after every save, discard, stop, or error. A triple press while idle does nothing; the panel's **Start recording** still requires an engaged rig.
 
-    While recording, rapidly fully squeeze and release either trigger **three times** to end and save, or **four times** to end and discard (the same outcome as the panel's **Discard episode**). Three presses resolve after a short pause so a fourth can still select discard.
+    While recording, rapidly fully squeeze and release either trigger — or both together — **three times** to end and save, or **four times** to end and discard (the same outcome as the panel's **Discard episode**). Three presses resolve after a short pause so a fourth can still select discard. The saved episode ends where the first of the three squeezes *began* — the rows captured during the clicks are trimmed before the save, so the gesture leaves no trace in the data.
   </Step>
 
   <Step title="Treat any tracking/input break as a failed take">
@@ -200,7 +200,7 @@ The controller stays live the whole time — the panel is a parallel input, and 
 </Note>
 
 <Note>
-  **Saved takes are integrity-checked.** If the camera encoder drops frames during a take (a feed-queue overflow under heavy load), the video no longer lines up with its recorded rows — so that episode is **discarded instead of saved**, with an error explaining why (in the CLI output / control panel log console). Re-record it rather than adding a misaligned episode to the dataset.
+  **Saved takes are integrity-checked.** If the camera encoder drops frames during a take (a feed-queue overflow under heavy load), the video no longer lines up with its recorded rows — so that episode is **discarded instead of saved**, with an error explaining why (in the CLI output / control panel log console). The session stays up — the next take starts as usual — so re-record it rather than adding a misaligned episode to the dataset.
 </Note>
 
 <Note>

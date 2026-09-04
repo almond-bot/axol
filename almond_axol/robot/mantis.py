@@ -39,6 +39,15 @@ _logger = logging.getLogger(__name__)
 
 _N_ARM = len(ARM_JOINTS)
 _DEFAULT_GRIPPER_POSITION = 1.0
+# ``open_fully`` accepts the jaws as "all the way open" from this normalised
+# position (1.0 is the calibrated hard-stop, which the motor holds against
+# with a torque cap, so feedback settles just short of it).
+_FULLY_OPEN_MIN = 0.95
+# How long the jaws get to reach the open stop once commanded. Right after the
+# calibration sweep they are already there; a cold gripper travels the full
+# 290 deg at ``PositionForceConfig.max_speed`` well inside this.
+_OPEN_FULLY_TIMEOUT_S = 5.0
+_OPEN_FULLY_POLL_S = 0.02
 
 
 class MantisGripperArm:
@@ -221,6 +230,41 @@ class MantisGripperArm:
         if not self._enabled:
             return
         await self._send_gripper_target()
+
+    def preset_open_target(self) -> None:
+        """Latch "fully open" as the target the next :meth:`enable` commands.
+
+        The virtual arm joints are untouched; only the gripper target changes,
+        so a stale trigger value latched before enable cannot be what the jaws
+        move to when torque comes on.
+        """
+        self._gripper_target = _DEFAULT_GRIPPER_POSITION
+
+    async def open_fully(self, *, timeout: float = _OPEN_FULLY_TIMEOUT_S) -> None:
+        """Command the jaws fully open and wait for feedback to confirm it.
+
+        Requires :meth:`enable` (so the hard-stop mapping exists and torque is
+        on). Raises :class:`MotorError` if the motor is not enabled or the jaws
+        do not reach ``_FULLY_OPEN_MIN`` within ``timeout`` seconds.
+        """
+        if not self._enabled or not self._calibrated:
+            raise MotorError("Mantis gripper must be enabled before opening it")
+        self._gripper_target = _DEFAULT_GRIPPER_POSITION
+        await self._send_gripper_target()
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        opening = 0.0
+        while True:
+            opening = float((await self.get_positions())[_N_ARM])
+            if opening >= _FULLY_OPEN_MIN:
+                return
+            if loop.time() >= deadline:
+                raise MotorError(
+                    "Mantis gripper did not open all the way within "
+                    f"{timeout:.1f}s (reached {opening:.2f} of 1.0); check that "
+                    "nothing is between the jaws and that the motor is powered"
+                )
+            await asyncio.sleep(_OPEN_FULLY_POLL_S)
 
     async def _send_gripper_target(self) -> None:
         raw = self._closed_pos + self._gripper_target * (
@@ -426,13 +470,49 @@ class Mantis(RobotBase):
     async def disable_grippers(self) -> None:
         """Force-disable both grippers while keeping buses and calibration."""
         async with self._lifecycle_lock:
+            await self._disable_grippers_unlocked()
+
+    async def _disable_grippers_unlocked(self) -> None:
+        arms = [a for a in (self.left, self.right) if a is not None]
+        results = await asyncio.gather(
+            *[a.force_disable() for a in arms], return_exceptions=True
+        )
+        failures = [r for r in results if isinstance(r, BaseException)]
+        if failures:
+            raise failures[0]
+
+    async def open_grippers(self) -> None:
+        """Open both grippers all the way, then release their torque.
+
+        One autonomous move for the pre-record phase of a collection: enable
+        both grippers (the first activation runs the hard-stop calibration
+        sweep, which is what physically drives the jaws open), command "fully
+        open", wait for feedback to confirm it, then force-disable. Afterwards
+        the jaws sit wide open with no torque, the calibration is retained, and
+        the first take's :meth:`enable_grippers` skips the sweep -- so the
+        gripper is already at its open pose when the first episode's rows are
+        written instead of finishing its sweep in-shot.
+
+        A failure at any step force-disables both grippers before it
+        propagates; an unconfirmed torque-off is marked hardware-uncertain the
+        same way a failed :meth:`enable_grippers` is.
+        """
+        async with self._lifecycle_lock:
+            await self._connect_unlocked()
             arms = [a for a in (self.left, self.right) if a is not None]
-            results = await asyncio.gather(
-                *[a.force_disable() for a in arms], return_exceptions=True
-            )
-            failures = [r for r in results if isinstance(r, BaseException)]
-            if failures:
-                raise failures[0]
+            for arm in arms:
+                arm.preset_open_target()
+            try:
+                await self._enable_grippers_unlocked()
+                await _await_all_hardware_actions(*(arm.open_fully() for arm in arms))
+            except BaseException as open_error:
+                # Covers cancellation mid-sweep too (a Stop during the
+                # pre-record prep): force torque off before unwinding.
+                await self._rollback_gripper_enable(
+                    arms, open_error, context="gripper pre-open"
+                )
+                raise
+            await self._disable_grippers_unlocked()
 
     async def disable(self) -> None:
         """Disable both grippers and close both buses, or report uncertainty.

@@ -1678,6 +1678,9 @@ def _run(
             reset_controller.stop,
             requires_control_exit=False,
         )
+        # Close the relay's raw/dataset branch before any reader detaches (a
+        # session error mid-episode leaves it open; see collect_data).
+        _cleanup("video relay raw branch", lambda: relay.set_raw_enabled(False))
         # Recorder owns the dataset: finalize (and empty-dataset cleanup)
         # happen in recorder.close(). Shut the relay down after it so the
         # recorder's shm readers never outlive their blocks.

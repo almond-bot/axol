@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
+  controlDisconnectRearmDelay,
   controlPeerNeedsRetry,
   controlRequestIsDue,
   retireCurrentControlPeer,
@@ -13,12 +14,38 @@ test("a missing control offer is retried until one is seen", () => {
   assert.equal(controlRequestIsDue(true, 1_000, 10_000, 3_000), false)
 })
 
-test("closed data channels and terminal peer states require a retry", () => {
-  for (const state of ["disconnected", "failed", "closed"]) {
+test("a failed negotiation backs off instead of re-requesting on the next tick", () => {
+  // rearmPeer/rearmSocket zero lastRequestAt but set notBefore = failure time +
+  // backoff, so a fast deterministic failure can't loop every 300 ms.
+  const failedAt = 5_000
+  const notBefore = failedAt + 3_000
+  assert.equal(controlRequestIsDue(false, 0, failedAt + 300, 3_000, notBefore), false)
+  assert.equal(controlRequestIsDue(false, 0, notBefore - 1, 3_000, notBefore), false)
+  assert.equal(controlRequestIsDue(false, 0, notBefore, 3_000, notBefore), true)
+  // A socket swap clears the backoff so a fresh socket requests immediately.
+  assert.equal(controlRequestIsDue(false, 0, failedAt + 300, 3_000, 0), true)
+  // An offer landing cancels the request regardless of the backoff.
+  assert.equal(controlRequestIsDue(true, 0, notBefore + 1, 3_000, notBefore), false)
+})
+
+test("only terminal peer states require an immediate retry", () => {
+  for (const state of ["failed", "closed"]) {
     assert.equal(controlPeerNeedsRetry(state), true, state)
   }
-  for (const state of ["new", "connecting", "connected"]) {
+  // "disconnected" is transient and gets a grace period instead.
+  for (const state of ["new", "connecting", "connected", "disconnected"]) {
     assert.equal(controlPeerNeedsRetry(state), false, state)
+  }
+})
+
+test("a disconnected control peer is re-armed only once its grace elapses", () => {
+  const disconnectedAt = 10_000
+  assert.equal(controlDisconnectRearmDelay("disconnected", disconnectedAt, 10_000, 3_000), 3_000)
+  assert.equal(controlDisconnectRearmDelay("disconnected", disconnectedAt, 12_000, 3_000), 1_000)
+  assert.equal(controlDisconnectRearmDelay("disconnected", disconnectedAt, 13_000, 3_000), 0)
+  assert.equal(controlDisconnectRearmDelay("disconnected", disconnectedAt, 30_000, 3_000), 0)
+  for (const state of ["connected", "completed", "connecting", "new", "failed", "closed"]) {
+    assert.equal(controlDisconnectRearmDelay(state, disconnectedAt, 13_000, 3_000), null, state)
   }
 })
 

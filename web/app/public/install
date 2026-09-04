@@ -818,6 +818,15 @@ reject_candidate_after_health_failure() {
         "$1" "Axol $1 did not pass its one-shot service health check"
 }
 
+# The new runtime is installed but its host provisioning (or the opted-in
+# Ultimate runtime restore) failed before the candidate was ever started. Treat
+# it exactly like a failed health check: block the candidate, keep the pending
+# rollback, and print the restore command instead of a bare die.
+reject_candidate_after_provision_failure() {
+    reject_candidate_after_failure \
+        "$1" "Axol $1 was installed, but $2 failed before its service could start"
+}
+
 mantis_service_is_stable() {
     local stable_pid=""
     local stable_samples=0
@@ -1766,7 +1775,13 @@ chmod 0644 "${GUARD_TMP}"
 durable_replace "${GUARD_TMP}" "${UPDATE_GUARD_FILE}"
 GUARD_TMP=""
 MANTIS_GUARD_TMP="$(mktemp "${MANTIS_UPDATE_GUARD_DIR}/.20-update-guard.XXXXXX")"
-printf '[Unit]\nConditionPathExists=|!%s\nConditionPathExists=|%s\n\n[Service]\nExecStartPre=/usr/bin/rm -f -- %s\n' \
+# Shared with almond_axol.serve.update. The empty assignment resets the unit
+# body's own condition list: an older body carries a non-triggering
+# `ConditionPathExists=!marker` that systemd would AND with the triggering `|`
+# group, so the one-shot token could never admit a start while the marker is
+# armed. The helper runs as the operator while /run/almond-axol is root-only,
+# so the token consume runs with full privileges (`+`).
+printf '[Unit]\nConditionPathExists=\nConditionPathExists=|!%s\nConditionPathExists=|%s\n\n[Service]\nExecStartPre=+/usr/bin/rm -f -- %s\n' \
     "${UPDATE_MARKER}" "${MANTIS_START_TOKEN}" "${MANTIS_START_TOKEN}" \
     > "${MANTIS_GUARD_TMP}"
 chown root:root "${MANTIS_GUARD_TMP}"
@@ -1913,7 +1928,7 @@ REBOOT_REQUIRED=0
 if grep -q "REBOOT REQUIRED" "${PROVISION_LOG}"; then REBOOT_REQUIRED=1; fi
 rm -f "${PROVISION_LOG}"
 if [ "${PROVISION_STATUS}" -ne 0 ]; then
-    die "Axol was updated, but provisioning failed. The service remains blocked and disabled; repair the reported host dependencies and rerun this installer."
+    reject_candidate_after_provision_failure "${VERSION}" "system provisioning"
 fi
 
 # Verify with the newly installed CLI, which repairs system dependencies and
@@ -1922,7 +1937,7 @@ fi
 if [ "${ULTIMATE_PRESERVED}" -eq 1 ]; then
     say "Verifying the preserved VIVE Ultimate runtime..."
     "${AXOL}" tracker.ultimate.install \
-        || die "Axol was updated, but VIVE Ultimate restore failed. The service remains blocked and disabled; repair the runtime and rerun this installer."
+        || reject_candidate_after_provision_failure "${VERSION}" "the VIVE Ultimate runtime restore"
 fi
 
 # -- Quest-over-USB operator access -------------------------------------------
@@ -2156,6 +2171,10 @@ ExecStart=${BIN_DIR}/axol serve
 # the installer retains the durable marker through Mantis verification. On an
 # ordinary start with no candidate marker it is an immediate no-op.
 ExecStartPost=${BIN_DIR}/axol update-healthcheck
+# The start job spans ExecStartPre (clock pinning) and the ExecStartPost health
+# dwell, which gives a cold candidate up to 120s to answer. systemd's default
+# 90s would kill a slow but healthy first boot before the verifier finished.
+TimeoutStartSec=180
 Restart=always
 RestartSec=3
 # A stop during a recording session must outlive the serve layer's dataset

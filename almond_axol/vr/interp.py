@@ -908,6 +908,7 @@ def _build_frame(
         reset=latest.reset,
         state=latest.state,
         episode_outcome=latest.episode_outcome,
+        episode_end_t_host=latest.episode_end_t_host,
         lock_release_id=latest.lock_release_id,
         t=(play * 1000.0) if play is not None else latest.t,
         seq=latest.seq,
@@ -970,6 +971,7 @@ def _same_control(a: VRFrame, b: VRFrame) -> bool:
         and a.reset == b.reset
         and a.state == b.state
         and a.episode_outcome == b.episode_outcome
+        and a.episode_end_t_host == b.episode_end_t_host
         and a.lock_release_id == b.lock_release_id
         and a.pose_source_id == b.pose_source_id
         and a.pose_source_kind == b.pose_source_kind

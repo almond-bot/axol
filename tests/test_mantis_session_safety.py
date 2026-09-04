@@ -41,9 +41,12 @@ class MantisSessionSafetyTest(unittest.TestCase):
         self.assertIn("User=operator\n", unit)
         self.assertIn("Wants=axol.service\n", unit)
         self.assertIn("After=network-online.target axol.service\n", unit)
+        # Triggering (``|``) so the updater's one-shot token drop-in can admit a
+        # start; a non-triggering condition is ANDed with that OR group.
         self.assertIn(
-            "ConditionPathExists=!/var/lib/almond-axol/update-incomplete\n", unit
+            "ConditionPathExists=|!/var/lib/almond-axol/update-incomplete\n", unit
         )
+        self.assertNotIn("ConditionPathExists=!", unit)
 
     def test_retired_service_shutdown_failure_keeps_definition(self) -> None:
         for failed_action in ("stop", "disable"):

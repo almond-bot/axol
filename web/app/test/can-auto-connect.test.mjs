@@ -12,8 +12,12 @@ import {
   chooseAutoConnectTarget,
   chooseDiagnosticsAutoConnectProfile,
   chooseUnambiguousAutoConnectProfile,
+  claimCanInventoryPollResponse,
+  issueCanInventoryPoll,
+  newCanInventoryPollSequence,
   nextAutoConnectAttempt,
   shouldStartCanDiscovery,
+  voidCanInventoryPolls,
 } from "../src/lib/can-auto-connect.ts"
 import {
   ApiRequestError,
@@ -316,4 +320,48 @@ test("robot connect identifies automatic and manual requests to the backend", as
       },
     },
   ])
+})
+
+test("a slow CAN inventory response still applies when a newer poll has been issued", () => {
+  // Fixed 2 s poll interval, endpoint taking ~5 s: three requests are in
+  // flight before the first response lands. The old "must be the newest
+  // request" guard dropped every one of them forever.
+  const sequence = newCanInventoryPollSequence()
+  const first = issueCanInventoryPoll(sequence)
+  const second = issueCanInventoryPoll(sequence)
+  const third = issueCanInventoryPoll(sequence)
+
+  assert.equal(claimCanInventoryPollResponse(sequence, first), true)
+  assert.equal(claimCanInventoryPollResponse(sequence, second), true)
+  assert.equal(claimCanInventoryPollResponse(sequence, third), true)
+})
+
+test("a CAN inventory response older than the last applied one is dropped", () => {
+  const sequence = newCanInventoryPollSequence()
+  const first = issueCanInventoryPoll(sequence)
+  const second = issueCanInventoryPoll(sequence)
+
+  // Responses arrive out of order: the newer lands first and wins.
+  assert.equal(claimCanInventoryPollResponse(sequence, second), true)
+  assert.equal(claimCanInventoryPollResponse(sequence, first), false)
+  // A response is applied at most once.
+  assert.equal(claimCanInventoryPollResponse(sequence, second), false)
+
+  // The next poll is unaffected.
+  const third = issueCanInventoryPoll(sequence)
+  assert.equal(claimCanInventoryPollResponse(sequence, third), true)
+})
+
+test("voiding CAN inventory polls drops every in-flight response but not later ones", () => {
+  const sequence = newCanInventoryPollSequence()
+  const first = issueCanInventoryPoll(sequence)
+  const second = issueCanInventoryPoll(sequence)
+
+  // Disconnect / host change: nothing outstanding may repopulate state.
+  voidCanInventoryPolls(sequence)
+  assert.equal(claimCanInventoryPollResponse(sequence, first), false)
+  assert.equal(claimCanInventoryPollResponse(sequence, second), false)
+
+  const third = issueCanInventoryPoll(sequence)
+  assert.equal(claimCanInventoryPollResponse(sequence, third), true)
 })

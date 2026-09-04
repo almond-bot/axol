@@ -29,12 +29,14 @@ class EncodedCaptureTimestampTest(unittest.TestCase):
         stop = threading.Event()
         errors: list[str] = []
         frame_counter = {"n": 0}
+        row_times: list[float] = []
 
         class Camera:
             def __init__(self, name: str) -> None:
                 self.name = name
                 self.reads = 0
                 self.flushes = 0
+                self.disarms = 0
 
             @property
             def pending(self) -> int:
@@ -43,11 +45,14 @@ class EncodedCaptureTimestampTest(unittest.TestCase):
             def flush(self) -> None:
                 self.flushes += 1
 
+            def disarm(self) -> None:
+                self.disarms += 1
+
             def read_next_au(self, *, timeout_ms: float) -> tuple[bytes, float]:
                 del timeout_ms
                 self.reads += 1
                 if self.reads == 1:
-                    return f"{self.name}-idr".encode(), time.perf_counter()
+                    return f"{self.name}-idr".encode(), 1000.0 + len(self.name)
                 if self.name == "left":
                     left_second_popped.set()
                     return b"left-p-frame", time.perf_counter()
@@ -90,6 +95,7 @@ class EncodedCaptureTimestampTest(unittest.TestCase):
                     "stop_event": stop,
                     "frame_counter": frame_counter,
                     "on_error": errors.append,
+                    "row_times": row_times,
                 },
                 daemon=True,
             )
@@ -111,10 +117,13 @@ class EncodedCaptureTimestampTest(unittest.TestCase):
         self.assertFalse(capture.is_alive())
         dataset.add_frame.assert_not_called()
         self.assertEqual(frame_counter["n"], 1)
+        # One capture time per appended row: the row's freshest camera AU.
+        self.assertEqual(row_times, [1005.0])
         self.assertEqual(left.reads, 2)
         self.assertEqual(right.reads, 2)
-        self.assertEqual(left.flushes, 2)
-        self.assertEqual(right.flushes, 2)
+        # Armed once at episode start, parked once when the failed loop exits.
+        self.assertEqual((left.flushes, left.disarms), (1, 1))
+        self.assertEqual((right.flushes, right.disarms), (1, 1))
         self.assertEqual(len(errors), 1)
         self.assertIn("'right'", errors[0])
         self.assertIn("after capture was primed", errors[0])
@@ -126,6 +135,7 @@ class EncodedCaptureTimestampTest(unittest.TestCase):
         class Camera:
             def __init__(self) -> None:
                 self.flushes = 0
+                self.disarms = 0
 
             @property
             def pending(self) -> int:
@@ -133,6 +143,9 @@ class EncodedCaptureTimestampTest(unittest.TestCase):
 
             def flush(self) -> None:
                 self.flushes += 1
+
+            def disarm(self) -> None:
+                self.disarms += 1
 
             def read_next_au(self, *, timeout_ms: float) -> tuple[bytes, float]:
                 del timeout_ms
@@ -162,7 +175,7 @@ class EncodedCaptureTimestampTest(unittest.TestCase):
             )
 
         self.assertEqual(errors, ["dataset writer exited"])
-        self.assertEqual(camera.flushes, 2)
+        self.assertEqual((camera.flushes, camera.disarms), (1, 1))
 
     def test_valid_pipeline_latency_is_subtracted_from_receive_time(self) -> None:
         self.assertAlmostEqual(_capture_perf_from_receive(123.5, 0.037), 123.463)
@@ -271,7 +284,12 @@ class EncodedCaptureTimestampTest(unittest.TestCase):
         self.assertIn("! application/x-gdp ! gdpdepay ! h264parse", pipeline)
         self.assertEqual(reader._pts_origin_perf, 8_765.25)
 
-    def test_reader_rejects_mid_episode_discontinuity_but_not_first_au(self) -> None:
+    def test_reader_keeps_mid_episode_discontinuity_and_warns_once(self) -> None:
+        # The relay's leaky queue sits *upstream* of the dataset encoder, so a
+        # frame it sheds under load marks the next buffer DISCONT while the
+        # H.264 reference chain stays intact. That used to abort the take; it
+        # must only warn (rate-limited) and keep the picture. The keyframe-gap
+        # guard remains the bitstream-integrity check.
         gst = mock.Mock()
         with mock.patch(
             "almond_axol.video.gst_zed._require_gst", return_value=(gst, None)
@@ -287,18 +305,21 @@ class EncodedCaptureTimestampTest(unittest.TestCase):
         )
         self.assertEqual(reader.read_next_au(timeout_ms=0), (b"episode-idr", 10.0))
 
-        reader._accept_access_unit(
-            b"orphaned-p-frame",
-            10.1,
-            is_keyframe=False,
-            discont=True,
-        )
-        with self.assertRaisesRegex(RuntimeError, "discontinuity.*left"):
-            reader.read_next_au(timeout_ms=0)
-        self.assertEqual(reader.pending, 0)
+        with self.assertLogs("almond_axol.video.shm_frames", level="WARNING") as logs:
+            for i in range(5):
+                reader._accept_access_unit(
+                    b"p%d" % i,
+                    10.1 + i * 0.01,
+                    is_keyframe=False,
+                    discont=True,
+                )
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("discontinuity on left", logs.output[0])
+        self.assertEqual(reader.pending, 5)
+        self.assertEqual(reader.read_next_au(timeout_ms=0), (b"p0", 10.1))
 
-        # A new episode clears the fault and grants exactly one new boundary
-        # exemption; its first IDR is readable even when shmsrc marks DISCONT.
+        # A new episode resets the warning budget; its first IDR is readable
+        # even when shmsrc marks DISCONT.
         reader.flush()
         reader._accept_access_unit(
             b"next-idr",
@@ -307,6 +328,7 @@ class EncodedCaptureTimestampTest(unittest.TestCase):
             discont=True,
         )
         self.assertEqual(reader.read_next_au(timeout_ms=0), (b"next-idr", 20.0))
+        self.assertEqual(reader._discont_count, 0)
 
     def test_reader_latches_excessive_keyframe_gap_until_flush(self) -> None:
         gst = mock.Mock()
@@ -365,6 +387,61 @@ class EncodedCaptureTimestampTest(unittest.TestCase):
             reader.read_next_au(timeout_ms=0),
             (b"recovered-idr", 4.0),
         )
+
+    def test_reader_ignores_access_units_until_the_capture_loop_arms_it(
+        self,
+    ) -> None:
+        """AUs that arrive while nobody is draining are not a backlog fault.
+
+        The relay opens its valve (and the first IDR lands) before the recorder
+        has its muxers up and its capture loop draining, and it keeps producing
+        for a few frames after a take ends. Both windows exceed the 0.25 s
+        backlog budget at 60 fps and used to log an "episode aborted" error the
+        capture loop then never saw (its flush cleared it).
+        """
+        gst = mock.Mock()
+        with mock.patch(
+            "almond_axol.video.gst_zed._require_gst", return_value=(gst, None)
+        ):
+            reader = EncodedAuReader("/tmp/camera.sock", 640, 480, 60, name="left")
+        reader._max_pending_aus = 2
+
+        # Freshly constructed: parked. A whole GOP arrives; nothing is kept and
+        # no stream error latches, however long it goes on.
+        with self.assertNoLogs("almond_axol.video.shm_frames", level="ERROR"):
+            reader._accept_access_unit(b"idr0", 0.0, is_keyframe=True, discont=True)
+            for i in range(1, 6):
+                reader._accept_access_unit(
+                    f"p{i}".encode(), float(i), is_keyframe=False, discont=False
+                )
+        self.assertEqual(reader.pending, 0)
+        self.assertIsNone(reader._stream_error)
+        with self.assertRaises(TimeoutError):
+            reader.read_next_au(timeout_ms=0)
+
+        # Armed by the capture loop: the episode begins at the next IDR and the
+        # backlog guard is live from here on.
+        reader.flush()
+        reader._accept_access_unit(b"p6", 6.0, is_keyframe=False, discont=False)
+        self.assertEqual(reader.pending, 0)  # still waiting for a keyframe
+        reader._accept_access_unit(b"idr7", 7.0, is_keyframe=True, discont=False)
+        self.assertEqual(reader.read_next_au(timeout_ms=0), (b"idr7", 7.0))
+
+        # The loop exits (save): parked again. Stragglers are dropped silently
+        # even past the backlog budget, and a latched error does not survive.
+        reader.disarm()
+        with self.assertNoLogs("almond_axol.video.shm_frames", level="ERROR"):
+            for i in range(8, 14):
+                reader._accept_access_unit(
+                    f"p{i}".encode(), float(i), is_keyframe=False, discont=False
+                )
+        self.assertEqual(reader.pending, 0)
+        self.assertIsNone(reader._stream_error)
+
+        # Next take: a clean start on its first IDR.
+        reader.flush()
+        reader._accept_access_unit(b"idr14", 14.0, is_keyframe=True, discont=True)
+        self.assertEqual(reader.read_next_au(timeout_ms=0), (b"idr14", 14.0))
 
     def test_reader_connect_failure_rolls_pipeline_back_to_null(self) -> None:
         gst = mock.Mock()
