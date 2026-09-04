@@ -76,6 +76,13 @@ from ..utils import affinity
 from ..utils.control_loop import run_blocking_with_control_ticks
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
+from ..utils.stall_diag import (
+    GcHold,
+    StallWatchdog,
+    freeze_startup_heap,
+    install_gc_pause_logger,
+    unfreeze_heap,
+)
 from .config import DatasetResolution, LogLevel, parse
 
 if TYPE_CHECKING:
@@ -363,6 +370,13 @@ class CollectDataConfig:
 # starting, mirroring the in-headset record countdown so the operator has time
 # to pick the controllers back up. A second click cancels.
 _PANEL_START_COUNTDOWN_S = 3.0
+
+# Control-tick heartbeat age that counts as a stall worth a stack trace: six
+# ticks at 120 Hz. The recorder pairs each camera exposure with the state
+# snapshot the control loop published within 50 ms of it and gives up after a
+# 100 ms wait, so a tick gap this long is already what ends an episode
+# ("no retained robot-state snapshot brackets camera exposure").
+_TICK_STALL_S = 0.05
 
 # Buttons the panel renders per phase (see EpisodeControls in the web app):
 # ``confirm`` asks for a second, confirming click — the panel's stand-in for
@@ -888,6 +902,29 @@ def _run(
     tegra = TegraStatsDiag(_logger)  # no-op off-Tegra
     tegra.start()
 
+    # Stall attribution for the control tick. The recorder ends an episode when
+    # this loop stops publishing state for ~100 ms, but nothing so far said
+    # *why* the tick stopped: the watchdog logs the tick thread's stack and
+    # kernel scheduling state while it is stuck (armed only while a take is
+    # starting/recording — resets and saves idle the loop on purpose), and the
+    # gc hook names a stop-the-world collection if that is what paused it.
+    # Cyclic GC is the prime suspect: this process (under `axol serve`, the
+    # whole web server too) carries a large permanent heap, so a gen-2 pass
+    # freezes every thread for hundreds of ms — the pause run-policy measured
+    # at ~500 ms and the relay at ~100 ms, both of which disable the collector
+    # for that reason. Here the permanent heap is frozen out of the collector's
+    # reach once, automatic collection is held for each take, and the deferred
+    # garbage is swept between episodes with the arms at rest.
+    tick_watchdog = StallWatchdog("control tick", _TICK_STALL_S, logger=_logger)
+    tick_watchdog.suspend()
+    tick_watchdog.start()
+    uninstall_gc_log = install_gc_pause_logger(_logger)
+    take_gc = GcHold("control take", _logger)
+    _logger.info(
+        "gc: froze %d startup objects out of the collector's reach",
+        freeze_startup_heap(),
+    )
+
     episodes_recorded = 0
     episode_idx = recorder.episode_count()
     teleop_interval = 1.0 / teleop_hz
@@ -924,6 +961,7 @@ def _run(
 
     def _maybe_log_rate(t0: float) -> None:
         nonlocal last_rate_log, sect
+        tick_watchdog.beat()
         loop_times.append(t0)
         if prev_t0["v"]:
             gap = t0 - prev_t0["v"]
@@ -935,20 +973,20 @@ def _run(
         span = loop_times[-1] - loop_times[0]
         n = len(loop_times)
         loop_hz = (n - 1) / span if span > 0 else 0.0
+        # maxgap/maxslip ("the thread lost the CPU") ride on the INFO line: an
+        # average rate hides the single 300 ms gap that discards an episode.
         _logger.info(
-            "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz",
+            "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz  maxgap: %.0fms  maxslip: %.0fms",
             loop_hz,
             teleop.vr_hz(),
             teleop.ik_hz(),
+            1e3 * max_gap["v"],
+            1e3 * max_slip["v"],
         )
-        # Jitter detail (maxgap/maxslip = "the thread lost the CPU") and the
-        # per-section breakdown stay at DEBUG so INFO is just the rate line.
+        # The per-section breakdown stays at DEBUG.
         if time_sections:
             _logger.debug(
-                "loop maxgap=%.1fms maxslip=%.1fms  sections (mean ms): "
-                "obs=%.2f act=%.2f proc=%.2f send=%.2f",
-                1e3 * max_gap["v"],
-                1e3 * max_slip["v"],
+                "loop sections (mean ms): obs=%.2f act=%.2f proc=%.2f send=%.2f",
                 1e3 * sect["obs"] / n,
                 1e3 * sect["act"] / n,
                 1e3 * sect["proc"] / n,
@@ -1147,6 +1185,12 @@ def _run(
             if start_requested and not recording:
                 pending_start = None
                 recording = True
+                # From here until the take is over every tick must publish
+                # state on time: hold cyclic GC (the previous take's garbage
+                # was swept between episodes, so no up-front sweep) and arm the
+                # tick watchdog so a stall is attributed, not just detected.
+                take_gc.begin(collect=False)
+                tick_watchdog.resume()
                 # Arm recorder cutoffs before opening the shared-timestamp
                 # dataset valves. Both calls can wait for transport boundaries,
                 # so run them off-loop while normal teleop ticks continue
@@ -1195,6 +1239,10 @@ def _run(
             if slip > max_slip["v"]:
                 max_slip["v"] = slip
 
+        if contact:
+            # The limp hold that follows ticks through the gravity step, which
+            # carries no heartbeat: stop judging the tick now.
+            tick_watchdog.suspend()
         if recording:
             # A contact abort must never resume the last tracked target while
             # the bounded capture close drains. Keep the arm limp instead;
@@ -1211,6 +1259,7 @@ def _run(
             )
             if finish_capture_failure is not None:
                 capture_failure = capture_failure or finish_capture_failure
+        tick_watchdog.suspend()
         return recording, rerecord, contact, captured_rows, capture_failure
 
     # Guarded return-to-rest: the sequencing (torque watchdog, gravity-comp
@@ -1397,6 +1446,10 @@ def _run(
             relay.set_raw_enabled(False)
 
         while not _stopped():
+            # Arms at rest, nothing recording: sweep the garbage the previous
+            # take deferred (a no-op before the first take). This is the one
+            # place a multi-hundred-ms stop-the-world pass costs nothing.
+            take_gc.end()
             episode_idx = recorder.episode_count()
             # Surface the (1-based) episode number in the headset HUD so the
             # operator can see which episode they're about to record. The panel
@@ -1486,6 +1539,12 @@ def _run(
 
         diag.stop()
         tegra.stop()
+        tick_watchdog.stop()
+        # Under `axol serve` this process outlives the operation: give its
+        # collector back the frozen heap and a working automatic collection.
+        take_gc.end()
+        unfreeze_heap()
+        uninstall_gc_log()
 
         if imu_src is not None:
             imu_src.close()

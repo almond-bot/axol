@@ -157,6 +157,12 @@ class _StatsWorker:
                 auto_downsample_height_width,
             )
 
+            # Same reason as _compute_stats_from_file: the yuv420p -> rgb24
+            # conversion has no SIMD path in this ffmpeg build and libswscale
+            # logs a WARNING per scaler context. Left unsilenced here, every
+            # sampled IDR during a take printed one (dozens per second across
+            # four cameras), burying the recorder's own diagnostics.
+            av.logging.set_level(av.logging.ERROR)
             codec = av.CodecContext.create("h264", "r")
             self._stats = RunningQuantileStats()
         except Exception as exc:  # noqa: BLE001 - deps missing -> no live stats

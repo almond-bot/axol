@@ -111,6 +111,12 @@ _SNAPSHOT_HISTORY_SIZE = 512
 # before they silently contaminate a whole episode.
 _STATE_ALIGNMENT_WARN_S = 0.050
 
+# A capture row that goes this long without a heartbeat is a stall worth a
+# stack trace: 30 frame periods at 60 fps, well under the 2 s encoded-AU
+# backlog limit and the 1 s row deadline that would otherwise end the episode
+# without saying what the capture thread was doing.
+_CAPTURE_ROW_STALL_S = 0.5
+
 
 class RecorderDatasetSaveError(RuntimeError):
     """A dataset save failed after its irreversible commit phase began.
@@ -889,6 +895,42 @@ def _wait_snapshot_nearest(
     return None
 
 
+def _describe_snapshot_miss(
+    target_ts: float,
+    read_latest: Callable[[], tuple[dict, dict, float, bool] | None],
+    now: float | None = None,
+) -> str:
+    """Say *why* no robot-state snapshot brackets ``target_ts``.
+
+    The bracket wait fails for two unrelated reasons that used to share one
+    message. Comparing the exposure against the newest published snapshot
+    tells them apart:
+
+    * the newest snapshot is *older* than the exposure — the control loop
+      stopped publishing state (a stall in the control process, not the
+      recorder), and no amount of recorder history could have helped;
+    * the newest snapshot is *newer* than the exposure — the exposure aged out
+      of the retained history, i.e. the recorder itself fell behind.
+    """
+    latest = read_latest()
+    if latest is None:
+        return "no robot-state snapshot has been published yet"
+    latest_ts = latest[2]
+    if latest_ts < target_ts:
+        age_ms = (target_ts - latest_ts) * 1e3
+        since_ms = ((now if now is not None else time.perf_counter()) - latest_ts) * 1e3
+        return (
+            "the control loop stopped publishing robot state: newest snapshot is "
+            f"{age_ms:.0f} ms older than the exposure ({since_ms:.0f} ms old now) "
+            "(control-process stall, not a recorder backlog)"
+        )
+    behind_ms = (latest_ts - target_ts) * 1e3
+    return (
+        f"the exposure is {behind_ms:.0f} ms behind the newest snapshot and has "
+        "aged out of the retained state history (recorder fell behind)"
+    )
+
+
 def _camera_alignment_limit(fps: int) -> float:
     """Maximum allowed exposure spread within a multi-camera dataset row."""
     return max(0.010, 1.5 / fps) if fps > 0 else 0.050
@@ -1119,8 +1161,13 @@ def run_capture_loop(
     record_event: "threading.Event | None" = None,
     frame_counter: "dict[str, int] | None" = None,
     on_error: Callable[[str], None] | None = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> None:
     """Capture dataset rows at ``fps`` Hz until ``stop_event`` is set.
+
+    ``heartbeat`` (optional) is called once per tick from this thread so a
+    :class:`~almond_axol.utils.stall_diag.StallWatchdog` can attribute a
+    stalled row (see :func:`run_encoded_capture_loop`).
 
     Each tick sleeps until ``T_n = recording_start + n/fps`` and waits for a
     frame with ``capture_perf_ts >= T_n`` from every camera. The row is paired
@@ -1194,6 +1241,8 @@ def run_capture_loop(
         cap_last_log = time.perf_counter()
 
         while not stop_event.is_set():
+            if heartbeat is not None:
+                heartbeat()
             if record_event is not None and not record_event.is_set():
                 # Paused: idle without capturing and drop the anchor so the
                 # tick clock re-anchors on resume (no timestamp gap).
@@ -1297,7 +1346,9 @@ def run_capture_loop(
                     return
                 raise RuntimeError(
                     "no retained robot-state snapshot brackets raw camera "
-                    f"exposure {row_capture_ts:.6f}; episode discarded"
+                    f"exposure {row_capture_ts:.6f}: "
+                    f"{_describe_snapshot_miss(row_capture_ts, read_snapshot)}; "
+                    "episode discarded"
                 )
             joint_obs, action, _snap_ts, intervention = snap
             snapshot_skew = abs(_snap_ts - row_capture_ts)
@@ -1361,8 +1412,13 @@ def run_encoded_capture_loop(
     repair_events: "list[dict[str, Any]] | None" = None,
     on_error: Callable[[str], None] | None = None,
     on_armed: Callable[[], None] | None = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> None:
     """Frame-driven capture for the relay-encoded (gstshm-h264) transport.
+
+    ``heartbeat`` (optional) is called once per row from this thread so a
+    :class:`~almond_axol.utils.stall_diag.StallWatchdog` can name what the
+    loop was doing if a row ever takes far longer than a frame period.
 
     ``frame_counter`` mirrors :func:`run_capture_loop`'s (a mutable
     ``{"n": int}`` incremented per appended row). There is no ``record_event``
@@ -1476,6 +1532,8 @@ def run_encoded_capture_loop(
         last_log = time.perf_counter()
 
         while not stop_event.is_set():
+            if heartbeat is not None:
+                heartbeat()
             budget = _ENCODED_START_TIMEOUT_S if not primed else _ENCODED_ROW_TIMEOUT_S
             # One shared deadline for the whole row: with per-camera budgets the
             # serial reads compound (a stalled first camera would hand every
@@ -1693,7 +1751,8 @@ def run_encoded_capture_loop(
                     return
                 raise RuntimeError(
                     "no retained robot-state snapshot brackets camera exposure "
-                    f"{row_capture_ts:.6f}; recorder exceeded timestamp history"
+                    f"{row_capture_ts:.6f}: "
+                    f"{_describe_snapshot_miss(row_capture_ts, read_snapshot)}"
                 )
             joint_obs, action, _snap_ts, intervention = snap
             snapshot_skew = abs(_snap_ts - row_capture_ts)
@@ -2332,12 +2391,24 @@ def _recorder_main(
     # control loop's cores; fall back to a positive nice where affinity isn't
     # available so it still never preempts the control loop / IK.
     from ..utils import affinity
+    from ..utils.stall_diag import GcHold, StallWatchdog, install_gc_pause_logger
 
     if not affinity.pin_background():
         try:
             os.nice(5)
         except (AttributeError, OSError):
             pass
+
+    # Stall attribution. A capture row that stops for seconds ends the episode
+    # ("encoded-AU backlog exceeded") without saying what the thread was doing;
+    # the watchdog logs its stack + kernel state while it is still stuck, and
+    # the gc hook names a stop-the-world collection if that is what paused it.
+    # Cyclic GC is held for the whole take (the per-row dicts/arrays are freed
+    # by refcount anyway) and swept between episodes, as the relay and
+    # run-policy already do for the same measured reason.
+    uninstall_gc_log = install_gc_pause_logger(_logger)
+    gc_hold = GcHold("recorder take", _logger)
+    watchdog: StallWatchdog | None = None
 
     from lerobot.processor import make_default_processors
 
@@ -2450,7 +2521,10 @@ def _recorder_main(
             error_conn.send(message)
 
     def stop_capture() -> None:
-        nonlocal thread
+        nonlocal thread, watchdog
+        if watchdog is not None:
+            watchdog.stop()
+            watchdog = None
         if thread is not None and stop is not None:
             stop.set()
             thread.join(timeout=_CAPTURE_STOP_TIMEOUT_S)
@@ -2460,6 +2534,9 @@ def _recorder_main(
                     "finalize while dataset writes may still be in flight"
                 )
             thread = None
+        # The take is over: sweep the garbage deferred during it now, while
+        # nothing time-critical runs in this process.
+        gc_hold.end()
         # Nothing records now: let the previous episode's verify continue.
         verifier.resume()
 
@@ -2488,6 +2565,10 @@ def _recorder_main(
 
                 reset_dropped_frames()
                 stop = threading.Event()
+                gc_hold.begin()
+                watchdog = StallWatchdog(
+                    "recorder capture row", _CAPTURE_ROW_STALL_S, logger=_logger
+                )
                 loop_kwargs = dict(
                     cameras=cameras,
                     read_snapshot=snap_reader.read_latest,
@@ -2499,6 +2580,7 @@ def _recorder_main(
                     rerun_ip=config["rerun_ip"],
                     stop_event=stop,
                     on_error=report_capture_error,
+                    heartbeat=watchdog.beat,
                 )
                 loop_kwargs["frame_counter"] = frame_counter
                 if not encoded_mode:
@@ -2523,10 +2605,14 @@ def _recorder_main(
                     stop.set()
                     thread.join(timeout=2.0)
                     if not thread.is_alive():
+                        gc_hold.end()
                         verifier.resume()
                     detail = capture_error["v"] or "encoded readers did not arm"
                     conn.send(("error", detail))
                     continue
+                # Arm the watchdog only once the readers are flushed and
+                # armed: the pre-arm flush handshake legitimately blocks.
+                watchdog.start()
                 conn.send(("started",))
             elif kind == "finish_episode":
                 try:
@@ -2670,10 +2756,15 @@ def _recorder_main(
         # Never close/finalize the dataset while its capture thread may still
         # be inside add_frame/appsrc. A wedged child is ultimately terminated by
         # the parent's bounded close(), but must not race cleanup in-process.
+        if watchdog is not None:
+            watchdog.stop()
+            watchdog = None
         if thread is not None and stop is not None:
             stop.set()
             thread.join()
             thread = None
+        gc_hold.end()
+        uninstall_gc_log()
         # EOF, shutdown, and KeyboardInterrupt may all bypass the explicit
         # cancel command. Always discard any uncommitted rows and cancel a live
         # streaming encoder before finalizing; after a successful save this is

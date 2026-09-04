@@ -17,8 +17,76 @@ from almond_axol.recording.record_proc import (
     _align_independent_encoded_start,
     _concealable_encoded_gap_frames,
     _concealment_within_budget,
+    _describe_snapshot_miss,
     run_encoded_capture_loop,
 )
+
+
+class SnapshotMissAttributionTest(unittest.TestCase):
+    """The bracket-miss message must say which process fell behind."""
+
+    def test_stale_newest_snapshot_blames_the_control_loop(self) -> None:
+        # Exposure at t=10.000; the control loop last published at t=9.700 and
+        # it is now t=10.050: the writer stalled, not the recorder.
+        text = _describe_snapshot_miss(10.0, lambda: ({}, {}, 9.7, False), now=10.05)
+        self.assertIn("control loop stopped publishing", text)
+        self.assertIn("300 ms older than the exposure", text)
+        self.assertIn("350 ms old now", text)
+        self.assertNotIn("recorder fell behind", text)
+
+    def test_exposure_behind_history_blames_the_recorder(self) -> None:
+        text = _describe_snapshot_miss(10.0, lambda: ({}, {}, 14.5, False))
+        self.assertIn("recorder fell behind", text)
+        self.assertIn("4500 ms behind the newest snapshot", text)
+        self.assertNotIn("control loop stopped", text)
+
+    def test_no_snapshot_at_all(self) -> None:
+        self.assertIn(
+            "no robot-state snapshot", _describe_snapshot_miss(1.0, lambda: None)
+        )
+
+    def test_encoded_loop_error_carries_the_attribution(self) -> None:
+        stop = threading.Event()
+        dataset = _CaptureDataset(stop, stop_after=10)
+        errors: list[str] = []
+        base = time.perf_counter() + 0.05
+        cam = _EncodedCamera(
+            [
+                (b"\x00\x00\x00\x01\x65au", base + i / 60, base + i / 60)
+                for i in range(6)
+            ]
+        )
+        # The control loop's last publish predates every exposure.
+        stale = ({"state": 1}, {"target": 2}, base - 0.3, False)
+        with (
+            patch(
+                "lerobot.utils.feature_utils.build_dataset_frame",
+                side_effect=lambda _f, values, prefix: dict(values),
+            ),
+            patch("lerobot.utils.visualization_utils.log_rerun_data"),
+            patch(
+                "almond_axol.recording.record_proc._SNAPSHOT_BRACKET_TIMEOUT_S",
+                0.01,
+            ),
+        ):
+            run_encoded_capture_loop(
+                cameras={"cam": cam},
+                # Fresh enough to pass the episode-start gate, then never newer
+                # than the exposures: the writer went quiet.
+                read_snapshot=lambda: (
+                    stale if cam.reads else ({}, {}, time.perf_counter(), False)
+                ),
+                read_snapshot_nearest=lambda _ts: None,
+                dataset=dataset,
+                robot_obs_proc=lambda obs: obs,
+                fps=60,
+                task="test",
+                rerun_ip=None,
+                stop_event=stop,
+                on_error=errors.append,
+            )
+        self.assertEqual(len(errors), 1)
+        self.assertIn("control loop stopped publishing", errors[0])
 
 
 class _FakeDataset:
