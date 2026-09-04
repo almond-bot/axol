@@ -75,7 +75,7 @@ See the [`teleop`](/cli/teleop) CLI command for the equivalent command-line entr
 | `box_width_speed` | `0.08` m/s | Rate the other stick's x changes the gripper-to-gripper width |
 | `box_width_min` / `box_width_max` | `0.10` / `0.70` m | Clamp on that width |
 | `box_align_duration` | `1.5` s | Smoothstep blend from the arms' actual poses into the parallel pair when engaging in box mode |
-| `box_elbow_out` | `40` ° | Box mode holds each elbow this far out from straight down, toward the arm's side, by feeding the IK a synthetic elbow hint (the current elbow rotated about the shoulder–wrist line) — keeps the elbows off the torso as the grippers close on the box. `0` hangs the elbows under the arm, `90` holds them level. A [live setting](/api/vr#live-session-settings) (**Elbows out**) |
+| `box_elbow_out` | `30` ° | Box mode holds each elbow this far out from straight down, toward the arm's side, by feeding the IK a synthetic elbow hint (the current elbow rotated about the shoulder–wrist line) — keeps the elbows off the torso as the grippers close on the box. `0` hangs the elbows under the arm, `90` holds them level. A [live setting](/api/vr#live-session-settings) (**Elbows out**) |
 | `box_elbow_weight` | `10` | IK weight on that hint (gripper `pos_weight` is 50, `posture_weight` 5); `0` disables it |
 
 <Note>

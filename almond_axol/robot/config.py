@@ -177,7 +177,7 @@ class JointConfig:
                   weight is not "pressing"); friction/inertia feedforwards
                   fall to zero on their own once the sent command stops
                   moving. ``inf`` (the default) disables it. Set on the
-                  wrists (3 Nm), where sustained pressing against an object
+                  wrists (5 Nm), where sustained pressing against an object
                   during teleop was overheating the small Damiao motors —
                   the shoulders and elbow are left uncapped so gravity
                   loading and fast moves are never starved.
@@ -350,9 +350,11 @@ class ArmConfig:
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
             # The wrist Damiaos overheat when teleop keeps them pressed
-            # against an object; bound the spring torque (kp=130 → ~1.3°
-            # of position error) rather than the stiffness.
-            torque_limit=3.0,
+            # against an object; bound the spring torque (kp=130 → ~2.2°
+            # of position error) rather than the stiffness. Raised from 3 Nm
+            # once box-mode carries needed more wrist authority to hold a
+            # clamped box.
+            torque_limit=5.0,
         )
     )
     wrist_3: JointConfig = field(
@@ -362,7 +364,7 @@ class ArmConfig:
             friction=_ZERO_FRICTION,
             mass=0.75,
             com=(-0.0285, 0.0, -0.089453),
-            torque_limit=3.0,
+            torque_limit=5.0,
         )
     )
     gripper: PositionForceConfig = field(

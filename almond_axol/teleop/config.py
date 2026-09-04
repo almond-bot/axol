@@ -311,7 +311,7 @@ class VRTeleopConfig:
     box_width_min: float = 0.10
     box_width_max: float = 0.70
     box_align_duration: float = 1.5
-    box_elbow_out: float = 40.0
+    box_elbow_out: float = 30.0
     box_elbow_weight: float = 10.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
