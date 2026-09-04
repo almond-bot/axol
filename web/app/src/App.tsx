@@ -900,15 +900,15 @@ function StateDisplay({
   )
 }
 
-// Current episode number, shown top-right just under the recording status
-// during data collection. Null (plain teleop, or before the server announces
-// one) renders nothing.
+// Current episode number, shown top-right under the recording status and the
+// tools row during data collection. Null (plain teleop, or before the server
+// announces one) renders nothing.
 function EpisodeDisplay({ episode }: { episode: number | null }) {
   if (episode === null) return null
 
   return (
     <HudText
-      position={[0.2, 0.06, -0.5]}
+      position={[0.2, 0.05, -0.5]}
       fontSize={0.016}
       fontWeight="bold"
       color="white"
@@ -923,10 +923,17 @@ function EpisodeDisplay({ episode }: { episode: number | null }) {
   )
 }
 
-// One clickable entry of the bottom tools row (see ToolsRow).
+// Vertical position of the tools row: the second HUD line, just under the
+// Exit / ? / status line (top edge 0.1) and still above the overhead feed's
+// top edge (~+6° up, i.e. y ≈ 0.053 at this 0.5 m HUD distance), so the tools
+// sit in the same peripheral band as the rest of the HUD and never cover the
+// camera view.
+const TOOLS_ROW_Y = 0.078
+
+// One clickable entry of the tools row (see ToolsRow).
 function HudButton({
   x,
-  y = -0.13,
+  y = TOOLS_ROW_Y,
   label,
   active,
   accent,
@@ -948,7 +955,7 @@ function HudButton({
       fontWeight="bold"
       color={hovered ? "yellow" : (accent ?? (active ? "#4ade80" : "white"))}
       anchorX="center"
-      anchorY="bottom"
+      anchorY="top"
       renderOrder={999}
       material-depthTest={false}
       {...hudBg}
@@ -981,10 +988,11 @@ function usePairStatus(jointsRef: RefObject<AxolJointSample | null>): {
   return { aligned, tilt }
 }
 
-// Bottom-of-view tools: the two most-used live settings (box mode, re-engage
-// ramp) as one-click toggles, the local ghost overlay toggle, and the entry
-// to the full settings panel. Server-mirrored settings are hidden until the
-// server announces them (an older server has no live settings).
+// Tools row (second HUD line, under Exit / ? / status): the two most-used
+// live settings (box mode, re-engage ramp) as one-click toggles, the local
+// ghost overlay toggle, and the entry to the full settings panel.
+// Server-mirrored settings are hidden until the server announces them (an
+// older server has no live settings).
 function ToolsRow({
   settings,
   onSet,
