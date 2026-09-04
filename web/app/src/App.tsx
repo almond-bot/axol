@@ -961,16 +961,24 @@ function HudButton({
   )
 }
 
-// Mirrors the worker's "grippers aligned" flag (from the ~20 Hz joints push)
-// into React state, changing only on edges so the HUD doesn't re-render per
-// frame. False until the server reports the pair geometry.
-function usePairAligned(jointsRef: RefObject<AxolJointSample | null>): boolean {
+// Mirrors the worker's pair geometry (from the ~20 Hz joints push) into React
+// state — the "grippers aligned" flag and the fingertip tilt (whole degrees)
+// — changing only on edges so the HUD doesn't re-render per frame. Aligned is
+// false and the tilt 0 until the server reports the pair geometry.
+function usePairStatus(jointsRef: RefObject<AxolJointSample | null>): {
+  aligned: boolean
+  tilt: number
+} {
   const [aligned, setAligned] = useState(false)
+  const [tilt, setTilt] = useState(0)
   useFrame(() => {
-    const next = jointsRef.current?.pair?.aligned ?? false
-    if (next !== aligned) setAligned(next)
+    const pair = jointsRef.current?.pair
+    const nextAligned = pair?.aligned ?? false
+    if (nextAligned !== aligned) setAligned(nextAligned)
+    const nextTilt = Math.round(pair?.tilt ?? 0)
+    if (nextTilt !== tilt) setTilt(nextTilt)
   })
-  return aligned
+  return { aligned, tilt }
 }
 
 // Bottom-of-view tools: the two most-used live settings (box mode, re-engage
@@ -981,6 +989,7 @@ function ToolsRow({
   settings,
   onSet,
   aligned,
+  tilt,
   ghost,
   onToggleGhost,
   onOpenSettings,
@@ -988,18 +997,26 @@ function ToolsRow({
   settings: AxolSettings | null
   onSet: (key: string, value: boolean | number | string) => void
   aligned: boolean
+  // Pair fingertip tilt (degrees); shown on the Box button while box mode is
+  // on so the jog (other stick clicked + left/right) has a readout.
+  tilt: number
   ghost: boolean
   onToggleGhost: () => void
   onOpenSettings: () => void
 }) {
   const boxMode = settings ? settings.values.box_mode === true : null
   const reengage = settings ? String(settings.values.reengage ?? "") : null
+  const boxLabel = boxMode
+    ? `Box: ON (tilt ${tilt > 0 ? "+" : ""}${tilt}°)`
+    : aligned
+      ? "Box: OFF (aligned)"
+      : "Box: OFF"
   return (
     <>
       {boxMode !== null && (
         <HudButton
           x={-0.16}
-          label={boxMode ? "Box: ON" : aligned ? "Box: OFF (aligned)" : "Box: OFF"}
+          label={boxLabel}
           active={boxMode}
           accent={!boxMode && aligned ? "#38bdf8" : undefined}
           onClick={() => onSet("box_mode", !boxMode)}
@@ -1164,13 +1181,14 @@ function HudTools({
   onCloseSettings: () => void
   onStep: (def: AxolSettingDef, direction: 1 | -1) => void
 }) {
-  const aligned = usePairAligned(jointsRef)
+  const { aligned, tilt } = usePairStatus(jointsRef)
   return (
     <>
       <ToolsRow
         settings={settings}
         onSet={onSet}
         aligned={aligned}
+        tilt={tilt}
         ghost={ghost}
         onToggleGhost={onToggleGhost}
         onOpenSettings={onOpenSettings}
@@ -1208,7 +1226,12 @@ function HelpPanel({
     "[Y]  Exit VR",
     "[X]  Reset Pose",
     ...(boxMode
-      ? ["[Grip]  Lead Both Arms", "[Other Stick]  Up / Width", "[Both Clicks]  Box Mode"]
+      ? [
+          "[Grip]  Lead Both Arms",
+          "[Other Stick]  Up / Width",
+          "[Other Click+Stick]  Tilt In / Out",
+          "[Both Clicks]  Box Mode",
+        ]
       : ["[Grip]  Engage / Freeze Arm", "[Ramp]  Arm Comes To Hand", "[Settings]  Live Tuning"]),
   ].join("\n")
 
@@ -1545,8 +1568,10 @@ export default function App() {
     })
   }
 
-  // Controller shortcut (both thumbsticks clicked): toggle box mode. Reads the
-  // latest mirrored value so it flips whatever the server currently has.
+  // Controller shortcut (both thumbsticks clicked): toggle box mode. The flip
+  // happens server-side ("toggle") against the value the server actually
+  // holds — our mirror lags it by a round trip, so a gesture repeated before
+  // the echo lands would otherwise re-send the stale state.
   const settingsRef = useRef<AxolSettings | null>(null)
   useEffect(() => {
     settingsRef.current = settings
@@ -1554,7 +1579,7 @@ export default function App() {
   const handleBothStickClick = () => {
     const cur = settingsRef.current
     if (!cur || !("box_mode" in cur.values)) return
-    setSetting("box_mode", cur.values.box_mode !== true)
+    setSetting("box_mode", "toggle")
   }
 
   return (
@@ -1668,7 +1693,7 @@ export default function App() {
                     ...(boxMode
                       ? ([
                           ["Grip", "Lead both arms"],
-                          ["Stick (other)", "Pair up / down, width"],
+                          ["Stick (other)", "Pair up / down, width; click: tilt in / out"],
                         ] as [string, string][])
                       : ([
                           ["Grip", "Engage / freeze arm"],

@@ -430,11 +430,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Box mode at startup",
                 type="boolean",
                 help=(
-                    "Start sessions in box mode: the grippers face each other "
-                    "like two hands around a box and one grip drives both arms "
-                    "as a rigid pair (the other hand's grip hands over the "
-                    "lead). Thumbsticks jog the pair instead of driving the "
-                    "base. Can also be toggled live from the headset menu."
+                    "Start sessions in box mode: the grippers clamp the box "
+                    "between their sides like two flat hands (fingers forward) "
+                    "and one grip drives both arms as a rigid pair (the other "
+                    "hand's grip hands over the lead). Thumbsticks jog the "
+                    "pair instead of driving the base. Can also be toggled "
+                    "live from the headset menu or both thumbstick clicks."
                 ),
                 targets={
                     "teleop": ("teleop.box_mode",),

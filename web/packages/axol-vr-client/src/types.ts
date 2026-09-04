@@ -57,9 +57,10 @@ export type AxolPoseData = {
   /** Left thumbstick pressed in — lift down while held. */
   l_stick_click?: boolean
   /**
-   * Right thumbstick pressed in — lift up while held. Both sticks clicked
-   * together toggle box mode (the headset sends the `set` message itself, see
-   * `AxolVRClient.onBothStickClick`).
+   * Right thumbstick pressed in — lift up while held (in box mode: a jog
+   * modifier — leader stick up/yaw, other stick fingertip tilt). Both sticks
+   * clicked together toggle box mode (the headset sends the `set` message
+   * itself, see `AxolVRClient.onBothStickClick`).
    */
   r_stick_click?: boolean
 }
@@ -92,8 +93,9 @@ export type AxolSettingDef = {
  * The server's live session settings, pushed as
  * `{"type":"settings","value":AxolSettings}` on connect and after every change
  * (from any client). Change one with `{"type":"set","key","value"}` — see
- * `useAxolSettings`. The value set includes at least `box_mode` (boolean) and
- * `reengage` (`AxolReengage`).
+ * `useAxolSettings`; a boolean key also takes the value `"toggle"`, flipped
+ * server-side against the value the server holds. The value set includes at
+ * least `box_mode` (boolean) and `reengage` (`AxolReengage`).
  */
 export type AxolSettings = {
   schema: AxolSettingDef[]
@@ -105,14 +107,16 @@ export type AxolSettings = {
  * `{"type":"joints","value":AxolJointState}` — drives the in-headset ghost
  * robot. `q` maps URDF joint names (e.g. `left_s1_0`) to radians; grips are
  * normalised 0 (closed) – 1 (open). `pair` is the gripper-pair geometry from
- * the IK worker: `aligned` when the grippers already face each other across a
- * box-mode-sized gap (a good moment to switch to box mode), `width` in metres.
- * Null until the worker's first report.
+ * the IK worker: `aligned` when the grippers already form the box-mode pair
+ * (fingers forward, a flat face toward each other across a box-mode-sized gap
+ * — a good moment to switch to box mode), `width` in metres, `tilt` the pair's
+ * inward fingertip yaw in degrees (jogged live in box mode). Null until the
+ * worker's first report.
  */
 export type AxolJointState = {
   q: Record<string, number>
   l_grip: number
   r_grip: number
   engaged: boolean
-  pair: { aligned: boolean; width: number } | null
+  pair: { aligned: boolean; width: number; tilt: number } | null
 }

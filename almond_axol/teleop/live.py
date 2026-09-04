@@ -14,6 +14,7 @@ is a one-line addition.
 Wire protocol (over the VR server's WebSocket, any client):
 
 - client → server ``{"type": "set", "key": "<key>", "value": <value>}``
+  (a boolean key also takes ``"value": "toggle"``, flipped server-side)
 - server → clients ``{"type": "settings", "value": {"schema": [...],
   "values": {"<key>": <value>, ...}}}`` — on connect (via
   ``VRServer.set_announce``) and after every change, so all clients converge
@@ -248,13 +249,22 @@ class LiveSettings:
     def apply(self, key: str, value: Any) -> None:
         """Validate and apply one ``set`` request, then publish.
 
+        A boolean setting also accepts the value ``"toggle"``, flipped
+        against the *server's* current value — for controller gestures (both
+        thumbsticks clicked = box mode) whose client-side mirror may lag the
+        server by a round trip, so a repeated gesture can never re-send a
+        stale state.
+
         Raises ``KeyError`` / ``ValueError`` for an unknown key or an
         out-of-range value (the server logs and drops the request).
         """
         d = _DEFS.get(key)
         if d is None:
             raise KeyError(f"unknown live setting {key!r}")
-        coerced = self._coerce(d, value)
+        if d.type == "boolean" and value == "toggle":
+            coerced = not bool(self.values().get(d.key))
+        else:
+            coerced = self._coerce(d, value)
         if d.key == "gripper_torque":
             arms = [a for a in self._arms() if a._arm_config.gripper is not None]
             if not arms:

@@ -105,8 +105,10 @@ class VRFrame(BaseModel):
             by Jelly; in box mode it is part of the jog.
         l_stick_click: Left thumbstick pressed in — lift down while held.
         r_stick_click: Right thumbstick pressed in — lift up while held.
-            Both sticks clicked together toggle **box mode** (handled on the
-            headset, which sends the ``set`` message; see
+            In box mode a click is a jog modifier instead (leader stick:
+            up/yaw; other stick: fingertip tilt). Both sticks clicked
+            *together* toggle **box mode** (handled on the headset, which
+            sends the ``set`` message; see
             :meth:`almond_axol.vr.server.VRServer.set_on_setting`).
         box_leader: Server-internal: which controller leads the arm pair in
             box mode (``"left"`` / ``"right"``). Set by the teleop core on

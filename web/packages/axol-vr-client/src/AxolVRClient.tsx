@@ -7,6 +7,15 @@ import type { AxolMode, ConfirmAction } from "./types"
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
 
+// Minimum gap between two firings of the both-sticks-clicked gesture (ms).
+// Longer than a reflexive double click, shorter than a deliberate repeat.
+const BOTH_CLICK_DEBOUNCE_MS = 600
+// The two stick presses must land within this window of each other to count
+// as "clicked together". In box mode each stick's click is also a jog
+// modifier (leader: up / yaw, other: tilt), so a stick that has been held
+// for a while when the other one is pressed is a modifier, not the gesture.
+const BOTH_CLICK_TOGETHER_MS = 350
+
 // Pose sinks (WebSocket and RTCDataChannel) both expose `.send(string)`; this is
 // the minimal shape AxolVRClient needs to ship a frame.
 type PoseSink = { send: (data: string) => void }
@@ -92,9 +101,19 @@ export function AxolVRClient({
   // the "unset" sentinel (distinct from a real episode value or an explicit
   // null the server could send); replaced with the parsed value on each push.
   const serverEpisodeRef = useRef<number | null | -1>(-1)
-  // Both thumbsticks clicked on the previous frame (edge detection for the
-  // box-mode gesture).
+  // Box-mode gesture state: each stick's click on the previous frame and when
+  // it was last pressed (to require the two presses to land together, see
+  // BOTH_CLICK_TOGETHER_MS), both clicked on the previous frame (edge
+  // detection), and when the gesture last fired: a second rising edge inside
+  // BOTH_CLICK_DEBOUNCE_MS — a "double click", or one stick's contact
+  // bouncing while the other is held — is ignored so the mode can't toggle
+  // twice and land where it started.
+  const prevLClickRef = useRef(false)
+  const prevRClickRef = useRef(false)
+  const lClickAtRef = useRef(0)
+  const rClickAtRef = useRef(0)
   const prevBothClickRef = useRef(false)
+  const lastBothClickAtRef = useRef(0)
   // Track which WebSocket we have attached onmessage to avoid re-attaching.
   const wsWithHandlerRef = useRef<WebSocket | null>(null)
   // Change key of the last HUD state published to the server (see below).
@@ -415,9 +434,23 @@ export function AxolVRClient({
     const l_stick_click = leftSource?.gamepad?.buttons[3]?.pressed ?? false
     const r_stick_click = rightSource?.gamepad?.buttons[3]?.pressed ?? false
 
-    // Both sticks clicked together: box-mode toggle gesture (rising edge).
+    // Both sticks clicked together: box-mode toggle gesture. Fires on the
+    // rising edge of "both down" when the two presses landed within
+    // BOTH_CLICK_TOGETHER_MS of each other (a stick already held as a jog
+    // modifier doesn't count), debounced by BOTH_CLICK_DEBOUNCE_MS.
+    const now = performance.now()
+    if (l_stick_click && !prevLClickRef.current) lClickAtRef.current = now
+    if (r_stick_click && !prevRClickRef.current) rClickAtRef.current = now
+    prevLClickRef.current = l_stick_click
+    prevRClickRef.current = r_stick_click
     const bothClick = l_stick_click && r_stick_click
-    if (bothClick && !prevBothClickRef.current) onBothStickClick?.()
+    if (bothClick && !prevBothClickRef.current) {
+      const together = Math.abs(lClickAtRef.current - rClickAtRef.current) <= BOTH_CLICK_TOGETHER_MS
+      if (together && now - lastBothClickAtRef.current >= BOTH_CLICK_DEBOUNCE_MS) {
+        lastBothClickAtRef.current = now
+        onBothStickClick?.()
+      }
+    }
     prevBothClickRef.current = bothClick
 
     // Serialise once so both transports carry the identical frame (same seq),

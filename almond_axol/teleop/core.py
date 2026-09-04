@@ -192,8 +192,9 @@ class VRTeleopCore:
         self._worker_updates: list[tuple[str, object]] = []
 
         # Latest gripper-pair geometry from the worker (see
-        # ``IKWorker.pair_status``): ``{"aligned": bool, "width": m}``, or
-        # None before the first report. Read by the adapter for the headset.
+        # ``IKWorker.pair_status``): ``{"aligned": bool, "width": m, "tilt":
+        # deg}``, or None before the first report. Read by the adapter for
+        # the headset.
         self.pair_status: dict | None = None
 
         # Reset latch (set from the VR frame callback / programmatically).
@@ -360,6 +361,9 @@ class VRTeleopCore:
             "box_jog_yaw_speed",
             "box_width_speed",
             "box_align_duration",
+            "box_grip_tilt",
+            "box_tilt_speed",
+            "box_tilt_max",
         }
     )
 

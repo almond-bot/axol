@@ -41,7 +41,11 @@ export function useAxolJoints(
           engaged: !!v.engaged,
           pair:
             pair && typeof pair === "object" && typeof pair.width === "number"
-              ? { aligned: !!pair.aligned, width: pair.width }
+              ? {
+                  aligned: !!pair.aligned,
+                  width: pair.width,
+                  tilt: typeof pair.tilt === "number" ? pair.tilt : 0,
+                }
               : null,
           receivedAt: performance.now(),
         }

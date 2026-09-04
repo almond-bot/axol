@@ -9,12 +9,16 @@ robot's world frame (FLU:
 The **box frame** sits at the midpoint of the two gripper mount frames. Its
 axes are ``x`` forward, ``y`` *lateral* — the horizontal direction from the
 right gripper to the left one — and ``z`` up. The grippers live at
-``center ± y * width / 2`` with their approach axes (the gripper link's
-``-Z``, the direction the fingers point) turned toward each other, so the
-two palms face like a pair of hands around a box. Each gripper's roll about
-its approach axis is *not* canonicalised: the alignment applies the smallest
-rotation that turns the current approach axis onto the target, which keeps
-the wrist from flipping and leaves the fingers wherever they were.
+``center ± y * width / 2`` and hold the box the way two flat hands clamp its
+sides: the fingers point *forward* (the gripper link's ``-Z``, the direction
+the fingers point, goes along the box ``+x``) and the flat outer face of the
+closed fingers — the gripper link's ``±X`` side, the jaw's open/close axis —
+faces the box centre, so the box is held between the sides of the two
+grippers by friction. Which of the two flat faces (``+X`` or ``-X``) is
+turned toward the box is chosen per gripper as the one closest to its
+current rotation, so the wrist never flips through 180° to get there. An
+optional *tilt* yaws each gripper inward by a few degrees so the wedge-shaped
+finger face lies flush on the box side instead of touching along its heel.
 """
 
 from __future__ import annotations
@@ -41,43 +45,9 @@ def rodrigues(axis: np.ndarray, angle: float) -> np.ndarray:
     return r.astype(np.float32)
 
 
-def rotation_between(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Smallest rotation taking unit vector ``a`` onto unit vector ``b``.
-
-    Anti-parallel inputs have no unique axis; any axis perpendicular to ``a``
-    works, so one is picked deterministically (world up, or world +y when
-    ``a`` is itself vertical).
-    """
-    a = np.asarray(a, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
-    a = a / max(np.linalg.norm(a), 1e-12)
-    b = b / max(np.linalg.norm(b), 1e-12)
-    axis = np.cross(a, b)
-    s = float(np.linalg.norm(axis))
-    c = float(np.clip(np.dot(a, b), -1.0, 1.0))
-    if s < 1e-9:
-        if c > 0.0:
-            return np.eye(3, dtype=np.float32)
-        perp = np.cross(a, _UP.astype(np.float64))
-        if np.linalg.norm(perp) < 1e-6:
-            perp = np.cross(a, _LEFT.astype(np.float64))
-        return rodrigues(perp / np.linalg.norm(perp), math.pi)
-    return rodrigues(axis / s, math.atan2(s, c))
-
-
 def approach_axis(rot: np.ndarray) -> np.ndarray:
     """Direction the fingers point for a gripper mount rotation (its ``-Z``)."""
     return -np.asarray(rot, dtype=np.float32)[:, 2]
-
-
-def align_to_approach(rot: np.ndarray, target_approach: np.ndarray) -> np.ndarray:
-    """Turn ``rot`` so its approach axis points along ``target_approach``.
-
-    The smallest such rotation is applied (see :func:`rotation_between`), so
-    the roll about the approach axis is carried over from ``rot``.
-    """
-    r = rotation_between(approach_axis(rot), target_approach)
-    return (r @ np.asarray(rot, dtype=np.float32)).astype(np.float32)
 
 
 def box_frame(
@@ -148,8 +118,11 @@ class BoxState:
     (the box rides rigidly on the leader gripper's clutch mapping, see
     ``IKWorker``), then the accumulated stick jog — a world-frame offset
     ``jog_pos`` and a yaw ``jog_yaw`` about the box centre — on top.
-    ``grip_rel`` holds each gripper's rotation relative to the box frame,
-    fixed at the snap so the pair turns rigidly with the box.
+    ``face`` records which flat face (``±1``, the gripper's ``±X`` side) each
+    gripper turns toward the box, chosen at the snap; ``tilt`` is the
+    grippers' inward yaw (rad), seeded from the config and jogged live.
+    Together they give each gripper's rotation relative to the box frame
+    (:meth:`grip_rel`), so the pair turns rigidly with the box.
     ``align_start`` holds where each gripper actually was at the snap,
     expressed in the box frame, for the blend into the parallel
     configuration.
@@ -158,7 +131,8 @@ class BoxState:
     center: np.ndarray
     rot: np.ndarray
     width: float
-    grip_rel: dict[str, np.ndarray]
+    face: dict[str, float]
+    tilt: float
     align_start: dict[str, Pose]
     align_t0: float
     align_duration: float
@@ -166,6 +140,13 @@ class BoxState:
     jog_yaw: float = 0.0
     # Wall time of the previous jog integration step (None before the first).
     jog_t: float | None = None
+
+    def grip_rel(self) -> dict[str, np.ndarray]:
+        """Each gripper's rotation relative to the box frame (see :func:`side_clamp_rotation`)."""
+        return {
+            side: side_clamp_rotation(sign, self.face[side], self.tilt)
+            for side, sign in _SIDE_SIGN.items()
+        }
 
     @property
     def aligned(self) -> bool:
@@ -182,19 +163,91 @@ class BoxState:
         return smoothstep(u)
 
 
-def parallel_gripper_rotations(
-    left: Pose, right: Pose, lateral: np.ndarray
-) -> dict[str, np.ndarray]:
-    """World rotations putting both grippers' approach axes on the lateral line.
+# Which side of the box each gripper sits on, as the sign of its lateral
+# coordinate: the left gripper is at +y (the box's lateral axis runs from the
+# right gripper to the left one).
+_SIDE_SIGN = {"left": 1.0, "right": -1.0}
 
-    The left gripper (on the ``+lateral`` side) points ``-lateral``, toward
-    the right one, and vice versa — palms facing.
+
+def side_clamp_rotation(sign: float, face: float, tilt: float) -> np.ndarray:
+    """Box-frame rotation of a gripper clamping the box side with a flat face.
+
+    ``sign`` is the gripper's side (+1 left, -1 right; see ``_SIDE_SIGN``),
+    ``face`` which of its flat faces is turned toward the box (+1: the
+    gripper's ``+X`` side, -1: its ``-X`` side) and ``tilt`` (rad) the inward
+    yaw: 0 points the fingers straight along the box ``+x``; a positive tilt
+    turns the fingertips toward the box centre so a finger face that narrows
+    toward the tip (a wedge with half-angle ``tilt``) lies flush on the side.
     """
-    lateral = np.asarray(lateral, dtype=np.float32)
+    # Fingers along the box +x (the gripper's -Z), the chosen flat face
+    # toward the centre (-sign * lateral), Y completing a right-handed frame.
+    x_g = np.array((0.0, -sign * face, 0.0), dtype=np.float64)
+    z_g = np.array((-1.0, 0.0, 0.0), dtype=np.float64)
+    y_g = np.cross(z_g, x_g)
+    r0 = np.stack([x_g, y_g, z_g], axis=1)
+    if tilt:
+        r0 = rodrigues(_UP, -sign * tilt).astype(np.float64) @ r0
+    return r0.astype(np.float32)
+
+
+def parallel_grip_rel(
+    current: dict[str, np.ndarray], rot: np.ndarray, tilt: float
+) -> dict[str, np.ndarray]:
+    """Box-relative rotations of the side-clamping gripper pair.
+
+    ``current`` holds each gripper's world rotation, ``rot`` the box rotation
+    and ``tilt`` the inward yaw (rad, see :func:`side_clamp_rotation`). Both
+    flat faces of a gripper clamp equally well, so the one needing the
+    smaller turn from ``current`` is used (:func:`choose_faces`) — the wrist
+    never has to roll through 180° to reach the grasp.
+    """
+    faces = choose_faces(current, rot, tilt)
     return {
-        "left": align_to_approach(left[1], -lateral),
-        "right": align_to_approach(right[1], lateral),
+        side: side_clamp_rotation(sign, faces[side], tilt)
+        for side, sign in _SIDE_SIGN.items()
     }
+
+
+def choose_faces(
+    current: dict[str, np.ndarray], rot: np.ndarray, tilt: float
+) -> dict[str, float]:
+    """Per gripper, the flat face (``±1``) nearest its ``current`` world rotation."""
+    out: dict[str, float] = {}
+    for side, sign in _SIDE_SIGN.items():
+        out[side] = min(
+            (1.0, -1.0),
+            key=lambda face: rotation_angle(
+                current[side], rot @ side_clamp_rotation(sign, face, tilt)
+            ),
+        )
+    return out
+
+
+def pair_aligned(
+    left: Pose,
+    right: Pose,
+    width_min: float,
+    width_max: float,
+    tilt: float,
+    tol_deg: float,
+) -> bool:
+    """True when the grippers already form the side-clamping pair.
+
+    Each gripper is within ``tol_deg`` of the rotation a box-mode engage
+    would blend it to (fingers forward, a flat face toward the other
+    gripper; see :func:`parallel_grip_rel`) and their separation is inside
+    ``[width_min, width_max]`` — so switching to box mode from here costs
+    (almost) no alignment blend.
+    """
+    _center, rot, width = box_frame(left[0], right[0])
+    if not (width_min <= width <= width_max):
+        return False
+    rel = parallel_grip_rel({"left": left[1], "right": right[1]}, rot, tilt)
+    tol = math.radians(tol_deg)
+    return all(
+        rotation_angle(pose[1], rot @ rel[side]) <= tol
+        for side, pose in (("left", left), ("right", right))
+    )
 
 
 def snap_box(
@@ -204,13 +257,16 @@ def snap_box(
     align_duration: float,
     width_min: float,
     width_max: float,
+    tilt: float = 0.0,
 ) -> BoxState:
-    """Build the box state for an engage snap from the current gripper poses."""
+    """Build the box state for an engage snap from the current gripper poses.
+
+    ``tilt`` is the grippers' starting inward yaw in radians (see
+    :func:`side_clamp_rotation`); the jog changes it live afterwards.
+    """
     center, rot, width = box_frame(left[0], right[0])
     width = float(np.clip(width, width_min, width_max))
-    lateral = rot[:, 1]
-    aligned = parallel_gripper_rotations(left, right, lateral)
-    grip_rel = {side: (rot.T @ r).astype(np.float32) for side, r in aligned.items()}
+    face = choose_faces({"left": left[1], "right": right[1]}, rot, tilt)
     align_start = {
         side: (
             (rot.T @ (pose[0] - center)).astype(np.float32),
@@ -222,7 +278,8 @@ def snap_box(
         center=center,
         rot=rot,
         width=width,
-        grip_rel=grip_rel,
+        face=face,
+        tilt=float(tilt),
         align_start=align_start,
         align_t0=now,
         align_duration=max(align_duration, 0.0),
@@ -255,7 +312,7 @@ def box_targets(
     snap (carried along with the box) into its parallel slot; afterwards the
     parallel pair is returned directly.
     """
-    ideal = ideal_gripper_poses(center, rot, state.width, state.grip_rel)
+    ideal = ideal_gripper_poses(center, rot, state.width, state.grip_rel())
     alpha = state.align_alpha(now)
     if alpha >= 1.0:
         return ideal

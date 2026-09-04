@@ -108,11 +108,13 @@ class VRTeleopConfig:
         reengage_ramp_min_s: Floor (s) on the ``"ramp"`` blend duration so a
             small correction is still eased rather than stepped.
         box_mode: Start the session in **box mode** (bimanual carry). The two
-            grippers are held parallel and facing each other — the way two
-            palms hold a box — and *one* controller moves both arms as a
-            rigid pair: either grip engages both arms with that hand as the
-            leader (no both-grips gate; the other grip switches leader), and
-            the leader's trigger drives both grippers. On engage the grippers
+            grippers are held as a parallel pair clamping the box between
+            their sides — fingers pointing forward like two flat hands, the
+            flat outer face of each closed gripper against the box, held by
+            friction — and *one* controller moves both arms as a rigid pair:
+            either grip engages both arms with that hand as the leader (no
+            both-grips gate; the other grip switches leader), and the
+            leader's trigger drives both grippers. On engage the grippers
             first blend into the parallel configuration over
             ``box_align_duration`` (from wherever they were, e.g. after
             someone hand-guided the arms), then track the leader controller.
@@ -122,8 +124,26 @@ class VRTeleopConfig:
             between the grippers); with the leader stick clicked in the same
             axes become up/down and yaw. The other controller's stick moves
             the pair up/down (y) and changes the gripper separation (x —
-            right = wider). The headset can toggle the mode at runtime
-            (``VRFrame.box_mode``); this is the default it starts in.
+            right = wider); with that stick clicked in, x tilts the
+            fingertips in/out instead (``box_grip_tilt``). On these, only the
+            stick's dominant axis counts, so a width change never also lifts
+            the pair. The mode is a live setting
+            (``VRTeleopCore.set_box_mode``, the headset's **Box** button,
+            both thumbstick clicks together, the control panel); this is the
+            default it starts in.
+        box_grip_tilt: Starting inward yaw (degrees) of each gripper in box
+            mode. ``0`` points the fingers straight forward, parallel to each
+            other. The closed fingers are a wedge that narrows toward the
+            tip, so with a positive tilt the fingertips turn toward the box
+            centre and the finger's flat face lies flush on the box side
+            instead of touching along its heel; the wedge half-angle (~20°)
+            makes the face fully flat. Negative splays the tips outward.
+            Jogged live with the other controller's stick clicked in (x:
+            left = inward, right = outward); the jogged value carries over to
+            the next engage.
+        box_tilt_speed: Rate (deg/s) the tilt changes at full stick
+            deflection.
+        box_tilt_max: Largest tilt (degrees, either way) the jog allows.
         box_jog_speed: Jog translation speed (m/s) at full stick deflection
             in box mode.
         box_jog_yaw_speed: Jog yaw rate (rad/s) at full stick deflection in
@@ -267,6 +287,9 @@ class VRTeleopConfig:
     reengage_ramp_speed: float = 0.15
     reengage_ramp_min_s: float = 0.75
     box_mode: bool = False
+    box_grip_tilt: float = 0.0
+    box_tilt_speed: float = 30.0
+    box_tilt_max: float = 45.0
     box_jog_speed: float = 0.15
     box_jog_yaw_speed: float = 0.6
     box_width_speed: float = 0.08
