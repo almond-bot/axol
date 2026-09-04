@@ -175,9 +175,11 @@ class SnapshotRingTest(unittest.TestCase):
         t = threading.Thread(target=writer, daemon=True)
         t.start()
         try:
-            deadline = time.perf_counter() + 0.5
+            # Count reads, not wall time: the writer thread contends for the
+            # GIL, so throughput varies wildly with host load.
+            deadline = time.perf_counter() + 5.0
             reads = 0
-            while time.perf_counter() < deadline:
+            while reads < 200 and time.perf_counter() < deadline:
                 latest = self.reader.read_latest()
                 if latest is None:
                     continue
@@ -198,7 +200,7 @@ class SnapshotRingTest(unittest.TestCase):
             stop.set()
             t.join(5.0)
         self.assertEqual(errors, [])
-        self.assertGreater(reads, 100)
+        self.assertGreaterEqual(reads, 200)
 
 
 if __name__ == "__main__":
