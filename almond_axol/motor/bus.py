@@ -57,6 +57,12 @@ class CanBus:
         self._ready.clear()
         self._closed_reason = None
         try:
+            # Own process group: the proxy has no signal handler, so a
+            # terminal Ctrl-C or the serve manager's group SIGINT would kill
+            # it outright and leave Python's interrupt cleanup (a return-home
+            # ramp, a verified disable) with no CAN transport. Python reaps
+            # it in close(); if Python dies first the proxy exits on the
+            # closed socket.
             self._proc = subprocess.Popen(
                 [
                     find_binary(),
@@ -65,7 +71,8 @@ class CanBus:
                     self._socket_path,
                     "--iface",
                     self._channel,
-                ]
+                ],
+                process_group=0,
             )
         except OSError as exc:
             raise can.CanInitializationError(

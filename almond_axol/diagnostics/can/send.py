@@ -1,12 +1,17 @@
 """Cycle one joint through its limits while holding all others at their start position.
 
+The arms are driven through the Rust realtime core (``RtAxol``) — the same
+control path as teleop — so what this exercises is the production controller
+and its CAN traffic, not a Python-side loop. Every motor of each selected arm
+must be on the bus (the core brings the whole arm up); only the chosen joint
+moves.
+
 Run directly:
     uv run -m almond_axol.diagnostics.can.send --l --joint shoulder_1
     uv run -m almond_axol.diagnostics.can.send --r --joint elbow
-    uv run -m almond_axol.diagnostics.can.send --joint elbow        # both arms, log only
+    uv run -m almond_axol.diagnostics.can.send --joint elbow        # both arms
     uv run -m almond_axol.diagnostics.can.send --l --joint wrist_2 --hz 50
     uv run -m almond_axol.diagnostics.can.send --l --joint gripper --hz 100 --log-file can_send.log
-    uv run -m almond_axol.diagnostics.can.send --l --joint shoulder_1 --joints shoulder_1
 """
 
 from __future__ import annotations
@@ -24,11 +29,10 @@ from datetime import datetime
 
 import numpy as np
 
-from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
-from ...motor import CanBus, ControlMode
-from ...robot.axol import GRIPPER_TRAVEL, AxolArm, arm_limits
+from ...constants import CAN_LEFT, CAN_RIGHT, Joint
+from ...robot.axol import GRIPPER_TRAVEL, Axol, arm_limits
 from ...robot.config import AxolConfig
-from ...robot.gravity import GravityCompensator
+from ...rt import RtAxol
 
 _BAR_WIDTH = 24
 _TAU = 2 * math.pi
@@ -38,129 +42,6 @@ _COL_GAP = 2
 
 # Consistent with home.py and gripper.py.
 _SPEED = 0.2 * _TAU  # rad/s
-
-
-def _parse_joints(spec: str | None) -> set[Joint]:
-    """Parse a comma-separated joint spec into a set of present :class:`Joint`.
-
-    ``None`` or empty selects every joint. Names match the joint enum values
-    (e.g. ``shoulder_1``, ``elbow``, ``gripper``).
-    """
-    if not spec:
-        return set(Joint)
-    by_value = {j.value: j for j in Joint}
-    selected: set[Joint] = set()
-    for raw in spec.split(","):
-        name = raw.strip().lower()
-        if not name:
-            continue
-        if name not in by_value:
-            valid = ", ".join(by_value)
-            raise SystemExit(f"Unknown joint '{name}'. Valid joints: {valid}")
-        selected.add(by_value[name])
-    return selected or set(Joint)
-
-
-def _joint_frame(arm: AxolArm, idx: int, joint: Joint, raw: float) -> float:
-    """Convert a raw motor-frame reading to the public joint-frame value."""
-    if joint == Joint.GRIPPER:
-        gi = arm._gripper_i
-        return (raw - arm._limits_hi[gi]) / (arm._limits_lo[gi] - arm._limits_hi[gi])
-    return raw + float(arm._joint_offsets[idx])
-
-
-async def _enable(arm: AxolArm, present: set[Joint]) -> None:
-    """Enable motors. Full arm uses ``arm.enable()``; a subset enables only
-    the present motors so absent ones are not waited on."""
-    if present == set(Joint):
-        await arm.enable()
-        return
-    # This subset path bypasses AxolArm.enable, so resolve/verify the present
-    # joints' encoder zeros (either-stop side detection + unset-zero
-    # rejection) before any torque is applied — position reads work on
-    # disabled motors.
-    await arm.resolve_joint_offsets(present)
-    await asyncio.gather(*[arm.motors[j].enable() for j in present])
-    await asyncio.gather(
-        *[arm.motors[j].set_control_mode(ControlMode.IMPEDANCE) for j in present]
-    )
-    if Joint.GRIPPER in present:
-        await arm._calibrate_gripper()
-        await arm.motors[Joint.GRIPPER].set_control_mode(ControlMode.POSITION_FORCE)
-
-
-async def _disable(arm: AxolArm, present: set[Joint]) -> None:
-    """Disable motors, limited to the present subset."""
-    if present == set(Joint):
-        await arm.disable()
-        return
-    await asyncio.gather(*[arm.motors[j].disable() for j in present])
-
-
-async def _read_hold_q(arm: AxolArm, present: set[Joint]) -> np.ndarray:
-    """Read start positions (joint frame). Absent motors are reported as 0."""
-    if present == set(Joint):
-        return await arm.get_positions()
-    q = np.zeros(len(list(Joint)), dtype=np.float32)
-    for i, j in enumerate(Joint):
-        if j in present:
-            q[i] = _joint_frame(arm, i, j, await arm.motors[j].get_position())
-    return q
-
-
-def _read_positions(
-    arm: AxolArm, present: set[Joint], fallback: np.ndarray
-) -> np.ndarray:
-    """Read cached positions (joint frame) without raising on absent motors."""
-    if present == set(Joint):
-        try:
-            return arm.positions
-        except Exception:
-            return fallback
-    vals: list[float] = []
-    for i, j in enumerate(Joint):
-        m = arm.motors[j]
-        if j in present and m.has_position:
-            vals.append(_joint_frame(arm, i, j, m.position))
-        else:
-            vals.append(float(fallback[i]))
-    return np.array(vals, dtype=np.float32)
-
-
-async def _command(arm: AxolArm, q: np.ndarray, present: set[Joint]) -> None:
-    """Send control commands. The full arm uses ``arm.motion_control`` (with its
-    full feedforward stack); a subset sends gravity-compensated impedance holds
-    to the present arm joints and a position-force command to the gripper."""
-    if present == set(Joint):
-        await arm.motion_control(q)
-        return
-    q = q.copy()
-    arm_q = q[: len(ARM_JOINTS)].astype(np.float32)
-    gravity = arm._gravity_comp.gravity_arm(arm_q, is_left=arm._is_left)
-    offsets = arm._joint_offsets
-    tasks = []
-    for i, j in enumerate(ARM_JOINTS):
-        if j not in present:
-            continue
-        gains = getattr(arm._arm_config, j.value)
-        tasks.append(
-            arm.motors[j].set_impedance(
-                float(q[i] - offsets[i]), 0.0, gains.kp, gains.kd, float(gravity[i])
-            )
-        )
-    if Joint.GRIPPER in present:
-        gi = arm._gripper_i
-        gripper_pos = arm._limits_hi[gi] + float(q[gi]) * (
-            arm._limits_lo[gi] - arm._limits_hi[gi]
-        )
-        tasks.append(
-            arm.motors[Joint.GRIPPER].set_position_force(
-                gripper_pos,
-                arm._arm_config.gripper.max_speed,
-                arm._arm_config.gripper.torque_limit,
-            )
-        )
-    await asyncio.gather(*tasks)
 
 
 def _make_logger(log_file: str, name: str) -> logging.Logger:
@@ -200,115 +81,132 @@ def _read_can_stats(channel: str) -> str:
         return f"(failed to read stats: {exc})"
 
 
-async def _stats_monitor(
-    channel: str, arm: AxolArm, log: logging.Logger, present: set[Joint]
-) -> None:
-    """Background task: log CAN interface stats and position staleness every second."""
-    prev_positions: np.ndarray | None = None
-    stale_count = 0
-    update_count = 0
-    interval_start = time.perf_counter()
-
-    while True:
-        await asyncio.sleep(1.0)
-        now = time.perf_counter()
-        elapsed = now - interval_start
-        interval_start = now
-
-        fallback = (
-            prev_positions
-            if prev_positions is not None
-            else np.zeros(len(list(Joint)), dtype=np.float32)
-        )
-        positions = _read_positions(arm, present, fallback)
-
-        if prev_positions is not None:
-            if np.allclose(positions, prev_positions, atol=1e-6):
-                stale_count += 1
-            else:
-                update_count += 1
-        prev_positions = positions.copy()
-
-        can_stats = _read_can_stats(channel)
-        log.info(
-            "--- 1s interval (%.2fs) | pos_updates=%d stale_checks=%d ---\n%s",
-            elapsed,
-            update_count,
-            stale_count,
-            can_stats,
-        )
-        update_count = 0
-        stale_count = 0
-
-
 @dataclass
-class _SendSnapshot:
-    """Latest per-arm cycling state shared with the side-by-side display renderer."""
+class _ArmCycle:
+    """One arm's cycling state: the sweep segment plus display counters."""
 
     side: str
-    hz: int
-    log_file: str
+    channel: str
     is_left: bool
     cycle_joint: Joint
-    positions: np.ndarray = field(default_factory=lambda: np.zeros(len(list(Joint))))
-    cycle_count: int = 0
-    send_error_count: int = 0
-    timeout_error_count: int = 0
-    other_error_count: int = 0
+    hold_q: np.ndarray
+    lo_api: float
+    hi_api: float
+    targets: list[float] = field(default_factory=list)
+    target_idx: int = 0
     segment_start: float = 0.0
     segment_target: float = 0.0
+    duration: float = 0.05
+    t_seg: float = 0.0
     alpha: float = 0.0
+    positions: np.ndarray = field(default_factory=lambda: np.zeros(len(list(Joint))))
+    stale_checks: int = 0
+    pos_updates: int = 0
+    _prev_positions: np.ndarray | None = None
+
+    def start(self, log: logging.Logger) -> None:
+        joint_idx = list(Joint).index(self.cycle_joint)
+        cycle_start = float(self.hold_q[joint_idx])
+        log.info(
+            "%s: initial positions read. cycle_joint=%s  start=%.4f",
+            self.side,
+            self.cycle_joint.value,
+            cycle_start,
+        )
+        # Cycle: start → hi → lo → hi → lo → ...
+        # Pick whichever limit is further first for a fuller first sweep.
+        if abs(self.hi_api - cycle_start) >= abs(self.lo_api - cycle_start):
+            self.targets = [self.hi_api, self.lo_api]
+        else:
+            self.targets = [self.lo_api, self.hi_api]
+        self.segment_start = cycle_start
+        self.segment_target = self.targets[0]
+        self._plan_segment()
+
+    def _plan_segment(self) -> None:
+        dist_rad = _cycle_dist_rad(
+            self.segment_target - self.segment_start, self.cycle_joint
+        )
+        self.duration = max(dist_rad / _SPEED, 0.05)
+        self.t_seg = time.perf_counter()
+
+    def target(self, now: float) -> np.ndarray:
+        """The full-arm target for this tick (hold pose + cycled joint)."""
+        self.alpha = min((now - self.t_seg) / self.duration, 1.0)
+        smooth = self.alpha * self.alpha * (3.0 - 2.0 * self.alpha)
+        q = self.hold_q.copy()
+        q[list(Joint).index(self.cycle_joint)] = self.segment_start + smooth * (
+            self.segment_target - self.segment_start
+        )
+        return q
+
+    def advance(self, log: logging.Logger) -> None:
+        """Move to the next segment once the current one has completed."""
+        if self.alpha < 1.0:
+            return
+        self.segment_start = self.segment_target
+        self.target_idx += 1
+        self.segment_target = self.targets[self.target_idx % 2]
+        self._plan_segment()
+        log.info(
+            "%s: new segment: %.4f → %.4f  duration=%.2fs",
+            self.side,
+            self.segment_start,
+            self.segment_target,
+            self.duration,
+        )
+
+    def observe(self, positions: np.ndarray | None) -> None:
+        """Track feedback staleness for the 1 s stats log."""
+        if positions is None:
+            return
+        self.positions = positions.copy()
+        if self._prev_positions is not None:
+            if np.allclose(positions, self._prev_positions, atol=1e-6):
+                self.stale_checks += 1
+            else:
+                self.pos_updates += 1
+        self._prev_positions = positions.copy()
 
 
-def _arm_lines(snap: _SendSnapshot) -> list[str]:
+def _arm_lines(
+    arm: _ArmCycle, hz: int, cycles: int, errors: int, log_file: str
+) -> list[str]:
     joints = list(Joint)
     lines = [
-        f"  {snap.side.upper()} ARM  [{snap.hz} Hz]  cycling={snap.cycle_joint.value}"
-        f"  log→{snap.log_file}",
+        f"  {arm.side.upper()} ARM  [{hz} Hz]  cycling={arm.cycle_joint.value}  log→{log_file}",
+        f"  cycles={cycles}  send_err={errors}",
         (
-            f"  cycles={snap.cycle_count}  send_err={snap.send_error_count}"
-            f"  timeout_err={snap.timeout_error_count}"
-            f"  other_err={snap.other_error_count}"
+            f"  segment: {arm.segment_start:+.4f} → {arm.segment_target:+.4f}"
+            f"  α={arm.alpha:.2f}"
         ),
-        f"  segment: {snap.segment_start:+.4f} → {snap.segment_target:+.4f}"
-        f"  α={snap.alpha:.2f}",
         f"  {'Joint':<12}  {'rev':>8}  {'':^{_BAR_WIDTH}}",
         "  " + "─" * (12 + 8 + _BAR_WIDTH + 4),
     ]
     for i, joint in enumerate(joints):
-        lo, hi = arm_limits(joint, is_left=snap.is_left)
-        p = float(snap.positions[i])
-        marker = " ◀" if joint == snap.cycle_joint else ""
+        lo, hi = arm_limits(joint, is_left=arm.is_left)
+        p = float(arm.positions[i])
+        marker = " ◀" if joint == arm.cycle_joint else ""
         lines.append(
             f"  {joint.value:<12}  {p / _TAU:>+8.4f}  {_bar(p, lo, hi)}{marker}"
         )
     return lines
 
 
-async def _display_both(left: _SendSnapshot, right: _SendSnapshot) -> None:
-    right_col = _COL_WIDTH + _COL_GAP + 1
-    print("\033[?25l\033[2J", end="", flush=True)
-    try:
-        while True:
-            left_lines = _arm_lines(left)
-            right_lines = _arm_lines(right)
-            n_rows = max(len(left_lines), len(right_lines))
-
-            buf: list[str] = []
-            for row in range(n_rows):
-                if row < len(left_lines):
-                    cell = left_lines[row][:_COL_WIDTH].ljust(_COL_WIDTH)
-                    buf.append(f"\033[{row + 1};1H{cell}")
-                if row < len(right_lines):
-                    buf.append(f"\033[{row + 1};{right_col}H{right_lines[row]}\033[K")
-
-            buf.append(f"\033[{n_rows + 2};1H  ctrl+c to quit\033[K")
-            print("".join(buf), end="", flush=True)
-            await asyncio.sleep(1.0 / _DISPLAY_HZ)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        print("\033[?25h", end="", flush=True)
+def _render(
+    arms: list[_ArmCycle], hz: int, cycles: int, errors: int, log_file: str
+) -> None:
+    columns = [_arm_lines(arm, hz, cycles, errors, log_file) for arm in arms]
+    n_rows = max(len(col) for col in columns)
+    buf: list[str] = ["\033[H\033[J"]
+    for row in range(n_rows):
+        for c, col in enumerate(columns):
+            if row < len(col):
+                x = 1 + c * (_COL_WIDTH + _COL_GAP)
+                cell = col[row][:_COL_WIDTH].ljust(_COL_WIDTH)
+                buf.append(f"\033[{row + 1};{x}H{cell}")
+    buf.append(f"\033[{n_rows + 2};1H  ctrl+c to quit\033[K")
+    print("".join(buf), end="", flush=True)
 
 
 def _cycle_dist_rad(dist_api: float, joint: Joint) -> float:
@@ -319,17 +217,14 @@ def _cycle_dist_rad(dist_api: float, joint: Joint) -> float:
 
 
 async def _run(
-    is_left: bool,
+    run_left: bool,
+    run_right: bool,
     cycle_joint: Joint,
     hz: int,
     log_file: str,
     display: bool = True,
-    snapshot: _SendSnapshot | None = None,
-    present: set[Joint] | None = None,
 ) -> None:
-    side = "left" if is_left else "right"
-    present = set(Joint) if present is None else present
-    log = _make_logger(log_file, f"{__name__}.{side}")
+    log = _make_logger(log_file, __name__)
 
     def _asyncio_exc_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
         exc = context.get("exception")
@@ -342,221 +237,155 @@ async def _run(
 
     asyncio.get_running_loop().set_exception_handler(_asyncio_exc_handler)
 
-    joints = list(Joint)
-    joint_idx = joints.index(cycle_joint)
-    channel = CAN_LEFT if is_left else CAN_RIGHT
+    def limits(is_left: bool) -> tuple[float, float]:
+        # Limits in API units (gripper = [0, 1]; arm joints = radians).
+        if cycle_joint == Joint.GRIPPER:
+            return 0.0, 1.0
+        return arm_limits(cycle_joint, is_left=is_left)
 
-    # Limits in API units (gripper = [0, 1]; arm joints = radians).
-    if cycle_joint == Joint.GRIPPER:
-        lo_api, hi_api = 0.0, 1.0
-    else:
-        lo_api, hi_api = arm_limits(cycle_joint, is_left=is_left)
-
-    log.info(
-        "Starting  side=%s  channel=%s  joint=%s  hz=%d  limits=[%.4f, %.4f]"
-        "  present=%s",
-        side,
-        channel,
-        cycle_joint.value,
-        hz,
-        lo_api,
-        hi_api,
-        ",".join(j.value for j in joints if j in present),
-    )
-    log.info("Initial CAN stats:\n%s", _read_can_stats(channel))
+    channels = [
+        (side, ch, is_left)
+        for side, ch, is_left, on in (
+            ("left", CAN_LEFT, True, run_left),
+            ("right", CAN_RIGHT, False, run_right),
+        )
+        if on
+    ]
+    for side, ch, is_left in channels:
+        lo, hi = limits(is_left)
+        log.info(
+            "Starting  side=%s  channel=%s  joint=%s  hz=%d  limits=[%.4f, %.4f]",
+            side,
+            ch,
+            cycle_joint.value,
+            hz,
+            lo,
+            hi,
+        )
+        log.info("Initial CAN stats (%s):\n%s", ch, _read_can_stats(ch))
 
     t_start = time.perf_counter()
     cycle_count = 0
     send_error_count = 0
-    timeout_error_count = 0
-    other_error_count = 0
 
-    stats_task: asyncio.Task | None = None
-
+    # ``resolved()`` applies the default stiffness blend at the ``Axol``
+    # construction boundary, so the core runs the same gains teleop does.
+    robot = RtAxol(
+        Axol(
+            config=AxolConfig(),
+            left_channel=CAN_LEFT if run_left else None,
+            right_channel=CAN_RIGHT if run_right else None,
+        )
+    )
     try:
-        async with CanBus(channel) as bus:
-            # ``resolved()`` applies the default stiffness blend (done at the
-            # ``Axol`` construction boundary) so this directly-built arm gets
-            # the same gains Axol would.
-            cfg = AxolConfig().resolved()
-            arm = AxolArm(bus, cfg, GravityCompensator(cfg), is_left=is_left)
+        try:
+            await robot.enable()
+            log.info("Motors enabled (realtime core armed)")
+        except Exception as exc:
+            log.error("enable failed: %s\n%s", exc, traceback.format_exc())
+            raise
 
-            stats_task = asyncio.create_task(
-                _stats_monitor(channel, arm, log, present), name="can_stats_monitor"
-            )
+        hold_left, hold_right = await robot.get_positions()
+        arms: list[_ArmCycle] = []
+        for side, ch, is_left in channels:
+            hold_q = hold_left if is_left else hold_right
+            assert hold_q is not None
+            lo, hi = limits(is_left)
+            arm = _ArmCycle(side, ch, is_left, cycle_joint, hold_q.copy(), lo, hi)
+            arm.start(log)
+            arms.append(arm)
 
-            try:
-                await _enable(arm, present)
-                log.info("Motors enabled")
-            except Exception as exc:
-                log.error("enable failed: %s\n%s", exc, traceback.format_exc())
-                raise
+        if display:
+            print("\033[?25l", end="")
+        last_stat_log = time.perf_counter()
+        last_display = 0.0
+        interval = 1.0 / hz
 
-            hold_q = await _read_hold_q(arm, present)
-            cycle_start = float(hold_q[joint_idx])
-            log.info(
-                "Initial positions read. cycle_joint=%s  start=%.4f",
-                cycle_joint.value,
-                cycle_start,
-            )
+        try:
+            while True:
+                if robot.limp is not None:
+                    log.error("realtime core went limp: %s — stopping", robot.limp)
+                    print(
+                        f"\nRealtime core went limp ({robot.limp}) — arms are in "
+                        "gravity comp; hand-guide them to rest."
+                    )
+                    break
+                cycle_count += 1
+                t_iter = time.perf_counter()
+                now = t_iter
 
-            # Cycle: start → hi → lo → hi → lo → ...
-            # Pick whichever limit is further first for a fuller first sweep.
-            if abs(hi_api - cycle_start) >= abs(lo_api - cycle_start):
-                targets = [hi_api, lo_api]
-            else:
-                targets = [lo_api, hi_api]
-
-            target_idx = 0
-            segment_start = cycle_start
-            segment_target = targets[0]
-            dist_rad = _cycle_dist_rad(segment_target - segment_start, cycle_joint)
-            duration = max(dist_rad / _SPEED, 0.05)
-            t_seg = time.perf_counter()
-
-            if display:
-                print("\033[?25l", end="")
-            last_stat_log = time.perf_counter()
-            last_display = 0.0
-            interval = 1.0 / hz
-
-            try:
-                while True:
-                    cycle_count += 1
-                    t_iter = time.perf_counter()
-
-                    now = t_iter
-                    alpha = min((now - t_seg) / duration, 1.0)
-                    smooth = alpha * alpha * (3.0 - 2.0 * alpha)
-                    cycle_pos = segment_start + smooth * (
-                        segment_target - segment_start
+                targets = {arm.side: arm.target(now) for arm in arms}
+                try:
+                    await robot.motion_control(
+                        left=targets.get("left"), right=targets.get("right")
+                    )
+                except Exception as exc:
+                    send_error_count += 1
+                    log.error(
+                        "motion_control failed (cycle=%d): %s\n%s",
+                        cycle_count,
+                        exc,
+                        traceback.format_exc(),
                     )
 
-                    q = hold_q.copy()
-                    q[joint_idx] = cycle_pos
+                # Read back positions for display; the core's telemetry fills
+                # the caches every tick.
+                pos_left, pos_right = await robot.get_positions()
+                for arm in arms:
+                    arm.observe(pos_left if arm.is_left else pos_right)
 
-                    try:
-                        await _command(arm, q, present)
-                    except Exception as exc:
-                        send_error_count += 1
-                        log.error(
-                            "motion_control failed (cycle=%d): %s\n%s",
-                            cycle_count,
-                            exc,
-                            traceback.format_exc(),
-                        )
+                if display and now - last_display >= 1.0 / _DISPLAY_HZ:
+                    _render(arms, hz, cycle_count, send_error_count, log_file)
+                    last_display = now
 
-                    # Read back positions for display; fall back to hold_q until
-                    # control feedback has arrived for the present motors.
-                    positions = _read_positions(arm, present, hold_q)
-
-                    if snapshot is not None:
-                        snapshot.positions = positions.copy()
-                        snapshot.cycle_count = cycle_count
-                        snapshot.send_error_count = send_error_count
-                        snapshot.timeout_error_count = timeout_error_count
-                        snapshot.other_error_count = other_error_count
-                        snapshot.segment_start = segment_start
-                        snapshot.segment_target = segment_target
-                        snapshot.alpha = alpha
-
-                    if display and now - last_display >= 1.0 / _DISPLAY_HZ:
-                        lines = []
-                        lines.append("\033[H\033[J")
-                        lines.append(
-                            f"  {side.upper()} ARM  [{hz} Hz]  cycling={cycle_joint.value}"
-                            f"  log→{log_file}"
-                        )
-                        lines.append(
-                            f"  cycles={cycle_count}  send_err={send_error_count}"
-                            f"  timeout_err={timeout_error_count}"
-                            f"  other_err={other_error_count}"
-                        )
-                        lines.append(
-                            f"  segment: {segment_start:+.4f} → {segment_target:+.4f}"
-                            f"  α={alpha:.2f}"
-                        )
-                        lines.append(f"  {'Joint':<12}  {'rev':>8}  {'':^{_BAR_WIDTH}}")
-                        lines.append("  " + "─" * (12 + 8 + _BAR_WIDTH + 4))
-
-                        for i, joint in enumerate(joints):
-                            lo, hi = arm_limits(joint, is_left=is_left)
-                            p = float(positions[i])
-                            marker = " ◀" if joint == cycle_joint else ""
-                            lines.append(
-                                f"  {joint.value:<12}  {p / _TAU:>+8.4f}"
-                                f"  {_bar(p, lo, hi)}{marker}"
-                            )
-
-                        lines.append("")
-                        lines.append("  ctrl+c to quit")
-                        print("\n".join(lines), end="", flush=True)
-                        last_display = now
-
-                    if now - last_stat_log >= 10.0:
-                        elapsed_total = now - t_start
+                if now - last_stat_log >= 1.0:
+                    elapsed_total = now - t_start
+                    for arm in arms:
                         log.info(
-                            "CYCLE STATS  elapsed=%.1fs  cycles=%d  actual_hz=%.1f"
-                            "  send_err=%d  timeout_err=%d  other_err=%d",
-                            elapsed_total,
-                            cycle_count,
-                            cycle_count / elapsed_total,
-                            send_error_count,
-                            timeout_error_count,
-                            other_error_count,
+                            "--- %s 1s interval | pos_updates=%d stale_checks=%d ---\n%s",
+                            arm.side,
+                            arm.pos_updates,
+                            arm.stale_checks,
+                            _read_can_stats(arm.channel),
                         )
-                        last_stat_log = now
+                        arm.pos_updates = 0
+                        arm.stale_checks = 0
+                    log.info(
+                        "CYCLE STATS  elapsed=%.1fs  cycles=%d  actual_hz=%.1f  send_err=%d",
+                        elapsed_total,
+                        cycle_count,
+                        cycle_count / elapsed_total,
+                        send_error_count,
+                    )
+                    last_stat_log = now
 
-                    # Advance to next segment when current one completes.
-                    if alpha >= 1.0:
-                        segment_start = segment_target
-                        target_idx += 1
-                        segment_target = targets[target_idx % 2]
-                        dist_rad = _cycle_dist_rad(
-                            segment_target - segment_start, cycle_joint
-                        )
-                        duration = max(dist_rad / _SPEED, 0.05)
-                        t_seg = time.perf_counter()
-                        log.info(
-                            "New segment: %.4f → %.4f  duration=%.2fs",
-                            segment_start,
-                            segment_target,
-                            duration,
-                        )
+                for arm in arms:
+                    arm.advance(log)
 
-                    elapsed = time.perf_counter() - t_iter
-                    await asyncio.sleep(max(0.0, interval - elapsed))
+                elapsed = time.perf_counter() - t_iter
+                await asyncio.sleep(max(0.0, interval - elapsed))
 
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                pass
-            finally:
-                if display:
-                    print("\033[?25h")
-                await _disable(arm, present)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            if display:
+                print("\033[?25h")
+            await robot.disable()
 
     except Exception as exc:
         log.error("Fatal error in _run: %s\n%s", exc, traceback.format_exc())
         raise
     finally:
-        if stats_task is not None and not stats_task.done():
-            stats_task.cancel()
-            try:
-                await stats_task
-            except asyncio.CancelledError:
-                pass
-
         elapsed_total = time.perf_counter() - t_start
         log.info(
-            "FINAL STATS  elapsed=%.1fs  cycles=%d  actual_hz=%.1f"
-            "  send_err=%d  timeout_err=%d  other_err=%d",
+            "FINAL STATS  elapsed=%.1fs  cycles=%d  actual_hz=%.1f  send_err=%d",
             elapsed_total,
             cycle_count,
             cycle_count / elapsed_total if elapsed_total > 0 else 0.0,
             send_error_count,
-            timeout_error_count,
-            other_error_count,
         )
-        log.info("Final CAN stats:\n%s", _read_can_stats(channel))
+        for _side, ch, _is_left in channels:
+            log.info("Final CAN stats (%s):\n%s", ch, _read_can_stats(ch))
 
 
 def main() -> None:
@@ -576,100 +405,31 @@ def main() -> None:
         help=f"Joint to cycle. One of: {', '.join(valid_joints)}",
     )
     parser.add_argument(
-        "--hz", type=int, default=100, help="Control rate in Hz (default: 100)"
+        "--hz", type=int, default=100, help="Target stream rate in Hz (default: 100)"
     )
     parser.add_argument(
         "--log-file",
         default=f"logs/can_send_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
         help="Path for the diagnostic log file",
     )
-    parser.add_argument(
-        "--joints",
-        default=None,
-        help="Comma-separated joints present on the bus (e.g. shoulder_1,elbow). "
-        "Only these motors are enabled and commanded. Default: all joints. "
-        "The --joint being cycled must be included. Useful for bench-testing a "
-        "subset of motors.",
-    )
     args = parser.parse_args()
 
     cycle_joint = Joint(args.joint)
-    present = _parse_joints(args.joints)
-    if cycle_joint not in present:
-        present_names = ", ".join(j.value for j in Joint if j in present)
-        raise SystemExit(
-            f"Cycled joint '{cycle_joint.value}' is not in --joints ({present_names}). "
-            f"Include it in --joints."
-        )
+    run_left = args.l or not args.r
+    run_right = args.r or not args.l
+    if run_left and run_right:
+        print("No side specified — running both arms.")
 
     try:
-        if not args.l and not args.r:
-            stem, _, ext = args.log_file.rpartition(".")
-            left_log = f"{stem}_left.{ext}"
-            right_log = f"{stem}_right.{ext}"
-            print("No side specified — running both arms.")
-            print(f"  left  → {left_log}")
-            print(f"  right → {right_log}")
-
-            joints = list(Joint)
-            left_snap = _SendSnapshot(
-                side="left",
-                hz=args.hz,
-                log_file=left_log,
-                is_left=True,
+        asyncio.run(
+            _run(
+                run_left=run_left,
+                run_right=run_right,
                 cycle_joint=cycle_joint,
-                positions=np.zeros(len(joints)),
-            )
-            right_snap = _SendSnapshot(
-                side="right",
                 hz=args.hz,
-                log_file=right_log,
-                is_left=False,
-                cycle_joint=cycle_joint,
-                positions=np.zeros(len(joints)),
+                log_file=args.log_file,
             )
-
-            async def _run_both() -> None:
-                display_task = asyncio.create_task(_display_both(left_snap, right_snap))
-                try:
-                    await asyncio.gather(
-                        _run(
-                            is_left=True,
-                            cycle_joint=cycle_joint,
-                            hz=args.hz,
-                            log_file=left_log,
-                            display=False,
-                            snapshot=left_snap,
-                            present=present,
-                        ),
-                        _run(
-                            is_left=False,
-                            cycle_joint=cycle_joint,
-                            hz=args.hz,
-                            log_file=right_log,
-                            display=False,
-                            snapshot=right_snap,
-                            present=present,
-                        ),
-                    )
-                finally:
-                    display_task.cancel()
-                    try:
-                        await display_task
-                    except asyncio.CancelledError:
-                        pass
-
-            asyncio.run(_run_both())
-        else:
-            asyncio.run(
-                _run(
-                    is_left=args.l,
-                    cycle_joint=cycle_joint,
-                    hz=args.hz,
-                    log_file=args.log_file,
-                    present=present,
-                )
-            )
+        )
     except KeyboardInterrupt:
         pass
 

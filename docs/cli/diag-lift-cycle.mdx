@@ -3,7 +3,7 @@ title: "diag.lift-cycle"
 description: "Raise the arms for clearance, then cycle the telescoping lift down and up."
 ---
 
-Exercises the powered cart's telescoping lift with the robot mounted. Before the lift moves, the command enables the selected arms and smoothly moves their S1 joints to the mirrored 90° clearance pose. It then runs the requested number of complete **down, then up** cycles. After a successful run verifies the lift is fully up and stopped, it smoothly returns S1 to 0° rest while holding every other joint at its measured starting position, verifies both the arm pose and lift state, then disables the selected arm motors and confirms none still reports holding. This is not a full-arm rest-pose replay.
+Exercises the powered cart's telescoping lift with the robot mounted. Before the lift moves, the command enables the selected arms and smoothly moves their S1 joints to the mirrored 90° clearance pose. It then runs the requested number of complete **down, then up** cycles. After a successful run verifies the lift is fully up and stopped, it smoothly returns S1 to 0° rest while holding every other joint at its measured starting position, verifies both the arm pose and lift state, then disables the selected arm motors and confirms none still reports holding. This is not a full-arm rest-pose replay. The arms are driven through the Rust realtime core (the [`teleop`](/cli/teleop) control path), which holds the clearance pose with live damping for the whole time the lift is cycling.
 
 ```bash
 axol diag.lift-cycle --cycles 3

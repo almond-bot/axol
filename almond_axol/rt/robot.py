@@ -566,6 +566,17 @@ class RtAxol:
         return sink
 
     @property
+    def fault(self) -> str | None:
+        """The core's latched ``fault: ...``, or ``None`` while healthy.
+
+        After a fault the core has stopped streaming and the motors hold
+        their last command; :meth:`disable` deliberately leaves them that
+        way. Flows that must *prove* a torque-off (diagnostics) check this
+        before trusting a disable.
+        """
+        return self._link.fault
+
+    @property
     def limp(self) -> str | None:
         """Why the core went limp (``limp: ...``), or ``None`` while healthy.
 
@@ -656,6 +667,37 @@ class RtAxol:
             arm_positions(self._robot.left),
             arm_positions(self._robot.right),
         )
+
+    async def detach(self) -> None:
+        """Release the bus with every motor left holding its last command.
+
+        For flows that hand a still-energized robot to a later process:
+        ``diag.rom-enable`` leaves the grippers clamped on the item for
+        ``diag.rom-disable`` to release, and ``diag.lift-cycle`` must never
+        torque off arms that are out of their clearance pose. No disarm is
+        sent — the core exits on the closed link and, as on every exit that
+        is not an explicit ``D``, leaves each motor holding its last MIT
+        command on firmware gains, gravity feedforward included. Host
+        damping stops with the core, exactly as when a classic session
+        closed its buses without disabling. A later ``enable()`` (or the
+        maintenance-proxy attach ``rom.disable`` does) picks the robot up
+        from there.
+        """
+        if self._rec is not None:
+            self.set_recording_engaged(False)
+        for _side, arm in self._arms():
+            arm._command_sink = None
+        self._link.on_feedback = None
+        try:
+            await self._link.close()
+        except Exception:  # noqa: BLE001 - the motors hold either way
+            _logger.exception("rt: core link teardown failed")
+        if self._rec is not None:
+            try:
+                self._rec.dump()
+            except Exception:  # noqa: BLE001 - continue trace finalization
+                _logger.exception("rt: could not dump the measurement trace")
+        _logger.info("rt: detached — motors left holding their last command")
 
     async def disable(self) -> None:
         """Disarm the core and tear the link down.

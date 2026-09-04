@@ -119,8 +119,17 @@ class RtLink:
         if self._trace_prefix is not None:
             env["AXOL_RT_TRACE"] = f"{self._trace_prefix}_rt"
             env["AXOL_RT_TRACE_GATED"] = "1"
+        # Own process group: a terminal Ctrl-C (and the serve manager's Stop,
+        # which SIGINTs the whole group) must reach *Python only*. The core
+        # treats SIGINT/SIGTERM as "exit holding", so if it shared our group
+        # the interrupt would kill the motor owner at the very moment the
+        # flow starts its return-to-rest ramp. Python still ends the core
+        # itself in close(); a Python that dies outright drops the socket and
+        # the core exits on the lost client, motors holding.
         self._proc = subprocess.Popen(
-            [self._binary, "serve", "--socket", self._socket_path], env=env
+            [self._binary, "serve", "--socket", self._socket_path],
+            env=env,
+            process_group=0,
         )
         deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_S
         while True:
