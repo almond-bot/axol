@@ -1906,7 +1906,21 @@ class _EpisodeVideoVerifier:
     very thing that tempts an operator into the kill that corrupts the
     dataset. Off the save path (background thread) so the SAVING window stays
     short; per-episode files are written-once, so each is verified exactly
-    once, and by shutdown the backlog is at most the last episode.
+    once.
+
+    The decode only runs **between** episodes. A software re-decode of four
+    60 fps files costs more CPU time than the episode took to record (~100
+    core-seconds for a three-minute take), all of it on the two background
+    cores the recorder's capture thread and the relay's CFS encoder-feed
+    threads share. Measured 2026-09-03: with the verifier decoding episode 1
+    throughout episode 2, ``left_arm``'s NVENC input queue overran four times
+    in six seconds and the take was discarded — while episode 1, recorded with
+    the verifier idle, lost nothing. ``nice 19`` does not fix that (it only
+    yields to CFS peers, and the load also contends for memory bandwidth and
+    the GIL), so the owner calls :meth:`suspend` when an episode starts and
+    :meth:`resume` once its capture thread has stopped; the decode picks up
+    where it left off, and :meth:`close` lifts the gate before its bounded
+    wait so shutdown never blocks on it.
     """
 
     def __init__(self, dataset_root: "Path | str") -> None:
@@ -1914,6 +1928,13 @@ class _EpisodeVideoVerifier:
 
         self._root = Path(dataset_root)
         self._queue: "queue.Queue[list | None]" = queue.Queue()
+        # Set while no episode is recording; the decode loop waits on it
+        # between frames, so a running verify parks within one frame of
+        # suspend() and continues from the same file on resume().
+        self._idle = threading.Event()
+        self._idle.set()
+        self._pending_files = 0
+        self._pending_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run, name="axol-video-verify", daemon=True
         )
@@ -1922,25 +1943,47 @@ class _EpisodeVideoVerifier:
     def submit(self, episode_row: dict[str, Any]) -> None:
         paths = _episode_video_paths(self._root, episode_row)
         if paths:
+            with self._pending_lock:
+                self._pending_files += len(paths)
             self._queue.put(paths)
 
+    @property
+    def pending_files(self) -> int:
+        """Video files submitted but not yet verified (a backlog indicator)."""
+        with self._pending_lock:
+            return self._pending_files
+
+    def suspend(self) -> None:
+        """Park the decode (call when an episode starts recording)."""
+        self._idle.clear()
+
+    def resume(self) -> None:
+        """Let the decode continue (call once the capture thread has stopped)."""
+        self._idle.set()
+
     def close(self, timeout: float = 60.0) -> None:
-        """Finish the pending verifies (bounded — the backlog is ~1 episode)."""
+        """Finish the pending verifies (bounded so shutdown can't hang on them).
+
+        Lifts the recording gate first: by the time the owner closes, nothing
+        records anymore, and a suspended verifier would otherwise just sit out
+        the timeout.
+        """
+        self.resume()
         self._queue.put(None)
         self._thread.join(timeout)
         if self._thread.is_alive():
             _logger.warning(
                 "video integrity: verifier still running after %.0fs; leaving "
-                "the last episode's videos unverified",
+                "%d video file(s) of the last episode(s) unverified",
                 timeout,
+                self.pending_files,
             )
 
     def _run(self) -> None:
-        # A software re-decode of four 60 fps files takes longer than the
-        # episode did, so this thread (and the libav workers it spawns, which
-        # inherit its priority) is CPU-bound for most of a session on the same
-        # background cores as the capture thread. Yield to that thread: it
-        # holds the snapshot lock the 120 Hz control loop waits on.
+        # Even between episodes this thread (and the libav workers it spawns,
+        # which inherit its priority) is CPU-bound on the background cores
+        # while a save/return-to-rest is under way; yield to everything else
+        # there.
         try:
             os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)
         except (AttributeError, OSError):
@@ -1951,12 +1994,15 @@ class _EpisodeVideoVerifier:
                 return
             for mp4 in paths:
                 try:
-                    packets, decoded = self._probe(mp4)
+                    packets, decoded = self._probe(mp4, self._idle)
                 except Exception as exc:  # noqa: BLE001 - verify is best-effort
                     _logger.warning(
                         "video integrity: could not verify %s: %s", mp4, exc
                     )
                     continue
+                finally:
+                    with self._pending_lock:
+                        self._pending_files -= 1
                 if decoded != packets:
                     _logger.error(
                         "video integrity: %s has %d frames but only %d decode "
@@ -1976,15 +2022,28 @@ class _EpisodeVideoVerifier:
                     )
 
     @staticmethod
-    def _probe(mp4: "Path") -> tuple[int, int]:
+    def _probe(
+        mp4: "Path", proceed: "threading.Event | None" = None
+    ) -> tuple[int, int]:
+        """``(muxed packets, decodable frames)`` of ``mp4``.
+
+        ``proceed`` (when given) is waited on before every decoded frame, so a
+        cleared event parks the decode — including libav's worker threads,
+        which stall as soon as this pump stops feeding them — until it is set
+        again.
+        """
         import av
 
         with av.open(str(mp4)) as container:
             packets = sum(1 for p in container.demux(video=0) if p.pts is not None)
+        decoded = 0
         with av.open(str(mp4)) as container:
             stream = container.streams.video[0]
             stream.thread_type = "AUTO"
-            decoded = sum(1 for _ in container.decode(stream))
+            for _ in container.decode(stream):
+                decoded += 1
+                if proceed is not None and not proceed.is_set():
+                    proceed.wait()
         return packets, decoded
 
 
@@ -2152,6 +2211,9 @@ class InProcessRecorder:
             name="axol-capture",
             daemon=True,
         )
+        # Park the previous episode's video verify for the whole take (see
+        # _EpisodeVideoVerifier); _stop_capture() resumes it.
+        self._verifier.suspend()
         self._thread.start()
 
     def pause_episode(self) -> int:
@@ -2178,6 +2240,8 @@ class InProcessRecorder:
                     "finalize while dataset writes may still be in flight"
                 )
             self._thread = None
+        # Nothing records now: let the previous episode's verify continue.
+        self._verifier.resume()
 
     def finish_episode(self) -> int:
         """Freeze capture without saving and return the exact buffered rows."""
@@ -2397,6 +2461,8 @@ def _recorder_main(
                     "finalize while dataset writes may still be in flight"
                 )
             thread = None
+        # Nothing records now: let the previous episode's verify continue.
+        verifier.resume()
 
     try:
         while True:
@@ -2450,10 +2516,15 @@ def _recorder_main(
                     name="axol-capture",
                     daemon=True,
                 )
+                # Park the previous episode's video verify for the whole take
+                # (see _EpisodeVideoVerifier); stop_capture() resumes it.
+                verifier.suspend()
                 thread.start()
                 if encoded_mode and not armed.wait(2.0):
                     stop.set()
                     thread.join(timeout=2.0)
+                    if not thread.is_alive():
+                        verifier.resume()
                     detail = capture_error["v"] or "encoded readers did not arm"
                     conn.send(("error", detail))
                     continue

@@ -477,6 +477,50 @@ def _irq_affinity(irq: int, *, proc_root: Path = _PROC_ROOT) -> set[int] | None:
         return None
 
 
+def _irq_effective_affinity(
+    irq: int, *, proc_root: Path = _PROC_ROOT
+) -> set[int] | None:
+    """CPUs ``irq`` is *actually* delivered to.
+
+    The GIC picks one CPU out of a multi-CPU nominal mask (CPU0 for the Jetson's
+    default ``0-7``); the kernel reports that choice in
+    ``effective_affinity_list`` where it tracks one. Falls back to the nominal
+    :func:`_irq_affinity` when the node is absent or empty. ``None`` if neither
+    is readable.
+    """
+    try:
+        effective = _parse_cpu_list(
+            (proc_root / "irq" / str(irq) / "effective_affinity_list").read_text()
+        )
+    except (OSError, ValueError):
+        effective = set()
+    return effective or _irq_affinity(irq, proc_root=proc_root)
+
+
+def can_irq_cpus(
+    *, proc_root: Path = _PROC_ROOT, sys_root: Path = _SYS_ROOT
+) -> set[int] | None:
+    """CPUs the CAN adapters' USB-controller interrupt(s) can currently land on.
+
+    The union of :func:`_irq_effective_affinity` over every interrupt
+    :func:`_can_usb_irqs` names — i.e. ``{7}`` once :func:`_steer_can_irq` has
+    run this boot, ``{0}`` (or the whole nominal mask) before it. ``None`` when
+    no such interrupt is found or an affinity is unreadable: callers must read
+    that as "could be anywhere" and keep real-time camera work off the default
+    interrupt CPU (see :func:`affinity.realtime_camera_cores`).
+    """
+    irqs = _can_usb_irqs(proc_root=proc_root, sys_root=sys_root)
+    if not irqs:
+        return None
+    cpus: set[int] = set()
+    for irq in irqs:
+        delivered = _irq_effective_affinity(irq, proc_root=proc_root)
+        if delivered is None:
+            return None
+        cpus |= delivered
+    return cpus
+
+
 def _irqbalance_active() -> bool:
     """True when the ``irqbalance`` service is running (it would undo our steering)."""
     systemctl = shutil.which("systemctl")
@@ -569,7 +613,10 @@ def _prioritize_capture_daemons(escalator: _RootEscalator) -> None:
     (:func:`affinity.realtime_camera_cores`) it cannot preempt the Python
     control loop or IK, nor sit on the CPU the CAN adapters' interrupt lands
     on before :func:`_steer_can_irq` moves it, where a FIFO thread delays the
-    interrupt's bottom half and with it both arms' feedback.
+    interrupt's bottom half and with it both arms' feedback. That core set is
+    read *after* the steering step, so once the interrupt is on a CAN core the
+    daemon (like the relay's capture threads) may use CPU0 as well; the
+    drop-in is rewritten whenever the set changes.
     """
     if not _is_jetson():
         _logger.debug("not a Jetson; leaving the camera daemons' scheduling alone")

@@ -105,26 +105,57 @@ class PrioritizeCaptureThreadsTest(TestCase):
 
 
 class RealtimeCameraCoresTest(TestCase):
-    def test_eight_cores_excludes_irq_cpu_and_relay_python_core(self) -> None:
+    """The FIFO camera pool follows the *live* placement of the CAN interrupt."""
+
+    def _cores(self, n: int, irq_cpus: set[int] | None) -> set[int] | None:
+        with (
+            patch.object(affinity.os, "cpu_count", return_value=n),
+            patch("almond_axol.utils.jetson.can_irq_cpus", return_value=irq_cpus),
+        ):
+            return affinity.realtime_camera_cores()
+
+    def test_eight_cores_excludes_irq_cpu_while_the_interrupt_can_land_there(
+        self,
+    ) -> None:
         with patch.object(affinity.os, "cpu_count", return_value=8):
             groups = affinity.core_groups()
-            cores = affinity.realtime_camera_cores()
         assert groups is not None
         self.assertEqual(groups["irq"], {0})
-        self.assertEqual(cores, {1, 5})
-        # Disjoint from everything a FIFO camera thread must never preempt.
-        for group in ("can", "realtime", "ik", "irq"):
+        # Unsteered: the GIC delivers to CPU0 (effective) or anywhere (nominal).
+        for irq_cpus in ({0}, set(range(8))):
+            cores = self._cores(8, irq_cpus)
+            assert cores is not None
+            self.assertEqual(cores, {1, 5}, irq_cpus)
+            # Disjoint from everything a FIFO camera thread must never preempt.
+            for group in ("can", "realtime", "ik", "irq"):
+                self.assertTrue(cores.isdisjoint(groups[group]), group)
+            self.assertNotIn(min(groups["relay"]), cores)
+
+    def test_unknown_interrupt_placement_keeps_cpu0_excluded(self) -> None:
+        # No /proc row, unreadable affinity, not a Jetson: the conservative
+        # (pre-existing) layout.
+        self.assertEqual(self._cores(8, None), {1, 5})
+
+    def test_steered_interrupt_returns_cpu0_to_the_camera_pool(self) -> None:
+        with patch.object(affinity.os, "cpu_count", return_value=8):
+            groups = affinity.core_groups()
+        assert groups is not None
+        cores = self._cores(8, {affinity.can_irq_cpu()})
+        assert cores is not None
+        self.assertEqual(cores, {0, 1, 5})
+        # Still never a control, IK, CAN, or relay-Python core.
+        for group in ("can", "realtime", "ik"):
             self.assertTrue(cores.isdisjoint(groups[group]), group)
         self.assertNotIn(min(groups["relay"]), cores)
 
     def test_smaller_layouts_still_avoid_cpu0(self) -> None:
+        # Below 8 cores CPU0 is a CAN core, so steering never changes the pool.
         for n, expected in ((6, {4, 5}), (5, {3, 4}), (4, {3})):
-            with patch.object(affinity.os, "cpu_count", return_value=n):
-                self.assertEqual(affinity.realtime_camera_cores(), expected, n)
+            for irq_cpus in (None, {0}, {n - 1}):
+                self.assertEqual(self._cores(n, irq_cpus), expected, (n, irq_cpus))
 
     def test_none_when_partitioning_is_not_applicable(self) -> None:
-        with patch.object(affinity.os, "cpu_count", return_value=2):
-            self.assertIsNone(affinity.realtime_camera_cores())
+        self.assertIsNone(self._cores(2, None))
 
 
 class CanIrqCpuTest(TestCase):
@@ -133,10 +164,19 @@ class CanIrqCpuTest(TestCase):
             with patch.object(affinity.os, "cpu_count", return_value=n):
                 groups = affinity.core_groups()
                 target = affinity.can_irq_cpu()
-                cameras = affinity.realtime_camera_cores()
-            assert groups is not None and target is not None and cameras is not None
+                assert target is not None
+                # Whether the interrupt is still on CPU0 or already steered
+                # onto the CAN core, that core is never a camera core.
+                for irq_cpus in (None, {0}, {target}):
+                    with patch(
+                        "almond_axol.utils.jetson.can_irq_cpus",
+                        return_value=irq_cpus,
+                    ):
+                        cameras = affinity.realtime_camera_cores()
+                    assert cameras is not None
+                    self.assertNotIn(target, cameras, (n, irq_cpus))
+            assert groups is not None
             self.assertEqual(target, max(groups["can"]), n)
-            self.assertNotIn(target, cameras, n)
             self.assertNotIn(target, groups["irq"], n)
 
     def test_none_without_a_can_partition(self) -> None:

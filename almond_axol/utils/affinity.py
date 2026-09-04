@@ -75,8 +75,10 @@ def core_groups() -> dict[str, set[int]] | None:
     CAN core (:func:`can_irq_cpu`), which ``jetson.setup`` does at every boot:
     the whole receive path then runs where its consumer already is and no
     camera thread is allowed. :func:`realtime_camera_cores` additionally
-    keeps real-time camera work off the ``irq`` CPU, so the two subsystems
-    stay decoupled even when that steering has not (yet) been applied.
+    keeps real-time camera work off the ``irq`` CPU for as long as the
+    interrupt can still land there, so the two subsystems stay decoupled
+    when that steering has not (yet) been applied — and hands the CPU back
+    to the camera pool once it has.
 
     The relay gets *two* private cores so :func:`isolate_relay_cpu` can keep its
     Python work (the aiortc WebRTC send + encoded-AU pull loops, all
@@ -97,7 +99,7 @@ def core_groups() -> dict[str, set[int]] | None:
         return None
     # The Jetson's xHCI interrupt lands on CPU0 until jetson.setup steers it
     # (its nominal mask says all CPUs; the GIC picks CPU0); every layout keeps
-    # SCHED_FIFO camera work off it.
+    # SCHED_FIFO camera work off it until then (realtime_camera_cores).
     irq = {0}
     if n >= 8:
         # CPU0 takes the Jetson's xHCI interrupt by default (both USB CAN
@@ -132,21 +134,49 @@ def realtime_camera_cores() -> set[int] | None:
 
     The relay's throughput cores (everything but its Python core) plus the
     background cores — the same pool :func:`isolate_relay_cpu` gives the CFS
-    GStreamer workers — **minus** the ``irq`` CPU. The capture chain the relay
+    GStreamer workers — **minus** the ``irq`` CPU while the CAN adapters'
+    interrupt can still be delivered there. The capture chain the relay
     elevates (:func:`prioritize_capture_threads`) and the Argus daemon
-    ``jetson.setup`` elevates both live here, so neither can ever sit on the
-    CPU the CAN adapters' interrupt is delivered to before ``jetson.setup``
-    steers it away (see :func:`core_groups`), nor land on a control, IK, or
-    CAN core. ``None`` when partitioning isn't applicable or the pool would be
-    empty.
+    ``jetson.setup`` elevates both live here, so neither can sit on the CPU
+    the CAN replies arrive on (see :func:`core_groups`), nor land on a
+    control, IK, or CAN core.
+
+    Once ``jetson.setup`` has steered that interrupt onto a CAN core
+    (:func:`can_irq_cpu`, checked live via ``jetson.can_irq_cpus``), the
+    ``irq`` CPU is an ordinary throughput core again and rejoins the pool.
+    Confining the whole FIFO set — some 30 relay threads plus the Argus
+    daemon — to two cores instead of three left the CFS work sharing those
+    cores (the NVENC feed threads, the recorder) preempted for long
+    stretches: on 2026-09-03 a recording lost frames at a dataset encoder's
+    input queue whose feed thread spent 20 % of its time runnable-but-waiting,
+    while no camera source skipped an exposure. Unknown interrupt placement
+    (no ``/proc`` row, unreadable affinity, not a Jetson) keeps the CPU
+    excluded, exactly as before. ``None`` when partitioning isn't applicable
+    or the pool would be empty.
     """
     groups = core_groups()
     if groups is None:
         return None
     relay = sorted(groups["relay"])
     py_core = {relay[0]} if relay else set()
-    cores = (set(relay[1:]) | groups["background"]) - py_core - groups["irq"]
+    cores = (set(relay[1:]) | groups["background"]) - py_core
+    if _can_irq_may_land_on(groups["irq"]):
+        cores -= groups["irq"]
     return cores or None
+
+
+def _can_irq_may_land_on(cpus: set[int]) -> bool:
+    """Whether the CAN adapters' interrupt can still be delivered to ``cpus``.
+
+    ``True`` unless the interrupt's live affinity is readable *and* proves it
+    is steered elsewhere — the conservative reading, because a FIFO camera
+    thread on the interrupt's CPU stalls both arms' feedback.
+    """
+    # utils.jetson imports this module at top level; import lazily.
+    from .jetson import can_irq_cpus
+
+    delivered = can_irq_cpus()
+    return delivered is None or bool(delivered & cpus)
 
 
 def can_irq_cpu() -> int | None:
