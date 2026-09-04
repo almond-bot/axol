@@ -79,11 +79,14 @@ with `v_des = 0`.
 The core owns the wire and the **fast physics**, all per tick from its
 own trajectory and feedback states:
 
-- Hard 240 Hz pacing (spin-assisted `sleep_until`). On 8+ core robot hosts,
-  the left and right CAN threads are pinned to dedicated CPUs, separate from
-  Python control, IK, camera relay, and dataset recording. They additionally
-  request SCHED_FIFO priority 20 when permitted by the launcher; CPU isolation
-  remains active with an explicit warning for unprivileged development runs.
+- Hard 240 Hz pacing (spin-assisted `sleep_until`). On every partitioned
+  host (4+ cores: Jetson and Raspberry Pi 5), the left and right CAN threads
+  are pinned to dedicated CPUs, separate from Python control, IK, camera
+  relay, and dataset recording, and run at SCHED_FIFO priority 20. The
+  launcher (`rt.link`) sets both from `affinity.core_groups()`; the binary
+  needs `CAP_SYS_NICE` (`axol rt.install` grants it) and refuses to arm
+  without the real-time class rather than run the phase-sensitive damping
+  on CFS timing.
 - **In-core target tracker**: the golden-ported `TrapezoidalFilter`
   (`filter::Trapezoid`) chases the latest streamed target under the
   config velocity/acceleration limits (teleop caps × 1.5 headroom),

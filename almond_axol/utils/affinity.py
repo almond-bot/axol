@@ -2,8 +2,9 @@
 
 During ``collect-data`` the box runs five kinds of work that contend for cores:
 
-* **can** — the two Rust 240 Hz CAN loops. On an 8+ core robot each arm owns a
-  dedicated core; the Rust process pins the bus threads individually.
+* **can** — the two Rust 240 Hz CAN loops. On every partitioned host (4+
+  cores, Jetson or Raspberry Pi 5) each arm owns a dedicated core; the Rust
+  process pins the bus threads individually and runs them ``SCHED_FIFO``.
 * **realtime** — the Python 120 Hz target loop plus its web/VR/teleop and
   IK-dispatch threads. It has a separate core from CAN, so Python or camera
   activity cannot delay a motor tick.
@@ -93,6 +94,22 @@ def core_groups() -> dict[str, set[int]] | None:
     Below 8 cores there's no room to dedicate an IK core, so ``ik`` shares the
     control group; on 4-5 cores the relay also shares the background group (still
     kept off the control cores). ``None`` when partitioning isn't applicable.
+
+    4-5 cores (Raspberry Pi 5 hosts): the two CAN cores are still carved out
+    and kept disjoint from ``realtime``, because that disjointness is what
+    lets ``rt.link`` hand the Rust core a CPU per bus *and* request
+    ``SCHED_FIFO`` for it. The earlier layout put CAN and Python control on
+    the same pair with no pinning and no real-time class, so the 240 Hz bus
+    loops ran as ordinary CFS threads next to the target stream, the CSV
+    logger and the dashboard. Measured on a Pi 5 ROM soak (2026-09-03): a
+    43.8 ms overrun sent the core limp mid-sweep, and every tick more than
+    0.5 ms late had already switched the shoulder host damping off for that
+    tick (``serve.rs`` gates ``damp_ok`` on on-time ticks), which chops the
+    only damper the shoulders have into torque transients. The Pi has no
+    room for anything else: control, IK and the CAN cores take three CPUs,
+    and the interrupt CPU carries all throughput work (relay + dataset). A
+    FIFO camera pool cannot exist there — :func:`realtime_camera_cores`
+    returns ``None`` — but Pi hosts run no ZED cameras anyway.
     """
     n = os.cpu_count()
     if not n or n < _MIN_CORES:
@@ -116,9 +133,14 @@ def core_groups() -> dict[str, set[int]] | None:
         rt = ik = {2}
         relay = {3, 4}
         bg = set(range(5, n))
-    else:  # 4-5 cores: isolate control only; relay + dataset share the rest
-        can = rt = ik = {0, 1}
-        relay = bg = set(range(2, n))
+    else:
+        # 4-5 cores: the bus loops get the last two cores (pinned + FIFO via
+        # rt.link, exactly as on 8+), Python control/IK one core, and the
+        # remaining CPU(s) — including the interrupt CPU, which only CFS
+        # work may share — take the relay and dataset throughput work.
+        can = {n - 2, n - 1}
+        rt = ik = {1}
+        relay = bg = set(range(0, n - 2)) - rt
     return {
         "can": can,
         "realtime": rt,

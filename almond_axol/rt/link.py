@@ -90,12 +90,13 @@ class RtLink:
         # it does log (bring-up, faults) belongs in the teleop output.
         env = dict(os.environ)
         # Keep the motor deadlines independent of Python/IK/video scheduling.
-        # On robot-sized hosts affinity.core_groups() reserves two CAN cores;
-        # the Rust process pins one bus thread to each. SCHED_FIFO is requested
-        # as a second layer when the launcher has CAP_SYS_NICE / an rtprio
-        # allowance (the installed root service does); a manual unprivileged
-        # run still gets the hard CPU partition and Rust logs the denied
-        # priority request explicitly.
+        # On every partitioned host (4+ cores — Jetson and Pi 5 alike)
+        # affinity.core_groups() reserves two CAN cores disjoint from Python
+        # control; the Rust process pins one bus thread to each and enters
+        # SCHED_FIFO on it. The binary carries CAP_SYS_NICE (`axol rt.install`
+        # sets it) so that works from any launcher; without it the core
+        # refuses to arm rather than run the phase-sensitive damping on CFS
+        # timing (see configure_bus_scheduling in serve.rs).
         from ..utils.affinity import core_groups
 
         groups = core_groups()
