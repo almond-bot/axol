@@ -1,12 +1,13 @@
 ---
 title: "provision"
-description: "Install or refresh the non-PyPI and system pieces — adb, pyzed, GStreamer/PyGObject, and the patched zed-gstreamer plugins."
+description: "Install or refresh the native and non-PyPI pieces used by Lighthouse tracking, Quest USB, and ZED cameras."
 ---
 
 Installs and refreshes the pieces `uv tool install` can't manage on its own:
 
 - **adb** + the Quest udev rule — for the [Quest-over-USB](/guides/quest-over-usb) controller transport (the `adb reverse` tunnel that streams poses over the cable). Self-gates on `apt`.
-- [`zed.driver`](/cli/zed-driver) — replaces the ZED Box Duo's known-bad factory **GMSL camera driver** (`stereolabs-zedbox-duo`) with the pinned release. Takes effect on the next reboot (prints a notice; never reboots itself). A no-op off a factory-flashed ZED Box Duo.
+- [`tracker.install`](/cli/tracker) — a pinned **libsurvive** build and Vive USB permissions for Mantis Lighthouse tracking.
+- [`zed.driver`](/cli/zed-driver) — replaces a ZED Box's outdated factory **GMSL camera driver** (`stereolabs-zedbox-duo` on the Duo, `stereolabs-zedbox-mini` on the Mini) with the release pinned for the ZED SDK. Takes effect on the next reboot (prints a notice; never reboots itself). A no-op off a factory-flashed ZED Box; warns about a Stereolabs driver package it has no pin for.
 - **board IMU** (`gyro.install`) — grants the `imu` group access to the carrier board's BMI088 sampling timer, the [powered cart](/guides/vr-interface#powered-cart)'s heading-hold yaw reference, so teleop can start it without root. Self-gates on the board driver's presence.
 - [`zed.install`](/cli/zed-install) — the **pyzed** bindings (not on PyPI; needs the ZED SDK).
 - [`gst.install`](/cli/gst-install) — the **GStreamer + PyGObject** `appsink` stack (PyGObject builds against the system gobject-introspection and is dropped whenever the tool environment is rebuilt, e.g. by a release upgrade).
@@ -18,10 +19,12 @@ axol provision
 
 Both the hosted installer and the [`axol serve`](/cli/serve) self-updater run **this** command, so the set of steps lives in exactly one place and can't drift between them. Every step is idempotent and best-effort — each self-gates on the ZED SDK / `apt` / NVENC and no-ops when unavailable — so `axol provision` is safe to run on any host and re-run anytime.
 
+Provisioning holds the host-wide update lock, which is root-only. Run from a terminal as a regular user, the steps still execute as that user (their `uv`, download caches, and Python environment) and only a small lock-holder process escalates via `sudo` (one password prompt, shared with the steps that need root). Without a usable `sudo` the command exits with a message instead of a traceback.
+
 <Note>
   `provision` does **not** pin the Jetson clocks — that's [`jetson.setup`](/cli/jetson-setup), a per-boot runtime tweak owned by the systemd `ExecStartPre`, not an install step.
 </Note>
 
-When there's no ZED SDK at `/usr/local/zed`, the pyzed and zed-gstreamer build steps are skipped (only the GStreamer/PyGObject stack and adb are installed).
+When there's no ZED SDK at `/usr/local/zed`, the pyzed and zed-gstreamer build steps are skipped. The GStreamer/NVENC steps also skip on non-Jetson hosts, where that pipeline cannot run. Lighthouse tracking and adb remain independently available on normal Linux workstations.
 
 See [Development install → Headset-video stack](/advanced/development-install#headset-video-stack) for when you'd run this by hand.

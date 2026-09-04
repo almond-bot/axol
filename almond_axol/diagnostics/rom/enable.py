@@ -47,7 +47,14 @@ import time
 
 import numpy as np
 
-from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
+from ...constants import (
+    ARM_JOINTS,
+    CAN_LEFT,
+    CAN_MANTIS_LEFT,
+    CAN_MANTIS_RIGHT,
+    CAN_RIGHT,
+    Joint,
+)
 from ...motor import ControlMode
 from ...robot.axol import (
     ELBOW_LEFT_LIMITS,
@@ -625,6 +632,7 @@ async def run_axol(
     capture: bool = True,
     left_channel: str = CAN_LEFT,
     right_channel: str = CAN_RIGHT,
+    target: str = "axol",
 ) -> None:
     run_left = not no_left
     run_right = not no_right
@@ -635,7 +643,7 @@ async def run_axol(
     grasp = present == set(Joint)
     sweep_gripper = has_gripper and not grasp
 
-    print("=== ROM TEST — PHYSICAL ROBOT ===")
+    print(f"=== ROM TEST — {target.upper()} ===")
     print("Make sure the area is clear.")
     arms_desc = (
         "both arms"
@@ -815,18 +823,24 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
     parser.add_argument(
+        "--target",
+        choices=["axol", "mantis"],
+        default="axol",
+        help="Test the Axol arms or Mantis grippers (default: %(default)s).",
+    )
+    parser.add_argument(
         "--left-channel",
-        default=CAN_LEFT,
+        default=None,
         metavar="IFACE",
         help="SocketCAN interface for the left arm, for setups without the "
-        "Axol hub CAN adapter (default: %(default)s).",
+        "selected hardware's default bus.",
     )
     parser.add_argument(
         "--right-channel",
-        default=CAN_RIGHT,
+        default=None,
         metavar="IFACE",
         help="SocketCAN interface for the right arm, for setups without the "
-        "Axol hub CAN adapter (default: %(default)s).",
+        "selected hardware's default bus.",
     )
     parser.add_argument(
         "--web-prompts",
@@ -859,6 +873,15 @@ def run_cli(args: argparse.Namespace) -> None:
     if args.no_left and args.no_right:
         raise SystemExit("Cannot skip both arms.")
     present = parse_joints(args.joints)
+    if args.target == "mantis":
+        if args.joints and present != {Joint.GRIPPER}:
+            raise SystemExit("Mantis ROM supports only --joints gripper.")
+        present = {Joint.GRIPPER}
+    defaults = (
+        (CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT)
+        if args.target == "mantis"
+        else (CAN_LEFT, CAN_RIGHT)
+    )
     asyncio.run(
         run_axol(
             present=present,
@@ -866,8 +889,9 @@ def run_cli(args: argparse.Namespace) -> None:
             no_right=args.no_right,
             web_prompts=args.web_prompts,
             capture=not args.no_capture,
-            left_channel=args.left_channel,
-            right_channel=args.right_channel,
+            left_channel=args.left_channel or defaults[0],
+            right_channel=args.right_channel or defaults[1],
+            target=args.target,
         )
     )
 

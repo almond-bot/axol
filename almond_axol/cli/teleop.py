@@ -21,6 +21,7 @@ import logging
 import socket
 from typing import TYPE_CHECKING, Any
 
+from ..utils.network import local_ip
 from .config import TeleopCmdConfig, normalize_bool_flags, parse
 
 if TYPE_CHECKING:
@@ -29,31 +30,93 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
-def _get_local_ip() -> str:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+def _prepare_mantis_teleop(cfg: TeleopCmdConfig) -> None:
+    """Apply and validate deterministic Mantis config before live hardware."""
+    if cfg.sim:
+        raise ValueError("--mantis and --sim are mutually exclusive")
+    if cfg.cart_only:
+        raise ValueError(
+            "--mantis drives the handheld rig and --cart_only the powered "
+            "cart — pick one"
+        )
+
+    # Mantis is a handheld rig whose arms are virtual. A host may have the
+    # robot's powered-cart setting persisted from an earlier Axol session;
+    # never let that unrelated setting open or move base/lift hardware during
+    # a Mantis run.
+    if cfg.cart.enabled:
+        _logger.info("--mantis: disabling powered-cart control.")
+        cfg.cart.enabled = False
+
+    from ..kinematics.config import apply_mantis_kinematics_profile
+    from ..teleop.config import apply_mantis_teleop_profile
+
+    apply_mantis_teleop_profile(cfg.teleop, tracker_source=cfg.mantis_source)
+    cfg.vr_server.pose_source_kind = (
+        "webxr" if cfg.mantis_source == "quest" else "tracker"
+    )
+    apply_mantis_kinematics_profile(cfg.kinematics)
 
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a VR teleop session."""
-    cfg = parse(TeleopCmdConfig, normalize_bool_flags(argv, "sim", "cart_only"))
+    normalized_argv = normalize_bool_flags(argv, "sim", "mantis", "cart_only")
+    cfg = parse(TeleopCmdConfig, normalized_argv)
+    if cfg.mantis:
+        from .mantis_bridge import (
+            add_quest_key_to_direct_fallback,
+            load_direct_mantis_fallback,
+        )
+
+        fallback, quest_key = load_direct_mantis_fallback(collection=False)
+        cfg = parse(TeleopCmdConfig, normalized_argv, fallback_overlay=fallback)
+        if cfg.mantis_source == "quest" and quest_key is not None:
+            add_quest_key_to_direct_fallback(fallback, quest_key, collection=False)
+            cfg = parse(TeleopCmdConfig, normalized_argv, fallback_overlay=fallback)
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop log_say() / INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+
+    if cfg.mantis:
+        # Resolve/validate all source-specific config before starting a tracker
+        # reader or waiting for live hardware. _run repeats this idempotently
+        # because the control-panel runner calls it directly.
+        _prepare_mantis_teleop(cfg)
 
     # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled
     # by the host installer + its boot service, not here — see
     # `axol jetson.setup` / `axol gst.install`. This entry point just runs.
 
     hostname = socket.gethostname()
-    local_ip = _get_local_ip()
-    print("Connect the VR app (https://axol.almond.bot) to this machine:")
+    host_ip = local_ip()
+    if cfg.mantis and cfg.mantis_source != "quest":
+        print(
+            "Optional camera/episode UI (tracking comes from the local "
+            f"{cfg.mantis_source} bridge):"
+        )
+    else:
+        print("Connect the VR app (https://axol.almond.bot) to this machine:")
     print(f"  Hostname : {hostname}.local")
-    print(f"  IP       : {local_ip}")
+    print(f"  IP       : {host_ip}")
 
-    asyncio.run(_run(cfg))
+    if cfg.mantis:
+        from .mantis_bridge import managed_mantis_bridge, set_managed_pose_source_id
+
+        pose_source_id = (
+            set_managed_pose_source_id(cfg) if cfg.mantis_source != "quest" else None
+        )
+
+        with managed_mantis_bridge(
+            cfg.mantis_source,
+            left_channel=cfg.left_channel,
+            right_channel=cfg.right_channel,
+            port=cfg.vr_server.port,
+            pose_source_id=pose_source_id,
+        ):
+            asyncio.run(_run(cfg))
+    else:
+        asyncio.run(_run(cfg))
 
 
 def _stereo_serials_for(cfg: TeleopCmdConfig) -> set[int]:
@@ -330,8 +393,11 @@ async def _run_cart_only(cfg: TeleopCmdConfig) -> None:
 
 
 async def _run(cfg: TeleopCmdConfig) -> None:
-    from ..robot import Axol, Sim
+    from ..robot import Axol, Mantis, Sim
     from ..teleop import VRTeleop
+
+    if cfg.mantis:
+        _prepare_mantis_teleop(cfg)
 
     if cfg.cart_only:
         if cfg.sim:
@@ -339,10 +405,29 @@ async def _run(cfg: TeleopCmdConfig) -> None:
                 "cart-only teleop has no sim mode (there is no cart hardware "
                 "model in the visualizer) — drop --sim or --cart_only"
             )
+        if cfg.mantis:
+            raise ValueError(
+                "--mantis drives the handheld rig and --cart_only the powered "
+                "cart — pick one"
+            )
         await _run_cart_only(cfg)
         return
 
-    if cfg.sim:
+    if cfg.mantis:
+        # Mantis bench mode: the Quest triggers drive the two real
+        # grippers; the arms exist only as the headset's URDF overlay. Force
+        # the same absolute-mapping profile collect-data --mantis uses so the
+        # bench test exercises exactly what collection will.
+        from ..constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
+
+        left = cfg.left_channel
+        right = cfg.right_channel
+        if left == CAN_LEFT:
+            left = CAN_MANTIS_LEFT
+        if right == CAN_RIGHT:
+            right = CAN_MANTIS_RIGHT
+        robot = Mantis(config=cfg.axol, left_channel=left, right_channel=right)
+    elif cfg.sim:
         robot = Sim()
     else:
         robot = Axol(
@@ -352,7 +437,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         )
     # Powered-cart robots (--cart.enabled true) get the base + lift driven by
     # the headset thumbsticks; VRTeleop owns the cart's lifecycle. Skipped in
-    # sim — there's no cart hardware model in the visualizer.
+    # sim and Mantis mode — neither has cart hardware in its model/profile.
     cart = None
     if cfg.cart.enabled and not cfg.sim:
         from ..robot.cart import Cart

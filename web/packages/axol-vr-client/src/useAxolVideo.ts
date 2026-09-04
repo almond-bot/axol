@@ -1,5 +1,11 @@
 import type { RefObject } from "react"
 import { useEffect, useRef, useState } from "react"
+import {
+  retireCurrentVideoPeer,
+  videoDisconnectRearmDelay,
+  videoPeerNeedsRetry,
+  videoRequestIsDue,
+} from "./videoRetry"
 import { waitForIceGathering } from "./webrtc"
 
 /** Live camera streams keyed by camera name (e.g. "overhead", "left_arm"). */
@@ -16,6 +22,20 @@ const POLL_MS = 300
 // The request is a tiny JSON message on the already-open teleop socket, so
 // retrying is harmless even against a robot that genuinely has no cameras.
 const REQUEST_RETRY_MS = 2000
+
+// After a peer is re-armed because negotiation *failed* (rejected SDP, a peer
+// that went failed/closed, a track that ended), hold the next request back by
+// this much. A socket swap still requests immediately; only failures back off,
+// so a fast deterministic failure can't become a 300 ms loop of server
+// create_offer/close cycles.
+const FAILURE_BACKOFF_MS = REQUEST_RETRY_MS
+
+// A peer in "disconnected" gets this long to come back on its own before it is
+// torn down and renegotiated. Per the WebRTC spec the state is transient: over
+// Tailscale Funnel/TURN or a Wi-Fi roam Chrome flaps connected → disconnected
+// → connected in ~1–3 s, and a full renegotiation (server close, new offer,
+// ICE/TURN, DTLS, first keyframe) costs far more frozen video than waiting.
+const DISCONNECT_GRACE_MS = 5000
 
 // Receiver jitter-buffer target (ms). A *zero* buffer minimises latency but
 // leaves no time for a NACK retransmit of a dropped/reordered RTP packet, so
@@ -67,19 +87,54 @@ export function useAxolVideo(
   // dead peer connection clears `offerSeen` so the loop renegotiates.
   const lastRequestAtRef = useRef(0)
   const offerSeenRef = useRef(false)
+  // Earliest time the next webrtc-request may go out; pushed forward by
+  // FAILURE_BACKOFF_MS when a rearm is caused by a failure.
+  const requestNotBeforeRef = useRef(0)
+  // Pending grace timer for the current peer's "disconnected" state.
+  const disconnectGraceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     if (!enabled) return
 
+    function clearDisconnectGrace() {
+      if (disconnectGraceRef.current !== null) {
+        clearTimeout(disconnectGraceRef.current)
+        disconnectGraceRef.current = null
+      }
+    }
+
     function closePc() {
-      if (pcRef.current) {
+      clearDisconnectGrace()
+      const pc = pcRef.current
+      // Retire before close(): Chromium may dispatch "closed" synchronously,
+      // and that local teardown must not re-arm negotiation.
+      pcRef.current = null
+      if (pc) {
         try {
-          pcRef.current.close()
+          pc.close()
         } catch {
           // already closed
         }
-        pcRef.current = null
       }
+    }
+
+    // Retire a peer whose negotiation *failed* (remote failure, rejected SDP,
+    // ended track, or a disconnect that outlived its grace) and let the polling
+    // loop request a fresh offer — after FAILURE_BACKOFF_MS, not on the next
+    // tick, so a deterministic failure doesn't hammer the server.
+    function rearmPeer(signalingWs: WebSocket, pc: RTCPeerConnection) {
+      if (!retireCurrentVideoPeer(attachedWsRef, pcRef, signalingWs, pc)) return
+      clearDisconnectGrace()
+      try {
+        pc.close()
+      } catch {
+        // already closed
+      }
+      setStreams({})
+      setAvailable(null)
+      offerSeenRef.current = false
+      lastRequestAtRef.current = 0
+      requestNotBeforeRef.current = Date.now() + FAILURE_BACKOFF_MS
     }
 
     function detach() {
@@ -88,25 +143,32 @@ export function useAxolVideo(
       attachedWsRef.current = null
       listenerRef.current = null
       lastRequestAtRef.current = 0
+      requestNotBeforeRef.current = 0
       offerSeenRef.current = false
       closePc()
     }
 
     async function handleOffer(
+      signalingWs: WebSocket,
       sdp: string,
       trackMap: Record<string, string>,
       iceServers: RTCIceServer[]
     ) {
+      // A queued offer from a socket that was just replaced must not close the
+      // new socket's peer connection or send its SDP answer to the new host.
+      if (attachedWsRef.current !== signalingWs) return
       closePc()
       // Off-LAN operators get TURN/STUN servers from the server; on a LAN the
       // list is empty and we use the browser default (direct host candidates).
       const pc = new RTCPeerConnection(iceServers.length > 0 ? { iceServers } : undefined)
       pcRef.current = pc
+      const isCurrent = () => attachedWsRef.current === signalingWs && pcRef.current === pc
 
       // Accumulate streams as tracks arrive, matching each transceiver's mid to
       // its camera name from the server's map.
       const acc: CameraStreams = {}
       pc.ontrack = (e: RTCTrackEvent) => {
+        if (!isCurrent()) return
         // Keep the receiver buffer small for low-latency LAN teleop, but not
         // zero: a tiny buffer still lets a NACK retransmit recover a lost or
         // reordered packet before playout, instead of decoding an incomplete
@@ -124,30 +186,68 @@ export function useAxolVideo(
         const mid = e.transceiver?.mid ?? null
         const name = mid != null ? trackMap[mid] : undefined
         if (!name) return
+        e.track.addEventListener("ended", () => rearmPeer(signalingWs, pc), {
+          once: true,
+        })
         acc[name] = new MediaStream([e.track])
         setStreams({ ...acc })
       }
+      // "disconnected" is transient: give it DISCONNECT_GRACE_MS to recover
+      // before renegotiating. Any state change cancels the pending grace timer;
+      // if the state is still "disconnected" when it fires, rearm.
+      const scheduleDisconnectRearm = (disconnectedAt: number, delayMs: number) => {
+        disconnectGraceRef.current = setTimeout(() => {
+          disconnectGraceRef.current = null
+          if (!isCurrent()) return
+          const remaining = videoDisconnectRearmDelay(
+            pc.connectionState,
+            disconnectedAt,
+            Date.now(),
+            DISCONNECT_GRACE_MS
+          )
+          if (remaining === null) return
+          if (remaining > 0) {
+            scheduleDisconnectRearm(disconnectedAt, remaining)
+            return
+          }
+          rearmPeer(signalingWs, pc)
+        }, delayMs)
+      }
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === "failed" || pc.connectionState === "closed") {
-          setStreams({})
-          // Let the retry loop renegotiate a fresh connection. Only remotely
-          // caused failures land here — a local pc.close() (detach / socket
-          // swap / re-offer) doesn't fire this handler.
-          offerSeenRef.current = false
+        if (!isCurrent()) return
+        clearDisconnectGrace()
+        const state = pc.connectionState
+        if (videoPeerNeedsRetry(state)) {
+          rearmPeer(signalingWs, pc)
+          return
         }
+        const now = Date.now()
+        const delay = videoDisconnectRearmDelay(state, now, now, DISCONNECT_GRACE_MS)
+        if (delay !== null) scheduleDisconnectRearm(now, delay)
       }
 
-      await pc.setRemoteDescription({ type: "offer", sdp })
-      const answer = await pc.createAnswer()
-      await pc.setLocalDescription(answer)
-      // Non-trickle: wait for gathering so the (TURN relay) candidate is in the
-      // SDP we signal back. On a LAN this completes immediately.
-      await waitForIceGathering(pc)
-      const answerSdp = pc.localDescription?.sdp ?? answer.sdp
-      attachedWsRef.current?.send(JSON.stringify({ type: "webrtc-answer", sdp: answerSdp }))
+      try {
+        await pc.setRemoteDescription({ type: "offer", sdp })
+        if (!isCurrent()) return
+        const answer = await pc.createAnswer()
+        if (!isCurrent()) return
+        await pc.setLocalDescription(answer)
+        if (!isCurrent()) return
+        // Non-trickle: wait for gathering so the (TURN relay) candidate is in
+        // the SDP we signal back. On a LAN this completes immediately.
+        await waitForIceGathering(pc)
+        if (!isCurrent()) return
+        const answerSdp = pc.localDescription?.sdp ?? answer.sdp
+        signalingWs.send(JSON.stringify({ type: "webrtc-answer", sdp: answerSdp }))
+      } catch {
+        if (!isCurrent()) return
+        // Negotiation failed; let the retry loop request a fresh offer.
+        rearmPeer(signalingWs, pc)
+      }
     }
 
-    function onMessage(e: MessageEvent) {
+    function onMessage(signalingWs: WebSocket, e: MessageEvent) {
+      if (attachedWsRef.current !== signalingWs) return
       let msg: unknown
       try {
         msg = JSON.parse(e.data as string)
@@ -164,10 +264,7 @@ export function useAxolVideo(
       if (m.type === "webrtc-offer" && typeof m.sdp === "string") {
         offerSeenRef.current = true
         setAvailable(true)
-        handleOffer(m.sdp, m.tracks ?? {}, m.iceServers ?? []).catch(() => {
-          // Negotiation failed; let the retry loop request a fresh offer.
-          offerSeenRef.current = false
-        })
+        void handleOffer(signalingWs, m.sdp, m.tracks ?? {}, m.iceServers ?? [])
       } else if (m.type === "webrtc-pending") {
         // The robot's cameras are configured but still starting; the server
         // will push the offer when they're up. Stay in the "connecting"
@@ -188,7 +285,9 @@ export function useAxolVideo(
           attachedWsRef.current.removeEventListener("message", listenerRef.current)
         attachedWsRef.current = null
         listenerRef.current = null
+        // A fresh socket requests right away: no failure backoff applies.
         lastRequestAtRef.current = 0
+        requestNotBeforeRef.current = 0
         offerSeenRef.current = false
         closePc()
         setStreams({})
@@ -196,14 +295,25 @@ export function useAxolVideo(
       }
       if (!ws || ws.readyState !== WebSocket.OPEN) return
       if (!listenerRef.current) {
-        listenerRef.current = onMessage
+        const listener = (event: MessageEvent) => onMessage(ws, event)
+        listenerRef.current = listener
         attachedWsRef.current = ws
-        ws.addEventListener("message", onMessage)
+        ws.addEventListener("message", listener)
       }
       // Keep requesting until an offer lands (first request fires
-      // immediately; see REQUEST_RETRY_MS for why this retries).
-      if (!offerSeenRef.current && Date.now() - lastRequestAtRef.current >= REQUEST_RETRY_MS) {
-        lastRequestAtRef.current = Date.now()
+      // immediately; see REQUEST_RETRY_MS for why this retries, and
+      // FAILURE_BACKOFF_MS for why a failed negotiation waits).
+      const now = Date.now()
+      if (
+        videoRequestIsDue(
+          offerSeenRef.current,
+          lastRequestAtRef.current,
+          now,
+          REQUEST_RETRY_MS,
+          requestNotBeforeRef.current
+        )
+      ) {
+        lastRequestAtRef.current = now
         try {
           ws.send(JSON.stringify({ type: "webrtc-request" }))
         } catch {

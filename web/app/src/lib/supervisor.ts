@@ -55,8 +55,14 @@ export interface CommandSpec {
   simFlag?: string | null
   /** Arg names that skip the arm-robot gates without being sim (cart_only). */
   robotFreeFlags?: string[]
+  /** Whether this operation can run against the Mantis hardware profile. */
+  supportsMantis?: boolean
+  /** Connected hardware profiles on which this command may be launched. */
+  hardwareProfiles?: HardwareProfile[]
   /** Driven from the VR headset, so the panel shows the connect hint. */
   usesHeadset?: boolean
+  /** Honors the camera spec's headset-stream branch during this operation. */
+  streamsVideo?: boolean
 }
 
 /** Catalog category display order (matches serve/commands.py CATEGORY_ORDER). */
@@ -134,10 +140,23 @@ export function wsBaseUrl(): string {
   return `${proto}://${u.host}`
 }
 
+export class ApiRequestError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = "ApiRequestError"
+    this.status = status
+  }
+}
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
-    throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`)
+    throw new ApiRequestError(
+      (body as { error?: string }).error ?? `HTTP ${res.status}`,
+      res.status
+    )
   }
   // A non-JSON 200 means whatever answered isn't axol serve (typically the
   // static site itself when no host is configured, answering index.html for
@@ -202,6 +221,31 @@ export async function fetchUpdateStatus(force = false): Promise<UpdateStatus> {
   return json(await fetch(apiUrl(`/api/update/status${force ? "?refresh=1" : ""}`)))
 }
 
+/**
+ * Probe the update API before touching legacy polling endpoints. Servers from
+ * v0.1.0 through v0.1.2 return 404 here, but `/api/info` and `/api/op/status`
+ * trigger their unsafe main-tracking updater. `null` therefore means the UI
+ * must stop and show the one-time hosted-installer migration.
+ */
+export async function probeUpdateStatus(): Promise<UpdateStatus | null> {
+  let response: Response
+  try {
+    response = await fetch(apiUrl("/api/update/status"), {
+      signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
+    })
+  } catch (error) {
+    if (
+      error instanceof DOMException &&
+      (error.name === "TimeoutError" || error.name === "AbortError")
+    ) {
+      throw new Error(`no response from the host after ${CONNECT_TIMEOUT_MS / 1000}s`)
+    }
+    throw error
+  }
+  if (response.status === 404) return null
+  return json(response)
+}
+
 /** Trigger the on-demand upgrade; the server restarts onto new code when idle. */
 export async function startUpdate(): Promise<{ started: boolean }> {
   return json(await fetch(apiUrl("/api/update/start"), { method: "POST" }))
@@ -228,6 +272,7 @@ export async function restartHost(): Promise<{ ok: boolean }> {
 // ---------------------------------------------------------------------------
 
 export type RobotState = "disconnected" | "connecting" | "connected" | "busy" | "error"
+export type HardwareProfile = "axol" | "mantis"
 
 export interface MotorHealth {
   arm: string
@@ -266,6 +311,8 @@ export interface RobotStatus {
   faults?: MotorFault[]
   /** Configured CAN interfaces (older hosts omit this). */
   channels?: RobotChannels
+  /** Hardware currently shown by the idle diagnostics link. */
+  profile?: HardwareProfile
   /** Whether this robot has grippers (older hosts omit this = true). */
   hasGripper?: boolean
 }
@@ -288,15 +335,21 @@ export async function fetchRobotStatus(): Promise<RobotStatus> {
  * host and reused by every later connect and operation; omit it to connect
  * with the stored/default interfaces.
  */
-export async function robotConnect(channels?: RobotChannels): Promise<RobotStatus> {
-  const init: RequestInit = { method: "POST" }
-  if (channels) {
-    init.headers = { "Content-Type": "application/json" }
-    init.body = JSON.stringify({
-      leftChannel: channels.left,
-      rightChannel: channels.right,
-      channelsSet: true,
-    })
+export async function robotConnect(
+  channels?: RobotChannels,
+  profile: HardwareProfile = "axol",
+  automatic = false
+): Promise<RobotStatus> {
+  const init: RequestInit = {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      leftChannel: channels?.left ?? null,
+      rightChannel: channels?.right ?? null,
+      channelsSet: channels != null,
+      profile,
+      automatic,
+    }),
   }
   return json(await fetch(apiUrl("/api/robot/connect"), init))
 }
@@ -311,8 +364,63 @@ export interface CanInterface {
   up: boolean
 }
 
-export async function fetchCanInterfaces(): Promise<{ interfaces: CanInterface[] }> {
+/** Presence of one configured hardware profile in the host's CAN inventory. */
+export interface CanProfilePresence {
+  channels: RobotChannels
+  /** Configured channels exist, or their exact persisted USB hub is attached. */
+  present: boolean
+  /** Every configured channel netdev exists and is administratively up. */
+  up: boolean
+  /** This exact profile/map was manually disconnected on the serve host. */
+  automaticConnectSuppressed?: boolean
+}
+
+export type CanProfileInventory = Record<HardwareProfile, CanProfilePresence>
+
+export type CanDiscoveryStatus =
+  | "ready"
+  | "needed"
+  | "running"
+  | "configured"
+  | "partial"
+  | "unidentified"
+  | "error"
+
+/** Server-owned discovery of an attached, not-yet-trusted Axol/Mantis hub. */
+export interface CanDiscoveryState {
+  status: CanDiscoveryStatus
+  candidateCount: number
+  /** Opaque server-local epoch; changes when unresolved attached hardware changes. */
+  generation: number
+  message?: string
+}
+
+export interface CanInterfaceInventory {
+  /** Opaque app-lifetime identity; omitted by older serve releases. */
+  serverInstanceId?: string
+  interfaces: CanInterface[]
+  /** Omitted by serve releases that predate hardware-aware auto-connect. */
+  profiles?: CanProfileInventory
+  /** Omitted by serve releases that predate safe, non-interactive discovery. */
+  discovery?: CanDiscoveryState
+}
+
+export async function fetchCanInterfaces(): Promise<CanInterfaceInventory> {
   return json(await fetch(apiUrl("/api/can/interfaces")))
+}
+
+/** Identify and persist any attached, unassigned Axol/Mantis hub. */
+export async function discoverCanHardware(force = false): Promise<CanInterfaceInventory> {
+  const path = force ? "/api/can/discover?force=true" : "/api/can/discover"
+  return json(await fetch(apiUrl(path), { method: "POST" }))
+}
+
+/** A busy race, transport interruption, or server fault may retry on the next inventory poll. */
+export function canDiscoveryRequestCanRetry(error: unknown): boolean {
+  return (
+    error instanceof TypeError ||
+    (error instanceof ApiRequestError && (error.status === 409 || error.status >= 500))
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -466,12 +574,12 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
 }
 
 // ---------------------------------------------------------------------------
-// Datasets on disk (the replay / collect-data panels' dataset picker)
+// Datasets on disk (the operation panels' shared repo-id picker)
 // ---------------------------------------------------------------------------
 
 /** One LeRobot dataset found on the serve host (see /api/datasets). */
 export interface DatasetInfo {
-  /** Repo id relative to the datasets root — what replay/collect take. */
+  /** Repo id relative to the datasets root — accepted by dataset operations. */
   repoId: string
   /** Absolute dataset directory on the serve host. */
   root: string
@@ -515,6 +623,8 @@ export const RESOLUTION_OFF = "off"
  */
 export interface CameraSpec {
   serials: Record<CameraSlot, string>
+  /** Mantis wrist-camera assignment, kept separate from the Axol camera map. */
+  mantis_serials?: Pick<Record<CameraSlot, string>, "left_arm" | "right_arm">
   /** Capture resolution → headset stream (full quality), or `"off"`. */
   stream_resolution?: string
   /** Dataset downscale target (collect-data recording), or `"off"`. */
@@ -586,6 +696,231 @@ export async function sendSessionInput(id: string, line = ""): Promise<{ ok: boo
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ line }),
+    })
+  )
+}
+
+export type TrackerBackend = "survive" | "ultimate"
+
+export interface TrackerBinding {
+  complete: boolean
+  left: string | null
+  right: string | null
+}
+
+export type TrackerTransformStatus = "measured" | "factory" | "candidate" | "missing" | "stale"
+
+export interface TrackerTransformReadiness {
+  left: TrackerTransformStatus
+  right: TrackerTransformStatus
+}
+
+export interface QuestTrackerReadiness {
+  binding: "automatic-handedness"
+  installed: boolean
+  transforms: TrackerTransformReadiness
+  calibrationKey: string | null
+  controllerProfile: string | null
+  poseSpace: "grip" | "target-ray" | null
+  availableCalibrationKeys: string[]
+  datumStatus: "configured" | "ambiguous" | "invalid" | "missing"
+  liveDatum?: {
+    left: { profile: string | null; poseSpace: "grip" | "target-ray" | null }
+    right: { profile: string | null; poseSpace: "grip" | "target-ray" | null }
+    commonKey: string | null
+    observedAt: number
+    ageSeconds: number
+    live: boolean
+  } | null
+}
+
+export interface LighthouseTrackerReadiness {
+  binding: TrackerBinding
+  installed: boolean
+  available: boolean
+  pairingCli: boolean
+  pinnedBuild: boolean
+  udevReady: boolean
+  pinnedRef: string
+  buildRevision: string
+  installedRef: string | null
+  installedBuildRevision: string | null
+  issues: string[]
+  transforms: TrackerTransformReadiness
+  /**
+   * Last base-station survey from Check base stations or Identify trackers.
+   * `null` until one has run on this host; absent on older serve hosts.
+   */
+  baseStations?: LighthouseBaseStationSurvey | null
+}
+
+export interface LighthouseBaseStationSurvey {
+  checkedAt: number
+  /**
+   * Serials of the base stations a tracker actually received during the check,
+   * keyed by the channel number shown on the station (1–16).
+   */
+  channels: Record<string, string[]>
+  /** Stations libsurvive replayed from its saved calibration; not counted as seen. */
+  savedChannels?: Record<string, string[]>
+  clashingChannels: number[]
+  baseStationCount: number
+  /** How many stations the rig is expected to have; absent in older surveys. */
+  expectedBaseStations?: number
+  trackers: string[]
+  /** Operator-facing problems, each ending with the fix. */
+  problems: string[]
+}
+
+export interface UltimateTrackerReadiness {
+  binding: TrackerBinding
+  installed: boolean
+  nativeDependencies: boolean
+  pythonHid: boolean
+  apiCompatible: boolean
+  pinnedPyvut: boolean
+  pinnedRef: string
+  logSuppression: boolean
+  udevReady: boolean
+  operatorAccess: boolean
+  dongleConnected: boolean
+  endpointStatus: "accessible" | "permission-denied" | "missing" | "unavailable"
+  wifiConfig: "valid" | "missing" | "invalid" | "permissions-warning"
+  quatOrder: "xyzw" | "wxyz"
+  upAxis: "y" | "z"
+  issues: string[]
+  transforms: TrackerTransformReadiness
+}
+
+export interface TrackerSourceReadiness {
+  quest: QuestTrackerReadiness
+  lighthouse: LighthouseTrackerReadiness
+  ultimate: UltimateTrackerReadiness
+}
+
+export interface TrackerBindingsSnapshot {
+  bindings: Record<TrackerBackend, TrackerBinding>
+  /** Non-invasive setup checks; absent on older serve hosts. */
+  sources?: TrackerSourceReadiness
+  /** Resolved trigger/gripper channels; absent on older serve hosts. */
+  channels?: RobotChannels
+}
+
+export async function fetchTrackerBindings(): Promise<TrackerBindingsSnapshot> {
+  return json(await fetch(apiUrl("/api/tracker/bindings"), { cache: "no-store" }))
+}
+
+export type MantisTrackerSource = "quest" | "lighthouse" | "ultimate"
+
+export interface UltimateWifiConfig {
+  /** Host path is informational only; credential values never include the password. */
+  path: string
+  configured: boolean
+  status: "valid" | "missing" | "invalid" | "permissions-warning"
+  error: string | null
+  ssid: string
+  country: string
+  freq: number
+  passwordSet: boolean
+}
+
+export interface UltimateWifiUpdate {
+  ssid: string
+  country: string
+  freq: number
+  /** Omit to preserve the existing password. The host never returns it. */
+  pass?: string
+}
+
+export async function fetchUltimateWifiConfig(): Promise<UltimateWifiConfig> {
+  return json(
+    await fetch(apiUrl("/api/tracker/ultimate/wifi"), {
+      cache: "no-store",
+    })
+  )
+}
+
+export async function saveUltimateWifiConfig(
+  update: UltimateWifiUpdate
+): Promise<UltimateWifiConfig> {
+  return json(
+    await fetch(apiUrl("/api/tracker/ultimate/wifi"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(update),
+    })
+  )
+}
+
+export type TrackerCalibrationStatus = TrackerTransformStatus | "unbound"
+
+export interface TrackerCalibrationSide {
+  key: string | null
+  status: TrackerCalibrationStatus
+  /** Exact active and legacy/same-family entries eligible for explicit removal. */
+  overrideKeys?: string[]
+  /** Content revisions guarding confirmation-gated removal against stale tabs. */
+  overrideRevisions?: Record<string, string>
+  /** Measured and stale saved values are returned; factory/candidate values stay null. */
+  pos: [number, number, number] | null
+  quat: [number, number, number, number] | null
+  /** Ultimate parser convention recorded with this measurement, when present. */
+  poseConvention?: { quatOrder: "xyzw" | "wxyz"; upAxis: "y" | "z" } | null
+}
+
+export interface TrackerCalibrationSnapshot {
+  path: string
+  source: MantisTrackerSource
+  keys: { left: string | null; right: string | null }
+  /** Active Ultimate parser convention; absent/null for older hosts and other sources. */
+  activePoseConvention?: { quatOrder: "xyzw" | "wxyz"; upAxis: "y" | "z" } | null
+  left: TrackerCalibrationSide
+  right: TrackerCalibrationSide
+}
+
+export interface TrackerCalibrationValue {
+  /** Echoed active key; the host rejects the write if identification changed. */
+  key: string
+  pos: [number, number, number]
+  quat: [number, number, number, number]
+}
+
+export type TrackerCalibrationUpdate = Partial<Record<"left" | "right", TrackerCalibrationValue>>
+
+export async function fetchTrackerCalibration(
+  source: MantisTrackerSource
+): Promise<TrackerCalibrationSnapshot> {
+  return json(
+    await fetch(apiUrl(`/api/tracker/calibration/${source}`), {
+      cache: "no-store",
+    })
+  )
+}
+
+export async function saveTrackerCalibration(
+  source: MantisTrackerSource,
+  update: TrackerCalibrationUpdate
+): Promise<TrackerCalibrationSnapshot> {
+  return json(
+    await fetch(apiUrl(`/api/tracker/calibration/${source}`), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(update),
+    })
+  )
+}
+
+export async function removeTrackerCalibration(
+  source: MantisTrackerSource,
+  side: "left" | "right",
+  key: string,
+  activeKey: string,
+  revision: string
+): Promise<TrackerCalibrationSnapshot> {
+  const query = new URLSearchParams({ key, active_key: activeKey, revision })
+  return json(
+    await fetch(apiUrl(`/api/tracker/calibration/${source}/${side}?${query.toString()}`), {
+      method: "DELETE",
     })
   )
 }
@@ -680,15 +1015,67 @@ export function urdfUrl(): string {
   return apiUrl("/api/urdf/axol.urdf")
 }
 
-export function cameraCount(spec: CameraSpec): number {
-  return Object.values(spec.serials).filter((s) => s.trim()).length
+export function cameraSerials(
+  spec: CameraSpec,
+  mantis?: boolean
+): Partial<Record<CameraSlot, string>> {
+  if (mantis === true) {
+    return (
+      spec.mantis_serials ?? {
+        left_arm: spec.serials.left_arm,
+        right_arm: spec.serials.right_arm,
+      }
+    )
+  }
+  return spec.serials
 }
 
-/** Non-empty, trimmed serials assigned across the camera slots. */
-export function configuredSerials(spec: CameraSpec): string[] {
-  return Object.values(spec.serials)
-    .map((s) => s.trim())
+export function cameraCount(spec: CameraSpec, mantis?: boolean): number {
+  const values =
+    mantis === undefined
+      ? [...Object.values(spec.serials), ...Object.values(spec.mantis_serials ?? {})]
+      : Object.values(cameraSerials(spec, mantis))
+  return new Set(values.map((s) => s?.trim()).filter(Boolean)).size
+}
+
+function branchResolutionEnabled(spec: CameraSpec, branch: "stream" | "record"): boolean {
+  const value =
+    branch === "stream"
+      ? (spec.stream_resolution ?? spec.resolution ?? "SVGA")
+      : (spec.record_resolution ?? "SVGA")
+  return value.trim() !== "" && value.toLowerCase() !== RESOLUTION_OFF
+}
+
+function cameraBranchEnabled(
+  spec: CameraSpec,
+  slot: CameraSlot,
+  branch: "stream" | "record"
+): boolean {
+  if (!branchResolutionEnabled(spec, branch)) return false
+  const raw: unknown = spec[branch]?.[slot]
+  return raw !== false && raw !== null && raw !== "off" && raw !== ""
+}
+
+/** Assigned serials that an operation will actually open. */
+export function participatingCameraSerials(
+  spec: CameraSpec,
+  mantis = false,
+  branches: { stream: boolean; record: boolean } = { stream: true, record: true }
+): string[] {
+  const values = Object.entries(cameraSerials(spec, mantis))
+    .filter(
+      ([slot]) =>
+        (branches.stream && cameraBranchEnabled(spec, slot as CameraSlot, "stream")) ||
+        (branches.record && cameraBranchEnabled(spec, slot as CameraSlot, "record"))
+    )
+    .map(([, serial]) => serial?.trim() ?? "")
     .filter(Boolean)
+  return [...new Set(values)]
+}
+
+/** Number of distinct assigned cameras included in the dataset branch. */
+export function recordingCameraCount(spec: CameraSpec, mantis = false): number {
+  return participatingCameraSerials(spec, mantis, { stream: false, record: true }).length
 }
 
 /**
@@ -696,9 +1083,14 @@ export function configuredSerials(spec: CameraSpec): string[] {
  * cameras the operator assigned but that aren't physically connected. An empty
  * result means every assigned camera was found.
  */
-export function missingCameraSerials(spec: CameraSpec, detected: CameraDevice[]): string[] {
+export function missingCameraSerials(
+  spec: CameraSpec,
+  detected: CameraDevice[],
+  mantis = false,
+  branches: { stream: boolean; record: boolean } = { stream: true, record: true }
+): string[] {
   const present = new Set(detected.map((d) => String(d.serial)))
-  return configuredSerials(spec).filter((s) => !present.has(s))
+  return participatingCameraSerials(spec, mantis, branches).filter((s) => !present.has(s))
 }
 
 // ---------------------------------------------------------------------------
@@ -806,10 +1198,14 @@ export interface OperationMeta {
   /** Args that skip the arm-robot gates without being sim (teleop's cart_only:
    * real hardware, but the arms and their CAN bus are never touched). */
   robotFreeFlags: string[]
+  /** Runtime supports the Mantis hardware profile. */
+  supportsMantis: boolean
   /** Shows the episode start / save / discard controls while running. */
   episodeControl: boolean
   /** Shows the "point the headset at this machine" hint while running. */
   usesHeadset: boolean
+  /** Honors cameras selected for headset streaming, in addition to recording. */
+  streamsVideo: boolean
 }
 
 /**
@@ -821,15 +1217,17 @@ export const OPERATIONS: OperationMeta[] = [
   {
     id: "teleop",
     label: "Teleoperation",
-    description: "Drive the Axol from a VR headset. Enable sim to preview in the browser.",
-    fields: ["sim"],
+    description: "Drive Axol from VR; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
+    fields: ["sim", "mantis"],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: true,
     simFlag: "sim",
-    robotFreeFlags: [],
+    robotFreeFlags: ["mantis"],
+    supportsMantis: true,
     episodeControl: false,
     usesHeadset: true,
+    streamsVideo: true,
   },
   {
     id: "gravity-comp",
@@ -841,25 +1239,30 @@ export const OPERATIONS: OperationMeta[] = [
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
+    streamsVideo: false,
   },
   {
     id: "collect-data",
     label: "Collect data",
-    description: "Record teleoperation episodes to a LeRobot dataset with the ZED cameras.",
-    fields: ["repo_id", "task"],
+    description:
+      "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
+    fields: ["mantis", "repo_id", "task"],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
     simFlag: null,
-    robotFreeFlags: [],
+    robotFreeFlags: ["mantis"],
+    supportsMantis: true,
     // Panel-driven episodes are newer than the registry, so a host old enough
     // to need this table can't serve them — the controls would sit on
     // "Preparing" forever. Its collect-data does run the VR server with the
     // camera tracks, so the feeds are safe to offer.
     episodeControl: false,
     usesHeadset: true,
+    streamsVideo: true,
   },
   {
     id: "replay-dataset",
@@ -871,8 +1274,10 @@ export const OPERATIONS: OperationMeta[] = [
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
+    streamsVideo: false,
   },
   {
     id: "run-policy",
@@ -885,8 +1290,10 @@ export const OPERATIONS: OperationMeta[] = [
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    supportsMantis: false,
     episodeControl: true,
     usesHeadset: false,
+    streamsVideo: false,
   },
 ]
 
@@ -912,8 +1319,10 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     simCapable: s.simCapable,
     simFlag: s.simFlag ?? null,
     robotFreeFlags: s.robotFreeFlags ?? [],
+    supportsMantis: s.supportsMantis ?? Boolean(s.perRunFields?.includes("mantis")),
     episodeControl: Boolean(s.episodeControl),
     usesHeadset: Boolean(s.usesHeadset),
+    streamsVideo: Boolean(s.streamsVideo),
   }))
 }
 
@@ -995,13 +1404,14 @@ export function useSessionLogs(sessionId: string | null): {
   lines: string[]
   status: SessionInfo | null
 } {
-  const [lines, setLines] = useState<string[]>([])
-  const [status, setStatus] = useState<SessionInfo | null>(null)
+  const [logState, setLogState] = useState<{
+    sessionId: string | null
+    lines: string[]
+    status: SessionInfo | null
+  }>({ sessionId: null, lines: [], status: null })
   const wsRef = useRef<WebSocket | null>(null)
 
   useEffect(() => {
-    setLines([])
-    setStatus(null)
     if (!sessionId) return
 
     const ws = new WebSocket(wsUrl(sessionId))
@@ -1009,16 +1419,22 @@ export function useSessionLogs(sessionId: string | null): {
 
     ws.onmessage = (event) => {
       const msg: LogMessage = JSON.parse(event.data)
-      if (msg.type === "log" && msg.line !== undefined) {
-        setLines((prev) => {
-          const base = prev.length >= MAX_LINES ? prev.slice(-MAX_LINES + 1) : prev
-          return [...base, msg.line as string]
-        })
-      } else if (msg.type === "status" && msg.session) {
-        setStatus(msg.session)
-      } else if (msg.type === "error" && msg.message) {
-        setLines((prev) => [...prev, `[error] ${msg.message}`])
-      }
+      setLogState((previous) => {
+        const current =
+          previous.sessionId === sessionId ? previous : { sessionId, lines: [], status: null }
+        if (msg.type === "log" && msg.line !== undefined) {
+          const base =
+            current.lines.length >= MAX_LINES ? current.lines.slice(-MAX_LINES + 1) : current.lines
+          return { ...current, lines: [...base, msg.line] }
+        }
+        if (msg.type === "status" && msg.session) {
+          return { ...current, status: msg.session }
+        }
+        if (msg.type === "error" && msg.message) {
+          return { ...current, lines: [...current.lines, `[error] ${msg.message}`] }
+        }
+        return current
+      })
     }
 
     return () => {
@@ -1028,5 +1444,7 @@ export function useSessionLogs(sessionId: string | null): {
     }
   }, [sessionId])
 
-  return { lines, status }
+  return logState.sessionId === sessionId
+    ? { lines: logState.lines, status: logState.status }
+    : { lines: [], status: null }
 }

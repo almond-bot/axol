@@ -20,18 +20,22 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import os
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 from ..constants import Joint
 from ..motor import MotorError
+from ..utils.paths import almond_path
+from ..utils.state_files import secure_open_new_text
 
 if TYPE_CHECKING:
     from ..robot.axol import Axol, AxolArm
 
-CAPTURE_DIR = Path.home() / ".almond" / "diagnostics" / "captures"
+CAPTURE_DIR = almond_path("diagnostics", "captures")
 
 _DEFAULT_HZ = 5.0
 
@@ -49,7 +53,7 @@ class TelemetryCsvLogger:
         self._axol = axol
         self._hz = hz
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._path = out_dir / f"{name}_{stamp}.csv"
+        self._path = out_dir / f"{name}_{stamp}_{uuid.uuid4().hex[:8]}.csv"
         self._task: asyncio.Task[None] | None = None
         self._file: TextIO | None = None
 
@@ -59,8 +63,7 @@ class TelemetryCsvLogger:
 
     def start(self) -> None:
         """Open the CSV, announce it in the log, and start sampling."""
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self._path.open("w", newline="")
+        self._file = secure_open_new_text(self._path, newline="")
         writer = csv.writer(self._file)
         header = ["t"]
         for side, arm in self._arms():
@@ -81,6 +84,8 @@ class TelemetryCsvLogger:
                 pass
             self._task = None
         if self._file is not None:
+            self._file.flush()
+            os.fsync(self._file.fileno())
             self._file.close()
             self._file = None
 

@@ -9,7 +9,7 @@ By default the Quest streams controller pose to the robot over Wi-Fi. On some ne
   USB carries **controller poses only**. Camera video still streams over the LAN — WebRTC can't cross the `adb` TCP forward — so you connect to the robot's address as usual and the cameras keep working over Wi-Fi/Ethernet. USB just takes over the pose link.
 </Note>
 
-When USB is selected, the headset sends every pose frame over **both** the cable and Wi-Fi. The robot prefers the wired stream and uses the Wi-Fi frames only while the cable goes quiet, so a mid-session USB drop (or a yanked cable) **fails over to Wi-Fi instantly** with no reconnect, and the cable reclaims the link the moment it comes back. You get the wired link's low latency whenever it's up, without teleop stalling when it isn't.
+When USB is selected, the headset sends every pose frame over **both** the cable and Wi-Fi with one logical producer id and sequence. The robot accepts whichever copy arrives first and discards the duplicate globally. USB normally wins because it is lower-latency; if the cable drops, the next Wi-Fi copy is accepted immediately with no reconnect, and a restored cable naturally wins again when its copies arrive first. Delayed copies can never rewind controls or enter the jitter buffer.
 
 ## One-time setup
 

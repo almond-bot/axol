@@ -1,6 +1,7 @@
 # Publish almond-axol and lerobot_robot_axol to PyPI on every published
-# GitHub release, via PyPI trusted publishing (OIDC) — no tokens or secrets
-# required.
+# GitHub release, via PyPI trusted publishing (OIDC) — no PyPI token is
+# required. The final notification job uses the repository webhook secrets
+# documented beside that job below.
 #
 # The two packages publish from separate jobs with distinct environment
 # claims: PyPI *pending* publishers are unique on (owner, repo, workflow,
@@ -19,42 +20,337 @@
 #
 # The published almond-axol version is whatever `version` in pyproject.toml
 # says at the release tag — the release flow already bumps it per release.
+# SECURITY: releases after v0.1.36 must use `release-vX.Y.Z`, never the legacy
+# `vX.Y.Z` namespace polled by the destructive updater on unmigrated hosts.
+# The hosted installer is the safe one-time migration into the new updater.
 # The plugin's version lives in plugins/lerobot_robot_axol/pyproject.toml and
 # only needs bumping when the plugin itself changes (skip-existing keeps
 # unbumped re-uploads harmless).
-name: Publish to PyPI
+name: Validate and publish to PyPI
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   release:
     types: [published]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event_name }}-${{ github.ref }}
+  # Supersede stale PR validation, but never cancel a main or release run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  validate-release-provenance:
+    name: Validate release provenance
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the release commit to be on origin/main
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git check-ref-format "refs/tags/${RELEASE_TAG}"
+          git fetch --no-tags --prune origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          event_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+          if [ "${tag_commit}" != "${event_commit}" ]; then
+            echo "::error::Release event SHA does not dereference to ${RELEASE_TAG}."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor \
+              "${tag_commit}" refs/remotes/origin/main; then
+            echo "::error::Release tag ${RELEASE_TAG} points to ${tag_commit}, which is not contained in origin/main. Merge the exact reviewed commit before publishing."
+            exit 1
+          fi
+
+  validate-python:
+    name: Validate Python (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    env:
+      # Keep matrix data out of shell source, even though these values are
+      # fixed in this workflow rather than supplied by an event payload.
+      PYTHON_VERSION: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - run: uv python install "${PYTHON_VERSION}"
+      - name: Verify the legacy release-tag namespace is protected
+        if: github.event_name == 'release' && matrix.python-version == '3.13'
+        env:
+          # The default workflow token cannot reveal ruleset bypass actors.
+          # This dedicated read-only credential must have repository
+          # Administration access; see .github/RELEASING.md.
+          GH_TOKEN: ${{ secrets.RULESET_AUDIT_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::RULESET_AUDIT_TOKEN is not configured; release publishing cannot verify the legacy tag guard. See .github/RELEASING.md."
+            exit 1
+          fi
+          protected=0
+          while IFS= read -r ruleset_id; do
+            [ -n "${ruleset_id}" ] || continue
+            if gh api "repos/${REPOSITORY}/rulesets/${ruleset_id}" | jq -e '
+              .target == "tag"
+              and .enforcement == "active"
+              and (.conditions.ref_name.include | any(. == "refs/tags/v*" or . == "v*"))
+              and (.conditions.ref_name.exclude | length == 0)
+              and (.rules | any(.type == "creation"))
+              and has("bypass_actors")
+              and (.bypass_actors | type == "array")
+              and (.bypass_actors | length == 0)
+            ' >/dev/null; then
+              protected=1
+              break
+            fi
+          done < <(
+            gh api --paginate "repos/${REPOSITORY}/rulesets?includes_parents=true" \
+              --jq '.[] | select(.target == "tag" and .enforcement == "active") | .id'
+          )
+          if [ "${protected}" -ne 1 ]; then
+            echo "::error::An active tag ruleset must restrict creation of refs/tags/v* before publishing. Future releases use release-vX.Y.Z; an accidental legacy v-tag activates the unsafe updater on unmigrated <=0.1.36 hosts."
+            exit 1
+          fi
+      - name: Verify release tag matches the SDK version
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          expected_tag="release-v$(uv version --short)"
+          if [ "${RELEASE_TAG}" != "${expected_tag}" ]; then
+            echo "Release tag ${RELEASE_TAG} does not match pyproject version ${expected_tag}." >&2
+            exit 1
+          fi
+      # LeRobot's training extras produce a multi-gigabyte environment. Avoid
+      # retaining a second persistent copy in uv's cache on the hosted runner.
+      - run: uv sync --python "${PYTHON_VERSION}" --no-cache --frozen --extra sim --extra lerobot --extra tracker
+      # The preceding exact sync selected all hosted extras. Avoid a second
+      # default-only sync here, which would prune those extras before tests.
+      - run: uv run --python "${PYTHON_VERSION}" --no-sync python -m unittest discover -s tests
+      - run: uvx ruff@0.9.7 check .
+      - run: uvx ruff@0.9.7 format --check .
+      - if: matrix.python-version == '3.13'
+        run: bash -n web/app/public/install
+      - if: matrix.python-version == '3.13'
+        run: uv build
+      - name: Verify the SDK wheel embeds the reviewed installer
+        if: matrix.python-version == '3.13'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = list(Path("dist").glob("almond_axol-*-py3-none-any.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one SDK wheel, found {wheels}")
+          expected = Path("web/app/public/install").read_bytes()
+          with ZipFile(wheels[0]) as archive:
+              embedded = archive.read("almond_axol/_installer.sh")
+          if embedded != expected:
+              raise SystemExit("SDK wheel installer differs from reviewed source")
+          PY
+      - if: matrix.python-version == '3.13'
+        run: uv build --project plugins/lerobot_robot_axol
+      - if: matrix.python-version == '3.13'
+        run: uvx --from twine==7.0.0 twine check dist/* plugins/lerobot_robot_axol/dist/*
+
+  validate-web:
+    name: Validate web
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          # Release artifacts must never consume a cache writable by PR jobs.
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm test --workspace=axol-vr-app
+      - run: npm test --workspace=@almond/axol-vr-client
+      - run: npm run build
+
   publish-sdk:
+    name: Publish SDK
+    if: github.event_name == 'release'
+    needs: [validate-release-provenance, validate-python, validate-web]
     runs-on: ubuntu-latest
     permissions:
-      # Required for PyPI trusted publishing (OIDC).
-      id-token: write
+      id-token: write # Required for PyPI trusted publishing (OIDC).
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv build
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          skip-existing: true
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - run: uv build
+      - name: Verify the published wheel embeds the reviewed installer
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = list(Path("dist").glob("almond_axol-*-py3-none-any.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one SDK wheel, found {wheels}")
+          expected = Path("web/app/public/install").read_bytes()
+          with ZipFile(wheels[0]) as archive:
+              embedded = archive.read("almond_axol/_installer.sh")
+          if embedded != expected:
+              raise SystemExit("SDK wheel installer differs from reviewed source")
+          PY
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
 
   publish-plugin:
+    name: Publish LeRobot plugin
+    if: github.event_name == 'release'
+    needs: [validate-release-provenance, validate-python, validate-web]
     runs-on: ubuntu-latest
     # Distinct OIDC environment claim; see the header comment.
     environment: pypi-plugin
     permissions:
-      id-token: write
+      id-token: write # Required for PyPI trusted publishing (OIDC).
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.12.3"
+          enable-cache: false
       - run: uv build --project plugins/lerobot_robot_axol
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: plugins/lerobot_robot_axol/dist
           skip-existing: true
+
+  # Keep customer announcements in this workflow so a release is announced
+  # only after both packages and every validation job complete successfully.
+  # Required repository secrets:
+  #   DISCORD_WEBHOOK_URL  One Discord incoming-webhook URL.
+  #   SLACK_WEBHOOK_URL_*  One secret per customer channel, each holding a single
+  #                        Slack incoming-webhook URL (api.slack.com/apps ->
+  #                        Incoming Webhooks), e.g. SLACK_WEBHOOK_URL_ACME.
+  #                        Every SLACK_WEBHOOK_URL_* secret gets the
+  #                        announcement; to add a channel, just add a secret.
+  notify-release:
+    name: Notify release channels
+    if: github.event_name == 'release'
+    needs: [publish-sdk, publish-plugin]
+    runs-on: ubuntu-latest
+    env:
+      # Passed through the environment (not interpolated into the scripts) so
+      # release names/notes cannot inject shell or JSON; jq does the quoting.
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      RELEASE_NAME: ${{ github.event.release.name }}
+      RELEASE_BODY: ${{ github.event.release.body }}
+      RELEASE_URL: ${{ github.event.release.html_url }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Notify Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "${DISCORD_WEBHOOK_URL}" ]; then
+            echo "::error::DISCORD_WEBHOOK_URL secret is not set"
+            exit 1
+          fi
+          payload="$(jq -n \
+            --arg title "${RELEASE_NAME:-${RELEASE_TAG}}" \
+            --arg url "${RELEASE_URL}" \
+            --arg body "${RELEASE_BODY}" \
+            --arg repo "${REPO}" \
+            '{
+              embeds: [{
+                title: ("\($repo) \($title) released"),
+                url: $url,
+                description: (if ($body | length) > 0 then $body[:4000] else $url end),
+                color: 5763719
+              }]
+            }')"
+          curl -fsS -X POST -H "Content-Type: application/json" \
+            -d "${payload}" "${DISCORD_WEBHOOK_URL}"
+
+      - name: Notify Slack channels
+        # Runs even if the Discord step failed, so one bad webhook does not
+        # silently skip the customer announcements.
+        if: always()
+        env:
+          # Workflow expressions cannot enumerate secrets by name prefix, so
+          # the whole secrets context is passed in and filtered with jq below.
+          # Values never hit the log; GitHub masks secrets there regardless.
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          webhooks="$(jq -r '
+            to_entries
+            | map(select(.key | startswith("SLACK_WEBHOOK_URL_")))
+            | sort_by(.key)
+            | .[].value
+          ' <<< "${ALL_SECRETS}")"
+          if [ -z "${webhooks}" ]; then
+            echo "::error::No SLACK_WEBHOOK_URL_* secrets are set"
+            exit 1
+          fi
+          echo "Notifying $(grep -c . <<< "${webhooks}") Slack channel(s)"
+          payload="$(jq -n \
+            --arg title "${RELEASE_NAME:-${RELEASE_TAG}}" \
+            --arg url "${RELEASE_URL}" \
+            --arg body "${RELEASE_BODY}" \
+            --arg repo "${REPO}" \
+            '{
+              blocks: [
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: ("*<\($url)|\($repo) \($title) released>*")
+                  }
+                },
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: (if ($body | length) > 0 then $body[:2900] else "See the release page for details." end)
+                  }
+                }
+              ]
+            }')"
+          failed=0
+          while IFS= read -r webhook; do
+            webhook="$(echo "${webhook}" | tr -d "[:space:]")"
+            [ -n "${webhook}" ] || continue
+            if ! curl -fsS -X POST -H "Content-Type: application/json" \
+                -d "${payload}" "${webhook}"; then
+              echo "::error::Slack notification failed for one webhook"
+              failed=1
+            fi
+            echo
+          done <<< "${webhooks}"
+          exit "${failed}"

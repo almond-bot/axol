@@ -22,8 +22,9 @@ built-in five:
   context).
 - ``execution="thread"`` (collect-data / run-policy / replay-dataset) runs
   ``_run(cfg, stop_event=...)`` on a worker thread, stopped via the
-  ``threading.Event``. An op declaring ``episode_control`` also gets
-  ``control=``, a queue-backed object taking save/rerecord/quit from the UI.
+  ``threading.Event``. An op declaring ``episode_control`` (run-policy,
+  collect-data, waypoints) also gets ``control=``, a queue-backed object
+  taking save/rerecord/quit from the UI.
 
 Before a hardware operation starts the runner releases the robot link's CAN
 bus; when the operation ends it hands the bus back.
@@ -40,7 +41,9 @@ import sys
 import threading
 from typing import Any
 
+from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
 from ..zed import stereo_serials
+from .commands import flag_enabled, normalize_boolean_args
 from .manager import Session
 
 _logger = logging.getLogger(__name__)
@@ -68,6 +71,13 @@ _FORCE_GRACE_S = 5.0
 # usually stuck on) and gives the recorder that long before killing it too.
 _RECORDER_PROC_NAME = "dataset-recorder"
 _FINALIZE_GRACE_S = 200.0
+
+# A managed Mantis bridge reports ready after both trackers and configured
+# trigger nodes have produced fresh, usable data. It does not wait for the
+# operation's VR server: its WebSocket loop reconnects until that server begins
+# listening.
+_BRIDGE_READY_TIMEOUT_S = 35.0
+_BRIDGE_STOP_TIMEOUT_S = 4.0
 
 # Loggers whose records we never forward to the UI: webserver lifecycle,
 # access logs, low-level asyncio chatter. We still want the underlying ops'
@@ -98,6 +108,74 @@ _UVICORN_LINE = re.compile(r"^(INFO|WARNING|ERROR|DEBUG|CRITICAL|TRACE):\s{2,}")
 
 # The camera slots the control panel can configure serials for.
 _CAMERA_SLOTS = ("overhead", "left_arm", "right_arm")
+
+
+def _managed_mantis_run_channels(cfg: Any) -> tuple[str, str]:
+    """Resolve and validate the gripper channels a parsed Mantis run opens."""
+    from ..constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
+    from ..utils.can_channels import require_mantis_channels
+
+    robot_config = getattr(cfg, "robot_config", None)
+    left = getattr(robot_config, "left_channel", getattr(cfg, "left_channel", None))
+    right = getattr(robot_config, "right_channel", getattr(cfg, "right_channel", None))
+    if left == CAN_LEFT:
+        left = CAN_MANTIS_LEFT
+    if right == CAN_RIGHT:
+        right = CAN_MANTIS_RIGHT
+    return require_mantis_channels((left, right))
+
+
+def _bind_managed_mantis_trigger_channels(config: Any, cfg: Any) -> None:
+    """Make bridge trigger readers follow this run's gripper channel map."""
+    left, right = _managed_mantis_run_channels(cfg)
+    config.trigger_can_left = left
+    config.trigger_can_right = right
+
+
+def _managed_tracker_bridge_main(
+    config: Any,
+    stop_event: Any,
+    command_queue: Any,
+    ready_conn: Any,
+    port: int,
+    auto_engage: bool,
+    pose_source_id: str,
+) -> None:
+    """Spawn-process entry point for a control-panel-owned tracker bridge."""
+    logging.basicConfig(level=logging.INFO, force=True)
+    ready_sent = False
+
+    def ready() -> None:
+        nonlocal ready_sent
+        ready_conn.send({"ok": True})
+        ready_sent = True
+        ready_conn.close()
+
+    try:
+        from ..cli.tracker_bridge import run_configured_bridge
+        from ..tracker.bridge import StopEventControls
+
+        run_configured_bridge(
+            config,
+            port=port,
+            controls=StopEventControls(stop_event, command_queue),
+            on_ready=ready,
+            auto_engage=auto_engage,
+            require_live_inputs=True,
+            pose_source_id=pose_source_id,
+        )
+    except BaseException as exc:
+        if not ready_sent:
+            try:
+                ready_conn.send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+        raise
+    finally:
+        try:
+            ready_conn.close()
+        except OSError:
+            pass
 
 
 def _forward_line(sink: Any, line: str) -> None:
@@ -349,12 +427,25 @@ class OperationRunner:
         # the force-kill only targets subprocesses this op spawned (relay,
         # recorder, IK worker) and never anything the serve process owns.
         self._baseline_children: set[int] = set()
+        # Mantis operations launched from the panel own a tracker bridge child
+        # for exactly the operation's lifetime.
+        self._bridge_process: multiprocessing.Process | None = None
+        self._bridge_stop_event: Any = None
+        self._bridge_commands: Any = None
+        self._bridge_monitor: threading.Thread | None = None
         # asyncio op plumbing (set while an async op runs).
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task[Any] | None = None
         # Episode control of the live op (set while an op declaring
-        # episode_control runs, e.g. run-policy).
-        self._policy_control: Any = None
+        # episode_control runs, e.g. run-policy or collect-data): a
+        # queue-backed object with push()/snapshot() that the op's episode
+        # loop drains.
+        self._episode_control: Any = None
+        # A command reported that its hardware disconnect/disable did not
+        # complete.  The command may still own one or both CAN buses, so no
+        # later operation may start and the idle RobotLink must not reacquire
+        # them.  Only restarting the serve process can re-establish ownership.
+        self._hardware_cleanup_uncertain = False
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
 
@@ -376,8 +467,27 @@ class OperationRunner:
     def is_running(self) -> bool:
         # "stopping" still counts as running: the op owns the CAN bus until its
         # worker thread unwinds, so a new op must not start until it's gone.
+        # An exception records the terminal error before the worker finishes
+        # stopping its managed tracker bridge and reacquiring the idle robot
+        # link.  Keep reporting busy while that worker is alive so another
+        # launch cannot overlap that cleanup window.
         s = self._session
-        return s is not None and s.status in ("starting", "running", "stopping")
+        active_status = s is not None and s.status in (
+            "starting",
+            "running",
+            "stopping",
+        )
+        worker_alive = self._thread is not None and self._thread.is_alive()
+        # A non-None bridge is owned until teardown has positively reaped it.
+        # In particular, Process.start() may fail after partially creating the
+        # child, and multiprocessing rejects is_alive() on an unstarted object.
+        bridge_owned = self._bridge_process is not None
+        return (
+            active_status
+            or worker_alive
+            or bridge_owned
+            or self._hardware_cleanup_uncertain
+        )
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -419,6 +529,16 @@ class OperationRunner:
                 args = self._settings.merged_args(op_id, args)
                 if cameras is None:
                     cameras = self._settings.cameras()
+            args = normalize_boolean_args(op_id, args)
+
+            requested_mantis = flag_enabled(args.get("mantis"))
+            if requested_mantis and not cmd.supports_mantis:
+                raise ValueError(
+                    f"{op_id} does not support Mantis; use teleop or collect-data"
+                )
+            mantis_mode = cmd.supports_mantis and requested_mantis
+
+            cameras = self._camera_spec_for_profile(cameras, mantis=mantis_mode)
 
             # Fold the camera spec into the argv-style args for the ops whose
             # camera serials are required draccus inputs.
@@ -427,7 +547,129 @@ class OperationRunner:
                     args, cameras, streams_video=cmd.streams_video
                 )
 
+            # Expose the immutable, fully merged run selection to every UI
+            # client. In particular, changing the saved Mantis source while a
+            # run is live must not relabel its hints/reset controls.
+            session.args = dict(args)
+
             cfg = self._build_config(op_id, args)
+            # A whole-config file is lower priority than explicit argv, but it
+            # can still supply a safety-critical mode when the request omitted
+            # that field.  The API classified/surveyed the launch from
+            # ``args`` before entering the runner, so require the fully parsed
+            # config to describe exactly the same hardware/no-hardware mode.
+            # Otherwise (for example) ``mantis: true`` in config_path could
+            # borrow an Axol survey and then open the Mantis buses.
+            safety_flags = tuple(
+                dict.fromkeys(
+                    flag
+                    for flag in (cmd.sim_flag, *cmd.robot_free_flags)
+                    if flag is not None
+                )
+            )
+            parsed_flags: dict[str, bool] = {}
+            for flag in safety_flags:
+                requested = flag_enabled(args.get(flag))
+                parsed = flag_enabled(getattr(cfg, flag, False))
+                if parsed != requested:
+                    raise ValueError(
+                        f"{op_id}'s parsed {flag}={parsed} does not match the "
+                        f"submitted {flag}={requested}; safety modes in "
+                        "config_path must also be supplied explicitly"
+                    )
+                parsed_flags[flag] = parsed
+
+            parsed_mantis = flag_enabled(getattr(cfg, "mantis", False))
+            if parsed_mantis != mantis_mode:
+                raise ValueError(
+                    f"{op_id}'s parsed mantis={parsed_mantis} does not match "
+                    f"the submitted mantis={mantis_mode}; select Mantis only "
+                    "through the operation's Mantis toggle"
+                )
+            if cmd.requires_cameras and not self._has_recording_camera(cfg):
+                raise ValueError(
+                    f"{op_id} requires at least one assigned camera with "
+                    "recording enabled. Choose a recording resolution and "
+                    "enable Record for that camera in Settings."
+                )
+            if mantis_mode:
+                if op_id == "collect-data":
+                    from ..cli.collect_data import _prepare_mantis_collection
+
+                    # Fail missing/ambiguous tracker→TCP calibration before
+                    # releasing CAN or opening the managed tracker backend.
+                    _prepare_mantis_collection(cfg)
+                elif op_id == "teleop":
+                    from ..cli.teleop import _prepare_mantis_teleop
+
+                    # Resolve source identity, transform validation, and
+                    # viewer-world policy before a tracker process or CAN
+                    # owner starts. The operation repeats this idempotently.
+                    _prepare_mantis_teleop(cfg)
+                from ..cli.mantis_bridge import (
+                    require_mantis_tracker_readiness,
+                    set_managed_pose_source_id,
+                )
+
+                # Quest is checked live by the WebXR handshake. External
+                # sources must pass the same supported-runtime/access gate as
+                # direct CLI commands before releasing CAN or opening hardware.
+                require_mantis_tracker_readiness(str(cfg.mantis_source))
+                _managed_mantis_run_channels(cfg)
+                if str(cfg.mantis_source) != "quest":
+                    set_managed_pose_source_id(cfg)
+            robot_config = getattr(cfg, "robot_config", None)
+            if robot_config is not None:
+                from ..lerobot.robot.config_mantis import MantisRobotConfig
+
+                parsed_mantis_robot = isinstance(robot_config, MantisRobotConfig)
+                if parsed_mantis_robot != mantis_mode:
+                    raise ValueError(
+                        f"{op_id}'s robot_config hardware profile does not match "
+                        f"mantis={mantis_mode}; select Mantis only through the "
+                        "operation's Mantis toggle"
+                    )
+
+            is_sim = cmd.sim_flag is not None and parsed_flags.get(cmd.sim_flag, False)
+            # A robot-free run (sim, or e.g. teleop's cart_only) never touches
+            # the arms, so the persistent robot link stays connected and its
+            # motor telemetry keeps streaming while the op runs.
+            robot_free = is_sim or any(
+                parsed_flags.get(flag, False) for flag in cmd.robot_free_flags
+            )
+            hardware_profile = "mantis" if mantis_mode else "axol"
+            link_matches_run = (
+                self._robot_link is not None
+                and self._robot_link.profile() == hardware_profile
+            )
+            # Only release an idle link whose buses this run will use. An Axol
+            # link and a Mantis run (or vice versa) own distinct CAN interfaces.
+            needs_robot = (
+                cmd.uses_can_bus
+                and link_matches_run
+                and (not robot_free or hardware_profile == "mantis")
+            )
+            if (
+                needs_robot
+                and hardware_profile == "axol"
+                and self._robot_link is not None
+            ):
+                axol_config = getattr(cfg, "axol", None)
+                if axol_config is None:
+                    robot_config = getattr(cfg, "robot_config", None)
+                    axol_config = getattr(robot_config, "axol_config", None)
+                configured_has_gripper = flag_enabled(
+                    getattr(axol_config, "has_gripper", True)
+                )
+                if (
+                    configured_has_gripper
+                    and self._robot_link.status().get("hasGripper") is not True
+                ):
+                    raise ValueError(
+                        "the operation config enables grippers, but the connected "
+                        "Axol survey is gripperless; disable has_gripper before "
+                        "starting"
+                    )
         except Exception as exc:  # noqa: BLE001 - surface config errors to UI
             session.status = "error"
             session.error = f"{type(exc).__name__}: {exc}"
@@ -450,14 +692,6 @@ class OperationRunner:
                     "continuing without cameras"
                 )
 
-        is_sim = cmd.sim_flag is not None and bool(args.get(cmd.sim_flag))
-        # A robot-free run (sim, or e.g. teleop's cart_only) never touches the
-        # arms, so the persistent robot link stays connected and its motor
-        # telemetry keeps streaming while the op runs.
-        robot_free = is_sim or any(
-            bool(args.get(flag)) for flag in cmd.robot_free_flags
-        )
-        needs_robot = cmd.uses_can_bus and not robot_free
         log_level = self._log_level(args)
 
         session.status = "running"
@@ -468,13 +702,22 @@ class OperationRunner:
             try:
                 self._robot_link.release()
             except Exception as exc:  # noqa: BLE001
-                session.emit(f"[serve] robot release warning: {exc}")
+                session.status = "error"
+                session.error = f"{type(exc).__name__}: {exc}"
+                session.emit(
+                    "[serve] error: robot link could not be released; "
+                    "operation was not started"
+                )
+                session.close_stream()
+                return session
 
         if cmd.execution == "async":
             target = self._run_async
         else:
             target = self._run_thread
-        run_args = (session, op_id, cfg, log_level, needs_robot)
+        mantis_source = str(getattr(cfg, "mantis_source", "lighthouse"))
+        manage_bridge = mantis_mode and mantis_source != "quest"
+        run_args = (session, op_id, cfg, log_level, needs_robot, manage_bridge)
         self._thread = threading.Thread(
             target=target, args=run_args, name=f"axol-op-{op_id}", daemon=True
         )
@@ -528,6 +771,9 @@ class OperationRunner:
             session.status = "stopping"
         session.emit("[serve] stopping…")
         self._stop_event.set()
+        bridge_stop = self._bridge_stop_event
+        if bridge_stop is not None:
+            bridge_stop.set()
         loop, task = self._async_loop, self._async_task
         if loop is not None and task is not None:
             try:
@@ -620,8 +866,24 @@ class OperationRunner:
         return spared_any
 
     def episode_command(self, command: str) -> bool:
-        """Forward an episode command (start/s/r/q) to the live op's control."""
-        control = self._policy_control
+        """Forward an episode command (start/s/r/q) to the live op's control.
+
+        Returns ``False`` when no op with episode control is running.
+        """
+        # Managed Mantis teleop and collection always track. Reject the old
+        # toggle command explicitly so a stale panel (or forged API request)
+        # cannot enqueue a disengage pulse. Reset remains a valid bridge
+        # action because it does not serve as an operator pause control.
+        if command == "bridge-toggle":
+            return False
+        bridge_command = {"bridge-reset": "reset"}.get(command)
+        if bridge_command is not None and self._bridge_commands is not None:
+            try:
+                self._bridge_commands.put(bridge_command)
+                return True
+            except (OSError, ValueError):
+                return False
+        control = self._episode_control
         if control is None:
             return False
         control.push(command)
@@ -630,10 +892,11 @@ class OperationRunner:
     def policy_state(self) -> dict[str, Any] | None:
         """The live op's episode phase/message/count, or None if there is none.
 
-        Read by /api/op/status so the control panel reflects whether an episode
-        is recording or sitting at the between-episode gate on any computer.
+        Read by /api/op/status (as the ``policy`` key, kept for UI
+        compatibility) so the control panel reflects whether an episode is
+        recording or sitting at the between-episode gate on any computer.
         """
-        control = self._policy_control
+        control = self._episode_control
         return control.snapshot() if control is not None else None
 
     async def shutdown(self) -> None:
@@ -653,6 +916,44 @@ class OperationRunner:
     # -- config building ----------------------------------------------------
 
     @staticmethod
+    def _camera_spec_for_profile(
+        cameras: dict[str, Any] | None, *, mantis: bool
+    ) -> dict[str, Any] | None:
+        """Select the saved camera assignment for the active hardware profile.
+
+        Axol uses the normal overhead/left-arm/right-arm map. Mantis has its
+        own two-camera map so changing gripper cameras does not overwrite the
+        Axol rig. Older saved specs fall back to the Axol left/right entries.
+        """
+        if not cameras:
+            return cameras
+
+        selected = dict(cameras)
+        # Migrate the pre-branch camera shape in memory. Before Stream and
+        # Record became independent, an assigned camera was always recorded;
+        # preserve that contract for stored specs and older REST clients.
+        selected.setdefault("stream_resolution", selected.get("resolution") or "SVGA")
+        selected.setdefault("record_resolution", "SVGA")
+        selected.setdefault("stream", {})
+        selected.setdefault("record", {})
+        if not mantis:
+            return selected
+
+        axol_serials = cameras.get("serials") or {}
+        raw_mantis = cameras.get("mantis_serials")
+        mantis_serials = raw_mantis if isinstance(raw_mantis, dict) else {}
+        selected["serials"] = {
+            "overhead": "",
+            "left_arm": mantis_serials.get(
+                "left_arm", axol_serials.get("left_arm", "")
+            ),
+            "right_arm": mantis_serials.get(
+                "right_arm", axol_serials.get("right_arm", "")
+            ),
+        }
+        return selected
+
+    @staticmethod
     def _camera_serials(cameras: dict[str, Any] | None) -> dict[str, int]:
         """Valid ``slot -> serial`` pairs from a camera spec (empty if none)."""
         serials: dict[str, int] = {}
@@ -666,6 +967,19 @@ class OperationRunner:
             if serial > 0:
                 serials[slot] = serial
         return serials
+
+    @staticmethod
+    def _has_recording_camera(cfg: Any) -> bool:
+        """Whether the parsed operation config has a real recorded camera."""
+        robot_config = getattr(cfg, "robot_config", None)
+        cameras = getattr(robot_config, "cameras", None)
+        if not isinstance(cameras, dict):
+            return False
+        return any(
+            int(getattr(camera, "serial", 0) or 0) > 0
+            and bool(getattr(camera, "record", True))
+            for camera in cameras.values()
+        )
 
     @staticmethod
     def _resolution(
@@ -868,6 +1182,215 @@ class OperationRunner:
         raw = str(args.get("log_level", "INFO")).upper()
         return getattr(logging, raw, logging.INFO)
 
+    @staticmethod
+    def _bridge_port(cfg: Any) -> int:
+        """VR server port from native teleop or LeRobot collection config."""
+        server = getattr(cfg, "vr_server", None)
+        if server is None:
+            teleop = getattr(cfg, "teleop_config", None)
+            server = getattr(teleop, "vr_server_config", None)
+        return int(getattr(server, "port", 8000))
+
+    def _start_tracker_bridge(self, session: Session, cfg: Any, op_id: str) -> None:
+        """Start the selected tracker bridge and wait for initialization."""
+        from ..tracker import load_tracker_config
+        from ..tracker.config import select_tracker_backend
+
+        config = load_tracker_config()
+        source = str(getattr(cfg, "mantis_source", "lighthouse"))
+        backend = {"lighthouse": "survive", "ultimate": "ultimate"}.get(source)
+        if backend is None:
+            raise RuntimeError(
+                f"Mantis source {source!r} does not use a tracker bridge"
+            )
+        select_tracker_backend(config, backend)
+        server = getattr(cfg, "vr_server", None)
+        if server is None:
+            teleop = getattr(cfg, "teleop_config", None)
+            server = getattr(teleop, "vr_server_config", None)
+        pose_source_id = getattr(server, "expected_pose_source_id", None)
+        if not pose_source_id:
+            raise RuntimeError(
+                "managed Mantis operation is missing its exact pose-source token"
+            )
+        # A managed Mantis run has one authoritative channel map: the channels
+        # its grippers open.  tracker.bridge may have custom trigger overrides
+        # for standalone diagnostics, but carrying those into an operation
+        # could leave its controls attached to the old logical side after a hub
+        # swap, so managed trigger readers always follow the run config.
+        _bind_managed_mantis_trigger_channels(config, cfg)
+        if (
+            config.left is None or config.right is None
+        ) and not config.allow_single_side:
+            raise RuntimeError(
+                f"No complete {source} tracker binding is saved; open Settings → "
+                "Mantis and select Identify trackers first"
+            )
+        ctx = multiprocessing.get_context("spawn")
+        stop_event = ctx.Event()
+        command_queue = ctx.Queue()
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        process = ctx.Process(
+            target=_managed_tracker_bridge_main,
+            args=(
+                config,
+                stop_event,
+                command_queue,
+                child_conn,
+                self._bridge_port(cfg),
+                op_id in {"teleop", "collect-data"},
+                pose_source_id,
+            ),
+            name="tracker-bridge",
+            daemon=True,
+        )
+        # Publish ownership before start(): multiprocessing can raise after a
+        # child has already inherited the tracker dongle, and an interrupt in
+        # that window must still leave an object the common teardown can reap.
+        with self._lock:
+            self._bridge_process = process
+            self._bridge_stop_event = stop_event
+            self._bridge_commands = command_queue
+
+        try:
+            process.start()
+            child_conn.close()
+            try:
+                if not parent_conn.poll(_BRIDGE_READY_TIMEOUT_S):
+                    raise RuntimeError(
+                        "tracker bridge did not initialize within "
+                        f"{_BRIDGE_READY_TIMEOUT_S:.0f}s"
+                    )
+                result = parent_conn.recv()
+                if not result.get("ok"):
+                    raise RuntimeError(result.get("error") or "tracker bridge failed")
+            except (EOFError, OSError) as exc:
+                raise RuntimeError("tracker bridge exited during startup") from exc
+        except BaseException as startup_error:
+            try:
+                self._stop_tracker_bridge(session)
+            except BaseException as cleanup_error:
+                startup_error.add_note(
+                    "additional tracker-bridge startup cleanup failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+        finally:
+            try:
+                child_conn.close()
+            except OSError:
+                pass
+            try:
+                parent_conn.close()
+            except OSError:
+                pass
+        session.emit(
+            f"[serve] Mantis tracker bridge ready (pid {process.pid}, "
+            f"backend {config.backend})"
+        )
+        monitor = threading.Thread(
+            target=self._monitor_tracker_bridge,
+            args=(session, process, stop_event),
+            name="tracker-bridge-monitor",
+            daemon=True,
+        )
+        with self._lock:
+            self._bridge_monitor = monitor
+        try:
+            monitor.start()
+        except BaseException as startup_error:
+            try:
+                self._stop_tracker_bridge(session)
+            except BaseException as cleanup_error:
+                startup_error.add_note(
+                    "additional tracker-bridge monitor cleanup failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+
+    def _monitor_tracker_bridge(
+        self, session: Session, process: multiprocessing.Process, stop_event: Any
+    ) -> None:
+        """Turn an unexpected post-readiness bridge exit into an op failure."""
+        process.join()
+        with self._lock:
+            expected = (
+                stop_event.is_set()
+                or self._bridge_process is not process
+                or self._session is not session
+            )
+        if expected:
+            return
+        detail = (
+            f"exit code {process.exitcode}"
+            if process.exitcode is not None
+            else "unknown exit status"
+        )
+        message = f"Mantis tracker bridge exited unexpectedly ({detail})"
+        session.emit(f"[serve] error: {message}")
+        self._mark_terminal(session, "error", error=message)
+        self._stop_event.set()
+        loop, task = self._async_loop, self._async_task
+        if loop is not None and task is not None:
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+
+    def _stop_tracker_bridge(self, session: Session) -> None:
+        """Stop and reap the bridge child owned by the current operation."""
+        with self._lock:
+            process = self._bridge_process
+            stop_event = self._bridge_stop_event
+            command_queue = self._bridge_commands
+            monitor = self._bridge_monitor
+        if process is None:
+            return
+        if stop_event is not None:
+            stop_event.set()
+        # A Process whose start() failed before native creation has pid=None and
+        # rejects join()/is_alive(); it still owns the queue objects above.
+        process_started = getattr(process, "pid", object()) is not None
+        if process_started:
+            process.join(timeout=_BRIDGE_STOP_TIMEOUT_S)
+        process_alive = process_started and process.is_alive()
+        if process_alive:
+            session.emit("[serve] tracker bridge did not stop cleanly; terminating")
+            process.terminate()
+            process.join(timeout=1.0)
+            process_alive = process.is_alive()
+        if process_alive:
+            session.emit("[serve] tracker bridge ignored terminate; killing")
+            process.kill()
+            process.join(timeout=1.0)
+            process_alive = process.is_alive()
+        if command_queue is not None:
+            command_queue.close()
+            # Reset commands are disposable once this bridge is stopping.
+            # Never let a stuck multiprocessing feeder wedge operation cleanup.
+            command_queue.cancel_join_thread()
+        if (
+            monitor is not None
+            and monitor is not threading.current_thread()
+            and (monitor.ident is not None or monitor.is_alive())
+        ):
+            monitor.join(timeout=1.0)
+        if process_alive:
+            # Retain ownership so is_running() keeps future operations out of
+            # this process until the server is restarted and the native child
+            # can no longer hold the tracker dongle.
+            message = "Mantis tracker bridge could not be killed; restart axol serve"
+            session.emit(f"[serve] error: {message}")
+            self._mark_terminal(session, "error", error=message)
+            return
+        with self._lock:
+            if self._bridge_process is process:
+                self._bridge_process = None
+                self._bridge_stop_event = None
+                self._bridge_commands = None
+                self._bridge_monitor = None
+        session.emit("[serve] Mantis tracker bridge stopped")
+
     # -- async ops (teleop / gravity-comp) ----------------------------------
 
     def _run_async(
@@ -877,6 +1400,7 @@ class OperationRunner:
         cfg: Any,
         log_level: int,
         needs_robot: bool,
+        manage_bridge: bool,
     ) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -888,19 +1412,31 @@ class OperationRunner:
             core = COMMANDS[op_id].load_entrypoint()
             await core(cfg)
 
+        cleanup_uncertain = False
         with _Capture(session, log_level):
             try:
+                if manage_bridge:
+                    self._start_tracker_bridge(session, cfg, op_id)
                 task = loop.create_task(_wrap())
                 self._async_task = task
                 loop.run_until_complete(task)
             except asyncio.CancelledError:
                 pass
+            except HardwareCleanupError as exc:
+                cleanup_uncertain = True
+                self._mark_terminal(
+                    session, "error", error=f"{type(exc).__name__}: {exc}"
+                )
+                session.emit(f"[serve] error: {session.error}")
             except Exception as exc:  # noqa: BLE001
+                cleanup_uncertain = is_hardware_cleanup_uncertain(exc)
                 self._mark_terminal(
                     session, "error", error=f"{type(exc).__name__}: {exc}"
                 )
                 session.emit(f"[serve] error: {session.error}")
             finally:
+                if manage_bridge:
+                    self._stop_tracker_bridge(session)
                 try:
                     loop.run_until_complete(loop.shutdown_asyncgens())
                 except Exception:  # noqa: BLE001
@@ -908,7 +1444,7 @@ class OperationRunner:
                 loop.close()
                 self._async_loop = None
                 self._async_task = None
-        self._finish(session, needs_robot)
+        self._finish(session, needs_robot, cleanup_uncertain=cleanup_uncertain)
 
     # -- thread ops (collect-data / run-policy / replay-dataset) ------------
 
@@ -919,12 +1455,16 @@ class OperationRunner:
         cfg: Any,
         log_level: int,
         needs_robot: bool,
+        manage_bridge: bool,
     ) -> None:
         from .commands import COMMANDS
 
         cmd = COMMANDS[op_id]
+        cleanup_uncertain = False
         with _Capture(session, log_level):
             try:
+                if manage_bridge:
+                    self._start_tracker_bridge(session, cfg, op_id)
                 core = cmd.load_entrypoint()
                 control_cls = cmd.load_episode_control()
                 if control_cls is None:
@@ -934,16 +1474,25 @@ class OperationRunner:
                     # API rather than stdin; the op blocks on this object and the
                     # panel reads its phase back via policy_state().
                     control = control_cls(self._stop_event)
-                    self._policy_control = control
+                    self._episode_control = control
                     core(cfg, stop_event=self._stop_event, control=control)
+            except HardwareCleanupError as exc:
+                cleanup_uncertain = True
+                self._mark_terminal(
+                    session, "error", error=f"{type(exc).__name__}: {exc}"
+                )
+                session.emit(f"[serve] error: {session.error}")
             except Exception as exc:  # noqa: BLE001
+                cleanup_uncertain = is_hardware_cleanup_uncertain(exc)
                 self._mark_terminal(
                     session, "error", error=f"{type(exc).__name__}: {exc}"
                 )
                 session.emit(f"[serve] error: {session.error}")
             finally:
-                self._policy_control = None
-        self._finish(session, needs_robot)
+                self._episode_control = None
+                if manage_bridge:
+                    self._stop_tracker_bridge(session)
+        self._finish(session, needs_robot, cleanup_uncertain=cleanup_uncertain)
 
     # -- shared teardown ----------------------------------------------------
 
@@ -965,13 +1514,31 @@ class OperationRunner:
             if status == "exited":
                 session.exit_code = 0
 
-    def _finish(self, session: Session, needs_robot: bool) -> None:
+    def _finish(
+        self,
+        session: Session,
+        needs_robot: bool,
+        *,
+        cleanup_uncertain: bool = False,
+    ) -> None:
+        if cleanup_uncertain:
+            with self._lock:
+                self._hardware_cleanup_uncertain = True
+            message = (
+                "hardware cleanup could not be verified; robot ownership remains "
+                "reserved until axol serve is restarted"
+            )
+            self._mark_terminal(session, "error", error=session.error or message)
+            session.emit(f"[serve] safety lockout: {message}")
         self._mark_terminal(session, "exited")
         session.emit(f"[serve] {session.command_id} finished")
-        session.close_stream()
-        if needs_robot and self._robot_link is not None:
+        if needs_robot and self._robot_link is not None and not cleanup_uncertain:
             try:
                 self._robot_link.reacquire()
                 session.emit("[serve] robot link reacquired")
             except Exception as exc:  # noqa: BLE001
-                _logger.debug("robot reacquire failed: %s", exc)
+                message = f"robot link reacquire failed: {exc}"
+                self._mark_terminal(session, "error", error=message)
+                session.emit(f"[serve] error: {message}")
+                _logger.warning("robot reacquire failed: %s", exc)
+        session.close_stream()

@@ -30,15 +30,19 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
+from ..utils.paths import almond_path
+from ..utils.state_files import secure_atomic_write_json, secure_read_text
+from .commands import flag_enabled, normalize_boolean_args, parse_boolean
+
 _logger = logging.getLogger(__name__)
 
-SETTINGS_PATH = Path.home() / ".almond" / "settings.json"
+SETTINGS_PATH = almond_path("settings.json")
 
 # The built-in operations, whose dotted config paths the tables below spell
 # out. A registered operation joins the same tables through its
@@ -104,6 +108,95 @@ def _settings_op(op_id: str) -> str:
     return cmd.settings_like if cmd is not None and cmd.settings_like else op_id
 
 
+def _confine_hosted_runtime_paths(target_op: str, merged: dict[str, Any]) -> None:
+    """Remove privileged path overrides before an operation config is parsed.
+
+    The root control-panel service shares operator settings, but it must not
+    let either those saved values or one request redirect libraries that open
+    paths by name. VR certificate setup can create/replace both configured
+    files when one half of the pair is missing, while LeRobot constructors
+    create their calibration directory and read ``<id>.json``. Pin TLS to the
+    one managed pair and let LeRobot use its ordinary service-local defaults.
+
+    ``target_op`` deliberately follows :func:`_settings_op`, so operations such
+    as ``collect-dagger`` that alias the collect-data config shape inherit the
+    same boundary automatically. Direct CLI use and non-root embeddings never
+    call this helper.
+    """
+    tls_prefix = {
+        "teleop": "vr_server",
+        "collect-data": "teleop_config.vr_server_config",
+    }.get(target_op)
+    if tls_prefix is not None:
+        from ..utils.certs import CERTFILE, KEYFILE
+
+        merged[f"{tls_prefix}.certfile"] = CERTFILE
+        merged[f"{tls_prefix}.keyfile"] = KEYFILE
+
+    calibration_fields = {
+        "collect-data": (
+            "robot_config.calibration_dir",
+            "robot_config.id",
+            "teleop_config.calibration_dir",
+            "teleop_config.id",
+        ),
+        "run-policy": (
+            "robot_config.calibration_dir",
+            "robot_config.id",
+        ),
+        "replay-dataset": (
+            "robot_config.calibration_dir",
+            "robot_config.id",
+        ),
+    }.get(target_op, ())
+    for field_name in calibration_fields:
+        merged.pop(field_name, None)
+
+
+def _mantis_channels_from_values(
+    values: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Resolve stored Mantis channel values, including reset/default semantics."""
+    from ..constants import CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
+
+    def norm(key: str, default: str) -> str | None:
+        value = values.get(key)
+        if value is None:
+            return default
+        text = str(value).strip()
+        if not text:
+            return default
+        return None if text.lower() in ("null", "none") else text
+
+    return (
+        norm("mantis.left_channel", CAN_MANTIS_LEFT),
+        norm("mantis.right_channel", CAN_MANTIS_RIGHT),
+    )
+
+
+def _axol_channels_from_values(
+    values: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Resolve defaults/nulls and validate the persisted Axol arm map."""
+    from ..constants import CAN_LEFT, CAN_RIGHT
+
+    def norm(key: str, default: str) -> str | None:
+        value = values.get(key)
+        if value is None:
+            return default
+        text = str(value).strip()
+        if not text:
+            return default
+        return None if text.lower() in ("null", "none") else text
+
+    return require_distinct_axol_channels(
+        (
+            norm("robot.left_channel", CAN_LEFT),
+            norm("robot.right_channel", CAN_RIGHT),
+        )
+    )
+
+
 def _lerobot_dataset_root() -> str:
     """The directory datasets actually land in when ``root`` is unset."""
     try:
@@ -167,6 +260,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "collect-data": (f"{_ROBOT}.left_channel",),
                     "run-policy": (f"{_ROBOT}.left_channel",),
                     "replay-dataset": (f"{_ROBOT}.left_channel",),
+                    "diag.lift-cycle": ("left_channel",),
                 },
             ),
             SettingDef(
@@ -184,6 +278,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "collect-data": (f"{_ROBOT}.right_channel",),
                     "run-policy": (f"{_ROBOT}.right_channel",),
                     "replay-dataset": (f"{_ROBOT}.right_channel",),
+                    "diag.lift-cycle": ("right_channel",),
                 },
             ),
             SettingDef(
@@ -203,7 +298,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "collect-data": (f"{_AXOL}.has_gripper",),
                     "run-policy": (f"{_AXOL}.has_gripper",),
                     "replay-dataset": (f"{_AXOL}.has_gripper",),
-                    "diag.lift-cycle": ("has_gripper",),
                 },
             ),
             SettingDef(
@@ -373,6 +467,62 @@ SETTINGS: tuple[SettingCategory, ...] = (
         label="Teleop & VR",
         description="How VR controller motion drives the arms (teleop and data collection).",
         settings=(
+            SettingDef(
+                key="teleop.mantis_source",
+                label="Mantis tracking",
+                type="select",
+                options=("quest", "lighthouse", "ultimate"),
+                help=(
+                    "Pose source used when Mantis is enabled for a run. "
+                    "Quest connects directly over WebXR; Lighthouse and "
+                    "Ultimate automatically start their tracker bridge."
+                ),
+                targets={
+                    "teleop": ("mantis_source",),
+                    "collect-data": ("mantis_source",),
+                },
+            ),
+            SettingDef(
+                key="mantis.quest_tracker_key",
+                label="Quest calibration key",
+                type="text",
+                help=(
+                    "Exact controller-local datum used by both saved mount "
+                    "transforms: quest:<WebXR-profile>:grip. Start a Quest "
+                    "bring-up run and paste the live key shown below. This "
+                    "setting is applied only when Mantis tracking is Quest."
+                ),
+                targets={
+                    "teleop": ("teleop.tracker_key",),
+                    "collect-data": (f"{_VRT}.tracker_key",),
+                },
+            ),
+            SettingDef(
+                key="mantis.left_channel",
+                label="Left Mantis CAN channel",
+                type="text",
+                help=(
+                    "SocketCAN interface connected to the left handheld rig. "
+                    "Use this to swap hub channels without moving cables. "
+                    "The trigger reader follows the same interface."
+                ),
+                # Applied conditionally by SettingsStore.merged_args only when
+                # that run has Mantis enabled; Axol runs retain robot.*.
+                targets={},
+                effective_default="can_mantis_l",
+            ),
+            SettingDef(
+                key="mantis.right_channel",
+                label="Right Mantis CAN channel",
+                type="text",
+                help=(
+                    "SocketCAN interface connected to the right handheld rig. "
+                    "Use this to swap hub channels without moving cables. "
+                    "The trigger reader follows the same interface."
+                ),
+                targets={},
+                effective_default="can_mantis_r",
+            ),
             SettingDef(
                 key="teleop.frequency",
                 label="Teleop rate (Hz)",
@@ -614,7 +764,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="recording.root",
                 label="Dataset root",
                 type="text",
-                help="Local directory datasets are written to / read from.",
+                help=(
+                    "Local directory datasets are written to / read from. "
+                    "The installed root service always uses its sealed "
+                    "/var/lib/almond-axol/datasets store and ignores custom "
+                    "roots; custom paths remain available to non-root CLI runs."
+                ),
                 effective_default=_lerobot_dataset_root,
                 targets={
                     "collect-data": ("root",),
@@ -1033,12 +1188,20 @@ class SettingsStore:
 
     def _load(self) -> dict[str, Any]:
         try:
-            raw = json.loads(self._path.read_text())
+            raw = json.loads(secure_read_text(self._path))
             if isinstance(raw, dict):
+                values = dict(raw.get("values") or {})
+                advanced = dict(raw.get("advanced") or {})
+                # tracker_key used to be buried in Advanced. Adopt it into
+                # the source-specific Mantis control so there is one visible
+                # value and readiness evaluates exactly what a run will use.
+                legacy_key = advanced.pop("vr_teleop.tracker_key", None)
+                if legacy_key is not None:
+                    values.setdefault("mantis.quest_tracker_key", legacy_key)
                 return {
-                    "values": dict(raw.get("values") or {}),
+                    "values": values,
                     "cameras": raw.get("cameras"),
-                    "advanced": dict(raw.get("advanced") or {}),
+                    "advanced": advanced,
                 }
         except FileNotFoundError:
             pass
@@ -1048,10 +1211,7 @@ class SettingsStore:
 
     def _save_locked(self) -> None:
         payload = {"version": 1, **self._data}
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        os.replace(tmp, self._path)
+        secure_atomic_write_json(self._path, payload)
 
     # -- API surface ---------------------------------------------------------
 
@@ -1075,15 +1235,73 @@ class SettingsStore:
         key (reset to default). ``cameras`` replaces the whole camera spec
         (``None`` clears it).
         """
+        if advanced is not None and "vr_teleop.tracker_key" in advanced:
+            # Accept an imported pre-migration settings file, but immediately
+            # move its hidden Advanced value into the visible Quest control.
+            legacy_key = advanced.get("vr_teleop.tracker_key")
+            advanced = dict(advanced)
+            advanced.pop("vr_teleop.tracker_key", None)
+            values = dict(values or {})
+            values.setdefault("mantis.quest_tracker_key", legacy_key)
         if values is not None:
+            values = dict(values)
             unknown = [k for k in values if k not in _SETTINGS_BY_KEY]
             if unknown:
                 raise KeyError(f"unknown settings: {', '.join(sorted(unknown))}")
+            for key, value in values.items():
+                setting = _SETTINGS_BY_KEY[key]
+                if setting.type == "boolean" and value is not None:
+                    values[key] = parse_boolean(value, key=key)
         if advanced is not None:
             bad = [k for k in advanced if k.partition(".")[0] not in _ADVANCED_BY_KEY]
             if bad:
                 raise KeyError(f"unknown advanced settings: {', '.join(sorted(bad))}")
         with self._lock:
+            if (
+                values is not None
+                and {
+                    "robot.left_channel",
+                    "robot.right_channel",
+                }
+                & values.keys()
+            ):
+                proposed = dict(self._data["values"])
+                for key, value in values.items():
+                    if value is None:
+                        proposed.pop(key, None)
+                    else:
+                        proposed[key] = value
+                _axol_channels_from_values(proposed)
+            if (
+                values is not None
+                and {
+                    "mantis.left_channel",
+                    "mantis.right_channel",
+                }
+                & values.keys()
+            ):
+                for key in (
+                    "mantis.left_channel",
+                    "mantis.right_channel",
+                ):
+                    if (
+                        key in values
+                        and values[key] is not None
+                        and not str(values[key]).strip()
+                    ):
+                        side = key.removeprefix("mantis.").removesuffix("_channel")
+                        raise ValueError(
+                            f"Mantis {side} CAN channel is empty; use null to "
+                            "reset it to the default"
+                        )
+                proposed = dict(self._data["values"])
+                for key, value in values.items():
+                    if value is None:
+                        proposed.pop(key, None)
+                    else:
+                        proposed[key] = value
+                left, right = _mantis_channels_from_values(proposed)
+                require_mantis_channels((left, right))
             if values is not None:
                 for k, v in values.items():
                     if v is None:
@@ -1116,21 +1334,84 @@ class SettingsStore:
         adapter chosen once (Settings, or the dashboard's CAN adapter picker)
         applies everywhere.
         """
+        with self._lock:
+            values = dict(self._data["values"])
+        return _axol_channels_from_values(values)
+
+    def mantis_can_channels(self) -> tuple[str | None, str | None]:
+        """The handheld rig's persisted (left, right) SocketCAN mapping."""
+        with self._lock:
+            values = dict(self._data["values"])
+        return _mantis_channels_from_values(values)
+
+    def effective_axol_can_channels(
+        self, op_id: str, args: dict[str, Any]
+    ) -> tuple[str | None, str | None]:
+        """Resolve the exact Axol arm channels an operation request will open."""
         from ..constants import CAN_LEFT, CAN_RIGHT
 
-        with self._lock:
-            left = self._data["values"].get("robot.left_channel")
-            right = self._data["values"].get("robot.right_channel")
+        merged = self.merged_args(op_id, args)
+        target_op = _settings_op(op_id)
+        if target_op in {"teleop", "gravity-comp"}:
+            keys = ("left_channel", "right_channel")
+        elif target_op in {
+            "collect-data",
+            "run-policy",
+            "replay-dataset",
+        }:
+            keys = (f"{_ROBOT}.left_channel", f"{_ROBOT}.right_channel")
+        else:
+            return self.can_channels()
 
-        def norm(value: Any, default: str) -> str | None:
-            if value is None:
+        def resolve(key: str, default: str) -> str | None:
+            # build_argv omits JSON null/blank values, so draccus then uses the
+            # config default. The literal string "null" is what decodes to None.
+            value = merged.get(key)
+            if value is None or not str(value).strip():
                 return default
             text = str(value).strip()
-            if not text:
-                return default
             return None if text.lower() in ("null", "none") else text
 
-        return norm(left, CAN_LEFT), norm(right, CAN_RIGHT)
+        return require_distinct_axol_channels(
+            (resolve(keys[0], CAN_LEFT), resolve(keys[1], CAN_RIGHT))
+        )
+
+    def effective_mantis_can_channels(
+        self, op_id: str, args: dict[str, Any]
+    ) -> tuple[str | None, str | None]:
+        """Resolve the exact Mantis channels an operation request will open.
+
+        This mirrors :meth:`merged_args` plus the command-level Mantis profile:
+        stored rig channels are folded below request overrides, and untouched
+        Axol defaults are translated to the Mantis hub names.  The serve API
+        uses this result to ensure its already-open diagnostics link represents
+        the same buses the impending operation will borrow.
+        """
+        from ..constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
+
+        merged = self.merged_args(op_id, args)
+        target_op = _settings_op(op_id)
+        if target_op == "teleop":
+            left = merged.get("left_channel", CAN_LEFT)
+            right = merged.get("right_channel", CAN_RIGHT)
+        elif target_op == "collect-data":
+            left = merged.get(f"{_ROBOT}.left_channel", CAN_LEFT)
+            right = merged.get(f"{_ROBOT}.right_channel", CAN_RIGHT)
+        else:
+            return self.mantis_can_channels()
+
+        def resolve(value: Any, arm_default: str, rig_default: str) -> str | None:
+            if value is None:
+                return None
+            text = str(value).strip()
+            if not text or text == arm_default:
+                return rig_default
+            return None if text.lower() in ("null", "none") else text
+
+        return (
+            resolve(left, CAN_LEFT, CAN_MANTIS_LEFT),
+            resolve(right, CAN_RIGHT, CAN_MANTIS_RIGHT),
+        )
 
     def has_gripper(self) -> bool:
         """Whether this robot is the gripper-equipped SKU (default ``True``).
@@ -1143,9 +1424,7 @@ class SettingsStore:
             value = self._data["values"].get("robot.has_gripper")
         if value is None:
             return True
-        if isinstance(value, str):
-            return value.strip().lower() not in ("false", "0", "no", "null")
-        return bool(value)
+        return parse_boolean(value, key="robot.has_gripper")
 
     def merged_args(self, op_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Fold the shared settings into one op start's args.
@@ -1176,5 +1455,75 @@ class SettingsStore:
             prefix = section.targets.get(target_op)
             if prefix:
                 merged[f"{prefix}.{subpath}"] = value
+
+        # The Mantis and Axol channel maps are deliberately independent. The
+        # curated target table cannot express a conditional target, so fold
+        # the rig map in only for a Mantis run and still leave request args as
+        # the final override below.
+        raw_mantis = args.get("mantis")
+        mantis = flag_enabled(raw_mantis)
+        if mantis:
+            left, right = self.mantis_can_channels()
+            if target_op == "teleop":
+                merged["left_channel"] = left
+                merged["right_channel"] = right
+            elif target_op == "collect-data":
+                merged[f"{_ROBOT}.left_channel"] = left
+                merged[f"{_ROBOT}.right_channel"] = right
+        # The curated Quest datum is intentionally source-scoped. Without
+        # this removal, switching the UI to Lighthouse/Ultimate would keep a
+        # Quest key as an explicit override and prevent those tracker-specific
+        # transforms from resolving. Request args below may still make an
+        # intentional one-run override.
+        source = args.get("mantis_source", merged.get("mantis_source"))
+        if not mantis or source != "quest":
+            if target_op == "teleop":
+                merged.pop("teleop.tracker_key", None)
+            elif target_op == "collect-data":
+                merged.pop(f"{_VRT}.tracker_key", None)
         merged.update(args)
-        return merged
+
+        # A hosted root process must never honor saved or per-request paths for
+        # TLS generation or LeRobot calibration state. Keep this after request
+        # precedence so the security boundary is the final authority.
+        from ..utils.state_files import privileged_service_active
+
+        hosted_service = privileged_service_active()
+        if hosted_service:
+            _confine_hosted_runtime_paths(target_op, merged)
+
+        # ``diag.lift-cycle`` is argparse-backed: unlike draccus, the literal
+        # string "null" would be treated as an interface name. Translate a
+        # disabled saved/request channel into the diagnostic's explicit skip
+        # flag so its argv and the serve-side hardware preflight agree.
+        if target_op == "diag.lift-cycle":
+            for side in ("left", "right"):
+                channel_key = f"{side}_channel"
+                channel = merged.get(channel_key)
+                if channel is not None and str(channel).strip().lower() in (
+                    "",
+                    "null",
+                    "none",
+                ):
+                    merged.pop(channel_key, None)
+                    merged[f"no_{side}"] = True
+
+        # Third-party dataset writers reopen names internally, so the hosted
+        # root service must always use the installer-sealed store. Stale saved
+        # values and request overrides remain valid for non-root embeddings,
+        # but cannot redirect (or merely break) panel operations. Aliases such
+        # as collect-dagger resolve through ``target_op`` above.
+        if target_op in {"collect-data", "run-policy", "replay-dataset"}:
+            from ..utils.state_files import service_dataset_path_for_repo_id
+
+            if hosted_service:
+                repo_id = merged.get("repo_id")
+                if repo_id:
+                    merged["root"] = str(service_dataset_path_for_repo_id(repo_id))
+                else:
+                    # run-policy may intentionally run without recording. A
+                    # stale/request root must not turn that into an implicit
+                    # dataset operation; required-repo operations will surface
+                    # their normal config error after this sanitization.
+                    merged.pop("root", None)
+        return normalize_boolean_args(op_id, merged)

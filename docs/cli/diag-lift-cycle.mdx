@@ -3,7 +3,7 @@ title: "diag.lift-cycle"
 description: "Raise the arms for clearance, then cycle the telescoping lift down and up."
 ---
 
-Exercises the powered cart's telescoping lift with the robot mounted. Before the lift moves, the command enables the selected arms and smoothly moves their S1 joints to the mirrored 90° clearance pose. It then runs the requested number of complete **down, then up** cycles. After a successful run verifies the lift is fully up and stopped, it smoothly returns S1 to 0° rest while holding every other joint at its measured starting position, verifies both the arm pose and lift state, then disables the selected arm motors and confirms none still reports holding. This is not a full-arm rest-pose replay.
+Exercises the powered cart's telescoping lift with the robot mounted. Before the lift moves, the command enables the seven arm joints on each selected side and smoothly moves their S1 joints to the mirrored 90° clearance pose. It then runs the requested number of complete **down, then up** cycles. After a successful run verifies the lift is fully up and stopped, it smoothly returns S1 to 0° rest while holding every other arm joint at its current measured position, verifies both the arm pose and lift state, then disables those arm joints and confirms none still reports holding. This is not a full-arm rest-pose replay, and it never enables, calibrates, commands, or disables either gripper.
 
 ```bash
 axol diag.lift-cycle --cycles 3
@@ -16,7 +16,7 @@ In a terminal, omit `--cycles` and the command prompts for a positive number of 
 
 The wheel motors and `can_alm_axol_b` do not need to be connected. With the defaults, this command opens only the selected arm buses and the lift/base interface `can_alm_axol_c`.
 
-`--left-channel` and `--right-channel` select the arm buses. Use `--no-left` or `--no-right` when only one arm is installed or connected; at least one arm is required so the mounted robot can be moved to the clearance pose. Pass `--no-gripper` on a gripperless robot so the nonexistent gripper motors are never contacted. The diagnostics dashboard inherits this from the shared **Grippers fitted** setting.
+`--left-channel` and `--right-channel` select the arm buses. Use `--no-left` or `--no-right` when only one arm is installed or connected; at least one arm is required so the mounted robot can be moved to the clearance pose. Grippers are excluded unconditionally, on both gripper-equipped and gripperless robots.
 
 <Note>
   The lift must already be homed. Run [`axol lift.home`](/cli/lift-home) first; both commands default to the named lift interface `can_alm_axol_c`.

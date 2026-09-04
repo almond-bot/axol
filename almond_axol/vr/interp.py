@@ -139,6 +139,11 @@ class PoseInterpolator:
         self._outlier_floor = float(outlier_floor_m)
 
         self._lock = threading.Lock()
+        # Incremented whenever buffered timing/ownership state is invalidated.
+        # sample() performs its numpy work outside the lock; this generation
+        # prevents an in-flight render from committing or returning the old
+        # owner's pose after reset() has established a new domain.
+        self._generation = 0
         # Buffer of (capture_time_s, frame), kept sorted by capture time.
         self._caps: list[float] = []
         self._frames: list[VRFrame] = []
@@ -173,10 +178,18 @@ class PoseInterpolator:
         # Hold-episode bookkeeping for the rate-limited log warning.
         self._hold_since: dict[str, float | None] = {"left": None, "right": None}
         self._hold_warned: dict[str, bool] = {"left": False, "right": False}
+        # Raw tracked-state transitions are safety events, not pose samples to
+        # be averaged away. Sequence counters make a brief false→true burst
+        # sticky until sample() has emitted at least one false frame to the
+        # teleop core, without losing a second dropout that races rendering.
+        self._raw_tracking: dict[str, bool | None] = {"left": None, "right": None}
+        self._tracking_loss_seq: dict[str, int] = {"left": 0, "right": 0}
+        self._tracking_loss_delivered: dict[str, int] = {"left": 0, "right": 0}
 
     def reset(self) -> None:
         """Drop all buffered state (e.g. on reconnect)."""
         with self._lock:
+            self._generation += 1
             self._caps.clear()
             self._frames.clear()
             self._vecs.clear()
@@ -190,6 +203,9 @@ class PoseInterpolator:
             self._held = {"left": None, "right": None}
             self._hold_since = {"left": None, "right": None}
             self._hold_warned = {"left": False, "right": False}
+            self._raw_tracking = {"left": None, "right": None}
+            self._tracking_loss_seq = {"left": 0, "right": 0}
+            self._tracking_loss_delivered = {"left": 0, "right": 0}
 
     def push(self, frame: VRFrame, now: float | None = None) -> None:
         """Ingest a freshly received frame.
@@ -207,6 +223,7 @@ class PoseInterpolator:
             # Reset estimation if the capture-time source changes (e.g. the
             # client transport switched between USB and network).
             if self._t_is_client is not None and is_client != self._t_is_client:
+                self._generation += 1
                 self._caps.clear()
                 self._frames.clear()
                 self._vecs.clear()
@@ -215,8 +232,18 @@ class PoseInterpolator:
                 self._delay = self._min_delay
                 self._last_out = None
                 self._last_pos = None
+                self._raw_tracking = {"left": None, "right": None}
+                self._tracking_loss_seq = {"left": 0, "right": 0}
+                self._tracking_loss_delivered = {"left": 0, "right": 0}
             self._t_is_client = is_client
             self._latest = frame
+            for side, tracked in (
+                ("left", bool(frame.l_tracked)),
+                ("right", bool(frame.r_tracked)),
+            ):
+                if not tracked and self._raw_tracking[side] is not False:
+                    self._tracking_loss_seq[side] += 1
+                self._raw_tracking[side] = tracked
 
             # Jitter / clock-offset estimation over the sliding window.
             transit = local_recv - cap_t
@@ -226,6 +253,10 @@ class PoseInterpolator:
                 self._transits.pop(0)
             ts = [t for _, t in self._transits]
             self._clock_offset = min(ts)
+            # Host-clock estimate of when this frame's poses were captured
+            # (biased late by the minimum one-way transit, which the min-filter
+            # can't separate from the clock offset — negligible on USB).
+            frame.t_host = cap_t + self._clock_offset
             jitter = max(ts) - self._clock_offset
             target_delay = min(max(jitter, self._min_delay), self._max_delay)
             # Grow the delay immediately (don't let the buffer run dry), shrink
@@ -299,10 +330,11 @@ class PoseInterpolator:
         to plain lerp/slerp between the two bracketing frames when the window
         is too sparse (startup, unstamped transports, ``smooth_window_s == 0``).
 
-        Returns ``None`` only before any frame has been received. The returned
-        object is *identity-stable*: when the rendered pose hasn't moved beyond
-        ``pos_eps`` and the control state is unchanged, the previous object is
-        returned so the IK loop can skip a redundant solve.
+        Returns ``None`` before any frame has been received, or when a concurrent
+        :meth:`reset` invalidates an in-flight render. The returned object is
+        *identity-stable*: when the rendered pose hasn't moved beyond ``pos_eps``
+        and the control state is unchanged, the previous object is returned so
+        the IK loop can skip a redundant solve.
         """
         if now is None:
             now = time.perf_counter()
@@ -310,13 +342,40 @@ class PoseInterpolator:
             latest = self._latest
             if latest is None:
                 return None
+            generation = self._generation
+            loss_seq_l = self._tracking_loss_seq["left"]
+            loss_seq_r = self._tracking_loss_seq["right"]
+            force_untracked_l = (
+                loss_seq_l > self._tracking_loss_delivered["left"]
+                or not latest.l_tracked
+            )
+            force_untracked_r = (
+                loss_seq_r > self._tracking_loss_delivered["right"]
+                or not latest.r_tracked
+            )
             if not self.enabled or self._clock_offset is None or len(self._caps) < 2:
                 # Passthrough: behave like latest-wins.
-                if self._last_out is latest:
+                output = latest
+                if (not force_untracked_l) != latest.l_tracked or (
+                    (not force_untracked_r) != latest.r_tracked
+                ):
+                    output = latest.model_copy(
+                        update={
+                            "l_tracked": not force_untracked_l,
+                            "r_tracked": not force_untracked_r,
+                        }
+                    )
+                self._tracking_loss_delivered["left"] = max(
+                    self._tracking_loss_delivered["left"], loss_seq_l
+                )
+                self._tracking_loss_delivered["right"] = max(
+                    self._tracking_loss_delivered["right"], loss_seq_r
+                )
+                if self._last_out is output:
                     return self._last_out
-                self._last_out = latest
+                self._last_out = output
                 self._last_pos = None
-                return latest
+                return output
 
             # The extra half-window playout shift only applies when smoothing
             # is active (client-stamped streams); unstamped streams keep the
@@ -365,6 +424,13 @@ class PoseInterpolator:
             last_pos = self._last_pos
             held_l = self._held["left"]
             held_r = self._held["right"]
+            t_is_client = self._t_is_client
+            # The rendered pose corresponds to headset-time ``play``. Clamp
+            # its timestamp to the available capture range: when input stops,
+            # a held last frame must not acquire an ever-newer timestamp and
+            # masquerade as a live pose heartbeat.
+            stamped_play = min(max(play, caps[0]), caps[-1])
+            play_host = stamped_play + self._clock_offset
 
         if win_vecs is not None and win_caps is not None:
             rendered, pos, l_out, l_live, r_out, r_live = _smooth_window(
@@ -377,8 +443,17 @@ class PoseInterpolator:
                 latest,
                 held_l,
                 held_r,
+                play_host,
+                force_untracked_l=force_untracked_l,
+                force_untracked_r=force_untracked_r,
             )
+            # _smooth_window uses the unclamped play time for Gaussian
+            # weighting; metadata still names the newest capture actually
+            # available, never a fabricated time beyond the buffer.
+            rendered.t = stamped_play * 1000.0
             with self._lock:
+                if generation != self._generation:
+                    return None
                 warn_l = self._update_hold("left", l_live, held_l, l_out, now)
                 warn_r = self._update_hold("right", r_live, held_r, r_out, now)
             for side, warn in (("left", warn_l), ("right", warn_r)):
@@ -394,7 +469,14 @@ class PoseInterpolator:
             # unstamped frames keep their original (absent) stamp so the
             # worker's filters fall back to their fixed rate.
             rendered, pos = _interpolate(
-                a, b, alpha, latest, play if self._t_is_client else None
+                a,
+                b,
+                alpha,
+                latest,
+                stamped_play if t_is_client else None,
+                play_host,
+                force_untracked_l=force_untracked_l,
+                force_untracked_r=force_untracked_r,
             )
 
         # Identity-stable: reuse the previous object when nothing moved and the
@@ -403,13 +485,37 @@ class PoseInterpolator:
             last_out is not None
             and last_pos is not None
             and _same_control(last_out, rendered)
-            and float(np.max(np.abs(pos - last_pos))) < self._pos_eps
+            and _same_motion(last_pos, pos, self._pos_eps)
         ):
+            with self._lock:
+                if generation != self._generation:
+                    return None
+                # Preserve identity for the IK skip while advancing the
+                # capture heartbeat to this equal-valued rendered sample.
+                # Only timestamp/seq metadata changes; pose/control equality
+                # was proven above.
+                last_out.t = rendered.t
+                last_out.t_host = rendered.t_host
+                last_out.seq = rendered.seq
+                self._tracking_loss_delivered["left"] = max(
+                    self._tracking_loss_delivered["left"], loss_seq_l
+                )
+                self._tracking_loss_delivered["right"] = max(
+                    self._tracking_loss_delivered["right"], loss_seq_r
+                )
             return last_out
 
         with self._lock:
+            if generation != self._generation:
+                return None
             self._last_out = rendered
             self._last_pos = pos
+            self._tracking_loss_delivered["left"] = max(
+                self._tracking_loss_delivered["left"], loss_seq_l
+            )
+            self._tracking_loss_delivered["right"] = max(
+                self._tracking_loss_delivered["right"], loss_seq_r
+            )
         return rendered
 
 
@@ -556,6 +662,7 @@ def _hand_mean(
     outlier_k: float,
     outlier_floor: float,
     held: np.ndarray | None,
+    force_untracked: bool = False,
 ) -> tuple[np.ndarray, bool]:
     """Weighted mean of one hand's streams over its tracked, inlier frames.
 
@@ -571,10 +678,22 @@ def _hand_mean(
         same Hampel-rejected mean over all frames, ``live=False`` — exactly
         the pre-gating behaviour rather than freezing teleop.
     """
-    if not bool(trk.any()):
+    if force_untracked or not bool(trk.any()):
         if held is not None:
             return held, False
-        return _hampel_mean(V, g, ee_sl, q_sl, el_sl, outlier_k, outlier_floor), False
+        visible = trk if bool(trk.any()) else np.ones(len(V), dtype=bool)
+        return (
+            _hampel_mean(
+                V[visible],
+                g[visible],
+                ee_sl,
+                q_sl,
+                el_sl,
+                outlier_k,
+                outlier_floor,
+            ),
+            False,
+        )
 
     all_tracked = bool(trk.all())
     Vt = V if all_tracked else V[trk]
@@ -592,6 +711,10 @@ def _smooth_window(
     latest: VRFrame,
     held_l: np.ndarray | None,
     held_r: np.ndarray | None,
+    t_host: float | None = None,
+    *,
+    force_untracked_l: bool = False,
+    force_untracked_r: bool = False,
 ) -> tuple[VRFrame, np.ndarray, np.ndarray, bool, np.ndarray, bool]:
     """Render the Gaussian-weighted, outlier-rejected mean pose of a window.
 
@@ -642,6 +765,7 @@ def _smooth_window(
         outlier_k,
         outlier_floor,
         held_l,
+        force_untracked_l,
     )
     r_out, r_live = _hand_mean(
         V,
@@ -653,6 +777,7 @@ def _smooth_window(
         outlier_k,
         outlier_floor,
         held_r,
+        force_untracked_r,
     )
 
     frame, pos = _build_frame(
@@ -666,12 +791,23 @@ def _smooth_window(
         r_grip,
         latest,
         play,
+        t_host,
+        l_tracked=l_live,
+        r_tracked=r_live,
     )
     return frame, pos, l_out, l_live, r_out, r_live
 
 
 def _interpolate(
-    a: VRFrame, b: VRFrame, alpha: float, latest: VRFrame, play: float | None
+    a: VRFrame,
+    b: VRFrame,
+    alpha: float,
+    latest: VRFrame,
+    play: float | None,
+    t_host: float | None = None,
+    *,
+    force_untracked_l: bool = False,
+    force_untracked_r: bool = False,
 ) -> tuple[VRFrame, np.ndarray]:
     """Interpolate motion between ``a`` and ``b``; take control state from
     ``latest``. Returns ``(frame, pos_vector)`` where ``pos_vector`` is the
@@ -685,7 +821,19 @@ def _interpolate(
     l_grip = float(a.l_grip + alpha * (b.l_grip - a.l_grip))
     r_grip = float(a.r_grip + alpha * (b.r_grip - a.r_grip))
     return _build_frame(
-        l_ee_p, l_ee_q, r_ee_p, r_ee_q, l_el, r_el, l_grip, r_grip, latest, play
+        l_ee_p,
+        l_ee_q,
+        r_ee_p,
+        r_ee_q,
+        l_el,
+        r_el,
+        l_grip,
+        r_grip,
+        latest,
+        play,
+        t_host,
+        l_tracked=(not force_untracked_l and a.l_tracked and b.l_tracked),
+        r_tracked=(not force_untracked_r and a.r_tracked and b.r_tracked),
     )
 
 
@@ -700,6 +848,10 @@ def _build_frame(
     r_grip: float,
     latest: VRFrame,
     play: float | None,
+    t_host: float | None = None,
+    *,
+    l_tracked: bool,
+    r_tracked: bool,
 ) -> tuple[VRFrame, np.ndarray]:
     """Assemble a rendered frame; motion from the args, control state from
     ``latest``. Returns ``(frame, pos_vector)`` where ``pos_vector`` is the
@@ -710,6 +862,10 @@ def _build_frame(
     the *motion* correctly — the IK worker's One Euro filters use consecutive
     ``t`` values as true sample spacing. ``None`` (unstamped stream) falls
     back to the latest arrival stamp.
+
+    ``t_host`` is the same playout instant mapped onto the host clock
+    (``time.perf_counter`` seconds); it becomes the frame's ``t_host`` for
+    consumers that align dataset rows to capture time (Mantis recording).
 
     Uses ``model_construct`` (no validation) with explicit ``float()``
     conversion: this runs per sample on the IK dispatch thread and the fields
@@ -751,11 +907,61 @@ def _build_frame(
         r_lock=latest.r_lock,
         reset=latest.reset,
         state=latest.state,
+        episode_outcome=latest.episode_outcome,
+        episode_end_t_host=latest.episode_end_t_host,
+        lock_release_id=latest.lock_release_id,
         t=(play * 1000.0) if play is not None else latest.t,
         seq=latest.seq,
+        t_host=t_host,
+        pose_source_id=latest.pose_source_id,
+        pose_source_kind=latest.pose_source_kind,
+        l_pose_profile=latest.l_pose_profile,
+        r_pose_profile=latest.r_pose_profile,
+        l_pose_space=latest.l_pose_space,
+        r_pose_space=latest.r_pose_space,
+        l_tracked=l_tracked,
+        r_tracked=r_tracked,
+        l_trigger_live=latest.l_trigger_live,
+        r_trigger_live=latest.r_trigger_live,
+        # Cart input is control state, not delayed motion. Preserve the newest
+        # thumbstick/click values exactly so interpolation cannot neutralize a
+        # drive command or keep a stale lift command alive.
+        l_stick_x=latest.l_stick_x,
+        l_stick_y=latest.l_stick_y,
+        r_stick_x=latest.r_stick_x,
+        l_stick_click=latest.l_stick_click,
+        r_stick_click=latest.r_stick_click,
     )
-    pos = np.concatenate([l_ee_p, r_ee_p, l_el, r_el])
-    return frame, pos
+    motion = np.concatenate(
+        [
+            l_ee_p,
+            r_ee_p,
+            l_el,
+            r_el,
+            l_ee_q,
+            r_ee_q,
+            np.array([l_grip, r_grip]),
+        ]
+    )
+    return frame, motion
+
+
+def _same_motion(a: np.ndarray, b: np.ndarray, eps: float) -> bool:
+    """Whether position, orientation, and analog grips are all unchanged."""
+    if a.shape != (22,) or b.shape != (22,):
+        return False
+    if float(np.max(np.abs(a[:12] - b[:12]))) >= eps:
+        return False
+    for q_slice in (slice(12, 16), slice(16, 20)):
+        qa = a[q_slice]
+        qb = b[q_slice]
+        denom = float(np.linalg.norm(qa) * np.linalg.norm(qb))
+        if denom <= 1e-12:
+            return False
+        dot = float(np.clip(abs(float(np.dot(qa, qb))) / denom, 0.0, 1.0))
+        if 2.0 * float(np.arccos(dot)) >= eps:
+            return False
+    return float(np.max(np.abs(a[20:22] - b[20:22]))) < eps
 
 
 def _same_control(a: VRFrame, b: VRFrame) -> bool:
@@ -764,4 +970,22 @@ def _same_control(a: VRFrame, b: VRFrame) -> bool:
         and a.r_lock == b.r_lock
         and a.reset == b.reset
         and a.state == b.state
+        and a.episode_outcome == b.episode_outcome
+        and a.episode_end_t_host == b.episode_end_t_host
+        and a.lock_release_id == b.lock_release_id
+        and a.pose_source_id == b.pose_source_id
+        and a.pose_source_kind == b.pose_source_kind
+        and a.l_pose_profile == b.l_pose_profile
+        and a.r_pose_profile == b.r_pose_profile
+        and a.l_pose_space == b.l_pose_space
+        and a.r_pose_space == b.r_pose_space
+        and a.l_tracked == b.l_tracked
+        and a.r_tracked == b.r_tracked
+        and a.l_trigger_live == b.l_trigger_live
+        and a.r_trigger_live == b.r_trigger_live
+        and a.l_stick_x == b.l_stick_x
+        and a.l_stick_y == b.l_stick_y
+        and a.r_stick_x == b.r_stick_x
+        and a.l_stick_click == b.l_stick_click
+        and a.r_stick_click == b.r_stick_click
     )

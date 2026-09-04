@@ -4,6 +4,7 @@ import { Button, buttonVariants } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
 const RELEASES_URL = "https://github.com/almond-bot/axol/releases"
+const INSTALLER_COMMAND = "curl https://axol.almond.bot/install -fsS | bash"
 
 /** Human-readable label for the current update step (shown on the button). */
 const PHASE_LABEL: Record<UpdatePhase, string> = {
@@ -15,6 +16,23 @@ const PHASE_LABEL: Record<UpdatePhase, string> = {
 /** Release version with the conventional "v" prefix, e.g. "v0.1.2". */
 function tag(version: string | null): string {
   return version ? `v${version}` : "unknown"
+}
+
+/** One-time migration notice for hosts whose legacy updater is unsafe. */
+export function InstallerMigrationBanner({ version }: { version: string | null }) {
+  return (
+    <div className="flex flex-col gap-1.5 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
+      <span className="font-medium text-amber-200">One-time installer migration required</span>
+      {version && <span className="font-mono text-amber-200/60">Installed: {tag(version)}</span>}
+      <span className="text-amber-100/80">
+        This release&apos;s legacy Update button cannot preserve the new hosted environment. Run on
+        the robot:{" "}
+        <code className="select-all rounded bg-black/20 px-1.5 py-0.5 font-mono text-amber-100">
+          {INSTALLER_COMMAND}
+        </code>
+      </span>
+    </div>
+  )
 }
 
 /**

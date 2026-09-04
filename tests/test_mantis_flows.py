@@ -1,0 +1,1514 @@
+from __future__ import annotations
+
+import json
+import logging
+import math
+import struct
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import numpy as np
+
+from almond_axol.cli import collect_data, teleop
+from almond_axol.cli.collect_data import _validate_mantis_calibration
+from almond_axol.cli.config import TeleopCmdConfig
+from almond_axol.lerobot.robot.config_mantis import MantisRobotConfig
+from almond_axol.lerobot.teleop.config_vr import AxolVRTeleopConfig
+from almond_axol.mantis.calibration import (
+    LEGACY_TRACKER_KEY,
+    ULTIMATE_POSE_CONVENTION_FIELD,
+    VIVE_TRACKER_CAD_ORIGINS_MM,
+    candidate_transform_for,
+    design_transform_for,
+    load_tcp_transforms,
+    validate_tcp_transform,
+)
+from almond_axol.mantis.relative import quat_xyzw_to_matrix
+from almond_axol.teleop.config import VRTeleopConfig, apply_mantis_teleop_profile
+from almond_axol.teleop.core import TCPPoseSnapshot, VRTeleopCore
+from almond_axol.tracker.base import TrackerPose
+from almond_axol.tracker.bridge import StopEventControls, TrackerBridge
+from almond_axol.tracker.config import (
+    TrackerConfig,
+    load_tracker_config,
+    save_tracker_config,
+    select_tracker_backend,
+)
+from almond_axol.tracker.trigger import decode_trigger_payload, parse_trigger_frame
+from almond_axol.vr.models import VREpisodeOutcome, VRState
+
+
+class _Source:
+    def __init__(self) -> None:
+        self.tracking = True
+
+    def poses(self) -> dict[str, TrackerPose]:
+        now = time.perf_counter()
+        return {
+            side: TrackerPose(
+                pos=np.array([offset, 1.0, -0.4]),
+                quat=np.array([0.0, 0.0, 0.0, 1.0]),
+                t=now,
+                tracking=self.tracking,
+            )
+            for side, offset in (("left", 0.2), ("right", -0.2))
+        }
+
+
+class _Trigger:
+    def __init__(self, grip: float = 1.0) -> None:
+        self.value = grip
+        self.stale = False
+
+    def grip(self) -> float:
+        return self.value
+
+    def is_stale(self) -> bool:
+        return self.stale
+
+
+class _SkewedSource:
+    def __init__(self, skew_s: float) -> None:
+        self.skew_s = skew_s
+        self.calls = 0
+
+    def poses(self) -> dict[str, TrackerPose]:
+        self.calls += 1
+        now = time.perf_counter()
+        return {
+            "left": TrackerPose(
+                pos=np.array([0.2, 1.0, -0.4]),
+                quat=np.array([0.0, 0.0, 0.0, 1.0]),
+                t=now - self.skew_s,
+            ),
+            "right": TrackerPose(
+                pos=np.array([-0.2, 1.0, -0.4]),
+                quat=np.array([0.0, 0.0, 0.0, 1.0]),
+                t=now,
+            ),
+        }
+
+
+class MantisFlowTest(unittest.TestCase):
+    def test_tcp_pose_snapshot_keeps_pose_and_timestamp_from_one_publish(self) -> None:
+        core = VRTeleopCore(
+            VRTeleopConfig(absolute_mode=True),
+            logging.getLogger(__name__),
+            lambda _enabled: None,
+        )
+        first = {
+            "left": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            "right": [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        }
+        second = {
+            "left": [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            "right": [-2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        }
+
+        core._publish_tcp_pose(first, 10.0)
+        captured = core.last_tcp_snapshot
+        core._publish_tcp_pose(second, 20.0)
+
+        self.assertEqual(
+            captured,
+            TCPPoseSnapshot(
+                pose_host_ts=10.0,
+                left=tuple(first["left"]),
+                right=tuple(first["right"]),
+            ),
+        )
+        self.assertEqual(core.last_tcp_snapshot.pose_host_ts, 20.0)
+        self.assertEqual(core.last_tcp_snapshot.left[0], 2.0)
+
+    def test_tcp_pose_snapshot_copies_mutable_ik_message(self) -> None:
+        core = VRTeleopCore(
+            VRTeleopConfig(absolute_mode=True),
+            logging.getLogger(__name__),
+            lambda _enabled: None,
+        )
+        tcp = {
+            "left": [1.0] * 7,
+            "right": [2.0] * 7,
+        }
+        core._publish_tcp_pose(tcp, 12.5)
+        snapshot = core.last_tcp_snapshot
+        tcp["left"][0] = 99.0
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.left[0], 1.0)
+        with self.assertRaises(TypeError):
+            snapshot.left[0] = 3.0  # type: ignore[index]
+
+    def test_direct_mantis_teleop_disables_inherited_powered_cart(self) -> None:
+        cfg = TeleopCmdConfig(mantis=True)
+        cfg.cart.enabled = True
+        with (
+            mock.patch(
+                "almond_axol.teleop.config.apply_mantis_teleop_profile"
+            ) as apply_teleop,
+            mock.patch(
+                "almond_axol.kinematics.config.apply_mantis_kinematics_profile"
+            ) as apply_kinematics,
+        ):
+            teleop._prepare_mantis_teleop(cfg)
+
+        self.assertFalse(cfg.cart.enabled)
+        apply_teleop.assert_called_once_with(
+            cfg.teleop, tracker_source=cfg.mantis_source
+        )
+        apply_kinematics.assert_called_once_with(cfg.kinematics)
+
+    def test_mantis_collection_disables_inherited_powered_cart(self) -> None:
+        cfg = collect_data.CollectDataConfig(repo_id="test/repo", task="test")
+        self.assertIsInstance(cfg.teleop_config, AxolVRTeleopConfig)
+        assert isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+        cfg.teleop_config.cart.enabled = True
+        with (
+            mock.patch(
+                "almond_axol.teleop.config.apply_mantis_teleop_profile"
+            ) as apply_teleop,
+            mock.patch(
+                "almond_axol.kinematics.config.apply_mantis_kinematics_profile"
+            ) as apply_kinematics,
+        ):
+            collect_data._apply_mantis_profile(cfg)
+
+        self.assertFalse(cfg.teleop_config.cart.enabled)
+        apply_teleop.assert_called_once()
+        apply_kinematics.assert_called_once()
+
+    def test_mantis_collection_restores_required_gripper_schema(self) -> None:
+        cfg = collect_data.CollectDataConfig(repo_id="test/repo", task="test")
+        cfg.robot_config.axol_config.has_gripper = False
+        self.assertIsInstance(cfg.teleop_config, AxolVRTeleopConfig)
+        assert isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+        cfg.teleop_config.has_gripper = False
+
+        with (
+            mock.patch("almond_axol.teleop.config.apply_mantis_teleop_profile"),
+            mock.patch("almond_axol.kinematics.config.apply_mantis_kinematics_profile"),
+        ):
+            collect_data._apply_mantis_profile(cfg)
+
+        self.assertIsInstance(cfg.robot_config, MantisRobotConfig)
+        self.assertTrue(cfg.robot_config.axol_config.has_gripper)
+        self.assertTrue(cfg.teleop_config.has_gripper)
+
+    def test_explicit_mantis_config_rejects_gripperless_hardware_schema(self) -> None:
+        cfg = collect_data._default_robot_config()
+        cfg.axol_config.has_gripper = False
+        with self.assertRaisesRegex(ValueError, "Mantis always has two"):
+            MantisRobotConfig(axol_config=cfg.axol_config)
+
+    def test_direct_collection_rejects_camera_config_before_tracker_bridge(
+        self,
+    ) -> None:
+        cfg = SimpleNamespace(
+            mantis=True,
+            mantis_source="lighthouse",
+            log_level="INFO",
+        )
+        with (
+            mock.patch.object(collect_data, "parse", return_value=cfg),
+            mock.patch.object(collect_data, "_prepare_mantis_collection"),
+            mock.patch.object(
+                collect_data,
+                "_prepare_recording_cameras",
+                side_effect=ValueError("no recording camera"),
+            ),
+            mock.patch("almond_axol.cli.mantis_bridge.managed_mantis_bridge") as bridge,
+            self.assertRaisesRegex(ValueError, "no recording camera"),
+        ):
+            collect_data.main([])
+
+        bridge.assert_not_called()
+
+    def test_failed_collection_setup_disconnects_robot_and_preserves_error(
+        self,
+    ) -> None:
+        dataset_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(dataset_dir.cleanup)
+        robot = mock.Mock()
+        robot.action_features = {}
+        robot.observation_features = {}
+        robot.get_joint_observation.return_value = {}
+        robot.positions = (np.zeros(8), np.zeros(8))
+        robot.cameras = {}
+        robot.name = "test-robot"
+        robot.disconnect.side_effect = RuntimeError("cleanup sentinel")
+
+        teleop = mock.Mock()
+        teleop.cart = None
+        teleop.connect.side_effect = ValueError("setup sentinel")
+        cfg = SimpleNamespace(
+            mantis=False,
+            repo_id="test/repo",
+            task="test",
+            fps=60,
+            teleop_hz=120,
+            vcodec="auto",
+            root=dataset_dir.name,
+            push_to_hub=False,
+            rerun_ip=None,
+            rerun_port=9876,
+            dataset_resolution="SVGA",
+            log_level="INFO",
+            robot_config=SimpleNamespace(observation_cameras=lambda: {}),
+            teleop_config=SimpleNamespace(),
+        )
+        original_affinity = {2, 3, 4, 5}
+
+        with (
+            mock.patch.object(collect_data, "_prepare_recording_cameras"),
+            mock.patch.object(collect_data.affinity, "pin_realtime"),
+            mock.patch.object(
+                collect_data.os,
+                "sched_getaffinity",
+                return_value=original_affinity,
+            ),
+            mock.patch.object(collect_data.os, "sched_setaffinity") as restore,
+            mock.patch.object(collect_data, "_start_video_relay", return_value=None),
+            mock.patch(
+                "almond_axol.lerobot.robot.robot_axol.AxolRobot",
+                return_value=robot,
+            ),
+            mock.patch(
+                "almond_axol.lerobot.teleop.teleop_vr.AxolVRTeleop",
+                return_value=teleop,
+            ),
+            mock.patch("almond_axol.utils.network.local_ip", return_value="127.0.0.1"),
+            self.assertRaisesRegex(ValueError, "setup sentinel") as raised,
+        ):
+            collect_data._run(cfg)
+
+        robot.connect.assert_called_once_with()
+        teleop.disconnect.assert_called_once_with()
+        robot.disconnect.assert_called_once_with()
+        restore.assert_called_once_with(0, original_affinity)
+        self.assertTrue(
+            getattr(raised.exception, "_axol_hardware_cleanup_uncertain", False)
+        )
+
+    def test_trigger_decoder_accepts_both_firmware_lengths(self) -> None:
+        core = struct.pack("<fH", 0.25, 1234)
+        self.assertEqual(decode_trigger_payload(core), (0.25, 1234))
+        self.assertEqual(decode_trigger_payload(core + b"\xa5"), (0.25, 1234))
+        self.assertIsNone(decode_trigger_payload(core + b"\x00\x00"))
+        self.assertIsNone(decode_trigger_payload(struct.pack("<fH", math.nan, 0)))
+        self.assertAlmostEqual(parse_trigger_frame(core + b"\x00").position, 0.25)
+
+    def test_managed_engage_requires_both_squeeze_then_release(self) -> None:
+        source = _Source()
+        left = _Trigger()
+        right = _Trigger()
+        bridge = TrackerBridge(
+            source,
+            left="left",
+            right="right",
+            controls=StopEventControls(threading.Event()),
+            left_trigger=left,
+            right_trigger=right,
+            auto_engage=True,
+            confirm_auto_engage=True,
+        )
+
+        released = bridge.compose_frame()
+        self.assertFalse(released["l_lock"])
+        self.assertTrue(released["l_tracked"])
+        # One hand squeezing and releasing is an ordinary grip, not a start.
+        left.value = 0.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        left.value = 1.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        # Both squeezed together only arms the gesture; the engage (and the
+        # base-transform snapshot) happens when both are released again.
+        left.value = right.value = 0.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        left.value = 1.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        right.value = 1.0
+        engaged = bridge.compose_frame()
+        self.assertTrue(engaged["l_lock"] and engaged["r_lock"])
+        # Plain teleop: the gesture engages but never opens a take.
+        self.assertEqual(engaged["state"], VRState.TELEOP.value)
+        for recognizer in bridge._gesture.values():
+            self.assertFalse(recognizer._pressed)
+            self.assertEqual(recognizer._presses, 0)
+
+    def _collection_bridge(self) -> tuple[TrackerBridge, _Trigger, _Trigger]:
+        left = _Trigger()
+        right = _Trigger()
+        bridge = TrackerBridge(
+            _Source(),
+            left="left",
+            right="right",
+            controls=StopEventControls(threading.Event()),
+            left_trigger=left,
+            right_trigger=right,
+            auto_engage=True,
+            confirm_auto_engage=True,
+        )
+        bridge._state = VRState.DATA_COLLECTION
+        return bridge, left, right
+
+    @staticmethod
+    def _press(
+        bridge: TrackerBridge, trigger: _Trigger, now: list[float], count: int
+    ) -> dict:
+        """Issue ``count`` rapid full presses on one trigger; return last frame."""
+        frame: dict = {}
+        for _ in range(count):
+            trigger.value = 0.0
+            now[0] += 0.05
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                frame = bridge.compose_frame()
+            trigger.value = 1.0
+            now[0] += 0.05
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                frame = bridge.compose_frame()
+        return frame
+
+    def test_start_gesture_opens_take_only_after_engage_ack(self) -> None:
+        bridge, left, right = self._collection_bridge()
+
+        left.value = right.value = 0.0
+        bridge.compose_frame()
+        left.value = right.value = 1.0
+        requested = bridge.compose_frame()
+        self.assertTrue(requested["l_lock"] and requested["r_lock"])
+        # The server must never see RECORDING before the core is engaged:
+        # collect-data refuses a take while disengaged.
+        self.assertEqual(requested["state"], VRState.DATA_COLLECTION.value)
+        self.assertEqual(bridge.compose_frame()["state"], VRState.DATA_COLLECTION.value)
+
+        bridge._handle_tracking_state(True)
+        recording = bridge.compose_frame()
+        self.assertEqual(recording["state"], VRState.RECORDING.value)
+        self.assertFalse(recording["reset"])
+
+    def test_start_gesture_while_engaged_opens_take_immediately(self) -> None:
+        bridge, left, right = self._collection_bridge()
+        bridge._handle_tracking_state(True)  # already-engaged core
+
+        left.value = right.value = 0.0
+        bridge.compose_frame()
+        left.value = right.value = 1.0
+        self.assertEqual(bridge.compose_frame()["state"], VRState.RECORDING.value)
+
+    def test_dropout_before_engage_ack_cancels_pending_take(self) -> None:
+        bridge, left, right = self._collection_bridge()
+
+        left.value = right.value = 0.0
+        bridge.compose_frame()
+        left.value = right.value = 1.0
+        self.assertTrue(bridge.compose_frame()["l_lock"])
+        left.stale = True
+        withdrawn = bridge.compose_frame()
+        self.assertFalse(withdrawn["l_lock"])
+        left.stale = False
+        bridge._handle_lock_release(withdrawn["lock_release_id"])
+
+        # A late engage ack for the withdrawn request must not open a take.
+        bridge._handle_tracking_state(True)
+        self.assertEqual(bridge.compose_frame()["state"], VRState.DATA_COLLECTION.value)
+
+    def test_triple_press_saves_and_quadruple_press_discards(self) -> None:
+        bridge, left, right = self._collection_bridge()
+        now = [100.0]
+
+        # Idle: a triple press is not a start any more.
+        self._press(bridge, left, now, 3)
+        now[0] += 1.0
+        with mock.patch("almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]):
+            idle = bridge.compose_frame()
+        self.assertEqual(idle["state"], VRState.DATA_COLLECTION.value)
+
+        def start_take() -> None:
+            left.value = right.value = 0.0
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                bridge.compose_frame()
+            left.value = right.value = 1.0
+            now[0] += 0.05
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                bridge.compose_frame()
+            bridge._handle_tracking_state(True)
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                frame = bridge.compose_frame()
+            self.assertEqual(frame["state"], VRState.RECORDING.value)
+            if "lock_release_id" in frame:
+                bridge._handle_lock_release(frame["lock_release_id"])
+
+        start_take()
+        # Three presses resolve after the inter-press timeout: end + save.
+        self._press(bridge, right, now, 3)
+        now[0] += 1.0
+        with mock.patch("almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]):
+            saved = bridge.compose_frame()
+        self.assertEqual(saved["state"], VRState.DATA_COLLECTION.value)
+        self.assertEqual(saved["episode_outcome"], VREpisodeOutcome.SUCCESS.value)
+        self.assertFalse(saved["reset"])
+
+        # Back to idle in collection (the server re-announces this state).
+        bridge._state = VRState.DATA_COLLECTION
+        start_take()
+        # Four presses resolve on the fourth press edge: end + discard, which
+        # is the RECORDING→DATA_COLLECTION transition with a reset edge.
+        discarded = self._press(bridge, left, now, 4)
+        self.assertEqual(discarded["state"], VRState.DATA_COLLECTION.value)
+        self.assertIsNone(discarded["episode_outcome"])
+        self.assertTrue(discarded["reset"])
+
+    def test_two_handed_presses_end_a_take_instead_of_restarting_it(self) -> None:
+        """Operators squeeze both triggers together for x3 / x4.
+
+        Each two-handed squeeze+release matches the start-gesture pattern; the
+        bridge used to consume it as a (no-op) start and reset both press
+        counters, so a two-handed triple/quadruple could never accumulate.
+        """
+        bridge, left, right = self._collection_bridge()
+        now = [200.0]
+
+        def frame() -> dict:
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                return bridge.compose_frame()
+
+        def both(value: float) -> dict:
+            left.value = right.value = value
+            now[0] += 0.05
+            return frame()
+
+        def start_take() -> None:
+            both(0.0)
+            both(1.0)
+            bridge._handle_tracking_state(True)
+            opened = frame()
+            self.assertEqual(opened["state"], VRState.RECORDING.value)
+            if "lock_release_id" in opened:
+                bridge._handle_lock_release(opened["lock_release_id"])
+
+        start_take()
+        # Two-handed triple: three squeeze/release cycles, then the timeout.
+        for _ in range(3):
+            self.assertEqual(both(0.0)["state"], VRState.RECORDING.value)
+            self.assertEqual(both(1.0)["state"], VRState.RECORDING.value)
+        now[0] += 1.0
+        saved = frame()
+        self.assertEqual(saved["state"], VRState.DATA_COLLECTION.value)
+        self.assertEqual(saved["episode_outcome"], VREpisodeOutcome.SUCCESS.value)
+        self.assertFalse(saved["reset"])
+        # ...and the second hand's pending sequence was consumed with it, so
+        # it cannot resolve on its own later.
+        for recognizer in bridge._gesture.values():
+            self.assertEqual(recognizer._presses, 0)
+        now[0] += 1.0
+        self.assertEqual(frame()["state"], VRState.DATA_COLLECTION.value)
+
+        # The next start gesture still opens a take (recognizers are clean).
+        bridge._state = VRState.DATA_COLLECTION
+        start_take()
+
+        # Two-handed quadruple resolves on the fourth press edge with both
+        # triggers still squeezed: discard, then the release that follows
+        # must not read as a start that reopens a take.
+        for _ in range(3):
+            both(0.0)
+            both(1.0)
+        fourth = both(0.0)
+        self.assertEqual(fourth["state"], VRState.DATA_COLLECTION.value)
+        self.assertTrue(fourth["reset"])
+        released = both(1.0)
+        self.assertEqual(released["state"], VRState.DATA_COLLECTION.value)
+        now[0] += 1.0
+        self.assertEqual(frame()["state"], VRState.DATA_COLLECTION.value)
+
+        # A fresh two-handed squeeze/release after that is a start again.
+        both(0.0)
+        self.assertEqual(both(1.0)["state"], VRState.RECORDING.value)
+
+    def test_start_gesture_still_reanchors_after_mid_take_dropout(self) -> None:
+        bridge, left, right = self._collection_bridge()
+        now = [300.0]
+
+        def frame() -> dict:
+            with mock.patch(
+                "almond_axol.tracker.bridge.time.perf_counter", lambda: now[0]
+            ):
+                return bridge.compose_frame()
+
+        def both(value: float) -> dict:
+            left.value = right.value = value
+            now[0] += 0.05
+            return frame()
+
+        both(0.0)
+        both(1.0)
+        bridge._handle_tracking_state(True)
+        opened = frame()
+        self.assertEqual(opened["state"], VRState.RECORDING.value)
+        if "lock_release_id" in opened:
+            bridge._handle_lock_release(opened["lock_release_id"])
+
+        # Tracker dropout mid-take: the bridge freezes and toggles the core
+        # out of tracking; the core acknowledges and the low-frame handshake
+        # completes once the trigger is fresh again.
+        left.stale = True
+        frozen = frame()
+        self.assertTrue(frozen["l_lock"] and frozen["r_lock"])  # disengage edge
+        bridge._handle_tracking_state(False)
+        left.stale = False
+        low = frame()
+        self.assertFalse(low["l_lock"])
+        bridge._handle_lock_release(low["lock_release_id"])
+        self.assertFalse(frame()["l_lock"])
+
+        # The take is still nominally open, but tracking is not engaged, so
+        # repeating the start gesture re-anchors (requests a new engage)
+        # instead of being swallowed as an in-take two-handed press.
+        both(0.0)
+        reanchor = both(1.0)
+        self.assertTrue(reanchor["l_lock"] and reanchor["r_lock"])
+
+    def test_managed_bridge_uses_operation_pose_source_token(self) -> None:
+        bridge = TrackerBridge(
+            _Source(),
+            left="left",
+            right="right",
+            controls=StopEventControls(threading.Event()),
+            pose_source_id="managed-ultimate-run",
+        )
+
+        self.assertEqual(
+            bridge.compose_frame()["pose_source_id"], "managed-ultimate-run"
+        )
+
+    def test_bridge_never_marks_malformed_custom_source_pose_live(self) -> None:
+        source = _Source()
+        bridge = TrackerBridge(
+            source,
+            left="left",
+            right="right",
+            controls=StopEventControls(threading.Event()),
+        )
+        self.assertTrue(bridge.compose_frame()["l_tracked"])
+
+        original_poses = source.poses
+
+        def malformed() -> dict[str, TrackerPose]:
+            poses = original_poses()
+            poses["left"].pos[0] = math.nan
+            return poses
+
+        source.poses = malformed  # type: ignore[method-assign]
+        frame = bridge.compose_frame()
+        self.assertFalse(frame["l_tracked"])
+        self.assertTrue(frame["r_tracked"])
+        self.assertTrue(math.isfinite(frame["l_ee"]["position"]["x"]))
+
+    def test_confirmation_must_restart_after_tracker_dropout(self) -> None:
+        source = _Source()
+        left = _Trigger()
+        right = _Trigger()
+        bridge = TrackerBridge(
+            source,
+            left="left",
+            right="right",
+            controls=StopEventControls(threading.Event()),
+            left_trigger=left,
+            right_trigger=right,
+            auto_engage=True,
+            confirm_auto_engage=True,
+        )
+
+        left.value = right.value = 0.0
+        bridge.compose_frame()  # both squeezed: start gesture is half done
+        source.tracking = False
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        source.tracking = True
+        # Releasing after the dropout cannot complete the pre-dropout squeeze.
+        left.value = right.value = 1.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        left.value = right.value = 0.0
+        self.assertFalse(bridge.compose_frame()["l_lock"])
+        left.value = right.value = 1.0
+        self.assertTrue(bridge.compose_frame()["l_lock"])
+
+    def test_managed_confirmation_requires_two_distinct_inputs(self) -> None:
+        source = _Source()
+        with self.assertRaisesRegex(ValueError, "two distinct"):
+            TrackerBridge(source, left="left", right="left")
+        with self.assertRaisesRegex(ValueError, "left and right trigger"):
+            TrackerBridge(
+                source,
+                left="left",
+                right="right",
+                left_trigger=_Trigger(),
+                auto_engage=True,
+                confirm_auto_engage=True,
+            )
+
+    def test_absolute_core_requires_release_after_tracking_loss(self) -> None:
+        broadcasts: list[bool] = []
+        core = VRTeleopCore(
+            VRTeleopConfig(absolute_mode=True),
+            logging.getLogger(__name__),
+            broadcasts.append,
+        )
+
+        def frame(*, tracked: bool, left: bool, right: bool) -> SimpleNamespace:
+            return SimpleNamespace(
+                l_tracked=tracked,
+                r_tracked=tracked,
+                l_lock=left,
+                r_lock=right,
+                l_grip=0.5,
+                r_grip=0.5,
+                lock_release_id=None,
+            )
+
+        engaged = frame(tracked=True, left=True, right=True)
+        released = frame(tracked=True, left=False, right=False)
+        self.assertTrue(core._accept_tracking_frame(engaged))
+        core.update_engage(engaged)
+        self.assertTrue(core.teleop_enabled)
+
+        # A total WebXR stream gap has no frame carrying tracked=False; the
+        # stale-stream path still funnels through the same forced-disengage
+        # gate and must reject a held-over squeeze on recovery.
+        core._disengage_all()
+        self.assertFalse(core._accept_tracking_frame(engaged))
+        self.assertTrue(core._accept_tracking_frame(released))
+        core.update_engage(released)
+        self.assertTrue(core._accept_tracking_frame(engaged))
+        core.update_engage(engaged)
+        self.assertTrue(core.teleop_enabled)
+
+        self.assertFalse(
+            core._accept_tracking_frame(frame(tracked=False, left=True, right=True))
+        )
+        self.assertFalse(core.teleop_enabled)
+        self.assertFalse(core._accept_tracking_frame(engaged))
+        self.assertFalse(
+            core._accept_tracking_frame(frame(tracked=True, left=False, right=True))
+        )
+
+        self.assertTrue(core._accept_tracking_frame(released))
+        core.update_engage(released)
+        self.assertFalse(core.teleop_enabled)
+        self.assertTrue(core._accept_tracking_frame(engaged))
+        core.update_engage(engaged)
+        self.assertTrue(core.teleop_enabled)
+
+    def test_quest_calibration_rejects_wrong_profile_or_pose_space(self) -> None:
+        core = VRTeleopCore(
+            VRTeleopConfig(
+                absolute_mode=True,
+                quest_controller_profile="oculus-touch-v3",
+                quest_pose_space="grip",
+            ),
+            logging.getLogger(__name__),
+            lambda _enabled: None,
+        )
+
+        def frame(profile: str, pose_space: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                l_tracked=True,
+                r_tracked=True,
+                l_pose_profile=profile,
+                r_pose_profile=profile,
+                l_pose_space=pose_space,
+                r_pose_space=pose_space,
+            )
+
+        self.assertEqual(
+            core._validated_tracking_flags(frame("oculus-touch-v3", "grip")),
+            {"left": True, "right": True},
+        )
+        self.assertEqual(
+            core._validated_tracking_flags(frame("oculus-touch-v3", "target-ray")),
+            {"left": False, "right": False},
+        )
+        self.assertEqual(
+            core._validated_tracking_flags(frame("other-controller", "grip")),
+            {"left": False, "right": False},
+        )
+
+    def test_lost_tracking_is_carried_per_side(self) -> None:
+        source = _Source()
+        bridge = TrackerBridge(
+            source,
+            left="left",
+            right="right",
+            controls=StopEventControls(threading.Event()),
+            auto_engage=True,
+        )
+        self.assertTrue(bridge.compose_frame()["l_tracked"])
+        source.tracking = False
+        lost = bridge.compose_frame()
+        self.assertFalse(lost["l_tracked"])
+        self.assertFalse(lost["r_tracked"])
+
+    def test_tracker_frame_uses_one_snapshot_and_rejects_side_skew(self) -> None:
+        source = _SkewedSource(0.08)
+        bridge = TrackerBridge(
+            source,
+            left="left",
+            right="right",
+            controls=StopEventControls(threading.Event()),
+            auto_engage=True,
+        )
+        frame = bridge.compose_frame()
+        self.assertEqual(source.calls, 1)
+        self.assertFalse(frame["l_tracked"])
+        self.assertTrue(frame["r_tracked"])
+
+    def test_tracker_frame_timestamp_is_newest_contributing_side(self) -> None:
+        source = _SkewedSource(0.02)
+        bridge = TrackerBridge(
+            source,
+            left="left",
+            right="right",
+            controls=StopEventControls(threading.Event()),
+        )
+        frame = bridge.compose_frame()
+        self.assertTrue(frame["l_tracked"] and frame["r_tracked"])
+        right_capture_ms = bridge._held["right"].t * 1000.0
+        self.assertAlmostEqual(frame["t"], right_capture_ms, places=3)
+
+    def test_source_binding_restore_is_backend_specific(self) -> None:
+        config = TrackerConfig(
+            backend="survive",
+            bindings={
+                "survive": {"left": "T20", "right": "T21"},
+                "ultimate": {"left": "a:b:c:d:e:f", "right": "1:2:3:4:5:6"},
+            },
+        )
+        select_tracker_backend(config, "survive")
+        self.assertEqual((config.left, config.right), ("T20", "T21"))
+        select_tracker_backend(config, "ultimate")
+        self.assertEqual((config.left, config.right), ("a:b:c:d:e:f", "1:2:3:4:5:6"))
+
+    def test_invalid_config_and_transform_files_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text("[]")
+            self.assertEqual(load_tracker_config(config_path), TrackerConfig())
+
+            transform_path = root / "tcp.json"
+            transform_path.write_text(
+                json.dumps(
+                    {
+                        "left": {
+                            "quest": {
+                                "pos": [0, 0, 0],
+                                "quat": [0, 0, 0, 0],
+                            }
+                        },
+                        "right": {
+                            "quest": {
+                                "pos": [0, 0, 0],
+                                "quat": [0, 0, 0, 2],
+                            }
+                        },
+                    }
+                )
+            )
+            loaded = load_tcp_transforms(transform_path)
+            self.assertNotIn("left", loaded)
+            self.assertEqual(loaded["right"]["quest"][3:], [0.0, 0.0, 0.0, 1.0])
+
+    def test_ultimate_transform_requires_matching_pose_convention(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "tracker.json"
+            transform_path = root / "tcp.json"
+            config = TrackerConfig(
+                backend="ultimate",
+                left="a:b:c:d:e:f",
+                right="1:2:3:4:5:6",
+                ultimate_quat_order="wxyz",
+                ultimate_up_axis="z",
+            )
+            save_tracker_config(config, config_path)
+            entry = {
+                "pos": [0.0, 0.0465, -0.092],
+                "quat": [0.7071068, 0.0, 0.0, 0.7071068],
+            }
+            transform_path.write_text(
+                json.dumps(
+                    {
+                        "left": {
+                            "survive:T20": dict(entry),
+                            "ultimate:a:b:c:d:e:f": dict(entry),
+                        },
+                        "right": {
+                            "ultimate:1:2:3:4:5:6": {
+                                **entry,
+                                ULTIMATE_POSE_CONVENTION_FIELD: {
+                                    "quat_order": "wxyz",
+                                    "up_axis": "z",
+                                },
+                            }
+                        },
+                    }
+                )
+            )
+
+            loaded = load_tcp_transforms(
+                transform_path,
+                tracker_config_path=config_path,
+            )
+            self.assertIn("survive:T20", loaded["left"])
+            self.assertNotIn("ultimate:a:b:c:d:e:f", loaded["left"])
+            self.assertIn("ultimate:1:2:3:4:5:6", loaded["right"])
+
+            config.ultimate_up_axis = "y"
+            save_tracker_config(config, config_path)
+            loaded = load_tcp_transforms(
+                transform_path,
+                tracker_config_path=config_path,
+            )
+            self.assertNotIn("ultimate:1:2:3:4:5:6", loaded.get("right", {}))
+
+            config.ultimate_up_axis = "z"
+            config.ultimate_quat_order = "xyzw"
+            save_tracker_config(config, config_path)
+            loaded = load_tcp_transforms(
+                transform_path,
+                tracker_config_path=config_path,
+            )
+            self.assertNotIn("ultimate:1:2:3:4:5:6", loaded.get("right", {}))
+
+            # Malformed convention metadata is stale, not an exception that
+            # could turn a readiness inspection into an availability failure.
+            document = json.loads(transform_path.read_text())
+            document["left"]["ultimate:a:b:c:d:e:f"][ULTIMATE_POSE_CONVENTION_FIELD] = {
+                "quat_order": [],
+                "up_axis": "z",
+            }
+            transform_path.write_text(json.dumps(document))
+            self.assertNotIn(
+                "ultimate:a:b:c:d:e:f",
+                load_tcp_transforms(
+                    transform_path,
+                    tracker_config_path=config_path,
+                ).get("left", {}),
+            )
+
+    def test_tcp_transform_validator_rejects_unsafe_values(self) -> None:
+        unsafe = {
+            "wrong length": [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            "non-finite position": [math.nan, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            "non-finite quaternion": [0.0, 0.0, 0.0, 0.0, math.inf, 0.0, 1.0],
+            "overflowing numeric": [10**1000, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            "zero quaternion": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "millimetres entered as metres": [47, 0, 35, 0, 0, 0, 1],
+        }
+        for name, transform in unsafe.items():
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    validate_tcp_transform(transform)
+
+        self.assertEqual(
+            validate_tcp_transform([0, 0, 0, 0, 0, 0, 2]),
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        )
+
+    def test_explicit_tcp_transforms_are_validated_before_teleop(self) -> None:
+        identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        unsafe = (
+            identity[:-1],
+            [math.nan, *identity[1:]],
+            [*identity[:3], 0.0, 0.0, 0.0, 0.0],
+        )
+        for transform in unsafe:
+            with self.subTest(transform=transform):
+                config = VRTeleopConfig(
+                    tcp_transform_left=transform,
+                    tcp_transform_right=identity,
+                )
+                with self.assertRaisesRegex(ValueError, "Mantis left.*invalid"):
+                    apply_mantis_teleop_profile(config, tracker_source="lighthouse")
+
+        non_unit = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0]
+        config = VRTeleopConfig(
+            tcp_transform_left=non_unit,
+            tcp_transform_right=non_unit,
+        )
+        apply_mantis_teleop_profile(config, tracker_source="lighthouse")
+        self.assertEqual(config.tcp_transform_left, identity)
+        self.assertEqual(config.tcp_transform_right, identity)
+
+    def test_collection_preflight_rejects_unsafe_explicit_transform(self) -> None:
+        identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+        def command(transform: list[float], *, allow: bool = False) -> SimpleNamespace:
+            return SimpleNamespace(
+                mantis_allow_uncalibrated=allow,
+                mantis_source="lighthouse",
+                teleop_config=SimpleNamespace(
+                    vr_teleop_config=VRTeleopConfig(
+                        tcp_transform_left=transform,
+                        tcp_transform_right=identity,
+                    )
+                ),
+            )
+
+        for transform in (
+            identity[:-1],
+            [math.inf, *identity[1:]],
+            [*identity[:3], 0.0, 0.0, 0.0, 0.0],
+        ):
+            with self.subTest(transform=transform):
+                with self.assertRaisesRegex(ValueError, "Mantis left.*invalid"):
+                    _validate_mantis_calibration(command(transform))
+
+        # The uncalibrated bring-up flag allows absence, never malformed input.
+        with self.assertRaisesRegex(ValueError, "Mantis left.*invalid"):
+            _validate_mantis_calibration(command(identity[:-1], allow=True))
+
+    def test_collection_requires_authoritative_active_transform(self) -> None:
+        identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        config = SimpleNamespace(
+            mantis_allow_uncalibrated=False,
+            mantis_source="lighthouse",
+            teleop_config=SimpleNamespace(
+                vr_teleop_config=VRTeleopConfig(
+                    tcp_transform_left=identity,
+                    tcp_transform_right=identity,
+                )
+            ),
+        )
+        keys = {"left": "survive:T20", "right": "survive:T21"}
+
+        def active_key(side: str, **_kwargs: object) -> tuple[str, str]:
+            return keys[side], "test binding"
+
+        with (
+            mock.patch(
+                "almond_axol.mantis.calibration.tracker_key_for_side",
+                side_effect=active_key,
+            ),
+            mock.patch(
+                "almond_axol.mantis.calibration.load_tcp_transforms",
+                return_value={},
+            ),
+            self.assertRaisesRegex(ValueError, "left \\(survive:T20\\)"),
+        ):
+            _validate_mantis_calibration(config)
+
+        measured = {
+            "left": {"survive:T20": identity},
+            "right": {"survive:T21": identity},
+        }
+        with (
+            mock.patch(
+                "almond_axol.mantis.calibration.tracker_key_for_side",
+                side_effect=active_key,
+            ),
+            mock.patch(
+                "almond_axol.mantis.calibration.load_tcp_transforms",
+                return_value=measured,
+            ),
+        ):
+            _validate_mantis_calibration(config)
+
+        config.teleop_config.vr_teleop_config.tcp_transform_left = [
+            0.01,
+            *identity[1:],
+        ]
+        with (
+            mock.patch(
+                "almond_axol.mantis.calibration.tracker_key_for_side",
+                side_effect=active_key,
+            ),
+            mock.patch(
+                "almond_axol.mantis.calibration.load_tcp_transforms",
+                return_value=measured,
+            ),
+            self.assertRaisesRegex(ValueError, "unproven transform override"),
+        ):
+            _validate_mantis_calibration(config)
+
+    def test_factory_vive_transforms_authorize_collection(self) -> None:
+        self.assertEqual(VIVE_TRACKER_CAD_ORIGINS_MM["survive"], (47.0, 0.0, 35.0))
+        self.assertEqual(VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"], (47.0, 0.0, 46.0))
+        with mock.patch(
+            "almond_axol.mantis.calibration.current_ultimate_pose_convention",
+            return_value=("wxyz", "z"),
+        ):
+            survive = design_transform_for("left", "survive:T20")
+            self.assertIsNotNone(survive)
+            assert survive is not None
+            ultimate = [0.0, 0.0465, -0.092, 0.7071068, 0.0, 0.0, 0.7071068]
+            self.assertEqual(
+                design_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff"),
+                ultimate,
+            )
+            self.assertEqual(
+                design_transform_for("right", "ultimate:11:22:33:44:55:66"),
+                ultimate,
+            )
+            self.assertIsNone(candidate_transform_for("left", "survive:T20"))
+            self.assertIsNone(
+                candidate_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff")
+            )
+            with mock.patch(
+                "almond_axol.mantis.calibration.current_ultimate_pose_convention",
+                return_value=("wxyz", "y"),
+            ):
+                self.assertIsNone(
+                    design_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff")
+                )
+
+            # Origins are expressed in the shared gripper/CAD frame G, while
+            # the stored translation is the TCP origin in tracker frame T.
+            # Therefore delta_p_TG = -R_TG @ delta_O; Rx(+90 deg) turns the
+            # +11 mm CAD-z origin shift into +11 mm of tracker-y translation.
+            origin_delta_m = (
+                np.asarray(VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"])
+                - np.asarray(VIVE_TRACKER_CAD_ORIGINS_MM["survive"])
+            ) / 1000.0
+            rotation_tg = quat_xyzw_to_matrix(np.asarray(survive[3:]))
+            np.testing.assert_allclose(
+                np.asarray(ultimate[:3]) - np.asarray(survive[:3]),
+                -(rotation_tg @ origin_delta_m),
+                atol=1e-9,
+            )
+
+            config = VRTeleopConfig()
+            with (
+                mock.patch(
+                    "almond_axol.mantis.calibration.load_tcp_transforms",
+                    return_value={},
+                ),
+                mock.patch(
+                    "almond_axol.mantis.calibration.tracker_key_for_side",
+                    return_value=("survive:T20", "test binding"),
+                ),
+            ):
+                apply_mantis_teleop_profile(config, tracker_source="lighthouse")
+            normalized_survive = validate_tcp_transform(survive)
+            self.assertEqual(config.tcp_transform_left, normalized_survive)
+            self.assertEqual(config.tcp_transform_right, normalized_survive)
+
+            ultimate_config = VRTeleopConfig()
+            with (
+                mock.patch(
+                    "almond_axol.mantis.calibration.load_tcp_transforms",
+                    return_value={},
+                ),
+                mock.patch(
+                    "almond_axol.mantis.calibration.tracker_key_for_side",
+                    return_value=(
+                        "ultimate:aa:bb:cc:dd:ee:ff",
+                        "test binding",
+                    ),
+                ),
+            ):
+                apply_mantis_teleop_profile(ultimate_config, tracker_source="ultimate")
+            normalized_ultimate = validate_tcp_transform(ultimate)
+            self.assertEqual(ultimate_config.tcp_transform_left, normalized_ultimate)
+            self.assertEqual(ultimate_config.tcp_transform_right, normalized_ultimate)
+
+            collection = SimpleNamespace(
+                mantis_allow_uncalibrated=False,
+                mantis_source="ultimate",
+                teleop_config=SimpleNamespace(vr_teleop_config=ultimate_config),
+            )
+            keys = {
+                "left": "ultimate:aa:bb:cc:dd:ee:ff",
+                "right": "ultimate:11:22:33:44:55:66",
+            }
+            with (
+                mock.patch(
+                    "almond_axol.mantis.calibration.tracker_key_for_side",
+                    side_effect=lambda side, **_kwargs: (keys[side], "test binding"),
+                ),
+                mock.patch(
+                    "almond_axol.mantis.calibration.load_tcp_transforms",
+                    return_value={},
+                ),
+            ):
+                _validate_mantis_calibration(collection)
+
+    def test_ultimate_convention_change_invalidates_production_transform(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "tracker.json"
+            transform_path = root / "tcp.json"
+            tracker_config = TrackerConfig(
+                backend="ultimate",
+                left="a:b:c:d:e:f",
+                right="1:2:3:4:5:6",
+                ultimate_quat_order="wxyz",
+                ultimate_up_axis="z",
+            )
+            save_tracker_config(tracker_config, config_path)
+            transform = {
+                "pos": [0.0, 0.0465, -0.092],
+                "quat": [0.7071068, 0.0, 0.0, 0.7071068],
+                ULTIMATE_POSE_CONVENTION_FIELD: {
+                    "quat_order": "wxyz",
+                    "up_axis": "z",
+                },
+            }
+            transform_path.write_text(
+                json.dumps(
+                    {
+                        "left": {"ultimate:a:b:c:d:e:f": transform},
+                        "right": {"ultimate:1:2:3:4:5:6": transform},
+                    }
+                )
+            )
+
+            vrt = VRTeleopConfig()
+            collection = SimpleNamespace(
+                mantis_allow_uncalibrated=False,
+                mantis_source="ultimate",
+                teleop_config=SimpleNamespace(vr_teleop_config=vrt),
+            )
+            with (
+                mock.patch(
+                    "almond_axol.mantis.calibration.MANTIS_TCP_TRANSFORM_FILE",
+                    transform_path,
+                ),
+                mock.patch(
+                    "almond_axol.tracker.config.TRACKER_CONFIG_FILE",
+                    config_path,
+                ),
+            ):
+                apply_mantis_teleop_profile(vrt, tracker_source="ultimate")
+                _validate_mantis_calibration(collection)
+
+                tracker_config.ultimate_up_axis = "y"
+                save_tracker_config(tracker_config, config_path)
+                with self.assertRaisesRegex(ValueError, "no verified"):
+                    _validate_mantis_calibration(collection)
+
+    def test_stale_ultimate_override_suppresses_factory_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "tracker.json"
+            transform_path = root / "tcp.json"
+            tracker_config = TrackerConfig(
+                backend="ultimate",
+                left="a:b:c:d:e:f",
+                right="1:2:3:4:5:6",
+                bindings={
+                    "ultimate": {
+                        "left": "a:b:c:d:e:f",
+                        "right": "1:2:3:4:5:6",
+                    }
+                },
+                ultimate_quat_order="wxyz",
+                ultimate_up_axis="z",
+            )
+            save_tracker_config(tracker_config, config_path)
+            # These valid-looking entries predate convention provenance. They
+            # must not be hidden by the standard-mount factory fallback: the
+            # unit may deliberately have a non-standard physical mount.
+            conventionless = {
+                "pos": [0.0, 0.0, 0.0],
+                "quat": [0.0, 0.0, 0.0, 1.0],
+            }
+            transform_path.write_text(
+                json.dumps(
+                    {
+                        "left": {"ultimate:a:b:c:d:e:f": conventionless},
+                        "right": {"ultimate:1:2:3:4:5:6": conventionless},
+                    }
+                )
+            )
+
+            vrt = VRTeleopConfig()
+            collection = SimpleNamespace(
+                mantis_allow_uncalibrated=False,
+                mantis_source="ultimate",
+                teleop_config=SimpleNamespace(vr_teleop_config=vrt),
+            )
+            with (
+                mock.patch(
+                    "almond_axol.mantis.calibration.MANTIS_TCP_TRANSFORM_FILE",
+                    transform_path,
+                ),
+                mock.patch(
+                    "almond_axol.tracker.config.TRACKER_CONFIG_FILE",
+                    config_path,
+                ),
+            ):
+                apply_mantis_teleop_profile(vrt, tracker_source="ultimate")
+                self.assertIsNone(vrt.tcp_transform_left)
+                self.assertIsNone(vrt.tcp_transform_right)
+                with self.assertRaisesRegex(ValueError, "no verified"):
+                    _validate_mantis_calibration(collection)
+
+    def test_invalid_transform_file_suppresses_factory_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "tracker.json"
+            transform_path = root / "tcp.json"
+            save_tracker_config(
+                TrackerConfig(
+                    backend="ultimate",
+                    left="a:b:c:d:e:f",
+                    right="1:2:3:4:5:6",
+                    bindings={
+                        "ultimate": {
+                            "left": "a:b:c:d:e:f",
+                            "right": "1:2:3:4:5:6",
+                        }
+                    },
+                ),
+                config_path,
+            )
+            invalid_documents = (
+                "{",
+                json.dumps({"left": [], "right": {}}),
+                json.dumps({"left": {"pos": [0.0, 0.0, 0.0]}, "right": {}}),
+                json.dumps(
+                    {
+                        "left": {"pos": [], "quat": [0.0, 0.0, 0.0, 1.0]},
+                        "right": {"pos": [], "quat": [0.0, 0.0, 0.0, 1.0]},
+                    }
+                ),
+            )
+            for contents in invalid_documents:
+                with self.subTest(contents=contents):
+                    transform_path.write_text(contents)
+                    vrt = VRTeleopConfig()
+                    collection = SimpleNamespace(
+                        mantis_allow_uncalibrated=False,
+                        mantis_source="ultimate",
+                        teleop_config=SimpleNamespace(vr_teleop_config=vrt),
+                    )
+                    with (
+                        mock.patch(
+                            "almond_axol.mantis.calibration.MANTIS_TCP_TRANSFORM_FILE",
+                            transform_path,
+                        ),
+                        mock.patch(
+                            "almond_axol.tracker.config.TRACKER_CONFIG_FILE",
+                            config_path,
+                        ),
+                    ):
+                        apply_mantis_teleop_profile(vrt, tracker_source="ultimate")
+                        self.assertIsNone(vrt.tcp_transform_left)
+                        self.assertIsNone(vrt.tcp_transform_right)
+                        with self.assertRaisesRegex(ValueError, "no verified"):
+                            _validate_mantis_calibration(collection)
+
+    def test_active_source_never_uses_unknown_legacy_transform(self) -> None:
+        identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        saved = {
+            "left": {LEGACY_TRACKER_KEY: identity},
+            "right": {LEGACY_TRACKER_KEY: identity},
+        }
+        config = VRTeleopConfig()
+        with (
+            mock.patch(
+                "almond_axol.mantis.calibration.load_tcp_transforms",
+                return_value=saved,
+            ),
+            mock.patch(
+                "almond_axol.mantis.calibration.tracker_key_for_side",
+                return_value=("ultimate:aa", "test binding"),
+            ),
+        ):
+            apply_mantis_teleop_profile(config, tracker_source="ultimate")
+        self.assertIsNone(config.tcp_transform_left)
+        self.assertIsNone(config.tcp_transform_right)
+
+        # Preserve the legacy SDK fallback when no managed source is known,
+        # but never let the new factory value silently take precedence over it.
+        legacy_config = VRTeleopConfig()
+        with (
+            mock.patch(
+                "almond_axol.mantis.calibration.load_tcp_transforms",
+                return_value=saved,
+            ),
+            mock.patch(
+                "almond_axol.mantis.calibration.tracker_key_for_side",
+                return_value=("ultimate:aa", "test binding"),
+            ),
+        ):
+            apply_mantis_teleop_profile(legacy_config)
+        self.assertEqual(legacy_config.tcp_transform_left, identity)
+        self.assertEqual(legacy_config.tcp_transform_right, identity)
+
+    def test_factory_never_hides_unscoped_hardware_override(self) -> None:
+        identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        for source, family, exact_key in (
+            ("lighthouse", "survive", "survive:T20"),
+            ("ultimate", "ultimate", "ultimate:aa:bb:cc:dd:ee:ff"),
+        ):
+            for saved_key in (family, f"{family}:previous-device"):
+                with self.subTest(source=source, saved_key=saved_key):
+                    saved = {
+                        "left": {saved_key: identity},
+                        "right": {saved_key: identity},
+                    }
+                    vrt = VRTeleopConfig()
+                    collection = SimpleNamespace(
+                        mantis_allow_uncalibrated=False,
+                        mantis_source=source,
+                        teleop_config=SimpleNamespace(vr_teleop_config=vrt),
+                    )
+                    with (
+                        mock.patch(
+                            "almond_axol.mantis.calibration.load_tcp_transforms",
+                            return_value=saved,
+                        ),
+                        mock.patch(
+                            "almond_axol.mantis.calibration.tracker_key_for_side",
+                            return_value=(exact_key, "test binding"),
+                        ),
+                    ):
+                        apply_mantis_teleop_profile(vrt, tracker_source=source)
+                    self.assertIsNone(vrt.tcp_transform_left)
+                    self.assertIsNone(vrt.tcp_transform_right)
+                    with (
+                        mock.patch(
+                            "almond_axol.mantis.calibration.load_tcp_transforms",
+                            return_value=saved,
+                        ),
+                        mock.patch(
+                            "almond_axol.mantis.calibration.tracker_key_for_side",
+                            return_value=(exact_key, "test binding"),
+                        ),
+                        self.assertRaisesRegex(ValueError, "no verified"),
+                    ):
+                        _validate_mantis_calibration(collection)
+
+    def test_keyed_measured_transform_is_applied(self) -> None:
+        identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        keys = {"left": "ultimate:left", "right": "ultimate:right"}
+        saved = {
+            "left": {keys["left"]: identity},
+            "right": {keys["right"]: identity},
+        }
+        config = VRTeleopConfig(tracker_key="ultimate:must-not-override-bindings")
+        with (
+            mock.patch(
+                "almond_axol.mantis.calibration.load_tcp_transforms",
+                return_value=saved,
+            ),
+            mock.patch(
+                "almond_axol.mantis.calibration.tracker_key_for_side",
+                side_effect=lambda side, **_kwargs: (keys[side], "test binding"),
+            ),
+        ):
+            apply_mantis_teleop_profile(config, tracker_source="ultimate")
+        self.assertEqual(config.tcp_transform_left, identity)
+        self.assertEqual(config.tcp_transform_right, identity)
+
+    def test_profile_scoped_quest_transform_is_selected_and_validated(self) -> None:
+        identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        key = "quest:oculus-touch-v3:grip"
+        saved = {"left": {key: identity}, "right": {key: identity}}
+        config = VRTeleopConfig()
+        with mock.patch(
+            "almond_axol.mantis.calibration.load_tcp_transforms", return_value=saved
+        ):
+            apply_mantis_teleop_profile(config, tracker_source="quest")
+        self.assertEqual(config.tracker_key, key)
+        self.assertEqual(config.quest_controller_profile, "oculus-touch-v3")
+        self.assertEqual(config.quest_pose_space, "grip")
+        self.assertEqual(config.tcp_transform_left, identity)
+        self.assertEqual(config.tcp_transform_right, identity)
+        self.assertTrue(config.urdf_viewer_world_aligned)
+
+    def test_external_tracker_world_hides_unregistered_quest_overlay(self) -> None:
+        config = VRTeleopConfig()
+        with mock.patch(
+            "almond_axol.mantis.calibration.load_tcp_transforms", return_value={}
+        ):
+            apply_mantis_teleop_profile(config, tracker_source="lighthouse")
+        self.assertFalse(config.urdf_viewer_world_aligned)
+
+        explicitly_registered = VRTeleopConfig(urdf_viewer_world_aligned=True)
+        with mock.patch(
+            "almond_axol.mantis.calibration.load_tcp_transforms", return_value={}
+        ):
+            apply_mantis_teleop_profile(
+                explicitly_registered, tracker_source="ultimate"
+            )
+        self.assertTrue(explicitly_registered.urdf_viewer_world_aligned)
+
+    def test_quest_collection_gate_requires_scoped_grip_datum(self) -> None:
+        identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+        def command(config: VRTeleopConfig) -> SimpleNamespace:
+            return SimpleNamespace(
+                mantis_allow_uncalibrated=False,
+                mantis_source="quest",
+                teleop_config=SimpleNamespace(vr_teleop_config=config),
+            )
+
+        for config in (
+            VRTeleopConfig(
+                tcp_transform_left=identity,
+                tcp_transform_right=identity,
+                tracker_key="quest",
+            ),
+            VRTeleopConfig(
+                tcp_transform_left=identity,
+                tcp_transform_right=identity,
+                tracker_key="quest:oculus-touch-v3:target-ray",
+                quest_controller_profile="oculus-touch-v3",
+                quest_pose_space="target-ray",
+            ),
+            VRTeleopConfig(
+                tcp_transform_left=identity,
+                tcp_transform_right=identity,
+            ),
+        ):
+            with self.subTest(key=config.tracker_key):
+                with self.assertRaisesRegex(ValueError, "profile-scoped"):
+                    _validate_mantis_calibration(command(config))
+
+        good = VRTeleopConfig(
+            tcp_transform_left=identity,
+            tcp_transform_right=identity,
+            tracker_key="quest:oculus-touch-v3:grip",
+            quest_controller_profile="oculus-touch-v3",
+            quest_pose_space="grip",
+        )
+        key = "quest:oculus-touch-v3:grip"
+        saved = {"left": {key: identity}, "right": {key: identity}}
+        with mock.patch(
+            "almond_axol.mantis.calibration.load_tcp_transforms",
+            return_value=saved,
+        ):
+            _validate_mantis_calibration(command(good))
+
+    def test_quest_scoped_key_rejects_conflicting_expected_metadata(self) -> None:
+        config = VRTeleopConfig(
+            tracker_key="quest:oculus-touch-v3:grip",
+            quest_controller_profile="wrong-profile",
+        )
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            apply_mantis_teleop_profile(config, tracker_source="quest")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -72,6 +72,8 @@ _logger = logging.getLogger(__name__)
 # pipelined gst queues (see `_gst_argv`), so in normal running it stays near empty.
 # Cost is ~1.7 MB/frame (HWC RGB uint8): 90 x 3 cameras ~= 460 MB peak.
 _FEED_QUEUE_MAXSIZE = 90
+_WRITER_FINISH_TIMEOUT_S = 120.0
+_WRITER_ABORT_TIMEOUT_S = 5.0
 
 # Image stats are accumulated *during* the episode on the encoder's writer
 # thread in the recorder subprocess (not by decoding the finished mp4 afterwards,
@@ -202,6 +204,8 @@ class _CameraNvencEncoder:
         self.video_path = video_path
         self._fps = fps
         self._queue: queue.Queue = queue.Queue(maxsize=max(1, queue_maxsize))
+        self._stop = threading.Event()
+        self._cancelled = threading.Event()
         self._proc: subprocess.Popen | None = None
         self._stdin_fd: int | None = None
         self._rgba: NDArray | None = None
@@ -257,7 +261,11 @@ class _CameraNvencEncoder:
         return self._dropped
 
     def feed(self, image: "NDArray") -> None:
-        if not self._thread.is_alive():
+        if self._error is not None:
+            raise RuntimeError(
+                f"NVENC encoder for {self.video_path.name} failed: {self._error}"
+            )
+        if self._stop.is_set() or not self._thread.is_alive():
             raise RuntimeError(
                 f"NVENC encoder for {self.video_path.name} is not alive: {self._error}"
             )
@@ -266,22 +274,41 @@ class _CameraNvencEncoder:
         except queue.Full:
             self._dropped += 1
             _EPISODE_DROPPED["n"] += 1
-            if self._dropped == 1 or self._dropped % 10 == 0:
-                _logger.warning(
-                    "NVENC encoder queue full for %s, dropped %d frame(s).",
-                    self.video_path.name,
-                    self._dropped,
-                )
+            self._error = (
+                f"feed queue overflow dropped frame {self._dropped}; the episode's "
+                "video is shorter than its dataset rows"
+            )
+            _logger.error(
+                "NVENC encoder queue full for %s; aborting the episode before a "
+                "misaligned video can be saved",
+                self.video_path.name,
+            )
+            raise RuntimeError(
+                f"NVENC encoder for {self.video_path.name}: {self._error}"
+            )
 
     def finish(self) -> tuple[Path, dict | None]:
         """Signal end of episode, wait for the mp4 to finalize, return stats."""
-        self._queue.put(None)
-        self._thread.join(timeout=120)
+        self._request_stop(cancel=False)
+        self._thread.join(timeout=_WRITER_FINISH_TIMEOUT_S)
         if self._thread.is_alive():
-            _logger.error(
-                "NVENC encoder for %s did not finish in time", self.video_path.name
+            message = (
+                f"NVENC encoder for {self.video_path.name} did not finish within "
+                f"{_WRITER_FINISH_TIMEOUT_S:g}s; its MP4 may be truncated"
             )
-            return self.video_path, None
+            _logger.error(message)
+            self._request_stop(cancel=True)
+            try:
+                self._kill()
+            except Exception as exc:  # noqa: BLE001 - preserve timeout failure
+                message += f"; forced pipeline stop also failed: {exc}"
+            self._thread.join(timeout=_WRITER_ABORT_TIMEOUT_S)
+            if self._thread.is_alive():
+                message += (
+                    f"; writer remained alive {_WRITER_ABORT_TIMEOUT_S:g}s after "
+                    "forced pipeline stop"
+                )
+            raise RuntimeError(message)
         if self._error is not None:
             raise RuntimeError(
                 f"NVENC encoder for {self.video_path.name} failed: {self._error}"
@@ -297,21 +324,60 @@ class _CameraNvencEncoder:
         return self.video_path, stats
 
     def cancel(self) -> None:
-        self._queue.put(None)
-        self._thread.join(timeout=5)
-        self._kill()
+        self._request_stop(cancel=True)
+        kill_error: BaseException | None = None
+        try:
+            self._kill()
+        except BaseException as error:
+            kill_error = error
+        self._thread.join(timeout=_WRITER_ABORT_TIMEOUT_S)
+        if self._thread.is_alive():
+            message = (
+                f"NVENC encoder writer for {self.video_path.name} remained alive "
+                f"{_WRITER_ABORT_TIMEOUT_S:g}s after cancel"
+            )
+            _logger.error(message)
+            failure = RuntimeError(message)
+            if kill_error is not None:
+                failure.add_note(
+                    "pipeline kill/reap also failed: "
+                    f"{type(kill_error).__name__}: {kill_error}"
+                )
+            raise failure
+        if kill_error is not None:
+            raise kill_error
+
+    def _request_stop(self, *, cancel: bool) -> None:
+        """Stop accepting frames and wake the writer without waiting for queue room."""
+        if cancel:
+            self._cancelled.set()
+        self._stop.set()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            # Finish drains the full queue and then observes _stop. Cancel also
+            # kills the gst child, unblocking a writer stuck in os.write.
+            pass
 
     # -- writer thread -------------------------------------------------------
 
     def _run(self) -> None:
         try:
-            while True:
-                item = self._queue.get()
+            while not self._cancelled.is_set():
+                try:
+                    item = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    if self._stop.is_set():
+                        break
+                    continue
                 if item is None:
                     break
                 self._encode(item)
-            self._finalize()
-        except Exception as exc:  # noqa: BLE001 - surface via _error on finish()
+                if self._stop.is_set() and self._queue.empty():
+                    break
+            if not self._cancelled.is_set():
+                self._finalize()
+        except BaseException as exc:
             self._error = str(exc)
             _logger.error(
                 "NVENC encoder thread for %s failed: %s", self.video_path.name, exc
@@ -472,6 +538,23 @@ class _CameraNvencEncoder:
                 self._proc.wait(timeout=2)
 
 
+def _remove_nvenc_staging(video_path: Path) -> None:
+    """Remove one exact temporary camera file/directory after cancellation."""
+    if not (video_path.exists() or video_path.parent.exists()):
+        return
+    from ..utils.state_files import (
+        privileged_service_active,
+        secure_rmdir,
+        secure_unlink,
+    )
+
+    if privileged_service_active():
+        secure_unlink(video_path, missing_ok=True)
+        secure_rmdir(video_path.parent, missing_ok=True)
+    else:
+        shutil.rmtree(str(video_path.parent), ignore_errors=True)
+
+
 class NvencStreamingEncoder:
     """LeRobot ``StreamingVideoEncoder``-compatible encoder backed by Jetson NVENC.
 
@@ -501,13 +584,36 @@ class NvencStreamingEncoder:
             self.cancel_episode()
         temp_dir = Path(temp_dir)
         self._cams = {}
-        for video_key in video_keys:
-            ep_dir = Path(tempfile.mkdtemp(dir=temp_dir))
-            video_path = ep_dir / f"{video_key.replace('/', '_')}_streaming.mp4"
-            self._cams[video_key] = _CameraNvencEncoder(
-                video_path, self.fps, self.queue_maxsize
-            )
         self._episode_active = True
+        try:
+            for video_key in video_keys:
+                ep_dir = Path(tempfile.mkdtemp(dir=temp_dir))
+                video_path = ep_dir / f"{video_key.replace('/', '_')}_streaming.mp4"
+                try:
+                    camera = _CameraNvencEncoder(
+                        video_path,
+                        self.fps,
+                        self.queue_maxsize,
+                    )
+                except BaseException as error:
+                    try:
+                        _remove_nvenc_staging(video_path)
+                    except BaseException as cleanup_error:
+                        error.add_note(
+                            "additional failed-camera staging cleanup failure: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    raise
+                self._cams[video_key] = camera
+        except BaseException as error:
+            try:
+                self.cancel_episode()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "additional NVENC episode-start rollback failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
 
     def feed_frame(self, video_key: str, image: "NDArray") -> None:
         if not self._episode_active:
@@ -530,11 +636,10 @@ class NvencStreamingEncoder:
             # every frame after a drop slides onto an earlier timestamp. The result
             # is a silent, progressive video<->action (and camera<->camera)
             # misalignment, so flag the episode as suspect for the operator.
-            _logger.warning(
-                "episode dropped encoder frames (%s) — the recorded video is "
-                "misaligned with the recorded actions and with the other cameras; "
-                "consider discarding and re-recording this episode.",
-                ", ".join(f"{k}={v}" for k, v in dropped.items()),
+            raise RuntimeError(
+                "episode dropped encoder frames ("
+                + ", ".join(f"{k}={v}" for k, v in dropped.items())
+                + "); refusing to return shorter/misaligned videos"
             )
         self._cams = {}
         self._episode_active = False
@@ -543,13 +648,40 @@ class NvencStreamingEncoder:
     def cancel_episode(self) -> None:
         if not self._episode_active:
             return
-        for cam in self._cams.values():
-            cam.cancel()
-            video_path = cam.video_path
-            if video_path.exists() or video_path.parent.exists():
-                shutil.rmtree(str(video_path.parent), ignore_errors=True)
-        self._cams = {}
-        self._episode_active = False
+        first_error: BaseException | None = None
+        remaining: dict[str, _CameraNvencEncoder] = {}
+        for video_key, cam in self._cams.items():
+            camera_stopped = False
+            try:
+                cam.cancel()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                else:
+                    first_error.add_note(
+                        "additional NVENC camera cancellation failure: "
+                        f"{type(error).__name__}: {error}"
+                    )
+            else:
+                camera_stopped = True
+            if camera_stopped:
+                try:
+                    _remove_nvenc_staging(cam.video_path)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                    else:
+                        first_error.add_note(
+                            "additional NVENC staging cleanup failure: "
+                            f"{type(error).__name__}: {error}"
+                        )
+                else:
+                    continue
+            remaining[video_key] = cam
+        self._cams = remaining
+        self._episode_active = bool(remaining)
+        if first_error is not None:
+            raise first_error
 
     def close(self) -> None:
         if self._closed:

@@ -5,9 +5,21 @@ import importlib
 import sys
 
 from ..utils.dotenv import load_local_env
+from . import (
+    mantis_latency,
+    mantis_session,
+    tracker_bridge,
+    tracker_identify,
+    tracker_install,
+    tracker_lighthouse,
+    tracker_pair,
+    tracker_ultimate,
+)
 from . import migrate_dataset as migrate_dataset_cmd
 from . import provision as provision_cmd
 from . import serve as serve_cmd
+from . import update_healthcheck as update_healthcheck_cmd
+from . import update_preflight as update_preflight_cmd
 from .can import driver as can_driver
 from .can import enable as can_enable
 from .can import setup as can_setup
@@ -55,6 +67,10 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
         "almond_axol.diagnostics.zed.cable",
         "Verify a ZED camera cable by validating captured frames.",
     ),
+    "diag.mantis-trigger": (
+        "almond_axol.diagnostics.mantis.trigger",
+        "Drive the Mantis grippers from their triggers without tracking or cameras.",
+    ),
 }
 
 _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
@@ -74,6 +90,10 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
         "Replay a recorded dataset episode on the robot.",
     ),
     "run-policy": ("run_policy", "Run a trained policy on the robot."),
+    "mantis.train": (
+        "mantis_train",
+        "lerobot-train with Mantis chunk-relative EE actions (any policy type).",
+    ),
     "inference-server": (
         "inference_server",
         "Serve policy inference for run-policy --server_host.",
@@ -83,8 +103,16 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
 
 def _dispatch_draccus(command: str, argv: list[str]) -> None:
     module_name, _ = _DRACCUS_COMMANDS[command]
-    module = importlib.import_module(f".{module_name}", __name__)
-    module.main(argv)
+    try:
+        module = importlib.import_module(f".{module_name}", __name__)
+        module.main(argv)
+    except ModuleNotFoundError as exc:
+        if exc.name == "lerobot" or (exc.name or "").startswith("lerobot."):
+            raise SystemExit(
+                f"axol {command} requires the LeRobot dependencies. "
+                "Install them with: pip install 'almond-axol[lerobot]'"
+            ) from None
+        raise
 
 
 def main() -> None:
@@ -108,6 +136,14 @@ def main() -> None:
     can_setup.add_parser(subparsers)
     can_enable.add_parser(subparsers)
     can_driver.add_parser(subparsers)
+    mantis_session.add_parser(subparsers)
+    mantis_latency.add_parser(subparsers)
+    tracker_bridge.add_parser(subparsers)
+    tracker_identify.add_parser(subparsers)
+    tracker_install.add_parser(subparsers)
+    tracker_lighthouse.add_parser(subparsers)
+    tracker_pair.add_parser(subparsers)
+    tracker_ultimate.add_parser(subparsers)
     lift_home.add_parser(subparsers)
     lift_goto.add_parser(subparsers)
     set_can_id.add_parser(subparsers)
@@ -123,6 +159,8 @@ def main() -> None:
     gst_install.add_parser(subparsers)
     gst_build_zed.add_parser(subparsers)
     provision_cmd.add_parser(subparsers)
+    update_healthcheck_cmd.add_parser(subparsers)
+    update_preflight_cmd.add_parser(subparsers)
     jetson_setup.add_parser(subparsers)
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)

@@ -7,6 +7,7 @@ Run directly:
     uv run -m almond_axol.diagnostics.can.send --l --joint wrist_2 --hz 50
     uv run -m almond_axol.diagnostics.can.send --l --joint gripper --hz 100 --log-file can_send.log
     uv run -m almond_axol.diagnostics.can.send --l --joint shoulder_1 --joints shoulder_1
+    uv run -m almond_axol.diagnostics.can.send --target mantis --l --joint gripper
 """
 
 from __future__ import annotations
@@ -24,7 +25,14 @@ from datetime import datetime
 
 import numpy as np
 
-from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
+from ...constants import (
+    ARM_JOINTS,
+    CAN_LEFT,
+    CAN_MANTIS_LEFT,
+    CAN_MANTIS_RIGHT,
+    CAN_RIGHT,
+    Joint,
+)
 from ...motor import CanBus, ControlMode
 from ...robot.axol import GRIPPER_TRAVEL, AxolArm, arm_limits
 from ...robot.config import AxolConfig
@@ -326,6 +334,7 @@ async def _run(
     display: bool = True,
     snapshot: _SendSnapshot | None = None,
     present: set[Joint] | None = None,
+    target: str = "axol",
 ) -> None:
     side = "left" if is_left else "right"
     present = set(Joint) if present is None else present
@@ -344,7 +353,10 @@ async def _run(
 
     joints = list(Joint)
     joint_idx = joints.index(cycle_joint)
-    channel = CAN_LEFT if is_left else CAN_RIGHT
+    if target == "mantis":
+        channel = CAN_MANTIS_LEFT if is_left else CAN_MANTIS_RIGHT
+    else:
+        channel = CAN_LEFT if is_left else CAN_RIGHT
 
     # Limits in API units (gripper = [0, 1]; arm joints = radians).
     if cycle_joint == Joint.GRIPPER:
@@ -569,6 +581,12 @@ def main() -> None:
     side.add_argument("--l", action="store_true", help="Use left arm")
     side.add_argument("--r", action="store_true", help="Use right arm")
     parser.add_argument(
+        "--target",
+        choices=["axol", "mantis"],
+        default="axol",
+        help="CAN hardware to exercise (default: %(default)s).",
+    )
+    parser.add_argument(
         "--joint",
         required=True,
         choices=valid_joints,
@@ -595,6 +613,14 @@ def main() -> None:
 
     cycle_joint = Joint(args.joint)
     present = _parse_joints(args.joints)
+    if args.target == "mantis":
+        if cycle_joint != Joint.GRIPPER:
+            raise SystemExit("Mantis CAN send diagnostics can cycle only the gripper.")
+        if args.joints and present != {Joint.GRIPPER}:
+            raise SystemExit(
+                "Mantis CAN send diagnostics supports only --joints gripper."
+            )
+        present = {Joint.GRIPPER}
     if cycle_joint not in present:
         present_names = ", ".join(j.value for j in Joint if j in present)
         raise SystemExit(
@@ -641,6 +667,7 @@ def main() -> None:
                             display=False,
                             snapshot=left_snap,
                             present=present,
+                            target=args.target,
                         ),
                         _run(
                             is_left=False,
@@ -650,6 +677,7 @@ def main() -> None:
                             display=False,
                             snapshot=right_snap,
                             present=present,
+                            target=args.target,
                         ),
                     )
                 finally:
@@ -668,6 +696,7 @@ def main() -> None:
                     hz=args.hz,
                     log_file=args.log_file,
                     present=present,
+                    target=args.target,
                 )
             )
     except KeyboardInterrupt:

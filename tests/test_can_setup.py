@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import io
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -8,7 +10,1582 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
-from almond_axol.cli.can import setup
+from almond_axol.cli.can import driver, setup
+
+
+class CanSetupAssignmentTest(unittest.TestCase):
+    @staticmethod
+    def _configured_axol_only(
+        profile: setup._Profile = setup._AXOL_PROFILE,
+    ) -> str | None:
+        return "SERIAL" if profile is setup._AXOL_PROFILE else None
+
+    def test_global_setup_lock_is_reentrant_without_relocking(self) -> None:
+        with (
+            patch.object(setup, "_ensure_root_lock_file") as ensure,
+            patch.object(setup, "_open_root_lock_file", return_value=19) as open_lock,
+            patch.object(setup.fcntl, "flock") as flock,
+            patch.object(setup.os, "close") as close,
+        ):
+            with setup._global_setup_lock():
+                with setup._global_setup_lock():
+                    self.assertEqual(setup._LOCK_LOCAL.depth, 2)
+
+        ensure.assert_called_once_with(setup._GLOBAL_LOCK_FILE)
+        open_lock.assert_called_once_with(setup._GLOBAL_LOCK_FILE)
+        self.assertEqual(
+            flock.call_args_list,
+            [call(19, setup.fcntl.LOCK_EX), call(19, setup.fcntl.LOCK_UN)],
+        )
+        close.assert_called_once_with(19)
+        self.assertEqual(setup._LOCK_LOCAL.depth, 0)
+
+    def test_setup_does_not_forget_an_unplugged_configured_hub(self) -> None:
+        with (
+            patch.object(setup, "_detect_serials", return_value=[]),
+            patch.object(
+                setup, "_configured_serial", side_effect=self._configured_axol_only
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup._find_dual_serials(), ("SERIAL", None))
+
+    def test_usb_bootstrap_requires_one_complete_consistent_profile_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            rules = Path(directory) / "profile.rules"
+            rules.write_text(setup._dual_channel_rules("SERIAL", setup._AXOL_PROFILE))
+            self.assertEqual(
+                setup._dual_channel_rule_serial(
+                    rules, setup._AXOL_PROFILE.left, setup._AXOL_PROFILE.right
+                ),
+                "SERIAL",
+            )
+
+            rules.write_text(
+                "\n".join(
+                    f"  # {line}" if line.startswith("SUBSYSTEM") else line
+                    for line in rules.read_text().splitlines()
+                )
+                + "\n"
+            )
+            self.assertIsNone(
+                setup._dual_channel_rule_serial(
+                    rules, setup._AXOL_PROFILE.left, setup._AXOL_PROFILE.right
+                )
+            )
+
+            rules.write_text(
+                setup._dual_channel_rules("SERIAL", setup._AXOL_PROFILE).replace(
+                    ', ACTION=="add"', ""
+                )
+            )
+            self.assertIsNone(
+                setup._dual_channel_rule_serial(
+                    rules, setup._AXOL_PROFILE.left, setup._AXOL_PROFILE.right
+                )
+            )
+
+            rules.write_text(
+                setup._dual_channel_rules("SERIAL", setup._AXOL_PROFILE).replace(
+                    ', NAME="', ', ENV{DISABLED}=="1", NAME="'
+                )
+            )
+            self.assertIsNone(
+                setup._dual_channel_rule_serial(
+                    rules, setup._AXOL_PROFILE.left, setup._AXOL_PROFILE.right
+                )
+            )
+
+            rules.write_text(setup._dual_channel_rules("SERIAL", setup._AXOL_PROFILE))
+
+            lines = rules.read_text().splitlines()
+            rules.write_text(
+                "\n".join(
+                    line.replace('ATTRS{serial}=="SERIAL"', 'ATTRS{serial}=="OTHER"')
+                    if 'ATTR{dev_id}=="0x1"' in line
+                    else line
+                    for line in lines
+                )
+                + "\n"
+            )
+            self.assertIsNone(
+                setup._dual_channel_rule_serial(
+                    rules, setup._AXOL_PROFILE.left, setup._AXOL_PROFILE.right
+                )
+            )
+
+    def test_usb_bootstrap_only_returns_attached_nonconflicting_claims(self) -> None:
+        with (
+            patch.object(
+                setup,
+                "_configured_profile_usb_serials",
+                return_value={"axol": "AXOL", "mantis": "MANTIS"},
+            ),
+            patch.object(
+                setup,
+                "_attached_supported_usb_devices",
+                return_value=(("1-1", "AXOL"),),
+            ),
+            patch.object(setup, "_scan_adapters", return_value={}),
+            patch.object(setup, "_configured_named_serial", return_value=None),
+        ):
+            self.assertEqual(setup.attached_configured_hub_profiles(), {"axol"})
+
+        with (
+            patch.object(
+                setup,
+                "_configured_profile_usb_serials",
+                return_value={"axol": "SHARED", "mantis": "SHARED"},
+            ),
+            patch.object(
+                setup,
+                "_attached_supported_usb_devices",
+                return_value=(("1-1", "SHARED"),),
+            ),
+            patch.object(setup, "_scan_adapters", return_value={}),
+            patch.object(setup, "_configured_named_serial", return_value=None),
+        ):
+            self.assertEqual(setup.attached_configured_hub_profiles(), set())
+
+    def test_usb_bootstrap_scans_supported_usb_serial_without_netdevs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            supported = root / "1-1"
+            supported.mkdir()
+            supported.joinpath("idVendor").write_text(setup._VID.upper())
+            supported.joinpath("idProduct").write_text(setup._PID.upper())
+            supported.joinpath("serial").write_text("AXOL-SERIAL\n")
+            unrelated = root / "1-2"
+            unrelated.mkdir()
+            unrelated.joinpath("idVendor").write_text("28de")
+            unrelated.joinpath("idProduct").write_text("2300")
+            unrelated.joinpath("serial").write_text("VIVE\n")
+
+            with patch.object(setup, "_USB_DEVICES", root):
+                self.assertEqual(
+                    setup._attached_supported_usb_serials(), {"AXOL-SERIAL"}
+                )
+
+    def test_usb_bootstrap_waits_for_both_channels_of_exact_serial(self) -> None:
+        incomplete = {
+            "SERIAL": {
+                "vid": setup._VID,
+                "pid": setup._PID,
+                "dev_ids": {0},
+                "interfaces": [("can0", 0)],
+            }
+        }
+        complete = {
+            "SERIAL": {
+                "vid": setup._VID,
+                "pid": setup._PID,
+                "dev_ids": {0, 1},
+                "interfaces": [("can0", 0), ("can1", 1)],
+            }
+        }
+        with (
+            patch.object(setup, "_scan_adapters", side_effect=[incomplete, complete]),
+            patch.object(setup.time, "sleep") as sleep,
+        ):
+            self.assertTrue(
+                setup._wait_for_dual_channel_serial(
+                    "SERIAL", timeout=1.0, poll_interval=0.01
+                )
+            )
+
+        sleep.assert_called_once_with(0.01)
+
+    def test_headless_profile_setup_waits_after_driver_load_before_detection(
+        self,
+    ) -> None:
+        configured = {"axol": "AXOL", "mantis": "MANTIS"}
+        events: list[tuple[str, str]] = []
+
+        def wait(serial: str) -> bool:
+            events.append(("wait", serial))
+            return True
+
+        def detect() -> list[str]:
+            events.append(("detect", "MANTIS"))
+            return ["MANTIS"]
+
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(setup.driver, "ensure_driver", return_value=False),
+            patch.object(
+                setup, "_attached_configured_hub_serials", return_value=configured
+            ),
+            patch.object(setup, "_wait_for_dual_channel_serial", side_effect=wait),
+            patch.object(
+                setup,
+                "_configured_serial",
+                side_effect=lambda profile=setup._AXOL_PROFILE: configured[
+                    "mantis" if profile is setup._MANTIS_PROFILE else "axol"
+                ],
+            ),
+            patch.object(setup, "_configured_named_serial", return_value=None),
+            patch.object(setup, "_resolve_hub_serial", return_value="AXOL") as resolve,
+            patch.object(setup, "_detect_serials", side_effect=detect),
+            patch.object(setup, "_identify_dual_adapter", return_value="mantis"),
+            patch.object(setup, "_apply_setup") as apply_setup,
+            patch.object(setup, "_configure_mantis") as configure_mantis,
+        ):
+            setup.ensure_setup()
+            setup.ensure_mantis_setup()
+
+        self.assertEqual(
+            events,
+            [("wait", "AXOL"), ("wait", "MANTIS"), ("detect", "MANTIS")],
+        )
+        resolve.assert_called_once_with()
+        apply_setup.assert_called_once_with("AXOL", None, None)
+        configure_mantis.assert_called_once_with("MANTIS")
+
+    def test_axol_pin_is_not_preserved_when_serial_now_enumerates_single(self) -> None:
+        with (
+            patch.object(setup, "_detect_serials", return_value=[]),
+            patch.object(
+                setup, "_configured_serial", side_effect=self._configured_axol_only
+            ),
+            patch.object(
+                setup,
+                "_scan_adapters",
+                return_value={"SERIAL": {"dev_ids": {0}}},
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup._find_dual_serials(), (None, None))
+
+    def test_other_product_does_not_displace_an_unplugged_hub(self) -> None:
+        with (
+            patch.object(setup, "_detect_serials", return_value=["MANTIS"]),
+            patch.object(
+                setup, "_configured_serial", side_effect=self._configured_axol_only
+            ),
+            patch.object(setup, "_identify_dual_adapter", return_value="mantis"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup._find_dual_serials(), ("SERIAL", "MANTIS"))
+
+    def test_skipped_silent_adapter_does_not_forget_an_unplugged_hub(self) -> None:
+        with (
+            patch.object(setup, "_detect_serials", return_value=["NEW-SILENT"]),
+            patch.object(
+                setup, "_configured_serial", side_effect=self._configured_axol_only
+            ),
+            patch.object(setup, "_identify_dual_adapter", return_value=None),
+            patch("builtins.input", return_value=""),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                setup._find_dual_serials(),
+                ("SERIAL", None),
+            )
+
+    def test_plain_setup_offers_an_attached_silent_hub(self) -> None:
+        with (
+            patch.object(setup, "_detect_serials", return_value=["SERIAL"]),
+            patch.object(
+                setup, "_configured_serial", side_effect=self._configured_axol_only
+            ),
+            patch.object(setup, "_identify_dual_adapter", return_value=None),
+            patch("builtins.input", return_value="m"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup._find_dual_serials(), (None, "SERIAL"))
+
+    def test_plain_setup_enter_preserves_an_attached_silent_hub(self) -> None:
+        output = io.StringIO()
+        with (
+            patch.object(setup, "_detect_serials", return_value=["SERIAL"]),
+            patch.object(
+                setup, "_configured_serial", side_effect=self._configured_axol_only
+            ),
+            patch.object(setup, "_identify_dual_adapter", return_value=None),
+            patch("builtins.input", return_value="") as prompt,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(setup._find_dual_serials(), ("SERIAL", None))
+        prompt.assert_called_once()
+        self.assertIn("[Enter] keeps axol", prompt.call_args.args[0])
+
+    def test_plain_setup_reclassifies_axol_pin_when_mantis_answers(self) -> None:
+        with (
+            patch.object(setup, "_detect_serials", return_value=["SERIAL"]),
+            patch.object(
+                setup, "_configured_serial", side_effect=self._configured_axol_only
+            ),
+            patch.object(
+                setup, "_identify_dual_adapter", return_value="mantis"
+            ) as identify,
+            patch("builtins.input") as prompt,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup._find_dual_serials(), (None, "SERIAL"))
+        identify.assert_called_once_with("SERIAL", reset=True)
+        prompt.assert_not_called()
+
+    def test_dual_identity_recovers_rx_before_deciding_hub_is_silent(self) -> None:
+        channels = [setup.CAN_LEFT, setup.CAN_RIGHT]
+        with (
+            patch.object(setup, "_ifaces_for_serial", return_value=channels),
+            patch.object(setup, "iface_up", return_value=True),
+            patch.object(setup, "bring_up_interfaces") as bring_up,
+            patch.object(
+                setup,
+                "_probe_mantis_trigger",
+                side_effect=[False, False, True],
+            ),
+            patch.object(setup, "_probe_axol_shoulder", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup._identify_dual_adapter("SERIAL"), "mantis")
+        self.assertEqual(
+            bring_up.call_args_list,
+            [
+                unittest.mock.call(channels, force_cycle=False),
+                unittest.mock.call(channels, force_cycle=True),
+            ],
+        )
+
+    def test_dual_identity_does_not_cycle_after_a_live_first_probe(self) -> None:
+        channels = [setup.CAN_LEFT, setup.CAN_RIGHT]
+        with (
+            patch.object(setup, "_ifaces_for_serial", return_value=channels),
+            patch.object(setup, "iface_up", return_value=True),
+            patch.object(setup, "bring_up_interfaces") as bring_up,
+            patch.object(setup, "_probe_mantis_trigger", return_value=True),
+            patch.object(setup, "_probe_axol_shoulder", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup._identify_dual_adapter("SERIAL"), "mantis")
+        bring_up.assert_called_once_with(channels, force_cycle=False)
+
+    def test_dual_identity_recovery_is_bounded_when_hardware_is_off(self) -> None:
+        channels = [setup.CAN_LEFT, setup.CAN_RIGHT]
+        with (
+            patch.object(setup, "_ifaces_for_serial", return_value=channels),
+            patch.object(setup, "iface_up", return_value=True),
+            patch.object(setup, "bring_up_interfaces") as bring_up,
+            patch.object(setup, "_probe_mantis_trigger", return_value=False),
+            patch.object(setup, "_probe_axol_shoulder", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup._identify_dual_adapter("SERIAL"), "silent")
+        self.assertEqual(bring_up.call_count, 3)
+        self.assertEqual(
+            [call.kwargs["force_cycle"] for call in bring_up.call_args_list],
+            [False, True, True],
+        )
+
+    def test_paired_recovery_takes_both_channels_down_before_either_up(self) -> None:
+        channels = [setup.CAN_LEFT, setup.CAN_RIGHT]
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(setup.Path, "exists", return_value=True),
+            patch.object(setup, "run_root") as run_root,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup.bring_up_interfaces(channels, force_cycle=True)
+
+        commands = [call.args[0] for call in run_root.call_args_list]
+        down = [["ip", "link", "set", channel, "down"] for channel in channels]
+        up = [["ip", "link", "set", channel, "up"] for channel in channels]
+        self.assertEqual(commands[:2], down)
+        self.assertEqual(commands[-2:], up)
+        self.assertTrue(
+            all(
+                commands.index(down_command) < commands.index(up[0])
+                for down_command in down
+            )
+        )
+
+    def test_axol_rx_retry_does_not_reset_wheel_and_lift_buses_again(self) -> None:
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(setup._LOCK_LOCAL, "depth", 1, create=True),
+            patch.object(setup.Path, "exists", return_value=True),
+            patch.object(setup, "run_root") as run_root,
+            patch.object(
+                setup,
+                "rx_alive_per_arm",
+                side_effect=[(False, False), (True, True)],
+            ),
+            patch.object(setup, "bring_up_interfaces") as recover_pair,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup.bring_up_can(setup._AXOL_PROFILE)
+
+        run_root.assert_called_once_with(
+            [
+                "env",
+                f"{setup._GLOBAL_LOCK_ENV}=1",
+                "bash",
+                str(setup._AXOL_PROFILE.cron_script),
+            ],
+            check=True,
+        )
+        recover_pair.assert_called_once_with(
+            [setup.CAN_LEFT, setup.CAN_RIGHT], force_cycle=True
+        )
+
+    def test_root_executed_scripts_install_root_owned_outside_operator_state(
+        self,
+    ) -> None:
+        installed_script = ""
+
+        def run_root(command: list[str], **_kwargs: object) -> SimpleNamespace:
+            nonlocal installed_script
+            if command[:2] == ["install", "-o"]:
+                installed_script = Path(command[-2]).read_text()
+            return SimpleNamespace(stdout="")
+
+        with (
+            patch.object(setup, "_ensure_root_lock_file"),
+            patch.object(setup, "run_root", side_effect=run_root) as root,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup._write_cron_script(setup._MANTIS_PROFILE)
+
+        self.assertEqual(
+            setup._MANTIS_PROFILE.cron_script,
+            Path("/etc/almond-axol/can/startup_mantis.sh"),
+        )
+        self.assertEqual(root.call_count, 5)
+        self.assertEqual(
+            root.call_args_list[0],
+            unittest.mock.call(
+                [
+                    "install",
+                    "-d",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "-m",
+                    "0755",
+                    "/etc/almond-axol/can",
+                ],
+                check=True,
+            ),
+        )
+        file_command = root.call_args_list[1].args[0]
+        self.assertEqual(
+            file_command[:7],
+            ["install", "-o", "root", "-g", "root", "-m", "0755"],
+        )
+        self.assertEqual(Path(file_command[-1]).parent, setup._CAN_DIR)
+        self.assertIn(".startup_mantis.sh.", Path(file_command[-1]).name)
+        self.assertEqual(
+            root.call_args_list[3].args[0][-1],
+            str(setup._MANTIS_PROFILE.cron_script),
+        )
+        self.assertIn("can_mantis_l can_mantis_r", installed_script)
+
+    def test_cron_migrates_exact_legacy_operator_script_to_privileged_path(
+        self,
+    ) -> None:
+        legacy = Path("/home/operator/.almond/can")
+        old_entry = f"@reboot {legacy / 'startup.sh'}"
+        old_other_profile = f"@reboot {legacy / 'startup_mantis.sh'}"
+        unrelated = "@reboot /home/operator/bin/backup"
+        root_crontab = SimpleNamespace(
+            returncode=0,
+            stdout=f"{old_entry}\n{old_other_profile}\n{unrelated}\n",
+            stderr="",
+        )
+        with (
+            patch.object(setup, "_LEGACY_CAN_DIRS", {legacy}),
+            patch.object(
+                setup,
+                "run_root",
+                side_effect=(root_crontab, SimpleNamespace(stdout="")),
+            ) as run_root,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup._register_cron(setup._AXOL_PROFILE)
+
+        written = run_root.call_args_list[1].kwargs["input_text"]
+        self.assertNotIn(old_entry, written)
+        self.assertNotIn(old_other_profile, written)
+        self.assertIn(unrelated, written)
+        self.assertIn(
+            "@reboot /etc/almond-axol/can/startup.sh\n",
+            written,
+        )
+
+    def test_pre_mantis_migration_removes_schedulers_before_old_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rules = root / "91-can-old.rules"
+            unit = root / "axol-can-old-up.service"
+            script = root / "startup-old.sh"
+            for path in (rules, unit, script):
+                path.write_text("legacy")
+            legacy_dir = root / "operator" / ".almond" / "can"
+            obsolete = legacy_dir / f"startup_{setup._PRE_MANTIS_NAME}.sh"
+            unrelated = "@reboot /root/bin/backup"
+            crontab = SimpleNamespace(
+                returncode=0,
+                stdout=f"@reboot {obsolete}\n{unrelated}\n",
+                stderr="",
+            )
+            calls: list[tuple[list[str], dict[str, object]]] = []
+
+            def run_root(command: list[str], **kwargs: object) -> object:
+                calls.append((command, kwargs))
+                if command == ["env", "LC_ALL=C", "crontab", "-l"]:
+                    return crontab
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.object(setup, "_PRE_MANTIS_RULES_FILE", rules),
+                patch.object(setup, "_PRE_MANTIS_HOTPLUG_UNIT_FILE", unit),
+                patch.object(setup, "_PRE_MANTIS_CRON_SCRIPT", script),
+                patch.object(setup, "_LEGACY_CAN_DIRS", {legacy_dir}),
+                patch.object(setup, "run_root", side_effect=run_root),
+            ):
+                setup._remove_pre_mantis_config()
+
+            commands = [command for command, _ in calls]
+            cron_write_i = commands.index(["crontab", "-"])
+            stop_i = commands.index(
+                ["systemctl", "stop", setup._PRE_MANTIS_HOTPLUG_UNIT]
+            )
+            unit_rm_i = commands.index(["rm", "-f", str(unit)])
+            rules_rm_i = commands.index(["rm", "-f", str(rules)])
+            script_rm_i = commands.index(["rm", "-f", str(script)])
+            self.assertLess(cron_write_i, stop_i)
+            self.assertLess(stop_i, unit_rm_i)
+            self.assertLess(unit_rm_i, rules_rm_i)
+            self.assertLess(unit_rm_i, script_rm_i)
+            self.assertEqual(calls[cron_write_i][1]["input_text"], unrelated + "\n")
+
+    def test_pre_mantis_crontab_failure_leaves_all_files_and_unit_untouched(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rules = root / "91-can-old.rules"
+            unit = root / "axol-can-old-up.service"
+            script = root / "startup-old.sh"
+            for path in (rules, unit, script):
+                path.write_text("legacy")
+            legacy_dir = root / "operator" / ".almond" / "can"
+            obsolete = legacy_dir / f"startup_{setup._PRE_MANTIS_NAME}.sh"
+            crontab = SimpleNamespace(
+                returncode=0,
+                stdout=f"@reboot {obsolete}\n",
+                stderr="",
+            )
+
+            def run_root(command: list[str], **_kwargs: object) -> object:
+                if command == ["env", "LC_ALL=C", "crontab", "-l"]:
+                    return crontab
+                if command == ["crontab", "-"]:
+                    raise RuntimeError("crontab write denied")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with (
+                patch.object(setup, "_PRE_MANTIS_RULES_FILE", rules),
+                patch.object(setup, "_PRE_MANTIS_HOTPLUG_UNIT_FILE", unit),
+                patch.object(setup, "_PRE_MANTIS_CRON_SCRIPT", script),
+                patch.object(setup, "_LEGACY_CAN_DIRS", {legacy_dir}),
+                patch.object(setup, "run_root", side_effect=run_root) as root_run,
+                self.assertRaisesRegex(RuntimeError, "crontab write denied"),
+            ):
+                setup._remove_pre_mantis_config()
+
+            commands = [call.args[0] for call in root_run.call_args_list]
+            self.assertFalse(
+                any(command[0] in {"systemctl", "rm"} for command in commands)
+            )
+            self.assertTrue(all(path.exists() for path in (rules, unit, script)))
+
+    def test_apply_setup_does_not_swallow_rp1_security_cleanup_failure(self) -> None:
+        with (
+            patch.object(setup, "_write_udev_rules"),
+            patch.object(setup, "_write_cron_script"),
+            patch.object(setup, "_write_hotplug_unit"),
+            patch.object(setup, "_reload_udev"),
+            patch.object(setup, "_rename_interfaces"),
+            patch.object(setup, "_register_cron"),
+            patch.object(
+                setup,
+                "_setup_rp1_usb_quirk",
+                side_effect=RuntimeError("legacy unit stop denied"),
+            ),
+            patch.object(setup, "bring_up_can") as bring_up,
+            self.assertRaisesRegex(RuntimeError, "legacy unit stop denied"),
+        ):
+            setup._apply_setup("AXOL", None, None)
+
+        bring_up.assert_not_called()
+
+    def test_hotplug_unit_executes_only_privileged_script_path(self) -> None:
+        with (
+            patch.object(setup, "_publish_privileged_text") as publish,
+            patch.object(setup, "run_root"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup._write_hotplug_unit(setup._MANTIS_PROFILE)
+
+        unit = publish.call_args.args[1]
+        self.assertIn(
+            "ExecStart=/bin/bash /etc/almond-axol/can/startup_mantis.sh",
+            unit,
+        )
+        self.assertNotIn(".almond/can", unit)
+
+    def test_inapplicable_rp1_setup_removes_legacy_root_unit_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            unit_file = Path(directory) / "axol-rp1-usb-quirk.service"
+            unit_file.write_text(
+                "ExecStart=/bin/bash /home/operator/.almond/can/rp1-usb-quirk.sh\n"
+            )
+            with (
+                patch.object(setup, "_RP1_QUIRK_UNIT_FILE", unit_file),
+                patch.object(setup, "_is_raspberry_pi_5", return_value=False),
+                patch.object(setup, "run_root") as run_root,
+            ):
+                setup._setup_rp1_usb_quirk()
+
+        self.assertEqual(
+            [call.args[0] for call in run_root.call_args_list],
+            [
+                ["systemctl", "stop", setup._RP1_QUIRK_UNIT],
+                ["systemctl", "disable", setup._RP1_QUIRK_UNIT],
+                ["rm", "-f", str(unit_file)],
+                ["systemctl", "daemon-reload"],
+            ],
+        )
+        self.assertTrue(
+            all(call.kwargs == {"check": True} for call in run_root.call_args_list)
+        )
+
+    def test_rp1_shutdown_failure_keeps_unit_for_retry(self) -> None:
+        for failed_action in ("stop", "disable"):
+            with (
+                self.subTest(failed_action=failed_action),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                unit_file = Path(directory) / "axol-rp1-usb-quirk.service"
+                unit_file.write_text(
+                    "ExecStart=/bin/bash /home/operator/.almond/can/rp1-usb-quirk.sh\n"
+                )
+
+                def run_root(command: list[str], **_kwargs: object) -> object:
+                    if command == [
+                        "systemctl",
+                        failed_action,
+                        setup._RP1_QUIRK_UNIT,
+                    ]:
+                        raise RuntimeError(f"{failed_action} denied")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with (
+                    patch.object(setup, "_RP1_QUIRK_UNIT_FILE", unit_file),
+                    patch.object(setup, "run_root", side_effect=run_root) as root_run,
+                    self.assertRaisesRegex(RuntimeError, f"{failed_action} denied"),
+                ):
+                    setup._remove_rp1_quirk_unit()
+
+                self.assertTrue(unit_file.exists())
+                self.assertNotIn(
+                    ["rm", "-f", str(unit_file)],
+                    [call.args[0] for call in root_run.call_args_list],
+                )
+
+    def test_explicit_single_bus_identification_resets_before_probing(self) -> None:
+        with (
+            patch.object(setup, "_iface_for_serial", return_value=setup.CAN_BASE),
+            patch.object(setup, "iface_up", return_value=True),
+            patch.object(setup, "bring_up_interfaces") as bring_up,
+            patch.object(setup, "_send_once"),
+            patch.object(setup.time, "sleep"),
+            patch.object(setup, "_probe_wheels", return_value=True),
+            patch.object(setup, "_probe_chest", return_value=False),
+        ):
+            self.assertEqual(setup._identify_adapter("WHEELS", reset=True), "wheels")
+        bring_up.assert_called_once_with([setup.CAN_BASE], force_cycle=True)
+
+    def test_unknown_silent_single_restores_its_initial_down_state(self) -> None:
+        with (
+            patch.object(setup, "_iface_for_serial", return_value="can7"),
+            patch.object(setup, "iface_up", return_value=False),
+            patch.object(setup, "bring_up_interfaces") as bring_up,
+            patch.object(setup, "_send_once"),
+            patch.object(setup.time, "sleep"),
+            patch.object(setup, "_probe_wheels", return_value=False),
+            patch.object(setup, "_probe_chest", return_value=False),
+            patch.object(setup, "run_root") as run_root,
+        ):
+            self.assertIsNone(setup._identify_adapter("UNKNOWN", recover_silence=False))
+        bring_up.assert_called_once_with(["can7"], force_cycle=True)
+        run_root.assert_called_once_with(
+            ["ip", "link", "set", "can7", "down"], check=False
+        )
+
+    def test_unknown_single_uses_non_disruptive_discovery_probe(self) -> None:
+        with (
+            patch.object(setup, "_configured_named_serial", return_value=None),
+            patch.object(setup, "_mantis_claimed_serials", return_value=set()),
+            patch.object(setup, "_detect_single_serials", return_value=["NEW"]),
+            patch.object(setup, "_scan_adapters", return_value={"NEW": {}}),
+            patch.object(setup, "_identify_adapter", return_value="wheels") as identify,
+            patch("builtins.input") as prompt,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup._find_single_serials(None), ("NEW", None))
+        identify.assert_called_once_with("NEW", recover_silence=False)
+        prompt.assert_not_called()
+
+    def test_single_bus_stale_wheel_pin_corrects_to_cart_lift(self) -> None:
+        def configured(name: str) -> str | None:
+            return "SERIAL" if name == setup.CAN_BASE else None
+
+        with (
+            patch.object(setup, "_configured_named_serial", side_effect=configured),
+            patch.object(setup, "_mantis_claimed_serials", return_value=set()),
+            patch.object(setup, "_detect_single_serials", return_value=["SERIAL"]),
+            patch.object(setup, "_identify_adapter", return_value="chest") as identify,
+            patch("builtins.input") as prompt,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup._find_single_serials(None), (None, "SERIAL"))
+        identify.assert_called_once_with("SERIAL", reset=True)
+        prompt.assert_not_called()
+
+    def test_single_bus_swapped_pins_are_both_corrected(self) -> None:
+        configured = {setup.CAN_BASE: "OLD-WHEEL", setup.CAN_CHEST: "OLD-CHEST"}
+        identified = {"OLD-WHEEL": "chest", "OLD-CHEST": "wheels"}
+        with (
+            patch.object(
+                setup,
+                "_configured_named_serial",
+                side_effect=lambda name: configured.get(name),
+            ),
+            patch.object(setup, "_mantis_claimed_serials", return_value=set()),
+            patch.object(
+                setup,
+                "_detect_single_serials",
+                return_value=["OLD-WHEEL", "OLD-CHEST"],
+            ),
+            patch.object(
+                setup,
+                "_identify_adapter",
+                side_effect=lambda serial, **_kwargs: identified[serial],
+            ) as identify,
+            patch("builtins.input") as prompt,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                setup._find_single_serials(None), ("OLD-CHEST", "OLD-WHEEL")
+            )
+        self.assertEqual(identify.call_count, 2)
+        self.assertTrue(
+            all(call.kwargs == {"reset": True} for call in identify.call_args_list)
+        )
+        prompt.assert_not_called()
+
+    def test_single_bus_silent_configured_pin_is_unverified_without_prompt(
+        self,
+    ) -> None:
+        def configured(name: str) -> str | None:
+            return "SERIAL" if name == setup.CAN_BASE else None
+
+        with (
+            patch.object(setup, "_configured_named_serial", side_effect=configured),
+            patch.object(setup, "_mantis_claimed_serials", return_value=set()),
+            patch.object(setup, "_detect_single_serials", return_value=["SERIAL"]),
+            patch.object(setup, "_identify_adapter", return_value=None),
+            patch("builtins.input") as prompt,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(setup._find_single_serials(None), ("SERIAL", None))
+        prompt.assert_not_called()
+        self.assertIn("unverified", output.getvalue())
+
+    def test_single_bus_unplugged_pins_are_preserved(self) -> None:
+        configured = {setup.CAN_BASE: "WHEELS", setup.CAN_CHEST: "LIFT"}
+        with (
+            patch.object(
+                setup,
+                "_configured_named_serial",
+                side_effect=lambda name: configured.get(name),
+            ),
+            patch.object(setup, "_mantis_claimed_serials", return_value=set()),
+            patch.object(setup, "_detect_single_serials", return_value=[]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(setup._find_single_serials(None), ("WHEELS", "LIFT"))
+
+    def test_single_pin_is_not_preserved_when_serial_is_selected_as_hub(self) -> None:
+        def configured(name: str) -> str | None:
+            return "SERIAL" if name == setup.CAN_BASE else None
+
+        with (
+            patch.object(setup, "_configured_named_serial", side_effect=configured),
+            patch.object(setup, "_mantis_claimed_serials", return_value=set()),
+            patch.object(setup, "_detect_single_serials", return_value=[]),
+            patch.object(
+                setup,
+                "_scan_adapters",
+                return_value={"SERIAL": {"dev_ids": {0, 1}}},
+            ),
+        ):
+            self.assertEqual(setup._find_single_serials("SERIAL"), (None, None))
+
+    def test_plain_run_migrates_recovered_mantis_out_of_axol_profile(self) -> None:
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(setup.driver, "ensure_driver", return_value=False),
+            patch.object(
+                setup, "_configured_serial", side_effect=self._configured_axol_only
+            ),
+            patch.object(setup, "_configured_named_serial", return_value=None),
+            patch.object(setup, "_find_dual_serials", return_value=(None, "SERIAL")),
+            patch.object(setup, "_find_single_serials", return_value=(None, None)),
+            patch.object(setup, "_write_udev_rules") as write_rules,
+            patch.object(setup, "_configure_mantis") as configure_mantis,
+            patch.object(setup, "_apply_setup") as apply_setup,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup.run(SimpleNamespace())
+        write_rules.assert_called_once_with(None, None, None)
+        configure_mantis.assert_called_once_with("SERIAL")
+        apply_setup.assert_not_called()
+
+    def test_plain_run_clears_single_bus_pin_reclassified_as_mantis(self) -> None:
+        configured_names = {setup.CAN_BASE: "SERIAL", setup.CAN_CHEST: None}
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(setup.driver, "ensure_driver", return_value=False),
+            patch.object(setup, "_configured_serial", return_value=None),
+            patch.object(
+                setup,
+                "_configured_named_serial",
+                side_effect=lambda name: configured_names[name],
+            ),
+            patch.object(setup, "_find_dual_serials", return_value=(None, "SERIAL")),
+            patch.object(setup, "_find_single_serials", return_value=(None, None)),
+            patch.object(setup, "_write_udev_rules") as write_rules,
+            patch.object(setup, "_configure_mantis") as configure_mantis,
+            patch.object(setup, "_apply_setup") as apply_setup,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup.run(SimpleNamespace())
+
+        write_rules.assert_called_once_with(None, None, None)
+        configure_mantis.assert_called_once_with("SERIAL")
+        apply_setup.assert_not_called()
+
+    def test_control_panel_can_recover_a_mantis_stale_pinned_as_axol(self) -> None:
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(setup.driver, "ensure_driver", return_value=False),
+            patch.object(
+                setup, "_configured_serial", side_effect=self._configured_axol_only
+            ),
+            patch.object(setup, "_detect_serials", return_value=["SERIAL"]),
+            patch.object(setup, "_identify_dual_adapter", return_value="mantis"),
+            patch.object(setup, "_configured_named_serial", return_value=None),
+            patch.object(setup, "_write_udev_rules") as write_rules,
+            patch.object(setup, "_configure_mantis") as configure_mantis,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup.ensure_mantis_setup()
+        write_rules.assert_called_once_with(None, None, None)
+        configure_mantis.assert_called_once_with("SERIAL")
+
+    def test_control_panel_clears_single_bus_pin_reclassified_as_mantis(
+        self,
+    ) -> None:
+        configured_names = {
+            setup.CAN_BASE: "SERIAL",
+            setup.CAN_CHEST: "CHEST",
+        }
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(setup.driver, "ensure_driver", return_value=False),
+            patch.object(setup, "_configured_serial", return_value=None),
+            patch.object(setup, "_detect_serials", return_value=["SERIAL"]),
+            patch.object(setup, "_identify_dual_adapter", return_value="mantis"),
+            patch.object(
+                setup,
+                "_configured_named_serial",
+                side_effect=lambda name: configured_names.get(name),
+            ),
+            patch.object(setup, "_write_udev_rules") as write_rules,
+            patch.object(setup, "_configure_mantis") as configure_mantis,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup.ensure_mantis_setup()
+        write_rules.assert_called_once_with(None, None, "CHEST")
+        configure_mantis.assert_called_once_with("SERIAL")
+
+    def test_probe_rejects_nonstandard_can_frame_types(self) -> None:
+        self.assertEqual(setup._standard_data_can_id(0x009), 0x009)
+        for frame_flag in (0x80000000, 0x40000000, 0x20000000):
+            with self.subTest(frame_flag=frame_flag):
+                self.assertIsNone(setup._standard_data_can_id(frame_flag | 0x009))
+
+    def test_swapped_hub_names_use_collision_free_temporary_stage(self) -> None:
+        records = [
+            (setup.CAN_LEFT, "MANTIS", 0),
+            (setup.CAN_RIGHT, "MANTIS", 1),
+            (setup.CAN_MANTIS_LEFT, "AXOL", 0),
+            (setup.CAN_MANTIS_RIGHT, "AXOL", 1),
+        ]
+        temporary, final = setup._interface_rename_plan(
+            records,
+            {
+                ("AXOL", 0): setup.CAN_LEFT,
+                ("AXOL", 1): setup.CAN_RIGHT,
+            },
+        )
+
+        # Both the Axol sources and the stale Mantis occupants move before any
+        # final name is claimed, so neither direct rename can collide.
+        self.assertEqual({source for source, _ in temporary}, {r[0] for r in records})
+        self.assertEqual({name for _, name in final}, {setup.CAN_LEFT, setup.CAN_RIGHT})
+        self.assertTrue(all(name.startswith("can_tmp") for _, name in temporary))
+        self.assertTrue(all(len(name) <= 15 for _, name in temporary))
+        self.assertEqual(len({name for _, name in temporary}), len(temporary))
+
+    def test_cli_formats_driver_failure_without_traceback(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(
+                setup.driver, "ensure_driver", side_effect=RuntimeError("test failure")
+            ),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            setup.run(SimpleNamespace(reassign=False))
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(stderr.getvalue(), "ERROR: test failure\n")
+
+
+class CanDriverIdentityTest(unittest.TestCase):
+    def test_standalone_driver_command_shares_setup_global_lock(self) -> None:
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ) as global_lock,
+            patch.object(driver, "ensure_driver", return_value=False) as ensure_driver,
+            redirect_stdout(io.StringIO()),
+        ):
+            driver.run()
+
+        global_lock.assert_called_once_with()
+        ensure_driver.assert_called_once_with()
+
+    def test_install_requires_kmod_tools_before_mutating_driver(self) -> None:
+        with (
+            patch.object(driver, "_find_depmod", return_value=None),
+            patch.object(driver, "_find_modprobe", return_value="/sbin/modprobe"),
+            patch.object(driver, "run_root") as run_root,
+            self.assertRaisesRegex(RuntimeError, "depmod"),
+        ):
+            driver._install(Path("/tmp/gs_usb.ko"))
+        run_root.assert_not_called()
+
+    def test_install_rolls_back_oserror_and_keyboard_interrupt(self) -> None:
+        for failure in (OSError("could not execute modprobe"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    ko = root / "built.ko"
+                    ko.write_bytes(b"new driver")
+                    destination = root / "modules" / "updates" / "gs_usb.ko"
+                    destination.parent.mkdir(parents=True)
+                    destination.write_bytes(b"previous driver")
+                    loaded = root / "loaded"
+                    loaded.mkdir()
+                    modules_load = root / "modules-load.d" / "gs_usb.conf"
+                    depmod = "/sbin/depmod"
+                    modprobe = "/sbin/modprobe"
+                    failed_once = False
+
+                    def run_root(
+                        command: list[str], **kwargs: object
+                    ) -> SimpleNamespace:
+                        nonlocal failed_once
+                        executable = Path(command[0]).name
+                        if executable == "install":
+                            source, target = map(Path, command[-2:])
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(source.read_bytes())
+                        elif command == [modprobe, "-r", "gs_usb"]:
+                            loaded.rmdir()
+                        elif command == [modprobe, "gs_usb"]:
+                            if not failed_once:
+                                failed_once = True
+                                raise failure
+                            loaded.mkdir()
+                        elif executable == "rm":
+                            Path(command[-1]).unlink(missing_ok=True)
+                        elif executable == "tee":
+                            target = Path(command[-1])
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_text(str(kwargs.get("input_text", "")))
+                        return SimpleNamespace(returncode=0, stderr="")
+
+                    patches = (
+                        patch.object(driver, "_BUILD_DIR", root / "build"),
+                        patch.object(driver, "_MODULES_LOAD_FILE", modules_load),
+                        patch.object(driver, "_LOADED_MODULE", loaded),
+                        patch.object(
+                            driver, "_vendored_driver_path", return_value=destination
+                        ),
+                        patch.object(
+                            driver,
+                            "_selected_driver_path",
+                            return_value=str(destination),
+                        ),
+                        patch.object(driver, "_find_depmod", return_value=depmod),
+                        patch.object(driver, "_find_modprobe", return_value=modprobe),
+                        patch.object(driver, "run_root", side_effect=run_root),
+                    )
+                    expected = (
+                        KeyboardInterrupt
+                        if isinstance(failure, KeyboardInterrupt)
+                        else RuntimeError
+                    )
+                    with (
+                        patches[0],
+                        patches[1],
+                        patches[2],
+                        patches[3],
+                        patches[4],
+                        patches[5],
+                        patches[6],
+                        patches[7],
+                        redirect_stdout(io.StringIO()),
+                        self.assertRaises(expected),
+                    ):
+                        driver._install(ko)
+
+                    self.assertEqual(destination.read_bytes(), b"previous driver")
+                    self.assertTrue(loaded.is_dir())
+                    self.assertFalse(modules_load.exists())
+
+    def test_install_rolls_back_interrupt_after_replacement_module_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ko = root / "built.ko"
+            ko.write_bytes(b"new driver")
+            destination = root / "modules" / "updates" / "gs_usb.ko"
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"previous driver")
+            loaded = root / "loaded"
+            loaded.mkdir()
+            modules_load = root / "modules-load.d" / "gs_usb.conf"
+            depmod = "/sbin/depmod"
+            modprobe = "/sbin/modprobe"
+            commands: list[list[str]] = []
+            load_calls = 0
+
+            def run_root(command: list[str], **kwargs: object) -> SimpleNamespace:
+                nonlocal load_calls
+                commands.append(command)
+                executable = Path(command[0]).name
+                if executable == "install":
+                    source, target = map(Path, command[-2:])
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(source.read_bytes())
+                elif command == [modprobe, "-r", "gs_usb"]:
+                    loaded.rmdir()
+                elif command == [modprobe, "gs_usb"]:
+                    load_calls += 1
+                    loaded.mkdir()
+                    if load_calls == 1:
+                        # Model Ctrl-C after modprobe has inserted the new module
+                        # but before the wrapper can return to sample sysfs.
+                        raise KeyboardInterrupt
+                elif executable == "rm":
+                    Path(command[-1]).unlink(missing_ok=True)
+                elif executable == "tee":
+                    target = Path(command[-1])
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(str(kwargs.get("input_text", "")))
+                return SimpleNamespace(returncode=0, stderr="")
+
+            with (
+                patch.object(driver, "_BUILD_DIR", root / "build"),
+                patch.object(driver, "_MODULES_LOAD_FILE", modules_load),
+                patch.object(driver, "_LOADED_MODULE", loaded),
+                patch.object(driver, "_vendored_driver_path", return_value=destination),
+                patch.object(
+                    driver,
+                    "_selected_driver_path",
+                    return_value=str(destination),
+                ),
+                patch.object(driver, "_find_depmod", return_value=depmod),
+                patch.object(driver, "_find_modprobe", return_value=modprobe),
+                patch.object(driver, "run_root", side_effect=run_root),
+                redirect_stdout(io.StringIO()),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                driver._install(ko)
+
+            self.assertEqual(destination.read_bytes(), b"previous driver")
+            self.assertTrue(loaded.is_dir())
+            self.assertFalse(modules_load.exists())
+            self.assertEqual(commands.count([modprobe, "-r", "gs_usb"]), 2)
+            self.assertEqual(commands.count([modprobe, "gs_usb"]), 2)
+
+    def test_lockdown_also_counts_as_signature_enforcement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sig_enforce = root / "sig_enforce"
+            lockdown = root / "lockdown"
+            sig_enforce.write_text("N\n")
+            lockdown.write_text("none [integrity] confidentiality\n")
+            with (
+                patch.object(driver, "_SIGNATURE_ENFORCEMENT", sig_enforce),
+                patch.object(driver, "_LOCKDOWN_STATE", lockdown),
+            ):
+                self.assertTrue(driver._signature_enforced())
+            lockdown.write_text("[none] integrity confidentiality\n")
+            with (
+                patch.object(driver, "_SIGNATURE_ENFORCEMENT", sig_enforce),
+                patch.object(driver, "_LOCKDOWN_STATE", lockdown),
+            ):
+                self.assertFalse(driver._signature_enforced())
+
+    def test_optional_canable_alias_is_required_only_while_attached(self) -> None:
+        with patch.object(driver, "_attached_usb_ids", return_value=set()):
+            self.assertEqual(driver._required_aliases(), {driver._HUB_ALIAS})
+        with patch.object(driver, "_attached_usb_ids", return_value={("16d0", "117e")}):
+            self.assertEqual(
+                driver._required_aliases(),
+                {driver._HUB_ALIAS, driver._CANABLE2_ALIAS},
+            )
+
+    def test_weak_updates_symlink_resolves_to_native_module(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            modules = Path(directory) / "modules"
+            native = modules / "6.13.0" / "kernel" / "drivers" / "gs_usb.ko"
+            weak = modules / "6.13.0" / "weak-updates" / "gs_usb.ko"
+            native.parent.mkdir(parents=True)
+            weak.parent.mkdir(parents=True)
+            native.write_bytes(b"native")
+            weak.symlink_to(native)
+            with (
+                patch.object(driver, "_MODULES_ROOT", modules),
+                patch.object(
+                    driver.os,
+                    "uname",
+                    return_value=SimpleNamespace(release="6.13.0"),
+                ),
+                patch.object(driver, "_selected_driver_path", return_value=str(weak)),
+            ):
+                self.assertTrue(driver._selected_driver_is_native())
+                self.assertTrue(driver._selected_driver_has_hub_fixes())
+
+    def test_native_hub_fix_boundary_is_linux_6_13(self) -> None:
+        with (
+            patch.object(driver, "_selected_driver_path", return_value="(builtin)"),
+            patch.object(
+                driver.os,
+                "uname",
+                return_value=SimpleNamespace(release="6.12.99-custom"),
+            ),
+        ):
+            self.assertFalse(driver._selected_driver_has_hub_fixes())
+
+        with (
+            patch.object(driver, "_selected_driver_path", return_value="(builtin)"),
+            patch.object(
+                driver.os,
+                "uname",
+                return_value=SimpleNamespace(release="6.13.0"),
+            ),
+        ):
+            self.assertTrue(driver._selected_driver_has_hub_fixes())
+
+    def test_signed_native_stable_backport_is_kept_under_secure_boot(self) -> None:
+        native = "/lib/modules/6.8.0/kernel/drivers/net/can/usb/gs_usb.ko.zst"
+        with (
+            patch.object(driver, "is_driver_available", return_value=True),
+            patch.object(driver, "_signature_enforced", return_value=True),
+            patch.object(driver, "_module_signer", return_value="distro kernel key"),
+            patch.object(driver, "_selected_driver_path", return_value=native),
+            patch.object(driver, "_load_available_driver"),
+            patch.object(driver, "_driver_supports_required_ids", return_value=True),
+            patch.object(driver, "_selected_driver_is_native", return_value=True),
+            patch.object(
+                driver.os,
+                "uname",
+                return_value=SimpleNamespace(release="6.8.0-60-generic"),
+            ),
+            patch.object(driver, "_module_references_symbol", return_value=True),
+            patch.object(driver, "_build") as build,
+        ):
+            self.assertFalse(driver.ensure_driver())
+        build.assert_not_called()
+
+    def test_native_stable_backport_capability_requires_exact_symbol(self) -> None:
+        similar = SimpleNamespace(
+            returncode=0, stdout="0x12345678 usb_find_common_endpoints_extra\n"
+        )
+        exact = SimpleNamespace(
+            returncode=0, stdout="0x87654321 usb_find_common_endpoints\n"
+        )
+        with (
+            patch.object(driver, "_find_modprobe", return_value="/sbin/modprobe"),
+            patch.object(driver.subprocess, "run", side_effect=(similar, exact)) as run,
+        ):
+            self.assertFalse(
+                driver._module_references_symbol(
+                    "usb_find_common_endpoints", "/modules/gs_usb.ko.zst"
+                )
+            )
+            self.assertTrue(
+                driver._module_references_symbol(
+                    "usb_find_common_endpoints", "/modules/gs_usb.ko.zst"
+                )
+            )
+        self.assertEqual(run.call_count, 2)
+        run.assert_called_with(
+            [
+                "/sbin/modprobe",
+                "--show-modversions",
+                "/modules/gs_usb.ko.zst",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_no_srcversion_never_trusts_native_taint_as_byte_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            modules = root / "modules"
+            native = modules / "6.14.0" / "kernel" / "drivers" / "gs_usb.ko"
+            loaded = root / "loaded"
+            native.parent.mkdir(parents=True)
+            native.write_bytes(b"native")
+            loaded.mkdir()
+            (loaded / "taint").write_text("")
+            common = (
+                patch.object(driver, "_MODULES_ROOT", modules),
+                patch.object(driver, "_LOADED_MODULE", loaded),
+                patch.object(
+                    driver.os,
+                    "uname",
+                    return_value=SimpleNamespace(release="6.14.0"),
+                ),
+                patch.object(driver, "_selected_driver_path", return_value=str(native)),
+                patch.object(driver, "_selected_driver_srcversion", return_value=""),
+                patch.object(driver, "run_root"),
+            )
+            with (
+                common[0],
+                common[1],
+                common[2],
+                common[3],
+                common[4],
+                common[5] as root_run,
+                self.assertRaisesRegex(RuntimeError, "enough build identity"),
+            ):
+                driver._load_available_driver()
+                root_run.assert_not_called()
+
+            # Even an in-tree-looking loaded module cannot authenticate a
+            # different file that appeared at modprobe's selected path later.
+            native.write_bytes(b"arbitrary replacement")
+            (loaded / "taint").write_text("O")
+            with common[0], common[1], common[2], common[3], common[4], common[5]:
+                with self.assertRaisesRegex(RuntimeError, "enough build identity"):
+                    driver._load_available_driver()
+
+    def test_attached_driver_topology_requires_binding_and_exact_channels(self) -> None:
+        with patch.object(driver, "_bound_can_topology") as topology:
+            driver._verify_attached_driver_devices(())
+        topology.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            usb = root / "usb"
+            net_class = root / "net"
+            device = usb / "1-2"
+            interface = usb / "1-2:1.0"
+            gs_usb = root / "drivers" / "gs_usb"
+            device.mkdir(parents=True)
+            interface.joinpath("net", "can0").mkdir(parents=True)
+            interface.joinpath("net", "can1").mkdir(parents=True)
+            gs_usb.mkdir(parents=True)
+            (device / "idVendor").write_text("1d50\n")
+            (device / "idProduct").write_text("606f\n")
+            (interface / "driver").symlink_to(gs_usb)
+            (interface / "net" / "can0" / "dev_id").write_text("0x0\n")
+            (interface / "net" / "can1" / "dev_id").write_text("0x1\n")
+
+            with (
+                patch.object(driver, "_USB_DEVICES", usb),
+                patch.object(driver, "_NET_CLASS", net_class),
+            ):
+                expected = driver._attached_driver_devices()
+                self.assertEqual(
+                    expected,
+                    (("1-2", "1d50", "606f", ((0,), (0, 1))),),
+                )
+                driver._verify_attached_driver_devices(expected, timeout=0)
+
+                # The same VID/PID is also the supported single-channel
+                # cart/chest adapter. Its complete (0,) topology must not make
+                # first-run driver installation roll back before can.setup can
+                # probe and classify the bus.
+                can1 = interface / "net" / "can1"
+                (can1 / "dev_id").unlink()
+                can1.rmdir()
+                driver._verify_attached_driver_devices(expected, timeout=0)
+
+                can1.mkdir()
+                (can1 / "dev_id").write_text("0x2\n")
+                with self.assertRaisesRegex(RuntimeError, "expected topology"):
+                    driver._verify_attached_driver_devices(expected, timeout=0)
+
+    def test_install_rolls_back_before_commit_when_attached_topology_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ko = root / "built.ko"
+            ko.write_bytes(b"new driver")
+            destination = root / "modules" / "updates" / "gs_usb.ko"
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"previous driver")
+            loaded = root / "loaded"
+            loaded.mkdir()
+            modules_load = root / "modules-load.d" / "gs_usb.conf"
+            depmod = "/sbin/depmod"
+            modprobe = "/sbin/modprobe"
+            commands: list[list[str]] = []
+
+            def run_root(command: list[str], **kwargs: object) -> SimpleNamespace:
+                commands.append(command)
+                executable = Path(command[0]).name
+                if executable == "install":
+                    source, target = map(Path, command[-2:])
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(source.read_bytes())
+                elif command == [modprobe, "-r", "gs_usb"]:
+                    for child in loaded.iterdir():
+                        child.unlink()
+                    loaded.rmdir()
+                elif command == [modprobe, "gs_usb"]:
+                    loaded.mkdir()
+                    (loaded / "version").write_text(driver._VENDORED_MODULE_VERSION)
+                elif executable == "rm":
+                    Path(command[-1]).unlink(missing_ok=True)
+                elif executable == "tee":
+                    target = Path(command[-1])
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(str(kwargs.get("input_text", "")))
+                return SimpleNamespace(returncode=0, stderr="")
+
+            attached = (("1-2", "1d50", "606f", (0, 1)),)
+            with (
+                patch.object(driver, "_BUILD_DIR", root / "build"),
+                patch.object(driver, "_MODULES_LOAD_FILE", modules_load),
+                patch.object(driver, "_LOADED_MODULE", loaded),
+                patch.object(driver, "_vendored_driver_path", return_value=destination),
+                patch.object(
+                    driver, "_selected_driver_path", return_value=str(destination)
+                ),
+                patch.object(driver, "_find_depmod", return_value=depmod),
+                patch.object(driver, "_find_modprobe", return_value=modprobe),
+                patch.object(driver, "_attached_driver_devices", return_value=attached),
+                patch.object(
+                    driver,
+                    "_verify_attached_driver_devices",
+                    side_effect=RuntimeError("bad attached topology"),
+                ) as verify,
+                patch.object(driver, "run_root", side_effect=run_root),
+                redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(RuntimeError, "previous .* state was restored"),
+            ):
+                driver._install(ko)
+
+            verify.assert_called_once_with(attached)
+            self.assertEqual(destination.read_bytes(), b"previous driver")
+            self.assertTrue(loaded.is_dir())
+            self.assertFalse(modules_load.exists())
+            self.assertFalse(
+                any(Path(command[0]).name == "tee" for command in commands)
+            )
+            self.assertTrue(all(Path(command[0]).is_absolute() for command in commands))
+
+    def test_privileged_tool_lookup_ignores_operator_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            malicious = Path(directory) / "modprobe"
+            malicious.write_text("#!/bin/sh\nexit 0\n")
+            malicious.chmod(0o755)
+            self.assertFalse(driver._trusted_root_executable(malicious))
+            with patch.dict(os.environ, {"PATH": directory}):
+                selected = driver._find_modprobe()
+        self.assertIsNotNone(selected)
+        self.assertNotEqual(selected, str(malicious))
+        self.assertTrue(Path(selected or "").is_absolute())
+
+    def test_unverifiable_managed_override_is_rebuilt_automatically(self) -> None:
+        built = Path("/tmp/gs_usb-build/gs_usb.ko")
+        output = io.StringIO()
+        identity_error = driver._DriverIdentityError("cannot compare modules")
+        with (
+            patch.object(driver, "is_driver_available", return_value=True),
+            patch.object(driver, "_signature_enforced", return_value=False),
+            patch.object(driver, "_load_available_driver", side_effect=identity_error),
+            patch.object(driver, "_selected_driver_is_vendored", return_value=True),
+            patch.object(driver, "_driver_supports_required_ids") as supports_ids,
+            patch.object(driver, "_selected_driver_has_hub_fixes") as has_fixes,
+            patch.object(driver, "_build", return_value=built) as build,
+            patch.object(driver, "_install") as install,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertTrue(driver.ensure_driver())
+
+        build.assert_called_once_with()
+        install.assert_called_once_with(built)
+        supports_ids.assert_not_called()
+        has_fixes.assert_not_called()
+        self.assertIn("managed driver override", output.getvalue())
+
+    def test_unverifiable_unmanaged_driver_still_fails_closed(self) -> None:
+        identity_error = driver._DriverIdentityError("cannot compare modules")
+        with (
+            patch.object(driver, "is_driver_available", return_value=True),
+            patch.object(driver, "_signature_enforced", return_value=False),
+            patch.object(driver, "_load_available_driver", side_effect=identity_error),
+            patch.object(driver, "_selected_driver_is_vendored", return_value=False),
+            patch.object(driver, "_build") as build,
+            self.assertRaisesRegex(RuntimeError, "cannot compare modules"),
+        ):
+            driver.ensure_driver()
+        build.assert_not_called()
+
+    def test_unverifiable_signed_override_is_not_replaced(self) -> None:
+        identity_error = driver._DriverIdentityError("cannot compare modules")
+        with (
+            patch.object(driver, "is_driver_available", return_value=True),
+            patch.object(driver, "_unsigned_driver_is_blocked", return_value=False),
+            patch.object(driver, "_signature_enforced", return_value=True),
+            patch.object(driver, "_load_available_driver", side_effect=identity_error),
+            patch.object(driver, "_selected_driver_is_vendored", return_value=True),
+            patch.object(driver, "_build") as build,
+            self.assertRaisesRegex(RuntimeError, "cannot compare modules"),
+        ):
+            driver.ensure_driver()
+        build.assert_not_called()
+
+    def test_signed_legacy_vendored_fingerprint_is_narrow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            modules = root / "modules"
+            loaded = root / "loaded"
+            destination = modules / "5.15.0-tegra" / "updates" / "gs_usb.ko"
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"legacy")
+            loaded.mkdir()
+            (loaded / "taint").write_text("O")
+            (loaded / "srcversion").write_text("LEGACY_SOURCE")
+            aliases = "\n".join(driver._LEGACY_VENDORED_ALIASES)
+
+            def module_field(field: str, _module: str = "gs_usb") -> str:
+                return {
+                    "version": "",
+                    "intree": "N",
+                    "srcversion": "LEGACY_SOURCE",
+                }.get(field, "")
+
+            patches = (
+                patch.object(driver, "_MODULES_ROOT", modules),
+                patch.object(driver, "_LOADED_MODULE", loaded),
+                patch.object(
+                    driver.os,
+                    "uname",
+                    return_value=SimpleNamespace(release="5.15.0-tegra"),
+                ),
+                patch.object(
+                    driver, "_selected_driver_path", return_value=str(destination)
+                ),
+                patch.object(driver, "_signature_enforced", return_value=True),
+                patch.object(driver, "_module_signer", return_value="enrolled key"),
+                patch.object(driver, "_module_field", side_effect=module_field),
+                patch.object(driver, "_module_info", return_value=aliases),
+            )
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+                patches[7],
+            ):
+                self.assertTrue(driver._selected_driver_is_legacy_vendored())
+                driver._load_available_driver()
+                self.assertTrue(driver._selected_driver_has_hub_fixes())
+
+            (loaded / "srcversion").write_text("DIFFERENT_SOURCE")
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+                patches[7],
+            ):
+                self.assertFalse(driver._selected_driver_is_legacy_vendored())
+            (loaded / "srcversion").write_text("LEGACY_SOURCE")
+
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patch.object(driver, "_module_signer", return_value=""),
+                patches[6],
+                patches[7],
+            ):
+                self.assertFalse(driver._selected_driver_is_legacy_vendored())
+
+            incomplete_aliases = "\n".join(driver._LEGACY_VENDORED_ALIASES[:-1])
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+                patch.object(driver, "_module_info", return_value=incomplete_aliases),
+            ):
+                self.assertFalse(driver._selected_driver_is_legacy_vendored())
 
 
 class FindSingleSerialsTest(unittest.TestCase):
@@ -24,7 +1601,7 @@ class FindSingleSerialsTest(unittest.TestCase):
             setup._CAN_B: configured_wheels,
             setup._CAN_C: configured_chest,
         }
-        identify = Mock(side_effect=lambda serial: detected[serial])
+        identify = Mock(side_effect=lambda serial, **_kwargs: detected[serial])
         find = Mock(return_value=list(reversed(detected)))
         output = io.StringIO()
         with (
@@ -34,6 +1611,12 @@ class FindSingleSerialsTest(unittest.TestCase):
                 side_effect=lambda name: configured[name],
             ),
             patch.object(setup, "_detect_single_serials", find),
+            patch.object(setup, "_mantis_claimed_serials", return_value=set()),
+            patch.object(
+                setup,
+                "_scan_adapters",
+                return_value={serial: {} for serial in detected},
+            ),
             patch.object(setup, "_identify_adapter", identify),
             patch("builtins.input", side_effect=answers or []),
             redirect_stdout(output),
@@ -50,9 +1633,12 @@ class FindSingleSerialsTest(unittest.TestCase):
 
         self.assertEqual(result, ("wheel", "chest"))
         find.assert_called_once_with({"hub"})
-        self.assertEqual(identify.call_args_list, [call("chest"), call("wheel")])
+        self.assertEqual(
+            identify.call_args_list,
+            [call("chest", reset=True), call("wheel", reset=True)],
+        )
         self.assertIn("Damiao wheel motors answered", output)
-        self.assertIn("jelly_legs board answered", output)
+        self.assertIn("cart lift controller answered", output)
 
     def test_live_responses_correct_a_wheel_chest_swap(self) -> None:
         result, _, _, _ = self.run_find(
@@ -160,8 +1746,10 @@ class RenameInterfacesTest(unittest.TestCase):
         self,
         identities: dict[str, tuple[str, int]],
         *,
+        hub: str | None = None,
         wheels: str | None,
         chest: str | None,
+        profile: setup._Profile = setup._AXOL_PROFILE,
     ) -> tuple[dict[str, tuple[str, int]], list[list[str]]]:
         with tempfile.TemporaryDirectory() as directory:
             net_dir = Path(directory)
@@ -199,10 +1787,18 @@ class RenameInterfacesTest(unittest.TestCase):
             with (
                 patch.object(setup, "Path", side_effect=make_path),
                 patch.object(setup.subprocess, "run", side_effect=udev_info),
+                patch.object(
+                    setup,
+                    "_interface_usb_device_identity",
+                    side_effect=lambda path: (
+                        f"usb-{current[Path(path).name][0]}",
+                        current[Path(path).name][0],
+                    ),
+                ),
                 patch.object(setup, "run_root", side_effect=run_root),
                 redirect_stdout(io.StringIO()),
             ):
-                setup._rename_interfaces(None, wheels, chest)
+                setup._rename_interfaces(hub, wheels, chest, profile)
             return current, commands
 
     def test_stages_a_wheel_chest_swap_before_assigning_final_names(self) -> None:
@@ -218,8 +1814,9 @@ class RenameInterfacesTest(unittest.TestCase):
         self.assertEqual(current[setup._CAN_B], ("wheel", 0))
         self.assertEqual(current[setup._CAN_C], ("chest", 0))
         renames = [command for command in commands if command[4] == "name"]
+        self.assertTrue(all(command[4] == "down" for command in commands[:2]))
         self.assertTrue(
-            all(command[5].startswith("can_ax_tmp") for command in renames[:2])
+            all(command[5].startswith("can_tmp") for command in renames[:2])
         )
         self.assertEqual(
             {command[5] for command in renames[2:]}, {setup._CAN_B, setup._CAN_C}
@@ -267,6 +1864,98 @@ class RenameInterfacesTest(unittest.TestCase):
             redirect_stdout(io.StringIO()),
         ):
             setup._rename_interfaces("same", "same", None)
+
+    def test_mantis_pass_does_not_evict_axol_managed_names(self) -> None:
+        current, _ = self.run_rename(
+            {
+                setup.CAN_LEFT: ("axol", 0),
+                setup.CAN_RIGHT: ("axol", 1),
+                "can0": ("mantis", 0),
+                "can1": ("mantis", 1),
+            },
+            hub="mantis",
+            wheels=None,
+            chest=None,
+            profile=setup._MANTIS_PROFILE,
+        )
+
+        self.assertEqual(current[setup.CAN_LEFT], ("axol", 0))
+        self.assertEqual(current[setup.CAN_RIGHT], ("axol", 1))
+        self.assertEqual(current[setup.CAN_MANTIS_LEFT], ("mantis", 0))
+        self.assertEqual(current[setup.CAN_MANTIS_RIGHT], ("mantis", 1))
+
+    def test_serialless_destination_collision_fails_before_link_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            net_dir = Path(directory)
+            source = net_dir / "can0"
+            destination = net_dir / setup._CAN_B
+            source.touch()
+            destination.touch()
+
+            def make_path(value: str) -> Path:
+                return net_dir if value == "/sys/class/net" else Path(value)
+
+            def udev_info(command: list[str], **_kwargs: object) -> SimpleNamespace:
+                iface = Path(command[-1]).name
+                if iface == "can0":
+                    return SimpleNamespace(
+                        stdout='ATTRS{serial}=="wheel"\nATTR{dev_id}=="0x0"\n'
+                    )
+                return SimpleNamespace(stdout='ATTR{dev_id}=="0x0"\n')
+
+            with (
+                patch.object(setup, "Path", side_effect=make_path),
+                patch.object(setup.subprocess, "run", side_effect=udev_info),
+                patch.object(
+                    setup,
+                    "_interface_usb_device_identity",
+                    return_value=("usb-wheel", "wheel"),
+                ),
+                patch.object(setup, "run_root") as run_root,
+                redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(RuntimeError, "unrelated network interface"),
+            ):
+                setup._rename_interfaces(None, "wheel", None)
+            run_root.assert_not_called()
+
+    def test_duplicate_target_channel_fails_before_link_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            net_dir = Path(directory)
+            (net_dir / "can0").touch()
+            (net_dir / "can1").touch()
+
+            def make_path(value: str) -> Path:
+                return net_dir if value == "/sys/class/net" else Path(value)
+
+            def udev_info(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(
+                    stdout='ATTRS{serial}=="wheel"\nATTR{dev_id}=="0x0"\n'
+                )
+
+            with (
+                patch.object(setup, "Path", side_effect=make_path),
+                patch.object(setup.subprocess, "run", side_effect=udev_info),
+                patch.object(
+                    setup,
+                    "_interface_usb_device_identity",
+                    side_effect=[("usb-1", "wheel"), ("usb-2", "wheel")],
+                ),
+                patch.object(setup, "run_root") as run_root,
+                redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(RuntimeError, "same target serial/channel"),
+            ):
+                setup._rename_interfaces(None, "wheel", None)
+            run_root.assert_not_called()
+
+    def test_apply_setup_rejects_duplicate_assignment_before_writing(self) -> None:
+        with (
+            patch.object(setup, "_write_udev_rules") as write_rules,
+            self.assertRaisesRegex(RuntimeError, "wheel bus and chest bus"),
+        ):
+            setup._apply_setup(None, "duplicate", "duplicate")
+        write_rules.assert_not_called()
 
 
 if __name__ == "__main__":

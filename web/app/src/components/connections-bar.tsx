@@ -1,7 +1,14 @@
 import { Cpu, Loader2, Plug, Power, RotateCcw, Server, Unplug } from "lucide-react"
 import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import { restartHost, shutdownHost, type MotorHealth, type RobotStatus } from "@/lib/supervisor"
+import {
+  restartHost,
+  shutdownHost,
+  type CanProfileInventory,
+  type HardwareProfile,
+  type MotorHealth,
+  type RobotStatus,
+} from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { useToast } from "@/components/ui/toast"
@@ -88,10 +95,10 @@ const POWER_ACTIONS: Record<
 }
 
 /**
- * The two connection tiles: the Axol Host (the machine running `axol serve`)
- * and the Axol robot itself, with live per-motor health and any active motor
- * faults called out (a fault blocks every hardware operation from starting).
- * Cameras and Quest USB live in the Settings tabs below.
+ * Connection tiles for the Axol Host and the two hardware profiles. Axol and
+ * Mantis share one idle telemetry link, so connecting either hardware tile
+ * switches that link to its CAN interfaces and motor set. Cameras and Quest
+ * USB live in the Settings tabs below.
  *
  * The host tile also carries the host power controls (restart / shut down,
  * each behind a confirmation) — the Disconnect button only drops this
@@ -107,6 +114,7 @@ export function ConnectionsBar({
   opRunning = false,
   robot,
   robotBusy,
+  canProfiles,
   onRobotConnect,
   onRobotDisconnect,
 }: {
@@ -122,7 +130,9 @@ export function ConnectionsBar({
   opRunning?: boolean
   robot: RobotStatus | null
   robotBusy: boolean
-  onRobotConnect: () => void
+  /** Configured profiles whose CAN netdevs or exact persisted USB hub exist. */
+  canProfiles?: CanProfileInventory | null
+  onRobotConnect: (profile: HardwareProfile) => void
   onRobotDisconnect: () => void
 }) {
   const toast = useToast()
@@ -156,38 +166,101 @@ export function ConnectionsBar({
       ? hostName || host || "Connected"
       : conn === "err"
         ? "Offline"
-        : conn === "idle"
-          ? "Not connected"
-          : "Connecting…"
+        : conn === "migration"
+          ? "Installer migration required"
+          : conn === "idle"
+            ? "Not connected"
+            : "Connecting…"
 
-  // -- robot --
-  const rs = robot?.state ?? "disconnected"
-  const faults = robot?.faults ?? []
-  const robotDot: Dot =
-    rs === "connected"
-      ? faults.length > 0
-        ? "err"
-        : "ok"
-      : rs === "busy"
-        ? "busy"
-        : rs === "connecting"
-          ? "warn"
-          : rs === "error"
-            ? "err"
-            : "idle"
-  const robotLabel =
-    rs === "connected"
-      ? "Connected"
-      : rs === "busy"
-        ? "In use by task"
-        : rs === "connecting"
-          ? "Connecting…"
-          : rs === "error"
-            ? robot?.error || "Error"
-            : "Disconnected"
+  // Axol and Mantis are two profiles of the same server-owned telemetry link.
+  // Older hosts omit profile and are necessarily the original Axol profile.
+  const activeProfile = robot?.profile ?? "axol"
+  const hardwareTile = (profile: HardwareProfile, title: string) => {
+    const active = activeProfile === profile
+    const detected = canProfiles?.[profile].present ?? false
+    const state = active ? (robot?.state ?? "disconnected") : "disconnected"
+    const faults = active ? (robot?.faults ?? []) : []
+    const dot: Dot =
+      state === "connected"
+        ? faults.length > 0
+          ? "err"
+          : "ok"
+        : state === "busy"
+          ? "busy"
+          : state === "connecting"
+            ? "warn"
+            : state === "error"
+              ? "err"
+              : detected
+                ? "warn"
+                : "idle"
+    const label =
+      state === "connected"
+        ? "Connected"
+        : state === "busy"
+          ? "In use by task"
+          : state === "connecting"
+            ? "Connecting…"
+            : state === "error"
+              ? robot?.error || "Error"
+              : detected
+                ? "CAN detected"
+                : canProfiles
+                  ? "Not detected"
+                  : "Disconnected"
+
+    return (
+      <Tile
+        icon={<Cpu className="size-3.5" />}
+        title={title}
+        dot={dot}
+        label={label}
+        pulse={state === "connecting"}
+        statusContent={
+          active &&
+          robot &&
+          robot.motors.length > 0 &&
+          (state === "connected" || state === "busy") ? (
+            <MotorGrid robot={robot} />
+          ) : undefined
+        }
+      >
+        {active && (state === "connected" || state === "busy") ? (
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={onRobotDisconnect}
+            disabled={robotBusy || opRunning}
+            aria-label={`Disconnect ${title}`}
+            title={
+              opRunning
+                ? "Wait for the active operation or setup session to finish."
+                : `Release the ${title} link (CAN). The hardware stays powered.`
+            }
+            className="size-8"
+          >
+            <Unplug />
+          </Button>
+        ) : (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => onRobotConnect(profile)}
+            disabled={!online || robotBusy || opRunning}
+            title={
+              opRunning ? "Wait for the active operation or setup session to finish." : undefined
+            }
+          >
+            {robotBusy ? <Loader2 className="animate-spin" /> : <Plug />}
+            Connect
+          </Button>
+        )}
+      </Tile>
+    )
+  }
 
   return (
-    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2 lg:grid-cols-3">
       <Tile
         icon={<Server className="size-3.5" />}
         title="Axol Host"
@@ -243,42 +316,8 @@ export function ConnectionsBar({
         )}
       </Tile>
 
-      <Tile
-        icon={<Cpu className="size-3.5" />}
-        title="Axol"
-        dot={robotDot}
-        label={robotLabel}
-        pulse={rs === "connecting"}
-        statusContent={
-          robot && robot.motors.length > 0 && (rs === "connected" || rs === "busy") ? (
-            <MotorGrid robot={robot} />
-          ) : undefined
-        }
-      >
-        {rs === "connected" || rs === "busy" ? (
-          <Button
-            variant="outline"
-            size="icon"
-            onClick={onRobotDisconnect}
-            disabled={robotBusy}
-            aria-label="Disconnect Axol"
-            title="Release the robot link (CAN). The robot stays powered."
-            className="size-8"
-          >
-            <Unplug />
-          </Button>
-        ) : (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onRobotConnect}
-            disabled={!online || robotBusy}
-          >
-            {rs === "connecting" || robotBusy ? <Loader2 className="animate-spin" /> : <Plug />}
-            Connect
-          </Button>
-        )}
-      </Tile>
+      {hardwareTile("axol", "Axol")}
+      {hardwareTile("mantis", "Mantis")}
 
       {/* Host power confirmation (shutdown / restart) */}
       {powerOpen && (
@@ -358,11 +397,11 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
     err: "bg-red-400/70",
   }
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+    <div className="flex items-center gap-2 whitespace-nowrap">
       {arms.map((arm) => (
-        <div key={arm} className="flex items-center gap-1.5">
+        <div key={arm} className="flex items-center gap-1">
           <span className="font-mono text-[0.6rem] text-white/35">{arm[0].toUpperCase()}</span>
-          <div className="flex gap-1">
+          <div className="flex gap-0.5">
             {robot.motors
               .filter((m) => m.arm === arm)
               .map((m, index, motors) => {
@@ -376,7 +415,7 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
                     aria-describedby={tooltip}
                     className="group/motor relative inline-flex rounded-[3px] outline-none focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#111]"
                   >
-                    <span className={cn("size-3 rounded-[3px]", SQUARE[color(m)])} />
+                    <span className={cn("size-2.5 rounded-[3px]", SQUARE[color(m)])} />
                     <span
                       id={tooltip}
                       role="tooltip"

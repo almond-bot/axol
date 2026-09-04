@@ -30,6 +30,7 @@ import asyncio
 import logging
 import threading
 import time
+from concurrent.futures import Future
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -40,15 +41,43 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ...constants import Joint
 from ...robot.axol import Axol
+from ...robot.base import HardwareCleanupError
 from ...teleop.config import VRTeleopConfig
 from ...teleop.filter import TrapezoidalFilter
 from .config_axol import AxolRobotConfig
 
 if TYPE_CHECKING:
+    from ...kinematics.config import KinematicsConfig
     from ...kinematics.fk import AxolForwardKinematics
     from ...kinematics.solver import KinematicsSolver
 
 _logger = logging.getLogger(__name__)
+
+
+def default_tracking_ik_config() -> "KinematicsConfig":
+    """Tracking-grade IK solver config for executing Cartesian policy actions.
+
+    The ``KinematicsConfig`` defaults are the *soft* arm-teleop profile
+    (pos_weight=50, ori_weight=10, self_collision_margin=0.1): comfortable for
+    a human driving the arms, but it lets the rest/posture regularizers and
+    the 10 cm collision standoff shove commanded poses ~9 mm off target. A
+    policy replays absolute end-effector poses from its training data, so
+    deployment needs the accurate-tracking weights instead. Those are exactly
+    the Mantis overrides (pos_weight=200, ori_weight=120,
+    margin=0.02, ... — see ``MANTIS_KINEMATICS_OVERRIDES`` and its rationale in
+    :mod:`almond_axol.kinematics.config`), applied here via
+    :func:`apply_mantis_kinematics_profile` so the two stay in lock-step.
+
+    Returns:
+        A fresh config; mutate the result (or pass your own via
+        ``AxolRobot(..., ik_config=...)``) to override individual fields.
+    """
+    from ...kinematics.config import KinematicsConfig, apply_mantis_kinematics_profile
+
+    config = KinematicsConfig()
+    apply_mantis_kinematics_profile(config)
+    return config
+
 
 _JOINTS = list(Joint)
 _LEFT_POS_KEYS = [f"left_{j.value}.pos" for j in _JOINTS]
@@ -78,12 +107,23 @@ class AxolRobot(Robot):
 
     Args:
         config: Hardware channels, camera configs, and gain config.
+        ik_config: Solver weights for the Cartesian-action IK solver (built
+            lazily by :meth:`_ensure_ik`; run-policy only — collect-data and
+            teleop command joints and never build it). Defaults to
+            :func:`default_tracking_ik_config`. Kept a constructor argument
+            rather than an ``AxolRobotConfig`` field because that config is
+            shared with (and serialized by) consumers that never run IK.
     """
 
     config_class = AxolRobotConfig
     name = "axol"
 
-    def __init__(self, config: AxolRobotConfig) -> None:
+    def __init__(
+        self,
+        config: AxolRobotConfig,
+        *,
+        ik_config: "KinematicsConfig | None" = None,
+    ) -> None:
         super().__init__(config)
         self.config = config
         # Feature keys for the joints this robot actually has: the gripperless
@@ -96,9 +136,15 @@ class AxolRobot(Robot):
         self._right_pos_keys = [f"right_{j.value}.pos" for j in joints]
         self._left_trq_keys = [f"left_{j.value}.trq" for j in joints]
         self._right_trq_keys = [f"right_{j.value}.trq" for j in joints]
+        self._ik_config = ik_config
         self._axol: Axol | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
+        self._connect_future: Future[None] | None = None
+        # Retain a timed-out shutdown Future.  ``Future.result(timeout)`` does
+        # not stop its coroutine, so a retry must wait for this exact attempt
+        # rather than submit a second, overlapping motor/bus teardown.
+        self._disconnect_future: Future[None] | None = None
         self.cameras, self._stereo_cameras = self._build_cameras()
         self._observation_features: dict[str, type | tuple] | None = None
         self._action_features: dict[str, type | tuple] | None = None
@@ -310,6 +356,14 @@ class AxolRobot(Robot):
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         """Open CAN buses, enable motors, start telemetry, and connect cameras."""
+        if (
+            self._connect_future is not None
+            or self._disconnect_future is not None
+            or (self._loop_thread is not None and self._loop_thread.is_alive())
+        ):
+            raise HardwareCleanupError(
+                "a previous robot shutdown is incomplete; retry disconnect first"
+            )
         loop = asyncio.new_event_loop()
         self._loop = loop
         self._loop_thread = threading.Thread(
@@ -317,7 +371,19 @@ class AxolRobot(Robot):
         )
         self._loop_thread.start()
 
-        asyncio.run_coroutine_threadsafe(self._connect_async(), loop).result(timeout=30)
+        self._connect_future = asyncio.run_coroutine_threadsafe(
+            self._connect_async(), loop
+        )
+        try:
+            self._connect_future.result(timeout=30)
+        except BaseException:
+            # Retain a timed-out attempt so disconnect() waits for this exact
+            # coroutine before disabling. A completed failure can be cleaned
+            # immediately, but its loop still remains for disconnect().
+            if self._connect_future.done():
+                self._connect_future = None
+            raise
+        self._connect_future = None
 
         if self.config.observe_cartesian and self._fk is None:
             from ...kinematics.fk import AxolForwardKinematics
@@ -329,12 +395,16 @@ class AxolRobot(Robot):
 
         _logger.info("AxolRobot connected.")
 
-    async def _connect_async(self) -> None:
-        self._axol = Axol(
+    def _build_hardware(self) -> Axol:
+        """Construct the hardware driver. Overridden by the Mantis subclass."""
+        return Axol(
             self.config.axol_config,
             left_channel=self.config.left_channel,
             right_channel=self.config.right_channel,
         )
+
+    async def _connect_async(self) -> None:
+        self._axol = self._build_hardware()
         await self._axol.enable()
         if self.config.telemetry_hz > 0:
             await self._axol.start_telemetry(
@@ -359,25 +429,70 @@ class AxolRobot(Robot):
 
     def disconnect(self) -> None:
         """Disable motors, stop telemetry, close CAN buses, and disconnect cameras."""
+        camera_failures: list[BaseException] = []
         for cam in self.cameras.values():
             if cam.is_connected:
-                cam.disconnect()
+                try:
+                    cam.disconnect()
+                except BaseException as exc:
+                    # Cameras must not prevent the motor/bus teardown below.
+                    camera_failures.append(exc)
 
-        if self._loop is not None and self._axol is not None:
-            asyncio.run_coroutine_threadsafe(
-                self._disconnect_async(), self._loop
-            ).result(timeout=10)
+        if self._connect_future is not None:
+            connect_future = self._connect_future
+            try:
+                connect_future.result(timeout=10)
+            except TimeoutError as exc:
+                raise HardwareCleanupError(
+                    "robot connect is still running; hardware ownership is uncertain"
+                ) from exc
+            except BaseException:
+                # The failed bring-up is the caller's visible error; cleanup
+                # must still disable whatever subset it opened.
+                pass
+            finally:
+                if connect_future.done():
+                    self._connect_future = None
+
+        if self._loop is not None and (
+            self._axol is not None or self._disconnect_future is not None
+        ):
+            if self._disconnect_future is None:
+                self._disconnect_future = asyncio.run_coroutine_threadsafe(
+                    self._disconnect_async(), self._loop
+                )
+            future = self._disconnect_future
+            try:
+                future.result(timeout=10)
+            except BaseException as exc:
+                # A completed failure is retryable by submitting a fresh
+                # disable. A timeout stays attached so the retry waits for the
+                # still-running coroutine instead of overlapping it.
+                if future.done():
+                    self._disconnect_future = None
+                raise HardwareCleanupError(
+                    "robot disable failed; hardware ownership is uncertain"
+                ) from exc
+            self._disconnect_future = None
 
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=5)
+            if self._loop_thread.is_alive():
+                raise HardwareCleanupError(
+                    "robot event loop did not stop; hardware ownership is uncertain"
+                )
+        if self._loop is not None:
+            self._loop.close()
 
         self._loop = None
         self._loop_thread = None
         self._fk = None
         self._ik = None
         _logger.info("AxolRobot disconnected.")
+        if camera_failures:
+            raise camera_failures[0]
 
     async def _disconnect_async(self) -> None:
         if self._axol is None:
@@ -532,15 +647,50 @@ class AxolRobot(Robot):
         fall back to ``read_latest()`` so a single stale camera doesn't stall
         inference.
         """
+        observation, _pose_lag = self._get_observation_with_pose_lag(
+            require_camera_timestamps=False
+        )
+        return observation
+
+    @check_if_not_connected
+    def get_observation_with_pose_lag(self) -> tuple[RobotObservation, float]:
+        """Return one observation and its signed pose-to-image capture skew.
+
+        The lag is the freshest camera exposure timestamp minus the timestamp
+        immediately before the cached joint sample, on the shared
+        ``perf_counter`` timeline.  It is returned out-of-band rather than
+        inserted into the observation so policy feature dictionaries remain
+        unchanged.  Keeping the metadata in the return value also binds it to
+        this exact call when inference and rollout capture read concurrently.
+
+        A timestamped ``read_latest_with_ts`` fallback is required here: a
+        rollout row that declares ``observation.pose_lag`` must never silently
+        substitute zero when a camera timed out and supplied a stale frame.
+        """
+        observation, pose_lag = self._get_observation_with_pose_lag(
+            require_camera_timestamps=True
+        )
+        if pose_lag is None:
+            raise RuntimeError(
+                "one or more cameras did not report a capture timestamp; "
+                "refusing to fabricate pose_lag"
+            )
+        return observation, pose_lag
+
+    def _get_observation_with_pose_lag(
+        self, *, require_camera_timestamps: bool
+    ) -> tuple[RobotObservation, float | None]:
+        """Read an observation, optionally requiring complete camera timing."""
         target_ts = time.perf_counter()
 
         obs = self._joint_state()
+        camera_capture_timestamps: list[float] = []
 
         for cam_key, cam in self.cameras.items():
             cam_fps = getattr(cam, "fps", None) or 30
             timeout_ms = int(2 * 1000.0 / cam_fps + 200)
             try:
-                frame, _cap_ts, _recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
+                frame, cap_ts, _recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
                     target_ts, timeout_ms=timeout_ms
                 )
             except (TimeoutError, RuntimeError) as exc:
@@ -551,39 +701,83 @@ class AxolRobot(Robot):
                     target_ts,
                     exc,
                 )
-                frame = cam.read_latest()
+                if not require_camera_timestamps:
+                    frame = cam.read_latest()
+                    cap_ts = None
+                else:
+                    read_latest_with_ts = getattr(cam, "read_latest_with_ts", None)
+                    if not callable(read_latest_with_ts):
+                        raise RuntimeError(
+                            f"camera {cam_key!r} cannot report the capture "
+                            "timestamp of its fallback frame; refusing to "
+                            "fabricate pose_lag"
+                        ) from exc
+                    frame, cap_ts, recv_ts = read_latest_with_ts()
+                    # Preserve read_latest()'s normal stale-frame guard while
+                    # retaining the timestamp belonging to this exact copy.
+                    recv_ts = float(recv_ts)
+                    if not np.isfinite(recv_ts):
+                        raise RuntimeError(
+                            f"camera {cam_key!r} returned a non-finite receive "
+                            "timestamp for its fallback frame"
+                        )
+                    age_ms = (time.perf_counter() - recv_ts) * 1e3
+                    if age_ms > 500:
+                        raise TimeoutError(
+                            f"latest {cam_key!r} frame is {age_ms:.0f}ms old (> 500ms)"
+                        )
             obs[cam_key] = frame
+            if cap_ts is not None:
+                capture_ts = float(cap_ts)
+                if not np.isfinite(capture_ts):
+                    raise RuntimeError(
+                        f"camera {cam_key!r} returned a non-finite capture timestamp"
+                    )
+                camera_capture_timestamps.append(capture_ts)
 
-        return obs
+        if len(camera_capture_timestamps) != len(self.cameras):
+            return obs, None
+        freshest_capture_ts = max(camera_capture_timestamps, default=target_ts)
+        return obs, freshest_capture_ts - target_ts
 
     def _ensure_ik(self) -> KinematicsSolver:
         """Lazily build the IK solver used to resolve Cartesian action targets.
 
         Built on first use rather than on connect so the joint-action paths
         (collect-data, teleop) never pay for the solver's URDF load, collision
-        model, and IK JIT warmup.
+        model, and IK JIT warmup. Uses the ``ik_config`` passed at
+        construction, defaulting to the tracking-grade profile
+        (:func:`default_tracking_ik_config`) — the soft ``KinematicsConfig``
+        defaults would systematically distort commanded policy poses by ~9 mm.
         """
         if self._ik is None:
             from ...kinematics.solver import KinematicsSolver
 
+            ik_config = (
+                self._ik_config
+                if self._ik_config is not None
+                else default_tracking_ik_config()
+            )
             _logger.info("Building IK solver for Cartesian actions...")
-            self._ik = KinematicsSolver()
+            solver = KinematicsSolver(ik_config)
 
             # The solver warms up its *with-elbow* IK graph, but our Cartesian
             # sends pass no elbow hint — a distinct graph that would otherwise
             # JIT-compile on the first real send, blocking the event loop past
             # send_action's timeout (and clogging it for the rest of the run).
             # Compile that exact no-elbow variant here, on the caller thread,
-            # with a dummy reachable target. Best-effort: warmup only compiles.
+            # with a dummy reachable target. A failure means this solver cannot
+            # execute the policy's real command shape, so fail startup instead
+            # of logging a false-ready worker and discovering it after motion
+            # begins. Publish ``self._ik`` only after both warmups succeed so a
+            # caller may safely retry construction.
             dummy_pose = (
                 np.array([0.0, 0.0, 0.3], dtype=np.float32),
                 np.eye(3, dtype=np.float32),
             )
-            q0 = np.zeros(self._ik.num_joints, dtype=np.float32)
-            try:
-                self._ik.ik(q0, left_pose=dummy_pose, right_pose=dummy_pose)
-            except Exception:  # noqa: BLE001 - warmup just triggers compilation
-                _logger.warning("Cartesian IK warmup failed", exc_info=True)
+            q0 = np.zeros(solver.num_joints, dtype=np.float32)
+            solver.ik(q0, left_pose=dummy_pose, right_pose=dummy_pose)
+            self._ik = solver
             _logger.info("IK solver ready for Cartesian actions.")
         return self._ik
 

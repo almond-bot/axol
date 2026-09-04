@@ -62,8 +62,16 @@ class FakeLift:
     def status_is_fresh(self, max_age_s: float) -> bool:
         return max_age_s >= 0
 
-    async def set_position(self, target: int, speed: int) -> None:
+    async def set_position(
+        self,
+        target: int,
+        speed: int,
+        *,
+        before_send=None,  # noqa: ANN001 - mirrors the production callback
+    ) -> None:
         del target, speed
+        if before_send is not None:
+            await before_send()
 
     async def stop_motion(self) -> None:
         self._events.append("lift.stop")
@@ -93,6 +101,32 @@ class FakeAxol:
             if right_channel is None
             else np.linspace(0.4, -0.3, len(Joint), dtype=np.float32),
         )
+        self.left = (
+            None
+            if left_channel is None
+            else SimpleNamespace(
+                motors={
+                    joint: SimpleNamespace(
+                        is_holding=AsyncMock(return_value=True),
+                        disable=AsyncMock(),
+                    )
+                    for joint in cycle.ARM_JOINTS
+                }
+            )
+        )
+        self.right = (
+            None
+            if right_channel is None
+            else SimpleNamespace(
+                motors={
+                    joint: SimpleNamespace(
+                        is_holding=AsyncMock(return_value=True),
+                        disable=AsyncMock(),
+                    )
+                    for joint in cycle.ARM_JOINTS
+                }
+            )
+        )
 
     async def enable(self) -> None:
         self._events.append("arms.enable")
@@ -106,28 +140,42 @@ class FakeAxol:
 
 
 class FakeOpeningLift:
-    def __init__(self, *, broadcasts: bool) -> None:
+    def __init__(self, *, broadcasts: bool, interval_s: float = 0.2) -> None:
         self.status: LiftStatus | None = None
         self.last_status_monotonic: float | None = None
+        self.status_timestamps: list[float] = []
         self.status_age = 0.0
         self.broadcasts = broadcasts
+        self.interval_s = interval_s
         self.events: list[str] = []
 
     def status_is_fresh(self, max_age_s: float) -> bool:
         return max_age_s >= 0 and self.status is not None
 
-    async def start(self) -> None:
-        self.events.append("start")
-        self.status = _status(1000)
-        self.last_status_monotonic = 1.0
+    def _publish(self, stamp: float) -> None:
+        self.last_status_monotonic = stamp
+        self.status_timestamps.append(stamp)
 
-    async def set_status_period(self, period_ms: int) -> None:
-        self.events.append(f"rate:{period_ms}")
+    async def start(self, *, request_status: bool = True) -> None:
+        self.events.append(f"start:{request_status}")
+        self.status = _status(1000)
+        self._publish(1.0)
         if self.broadcasts:
-            self.last_status_monotonic = 2.0
-            asyncio.get_running_loop().call_later(
-                0.001, setattr, self, "last_status_monotonic", 3.0
-            )
+            loop = asyncio.get_running_loop()
+            for index in range(1, 4):
+                loop.call_later(
+                    0.02 * index,
+                    self._publish,
+                    1.0 + self.interval_s * index,
+                )
+
+    async def set_status_period(
+        self, period_ms: int, *, recover_stale: bool = True
+    ) -> None:
+        self.events.append(f"rate:{period_ms}:{recover_stale}")
+
+    def enable_broadcast_recovery(self) -> None:
+        self.events.append("recovery")
 
     async def close(self) -> None:
         self.events.append("close")
@@ -145,7 +193,6 @@ def _args(cycles: int = 2) -> SimpleNamespace:
         speed=0,
         no_left=False,
         no_right=False,
-        has_gripper=True,
         left_channel="can-left-test",
         right_channel="can-right-test",
     )
@@ -226,13 +273,14 @@ class LiftCycleHelpersTest(unittest.TestCase):
         self.assertEqual(args.lift_channel, "can_alm_axol_c")
         self.assertEqual(args.lift_channel, CAN_CHEST)
 
-    def test_parser_supports_gripperless_arms(self) -> None:
+    def test_parser_has_no_gripper_control_surface(self) -> None:
         parser = argparse.ArgumentParser()
         cycle._add_arguments(parser, cycles_required=False)
 
-        args = parser.parse_args(["--cycles", "1", "--no-gripper"])
+        args = parser.parse_args(["--cycles", "1"])
 
-        self.assertFalse(args.has_gripper)
+        self.assertFalse(hasattr(args, "has_gripper"))
+        self.assertNotIn("gripper", parser.format_help().lower())
 
     def test_terminal_can_prompt_for_cycle_count(self) -> None:
         with (
@@ -264,25 +312,53 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(opened, lift)
         lift_type.assert_called_once_with("can-test")
-        self.assertEqual(lift.events, ["start", "rate:200"])
+        self.assertEqual(lift.events, ["rate:200:False", "start:False", "recovery"])
 
     async def test_open_lift_closes_when_broadcast_never_starts(self) -> None:
         lift = FakeOpeningLift(broadcasts=False)
         with (
             patch.object(cycle, "Lift", return_value=lift),
-            patch.object(cycle, "_STATUS_STALE_S", 0.0),
+            patch.object(cycle, "_FIRST_STATUS_TIMEOUT_S", 0.0),
             self.assertRaisesRegex(cycle.DiagnosticFailure, "200 ms status broadcasts"),
         ):
             await cycle._open_lift("can-test")
 
-        self.assertEqual(lift.events, ["start", "rate:200", "close"])
+        self.assertEqual(lift.events, ["rate:200:False", "start:False", "close"])
+
+    async def test_open_lift_rejects_default_50ms_broadcast_cadence(self) -> None:
+        lift = FakeOpeningLift(broadcasts=True, interval_s=0.05)
+        with (
+            patch.object(cycle, "Lift", return_value=lift),
+            self.assertRaisesRegex(cycle.DiagnosticFailure, "observed 50, 50 ms"),
+        ):
+            await cycle._open_lift("can-test")
+
+        self.assertEqual(lift.events[-1], "close")
+
+    async def test_open_lift_preserves_cleanup_cancellation(self) -> None:
+        lift = SimpleNamespace(
+            set_status_period=AsyncMock(),
+            start=AsyncMock(side_effect=OSError("startup failed")),
+            close=AsyncMock(side_effect=asyncio.CancelledError),
+        )
+        with (
+            patch.object(cycle, "Lift", return_value=lift),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await cycle._open_lift("can-test")
+
+        self.assertEqual(lift.close.await_count, 2)
 
     async def test_clearance_monitor_detects_non_s1_joint_drift(self) -> None:
         target = np.zeros(len(Joint), dtype=np.float32)
         measured = target.copy()
         elbow_index = list(Joint).index(Joint.ELBOW)
         measured[elbow_index] = math.radians(6)
-        axol = SimpleNamespace(get_positions=AsyncMock(return_value=(measured, None)))
+        axol = SimpleNamespace(
+            left=SimpleNamespace(),
+            right=None,
+            get_positions=AsyncMock(return_value=(measured, None)),
+        )
 
         with self.assertRaisesRegex(cycle.DiagnosticFailure, "left elbow"):
             await cycle._verify_arm_targets(axol, target, None, "monitor")
@@ -308,20 +384,118 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
         safety_check.assert_awaited_once_with()
         axol.motion_control.assert_not_awaited()
 
-    async def test_arm_shutdown_requires_every_motor_to_report_disabled(self) -> None:
-        disabled_motor = SimpleNamespace(
-            disable=AsyncMock(), is_holding=AsyncMock(return_value=False)
+    async def test_move_rechecks_interrupt_after_awaited_safety_callback(self) -> None:
+        events: list[str] = []
+        lift = FakeLift(_status(500), events)
+        lift.set_position = AsyncMock()  # type: ignore[method-assign]
+        interrupted = asyncio.Event()
+
+        async def interrupt_during_check() -> None:
+            interrupted.set()
+
+        with self.assertRaises(cycle.Interrupted):
+            await cycle._move_lift(
+                lift,
+                1000,
+                0,
+                interrupted,
+                "raise",
+                interrupt_during_check,
+            )
+
+        lift.set_position.assert_not_awaited()
+
+    async def test_move_rechecks_interlock_after_driver_stop_handshake(self) -> None:
+        events: list[str] = []
+        lift = FakeLift(_status(500), events)
+        interrupted = asyncio.Event()
+        checks = 0
+
+        async def interrupt_on_post_stop_check() -> None:
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                interrupted.set()
+
+        with self.assertRaises(cycle.Interrupted):
+            await cycle._move_lift(
+                lift,
+                1000,
+                0,
+                interrupted,
+                "raise",
+                interrupt_on_post_stop_check,
+            )
+
+        self.assertEqual(checks, 2)
+
+    async def test_arm_ramp_rechecks_interrupt_after_safety_callback(self) -> None:
+        pose = np.zeros(len(Joint), dtype=np.float32)
+        axol = SimpleNamespace(motion_control=AsyncMock())
+        interrupted = asyncio.Event()
+
+        async def interrupt_during_check() -> None:
+            interrupted.set()
+
+        with self.assertRaises(cycle.Interrupted):
+            await cycle._ramp_arms(
+                axol,
+                pose,
+                None,
+                pose.copy(),
+                None,
+                interrupted,
+                safety_check=interrupt_during_check,
+            )
+
+        axol.motion_control.assert_not_awaited()
+
+    async def test_arm_positions_require_exact_shape_and_finite_values(self) -> None:
+        for pose, message in (
+            (np.zeros(len(Joint) - 1), "shape"),
+            (
+                np.array([0.0] * (len(Joint) - 1) + [math.nan]),
+                "finite",
+            ),
+        ):
+            axol = SimpleNamespace(
+                left=SimpleNamespace(),
+                right=None,
+                get_positions=AsyncMock(return_value=(pose, None)),
+            )
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(cycle.DiagnosticFailure, message),
+            ):
+                await cycle._read_valid_arm_positions(axol, "test")
+
+    async def test_arm_monitor_rejects_motor_that_is_not_holding(self) -> None:
+        motors = {
+            joint: SimpleNamespace(is_holding=AsyncMock(return_value=True))
+            for joint in cycle.ARM_JOINTS
+        }
+        motors[Joint.ELBOW].is_holding = AsyncMock(return_value=False)
+        axol = SimpleNamespace(
+            left=SimpleNamespace(motors=motors),
+            right=None,
         )
+
+        with self.assertRaisesRegex(cycle.DiagnosticFailure, "elbow is not enabled"):
+            await cycle._verify_arms_holding(axol, "monitor")
+
+    async def test_arm_shutdown_requires_every_motor_to_report_disabled(self) -> None:
+        motors = {
+            joint: SimpleNamespace(
+                disable=AsyncMock(), is_holding=AsyncMock(return_value=False)
+            )
+            for joint in cycle.ARM_JOINTS
+        }
         holding_motor = SimpleNamespace(
             disable=AsyncMock(), is_holding=AsyncMock(return_value=True)
         )
+        motors[Joint.ELBOW] = holding_motor
         axol = SimpleNamespace(
-            left=SimpleNamespace(
-                motors={
-                    Joint.SHOULDER_1: disabled_motor,
-                    Joint.ELBOW: holding_motor,
-                }
-            ),
+            left=SimpleNamespace(motors=motors),
             right=None,
         )
 
@@ -330,22 +504,92 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
         ):
             await cycle._disable_arms_verified(axol)
 
-        disabled_motor.disable.assert_awaited_once_with()
+        motors[Joint.SHOULDER_1].disable.assert_awaited_once_with()
         holding_motor.disable.assert_awaited_once_with()
 
     async def test_arm_shutdown_passes_when_every_motor_reports_disabled(self) -> None:
-        motor = SimpleNamespace(
-            disable=AsyncMock(), is_holding=AsyncMock(return_value=False)
-        )
+        motors = {
+            joint: SimpleNamespace(
+                disable=AsyncMock(), is_holding=AsyncMock(return_value=False)
+            )
+            for joint in cycle.ARM_JOINTS
+        }
         axol = SimpleNamespace(
-            left=SimpleNamespace(motors={Joint.SHOULDER_1: motor}),
+            left=SimpleNamespace(motors=motors),
             right=None,
         )
 
         await cycle._disable_arms_verified(axol)
 
-        motor.disable.assert_awaited_once_with()
-        motor.is_holding.assert_awaited_once_with()
+        for motor in motors.values():
+            motor.disable.assert_awaited_once_with()
+            motor.is_holding.assert_awaited_once_with()
+
+    async def test_arm_shutdown_never_ignores_disable_exception(self) -> None:
+        motors = {
+            joint: SimpleNamespace(
+                disable=AsyncMock(), is_holding=AsyncMock(return_value=False)
+            )
+            for joint in cycle.ARM_JOINTS
+        }
+        motors[Joint.SHOULDER_1].disable = AsyncMock(
+            side_effect=OSError("disable lost")
+        )
+        axol = SimpleNamespace(
+            left=SimpleNamespace(motors=motors),
+            right=None,
+        )
+
+        with self.assertRaisesRegex(cycle.DiagnosticFailure, "disable lost"):
+            await cycle._disable_arms_verified(axol)
+
+    async def test_cleanup_retry_finishes_then_preserves_cancellation(self) -> None:
+        operation = AsyncMock(side_effect=[asyncio.CancelledError(), None])
+
+        with self.assertRaises(asyncio.CancelledError):
+            await cycle._retry_cleanup(operation, label="test cleanup")
+
+        self.assertEqual(operation.await_count, 2)
+
+    async def test_stop_retry_finishes_then_preserves_cancellation(self) -> None:
+        lift = SimpleNamespace(
+            stop_motion=AsyncMock(side_effect=[asyncio.CancelledError(), None])
+        )
+        wait = AsyncMock(return_value=_status(1000))
+        with (
+            patch.object(cycle, "_wait_for_status_after", wait),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await cycle._stop_lift_verified(
+                lift,
+                context="test stop",
+                require_upper=True,
+            )
+
+        self.assertEqual(lift.stop_motion.await_count, 2)
+        wait.assert_awaited_once()
+
+    async def test_cleanup_cancellation_overrides_prior_diagnostic_failure(
+        self,
+    ) -> None:
+        events: list[str] = []
+        lift = FakeLift(_status(1000), events)
+        lift.status_is_fresh = lambda _max_age_s: False
+        with (
+            patch.object(cycle, "_open_lift", AsyncMock(return_value=lift)),
+            patch.object(cycle, "interrupt_event", _interrupt_context),
+            patch.object(
+                cycle,
+                "_stop_lift_verified",
+                AsyncMock(side_effect=asyncio.CancelledError),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await cycle._run(_args(cycles=1))
+
+        self.assertEqual(events[-1], "lift.close")
 
     async def _run_with_fakes(
         self,
@@ -353,6 +597,8 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
         initial: LiftStatus,
         move_side_effect,  # noqa: ANN001
         cycles: int = 2,
+        disconnect_side_effect=None,  # noqa: ANN001
+        stdout: io.StringIO | None = None,
     ):
         events: list[str] = []
         lift = FakeLift(initial, events)
@@ -366,11 +612,25 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
                 right_channel=right_channel,
                 events=events,
             )
+            if disconnect_side_effect is not None:
+                fake_axol.disconnect = AsyncMock(  # type: ignore[method-assign]
+                    side_effect=disconnect_side_effect
+                )
             return fake_axol
 
         async def ramp(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
-            del args
             events.append("arms.ramp")
+            assert fake_axol is not None
+            measured_left = None if args[3] is None else args[3].copy()
+            measured_right = None if args[4] is None else args[4].copy()
+            if events.count("arms.ramp") == 1:
+                # A small, in-tolerance measured offset proves the return ramp
+                # starts from live feedback rather than the old command.
+                if measured_left is not None:
+                    measured_left[1] += 0.01
+                if measured_right is not None:
+                    measured_right[1] -= 0.01
+            fake_axol._positions = (measured_left, measured_right)
             safety_check = kwargs.get("safety_check")
             if safety_check is not None:
                 await safety_check()
@@ -381,6 +641,7 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
         async def disable_arms(_axol) -> None:  # noqa: ANN001
             events.append("arms.disable")
 
+        output = stdout if stdout is not None else io.StringIO()
         with (
             patch.object(cycle, "_open_lift", AsyncMock(return_value=lift)),
             patch.object(cycle, "Axol", side_effect=make_axol),
@@ -393,7 +654,7 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
             patch.object(cycle, "_ramp_arms", side_effect=ramp) as ramp_mock,
             patch.object(cycle, "_disable_arms_verified", side_effect=disable_arms),
             patch.object(cycle, "_verify_arm_targets", AsyncMock()),
-            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stdout(output),
         ):
             await cycle._run(_args(cycles))
 
@@ -421,7 +682,7 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ramp.await_count, 2)
         self.assertEqual(fake_axol.left_channel, "can-left-test")
         self.assertEqual(fake_axol.right_channel, "can-right-test")
-        self.assertTrue(fake_axol.config.has_gripper)
+        self.assertFalse(fake_axol.config.has_gripper)
         start_left, start_right = fake_axol._positions
         clearance_left, clearance_right = cycle._clearance_targets(
             start_left, start_right
@@ -441,6 +702,33 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
         final_stop = len(events) - 1 - events[::-1].index("lift.stop")
         self.assertLess(final_stop, events.index("arms.disconnect"))
         self.assertEqual(events[-1], "lift.close")
+
+    async def test_pass_is_withheld_when_final_cleanup_cannot_be_verified(
+        self,
+    ) -> None:
+        async def successful_move(  # noqa: ANN001
+            lift, target, speed, interrupted, label, safety_check
+        ):
+            del speed, interrupted, label
+            await safety_check()
+            lift.status = _status(target)
+            lift.last_status_monotonic = time.monotonic()
+            return lift.status
+
+        stdout = io.StringIO()
+        with self.assertRaisesRegex(cycle.DiagnosticFailure, "closing arm CAN buses"):
+            await self._run_with_fakes(
+                initial=_status(1000),
+                move_side_effect=successful_move,
+                cycles=1,
+                disconnect_side_effect=[
+                    OSError("close failed once"),
+                    OSError("close failed twice"),
+                ],
+                stdout=stdout,
+            )
+
+        self.assertNotIn("PASS", stdout.getvalue())
 
     async def test_return_to_rest_aborts_if_lift_leaves_upper_endpoint(self) -> None:
         async def successful_move(  # noqa: ANN001

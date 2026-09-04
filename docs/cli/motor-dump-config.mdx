@@ -7,9 +7,10 @@ Reads every configuration parameter from one motor (or all motors on the bus whe
 
 | Flag | Description |
 |---|---|
-| `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
-| `--channel IFACE` | SocketCAN interface to use instead of the selected arm's Axol hub interface, for setups without the Axol hub CAN adapter (e.g. `can0`) |
-| `--id ID` | Motor CAN ID, hex or decimal. Omit to dump every motor on the bus (IDs 1–8) |
+| `--l` / `--r` | Select the left or right side (mutually exclusive, required) |
+| `--target {axol,mantis}` | Use that side's Axol arm or Mantis gripper bus (default: `axol`) |
+| `--channel IFACE` | Override the selected hardware's default SocketCAN interface (e.g. `can0`) |
+| `--id ID` | Motor CAN ID, hex or decimal. Omit to dump IDs 1–8 on Axol or ID 8 on Mantis |
 | `--type {myactuator,damiao}` | Motor type (inferred from the ID if omitted) |
 | `--out FILE` | Write a JSON snapshot for `motor.restore-config` |
 | `--raw` | Sweep raw parameter indices instead of the known table, to surface indices not yet named (MyActuator only — Damiao's register table is complete) |
@@ -21,6 +22,7 @@ axol motor.dump-config --l --id 0x01              # one motor
 axol motor.dump-config --l                        # every motor on the left bus
 axol motor.dump-config --l --out arm-left.json    # save a snapshot to restore later
 axol motor.dump-config --l --id 0x01 --raw        # sweep unnamed indices (MyActuator)
+axol motor.dump-config --target mantis --l --out mantis-left.json
 ```
 
 <Note>

@@ -20,7 +20,9 @@ Usage:
     axol diag.lift-cycle --cycles 10
     axol diag.lift-cycle --cycles 3 --speed 300
     axol diag.lift-cycle --cycles 2 --no-right
-    axol diag.lift-cycle --cycles 2 --no-gripper
+
+The diagnostic is arm-joints-only: it never enables, calibrates, commands, or
+disables either gripper.
 """
 
 from __future__ import annotations
@@ -43,6 +45,11 @@ from ...robot.lift import Lift, LiftStatus
 _STATUS_PERIOD_MS = 200
 _STATUS_STALE_S = 1.0
 _FIRST_STATUS_TIMEOUT_S = 3.0
+# Accept scheduler jitter and one missed frame while still rejecting the
+# firmware's TX-starving 50 ms default cadence.
+_STATUS_CADENCE_MIN_S = 0.12
+_STATUS_CADENCE_MAX_S = 0.50
+_STATUS_CADENCE_SAMPLES = 3
 _MOVE_START_TIMEOUT_S = 5.0
 # The firmware stops a position move at 60 s. Leave enough headroom for one
 # status interval plus arm-safety reads, so the host can request STOP first.
@@ -157,6 +164,20 @@ def _is_idle(status: LiftStatus) -> bool:
     return not (status.moving or status.pos_move or status.homing or status.jog)
 
 
+def _require_lift_ready(lift: Lift, context: str) -> LiftStatus:
+    """Require a healthy, homed, idle controller with no pending save."""
+    status = _require_fresh_status(lift, context)
+    if not status.homed:
+        raise DiagnosticFailure(f"{context}: lift homing state is unavailable")
+    if not _is_idle(status):
+        raise DiagnosticFailure(
+            f"{context}: lift is already moving: {_status_line(status)}"
+        )
+    if status.save_pending:
+        raise DiagnosticFailure(f"{context}: a position save is still pending")
+    return status
+
+
 def _at_endpoint(status: LiftStatus, target: int) -> bool:
     position = status.position_permille
     if position is None or abs(position - target) > _ENDPOINT_TOLERANCE_PERMILLE:
@@ -183,6 +204,8 @@ async def _wait_for_status_after(
         now = time.monotonic()
         if safety_check is not None and now >= next_safety_check:
             await safety_check()
+            if interrupted.is_set():
+                raise Interrupted
             next_safety_check = time.monotonic() + _ARM_SAFETY_CHECK_PERIOD_S
         now = time.monotonic()
         stamp = lift.last_status_monotonic
@@ -241,6 +264,8 @@ async def _settle_endpoint(
         now = time.monotonic()
         if safety_check is not None and now >= next_safety_check:
             await safety_check()
+            if interrupted.is_set():
+                raise Interrupted
             next_safety_check = time.monotonic() + _ARM_SAFETY_CHECK_PERIOD_S
         await asyncio.sleep(0.02)
     status = await _wait_for_status_after(
@@ -278,11 +303,25 @@ async def _move_lift(
     label: str,
     safety_check: Callable[[], Awaitable[None]] | None = None,
 ) -> LiftStatus:
-    if interrupted.is_set():
-        raise Interrupted
+    async def verify_before_send() -> None:
+        if interrupted.is_set():
+            raise Interrupted
+        if safety_check is not None:
+            await safety_check()
+        if interrupted.is_set():
+            raise Interrupted
+        _require_lift_ready(lift, f"{label} pre-command")
+        if interrupted.is_set():
+            raise Interrupted
+
+    # Check before beginning the driver's canonical STOP handshake, then
+    # again after that awaited wire operation and directly before SET_POS.
+    await verify_before_send()
     print(f"{label}: commanding {target / 10:.1f}% ...", flush=True)
+    await lift.set_position(target, speed, before_send=verify_before_send)
+    # A cached frame that happened to arrive during preflight/send cannot
+    # prove the firmware accepted this command. Require a later frame.
     commanded_at = time.monotonic()
-    await lift.set_position(target, speed)
     started_at = time.monotonic()
     deadline = started_at + _MOVE_TIMEOUT_S
     start_deadline = started_at + _MOVE_START_TIMEOUT_S
@@ -348,12 +387,14 @@ async def _move_lift(
 
 
 async def _open_lift(channel: str) -> Lift:
-    # Establish one request/response exchange on a quiet bus first, then turn
-    # on the firmware's validated 200 ms receive-only stream and prove it is
-    # live before any arm or lift motion starts.
+    # Configure receive-only recovery before the driver starts, and suppress
+    # even its bootstrap GET_STATUS. Every observed frame is therefore an
+    # unsolicited firmware broadcast. Discard the first transition frame,
+    # then validate the requested cadence before any arm or lift motion.
     lift = Lift(channel)
     try:
-        await lift.start()
+        await lift.set_status_period(_STATUS_PERIOD_MS, recover_stale=False)
+        await lift.start(request_status=False)
         deadline = time.monotonic() + _FIRST_STATUS_TIMEOUT_S
         while lift.status is None and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
@@ -366,43 +407,74 @@ async def _open_lift(channel: str) -> Lift:
         first_stamp = lift.last_status_monotonic
         if first_stamp is None:
             raise DiagnosticFailure("initial status did not have a receive timestamp")
-        await lift.set_status_period(_STATUS_PERIOD_MS)
-        # Require two newer frames. The first could be a GET_STATUS response
-        # already in flight from the polling task as it switches modes; the
-        # second proves the periodic receive-only stream is continuing.
-        latest_stamp = first_stamp
-        for frame_number in (1, 2):
-            deadline = time.monotonic() + _STATUS_STALE_S
-            while (
-                lift.last_status_monotonic is None
-                or lift.last_status_monotonic <= latest_stamp
-            ) and time.monotonic() < deadline:
-                await asyncio.sleep(0.02)
-            if (
-                lift.last_status_monotonic is None
-                or lift.last_status_monotonic <= latest_stamp
-            ):
-                raise DiagnosticFailure(
-                    f"{_STATUS_PERIOD_MS} ms status broadcasts did not continue "
-                    f"on {channel} (waiting for frame {frame_number}/2)"
-                )
-            latest_stamp = lift.last_status_monotonic
-            _require_fresh_status(lift, f"initial broadcast {frame_number}/2")
+        deadline = time.monotonic() + _FIRST_STATUS_TIMEOUT_S
+        steady_stamps: list[float] = []
+        while time.monotonic() < deadline:
+            steady_stamps = [
+                stamp for stamp in lift.status_timestamps if stamp > first_stamp
+            ]
+            if len(steady_stamps) >= _STATUS_CADENCE_SAMPLES:
+                break
+            await asyncio.sleep(0.02)
+        if len(steady_stamps) < _STATUS_CADENCE_SAMPLES:
+            raise DiagnosticFailure(
+                f"{_STATUS_PERIOD_MS} ms status broadcasts did not continue "
+                f"on {channel} (received {len(steady_stamps)}/"
+                f"{_STATUS_CADENCE_SAMPLES} steady-state frames)"
+            )
+        steady_stamps = steady_stamps[:_STATUS_CADENCE_SAMPLES]
+        intervals = [
+            current - previous
+            for previous, current in zip(
+                steady_stamps[:-1],
+                steady_stamps[1:],
+                strict=True,
+            )
+        ]
+        if any(
+            interval < _STATUS_CADENCE_MIN_S or interval > _STATUS_CADENCE_MAX_S
+            for interval in intervals
+        ):
+            observed = ", ".join(f"{interval * 1000:.0f}" for interval in intervals)
+            raise DiagnosticFailure(
+                f"status broadcast cadence on {channel} did not match the "
+                f"requested {_STATUS_PERIOD_MS} ms period (observed {observed} ms)"
+            )
+        _require_fresh_status(lift, "validated status broadcast cadence")
+        # Only now may the driver's SET_RATE/GET_STATUS recovery resume.
+        lift.enable_broadcast_recovery()
         print(f"Jelly Legs controller connected on {channel}.")
         return lift
     except BaseException as exc:
+        cleanup_error: BaseException | None = None
         try:
-            await lift.close()
-        except Exception:  # noqa: BLE001 - preserve the connection failure
-            pass
+            await _retry_cleanup(lift.close, label="closing lift after open failure")
+        except BaseException as close_exc:
+            cleanup_error = close_exc
+            exc.add_note(
+                "opening the lift also failed to clean up: "
+                f"{type(close_exc).__name__}: {close_exc}"
+            )
+        if isinstance(cleanup_error, (KeyboardInterrupt, asyncio.CancelledError)):
+            cleanup_error.add_note(
+                "opening the lift also failed before cleanup was interrupted: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise cleanup_error
         if isinstance(exc, DiagnosticFailure):
             raise
         if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
             raise
-        raise DiagnosticFailure(
+        failure = DiagnosticFailure(
             f"could not open {channel}: {exc}; run `axol can.setup` to "
             "configure the lift bus or pass --lift-channel"
-        ) from None
+        )
+        if cleanup_error is not None:
+            failure.add_note(
+                "lift cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise failure from None
 
 
 def _clearance_targets(
@@ -416,6 +488,83 @@ def _clearance_targets(
     if right_target is not None:
         right_target[_S1_INDEX] = -_SHOULDER_CLEARANCE_RAD
     return left_target, right_target
+
+
+def _validated_arm_pose(
+    value: np.ndarray | None,
+    *,
+    side: str,
+    context: str,
+    required: bool,
+) -> np.ndarray | None:
+    if value is None:
+        if required:
+            raise DiagnosticFailure(f"{context}: {side} arm returned no position")
+        return None
+    pose = np.asarray(value)
+    expected = (len(Joint),)
+    if pose.shape != expected:
+        raise DiagnosticFailure(
+            f"{context}: {side} arm position shape is {pose.shape}, expected {expected}"
+        )
+    if not np.issubdtype(pose.dtype, np.number) or not np.all(np.isfinite(pose)):
+        raise DiagnosticFailure(
+            f"{context}: {side} arm positions must all be finite numbers"
+        )
+    return pose.astype(np.float32, copy=True)
+
+
+async def _read_valid_arm_positions(
+    axol: Axol,
+    context: str,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    left, right = await axol.get_positions()
+    return (
+        _validated_arm_pose(
+            left,
+            side="left",
+            context=context,
+            required=axol.left is not None,
+        ),
+        _validated_arm_pose(
+            right,
+            side="right",
+            context=context,
+            required=axol.right is not None,
+        ),
+    )
+
+
+async def _verify_arms_holding(axol: Axol, context: str) -> None:
+    """Prove every selected arm joint remains enabled and holding torque."""
+    motors = [
+        (side, joint, arm.motors.get(joint))
+        for side, arm in (("left", axol.left), ("right", axol.right))
+        if arm is not None
+        for joint in ARM_JOINTS
+    ]
+    missing = [
+        f"{side} {joint.value}" for side, joint, motor in motors if motor is None
+    ]
+    if missing:
+        raise DiagnosticFailure(
+            f"{context}: arm motors are missing: {', '.join(missing)}"
+        )
+    results = await asyncio.gather(
+        *(motor.is_holding() for _, _, motor in motors if motor is not None),
+        return_exceptions=True,
+    )
+    problems: list[str] = []
+    for (side, joint, _), result in zip(motors, results, strict=True):
+        label = f"{side} {joint.value}"
+        if isinstance(result, BaseException):
+            problems.append(
+                f"{label} holding check failed ({type(result).__name__}: {result})"
+            )
+        elif not result:
+            problems.append(f"{label} is not enabled and holding")
+    if problems:
+        raise DiagnosticFailure(f"{context}: " + "; ".join(problems))
 
 
 def _rest_targets(
@@ -433,11 +582,23 @@ def _rest_targets(
 
 async def _disable_arms_verified(axol: Axol) -> None:
     """Disable every selected-arm motor and prove none still reports holding."""
+    missing = [
+        f"{side} {joint.value}"
+        for side, arm in (("left", axol.left), ("right", axol.right))
+        if arm is not None
+        for joint in ARM_JOINTS
+        if joint not in arm.motors
+    ]
+    if missing:
+        raise DiagnosticFailure(
+            "arm shutdown: selected arm motors are missing: " + ", ".join(missing)
+        )
     motors = [
         (side, joint, motor)
         for side, arm in (("left", axol.left), ("right", axol.right))
         if arm is not None
         for joint, motor in arm.motors.items()
+        if joint in ARM_JOINTS
     ]
     if not motors:
         raise DiagnosticFailure("arm shutdown: no selected arm motors are available")
@@ -460,13 +621,13 @@ async def _disable_arms_verified(axol: Axol) -> None:
         motors, disable_results, holding_results, strict=True
     ):
         label = f"{side} {joint.value}"
+        if isinstance(disable_result, BaseException):
+            problems.append(
+                f"{label} disable failed "
+                f"({type(disable_result).__name__}: {disable_result})"
+            )
         if isinstance(holding_result, BaseException):
             detail = f"{type(holding_result).__name__}: {holding_result}"
-            if isinstance(disable_result, BaseException):
-                detail += (
-                    f" (disable also raised {type(disable_result).__name__}: "
-                    f"{disable_result})"
-                )
             problems.append(f"{label} could not be verified ({detail})")
         elif holding_result:
             problems.append(f"{label} still reports enabled and holding")
@@ -484,6 +645,30 @@ async def _ramp_arms(
     interrupted: asyncio.Event,
     safety_check: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
+    start_left = _validated_arm_pose(
+        start_left,
+        side="left",
+        context="arm ramp start",
+        required=target_left is not None,
+    )
+    start_right = _validated_arm_pose(
+        start_right,
+        side="right",
+        context="arm ramp start",
+        required=target_right is not None,
+    )
+    target_left = _validated_arm_pose(
+        target_left,
+        side="left",
+        context="arm ramp target",
+        required=start_left is not None,
+    )
+    target_right = _validated_arm_pose(
+        target_right,
+        side="right",
+        context="arm ramp target",
+        required=start_right is not None,
+    )
     deltas = []
     if start_left is not None and target_left is not None:
         deltas.append(abs(float(target_left[_S1_INDEX] - start_left[_S1_INDEX])))
@@ -504,6 +689,8 @@ async def _ramp_arms(
         now = time.monotonic()
         if safety_check is not None and now >= next_safety_check:
             await safety_check()
+            if interrupted.is_set():
+                raise Interrupted
             next_safety_check = time.monotonic() + _ARM_SAFETY_CHECK_PERIOD_S
         progress = min((time.monotonic() - started_at) / duration, 1.0)
         smooth = progress * progress * (3.0 - 2.0 * progress)
@@ -529,7 +716,7 @@ async def _verify_arm_targets(
     target_right: np.ndarray | None,
     context: str,
 ) -> None:
-    measured_left, measured_right = await axol.get_positions()
+    measured_left, measured_right = await _read_valid_arm_positions(axol, context)
     for side, measured, target in (
         ("left", measured_left, target_left),
         ("right", measured_right, target_right),
@@ -552,6 +739,92 @@ async def _verify_arm_targets(
                 )
 
 
+async def _stop_lift_verified(
+    lift: Lift,
+    *,
+    context: str,
+    require_upper: bool,
+    attempts: int = 2,
+) -> LiftStatus:
+    """Retry canonical STOP and require a fresh, healthy idle reply."""
+    failures: list[BaseException] = []
+    cancelled: asyncio.CancelledError | None = None
+    for _attempt in range(attempts):
+        try:
+            await lift.stop_motion()
+            sent_at = time.monotonic()
+            status = await _wait_for_status_after(
+                lift,
+                sent_at,
+                asyncio.Event(),
+                context,
+            )
+            if not _is_idle(status):
+                raise DiagnosticFailure(
+                    f"{context}: lift still reports active motion: "
+                    f"{_status_line(status)}"
+                )
+            if require_upper and not _at_endpoint(status, _UPPER):
+                raise DiagnosticFailure(
+                    f"{context}: upper endpoint was not preserved: "
+                    f"{_status_line(status)}"
+                )
+        except asyncio.CancelledError as exc:
+            cancelled = cancelled or exc
+            failures.append(exc)
+        except BaseException as exc:
+            failures.append(exc)
+        else:
+            if cancelled is not None:
+                raise cancelled
+            return status
+    if cancelled is not None:
+        for failure in failures:
+            if failure is not cancelled:
+                cancelled.add_note(
+                    "additional STOP verification failure: "
+                    f"{type(failure).__name__}: {failure}"
+                )
+        raise cancelled
+    detail = "; ".join(f"{type(exc).__name__}: {exc}" for exc in failures)
+    raise DiagnosticFailure(
+        f"{context}: STOP could not be sent and verified after {attempts} "
+        f"attempt(s): {detail}"
+    )
+
+
+async def _retry_cleanup(
+    operation: Callable[[], Awaitable[None]],
+    *,
+    label: str,
+    attempts: int = 2,
+) -> None:
+    """Retry a teardown operation and surface all failed attempts."""
+    failures: list[BaseException] = []
+    cancelled: asyncio.CancelledError | None = None
+    for _attempt in range(attempts):
+        try:
+            await operation()
+        except asyncio.CancelledError as exc:
+            cancelled = cancelled or exc
+            failures.append(exc)
+        except BaseException as exc:
+            failures.append(exc)
+        else:
+            if cancelled is not None:
+                raise cancelled
+            return
+    if cancelled is not None:
+        for failure in failures:
+            if failure is not cancelled:
+                cancelled.add_note(
+                    f"additional {label} failure: {type(failure).__name__}: {failure}"
+                )
+        raise cancelled
+    detail = "; ".join(f"{type(exc).__name__}: {exc}" for exc in failures)
+    raise DiagnosticFailure(f"{label} failed after {attempts} attempt(s): {detail}")
+
+
 async def _run(args: argparse.Namespace) -> None:
     if args.no_left and args.no_right:
         raise SystemExit("ERROR: cannot skip both arms on a mounted-robot lift test.")
@@ -564,6 +837,8 @@ async def _run(args: argparse.Namespace) -> None:
     arms_at_clearance = False
     completed = False
     upper_verified = False
+    primary_error: BaseException | None = None
+    primary_traceback = None
 
     print("=== MOUNTED LIFT CYCLE TEST ===")
     print(
@@ -592,7 +867,10 @@ async def _run(args: argparse.Namespace) -> None:
             config = AxolConfig(
                 left_stiffness=1.0,
                 right_stiffness=1.0,
-                has_gripper=args.has_gripper,
+                # This diagnostic only needs the seven load-bearing arm
+                # joints. Never enable, calibrate, command, or disable a
+                # gripper while exercising the independent lift mechanism.
+                has_gripper=False,
             )
             axol = Axol(
                 config=config,
@@ -604,10 +882,16 @@ async def _run(args: argparse.Namespace) -> None:
             # cleanup must treat the arm state as live from this point onward.
             arms_enabled = True
             await axol.enable()
-            start_left, start_right = await axol.get_positions()
+            await _verify_arms_holding(axol, "arm enable check")
+            start_left, start_right = await _read_valid_arm_positions(
+                axol, "initial arm pose"
+            )
             clearance_left, clearance_right = _clearance_targets(
                 start_left, start_right
             )
+
+            async def ensure_lift_ready_for_clearance() -> None:
+                _require_lift_ready(lift, "arm clearance lift monitor")
 
             print("Ramping S1 to the mirrored 90 degree clearance pose ...")
             await _ramp_arms(
@@ -617,16 +901,19 @@ async def _run(args: argparse.Namespace) -> None:
                 clearance_left,
                 clearance_right,
                 interrupted,
+                safety_check=ensure_lift_ready_for_clearance,
             )
             await _verify_arm_targets(
                 axol, clearance_left, clearance_right, "clearance check"
             )
+            await _verify_arms_holding(axol, "clearance holding check")
             arms_at_clearance = True
             print("Arm clearance pose verified.")
 
             async def ensure_arm_clearance() -> None:
                 nonlocal arms_at_clearance
                 try:
+                    await _verify_arms_holding(axol, "arm clearance monitor")
                     await _verify_arm_targets(
                         axol,
                         clearance_left,
@@ -728,20 +1015,29 @@ async def _run(args: argparse.Namespace) -> None:
                         "S1 return monitor: lift left its stopped upper endpoint: "
                         f"{_status_line(status)}"
                     )
+                await _verify_arms_holding(axol, "S1 return holding monitor")
                 upper_verified = True
 
-            rest_left, rest_right = _rest_targets(start_left, start_right)
+            return_left, return_right = await _read_valid_arm_positions(
+                axol, "S1 return start"
+            )
+            await _verify_arms_holding(axol, "S1 return holding check")
+            await _verify_arm_targets(
+                axol, clearance_left, clearance_right, "S1 return clearance check"
+            )
+            rest_left, rest_right = _rest_targets(return_left, return_right)
             print("Lift is up and stopped; ramping S1 back to 0 degree rest ...")
             arms_at_clearance = False
             await _ramp_arms(
                 axol,
-                clearance_left,
-                clearance_right,
+                return_left,
+                return_right,
                 rest_left,
                 rest_right,
                 interrupted,
                 safety_check=ensure_lift_upper_stopped,
             )
+            await _verify_arms_holding(axol, "rest holding check")
             await _verify_arm_targets(axol, rest_left, rest_right, "rest check")
             post_rest_stamp = lift.last_status_monotonic or time.monotonic()
             await _wait_for_status_after(
@@ -756,51 +1052,40 @@ async def _run(args: argparse.Namespace) -> None:
             await _disable_arms_verified(axol)
             arms_disabled = True
             completed = True
-            print(f"\nPASS — {cycles} complete down/up cycle(s).")
-    finally:
+    except BaseException as exc:
+        primary_error = exc
+        primary_traceback = exc.__traceback__
+
+    cleanup_errors: list[BaseException] = []
+    try:
         # A verified STOP precedes the success-path disable above. This final
         # STOP precedes failure-path arm cleanup; a failed/low lift must never
         # cause the process to torque off arms out of their clearance.
         if lift is not None:
             try:
-                await lift.stop_motion()
-            except Exception as exc:  # noqa: BLE001 - report best-effort safety stop
-                print(
-                    f"WARNING: could not send final lift STOP: {exc}", file=sys.stderr
+                await _stop_lift_verified(
+                    lift,
+                    context="final cleanup stop",
+                    require_upper=completed,
                 )
-            else:
-                # CanBus deliberately drops sends while an interface is lost
-                # or stalled. Demand a post-STOP idle status when possible so
-                # teardown distinguishes delivery from a silent drop, without
-                # letting failed confirmation prevent the arms from holding.
-                stop_stamp = lift.last_status_monotonic or time.monotonic()
-                try:
-                    stopped_status = await _wait_for_status_after(
-                        lift,
-                        stop_stamp,
-                        asyncio.Event(),
-                        "cleanup stop",
-                    )
-                    if not _is_idle(stopped_status):
-                        raise DiagnosticFailure(
-                            "cleanup stop: lift still reports active motion: "
-                            f"{_status_line(stopped_status)}"
-                        )
-                except Exception as exc:  # noqa: BLE001 - best-effort confirmation
-                    print(
-                        f"WARNING: could not confirm final lift STOP: {exc}",
-                        file=sys.stderr,
-                    )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                print(f"WARNING: {exc}", file=sys.stderr)
         if axol is not None:
             try:
-                await axol.disconnect()
-            except Exception as exc:  # noqa: BLE001 - preserve original failure
-                print(f"WARNING: could not close arm CAN buses: {exc}", file=sys.stderr)
+                await _retry_cleanup(
+                    axol.disconnect,
+                    label="closing arm CAN buses",
+                )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                print(f"WARNING: {exc}", file=sys.stderr)
         if lift is not None:
             try:
-                await lift.close()
-            except Exception as exc:  # noqa: BLE001 - preserve original failure
-                print(f"WARNING: could not close the lift bus: {exc}", file=sys.stderr)
+                await _retry_cleanup(lift.close, label="closing lift CAN bus")
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                print(f"WARNING: {exc}", file=sys.stderr)
 
         if arms_enabled and not completed and not arms_disabled:
             pose = "90 degree clearance" if arms_at_clearance else "last commanded"
@@ -814,8 +1099,40 @@ async def _run(args: argparse.Namespace) -> None:
                 f"{reason}.",
                 file=sys.stderr,
             )
-        elif completed:
-            print("Lift is up; arm motors are disabled after verified S1 rest.")
+    except BaseException as exc:
+        # Teardown itself must not be interrupted before every independent
+        # resource has had its cleanup attempt above.
+        cleanup_errors.append(exc)
+
+    if cleanup_errors:
+        details = "; ".join(str(exc) for exc in cleanup_errors)
+        cleanup_cancelled = next(
+            (exc for exc in cleanup_errors if isinstance(exc, asyncio.CancelledError)),
+            None,
+        )
+        if cleanup_cancelled is not None and not isinstance(
+            primary_error, asyncio.CancelledError
+        ):
+            if primary_error is not None:
+                cleanup_cancelled.add_note(
+                    "diagnostic also failed before cancellation: "
+                    f"{type(primary_error).__name__}: {primary_error}"
+                )
+            primary_error = cleanup_cancelled
+            primary_traceback = cleanup_cancelled.__traceback__
+        elif primary_error is not None:
+            primary_error.add_note(f"additional cleanup failure(s): {details}")
+        else:
+            primary_error = cleanup_cancelled or DiagnosticFailure(
+                f"diagnostic work completed but cleanup was not verified: {details}"
+            )
+            primary_traceback = primary_error.__traceback__
+
+    if primary_error is not None:
+        raise primary_error.with_traceback(primary_traceback)
+
+    print(f"\nPASS — {cycles} complete down/up cycle(s).")
+    print("Lift is up; arm motors are disabled after verified S1 rest.")
 
 
 def _add_arguments(
@@ -844,15 +1161,6 @@ def _add_arguments(
     )
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
-    parser.add_argument(
-        "--no-gripper",
-        action="store_false",
-        dest="has_gripper",
-        help=(
-            "Run on the gripperless SKU; no gripper motor is enabled, calibrated, "
-            "or disabled."
-        ),
-    )
     parser.add_argument(
         "--left-channel",
         default=CAN_LEFT,

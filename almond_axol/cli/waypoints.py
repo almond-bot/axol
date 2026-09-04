@@ -42,7 +42,6 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -52,6 +51,7 @@ from ..kinematics.config import KinematicsConfig
 from ..robot.base import RobotBase
 from ..robot.config import AxolConfig
 from ..teleop.config import VRTeleopConfig
+from ..utils.paths import almond_path
 from ..waypoints import Waypoint, WaypointSet
 from .config import LogLevel, normalize_bool_flags, parse
 from .gravity_comp import _resolve_free_joints
@@ -73,7 +73,7 @@ Leg = tuple[list[np.ndarray], Grip, Grip]
 
 
 def _default_file() -> str:
-    return str(Path.home() / ".almond" / "waypoints.json")
+    return str(almond_path("waypoints.json"))
 
 
 @dataclass

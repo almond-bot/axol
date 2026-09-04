@@ -10,6 +10,7 @@ auto-discovery — no changes to LeRobot itself.
 | Kind | `type` | Class |
 |---|---|---|
 | Robot | `axol` | `almond_axol.lerobot.robot.AxolRobot` |
+| Robot | `axol_mantis` | `almond_axol.lerobot.robot.MantisRobot` |
 | Teleoperator | `axol_vr` | `almond_axol.lerobot.teleop.AxolVRTeleop` |
 | Camera | `zed` | `almond_axol.lerobot.camera.ZedCamera` |
 
@@ -20,8 +21,10 @@ this package is a thin shim that registers them with LeRobot at CLI startup.
 
 - The robot machine (typically the ZED Box / NVIDIA Jetson wired to the Axol) with
   CAN set up — see the [installation guide](https://docs.almond.bot/installation).
-- Python 3.13, Linux.
-- LeRobot >= 0.6.1.
+- Python 3.12+ (the hosted Axol installer bundles 3.13), Linux.
+- LeRobot 0.6.1 (pinned by `almond-axol[lerobot]`).
+- Almond Axol SDK 0.1.x (the plugin imports SDK module paths and intentionally
+  stays below the next pre-1.0 API line).
 - For the `zed` camera: the ZED SDK and pyzed (`axol zed.install`).
 
 ## Install
@@ -39,11 +42,27 @@ pip install "lerobot_robot_axol @ git+https://github.com/almond-bot/axol#subdire
 
 If you already installed the `axol` CLI via the
 [one-line installer](https://docs.almond.bot/installation), add the plugin to
-that environment instead:
+that shared environment in place, then put its LeRobot entry points on your
+interactive `PATH`:
 
 ```bash
-uv tool install --with lerobot_robot_axol almond-axol
+sudo /usr/local/bin/uv pip install \
+    --python /opt/axol/uv/tools/almond-axol/bin/python \
+    --no-deps \
+    "lerobot_robot_axol==0.1.1"
+export PATH="/opt/axol/uv/tools/almond-axol/bin:$PATH"
 ```
+
+Use the in-place command above rather than rebuilding the Axol tool with
+`uv tool install --with`: a tool rebuild exactly reconciles dependencies and
+would prune separately managed packages such as the VIVE Ultimate runtime or a
+JetPack-compatible CUDA Torch build. The hosted environment already contains
+the compatible Axol SDK/LeRobot dependencies, so `--no-deps` also prevents a
+plugin install from changing that running environment. Later hosted-installer
+or control-panel Axol updates detect a published plugin installed this way and
+preserve its exact version in the same transaction. A direct/VCS/custom plugin
+source blocks those force updates before mutation because its source cannot be
+reconstructed safely; update that deployment manually with the same source.
 
 ## Usage
 

@@ -1,0 +1,39 @@
+---
+title: "diag.mantis-trigger"
+description: "Test the Mantis triggers and grippers without cameras or tracking."
+---
+
+Runs a direct trigger-to-gripper hardware check. It needs only the powered
+Mantis rigs and their two CAN interfaces: no cameras, Quest, Lighthouse or
+Ultimate trackers, tracker binding, VR server, or tracker-to-TCP transform is
+involved.
+
+```bash
+axol diag.mantis-trigger
+```
+
+The command uses the left/right CAN mapping saved under **Settings → Mantis**.
+For a one-off override:
+
+```bash
+axol diag.mantis-trigger \
+  --left-channel can_mantis_l \
+  --right-channel can_mantis_r
+```
+
+Keep hands and objects clear before confirming the prompt. On first enable,
+each gripper moves fully open to find its hard stop. Both trigger streams must
+be fresh and both triggers released before torque is enabled; squeezing a
+trigger then closes its matching gripper proportionally. Press **Ctrl-C** to
+stop and disable both grippers. A lost trigger stream also immediately stops
+the test and disables both rather than holding a stale command.
+
+Use `--duration SECONDS` for a timed run. `--yes` skips the safety prompt and
+should only be used after the jaws have been cleared.
+
+This verifies CAN side mapping and trigger/gripper actuation only. A real
+Mantis teleop or collection run still needs its selected Quest, Lighthouse, or
+Ultimate setup and a production tracker-to-TCP transform.
+
+The same test appears in the Diagnostics dashboard when the connected hardware
+profile is **Mantis**. Its Continue action supplies the clear-jaws confirmation.

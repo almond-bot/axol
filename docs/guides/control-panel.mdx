@@ -37,7 +37,7 @@ Open the **Local** URL on the host, or the **LAN** URL from another machine on t
 
 ## Connections
 
-The top of the panel is a pair of tiles — **Axol Host** and **Axol** — each with a colored status dot. (Cameras and the Quest USB link are configured in the [Settings](#settings) tabs right below.)
+The top of the panel has three tiles — **Axol Host**, **Axol**, and **Mantis** — each with a colored status dot. Axol and Mantis share the host's idle telemetry connection: connecting one switches the live CAN health view to that hardware. The Mantis tile checks the two grippers on `can_mantis_l/r`; switching back to Axol restores the arm-motor view. (Cameras and the Quest USB link are configured in the [Settings](#settings) tabs right below.)
 
 ### Axol Host
 
@@ -53,23 +53,31 @@ Restart and shut down are **refused while any operation or session is running** 
 
 #### Updates
 
-When a newer [release](https://github.com/almond-bot/axol/releases) than the installed one exists, a banner appears above the tiles showing the version jump (e.g. `v0.1.2 → v0.1.3`) with a link to the release notes. Press **Update** to apply it: the host reinstalls at the new release, re-provisions its system dependencies, and restarts once idle — the button is disabled while an operation is running, since applying an update restarts the server. Nothing updates without that button press.
+When a newer [release](https://github.com/almond-bot/axol/releases) than the installed one exists, a banner appears above the tiles showing the version jump (e.g. `v0.1.2 → v0.1.3`) with a link to the release notes. Press **Update** to apply it: the host reinstalls at the new release, re-provisions its system dependencies, and restarts once idle — the button is disabled while an operation is running, since applying an update restarts the server. Nothing updates without that button press. A server on v0.1.36 or earlier instead shows **Installer required** and the one-time migration command; run that command on the robot because the legacy updater cannot safely preserve the new hosted environment.
 
 The same banner area also warns when the **control panel UI and the host backend are running different code** — the web bundle bakes in the git commit and release version it was built from, the host reports its own via `/api/info`, and a mismatch raises the warning (a released host is compared by version, a dev checkout by commit). This catches a stale hosted tab, or an unbuilt local `web/app/dist`, silently driving a newer or older backend; clear it by updating the host to the matching release or rebuilding the local UI.
 
-### Axol
+### Axol and Mantis
 
-The panel connects the robot **automatically** once the host comes online (one attempt per host session, so a manual disconnect isn't immediately undone); the **Connect** button is the manual fallback / reconnect. Bringing up the robot:
+The panel inventories the host's CAN interfaces when it comes online and while the link is idle. A new dual-channel hub may initially appear only as anonymous `can0`/`can1` interfaces; before connecting, the root server runs the same driver/setup identification path as `axol can.setup`, safely probes the attached shoulder motor and Mantis trigger, saves the proven role, and assigns the persistent interface names. The probe is bounded and shared across browser tabs, so an unpowered or ambiguous hub is never guessed or repeatedly reset. In that case, power the attached hardware and press **Retry CAN identification**; use interactive `axol can.setup` in a terminal only when the role still cannot be proven automatically. Unrelated arbitrary SocketCAN interfaces are never classified as Axol or Mantis automatically.
 
-- Enables the CAN interfaces — running [`can.setup`](/cli/can-setup) automatically the first time when the Axol Hub adapter is used and the host hasn't been configured yet. A non-hub SocketCAN adapter (chosen per arm in the **Robot** settings tab, or via the diagnostics dashboard's [CAN adapter picker](/guides/diagnostics-dashboard#choosing-can-adapters)) is brought up directly instead.
-- Pings all 16 motors once per second while idle, so the tile reflects live motor health as two rows of squares (grouped **L** / **R**): the top row is **CAN reachability**, the bottom row the motor's **error status**. Hover any square for the details (status, temperature).
+After discovery, if only Axol or only Mantis is present, the panel connects that hardware automatically; if both are present, the profile required by the selected operation wins. A present-but-down interface still qualifies because Connect brings it up. On a previously configured host, the exact USB serial saved in that profile's udev rules also qualifies before `gs_usb` has loaded or created the named interfaces; connecting then restores the driver and names. A hub that enumerates shortly after page load is picked up by the inventory poll. A failed automatic connection is retried twice with backoff; after that, the tile's **Connect** button is the manual fallback.
 
-**Motor faults block everything.** The *N/16 motors* count only includes motors that are both reachable **and** error-free. While any motor is unreachable or reporting an error (over-temperature, over-current, stall, encoder error, …), every hardware operation's **Start** is blocked — both in the panel (a per-fault entry under *Before you can start*) and by the server itself — since driving through a faulted motor risks the arm. Sim teleop stays available.
+A successful manual **Disconnect** pauses automatic reconnect for that exact hardware profile and saved CAN map across every open or newly opened panel. An explicit **Connect**, selecting an operation that targets a different detected profile, changing the saved map, or restarting `axol serve` starts a new automatic-connect intent. A successful manual **Connect** wins within the panel where it was clicked until that panel's selected operation changes; another control panel can still make a later selection. This is intentionally last-writer-wins between operators, not a browser lease.
+
+- Enables the CAN interfaces — running [`can.setup`](/cli/can-setup) automatically the first time when an Axol Hub adapter is used and the host has not been configured. Axol channel overrides live under **Robot**; Mantis channel mapping lives under **Mantis**. A non-hub SocketCAN adapter is brought up directly.
+- Pings the active profile once per second while idle: all 16 Axol motors, or the two Mantis grippers. Each square combines CAN reachability and motor error status; hover it for details and temperature.
+
+**Motor faults block the active hardware profile.** The count includes only motors that are both reachable and error-free. While a required Axol motor or Mantis gripper is unreachable or faulted, that profile's hardware operation is blocked by both the panel and server. Sim teleop stays available.
 
 The server runs as root under the one-command install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
 
+For **Mantis** teleop or collection, choose **Quest**, **Lighthouse**, or **Ultimate** under **Settings → Mantis** (default: Lighthouse). The per-run **Mantis** toggle remains in the operation card. Each source then walks through a [step-by-step setup flow](#mantis-tracker-setup) in the same tab: Quest waits for WebXR and uses controller handedness; Lighthouse and Ultimate install their runtime, verify trackers/base stations or the dongle, and run guided **Identify trackers**. Ultimate also has a protected private shared-map AP step and an optional **Run readiness check**. Once a device or Quest profile is known, the same tab edits the measured left/right tracker→TCP transforms under those exact active keys. The panel launches and owns the selected hardware tracker bridge and its two trigger readers.
+
+Managed Lighthouse/Ultimate does **not** move as soon as the trackers appear. Startup waits for both fresh poses and both live trigger broadcasts. Hold both rigs where the take should begin, squeeze both triggers together, then release both: that gesture fits the base transform at the rigs' pose and engages (and, in collection, starts the take). A Reset returns to rest and requires that gesture again. If either tracker or trigger heartbeat drops, both sides freeze; after recovery, repeat the both-squeeze→release gesture. Nothing re-anchors or resumes motion automatically. Teleop enables the physical grippers immediately; collection keeps them motor-disabled between takes and force-disables them after every save, rejection, stop, or error. Mantis is not available for Collect DAgger or Run Policy. A missing binding, incomplete trigger/channel mapping, or backend failure remains a visible blocker instead of leaving an apparently running session with no input.
+
 <Warning>
-  Closing the browser tab — or disconnecting the **host** — does **not** stop anything: the robot link and any running operation live in the `serve` process and keep running. Use **Stop**, **Robot Disconnect**, or stop `axol serve` to tear them down.
+  Closing the browser tab — or disconnecting the **host** — does **not** stop anything: the robot link and any running operation live in the `serve` process and keep running. Use **Stop** to end an active operation; **Robot Disconnect** is available only once all operations and diagnostics have released the hardware. Stopping `axol serve` tears the service down.
 </Warning>
 
 ## Settings
@@ -78,59 +86,86 @@ Almost nothing you configure is actually per-run — camera assignment, arm stif
 
 | Tab | What's in it |
 |---|---|
-| **Cameras** | The camera setup described [below](#cameras). |
+| **Axol Cameras** | Detected-camera previews and the separately stored Axol layout: overhead / left arm / right arm. See [Cameras](#cameras). |
+| **Mantis** | Quest/Lighthouse/Ultimate step-by-step setup flow (each step gated on host-reported readiness), logical left/right CAN mapping, and Left Mantis / Right Mantis cameras. Ultimate's protected private shared-map AP configuration can be saved without exposing the stored password. A live Quest run reports each controller's WebXR profile/space and a copyable common calibration key; use it as **Quest calibration key** so teleop and collection use the same selected datum. The measured-transform editor writes each side under its current bound device/profile key in `~/.almond/mantis/tcp_transform.json`. |
 | **Quest USB** | The optional [Quest-over-USB](#quest-usb) controller-pose link. |
 | **Robot** | Left/right arm stiffness sliders, CAN channels, gripper torque limit and max speed (both grippers), gravity-comp damping and rate, the **contact-stop** thresholds (the always-on reset guard plus the opt-in teleop and policy watchdogs — each a switch that arms it at a suggested value), and the **Powered cart** toggle (drives the [powered cart](/guides/vr-interface#powered-cart) from the headset thumbsticks in teleop and data collection). |
 | **Teleop & VR** | Teleop control rate, position and rotation multipliers, and the **hold-to-engage** grip scheme. |
 | **Rest pose** | An **interactive 3D pose editor**: the robot model (loaded from the host's URDF) rendered live, with a slider per joint for each arm. The pose you set here is where the arms start from — and return to — in teleop and data collection. |
 | **Kinematics** | The IK solver's main cost weights (position / orientation / elbow / rest) and the per-step joint delta cap. |
-| **Recording** | Dataset fps, video codec, dataset root, push-to-hub, Rerun viewer address. Setting the recording fps above the cameras' default 60 automatically raises the recording cameras' capture rate to match (the ZED X only supports rates above 60 at SVGA). |
+| **Recording** | Dataset fps, video codec, push-to-hub, Rerun viewer address, and the non-root CLI dataset-root preference. Installed panel runs always use the sealed `/var/lib/almond-axol/datasets` store; external/custom roots are CLI-only. Setting the recording fps above the cameras' default 60 automatically raises the recording cameras' capture rate to match (the ZED X only supports rates above 60 at SVGA). |
 | **Inference** | Device, remote inference server host/port, episode length, chunking and aggregation. |
 | **System** | Log level. |
 | **Advanced** | Every remaining config field, organized by subsystem (*Axol*, *Teleop*, *Kinematics*, *Cart*, *VR server*, *LeRobot robot*) with a search box across all of it. There is **one value per knob, applied to every operation** — the host translates it to each operation's config path, so there are never different per-task copies of the same setting. Runs of identical sub-configs — the per-joint gains — render as **one table per arm** (a row per joint, a column per parameter), and vector values like a link's CoM are entered as separate **x / y / z** fields, never raw arrays. Nothing is hidden behind collapsed groups. |
 
 Values are stored **on the Axol host** (`~/.almond/settings.json`) — not in your browser — so they're shared by every operation and every operator device, and they're folded into each operation start automatically (a per-run field always wins over a shared one). Edits stage locally until you press **Save** (or **Discard**). Unset fields show the config's own default as a placeholder; edited ones get a reset button. **Export** / **Import** in the card footer move the whole settings file as JSON for backup or copying between robots.
 
+### Mantis tracker setup
+
+Everything that can safely run on the Linux/Jetson host is available under **Settings → Mantis** as a step-by-step flow. Select the source, then work through one step at a time: each step resolves from what the host actually reports (not from ticking a box), **Continue** only unlocks once it is resolved, and a step that regresses later pulls the flow back to it. Every fix is an action inside the step, so the terminal is not needed; the flow stays on the step whose action is running until it finishes.
+
+| Step | Lighthouse / Tracker 3.0 | VIVE Ultimate | Quest / WebXR |
+|---|---|---|---|
+| **Source** | **Save settings** in place so runs and setup actions use the selected source. | Same. | Same. |
+| **Runtime** | **Install Lighthouse support** until the pinned libsurvive build and Vive USB rule are present (an existing pinned build is re-attested, not rebuilt). | **Install / Repair Ultimate support** until the pinned pyvut runtime, HID libraries, and USB rule are present. | — |
+| **Trackers** / **Dongle** / **Headset** | Power the base stations (each Base Station 2.0 on its own channel), **Pair tracker** for each Watchman dongle, then **Check base stations**. The step resolves only when the survey sees no shared channel, both base stations, and both trackers reporting; otherwise it names the channel to change and how. | Pair and map in VIVE Hub on Windows, then connect the dongle here. Resolves when the dongle is detected, its HID endpoint is accessible, and the operator has USB access. The one host-side step — adding the Axol login to `dialout` — is shown with its command because it needs a re-login. | Connect the headset during a Mantis run, **Use this key** for the reported controller datum, and **Save settings**. Resolves when the saved key is a grip-space datum matching the live controllers. |
+| **Wi-Fi** | — | Save the trackers' private shared-map AP (SSID, password, two-letter country, center frequency — not the Windows PC, robot LAN, or router credentials). Upstream pyvut requires all four; with the USB-dongle transport the tracker firmware supplies the active SLAM-host SSID/password/frequency and the saved country is consumed directly. The password is masked, never read back, and stored as `~/.almond/tracker/ultimate_wifi.json` with mode `0600`. | — |
+| **Identify sides** | **Identify trackers**: move only the requested Mantis during each capture. Refuses to bind while base stations share a channel. | Same, once the dongle, Wi-Fi, and runtime steps are resolved. | — (WebXR handedness) |
+| **Gripper offset** | Resolved automatically by the built-in factory transform for the flat-back mount; the editor only appears when a saved override is blocking or replacing it. | Same (the factory value includes the 11 mm origin adjustment). | Enter the bench-measured transform for both controllers under the exact `quest:<profile>:grip` key. |
+| **Test** | Short Mantis teleop acceptance run and the Diagnostics trigger/gripper test. | Same, plus an optional **Run readiness check** (non-invasive; does not open the dongle or prove live poses). | Same. |
+
+The equivalent terminal commands, manual JSON fallback, transform schema, and acceptance checks are in the [Mantis tracker CLI guide](/cli/tracker).
+
 ### Cameras
 
-Data collection and policy inference also need the ZED cameras attached to the host — they're assigned in the **Cameras** settings tab.
+Data collection and policy inference also need ZED cameras attached to the host. Axol cameras are assigned under **Axol Cameras**; the two Mantis slots live inside **Mantis**.
 
-The Cameras tab **detects the cameras** plugged into the host and shows one card per camera: its serial, its type (**stereo** ZED X / **mono** ZED-X One — detected automatically, never flagged manually), the model, and a **live preview frame**, so you can tell at a glance which physical camera each serial belongs to. Assign each one to its slot (overhead / left arm / right arm) — an assigned slot repeats the camera's preview thumbnail next to its name. Press **Refresh** to re-query the daemon's device list and grab fresh preview frames, or **Restart daemon** to restart the ZED X daemon so it re-scans the GMSL links — needed to pick up a camera plugged in or unplugged since boot. (Previews are unavailable while an operation is running, since it owns the cameras.)
+Both camera panels **detect the cameras** plugged into the host and show each serial, automatically detected type (**stereo** ZED X / **mono** ZED-X One), model, and a **live preview frame**, so you can identify the physical view before assigning it. **Axol Cameras** offers overhead / left arm / right arm. **Mantis** offers only Left Mantis / Right Mantis and stores that mapping separately, so changing it never overwrites Axol. Press **Refresh** to re-query the device list and grab previews, or **Restart daemon** after plugging/unplugging a GMSL camera so the daemon re-scans. Previews are unavailable while an operation owns the cameras.
 
-The Cameras tab is the single source of truth for all camera settings — these fields appear nowhere else. It controls two independent branches:
+These two hardware-layout panels are the single source of truth for camera settings. Each controls two independent branches:
 
 - **Stream** — what is relayed to the VR headset over WebRTC (used by teleop and collect-data). Run policy relays no video, so it ignores this branch entirely; collect DAgger does relay a headset view for the operator, but at the **Record** resolution below, so it too ignores this branch.
 - **Record** — what is written to the dataset during data collection (downscaled on the GPU's VIC, independently of the stream). Because **run policy** and **collect DAgger** feed the policy from what's recorded rather than from a headset stream, they capture their policy observations at this resolution — the size the dataset was recorded at and the policy was trained on — rather than grabbing a larger headset frame they'd only throw away.
 
 Each branch has its own **resolution** dropdown (`SVGA` / `HD1080` / `HD1200`, or **Off** to disable that branch globally) — so the headset can see a high-resolution feed while the dataset stores a lighter `SVGA` one, or vice versa. Each assigned camera then has independent **Stream** and **Record** controls: a single on/off for a mono camera, or per-eye **L** / **R** checkboxes for a stereo one (none checked = off for that branch). So you can stream a camera without recording it (or the reverse), choose which mono cameras feed the headset vs. the dataset, stream both eyes of a stereo camera for depth while recording only one, or turn either branch off entirely.
 
+An operation that records a dataset requires at least one assigned camera participating in **Record**; an assigned stream-only camera does not satisfy Start. Conversely, a camera disabled in both branches is omitted and does not create a false “not detected” blocker.
+
 A stereo **overhead** captures both eyes from one grab; with both eyes selected it's rendered per-lens in the headset (streamed as one side-by-side feed) and recorded as the two observation keys `overhead_left` / `overhead_right`. A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
 
-The assignments and stream/record selection persist **on the host** with the rest of the [shared settings](#settings), so every operation and every operator device sees the same camera setup. Teleop streams whichever cameras have streaming enabled; **collect data, run policy, and collect DAgger need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting any of those three also re-verifies that every assigned camera is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the Cameras tab. Teleop streams whatever is configured and is never blocked by this check.
+The assignments and stream/record selection persist **on the host** with the rest of the [shared settings](#settings), so every operation and every operator device sees the same camera setup. A Mantis run automatically passes only its left/right Mantis mapping to data collection; an Axol run uses the Axol mapping. Teleop streams whichever cameras have streaming enabled; **collect data, run policy, and collect DAgger need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting any of those three also re-verifies that every participating camera assigned to the active hardware profile is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the matching Axol Cameras/Mantis panel. Teleop streams whatever is configured and is never blocked by this check.
 
 ### Quest USB
 
-The **Quest USB** tab manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable instead of Wi-Fi for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the host sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only. The headset sends every pose over both the cable and Wi-Fi, so a dropped cable **fails over to Wi-Fi instantly** with no reconnect, and the cable reclaims the link when it returns.
+The **Quest USB** tab manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the host sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only. Every frame is mirrored over cable and Wi-Fi with one producer id/sequence; the first copy wins and the duplicate is discarded. A dropped cable therefore fails over immediately with no reconnect, and a restored low-latency cable naturally wins again.
 
 The tab also carries the [headless](/guides/quest-headless) **Keep awake** / **Restore** buttons: with the headset plugged in and authorized, **Keep awake** disables its proximity sensor over adb so the VR session keeps running with the headset set down, and **Restore** brings normal sleep behavior back (a headset reboot also resets it).
 
 ## Operations
 
+<Note>
+  Panel recordings use the root-owned hosted store at
+  `/var/lib/almond-axol/datasets`. The operator group can read but not modify
+  it, preventing local symlink races in LeRobot's pathname-based writers.
+  Explicit dataset paths outside that boundary fail closed. Non-root CLI
+  recordings continue to use the user's normal HuggingFace cache.
+</Note>
+
 Pick an operation from the selector. Each panel asks only for its **per-run inputs** — the dataset repo id and task for collect data, the policy path/type for run policy, the episode to replay — plus **Start**/**Stop**. Everything reusable lives in [Settings](#settings). Hover the **ⓘ** next to a field for its description, pulled from the CLI's own help.
 
 | Operation | Needs | Notes |
 |---|---|---|
-| **Teleoperation** | Axol, sim, or cart-only | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If the robot has the [powered cart](/guides/vr-interface#powered-cart), the **Powered cart** setting (Robot tab) also lets the thumbsticks drive it; tick **Cart only** to drive *just* the cart with the arms untouched — no Axol connection or motor check needed. If camera slots are assigned, the feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views) — and mirrored in the panel's [operator view](#operator-view). |
+| **Teleoperation** | Axol, Mantis, sim, or cart-only | Drive Axol from Quest, or validate a Mantis rig from Quest/Lighthouse/Ultimate. Toggle **sim** for the browser visualizer. Mantis enables its two grippers and renders virtual arms; see the [end-to-end source routes](/operations/teleop#mantis-teleop-end-to-end). If camera slots are assigned, feeds are relayed and mirrored in the [operator view](#operator-view). |
 | **Gravity compensation** | Axol | Hold the arms weightless for hand-guiding. |
 | **Waypoints** | Axol or sim | Teach-and-repeat: hand-guide the arms and press **Record waypoint** for each pose, then **Play** to replay the path as straight-line moves. **Undo**, **Clear**, and a gripper toggle are there while teaching; **Stop playback** interrupts a run. Toggle **sim** to preview a saved path in the browser visualizer. See [`waypoints`](/cli/waypoints). |
-| **Collect data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. The **repo id** field is a picker offering the datasets already on the host (with episode counts) so you can resume one, or type a new id. The feeds are mirrored in the panel's [operator view](#operator-view) and the [episode controls](#episode-controls) can start and end takes, so a session can be driven with the headset off. |
+| **Collect data** | Axol or Mantis + cameras | Record Axol joint or Cartesian actions, or Mantis Cartesian TCP actions. Production Mantis start is blocked without a ready source and approved factory or measured transforms. The **repo id** picker can resume host datasets; feeds and [episode controls](#episode-controls) are mirrored in the panel. See the [Mantis collection flow](/operations/data-collection#mantis-collection-end-to-end). |
 | **Replay dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. The **repo id** field is a picker offering the datasets on the host (with episode counts), and also accepts a bare id or a filesystem path. Toggle **loop** to replay continuously until **Stop**, and **interpolate** to smooth playback by upsampling the recorded actions to ~120 Hz commands. |
 | **Run policy** | Axol + Cameras | Run a trained policy via LeRobot async inference — locally or on a remote [inference server](/cli/inference-server). |
 | **Collect DAgger** | Axol + Cameras | Run a trained policy while you correct it from VR: the grip buttons freeze the policy and hand control to you, and the policy segments plus your corrections are recorded to a LeRobot dataset (with a per-frame intervention tag). The **repo id** field resumes an existing DAgger dataset or takes a new id. See [DAgger Collection](/operations/dagger). |
 
 ### Before you can start
 
-The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Fix motor fault: R elbow — over temperature*, *Assign at least one camera serial in the Cameras settings tab*, or *Set &lt;required field&gt;*.
+The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Fix motor fault: R elbow — over temperature*, *Assign at least one camera*, *Identify left + right Lighthouse trackers*, *Fix Ultimate private shared-map AP setup*, or *Add an approved factory or measured tracker-to-TCP transform*. Fix tracker setup in **Settings → Mantis**: the panel saves protected AP configuration and device/profile-keyed measured transforms, then refreshes the same readiness used by operation start. The [CLI schema and fallback](/cli/tracker#transforms-and-acceptance) remain available for scripted setup.
 
 Per-run values (repo ids, task names, …) are remembered by your browser so they reappear on reload; everything else persists on the host with the shared settings.
 
@@ -140,7 +175,7 @@ Starting an operation streams its logs into the console at the bottom of the pag
 
 ## Operator view
 
-While **teleoperation**, **collect data**, or **collect DAgger** streams camera video to the headset (camera slots assigned), the control panel mirrors those **live camera feeds**, so you can watch the robot's point of view on the dashboard and not only in VR. The panel joins the running operation's video stream as one more **view-only** client and shows the same tracks the headset receives — no extra work for the robot, and the [Cameras settings tab](#cameras) still decides what streams. A side-by-side stereo overhead is shown cropped to its left eye. (A **sim** or **Cart only** teleop run shows no mirrored feeds — neither relays headset video.)
+While **teleoperation**, **collect data**, or **collect DAgger** streams camera video to the headset (camera slots assigned), the control panel mirrors those **live camera feeds**, so you can watch the robot's point of view on the dashboard and not only in VR. The panel joins the running operation's video stream as one more **view-only** client and shows the same tracks the headset receives — no extra work for the robot, and the active [camera layout](#cameras) still decides what streams. A side-by-side stereo overhead is shown cropped to its left eye. (A **sim** or **Cart only** teleop run shows no mirrored feeds — neither relays headset video.)
 
 The **fullscreen** toggle on the camera-feeds header expands the feeds to a full-screen operator display that fits without scrolling; **Esc** or **Exit fullscreen** leaves. If the feeds never connect, the panel offers a one-tap button to **authorize** the stream server's self-signed certificate — the same one-time step the [VR app](/guides/vr-interface) uses.
 
@@ -159,7 +194,7 @@ For **Run policy** and **Collect DAgger** (which share the same episode controls
 
 These mirror the `s` / `r` keystrokes and the Enter prompts the [`run-policy`](/cli/run-policy) CLI reads from stdin.
 
-For **Collect data**, the buttons do exactly what the VR controller does, so a session can run with the headset off — pair them with the mirrored [camera feeds](#operator-view) above:
+For **Collect data**, the buttons provide the same episode decisions for Axol and every Mantis source, so managed Lighthouse/Ultimate can collect with no headset at all. Pair them with the mirrored [camera feeds](#operator-view):
 
 | Button | Effect |
 |---|---|
@@ -168,7 +203,7 @@ For **Collect data**, the buttons do exactly what the VR controller does, so a s
 | **Discard episode** | End the take and drop it to re-record, like confirming **X**. Also click-to-confirm. |
 | **Return to rest** | During a **Contact** hold — the guarded return met resistance, or (with the opt-in teleop contact stop enabled) a take hit something and was discarded — the arms are limp. Clear them by hand, then press this (or **X** on the controller) to replan the return from where they are. |
 
-The VR controller stays live throughout — the panel is a parallel input, not a replacement, and whichever arrives first ends the take. Anything the operator arms on the controller (the **Save episode?** / **Discard episode?** confirmation and the record countdown) is mirrored into the panel as a popup, so a headset worn off the face is still followable.
+For Axol or Quest Mantis, the VR controller stays live throughout and whichever panel/headset input arrives first wins. Managed Lighthouse/Ultimate instead starts a take by squeezing both rig triggers together and releasing (this also engages tracking); while recording, either trigger x3 ends and saves, x4 ends and discards — the same outcome as **Discard episode**. The panel's **Start recording** works only while the rig is already engaged. Headset save/discard popups and countdowns are mirrored into the panel when a Quest is the active pose source.
 
 ## Next steps
 

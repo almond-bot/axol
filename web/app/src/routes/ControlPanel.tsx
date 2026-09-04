@@ -1,13 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Loader2, RefreshCw } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
   OPERATIONS,
   cameraCount,
+  canDiscoveryRequestCanRetry,
   detectCameras,
+  discoverCanHardware,
+  fetchCanInterfaces,
   fetchCommands,
   fetchInfo,
   fetchOpStatus,
   fetchRobotStatus,
+  fetchSessions,
   fetchSettings,
   fetchUpdateStatus,
   fetchUsbStatus,
@@ -16,6 +21,7 @@ import {
   missingCameraSerials,
   operationsFromCommands,
   perRunFields,
+  probeUpdateStatus,
   robotConnect,
   robotDisconnect,
   saveOpSettings,
@@ -29,8 +35,12 @@ import {
   useSessionLogs,
   type CameraDevice,
   type CameraSpec,
+  type CanDiscoveryState,
+  type CanInterfaceInventory,
+  type CanProfileInventory,
   type CommandSpec,
   type FormValue,
+  type HardwareProfile,
   type OperationId,
   type OperationMeta,
   type PolicyState,
@@ -43,8 +53,24 @@ import {
   type UpdateStatus,
   type UsbStatus,
 } from "@/lib/supervisor"
-import { UpdateBanner } from "@/components/update-banner"
+import {
+  autoConnectPollStateKnown,
+  autoConnectRetryDelay,
+  autoConnectSignature,
+  canDiscoveryAttemptSignature,
+  canDiscoveryBlocksAutoConnect,
+  canServerEpoch,
+  chooseAutoConnectTarget,
+  claimCanInventoryPollResponse,
+  issueCanInventoryPoll,
+  newCanInventoryPollSequence,
+  nextAutoConnectAttempt,
+  shouldStartCanDiscovery,
+  voidCanInventoryPolls,
+} from "@/lib/can-auto-connect"
+import { InstallerMigrationBanner, UpdateBanner } from "@/components/update-banner"
 import { VersionMismatchBanner } from "@/components/version-mismatch-banner"
+import { requiresInstallerMigration, showInstallerMigration } from "@/lib/update-migration"
 import { versionMismatch } from "@/lib/version"
 import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
@@ -53,11 +79,13 @@ import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection, type SettingsTab } from "@/components/settings/settings-section"
 import { SiteNav } from "@/components/site-nav"
 import { useToast } from "@/components/ui/toast"
+import { Button } from "@/components/ui/button"
 
 type OpSettings = Record<OperationId, Record<string, FormValue>>
 
 const DEFAULT_CAMERAS: CameraSpec = {
   serials: { overhead: "", left_arm: "", right_arm: "" },
+  mantis_serials: { left_arm: "", right_arm: "" },
   stream_resolution: "SVGA",
   record_resolution: "SVGA",
   stream: {},
@@ -73,6 +101,13 @@ function loadCameras(): CameraSpec {
         ...DEFAULT_CAMERAS,
         ...parsed,
         serials: { ...DEFAULT_CAMERAS.serials, ...(parsed.serials ?? {}) },
+        mantis_serials: {
+          ...DEFAULT_CAMERAS.mantis_serials,
+          ...(parsed.mantis_serials ?? {
+            left_arm: parsed.serials?.left_arm ?? "",
+            right_arm: parsed.serials?.right_arm ?? "",
+          }),
+        },
         // Migrate the legacy single `resolution` to the streaming resolution.
         stream_resolution:
           parsed.stream_resolution ?? parsed.resolution ?? DEFAULT_CAMERAS.stream_resolution,
@@ -125,6 +160,54 @@ export default function ControlPanel() {
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [robotBusy, setRobotBusy] = useState(false)
+  // A backend restart can leave the tab's old auto-connect latch intact. A
+  // failed status poll followed by recovery starts a new connection epoch,
+  // without treating a remote browser's ordinary disconnect as a restart.
+  const robotStatusPollFailedRef = useRef(false)
+  const robotStatusRecoveryEpochRef = useRef(0)
+  const robotStatusKnownRef = useRef(false)
+  const canInventoryKnownRef = useRef(false)
+  const sessionInventoryKnownRef = useRef(false)
+  const autoRobotPollStateKnown = useCallback(
+    () =>
+      autoConnectPollStateKnown(
+        robotStatusKnownRef.current,
+        canInventoryKnownRef.current,
+        sessionInventoryKnownRef.current
+      ),
+    []
+  )
+  const [canProfiles, setCanProfiles] = useState<CanProfileInventory | null>(null)
+  const [canDiscovery, setCanDiscovery] = useState<CanDiscoveryState | null>(null)
+  const [canServerInstanceId, setCanServerInstanceId] = useState<string | null>(null)
+  const canServerInstanceIdRef = useRef<string | null>(null)
+  const previousCanServerInstanceIdRef = useRef<string | null>(null)
+  const canInventoryPollRef = useRef(newCanInventoryPollSequence())
+  const [canDiscoveryRetryBusy, setCanDiscoveryRetryBusy] = useState(false)
+  const currentCanServerEpoch = useCallback(
+    () => canServerEpoch(canServerInstanceIdRef.current, robotStatusRecoveryEpochRef.current),
+    []
+  )
+  // The backend owns the real single-flight. This per-tab latch prevents the
+  // 2s inventory poll from sending duplicate requests for one hardware epoch.
+  const automaticCanDiscoveryAttemptsRef = useRef(new Set<string>())
+  const canDiscoveryNoticesRef = useRef(new Set<string>())
+  // A successful response without profile summaries identifies an older host;
+  // retain its historical selected-profile auto-connect behavior.
+  const [legacyCanInventory, setLegacyCanInventory] = useState(false)
+  const installCanInventory = useCallback((inventory: CanInterfaceInventory) => {
+    const instanceId = inventory.serverInstanceId ?? null
+    canServerInstanceIdRef.current = instanceId
+    setCanServerInstanceId(instanceId)
+    setCanDiscovery(inventory.discovery ?? null)
+    if (inventory.profiles) {
+      setCanProfiles(inventory.profiles)
+      setLegacyCanInventory(false)
+    } else {
+      setCanProfiles(null)
+      setLegacyCanInventory(true)
+    }
+  }, [])
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
   const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
@@ -148,6 +231,12 @@ export default function ControlPanel() {
   const [settingsByOp, setSettingsByOp] = useState<OpSettings>({})
 
   const [session, setSession] = useState<SessionInfo | null>(null)
+  const [sessionInventoryReady, setSessionInventoryReady] = useState(false)
+  const [hardwareSessionBusy, setHardwareSessionBusy] = useState(false)
+  // Generic setup/diagnostic owner (Pair, Identify, installers, etc.). The
+  // server serializes it against operations; mirror that owner in the UI so
+  // opposite actions disable instead of optimistically ending in HTTP 409.
+  const [activeCommandSession, setActiveCommandSession] = useState<SessionInfo | null>(null)
   // run-policy episode phase/count, from the server so the episode controls are
   // correct on any computer (not just the tab that started the run).
   const [policy, setPolicy] = useState<PolicyState | null>(null)
@@ -161,6 +250,11 @@ export default function ControlPanel() {
   // Anchor for the on-page settings card, so "…live in Settings" links can
   // scroll to it.
   const settingsRef = useRef<HTMLDivElement>(null)
+  // Every API helper targets the module-level server base. A slow response
+  // from the previous host must therefore never update this host's UI (or
+  // trigger the legacy camera-settings migration against the new host).
+  const connectionGenerationRef = useRef(0)
+  const [connectionGeneration, setConnectionGeneration] = useState(0)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
 
@@ -175,26 +269,31 @@ export default function ControlPanel() {
   // Enumerate the ZED cameras on the serve host so the Cameras badge can verify
   // the assigned serials are actually connected (best-effort: failures leave the
   // last known state and surface as a "can't detect" warning).
-  const refreshCameras = useCallback(async () => {
+  const refreshCameras = useCallback(async (generation = connectionGenerationRef.current) => {
+    if (generation !== connectionGenerationRef.current) return
     setCameraDetecting(true)
     try {
       const result = await detectCameras()
+      if (generation !== connectionGenerationRef.current) return
       setCameraDevices(result.devices)
       setCameraDetectError(result.error)
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       setCameraDevices(null)
       setCameraDetectError(String(e).replace(/^Error:\s*/, ""))
     } finally {
-      setCameraDetecting(false)
+      if (generation === connectionGenerationRef.current) setCameraDetecting(false)
     }
   }, [])
 
   // Pull the shared settings from the serve host. A host whose stored camera
   // spec is empty gets this browser's legacy localStorage spec migrated up
   // once, so nobody has to re-enter serials after updating.
-  const loadSettings = useCallback(async () => {
+  const loadSettings = useCallback(async (generation = connectionGenerationRef.current) => {
+    if (generation !== connectionGenerationRef.current) return
     try {
       const snap = await fetchSettings()
+      if (generation !== connectionGenerationRef.current) return
       setSettingsError(null)
       if (snap.cameras) {
         setCameras(snap.cameras)
@@ -204,9 +303,12 @@ export default function ControlPanel() {
         const local = loadCameras()
         if (cameraCount(local) > 0) {
           try {
+            if (generation !== connectionGenerationRef.current) return
             await saveSettings({ cameras: local, camerasSet: true })
+            if (generation !== connectionGenerationRef.current) return
             setSettingsSnap({ ...snap, cameras: local })
           } catch {
+            if (generation !== connectionGenerationRef.current) return
             setSettingsSnap(snap)
           }
         } else {
@@ -214,6 +316,7 @@ export default function ControlPanel() {
         }
       }
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       // Old serve host without /api/settings: keep the localStorage camera
       // flow; the settings dialog explains the needed update.
       setSettingsSnap(null)
@@ -223,22 +326,72 @@ export default function ControlPanel() {
 
   const loadServer = useCallback(
     async (host: string) => {
+      const generation = ++connectionGenerationRef.current
+      setConnectionGeneration(generation)
       setServerBase(host)
       setConn({ state: "loading" })
+      // Hide all state owned by the previous host immediately. The generation
+      // checks below also stop its in-flight responses from repopulating it.
+      setCommands([])
+      setHostInfo(null)
+      setUpdate(null)
+      setStartingUpdate(false)
+      setUpdateAbandoned(false)
+      setUpdatePhase(null)
+      setRobot(null)
+      setRobotBusy(false)
+      setCanProfiles(null)
+      setCanDiscovery(null)
+      canServerInstanceIdRef.current = null
+      previousCanServerInstanceIdRef.current = null
+      setCanServerInstanceId(null)
+      setCanDiscoveryRetryBusy(false)
+      voidCanInventoryPolls(canInventoryPollRef.current)
+      setLegacyCanInventory(false)
+      automaticCanDiscoveryAttemptsRef.current.clear()
+      canDiscoveryNoticesRef.current.clear()
+      setUsb(null)
+      setUsbBusy(false)
+      setSession(null)
+      setSessionInventoryReady(false)
+      setHardwareSessionBusy(false)
+      setActiveCommandSession(null)
+      setPolicy(null)
+      setBusy(false)
+      setStartPhase(null)
+      setCameraDevices(null)
+      setCameraDetectError(null)
+      setCameraDetecting(false)
+      setSettingsSnap(null)
+      setSettingsError(null)
       try {
+        // Must be the first API probe. v0.1.0-v0.1.2 have no update endpoint,
+        // while their info/op-status endpoints start a destructive unpinned
+        // upgrade from main merely by being read.
+        const initialUpdate = await probeUpdateStatus()
+        if (generation !== connectionGenerationRef.current) return
+        if (initialUpdate === null) {
+          setConn({ state: "migration" })
+          setSetupOpen(false)
+          return
+        }
+        setUpdate(initialUpdate)
         const cmds = await fetchCommands()
+        if (generation !== connectionGenerationRef.current) return
         setCommands(cmds)
         setConn({ state: "ok" })
         setSetupOpen(false)
       } catch (e) {
+        if (generation !== connectionGenerationRef.current) return
         setCommands([])
         setConn({ state: "err", message: String(e) })
         return
       }
-      refreshCameras()
-      loadSettings()
+      void refreshCameras(generation)
+      void loadSettings(generation)
       fetchInfo()
         .then((info) => {
+          if (generation !== connectionGenerationRef.current) return
           setViewerPort(info.viewerPort)
           setHostInfo(info)
         })
@@ -246,13 +399,26 @@ export default function ControlPanel() {
       // Force a synchronous remote check on connect/page load so the banner
       // reflects reality immediately; the steady-state poll below stays cheap.
       fetchUpdateStatus(true)
-        .then(setUpdate)
+        .then((value) => {
+          if (generation === connectionGenerationRef.current) setUpdate(value)
+        })
         .catch(() => {})
       fetchRobotStatus()
-        .then(setRobot)
-        .catch(() => {})
+        .then((value) => {
+          if (generation === connectionGenerationRef.current) {
+            robotStatusKnownRef.current = true
+            setRobot(value)
+          }
+        })
+        .catch(() => {
+          if (generation === connectionGenerationRef.current) {
+            robotStatusKnownRef.current = false
+            setRobot(null)
+          }
+        })
       fetchOpStatus()
         .then((op) => {
+          if (generation !== connectionGenerationRef.current) return
           if (op.running && op.session) {
             setSession(op.session)
             setSelectedOp(op.session.command as OperationId)
@@ -265,15 +431,21 @@ export default function ControlPanel() {
   )
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadServer(serverHost)
     // Only on mount — reconnects are explicit via the setup dialog.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Poll the robot connection + Quest-USB status while online.
+  // Poll the robot connection, configured CAN presence, and Quest-USB status
+  // while online. CAN presence makes startup hardware-aware and also catches a
+  // hub that enumerates shortly after the page loads.
   useEffect(() => {
-    if (conn.state !== "ok") return
+    if (conn.state !== "ok") {
+      robotStatusKnownRef.current = false
+      canInventoryKnownRef.current = false
+      voidCanInventoryPolls(canInventoryPollRef.current)
+      return
+    }
     // Guard against in-flight polls landing after a disconnect (which flips
     // conn.state and tears this effect down): a late response must not
     // repopulate a tile while the host tile shows disconnected.
@@ -281,9 +453,49 @@ export default function ControlPanel() {
     const poll = () => {
       fetchRobotStatus()
         .then((r) => {
-          if (active) setRobot(r)
+          if (!active) return
+          if (robotStatusPollFailedRef.current) {
+            robotStatusPollFailedRef.current = false
+            robotStatusRecoveryEpochRef.current += 1
+          }
+          robotStatusKnownRef.current = true
+          setRobot(r)
         })
-        .catch(() => {})
+        .catch(() => {
+          if (active) {
+            robotStatusPollFailedRef.current = true
+            robotStatusKnownRef.current = false
+            setRobot(null)
+          }
+        })
+      // Drop only responses older than the last one applied (not every response
+      // superseded by a newer *request*): the endpoint can take longer than the
+      // 2 s cadence during CAN discovery, and inventory must still land.
+      const canRequest = issueCanInventoryPoll(canInventoryPollRef.current)
+      fetchCanInterfaces()
+        .then((inventory) => {
+          if (!active || !claimCanInventoryPollResponse(canInventoryPollRef.current, canRequest))
+            return
+          canInventoryKnownRef.current = true
+          installCanInventory(inventory)
+        })
+        .catch((error) => {
+          if (!active || !claimCanInventoryPollResponse(canInventoryPollRef.current, canRequest))
+            return
+          if (String(error).includes("HTTP 404")) {
+            canInventoryKnownRef.current = true
+            setCanProfiles(null)
+            setCanDiscovery(null)
+            canServerInstanceIdRef.current = null
+            setCanServerInstanceId(null)
+            setLegacyCanInventory(true)
+            return
+          }
+          canInventoryKnownRef.current = false
+          setCanProfiles(null)
+          setCanDiscovery(null)
+          setLegacyCanInventory(false)
+        })
       fetchUsbStatus()
         .then((u) => {
           if (active) setUsb(u)
@@ -296,7 +508,50 @@ export default function ControlPanel() {
       active = false
       clearInterval(t)
     }
-  }, [conn.state])
+  }, [conn.state, installCanInventory])
+
+  useEffect(() => {
+    if (conn.state !== "ok") {
+      sessionInventoryKnownRef.current = false
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setActiveCommandSession(null)
+      return
+    }
+    let active = true
+    const operationIds = new Set([
+      ...OPERATIONS.map((operation) => operation.id),
+      ...commands.filter((command) => command.isOperation).map((command) => command.id),
+    ])
+    const poll = () => {
+      fetchSessions()
+        .then((sessions) => {
+          if (!active) return
+          const liveSessions = sessions.filter(
+            (candidate) =>
+              candidate.status === "starting" ||
+              candidate.status === "running" ||
+              candidate.status === "stopping"
+          )
+          sessionInventoryKnownRef.current = true
+          setSessionInventoryReady(true)
+          setHardwareSessionBusy(liveSessions.length > 0)
+          setActiveCommandSession(
+            liveSessions.find((candidate) => !operationIds.has(candidate.command)) ?? null
+          )
+        })
+        .catch(() => {
+          if (!active) return
+          sessionInventoryKnownRef.current = false
+          setSessionInventoryReady(false)
+        })
+    }
+    poll()
+    const timer = window.setInterval(poll, 1500)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [conn.state, commands])
 
   // Poll the update indicator slowly while online (its server-side `ls-remote`
   // is debounced, so a tight interval would buy nothing). Paused while an
@@ -329,28 +584,71 @@ export default function ControlPanel() {
     }
   }, [conn.state, updating])
 
-  // Auto-connect Axol once after the host comes online, if it's sitting idle.
-  // The ref makes it fire at most once per host session, so a manual robot
-  // disconnect afterwards isn't immediately undone.
-  const autoRobotRef = useRef(false)
+  // A failed profile + mapping gets two delayed retries without being hammered
+  // by the 2s presence poll. A mapping change creates a fresh signature.
+  const autoRobotRef = useRef<string | null>(null)
+  const autoRobotAttemptsRef = useRef(new Map<string, number>())
+  const autoRobotRetryTimerRef = useRef<number | null>(null)
+  const autoRobotMountedRef = useRef(true)
+  const [autoRobotRetryRevision, setAutoRobotRetryRevision] = useState(0)
+  // Manual connect/disconnect wins until the selected operation changes.
+  const manualRobotOverrideRef = useRef(false)
+  const previousDesiredProfileRef = useRef<HardwareProfile | null>(null)
+  const resetAutoRobotRetry = useCallback(() => {
+    autoRobotRef.current = null
+    autoRobotAttemptsRef.current.clear()
+    if (autoRobotRetryTimerRef.current !== null) {
+      window.clearTimeout(autoRobotRetryTimerRef.current)
+      autoRobotRetryTimerRef.current = null
+    }
+  }, [])
   useEffect(() => {
-    if (conn.state !== "ok") {
-      autoRobotRef.current = false
-      return
+    autoRobotMountedRef.current = true
+    return () => {
+      autoRobotMountedRef.current = false
+      resetAutoRobotRetry()
     }
-    if (autoRobotRef.current || !robot) return
-    autoRobotRef.current = true
-    if (robot.state === "disconnected" && !robotBusy) {
-      robotConnectClick()
-    }
-    // robotConnectClick is stable enough (only uses state setters / fetch).
-  }, [conn.state, robot, robotBusy])
+  }, [resetAutoRobotRetry])
+
+  // A new backend process also clears its server-side manual-disconnect state.
+  // Drop this tab's old retry/manual latches as soon as inventory proves that
+  // the process changed, even when the restart fit between status polls.
+  useEffect(() => {
+    if (canServerInstanceId === null) return
+    const previous = previousCanServerInstanceIdRef.current
+    previousCanServerInstanceIdRef.current = canServerInstanceId
+    if (previous === null || previous === canServerInstanceId) return
+    resetAutoRobotRetry()
+    manualRobotOverrideRef.current = false
+    automaticCanDiscoveryAttemptsRef.current.clear()
+    canDiscoveryNoticesRef.current.clear()
+  }, [canServerInstanceId, resetAutoRobotRetry])
 
   // Auto-establish the Quest-over-USB tunnel as soon as an authorized headset
   // appears. The latch clears once the tunnel is up (so a later drop retries
   // once) or when the headset goes away, while preventing a per-poll retry loop
   // if `adb reverse` can't establish it.
   const autoUsbRef = useRef(false)
+  const usbConnectClick = useCallback(
+    async (generation = connectionGenerationRef.current) => {
+      if (generation !== connectionGenerationRef.current) return
+      setUsbBusy(true)
+      try {
+        const status = await usbConnect()
+        if (generation !== connectionGenerationRef.current) return
+        // Runs `adb reverse`; the first touch also pops the USB-debugging
+        // authorization prompt on the headset.
+        setUsb(status)
+      } catch (e) {
+        if (generation !== connectionGenerationRef.current) return
+        toast.error(String(e))
+      } finally {
+        if (generation === connectionGenerationRef.current) setUsbBusy(false)
+      }
+    },
+    [toast]
+  )
+
   useEffect(() => {
     if (conn.state !== "ok") {
       // Clear the latch on disconnect so a reconnect gets a fresh auto-connect
@@ -369,27 +667,53 @@ export default function ControlPanel() {
     if (autoUsbRef.current || usbBusy) return
     autoUsbRef.current = true
     usbConnectClick()
-    // usbConnectClick is stable (only uses state setters / fetch).
-  }, [conn.state, usb, usbBusy])
+  }, [conn.state, usb, usbBusy, usbConnectClick])
 
   function hostDisconnectClick() {
     // Purely client-side: drop this browser's view of the host without
     // touching server state. Other control panels on the network may be
     // driving the same host, so never stop a running op from here.
+    connectionGenerationRef.current += 1
+    setConnectionGeneration(connectionGenerationRef.current)
     setConn({ state: "idle" })
     setCommands([])
+    setHostInfo(null)
     setRobot(null)
+    setCanProfiles(null)
+    setCanDiscovery(null)
+    canServerInstanceIdRef.current = null
+    previousCanServerInstanceIdRef.current = null
+    setCanServerInstanceId(null)
+    setCanDiscoveryRetryBusy(false)
+    voidCanInventoryPolls(canInventoryPollRef.current)
+    setLegacyCanInventory(false)
+    setUsb(null)
+    setUsbBusy(false)
     setSession(null)
+    setSessionInventoryReady(false)
+    setHardwareSessionBusy(false)
+    setActiveCommandSession(null)
     setPolicy(null)
+    setBusy(false)
+    setStartPhase(null)
     setCameraDevices(null)
     setCameraDetectError(null)
+    setCameraDetecting(false)
     setSettingsSnap(null)
     setSettingsError(null)
     setUpdate(null)
     setStartingUpdate(false)
     setUpdateAbandoned(false)
     setUpdatePhase(null)
-    autoRobotRef.current = false
+    setRobotBusy(false)
+    robotStatusKnownRef.current = false
+    canInventoryKnownRef.current = false
+    sessionInventoryKnownRef.current = false
+    automaticCanDiscoveryAttemptsRef.current.clear()
+    canDiscoveryNoticesRef.current.clear()
+    resetAutoRobotRetry()
+    manualRobotOverrideRef.current = false
+    previousDesiredProfileRef.current = null
   }
 
   function updateServerHost(value: string) {
@@ -406,7 +730,21 @@ export default function ControlPanel() {
 
   // Persist a settings-dialog save: cameras also mirror to localStorage (the
   // fallback for old hosts / offline), everything else goes to the serve host.
-  async function handleSettingsSave(patch: SettingsPatch) {
+  async function handleSettingsSave(
+    patch: SettingsPatch,
+    generation = connectionGenerationRef.current
+  ) {
+    if (generation !== connectionGenerationRef.current) return
+    const changedChannelProfiles = (
+      [
+        ["axol", ["robot.left_channel", "robot.right_channel"]],
+        ["mantis", ["mantis.left_channel", "mantis.right_channel"]],
+      ] as const
+    )
+      .filter(([, keys]) =>
+        keys.some((key) => Object.prototype.hasOwnProperty.call(patch.values ?? {}, key))
+      )
+      .map(([profile]) => profile)
     if (patch.cameras) {
       setCameras(patch.cameras)
       persistLocalCameras(patch.cameras)
@@ -416,12 +754,29 @@ export default function ControlPanel() {
       return
     }
     const snap = await saveSettings(patch)
+    if (generation !== connectionGenerationRef.current) return
     setSettingsSnap((prev) => ({
       ...snap,
       schema: prev?.schema ?? snap.schema,
       advancedSchema: prev?.advancedSchema ?? snap.advancedSchema,
     }))
     if (snap.cameras) setCameras(snap.cameras)
+    if (changedChannelProfiles.length > 0) {
+      resetAutoRobotRetry()
+      const changedDesiredProfile = changedChannelProfiles.includes(desiredHardwareProfile)
+      if (changedDesiredProfile) manualRobotOverrideRef.current = false
+      const label =
+        changedChannelProfiles.length === 2
+          ? "CAN mappings"
+          : `${changedChannelProfiles[0] === "mantis" ? "Mantis" : "Axol"} CAN mapping`
+      if (!changedDesiredProfile) {
+        toast.info(`${label} saved. It will apply the next time that hardware connects.`)
+      } else if (isLive || robot?.state === "busy") {
+        toast.info(`${label} saved. The link will reconnect when this run stops.`)
+      } else {
+        toast.info(`${label} saved. Reconnecting the link when its configured bus is detected…`)
+      }
+    }
   }
 
   // The operations this host offers, and the selected one resolved against
@@ -441,6 +796,8 @@ export default function ControlPanel() {
 
   // -- per-operation settings --
   const settings = useMemo(() => settingsByOp[opId] ?? loadOpSettings(opId), [settingsByOp, opId])
+  const mantisMode = meta.supportsMantis && Boolean(settings.mantis)
+  const desiredHardwareProfile: HardwareProfile = mantisMode ? "mantis" : "axol"
 
   const updateSettings = useCallback((op: OperationId, next: Record<string, FormValue>) => {
     setSettingsByOp((prev) => ({ ...prev, [op]: next }))
@@ -462,42 +819,58 @@ export default function ControlPanel() {
   }
 
   // -- robot connection --
-  async function robotConnectClick() {
-    setRobotBusy(true)
-    try {
-      setRobot(await robotConnect())
-    } catch (e) {
-      toast.error(String(e))
-    } finally {
-      setRobotBusy(false)
-    }
-  }
+  const robotConnectClick = useCallback(
+    async (profile: HardwareProfile, automatic = false): Promise<boolean | null> => {
+      if (!autoRobotMountedRef.current) return null
+      const generation = connectionGenerationRef.current
+      if (!automatic) {
+        resetAutoRobotRetry()
+      }
+      setRobotBusy(true)
+      try {
+        const status = await robotConnect(undefined, profile, automatic)
+        if (!autoRobotMountedRef.current || generation !== connectionGenerationRef.current)
+          return null
+        setRobot(status)
+        if (!status.connected) {
+          throw new Error(status.error ?? `Could not connect the ${profile} CAN link`)
+        }
+        if (!automatic) manualRobotOverrideRef.current = true
+        return true
+      } catch (e) {
+        if (!autoRobotMountedRef.current || generation !== connectionGenerationRef.current)
+          return null
+        if (!automatic) toast.error(String(e))
+        return false
+      } finally {
+        if (autoRobotMountedRef.current && generation === connectionGenerationRef.current)
+          setRobotBusy(false)
+      }
+    },
+    [resetAutoRobotRetry, toast]
+  )
 
   async function robotDisconnectClick() {
+    const generation = connectionGenerationRef.current
+    resetAutoRobotRetry()
     setRobotBusy(true)
     try {
       // Kill any running task and wait for it to exit before releasing the
       // robot connection out from under it, then disconnect.
-      await stopRunningOp()
-      setRobot(await robotDisconnect())
+      if (!(await stopRunningOp(generation))) return
+      if (generation !== connectionGenerationRef.current) return
+      const status = await robotDisconnect()
+      if (generation !== connectionGenerationRef.current) return
+      setRobot(status)
+      if (status.state !== "disconnected") {
+        throw new Error(status.error ?? "Could not disconnect the robot CAN link")
+      }
+      manualRobotOverrideRef.current = true
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       toast.error(String(e))
     } finally {
-      setRobotBusy(false)
-    }
-  }
-
-  // -- quest over usb (adb reverse pose tunnel) --
-  async function usbConnectClick() {
-    setUsbBusy(true)
-    try {
-      // Runs `adb reverse`; the first touch also pops the USB-debugging
-      // authorization prompt on the headset.
-      setUsb(await usbConnect())
-    } catch (e) {
-      toast.error(String(e))
-    } finally {
-      setUsbBusy(false)
+      if (generation === connectionGenerationRef.current) setRobotBusy(false)
     }
   }
 
@@ -540,16 +913,286 @@ export default function ControlPanel() {
   const selectedStopping = isStopping && runningOp === opId
 
   // Whether the host is currently unsafe to restart / power off / update.
-  // `isLive` is the immediate, local signal (reacts the instant an op starts/
-  // stops) so the UI blocks without waiting for the slow status poll; the
-  // server's `update.idle` is the backstop for any other non-idle reason —
-  // e.g. a diagnostics run launched from another page or browser — (and the
-  // server guards each request regardless). Mirrors the server's _is_idle:
-  // only a running operation/session blocks (a connected robot is fine).
+  // `isLive` is the immediate local operation signal and the shared session
+  // inventory catches setup/diagnostics from other pages; `update.idle` is the
+  // backstop for any remaining non-idle reason. The server guards each request
+  // regardless. Mirrors _is_idle: only an operation/session blocks (a merely
+  // connected robot is fine).
   // Shared by the update banner and the host tile's power confirmations.
-  const hostBusy = isLive || !(update?.idle ?? true)
+  const hostBusy = isLive || hardwareSessionBusy || !(update?.idle ?? true)
   // Reason shown in the banner; capitalized clause, no trailing period.
   const updateBusyReason = isLive ? "Stop the running operation" : "The server is busy"
+  const canDiscoveryNeedsRetry =
+    canDiscovery?.status === "partial" ||
+    canDiscovery?.status === "unidentified" ||
+    canDiscovery?.status === "error"
+
+  const retryCanIdentification = useCallback(async () => {
+    if (canDiscoveryRetryBusy) return
+    const hostGeneration = connectionGenerationRef.current
+    setCanDiscoveryRetryBusy(true)
+    try {
+      const inventory = await discoverCanHardware(true)
+      if (!autoRobotMountedRef.current || hostGeneration !== connectionGenerationRef.current) return
+      canInventoryKnownRef.current = true
+      installCanInventory(inventory)
+      const result = inventory.discovery
+      if (result?.status === "configured" || result?.status === "ready") {
+        toast.success("CAN hardware identified")
+      } else if (result?.status === "partial") {
+        toast.warning(result.message ?? "Some CAN hardware still needs identification")
+      } else {
+        toast.error(result?.message ?? "CAN hardware could not be identified")
+      }
+    } catch (error) {
+      if (hostGeneration === connectionGenerationRef.current) {
+        toast.error(`CAN identification failed: ${String(error)}`)
+      }
+    } finally {
+      if (hostGeneration === connectionGenerationRef.current) {
+        setCanDiscoveryRetryBusy(false)
+      }
+    }
+  }, [canDiscoveryRetryBusy, installCanInventory, toast])
+
+  // A fresh Axol/Mantis hub initially appears only as anonymous canX devices.
+  // Ask the server to probe and persist its role before the ordinary profile
+  // chooser runs. The server is the cross-tab single-flight authority; this
+  // latch merely keeps one tab's 2s poll from duplicating the request.
+  useEffect(() => {
+    if (conn.state !== "ok" || !canDiscovery) return
+    if (canDiscovery.status === "ready" && canDiscovery.candidateCount === 0) {
+      automaticCanDiscoveryAttemptsRef.current.clear()
+      return
+    }
+    const signature = canDiscoveryAttemptSignature(canDiscovery)
+    const idle = !hostBusy && !activeCommandSession && !robotBusy
+    if (
+      signature === null ||
+      !shouldStartCanDiscovery(canDiscovery, robot?.state, autoRobotPollStateKnown(), idle)
+    )
+      return
+
+    const hostGeneration = connectionGenerationRef.current
+    const serverEpoch = currentCanServerEpoch()
+    const attemptKey = `${hostGeneration}:${serverEpoch}:${signature}`
+    if (automaticCanDiscoveryAttemptsRef.current.has(attemptKey)) return
+    automaticCanDiscoveryAttemptsRef.current.add(attemptKey)
+
+    void discoverCanHardware()
+      .then((inventory) => {
+        if (
+          !autoRobotMountedRef.current ||
+          hostGeneration !== connectionGenerationRef.current ||
+          serverEpoch !== currentCanServerEpoch()
+        )
+          return
+        installCanInventory(inventory)
+      })
+      .catch((error) => {
+        if (
+          !autoRobotMountedRef.current ||
+          hostGeneration !== connectionGenerationRef.current ||
+          serverEpoch !== currentCanServerEpoch()
+        )
+          return
+        if (canDiscoveryRequestCanRetry(error)) {
+          // Let the next coherent inventory poll retry after a session-launch
+          // race or transient transport/server failure. The backend remains
+          // the cross-tab single-flight and per-hardware rate-limit authority.
+          automaticCanDiscoveryAttemptsRef.current.delete(attemptKey)
+        }
+        const noticeKey = `request:${attemptKey}`
+        if (canDiscoveryNoticesRef.current.has(noticeKey)) return
+        canDiscoveryNoticesRef.current.add(noticeKey)
+        toast.error(`Automatic CAN discovery failed: ${String(error)}`)
+      })
+  }, [
+    activeCommandSession,
+    autoRobotPollStateKnown,
+    canDiscovery,
+    canServerInstanceId,
+    conn.state,
+    currentCanServerEpoch,
+    hostBusy,
+    installCanInventory,
+    robot?.state,
+    robotBusy,
+    toast,
+  ])
+
+  // Silent, ambiguous, or only partially identified hardware requires an
+  // operator decision. Surface the server's actionable result once per
+  // hardware generation, not every poll.
+  useEffect(() => {
+    if (
+      conn.state !== "ok" ||
+      !canDiscovery ||
+      (canDiscovery.status !== "partial" &&
+        canDiscovery.status !== "unidentified" &&
+        canDiscovery.status !== "error")
+    )
+      return
+    const noticeKey = `${connectionGenerationRef.current}:${currentCanServerEpoch()}:${canDiscovery.generation}:${canDiscovery.status}`
+    if (canDiscoveryNoticesRef.current.has(noticeKey)) return
+    canDiscoveryNoticesRef.current.add(noticeKey)
+    const fallback =
+      canDiscovery.status === "unidentified"
+        ? "Power the attached hardware, then use Retry CAN identification below."
+        : "Run axol can.setup in a terminal if the problem continues."
+    if (canDiscovery.status === "partial") toast.warning(canDiscovery.message ?? fallback)
+    else toast.error(canDiscovery.message ?? fallback)
+  }, [canDiscovery, canServerInstanceId, conn.state, currentCanServerEpoch, toast])
+
+  // Pick from hardware actually present on the host. If only one configured
+  // profile exists, connect it; if both exist, the selected operation wins.
+  // Never guess arbitrary can0 devices or switch underneath a live operation.
+  useEffect(() => {
+    if (conn.state !== "ok") {
+      resetAutoRobotRetry()
+      manualRobotOverrideRef.current = false
+      previousDesiredProfileRef.current = null
+      return
+    }
+
+    const desiredChanged =
+      previousDesiredProfileRef.current !== null &&
+      previousDesiredProfileRef.current !== desiredHardwareProfile
+    previousDesiredProfileRef.current = desiredHardwareProfile
+    if (desiredChanged) {
+      resetAutoRobotRetry()
+      manualRobotOverrideRef.current = false
+    }
+
+    if (!robot || !sessionInventoryReady || (!canProfiles && !legacyCanInventory)) return
+    if (
+      canDiscoveryBlocksAutoConnect(canDiscovery) ||
+      isLive ||
+      hardwareSessionBusy ||
+      activeCommandSession ||
+      robotBusy ||
+      robot.state === "busy" ||
+      manualRobotOverrideRef.current ||
+      !autoRobotPollStateKnown()
+    )
+      return
+
+    const activeProfile = robot.profile ?? "axol"
+    // A saved mapping can move away from every currently attached interface.
+    // Do one normal connect onto that new mapping while the old link is still
+    // open: the server first closes the stale buses, then returns an explicit
+    // error for the absent replacement. This keeps Connected/Start from
+    // continuing to describe the old mapping. Ordinary absence never triggers
+    // a connect attempt.
+    const target = canProfiles
+      ? chooseAutoConnectTarget(
+          canProfiles,
+          desiredHardwareProfile,
+          activeProfile,
+          robot.channels,
+          robot.state === "connected"
+        )
+      : desiredHardwareProfile
+    if (target === null) {
+      // Do not latch genuine absence: a later physical replug gets a fresh
+      // bounded attempt budget. Driver/netdev cycling for a configured hub
+      // remains present through its persisted USB identity.
+      resetAutoRobotRetry()
+      return
+    }
+    const targetPresence = canProfiles?.[target]
+    const profileSignature = targetPresence
+      ? autoConnectSignature(target, targetPresence)
+      : `legacy:${target}`
+    const serverEpoch = currentCanServerEpoch()
+    const signature = `${profileSignature}:host-${serverEpoch}`
+    const mappingChanged =
+      activeProfile === target &&
+      targetPresence !== undefined &&
+      robot.channels !== undefined &&
+      (robot.channels.left !== targetPresence.channels.left ||
+        robot.channels.right !== targetPresence.channels.right)
+    if (autoRobotRef.current === signature) return
+    if (
+      activeProfile !== target ||
+      robot.state === "disconnected" ||
+      robot.state === "error" ||
+      mappingChanged
+    ) {
+      const attempts = nextAutoConnectAttempt(
+        autoRobotAttemptsRef.current.get(signature) ?? 0,
+        autoRobotPollStateKnown()
+      )
+      if (attempts === null) {
+        // A down/up inventory oscillation can revisit an old signature. Keep
+        // its exhausted budget latched instead of starting attempt 4+.
+        autoRobotRef.current = signature
+        return
+      }
+      const timer = window.setTimeout(() => {
+        autoRobotRef.current = signature
+        const generation = connectionGenerationRef.current
+        void robotConnectClick(target, true).then((connected) => {
+          if (
+            connected !== false ||
+            !autoRobotMountedRef.current ||
+            generation !== connectionGenerationRef.current ||
+            serverEpoch !== currentCanServerEpoch() ||
+            manualRobotOverrideRef.current
+          )
+            return
+          if (!autoRobotPollStateKnown()) {
+            // A request that settles while inventory/session authority is
+            // unknown is not evidence that this hardware target failed.
+            autoRobotRef.current = null
+            return
+          }
+          autoRobotAttemptsRef.current.set(signature, attempts)
+          const delay = autoConnectRetryDelay(attempts)
+          if (delay === null) return
+          if (autoRobotRetryTimerRef.current !== null) {
+            window.clearTimeout(autoRobotRetryTimerRef.current)
+          }
+          autoRobotRetryTimerRef.current = window.setTimeout(() => {
+            autoRobotRetryTimerRef.current = null
+            if (
+              generation === connectionGenerationRef.current &&
+              serverEpoch === currentCanServerEpoch() &&
+              autoRobotMountedRef.current &&
+              !manualRobotOverrideRef.current &&
+              autoRobotRef.current === signature
+            ) {
+              autoRobotRef.current = null
+              // Recovery itself causes the rerender. Do not spend or schedule
+              // an attempt while one of the authoritative polls is unknown.
+              if (!autoRobotPollStateKnown()) return
+              setAutoRobotRetryRevision((revision) => revision + 1)
+            }
+          }, delay)
+        })
+      }, 0)
+      return () => window.clearTimeout(timer)
+    }
+    autoRobotRef.current = signature
+  }, [
+    activeCommandSession,
+    autoRobotPollStateKnown,
+    autoRobotRetryRevision,
+    canProfiles,
+    canDiscovery,
+    canServerInstanceId,
+    conn.state,
+    desiredHardwareProfile,
+    hardwareSessionBusy,
+    isLive,
+    legacyCanInventory,
+    robot,
+    robotBusy,
+    robotConnectClick,
+    currentCanServerEpoch,
+    resetAutoRobotRetry,
+    sessionInventoryReady,
+  ])
 
   // While an op is live (including the "stopping" window), poll the server's
   // authoritative op status so the panel reliably catches the transition to
@@ -580,9 +1223,15 @@ export default function ControlPanel() {
   // (handleUpdate drives its own watch poll then).
   useEffect(() => {
     if (conn.state !== "ok" || updating) return
+    let active = true
     fetchUpdateStatus()
-      .then(setUpdate)
+      .then((value) => {
+        if (active) setUpdate(value)
+      })
       .catch(() => {})
+    return () => {
+      active = false
+    }
   }, [conn.state, updating, isLive])
 
   // Drive an in-flight update to completion on ANY connected computer: advance
@@ -645,31 +1294,40 @@ export default function ControlPanel() {
   // The server-side stop now returns immediately with "stopping" (it force-kills
   // a stuck op in the background), so we poll op status until the op is truly
   // gone rather than relying on the stop response to block.
-  async function stopRunningOp() {
-    if (!isLive) return
-    setSession(await stopOperation())
+  async function stopRunningOp(generation = connectionGenerationRef.current): Promise<boolean> {
+    if (!isLive) return generation === connectionGenerationRef.current
+    const stopped = await stopOperation()
+    if (generation !== connectionGenerationRef.current) return false
+    setSession(stopped)
     // Bounded so an unkillable op (abandoned server-side) can't wedge the UI;
     // we proceed best-effort after the deadline.
     const deadline = Date.now() + 30_000
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 500))
+      if (generation !== connectionGenerationRef.current) return false
       try {
         const op = await fetchOpStatus()
+        if (generation !== connectionGenerationRef.current) return false
         if (op.session) setSession(op.session)
-        if (!op.running) return
+        if (!op.running) return true
       } catch {
-        return // host unreachable — nothing left to wait on
+        // Host unreachable — nothing left to wait on, but do not let a host
+        // switch turn the caller's next step into a request to the new host.
+        return generation === connectionGenerationRef.current
       }
     }
+    return generation === connectionGenerationRef.current
   }
 
   async function handleStart() {
+    const generation = connectionGenerationRef.current
     setBusy(true)
     try {
       // Only ops that actually require cameras (collect-data / run-policy) are
       // gated on them. Teleop streams whatever cameras are configured but must
       // never be blocked by camera detection, and sim never touches hardware.
       const isSimSelected = isSimRun(meta, settings)
+      const mantisSelected = mantisMode
       if (meta.requiresCameras && !isSimSelected) {
         // Reuse the detection we already ran (on connect / when the Cameras
         // dialog closed) instead of spawning a fresh enumeration on every start
@@ -681,6 +1339,7 @@ export default function ControlPanel() {
         if (devices === null) {
           setStartPhase("Checking cameras…")
           const detect = await detectCameras()
+          if (generation !== connectionGenerationRef.current) return
           setCameraDevices(detect.devices)
           setCameraDetectError(detect.error)
           devices = detect.devices
@@ -690,7 +1349,10 @@ export default function ControlPanel() {
           toast.error(`Can't verify cameras: ${detErr}`)
           return
         }
-        const missing = missingCameraSerials(cameras, devices ?? [])
+        const missing = missingCameraSerials(cameras, devices ?? [], mantisSelected, {
+          stream: meta.streamsVideo,
+          record: true,
+        })
         if (missing.length > 0) {
           toast.error(
             `Camera ${missing.length > 1 ? "serials" : "serial"} not detected: ${missing.join(
@@ -705,41 +1367,61 @@ export default function ControlPanel() {
       // advanced overrides) are folded in server-side, and stale keys from the
       // old per-op localStorage must not shadow them.
       const runKeys = new Set(spec ? perRunFields(spec, meta).map((f) => f.key) : [])
-      const args = Object.fromEntries(Object.entries(settings).filter(([k]) => runKeys.has(k)))
+      const args: Record<string, FormValue> = Object.fromEntries(
+        Object.entries(settings).filter(([k]) => runKeys.has(k))
+      )
+      // Snapshot the shared source into the session request. New hosts also
+      // return their fully merged args, but this keeps live hints/reset
+      // controls tied to the actual run even against an older serve host if
+      // the operator edits the saved source mid-run.
+      if (mantisSelected) args.mantis_source = mantisSource
       // Send the camera spec whenever any serial is assigned — collect-data /
       // run-policy need at least one, while teleop streams whichever are set to
       // the headset (and runs fine with none in sim). Newer hosts also hold the
       // spec in their settings store; sending it stays compatible with old ones.
-      const camSpec = meta.requiresCameras || cameraCount(cameras) > 0 ? cameras : undefined
+      const camSpec =
+        meta.requiresCameras || cameraCount(cameras, mantisSelected) > 0 ? cameras : undefined
+      if (generation !== connectionGenerationRef.current) return
       const result = await startOperation(opId, args, camSpec)
+      if (generation !== connectionGenerationRef.current) return
       setSession(result)
       // Fresh run — clear any stale phase; the live poll repopulates it.
       setPolicy(null)
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       toast.error(String(e))
     } finally {
-      setStartPhase(null)
-      setBusy(false)
+      if (generation === connectionGenerationRef.current) {
+        setStartPhase(null)
+        setBusy(false)
+      }
     }
   }
 
   async function handleStop() {
+    const generation = connectionGenerationRef.current
     setBusy(true)
     // Reflect "Stopping…" immediately — the server stop returns right away and
     // teardown runs in the background, so don't wait for the response/next poll
     // to flip the button.
     setSession((s) => (s ? { ...s, status: "stopping" } : s))
     try {
-      setSession(await stopOperation())
+      const stopped = await stopOperation()
+      if (generation !== connectionGenerationRef.current) return
+      setSession(stopped)
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       toast.error(String(e))
     } finally {
-      setBusy(false)
+      if (generation === connectionGenerationRef.current) setBusy(false)
     }
   }
 
   function handleEpisode(command: string) {
-    sendEpisodeCommand(command).catch((e) => toast.error(String(e)))
+    const generation = connectionGenerationRef.current
+    sendEpisodeCommand(command).catch((e) => {
+      if (generation === connectionGenerationRef.current) toast.error(String(e))
+    })
   }
 
   // Kick off the available update. The server upgrades and exits (systemd
@@ -748,12 +1430,21 @@ export default function ControlPanel() {
   // hard-reloads once the backend is back on the new release.
   async function handleUpdate() {
     if (!update?.remoteVersion) return
+    if (requiresInstallerMigration(update.version)) {
+      toast.error(
+        "This server needs the one-time hosted-installer migration; run the command shown on the robot."
+      )
+      return
+    }
+    const generation = connectionGenerationRef.current
     setUpdateAbandoned(false)
     setStartingUpdate(true)
     setUpdatePhase("upgrading")
     try {
       await startUpdate()
+      if (generation !== connectionGenerationRef.current) return
     } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
       toast.error(`Update failed to start: ${e}`)
       setStartingUpdate(false)
       setUpdatePhase(null)
@@ -763,6 +1454,7 @@ export default function ControlPanel() {
     // takes over; then drop the optimistic flag (server state carries it now).
     fetchUpdateStatus()
       .then((u) => {
+        if (generation !== connectionGenerationRef.current) return
         setUpdate(u)
         setStartingUpdate(false)
       })
@@ -770,6 +1462,18 @@ export default function ControlPanel() {
   }
 
   const viewerHost = serverHost || hostInfo?.lanIp || ""
+  const connectedReleaseVersion = update?.version ?? hostInfo?.version ?? null
+  const installerMigrationRequired =
+    conn.state === "ok" &&
+    showInstallerMigration(
+      connectedReleaseVersion,
+      hostInfo?.releaseInstall ?? update?.enabled ?? false
+    )
+  const mantisSource = String(settingsSnap?.values["teleop.mantis_source"] ?? "lighthouse")
+  // Child settings actions can finish after their old-host tree unmounts.
+  // Capture the generation represented by these callbacks so an old camera
+  // daemon restart or diagnostics launch cannot refresh/repopulate a new host.
+  const renderedConnectionGeneration = connectionGeneration
 
   // UI/backend skew warning (stale local bundle, or hosted UI on a different
   // release than the robot). Suppressed while the update banner covers the
@@ -784,7 +1488,13 @@ export default function ControlPanel() {
     <div className="min-h-screen">
       <SiteNav current="control" />
       <main className="safe-x mx-auto flex max-w-5xl flex-col gap-6 py-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:py-8">
-        {update?.updateAvailable && (
+        {conn.state === "migration" && <InstallerMigrationBanner version={null} />}
+
+        {installerMigrationRequired && (
+          <InstallerMigrationBanner version={connectedReleaseVersion} />
+        )}
+
+        {update?.updateAvailable && !installerMigrationRequired && (
           <UpdateBanner
             update={update}
             updating={updating}
@@ -795,7 +1505,7 @@ export default function ControlPanel() {
           />
         )}
 
-        {mismatch && !updating && !update?.updateAvailable && (
+        {mismatch && !updating && !update?.updateAvailable && !installerMigrationRequired && (
           <VersionMismatchBanner mismatch={mismatch} />
         )}
 
@@ -809,9 +1519,32 @@ export default function ControlPanel() {
           opRunning={hostBusy}
           robot={robot}
           robotBusy={robotBusy}
-          onRobotConnect={() => robotConnectClick()}
+          canProfiles={canProfiles}
+          onRobotConnect={robotConnectClick}
           onRobotDisconnect={robotDisconnectClick}
         />
+
+        {conn.state === "ok" && canDiscoveryNeedsRetry && (
+          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
+            <p className="min-w-0 flex-1 text-xs text-amber-100/80">
+              {canDiscovery?.message ??
+                "CAN hardware is attached but its Axol or Mantis role is not yet proven."}{" "}
+              Power the hardware, then retry identification. An idle robot link may disconnect
+              briefly while it is probed.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void retryCanIdentification()}
+              disabled={
+                canDiscoveryRetryBusy || hostBusy || activeCommandSession !== null || robotBusy
+              }
+            >
+              {canDiscoveryRetryBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+              Retry CAN identification
+            </Button>
+          </div>
+        )}
 
         {conn.state === "ok" && (
           <div ref={settingsRef} className="scroll-mt-18 sm:scroll-mt-20">
@@ -823,13 +1556,26 @@ export default function ControlPanel() {
               snapshot={settingsSnap}
               supportError={settingsError}
               cameras={cameras}
-              onSave={handleSettingsSave}
+              onSave={(patch) => handleSettingsSave(patch, renderedConnectionGeneration)}
               devices={cameraDevices}
               detecting={cameraDetecting}
-              onRefresh={refreshCameras}
+              onRefresh={() => void refreshCameras(renderedConnectionGeneration)}
               usb={usb}
               usbBusy={usbBusy}
-              onUsbConnect={() => usbConnectClick()}
+              onUsbConnect={() => void usbConnectClick(renderedConnectionGeneration)}
+              actionBlocker={
+                isLive
+                  ? `${runningOp ?? "An operation"} is running`
+                  : activeCommandSession
+                    ? `${activeCommandSession.command} is running`
+                    : null
+              }
+              activeCommandSession={activeCommandSession}
+              onCommandSessionChange={(next) => {
+                if (connectionGenerationRef.current === renderedConnectionGeneration) {
+                  setActiveCommandSession(next)
+                }
+              }}
             />
           </div>
         )}
@@ -849,13 +1595,15 @@ export default function ControlPanel() {
         )}
 
         <OperationPanel
+          key={renderedConnectionGeneration}
           meta={meta}
           spec={spec}
           settings={settings}
+          mantisSource={mantisSource}
           onChange={setSetting}
           onReset={resetSetting}
           onResetAll={resetAll}
-          onOpenSettings={() => openSettings(settingsTab === "cameras" ? "robot" : settingsTab)}
+          onOpenSettings={() => openSettings(mantisMode ? "mantis" : "robot")}
           cameras={cameras}
           robot={robot}
           live={selectedLive}
@@ -866,6 +1614,14 @@ export default function ControlPanel() {
           viewerPort={viewerPort}
           vrPort={hostInfo?.vrPort ?? 8000}
           startPhase={startPhase}
+          hostBlocker={
+            activeCommandSession
+              ? `${activeCommandSession.command} setup/diagnostic is running`
+              : isLive && !selectedLive
+                ? `${runningOp ?? "Another operation"} is running`
+                : null
+          }
+          connected={conn.state === "ok"}
           policy={selectedLive ? policy : null}
           onStart={handleStart}
           onStop={handleStop}
@@ -924,7 +1680,7 @@ function OperationSelector({
             type="button"
             onClick={() => onSelect(op.id)}
             className={cn(
-              "flex flex-col gap-1 rounded-xl border p-3 text-left transition-all",
+              "rounded-xl border p-3 text-left transition-all",
               active
                 ? "border-[#eff483]/40 bg-[#eff483]/10"
                 : "border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]"
@@ -936,9 +1692,6 @@ function OperationSelector({
               </span>
               {running && <span className="size-2 animate-pulse rounded-full bg-emerald-400" />}
             </div>
-            <span className="text-xs text-white/40">
-              {op.requiresCameras ? "Axol + Cameras" : op.simCapable ? "Axol or Sim" : "Axol"}
-            </span>
           </button>
         )
       })}

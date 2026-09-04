@@ -4,7 +4,15 @@ export { useAxolPoseSocket } from "./useAxolPoseSocket"
 export { useAxolControlChannel } from "./useAxolControlChannel"
 export { useAxolVideo } from "./useAxolVideo"
 export { useAxolTracking } from "./useAxolTracking"
+export { useAxolUrdfState } from "./useAxolUrdfState"
+export type { AxolUrdfBase, AxolUrdfState } from "./useAxolUrdfState"
 export { axolWsUrl, axolHttpsOrigin, resolveAuthority } from "./serverUrl"
 export { AxolConnectionStatus, AxolState } from "./types"
-export type { AxolPoseData, AxolMode, ConfirmAction } from "./types"
+export type {
+  AxolPoseData,
+  AxolMode,
+  AxolPoseMode,
+  AxolPoseSourceKind,
+  ConfirmAction,
+} from "./types"
 export type { CameraStreams } from "./useAxolVideo"

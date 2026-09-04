@@ -9,21 +9,24 @@ import {
   Square,
 } from "lucide-react"
 import {
-  cameraCount,
   fetchDatasets,
+  fetchTrackerBindings,
   isRobotFreeRun,
   isSimRun,
   motorFaultLabel,
   perRunFields,
+  recordingCameraCount,
   type CameraSpec,
   type CommandSpec,
   type DatasetInfo,
   type EpisodeControlSpec,
   type FormValue,
+  type MantisTrackerSource,
   type OperationMeta,
   type PolicyState,
   type RobotStatus,
   type SessionInfo,
+  type TrackerSourceReadiness,
 } from "@/lib/supervisor"
 import { CuratedForm, type FieldSuggestion } from "@/components/config-form"
 import { ArmJointPicker } from "@/components/arm-joint-picker"
@@ -33,6 +36,12 @@ import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
+
+const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse", "ultimate"])
+
+function isMantisTrackerSource(value: string): value is MantisTrackerSource {
+  return MANTIS_TRACKER_SOURCES.has(value as MantisTrackerSource)
+}
 
 /**
  * One operation's panel: just its per-run inputs (dataset / task / policy
@@ -44,6 +53,7 @@ export function OperationPanel({
   meta,
   spec,
   settings,
+  mantisSource: configuredMantisSource,
   onChange,
   onReset,
   onResetAll,
@@ -58,6 +68,8 @@ export function OperationPanel({
   viewerPort,
   vrPort,
   startPhase,
+  hostBlocker,
+  connected,
   policy,
   onStart,
   onStop,
@@ -66,6 +78,8 @@ export function OperationPanel({
   meta: OperationMeta
   spec: CommandSpec | null
   settings: Record<string, FormValue>
+  /** Shared Teleop & VR setting used when this is a Mantis run. */
+  mantisSource: string
   onChange: (key: string, value: FormValue) => void
   onReset: (key: string) => void
   onResetAll: () => void
@@ -82,6 +96,10 @@ export function OperationPanel({
   vrPort: number
   /** Progress label shown on the Start button while preparing (e.g. camera check). */
   startPhase: string | null
+  /** Active setup/diagnostic or other operation that owns the host. */
+  hostBlocker: string | null
+  /** False while disconnected or validating a replacement host. */
+  connected: boolean
   /** run-policy episode phase/count (null unless run-policy is the live op). */
   policy: PolicyState | null
   onStart: () => void
@@ -91,22 +109,36 @@ export function OperationPanel({
   // Per-run inputs: every required field plus the op's curated run-identity
   // fields (repo id, task, policy path, episode, …) — required ones first.
   const runFields = useMemo(() => (spec ? perRunFields(spec, meta) : []), [spec, meta])
+  const liveArgs = live && session ? session.args : null
+  const effectiveSettings: Record<string, FormValue> = liveArgs
+    ? { ...settings, ...(liveArgs as Record<string, FormValue>) }
+    : settings
+  const mantisMode = meta.supportsMantis && Boolean(effectiveSettings.mantis)
+  const mantisSource =
+    liveArgs && typeof liveArgs.mantis_source === "string"
+      ? liveArgs.mantis_source
+      : configuredMantisSource
+  const trackerSource = isMantisTrackerSource(mantisSource) ? mantisSource : null
   // Gravity-comp's joint subset gets a proper picker instead of a text field.
   const jointField = runFields.find((f) => f.key === "free_joints")
   const textFields = useMemo(() => runFields.filter((f) => f.key !== "free_joints"), [runFields])
 
   // Dataset picker: datasets found on the serve host, offered as a datalist
   // under the repo id field — typing a fresh id or a path stays possible.
-  // On replay it picks what to play; on collect-data it makes resuming an
-  // existing dataset a click instead of retyping its id. Refetched whenever
-  // the panel is editable (a run that just ended may have added one). Older
-  // hosts without /api/datasets simply leave the field a plain input.
-  const wantsDatasets =
-    (meta.id === "replay-dataset" || meta.id === "collect-data") &&
-    runFields.some((f) => f.key === "repo_id")
+  // Every operation with a repo_id gets the same picker: replay selects an
+  // input dataset, while collect-data, DAgger, and run-policy can resume an
+  // existing output dataset or type a new id. Refetched whenever the panel is
+  // editable (a run that just ended may have added one). Older hosts without
+  // /api/datasets simply leave the field a plain input.
+  const wantsDatasets = runFields.some((f) => f.key === "repo_id")
   const [datasets, setDatasets] = useState<DatasetInfo[]>([])
+  const [trackerReadiness, setTrackerReadiness] = useState<TrackerSourceReadiness | null>(null)
+  const [trackerReadinessState, setTrackerReadinessState] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle")
+  const [trackerReadinessSource, setTrackerReadinessSource] = useState<string | null>(null)
   useEffect(() => {
-    if (!wantsDatasets || live) return
+    if (!connected || !wantsDatasets || live) return
     let cancelled = false
     fetchDatasets()
       .then((found) => {
@@ -116,7 +148,40 @@ export function OperationPanel({
     return () => {
       cancelled = true
     }
-  }, [wantsDatasets, live])
+  }, [connected, wantsDatasets, live])
+  useEffect(() => {
+    if (!connected || !mantisMode || !trackerSource || live) return
+    let cancelled = false
+    const refresh = () => {
+      fetchTrackerBindings()
+        .then((snapshot) => {
+          if (cancelled) return
+          setTrackerReadinessSource(mantisSource)
+          if (snapshot.sources) {
+            setTrackerReadiness(snapshot.sources)
+            setTrackerReadinessState("ready")
+          } else {
+            setTrackerReadiness(null)
+            setTrackerReadinessState("error")
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setTrackerReadinessSource(mantisSource)
+            setTrackerReadiness(null)
+            setTrackerReadinessState("error")
+          }
+        })
+    }
+    refresh()
+    // Binding/install sessions and calibration-file edits happen outside this
+    // component. Poll while idle so Start unblocks as soon as setup is fixed.
+    const timer = window.setInterval(refresh, 3000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [connected, mantisMode, mantisSource, trackerSource, live])
   const suggestions = useMemo<Record<string, FieldSuggestion[]> | undefined>(() => {
     if (!wantsDatasets || datasets.length === 0) return undefined
     return {
@@ -128,33 +193,125 @@ export function OperationPanel({
     }
   }, [wantsDatasets, datasets])
 
-  const isSim = isSimRun(meta, settings)
-  // Sim, or a run that never touches the arms (teleop's cart-only mode):
-  // either way the arm-connection and motor-fault gates don't apply.
-  const robotFree = isRobotFreeRun(meta, settings)
+  const isSim = isSimRun(meta, effectiveSettings)
+  // Sim, cart-only, and Mantis runs do not touch the Axol arm motors. Mantis
+  // still needs its own live CAN link, however, so `robotFree` only controls
+  // the Axol connection/fault gates below; it is not a general hardware-free
+  // signal.
+  const robotFree = isRobotFreeRun(meta, effectiveSettings)
   const robotOk = robot?.state === "connected"
-  const camCount = cameraCount(cameras)
+  const axolOk = robotOk && (robot?.profile ?? "axol") === "axol"
+  const mantisOk = robotOk && robot?.profile === "mantis"
+  const cartOnly = meta.fields.includes("cart_only") && Boolean(effectiveSettings.cart_only)
+  // `usesHeadset` also identifies operations that run the camera relay. The
+  // relay is useful in the panel for every real teleop/collection run,
+  // including headset-free Lighthouse/Ultimate Mantis tracking.
+  const showFeeds = meta.usesHeadset && !isSim && !cartOnly
+  const camCount = recordingCameraCount(cameras, mantisMode)
+  const currentTrackerReadinessState =
+    trackerReadinessSource === mantisSource ? trackerReadinessState : "loading"
+  const currentTrackerReadiness = trackerReadinessSource === mantisSource ? trackerReadiness : null
 
   const blockers: string[] = []
-  if (meta.requiresRobot && !robotFree && !robotOk) blockers.push("Connect Axol")
-  // A faulted motor blocks every hardware operation (the server refuses the
-  // start too) — driving through an over-temp / stalled / unreachable motor
-  // risks the arm. Sim and cart-only runs never touch the arm motors.
-  if (!robotFree) {
+  if (!live && hostBlocker) blockers.push(`Wait: ${hostBlocker}`)
+  if (meta.requiresRobot && mantisMode && !mantisOk) {
+    blockers.push(
+      robotOk && robot?.profile !== "mantis"
+        ? "Connect Mantis (the current hardware link is Axol)"
+        : "Connect Mantis"
+    )
+  } else if (meta.requiresRobot && !robotFree && !axolOk) {
+    blockers.push(
+      robotOk && robot?.profile === "mantis"
+        ? "Connect Axol (the current hardware link is Mantis)"
+        : "Connect Axol"
+    )
+  }
+  // A faulted motor on the active hardware profile blocks the run (the server
+  // refuses it too). A Mantis run ignores stale Axol-arm faults while the Axol
+  // profile is showing, but once the Mantis link is selected its own gripper
+  // faults remain actionable.
+  const checkActiveProfileFaults = mantisMode ? mantisOk : !robotFree && axolOk
+  if (checkActiveProfileFaults) {
     for (const f of robot?.faults ?? []) {
       blockers.push(`Fix motor fault: ${motorFaultLabel(f)}`)
+    }
+  }
+  if (mantisMode && !trackerSource) {
+    blockers.push("Choose a valid Mantis tracker source in Settings → Mantis")
+  } else if (mantisMode && currentTrackerReadinessState !== "ready") {
+    blockers.push(
+      currentTrackerReadinessState === "error"
+        ? "Mantis tracker readiness is unavailable — reconnect the host or update Axol"
+        : "Checking Mantis tracker readiness…"
+    )
+  }
+  if (mantisMode && trackerSource && currentTrackerReadiness) {
+    const ready = currentTrackerReadiness[trackerSource]
+    if (trackerSource === "lighthouse") {
+      const status = currentTrackerReadiness.lighthouse
+      if (!status.available) blockers.push("Install libsurvive in Mantis settings")
+      else if (!status.installed) blockers.push("Repair Lighthouse support in Mantis settings")
+      if (!status.udevReady) blockers.push("Install the Lighthouse Vive USB permissions rule")
+      if (!status.binding.complete) blockers.push("Identify left + right Lighthouse trackers")
+    } else if (trackerSource === "ultimate") {
+      const status = currentTrackerReadiness.ultimate
+      if (!status.nativeDependencies) blockers.push("Install the Ultimate native HID libraries")
+      if (!status.pythonHid || !status.apiCompatible)
+        blockers.push("Install the supported Ultimate Python runtime")
+      else if (!status.pinnedPyvut) blockers.push("Reinstall the pinned pyvut revision")
+      if (!status.logSuppression)
+        blockers.push("Install pyvut with credential-log suppression support")
+      if (!status.udevReady) blockers.push("Install the Ultimate USB permissions rule")
+      if (!status.operatorAccess) blockers.push("Grant this operator Ultimate dongle access")
+      if (!status.dongleConnected) blockers.push("Connect the Ultimate wireless dongle")
+      else if (status.endpointStatus !== "accessible")
+        blockers.push("Make Ultimate HID interface 0 accessible")
+      if (status.wifiConfig !== "valid") blockers.push("Fix Ultimate shared-map Wi-Fi setup")
+      if (!status.binding.complete) blockers.push("Identify left + right Ultimate trackers")
+    }
+
+    const productionCollection = meta.id === "collect-data" && !settings.mantis_allow_uncalibrated
+    if (productionCollection) {
+      const transformReady = (["left", "right"] as const).every(
+        (side) => ready.transforms[side] === "measured" || ready.transforms[side] === "factory"
+      )
+      if (!transformReady) {
+        blockers.push(
+          "Provide approved factory or measured tracker-to-TCP transforms in Mantis settings"
+        )
+      }
+      if (
+        trackerSource === "quest" &&
+        (currentTrackerReadiness.quest.datumStatus !== "configured" ||
+          currentTrackerReadiness.quest.poseSpace !== "grip")
+      ) {
+        blockers.push("Choose one quest:<WebXR-profile>:grip calibration key in Settings → Mantis")
+      }
     }
   }
   // Collect-data / run-policy record whichever camera slots are assigned, so
   // at least one serial must be set before starting (the rest are optional).
   if (meta.requiresCameras && camCount < 1) {
-    blockers.push("Assign at least one camera serial in the Cameras settings tab")
+    blockers.push(
+      mantisMode
+        ? "Assign a camera and enable Record in Settings → Mantis"
+        : "Assign a camera and enable Record in Settings → Axol Cameras"
+    )
   }
   for (const f of runFields) {
     if (f.required) {
       const v = settings[f.key]
       if (v === undefined || String(v).trim() === "") blockers.push(`Set ${f.label}`)
     }
+  }
+  // Teleop's run modes are mutually exclusive (the server refuses the start
+  // too); catch the combination before the Start button instead of after.
+  const modeFlags = ["sim", "mantis", "cart_only"].filter(
+    (f) => meta.fields.includes(f) && Boolean(settings[f])
+  )
+  if (modeFlags.length > 1) {
+    blockers.push("Sim, Mantis, and Cart only are mutually exclusive — enable only one")
   }
 
   const editedCount = Object.keys(settings).length
@@ -171,7 +328,12 @@ export function OperationPanel({
             </div>
             <p className="mt-2 max-w-prose text-sm text-white/55">{meta.description}</p>
           </div>
-          <div className="flex shrink-0 items-center gap-2">
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            {live && mantisMode && mantisSource !== "quest" && (
+              <Button variant="outline" onClick={() => onEpisode("bridge-reset")} disabled={busy}>
+                <RotateCcw /> Reset
+              </Button>
+            )}
             {stopping ? (
               <Button variant="destructive" disabled>
                 <Loader2 className="animate-spin" />
@@ -260,13 +422,14 @@ export function OperationPanel({
                   status/controls, the mirrored headset popups, and the live
                   camera feeds — grouped so it can expand to a fullscreen
                   operator view (the headset-off replacement for the HUD). */}
-              {/* Skipped for robot-free runs: sim has the browser viewer, and
-                  cart-only has no camera relay or HUD popups to mirror. */}
-              {live && (meta.episodeControl || (meta.usesHeadset && !robotFree)) && (
+              {/* Sim has the browser viewer and cart-only has no video relay.
+                  Mantis still relays its configured wrist-camera feeds even
+                  when Lighthouse/Ultimate make the headset unnecessary. */}
+              {live && (meta.episodeControl || showFeeds) && (
                 <OperatorDeck
                   label={meta.label}
                   episodeControl={meta.episodeControl}
-                  showFeeds={meta.usesHeadset && !robotFree}
+                  showFeeds={showFeeds}
                   policy={policy}
                   onEpisode={onEpisode}
                   host={host}
@@ -276,6 +439,9 @@ export function OperationPanel({
 
               <RunningHints
                 usesHeadset={meta.usesHeadset}
+                mantisMode={mantisMode}
+                mantisSource={mantisSource}
+                dataCollection={meta.id === "collect-data"}
                 session={live ? session : null}
                 isSim={isSim}
                 host={host}
@@ -688,12 +854,18 @@ function EpisodeInputControl({
 
 function RunningHints({
   usesHeadset,
+  mantisMode,
+  mantisSource,
+  dataCollection,
   session,
   isSim,
   host,
   viewerPort,
 }: {
   usesHeadset: boolean
+  mantisMode: boolean
+  mantisSource: string
+  dataCollection: boolean
   session: SessionInfo | null
   isSim: boolean
   host: string
@@ -701,6 +873,9 @@ function RunningHints({
 }) {
   if (!session || session.status !== "running") return null
   const viewerUrl = host ? `http://${host}:${viewerPort}` : ""
+  const questMantis = mantisMode && mantisSource === "quest"
+  const managedMantis = mantisMode && !questMantis
+  const trackerLabel = mantisSource === "ultimate" ? "Ultimate" : "Lighthouse"
   return (
     <div className="flex flex-col gap-3">
       {isSim && viewerUrl && (
@@ -714,11 +889,47 @@ function RunningHints({
           Open 3D viewer
         </a>
       )}
-      {usesHeadset && (
+      {usesHeadset && !mantisMode && (
         <p className="rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
           Put on the headset, open <span className="text-white/70">axol.almond.bot</span>, and
           connect to <span className="font-mono text-[#eff483]">{host || "this machine"}</span>.
         </p>
+      )}
+      {questMantis && (
+        <div className="flex flex-col gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
+          <p>
+            On the Quest, open <span className="text-white/70">axol.almond.bot</span>, connect to{" "}
+            <span className="font-mono text-[#eff483]">{host || "this machine"}</span>, then choose{" "}
+            <span className="text-white/70">Enter VR</span>. Hold both controllers at the configured
+            rest pose and press both grip buttons together to engage.
+          </p>
+          {dataCollection && (
+            <p>
+              Use the Quest&apos;s A button to start or save a take and X to discard it (each stop
+              asks for the same button again), or use the episode controls above.
+            </p>
+          )}
+        </div>
+      )}
+      {managedMantis && (
+        <div className="flex flex-col gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
+          <p>
+            This run uses headset-free {trackerLabel} tracking. Power both bound trackers and keep
+            them tracking. Once both trackers and trigger channels are live, hold both Mantis rigs
+            where the session should begin, squeeze both triggers together, then release both to
+            engage at that pose{dataCollection ? " and start a take" : ""}.
+          </p>
+          <p>
+            If either tracker loses lock, motion holds. After both sides recover, repeat the
+            both-squeeze-then-release gesture to re-engage; Reset above explicitly returns to rest.
+          </p>
+          {dataCollection && (
+            <p className="text-white/65">
+              While recording, rapidly fully squeeze and release either Mantis trigger 3 times to
+              save the take, or 4 times to discard it. Start recording above requires an engaged rig.
+            </p>
+          )}
+        </div>
       )}
     </div>
   )

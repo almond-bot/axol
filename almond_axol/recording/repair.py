@@ -28,10 +28,18 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
+import stat
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from ..utils.state_files import (
+    secure_atomic_copy_file,
+    secure_atomic_write_json,
+    secure_read_text,
+    secure_unlink,
+)
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -175,8 +183,21 @@ def _repair(
     removed: list[Path] = []
 
     def _remove(path: Path) -> None:
-        os.remove(path)
+        secure_unlink(path)
         removed.append(path)
+
+    def _write_parquet_atomic(path: Path, table: Any) -> None:
+        try:
+            mode = stat.S_IMODE(path.lstat().st_mode)
+        except OSError:
+            mode = 0o600
+        # PyArrow accepts only a path/file object and may reopen it. Keep that
+        # activity in a root-private directory, then stream the completed bytes
+        # through the descriptor-relative no-follow publisher.
+        with tempfile.TemporaryDirectory(prefix="axol-parquet-repair-") as directory:
+            staged = Path(directory) / "repaired.parquet"
+            pq.write_table(table, staged, compression="snappy", use_dictionary=True)
+            secure_atomic_copy_file(staged, path, mode=mode)
 
     # 1. meta/episodes: drop unreadable files and any rows past the prefix.
     for f in unreadable_meta:
@@ -189,9 +210,7 @@ def _repair(
         if kept.num_rows == 0:
             _remove(f)
             continue
-        tmp = f.with_suffix(".parquet.tmp")
-        pq.write_table(kept, tmp, compression="snappy", use_dictionary=True)
-        os.replace(tmp, f)
+        _write_parquet_atomic(f, kept)
 
     surviving = [episodes[i] for i in range(keep)]
 
@@ -215,9 +234,7 @@ def _repair(
         mask = pc.less(table["episode_index"], keep)
         kept = table.filter(mask)
         if kept.num_rows != table.num_rows:
-            tmp = f.with_suffix(".parquet.tmp")
-            pq.write_table(kept, tmp, compression="snappy", use_dictionary=True)
-            os.replace(tmp, f)
+            _write_parquet_atomic(f, kept)
 
     # 3. videos: delete per-key files no surviving episode references. (Lost
     # episodes appended into a survivor's file leave a harmless unreferenced
@@ -246,7 +263,7 @@ def _repair(
     # unparseable, turning a still-intact dataset unresumable instead of just
     # re-running the repair.
     info_path = root / "meta" / "info.json"
-    info = json.loads(info_path.read_text())
+    info = json.loads(secure_read_text(info_path))
     info["total_episodes"] = keep
     info["total_frames"] = int(surviving[-1]["dataset_to_index"])
     info["splits"] = {"train": f"0:{keep}"}
@@ -272,9 +289,7 @@ def _repair(
 
 def _write_json_atomic(data: dict[str, Any], path: "Path") -> None:
     """Write JSON via tmp + rename so a kill mid-write can't corrupt the file."""
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=4, ensure_ascii=False) + "\n")
-    os.replace(tmp, path)
+    secure_atomic_write_json(path, data, sort_keys=False, indent=4)
 
 
 def _recompute_stats(root: "Path", surviving: list[dict[str, Any]]) -> None:

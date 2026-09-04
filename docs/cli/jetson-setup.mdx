@@ -5,7 +5,7 @@ description: "Pin the Jetson NVENC/VIC and CPU clocks for the real-time loops."
 
 Pins the Jetson clocks the real-time loops depend on:
 
-- the **MAXN power mode** (`nvpmodel -m 0`), which uncaps the clock ceiling the other two pins reach (`nvpmodel` otherwise caps how high the governor and engine clocks can go),
+- the strongest supported power mode — **MAXN SUPER** when it is present in the active `/etc/nvpmodel.conf`, otherwise **MAXN** (mode IDs vary by Jetson configuration) — which uncaps the clock ceiling the other two pins reach (`nvpmodel` otherwise caps how high the governor and engine clocks can go),
 - the **NVENC / VIC engine** devfreq nodes, so the camera relay's hardware H.264 encode stays low-latency (the default devfreq governor scales them for throughput, which roughly triples per-frame encode time), and
 - the **CPU governor**, so the bursty IK loop isn't underclocked.
 
@@ -14,6 +14,12 @@ axol jetson.setup
 ```
 
 These pins reset on every reboot, so the [one-command install](/installation) wires this into the `axol.service` systemd unit as an `ExecStartPre`, re-pinning the clocks at every boot, and runs it once during install. It is **not** called from `teleop` / `collect-data` / `serve` — those entry points just run.
+
+If changing the power-gating configuration requires a reboot, Axol declines the immediate reboot so it cannot interrupt an installation or robot session. It records the selected mode for NVIDIA's `nvpmodel.service` to apply on the next natural boot; `axol.service` is explicitly ordered after that service before it re-pins the clocks.
+
+<Warning>
+  NVIDIA classifies MAXN and MAXN SUPER as experimental, unconstrained modes and does not recommend sustained heavy workloads in them unless the module was flashed with the corresponding `-maxn` configuration and its more conservative thermal settings. Ensure the robot has adequate power and cooling and monitor thermal throttling during sustained local inference or training. Axol normally selects a named mode exposed by the active BSP configuration; on legacy or unreadable configurations it attempts NVIDIA's conventional mode 0 and reports any rejection. It does not change the board's thermal policy.
+</Warning>
 
 <Note>
   Best-effort and a no-op on non-Jetson machines. Pinning needs root: run as root, or you'll be prompted for `sudo` once on a terminal; if escalation isn't possible it logs the manual command and continues.

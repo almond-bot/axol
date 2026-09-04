@@ -3,13 +3,19 @@
 #
 #   curl https://axol.almond.bot/install -fsS | bash
 #
-# Installs uv, installs the axol CLI as a uv tool (from GitHub, pinned to the
-# latest release tag, all extras), installs the pyzed bindings when the ZED SDK
-# is present, installs adb for Quest-over-USB teleop, and registers a root
-# systemd service that keeps `axol serve` running at boot and restarts it if it
+# Installs uv, installs the axol CLI as a uv tool (from PyPI, pinned to the
+# latest GitHub release tag, with hosted feature extras), installs pyzed when
+# the ZED SDK is present, installs adb for Quest-over-USB teleop, and registers
+# a root systemd service that keeps `axol serve` running at boot and restarts it if it
 # ever goes down. Safe to re-run: re-running upgrades to the latest release.
 
 set -euo pipefail
+# A root installer must never resolve privileged utilities from a caller-
+# controlled path. Start with distribution-owned system directories only;
+# /usr/local/bin is added at the end only after its ownership, mode, and
+# existing entries have been validated below.
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 
 INSTALL_URL="https://axol.almond.bot/install"
 # GitHub stays the source of truth for what the latest release is; the package
@@ -20,11 +26,50 @@ REPO_URL="https://github.com/almond-bot/axol"
 # (GStreamer NVENC + PyGObject + the patched zed-gstreamer source plugins),
 # provisioned below by `axol provision`, not via a PyPI extra (see
 # pyproject.toml). WebRTC transport itself is aiortc, a normal core dependency.
-EXTRAS="lerobot,sim"
+EXTRAS="lerobot,sim,tracker"
 PYTHON_VERSION="3.13"
+UV_VERSION="0.12.3"
+# Reviewed digests from the official uv v0.12.3 GitHub release. The installer
+# downloads the platform archive directly and verifies it before root executes
+# any downloaded bytes; it never streams Astral's mutable install script into
+# a shell.
+UV_X86_64_LINUX_SHA256="600cf9a742aca00d292673b16b5acffaa7b8c269a364ad0c2e79498dcb1fe101"
+UV_AARCH64_LINUX_SHA256="bb66cb52e7b1823aed1183630d8d8e5c958840d584a4c55ec10a4cfc168dcca2"
+MIN_SAFE_RELEASE_VERSION="0.1.37"
+PYVUT_REPO_URL="https://github.com/nijkah/pyvut.git"
+PYVUT_REF="fcfcd33f4c1f16b0d84f5f741dc1319abdc7942a"
+PYVUT_SPEC="git+${PYVUT_REPO_URL}@${PYVUT_REF}"
+PYVUT_DEFAULT_WIFI_SHA256="fd64dd89b6dd61d06e91b1a5c913aa7fcae5ac2654903eb3f7e6dac8aeee2b67"
 BIN_DIR="/usr/local/bin"
+AXOL="${BIN_DIR}/axol"
 SERVICE_NAME="axol"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+MANTIS_SERVICE_NAME="axol-mantis"
+MANTIS_SERVICE_SHOULD_RUN=0
+SERVICE_WAS_ENABLED=0
+SERVICE_WAS_ACTIVE=0
+MANTIS_SERVICE_WAS_ENABLED=0
+MANTIS_SERVICE_WAS_ACTIVE=0
+# Shared with almond_axol.serve.update.  The permanent systemd condition makes
+# every future start fail closed while a package update is incomplete; the
+# marker survives crashes and reboots until a verified installer removes it.
+UPDATE_MARKER="/var/lib/almond-axol/update-incomplete"
+UPDATE_START_TOKEN="/var/lib/almond-axol/update-start-once"
+UPDATE_VERIFYING_MARKER="/var/lib/almond-axol/update-verifying"
+MANTIS_START_DIR="/run/almond-axol"
+MANTIS_START_TOKEN="${MANTIS_START_DIR}/mantis-update-start-once"
+UPDATE_LOCK="/var/lib/almond-axol/update.lock"
+UPDATE_WORKER_ROOT="/var/lib/almond-axol/update-workers"
+LEGACY_DATASET_ACK="/var/lib/almond-axol/legacy-datasets-ack"
+ROLLBACK_ROOT="/opt/axol/rollback"
+PENDING_ROLLBACK="${ROLLBACK_ROOT}/pending"
+PREVIOUS_ROLLBACK="${ROLLBACK_ROOT}/previous"
+FAILED_ROLLBACK_TOOL="${ROLLBACK_ROOT}/failed-tool"
+UPDATE_GUARD_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
+UPDATE_GUARD_FILE="${UPDATE_GUARD_DIR}/20-update-guard.conf"
+MANTIS_UPDATE_GUARD_DIR="/etc/systemd/system/${MANTIS_SERVICE_NAME}.service.d"
+MANTIS_UPDATE_GUARD_FILE="${MANTIS_UPDATE_GUARD_DIR}/20-update-guard.conf"
+SERVICE_DATASET_ROOT="/var/lib/almond-axol/datasets"
 # We install as root (the systemd service runs as root), but operators log in
 # as their own user and expect `axol` to work there too. uv's default tool +
 # managed-Python locations live under /root (mode 0700), which only root can
@@ -39,7 +84,96 @@ export UV_TOOL_DIR UV_PYTHON_INSTALL_DIR
 say() { printf "\033[1;36m[axol]\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31m[axol]\033[0m %s\n" "$*" >&2; exit 1; }
 
+# A new directory is not crash-durable until its entry has been committed in
+# the existing parent. Each guarded file later syncs the new directory itself.
+durable_install_directory() {
+    local path="$1"
+    local owner="$2"
+    local group="$3"
+    local mode="$4"
+    local parent
+    parent="$(dirname -- "${path}")"
+    install -d -o "${owner}" -g "${group}" -m "${mode}" "${path}" || return 1
+    sync -- "${parent}"
+}
+
+# Commit a prepared file and its directory entry before returning. GNU
+# coreutils `sync FILE` issues fsync(2) for that file; syncing the containing
+# directory after the atomic rename makes the new name survive a power loss.
+# Callers prepare ownership and mode on the root-owned temporary file first.
+durable_replace() {
+    local temporary="$1"
+    local destination="$2"
+    local parent
+    parent="$(dirname -- "${destination}")"
+    sync -- "${temporary}" || return 1
+    mv -fT -- "${temporary}" "${destination}" || return 1
+    sync -- "${parent}"
+}
+
+# Removing the verified-update marker is safe only once the unlink is durable;
+# otherwise a reboot can unexpectedly restore the guard after a successful
+# install and leave the service unavailable.
+durable_remove() {
+    local path="$1"
+    local parent
+    parent="$(dirname -- "${path}")"
+    rm -f -- "${path}" || return 1
+    sync -- "${parent}"
+}
+
+write_update_marker() {
+    local marker_tmp
+    marker_tmp="$(mktemp "/var/lib/almond-axol/.update-incomplete.XXXXXX")" \
+        || return 1
+    if ! printf 'target-version=%s\n' "${VERSION}" > "${marker_tmp}" \
+        || ! chown root:root "${marker_tmp}" \
+        || ! chmod 0600 "${marker_tmp}" \
+        || ! durable_replace "${marker_tmp}" "${UPDATE_MARKER}"; then
+        rm -f -- "${marker_tmp}" || true
+        return 1
+    fi
+}
+
+write_update_start_token() {
+    local token_tmp
+    token_tmp="$(mktemp "/var/lib/almond-axol/.update-start-once.XXXXXX")" \
+        || return 1
+    if ! printf 'target-version=%s\n' "${VERSION}" > "${token_tmp}" \
+        || ! chown root:root "${token_tmp}" \
+        || ! chmod 0600 "${token_tmp}" \
+        || ! durable_replace "${token_tmp}" "${UPDATE_START_TOKEN}"; then
+        rm -f -- "${token_tmp}" || true
+        return 1
+    fi
+}
+
+write_mantis_start_token() {
+    local token_tmp
+    if [ -e "${MANTIS_START_DIR}" ] || [ -L "${MANTIS_START_DIR}" ]; then
+        [ -d "${MANTIS_START_DIR}" ] && [ ! -L "${MANTIS_START_DIR}" ] \
+            && [ "$(stat -c '%u:%g:%a' -- "${MANTIS_START_DIR}")" = "0:0:700" ] \
+            || return 1
+    else
+        install -d -o root -g root -m 0700 "${MANTIS_START_DIR}" || return 1
+        sync -- /run || return 1
+    fi
+    token_tmp="$(mktemp "${MANTIS_START_DIR}/.mantis-update-start.XXXXXX")" \
+        || return 1
+    if ! printf 'target-version=%s\n' "${VERSION}" > "${token_tmp}" \
+        || ! chown root:root "${token_tmp}" \
+        || ! chmod 0600 "${token_tmp}" \
+        || ! durable_replace "${token_tmp}" "${MANTIS_START_TOKEN}"; then
+        rm -f -- "${token_tmp}" || true
+        return 1
+    fi
+}
+
 [ "$(uname -s)" = "Linux" ] || die "This installer only supports Linux."
+AARCH64_HOST=0
+case "$(uname -m)" in
+    aarch64|arm64) AARCH64_HOST=1 ;;
+esac
 
 # The systemd service runs as root, so install everything as root. When piped
 # into a non-root shell, re-fetch ourselves and re-run elevated.
@@ -50,49 +184,1722 @@ fi
 
 command -v systemctl >/dev/null 2>&1 || die "systemd is required."
 command -v curl >/dev/null 2>&1 || die "curl is required."
-# git is needed both to resolve the latest release tag and by uv itself to
-# install from the GitHub URL.
+command -v python3 >/dev/null 2>&1 || die "system Python 3 is required."
+command -v sha256sum >/dev/null 2>&1 || die "coreutils sha256sum is required."
+command -v tar >/dev/null 2>&1 || die "tar is required."
+command -v install >/dev/null 2>&1 || die "coreutils install is required."
+command -v realpath >/dev/null 2>&1 || die "coreutils realpath is required."
+command -v sync >/dev/null 2>&1 || die "coreutils sync is required."
+command -v flock >/dev/null 2>&1 || die "util-linux flock is required."
+command -v namei >/dev/null 2>&1 || die "util-linux namei is required."
+# git resolves the latest release tag and restores the pinned Ultimate VCS
+# requirement when that runtime was explicitly configured.
 command -v git >/dev/null 2>&1 || die "git is required."
+
+# The managed uv and Axol entry points live here, and provisioning legitimately
+# discovers uv through PATH. Seal this directory before adding it to PATH, and
+# reject files an operator could have planted while it was previously writable.
+# System directories remain first so local names can never shadow root tools.
+for managed_dir in /usr/local "${BIN_DIR}"; do
+    if [ -e "${managed_dir}" ] || [ -L "${managed_dir}" ]; then
+        [ -d "${managed_dir}" ] && [ ! -L "${managed_dir}" ] \
+            && [ "$(stat -c '%u:%g:%a' -- "${managed_dir}")" = "0:0:755" ] \
+            || die "${managed_dir} must be a root-owned directory with mode 0755."
+    else
+        install -d -o root -g root -m 0755 "${managed_dir}"
+    fi
+done
+UNSAFE_LOCAL_ENTRY="$(find -P "${BIN_DIR}" -mindepth 1 -maxdepth 1 \
+    \( ! -uid 0 -o ! -gid 0 -o ! \( -type f -o -type l \) \
+       -o \( -type f -perm /022 \) \) -print -quit)"
+[ -z "${UNSAFE_LOCAL_ENTRY}" ] \
+    || die "${BIN_DIR} contains an entry that is not root-controlled."
+
+# A root-owned symlink can still target an operator-writable executable. Check
+# the resolved file and every directory that controls its name before any
+# privileged Python provisioning step may discover it through shutil.which().
+validate_local_symlink_target() {
+    local link="$1"
+    local target current mode chain line permissions owner group _remainder
+    local first_line=1
+    local component_count=0
+    # realpath alone is insufficient: /usr/local/bin/tool could point through
+    # an operator-controlled intermediate symlink that currently resolves to a
+    # safe binary. namei exposes every traversed component and symlink hop.
+    chain="$(namei -l -- "${link}")" \
+        || die "${link} has an unreadable local executable symlink chain."
+    while IFS= read -r line; do
+        if [ "${first_line}" -eq 1 ]; then
+            first_line=0
+            continue
+        fi
+        read -r permissions owner group _remainder <<< "${line}"
+        case "${permissions}" in
+            d?????????*|-?????????*|l?????????*) ;;
+            *) die "${link} has an unsafe local executable symlink chain." ;;
+        esac
+        [ "${owner}" = "root" ] && [ "${group}" = "root" ] \
+            || die "${link} has a non-root-controlled symlink component."
+        if [ "${permissions:0:1}" != "l" ]; then
+            [ "${permissions:5:1}" != "w" ] \
+                && [ "${permissions:8:1}" != "w" ] \
+                || die "${link} has a writable symlink-chain component."
+        fi
+        component_count=$((component_count + 1))
+    done <<< "${chain}"
+    [ "${component_count}" -gt 0 ] \
+        || die "${link} has an empty local executable symlink chain."
+    target="$(realpath -e -- "${link}")" \
+        || die "${link} is a broken local executable symlink."
+    [ -f "${target}" ] && [ ! -L "${target}" ] \
+        && [ "$(stat -c '%u:%g' -- "${target}")" = "0:0" ] \
+        && [ -z "$(find -P "${target}" -maxdepth 0 -perm /022 -print -quit)" ] \
+        || die "${link} does not resolve to a root-controlled regular file."
+    current="$(dirname -- "${target}")"
+    while :; do
+        [ -d "${current}" ] && [ ! -L "${current}" ] \
+            && [ "$(stat -c '%u:%g' -- "${current}")" = "0:0" ] \
+            || die "${link} has unsafe target ancestry at ${current}."
+        mode="$(stat -c '%a' -- "${current}")"
+        (( (8#${mode} & 8#22) == 0 )) \
+            || die "${link} has writable target ancestry at ${current}."
+        [ "${current}" = "/" ] && break
+        current="$(dirname -- "${current}")"
+    done
+}
+while IFS= read -r -d '' local_link; do
+    validate_local_symlink_target "${local_link}"
+done < <(find -P "${BIN_DIR}" -mindepth 1 -maxdepth 1 -type l -print0)
+PATH="/usr/sbin:/usr/bin:/sbin:/bin:${BIN_DIR}"
+export PATH
+
+# Resolve the login that owns this robot's operator state once and reuse it for
+# Quest USB access, datasets, and ALMOND_HOME. SUDO_USER is the person who
+# launched the installer; a direct root invocation retains the historical
+# first-/home-user fallback.
+PERSISTED_OPERATOR_USER="${AXOL_OPERATOR_USER:-}"
+if [ -n "${PERSISTED_OPERATOR_USER}" ]; then
+    if [ "${PERSISTED_OPERATOR_USER}" = "root" ]; then
+        OPERATOR_USER=""
+    else
+        [[ "${PERSISTED_OPERATOR_USER}" =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$?$ ]] \
+            && getent passwd "${PERSISTED_OPERATOR_USER}" >/dev/null 2>&1 \
+            && [ "$(id -u "${PERSISTED_OPERATOR_USER}" 2>/dev/null || true)" != "0" ] \
+            || die "AXOL_OPERATOR_USER does not name a valid non-root account."
+        OPERATOR_USER="${PERSISTED_OPERATOR_USER}"
+    fi
+else
+    OPERATOR_USER="${SUDO_USER:-}"
+fi
+if [ -z "${PERSISTED_OPERATOR_USER}" ] \
+    && { [ -z "${OPERATOR_USER}" ] || [ "${OPERATOR_USER}" = "root" ]; }; then
+    # With pipefail, an unmatched /home/* glob would make the old `ls | awk`
+    # fallback terminate the whole installer before it could use root's
+    # defaults. Walk candidates explicitly and leave the value empty when a
+    # machine genuinely has no non-root home.
+    OPERATOR_USER=""
+    for candidate_home in /home/*/; do
+        [ -d "${candidate_home}" ] || continue
+        candidate_user="$(stat -c '%U' -- "${candidate_home}" 2>/dev/null || true)"
+        if [ -n "${candidate_user}" ] && [ "${candidate_user}" != "root" ] \
+            && getent passwd "${candidate_user}" >/dev/null 2>&1; then
+            OPERATOR_USER="${candidate_user}"
+            break
+        fi
+    done
+fi
+if [ -n "${OPERATOR_USER}" ]; then
+    OPERATOR_ACCOUNT="$(getent passwd "${OPERATOR_USER}" 2>/dev/null || true)"
+    [[ "${OPERATOR_USER}" =~ ^[A-Za-z_][A-Za-z0-9_.-]*\$?$ ]] \
+        && [ "$(printf '%s\n' "${OPERATOR_ACCOUNT}" | cut -d: -f1)" = "${OPERATOR_USER}" ] \
+        && [ "$(id -u "${OPERATOR_USER}" 2>/dev/null || true)" != "0" ] \
+        || die "Could not resolve a valid non-root Axol operator account."
+fi
+OPERATOR_HOME=""
+OPERATOR_GROUP=""
+OPERATOR_UID=""
+OPERATOR_GID=""
+RUNUSER=""
+if [ -n "${OPERATOR_USER}" ] && [ "${OPERATOR_USER}" != "root" ]; then
+    OPERATOR_HOME="$(getent passwd "${OPERATOR_USER}" | cut -d: -f6)"
+    OPERATOR_GROUP="$(id -gn "${OPERATOR_USER}" 2>/dev/null || true)"
+    OPERATOR_UID="$(id -u "${OPERATOR_USER}" 2>/dev/null || true)"
+    OPERATOR_GID="$(id -g "${OPERATOR_USER}" 2>/dev/null || true)"
+    case "${OPERATOR_HOME}" in
+        /*) ;;
+        *) OPERATOR_HOME="" ;;
+    esac
+    if [ -n "${OPERATOR_HOME}" ] && [ -n "${OPERATOR_GROUP}" ]; then
+        RUNUSER="$(command -v runuser || true)"
+        [ -n "${RUNUSER}" ] \
+            || die "util-linux runuser is required for safe operator-state setup."
+    fi
+fi
+
+operator_run() {
+    [ -n "${RUNUSER}" ] || die "Cannot run a command as the operator account."
+    "${RUNUSER}" -u "${OPERATOR_USER}" -- "$@"
+}
+
+# Refuse the hosted dataset-root migration before changing uv, Axol, systemd,
+# groups, clocks, or any /var/lib state. Third-party dataset writers reopen
+# paths by name, so the root service cannot safely keep writing inside an
+# operator-controlled home. Existing bytes remain untouched and CLI-readable.
+LEGACY_LEROBOT_HOME="${OPERATOR_HOME:+${OPERATOR_HOME}/.cache/huggingface/lerobot}"
+LEGACY_DATASET=""
+LEGACY_DATASET_ACKED=0
+if [ -e "${LEGACY_DATASET_ACK}" ] || [ -L "${LEGACY_DATASET_ACK}" ]; then
+    [ -d "/var/lib/almond-axol" ] && [ ! -L "/var/lib/almond-axol" ] \
+        && [ "$(stat -c '%u:%g' -- "/var/lib/almond-axol")" = "0:0" ] \
+        && [ -z "$(find -P "/var/lib/almond-axol" -maxdepth 0 -perm /022 -print -quit)" ] \
+        || die "/var/lib/almond-axol is unsafe for a durable dataset acknowledgement."
+    [ -f "${LEGACY_DATASET_ACK}" ] && [ ! -L "${LEGACY_DATASET_ACK}" ] \
+        && [ "$(stat -c '%u:%g:%a' -- "${LEGACY_DATASET_ACK}")" = "0:0:600" ] \
+        && [ "$(wc -l < "${LEGACY_DATASET_ACK}")" = "1" ] \
+        && [ "$(cat -- "${LEGACY_DATASET_ACK}")" = "legacy-datasets-cli-only=1" ] \
+        || die "${LEGACY_DATASET_ACK} is unsafe or malformed."
+    LEGACY_DATASET_ACKED=1
+fi
+if [ -n "${RUNUSER}" ] && [ -d "${LEGACY_LEROBOT_HOME}" ]; then
+    LEGACY_DATASET="$(operator_run find -P "${LEGACY_LEROBOT_HOME}" \
+        -mindepth 3 -maxdepth 4 -type f -path '*/meta/info.json' \
+        -print -quit 2>/dev/null || true)"
+fi
+if [ -n "${LEGACY_DATASET}" ] \
+    && [ "${AXOL_ACK_LEGACY_DATASETS:-}" != "1" ] \
+    && [ "${LEGACY_DATASET_ACKED}" != "1" ] \
+    && [ "${AXOL_RESTORE_PREVIOUS:-}" != "1" ]; then
+    die "Existing datasets were found under ${LEGACY_LEROBOT_HOME}. They remain available to the non-root CLI but cannot be consumed safely by the root service. Back them up, then run exactly: curl ${INSTALL_URL} -fsS | sudo env AXOL_ACK_LEGACY_DATASETS=1 bash. This keeps legacy datasets CLI-only and uses ${SERVICE_DATASET_ROOT} for new panel recordings. The current Axol runtime was not changed."
+fi
+
+# Serialize curl-based installs, control-panel update workers, recovery, and
+# startup provisioning across processes. Take the lock before release/network
+# resolution so a recovery never depends on GitHub or PyPI being reachable.
+[ ! -L "/var/lib/almond-axol" ] \
+    || die "/var/lib/almond-axol must not be a symlink."
+durable_install_directory "/var/lib/almond-axol" root root 0751
+[ ! -L "${UPDATE_LOCK}" ] || die "${UPDATE_LOCK} must not be a symlink."
+[ ! -e "${UPDATE_LOCK}" ] || [ -f "${UPDATE_LOCK}" ] \
+    || die "${UPDATE_LOCK} must be a regular file."
+# Open with O_CREAT semantics instead of publishing a temporary by rename. Two
+# first-ever installers then open the same inode rather than replacing the path
+# underneath one another and flocking different files.
+OLD_UMASK="$(umask)"
+umask 077
+exec {UPDATE_LOCK_FD}<>"${UPDATE_LOCK}"
+umask "${OLD_UMASK}"
+[ -f "/proc/$$/fd/${UPDATE_LOCK_FD}" ] \
+    && [ "$(stat -Lc '%u:%g:%a' -- "/proc/$$/fd/${UPDATE_LOCK_FD}")" = "0:0:600" ] \
+    && [ "$(stat -Lc '%d:%i' -- "/proc/$$/fd/${UPDATE_LOCK_FD}")" \
+        = "$(stat -c '%d:%i' -- "${UPDATE_LOCK}")" ] \
+    || die "${UPDATE_LOCK} must be one stable root-owned regular file with mode 0600."
+flock -n "${UPDATE_LOCK_FD}" \
+    || die "Another Axol install, update, recovery, or provisioning transaction is active. Wait for it to finish, then retry."
+
+if [ -n "${LEGACY_DATASET}" ] \
+    && [ "${AXOL_ACK_LEGACY_DATASETS:-}" = "1" ] \
+    && [ "${LEGACY_DATASET_ACKED}" != "1" ]; then
+    LEGACY_ACK_TMP="$(mktemp "/var/lib/almond-axol/.legacy-datasets-ack.XXXXXX")"
+    printf 'legacy-datasets-cli-only=1\n' > "${LEGACY_ACK_TMP}"
+    chown root:root "${LEGACY_ACK_TMP}"
+    chmod 0600 "${LEGACY_ACK_TMP}"
+    durable_replace "${LEGACY_ACK_TMP}" "${LEGACY_DATASET_ACK}"
+    LEGACY_DATASET_ACKED=1
+    say "Recorded the operator's durable acknowledgement for legacy CLI-only datasets."
+fi
+
+# Keep the exact previously running uv environment, wrapper, unit, and service
+# intent on the robot. The first hardened release cannot fall back to an older
+# hardened tag, and reconstructing optional CUDA/plugin state from PyPI is not
+# reliable. The snapshot is therefore a local, byte-for-byte rollback target.
+prepare_rollback_root() {
+    [ ! -L "/opt/axol" ] || die "/opt/axol must not be a symlink."
+    install -d -o root -g root -m 0755 /opt/axol
+    [ "$(stat -c '%u:%g:%a' -- /opt/axol)" = "0:0:755" ] \
+        || die "/opt/axol must be a root-owned directory with mode 0755."
+    [ ! -L "${ROLLBACK_ROOT}" ] || die "${ROLLBACK_ROOT} must not be a symlink."
+    install -d -o root -g root -m 0700 "${ROLLBACK_ROOT}"
+    [ "$(stat -c '%u:%g:%a' -- "${ROLLBACK_ROOT}")" = "0:0:700" ] \
+        || die "${ROLLBACK_ROOT} must be a root-owned directory with mode 0700."
+}
+
+validate_rollback_slot() {
+    local slot="$1"
+    case "${slot}" in
+        "${PENDING_ROLLBACK}"|"${PREVIOUS_ROLLBACK}") ;;
+        *) die "Refusing an unknown Axol rollback path: ${slot}" ;;
+    esac
+    [ ! -L "${slot}" ] || die "Rollback state must not be a symlink: ${slot}"
+    [ -d "${slot}" ] || die "Rollback state is missing: ${slot}"
+    [ "$(stat -c '%u:%g:%a' -- "${slot}")" = "0:0:700" ] \
+        || die "Rollback state must be a root-owned directory with mode 0700: ${slot}"
+    [ -f "${slot}/metadata" ] && [ ! -L "${slot}/metadata" ] \
+        && [ "$(stat -c '%u:%g:%a' -- "${slot}/metadata")" = "0:0:600" ] \
+        || die "Rollback metadata is missing or unsafe: ${slot}/metadata"
+}
+
+rollback_metadata_value() {
+    local slot="$1"
+    local key="$2"
+    local count value
+    count="$(grep -c "^${key}=" "${slot}/metadata" || true)"
+    [ "${count}" = "1" ] || die "Rollback metadata has an invalid ${key} field."
+    value="$(sed -n "s/^${key}=//p" "${slot}/metadata")"
+    printf '%s' "${value}"
+}
+
+validate_root_owned_ancestry() {
+    local current="$1"
+    local mode
+    while :; do
+        [ ! -L "${current}" ] || die "Managed runtime ancestry must not contain a symlink: ${current}"
+        [ "$(stat -c '%u:%g' -- "${current}")" = "0:0" ] \
+            || die "Managed runtime ancestry is not root-owned: ${current}"
+        mode="$(stat -c '%a' -- "${current}")"
+        (( (8#${mode} & 8#22) == 0 )) \
+            || die "Managed runtime ancestry is writable outside root: ${current}"
+        [ "${current}" = "/" ] && break
+        current="$(dirname -- "${current}")"
+    done
+}
+
+validate_managed_tool_environment() {
+    local environment="$1"
+    local environment_real python_root_real python_store_real interpreter
+    local unsafe unexpected target link
+    local -a runtime_links=()
+    [ -d "${environment}" ] && [ ! -L "${environment}" ] \
+        || die "The managed Axol environment is missing or symlinked: ${environment}"
+    environment_real="$(realpath -e -- "${environment}")" \
+        || die "The managed Axol environment cannot be resolved."
+    [ "${environment_real}" = "${environment}" ] \
+        || die "The managed Axol environment must use its canonical path."
+    validate_root_owned_ancestry "${environment_real}"
+
+    interpreter="$(realpath -e -- "${environment}/bin/python")" \
+        || die "The managed Axol interpreter cannot be resolved."
+    python_store_real="$(realpath -e -- "${UV_PYTHON_INSTALL_DIR}")" \
+        || die "The managed Python store cannot be resolved."
+    case "${interpreter}" in
+        "${python_store_real}"/*/bin/python*) ;;
+        *) die "The managed Axol interpreter points outside the managed Python store." ;;
+    esac
+    python_root_real="$(dirname -- "$(dirname -- "${interpreter}")")"
+    validate_root_owned_ancestry "${python_root_real}"
+
+    for tree in "${environment_real}" "${python_root_real}"; do
+        unsafe="$(find -P "${tree}" \( -type d -o -type f \) \
+            \( ! -uid 0 -o -perm /022 \) -print -quit)"
+        [ -z "${unsafe}" ] \
+            || die "The managed Axol/Python runtime contains an unsafe writable or non-root file."
+        unexpected="$(find -P "${tree}" \
+            ! \( -type d -o -type f -o -type l \) -print -quit)"
+        [ -z "${unexpected}" ] \
+            || die "The managed Axol/Python runtime contains an unsupported file type."
+        unsafe="$(find -P "${tree}" -type l ! -uid 0 -print -quit)"
+        [ -z "${unsafe}" ] \
+            || die "The managed Axol/Python runtime contains a non-root symlink."
+        runtime_links=()
+        mapfile -d '' runtime_links < <(find -P "${tree}" -type l -print0)
+        for link in "${runtime_links[@]}"; do
+            target="$(realpath -e -- "${link}")" \
+                || die "The managed Axol/Python runtime contains a broken symlink."
+            case "${target}" in
+                "${environment_real}"|"${environment_real}"/*|\
+                "${python_root_real}"|"${python_root_real}"/*) ;;
+                *) die "The managed Axol/Python runtime contains an external symlink." ;;
+            esac
+        done
+    done
+}
+
+validate_managed_axol_wrapper() {
+    local canonical_tool="$1"
+    local shebang
+    if [ -L "${AXOL}" ]; then
+        [ "$(stat -c '%u:%g' -- "${AXOL}")" = "0:0" ] \
+            && [ "$(readlink -- "${AXOL}")" = "${canonical_tool}/bin/axol" ] \
+            || die "The managed Axol wrapper symlink is unsafe."
+    elif [ -f "${AXOL}" ]; then
+        [ "$(stat -c '%u:%g:%a' -- "${AXOL}")" = "0:0:755" ] \
+            || die "The managed Axol wrapper is unsafe."
+        IFS= read -r shebang < "${AXOL}" \
+            || die "The managed Axol wrapper cannot be inspected."
+        [ "${shebang}" = "#!${canonical_tool}/bin/python" ] \
+            || die "The managed Axol wrapper uses an unexpected interpreter."
+    else
+        die "The managed Axol wrapper is missing."
+    fi
+}
+
+tool_environment_version() {
+    local environment="$1"
+    [ -x "${environment}/bin/python" ] || return 1
+    "${environment}/bin/python" -c \
+        'import importlib.metadata; print(importlib.metadata.version("almond-axol"))' \
+        2>/dev/null
+}
+
+safe_remove_rollback_path() {
+    local path="$1"
+    case "${path}" in
+        "${PENDING_ROLLBACK}"|"${PREVIOUS_ROLLBACK}"|"${FAILED_ROLLBACK_TOOL}") ;;
+        *) die "Refusing to remove an unknown Axol rollback path: ${path}" ;;
+    esac
+    [ ! -L "${path}" ] || die "Refusing to remove symlinked rollback state: ${path}"
+    if [ -e "${path}" ]; then
+        rm -rf --one-file-system -- "${path}"
+        sync -- "${ROLLBACK_ROOT}"
+    fi
+}
+
+promote_pending_rollback() {
+    validate_rollback_slot "${PENDING_ROLLBACK}"
+    [ -d "${PENDING_ROLLBACK}/tool" ] \
+        && [ ! -L "${PENDING_ROLLBACK}/tool" ] \
+        || die "The pending rollback has no retained Axol environment."
+    safe_remove_rollback_path "${PREVIOUS_ROLLBACK}"
+    mv -T -- "${PENDING_ROLLBACK}" "${PREVIOUS_ROLLBACK}"
+    sync -- "${ROLLBACK_ROOT}"
+    say "Retained the previously verified Axol runtime for local rollback."
+}
+
+prepare_pending_rollback() {
+    local canonical_tool old_version service_present=0 wrapper_kind=""
+    local stage metadata_tmp
+    canonical_tool="${UV_TOOL_DIR}/almond-axol"
+    if [ ! -e "${canonical_tool}" ] && [ ! -L "${canonical_tool}" ]; then
+        [ ! -e "${AXOL}" ] && [ ! -L "${AXOL}" ] \
+            || die "An Axol wrapper exists without its managed tool environment; refusing an update without an exact rollback target."
+        return 0
+    fi
+    [ -d "${canonical_tool}" ] && [ ! -L "${canonical_tool}" ] \
+        || die "The existing Axol tool environment is unsafe."
+    [ ! -L "${UV_TOOL_DIR}" ] \
+        && [ "$(stat -c '%u:%g' -- "${UV_TOOL_DIR}")" = "0:0" ] \
+        || die "The Axol tool directory must be root-owned and must not be a symlink."
+    [ "$(stat -c '%d' -- "${UV_TOOL_DIR}")" = "$(stat -c '%d' -- "${ROLLBACK_ROOT}")" ] \
+        || die "The Axol tool and rollback directories must share one filesystem for a crash-safe update."
+    old_version="$(tool_environment_version "${canonical_tool}" || true)"
+    [[ "${old_version}" =~ ^[0-9]+(\.[0-9]+)*$ ]] \
+        || die "Could not identify the exact existing Axol version for rollback."
+    if [ -L "${AXOL}" ]; then
+        [ "$(stat -c '%u:%g' -- "${AXOL}")" = "0:0" ] \
+            && [ "$(readlink -- "${AXOL}")" = "${canonical_tool}/bin/axol" ] \
+            || die "The existing Axol wrapper symlink is unsafe."
+        wrapper_kind="symlink"
+    elif [ -e "${AXOL}" ]; then
+        [ -f "${AXOL}" ] \
+            && [ "$(stat -c '%u:%g:%a' -- "${AXOL}")" = "0:0:755" ] \
+            || die "The existing Axol wrapper is unsafe."
+        wrapper_kind="file"
+    else
+        die "The existing Axol environment has no executable wrapper to retain."
+    fi
+    if [ -e "${SERVICE_FILE}" ] || [ -L "${SERVICE_FILE}" ]; then
+        [ -f "${SERVICE_FILE}" ] && [ ! -L "${SERVICE_FILE}" ] \
+            && [ "$(stat -c '%u:%g:%a' -- "${SERVICE_FILE}")" = "0:0:644" ] \
+            || die "The existing Axol service unit is unsafe."
+        service_present=1
+    fi
+    [ ! -e "${PENDING_ROLLBACK}" ] && [ ! -L "${PENDING_ROLLBACK}" ] \
+        || die "A pending Axol rollback already exists."
+
+    # Publish complete metadata/copies while the old service is still running.
+    # Only the later retain step (after a proven stop) moves its tool directory.
+    stage="$(mktemp -d "${ROLLBACK_ROOT}/.pending.XXXXXX")"
+    chmod 0700 "${stage}"
+    if [ "${wrapper_kind}" = "symlink" ]; then
+        cp -a --no-dereference -- "${AXOL}" "${stage}/axol"
+    else
+        install -o root -g root -m 0755 "${AXOL}" "${stage}/axol"
+    fi
+    if [ "${service_present}" = "1" ]; then
+        install -o root -g root -m 0644 \
+            "${SERVICE_FILE}" "${stage}/axol.service"
+    fi
+    metadata_tmp="$(mktemp "${stage}/.metadata.XXXXXX")"
+    printf '%s\n' \
+        "version=${old_version}" \
+        "main-enabled=${SERVICE_WAS_ENABLED}" \
+        "main-active=${SERVICE_WAS_ACTIVE}" \
+        "mantis-enabled=${MANTIS_SERVICE_WAS_ENABLED}" \
+        "mantis-active=${MANTIS_SERVICE_WAS_ACTIVE}" \
+        "service-present=${service_present}" \
+        "wrapper-kind=${wrapper_kind}" > "${metadata_tmp}"
+    chown root:root "${metadata_tmp}"
+    chmod 0600 "${metadata_tmp}"
+    durable_replace "${metadata_tmp}" "${stage}/metadata"
+    if [ "${wrapper_kind}" = "file" ]; then sync -- "${stage}/axol"; fi
+    if [ "${service_present}" = "1" ]; then sync -- "${stage}/axol.service"; fi
+    sync -- "${stage}"
+    mv -T -- "${stage}" "${PENDING_ROLLBACK}"
+    sync -- "${ROLLBACK_ROOT}"
+    say "Prepared an offline recovery descriptor for Axol ${old_version}."
+}
+
+retain_pending_rollback_tool() {
+    local canonical_tool="${UV_TOOL_DIR}/almond-axol"
+    if [ ! -d "${PENDING_ROLLBACK}" ]; then
+        return 0
+    fi
+    validate_rollback_slot "${PENDING_ROLLBACK}"
+    [ ! -e "${PENDING_ROLLBACK}/tool" ] \
+        && [ ! -L "${PENDING_ROLLBACK}/tool" ] \
+        || die "The pending rollback already contains a retained environment."
+    [ -d "${canonical_tool}" ] && [ ! -L "${canonical_tool}" ] \
+        || die "The existing Axol tool environment disappeared before retention."
+    mv -T -- "${canonical_tool}" "${PENDING_ROLLBACK}/tool"
+    sync -- "${UV_TOOL_DIR}"
+    sync -- "${PENDING_ROLLBACK}"
+    durable_remove "${AXOL}"
+    say "Retained the exact previous Axol runtime until the candidate is verified."
+}
+
+service_payload_has_version() {
+    local payload="$1"
+    local expected_version="$2"
+    python3 -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    raise SystemExit(1)
+raise SystemExit(
+    not isinstance(payload, dict)
+    or payload.get("version") != sys.argv[1]
+)
+' "${expected_version}" <<< "${payload}"
+}
+
+health_payload_matches_service() {
+    local payload="$1"
+    local expected_version="$2"
+    local expected_pid="$3"
+    python3 -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+    expected_pid = int(sys.argv[2])
+except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(
+    not isinstance(payload, dict)
+    or payload.get("ready") is not True
+    or payload.get("version") != sys.argv[1]
+    or type(payload.get("pid")) is not int
+    or payload["pid"] != expected_pid
+)
+' "${expected_version}" "${expected_pid}" <<< "${payload}"
+}
+
+rollback_service_is_healthy() {
+    local expected_version="$1"
+    local allow_legacy_info="${2:-0}"
+    local stable_pid=""
+    local stable_samples=0
+    local pid payload payload_ok
+    for _attempt in $(seq 1 90); do
+        payload_ok=0
+        pid="$(systemctl show --property=MainPID --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
+        payload="$(curl -kfsS --max-time 2 --max-filesize 16384 https://127.0.0.1:8001/api/health 2>/dev/null || true)"
+        if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] \
+            && health_payload_matches_service \
+                "${payload}" "${expected_version}" "${pid}"; then
+            payload_ok=1
+        elif [ "${allow_legacy_info}" = "1" ] \
+            && [[ "${pid}" =~ ^[1-9][0-9]*$ ]]; then
+            # Releases before the hardened verifier did not expose /api/health.
+            payload="$(curl -kfsS --max-time 2 --max-filesize 16384 https://127.0.0.1:8001/api/info 2>/dev/null || true)"
+            if service_payload_has_version "${payload}" "${expected_version}"; then
+                payload_ok=1
+            fi
+        fi
+        if [ "${payload_ok}" = "1" ]; then
+            if [ "${pid}" = "${stable_pid}" ]; then
+                stable_samples=$((stable_samples + 1))
+            else
+                stable_pid="${pid}"
+                stable_samples=1
+            fi
+            if [ "${stable_samples}" -ge 5 ]; then
+                return 0
+            fi
+        else
+            stable_pid=""
+            stable_samples=0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+reject_candidate_after_failure() {
+    local candidate_version="$1"
+    local failure="$2"
+    local marker_armed=1
+    local attempt_state_cleared=1
+    local main_active=1
+    local main_enabled=1
+    local mantis_active=1
+    local main_state main_enable_state mantis_load_state mantis_state recovery
+
+    # Re-publish the transaction marker before stopping either candidate
+    # process. It normally remains armed throughout verification; rewriting it
+    # also repairs an unlink whose directory sync failed during final commit.
+    VERSION="${candidate_version}"
+    write_update_marker || marker_armed=0
+    durable_remove "${UPDATE_START_TOKEN}" || attempt_state_cleared=0
+    durable_remove "${UPDATE_VERIFYING_MARKER}" || attempt_state_cleared=0
+    if [ -e "${MANTIS_START_TOKEN}" ] || [ -L "${MANTIS_START_TOKEN}" ]; then
+        durable_remove "${MANTIS_START_TOKEN}" || attempt_state_cleared=0
+    fi
+    if [ ! -f "${UPDATE_MARKER}" ] || [ -L "${UPDATE_MARKER}" ] \
+        || [ "$(stat -c '%u:%g:%a' -- "${UPDATE_MARKER}" 2>/dev/null || true)" != "0:0:600" ] \
+        || [ "$(wc -l < "${UPDATE_MARKER}" 2>/dev/null || true)" != "1" ] \
+        || [ "$(cat -- "${UPDATE_MARKER}" 2>/dev/null || true)" != "target-version=${candidate_version}" ]; then
+        marker_armed=0
+    fi
+    if [ -e "${UPDATE_START_TOKEN}" ] || [ -L "${UPDATE_START_TOKEN}" ] \
+        || [ -e "${UPDATE_VERIFYING_MARKER}" ] || [ -L "${UPDATE_VERIFYING_MARKER}" ]; then
+        attempt_state_cleared=0
+    fi
+    systemctl stop "${MANTIS_SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    # Query exact postconditions. A failed systemctl query must be treated as
+    # unsafe; `is-active`/`is-enabled` nonzero alone ambiguously means either a
+    # contained service or an inability to inspect PID 1.
+    main_state="$(systemctl show --property=ActiveState --value \
+        "${SERVICE_NAME}.service" 2>/dev/null || true)"
+    case "${main_state}" in
+        inactive|failed) main_active=0 ;;
+    esac
+    main_enable_state="$(systemctl is-enabled \
+        "${SERVICE_NAME}.service" 2>/dev/null || true)"
+    if [ "${main_enable_state}" = "disabled" ]; then
+        main_enabled=0
+    fi
+    mantis_load_state="$(systemctl show --property=LoadState --value \
+        "${MANTIS_SERVICE_NAME}.service" 2>/dev/null || true)"
+    if [ "${mantis_load_state}" = "not-found" ]; then
+        mantis_active=0
+    elif [ -n "${mantis_load_state}" ]; then
+        mantis_state="$(systemctl show --property=ActiveState --value \
+            "${MANTIS_SERVICE_NAME}.service" 2>/dev/null || true)"
+        case "${mantis_state}" in
+            inactive|failed) mantis_active=0 ;;
+        esac
+    fi
+
+    if [ -d "${PENDING_ROLLBACK}" ] && [ ! -L "${PENDING_ROLLBACK}" ]; then
+        recovery=" Restore the exact prior runtime with: curl ${INSTALL_URL} -fsS | sudo env AXOL_RESTORE_PREVIOUS=1 bash"
+    else
+        recovery=" No prior managed runtime exists to restore; repair the helper and rerun this installer."
+    fi
+    if [ "${marker_armed}" -ne 1 ] || [ "${attempt_state_cleared}" -ne 1 ] \
+        || [ "${main_active}" -ne 0 ] \
+        || [ "${main_enabled}" -ne 0 ] || [ "${mantis_active}" -ne 0 ]; then
+        die "${failure}, and the Axol candidate could not be fully blocked. Keep this host offline and repair both services manually.${recovery}"
+    fi
+    die "${failure}. Axol ${candidate_version} is blocked and disabled, and the pending rollback was retained.${recovery}"
+}
+
+reject_candidate_after_mantis_failure() {
+    reject_candidate_after_failure \
+        "$1" "The ${MANTIS_SERVICE_NAME} helper failed its stable startup check"
+}
+
+reject_candidate_after_health_failure() {
+    reject_candidate_after_failure \
+        "$1" "Axol $1 did not pass its one-shot service health check"
+}
+
+# The new runtime is installed but its host provisioning (or the opted-in
+# Ultimate runtime restore) failed before the candidate was ever started. Treat
+# it exactly like a failed health check: block the candidate, keep the pending
+# rollback, and print the restore command instead of a bare die.
+reject_candidate_after_provision_failure() {
+    reject_candidate_after_failure \
+        "$1" "Axol $1 was installed, but $2 failed before its service could start"
+}
+
+mantis_service_is_stable() {
+    local stable_pid=""
+    local stable_samples=0
+    local pid
+    for _attempt in $(seq 1 20); do
+        pid="$(systemctl show --property=MainPID --value \
+            "${MANTIS_SERVICE_NAME}.service" 2>/dev/null || true)"
+        if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] \
+            && systemctl is-active --quiet "${MANTIS_SERVICE_NAME}.service"; then
+            if [ "${pid}" = "${stable_pid}" ]; then
+                stable_samples=$((stable_samples + 1))
+            else
+                stable_pid="${pid}"
+                stable_samples=1
+            fi
+            if [ "${stable_samples}" -ge 5 ]; then
+                return 0
+            fi
+        else
+            stable_pid=""
+            stable_samples=0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+restore_mantis_for_candidate() {
+    local candidate_version="$1"
+    local start_ok=1
+    [ "${MANTIS_SERVICE_SHOULD_RUN}" = "1" ] || return 0
+    say "Restoring the ${MANTIS_SERVICE_NAME} helper before committing Axol ${candidate_version}..."
+    # Recovery may resume after Mantis passed its dwell but before the durable
+    # marker unlink or rollback promotion. Do not require a second one-shot
+    # start from an already stable process (systemctl start would be a no-op and
+    # leave the new token unconsumed).
+    if systemctl is-active --quiet "${MANTIS_SERVICE_NAME}.service"; then
+        mantis_service_is_stable \
+            || reject_candidate_after_mantis_failure "${candidate_version}"
+        return 0
+    fi
+    VERSION="${candidate_version}"
+    write_mantis_start_token \
+        || reject_candidate_after_mantis_failure "${candidate_version}"
+    systemctl start "${MANTIS_SERVICE_NAME}.service" || start_ok=0
+    if [ "${start_ok}" -ne 1 ] \
+        || [ -e "${MANTIS_START_TOKEN}" ] \
+        || [ -L "${MANTIS_START_TOKEN}" ] \
+        || ! mantis_service_is_stable; then
+        reject_candidate_after_mantis_failure "${candidate_version}"
+    fi
+}
+
+restore_previous_runtime() {
+    local slot old_version main_enabled main_active mantis_enabled mantis_active
+    local service_present wrapper_kind canonical_tool canonical_version
+    if [ -d "${PENDING_ROLLBACK}" ] && [ ! -L "${PENDING_ROLLBACK}" ]; then
+        slot="${PENDING_ROLLBACK}"
+    elif [ -d "${PREVIOUS_ROLLBACK}" ] && [ ! -L "${PREVIOUS_ROLLBACK}" ]; then
+        slot="${PREVIOUS_ROLLBACK}"
+    else
+        die "No retained Axol runtime is available to restore."
+    fi
+    validate_rollback_slot "${slot}"
+    canonical_tool="${UV_TOOL_DIR}/almond-axol"
+    old_version="$(rollback_metadata_value "${slot}" version)"
+    [[ "${old_version}" =~ ^[0-9]+(\.[0-9]+)*$ ]] \
+        || die "The retained Axol version is invalid."
+    main_enabled="$(rollback_metadata_value "${slot}" main-enabled)"
+    main_active="$(rollback_metadata_value "${slot}" main-active)"
+    mantis_enabled="$(rollback_metadata_value "${slot}" mantis-enabled)"
+    mantis_active="$(rollback_metadata_value "${slot}" mantis-active)"
+    service_present="$(rollback_metadata_value "${slot}" service-present)"
+    wrapper_kind="$(rollback_metadata_value "${slot}" wrapper-kind)"
+    for value in "${main_enabled}" "${main_active}" "${mantis_enabled}" \
+        "${mantis_active}" "${service_present}"; do
+        [[ "${value}" =~ ^[01]$ ]] || die "The retained Axol service state is invalid."
+    done
+    case "${wrapper_kind}" in
+        file)
+            [ -f "${slot}/axol" ] && [ ! -L "${slot}/axol" ] \
+                || die "The retained Axol wrapper is missing or unsafe."
+            ;;
+        symlink)
+            [ -L "${slot}/axol" ] \
+                && [ "$(readlink -- "${slot}/axol")" = "${UV_TOOL_DIR}/almond-axol/bin/axol" ] \
+                || die "The retained Axol wrapper symlink is missing or unsafe."
+            ;;
+        *) die "The retained Axol wrapper kind is invalid." ;;
+    esac
+
+    say "Restoring the retained Axol ${old_version} runtime..."
+    systemctl stop "${MANTIS_SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+        die "Could not stop Axol before restoring its previous runtime."
+    fi
+
+    [ -d "${UV_TOOL_DIR}" ] && [ ! -L "${UV_TOOL_DIR}" ] \
+        && [ "$(stat -c '%d' -- "${UV_TOOL_DIR}")" = "$(stat -c '%d' -- "${ROLLBACK_ROOT}")" ] \
+        || die "The retained Axol environment cannot be restored atomically."
+    if [ -d "${slot}/tool" ] && [ ! -L "${slot}/tool" ]; then
+        validate_managed_tool_environment "${slot}/tool"
+        if [ -e "${canonical_tool}" ] || [ -L "${canonical_tool}" ]; then
+            [ -d "${canonical_tool}" ] && [ ! -L "${canonical_tool}" ] \
+                || die "The failed candidate environment is not a safe directory."
+            [ ! -e "${FAILED_ROLLBACK_TOOL}" ] \
+                && [ ! -L "${FAILED_ROLLBACK_TOOL}" ] \
+                || die "A previous recovery attempt retained an unresolved candidate environment."
+            # The candidate is untrusted precisely because its update failed.
+            # Move it out of the canonical name without executing any of it.
+            mv -T -- "${canonical_tool}" "${FAILED_ROLLBACK_TOOL}"
+            sync -- "${UV_TOOL_DIR}"
+            sync -- "${ROLLBACK_ROOT}"
+        fi
+        if [ ! -e "${canonical_tool}" ]; then
+            mv -T -- "${slot}/tool" "${canonical_tool}"
+            sync -- "${UV_TOOL_DIR}"
+            sync -- "${slot}"
+        fi
+    else
+        # Power may have failed after publishing metadata but before moving the
+        # old environment. In that state the canonical tool is still the exact
+        # retained version and can complete recovery without a network.
+        validate_managed_tool_environment "${canonical_tool}"
+    fi
+    validate_managed_tool_environment "${canonical_tool}"
+    canonical_version="$(tool_environment_version "${canonical_tool}" || true)"
+    [ "${canonical_version}" = "${old_version}" ] \
+        || die "The retained Axol environment could not be restored exactly."
+
+    [ ! -L "${BIN_DIR}" ] \
+        && [ "$(stat -c '%u:%g:%a' -- "${BIN_DIR}")" = "0:0:755" ] \
+        || die "${BIN_DIR} must be a root-owned directory with mode 0755."
+    WRAPPER_TMP="$(mktemp "${BIN_DIR}/.axol-restore.XXXXXX")"
+    if [ "${wrapper_kind}" = "symlink" ]; then
+        rm -f -- "${WRAPPER_TMP}"
+        ln -s -- "$(readlink -- "${slot}/axol")" "${WRAPPER_TMP}"
+        chown -h root:root "${WRAPPER_TMP}"
+    else
+        install -o root -g root -m 0755 "${slot}/axol" "${WRAPPER_TMP}"
+    fi
+    durable_replace "${WRAPPER_TMP}" "${AXOL}"
+
+    if [ "${service_present}" = "1" ]; then
+        [ -f "${slot}/axol.service" ] && [ ! -L "${slot}/axol.service" ] \
+            || die "The retained Axol service unit is missing or unsafe."
+        SERVICE_RESTORE_TMP="$(mktemp "/etc/systemd/system/.axol-restore.XXXXXX")"
+        install -o root -g root -m 0644 \
+            "${slot}/axol.service" "${SERVICE_RESTORE_TMP}"
+        durable_replace "${SERVICE_RESTORE_TMP}" "${SERVICE_FILE}"
+    else
+        durable_remove "${SERVICE_FILE}"
+    fi
+    systemctl daemon-reload
+
+    # The retained service predates the candidate transaction. Clear the guard
+    # only after its exact environment, wrapper, and unit are all back in place.
+    durable_remove "${UPDATE_START_TOKEN}"
+    durable_remove "${UPDATE_VERIFYING_MARKER}"
+    if [ -e "${MANTIS_START_TOKEN}" ] || [ -L "${MANTIS_START_TOKEN}" ]; then
+        durable_remove "${MANTIS_START_TOKEN}"
+    fi
+    durable_remove "${UPDATE_MARKER}"
+    if [ "${main_enabled}" = "1" ]; then
+        systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+            || die "Could not re-enable the restored Axol service."
+    fi
+    if [ "${main_active}" = "1" ]; then
+        if ! systemctl start "${SERVICE_NAME}.service" \
+            || ! rollback_service_is_healthy "${old_version}" 1; then
+            VERSION="${old_version}"
+            write_update_marker || true
+            systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+            die "Axol ${old_version} was restored, but did not pass its stable service health check. It remains blocked and disabled; inspect journalctl -u ${SERVICE_NAME}."
+        fi
+    fi
+    if [ "${mantis_enabled}" = "1" ]; then
+        systemctl enable "${MANTIS_SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    fi
+    if [ "${mantis_active}" = "1" ]; then
+        systemctl start "${MANTIS_SERVICE_NAME}.service" \
+            || die "Axol was restored, but ${MANTIS_SERVICE_NAME} could not be restarted."
+    fi
+    safe_remove_rollback_path "${FAILED_ROLLBACK_TOOL}"
+    safe_remove_rollback_path "${slot}"
+    say "Restored Axol ${old_version} and its previous service state."
+}
+
+prepare_rollback_root
+REUSING_PENDING_ROLLBACK=0
+PENDING_DESCRIPTOR_ONLY=0
+if [ "${AXOL_RESTORE_PREVIOUS:-}" = "1" ]; then
+    restore_previous_runtime
+    exit 0
+fi
+if [ -e "${PENDING_ROLLBACK}" ] || [ -L "${PENDING_ROLLBACK}" ]; then
+    if [ ! -e "${UPDATE_START_TOKEN}" ] \
+        && [ ! -L "${UPDATE_START_TOKEN}" ] \
+        && [ ! -e "${UPDATE_VERIFYING_MARKER}" ] \
+        && [ ! -L "${UPDATE_VERIFYING_MARKER}" ] \
+        && { { [ ! -e "${UPDATE_MARKER}" ] && [ ! -L "${UPDATE_MARKER}" ]; } \
+            || { [ -f "${UPDATE_MARKER}" ] && [ ! -L "${UPDATE_MARKER}" ]; }; } \
+        && systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+        validate_rollback_slot "${PENDING_ROLLBACK}"
+        if [ -d "${PENDING_ROLLBACK}/tool" ] \
+            && [ ! -L "${PENDING_ROLLBACK}/tool" ]; then
+            # Axol passed its verifier. The installer may have lost power
+            # before/during Mantis restore, after the shared marker commit, or
+            # immediately before rollback promotion. Revalidate both services
+            # and idempotently finish whichever boundary was interrupted.
+            validate_managed_tool_environment "${UV_TOOL_DIR}/almond-axol"
+            validate_managed_axol_wrapper "${UV_TOOL_DIR}/almond-axol"
+            RECOVERED_CANDIDATE_VERSION="$(tool_environment_version "${UV_TOOL_DIR}/almond-axol" || true)"
+            [[ "${RECOVERED_CANDIDATE_VERSION}" =~ ^[0-9]+(\.[0-9]+)*$ ]] \
+                || die "Could not identify the verified Axol candidate while finalizing its update."
+            if [ -e "${UPDATE_MARKER}" ]; then
+                [ "$(stat -c '%u:%g:%a' -- "${UPDATE_MARKER}" 2>/dev/null || true)" = "0:0:600" ] \
+                    && [ "$(wc -l < "${UPDATE_MARKER}" 2>/dev/null || true)" = "1" ] \
+                    && [ "$(cat -- "${UPDATE_MARKER}" 2>/dev/null || true)" = "target-version=${RECOVERED_CANDIDATE_VERSION}" ] \
+                    || die "The interrupted update marker does not identify the active Axol candidate."
+            fi
+            rollback_service_is_healthy "${RECOVERED_CANDIDATE_VERSION}" 0 \
+                || reject_candidate_after_health_failure "${RECOVERED_CANDIDATE_VERSION}"
+            RETAINED_MANTIS_ENABLED="$(rollback_metadata_value "${PENDING_ROLLBACK}" mantis-enabled)"
+            RETAINED_MANTIS_ACTIVE="$(rollback_metadata_value "${PENDING_ROLLBACK}" mantis-active)"
+            [[ "${RETAINED_MANTIS_ENABLED}" =~ ^[01]$ ]] \
+                && [[ "${RETAINED_MANTIS_ACTIVE}" =~ ^[01]$ ]] \
+                || die "The pending rollback has invalid Mantis service state."
+            if [ "${RETAINED_MANTIS_ENABLED}" = "1" ] \
+                || [ "${RETAINED_MANTIS_ACTIVE}" = "1" ]; then
+                MANTIS_SERVICE_SHOULD_RUN=1
+            fi
+            restore_mantis_for_candidate "${RECOVERED_CANDIDATE_VERSION}"
+            durable_remove "${UPDATE_MARKER}" \
+                || reject_candidate_after_health_failure "${RECOVERED_CANDIDATE_VERSION}"
+            promote_pending_rollback
+            if [ -z "${AXOL_RELEASE_TAG:-}" ] \
+                || [ "${AXOL_RELEASE_TAG}" = "release-v${RECOVERED_CANDIDATE_VERSION}" ]; then
+                say "Finished the interrupted Axol ${RECOVERED_CANDIDATE_VERSION} update."
+                exit 0
+            fi
+            # The control panel can discover a newer release after an older
+            # transaction committed but crashed before rollback promotion.
+            # Finish that bookkeeping above, then honor the explicit newer
+            # request as a separate transaction instead of making it look like
+            # the still-running updater worker failed.
+            say "Finished the interrupted Axol update; continuing with the explicitly requested release."
+        else
+            # Power failed after publishing service intent but before the guard
+            # or old-environment move. The still-active canonical runtime was
+            # never changed, so this unused descriptor can be discarded.
+            EXPECTED_UNCHANGED_VERSION="$(rollback_metadata_value "${PENDING_ROLLBACK}" version)"
+            validate_managed_tool_environment "${UV_TOOL_DIR}/almond-axol"
+            [ "$(tool_environment_version "${UV_TOOL_DIR}/almond-axol")" = "${EXPECTED_UNCHANGED_VERSION}" ] \
+                || die "The incomplete rollback descriptor does not match the active Axol runtime."
+            safe_remove_rollback_path "${PENDING_ROLLBACK}"
+        fi
+    elif [ -f "${UPDATE_MARKER}" ] && [ ! -L "${UPDATE_MARKER}" ]; then
+        validate_rollback_slot "${PENDING_ROLLBACK}"
+        RETAINED_MANTIS_ENABLED="$(rollback_metadata_value "${PENDING_ROLLBACK}" mantis-enabled)"
+        RETAINED_MANTIS_ACTIVE="$(rollback_metadata_value "${PENDING_ROLLBACK}" mantis-active)"
+        if [ "${RETAINED_MANTIS_ENABLED}" = "1" ] \
+            || [ "${RETAINED_MANTIS_ACTIVE}" = "1" ]; then
+            MANTIS_SERVICE_SHOULD_RUN=1
+        fi
+        if [ -d "${PENDING_ROLLBACK}/tool" ] \
+            && [ ! -L "${PENDING_ROLLBACK}/tool" ]; then
+            REUSING_PENDING_ROLLBACK=1
+            say "Retrying the interrupted update while retaining its exact prior runtime."
+        else
+            EXPECTED_UNMOVED_VERSION="$(rollback_metadata_value "${PENDING_ROLLBACK}" version)"
+            validate_managed_tool_environment "${UV_TOOL_DIR}/almond-axol"
+            validate_managed_axol_wrapper "${UV_TOOL_DIR}/almond-axol"
+            [ "$(tool_environment_version "${UV_TOOL_DIR}/almond-axol")" = "${EXPECTED_UNMOVED_VERSION}" ] \
+                || die "The interrupted update descriptor does not match the canonical runtime; restore it with: curl ${INSTALL_URL} -fsS | sudo env AXOL_RESTORE_PREVIOUS=1 bash"
+            PENDING_DESCRIPTOR_ONLY=1
+            say "Resuming an update interrupted before its prior runtime moved."
+        fi
+    else
+        die "An earlier Axol update has an uncommitted local rollback. Restore it with: curl ${INSTALL_URL} -fsS | sudo env AXOL_RESTORE_PREVIOUS=1 bash"
+    fi
+fi
+
+if [ "${REUSING_PENDING_ROLLBACK}" = "1" ]; then
+    validate_managed_tool_environment "${PENDING_ROLLBACK}/tool"
+elif [ -e "${UV_TOOL_DIR}/almond-axol" ] \
+    || [ -L "${UV_TOOL_DIR}/almond-axol" ]; then
+    validate_managed_tool_environment "${UV_TOOL_DIR}/almond-axol"
+    validate_managed_axol_wrapper "${UV_TOOL_DIR}/almond-axol"
+elif [ -e "${AXOL}" ] || [ -L "${AXOL}" ]; then
+    die "An Axol wrapper exists without its managed tool environment."
+fi
+
+# systemd parses Environment= with its own quoting rules, not shell quoting.
+# Escape quoting plus systemd's ``%`` specifier marker, and reject line breaks
+# so a passwd entry can never inject another directive.
+systemd_environment_line() {
+    local name="$1"
+    local value="$2"
+    case "${value}" in
+        *$'\n'*|*$'\r'*) die "Cannot write a multiline ${name} value to systemd." ;;
+    esac
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//%/%%}"
+    printf 'Environment="%s=%s"' "${name}" "${value}"
+}
+OPERATOR_USER_ENV_LINE="$(systemd_environment_line AXOL_OPERATOR_USER "${OPERATOR_USER:-root}")"
+
+# Only the release-v namespace is invisible to the destructive updater still
+# installed on legacy hosts. A numerically new vX.Y.Z tag is not a safe
+# migration release and must never be accepted merely because its version is
+# at or above the floor below.
+is_hardened_release_tag() {
+    local tag="${1:-}"
+    [[ "${tag}" =~ ^release-v[0-9]+(\.[0-9]+)*$ ]]
+}
+
+# -- release resolution ------------------------------------------------------
+
+# Releases through v0.1.36 used vX.Y.Z; hardened releases use release-vX.Y.Z so
+# the unsafe updater in an unmigrated old service never sees a future tag. This
+# installer deliberately ignores the legacy namespace. AXOL_RELEASE_TAG is the
+# explicit repair/rollback path and must name an available hardened release.
+say "Resolving the latest release..."
+REQUESTED_RELEASE_TAG="${AXOL_RELEASE_TAG:-}"
+if [ -n "${REQUESTED_RELEASE_TAG}" ]; then
+    is_hardened_release_tag "${REQUESTED_RELEASE_TAG}" \
+        || die "AXOL_RELEASE_TAG must be an exact hardened tag such as release-v${MIN_SAFE_RELEASE_VERSION}. The current Axol service and runtime were not changed."
+    git ls-remote --exit-code --tags "${REPO_URL}" \
+        "refs/tags/${REQUESTED_RELEASE_TAG}" \
+        "refs/tags/${REQUESTED_RELEASE_TAG}^{}" >/dev/null 2>&1 \
+        || die "Requested release ${REQUESTED_RELEASE_TAG} does not exist on ${REPO_URL}. The current Axol service and runtime were not changed."
+    LATEST_TAG="${REQUESTED_RELEASE_TAG}"
+    VERSION="${LATEST_TAG#release-v}"
+    say "Requested release: ${LATEST_TAG}."
+else
+    LATEST_RELEASE="$(git ls-remote --tags "${REPO_URL}" \
+            "refs/tags/release-v*" \
+        | awk -F/ '{print $NF}' | sed 's/\^{}$//' \
+        | grep -E '^release-v[0-9]+(\.[0-9]+)*$' | sort -u \
+        | awk '{ tag=$0; version=tag; sub(/^release-v/, "", version); print version, tag }' \
+        | sort -k1,1V -k2,2 | tail -n1)"
+    [ -n "${LATEST_RELEASE}" ] \
+        || die "No hardened release tags (release-vX.Y.Z) found on ${REPO_URL}."
+    VERSION="${LATEST_RELEASE%% *}"
+    LATEST_TAG="${LATEST_RELEASE#* }"
+    say "Latest release: ${LATEST_TAG}."
+fi
+is_hardened_release_tag "${LATEST_TAG}" \
+    || die "The latest version is not a hardened release tag (need release-v${MIN_SAFE_RELEASE_VERSION} or newer, found ${LATEST_TAG}). The current Axol service and runtime were not changed."
+OLDEST_VERSION="$(printf '%s\n%s\n' "${MIN_SAFE_RELEASE_VERSION}" "${VERSION}" \
+    | sort -V | head -n1)"
+[ "${OLDEST_VERSION}" = "${MIN_SAFE_RELEASE_VERSION}" ] \
+    || die "The hardened migration release is not published yet (need release-v${MIN_SAFE_RELEASE_VERSION}, found ${LATEST_TAG}). The current Axol service and runtime were not changed. Retry after that release is available."
+
+# A GitHub tag can become visible before its publish workflow finishes. Select
+# exactly the canonical pure-Python wheel from strict exact-version metadata,
+# retain those verified bytes through installation, and install from that local
+# path. A platform-specific artifact uploaded later can therefore never outrank
+# the reviewed wheel between verification and `uv tool install`.
+say "Checking and staging almond-axol ${VERSION} from PyPI..."
+RELEASE_WHEEL="${AXOL_RELEASE_WHEEL:-}"
+RELEASE_WHEEL_EXPECTED_SHA256="${AXOL_RELEASE_WHEEL_SHA256:-}"
+RELEASE_WHEEL_OWNED=0
+RELEASE_WHEEL_STAGE=""
+if [ -n "${RELEASE_WHEEL}" ] || [ -n "${RELEASE_WHEEL_EXPECTED_SHA256}" ]; then
+    [ -n "${RELEASE_WHEEL}" ] && [ -n "${RELEASE_WHEEL_EXPECTED_SHA256}" ] \
+        || die "The verified release-wheel handoff is incomplete; the current Axol runtime was not changed."
+    case "${RELEASE_WHEEL}" in
+        "${UPDATE_WORKER_ROOT}/release-${VERSION}-"*/"almond_axol-${VERSION}-py3-none-any.whl") ;;
+        *) die "The verified release wheel is outside the protected update staging path." ;;
+    esac
+    RELEASE_WHEEL_STAGE="$(dirname -- "${RELEASE_WHEEL}")"
+    [ -d "${UPDATE_WORKER_ROOT}" ] && [ ! -L "${UPDATE_WORKER_ROOT}" ] \
+        && [ "$(stat -c '%u:%g:%a' -- "${UPDATE_WORKER_ROOT}")" = "0:0:700" ] \
+        && [ -d "${RELEASE_WHEEL_STAGE}" ] && [ ! -L "${RELEASE_WHEEL_STAGE}" ] \
+        && [ "$(stat -c '%u:%g:%a' -- "${RELEASE_WHEEL_STAGE}")" = "0:0:700" ] \
+        || die "The verified release-wheel staging directory is unsafe."
+else
+    RELEASE_WHEEL_STAGE="$(mktemp -d /tmp/axol-release-wheel.XXXXXX)"
+    [ -d "${RELEASE_WHEEL_STAGE}" ] && [ ! -L "${RELEASE_WHEEL_STAGE}" ] \
+        && [ "$(stat -c '%u:%g:%a' -- "${RELEASE_WHEEL_STAGE}")" = "0:0:700" ] \
+        || die "Could not create a protected release-wheel staging directory."
+    RELEASE_WHEEL="${RELEASE_WHEEL_STAGE}/almond_axol-${VERSION}-py3-none-any.whl"
+    PYPI_METADATA_FILE="${RELEASE_WHEEL_STAGE}/pypi.json"
+    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+        --max-time 30 --max-filesize 2097152 \
+        --output "${PYPI_METADATA_FILE}" \
+        "https://pypi.org/pypi/almond-axol/${VERSION}/json" \
+        || die "Release ${LATEST_TAG} is not available on PyPI yet; the current Axol service and runtime were not changed. Wait for release publishing to finish, then retry."
+    RELEASE_WHEEL_OWNED=1
+fi
+
+if ! python3 - \
+        "${VERSION}" "${RELEASE_WHEEL}" \
+        "${RELEASE_WHEEL_EXPECTED_SHA256}" \
+        "${PYPI_METADATA_FILE:-}" >/dev/null 2>&1 <<'PY'
+import email.parser
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import urllib.parse
+import urllib.request
+import zipfile
+
+version, wheel_path, expected_sha256, metadata_path = sys.argv[1:]
+filename = f"almond_axol-{version}-py3-none-any.whl"
+max_wheel_bytes = 16 * 1024 * 1024
+max_installer_bytes = 512 * 1024
+max_metadata_bytes = 256 * 1024
+
+if os.path.basename(wheel_path) != filename:
+    raise ValueError("unexpected release wheel filename")
+
+declared_size = None
+if metadata_path:
+    with open(metadata_path, "rb") as stream:
+        raw_metadata = stream.read(2 * 1024 * 1024 + 1)
+    if len(raw_metadata) > 2 * 1024 * 1024:
+        raise ValueError("oversized PyPI metadata")
+    payload = json.loads(raw_metadata)
+    if not isinstance(payload, dict):
+        raise ValueError("invalid PyPI metadata")
+    info = payload.get("info")
+    urls = payload.get("urls")
+    if (
+        not isinstance(info, dict)
+        or info.get("name") != "almond-axol"
+        or info.get("version") != version
+        or not isinstance(urls, list)
+    ):
+        raise ValueError("wrong PyPI project identity")
+    candidates = [
+        item
+        for item in urls
+        if isinstance(item, dict)
+        and item.get("packagetype") == "bdist_wheel"
+        and item.get("yanked") is False
+        and item.get("filename") == filename
+    ]
+    if len(candidates) != 1:
+        raise ValueError("canonical PyPI wheel is absent or ambiguous")
+    candidate = candidates[0]
+    url = candidate.get("url")
+    digests = candidate.get("digests")
+    declared_size = candidate.get("size")
+    if (
+        not isinstance(url, str)
+        or not isinstance(digests, dict)
+        or type(declared_size) is not int
+        or not 0 < declared_size <= max_wheel_bytes
+    ):
+        raise ValueError("invalid PyPI wheel description")
+    expected_sha256 = digests.get("sha256")
+    if not isinstance(expected_sha256, str):
+        raise ValueError("missing PyPI wheel digest")
+    parsed = urllib.parse.urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "files.pythonhosted.org"
+        or parsed.port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or urllib.parse.unquote(parsed.path).rsplit("/", 1)[-1] != filename
+    ):
+        raise ValueError("untrusted PyPI wheel URL")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(wheel_path, flags, 0o600)
+    digest = hashlib.sha256()
+    received = 0
+    try:
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "almond-axol-installer"}
+        )
+        output = os.fdopen(fd, "wb")
+        fd = -1
+        with output, urllib.request.urlopen(
+            request, timeout=30
+        ) as response:
+            if getattr(response, "status", 200) != 200:
+                raise ValueError("wheel download failed")
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > declared_size or received > max_wheel_bytes:
+                    raise ValueError("wheel exceeded declared size")
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if received != declared_size or digest.hexdigest() != expected_sha256:
+        raise ValueError("wheel failed size or digest verification")
+
+if re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or "") is None:
+    raise ValueError("invalid expected wheel digest")
+wheel_stat = os.lstat(wheel_path)
+if (
+    not stat.S_ISREG(wheel_stat.st_mode)
+    or wheel_stat.st_uid != 0
+    or wheel_stat.st_gid != 0
+    or stat.S_IMODE(wheel_stat.st_mode) != 0o600
+    or not 0 < wheel_stat.st_size <= max_wheel_bytes
+):
+    raise ValueError("unsafe staged wheel")
+digest = hashlib.sha256()
+with open(wheel_path, "rb") as stream:
+    while chunk := stream.read(1024 * 1024):
+        digest.update(chunk)
+if digest.hexdigest() != expected_sha256:
+    raise ValueError("staged wheel digest changed")
+
+expected_metadata = f"almond_axol-{version}.dist-info/METADATA"
+with zipfile.ZipFile(wheel_path) as archive:
+    names = archive.namelist()
+    metadata_names = [name for name in names if name.endswith(".dist-info/METADATA")]
+    if metadata_names != [expected_metadata] or names.count(
+        "almond_axol/_installer.sh"
+    ) != 1:
+        raise ValueError("wheel package shape is invalid")
+    metadata_info = archive.getinfo(expected_metadata)
+    installer_info = archive.getinfo("almond_axol/_installer.sh")
+    if not 0 < metadata_info.file_size <= max_metadata_bytes:
+        raise ValueError("wheel metadata size is invalid")
+    if not 0 < installer_info.file_size <= max_installer_bytes:
+        raise ValueError("embedded installer size is invalid")
+    installer_mode = installer_info.external_attr >> 16
+    if stat.S_ISLNK(installer_mode) or stat.S_IFMT(installer_mode) not in {
+        0,
+        stat.S_IFREG,
+    }:
+        raise ValueError("embedded installer is not a regular file")
+    metadata = email.parser.BytesParser().parsebytes(archive.read(metadata_info))
+    installer = archive.read(installer_info)
+if metadata.get_all("Name") != ["almond-axol"] or metadata.get_all(
+    "Version"
+) != [version]:
+    raise ValueError("wheel identity is invalid")
+if not installer.startswith(b"#!/usr/bin/env bash\n") or b"\0" in installer:
+    raise ValueError("embedded installer is invalid")
+print(expected_sha256)
+PY
+then
+    die "Release ${LATEST_TAG} does not provide one verifiable canonical wheel; the current Axol service and runtime were not changed."
+fi
+unset AXOL_RELEASE_WHEEL AXOL_RELEASE_WHEEL_SHA256 PYPI_METADATA_FILE
 
 # -- uv -----------------------------------------------------------------------
 
-if ! command -v uv >/dev/null 2>&1; then
-    say "Installing uv to ${BIN_DIR}..."
-    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="${BIN_DIR}" sh
-else
-    say "uv already installed ($(command -v uv))."
+# The service PATH and plugin repair docs both use /usr/local/bin directly.
+# Do not accept a root/user-local uv elsewhere on PATH: that makes installation
+# appear successful while disabling the control-panel updater, and it bypasses
+# this installer's reviewed version pin.
+UV="${BIN_DIR}/uv"
+trusted_root_executable() {
+    local executable="$1"
+    [ -f "${executable}" ] && [ ! -L "${executable}" ] \
+        && [ -x "${executable}" ] \
+        && [ "$(stat -c '%u:%g' -- "${executable}")" = "0:0" ] \
+        && [ -z "$(find -P "${executable}" -maxdepth 0 -perm /022 -print -quit)" ]
+}
+uv_version_matches() {
+    case "$1" in
+        "uv ${UV_VERSION}"|"uv ${UV_VERSION} "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+UV_CURRENT=""
+if [ -e "${UV}" ] || [ -L "${UV}" ]; then
+    trusted_root_executable "${UV}" \
+        || die "Existing uv at ${UV} is not a trusted root-owned executable."
+    UV_CURRENT="$("${UV}" --version 2>/dev/null || true)"
 fi
-UV="$(command -v uv || echo "${BIN_DIR}/uv")"
+if ! uv_version_matches "${UV_CURRENT}"; then
+    say "Installing uv ${UV_VERSION} to ${BIN_DIR}..."
+    case "$(uname -m)" in
+        x86_64|amd64)
+            UV_TARGET="x86_64-unknown-linux-gnu"
+            UV_ARCHIVE_SHA256="${UV_X86_64_LINUX_SHA256}"
+            ;;
+        aarch64|arm64)
+            UV_TARGET="aarch64-unknown-linux-gnu"
+            UV_ARCHIVE_SHA256="${UV_AARCH64_LINUX_SHA256}"
+            ;;
+        *)
+            die "uv ${UV_VERSION} has no reviewed bootstrap archive for $(uname -m)."
+            ;;
+    esac
+    UV_BOOTSTRAP_STAGE="$(mktemp -d /tmp/axol-uv.XXXXXX)"
+    [ -d "${UV_BOOTSTRAP_STAGE}" ] && [ ! -L "${UV_BOOTSTRAP_STAGE}" ] \
+        && [ "$(stat -c '%u:%g:%a' -- "${UV_BOOTSTRAP_STAGE}")" = "0:0:700" ] \
+        || die "Could not create a protected uv bootstrap directory."
+    UV_BOOTSTRAP_TMP="$(mktemp "${BIN_DIR}/.uv.XXXXXX")"
+    cleanup_uv_bootstrap() {
+        case "${UV_BOOTSTRAP_STAGE:-}" in
+            /tmp/axol-uv.*) rm -rf -- "${UV_BOOTSTRAP_STAGE}" ;;
+        esac
+        if [ -n "${UV_BOOTSTRAP_TMP:-}" ]; then
+            rm -f -- "${UV_BOOTSTRAP_TMP}"
+        fi
+    }
+    trap cleanup_uv_bootstrap EXIT
+    UV_ARCHIVE="${UV_BOOTSTRAP_STAGE}/uv.tar.gz"
+    UV_ARCHIVE_URL="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${UV_TARGET}.tar.gz"
+    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+        --max-time 120 --max-filesize 67108864 \
+        --output "${UV_ARCHIVE}" "${UV_ARCHIVE_URL}" \
+        || die "Could not download the pinned uv ${UV_VERSION} archive."
+    printf '%s  %s\n' "${UV_ARCHIVE_SHA256}" "${UV_ARCHIVE}" \
+        | sha256sum --check --status \
+        || die "The uv ${UV_VERSION} archive failed SHA-256 verification."
+    tar --extract --gzip --file "${UV_ARCHIVE}" \
+        --directory "${UV_BOOTSTRAP_STAGE}" \
+        --no-same-owner --no-same-permissions \
+        "uv-${UV_TARGET}/uv" \
+        || die "Could not extract the verified uv ${UV_VERSION} executable."
+    UV_EXTRACTED="${UV_BOOTSTRAP_STAGE}/uv-${UV_TARGET}/uv"
+    [ -f "${UV_EXTRACTED}" ] && [ ! -L "${UV_EXTRACTED}" ] \
+        || die "The verified uv archive did not contain one regular executable."
+    install -o root -g root -m 0755 "${UV_EXTRACTED}" "${UV_BOOTSTRAP_TMP}"
+    uv_version_matches "$("${UV_BOOTSTRAP_TMP}" --version 2>/dev/null || true)" \
+        || die "The verified uv archive did not run as uv ${UV_VERSION}."
+    durable_replace "${UV_BOOTSTRAP_TMP}" "${UV}" \
+        || die "Could not durably install uv ${UV_VERSION}."
+    UV_BOOTSTRAP_TMP=""
+    cleanup_uv_bootstrap
+    UV_BOOTSTRAP_STAGE=""
+    trap - EXIT
+else
+    say "uv ${UV_VERSION} already installed at ${UV}."
+fi
+trusted_root_executable "${UV}" \
+    || die "uv did not install a trusted root-owned executable at ${UV}."
+uv_version_matches "$("${UV}" --version 2>/dev/null || true)" \
+    || die "uv at ${UV} does not match required version ${UV_VERSION}."
 
 # -- axol ---------------------------------------------------------------------
 
-# Installs track releases, not main: resolve the newest release tag (vX.Y.Z)
-# and install that exact version from PyPI (the release workflow publishes
-# every release there). The `axol serve` self-updater performs the same
-# version-pinned reinstall when a newer release appears (serve/update.py) —
-# keep the requirement here and there in sync.
-say "Resolving the latest release..."
-LATEST_TAG="$(git ls-remote --tags "${REPO_URL}" "refs/tags/v*" \
-    | awk -F/ '{print $NF}' | sed 's/\^{}$//' \
-    | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -u -V | tail -n1)"
-[ -n "${LATEST_TAG}" ] || die "No release tags (vX.Y.Z) found on ${REPO_URL}."
-VERSION="${LATEST_TAG#v}"
-say "Latest release: ${LATEST_TAG}."
+# Ask the currently installed, root-owned Axol CLI for its machine-readable
+# preflight before --force rebuilds the environment. It returns only allowlisted
+# requirements for explicitly installed Ultimate and published LeRobot plugin
+# runtimes. On aarch64 it also refuses to overwrite an existing CUDA-enabled/
+# custom PyTorch with PyPI's CPU-only 2.10 wheel. Older releases still get the
+# conservative legacy probes below.
+legacy_aarch64_torch_preflight() {
+    local existing_python="$1"
+    [ "${AARCH64_HOST}" = "1" ] || return 0
+    [ -x "${existing_python}" ] \
+        || die "Could not inspect the existing aarch64 Axol environment."
+    set +e
+    "${existing_python}" -c '
+import importlib.metadata as metadata
+
+try:
+    dist = metadata.distribution("torch")
+except metadata.PackageNotFoundError:
+    raise SystemExit(0)
+if dist.version != "2.10.0" or dist.read_text("direct_url.json"):
+    raise SystemExit(20)
+try:
+    import torch
+except BaseException:
+    raise SystemExit(21)
+cuda_build = bool(getattr(getattr(torch, "version", None), "cuda", None))
+standard_cpu = str(getattr(torch, "__version__", "")) in {"2.10.0", "2.10.0+cpu"}
+raise SystemExit(20 if cuda_build or not standard_cpu else 0)
+'
+    LEGACY_TORCH_STATUS=$?
+    set -e
+    case "${LEGACY_TORCH_STATUS}" in
+        0) ;;
+        20)
+            die "Axol update blocked: this aarch64 environment has a CUDA-enabled or custom PyTorch build. The hosted force install would replace it with PyPI's CPU-only torch==2.10.0. Keep the current install; this updater cannot reconstruct its wheel source. Use a manual update with an explicit restoration plan for the same JetPack-compatible torch and torchvision builds, or intentionally switch to CPU Torch before retrying."
+            ;;
+        *) die "Could not safely inspect the existing aarch64 PyTorch environment; refusing the force update." ;;
+    esac
+}
+
+legacy_plugin_update_requirement() {
+    local existing_python="$1"
+    local plugin_output plugin_status
+    [ -x "${existing_python}" ] \
+        || die "Could not inspect the existing Axol plugin environment."
+    set +e
+    plugin_output="$("${existing_python}" -c '
+import importlib.metadata as metadata
+import re
+
+try:
+    dist = metadata.distribution("lerobot_robot_axol")
+except metadata.PackageNotFoundError:
+    raise SystemExit(0)
+try:
+    version = dist.version
+    direct_url = dist.read_text("direct_url.json")
+except Exception:
+    raise SystemExit(21)
+if direct_url is not None or re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version) is None:
+    raise SystemExit(20)
+print(f"lerobot_robot_axol=={version}")
+')"
+    plugin_status=$?
+    set -e
+    case "${plugin_status}" in
+        0)
+            if [ -n "${plugin_output}" ]; then
+                [[ "${plugin_output}" =~ ^lerobot_robot_axol==[0-9]+(\.[0-9]+)+$ ]] \
+                    || die "Installed Axol returned an invalid LeRobot plugin preservation requirement."
+                UPDATE_WITH_ARGS+=(--with "${plugin_output}")
+                PLUGIN_PRESERVED=1
+                say "Preserving the explicitly installed published LeRobot plugin."
+            fi
+            ;;
+        20)
+            die "Axol update blocked: this environment has a direct or customized lerobot_robot_axol plugin install. The hosted force install cannot reconstruct that source safely. Reinstall Axol manually with an explicit plan for the same plugin source, or replace it with a published PyPI plugin release before retrying."
+            ;;
+        *) die "Could not safely inspect the existing Axol plugin environment; refusing the force update." ;;
+    esac
+}
+
+legacy_ultimate_update_requirement() {
+    local existing_python="$1"
+    local ultimate_output ultimate_status
+    [ -x "${existing_python}" ] \
+        || die "Could not inspect the existing VIVE Ultimate runtime."
+    set +e
+    ultimate_output="$("${existing_python}" -c '
+import hashlib
+import json
+import sys
+from importlib import metadata
+from pathlib import Path
+
+expected_ref, expected_url, expected_wifi_sha256, expected_spec = sys.argv[1:]
+
+try:
+    distributions = list(metadata.distributions(name="pyvut"))
+except Exception:
+    raise SystemExit(21)
+if not distributions:
+    raise SystemExit(0)
+if len(distributions) != 1:
+    raise SystemExit(20)
+dist = distributions[0]
+
+try:
+    direct_url_text = dist.read_text("direct_url.json")
+    if direct_url_text is None:
+        raise SystemExit(20)
+    direct_url = json.loads(direct_url_text)
+    if not isinstance(direct_url, dict):
+        raise SystemExit(20)
+    # pip and uv may retain or omit the conventional GitHub .git suffix in
+    # PEP 610 metadata. These are the only two accepted spellings; credentials,
+    # alternate schemes, mirrors, query strings, and subdirectories all block.
+    if direct_url.get("url") not in {expected_url, expected_url.removesuffix(".git")}:
+        raise SystemExit(20)
+    if set(direct_url) - {"url", "vcs_info"}:
+        raise SystemExit(20)
+    vcs_info = direct_url.get("vcs_info")
+    if not isinstance(vcs_info, dict):
+        raise SystemExit(20)
+    if set(vcs_info) - {"vcs", "requested_revision", "commit_id"}:
+        raise SystemExit(20)
+    if vcs_info.get("vcs") != "git" or vcs_info.get("commit_id") != expected_ref:
+        raise SystemExit(20)
+
+    files = dist.files
+    if files is None:
+        raise SystemExit(20)
+    matches = [
+        entry
+        for entry in files
+        if str(entry).replace("\\", "/") == "pyvut/wifi_info.json"
+    ]
+    if len(matches) != 1:
+        raise SystemExit(20)
+    package_wifi = Path(dist.locate_file(matches[0]))
+    if package_wifi.is_symlink() or not package_wifi.is_file():
+        raise SystemExit(20)
+    if hashlib.sha256(package_wifi.read_bytes()).hexdigest() != expected_wifi_sha256:
+        raise SystemExit(20)
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(21)
+
+print(expected_spec)
+' "${PYVUT_REF}" "${PYVUT_REPO_URL}" \
+        "${PYVUT_DEFAULT_WIFI_SHA256}" "${PYVUT_SPEC}" 2>/dev/null)"
+    ultimate_status=$?
+    set -e
+    case "${ultimate_status}" in
+        0)
+            if [ -n "${ultimate_output}" ]; then
+                [ "${ultimate_output}" = "${PYVUT_SPEC}" ] \
+                    || die "Installed Axol returned an invalid VIVE Ultimate preservation requirement."
+                [ "${ULTIMATE_PRESERVED}" -eq 0 ] \
+                    || die "Installed Axol returned a duplicate VIVE Ultimate preservation requirement."
+                UPDATE_WITH_ARGS+=(--with "${PYVUT_SPEC}")
+                ULTIMATE_PRESERVED=1
+                say "Preserving the explicitly installed VIVE Ultimate runtime."
+            fi
+            ;;
+        20)
+            die "VIVE Ultimate update blocked: the legacy pyvut install is not the exact supported GitHub revision, or its package-local Wi-Fi config is missing, ambiguous, or customized. A force update could erase credentials or install an unverified runtime. Back up and migrate any package-local Wi-Fi values to Axol's durable tracker configuration, restore the pinned pyvut placeholder, then retry. No credential values are included in this error."
+            ;;
+        *) die "Could not safely inspect the existing VIVE Ultimate runtime; refusing the force update." ;;
+    esac
+}
+
+UPDATE_WITH_ARGS=()
+ULTIMATE_PRESERVED=0
+PLUGIN_PRESERVED=0
+UPDATE_PREFLIGHT_COMMAND=()
+LEGACY_PREFLIGHT_PYTHON=""
+if [ "${REUSING_PENDING_ROLLBACK}" = "1" ]; then
+    RETAINED_PYTHON="${PENDING_ROLLBACK}/tool/bin/python"
+    [ -x "${RETAINED_PYTHON}" ] \
+        || die "The retained Axol environment cannot be inspected for a safe retry."
+    if "${RETAINED_PYTHON}" -c \
+        'import importlib.util; raise SystemExit(importlib.util.find_spec("almond_axol.cli.update_preflight") is None)' \
+        >/dev/null 2>&1; then
+        UPDATE_PREFLIGHT_COMMAND=(
+            "${RETAINED_PYTHON}" -c
+            'from almond_axol.cli.update_preflight import run; run()'
+        )
+    else
+        # The first hardened migration can be retrying a legacy release whose
+        # CLI did not yet expose update-preflight.
+        LEGACY_PREFLIGHT_PYTHON="${RETAINED_PYTHON}"
+    fi
+elif [ -x "${AXOL}" ]; then
+    UPDATE_PREFLIGHT_COMMAND=("${AXOL}" update-preflight)
+elif [ -x "${UV_TOOL_DIR}/almond-axol/bin/python" ]; then
+    LEGACY_PREFLIGHT_PYTHON="${UV_TOOL_DIR}/almond-axol/bin/python"
+fi
+
+if [ -n "${LEGACY_PREFLIGHT_PYTHON}" ]; then
+    legacy_aarch64_torch_preflight "${LEGACY_PREFLIGHT_PYTHON}"
+    legacy_ultimate_update_requirement "${LEGACY_PREFLIGHT_PYTHON}"
+    legacy_plugin_update_requirement "${LEGACY_PREFLIGHT_PYTHON}"
+elif [ "${#UPDATE_PREFLIGHT_COMMAND[@]}" -gt 0 ]; then
+    set +e
+    UPDATE_PREFLIGHT_OUTPUT="$("${UPDATE_PREFLIGHT_COMMAND[@]}" 2>&1)"
+    UPDATE_PREFLIGHT_STATUS=$?
+    set -e
+    case "${UPDATE_PREFLIGHT_STATUS}" in
+        0)
+            if [ -n "${UPDATE_PREFLIGHT_OUTPUT}" ]; then
+                while IFS= read -r update_requirement; do
+                    if [[ "${update_requirement}" =~ ^git\+https://github\.com/nijkah/pyvut\.git@[0-9a-f]{40}$ ]]; then
+                        [ "${ULTIMATE_PRESERVED}" -eq 0 ] \
+                            || die "Installed Axol returned a duplicate VIVE Ultimate preservation requirement."
+                        UPDATE_WITH_ARGS+=(--with "${update_requirement}")
+                        ULTIMATE_PRESERVED=1
+                    elif [[ "${update_requirement}" =~ ^lerobot_robot_axol==[0-9]+(\.[0-9]+)+$ ]]; then
+                        [ "${PLUGIN_PRESERVED}" -eq 0 ] \
+                            || die "Installed Axol returned a duplicate LeRobot plugin preservation requirement."
+                        UPDATE_WITH_ARGS+=(--with "${update_requirement}")
+                        PLUGIN_PRESERVED=1
+                    else
+                        die "Installed Axol returned an invalid update preservation requirement."
+                    fi
+                done <<< "${UPDATE_PREFLIGHT_OUTPUT}"
+                if [ "${ULTIMATE_PRESERVED}" -eq 1 ]; then
+                    say "Preserving the explicitly installed VIVE Ultimate runtime."
+                fi
+                if [ "${PLUGIN_PRESERVED}" -eq 1 ]; then
+                    say "Preserving the explicitly installed published LeRobot plugin."
+                fi
+            fi
+            ;;
+        2)
+            if [ "${REUSING_PENDING_ROLLBACK}" = "1" ] \
+                || [[ "${UPDATE_PREFLIGHT_OUTPUT}" != *"invalid choice: 'update-preflight'"* ]]; then
+                die "Could not inspect the existing Axol runtime before updating."
+            fi
+            # Backward-compatible protection for an Axol release that does not
+            # yet expose the shared preflight. uv-generated entry points use
+            # their environment's absolute Python in the shebang.
+            IFS= read -r EXISTING_AXOL_SHEBANG < "${AXOL}" \
+                || die "Could not inspect the existing Axol environment."
+            EXISTING_AXOL_PYTHON="${EXISTING_AXOL_SHEBANG#\#!}"
+            case "${EXISTING_AXOL_PYTHON}" in
+                /*) ;;
+                *) die "Could not inspect the existing Axol environment." ;;
+            esac
+            legacy_aarch64_torch_preflight "${EXISTING_AXOL_PYTHON}"
+            legacy_ultimate_update_requirement "${EXISTING_AXOL_PYTHON}"
+            legacy_plugin_update_requirement "${EXISTING_AXOL_PYTHON}"
+            ;;
+        20)
+            die "${UPDATE_PREFLIGHT_OUTPUT}"
+            ;;
+        *)
+            die "Could not inspect the existing Axol runtime before updating."
+            ;;
+    esac
+fi
+
+# Arm a durable start guard before touching either the running service or its
+# interpreter. This also repairs a host left behind by a failed control-panel
+# update. Build both files through root-owned temporary names and atomic renames
+# so pre-existing symlinks are replaced rather than followed.
+[ ! -L "/var/lib/almond-axol" ] \
+    || die "/var/lib/almond-axol must not be a symlink."
+durable_install_directory "/var/lib/almond-axol" root root 0751
+[ ! -L "${UPDATE_GUARD_DIR}" ] \
+    || die "${UPDATE_GUARD_DIR} must not be a symlink."
+durable_install_directory "${UPDATE_GUARD_DIR}" root root 0755
+[ ! -L "${MANTIS_UPDATE_GUARD_DIR}" ] \
+    || die "${MANTIS_UPDATE_GUARD_DIR} must not be a symlink."
+durable_install_directory "${MANTIS_UPDATE_GUARD_DIR}" root root 0755
+GUARD_TMP=""
+MANTIS_GUARD_TMP=""
+cleanup_update_guard_temporaries() {
+    if [ -n "${GUARD_TMP}" ]; then
+        rm -f -- "${GUARD_TMP}" || true
+    fi
+    if [ -n "${MANTIS_GUARD_TMP}" ]; then
+        rm -f -- "${MANTIS_GUARD_TMP}" || true
+    fi
+}
+trap cleanup_update_guard_temporaries EXIT
+GUARD_TMP="$(mktemp "${UPDATE_GUARD_DIR}/.20-update-guard.XXXXXX")"
+printf '[Unit]\nConditionPathExists=|!%s\nConditionPathExists=|%s\n' \
+    "${UPDATE_MARKER}" "${UPDATE_START_TOKEN}" > "${GUARD_TMP}"
+chown root:root "${GUARD_TMP}"
+chmod 0644 "${GUARD_TMP}"
+durable_replace "${GUARD_TMP}" "${UPDATE_GUARD_FILE}"
+GUARD_TMP=""
+MANTIS_GUARD_TMP="$(mktemp "${MANTIS_UPDATE_GUARD_DIR}/.20-update-guard.XXXXXX")"
+# Shared with almond_axol.serve.update. The empty assignment resets the unit
+# body's own condition list: an older body carries a non-triggering
+# `ConditionPathExists=!marker` that systemd would AND with the triggering `|`
+# group, so the one-shot token could never admit a start while the marker is
+# armed. The helper runs as the operator while /run/almond-axol is root-only,
+# so the token consume runs with full privileges (`+`).
+printf '[Unit]\nConditionPathExists=\nConditionPathExists=|!%s\nConditionPathExists=|%s\n\n[Service]\nExecStartPre=+/usr/bin/rm -f -- %s\n' \
+    "${UPDATE_MARKER}" "${MANTIS_START_TOKEN}" "${MANTIS_START_TOKEN}" \
+    > "${MANTIS_GUARD_TMP}"
+chown root:root "${MANTIS_GUARD_TMP}"
+chmod 0644 "${MANTIS_GUARD_TMP}"
+durable_replace "${MANTIS_GUARD_TMP}" "${MANTIS_UPDATE_GUARD_FILE}"
+MANTIS_GUARD_TMP=""
+systemctl daemon-reload
+
+# Snapshot service intent and publish the recovery descriptor before the
+# durable marker can block a reboot or either service is stopped. At this point
+# no runtime bytes move, so a power loss still leaves the old service runnable.
+if [ "${REUSING_PENDING_ROLLBACK}" != "1" ] \
+    && [ "${PENDING_DESCRIPTOR_ONLY}" != "1" ]; then
+    if systemctl cat "${MANTIS_SERVICE_NAME}.service" >/dev/null 2>&1; then
+        if systemctl is-enabled --quiet "${MANTIS_SERVICE_NAME}.service" 2>/dev/null; then
+            MANTIS_SERVICE_WAS_ENABLED=1
+        fi
+        if systemctl is-active --quiet "${MANTIS_SERVICE_NAME}.service"; then
+            MANTIS_SERVICE_WAS_ACTIVE=1
+        fi
+        if [ "${MANTIS_SERVICE_WAS_ENABLED}" = "1" ] \
+            || [ "${MANTIS_SERVICE_WAS_ACTIVE}" = "1" ]; then
+            MANTIS_SERVICE_SHOULD_RUN=1
+        fi
+    fi
+    if systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+        if systemctl is-enabled --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+            SERVICE_WAS_ENABLED=1
+        fi
+        if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+            SERVICE_WAS_ACTIVE=1
+        fi
+    fi
+    prepare_pending_rollback
+fi
+
+# Clear stale attempt state from a previously failed candidate. The durable
+# update marker itself is overwritten below only after both conditions are
+# loaded, so no unverified service can start through this repair window.
+durable_remove "${UPDATE_START_TOKEN}" \
+    || die "Could not clear stale Axol candidate-start state."
+durable_remove "${UPDATE_VERIFYING_MARKER}" \
+    || die "Could not clear stale Axol candidate-verification state."
+if [ -e "${MANTIS_START_TOKEN}" ] || [ -L "${MANTIS_START_TOKEN}" ]; then
+    durable_remove "${MANTIS_START_TOKEN}" \
+        || die "Could not clear stale Mantis candidate-start state."
+fi
+write_update_marker \
+    || die "Could not durably arm the update restart guard; the runtime was not changed."
+trap - EXIT
+
+# The optional Quest bootstrap helper uses this same Python environment. Stop
+# it before replacing that environment, including on upgrades from versions
+# that predate its marker-aware loop. Preserve both enabled and manually-active
+# state so a verified install can restore it below; a failed install leaves it
+# safely stopped behind the durable marker.
+if systemctl cat "${MANTIS_SERVICE_NAME}.service" >/dev/null 2>&1; then
+    say "Stopping the ${MANTIS_SERVICE_NAME} helper before updating its runtime..."
+    systemctl stop "${MANTIS_SERVICE_NAME}.service" >/dev/null 2>&1 \
+        || die "Could not stop the ${MANTIS_SERVICE_NAME} helper; its runtime was not changed."
+    if systemctl is-active --quiet "${MANTIS_SERVICE_NAME}.service"; then
+        die "The ${MANTIS_SERVICE_NAME} helper is still active; its runtime was not changed."
+    fi
+fi
+
+# Never replace the interpreter or tool environment under a live root service.
+# `systemctl stop` waits for Axol's graceful shutdown (including recorder and
+# dataset finalization) before it returns. The marker above closes the
+# Restart=always window before disable/stop begins, while disabling the unit
+# also prevents a boot from launching an unverified environment. A successful
+# install enables and starts it again below.
+if systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    say "Stopping and disabling the ${SERVICE_NAME} service before updating its runtime..."
+    systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 \
+        || die "Could not stop and disable the ${SERVICE_NAME} service; its runtime was not changed."
+    if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+        die "The ${SERVICE_NAME} service is still active; its runtime was not changed."
+    fi
+fi
+
+# With every process that imports the environment stopped, atomically move the
+# exact previous uv tool into the pending rollback slot. A failed install never
+# destroys the only known-good customer runtime.
+if [ "${REUSING_PENDING_ROLLBACK}" != "1" ]; then
+    retain_pending_rollback_tool
+fi
 
 say "Installing axol ${VERSION} from PyPI (extras: ${EXTRAS}) — this can take a few minutes..."
 mkdir -p "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
     --python "${PYTHON_VERSION}" \
     --force \
-    "almond-axol[${EXTRAS}]==${VERSION}"
+    "${UPDATE_WITH_ARGS[@]}" \
+    "${RELEASE_WHEEL}[${EXTRAS}]"
+
+# A first/manual install owns its temporary wheel and can discard it once uv
+# has copied the package into the managed tool. A control-panel worker leaves
+# its stage to systemd's ExecStopPost so every failure path has one owner.
+if [ "${RELEASE_WHEEL_OWNED}" = "1" ]; then
+    case "${RELEASE_WHEEL_STAGE}" in
+        /tmp/axol-release-wheel.*) rm -rf -- "${RELEASE_WHEEL_STAGE}" ;;
+        *) die "Refusing to remove an unexpected release-wheel staging path." ;;
+    esac
+    RELEASE_WHEEL_STAGE=""
+fi
 
 # uv creates the tool venv + managed Python with the root umask; make sure every
 # user can read/traverse them (dirs + already-executable files only, via 'X') so
 # the `axol` wrapper on PATH works for the operator's own login, not just root.
 chmod -R a+rX "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 
-command -v axol >/dev/null 2>&1 || die "axol did not end up on PATH (expected ${BIN_DIR}/axol)."
-say "axol installed at $(command -v axol)."
+[ -x "${AXOL}" ] || die "axol did not install at ${AXOL}."
+say "axol installed at ${AXOL}."
+if [ "${AARCH64_HOST}" = "1" ]; then
+    say "WARNING: PyPI torch 2.10 is CPU-only on aarch64."
+    say "WARNING: local CUDA run-policy/collect-dagger is unavailable until you explicitly manage a JetPack-compatible torch + torchvision build."
+    say "WARNING: use remote inference or pass --device cpu in the meantime."
+fi
 
 # -- System provisioning (pyzed + GStreamer camera stack + adb) ---------------
 
@@ -106,17 +1913,32 @@ say "axol installed at $(command -v axol)."
 # upgrade, so there is exactly one provisioning path. Each step self-gates
 # (a no-op without the ZED SDK / apt / NVENC).
 # Also installs adb + the Oculus udev rule (Quest-over-USB controller transport)
-# and, on a factory-flashed ZED Box Duo, replaces the known-bad factory GMSL
-# camera driver with the pinned release (`axol zed.driver`); the new driver
+# and, on a factory-flashed ZED Box (Duo or Mini), replaces an outdated GMSL
+# camera driver with the release pinned for the ZED SDK (`axol zed.driver`); the new driver
 # only loads at boot, so provision prints a REBOOT REQUIRED notice we surface
 # in the summary below rather than rebooting the box mid-install.
 say "Provisioning system dependencies (pyzed + GStreamer camera stack + adb)..."
 PROVISION_LOG="$(mktemp)"
-axol provision 2>&1 | tee "${PROVISION_LOG}" \
-    || say "WARNING: provisioning failed; cameras may be unavailable or fall back to the slower ZED SDK path. Re-run 'axol provision'."
+set +e
+AXOL_UPDATE_LOCK_FD="${UPDATE_LOCK_FD}" "${AXOL}" provision 2>&1 \
+    | tee "${PROVISION_LOG}"
+PROVISION_STATUS="${PIPESTATUS[0]}"
+set -e
 REBOOT_REQUIRED=0
 if grep -q "REBOOT REQUIRED" "${PROVISION_LOG}"; then REBOOT_REQUIRED=1; fi
 rm -f "${PROVISION_LOG}"
+if [ "${PROVISION_STATUS}" -ne 0 ]; then
+    reject_candidate_after_provision_failure "${VERSION}" "system provisioning"
+fi
+
+# Verify with the newly installed CLI, which repairs system dependencies and
+# advances to its expected pyvut pin if it changed between Axol releases. Never
+# restart the service into a silently degraded Ultimate setup.
+if [ "${ULTIMATE_PRESERVED}" -eq 1 ]; then
+    say "Verifying the preserved VIVE Ultimate runtime..."
+    "${AXOL}" tracker.ultimate.install \
+        || reject_candidate_after_provision_failure "${VERSION}" "the VIVE Ultimate runtime restore"
+fi
 
 # -- Quest-over-USB operator access -------------------------------------------
 
@@ -124,12 +1946,9 @@ rm -f "${PROVISION_LOG}"
 # `dialout` group -- the one operators already have for CAN/serial access, so
 # interactive `adb` works without a re-login. Make sure the operator is in it
 # (provision does this too, but be explicit here where the account is known):
-# SUDO_USER is whoever launched the installer (we re-exec under sudo above);
-# fall back to the first /home owner when run directly as root.
-QUEST_USER="${SUDO_USER:-}"
-if [ -z "${QUEST_USER}" ] || [ "${QUEST_USER}" = "root" ]; then
-    QUEST_USER="$(ls -ld /home/*/ 2>/dev/null | awk 'NR==1 {print $3}')"
-fi
+# OPERATOR_USER is whoever launched the installer (or the direct-root
+# fallback resolved above).
+QUEST_USER="${OPERATOR_USER}"
 if [ -n "${QUEST_USER}" ] && [ "${QUEST_USER}" != "root" ]; then
     usermod -aG dialout "${QUEST_USER}" 2>/dev/null \
         && say "Added ${QUEST_USER} to 'dialout' for Quest-over-USB adb access." \
@@ -143,53 +1962,219 @@ fi
 # every boot via ExecStartPre; do it once now too so it takes effect without a
 # reboot. No-op off a Jetson.
 say "Pinning Jetson clocks for the real-time loops..."
-axol jetson.setup || say "WARNING: jetson.setup failed (non-Jetson, or needs root)."
+"${AXOL}" jetson.setup || say "WARNING: jetson.setup failed (non-Jetson, or needs root)."
 
 # -- Dataset storage location -------------------------------------------------
 
-# The service runs as root, so without help LeRobot would write collected
-# datasets to /root/.cache/huggingface/lerobot. Point HF_LEROBOT_HOME at the
-# installing user's home instead so datasets live in their account. SUDO_USER
-# is set because we re-exec under sudo above; fall back to the owner of the
-# first /home/* directory when the installer is run directly as root.
-DATASET_USER="${SUDO_USER:-}"
-if [ -z "${DATASET_USER}" ] || [ "${DATASET_USER}" = "root" ]; then
-    DATASET_USER="$(ls -ld /home/*/ 2>/dev/null | awk 'NR==1 {print $3}')"
-fi
-LEROBOT_HOME_ENV=""
-if [ -n "${DATASET_USER}" ]; then
-    DATASET_HOME="$(getent passwd "${DATASET_USER}" | cut -d: -f6)"
-    if [ -n "${DATASET_HOME}" ] && [ -d "${DATASET_HOME}" ]; then
-        LEROBOT_HOME="${DATASET_HOME}/.cache/huggingface/lerobot"
-        say "Datasets will be stored under ${LEROBOT_HOME} (user: ${DATASET_USER})."
-        mkdir -p "${LEROBOT_HOME}"
-        # Own the cache chain so the user can browse/manage datasets (episode
-        # files written by the root service stay root-owned but readable).
-        chown "${DATASET_USER}:" \
-            "${DATASET_HOME}/.cache" \
-            "${DATASET_HOME}/.cache/huggingface" \
-            "${LEROBOT_HOME}" 2>/dev/null || true
-        LEROBOT_HOME_ENV="Environment=HF_LEROBOT_HOME=${LEROBOT_HOME}"
+# Third-party LeRobot/PyArrow/PyAV writers reopen paths by name. A root service
+# cannot safely target an operator-writable home: a local symlink swap could
+# redirect a later open outside the checked tree. Keep hosted datasets below a
+# root-owned, non-writable /var/lib boundary instead. The operator's group gets
+# read/traverse access after each save, never write access; plain CLI commands
+# remain in the operator's normal HuggingFace cache.
+DATASET_GROUP="${OPERATOR_GROUP:-root}"
+DATASET_UID="${OPERATOR_UID:-0}"
+DATASET_GID="${OPERATOR_GID:-0}"
+[ ! -L "/var/lib/almond-axol" ] \
+    || die "/var/lib/almond-axol must not be a symlink."
+# Seal the parent while its entry is protected by /var/lib. Only after that is
+# immutable to the operator is it safe to inspect/create the child: GNU
+# `install -d` follows a symlink-to-directory and must never see a swappable
+# child name.
+install -d -o root -g root -m 0751 /var/lib/almond-axol
+[ ! -L "${SERVICE_DATASET_ROOT}" ] \
+    || die "${SERVICE_DATASET_ROOT} must not be a symlink."
+install -d -o root -g "${DATASET_GROUP}" -m 2750 "${SERVICE_DATASET_ROOT}"
+install -d -o root -g root -m 0751 /var/lib/almond-axol
+LEROBOT_HOME_ENV="$(systemd_environment_line HF_LEROBOT_HOME "${SERVICE_DATASET_ROOT}")"
+SERVICE_DATASET_ROOT_ENV="$(systemd_environment_line AXOL_SERVICE_DATASET_ROOT "${SERVICE_DATASET_ROOT}")"
+SERVICE_OPERATOR_UID_ENV="$(systemd_environment_line AXOL_OPERATOR_UID "${DATASET_UID}")"
+SERVICE_OPERATOR_GID_ENV="$(systemd_environment_line AXOL_OPERATOR_GID "${DATASET_GID}")"
+say "Hosted datasets: ${SERVICE_DATASET_ROOT} (read-only group: ${DATASET_GROUP})."
+
+# -- Shared operator state ----------------------------------------------------
+
+# CLI commands historically use the operator's ~/.almond, while the hosted
+# service used /root/.almond. Point both at the existing operator tree. On an
+# upgrade, copy only missing state from the old root tree; an operator's
+# existing file always wins and the legacy copy remains as a backup.
+ALMOND_HOME_ENV_LINE=""
+SERVICE_GROUP_LINE=""
+ALMOND_STATE_HOME="${OPERATOR_HOME:+${OPERATOR_HOME}/.almond}"
+if [ -L "${ALMOND_STATE_HOME}" ]; then
+    say "WARNING: ${ALMOND_STATE_HOME} is a symlink; refusing root state migration and using /root/.almond for the service."
+elif [ -n "${OPERATOR_HOME}" ] && [ -n "${OPERATOR_GROUP}" ] && [ -d "${OPERATOR_HOME}" ]; then
+    operator_run mkdir -p -- "${ALMOND_STATE_HOME}"
+
+    # A root installer must never let an existing nested symlink redirect a
+    # missing destination into /etc, /root, or another tree. realpath -m
+    # resolves existing path components without requiring the final parent to
+    # exist; the final file itself must not be a symlink either.
+    state_destination_safe() {
+        local destination="$1"
+        local state_root destination_parent
+        [ ! -L "${destination}" ] || return 1
+        state_root="$(realpath -e -- "${ALMOND_STATE_HOME}")" || return 1
+        destination_parent="$(realpath -m -- "$(dirname -- "${destination}")")" \
+            || return 1
+        case "${destination_parent}" in
+            "${state_root}"|"${state_root}"/*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    # Never write legacy root-owned bytes directly into an operator-writable
+    # tree as root. Stage each source in a root-controlled random slot, hand
+    # only that slot to the operator, then let the operator create/copy the
+    # destination. A symlink swap after state_destination_safe is therefore
+    # privilege-contained; --no-clobber also preserves a destination that
+    # appears after the check.
+    STATE_MIGRATION_STAGE="$(mktemp -d /tmp/axol-state-migration.XXXXXX)"
+    chmod 0711 "${STATE_MIGRATION_STAGE}"
+    cleanup_state_migration_stage() {
+        case "${STATE_MIGRATION_STAGE:-}" in
+            /tmp/axol-state-migration.*)
+                rm -rf -- "${STATE_MIGRATION_STAGE}"
+                ;;
+        esac
+    }
+    trap cleanup_state_migration_stage EXIT
+
+    operator_state_copy() {
+        local source="$1"
+        local destination="$2"
+        local slot
+        slot="$(mktemp -d "${STATE_MIGRATION_STAGE}/item.XXXXXX")"
+        cp -a --no-dereference -- "${source}" "${slot}/payload"
+        chown -hR "${OPERATOR_USER}:${OPERATOR_GROUP}" "${slot}"
+        operator_run mkdir -p -- "$(dirname -- "${destination}")"
+        operator_run cp -a --no-clobber --no-target-directory -- \
+            "${slot}/payload" "${destination}"
+        rm -rf -- "${slot}"
+    }
+
+    LEGACY_STATE_HOME="/root/.almond"
+    if [ "${ALMOND_STATE_HOME}" != "${LEGACY_STATE_HOME}" ] \
+        && [ -d "${LEGACY_STATE_HOME}" ] && [ ! -L "${LEGACY_STATE_HOME}" ]; then
+        PRE_MANTIS_STATE_DIR="u""mi"
+        # CAN bring-up/quirk scripts are deliberately not operator state: root
+        # cron/systemd execute them, so current releases regenerate root-owned
+        # copies under /etc/almond-axol/can instead of migrating writable ones.
+        for item in \
+            settings.json tracker/config.json tracker/ultimate_wifi.json \
+            mantis/tcp_transform.json \
+            "${PRE_MANTIS_STATE_DIR}/tcp_transform.json" \
+            gripper_calibration.json waypoints.json; do
+            legacy_item="${LEGACY_STATE_HOME}/${item}"
+            operator_item="${ALMOND_STATE_HOME}/${item}"
+            if [ -f "${legacy_item}" ] && [ ! -L "${legacy_item}" ] \
+                && [ ! -e "${operator_item}" ] && [ ! -L "${operator_item}" ] \
+                && state_destination_safe "${operator_item}"; then
+                operator_state_copy "${legacy_item}" "${operator_item}"
+                if [ "${item}" = "${PRE_MANTIS_STATE_DIR}/tcp_transform.json" ]; then
+                    say "Migrated operator state: legacy Mantis calibration"
+                else
+                    say "Migrated operator state: ${item}"
+                fi
+            fi
+        done
+
+        # Keep a certificate and its private key as a pair; mixing halves from
+        # two homes creates a TLS configuration that looks complete but cannot
+        # start. If the operator has either half, normal cert setup regenerates
+        # the pair when needed instead of merging it here.
+        legacy_cert_dir="${LEGACY_STATE_HOME}/vr/certs"
+        operator_cert_dir="${ALMOND_STATE_HOME}/vr/certs"
+        if [ -f "${legacy_cert_dir}/cert.pem" ] && [ ! -L "${legacy_cert_dir}/cert.pem" ] \
+            && [ -f "${legacy_cert_dir}/key.pem" ] && [ ! -L "${legacy_cert_dir}/key.pem" ] \
+            && [ ! -e "${operator_cert_dir}/cert.pem" ] \
+            && [ ! -L "${operator_cert_dir}/cert.pem" ] \
+            && [ ! -e "${operator_cert_dir}/key.pem" ] \
+            && [ ! -L "${operator_cert_dir}/key.pem" ] \
+            && state_destination_safe "${operator_cert_dir}/cert.pem" \
+            && state_destination_safe "${operator_cert_dir}/key.pem"; then
+            operator_state_copy \
+                "${legacy_cert_dir}/cert.pem" "${operator_cert_dir}/cert.pem"
+            operator_state_copy \
+                "${legacy_cert_dir}/key.pem" "${operator_cert_dir}/key.pem"
+            say "Migrated operator state: Quest/control-panel TLS certificate"
+        fi
+
+        # Diagnostics are append-only history. Preserve the legacy tree only
+        # when the operator does not already have one; never merge run IDs.
+        if [ -d "${LEGACY_STATE_HOME}/diagnostics" ] \
+            && [ ! -L "${LEGACY_STATE_HOME}/diagnostics" ] \
+            && [ ! -e "${ALMOND_STATE_HOME}/diagnostics" ] \
+            && [ ! -L "${ALMOND_STATE_HOME}/diagnostics" ] \
+            && state_destination_safe "${ALMOND_STATE_HOME}/diagnostics"; then
+            operator_state_copy "${LEGACY_STATE_HOME}/diagnostics" \
+                "${ALMOND_STATE_HOME}/diagnostics"
+            say "Migrated operator state: diagnostics"
+        fi
     fi
-fi
-if [ -z "${LEROBOT_HOME_ENV}" ]; then
-    say "WARNING: could not resolve a non-root user home; datasets default to root's cache."
+
+    cleanup_state_migration_stage
+    trap - EXIT
+
+    # The operator created this root, and each staged legacy payload is handed
+    # over before the operator copies it. Never recursively chown an
+    # operator-controlled tree as root: a planted hardlink could transfer
+    # ownership of an external inode.
+    operator_run chmod 2775 -- "${ALMOND_STATE_HOME}"
+    ALMOND_HOME_ENV_LINE="$(systemd_environment_line ALMOND_HOME "${ALMOND_STATE_HOME}")"
+    SERVICE_GROUP_LINE="Group=${OPERATOR_GROUP}"
+    say "Shared operator state: ${ALMOND_STATE_HOME} (user: ${OPERATOR_USER})."
+else
+    say "WARNING: could not resolve a non-root operator home; service state defaults to /root/.almond."
 fi
 
 # -- systemd service ----------------------------------------------------------
 
 say "Writing ${SERVICE_FILE}..."
-cat > "${SERVICE_FILE}" <<EOF
+[ ! -L "/etc/systemd/system" ] \
+    || die "/etc/systemd/system must not be a symlink."
+[ "$(stat -c '%u:%g:%a' -- /etc/systemd/system)" = "0:0:755" ] \
+    || die "/etc/systemd/system must be a root-owned directory with mode 0755."
+[ ! -L "${SERVICE_FILE}" ] || die "${SERVICE_FILE} must not be a symlink."
+SERVICE_STAGE="$(mktemp -d /etc/systemd/system/.axol-service.XXXXXX)"
+chmod 0700 "${SERVICE_STAGE}"
+SERVICE_TMP="${SERVICE_STAGE}/${SERVICE_NAME}.service"
+cleanup_service_stage() {
+    rm -f -- "${SERVICE_TMP}" 2>/dev/null || true
+    rmdir -- "${SERVICE_STAGE}" 2>/dev/null || true
+}
+trap cleanup_service_stage EXIT
+cat > "${SERVICE_TMP}" <<EOF
 [Unit]
 Description=Axol control panel (axol serve)
-After=network-online.target
+# The deferred nvpmodel selection is applied by NVIDIA's boot service before
+# this unit re-pins clocks at that mode's ceiling. After= does not pull the
+# vendor unit in, so it remains harmless on non-Jetson hosts.
+After=nvpmodel.service network-online.target
 Wants=network-online.target
 
 [Service]
+# Keep root privileges for hardware setup while making newly-created operator
+# state writable by the login account selected above.
+${SERVICE_GROUP_LINE}
+UMask=0027
+# A pending update is allowed exactly one candidate boot while the durable
+# marker keeps every hardware API fail-closed. Move (not copy) the one-shot
+# token before Python exec so an import/start crash cannot enter a restart loop.
+ExecStartPre=/bin/sh -c 'if [ -e ${UPDATE_START_TOKEN} ]; then /usr/bin/mv -fT -- ${UPDATE_START_TOKEN} ${UPDATE_VERIFYING_MARKER} && /usr/bin/sync -- /var/lib/almond-axol; fi'
 # Re-pin the Jetson clocks at every boot (they reset on reboot). The leading
 # '-' makes a failure non-fatal, so serve still starts on non-Jetson hosts.
 ExecStartPre=-${BIN_DIR}/axol jetson.setup
 ExecStart=${BIN_DIR}/axol serve
+# This is part of systemd's start job. During an update it requires the exact
+# release to answer on one stable MainPID before clearing its attempt marker;
+# the installer retains the durable marker through Mantis verification. On an
+# ordinary start with no candidate marker it is an immediate no-op.
+ExecStartPost=${BIN_DIR}/axol update-healthcheck
+# The start job spans ExecStartPre (clock pinning) and the ExecStartPost health
+# dwell, which gives a cold candidate up to 120s to answer. systemd's default
+# 90s would kill a slow but healthy first boot before the verifier finished.
+TimeoutStartSec=180
 Restart=always
 RestartSec=3
 # A stop during a recording session must outlive the serve layer's dataset
@@ -200,10 +2185,24 @@ RestartSec=3
 # the next episode past them, permanently corrupting its episode indexing.
 TimeoutStopSec=240
 # Include the sbin dirs: CAN bring-up shells out to modinfo/modprobe/ip/etc.
-Environment=PATH=${BIN_DIR}:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin:${BIN_DIR}
 Environment=PYTHONUNBUFFERED=1
-# Store collected datasets under the installing user's home (see above) rather
-# than root's cache. Empty when no non-root user home was resolved.
+# Keep privileged-service path guards active independently of optional state
+# redirects. The CLI also sets this marker at serve startup for manual runs.
+Environment=AXOL_PRIVILEGED_SERVICE=1
+# Hosted dataset writes stay below this immutable root-owned boundary. The
+# numeric group receives read/traverse access when Axol seals each save.
+${SERVICE_DATASET_ROOT_ENV}
+${SERVICE_OPERATOR_UID_ENV}
+${SERVICE_OPERATOR_GID_ENV}
+# Preserve the selected login across root-owned transient update workers. A
+# direct-root installation with no operator uses the explicit root sentinel so
+# future updates never guess a different /home entry.
+${OPERATOR_USER_ENV_LINE}
+# Share settings, tracker bindings, Mantis calibration, CAN state, and Quest
+# certificates with the interactive CLI. Empty only when no operator resolved.
+${ALMOND_HOME_ENV_LINE}
+# Store hosted datasets below the immutable service boundary initialized above.
 ${LEROBOT_HOME_ENV}
 # Keep the self-updater's tag-pinned reinstall on the same shared install the
 # installer wrote, rather than letting uv fall back to its /root defaults.
@@ -217,11 +2216,54 @@ Environment=UV_TOOL_BIN_DIR=${BIN_DIR}
 [Install]
 WantedBy=multi-user.target
 EOF
+chown root:root "${SERVICE_TMP}"
+chmod 0644 "${SERVICE_TMP}"
+if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze verify "${SERVICE_TMP}" >/dev/null \
+        || die "The generated ${SERVICE_NAME}.service unit did not pass systemd validation."
+fi
+durable_replace "${SERVICE_TMP}" "${SERVICE_FILE}"
+rmdir -- "${SERVICE_STAGE}"
+trap - EXIT
 
 say "Enabling and starting the ${SERVICE_NAME} service..."
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
-systemctl restart "${SERVICE_NAME}"
+sync -- /etc/systemd/system
+# Keep the durable marker armed. The OR-condition admits exactly this one token,
+# ExecStartPre consumes it before Python starts, and ExecStartPost removes only
+# its attempt marker after a stable exact-version health dwell. The installer
+# removes the durable marker after Mantis is stable too. A failed candidate has
+# no second token, so Restart=always cannot loop into unverified code.
+write_update_start_token \
+    || die "Axol was installed, but its one-shot candidate token could not be written. The service remains blocked and disabled."
+START_OK=1
+systemctl start "${SERVICE_NAME}" || START_OK=0
+if [ "${START_OK}" -ne 1 ] \
+    || [ ! -f "${UPDATE_MARKER}" ] \
+    || [ -L "${UPDATE_MARKER}" ] \
+    || [ "$(stat -c '%u:%g:%a' -- "${UPDATE_MARKER}" 2>/dev/null || true)" != "0:0:600" ] \
+    || [ "$(wc -l < "${UPDATE_MARKER}" 2>/dev/null || true)" != "1" ] \
+    || [ "$(cat -- "${UPDATE_MARKER}" 2>/dev/null || true)" != "target-version=${VERSION}" ] \
+    || [ -e "${UPDATE_START_TOKEN}" ] \
+    || [ -e "${UPDATE_VERIFYING_MARKER}" ] \
+    || ! systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+    reject_candidate_after_health_failure "${VERSION}"
+fi
+# A boot that happened while the marker existed skipped this helper, and an
+# update stopped any already-running copy above. Restore its prior intended
+# state explicitly; multi-user.target is already active and will not do so. A
+# helper failure rejects and blocks the candidate while the rollback is still
+# pending, so the two services commit as one customer-visible transaction.
+restore_mantis_for_candidate "${VERSION}"
+durable_remove "${UPDATE_MARKER}" \
+    || reject_candidate_after_health_failure "${VERSION}"
+
+# Axol health and the required Mantis restart have both succeeded. Only now
+# rotate the retained environment and discard an older rollback.
+if [ -d "${PENDING_ROLLBACK}" ] && [ ! -L "${PENDING_ROLLBACK}" ]; then
+    promote_pending_rollback
+fi
 
 # -- done ---------------------------------------------------------------------
 
@@ -236,6 +2278,10 @@ fi
 say ""
 say "  Service logs  : journalctl -u ${SERVICE_NAME} -f"
 say "  Re-run this installer anytime to upgrade."
+if [ "${AARCH64_HOST}" = "1" ]; then
+    say ""
+    say "WARNING: this hosted aarch64 install uses CPU-only PyTorch; local CUDA policy inference requires an explicitly managed JetPack-compatible build."
+fi
 if [ "${REBOOT_REQUIRED}" = "1" ]; then
     say ""
     say "REBOOT REQUIRED: the ZED Box camera driver was upgraded and only loads"

@@ -21,12 +21,18 @@ flowchart LR
 
 You can launch a rollout from the **web control panel** or the **CLI** (`axol run-policy`).
 
+<Note>
+  Panel-saved rollouts go to the immutable hosted dataset boundary under
+  `/var/lib/almond-axol/datasets`; non-root CLI rollouts use the normal user
+  cache.
+</Note>
+
 ## Before you start
 
 - **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
 - **The ZED cameras the policy was trained on connected** (at least one), with their serials on hand — see the [Data Collection](/operations/data-collection#before-you-start) tip for listing them.
-- **A trained checkpoint** (local path or HuggingFace repo) and its policy type (`act`, `smolvla`, `pi0`, …). Assign the **same** cameras, and use the **same** camera resolution, stereo setting, and fps the policy was trained on.
-- **For local GPU inference**, a CUDA-capable PyTorch install — or offload to a remote server (below).
+- **A trusted trained checkpoint and any existing rollout dataset you append to** that you created or obtained from a source you trust (local path or HuggingFace repo), plus the checkpoint's policy type (`act`, `smolvla`, `pi0`, …). Upstream model deserialization and dataset parsing are not sandboxed. Assign the **same** cameras, and use the **same** camera resolution, stereo setting, and fps the policy was trained on.
+- **For local GPU inference**, a CUDA-capable PyTorch install — or offload to a remote server (below). The hosted aarch64/Jetson install deliberately receives PyPI's CPU-only Torch 2.10 build; use an explicitly managed JetPack-compatible Torch + Torchvision build, select a remote server, or pass `--device cpu`. Axol's hosted updater will not overwrite an existing custom/CUDA build.
 
 ## Run it
 
@@ -34,7 +40,7 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
   <Tab title="Control Panel">
     <Steps>
       <Step title="Connect the robot and assign cameras">
-        Connect the **Axol Host** and **Axol**, then assign the cameras the policy was trained on in the **Cameras** settings tab (at least one). See [Cameras](/guides/control-panel#cameras).
+        Connect the **Axol Host** and **Axol**, then assign the cameras the policy was trained on under **Axol Cameras** (at least one). See [Cameras](/guides/control-panel#cameras).
       </Step>
 
       <Step title="Select Run Policy and fill the fields">
@@ -98,10 +104,12 @@ You can also arm a watchdog for the **rollout itself** — while the policy is d
     The inference server runs on the GPU machine from the CLI — it isn't one of the control panel's operations. With the `lerobot` extra installed there:
 
     ```bash
-    axol inference-server
+    axol inference-server --host 192.168.1.99
     ```
 
-    Listens on `0.0.0.0:8765` until `Ctrl+C`. See [`inference-server`](/cli/inference-server).
+    Replace the example with the inference machine's exact LAN IP. The default is loopback-only; with `--host`, it listens on that interface's port `8765` until `Ctrl+C`. See [`inference-server`](/cli/inference-server).
+
+    Use remote inference only across an isolated trusted network (or authenticated VPN), with a host firewall allowing the robot IP alone. Axol replaces LeRobot 0.6's pickle transport with bounded, versioned messages, but gRPC still has no TLS/client authentication: a peer can request checkpoint loads or impersonate the server and return arbitrary robot actions, so shared or untrusted networks remain unsafe.
   </Step>
 
   <Step title="Point Run Policy at it">

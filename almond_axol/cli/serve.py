@@ -8,7 +8,7 @@ streams their output, and stops them. The four core operations (teleop,
 gravity-comp, collect-data, run-policy) run in-process so they share one robot
 connection; the setup/calibration commands run as ``axol`` subprocesses.
 
-    axol serve                  # serve on http://localhost:8001
+    axol serve                  # serve on https://localhost:8001
     axol serve --port 9000
     axol serve --open           # also open a browser window on startup
     axol serve --host 127.0.0.1 # localhost only
@@ -24,7 +24,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-from ..utils.certs import CERTFILE, KEYFILE, create_self_signed_cert
+from ..utils.certs import CERTFILE, KEYFILE, PreparedTLSFiles, prepare_tls_files
 
 # The VR server and this control-panel API share one self-signed certificate
 # (see ``almond_axol.utils.certs``) so a single browser cert acceptance covers both.
@@ -61,6 +61,14 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
             "machine without mixed-content blocking."
         ),
     )
+    parser.add_argument(
+        "--operator",
+        metavar="USER",
+        help=(
+            "Non-root account that may read datasets recorded by a manual root "
+            "serve (default: SUDO_USER). Ignored by non-root serves."
+        ),
+    )
     parser.set_defaults(func=run)
 
 
@@ -83,25 +91,37 @@ def _local_ip() -> str:
 
 def run(args: argparse.Namespace) -> None:
     """Start the control-panel server."""
+    # Explicit process marker: security gates must remain active for a manual
+    # root ``axol serve`` even when the installer did not set ALMOND_HOME.
+    from ..utils.state_files import (
+        configure_root_service_dataset,
+        mark_privileged_service,
+    )
+
+    mark_privileged_service()
+    if os.geteuid() == 0:
+        # Third-party dataset writers must never create group-writable entries
+        # inside the immutable hosted store, including on manual serve runs
+        # outside the installed systemd unit.
+        os.umask(0o027)
+        configure_root_service_dataset(getattr(args, "operator", None))
+
     import uvicorn
 
     from ..serve import create_app
 
+    tls = not args.no_tls
+    scheme = "https" if tls else "http"
+    lan_ip = _local_ip() if args.host in {"0.0.0.0", "::"} else args.host
+
     static_dir = _find_static_dir()
     app = create_app(static_dir)
-
-    tls = not args.no_tls
-    ssl_kwargs: dict[str, str] = {}
-    if tls:
-        _ensure_cert()
-        ssl_kwargs = {"ssl_certfile": CERTFILE, "ssl_keyfile": KEYFILE}
-    scheme = "https" if tls else "http"
 
     local = f"{scheme}://localhost:{args.port}"
     print("Axol control panel:")
     print(f"  Local : {local}")
     if args.host == "0.0.0.0":
-        print(f"  LAN   : {scheme}://{_local_ip()}:{args.port}")
+        print(f"  LAN   : {scheme}://{lan_ip}:{args.port}")
     if tls:
         print(
             "  (self-signed TLS — to connect from a browser on another machine, "
@@ -124,23 +144,27 @@ def run(args: argparse.Namespace) -> None:
     # and closes the adopted socket on exit.
     from ..utils.ports import open_listen_socket
 
+    tls_files: PreparedTLSFiles | None = None
     sock = open_listen_socket(args.host, args.port)
-    config = uvicorn.Config(
-        app, host=args.host, port=args.port, log_level="info", **ssl_kwargs
-    )
-    server = uvicorn.Server(config)
     try:
+        ssl_kwargs: dict[str, str] = {}
+        if tls:
+            tls_files = prepare_tls_files(CERTFILE, KEYFILE)
+            if tls_files.generated:
+                print("Generating self-signed TLS certificate ...")
+            ssl_kwargs = {
+                "ssl_certfile": tls_files.certfile,
+                "ssl_keyfile": tls_files.keyfile,
+            }
+        config = uvicorn.Config(
+            app, host=args.host, port=args.port, log_level="info", **ssl_kwargs
+        )
+        server = uvicorn.Server(config)
         server.run(sockets=[sock])
     finally:
         sock.close()
-
-
-def _ensure_cert() -> None:
-    """Generate the shared self-signed cert on first use (idempotent)."""
-    if os.path.isfile(CERTFILE) and os.path.isfile(KEYFILE):
-        return
-    print("Generating self-signed TLS certificate ...")
-    create_self_signed_cert(CERTFILE, KEYFILE)
+        if tls_files is not None:
+            tls_files.close()
 
 
 def _open_browser_when_ready(url: str) -> None:

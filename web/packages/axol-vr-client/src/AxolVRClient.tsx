@@ -1,8 +1,11 @@
 import type { RefObject } from "react"
 import { useRef } from "react"
 import { useFrame, useThree } from "@react-three/fiber"
+import { initialPoseSequence, nextPoseSequence } from "./poseSequence"
+import type { PoseSequence } from "./poseSequence"
+import { webxrCanControlPose, webxrCanControlRecording } from "./sessionAuthority"
 import { AxolState } from "./types"
-import type { AxolMode, ConfirmAction } from "./types"
+import type { AxolMode, AxolPoseMode, AxolPoseSourceKind, ConfirmAction } from "./types"
 
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
@@ -10,6 +13,35 @@ const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
 // Pose sinks (WebSocket and RTCDataChannel) both expose `.send(string)`; this is
 // the minimal shape AxolVRClient needs to ship a frame.
 type PoseSink = { send: (data: string) => void }
+
+const POSE_SOURCE_ID_KEY = "axol.webxr.pose-source-id.v2"
+// A current host replays pose_mode as soon as the signaling listener is
+// attached. Hold controller frames briefly so a reconnect cannot emit one
+// target-ray frame into an absolute/grip-space Mantis session. Older servers
+// have no announcement and safely fall back to the legacy relative convention.
+const POSE_MODE_REPLAY_WAIT_MS = 1_000
+
+function monotonicNowMs(): number {
+  return globalThis.performance?.now?.() ?? Date.now()
+}
+
+/** Keep one logical producer across a reload of this browser tab. */
+function poseSourceId(): string {
+  try {
+    const stored = globalThis.sessionStorage?.getItem(POSE_SOURCE_ID_KEY)
+    if (stored?.startsWith("webxr-") && stored.length <= 128) return stored
+  } catch {
+    // Storage can be blocked by browser privacy policy; an in-memory id still
+    // preserves de-duplication across this component's transports.
+  }
+  const created = `webxr-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`
+  try {
+    globalThis.sessionStorage?.setItem(POSE_SOURCE_ID_KEY, created)
+  } catch {
+    // Best-effort persistence only.
+  }
+  return created
+}
 
 /** Best open network pose transport: the low-latency WebRTC data channel when
  *  open (UDP; right path over a relayed Funnel, equal-or-better on a LAN),
@@ -38,6 +70,8 @@ export function AxolVRClient({
   onPendingRecording,
   onPendingConfirm,
   onMode,
+  onPoseMode,
+  onPoseSourceKind,
   onEpisode,
   onExit,
 }: {
@@ -58,6 +92,12 @@ export function AxolVRClient({
   onPendingConfirm?: (action: ConfirmAction | null) => void
   // Called when the server announces its operating mode (once per connection).
   onMode?: (mode: AxolMode) => void
+  // Called when the server announces the controller-pose convention. Relative
+  // is also emitted as the safe fallback while a new connection is pending.
+  onPoseMode?: (mode: AxolPoseMode) => void
+  // Called with the server's exclusive pose producer. Tracker means this
+  // connected Quest is a camera/status viewer, not a controller.
+  onPoseSourceKind?: (kind: AxolPoseSourceKind) => void
   // Called with the current 1-based episode number while collecting data (and
   // null if the server ever clears it). Drives the in-headset episode readout.
   onEpisode?: (episode: number | null) => void
@@ -66,7 +106,10 @@ export function AxolVRClient({
   const { gl } = useThree()
 
   const stateRef = useRef<AxolState>(AxolState.Teleop)
-  const seqRef = useRef(0)
+  const seqRef = useRef<PoseSequence | null>(null)
+  if (seqRef.current === null) seqRef.current = initialPoseSequence()
+  const poseSourceIdRef = useRef<string | null>(null)
+  if (poseSourceIdRef.current === null) poseSourceIdRef.current = poseSourceId()
   const prevXRef = useRef(false)
   const prevYRef = useRef(false)
   const prevARef = useRef(false)
@@ -83,6 +126,16 @@ export function AxolVRClient({
   const modeRef = useRef<AxolMode | null>(null)
   // Server-pushed mode announcement, applied at the start of the next frame.
   const serverModeRef = useRef<AxolMode | null>(null)
+  // Controller convention is distinct from the HUD mode: both teleop and
+  // data collection can run ordinary relative Axol or absolute Mantis. Safe
+  // legacy default for a server that predates the announcement is relative.
+  const poseModeRef = useRef<AxolPoseMode>("relative")
+  const poseModeReadyRef = useRef(false)
+  const poseModeFallbackAtRef = useRef<number | null>(null)
+  // A tracker-owned session accepts this Quest as a video/HUD viewer only.
+  // Until the host announces its policy, null retains older-server behavior.
+  const expectedPoseSourceKindRef = useRef<AxolPoseSourceKind>(null)
+  const poseSourceKindReadyRef = useRef(false)
   // Server-pushed episode number, applied at the start of the next frame. -1 is
   // the "unset" sentinel (distinct from a real episode value or an explicit
   // null the server could send); replaced with the parsed value on each push.
@@ -91,13 +144,34 @@ export function AxolVRClient({
   const wsWithHandlerRef = useRef<WebSocket | null>(null)
   // Change key of the last HUD state published to the server (see below).
   const lastHudKeyRef = useRef("")
+  // HUD controls are accepted only after this exact signaling socket has
+  // carried the active pose source. Keep that authorization knowledge across
+  // temporary controller/elbow loss, but never across a socket replacement.
+  const signalingPoseEstablishedRef = useRef(false)
 
   useFrame(() => {
     // Attach onmessage to the WebSocket whenever it changes so we can receive
     // server-pushed state overrides (e.g. the "saving" state after recording).
     const currentWs = wsRef.current
     if (currentWs !== wsWithHandlerRef.current) {
+      if (wsWithHandlerRef.current) wsWithHandlerRef.current.onmessage = null
       wsWithHandlerRef.current = currentWs
+      // Drop announcements queued by the superseded connection. Preserve the
+      // already-applied mode/state through a transient reconnect until the
+      // server's replay confirms their authoritative values.
+      serverStateRef.current = null
+      serverModeRef.current = null
+      poseModeRef.current = "relative"
+      poseModeReadyRef.current = false
+      expectedPoseSourceKindRef.current = null
+      poseSourceKindReadyRef.current = false
+      poseModeFallbackAtRef.current = monotonicNowMs() + POSE_MODE_REPLAY_WAIT_MS
+      onPoseMode?.("relative")
+      onPoseSourceKind?.(null)
+      // Publish the current HUD snapshot through the replacement signaling
+      // socket even if its values did not change during the reconnect.
+      lastHudKeyRef.current = ""
+      signalingPoseEstablishedRef.current = false
       // A new (or dropped) connection invalidates the previous session's
       // episode number: the HUD readout only advances on a server `episode`
       // message, and plain teleop never sends one, so without this a prior
@@ -111,6 +185,7 @@ export function AxolVRClient({
       onEpisode?.(null)
       if (currentWs) {
         currentWs.onmessage = (event: MessageEvent) => {
+          if (wsRef.current !== currentWs) return
           try {
             const msg = JSON.parse(event.data as string) as {
               type: string
@@ -120,12 +195,39 @@ export function AxolVRClient({
               serverStateRef.current = msg.value as AxolState
             } else if (msg.type === "mode") {
               serverModeRef.current = msg.value as AxolMode
+            } else if (
+              msg.type === "pose_mode" &&
+              (msg.value === "relative" || msg.value === "absolute")
+            ) {
+              poseModeRef.current = msg.value
+              poseModeReadyRef.current = true
+              onPoseMode?.(msg.value)
+            } else if (
+              msg.type === "pose_source_kind" &&
+              (msg.value === null || msg.value === "webxr" || msg.value === "tracker")
+            ) {
+              expectedPoseSourceKindRef.current = msg.value
+              poseSourceKindReadyRef.current = true
+              onPoseSourceKind?.(msg.value)
             } else if (msg.type === "episode") {
               serverEpisodeRef.current = typeof msg.value === "number" ? msg.value : null
             }
           } catch {
             // ignore malformed messages
           }
+        }
+
+        // The host also sends this configuration immediately after accept,
+        // but that packet can beat a React frame on a fast LAN/USB socket.
+        // Request an idempotent replay only after our listener is installed.
+        const requestSessionConfig = () => {
+          if (wsRef.current !== currentWs || currentWs.readyState !== WebSocket.OPEN) return
+          currentWs.send(JSON.stringify({ type: "session-config-request" }))
+        }
+        if (currentWs.readyState === WebSocket.OPEN) {
+          requestSessionConfig()
+        } else if (currentWs.readyState === WebSocket.CONNECTING) {
+          currentWs.addEventListener("open", requestSessionConfig, { once: true })
         }
       }
     }
@@ -136,6 +238,18 @@ export function AxolVRClient({
     const frame = gl.xr.getFrame()
     const refSpace = gl.xr.getReferenceSpace()
     if (!frame || !refSpace) return
+
+    // Do not read buttons or ship a pose until this connection's datum is
+    // known. In particular, deferring button-edge tracking means a held Y exit
+    // still sends its reliable return-to-rest frame after config arrives.
+    if (!poseModeReadyRef.current || !poseSourceKindReadyRef.current) {
+      if (poseModeFallbackAtRef.current === null) {
+        poseModeFallbackAtRef.current = monotonicNowMs() + POSE_MODE_REPLAY_WAIT_MS
+      }
+      if (monotonicNowMs() < poseModeFallbackAtRef.current) return
+      poseModeReadyRef.current = true
+      poseSourceKindReadyRef.current = true
+    }
 
     const leftSource = Array.from(session.inputSources).find(
       (s: XRInputSource) => s.handedness === "left"
@@ -208,13 +322,28 @@ export function AxolVRClient({
     // Recording (and thus the data-collection state machine) only exists in
     // data-collection mode. In teleop mode A/B do nothing. Until the server
     // announces a mode we keep the legacy behaviour (recording allowed).
-    const canRecord = modeRef.current !== "teleop"
+    const canControlPose = webxrCanControlPose(expectedPoseSourceKindRef.current)
+    const canRecord = webxrCanControlRecording(modeRef.current, expectedPoseSourceKindRef.current)
+
+    // Tracker-owned Lighthouse/Ultimate sessions keep the Quest connected for
+    // cameras and authoritative server HUD updates, but its A/X buttons must
+    // not create a local countdown or confirmation flow.
+    if (!canRecord) {
+      if (recordingPendingAtRef.current !== null) {
+        recordingPendingAtRef.current = null
+        onPendingRecording?.(null)
+      }
+      if (pendingConfirmRef.current !== null) {
+        pendingConfirmRef.current = null
+        onPendingConfirm?.(null)
+      }
+    }
 
     const isPending = recordingPendingAtRef.current !== null
 
     let reset = false
 
-    if (state === AxolState.Recording && !isSaving) {
+    if (canRecord && state === AxolState.Recording && !isSaving) {
       // Stopping a recording — to save (A) or discard (X) — is gated by a
       // confirmation popup: the first press arms it, pressing the SAME button
       // again commits, the OTHER button cancels and keeps recording. Handled
@@ -252,7 +381,7 @@ export function AxolVRClient({
       }
 
       // X — reset; also cancels a pending countdown (not allowed while saving).
-      if (xEdge && !isSaving) {
+      if (xEdge && !isSaving && canControlPose) {
         reset = true
         if (isPending) {
           setState(AxolState.DataCollection)
@@ -295,6 +424,7 @@ export function AxolVRClient({
     // Promote pending → recording after 3s
     if (
       recordingPendingAtRef.current !== null &&
+      canRecord &&
       Date.now() - recordingPendingAtRef.current >= 3000
     ) {
       setState(AxolState.Recording)
@@ -302,33 +432,34 @@ export function AxolVRClient({
       onPendingRecording?.(null)
     }
 
-    // Publish the HUD-only state (armed confirmation popup, record countdown)
-    // to the server whenever it changes, so a dashboard watching the session
-    // can mirror what this headset would show — the operator may be driving
-    // with the controllers while the headset is off. Sent over the main
-    // WebSocket (the signaling transport); the server relays it to the other
-    // connected clients and clears it when we disconnect.
-    {
+    // Once this signaling socket has carried the active WebXR source, HUD
+    // changes no longer depend on a fresh controller pose. This keeps mirrors
+    // correct when A/X or a server state update clears a countdown/confirmation
+    // during temporary controller or body-tracking loss. A replacement socket
+    // remains gated until the successful-pose path below re-establishes it.
+    const publishHudIfEstablished = () => {
+      if (!canRecord || !signalingPoseEstablishedRef.current) return
       const pendingAt = recordingPendingAtRef.current
       const confirm = pendingConfirmRef.current
       const hudKey = `${confirm ?? ""}|${pendingAt !== null}`
-      if (hudKey !== lastHudKeyRef.current) {
-        lastHudKeyRef.current = hudKey
-        const ws = wsRef.current
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              type: "hud",
-              value: {
-                confirm,
-                countdownRemainingMs:
-                  pendingAt !== null ? Math.max(0, 3000 - (Date.now() - pendingAt)) : null,
-              },
-            })
-          )
-        }
-      }
+      if (hudKey === lastHudKeyRef.current) return
+      const ws = wsRef.current
+      if (!ws || ws.readyState !== WebSocket.OPEN) return
+      ws.send(
+        JSON.stringify({
+          type: "hud",
+          pose_source_id: poseSourceIdRef.current,
+          pose_source_kind: "webxr",
+          value: {
+            confirm,
+            countdownRemainingMs:
+              pendingAt !== null ? Math.max(0, 3000 - (Date.now() - pendingAt)) : null,
+          },
+        })
+      )
+      lastHudKeyRef.current = hudKey
     }
+    publishHudIfEstablished()
 
     // Send each frame over every open transport: the wired USB `adb reverse`
     // tunnel for low latency, and the best network path (the WebRTC data
@@ -372,8 +503,18 @@ export function AxolVRClient({
       return { x: p.x, y: p.y, z: p.z }
     }
 
-    const l_hand = getPose(leftSource?.targetRaySpace)
-    const r_hand = getPose(rightSource?.targetRaySpace)
+    const absolutePose = poseModeRef.current === "absolute"
+    // Preserve Axol's established target-ray convention exactly. Only an
+    // explicitly announced absolute mapping selects the physical grip datum
+    // required by a controller-mounted Mantis. Older WebXR runtimes may omit
+    // gripSpace, so absolute mode retains targetRaySpace as a bring-up fallback
+    // whose distinct datum is surfaced to calibration/readiness checks.
+    const lUsesGrip = absolutePose && leftSource?.gripSpace != null
+    const rUsesGrip = absolutePose && rightSource?.gripSpace != null
+    const l_pose_space = lUsesGrip ? "grip" : "target-ray"
+    const r_pose_space = rUsesGrip ? "grip" : "target-ray"
+    const l_hand = getPose(lUsesGrip ? leftSource?.gripSpace : leftSource?.targetRaySpace)
+    const r_hand = getPose(rUsesGrip ? rightSource?.gripSpace : rightSource?.targetRaySpace)
 
     if (!l_hand || !r_hand) {
       // Lost controller tracking — can't ship a pose frame; leave XR anyway.
@@ -384,13 +525,18 @@ export function AxolVRClient({
     const r_ee = r_hand.pose
 
     const body = (frame as XRFrame & { body?: XRBody }).body
-    const l_elbow = getPosition(body?.get(L_ELBOW_JOINT))
-    const r_elbow = getPosition(body?.get(R_ELBOW_JOINT))
-
-    if (!l_elbow || !r_elbow) {
+    const trackedLeftElbow = getPosition(body?.get(L_ELBOW_JOINT))
+    const trackedRightElbow = getPosition(body?.get(R_ELBOW_JOINT))
+    // Relative Axol control has always required real body-elbow observations;
+    // fabricating controller positions changes IK behavior and defeats that
+    // safe no-pose gate. Absolute Mantis explicitly ignores elbow hints, so it
+    // can carry schema-compatible placeholders when body tracking is absent.
+    if (!absolutePose && (!trackedLeftElbow || !trackedRightElbow)) {
       if (yEdge) onExit?.()
       return
     }
+    const l_elbow = trackedLeftElbow ?? l_ee.position
+    const r_elbow = trackedRightElbow ?? r_ee.position
 
     const l_grip = 1 - (leftSource?.gamepad?.buttons[0]?.value ?? 0)
     const r_grip = 1 - (rightSource?.gamepad?.buttons[0]?.value ?? 0)
@@ -429,7 +575,19 @@ export function AxolVRClient({
       r_stick_x,
       l_stick_click,
       r_stick_click,
-      seq: ++seqRef.current,
+      seq: nextPoseSequence(seqRef.current!),
+      // One logical identity across USB, WebRTC, and network WebSocket. The
+      // server de-dupes the shared sequence globally and can keep this Quest
+      // view-only when a Lighthouse/Ultimate bridge owns Mantis poses.
+      pose_source_id: poseSourceIdRef.current,
+      pose_source_kind: "webxr",
+      // Mount calibration is datum-specific. The host validates both the
+      // WebXR controller generation and grip-vs-aim space before accepting a
+      // production Quest pose.
+      l_pose_profile: leftSource?.profiles?.[0] ?? null,
+      r_pose_profile: rightSource?.profiles?.[0] ?? null,
+      l_pose_space,
+      r_pose_space,
       // Capture timestamp (ms). The server's pose interpolator uses this to
       // reconstruct the true motion cadence when frames arrive batched over a
       // jittery/relayed link, so teleop stays smooth instead of stuttering.
@@ -437,6 +595,24 @@ export function AxolVRClient({
     })
     usbSink?.send(payload)
     netSink?.send(payload)
+    if (netSink === wsRef.current) signalingPoseEstablishedRef.current = true
+
+    // Publish the HUD-only state (armed confirmation popup, record countdown)
+    // to the server whenever it changes, so a dashboard can mirror what this
+    // headset would show. The server accepts HUD controls only from a socket
+    // already associated with the active WebXR pose source. Send this frame on
+    // the signaling socket first when WebRTC/USB carried the ordinary copies;
+    // that also makes reconnect-time HUD replay authoritative and ordered.
+    if (canRecord && lastHudKeyRef.current === "") {
+      const ws = wsRef.current
+      if (ws && ws.readyState === WebSocket.OPEN && !signalingPoseEstablishedRef.current) {
+        // USB/WebRTC carried the ordinary pose, so establish this replacement
+        // signaling socket before replaying its current HUD snapshot.
+        ws.send(payload)
+        signalingPoseEstablishedRef.current = true
+      }
+    }
+    publishHudIfEstablished()
 
     // End the XR session only now that the Y-press reset frame has been sent, so
     // the backend receives the return-to-rest before the pose stream stops.

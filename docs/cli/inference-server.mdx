@@ -7,9 +7,14 @@ Runs LeRobot's async-inference `PolicyServer` in the foreground, so [`run-policy
 
 The policy itself (`--policy_path` / `--policy_type` / `--device`) is selected by the **client** (`run-policy`), not the server — so one server can serve different policies across sessions without restarting. The server downloads the policy itself, so the path must be reachable from it (e.g. a HuggingFace Hub repo ID, or a local path that exists on the server machine).
 
+<Warning>
+  This is a **trusted-network-only** service. Axol replaces LeRobot 0.6's pickle transport with bounded, versioned setup/observation/action formats, but the gRPC connection still has no TLS or client authentication. Any reachable client can request a supported policy checkpoint/path to be downloaded and loaded, consuming server resources; a peer or machine-in-the-middle can impersonate the server and return arbitrary robot actions. Put the inference machine and robot on an isolated network (or authenticated VPN), firewall the port so only the intended peer IP can connect, and never expose it to shared Wi-Fi or the public internet. Treat every policy checkpoint itself as trusted input.
+</Warning>
+
 ```bash
-axol inference-server                 # listen on 0.0.0.0:8765
-axol inference-server --port 9000
+axol inference-server                              # loopback only
+axol inference-server --host 192.168.1.99          # explicit LAN interface
+axol inference-server --host 192.168.1.99 --port 9000
 ```
 
 Then, on the robot:
@@ -21,7 +26,7 @@ axol run-policy --server_host <server-ip> --policy_path myorg/pick-place-policy 
 
 | Flag | Description |
 |---|---|
-| `--host HOST` | Interface to bind the gRPC server to. Default `0.0.0.0` (accepts connections from the whole network). |
+| `--host HOST` | Interface to bind the gRPC server to. Default `127.0.0.1` (loopback only). Set the inference machine's exact LAN IP for remote use, and restrict the port with a host firewall. |
 | `--port INT` | gRPC port (default: 8765). Must match `run-policy`'s `--server_port`. |
 | `--fps INT` | Action chunk rate (default: 60). Must match `run-policy`'s `--fps`. |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |

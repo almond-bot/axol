@@ -11,7 +11,7 @@ It combines the two: a policy drives the arms like [Run Policy](/operations/run-
 
 - **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
 - **The ZED cameras the policy was trained on connected** (at least one), with their serials on hand — see the [Data Collection](/operations/data-collection#before-you-start) tip for listing them. Assign the **same** cameras, resolution, stereo setting, and fps the policy was trained on.
-- **A trained checkpoint** (local path or HuggingFace repo) and its policy type (`act`, `smolvla`, `pi0`, …). Inference runs **locally** on this machine (in-process, one action per control tick); a CUDA-capable PyTorch install is expected, or pass `--device cpu`.
+- **A trusted trained checkpoint and any DAgger dataset you resume** that you created or obtained from a source you trust (local path or HuggingFace repo), plus the checkpoint's policy type (`act`, `smolvla`, `pi0`, …). Upstream model deserialization and dataset parsing are not sandboxed. Inference runs **locally** on this machine (in-process, one action per control tick). A CUDA-capable PyTorch install is expected, or pass `--device cpu`. The hosted aarch64/Jetson install uses PyPI's CPU-only Torch 2.10 build unless you explicitly manage a JetPack-compatible Torch + Torchvision build; Axol's hosted updater will not overwrite such a custom/CUDA build.
 - **The VR TLS certificate authorized** once — see [Teleoperation](/operations/teleop#authorize-the-tls-certificate) — and the headset ready, since you drive interventions from it.
 
 ## Run it
@@ -20,7 +20,7 @@ It combines the two: a policy drives the arms like [Run Policy](/operations/run-
   <Tab title="Control Panel">
     <Steps>
       <Step title="Connect the robot and assign cameras">
-        Connect the **Axol Host** and **Axol**, then assign the cameras the policy was trained on in the **Cameras** settings tab (at least one, recording enabled). See [Cameras](/guides/control-panel#cameras).
+        Connect the **Axol Host** and **Axol**, then assign the cameras the policy was trained on under **Axol Cameras** (at least one, recording enabled). See [Cameras](/guides/control-panel#cameras).
       </Step>
 
       <Step title="Select Collect DAgger and fill the fields">

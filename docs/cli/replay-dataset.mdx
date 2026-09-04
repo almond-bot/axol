@@ -9,6 +9,18 @@ No cameras, teleop, or policy server are involved: replay only drives the arms, 
 
 Pass `--loop` to replay the episode continuously (returning to rest between takes) until you stop it with `Ctrl+C` (or **Stop** in the [control panel](/guides/control-panel)); either way the arm returns to the rest pose before the operation exits.
 
+<Note>
+  The hosted service only replays datasets below its root-owned store at
+  `/var/lib/almond-axol/datasets`; arbitrary filesystem paths remain available
+  to direct non-root CLI use.
+</Note>
+
+<Warning>
+  Replay only datasets you created or obtained from a trusted source. The
+  upstream dataset parser is not a sandbox for arbitrary HuggingFace
+  repositories or filesystem directories supplied by someone else.
+</Warning>
+
 This command is configured via draccus. The robot subsystem is exposed as the nested `robot_config` config (CAN channels, per-joint gains) — nest into it with dots or pass a whole-config file. See [Command configuration](/cli/configuration).
 
 | Flag | Description |

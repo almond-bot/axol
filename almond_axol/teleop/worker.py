@@ -13,6 +13,7 @@ import math
 import multiprocessing
 import multiprocessing.connection
 import os
+import signal
 import time
 
 import numpy as np
@@ -25,6 +26,9 @@ from .filter import OneEuroFilter
 from .trajectory import plan_collision_aware_trajectory
 
 _logger = logging.getLogger(__name__)
+
+# Up direction of the raw VR world frame (WebXR reference space: +y is up).
+_VR_UP = np.array([0.0, 1.0, 0.0])
 
 # Freeze detection (see IKWorker._note_solve): warn when the solver keeps
 # returning its seed unchanged while the tracked targets move away — the
@@ -39,6 +43,42 @@ _FREEZE_REWARN_EVERY_S = 2.0
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
 # ---------------------------------------------------------------------------
+
+
+def _matrix_to_quat_xyzw(R: np.ndarray) -> tuple[float, float, float, float]:
+    """Convert a 3x3 rotation matrix to an ``(x, y, z, w)`` quaternion."""
+    tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        return (
+            float(R[2, 1] - R[1, 2]) / s,
+            float(R[0, 2] - R[2, 0]) / s,
+            float(R[1, 0] - R[0, 1]) / s,
+            0.25 * s,
+        )
+    if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        return (
+            0.25 * s,
+            float(R[0, 1] + R[1, 0]) / s,
+            float(R[0, 2] + R[2, 0]) / s,
+            float(R[2, 1] - R[1, 2]) / s,
+        )
+    if R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        return (
+            float(R[0, 1] + R[1, 0]) / s,
+            0.25 * s,
+            float(R[1, 2] + R[2, 1]) / s,
+            float(R[0, 2] - R[2, 0]) / s,
+        )
+    s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+    return (
+        float(R[0, 2] + R[2, 0]) / s,
+        float(R[1, 2] + R[2, 1]) / s,
+        0.25 * s,
+        float(R[1, 0] - R[0, 1]) / s,
+    )
 
 
 def _quat_xyzw_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
@@ -197,6 +237,51 @@ class IKWorker:
         self._snap_elbow_ctrl: dict[str, np.ndarray] = {}
         self._snap_elbow_fk: dict[str, np.ndarray] = {}
 
+        # Absolute (Mantis) mode state: the world-anchored base transform solved
+        # at engage — ``(R_wb, t_wb)`` maps base-frame FLU coordinates into the
+        # raw VR world frame — plus each controller's rigid controller→TCP
+        # offset ``(p_off, R_off)`` expressed in the controller's local frame.
+        # ``_abs_active`` is the whole-session engage toggle (absolute mode
+        # has no per-arm freeze — both grips engage, both release).
+        self._abs_active: bool = False
+        self._abs_base: tuple[np.ndarray, np.ndarray] | None = None
+        self._abs_offset: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        # Tracker→gripper transforms (the rig's factory design constants, or
+        # per-unit file overrides — see almond_axol.mantis.calibration), per
+        # side as ``(p_off_3, R_off_3x3)`` in the tracker's local frame.
+        # When present for a side, engage uses it verbatim instead of
+        # absorbing the mount offset into the engage snapshot.
+        self._tcp_transforms: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for side, tf in (
+            ("left", config.tcp_transform_left),
+            ("right", config.tcp_transform_right),
+        ):
+            if tf is not None:
+                self._tcp_transforms[side] = (
+                    np.asarray(tf[:3], dtype=np.float64),
+                    _quat_xyzw_to_matrix(*tf[3:]).astype(np.float64),
+                )
+        # Quaternion sign continuity for the calibrated pose mapping (see
+        # :meth:`_apply_tcp_transform`).
+        self._last_mapped_quat: dict[str, np.ndarray] = {}
+        if self._tcp_transforms and config.absolute_mode:
+            _logger.info(
+                "absolute mode: using calibrated tracker→gripper transforms for %s",
+                sorted(self._tcp_transforms),
+            )
+        # JSON-safe copy of the base transform for the headset (VR world
+        # coords), so the web client can render the URDF at the engage-
+        # calibrated base. ``None`` until the first engage.
+        self.abs_base_msg: dict[str, list[float]] | None = None
+        # Latest absolute-mode TCP target per side, in the robot base frame:
+        # ``{"left": [x, y, z, qx, qy, qz, qw], "right": [...]}``. This is the
+        # tracked ground-truth pose the IK solver chases — Mantis data collection
+        # records it per row so training can use raw TCP trajectories instead
+        # of (or alongside) the IK joint solutions. Holds the last engaged
+        # target while disengaged (mirroring the latched virtual joints);
+        # seeded from rest FK so it is never ``None`` in absolute mode.
+        self.last_tcp_msg: dict[str, list[float]] | None = None
+
         freq = config.frequency
         mc = config.pose_min_cutoff
         beta = config.pose_beta
@@ -217,6 +302,14 @@ class IKWorker:
         self._rest_pose_left = q_settled[self._solver.left_indices].astype(np.float32)
         self._rest_pose_right = q_settled[self._solver.right_indices].astype(np.float32)
         self._solver.set_posture_pose(self.get_rest_q())
+
+        if config.absolute_mode:
+            # Warm the no-elbow IK graph now: absolute mode never passes elbow
+            # hints, and that distinct JAX graph would otherwise JIT-compile on
+            # the first engage, stalling the session for the compile time.
+            fk_l, fk_r = self._rest_fk_poses()
+            self._solver.ik(self.get_rest_q(), left_pose=fk_l, right_pose=fk_r)
+            self.last_tcp_msg = self._encode_tcp_msg(fk_l, fk_r)
 
     # -- Properties the main process needs ----------------------------------
 
@@ -249,6 +342,9 @@ class IKWorker:
         otherwise-engaged frame is frozen at the pose it had when its lock
         dropped. A frame with neither lock leaves ``q_current`` untouched.
         """
+        if self._config.absolute_mode:
+            return self._step_absolute(frame, q_current)
+
         l_lock = bool(frame.l_lock)
         r_lock = bool(frame.r_lock)
 
@@ -454,6 +550,99 @@ class IKWorker:
         )
         return q_new
 
+    def _step_absolute(self, frame: VRFrame, q_current: np.ndarray) -> np.ndarray:
+        """Mantis step: absolute world-anchored targets, no deltas.
+
+        The engage rising edge solves the base transform + per-controller TCP
+        offsets (:meth:`_engage_absolute`); every later frame maps each
+        controller pose rigidly into the base frame and solves IK against the
+        absolute target. Elbow hints are never passed — the operator's elbows
+        say nothing about the robot's preferred null-space posture, which is
+        instead anchored to the rest pose so joint solutions stay consistent
+        across operators and episodes.
+        """
+        enabled = frame.l_lock and frame.r_lock
+        if not enabled:
+            self._abs_active = False
+            return q_current
+
+        if not self._abs_active:
+            # Same rationale as the relative path: the One Euro state froze at
+            # the pose held when tracking was last disabled.
+            self._reset_pose_filters()
+
+        # Apply the calibrated tracker→gripper transform (when present) to the
+        # *raw* pose, before filtering: the signal of interest is the physical
+        # gripper, and filtering the tracker pose instead would let the mount
+        # lever arm leak filter lag into the gripper position during wrist
+        # rotations (filtering does not commute with a rigid transform).
+        lp_raw, lq_raw = self._apply_tcp_transform(
+            "left",
+            np.array(
+                [frame.l_ee.position.x, frame.l_ee.position.y, frame.l_ee.position.z]
+            ),
+            np.array(
+                [
+                    frame.l_ee.quaternion.x,
+                    frame.l_ee.quaternion.y,
+                    frame.l_ee.quaternion.z,
+                    frame.l_ee.quaternion.w,
+                ]
+            ),
+        )
+        rp_raw, rq_raw = self._apply_tcp_transform(
+            "right",
+            np.array(
+                [frame.r_ee.position.x, frame.r_ee.position.y, frame.r_ee.position.z]
+            ),
+            np.array(
+                [
+                    frame.r_ee.quaternion.x,
+                    frame.r_ee.quaternion.y,
+                    frame.r_ee.quaternion.z,
+                    frame.r_ee.quaternion.w,
+                ]
+            ),
+        )
+        lp = self._f_l_pos.update(lp_raw)
+        lq = self._f_l_quat.update(lq_raw)
+        lq = lq / np.linalg.norm(lq)
+        rp = self._f_r_pos.update(rp_raw)
+        rq = self._f_r_quat.update(rq_raw)
+        rq = rq / np.linalg.norm(rq)
+
+        l_pos, l_rot = (
+            lp.astype(np.float64),
+            _quat_xyzw_to_matrix(*lq).astype(np.float64),
+        )
+        r_pos, r_rot = (
+            rp.astype(np.float64),
+            _quat_xyzw_to_matrix(*rq).astype(np.float64),
+        )
+
+        if not self._abs_active:
+            self._abs_active = True
+            self._engage_absolute(l_pos, l_rot, r_pos, r_rot)
+            # Anchor the null-space posture at rest (not q_current) so arm
+            # configurations stay consistent across operators and episodes.
+            self._solver.set_posture_pose(self.get_rest_q())
+            # At engage the offsets make the controller poses coincide with
+            # rest FK by construction, so the targets equal rest FK exactly.
+            self.last_tcp_msg = self._encode_tcp_msg(
+                self._absolute_target("left", l_pos, l_rot),
+                self._absolute_target("right", r_pos, r_rot),
+            )
+            return q_current
+
+        left_target = self._absolute_target("left", l_pos, l_rot)
+        right_target = self._absolute_target("right", r_pos, r_rot)
+        self.last_tcp_msg = self._encode_tcp_msg(left_target, right_target)
+        return self._solver.ik(
+            q_current,
+            left_pose=left_target,
+            right_pose=right_target,
+        )
+
     def compute_reset_trajectory(
         self, q_current: np.ndarray, q_target: np.ndarray
     ) -> list[np.ndarray]:
@@ -487,12 +676,170 @@ class IKWorker:
         self._snap_fk = {}
         self._snap_elbow_ctrl = {}
         self._snap_elbow_fk = {}
+        self._abs_active = False
+        self._abs_base = None
+        self._abs_offset = {}
+        self.abs_base_msg = None
+        if self._config.absolute_mode:
+            # The reset trajectory returns the arms to rest, so the recorded
+            # TCP stream should land there too rather than hold the last
+            # engaged target.
+            self.last_tcp_msg = self._encode_tcp_msg(*self._rest_fk_poses())
         self._reset_pose_filters()
         # step() pins posture to q_current on each engage; an explicit reset
         # restores the default rest-pose attractor.
         self._solver.set_posture_pose(self.get_rest_q())
 
     # -- Internal -----------------------------------------------------------
+
+    def _rest_fk_poses(
+        self,
+    ) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+        """Rest-pose FK gripper poses ``(left, right)`` in the base frame."""
+        (l_pos, l_rot), (r_pos, r_rot) = self._solver.fk(self.get_rest_q())
+        return (
+            (np.asarray(l_pos, dtype=np.float64), np.asarray(l_rot, dtype=np.float64)),
+            (np.asarray(r_pos, dtype=np.float64), np.asarray(r_rot, dtype=np.float64)),
+        )
+
+    def _engage_absolute(
+        self,
+        l_pos: np.ndarray,
+        l_rot: np.ndarray,
+        r_pos: np.ndarray,
+        r_rot: np.ndarray,
+    ) -> None:
+        """Solve the world-anchored base transform + controller→TCP offsets.
+
+        The operator is holding both grippers at the agreed start pose — the
+        pose the robot's grippers occupy at rest, relative to the task scene.
+        The base transform is gravity-aligned (base up = VR world up) with its
+        yaw set so the base's left axis points from the right gripper to the
+        left one, and its translation chosen so the rest-pose FK gripper
+        midpoint lands on the measured gripper midpoint (``base_height``, when
+        set, pins the vertical component to the robot's real mounting height
+        instead).
+
+        A side with a tracker→gripper transform (factory design constant or
+        per-unit override) arrives here already mapped to the physical gripper
+        pose (see :meth:`_apply_tcp_transform`), so its engage offset is
+        identity — recorded poses are mount-independent, wrist rotations
+        don't smear into position error, and the operator's residual
+        alignment error at engage stays visible instead of being baked in.
+        An uncalibrated side gets whatever offset makes the engage pose
+        coincide exactly with rest FK — absorbing the physical mount
+        transform, URDF frame conventions, and the operator's alignment
+        error in one snapshot; its alignment quality at engage then bounds
+        the episode's absolute accuracy.
+        """
+        fk_l, fk_r = self._rest_fk_poses()
+
+        # The measured poses stand in for the gripper TCPs (exactly the TCPs
+        # for calibrated sides; controller origins otherwise, their lever arm
+        # absorbed into the per-side engage offsets below).
+        fk_l_anchor, fk_r_anchor = fk_l[0], fk_r[0]
+
+        # URDF base frame is FLU: +x = forward, +y = left, +z = up. Base up aligns
+        # with world up; the yaw is set so the base-frame anchor-separation
+        # direction (projected horizontal — along ±y for the gripper origins)
+        # maps onto the measured right→left direction.
+        d = l_pos - r_pos
+        d_h = d - np.dot(d, _VR_UP) * _VR_UP
+        n = float(np.linalg.norm(d_h))
+        if n < 1e-6:
+            _logger.warning(
+                "absolute engage: grippers are horizontally coincident; "
+                "base yaw is arbitrary — re-engage with grippers apart."
+            )
+            d_h, n = np.array([1.0, 0.0, 0.0]), 1.0
+        b = d_h / n
+        d_b = fk_l_anchor - fk_r_anchor
+        theta_a = math.atan2(float(d_b[1]), float(d_b[0]))
+        x_axis = b * math.cos(theta_a) - np.cross(_VR_UP, b) * math.sin(theta_a)
+        x_axis /= np.linalg.norm(x_axis)
+        z_axis = _VR_UP
+        y_axis = np.cross(z_axis, x_axis)
+        R_wb = np.column_stack([x_axis, y_axis, z_axis])
+
+        mid_w = 0.5 * (l_pos + r_pos)
+        mid_b = 0.5 * (fk_l_anchor + fk_r_anchor)
+        t_wb = mid_w - R_wb @ mid_b
+        if self._config.base_height is not None:
+            t_wb[1] = float(self._config.base_height)
+        self._abs_base = (R_wb, t_wb)
+        self.abs_base_msg = {
+            "pos": [float(v) for v in t_wb],
+            "quat": list(_matrix_to_quat_xyzw(R_wb)),
+        }
+
+        def _offset(
+            side: str,
+            ctrl_pos: np.ndarray,
+            ctrl_rot: np.ndarray,
+            fk_pose: tuple[np.ndarray, np.ndarray],
+        ) -> tuple[np.ndarray, np.ndarray]:
+            if side in self._tcp_transforms:
+                # Pose already mapped to the gripper by _apply_tcp_transform.
+                return np.zeros(3), np.eye(3)
+            fk_pos, fk_rot = fk_pose
+            r_off = ctrl_rot.T @ (R_wb @ fk_rot)
+            p_w_tcp = R_wb @ fk_pos + t_wb
+            return ctrl_rot.T @ (p_w_tcp - ctrl_pos), r_off
+
+        self._abs_offset = {
+            "left": _offset("left", l_pos, l_rot, fk_l),
+            "right": _offset("right", r_pos, r_rot, fk_r),
+        }
+
+    def _apply_tcp_transform(
+        self, side: str, pos: np.ndarray, quat: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Map a raw tracker pose to the gripper pose via the calibration.
+
+        No-op when the side has no calibrated transform. Returns
+        ``(pos_3, quat_xyzw)``; the output quaternion's sign is kept
+        continuous with the previous frame so the One Euro quaternion filter
+        never sees a representation flip.
+        """
+        tf = self._tcp_transforms.get(side)
+        if tf is None:
+            return pos, quat
+        p_x, R_x = tf
+        R_c = _quat_xyzw_to_matrix(*quat).astype(np.float64)
+        out_pos = np.asarray(pos, dtype=np.float64) + R_c @ p_x
+        out_quat = np.array(_matrix_to_quat_xyzw(R_c @ R_x))
+        prev = self._last_mapped_quat.get(side)
+        if prev is not None and float(np.dot(out_quat, prev)) < 0.0:
+            out_quat = -out_quat
+        self._last_mapped_quat[side] = out_quat
+        return out_pos, out_quat
+
+    @staticmethod
+    def _encode_tcp_msg(
+        left: tuple[np.ndarray, np.ndarray],
+        right: tuple[np.ndarray, np.ndarray],
+    ) -> dict[str, list[float]]:
+        """Pack two base-frame ``(pos, rot)`` poses as JSON-safe pos+quat lists."""
+
+        def _enc(pose: tuple[np.ndarray, np.ndarray]) -> list[float]:
+            pos, rot = pose
+            quat = _matrix_to_quat_xyzw(np.asarray(rot, dtype=np.float64))
+            return [float(pos[0]), float(pos[1]), float(pos[2]), *quat]
+
+        return {"left": _enc(left), "right": _enc(right)}
+
+    def _absolute_target(
+        self, side: str, pos: np.ndarray, rot: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Map a controller pose rigidly into the base frame. Returns (pos_3, rot_3x3)."""
+        assert self._abs_base is not None
+        R_wb, t_wb = self._abs_base
+        p_off, R_off = self._abs_offset[side]
+        p_w = pos + rot @ p_off
+        R_w = rot @ R_off
+        p_b = R_wb.T @ (p_w - t_wb)
+        R_b = R_wb.T @ R_w
+        return p_b.astype(np.float32), R_b.astype(np.float32)
 
     def _clear_freeze(self) -> None:
         """Forget any in-progress freeze run (disengage / engage / reset)."""
@@ -539,6 +886,7 @@ class IKWorker:
 
     def _reset_pose_filters(self) -> None:
         """Clear the OneEuroFilter state for every controller and elbow stream."""
+        self._last_mapped_quat = {}
         self._f_l_pos.reset()
         self._f_l_quat.reset()
         self._f_r_pos.reset()
@@ -627,6 +975,13 @@ def run_ik_worker(
       stale, and engaging against it would drag the robot back toward it.
     - ``None``                         → exit
     """
+    # Ctrl-C is owned by the parent, which first disables physical outputs and
+    # then sends the pipe sentinel / terminate / kill sequence. Terminal and
+    # process-group SIGINT otherwise interrupts JAX startup in this child and
+    # emits a several-page traceback while racing the parent's ownership
+    # checks. SIGTERM/SIGKILL retain their defaults for the bounded fallback.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     # Confine the JAX solve to a single core's worth of compute. The per-arm IK
     # is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
     # core for each solve; combined with this process's nice(-10) boost, that
@@ -726,7 +1081,14 @@ def run_ik_worker(
                 conn.send(("synced", q.copy()))
             elif isinstance(msg, VRFrame):
                 q = worker.step(msg, q)
-                conn.send(q.copy())
+                if config.absolute_mode:
+                    # Absolute (Mantis) mode replies carry the engage-calibrated
+                    # base transform (for the headset's URDF overlay) and the
+                    # base-frame TCP targets (recorded per dataset row by Mantis
+                    # data collection) alongside the joint solution.
+                    conn.send(("q", q.copy(), worker.abs_base_msg, worker.last_tcp_msg))
+                else:
+                    conn.send(q.copy())
         except (EOFError, KeyboardInterrupt, OSError):
             # OSError covers ConnectionResetError/BrokenPipeError when the
             # parent end closes abruptly (parent crash, or a shutdown that

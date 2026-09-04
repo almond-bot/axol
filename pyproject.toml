@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "almond-axol"
-version = "0.1.36"
+version = "0.1.37"
 description = "Almond Axol SDK"
 license = { text = "MIT" }
 readme = "README.md"
@@ -13,34 +13,62 @@ readme = "README.md"
 # .python-version and the install script.
 requires-python = ">=3.12"
 dependencies = [
-    "aiortc>=1.9", # WebRTC transport for headset camera video (pulls av)
+    # Hosted installs resolve from package metadata rather than uv.lock. Keep
+    # API-sensitive dependencies inside the release lines validated here so
+    # reinstalling the same Axol version cannot silently cross a breaking
+    # upstream boundary; widen these caps deliberately after CI/hardware tests.
+    "aiortc>=1.14.0,<1.15", # WebRTC transport for headset camera video (pulls av)
     "draccus>=0.11.6,<0.12",
-    "fastapi>=0.135.2",
-    "jax>=0.9.2",
-    "jaxlie>=1.5.0",
-    "mujoco>=3.8.0",
-    "pydantic>=2.12.5",
+    "fastapi>=0.135.2,<0.136",
+    "jax>=0.9.2,<0.10",
+    "jaxlie>=1.5.0,<2",
+    "mujoco>=3.8.0,<3.9",
+    "numpy>=2.2.6,<2.3",
+    "pydantic>=2.12.5,<3",
     # Our PyPI-published fork of pyroki (github.com/almond-bot-research/pyroki,
     # `almond` branch), which installs the `pyroki` import name. Upstream has no
     # PyPI release and pins jaxls from git, which PyPI rejects in dependency
     # metadata — the fork (and its almond-jaxls companion) is what makes
     # almond-axol itself installable from PyPI.
-    "almond-pyroki>=0.1.0",
-    "python-can>=4.6.1",
-    "scipy>=1.17.1",
-    "uvicorn[standard]>=0.42.0",
-    "yourdfpy>=0.0.60",
-    "opencv-python-headless>=4.13.0.92"
+    "almond-pyroki>=0.1.0,<0.2",
+    "python-can>=4.6.1,<5",
+    "scipy>=1.17.1,<2",
+    "uvicorn[standard]>=0.42.0,<0.43",
+    "yourdfpy>=0.0.60,<0.1",
+    "opencv-python-headless>=4.13.0.92,<4.14",
 ]
 
 [project.optional-dependencies]
-gamepad = ["pygame>=2.6"]
-# Floor 0.6.1: the bindings use lerobot.lerobot_types + the VideoEncoderConfig
-# API (both landed in 0.6.1). Our own installs pin the exact rev via
-# [tool.uv.sources]; the floor protects plain-pip consumers (e.g. the
-# lerobot_robot_axol plugin) resolving lerobot from PyPI.
-lerobot = ["lerobot[dataset,viz,async]>=0.6.1"]
-sim = ["viser>=1.0.24"]
+gamepad = ["pygame>=2.6,<3"]
+# training backs `axol mantis.train` (LeRobot's trainer: accelerate + wandb);
+# diffusion adds the diffusers dependency for --policy.type diffusion.
+# Pin 0.6.1: the bindings use lerobot.lerobot_types, VideoEncoderConfig, and
+# several trainer/inference internals. Customer installs resolve from PyPI
+# rather than this repository's lock, so allowing a future LeRobot release
+# would make an unchanged Axol release pick up an untested private API.
+lerobot = [
+    # Spell out LeRobot's dataset/training extras except TorchCodec. LeRobot
+    # 0.6.1 selects TorchCodec 0.11 on Linux aarch64, whose ABI requires Torch
+    # 2.11, while JetPack hosts must remain on Torch 2.10. LeRobot's supported
+    # PyAV decoder is used on every platform instead.
+    "lerobot[viz,async,diffusion,av-dep,accelerate-dep]==0.6.1",
+    "datasets>=4.8,<5",
+    "jsonlines>=4,<5",
+    "pandas>=2,<3",
+    "pyarrow>=21,<30",
+    "wandb>=0.24,<0.28",
+    # Keep hosted installs on the pair validated by this lock. PyTorch 2.11's
+    # aarch64 wheel pulls a CUDA 13 runtime that is not compatible with the
+    # JetPack generation deployed on customer robots.
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+]
+sim = ["viser>=1.0.24,<1.1"]
+# Vive tracker bridge (axol tracker.bridge). websockets is the bridge's WSS
+# client; pyvut imports the `hid` package (not the similarly named `hidapi`).
+# libsurvive is installed by `axol provision`; the pinned reverse-engineered
+# pyvut runtime is an explicit `axol tracker.ultimate.install` action.
+tracker = ["websockets>=12,<16", "hid>=1.0.5,<2"]
 
 [project.scripts]
 axol = "almond_axol.cli:main"
@@ -48,3 +76,22 @@ axol = "almond_axol.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["almond_axol"]
 
+# The control-panel updater downloads the exact target wheel, verifies PyPI's
+# advertised SHA-256, and executes this reviewed installer from that immutable
+# artifact. Keeping the browser endpoint as the one source file prevents the
+# first-install and update transactions from drifting.
+[tool.hatch.build.targets.wheel.force-include]
+"web/app/public/install" = "almond_axol/_installer.sh"
+
+# Keep source releases reproducible and limited to SDK inputs. Hatch's default
+# repository walk does not honor web/.gitignore, so a developer build could
+# otherwise ingest web/node_modules (including generated development TLS
+# material), exceed PyPI's file limit, and publish unrelated workspace files.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/almond_axol",
+    "/LICENSE",
+    "/README.md",
+    "/pyproject.toml",
+    "/web/app/public/install",
+]
