@@ -54,7 +54,7 @@ from ..constants import CAN_LEFT, CAN_RIGHT
 from ..kinematics.config import KinematicsConfig
 from ..robot.config import AxolConfig
 from ..robot.jelly import JellyConfig
-from ..teleop.config import VRTeleopConfig
+from ..teleop.config import ReengageMode, VRTeleopConfig
 from ..vr.config import VRServerConfig
 
 T = TypeVar("T")
@@ -132,6 +132,9 @@ def register_literal(lit: T) -> T:
 
 
 LogLevel = register_literal(Literal["DEBUG", "INFO", "WARNING", "ERROR"])
+# ``VRTeleopConfig.reengage`` — defined next to its dataclass, registered here
+# because this module is the one that imports draccus.
+register_literal(ReengageMode)
 # Downscale target for the recorded dataset video (collect-data). Names mirror
 # ``ZED_RESOLUTION_DIMS``; the relay clamps to the capture resolution so this
 # only ever downscales (never upscales).

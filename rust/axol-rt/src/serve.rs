@@ -51,9 +51,10 @@
 //! - `C` + text        config: `loop_hz`/`watchdog_ms`/`max_step_rad`
 //!                     keys, one `joint <side> <iface> <name>
 //!                     <motor_id> <kp> <kd> <max_vel> <max_accel> <fc> <k>
-//!                     <fv> <fo>` line per arm joint (tracker limits +
-//!                     friction params), and an optional `gripper <side>
-//!                     <iface> <motor_id>` line
+//!                     <fv> <fo> <tau_cap>` line per arm joint (tracker
+//!                     limits, friction params, spring-torque cap in Nm or
+//!                     `inf`), and an optional `gripper <side> <iface>
+//!                     <motor_id>` line
 //! - `P`               prep: MyActuator 0x76 reset + settle, Damiao
 //!                     clear-errors (torque-neutral; run *before* Python
 //!                     resolves joint offsets, so the wrap state it verifies
@@ -132,6 +133,12 @@
 //!   by the Python torque-residual `ContactWatchdog` (limp gravity-comp
 //!   hold, operator resets); a self-disabled motor just stops contributing
 //!   while the rest of the arm keeps working, as in classic mode.
+//! - Joints with a finite `tau_cap` (the wrists) never send a position
+//!   more than `tau_cap / kp` from their last measured one
+//!   (`filter::cap_spring`), bounding the impedance spring torque a blocked
+//!   joint develops. Being blocked is therefore *allowed* for them: the
+//!   commanded position stays within that window of the measured one, so
+//!   a runaway leans on whatever stopped it with at most `tau_cap`.
 //! - Every command batch accepts exactly one fresh reply per motor. A missed
 //!   sample suppresses host damping for that tick; bursty loss (4 of the last
 //!   32 ticks) marks the joint *degraded* — host damping stays off until a
@@ -745,7 +752,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
             }
             "joint" | "gripper" => {
                 // joint <side 0|1> <iface> <name> <motor_id> <kp> <kd>
-                //       <max_vel> <max_accel> <fc> <k> <fv> <fo>
+                //       <max_vel> <max_accel> <fc> <k> <fv> <fo> <tau_cap>
                 // gripper <side 0|1> <iface> <motor_id>
                 let gripper = f[0] == "gripper";
                 let side: u8 = f
@@ -782,6 +789,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         k: 0.0,
                         fv: 0.0,
                         fo: 0.0,
+                        tau_cap: f64::INFINITY,
                     }
                 } else {
                     MotorSpec {
@@ -801,6 +809,13 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         k: num(10)?,
                         fv: num(11)?,
                         fo: num(12)?,
+                        // "inf" parses to +infinity = uncapped. A NaN or
+                        // non-positive cap would clamp every command onto
+                        // the measured position (a joint that cannot move).
+                        tau_cap: match num(13)? {
+                            cap if cap > 0.0 => cap,
+                            _ => return Err(bad(line)),
+                        },
                     }
                 };
                 if spec.slot >= N_SLOTS {
@@ -1104,10 +1119,10 @@ mod tests {
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
             "loop_hz 240\n\
-             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
-             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
+             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 inf\n\
+             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 inf\n\
              gripper 0 canL 8\n\
-             joint 0 canL shoulder_3 3 180 2.0 9.4 33.0 0.4 250 0.08 0.0\n",
+             joint 0 canL wrist_2 6 130 3.5 9.4 33.0 0.4 250 0.08 0.0 3.0\n",
         )
         .unwrap();
         let specs = &cfg.buses[0].2;
@@ -1122,9 +1137,27 @@ mod tests {
             (specs[0].fc, specs[0].k, specs[0].fv, specs[0].fo),
             (0.6, 250.0, 0.15, 0.02)
         );
+        // Python formats an unset torque_limit as "inf" — uncapped.
+        assert_eq!(specs[0].tau_cap, f64::INFINITY);
+        assert_eq!(specs[3].tau_cap, 3.0);
+        assert_eq!(specs[2].tau_cap, f64::INFINITY);
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
         assert!(parse_config("joint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        // ... as must the 12-field layout without the torque cap, and a cap
+        // that would pin the joint to its measured position.
+        assert!(
+            parse_config("joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n")
+                .is_err()
+        );
+        assert!(parse_config(
+            "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 nan\n"
+        )
+        .is_err());
     }
 }
 
@@ -1810,13 +1843,32 @@ fn bus_loop(
                     // as-is, v_des = 0, slow t_ff only; the tracker re-seeds
                     // so a later mode switch starts transient-free.
                     let tracked = c.mode >= 0.5;
-                    let p_cmd = if tracked {
+                    let p_track = if tracked {
                         let (p, _, _) = trk[m.slot].update(c.p_des, tick_dt);
                         p
                     } else {
                         trk[m.slot].seed(c.p_des);
                         c.p_des
                     };
+                    // Spring-torque cap (wrists): keep the wire position
+                    // within tau_cap / kp of the last measured position so a
+                    // joint blocked by an object leans on it with at most
+                    // tau_cap instead of kp times the operator's run-ahead.
+                    // The tracker keeps rendering the real trajectory
+                    // underneath (no re-seed: a transient clip during a fast
+                    // move must not zero its velocity), and everything
+                    // downstream — the derivative chain feeding friction /
+                    // inertia / host damping, the trace — sees the clamped
+                    // command, so those feedforwards fall to zero while the
+                    // joint is held rather than adding to the press. The
+                    // measured position is the previous tick's reply (one
+                    // 240 Hz period old).
+                    let p_cmd = filter::cap_spring(
+                        p_track,
+                        latest[m.slot].map(|(pos, _, _, _)| pos),
+                        c.kp,
+                        m.tau_cap,
+                    );
                     let d = &mut damp[m.slot];
                     let (v_wire, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp) = if tracked {
                         // Match classic AxolArm.motion_control: friction uses

@@ -318,10 +318,34 @@ def _project_elbow(
     return jaxlie.SE3.from_rotation_and_translation(elbow.rotation(), proj)
 
 
-@functools.partial(jax.jit, static_argnames=("max_iterations",))
+def _clamp_to_limits_np(
+    robot: pk.Robot, q_from: np.ndarray, q_to: np.ndarray
+) -> np.ndarray:
+    """Clip the step ``q_from -> q_to`` so every joint stays inside its limits.
+
+    Enforces the solver's otherwise-soft joint limits on the collision-free
+    path (with the collision guard on, ``bound_step`` inside
+    :func:`_base_collision_safe_step` does this). Joints are clipped
+    *individually*: a joint that has reached its limit parks there while the
+    others keep moving. Scaling the whole vector instead — as ``bound_step``
+    must, to keep its clearance projection tangent — would freeze the entire
+    arm the moment one joint touches a limit, since the soft limit cost keeps
+    nudging that joint outward by a hair on every solve.
+    """
+    lower = np.asarray(robot.joints.lower_limits, dtype=np.float32)
+    upper = np.asarray(robot.joints.upper_limits, dtype=np.float32)
+    # A joint that starts outside its interval (hand-moved, measured offset)
+    # isn't yanked back in one step: clip to the interval widened to include
+    # q_from, so it can only move back toward its range, never further out.
+    lo = np.minimum(lower, q_from)
+    hi = np.maximum(upper, q_from)
+    return np.clip(q_to, lo, hi).astype(np.float32)
+
+
+@functools.partial(jax.jit, static_argnames=("max_iterations", "use_self_collision"))
 def _solve_ik(
     robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision,
+    robot_coll: pk.collision.RobotCollision | None,
     target_L: jaxlie.SE3 | None,
     target_R: jaxlie.SE3 | None,
     L_ee_idx: jax.Array,
@@ -355,6 +379,7 @@ def _solve_ik(
     cost_tolerance: float,
     lambda_initial: float,
     lambda_factor: float,
+    use_self_collision: bool,
 ) -> tuple[jax.Array, jax.Array]:
     JointVar = robot.joint_var_cls
 
@@ -467,16 +492,18 @@ def _solve_ik(
         )
 
     costs.append(pk.costs.limit_cost(robot, JointVar(0), weight=limit_weight))
-    costs.append(
-        _self_collision_cost(
-            robot,
-            robot_coll,
-            JointVar(0),
-            activation_start=self_collision_start,
-            ramp_width=self_collision_ramp,
-            weight=self_collision_weight,
+    if use_self_collision:
+        assert robot_coll is not None
+        costs.append(
+            _self_collision_cost(
+                robot,
+                robot_coll,
+                JointVar(0),
+                activation_start=self_collision_start,
+                ramp_width=self_collision_ramp,
+                weight=self_collision_weight,
+            )
         )
-    )
 
     var_joints = JointVar(jnp.array([0]))
     initial_vals = jaxls.VarValues.make(
@@ -669,10 +696,21 @@ class KinematicsSolver:
         # lets every solver after the first hit the in-memory jit cache
         # instead of re-tracing and re-running jaxls analysis.
         self.robot = shared_robot()
-        self.robot_coll = shared_robot_collision()
-        starts, widths = collision_cost_params(
-            self.robot, self.robot_coll, config.self_collision_margin
+        # Base collision detection is opt-in (config.self_collision): when
+        # off, no collision model is built at all — the soft cost is left out
+        # of the solve graph and the hard base guard below is skipped, so the
+        # only geometric constraint on the arms is their joint limits.
+        self.robot_coll: pk.collision.RobotCollision | None = (
+            shared_robot_collision() if config.self_collision else None
         )
+        if self.robot_coll is not None:
+            starts, widths = collision_cost_params(
+                self.robot, self.robot_coll, config.self_collision_margin
+            )
+        else:
+            _logger.info("Self-collision (arm/base) detection is off.")
+            starts = np.zeros(0, dtype=np.float32)
+            widths = np.zeros(0, dtype=np.float32)
         self._collision_starts = jnp.asarray(starts)
         self._collision_ramps = jnp.asarray(widths)
         # A soft cost normally turns every arm/base pair away. Independently
@@ -681,22 +719,25 @@ class KinematicsSolver:
         # overlaps at the safe straight-down pose, so the threshold is relative
         # to that reference: at most 20 mm closer. The observed contact was
         # 23-31 mm closer, leaving roughly 10 mm of model-space headroom.
-        q_home = jnp.zeros(self.robot.joints.num_actuated_joints)
-        home_distances = np.asarray(
-            self.robot_coll.compute_self_collision_distance(self.robot, q_home)
-        )
         clearance_floor = np.full_like(starts, -np.inf)
-        for k, (i, j) in enumerate(
-            zip(
-                np.asarray(self.robot_coll.active_idx_i),
-                np.asarray(self.robot_coll.active_idx_j),
+        if self.robot_coll is not None:
+            q_home = jnp.zeros(self.robot.joints.num_actuated_joints)
+            home_distances = np.asarray(
+                self.robot_coll.compute_self_collision_distance(self.robot, q_home)
             )
-        ):
-            a = self.robot_coll.link_names[int(i)]
-            b = self.robot_coll.link_names[int(j)]
-            arm_link = b if a in ("base", "s1") else a if b in ("base", "s1") else ""
-            if arm_link.endswith("_e1"):
-                clearance_floor[k] = home_distances[k] - 0.020
+            for k, (i, j) in enumerate(
+                zip(
+                    np.asarray(self.robot_coll.active_idx_i),
+                    np.asarray(self.robot_coll.active_idx_j),
+                )
+            ):
+                a = self.robot_coll.link_names[int(i)]
+                b = self.robot_coll.link_names[int(j)]
+                arm_link = (
+                    b if a in ("base", "s1") else a if b in ("base", "s1") else ""
+                )
+                if arm_link.endswith("_e1"):
+                    clearance_floor[k] = home_distances[k] - 0.020
         self._base_clearance_floor = jnp.asarray(clearance_floor)
         self._base_collision_guard_active = False
 
@@ -793,6 +834,16 @@ class KinematicsSolver:
         """Total number of actuated joints across both arms."""
         return self.robot.joints.num_actuated_joints
 
+    @property
+    def shoulder_positions(self) -> tuple[np.ndarray, np.ndarray]:
+        """World-frame ``(left, right)`` shoulder positions, ``(3,)`` each.
+
+        Fixed in the world frame (the shoulders are on the torso), so no
+        joint state is needed — the centres of the spheres the elbows move
+        on.
+        """
+        return self._left_shoulder_pos.copy(), self._right_shoulder_pos.copy()
+
     # -- Joint-order conversion ----------------------------------------------
 
     def to_pyroki_order(self, q: np.ndarray) -> np.ndarray:
@@ -862,6 +913,7 @@ class KinematicsSolver:
         left_elbow_pos: np.ndarray | None = None,
         right_elbow_pos: np.ndarray | None = None,
         delta_scale: float = 1.0,
+        elbow_weight: float | None = None,
     ) -> np.ndarray:
         """Compute joint positions for absolute Cartesian end-effector targets.
 
@@ -889,6 +941,13 @@ class KinematicsSolver:
                 the effective joint speed silently collapses (a 30 ms solve
                 under the default clamp allows only ~1.1 rad/s instead of
                 4 rad/s) and the accumulated error releases as a lurch.
+            elbow_weight: Per-call weight on the elbow hints, replacing
+                ``config.elbow_weight`` for this solve and applied *without*
+                the overhead fade — for hints the caller synthesises (box
+                mode's outward elbow bias, see
+                :func:`almond_axol.teleop.box.elbow_swivel_hint`) rather than
+                the headset's inferred elbow the fade exists for. ``None``
+                keeps the configured behaviour.
 
         Returns:
             Updated full ``(N,)`` joint array in radians.
@@ -941,8 +1000,13 @@ class KinematicsSolver:
         # elbow is inferred rather than tracked and degrades sharply once the
         # hand rises to shoulder height, exactly where the shoulder nears its
         # joint limits and bad swivel targets do the most damage.
-        elbow_w_l = cfg.elbow_weight * self._elbow_fade(lp, self._left_shoulder_pos)
-        elbow_w_r = cfg.elbow_weight * self._elbow_fade(rp, self._right_shoulder_pos)
+        if elbow_weight is not None:
+            elbow_w_l = elbow_w_r = float(elbow_weight)
+        else:
+            elbow_w_l = cfg.elbow_weight * self._elbow_fade(lp, self._left_shoulder_pos)
+            elbow_w_r = cfg.elbow_weight * self._elbow_fade(
+                rp, self._right_shoulder_pos
+            )
 
         q_prev = self._q_prev if self._q_prev is not None else q_current
         self._q_prev = np.asarray(q_current, dtype=np.float32).copy()
@@ -983,6 +1047,7 @@ class KinematicsSolver:
             cfg.cost_tolerance,
             cfg.lambda_initial,
             cfg.lambda_factor,
+            self.robot_coll is not None,
         )
         q_result_np = np.asarray(q_result, dtype=np.float32)
 
@@ -1016,6 +1081,11 @@ class KinematicsSolver:
         if max_abs > delta_budget:
             delta = delta * (delta_budget / max_abs)
         q_out = (q_current + delta).astype(np.float32)
+        if self.robot_coll is None:
+            # Collision detection off: the guard's projection is skipped, but
+            # the joint-limit clamp it also provided still applies.
+            q_out = _clamp_to_limits_np(self.robot, q_current, q_out)
+            return self.from_pyroki_order(q_out)
         q_out, guard_active_jax = _base_collision_safe_step(
             self.robot,
             self.robot_coll,
@@ -1051,21 +1121,30 @@ class KinematicsSolver:
     # -- Internal ------------------------------------------------------------
 
     def _warmup(self) -> None:
-        """Trigger JIT compilation with a dummy solve."""
+        """Trigger JIT compilation with dummy solves.
+
+        Both graph shapes are compiled — with and without elbow hints — so
+        neither the plain teleop solve nor box mode's first frame (which adds
+        synthetic elbow hints, see ``ik(elbow_weight=...)``) stalls on a
+        compile mid-session. The persistent compilation cache
+        (:mod:`almond_axol.kinematics.jax_cache`) makes the second one a
+        disk load on every run but the first.
+        """
         _logger.info("Warming up IK solver (JIT compile)...")
         dummy_q = np.zeros(self.num_joints, dtype=np.float32)
         dummy_pos = np.array([0.0, 0.0, 0.3], dtype=np.float32)
         dummy_rot = np.eye(3, dtype=np.float32)
         dummy_pose = (dummy_pos, dummy_rot)
-        kwargs: dict = dict(
-            q_current=dummy_q, left_pose=dummy_pose, right_pose=dummy_pose
-        )
-        if self.config.elbow_weight > 0:
-            dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
-            kwargs["left_elbow_pos"] = dummy_elbow
-            kwargs["right_elbow_pos"] = dummy_elbow
-        try:
-            self.ik(**kwargs)
-        except Exception:
-            pass
+        dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
+        for with_elbows in (False, True):
+            kwargs: dict = dict(
+                q_current=dummy_q, left_pose=dummy_pose, right_pose=dummy_pose
+            )
+            if with_elbows:
+                kwargs["left_elbow_pos"] = dummy_elbow
+                kwargs["right_elbow_pos"] = dummy_elbow
+            try:
+                self.ik(**kwargs)
+            except Exception:
+                pass
         _logger.info("IK solver ready.")

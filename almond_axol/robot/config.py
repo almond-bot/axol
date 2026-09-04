@@ -166,6 +166,21 @@ class JointConfig:
                   q=3 on both arms even with its pose-tracked centre: hardware
                   traces found a separate 12.5-13.6 Hz mast/forearm mode that
                   the old wide band could feed.
+        torque_limit: Cap (Nm) on the impedance *spring* torque the joint may
+                  develop against whatever blocks it. Enforced in the
+                  realtime core each tick by clamping the position error the
+                  wire carries: the commanded position is never sent more
+                  than ``torque_limit / kp`` from the measured position, so
+                  ``kp · error`` is bounded at ``torque_limit`` however far
+                  the operator's target runs ahead of a blocked joint. Gravity
+                  feedforward is on top of the cap (holding the arm's own
+                  weight is not "pressing"); friction/inertia feedforwards
+                  fall to zero on their own once the sent command stops
+                  moving. ``inf`` (the default) disables it. Set on the
+                  wrists (5 Nm), where sustained pressing against an object
+                  during teleop was overheating the small Damiao motors —
+                  the shoulders and elbow are left uncapped so gravity
+                  loading and fast moves are never starved.
     """
 
     kp: float
@@ -177,6 +192,7 @@ class JointConfig:
     kd_host: float = 0.0
     kd_host_hz: float | None = None
     kd_host_q: float | None = None
+    torque_limit: float = math.inf
 
 
 @dataclass
@@ -184,12 +200,30 @@ class PositionForceConfig:
     """Position-force control parameters.
 
     Attributes:
-        torque_limit: Peak output torque (Nm).
-        max_speed:    Maximum joint speed (rad/s).
+        torque_limit:    Peak output torque (Nm).
+        max_speed:       Maximum joint speed (rad/s).
+        close_direction: Sign of the motor rotation that closes the jaw:
+                         ``+1`` closes toward positive motor angles, ``-1``
+                         toward negative. The two grippers of a mirrored
+                         pair have opposite signs (:meth:`ArmConfig.mirror_to_right`
+                         flips it): the left jaw closes toward negative
+                         angles (the default here), the right toward
+                         positive. The end-stop calibration at enable time
+                         sweeps in this direction first to find the closed
+                         stop, then back to the open stop — so a wrong sign
+                         swaps open/closed and leaves the jaw closed after
+                         bring-up.
     """
 
     torque_limit: float
     max_speed: float
+    close_direction: int = -1
+
+    def __post_init__(self) -> None:
+        if self.close_direction not in (1, -1):
+            raise ValueError(
+                f"gripper close_direction must be +1 or -1, got {self.close_direction!r}"
+            )
 
 
 # Placeholder used in :class:`ArmConfig` defaults. Real per-arm friction
@@ -315,6 +349,12 @@ class ArmConfig:
             friction=_ZERO_FRICTION,
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
+            # The wrist Damiaos overheat when teleop keeps them pressed
+            # against an object; bound the spring torque (kp=130 → ~2.2°
+            # of position error) rather than the stiffness. Raised from 3 Nm
+            # once box-mode carries needed more wrist authority to hold a
+            # clamped box.
+            torque_limit=5.0,
         )
     )
     wrist_3: JointConfig = field(
@@ -324,6 +364,7 @@ class ArmConfig:
             friction=_ZERO_FRICTION,
             mass=0.75,
             com=(-0.0285, 0.0, -0.089453),
+            torque_limit=5.0,
         )
     )
     gripper: PositionForceConfig = field(
@@ -337,6 +378,10 @@ class ArmConfig:
         every joint, and ``com.y`` is additionally sign-flipped on
         ``wrist_2`` (because the CAD models the wrist-2 link asymmetrically
         per side rather than as a true mirror — see the URDF for details).
+        The gripper's ``close_direction`` is flipped too: the grippers are a
+        mirrored pair, so the right jaw closes with the opposite motor
+        rotation to the left (positive angles on the right, negative on the
+        left).
         """
         out = replace(
             self,
@@ -347,6 +392,9 @@ class ArmConfig:
             wrist_1=replace(self.wrist_1, com=_flip_x(self.wrist_1.com)),
             wrist_2=replace(self.wrist_2, com=_flip_x_y(self.wrist_2.com)),
             wrist_3=replace(self.wrist_3, com=_flip_x(self.wrist_3.com)),
+            gripper=replace(
+                self.gripper, close_direction=-self.gripper.close_direction
+            ),
         )
         return out
 

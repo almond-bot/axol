@@ -20,6 +20,18 @@ import numpy as np
 from ..kinematics.config import KinematicsConfig
 from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
+from .box import (
+    BoxState,
+    Pose,
+    blend_pose,
+    box_targets,
+    elbow_swivel_hint,
+    pair_aligned,
+    rodrigues,
+    rotation_angle,
+    smoothstep,
+    snap_box,
+)
 from .config import VRTeleopConfig
 from .filter import LagCompensatedLowPass
 from .recorder import make as _recorder_make
@@ -63,9 +75,46 @@ _SNAP_ACCEL_MAX = 25.0  # m/s², upper bound for genuine hand acceleration
 _SNAP_CONFIRM_FRAMES = 8  # suspect window length (~65 ms at 120 Hz)
 _SNAP_STABLE_RATIO = 0.5  # offset growth/size below this = shift, else motion
 
+# Box-mode jog (see IKWorker._step_box): stick deflections below this are
+# ignored so a resting stick never creeps the arm pair, and one integration
+# step is capped so a stalled frame stream can't authorise a large jump.
+_JOG_DEADZONE = 0.15
+_JOG_MAX_DT_S = 0.1
+_UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
+
+# Gripper-pair status (see IKWorker.pair_status): reported to the core every
+# this many solved frames (~10 Hz at the 120 Hz cadence), and the tolerance
+# (per gripper, from the rotation a box-mode engage would blend it to) for
+# calling the two grippers "aligned" into the side-clamping pair.
+_STATUS_EVERY_N = 12
+_ALIGNED_TOL_DEG = 25.0
+
+# Re-engage ramp (config.reengage == "ramp", see IKWorker.step): the blend from
+# the arm's pose at the grip to the controller-implied target is paced by the
+# configured linear speed and, for the rotational part, by this angular rate.
+_RAMP_ANG_SPEED = 0.6  # rad/s
+
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
 # ---------------------------------------------------------------------------
+
+
+def _dz(v: float) -> float:
+    """A thumbstick axis with the jog deadzone applied (``0.0`` when resting)."""
+    return 0.0 if abs(v) < _JOG_DEADZONE else float(v)
+
+
+def _dominant_axis(x: float, y: float) -> tuple[float, float]:
+    """Keep only the larger of a thumbstick's two axes (deadzoned).
+
+    For sticks whose axes drive different things (width vs. height), so the
+    off-axis leak of a thumb pushed "left" never also moves the other one.
+    Ties go to ``x``.
+    """
+    x, y = _dz(x), _dz(y)
+    if abs(x) >= abs(y):
+        return x, 0.0
+    return 0.0, y
 
 
 def _quat_xyzw_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
@@ -223,6 +272,10 @@ class IKWorker:
         self._snap_fk: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._snap_elbow_ctrl: dict[str, np.ndarray] = {}
         self._snap_elbow_fk: dict[str, np.ndarray] = {}
+        # Re-engage ramp (config.reengage == "ramp"): per arm, the EE pose it
+        # had at its grip edge plus (t0, duration) of the blend from there to
+        # the target implied by its *kept* snap. Absent while not ramping.
+        self._ramp: dict[str, tuple[tuple[np.ndarray, np.ndarray], float, float]] = {}
         # Tracking glitch detection state (see _frame_snap_verdict): last good
         # raw controller positions, their (effective) timestamp, an EMA
         # velocity per hand, and the in-progress suspect window, if any.
@@ -233,6 +286,10 @@ class IKWorker:
         # Wall time of the previous solve, for scaling the solver's per-call
         # step clamp by the actual solve cadence (see delta_scale in step()).
         self._last_solve_t: float | None = None
+        # Box mode (bimanual carry, see .box): the pair's state from the engage
+        # snap and which controller leads it. None while not in box tracking.
+        self._box: BoxState | None = None
+        self._box_leader: str | None = None
 
         # Pose-stream smoothing (see LagCompensatedLowPass for why this is a
         # linear filter and not OneEuro). Nominal rate is the VR-frame / IK
@@ -410,15 +467,50 @@ class IKWorker:
             right_e = np.array((re[2], re[1], -re[0]), dtype=np.float32)
 
         if not (l_lock or r_lock):
+            # Snap poses are deliberately kept: in "ramp" re-engage mode they
+            # are the session anchor the next grip ramps the arm back to
+            # (reset() / clear_engage() drop them; "clutch" mode re-snaps).
             self._active = {"left": False, "right": False}
             self._hold_fk = {}
             self._hold_elbow_fk = {}
+            self._ramp = {}
             self._clear_freeze()
+            self._box = None
+            self._box_leader = None
             return q_current
+
+        if frame.box_leader is not None:
+            return self._step_box(
+                frame,
+                q_current,
+                {"left": (left_pos, left_rot), "right": (right_pos, right_rot)},
+                lp,
+                rp,
+            )
+        if self._box is not None:
+            # Box tracking ended without a lock-less frame in between (mode
+            # switched while engaged): the per-arm path below re-snaps.
+            self._box = None
+            self._box_leader = None
+            self._active = {"left": False, "right": False}
+            self._hold_fk = {}
+            self._hold_elbow_fk = {}
+            self._ramp = {}
 
         was_any = self._active["left"] or self._active["right"]
         if not was_any:
             self._clear_freeze()
+
+        pos_mult = self._config.position_multiplier
+        rot_mult = self._config.rotation_multiplier
+        now = time.perf_counter()
+        # Re-engage behaviour: "clutch" re-snaps the controller against the
+        # arm's current pose (the arm stays; the controller "matches the
+        # arm"), "ramp" keeps the arm's existing snap and blends the arm out
+        # to where that mapping says the controller now is (the arm "matches
+        # the controller"). The live mode rides on the frame (core-forwarded
+        # HUD toggle); the config is the fallback.
+        ramp_mode = (frame.reengage or self._config.reengage) == "ramp"
 
         # Per-arm activation. FK of q_current is needed to snapshot a rising
         # arm's EE pose and to capture a freezing/frozen arm's hold pose;
@@ -457,14 +549,17 @@ class IKWorker:
                     self._active[side] = True
                     self._hold_fk.pop(side, None)
                     self._hold_elbow_fk.pop(side, None)
-                    self._snap_arm(
-                        side,
-                        ctrl_pos,
-                        ctrl_rot,
-                        ctrl_e,
-                        _ee(side),
-                        _elbow(side) if self._use_elbow else None,
-                    )
+                    if ramp_mode and side in self._snap_ctrl:
+                        self._start_ramp(side, ctrl_pos, ctrl_rot, _ee(side), now)
+                    else:
+                        self._snap_arm(
+                            side,
+                            ctrl_pos,
+                            ctrl_rot,
+                            ctrl_e,
+                            _ee(side),
+                            _elbow(side) if self._use_elbow else None,
+                        )
                     snapped.append(indices)
             else:
                 if self._active[side]:
@@ -499,26 +594,35 @@ class IKWorker:
             self._solver.set_posture_pose(posture)
             # An engage snap re-anchors that arm to q_current: return the
             # seed unchanged so the snap frame itself produces no motion
-            # (matching the previous whole-session engage behaviour).
+            # (matching the previous whole-session engage behaviour). A ramp
+            # engage likewise starts from q_current (blend alpha 0).
             self._clear_freeze()
             return q_current
-
-        pos_mult = self._config.position_multiplier
-        rot_mult = self._config.rotation_multiplier
 
         def _target(
             side: str, ctrl_pos: np.ndarray, ctrl_rot: np.ndarray
         ) -> tuple[np.ndarray, np.ndarray]:
-            if self._active[side]:
-                return _relative_target_np(
-                    ctrl_pos,
-                    ctrl_rot,
-                    *self._snap_ctrl[side],
-                    *self._snap_fk[side],
-                    position_multiplier=pos_mult,
-                    rotation_multiplier=rot_mult,
-                )
-            return self._hold_fk[side]
+            if not self._active[side]:
+                return self._hold_fk[side]
+            goal = _relative_target_np(
+                ctrl_pos,
+                ctrl_rot,
+                *self._snap_ctrl[side],
+                *self._snap_fk[side],
+                position_multiplier=pos_mult,
+                rotation_multiplier=rot_mult,
+            )
+            ramp = self._ramp.get(side)
+            if ramp is None:
+                return goal
+            start, t0, duration = ramp
+            alpha = smoothstep((now - t0) / duration)
+            if alpha >= 1.0:
+                del self._ramp[side]
+                return goal
+            # The goal is live: the hand may keep moving during the blend and
+            # the arm converges on wherever it ends up, never on a stale pose.
+            return blend_pose(start, goal, alpha)
 
         tl_pos, tl_rot = _target("left", left_pos, left_rot)
         tr_pos, tr_rot = _target("right", right_pos, right_rot)
@@ -547,7 +651,6 @@ class IKWorker:
         # the hand, and the backlog released as a lurch — the "random
         # jitter" bursts seen during fast wrist rotations. Capped at 4x so
         # a multi-second stall can't authorize a giant step.
-        now = time.perf_counter()
         delta_scale = 1.0
         if self._last_solve_t is not None:
             elapsed = now - self._last_solve_t
@@ -701,24 +804,95 @@ class IKWorker:
             max_iterations=cfg.reset_max_iterations,
         )
 
+    def set_config(self, key: str, value: object) -> None:
+        """Live-update one :class:`VRTeleopConfig` field (``("set", …)`` message).
+
+        Only fields this process reads at step time are meaningful here
+        (multipliers, box jog speeds, ramp pacing); the core validates the
+        key before forwarding, so an unknown one is logged and ignored rather
+        than raised.
+        """
+        if not hasattr(self._config, key):
+            _logger.warning("Ignoring live update of unknown config field %r", key)
+            return
+        current = getattr(self._config, key)
+        try:
+            coerced = (
+                type(current)(value)
+                if isinstance(current, (bool, int, float))
+                else value
+            )
+        except (TypeError, ValueError):
+            _logger.warning("Ignoring live update %s=%r (bad value)", key, value)
+            return
+        setattr(self._config, key, coerced)
+
+    def pair_status(self, q: np.ndarray) -> dict:
+        """Geometry of the gripper pair at ``q`` for the headset's cues.
+
+        ``aligned`` is True when the two grippers already form the box-mode
+        side-clamping pair — fingers forward, a flat face toward the other
+        gripper, each within ``_ALIGNED_TOL_DEG`` of where a box-mode engage
+        would blend it (see :func:`~almond_axol.teleop.box.pair_aligned`) —
+        and the gap is inside the box-mode width range, so switching to box
+        mode from here costs (almost) no alignment blend. ``width`` is the
+        mount separation in metres and ``tilt`` the pair's current inward
+        fingertip yaw in degrees (``config.box_grip_tilt``, which the jog
+        writes back to).
+        """
+        left, right = self._solver.fk(q)
+        width = float(
+            np.linalg.norm(
+                np.asarray(right[0], dtype=np.float64)
+                - np.asarray(left[0], dtype=np.float64)
+            )
+        )
+        aligned = width > 1e-3 and pair_aligned(
+            left,
+            right,
+            width_min=self._config.box_width_min,
+            width_max=self._config.box_width_max,
+            tilt=math.radians(self._config.box_grip_tilt),
+            tol_deg=_ALIGNED_TOL_DEG,
+        )
+        return {
+            "aligned": bool(aligned),
+            "width": round(width, 3),
+            "tilt": round(float(self._config.box_grip_tilt), 1),
+        }
+
+    def clear_engage(self) -> None:
+        """Drop engage state without touching the (warm) pose filters.
+
+        Used when the arms are moved by something other than this worker
+        (reset replay, external motion) so the next locked frame performs a
+        fresh engage snap against the new pose — in either re-engage mode,
+        since the snap poses (the "ramp" anchor) go too.
+        """
+        self._active = {"left": False, "right": False}
+        self._hold_fk = {}
+        self._hold_elbow_fk = {}
+        self._ramp = {}
+        self._clear_freeze()
+        self._box = None
+        self._box_leader = None
+        self._snap_ctrl = {}
+        self._snap_fk = {}
+        self._snap_elbow_ctrl = {}
+        self._snap_elbow_fk = {}
+        if self._rec is not None:
+            self._rec.set_engaged(False)
+
     def reset(self) -> None:
         """Deactivate the engage-toggle state and clear snap poses and filter state.
 
         Call this before replaying a reset trajectory so the next engage
         performs a fresh engage-snap from the current IK pose.
         """
-        self._active = {"left": False, "right": False}
-        self._hold_fk = {}
-        self._hold_elbow_fk = {}
-        self._clear_freeze()
         # A forced disengage (reset, stale stream) may never deliver another
-        # lock-less frame to step() — close the recording segment here too.
-        if self._rec is not None:
-            self._rec.set_engaged(False)
-        self._snap_ctrl = {}
-        self._snap_fk = {}
-        self._snap_elbow_ctrl = {}
-        self._snap_elbow_fk = {}
+        # lock-less frame to step() — clear_engage closes the recording
+        # segment too.
+        self.clear_engage()
         self._prev_raw = {}
         self._prev_raw_t = None
         self._raw_vel = {}
@@ -730,6 +904,252 @@ class IKWorker:
         self._solver.set_posture_pose(self.get_rest_q())
 
     # -- Internal -----------------------------------------------------------
+
+    def _step_box(
+        self,
+        frame: VRFrame,
+        q_current: np.ndarray,
+        ctrl: dict[str, tuple[np.ndarray, np.ndarray]],
+        lp: np.ndarray,
+        rp: np.ndarray,
+    ) -> np.ndarray:
+        """Box-mode solve: one controller carries both grippers as a rigid pair.
+
+        On engage the pair is snapped from FK (:func:`snap_box`), the leader
+        controller's pose is anchored, and the grippers are blended into the
+        side-clamping grasp (fingers forward, flat faces on the box) over
+        ``box_align_duration``. Afterwards the leader
+        gripper is driven by the usual per-arm clutch mapping
+        (:func:`_relative_target_np`, so one hand feels exactly like normal
+        teleop) and the box rides rigidly on it; the thumbsticks jog the pair
+        in the box's own horizontal frame (see :meth:`_integrate_jog`).
+        """
+        leader = frame.box_leader
+        assert leader in ("left", "right")
+        cfg = self._config
+        now = time.perf_counter()
+        if self._rec is not None:
+            self._rec.set_engaged(True)
+
+        engaged = self._active["left"] and self._active["right"]
+        if self._box is None or not engaged or self._box_leader != leader:
+            # Engage snap, or the leading hand changed: (re)anchor to the
+            # live pose. A handover mid-align simply restarts the blend from
+            # wherever the grippers are, so nothing jumps.
+            l_fk, r_fk = self._solver.fk(q_current)
+            self._box = snap_box(
+                l_fk,
+                r_fk,
+                now,
+                align_duration=cfg.box_align_duration,
+                width_min=cfg.box_width_min,
+                width_max=cfg.box_width_max,
+                tilt=math.radians(cfg.box_grip_tilt),
+            )
+            self._box_leader = leader
+            self._snap_ctrl = {leader: ctrl[leader]}
+            self._snap_fk = {leader: l_fk if leader == "left" else r_fk}
+            self._ramp = {}
+            self._active = {"left": True, "right": True}
+            self._hold_fk = {}
+            self._hold_elbow_fk = {}
+            self._clear_freeze()
+            self._solver.set_posture_pose(q_current)
+            self._last_solve_t = None
+            return q_current
+
+        box = self._box
+        ctrl_pos, ctrl_rot = ctrl[leader]
+        lead_pos, lead_rot = _relative_target_np(
+            ctrl_pos,
+            ctrl_rot,
+            *self._snap_ctrl[leader],
+            *self._snap_fk[leader],
+            position_multiplier=cfg.position_multiplier,
+            rotation_multiplier=cfg.rotation_multiplier,
+        )
+        # The box is rigidly attached to the leader gripper's snap frame:
+        # carry the snap-time box pose along with the leader's world motion.
+        snap_pos, snap_rot = self._snap_fk[leader]
+        r_delta = lead_rot @ snap_rot.T
+        center = lead_pos + r_delta @ (box.center - snap_pos)
+        rot = r_delta @ box.rot
+        self._integrate_jog(frame, box, rot, now)
+        center = (center + box.jog_pos).astype(np.float32)
+        if box.jog_yaw:
+            rot = rodrigues(_UP, box.jog_yaw) @ rot
+        rot = rot.astype(np.float32)
+        targets = box_targets(box, center, rot, now)
+        elbows = self._box_elbow_hints(q_current, targets)
+        # The posture attractor follows q for the whole of box mode. Pinned at
+        # the engage pose (normal teleop's behaviour) it balances the pose
+        # cost well short of the target — posture_weight 5 against pos_weight
+        # 50 left the grippers 20-45 mm apart from their slots and the pair
+        # twisted 5-13° in offline replays of a chest-height close, i.e. a
+        # visibly non-parallel grasp; following, the same closes land within
+        # 1 mm / 0.1°. The arms' free elbow swivel then has no attractor, and
+        # doesn't need one: rest damping holds it where it is, the arm/torso
+        # collision model keeps it off the base, and the optional elbow hint
+        # (box_elbow_weight > 0) steers it explicitly.
+        self._solver.set_posture_pose(q_current)
+
+        delta_scale = 1.0
+        if self._last_solve_t is not None:
+            elapsed = now - self._last_solve_t
+            delta_scale = float(np.clip(elapsed * cfg.ik_frequency, 1.0, 4.0))
+        self._last_solve_t = now
+
+        solve_t0 = time.perf_counter()
+        q_new = self._solver.ik(
+            q_current,
+            left_pose=targets["left"],
+            right_pose=targets["right"],
+            left_elbow_pos=elbows["left"] if elbows else None,
+            right_elbow_pos=elbows["right"] if elbows else None,
+            delta_scale=delta_scale,
+            elbow_weight=cfg.box_elbow_weight if elbows else None,
+        )
+        solve_ms = (time.perf_counter() - solve_t0) * 1000.0
+        q_new = np.asarray(q_new, dtype=np.float32).copy()
+        if self._rec is not None:
+            self._rec.record(
+                raw_l=np.array(
+                    [
+                        frame.l_ee.position.x,
+                        frame.l_ee.position.y,
+                        frame.l_ee.position.z,
+                    ]
+                ),
+                raw_r=np.array(
+                    [
+                        frame.r_ee.position.x,
+                        frame.r_ee.position.y,
+                        frame.r_ee.position.z,
+                    ]
+                ),
+                filt_l=lp,
+                filt_r=rp,
+                tgt_l=targets["left"][0],
+                tgt_r=targets["right"][0],
+                q=q_new,
+                engaged=np.array([1.0, 1.0]),
+                solve_ms=solve_ms,
+            )
+        return q_new
+
+    def _box_elbow_hints(
+        self, q_current: np.ndarray, targets: dict[str, Pose]
+    ) -> dict[str, np.ndarray] | None:
+        """Outward elbow hints for the box-mode solve, or ``None`` if disabled.
+
+        Box mode's gripper targets fix each wrist but leave the elbow swivel
+        free, and as the grippers close on the box the nearest solution
+        swings the elbows into the torso. Each hint is the arm's current
+        elbow rotated about its shoulder-wrist line to ``config.box_elbow_out``
+        degrees outboard of straight down (:func:`elbow_swivel_hint`), fed to
+        the solver at ``config.box_elbow_weight``. The wrist used is the
+        gripper *target*, not the measured pose, so the hint leads the motion
+        the same way the pose target does.
+        """
+        cfg = self._config
+        if cfg.box_elbow_weight <= 0.0:
+            return None
+        angle = math.radians(cfg.box_elbow_out)
+        shoulders = dict(zip(("left", "right"), self._solver.shoulder_positions))
+        elbows = dict(zip(("left", "right"), self._solver.elbow_positions(q_current)))
+        return {
+            side: elbow_swivel_hint(
+                shoulders[side], elbows[side], targets[side][0], sign, angle
+            )
+            for side, sign in (("left", 1.0), ("right", -1.0))
+        }
+
+    def _integrate_jog(
+        self, frame: VRFrame, box: BoxState, rot: np.ndarray, now: float
+    ) -> None:
+        """Accumulate this frame's thumbstick jog into ``box``.
+
+        Leader stick: forward/back and left/right translate the pair in the
+        box's horizontal frame (forward = the box's ``+x``, perpendicular to
+        the gripper-to-gripper line) — a free 2-D jog, so diagonals work.
+        With the stick clicked in, forward/back moves the pair up/down and
+        left/right yaws it about its centre. The *other* stick's forward/back
+        moves the pair up/down and its left/right widens / narrows the grasp;
+        with *that* stick clicked in, left/right instead tilts the fingertips
+        inward (left) / outward (right) — the grippers' yaw toward the box
+        centre, ``BoxState.tilt``, written back to ``config.box_grip_tilt`` so
+        the next engage starts from it. Where a stick's two axes drive
+        *different* things (the clicked leader stick, the other stick) only
+        its dominant axis counts, so a thumb pushing "left" with a little
+        forward in it changes the width alone and never lifts the pair (see
+        :func:`_dominant_axis`). ``rot`` is the box rotation before this
+        frame's jog, used to resolve the horizontal frame.
+        """
+        cfg = self._config
+        dt = 0.0 if box.jog_t is None else min(max(now - box.jog_t, 0.0), _JOG_MAX_DT_S)
+        box.jog_t = now
+        if dt <= 0.0:
+            return
+
+        if self._box_leader == "right":
+            sx, sy, click = (
+                _dz(frame.r_stick_x),
+                _dz(frame.r_stick_y),
+                frame.r_stick_click,
+            )
+            ox, oy = _dominant_axis(frame.l_stick_x, frame.l_stick_y)
+            o_click = frame.l_stick_click
+        else:
+            sx, sy, click = (
+                _dz(frame.l_stick_x),
+                _dz(frame.l_stick_y),
+                frame.l_stick_click,
+            )
+            ox, oy = _dominant_axis(frame.r_stick_x, frame.r_stick_y)
+            o_click = frame.r_stick_click
+        if click:
+            sx, sy = _dominant_axis(sx, sy)
+        if not (sx or sy or ox or oy):
+            return
+
+        if box.jog_yaw:
+            rot = rodrigues(_UP, box.jog_yaw) @ rot
+        fwd = np.array((rot[0, 0], rot[1, 0], 0.0))
+        n = float(np.linalg.norm(fwd))
+        fwd = fwd / n if n > 1e-6 else np.array((1.0, 0.0, 0.0))
+        lat = np.cross(_UP, fwd)
+
+        # Sticks report pushed-forward as -1 (WebXR), so negate y for "forward".
+        v_fwd = v_lat = v_up = yaw_rate = width_rate = tilt_rate = 0.0
+        if click:
+            v_up += -sy * cfg.box_jog_speed
+            yaw_rate += -sx * cfg.box_jog_yaw_speed  # push right = clockwise
+        else:
+            v_fwd += -sy * cfg.box_jog_speed
+            v_lat += -sx * cfg.box_jog_speed  # push right = move right
+        if o_click:
+            # Push left = fingertips inward (more pinch), right = outward —
+            # the same sense as the width axis (right opens).
+            tilt_rate += -ox * math.radians(cfg.box_tilt_speed)
+        else:
+            v_up += -oy * cfg.box_jog_speed
+            width_rate += ox * cfg.box_width_speed  # push right = wider
+
+        box.jog_pos = (
+            box.jog_pos + dt * (v_fwd * fwd + v_lat * lat + v_up * _UP)
+        ).astype(np.float32)
+        box.jog_yaw += dt * yaw_rate
+        if width_rate:
+            box.width = float(
+                np.clip(
+                    box.width + dt * width_rate, cfg.box_width_min, cfg.box_width_max
+                )
+            )
+        if tilt_rate:
+            limit = math.radians(abs(cfg.box_tilt_max))
+            box.tilt = float(np.clip(box.tilt + dt * tilt_rate, -limit, limit))
+            # Carry the jogged tilt into the next engage (and pair_status).
+            cfg.box_grip_tilt = math.degrees(box.tilt)
 
     def _note_raw(self, raw_l: np.ndarray, raw_r: np.ndarray, t_eff: float) -> None:
         """Fold a good frame into the raw-tracking state (position + EMA velocity)."""
@@ -994,6 +1414,49 @@ class IKWorker:
         self._snap_elbow_ctrl[side] = ctrl_e
         if elbow_pos is not None:
             self._snap_elbow_fk[side] = elbow_pos
+        # A fresh snap makes the target equal FK: nothing left to ramp to.
+        self._ramp.pop(side, None)
+
+    def _start_ramp(
+        self,
+        side: str,
+        ctrl_pos: np.ndarray,
+        ctrl_rot: np.ndarray,
+        ee_pose: tuple[np.ndarray, np.ndarray],
+        now: float,
+    ) -> None:
+        """Begin a "ramp" re-engage: blend ``side`` from ``ee_pose`` to its target.
+
+        The arm's existing snap is kept as the controller↔arm mapping, so the
+        target is wherever that mapping says the controller is *now*; the
+        blend duration is paced by the distance and turn to cover
+        (``reengage_ramp_speed`` / :data:`_RAMP_ANG_SPEED`) with a floor of
+        ``reengage_ramp_min_s`` so a short hop is still eased, not stepped.
+        """
+        cfg = self._config
+        goal = _relative_target_np(
+            ctrl_pos,
+            ctrl_rot,
+            *self._snap_ctrl[side],
+            *self._snap_fk[side],
+            position_multiplier=cfg.position_multiplier,
+            rotation_multiplier=cfg.rotation_multiplier,
+        )
+        dist = float(np.linalg.norm(goal[0] - ee_pose[0]))
+        angle = rotation_angle(ee_pose[1], goal[1])
+        duration = max(
+            cfg.reengage_ramp_min_s,
+            dist / max(cfg.reengage_ramp_speed, 1e-3),
+            angle / _RAMP_ANG_SPEED,
+        )
+        self._ramp[side] = (ee_pose, now, duration)
+        _logger.info(
+            "%s arm re-engaged (ramp): %.0f mm / %.0f° to the controller over %.1fs",
+            side,
+            dist * 1e3,
+            math.degrees(angle),
+            duration,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1012,7 +1475,12 @@ def run_ik_worker(
 
     Message protocol (after the ``("ready", …)`` handshake):
 
-    - ``VRFrame``                      → ``q`` (one solve step)
+    - ``VRFrame``                      → ``(q, status)`` (one solve step;
+      ``status`` is :meth:`IKWorker.pair_status` every
+      ``_STATUS_EVERY_N`` frames, else ``None``)
+    - ``("set", key, value)``          → *(no reply)* — live update of one
+      :class:`VRTeleopConfig` field on this process's copy of the config
+      (``VRTeleopCore.set_live``).
     - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
     - ``("sync", pos_left, pos_right)`` → ``("synced", q)`` — seat the worker's
       joint vector at the robot's measured arm positions (7 arm joints per
@@ -1085,12 +1553,15 @@ def run_ik_worker(
     # load (on <8-core hosts this collapses onto the realtime cores).
     affinity.pin_ik()
 
+    frames = 0
     while True:
         try:
             msg = conn.recv()
             if msg is None:
                 break
-            if isinstance(msg, tuple) and msg[0] == "reset":
+            if isinstance(msg, tuple) and msg[0] == "set":
+                worker.set_config(str(msg[1]), msg[2])
+            elif isinstance(msg, tuple) and msg[0] == "reset":
                 q_current = np.asarray(msg[1], dtype=np.float32)
                 traj = worker.compute_reset_trajectory(q_current, q_rest)
                 worker.reset()
@@ -1105,25 +1576,23 @@ def run_ik_worker(
                     q[gi] = pos_r[i]
                 # Deactivate the engage state and drop the stale snap and
                 # frozen-hold poses so the next engage performs a fresh
-                # engage-snap from the synced q. Deliberately NOT worker.reset(): that would also clear
-                # the One Euro pose filters, which step() keeps warm on every
-                # frame precisely so an engage isn't a smoothing cold start —
-                # and a DAgger takeover is exactly such an engage. The engage
-                # rising edge in step() re-pins the posture pose and re-snaps
-                # from the warm filtered poses, so nothing else from reset()
-                # is needed here.
-                worker._active = {"left": False, "right": False}
-                worker._hold_fk = {}
-                worker._hold_elbow_fk = {}
-                worker._clear_freeze()
-                worker._snap_ctrl = {}
-                worker._snap_fk = {}
-                worker._snap_elbow_ctrl = {}
-                worker._snap_elbow_fk = {}
+                # engage-snap from the synced q. Deliberately NOT
+                # worker.reset(): that would also clear the One Euro pose
+                # filters, which step() keeps warm on every frame precisely
+                # so an engage isn't a smoothing cold start — and a DAgger
+                # takeover is exactly such an engage. The engage rising edge
+                # in step() re-pins the posture pose and re-snaps from the
+                # warm filtered poses, so nothing else from reset() is needed
+                # here.
+                worker.clear_engage()
                 conn.send(("synced", q.copy()))
             elif isinstance(msg, VRFrame):
                 q = worker.step(msg, q)
-                conn.send(q.copy())
+                frames += 1
+                status = (
+                    worker.pair_status(q) if frames % _STATUS_EVERY_N == 0 else None
+                )
+                conn.send((q.copy(), status))
         except (EOFError, KeyboardInterrupt, OSError):
             # OSError covers ConnectionResetError/BrokenPipeError when the
             # parent end closes abruptly (parent crash, or a shutdown that

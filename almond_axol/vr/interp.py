@@ -753,15 +753,39 @@ def _build_frame(
         state=latest.state,
         t=(play * 1000.0) if play is not None else latest.t,
         seq=latest.seq,
+        # Thumbsticks are control state too: the IK worker reads them from
+        # this rendered frame for box-mode jogging.
+        l_stick_x=latest.l_stick_x,
+        l_stick_y=latest.l_stick_y,
+        r_stick_x=latest.r_stick_x,
+        r_stick_y=latest.r_stick_y,
+        l_stick_click=latest.l_stick_click,
+        r_stick_click=latest.r_stick_click,
     )
     pos = np.concatenate([l_ee_p, r_ee_p, l_el, r_el])
     return frame, pos
 
 
+# Thumbstick deflection below this is idle for the identity-stable check.
+_STICK_IDLE = 0.05
+
+
 def _same_control(a: VRFrame, b: VRFrame) -> bool:
+    # A deflected stick is never "unchanged": box-mode jogging integrates the
+    # stick over time in the IK worker, which only runs on a fresh frame, so a
+    # held stick with a still hand must keep producing new frames.
+    if (
+        abs(b.l_stick_x) > _STICK_IDLE
+        or abs(b.l_stick_y) > _STICK_IDLE
+        or abs(b.r_stick_x) > _STICK_IDLE
+        or abs(b.r_stick_y) > _STICK_IDLE
+    ):
+        return False
     return (
         a.l_lock == b.l_lock
         and a.r_lock == b.r_lock
         and a.reset == b.reset
         and a.state == b.state
+        and a.l_stick_click == b.l_stick_click
+        and a.r_stick_click == b.r_stick_click
     )

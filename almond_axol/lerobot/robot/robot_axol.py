@@ -411,6 +411,15 @@ class AxolRobot(Robot):
         pass
 
     @property
+    def axol(self) -> RtAxol | None:
+        """The underlying realtime-core robot while connected, else ``None``.
+
+        For flows that need the arms themselves (the teleoperator's live
+        settings adjust the gripper torque limit on them).
+        """
+        return self._axol
+
+    @property
     def positions(self) -> tuple[np.ndarray, np.ndarray]:
         """Cached arm positions from telemetry. Call after connect().
 

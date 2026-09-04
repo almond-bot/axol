@@ -30,7 +30,7 @@ from datetime import datetime
 import numpy as np
 
 from ...constants import CAN_LEFT, CAN_RIGHT, Joint
-from ...robot.axol import GRIPPER_TRAVEL, Axol, arm_limits
+from ...robot.axol import Axol, arm_limits
 from ...robot.config import AxolConfig
 from ...rt import RtAxol
 
@@ -92,6 +92,9 @@ class _ArmCycle:
     hold_q: np.ndarray
     lo_api: float
     hi_api: float
+    # Calibrated open-to-close gripper stroke (rad) — the arm measures it
+    # against both end stops during enable, so it's read after that.
+    gripper_travel: float
     targets: list[float] = field(default_factory=list)
     target_idx: int = 0
     segment_start: float = 0.0
@@ -125,7 +128,9 @@ class _ArmCycle:
 
     def _plan_segment(self) -> None:
         dist_rad = _cycle_dist_rad(
-            self.segment_target - self.segment_start, self.cycle_joint
+            self.segment_target - self.segment_start,
+            self.cycle_joint,
+            self.gripper_travel,
         )
         self.duration = max(dist_rad / _SPEED, 0.05)
         self.t_seg = time.perf_counter()
@@ -209,10 +214,10 @@ def _render(
     print("".join(buf), end="", flush=True)
 
 
-def _cycle_dist_rad(dist_api: float, joint: Joint) -> float:
+def _cycle_dist_rad(dist_api: float, joint: Joint, gripper_travel: float) -> float:
     """Convert an API-unit distance to radians for speed/duration calculations."""
     if joint == Joint.GRIPPER:
-        return abs(dist_api) * GRIPPER_TRAVEL
+        return abs(dist_api) * gripper_travel
     return abs(dist_api)
 
 
@@ -291,7 +296,18 @@ async def _run(
             hold_q = hold_left if is_left else hold_right
             assert hold_q is not None
             lo, hi = limits(is_left)
-            arm = _ArmCycle(side, ch, is_left, cycle_joint, hold_q.copy(), lo, hi)
+            axol_arm = robot.left if is_left else robot.right
+            assert axol_arm is not None
+            arm = _ArmCycle(
+                side,
+                ch,
+                is_left,
+                cycle_joint,
+                hold_q.copy(),
+                lo,
+                hi,
+                axol_arm.gripper_travel,
+            )
             arm.start(log)
             arms.append(arm)
 

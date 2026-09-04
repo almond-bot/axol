@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
+
+# Re-engage behaviour of a grip (see ``VRTeleopConfig.reengage``). Registered
+# as a draccus choice in ``almond_axol.cli.config``.
+ReengageMode = Literal["clutch", "ramp"]
 
 
 @dataclass
@@ -81,6 +86,92 @@ class VRTeleopConfig:
             stays held — release a grip and that arm freezes where it is,
             hold on and it keeps going; re-engaging from a full release
             requires holding both again.
+        reengage: What happens to an arm's controller↔arm mapping when its
+            grip re-engages (after a freeze, a disengage, or a pause in which
+            the operator walked away or the arm was moved by hand).
+            ``"clutch"`` (default) re-snaps: the arm stays where it is and
+            the controller's *current* pose becomes the new origin — the
+            operator brings the controller to (roughly) match the arm before
+            gripping, and nothing moves at the grip. ``"ramp"`` keeps the
+            mapping from the arm's previous engage as a session anchor and
+            eases the arm out to where that mapping says the controller now
+            is — the arm comes to the hand, over ``reengage_ramp_min_s`` or
+            longer (paced by ``reengage_ramp_speed``), then tracks 1:1. The
+            anchor is dropped by a reset / return-to-rest (the next grip
+            snaps fresh in either mode) and does not apply to box mode,
+            whose engage already blends the pair into the parallel grasp.
+            Toggled live from the headset HUD (``VRFrame.reengage``); this is
+            the mode a session starts in.
+        reengage_ramp_speed: Linear speed (m/s) that paces the ``"ramp"``
+            re-engage blend: an arm 30 cm from its target takes at least
+            ``0.30 / reengage_ramp_speed`` seconds to get there.
+        reengage_ramp_min_s: Floor (s) on the ``"ramp"`` blend duration so a
+            small correction is still eased rather than stepped.
+        box_mode: Start the session in **box mode** (bimanual carry). The two
+            grippers are held as a parallel pair clamping the box between
+            their sides — fingers pointing forward like two flat hands, the
+            flat outer face of each closed gripper against the box, held by
+            friction — and *one* controller moves both arms as a rigid pair:
+            either grip engages both arms with that hand as the leader (no
+            both-grips gate; the other grip switches leader), and the
+            leader's trigger drives both grippers. On engage the grippers
+            first blend into the parallel configuration over
+            ``box_align_duration`` (from wherever they were, e.g. after
+            someone hand-guided the arms), then track the leader controller.
+            While a grip is leading, the thumbsticks stop driving Jelly and
+            become a **jog** instead (freeze the pair — click the leader's
+            grip again — and they drive Jelly as usual, so the box can be
+            carried across the room): the leader stick translates the pair
+            in the horizontal plane
+            (pushed forward = away from the torso, sideways = along the line
+            between the grippers); with the leader stick clicked in the same
+            axes become up/down and yaw. The other controller's stick moves
+            the pair up/down (y) and changes the gripper separation (x —
+            right = wider); with that stick clicked in, x tilts the
+            fingertips in/out instead (``box_grip_tilt``). On these, only the
+            stick's dominant axis counts, so a width change never also lifts
+            the pair. The mode is a live setting
+            (``VRTeleopCore.set_box_mode``, the headset's **Box** button,
+            both thumbstick clicks together, the control panel); this is the
+            default it starts in.
+        box_grip_tilt: Starting inward yaw (degrees) of each gripper in box
+            mode. ``0`` points the fingers straight forward, parallel to each
+            other. The closed fingers are a wedge that narrows toward the
+            tip, so with a positive tilt the fingertips turn toward the box
+            centre and the finger's flat face lies flush on the box side
+            instead of touching along its heel; the wedge half-angle (~20°)
+            makes the face fully flat. Negative splays the tips outward.
+            Jogged live with the other controller's stick clicked in (x:
+            left = inward, right = outward); the jogged value carries over to
+            the next engage.
+        box_tilt_speed: Rate (deg/s) the tilt changes at full stick
+            deflection.
+        box_tilt_max: Largest tilt (degrees, either way) the jog allows.
+        box_jog_speed: Jog translation speed (m/s) at full stick deflection
+            in box mode.
+        box_jog_yaw_speed: Jog yaw rate (rad/s) at full stick deflection in
+            box mode.
+        box_width_speed: Rate (m/s) the gripper separation changes at full
+            stick deflection in box mode.
+        box_width_min: Smallest gripper separation (m, between the two
+            gripper mount frames) the box-mode jog allows.
+        box_width_max: Largest gripper separation (m) the box-mode jog allows.
+        box_align_duration: Seconds over which a box-mode engage blends the
+            grippers from their current poses into the parallel
+            configuration before the leader controller takes over 1:1.
+        box_elbow_out: Optional explicit elbow posture for box mode, in
+            degrees from straight down toward each arm's outboard side
+            (``0`` hangs the elbows under the shoulder-wrist line, ``90``
+            holds them out level). The parallel, fingers-forward gripper
+            poses of box mode leave each arm's elbow swivel free; by default
+            it is left alone — rest damping holds it, and the arm/torso
+            collision model (``KinematicsConfig.self_collision``) keeps it
+            off the base — but a nonzero ``box_elbow_weight`` steers it to
+            this angle with an IK elbow hint instead.
+        box_elbow_weight: IK weight on that elbow hint (compare
+            ``KinematicsConfig.pos_weight`` 50 for the grippers). ``0`` (the
+            default) disables the hint; ``10`` is a sensible value if you want
+            a deliberately flared carry.
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest
@@ -208,6 +299,21 @@ class VRTeleopConfig:
     teleop_torque_threshold: float = 0.0
     reset_gravity_comp_kd: float = 0.25
     hold_to_engage: bool = False
+    reengage: ReengageMode = "clutch"
+    reengage_ramp_speed: float = 0.15
+    reengage_ramp_min_s: float = 0.75
+    box_mode: bool = False
+    box_grip_tilt: float = 0.0
+    box_tilt_speed: float = 30.0
+    box_tilt_max: float = 45.0
+    box_jog_speed: float = 0.15
+    box_jog_yaw_speed: float = 0.6
+    box_width_speed: float = 0.08
+    box_width_min: float = 0.10
+    box_width_max: float = 0.70
+    box_align_duration: float = 1.5
+    box_elbow_out: float = 30.0
+    box_elbow_weight: float = 0.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi

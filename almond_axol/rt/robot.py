@@ -186,10 +186,12 @@ class RtAxol:
                 gains = getattr(arm._arm_config, j.value)
                 f = gains.friction
                 motor_id = _JOINT_CONFIG[j].motor_id
+                # torque_limit formats as "inf" when unset; Rust's f64 parser
+                # reads that as +infinity, i.e. no cap.
                 lines.append(
                     f"joint {side} {iface} {j.value} {motor_id} "
                     f"{gains.kp} {gains.kd} {trk_vel} {trk_acc} "
-                    f"{f.fc} {f.k} {f.fv} {f.fo}"
+                    f"{f.fc} {f.k} {f.fv} {f.fo} {gains.torque_limit}"
                 )
             if arm._has_gripper:
                 lines.append(

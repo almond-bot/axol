@@ -85,8 +85,7 @@ def _joint_frame(arm: AxolArm, idx: int, joint: Joint, raw: float) -> float:
     with ``arm.positions`` and the joint-space bars/rev display.
     """
     if joint == Joint.GRIPPER:
-        gi = arm._gripper_i
-        return (raw - arm._limits_hi[gi]) / (arm._limits_lo[gi] - arm._limits_hi[gi])
+        return arm._gripper_from_raw(raw)
     return raw + float(arm._joint_offsets[idx])
 
 

@@ -140,7 +140,10 @@ class JellyConfig:
         turn_scale:      Rotation weight relative to translation, in [0, 1].
         slew:            Max change of the normalized body command per second;
                          limits accel/decel so command steps ramp the wheels.
-                         The default takes 2s from rest to full deflection.
+                         One vector limit across translation and rotation
+                         together. The default takes 4s from rest to full
+                         deflection (halved from 2s: the faster ramp lurched
+                         the base, and the arms on it, at every stick flick).
         axis_snap_deg:   Translation headings within this many degrees of a
                          cardinal axis (forward/back/left/right) are snapped
                          onto that axis, absorbing off-axis thumb error during
@@ -189,7 +192,7 @@ class JellyConfig:
     channel: str | None = DEFAULT_CHANNEL
     max_speed: float = 20.0
     turn_scale: float = 1.0
-    slew: float = 0.5
+    slew: float = 0.25
     axis_snap_deg: float = 15.0
     imu: bool = False
     yaw_hold_gain: float = 2.0

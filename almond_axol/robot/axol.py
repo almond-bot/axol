@@ -53,26 +53,39 @@ LIMITS: dict[Joint, tuple[float, float]] = {
     Joint.WRIST_1: (math.radians(-135), math.radians(135)),
     Joint.WRIST_2: (math.radians(-90), math.radians(90)),
     Joint.WRIST_3: (math.radians(-90), math.radians(90)),
-    # Gripper absent: open position varies per unit, found at runtime by _calibrate_gripper().
+    # Gripper absent: both end stops vary per unit, found at runtime by _calibrate_gripper().
 }
 
-# Fixed open-to-close travel of the gripper (rad).
-GRIPPER_TRAVEL = math.radians(290)
+# Nominal open-to-close travel of the gripper (rad). Only a placeholder: the
+# real stroke is measured between the two hard stops by
+# ``AxolArm._calibrate_gripper()`` at enable time. Used to seed the
+# pre-calibration gripper range and to bound the calibration sweep.
+_GRIPPER_NOMINAL_TRAVEL = math.radians(290)
 
-# Gripper open-position calibration parameters.
-_GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm
+# Gripper end-stop calibration parameters.
+_GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm — pushing this hard into a stop ends a sweep
 _GRIPPER_CALIB_STEP = 0.005  # rad per step
 _GRIPPER_CALIB_SETTLE = 0.001  # s per step
-_GRIPPER_CALIB_MAX_STEPS = math.ceil(GRIPPER_TRAVEL / _GRIPPER_CALIB_STEP)
+# Longest sweep tolerated before concluding there is no stop in that direction.
+_GRIPPER_CALIB_MAX_SWEEP = 2.5 * _GRIPPER_NOMINAL_TRAVEL
+_GRIPPER_CALIB_MAX_STEPS = math.ceil(_GRIPPER_CALIB_MAX_SWEEP / _GRIPPER_CALIB_STEP)
+# A stop is only recognised from torque pushing *along* the sweep. Torque
+# building up against the sweep means the motor is already stalled on the
+# far stop (its reported torque sign disagrees with the commanded motion) —
+# abort rather than wind the impedance target further into the mechanism.
+_GRIPPER_CALIB_TORQUE_ABORT = 2.0  # Nm
+# Two stops closer together than this are not a gripper stroke (jammed jaw,
+# or a sweep that stalled on an obstruction).
+_GRIPPER_MIN_TRAVEL = math.radians(30)
 
-# Impedance gains used only during gripper open-stop calibration.
+# Impedance gains used only during gripper end-stop calibration.
 _GRIPPER_CALIB_KP = 50.0
 _GRIPPER_CALIB_KD = 1.0
 
-# The gripper open position varies per unit and is measured at runtime by
-# ``_calibrate_gripper()``. It is persisted here so a reconnecting
-# ``enable()`` can restore it without re-running the sweep (which physically
-# forces the jaw open, dropping anything a holding gripper grips).
+# The gripper end stops vary per unit and are measured at runtime by
+# ``_calibrate_gripper()``. They are persisted here so a reconnecting
+# ``enable()`` can restore them without re-running the sweep (which physically
+# closes then opens the jaw, dropping anything a holding gripper grips).
 _GRIPPER_CALIB_PATH = Path.home() / ".almond" / "gripper_calibration.json"
 
 # Tolerance (rad) around the calibrated travel range when validating a
@@ -82,8 +95,8 @@ _GRIPPER_CALIB_PATH = Path.home() / ".almond" / "gripper_calibration.json"
 _GRIPPER_CALIB_MARGIN = 0.35
 
 
-def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
-    """Persist one gripper's calibrated open position (raw motor rad).
+def _save_gripper_calibration(is_left: bool, open_pos: float, close_pos: float) -> None:
+    """Persist one gripper's calibrated end stops (raw motor rad).
 
     A write failure only costs the ability to reconnect to a holding gripper
     later, so it is logged rather than failing the enable that produced the
@@ -99,7 +112,7 @@ def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
         # Missing or corrupt file — overwrite it with a fresh calibration
         # rather than losing the one we just measured.
         pass
-    data[side] = {"open_pos": open_pos, "saved_at": time.time()}
+    data[side] = {"open_pos": open_pos, "close_pos": close_pos, "saved_at": time.time()}
     try:
         _GRIPPER_CALIB_PATH.parent.mkdir(parents=True, exist_ok=True)
         _GRIPPER_CALIB_PATH.write_text(json.dumps(data, indent=2))
@@ -112,19 +125,21 @@ def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
         )
 
 
-def _load_gripper_calibration(is_left: bool) -> float:
-    """Return the persisted open position (raw motor rad) for one gripper.
+def _load_gripper_calibration(is_left: bool) -> tuple[float, float]:
+    """Return the persisted ``(open_pos, close_pos)`` (raw motor rad) for one gripper.
 
     Raises:
-        MotorError: If no calibration has been persisted for this arm.
+        MotorError: If no calibration has been persisted for this arm, or the
+            file predates the two-stop calibration (open stop only).
     """
     side = "left" if is_left else "right"
     try:
         data = json.loads(_GRIPPER_CALIB_PATH.read_text())
-        return float(data[side]["open_pos"])
+        entry = data[side]
+        return float(entry["open_pos"]), float(entry["close_pos"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise MotorError(
-            f"No persisted gripper calibration for the {side} arm in "
+            f"No persisted two-stop gripper calibration for the {side} arm in "
             f"{_GRIPPER_CALIB_PATH} — a holding gripper cannot be reconnected "
             f"to without it; empty the gripper, then disable() and enable() "
             f"to calibrate"
@@ -514,20 +529,29 @@ class AxolArm:
         # motor radians (``arm_limits`` returns normalised [0, 1] for the
         # gripper, so the gripper bounds are seeded with raw defaults here
         # and ``_calibrate_gripper()`` overwrites them on enable).
-        # Pre-calibration gripper defaults assume zero is closed — do not rely
-        # on for actual motion.
         joints = list(Joint)
         self._gripper_i: int = joints.index(Joint.GRIPPER)
         self._limits_lo = np.array(
-            [
-                -GRIPPER_TRAVEL if j == Joint.GRIPPER else arm_limits(j, is_left)[0]
-                for j in joints
-            ],
+            [0.0 if j == Joint.GRIPPER else arm_limits(j, is_left)[0] for j in joints],
             dtype=float,
         )
         self._limits_hi = np.array(
             [0.0 if j == Joint.GRIPPER else arm_limits(j, is_left)[1] for j in joints],
             dtype=float,
+        )
+        # Raw motor angles of the gripper's two hard stops. The jaw closes in
+        # the configured ``close_direction``, so which of the two is the
+        # numerically larger angle differs between the mirrored left and right
+        # grippers — the [0 = closed, 1 = open] normalisation goes through
+        # ``_gripper_to_raw`` / ``_gripper_from_raw`` and never assumes an
+        # order. Pre-calibration placeholders assume zero is closed and a
+        # nominal stroke — do not rely on for actual motion.
+        self._gripper_open: float = 0.0
+        self._gripper_close: float = 0.0
+        self._set_gripper_range(
+            open_pos=-self._arm_config.gripper.close_direction
+            * _GRIPPER_NOMINAL_TRAVEL,
+            close_pos=0.0,
         )
 
         # Per-joint offset between motor frame and joint frame:
@@ -542,7 +566,7 @@ class AxolArm:
         # >180° from zero at power-up/reset — see
         # fixed_stop_wrap_correction), applied during zero verification.
         # The gripper offset is 0 because the gripper uses its own [0, 1]
-        # normalisation and is calibrated against torque, not an end stop.
+        # normalisation between its two torque-detected hard stops.
         self._joint_offsets = np.array(
             [
                 0.0
@@ -811,9 +835,7 @@ class AxolArm:
         values = self._pad_gripper([self.motors[j].position for j in self.motors])
         gripper_i = self._gripper_i
         if self._has_gripper:
-            values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
-                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-            )
+            values[gripper_i] = self._gripper_from_raw(values[gripper_i])
         arr = np.array(values, dtype=np.float32)
         return arr + self._joint_offsets.astype(np.float32)
 
@@ -831,37 +853,143 @@ class AxolArm:
     # Arm-wide commands                                                    #
     # ------------------------------------------------------------------ #
 
-    async def _calibrate_gripper(self) -> None:
-        """Find the gripper open position by stepping in the negative direction.
+    # ------------------------------------------------------------------ #
+    # Gripper range                                                        #
+    # ------------------------------------------------------------------ #
 
-        Steps the gripper motor incrementally toward open until the torque
-        magnitude drops to ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop).
-        Updates ``_limits_lo[gripper_idx]`` (open) and ``_limits_hi[gripper_idx]``
-        (close) which are used for normalization and clipping, and persists the
-        open position so a later :meth:`attach` can restore it without moving
-        the gripper.
+    @property
+    def gripper_travel(self) -> float:
+        """Calibrated open-to-close stroke of the gripper (rad, always positive).
 
-        Must be called with the gripper motor already enabled and in IMPEDANCE mode.
+        The nominal placeholder until :meth:`enable` has measured the stops.
+        """
+        return abs(self._gripper_open - self._gripper_close)
+
+    def _set_gripper_range(self, open_pos: float, close_pos: float) -> None:
+        """Adopt a pair of gripper hard stops (raw motor rad).
+
+        Records them for the [0, 1] normalisation and seeds the raw clipping
+        bounds with the ordered pair — ``np.clip`` needs ``lo <= hi``, which
+        the open/closed pair does not guarantee on a mirrored gripper.
+        """
+        self._gripper_open = float(open_pos)
+        self._gripper_close = float(close_pos)
+        gripper_i = self._gripper_i
+        self._limits_lo[gripper_i] = min(open_pos, close_pos)
+        self._limits_hi[gripper_i] = max(open_pos, close_pos)
+
+    def _gripper_to_raw(self, opening: float) -> float:
+        """Normalised opening (0.0 = closed, 1.0 = open) → raw motor rad."""
+        return self._gripper_close + opening * (
+            self._gripper_open - self._gripper_close
+        )
+
+    def _gripper_from_raw(self, raw: float) -> float:
+        """Raw motor rad → normalised opening (0.0 = closed, 1.0 = open)."""
+        return (raw - self._gripper_close) / (self._gripper_open - self._gripper_close)
+
+    async def _seek_gripper_stop(self, direction: int) -> float:
+        """Step the gripper in ``direction`` (±1) until it stalls on a hard stop.
+
+        Each step nudges the impedance target ``_GRIPPER_CALIB_STEP`` further
+        and reads the motor torque; the stop is reached once the torque
+        pushing *along* the sweep exceeds ``_GRIPPER_TORQUE_THRESHOLD``. The
+        signed test matters for the second sweep of a calibration, which
+        starts pressed against the stop the first one found: that torque
+        points the other way and must not end the sweep early.
+
+        Returns:
+            The measured shaft position at the stop (raw motor rad).
+
+        Raises:
+            MotorError: If torque builds up *against* the sweep (the motor
+                reports pushing opposite to its commanded motion — stalled on
+                the stop it should be leaving, or an inverted torque sign),
+                or no stop is met within ``_GRIPPER_CALIB_MAX_SWEEP``.
         """
         motor = self.motors[Joint.GRIPPER]
-        gripper_i = self._gripper_i
-
+        side = "left" if self._is_left else "right"
         target = await motor.get_position()
 
         for _ in range(_GRIPPER_CALIB_MAX_STEPS):
-            target -= _GRIPPER_CALIB_STEP
+            target += direction * _GRIPPER_CALIB_STEP
             await motor.set_impedance(
                 target, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
             )
             await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
             torque = await motor.get_torque()
-            if abs(torque) >= _GRIPPER_TORQUE_THRESHOLD:
-                break
+            along = torque * direction
+            if along >= _GRIPPER_TORQUE_THRESHOLD:
+                return await motor.get_position()
+            if along <= -_GRIPPER_CALIB_TORQUE_ABORT:
+                await self._unload_gripper_target()
+                raise MotorError(
+                    f"{side} gripper calibration: torque {torque:+.2f} Nm builds "
+                    f"up against the sweep (direction {direction:+d}) — the motor "
+                    f"reports pushing opposite to its commanded motion, so it is "
+                    f"stalled on the stop the sweep should be leaving (or its "
+                    f"torque sign is inverted); the jaw must be free to move"
+                )
 
-        open_pos = await motor.get_position()
-        self._limits_lo[gripper_i] = open_pos
-        self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
-        _save_gripper_calibration(self._is_left, open_pos)
+        await self._unload_gripper_target()
+        raise MotorError(
+            f"{side} gripper calibration: no hard stop met within "
+            f"{math.degrees(_GRIPPER_CALIB_MAX_SWEEP):.0f}° sweeping in direction "
+            f"{direction:+d} — is the gripper attached and the jaw free to move?"
+        )
+
+    async def _unload_gripper_target(self) -> None:
+        """Re-target the calibration impedance hold at the shaft's actual position.
+
+        Called before a failed sweep raises, so the motor is not left leaning
+        on whatever it stalled against with the wound-up target.
+        """
+        motor = self.motors[Joint.GRIPPER]
+        current = await motor.get_position()
+        await motor.set_impedance(
+            current, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
+        )
+
+    async def _calibrate_gripper(self) -> None:
+        """Measure both gripper hard stops and leave the jaw open.
+
+        Sweeps the jaw closed first (in the configured
+        ``ArmConfig.gripper.close_direction``) until it stalls on the closed
+        stop, then back the other way until it stalls on the open stop, so the
+        gripper finishes open. The stroke is whatever the two stops measure —
+        nothing about it is assumed. Adopts the pair for the [0, 1]
+        normalisation and raw clipping (see :meth:`_set_gripper_range`) and
+        persists it so a later reconnecting :meth:`enable` can restore it
+        without moving the gripper.
+
+        Must be called with the gripper motor already enabled and in IMPEDANCE mode.
+
+        Raises:
+            MotorError: If a stop is not found (see :meth:`_seek_gripper_stop`)
+                or the two stops are closer together than ``_GRIPPER_MIN_TRAVEL``.
+        """
+        close_direction = self._arm_config.gripper.close_direction
+        side = "left" if self._is_left else "right"
+
+        close_pos = await self._seek_gripper_stop(close_direction)
+        open_pos = await self._seek_gripper_stop(-close_direction)
+
+        travel = abs(open_pos - close_pos)
+        if travel < _GRIPPER_MIN_TRAVEL:
+            raise MotorError(
+                f"{side} gripper calibration: stops only {math.degrees(travel):.1f}° "
+                f"apart (closed {close_pos:.3f} rad, open {open_pos:.3f} rad) — "
+                f"the jaw is jammed or met an obstruction"
+            )
+        _logger.info(
+            "%s gripper calibrated: closed %.3f rad, open %.3f rad (stroke %.1f°)",
+            side,
+            close_pos,
+            open_pos,
+            math.degrees(travel),
+        )
+        self._set_gripper_range(open_pos, close_pos)
+        _save_gripper_calibration(self._is_left, open_pos, close_pos)
 
     async def enable(self, hold: bool = True) -> None:
         """Enable all arm motors in IMPEDANCE mode and the gripper in POSITION_FORCE mode.
@@ -871,10 +999,10 @@ class AxolArm:
         attached to with reads only — never reset, so they keep holding their
         pose — while the rest get the full bring-up (the mode switch reboots
         MyActuator motors, which is why it must never reach a holding joint).
-        A holding gripper keeps its grasp: its open-stop calibration is
+        A holding gripper keeps its grasp: its end-stop calibration is
         restored from the values persisted by the last full bring-up instead
-        of being re-measured (the calibration sweep would force the jaw
-        open). To force a fresh bring-up of a live robot, call
+        of being re-measured (the calibration sweep would close then open
+        the jaw). To force a fresh bring-up of a live robot, call
         :meth:`disable` first.
 
         With ``hold=True`` (the default) the arm finishes actively holding
@@ -980,32 +1108,36 @@ class AxolArm:
 
         The no-motion alternative to :meth:`_calibrate_gripper`, used when
         the idempotent :meth:`enable` finds the gripper already live and
-        holding: re-measuring the open stop would sweep the jaw open and
-        drop anything held.
+        holding: re-measuring the stops would sweep the jaw closed and open
+        and drop anything held.
 
         Raises:
-            MotorError: If no calibration was persisted, or it no longer
-                matches the encoder (motor re-zeroed or power-cycled).
+            MotorError: If no calibration was persisted, it disagrees with the
+                configured ``close_direction``, or it no longer matches the
+                encoder (motor re-zeroed or power-cycled).
         """
-        open_pos = _load_gripper_calibration(self._is_left)
+        side = "left" if self._is_left else "right"
+        open_pos, close_pos = _load_gripper_calibration(self._is_left)
+        close_direction = self._arm_config.gripper.close_direction
+        if (close_pos - open_pos) * close_direction <= 0:
+            raise MotorError(
+                f"Persisted {side} gripper calibration (open {open_pos:.2f} rad, "
+                f"closed {close_pos:.2f} rad) was measured with the opposite "
+                f"close_direction to the configured {close_direction:+d} — "
+                f"empty the gripper, then disable() and enable() to recalibrate"
+            )
+        lo = min(open_pos, close_pos)
+        hi = max(open_pos, close_pos)
         current = await self.motors[Joint.GRIPPER].get_position()
-        if not (
-            open_pos - _GRIPPER_CALIB_MARGIN
-            <= current
-            <= open_pos + GRIPPER_TRAVEL + _GRIPPER_CALIB_MARGIN
-        ):
-            side = "left" if self._is_left else "right"
+        if not (lo - _GRIPPER_CALIB_MARGIN <= current <= hi + _GRIPPER_CALIB_MARGIN):
             raise MotorError(
                 f"Persisted {side} gripper calibration does not match the "
                 f"motor: current position {current:.2f} rad is outside the "
-                f"calibrated range [{open_pos:.2f}, "
-                f"{open_pos + GRIPPER_TRAVEL:.2f}] rad (motor re-zeroed or "
+                f"calibrated range [{lo:.2f}, {hi:.2f}] rad (motor re-zeroed or "
                 f"power-cycled?) — empty the gripper, then disable() and "
                 f"enable() to recalibrate"
             )
-        gripper_i = self._gripper_i
-        self._limits_lo[gripper_i] = open_pos
-        self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
+        self._set_gripper_range(open_pos, close_pos)
 
     async def disable(self) -> None:
         """Disable all motors and engage brakes."""
@@ -1055,9 +1187,7 @@ class AxolArm:
         )
         gripper_i = self._gripper_i
         if self._has_gripper:
-            values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
-                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-            )
+            values[gripper_i] = self._gripper_from_raw(values[gripper_i])
         arr = np.array(values, dtype=np.float32)
         return arr + self._joint_offsets.astype(np.float32)
 
@@ -1202,9 +1332,7 @@ class AxolArm:
         positions = positions.copy()
         gripper_i = self._gripper_i
         if self._has_gripper:
-            positions[gripper_i] = self._limits_hi[gripper_i] + positions[gripper_i] * (
-                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-            )
+            positions[gripper_i] = self._gripper_to_raw(float(positions[gripper_i]))
         else:
             positions[gripper_i] = 0.0
         clipped = np.clip(positions, self._limits_lo, self._limits_hi)
@@ -1285,9 +1413,7 @@ class AxolArm:
 
         gripper_i = self._gripper_i
         if self._has_gripper:
-            q[gripper_i] = self._limits_hi[gripper_i] + q[gripper_i] * (
-                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-            )
+            q[gripper_i] = self._gripper_to_raw(float(q[gripper_i]))
         else:
             q[gripper_i] = 0.0
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
@@ -1563,9 +1689,7 @@ class AxolArm:
             else:
                 gripper_pos = float(np.clip(gripper_target, 0.0, 1.0))
                 torque = self._arm_config.gripper.torque_limit
-            gripper_pos_raw = self._limits_hi[gripper_i] + gripper_pos * (
-                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-            )
+            gripper_pos_raw = self._gripper_to_raw(gripper_pos)
             gripper_cmd = (
                 gripper_pos_raw,
                 self._arm_config.gripper.max_speed,

@@ -38,10 +38,14 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 | `useAxolPoseSocket` | Hook — maintains a dedicated pose WebSocket to `wss://localhost:<port>` (the Quest-over-USB `adb reverse` tunnel) so controller poses avoid WiFi latency; returns `{ poseWsRef, status }` |
 | `useAxolVideo` | Hook — negotiates a WebRTC connection over the same WebSocket and returns the camera video tracks streamed by the server (overhead / wrist cams), labelled by camera name |
 | `useAxolTracking` | Hook — returns a frame-readable `ref` reflecting whether the robot is currently engaged (mirroring the operator), driven by the server's `{"type":"tracking"}` pushes with a local grip-toggle fallback. Used to gate camera-screen repositioning to when the robot isn't being controlled |
+| `useAxolJoints` | Hook — frame-readable `ref` of the server's ~20 Hz `{"type":"joints"}` pushes (URDF joint angles, grips, engaged flag, gripper-pair `aligned`/`width`); drives the **Ghost** overlay and the *(aligned)* cue |
+| `useAxolSettings` | Hook — mirrors the server's **live session settings** (`{"type":"settings"}`: a schema plus current values) as React state and returns `setSetting(key, value)` / `step(def, ±1)`, which send `{"type":"set"}` on the socket. `nextSettingValue` / `formatSettingValue` are the generic stepper helpers both UIs share |
 | `AxolState` | Enum — `Teleop`, `DataCollection`, `Recording`, `Saving`, `Error` |
 | `AxolConnectionStatus` | Enum — `Idle`, `Connecting`, `Open`, `Error`, `Failed` |
 | `AxolPoseData` | Type — shape of each frame sent over the WebSocket |
 | `AxolMode` | Type — `"teleop" \| "data_collection"`, the server-announced operating mode that locks the HUD |
+| `AxolSettings` / `AxolSettingDef` | Types — the live-settings snapshot (`{ schema, values }`) and one schema entry (`key, label, type: "boolean" \| "select" \| "number", help, options, min, max, step, unit`) |
+| `AxolJointState` | Type — one `joints` push (`q`, `l_grip`, `r_grip`, `engaged`, `pair`) |
 | `ConfirmAction` | Type — `"save" \| "discard"`, which episode action a stop-recording confirmation popup is gating |
 | `CameraStreams` | Type — `Record<string, MediaStream>`, the camera-name → stream map returned by `useAxolVideo` |
 
@@ -56,6 +60,7 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 | `onPendingConfirm` | `(action: ConfirmAction \| null) => void` | Fires with `"save"` / `"discard"` when the stop-recording confirmation popup is armed, and `null` when it's confirmed or cancelled |
 | `onMode` | `(mode: AxolMode) => void` | Fires once per connection with the server-announced operating mode (`"teleop"` / `"data_collection"`) that locks the HUD |
 | `onEpisode` | `(episode: number \| null) => void` | Fires with the current 1-based episode number during data collection (and `null` when the server clears it, e.g. on a connection change); drives the `Episode N` HUD readout |
+| `onBothStickClick` | `() => void` | Fires on the rising edge of both thumbsticks clicked together (the two presses within 350 ms of each other), debounced to once per 600 ms — the controller shortcut for toggling box mode (the app sends `set box_mode "toggle"` via `useAxolSettings`) |
 | `onExit` | `() => void` | Fires when the Y button exits the XR session |
 
 **`useAxolVRClient` params**
@@ -101,8 +106,9 @@ Each frame sends a JSON message over the WebSocket:
   l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — Jelly strafe (ignored without Jelly)
   l_stick_y: number  // left thumbstick y, [-1, 1], pushed forward = -1 — Jelly drive
   r_stick_x: number  // right thumbstick x, [-1, 1], right = +1 — Jelly rotation
+  r_stick_y: number  // right thumbstick y, [-1, 1], pushed forward = -1 — box-mode jog only (Jelly ignores it)
   l_stick_click: boolean  // left thumbstick pressed in — lift down while held
-  r_stick_click: boolean  // right thumbstick pressed in — lift up while held
+  r_stick_click: boolean  // right thumbstick pressed in — lift up while held (both together: box-mode toggle, sent as a `set` message)
   seq:     number    // monotonic frame counter; the same frame is sent over both USB and WiFi with one seq, and the server processes each seq once (from whichever link delivers it first)
 }
 ```
@@ -127,6 +133,35 @@ The operating mode (teleop vs. data collection) is **announced by the server on 
 | — | Right thumbstick (x) | Rotate Jelly |
 | — | Left thumbstick (click) | Lower the telescoping lift while held |
 | — | Right thumbstick (click) | Raise the telescoping lift while held |
+| — | Both thumbsticks (click together) | Toggle **box mode** (same as the HUD's **Box** button) |
+
+### Re-engaging
+
+Whenever an arm's grip re-engages after a pause — you froze it, walked away, or someone moved the arm by hand — the server has to reconcile where your controller is with where the arm is. The **Ramp** HUD toggle (or the **Re-engage** row of the session settings, below) picks one of two behaviours (the server owns it and echoes it back, like box mode; the control panel's **Re-engage** setting picks the startup default):
+
+| Ramp | Behaviour |
+|---|---|
+| **OFF** — *clutch* (default) | The arm stays put and your controller's current pose becomes its new origin: **you match the arm**. Nothing moves at the grip; motion from there on is relative. Use the **Ghost** overlay (below) or the passthrough view of the real arm to bring your hand to roughly the arm's pose first if you want the same reach/comfort you had before |
+| **ON** — *ramp* | The mapping from the arm's previous engage is kept as a session anchor and the arm **eases out to where your controller is now** under it — **the arm matches you** — then tracks 1:1. The move is paced (`reengage_ramp_speed`, at least `reengage_ramp_min_s`) and the target is live, so you can keep moving while it catches up. A reset / return to rest drops the anchor (the next grip snaps fresh); box mode ignores the toggle, since its engage already blends the pair into the parallel grasp |
+
+The **Ghost** HUD button overlays a translucent copy of the robot (from the server's URDF) that follows the real joint state (green while engaged, grey otherwise), anchored to the floor in front of you at the robot's shoulder height, so the arms' true pose is visible through the passthrough while you line up a clutch engage.
+
+### Box mode
+
+Box mode is for carrying something with both hands: the grippers clamp the box between their sides like two flat hands — fingers forward, the flat outer face of each closed gripper against the box — and **one grip drives both arms as a rigid pair**. Toggle it with the **Box** HUD button, by clicking **both thumbsticks together** (within ~0.35 s of each other — a stick already held as a jog modifier doesn't count; debounced so a quick double click toggles once), or from the control panel's session settings (or start sessions in it with the **Box mode at startup** setting in the control panel); the server owns the mode and echoes it back, so the HUD state is authoritative for every connected headset. The **Box** button reads **Box: OFF (aligned)** while the two grippers already point forward with a flat face toward each other across a box-sized gap (from the `pair` field of the `joints` push) — the moment switching costs no alignment blend. In box mode:
+
+| Button | Action |
+|---|---|
+| Either grip | Press once to **engage** — the arms first blend into the parallel pair (keeping the current midpoint and width), then the pressed controller **leads**: its motion moves the pair as one body. Press the *other* grip to hand over the lead to that controller; press the leading grip again to freeze. Press **X** to return to rest as usual |
+| Leader's trigger | Actuates **both** grippers together |
+| Leader's thumbstick | Jog the pair horizontally in the pair's own frame (forward = away from the chest, perpendicular to the gripper-to-gripper line; left/right along it). Hold the stick **clicked** to jog **up/down** (y) or **yaw** the pair about its centre (x) instead — dominant axis only |
+| Other thumbstick | Jog the pair **up/down** (y) or change the **width** between the grippers (x, push right = wider) — dominant axis only, so a width change never lifts the pair. Hold it **clicked** and push left/right to **tilt** the fingertips inward / outward instead (the **Box** button shows the tilt) |
+
+Jogging is additive to the controller's motion (both apply while engaged). The thumbsticks belong to the arms only *while a grip is leading*: press the leader's grip again to **freeze** the pair (the arms hold the box where it is) and the sticks drive Jelly with the normal mapping — so carrying is grab, freeze, drive, lead again to adjust. The hand-over waits until both sticks are released, so a jog in progress can't become base motion; squeeze the trigger before taking the lead back, since the grippers follow it. Leaving box mode (same gesture, or the **Box** button) disengages the arms; both grips together engage again as usual.
+
+### Session settings
+
+The HUD's **Settings** button opens a panel of **live session settings** — box mode, re-engage behaviour, hold-to-engage, grip force (hardware only), reach scale, arm speed, box jog speed — with `[-]` / `[+]` steppers. The same list appears as a **Session settings** card in the control panel next to the camera feeds. Both are rendered generically from the schema the server publishes (`{"type":"settings"}`) and change values with `{"type":"set","key","value"}` on the VR socket, so a change from either side shows up on both and the server's echo is the single source of truth (a rejected value never echoes). Adding a knob is one entry in `almond_axol/teleop/live.py`.
 
 ## State machine
 
@@ -217,8 +252,11 @@ class VRFrame(BaseModel):     # headset → server (every XR frame)
     l_stick_x: float = 0.0     # thumbstick + click fields drive the powered
     l_stick_y: float = 0.0     # Jelly (base + lift) when configured;
     r_stick_x: float = 0.0     # neutral defaults keep older web builds working
+    r_stick_y: float = 0.0
     l_stick_click: bool = False
     r_stick_click: bool = False
+    box_leader: Literal["left", "right"] | None = None  # server-internal (core → IK worker)
+    reengage: Literal["clutch", "ramp"] | None = None   # server-internal (core → IK worker)
 ```
 
 **Server → headset feedback**
@@ -234,6 +272,10 @@ Use `AxolVRTeleop.send_feedback_state(VRState.SAVING)` / `send_feedback_state(VR
 On connect the server announces its operating mode — `{ "type": "mode", "value": "teleop" | "data_collection" }` (via `VRServer.set_mode()`) — which locks the headset HUD to that mode. During data collection it also pushes the current episode number — `{ "type": "episode", "value": N }` (1-based) — via `AxolVRTeleop.send_feedback_episode(episode)`, rendered as an `Episode N` HUD readout; the latest value is stored (`VRServer.set_episode()`) and re-sent on connect so a headset joining mid-session shows the right number.
 
 The server also pushes `{ "type": "tracking", "value": true|false }` whenever the engage toggle changes; the headset uses it to only allow repositioning the camera screens while the robot isn't being controlled.
+
+**Live settings** ride the same socket in both directions. Any client sends `{ "type": "set", "key": "<key>", "value": <value> }` — a boolean key also takes `"value": "toggle"`, flipped server-side, which is what the both-sticks gesture sends — (handled by the callback from `VRServer.set_on_setting()`, i.e. `almond_axol.teleop.live.LiveSettings.apply`); the server validates it and answers every request — including no-ops and from every client's point of view — with `{ "type": "settings", "value": { "schema": [...], "values": { ... } } }`, also sent on connect (`set_announce("settings", ...)`). `schema` entries are `{ key, label, type: "boolean"|"select"|"number", help, options, min, max, step, unit }`; the headset's Settings panel and the control panel's Session settings card render from it. Keys: `box_mode`, `reengage`, `hold_to_engage`, `gripper_torque` (hardware only), `position_multiplier`, `teleop_max_vel` (rev/s), `box_jog_speed`.
+
+`{ "type": "joints", "value": { "q": { "<urdf joint name>": rad, ... }, "l_grip": 0..1, "r_grip": 0..1, "engaged": bool, "pair": { "aligned": bool, "width": m, "tilt": deg } | null } }` streams the commanded arm joint state at ~20 Hz (measured positions when the robot reports them); `useAxolJoints` collects it, the **Ghost** overlay poses a translucent copy of the URDF from it, and `pair.aligned` (the IK worker's check that the grippers already form the box-mode pair: fingers forward, a flat face toward each other across a box-sized gap) drives the **Box** button's *(aligned)* cue; `pair.tilt` (the pair's inward fingertip yaw, jogged in box mode) is its readout while the mode is on. The URDF and its meshes are served by the same VR server under `https://<host>:8000/urdf/` (`axol.urdf`, `meshes/*.stl`) so the overlay needs no second origin.
 
 The server additionally **relays a HUD message between clients**: the headset publishes its transient HUD state — the armed save/discard confirmation popup and the record-start countdown — as `{ "type": "hud", "value": { "confirm": "save" | "discard" | null, "countdownRemainingMs": number | null } }`, and the server stores it and forwards it to every *other* connected client (re-sent to late joiners), clearing it with a null broadcast when the publisher disconnects. The control panel subscribes to this on its camera-feed socket to mirror the in-headset popups, so a session can be watched from the dashboard with the headset off.
 

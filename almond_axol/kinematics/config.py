@@ -51,6 +51,21 @@ class KinematicsConfig:
             Cholesky then NaNs, every LM step is rejected, and ik() silently
             returns its seed on GPU while CPU LAPACK survives by rounding luck.
         limit_weight: Weight penalising joint-limit violations.
+        self_collision: Whether the arm<->torso (``base`` / ``s1``) collision
+            model is part of the solve. ``True`` (the default) builds the
+            capsule model, adds the soft self-collision cost to the IK graph
+            and runs the hard upper-arm/base guard on every final step, so a
+            pose target cannot drive an arm into the torso; the
+            return-to-rest planner is collision-aware too. Plain teleop
+            rarely needs it — an operator's own arms keep the targets
+            physically plausible — but box mode hands the solver gripper
+            poses no human makes (parallel, fingers forward, closing on each
+            other), where the elbow's free swivel otherwise folds into the
+            base. ``False`` turns base collision detection off completely: no
+            capsule model, no cost, no guard, and the reset planner
+            interpolates in joint space with joint limits only. Joint limits
+            are clamped on every step either way. The two fields below tune
+            the collision-aware solve.
         self_collision_margin: Minimum clearance (m) enforced between collision
             bodies. Keep this below the arm-torso clearance of normal teleop
             poses: a margin that is already violated at the folded rest pose
@@ -160,6 +175,7 @@ class KinematicsConfig:
     posture_weight: float = 5.0
     manipulability_weight: float = 0.05
     limit_weight: float = 75.0
+    self_collision: bool = True
     self_collision_margin: float = 0.025
     self_collision_weight: float = 150.0
     max_iterations: int = 8

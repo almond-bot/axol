@@ -7,6 +7,15 @@ import type { AxolMode, ConfirmAction } from "./types"
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
 
+// Minimum gap between two firings of the both-sticks-clicked gesture (ms).
+// Longer than a reflexive double click, shorter than a deliberate repeat.
+const BOTH_CLICK_DEBOUNCE_MS = 600
+// The two stick presses must land within this window of each other to count
+// as "clicked together". In box mode each stick's click is also a jog
+// modifier (leader: up / yaw, other: tilt), so a stick that has been held
+// for a while when the other one is pressed is a modifier, not the gesture.
+const BOTH_CLICK_TOGETHER_MS = 350
+
 // Pose sinks (WebSocket and RTCDataChannel) both expose `.send(string)`; this is
 // the minimal shape AxolVRClient needs to ship a frame.
 type PoseSink = { send: (data: string) => void }
@@ -39,6 +48,7 @@ export function AxolVRClient({
   onPendingConfirm,
   onMode,
   onEpisode,
+  onBothStickClick,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
@@ -61,6 +71,10 @@ export function AxolVRClient({
   // Called with the current 1-based episode number while collecting data (and
   // null if the server ever clears it). Drives the in-headset episode readout.
   onEpisode?: (episode: number | null) => void
+  // Rising edge of both thumbsticks clicked together — the controller
+  // shortcut for toggling box mode (the app sends the `set` message, see
+  // useAxolSettings). Only fires while presenting with both controllers.
+  onBothStickClick?: () => void
   onExit?: () => void
 }) {
   const { gl } = useThree()
@@ -87,6 +101,19 @@ export function AxolVRClient({
   // the "unset" sentinel (distinct from a real episode value or an explicit
   // null the server could send); replaced with the parsed value on each push.
   const serverEpisodeRef = useRef<number | null | -1>(-1)
+  // Box-mode gesture state: each stick's click on the previous frame and when
+  // it was last pressed (to require the two presses to land together, see
+  // BOTH_CLICK_TOGETHER_MS), both clicked on the previous frame (edge
+  // detection), and when the gesture last fired: a second rising edge inside
+  // BOTH_CLICK_DEBOUNCE_MS — a "double click", or one stick's contact
+  // bouncing while the other is held — is ignored so the mode can't toggle
+  // twice and land where it started.
+  const prevLClickRef = useRef(false)
+  const prevRClickRef = useRef(false)
+  const lClickAtRef = useRef(0)
+  const rClickAtRef = useRef(0)
+  const prevBothClickRef = useRef(false)
+  const lastBothClickAtRef = useRef(0)
   // Track which WebSocket we have attached onmessage to avoid re-attaching.
   const wsWithHandlerRef = useRef<WebSocket | null>(null)
   // Change key of the last HUD state published to the server (see below).
@@ -114,7 +141,7 @@ export function AxolVRClient({
           try {
             const msg = JSON.parse(event.data as string) as {
               type: string
-              value: string | number | null
+              value: string | number | boolean | null
             }
             if (msg.type === "state") {
               serverStateRef.current = msg.value as AxolState
@@ -126,6 +153,12 @@ export function AxolVRClient({
           } catch {
             // ignore malformed messages
           }
+        }
+        // The server's connect-time `mode` / `episode` announces may have
+        // arrived before this handler existed (this component mounts a render
+        // after the socket opens): ask for them again.
+        if (currentWs.readyState === WebSocket.OPEN) {
+          currentWs.send(JSON.stringify({ type: "get" }))
         }
       }
     }
@@ -397,14 +430,34 @@ export function AxolVRClient({
     const l_lock = (leftSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
     const r_lock = (rightSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
 
-    // Thumbstick state for the Jelly (xr-standard mapping: stick axes
-    // at axes[2]/[3], stick click at buttons[3]). Servers without Jelly
-    // configured simply ignore these fields.
+    // Thumbstick state for the Jelly and the box-mode jog (xr-standard
+    // mapping: stick axes at axes[2]/[3], stick click at buttons[3]). Servers
+    // without Jelly configured simply ignore these fields.
     const l_stick_x = leftSource?.gamepad?.axes[2] ?? 0
     const l_stick_y = leftSource?.gamepad?.axes[3] ?? 0
     const r_stick_x = rightSource?.gamepad?.axes[2] ?? 0
+    const r_stick_y = rightSource?.gamepad?.axes[3] ?? 0
     const l_stick_click = leftSource?.gamepad?.buttons[3]?.pressed ?? false
     const r_stick_click = rightSource?.gamepad?.buttons[3]?.pressed ?? false
+
+    // Both sticks clicked together: box-mode toggle gesture. Fires on the
+    // rising edge of "both down" when the two presses landed within
+    // BOTH_CLICK_TOGETHER_MS of each other (a stick already held as a jog
+    // modifier doesn't count), debounced by BOTH_CLICK_DEBOUNCE_MS.
+    const now = performance.now()
+    if (l_stick_click && !prevLClickRef.current) lClickAtRef.current = now
+    if (r_stick_click && !prevRClickRef.current) rClickAtRef.current = now
+    prevLClickRef.current = l_stick_click
+    prevRClickRef.current = r_stick_click
+    const bothClick = l_stick_click && r_stick_click
+    if (bothClick && !prevBothClickRef.current) {
+      const together = Math.abs(lClickAtRef.current - rClickAtRef.current) <= BOTH_CLICK_TOGETHER_MS
+      if (together && now - lastBothClickAtRef.current >= BOTH_CLICK_DEBOUNCE_MS) {
+        lastBothClickAtRef.current = now
+        onBothStickClick?.()
+      }
+    }
+    prevBothClickRef.current = bothClick
 
     // Serialise once so both transports carry the identical frame (same seq),
     // letting the server treat them as one stream and de-dupe to whichever
@@ -427,6 +480,7 @@ export function AxolVRClient({
       l_stick_x,
       l_stick_y,
       r_stick_x,
+      r_stick_y,
       l_stick_click,
       r_stick_click,
       seq: ++seqRef.current,

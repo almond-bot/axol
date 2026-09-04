@@ -50,7 +50,10 @@ async with VRServer() as vr:
 | `seq` | `int \| None` | Monotonic frame counter set by the headset. The same `seq` arrives over both the USB and network transports; the server processes each logical frame once, via whichever transport delivers it first. `None` disables cross-transport de-duplication |
 | `l_stick_x` / `l_stick_y` | `float [-1, 1]` | Left thumbstick axes (right = +1; pushed forward = -1). Drive [Jelly](/guides/vr-interface#jelly)'s translation when one is configured |
 | `r_stick_x` | `float [-1, 1]` | Right thumbstick x (right = +1). Drives Jelly's rotation |
-| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press-in — left lowers Jelly's lift, right raises it. Neutral defaults keep older web builds (which omit these fields) compatible |
+| `r_stick_y` | `float [-1, 1]` | Right thumbstick y (pushed forward = -1). Only read in [box mode](/guides/vr-interface#box-mode) (jogging); Jelly ignores it |
+| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press-in — left lowers Jelly's lift, right raises it; while a box-mode leader is engaged a click is a jog modifier instead (leader: up/yaw, other: fingertip tilt); with the pair frozen the sticks drive Jelly as usual. Both pressed together (within ~0.35 s) toggle [box mode](/guides/vr-interface#box-mode) (the headset sends the `set` message below). Neutral defaults keep older web builds (which omit these fields) compatible |
+| `box_leader` | `"left" \| "right" \| None` | Set by `VRTeleopCore` on the frame it forwards to the IK worker, not by the headset: which controller currently leads the pair in box mode |
+| `reengage` | `"clutch" \| "ramp" \| None` | Set by `VRTeleopCore` on the frame it forwards to the IK worker, not by the headset: the session's effective [re-engage behaviour](/guides/vr-interface#re-engaging). Session modes are switched out of band with the `set` message, not through frames |
 
 ### Pose transports & USB/Wi-Fi fallback
 
@@ -67,6 +70,28 @@ On connect the server also announces its **operating mode** — `{"type": "mode"
 During data collection the server likewise pushes the current **episode number** — `{"type": "episode", "value": N}` (1-based) — which the headset renders as an `Episode N` HUD readout. [`axol collect-data`](/cli/collect-data) announces it at the start of each episode via `AxolVRTeleop.send_feedback_episode(episode)`, which both stores the value on the server (`VRServer.set_episode()`, re-sent on connect so a mid-session headset shows the right number) and broadcasts a live update to connected clients. Plain teleop never sets it, so the readout stays hidden.
 
 Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whenever the engage toggle changes, so the headset knows when the robot is being controlled — it uses this to only allow repositioning and resizing the camera screens (a trigger gesture) while tracking is disengaged.
+
+Teleop also streams the **arm joint state** at ~20 Hz — `{"type": "joints", "value": {"q": {"<urdf joint>": rad, ...}, "l_grip": 0..1, "r_grip": 0..1, "engaged": bool, "pair": {"aligned": bool, "width": m, "tilt": deg} | null}}` (measured positions when the robot reports them, else the commanded targets) — for the headset's **Ghost** overlay, a translucent copy of the robot posed from the live joints. `pair` is the gripper-pair geometry the IK worker reports a few times a second (`IKWorker.pair_status()`): `aligned` is true when the two grippers already form the box-mode pair — fingers forward, a flat face toward each other across a box-mode-sized gap — the HUD's **Box** button shows *(aligned)* then, since switching to [box mode](/guides/vr-interface#box-mode) from that pose costs no alignment blend; `tilt` is the pair's inward fingertip yaw in degrees (jogged live in box mode), shown on the same button while the mode is on. The URDF and its meshes are served from the same origin under `/urdf/` (`axol.urdf`, `meshes/*.stl`).
+
+### Live session settings
+
+The knobs an operator can turn *mid-session* — box mode, re-engage behaviour, hold-to-engage, grip force, reach scale, arm speed, jog speed — are exposed as **live settings** (`almond_axol.teleop.live.LiveSettings`) on the same socket, from any client (headset HUD, control panel, SDK):
+
+- **client → server** `{"type": "set", "key": "<key>", "value": <value>}` — handled by the callback installed with `VRServer.set_on_setting()`. Values are validated (type, range, choices); a rejected request is logged and simply not echoed. A boolean key also accepts `"value": "toggle"`, flipped against the server's current value — what the headset's both-sticks gesture sends, so a gesture repeated before the echo lands can't re-send a stale state.
+- **client → server** `{"type": "get"}` — re-sends that client the connect-time announces (`mode`, every `set_announce` entry such as `settings`, `episode`, `hud`). The web client sends it once its message listeners are installed, since those come up a render after the socket opens and the connect-time copy can land before anyone is listening (a headset that missed `settings` would hide every live control, box mode included).
+- **server → clients** `{"type": "settings", "value": {"schema": [...], "values": {"<key>": ...}}}` — sent on connect (`set_announce("settings", ...)`), on `get`, and after *every* `set`, including no-ops, so all clients converge on the server's state. `schema` is a list of `{key, label, type: "boolean"|"select"|"number", help, options, min, max, step, unit}` entries; both UIs render their controls from it, so a new knob is one entry in `LIVE_SETTINGS`.
+
+| Key | Type | Applies |
+|-----|------|---------|
+| `box_mode` | boolean | `VRTeleopCore.set_box_mode()` — switching disengages the arms first |
+| `reengage` | `"clutch"` / `"ramp"` | `VRTeleopCore.set_reengage()` — next grip edge |
+| `hold_to_engage` | boolean | grips as dead-man switches vs. toggles |
+| `gripper_torque` | number, Nm | both grippers' `torque_limit` (read on every gripper command). Hardware only — hidden in sim |
+| `position_multiplier` | number, × | hand-motion scale (forwarded to the IK worker) |
+| `teleop_max_vel` | number, rev/s | joint velocity cap while tracking |
+| `box_jog_speed` | number, m/s | box-mode thumbstick jog speed (forwarded to the IK worker) |
+
+Core-side settings are queued (`VRTeleopCore.set_live()`) and applied on the IK thread before the next frame — or while idle, so the panel can change them with no headset connected; IK-worker fields are mirrored to the worker subprocess as `("set", key, value)` messages.
 
 The server also **relays HUD state between clients**. The driving client (the headset) publishes its transient HUD — an armed save/discard confirmation popup and the record-start countdown — as `{"type": "hud", "value": {...}}`; the server stores the latest value, forwards it to every *other* connected client, re-sends it to one that joins mid-dialog, and clears it with a null broadcast when the publisher disconnects. The web control panel uses this to mirror the in-headset popups so a session can be followed from the dashboard.
 

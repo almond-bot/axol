@@ -40,8 +40,9 @@ from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from ..constants import URDF_PATH
 from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
 from ..utils.ports import open_listen_socket
 from .config import VRServerConfig
@@ -75,6 +76,7 @@ class VRServer:
         """
         self._port = config.port
         self._on_frame: Callable[[VRFrame], None] | None = None
+        self._on_setting: Callable[[str, Any], None] | None = None
         self._certfile = config.certfile or CERTFILE
         self._keyfile = config.keyfile or KEYFILE
 
@@ -100,6 +102,11 @@ class VRServer:
         # cleared — with a null broadcast — when the publisher disconnects.
         self._hud: dict[str, Any] | None = None
         self._hud_client: int | None = None
+
+        # Extra server-state messages announced to each client on connect
+        # (``{"type": key, "value": value}``), e.g. the live ``settings``; see
+        # :meth:`set_announce`. Live changes are broadcast separately.
+        self._announce: dict[str, Any] = {}
 
         # The headset streams identical frames (same ``seq``) over both the USB
         # tunnel and the network (WebRTC data channel / WebSocket). We process
@@ -209,6 +216,36 @@ class VRServer:
         call before :meth:`enable`.
         """
         self._mode = mode
+
+    def set_announce(self, msg_type: str, value: Any) -> None:
+        """Record a server-state message re-sent to every client on connect.
+
+        ``{"type": msg_type, "value": value}`` is pushed to each client in
+        the WebSocket accept handler (after ``mode``) and whenever the client
+        asks with ``{"type": "get"}`` (see :meth:`_send_announces`), so a
+        headset joining mid-session adopts the current state — e.g.
+        ``settings`` — instead of its own default. Live changes are pushed
+        separately via :meth:`broadcast_text`. Safe from any thread; ``None``
+        removes it.
+        """
+        if value is None:
+            self._announce.pop(msg_type, None)
+        else:
+            self._announce[msg_type] = value
+
+    def set_on_setting(self, callback: Callable[[str, Any], None] | None) -> None:
+        """Install the handler for ``{"type": "set", "key": k, "value": v}``.
+
+        Any client — the headset HUD, the control panel — may send one to
+        change a live session setting (box mode, re-engage behaviour, gripper
+        force, …; see :class:`~almond_axol.teleop.live.LiveSettings`). The
+        callback runs on the server's event-loop thread and must be quick and
+        thread-safe toward the control loops; it is expected to publish the
+        resulting state back with :meth:`set_announce` + :meth:`broadcast_text`
+        so every client (including the sender) converges on the server's
+        value. Safe to call after construction.
+        """
+        self._on_setting = callback
 
     def set_episode(self, episode: int | None) -> None:
         """Record the current episode number announced to headsets on connect.
@@ -532,11 +569,47 @@ class VRServer:
         if self._ingest_frame_obj(obj):
             self._pose_last[client_id] = time.monotonic()
 
+    async def _send_announces(self, websocket: WebSocket) -> None:
+        """Send one client the server-state messages it needs to render.
+
+        Sent on connect and again on request (``{"type": "get"}``): the
+        operating mode (so the UI can lock its HUD, teleop vs data
+        collection), every :meth:`set_announce` entry (the live ``settings``),
+        the current episode number (so a headset joining mid-session shows
+        the right value immediately, not on the next episode) and any live
+        headset HUD state (armed popup / countdown) so a dashboard joining
+        mid-dialog mirrors it. A client asks again because its message
+        handlers are installed a render after the socket opens, so the
+        connect-time copy can arrive before anyone is listening. Best-effort:
+        a send failure never blocks the receive loop.
+        """
+        msgs: list[dict[str, Any]] = []
+        if self._mode is not None:
+            msgs.append({"type": "mode", "value": self._mode})
+        msgs.extend(
+            {"type": key, "value": value} for key, value in list(self._announce.items())
+        )
+        if self._episode is not None:
+            msgs.append({"type": "episode", "value": self._episode})
+        if self._hud is not None:
+            msgs.append({"type": "hud", "value": self._hud})
+        for msg in msgs:
+            try:
+                await websocket.send_text(json.dumps(msg))
+            except Exception as exc:  # noqa: BLE001 - best-effort announce
+                _logger.warning("failed to send %s to client: %s", msg["type"], exc)
+
     async def _handle_signaling(
         self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
     ) -> None:
         """Handle a WebRTC signaling message from the headset."""
         msg_type = obj.get("type")
+
+        # A client's handlers came up after the connect-time announces: send
+        # them again (see _send_announces).
+        if msg_type == "get":
+            await self._send_announces(websocket)
+            return
 
         # Control data channel (pose transport): negotiated independently of the
         # cameras, so it's handled before the video-availability check below and
@@ -567,6 +640,21 @@ class VRServer:
             self._hud = value if isinstance(value, dict) else None
             self._hud_client = client_id
             await self._broadcast_hud(exclude=websocket)
+            return
+
+        # Live session setting from any client (see set_on_setting). The
+        # handler publishes the resulting state itself; a rejected value is
+        # logged and the clients keep the last announced one.
+        if msg_type == "set":
+            key = obj.get("key")
+            if self._on_setting is None or not isinstance(key, str):
+                return
+            try:
+                self._on_setting(key, obj.get("value"))
+            except Exception as exc:  # noqa: BLE001 - one bad request, not the loop
+                _logger.warning(
+                    "Rejected setting %s=%r: %s", key, obj.get("value"), exc
+                )
             return
 
         if self._webrtc is None:
@@ -689,6 +777,26 @@ class VRServer:
             """Self-closing page the web UI opens to approve the self-signed cert."""
             return HTMLResponse(ACCEPT_PAGE_HTML)
 
+        @app.get("/urdf/{asset_path:path}", response_model=None)
+        async def _urdf_asset(asset_path: str) -> FileResponse | JSONResponse:
+            """Serve the robot URDF + STL meshes for the headset's ghost overlay.
+
+            Same files ``axol serve`` exposes at ``/api/urdf``, but from this
+            host/port: the headset only knows the teleop server's origin (and
+            has already accepted its certificate), and ``axol serve`` may not
+            be running.
+            """
+            base = URDF_PATH.parent.resolve()
+            target = (base / asset_path).resolve()
+            if not target.is_relative_to(base) or not target.is_file():
+                return JSONResponse({"error": "not found"}, status_code=404)
+            media = "model/stl" if target.suffix == ".stl" else "application/xml"
+            return FileResponse(
+                target,
+                media_type=media,
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
         @app.websocket("/ws")
         async def _ws(websocket: WebSocket) -> None:
             await websocket.accept()
@@ -696,36 +804,7 @@ class VRServer:
             server._client_count += 1
             server._active_clients.add(websocket)
             client_id = id(websocket)
-            # Announce the operating mode so the UI can lock its HUD (teleop vs
-            # data collection). Sent per client on connect since a client may
-            # join after set_mode(); best-effort so a send failure never blocks
-            # the receive loop below.
-            if server._mode is not None:
-                try:
-                    await websocket.send_text(
-                        json.dumps({"type": "mode", "value": server._mode})
-                    )
-                except Exception as exc:  # noqa: BLE001 - best-effort announce
-                    _logger.warning("failed to send mode to client: %s", exc)
-            # Likewise seed the current episode number so a headset joining
-            # mid-session shows the right value immediately, not on the next
-            # episode. Best-effort for the same reason as the mode announce.
-            if server._episode is not None:
-                try:
-                    await websocket.send_text(
-                        json.dumps({"type": "episode", "value": server._episode})
-                    )
-                except Exception as exc:  # noqa: BLE001 - best-effort announce
-                    _logger.warning("failed to send episode to client: %s", exc)
-            # And any live headset HUD state (armed popup / countdown), so a
-            # dashboard joining mid-dialog mirrors it immediately.
-            if server._hud is not None:
-                try:
-                    await websocket.send_text(
-                        json.dumps({"type": "hud", "value": server._hud})
-                    )
-                except Exception as exc:  # noqa: BLE001 - best-effort announce
-                    _logger.warning("failed to send hud to client: %s", exc)
+            await server._send_announces(websocket)
             try:
                 while True:
                     data = await websocket.receive_text()
