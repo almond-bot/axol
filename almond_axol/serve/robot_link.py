@@ -144,7 +144,9 @@ def scoped_motor_faults(
     (ignored in guided zeroing, which walks ``joints`` instead). A bench setup
     with only some motors on the bus can then run a scoped test without the
     absent motors' "unreachable" faults blocking the launch — while faults on
-    the motors the run *does* drive still block it.
+    the motors the run *does* drive still block it. Callers whose ``joints``
+    does not mean bus presence (the ROM soak: the realtime core brings up the
+    whole arm and ``--joints`` only selects what moves) drop that key first.
     """
     arm = str(args.get("arm") or "").strip().lower()
     if arm in ("left", "right"):

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "almond-axol"
-version = "0.1.35"
+version = "0.1.36"
 description = "Almond Axol SDK"
 license = { text = "MIT" }
 readme = "README.md"
@@ -18,7 +18,11 @@ dependencies = [
     "fastapi>=0.135.2",
     "jax>=0.9.2",
     "jaxlie>=1.5.0",
-    "mujoco>=3.8.0",
+    # 3.10 changed the mj_fullM signature and 3.11 removed mjData.qM, both
+    # used by robot/gravity.py. The bound is what protects `uv tool install` /
+    # `pip install` (they re-resolve rather than read uv.lock); bump it together
+    # with the code and the lock.
+    "mujoco>=3.8.0,<3.10",
     "pydantic>=2.12.5",
     # Our PyPI-published fork of pyroki (github.com/almond-bot-research/pyroki,
     # `almond` branch), which installs the `pyroki` import name. Upstream has no

@@ -5,16 +5,20 @@ description: "Range-of-motion soak test: sweep every joint for two hours."
 
 Enables the motors, eases to home, then loops a full range-of-motion sweep of every joint for two hours. On a full-robot run it first prompts to clamp each gripper onto an item and holds it for the duration; when the soak finishes (or on Ctrl-C) the robot returns home with the item still gripped and the motors left enabled — run [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable) afterwards to release it and power down.
 
+The arms are driven through the Rust realtime core — the same control path as [`teleop`](/cli/teleop) — so the soak exercises exactly the controller the robot ships with: the core owns the CAN buses, renders the streamed sweep at 240 Hz, and runs the host damping against fresh feedback.
+
 Joint positions and torques are captured to a CSV under `~/.almond/diagnostics/captures` at 5 Hz so the run can be charted in the [diagnostics dashboard](https://docs.almond.bot/guides/diagnostics-dashboard)'s run history.
 
 ```bash
 axol diag.rom-enable
 axol diag.rom-enable --no-right                          # left arm only
-axol diag.rom-enable --joints wrist_1,wrist_2,wrist_3    # subset of joints
+axol diag.rom-enable --joints wrist_1,wrist_2,wrist_3    # sweep only these joints
 axol diag.rom-enable --web-prompts                       # dashboard-driven prompts
 axol diag.rom-enable --no-capture                        # skip the telemetry CSV
 axol diag.rom-enable --no-right --left-channel can0      # one arm on a non-hub CAN adapter
 ```
+
+`--joints` selects which joints are *swept*; every other joint holds home. The whole arm is still brought up and held (the realtime core enables every motor on the bus, so a partially populated bench arm cannot run this test), and a subset run skips the grasp step — if the gripper is among the selected joints it is cycled open↔close holding nothing.
 
 `--left-channel` / `--right-channel` override the SocketCAN interface used for each arm (default: the Axol hub adapter's `can_alm_axol_l` / `can_alm_axol_r`) — for setups where the Axol hub CAN adapter isn't attached. With a single-channel adapter, combine a channel override with `--no-left` / `--no-right` to run one arm.
 

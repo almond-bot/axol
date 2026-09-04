@@ -80,6 +80,19 @@ _SNAP_HEADER_BYTES = 64
 _SNAP_SLOT_META_DTYPE = np.dtype([("seq", "<u8"), ("generation", "<u8")])
 
 
+# How long the 120 Hz control thread may wait for the recorder to let go of the
+# snapshot lock before it skips that tick's sample. The recorder holds the lock
+# only for three bulk copies (~50 us), but it is a CFS thread on the loaded
+# background cores and can be descheduled mid-hold — a preemption there must
+# cost one control sample (the reader picks the nearest neighbour, 8 ms away),
+# never the session. Measured 2026-09-02: a 50 ms hold ended a 39-episode
+# collect-data run mid-take.
+_SNAP_LOCK_WAIT_S = 0.002
+# SemLock is not owner-death robust: a recorder SIGKILLed while reading leaves
+# the lock taken forever. Only a hold this long is treated as abandoned.
+_SNAP_LOCK_ABANDONED_S = 1.0
+
+
 def _snapshot_block_size(width: int, capacity: int = _SNAP_RING_CAPACITY) -> int:
     return (
         _SNAP_HEADER_BYTES
@@ -931,23 +944,53 @@ class SnapshotWriter:
         self._header["width"][0] = self._width
         self._slot_meta.fill(0)
         self._next_generation = 1
+        # Start of the current run of lock misses (perf_counter) and its length.
+        self._miss_since: float | None = None
+        self._misses = 0
+        self.skipped = 0
 
     def write(
         self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
-    ) -> None:
-        """Pack and commit one snapshot under the shared memory-ordering lock."""
-        # SemLock is not owner-death robust. If the recorder is SIGKILLed while
-        # reading, never let the 120 Hz robot-control thread block forever on
-        # its abandoned lock; surface a fatal recorder failure instead.
-        if not self._lock.acquire(timeout=0.050):
-            raise RuntimeError(
-                "recorder snapshot lock was not released within 50ms; "
-                "the recorder subprocess may have exited"
-            )
+    ) -> bool:
+        """Pack and commit one snapshot under the shared memory-ordering lock.
+
+        Returns ``False`` when the recorder still held the lock after
+        :data:`_SNAP_LOCK_WAIT_S` and this sample was skipped. A transient miss
+        is the recorder being descheduled mid-read; the control loop must keep
+        commanding the robot and the reader tolerates the gap. Raises only once
+        the lock has been unavailable for :data:`_SNAP_LOCK_ABANDONED_S`
+        straight, which means the recorder died holding it.
+        """
+        if not self._lock.acquire(timeout=_SNAP_LOCK_WAIT_S):
+            now = time.perf_counter()
+            if self._miss_since is None:
+                self._miss_since = now
+            self._misses += 1
+            self.skipped += 1
+            if now - self._miss_since >= _SNAP_LOCK_ABANDONED_S:
+                raise RuntimeError(
+                    "recorder snapshot lock was not released within "
+                    f"{_SNAP_LOCK_ABANDONED_S:.0f}s; the recorder subprocess may "
+                    "have exited"
+                )
+            return False
         try:
             self._write_locked(joint_obs, action, ts, intervention)
         finally:
             self._lock.release()
+        if self._miss_since is not None:
+            # Log from the tick that recovered, not the one that missed, so a
+            # stall never grows by the cost of a log record.
+            _logger.warning(
+                "recorder held the snapshot lock for %.1fms; skipped %d control "
+                "snapshot(s) (%d this session)",
+                1e3 * (time.perf_counter() - self._miss_since),
+                self._misses,
+                self.skipped,
+            )
+            self._miss_since = None
+            self._misses = 0
+        return True
 
     def _write_locked(
         self, joint_obs: dict, action: dict, ts: float, intervention: bool
@@ -1002,8 +1045,9 @@ class SnapshotReader:
     ``(joint_obs, action, ts, intervention)`` tuple using the same key order.
     :meth:`read_latest` preserves the original single-slot API, while
     :meth:`read_nearest` selects the committed record nearest a camera capture
-    timestamp. Both return ``None`` before the first publication or on the rare
-    occasion that a continuously wrapping writer prevents a coherent read.
+    timestamp. Both return ``None`` before the first publication. Each query
+    copies the ring under the shared lock and searches the copy, keeping the
+    lock hold to a few microseconds (see :meth:`_copy_ring`).
     """
 
     def __init__(
@@ -1056,125 +1100,120 @@ class SnapshotReader:
             offset=data_offset,
         )
 
+    def _copy_ring(self) -> "tuple[int, NDArray[Any], NDArray[Any]] | None":
+        """Copy the whole ring under the lock, then let callers search it.
+
+        The lock is held for one scalar read and two bulk ``ndarray.copy``
+        calls (~50 us for the usual 130 KiB) with no Python-level loop in
+        between, so the GIL cannot be handed to the recorder's encoder/verifier
+        threads mid-hold and the control thread's :meth:`SnapshotWriter.write`
+        is never made to wait on this process's scheduling. Because the writer
+        commits under the same lock, every slot in the copy is complete; the
+        seqlock checks below stay as a layout guard rather than a retry loop.
+        """
+        with self._lock:
+            published = int(self._header["published"][0])
+            if published == 0:
+                return None
+            meta = self._slot_meta.copy()
+            data = self._data.copy()
+        return published, meta, data
+
     def read_latest(self) -> tuple[dict, dict, float, bool] | None:
         """Return the newest committed snapshot, preserving the original API."""
-        with self._lock:
-            return self._read_latest_locked()
-
-    def _read_latest_locked(self) -> tuple[dict, dict, float, bool] | None:
-        """Read the newest snapshot; caller holds :attr:`_lock`."""
-        for _ in range(8):
-            generation = int(self._header["published"][0])
-            if generation == 0:
-                return None  # no snapshot published yet
-            snap = self._read_generation(generation)
-            if snap is not None:
-                return self._unpack(snap)
-        return None
+        ring = self._copy_ring()
+        if ring is None:
+            return None
+        published, meta, data = ring
+        snap = self._generation(meta, data, published)
+        return None if snap is None else self._unpack(snap)
 
     def read_nearest(self, target_ts: float) -> tuple[dict, dict, float, bool] | None:
         """Return the committed snapshot closest to ``target_ts``.
 
         Snapshot timestamps are monotonic ``perf_counter`` values, so a binary
-        search finds the bracketing generations in O(log capacity). Slot
-        generation + seqlock validation detects any overwrite during the search;
-        in that case the search restarts against the writer's new window.
+        search over the copied ring finds the bracketing generations in
+        O(log capacity).
         """
-        with self._lock:
-            return self._read_nearest_locked(target_ts)
+        ring = self._copy_ring()
+        if ring is None:
+            return None
+        published, meta, data = ring
+        return self._nearest_in(meta, data, published, target_ts)
 
-    def _read_nearest_locked(
-        self, target_ts: float
+    def _nearest_in(
+        self,
+        meta: "NDArray[Any]",
+        data: "NDArray[Any]",
+        newest: int,
+        target_ts: float,
     ) -> tuple[dict, dict, float, bool] | None:
-        """Find the nearest snapshot; caller holds :attr:`_lock`."""
-        for _ in range(8):
-            newest = int(self._header["published"][0])
-            if newest == 0:
+        """Find the nearest snapshot in a consistent ring copy."""
+        oldest = max(1, newest - self._capacity + 1)
+        oldest_ts = self._generation_ts(meta, data, oldest)
+        newest_ts = self._generation_ts(meta, data, newest)
+        if oldest_ts is None or newest_ts is None:
+            return None
+        # Never silently clamp an exposure outside retained state history.
+        # A target just newer than ``newest`` can be retried by the caller;
+        # one older than ``oldest`` means the recorder fell irrecoverably
+        # behind and the episode must not be saved as synchronized.
+        if target_ts < oldest_ts or target_ts > newest_ts:
+            return None
+        lo = oldest
+        hi = newest
+        first_at_or_after = newest + 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            ts = self._generation_ts(meta, data, mid)
+            if ts is None:
                 return None
-            oldest = max(1, newest - self._capacity + 1)
-            oldest_ts = self._read_generation_ts(oldest)
-            newest_ts = self._read_generation_ts(newest)
-            if oldest_ts is None or newest_ts is None:
-                continue
-            # Never silently clamp an exposure outside retained state history.
-            # A target just newer than ``newest`` can be retried by the caller;
-            # one older than ``oldest`` means the recorder fell irrecoverably
-            # behind and the episode must not be saved as synchronized.
-            if target_ts < oldest_ts or target_ts > newest_ts:
+            if ts >= target_ts:
+                first_at_or_after = mid
+                hi = mid - 1
+            else:
+                lo = mid + 1
+
+        candidates: list[tuple[float, "NDArray[Any]"]] = []
+        if first_at_or_after <= newest:
+            snap = self._generation(meta, data, first_at_or_after)
+            if snap is None:
                 return None
-            lo = oldest
-            hi = newest
-            first_at_or_after = newest + 1
-            retry = False
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                ts = self._read_generation_ts(mid)
-                if ts is None:
-                    retry = True
-                    break
-                if ts >= target_ts:
-                    first_at_or_after = mid
-                    hi = mid - 1
-                else:
-                    lo = mid + 1
-            if retry:
-                continue
+            candidates.append((abs(float(snap[0]) - target_ts), snap))
+        before = first_at_or_after - 1
+        if before >= oldest:
+            snap = self._generation(meta, data, before)
+            if snap is None:
+                return None
+            candidates.append((abs(float(snap[0]) - target_ts), snap))
+        if not candidates:
+            return None
+        # On an exact tie, prefer the later sample. This avoids pairing an
+        # image with a needlessly older state at a half-tick boundary.
+        _distance, nearest = min(
+            candidates, key=lambda item: (item[0], -float(item[1][0]))
+        )
+        return self._unpack(nearest)
 
-            candidates: list[tuple[float, "NDArray[Any]"]] = []
-            if first_at_or_after <= newest:
-                snap = self._read_generation(first_at_or_after)
-                if snap is None:
-                    continue
-                candidates.append((abs(float(snap[0]) - target_ts), snap))
-            before = first_at_or_after - 1
-            if before >= oldest:
-                snap = self._read_generation(before)
-                if snap is None:
-                    continue
-                candidates.append((abs(float(snap[0]) - target_ts), snap))
-            if not candidates:
-                continue
-            # On an exact tie, prefer the later sample. This avoids pairing an
-            # image with a needlessly older state at a half-tick boundary.
-            _distance, nearest = min(
-                candidates, key=lambda item: (item[0], -float(item[1][0]))
-            )
-            return self._unpack(nearest)
-        return None
-
-    def _read_generation_ts(self, generation: int) -> float | None:
-        """Read only a slot timestamp, validating it against concurrent wrap."""
+    def _slot_of(self, meta: "NDArray[Any]", generation: int) -> int | None:
+        """Physical slot holding ``generation`` if it is committed there."""
         slot = (generation - 1) % self._capacity
-        for _ in range(4):
-            seq1 = int(self._slot_meta["seq"][slot])
-            if seq1 == 0 or seq1 & 1:
-                continue
-            if int(self._slot_meta["generation"][slot]) != generation:
-                return None
-            ts = float(self._data[slot, 0])
-            if (
-                int(self._slot_meta["seq"][slot]) == seq1
-                and int(self._slot_meta["generation"][slot]) == generation
-            ):
-                return ts
-        return None
+        seq = int(meta["seq"][slot])
+        if seq == 0 or seq & 1 or int(meta["generation"][slot]) != generation:
+            return None
+        return slot
 
-    def _read_generation(self, generation: int) -> "NDArray[Any] | None":
-        """Copy one coherent logical generation from its physical ring slot."""
-        slot = (generation - 1) % self._capacity
-        for _ in range(4):
-            seq1 = int(self._slot_meta["seq"][slot])
-            if seq1 == 0 or seq1 & 1:
-                continue
-            if int(self._slot_meta["generation"][slot]) != generation:
-                return None
-            snap = np.array(self._data[slot], dtype="<f8")
-            if (
-                int(self._slot_meta["seq"][slot]) == seq1
-                and int(self._slot_meta["generation"][slot]) == generation
-            ):
-                return snap
-        return None
+    def _generation_ts(
+        self, meta: "NDArray[Any]", data: "NDArray[Any]", generation: int
+    ) -> float | None:
+        slot = self._slot_of(meta, generation)
+        return None if slot is None else float(data[slot, 0])
+
+    def _generation(
+        self, meta: "NDArray[Any]", data: "NDArray[Any]", generation: int
+    ) -> "NDArray[Any] | None":
+        slot = self._slot_of(meta, generation)
+        return None if slot is None else data[slot]
 
     def _unpack(self, snap: "NDArray[Any]") -> tuple[dict, dict, float, bool]:
         ts = float(snap[0])

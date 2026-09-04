@@ -532,7 +532,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         # --no-gripper flag before either fault scoping or argv construction.
         launch_args = settings.merged_args(req.command, req.args)
         if command.drives_motors:
-            fault_response = await _motor_fault_response(scope_args=launch_args)
+            scope_args = dict(launch_args)
+            if req.command == "diag.rom-enable":
+                # Its --joints picks which joints are *swept*; the realtime
+                # core still brings up every motor of each selected arm, so a
+                # fault anywhere on the arm blocks the run.
+                scope_args.pop("joints", None)
+            fault_response = await _motor_fault_response(scope_args=scope_args)
             if fault_response is not None:
                 return fault_response
 

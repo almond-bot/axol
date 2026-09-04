@@ -23,7 +23,13 @@ from .commands import COMMANDS, build_argv
 
 _LOG_BUFFER = 4000
 _QUEUE_MAX = 1000
-_STOP_GRACE_S = 6.0
+# How long Stop waits after SIGINT before escalating to SIGTERM. The
+# motor-driving diagnostics answer the interrupt with a return-to-rest ramp
+# (rom.enable from a shoulder at its 180° limit takes ~5 s at teleop's reset
+# speed) followed by the realtime core's disarm and the Python-side disable;
+# escalating earlier would kill the process mid-ramp and leave the arms
+# holding wherever they were.
+_STOP_GRACE_S = 15.0
 
 # The CLI package subprocess commands run out of, unless a command names
 # another (``CommandDef.module``).

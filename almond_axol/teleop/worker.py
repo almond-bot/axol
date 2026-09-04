@@ -513,10 +513,17 @@ class IKWorker:
                 elbow_fk = self._solver.elbow_positions(q_current)
             return elbow_fk[0] if side == "left" else elbow_fk[1]
 
-        snapped = False
-        for side, lock, ctrl_pos, ctrl_rot, ctrl_e in (
-            ("left", l_lock, left_pos, left_rot, left_e),
-            ("right", r_lock, right_pos, right_rot, right_e),
+        snapped: list[list[int]] = []
+        for side, lock, ctrl_pos, ctrl_rot, ctrl_e, indices in (
+            ("left", l_lock, left_pos, left_rot, left_e, self._solver.left_indices),
+            (
+                "right",
+                r_lock,
+                right_pos,
+                right_rot,
+                right_e,
+                self._solver.right_indices,
+            ),
         ):
             if lock:
                 if not self._active[side]:
@@ -534,7 +541,7 @@ class IKWorker:
                             _ee(side),
                             _elbow(side) if self._use_elbow else None,
                         )
-                    snapped = True
+                    snapped.append(indices)
             else:
                 if self._active[side]:
                     self._active[side] = False
@@ -553,7 +560,19 @@ class IKWorker:
             # posture pose left at the previous engage would drag it through
             # the null space — a visible settle over the first frames even
             # with a still controller.
-            self._solver.set_posture_pose(q_current)
+            #
+            # Only the snapping arm's joint slice is re-pinned. The other arm
+            # may still be tracking, balanced between its EE target and the
+            # posture pull toward wherever *its* slice was last pinned; moving
+            # that pin to its current q drops the pull instantly and the arm
+            # relaxes to the pure EE/manipulability solution on the next
+            # solve — a visible twitch on the tracking arm every time the
+            # frozen one was re-engaged, growing with how far it had travelled
+            # since its own pin.
+            posture = self._solver.posture_pose
+            for indices in snapped:
+                posture[indices] = q_current[indices]
+            self._solver.set_posture_pose(posture)
             # An engage snap re-anchors that arm to q_current: return the
             # seed unchanged so the snap frame itself produces no motion
             # (matching the previous whole-session engage behaviour). A ramp

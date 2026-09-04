@@ -40,6 +40,16 @@ Guarded return works exactly as in classic mode: ``torque_residuals`` and
 state, and ``gravity_compensate`` streams its tuples through the same
 command sink, so the contact watchdog, the limp contact hold, and the
 replanned reset all run against the core.
+
+Faults never drop the arms. When the core loses trust in its own loop
+(unhealthy timing, a motor silent for a second) it goes *limp* — every arm
+joint at kp = 0 with the streamed gravity feedforward, still serving — and
+reports ``limp: ...``. ``motion_control`` then streams gravity comp instead
+of tracking, so the arms stay weightless and hand-guidable while the
+operator moves them to rest and stops the session; ``disable`` leaves them
+limp rather than torquing off. A hard fault (dead bus, protocol error) or a
+core that cannot ack the disarm leaves the motors holding their last
+command instead. See the Safety notes in ``rust/axol-rt/src/serve.rs``.
 """
 
 from __future__ import annotations
@@ -65,6 +75,12 @@ _logger = logging.getLogger(__name__)
 
 _N_ARM = len(ARM_JOINTS)
 
+# Firmware damping streamed for the limp fallback. The core enforces its own
+# `LIMP_KD` on the wire regardless; this only has to be a sane value for the
+# gravity-comp tuples Python keeps streaming. Matches
+# ``VRTeleopConfig.reset_gravity_comp_kd`` (the classic contact hold).
+_LIMP_KD = 0.25
+
 
 class RtAxol:
     """Axol with the control loop in the Rust realtime core."""
@@ -82,7 +98,6 @@ class RtAxol:
         robot: Axol,
         loop_hz: float = 240.0,
         watchdog_ms: float = 150.0,
-        abort_deg: float = 25.0,
         max_vel: float = 2.0 * math.pi,
         max_accel: float = 7.0 * math.pi,
         record: str | None = None,
@@ -102,10 +117,10 @@ class RtAxol:
         self._robot = robot
         self._loop_hz = loop_hz
         self._watchdog_ms = watchdog_ms
-        self._abort_deg = abort_deg
         self._max_vel = max_vel
         self._max_accel = max_accel
         self._seq = 0
+        self._limp_announced = False
         # Telemetry packets received per side since arm.
         self._fb_packets = [0, 0]
         # Pair independently arriving left/right core feedback packets into
@@ -160,7 +175,6 @@ class RtAxol:
             # Corruption defense on the core side; the Python max-step gate
             # in motion_control is the real per-command limit.
             f"max_step_rad {max_step}",
-            f"abort_deg {self._abort_deg}",
         ]
         trk_vel = self._TRACKER_HEADROOM * self._max_vel
         trk_acc = self._TRACKER_HEADROOM * self._max_accel
@@ -216,6 +230,7 @@ class RtAxol:
     async def _enable(self) -> None:
         """Bring up the realtime core; :meth:`enable` owns rollback."""
         self._fb_packets = [0, 0]
+        self._limp_announced = False
         await self._link.start()
         await self._link.configure(self._config_text())
         # The core's prep resets the MyActuator motors (multi-turn wrap state
@@ -552,10 +567,52 @@ class RtAxol:
 
         return sink
 
+    @property
+    def fault(self) -> str | None:
+        """The core's latched ``fault: ...``, or ``None`` while healthy.
+
+        After a fault the core has stopped streaming and the motors hold
+        their last command; :meth:`disable` deliberately leaves them that
+        way. Flows that must *prove* a torque-off (diagnostics) check this
+        before trusting a disable.
+        """
+        return self._link.fault
+
+    @property
+    def limp(self) -> str | None:
+        """Why the core went limp (``limp: ...``), or ``None`` while healthy.
+
+        Once set, the arms are at kp = 0 with gravity feedforward for the
+        rest of the session and :meth:`motion_control` streams gravity comp
+        instead of tracking. Flows may check this to end their loop; leaving
+        it running is safe — the arms just stay hand-guidable.
+        """
+        return self._link.limp
+
     async def motion_control(
         self, left: np.ndarray | None = None, right: np.ndarray | None = None
     ) -> None:
-        """Production motion_control math; the sink ships the result."""
+        """Production motion_control math; the sink ships the result.
+
+        While the core is limp (see :attr:`limp`), this streams one
+        gravity-comp cycle instead: the core ignores stiffness anyway, and
+        what it needs from Python is gravity evaluated at the *measured*
+        (hand-guided) pose, not at a target the arm can no longer follow.
+        Every control loop keeps its cadence, the arms stay weightless, and
+        the operator guides them to rest and stops the session.
+        """
+        limp = self._link.limp
+        if limp is not None:
+            if not self._limp_announced:
+                self._limp_announced = True
+                _logger.warning(
+                    "rt: core is limp (%s) — arms are in gravity comp and will "
+                    "not track; hand-guide them to rest, then stop and restart "
+                    "the session",
+                    limp,
+                )
+            await self.gravity_compensate(kd=_LIMP_KD)
+            return
         tasks = []
         if left is not None and self._robot.left is not None:
             tasks.append(self._robot.left.motion_control(left))
@@ -613,17 +670,86 @@ class RtAxol:
             arm_positions(self._robot.right),
         )
 
-    async def disable(self) -> None:
-        """Disarm the core, tear the link down, then belt-and-braces disable."""
+    async def detach(self) -> None:
+        """Release the bus with every motor left holding its last command.
+
+        For flows that hand a still-energized robot to a later process:
+        ``diag.rom-enable`` leaves the grippers clamped on the item for
+        ``diag.rom-disable`` to release, and ``diag.lift-cycle`` must never
+        torque off arms that are out of their clearance pose. No disarm is
+        sent — the core exits on the closed link and, as on every exit that
+        is not an explicit ``D``, leaves each motor holding its last MIT
+        command on firmware gains, gravity feedforward included. Host
+        damping stops with the core, exactly as when a classic session
+        closed its buses without disabling. A later ``enable()`` (or the
+        maintenance-proxy attach ``rom.disable`` does) picks the robot up
+        from there.
+        """
         if self._rec is not None:
             self.set_recording_engaged(False)
         for _side, arm in self._arms():
             arm._command_sink = None
         self._link.on_feedback = None
         try:
+            await self._link.close()
+        except Exception:  # noqa: BLE001 - the motors hold either way
+            _logger.exception("rt: core link teardown failed")
+        if self._rec is not None:
+            try:
+                self._rec.dump()
+            except Exception:  # noqa: BLE001 - continue trace finalization
+                _logger.exception("rt: could not dump the measurement trace")
+        _logger.info("rt: detached — motors left holding their last command")
+
+    async def disable(self) -> None:
+        """Disarm the core and tear the link down.
+
+        On a healthy session this is the operator's deliberate stop: the core
+        disables the motors on ``D`` and Python repeats the disable once the
+        bus is free.
+
+        After a core ``fault:`` — or when the core is gone and cannot ack the
+        disarm — the arms are deliberately *left holding* their last command.
+        After a ``limp:`` they are left limp (kp = 0, last gravity
+        feedforward). The core never disables on either, and neither does
+        this teardown: a disabled arm falls; a holding or limp arm waits for
+        the operator. Matches the classic controller, where a session dying
+        mid-command left the motors holding for the next ``enable()``.
+        """
+        if self._rec is not None:
+            self.set_recording_engaged(False)
+        for _side, arm in self._arms():
+            arm._command_sink = None
+        self._link.on_feedback = None
+        fault = self._link.fault
+        if fault is not None:
+            _logger.warning(
+                "rt: core reported %s — leaving the motors holding their last "
+                "command (not disabling); the arms are still energized",
+                fault,
+            )
+        elif self._link.limp is not None:
+            fault = self._link.limp
+            _logger.warning(
+                "rt: core is limp (%s) — leaving the motors at kp = 0 with their "
+                "last gravity feedforward (not disabling); the arms are still "
+                "energized and hand-guidable",
+                fault,
+            )
+        try:
             await self._link.disarm()
         except Exception as exc:  # noqa: BLE001 - core may already be gone
-            _logger.warning("rt: disarm failed (%s); core teardown continues", exc)
+            # No ack means the core did not run its disable — it faulted,
+            # crashed, or the link is gone. Treat it like a fault below: the
+            # motors are holding whatever they last received, and dropping
+            # them from here would turn a host-side failure into a fall.
+            _logger.warning(
+                "rt: disarm failed (%s); leaving the motors holding, core "
+                "teardown continues",
+                exc,
+            )
+            if fault is None:
+                fault = f"disarm failed: {exc}"
         try:
             await self._link.close()
         except Exception:  # noqa: BLE001 - continue with maintenance disable
@@ -652,13 +778,23 @@ class RtAxol:
                     bus._channel,
                     result,
                 )
-        # The core already disabled the motors on disarm/exit; repeating the
-        # shutdown from Python is harmless (the bus is free again) and covers
-        # a core that died mid-session. Also closes the Python buses.
-        try:
-            await self._robot.disable()
-        except Exception:  # noqa: BLE001 - best-effort cleanup
-            _logger.exception("rt: python-side disable failed")
+        if fault is not None:
+            # Fault/limp path: close the Python buses without touching
+            # torque. The core left the motors holding (or limp) on purpose;
+            # a Python-side disable here would drop the arms it just kept up.
+            try:
+                await self._robot.disconnect()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                _logger.exception("rt: python-side disconnect failed")
+        else:
+            # Deliberate stop, acked by the core: it already disabled the
+            # motors on disarm; repeating the shutdown from Python is
+            # harmless (the bus is free again) and covers a partial disable.
+            # Also closes the Python buses.
+            try:
+                await self._robot.disable()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                _logger.exception("rt: python-side disable failed")
         if self._rec is not None:
             # Join any disengage writer before teardown returns.
             try:

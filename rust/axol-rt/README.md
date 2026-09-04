@@ -53,7 +53,7 @@ Measured on the robot (2026-08-27):
 | bench 240 Hz telemetry | tick lateness p99 0.014 ms, 0/9600 replies lost |
 | serve, teleop headless | 30000 ticks @ 240 Hz, 0.03% late, watchdog + disarm clean |
 | serve, wrist_3 ±8° sinusoid + gripper cycle | worst tracking error 0.42° (moving), ≤0.11° (holding); gripper swept 1.00→0.66→1.00 as commanded |
-| serve, Python killed while armed | core held 10 s, disabled everything, exited clean |
+| serve, Python killed while armed | core held 10 s, disabled everything, exited clean (historical — the core now exits with the motors holding; see Safety) |
 | TX-stall detection (unpowered bus, e-stop condition) | 348 frames queued, ENOBUFS drops for 1 s, stall declared at 1.75 s (`cargo test stall_detection_live -- --ignored`) |
 
 For comparison, the Python control loop under teleop measured 30-57% of
@@ -116,19 +116,40 @@ own trajectory and feedback states:
   intended ~3.2 Hz mode while rejecting the measured 12.5-13.6 Hz
   mast/forearm structural mode. Every production flow consumes the same
   value, and explicit calibration or CLI Q values remain authoritative.
+- **Faults never disable the motors.** Dropping the arms is worse than
+  anything the checks detect. Torque comes off only on an explicit `D`
+  disarm of a healthy session (the operator's deliberate stop) or an
+  e-stop.
+- **Loss-of-trust faults go limp.** Unhealthy control timing or a motor
+  silent for a second means the core should stop applying stiffness and
+  phase-sensitive damping — so it does exactly that: every arm joint on
+  both buses drops to kp = 0, firmware kd only, with the streamed gravity
+  `t_ff` still applied, and the loop keeps running. It reports `limp: ...`;
+  Python's `motion_control` switches to streaming gravity comp (gravity at
+  the measured pose), so the arms are weightless and hand-guidable. The
+  operator moves them to rest and restarts. This is the classic
+  contact-hold gravity comp, entered from the core side; limp is never
+  cleared within a session and a disarm while limp leaves the motors limp.
+- **Hard faults leave the last command in place.** A dead bus (e-stop),
+  bring-up failure, protocol error, signal, or lost client stops the
+  stream and exits with each motor holding its last MIT command on
+  firmware gains — what a classic Python session dying mid-command did.
 - Watchdog: targets stop arriving → the tracker converges on the last
   target and the arms hold there, damping active (matching what the
   firmware itself does if a host dies mid-command, plus the damper).
-  Client disconnect while armed → hold 10 s, then disable and exit, so an
-  orphaned core never stays energized.
-- Deviation abort: any joint more than `abort_deg` (default 25°) from its
-  *commanded* (tracker-output) position disables both buses.
+  Client disconnect while armed → stop streaming and exit, motors holding.
+- No position-deviation abort, matching the classic controller. Position
+  error is not a safety signal on a compliant impedance controller: a hand
+  on the arm and a joint that lost torque (overtemp self-disable) both look
+  like "deviation", and the old 25° abort dropped healthy arms for both.
+  Contact is the Python torque-residual `ContactWatchdog`'s job (limp
+  gravity-comp hold, operator resets); a self-disabled motor just stops
+  contributing while the rest of the arm keeps working.
 - Max-step gate on incoming targets (corruption defense; Python's gate is
   the real per-command limit — and whatever gets through, the tracker's
   limits bound what the wire can see).
 - Any protocol error (e.g. a version-skewed target size) stops the bus
-  threads and disables the motors before the process exits — never an
-  energized orphan.
+  threads before the process exits, motors holding.
 - TX-stall (e-stop) handling, ported from `motor/bus.py`: `ENOBUFS`
   persisting >1 s across sends means no node is ACKing — the e-stop cut
   motor power. The core stops commanding, purges the poisoned TX queue
@@ -141,7 +162,7 @@ own trajectory and feedback states:
 
 The gripper rides the same target packets in slot 7 as a POSITION_FORCE
 command (motor-frame target, speed limit, torque limit). It is exempt
-from the max-step gate and the deviation abort (stalling against an
+from the max-step gate and feedback-health tracking (stalling against an
 object is its job), is never commanded until the first target arrives,
 and its bring-up — enable, open-stop calibration or attach/restore of a
 holding jaw — stays in Python, run on the quiet bus before the core arms.
@@ -194,12 +215,16 @@ write them, and the regular five-second status line reports any trace drops.
 
 `scan` and `bench` are strictly read-only — safe against a powered robot
 at rest. `hold` requires `--yes` to actuate. `serve` only actuates after
-the explicit config/prep/arm handshake, and every exit path (disarm,
-fault, signal, client loss) runs the disable sequence. Missed CAN replies
-degrade rather than fault: host damping is never computed from a stale
-sample, a joint missing 4 of the last 32 replies runs on firmware kd (logged,
-counted in the five-second stats line) until a clean window, and only a motor
-silent for a full second stops the session — bursty loss is expected while
+the explicit config/prep/arm handshake. Only a deliberate disarm of a
+healthy session disables the motors (a disabled arm falls). A timing or
+silent-motor fault takes the session limp — gravity comp on every joint,
+still serving, so the operator can hand-guide the arms to rest; a dead
+bus, signal, or client loss stops the stream and leaves the arms holding
+their last command. Missed CAN replies degrade rather than fault: host
+damping is never computed from a stale sample, a joint missing 4 of the
+last 32 replies runs on firmware kd (logged, counted in the five-second
+stats line) until a clean window, and only a motor silent for a full second
+takes the session limp — bursty loss is expected while
 cameras and IK compilation contend for the same host and USB fabric during
 startup. `proxy` is the sole
 frame transport for maintenance, tuning, firmware, and arm diagnostics;

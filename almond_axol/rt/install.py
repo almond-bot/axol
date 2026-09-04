@@ -17,7 +17,10 @@ Three concerns, each idempotent and self-gating:
   package). Tool installs have no sources on disk, so the crate is fetched
   into ``~/.almond/axol-rt-src`` at the exact ref matching the installed
   package: the PEP 610 git commit for ``uv tool install git+...``, or the
-  ``v<version>`` release tag for PyPI installs.
+  ``v<version>`` release tag for PyPI installs. A tool install made from a
+  local checkout (``uv tool install /path/to/axol``) builds that checkout's
+  crate. ``AXOL_RT_SOURCE`` (a checkout path, or ``<git url>@<ref>``)
+  overrides all of the above.
 * **Binary** — dev checkouts leave it in ``target/release/`` (where
   :func:`almond_axol.rt.link.find_binary` already looks, and where a manual
   ``cargo build`` stays authoritative). Tool installs copy it into
@@ -37,10 +40,15 @@ import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError, distribution, version
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 _logger = logging.getLogger(__name__)
 
 _PACKAGE = "almond-axol"
+# Explicit source override for tool installs whose origin can't be inferred
+# (or is wrong): a path to an axol checkout / the crate, or ``<git url>@<ref>``.
+_SOURCE_ENV = "AXOL_RT_SOURCE"
 # Keep in sync with almond_axol.serve.update._REPO_URL (not imported: pulling
 # in the serve package would drag the whole FastAPI stack into provision).
 _REPO_URL = "https://github.com/almond-bot/axol"
@@ -146,40 +154,104 @@ def _repo_crate() -> Path | None:
     return crate if (crate / "Cargo.toml").exists() else None
 
 
-def _source_ref() -> tuple[str, str] | None:
-    """``(git url, ref)`` matching the installed package, for tool installs.
+def _local_crate(root: Path) -> Path | None:
+    """The crate under a checkout ``root`` (or ``root`` itself, if it is the crate)."""
+    for crate in (root / "rust" / "axol-rt", root):
+        if (crate / "Cargo.toml").exists():
+            return crate
+    return None
 
-    Git installs record their repository URL and commit in PEP 610
-    ``direct_url.json``; index (PyPI) installs carry none, so the ``v<version>``
-    release tag is the ref that produced the published artifact (the release
-    workflow tags and publishes together).
+
+def _source_override() -> Path | tuple[str, str] | None:
+    """Parse ``AXOL_RT_SOURCE``: a local checkout/crate path, or ``<git url>@<ref>``."""
+    raw = os.environ.get(_SOURCE_ENV, "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if path.exists():
+        crate = _local_crate(path)
+        if crate is None:
+            raise RuntimeError(
+                f"{_SOURCE_ENV}={raw!r} has no rust/axol-rt crate "
+                "(point it at a checkout of the axol repo or at the crate itself)"
+            )
+        return crate
+    url, sep, ref = raw.rpartition("@")
+    if not sep or not url or not ref or "/" in ref:
+        raise RuntimeError(
+            f"{_SOURCE_ENV}={raw!r} is neither an existing path nor "
+            "'<git url>@<branch|tag|commit>'"
+        )
+    return url, ref
+
+
+def _source_ref() -> Path | tuple[str, str] | None:
+    """Where the axol-rt sources for this (tool) install come from.
+
+    Returns a local crate ``Path`` to build in place, ``(git url, ref)`` to
+    fetch and build, or ``None`` when nothing can be inferred.
+
+    * :data:`_SOURCE_ENV` wins when set (see :func:`_source_override`) —
+      the escape hatch for anything below that guesses wrong.
+    * Git installs (``uv tool install git+...@<branch>``) record their
+      repository URL and pinned commit in PEP 610 ``direct_url.json``.
+    * Local-path installs (``uv tool install /path/to/checkout``) record the
+      directory instead; its in-tree crate is used while it is still there.
+    * Index (PyPI) installs carry no ``direct_url.json`` at all, so the
+      ``v<version>`` release tag is the ref that produced the published
+      artifact (the release workflow tags and publishes together).
+    * Wheel/sdist file installs can't be traced back to sources.
     """
+    override = _source_override()
+    if override is not None:
+        return override
     try:
         dist = distribution(_PACKAGE)
     except PackageNotFoundError:
         return None
     raw = dist.read_text("direct_url.json")
-    if raw:
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            data = {}
-        commit = (data.get("vcs_info") or {}).get("commit_id")
-        url = data.get("url") or ""
-        if url.startswith("git+"):
-            url = url[len("git+") :]
-        if commit and url:
-            return url, commit
-        return None  # directory (dev) install — handled by _repo_crate
-    return _REPO_URL, f"v{version(_PACKAGE)}"
+    if not raw:
+        return _REPO_URL, f"v{version(_PACKAGE)}"
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = {}
+    url = data.get("url") or ""
+    if url.startswith("git+"):
+        url = url[len("git+") :]
+    commit = (data.get("vcs_info") or {}).get("commit_id")
+    if commit and url:
+        return url, commit
+    if "dir_info" in data and url.startswith("file:"):
+        # A non-editable install from a checkout: the package lives in the
+        # tool env (so _repo_crate misses), but the checkout it came from
+        # still carries the crate. Editable installs never get here.
+        root = Path(url2pathname(urlparse(url).path))
+        crate = _local_crate(root)
+        if crate is not None:
+            return crate
+        _logger.warning(
+            "installed from %s, but no rust/axol-rt crate is there any more", root
+        )
+    return None
 
 
-def _fetch_crate(url: str, ref: str) -> Path:
+def _no_source_error() -> RuntimeError:
+    return RuntimeError(
+        "cannot resolve the axol-rt source ref for this install: it was not "
+        "installed from git, a PyPI release, or a checkout that still exists. "
+        f"Set {_SOURCE_ENV} to a checkout of the axol repo or to "
+        f"'<git url>@<branch|tag|commit>' (e.g. {_REPO_URL}@main) and re-run."
+    )
+
+
+def _fetch_crate(url: str, ref: str) -> tuple[Path, str]:
     """Shallow-fetch ``ref`` from ``url`` into the source cache.
 
-    ``git fetch --depth 1 <url> <ref>`` accepts both tags and bare commit ids
-    (GitHub serves arbitrary reachable commits), and the cached repository
-    makes re-provisioning at a new ref an incremental fetch.
+    ``git fetch --depth 1 <url> <ref>`` accepts branches, tags and bare commit
+    ids (GitHub serves arbitrary reachable commits), and the cached repository
+    makes re-provisioning at a new ref an incremental fetch. Returns the crate
+    path and the commit that ``ref`` resolved to.
     """
     _SRC_CACHE.mkdir(parents=True, exist_ok=True)
     if not (_SRC_CACHE / ".git").exists():
@@ -189,20 +261,38 @@ def _fetch_crate(url: str, ref: str) -> Path:
             timeout=_FETCH_TIMEOUT,
         )
     git = ["git", "-C", str(_SRC_CACHE)]
-    subprocess.run(
-        [*git, "fetch", "--quiet", "--depth", "1", url, ref],
-        check=True,
-        timeout=_FETCH_TIMEOUT,
-    )
+    try:
+        subprocess.run(
+            [*git, "fetch", "--quiet", "--depth", "1", url, ref],
+            check=True,
+            timeout=_FETCH_TIMEOUT,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"could not fetch {ref} from {url} (does that branch/tag/commit "
+            f"exist there?). Set {_SOURCE_ENV} to the sources to build from "
+            "and re-run."
+        ) from exc
     subprocess.run(
         [*git, "checkout", "--quiet", "--force", "FETCH_HEAD"],
         check=True,
         timeout=_FETCH_TIMEOUT,
     )
+    commit = subprocess.run(
+        [*git, "rev-parse", "FETCH_HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=_FETCH_TIMEOUT,
+    ).stdout.strip()
     crate = _SRC_CACHE / "rust" / "axol-rt"
     if not (crate / "Cargo.toml").exists():
-        raise RuntimeError(f"{url}@{ref} has no rust/axol-rt crate")
-    return crate
+        raise RuntimeError(
+            f"{url}@{ref} has no rust/axol-rt crate (a release that predates "
+            f"the realtime core?). Set {_SOURCE_ENV} to a ref that has it, "
+            f"e.g. {_REPO_URL}@main, and re-run."
+        )
+    return crate, commit
 
 
 def _build(crate: Path, cargo: str) -> Path:
@@ -287,12 +377,27 @@ def run(_args: object = None) -> None:
 
     source = _source_ref()
     if source is None:
-        raise RuntimeError("cannot resolve the axol-rt source ref for this install")
-    url, ref = source
+        raise _no_source_error()
     dest = _install_dir() / "axol-rt"
+    if isinstance(source, Path):
+        # Sources on disk but the package isn't (tool install from a checkout,
+        # or AXOL_RT_SOURCE=<path>): build there, install onto PATH. Always
+        # rebuild — a working tree has no ref to stamp, and cargo is
+        # incremental anyway.
+        binary = _build(source, _ensure_toolchain())
+        dest = _install(binary, f"path:{source}", dest)
+        _grant_realtime(dest)
+        print(f"axol-rt installed: {dest} (built from {source})")
+        return
+
+    url, ref = source
     stamp = _stamp_for(dest)
+    # Only an inferred (pinned commit / release tag) ref can be trusted to
+    # name the same sources as last time; an explicit override may be a
+    # branch, so it always rebuilds.
     if (
-        dest.is_file()
+        _SOURCE_ENV not in os.environ
+        and dest.is_file()
         and os.access(dest, os.X_OK)
         and stamp.exists()
         and stamp.read_text().strip() == ref
@@ -302,7 +407,8 @@ def run(_args: object = None) -> None:
         return
     cargo = _ensure_toolchain()
     print(f"Fetching axol-rt sources ({url} @ {ref}) ...")
-    binary = _build(_fetch_crate(url, ref), cargo)
+    crate, commit = _fetch_crate(url, ref)
+    binary = _build(crate, cargo)
     dest = _install(binary, ref, dest)
     _grant_realtime(dest)
-    print(f"axol-rt installed: {dest} (ref {ref})")
+    print(f"axol-rt installed: {dest} (ref {ref}, commit {commit[:12]})")

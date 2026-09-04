@@ -127,7 +127,13 @@ def _step_worker() -> IKWorker:
     return worker
 
 
-def _frame(*, left_forward: float, t_ms: float) -> VRFrame:
+def _frame(
+    *,
+    left_forward: float,
+    t_ms: float,
+    l_lock: bool = True,
+    r_lock: bool = True,
+) -> VRFrame:
     identity = VRQuaternion(x=0.0, y=0.0, z=0.0, w=1.0)
     zero = VRPosition(x=0.0, y=0.0, z=0.0)
     return VRFrame(
@@ -139,8 +145,8 @@ def _frame(*, left_forward: float, t_ms: float) -> VRFrame:
         r_ee=VRPose(position=zero, quaternion=identity),
         l_elbow=zero,
         r_elbow=zero,
-        l_lock=True,
-        r_lock=True,
+        l_lock=l_lock,
+        r_lock=r_lock,
         t=t_ms,
     )
 
@@ -293,6 +299,31 @@ class FreezeClutchStepTest(unittest.TestCase):
         )
         np.testing.assert_allclose(target_pos, worker._solver.left_pose[0], atol=1e-7)
         np.testing.assert_allclose(target_rot, worker._solver.left_pose[1], atol=1e-7)
+
+    def test_single_arm_reengage_repins_only_that_arms_posture(self) -> None:
+        # Both arms tracking; the right arm has travelled since its posture
+        # was pinned (posture is arange(14), q_current sits elsewhere).
+        worker = _step_worker()
+        posture_before = worker._solver.posture_pose
+        q0 = np.full(14, 0.5, np.float32)
+
+        with patch(
+            "almond_axol.teleop.worker.time.monotonic", side_effect=(30.0, 30.01)
+        ):
+            # Freeze the left arm, then re-engage it: the rising lock is an
+            # engage snap for the left arm only.
+            q1 = worker.step(_frame(left_forward=0.0, t_ms=0.0, l_lock=False), q0)
+            q2 = worker.step(_frame(left_forward=0.0, t_ms=8.33), q1)
+
+        # The snap frame itself produces no motion.
+        np.testing.assert_array_equal(q2, q1)
+        posture_after = worker._solver.posture_pose
+        # The re-engaging arm is pinned to its held joints...
+        np.testing.assert_array_equal(posture_after[:7], q1[:7])
+        # ...while the arm that kept tracking keeps its existing attractor, so
+        # its null-space equilibrium is untouched by the other arm's unfreeze.
+        np.testing.assert_array_equal(posture_after[7:], posture_before[7:])
+        self.assertFalse(np.array_equal(posture_after[7:], q1[7:]))
 
     def test_snap_arm_reanchors_elbow_origin_too(self) -> None:
         worker = _freeze_tracker()

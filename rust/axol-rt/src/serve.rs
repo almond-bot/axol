@@ -48,8 +48,8 @@
 //! ## Protocol (length-prefixed messages: u32 LE size, then payload)
 //!
 //! Python -> Rust:
-//! - `C` + text        config: `loop_hz`/`watchdog_ms`/`max_step_rad`/
-//!                     `abort_deg` keys, one `joint <side> <iface> <name>
+//! - `C` + text        config: `loop_hz`/`watchdog_ms`/`max_step_rad`
+//!                     keys, one `joint <side> <iface> <name>
 //!                     <motor_id> <kp> <kd> <max_vel> <max_accel> <fc> <k>
 //!                     <fv> <fo> <tau_cap>` line per arm joint (tracker
 //!                     limits, friction params, spring-torque cap in Nm or
@@ -78,10 +78,16 @@
 //!                     Python monotonic timestamp f64 LE. A rising edge
 //!                     truncates the previous segment and starts a gated
 //!                     `AXOL_RT_TRACE`; disable stops adding rows.
-//! - `D`               disarm: disable motors, threads exit
+//! - `D`               disarm: disable motors, threads exit. The *only*
+//!                     path that ever disables the motors (and only when no
+//!                     fault is latched); see Safety.
 //!
 //! Rust -> Python:
-//! - `S` + text        state/fault message
+//! - `S` + text        state message. `fault: ...` — the core stopped
+//!                     streaming (bus dead / arm failed); `limp: ...` — the
+//!                     core is still serving but at kp = 0 with the streamed
+//!                     gravity t_ff on every arm joint (see Safety); the
+//!                     client should keep streaming gravity-comp targets.
 //! - `L` + text        log line
 //! - `F` + binary      telemetry, one per bus per tick while armed: side
 //!                     u8, valid-mask u8, then 8 x (pos f64, vel f64, tau
@@ -91,37 +97,64 @@
 //!                     core is armed.
 //!
 //! ## Safety
+//! - **A fault never disables the motors.** Cutting torque drops the arms,
+//!   which is worse than any condition the checks detect. Torque comes off
+//!   only on an explicit `D` disarm of a healthy session (or an e-stop,
+//!   which removes motor power itself).
+//! - **Loss-of-trust faults go *limp*, not dead.** Unhealthy control timing
+//!   and a motor silent for a second both mean the core should no longer be
+//!   applying stiffness or phase-sensitive damping — so it stops doing
+//!   exactly that and nothing more: every arm joint on both buses goes to
+//!   kp = 0, firmware kd `LIMP_KD`, no host damping or inertia term, with
+//!   the streamed gravity `t_ff` still applied (Python keeps evaluating it
+//!   at the measured pose). The loop keeps running, so the arms are
+//!   weightless and hand-guidable — the operator moves them to rest and
+//!   restarts. This is the classic contact-hold gravity comp, entered from
+//!   the core side. Limp is enforced in-core regardless of what targets
+//!   arrive, and is never cleared within a session. A disarm while limp
+//!   leaves the motors limp rather than disabling.
+//! - **Hard faults stop the stream and leave the last command in place.**
+//!   A dead bus (TX stall — the e-stop cut motor power), a bring-up
+//!   failure, a protocol error, a signal, or a lost client: the core
+//!   reports `fault: ...` (where it can), stops streaming, and exits with
+//!   each motor holding its last MIT command on firmware gains — the same
+//!   outcome as a classic Python session dying mid-command.
 //! - Targets stepping more than `max_step_rad` from the previous target
 //!   are rejected (counted, reported) — corruption defense; the Python
 //!   side has its own max-step gate. The gripper slot is exempt (its
 //!   targets legitimately jump, matching the Python gate). Whatever gets
 //!   through, the tracker's velocity/acceleration limits bound what the
 //!   wire can ever see.
-//! - A joint deviating more than `abort_deg` from its *commanded* position
-//!   (the tracker output) disables both buses (e.g. a collision or a
-//!   runaway). The gripper is exempt — stalling against an object is its
-//!   normal operation.
+//! - There is deliberately **no position-deviation abort**, matching the
+//!   classic Python controller. Position error on a compliant impedance
+//!   controller is not a safety signal: a hand on the arm and a joint that
+//!   lost torque (overtemp self-disable) both look like "deviation", and
+//!   the old 25° abort took down healthy arms for both. Contact is handled
+//!   by the Python torque-residual `ContactWatchdog` (limp gravity-comp
+//!   hold, operator resets); a self-disabled motor just stops contributing
+//!   while the rest of the arm keeps working, as in classic mode.
 //! - Joints with a finite `tau_cap` (the wrists) never send a position
 //!   more than `tau_cap / kp` from their last measured one
 //!   (`filter::cap_spring`), bounding the impedance spring torque a blocked
 //!   joint develops. Being blocked is therefore *allowed* for them: the
 //!   commanded position stays within that window of the measured one, so
-//!   the deviation abort only ever sees the window, and a runaway is
-//!   bounded by `tau_cap` rather than caught.
+//!   a runaway leans on whatever stopped it with at most `tau_cap`.
 //! - Every command batch accepts exactly one fresh reply per motor. A missed
 //!   sample suppresses host damping for that tick; bursty loss (4 of the last
 //!   32 ticks) marks the joint *degraded* — host damping stays off until a
 //!   clean 32-tick window, the transition is logged, and the loop keeps
-//!   running on firmware kd. Only a motor silent for a full second faults
-//!   both buses. Clustered late ticks still fail closed, and a full-cycle
-//!   overrun is an immediate fault.
+//!   running on firmware kd. Only a motor silent for a full second takes
+//!   the session limp. Clustered late ticks and a full-cycle overrun go
+//!   limp the same way — phase-sensitive damping must not run on stale
+//!   timing, and limp mode has none.
 //! - The gripper is not commanded at all until the first target arrives
 //!   (matching classic mode, where it sits idle until motion_control).
 //! - Watchdog: no target for `watchdog_ms` holds the last target (the
 //!   tracker converges and stays, damping live). The arms keep holding —
 //!   matching what the firmware itself does if the host dies — until a
 //!   disarm or an operator e-stop.
-//! - SIGINT/SIGTERM disable everything before exit.
+//! - Client disconnect while armed, SIGINT/SIGTERM, and protocol errors
+//!   stop the stream and exit with the motors holding (not disabled).
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -163,14 +196,20 @@ const GRIPPER_SLOT: usize = 7;
 /// adapters — disabling both arms for it ended otherwise healthy sessions.
 const DEGRADED_RECENT_MISSED_FEEDBACK: u32 = 4;
 /// A motor that has not replied for this long is treated as gone rather than
-/// lossy. Commanding it blind leaves the deviation abort inactive for that
-/// joint, so past this point the core fails closed. Matches the TX-stall
-/// e-stop detection window rather than the old 12.5 ms.
+/// lossy. Past this point the session goes limp (see the Safety notes)
+/// rather than streaming stiffness to it blind. Matches the TX-stall e-stop
+/// detection window rather than the old 12.5 ms.
 const SILENT_FEEDBACK_FAULT: Duration = Duration::from_secs(1);
 /// Degraded/recovered transitions are logged at most this often per bus so a
 /// joint flapping across the threshold during boot cannot flood the log; the
 /// five-second stats line carries the cumulative count regardless.
 const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
+/// Firmware velocity damping (Nm·s/rad) on the arm joints while the core is
+/// *limp* — the fallback for a loss-of-trust fault (timing, silent motor).
+/// Matches `VRTeleopConfig.reset_gravity_comp_kd`, the classic contact-hold
+/// gravity comp: enough to keep a hand-guided arm from feeling twitchy, far
+/// too little to hold it up. Gravity itself comes from the streamed `t_ff`.
+const LIMP_KD: f64 = 0.25;
 /// Leave a small slice of each cycle for telemetry handoff and the next
 /// absolute sleep. The rest is valid reply time; the old 80% window discarded
 /// delayed USB-CAN replies despite there still being cycle headroom.
@@ -312,7 +351,7 @@ enum FeedbackVerdict {
     /// A full clean window just closed out a degraded stretch.
     Recovered,
     /// The motor has not replied for the silent-fault interval: treat it as
-    /// gone and fail closed.
+    /// gone and take the session limp (see the Safety notes).
     Silent,
 }
 
@@ -391,6 +430,26 @@ impl TimingHealth {
 }
 
 type BusStartGate = (Mutex<Option<Instant>>, Condvar);
+
+/// Take the whole session limp (both buses — the flag is shared) and tell
+/// the client why, once. Edge-triggered: a repeating condition (a motor that
+/// stays silent) reports on its first tick only. Returns whether this call
+/// made the transition.
+fn go_limp(limp: &AtomicBool, out_tx: &mpsc::Sender<Vec<u8>>, reason: &str) -> bool {
+    if limp
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    send_text(out_tx, b'S', &format!("limp: {reason}"));
+    send_text(
+        out_tx,
+        b'L',
+        "limp: arm joints at kp = 0 with gravity feedforward on both buses — hand-guide the arms to rest, then stop and restart the session",
+    );
+    true
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JointCmd {
@@ -650,7 +709,6 @@ struct Config {
     loop_hz: f64,
     watchdog_ms: f64,
     max_step_rad: f64,
-    abort_deg: f64,
     /// (side, iface, specs) — side 0 = left, 1 = right.
     buses: Vec<(u8, String, Vec<MotorSpec>)>,
 }
@@ -659,7 +717,6 @@ fn parse_config(text: &str) -> io::Result<Config> {
     let mut loop_hz = 240.0;
     let mut watchdog_ms = 150.0;
     let mut max_step_rad = 0.35;
-    let mut abort_deg = 25.0;
     let mut buses: Vec<(u8, String, Vec<MotorSpec>)> = Vec::new();
 
     let bad = |line: &str| {
@@ -689,12 +746,6 @@ fn parse_config(text: &str) -> io::Result<Config> {
             }
             "max_step_rad" => {
                 max_step_rad = f
-                    .get(1)
-                    .and_then(|v| v.parse().ok())
-                    .ok_or_else(|| bad(line))?
-            }
-            "abort_deg" => {
-                abort_deg = f
                     .get(1)
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(|| bad(line))?
@@ -785,7 +836,6 @@ fn parse_config(text: &str) -> io::Result<Config> {
         loop_hz,
         watchdog_ms,
         max_step_rad,
-        abort_deg,
         buses,
     })
 }
@@ -1214,11 +1264,23 @@ pub fn run(socket_path: &str) -> io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     // 0 = running, 1 = fault (set by a bus thread on abort).
     let fault = Arc::new(AtomicU8::new(0));
+    // Set only by an explicit `D` from the client. It is the one exit that
+    // disables the motors; every other way out of the bus loops (fault,
+    // signal, peer loss, protocol error) stops commanding and leaves the
+    // motors holding their last MIT command on firmware gains — dropping
+    // the arms is never an acceptable failure response.
+    let disarm = Arc::new(AtomicBool::new(false));
+    // Set by a bus thread on a loss-of-trust fault (timing, silent motor):
+    // both buses drop to gravity comp (kp = 0, streamed gravity t_ff) and
+    // keep serving so the operator can hand-guide the arms to rest. Never
+    // cleared within a session; a disarm in this state leaves the motors
+    // limp rather than disabling.
+    let limp = Arc::new(AtomicBool::new(false));
     let mut bus_threads: Vec<std::thread::JoinHandle<io::Result<()>>> = Vec::new();
 
     // Errors below `break` out (never early-return): the cleanup after the
-    // loop must always run so the bus threads stop and disable the motors —
-    // an early `?` here would leave them energized with no owner.
+    // loop must always run so the bus threads stop streaming and the socket
+    // is torn down in order.
     let mut loop_err: Option<io::Error> = None;
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -1237,20 +1299,13 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                 println!("axol-rt serve: client disconnected");
                 break;
             }
-            // Peer died while armed. Hold for a grace period (a crashed
-            // Python side can't reconnect, but a signal may still arrive
-            // first), then disable and exit so an orphaned core never keeps
-            // the arms energized indefinitely.
+            // Peer died while armed (or closed after a fault). Stop
+            // streaming and exit; the motors keep holding their last
+            // command on firmware gains, exactly as when a classic Python
+            // session died mid-command.
             println!(
-                "axol-rt serve: client disconnected while armed — holding 10 s, then disabling"
+                "axol-rt serve: client disconnected while armed — exiting; motors left holding (not disabled)"
             );
-            let grace_end = Instant::now() + Duration::from_secs(10);
-            while !SHUTDOWN.load(Ordering::SeqCst)
-                && fault.load(Ordering::SeqCst) == 0
-                && Instant::now() < grace_end
-            {
-                std::thread::sleep(Duration::from_millis(100));
-            }
             break;
         };
         let (tag, body) = (payload[0], &payload[1..]);
@@ -1295,6 +1350,8 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                 };
                 stop.store(false, Ordering::SeqCst);
                 fault.store(0, Ordering::SeqCst);
+                disarm.store(false, Ordering::SeqCst);
+                limp.store(false, Ordering::SeqCst);
                 let (ready_tx, ready_rx) = mpsc::channel::<io::Result<()>>();
                 // Release both buses onto one epoch only after bring-up has
                 // completed. Each side then gets half a period of phase
@@ -1306,6 +1363,8 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                     let targets = Arc::clone(&targets);
                     let stop = Arc::clone(&stop);
                     let fault = Arc::clone(&fault);
+                    let disarm = Arc::clone(&disarm);
+                    let limp = Arc::clone(&limp);
                     let trace_enabled = Arc::clone(&trace_enabled);
                     let trace_generation = Arc::clone(&trace_generation);
                     let trace_origin_bits = Arc::clone(&trace_origin_bits);
@@ -1321,6 +1380,8 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                             &targets,
                             &stop,
                             &fault,
+                            &disarm,
+                            &limp,
                             &trace_enabled,
                             &trace_generation,
                             &trace_origin_bits,
@@ -1382,6 +1443,27 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                 }
             },
             b'D' => {
+                // The deliberate operator stop: the only path that disables
+                // the motors. After a fault the bus loops have already
+                // stopped without disabling, and after a limp transition
+                // they are serving gravity comp; either way this ack just
+                // lets the client tear down in order — torque stays as it is
+                // (holding, or limp with gravity feedforward).
+                let faulted = fault.load(Ordering::SeqCst) != 0;
+                let limped = limp.load(Ordering::SeqCst);
+                if !faulted && !limped {
+                    disarm.store(true, Ordering::SeqCst);
+                } else {
+                    send_text(
+                        &out_tx,
+                        b'L',
+                        if limped {
+                            "disarm while limp: motors left at kp = 0 with their last gravity feedforward (not disabled)"
+                        } else {
+                            "disarm after fault: motors left holding their last command (not disabled)"
+                        },
+                    );
+                }
                 stop.store(true, Ordering::SeqCst);
                 for handle in bus_threads.drain(..) {
                     if let Err(err) = handle.join().expect("bus thread panicked") {
@@ -1396,8 +1478,10 @@ pub fn run(socket_path: &str) -> io::Result<()> {
         }
     }
 
-    // Signal, peer loss, or protocol error: stop and disable everything
-    // before exit.
+    // Signal, peer loss, or protocol error: stop streaming and exit. The
+    // motors are *not* disabled here — `disarm` is still false, so the bus
+    // loops leave them holding their last command rather than dropping the
+    // arms on a host-side failure.
     stop.store(true, Ordering::SeqCst);
     for handle in bus_threads {
         let _ = handle.join();
@@ -1421,6 +1505,8 @@ fn bus_loop(
     targets: &[Mutex<TargetSlot>; 2],
     stop: &AtomicBool,
     fault: &AtomicU8,
+    disarm: &AtomicBool,
+    limp: &AtomicBool,
     trace_enabled: &AtomicBool,
     trace_generation: &AtomicU64,
     trace_origin_bits: &AtomicU64,
@@ -1543,18 +1629,11 @@ fn bus_loop(
     // each slot. Host damping is suppressed for one tick after a miss; the
     // firmware's local kd remains active without relying on stale host state.
     let mut feedback_fresh = [false; N_SLOTS];
-    // Wire command per slot this tick (tracker output or passthrough) —
-    // the reference the deviation abort measures against.
-    let mut cmd_pos: [f64; N_SLOTS] = [0.0; N_SLOTS];
-    for m in &motors {
-        cmd_pos[m.slot] = m.hold_pos;
-    }
     let mut have_target = false;
     let mut last_seq: Option<u32> = None;
     let mut last_arrival: Option<Instant> = None;
 
     let period = Duration::from_secs_f64(1.0 / cfg.loop_hz);
-    let abort_rad = cfg.abort_deg.to_radians();
     let watchdog = Duration::from_secs_f64(cfg.watchdog_ms / 1e3);
     let mut rejected: u64 = 0;
     let mut late: u64 = 0;
@@ -1614,18 +1693,25 @@ fn bus_loop(
                 late += 1;
             }
             // A whole-cycle overrun means the causal sample/command ordering
-            // has been lost. Stop before issuing another impedance command.
-            // Smaller isolated late ticks are tolerated with host damping
-            // suppressed below; clustered lateness also fails closed.
-            if timing_health.record_lateness(lateness, period) {
-                fault.store(1, Ordering::SeqCst);
-                stop.store(true, Ordering::SeqCst);
-                return Err(io::Error::other(format!(
-                    "{iface}: control timing unhealthy ({:.3} ms late, {} of the last 32 ticks late); stopping before phase-sensitive damping",
-                    lateness.as_secs_f64() * 1e3,
-                    timing_health.recent_late.count_ones(),
-                )));
+            // has been lost; clustered lateness says the same more slowly.
+            // Phase-sensitive host damping must not run on that, so the
+            // session goes *limp*: kp = 0, firmware kd only, gravity from
+            // the streamed t_ff — no host damping to be out of phase. The
+            // operator hand-guides the arms to rest and restarts. Already
+            // limp: nothing left to protect, keep serving gravity comp.
+            let is_limp = limp.load(Ordering::SeqCst);
+            if timing_health.record_lateness(lateness, period) && !is_limp {
+                go_limp(
+                    limp,
+                    out_tx,
+                    &format!(
+                        "{iface}: control timing unhealthy ({:.3} ms late, {} of the last 32 ticks late) — going limp before phase-sensitive damping",
+                        lateness.as_secs_f64() * 1e3,
+                        timing_health.recent_late.count_ones(),
+                    ),
+                );
             }
+            let is_limp = is_limp || limp.load(Ordering::SeqCst);
             ticks += 1;
 
             // Adopt a newly arrived target: latest-wins — the tracker
@@ -1638,10 +1724,14 @@ fn bus_loop(
                         // Corruption defense on the raw target step; the
                         // gripper slot is exempt (its targets legitimately
                         // jump — the Python max-step gate excludes it too).
-                        let step_ok = t.cmds[..GRIPPER_SLOT]
-                            .iter()
-                            .zip(play.iter())
-                            .all(|(c, p)| (c.p_des - p.p_des).abs() <= cfg.max_step_rad);
+                        // Limp: p_des carries no torque (kp = 0) and follows
+                        // the hand-guided arm, so a large step is normal and
+                        // the fresh gravity t_ff it carries must not be lost.
+                        let step_ok = is_limp
+                            || t.cmds[..GRIPPER_SLOT]
+                                .iter()
+                                .zip(play.iter())
+                                .all(|(c, p)| (c.p_des - p.p_des).abs() <= cfg.max_step_rad);
                         if step_ok {
                             play = t.cmds;
                             have_target = true;
@@ -1708,7 +1798,26 @@ fn bus_loop(
             let mut expected = vec![false; motors.len()];
             let mut trace_pending: [Option<TraceRow>; N_SLOTS] = [None; N_SLOTS];
             for (motor_index, m) in motors.iter().enumerate() {
-                let c = &play[m.slot];
+                let c = if is_limp && !m.gripper {
+                    // Limp is enforced here, whatever the target says: no
+                    // stiffness, firmware damping only, no host damping or
+                    // inertia term, passthrough mode. Only the streamed
+                    // gravity t_ff (Python evaluates it at the measured pose
+                    // while limp) and p_des (informational) pass through.
+                    // The gripper keeps its own command — Python's gravity
+                    // comp holds it softly, or drives it as asked.
+                    JointCmd {
+                        mode: 0.0,
+                        kp: 0.0,
+                        kd: LIMP_KD,
+                        kd_host: 0.0,
+                        j_eff: 0.0,
+                        ..play[m.slot]
+                    }
+                } else {
+                    play[m.slot]
+                };
+                let c = &c;
                 let (arb, frame) = if m.gripper {
                     // Idle until the first target (classic mode leaves the
                     // gripper uncommanded until motion_control too). Slot
@@ -1749,18 +1858,17 @@ fn bus_loop(
                     // underneath (no re-seed: a transient clip during a fast
                     // move must not zero its velocity), and everything
                     // downstream — the derivative chain feeding friction /
-                    // inertia / host damping, the deviation abort reference,
-                    // the trace — sees the clamped command, so those
-                    // feedforwards fall to zero while the joint is held
-                    // rather than adding to the press. The measured position
-                    // is the previous tick's reply (one 240 Hz period old).
+                    // inertia / host damping, the trace — sees the clamped
+                    // command, so those feedforwards fall to zero while the
+                    // joint is held rather than adding to the press. The
+                    // measured position is the previous tick's reply (one
+                    // 240 Hz period old).
                     let p_cmd = filter::cap_spring(
                         p_track,
                         latest[m.slot].map(|(pos, _, _, _)| pos),
                         c.kp,
                         m.tau_cap,
                     );
-                    cmd_pos[m.slot] = p_cmd;
                     let d = &mut damp[m.slot];
                     let (v_wire, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp) = if tracked {
                         // Match classic AxolArm.motion_control: friction uses
@@ -1876,7 +1984,7 @@ fn bus_loop(
                 }
             }
 
-            // Collect replies; deviation abort against the played target. The
+            // Collect replies. The
             // window begins when this tick actually began, not at its nominal
             // schedule point: a late wake must not discard shoulder feedback
             // simply because the old absolute deadline has already elapsed.
@@ -1929,8 +2037,8 @@ fn bus_loop(
                 pending -= 1;
                 let recv_time = Instant::now();
                 latest[motors[idx].slot] = Some((pos, vel, tau, recv_time));
-                // No deviation abort for the gripper: stalling against an
-                // object (or a jaw span the target overshoots) is normal.
+                // The gripper has no damping chain or trace row: its
+                // POSITION_FORCE reply only feeds the telemetry cache.
                 if motors[idx].gripper {
                     continue;
                 }
@@ -1960,21 +2068,15 @@ fn bus_loop(
                         Err(mpsc::TrySendError::Disconnected(_)) => trace_dropped += 1,
                     }
                 }
-                // Deviation abort against the *commanded* position (the
-                // tracker output), not the raw target — during a legitimate
-                // catch-up move the target may briefly lead the arm by more
-                // than abort_deg while the command never does.
-                let e = (pos - cmd_pos[motors[idx].slot]).abs();
-                if e > abort_rad {
-                    fault.store(1, Ordering::SeqCst);
-                    stop.store(true, Ordering::SeqCst);
-                    return Err(io::Error::other(format!(
-                        "{iface}: {} deviated {:.2}° from command (abort at {:.0}°)",
-                        motors[idx].joint,
-                        e.to_degrees(),
-                        cfg.abort_deg,
-                    )));
-                }
+                // No position-deviation abort here, deliberately. Position
+                // error is not a safety signal on a compliant impedance
+                // controller: a hand on the arm or a joint that lost torque
+                // (overtemp self-disable) both look like "deviation", and
+                // cutting torque on every joint for it dropped otherwise
+                // healthy arms. Contact is the Python torque-residual
+                // watchdog's job (limp gravity-comp hold, as in classic
+                // mode); a self-disabled motor simply stops contributing,
+                // as it did in classic mode.
             }
 
             // Replies still outstanding at the window's end. Counted into the
@@ -1986,10 +2088,10 @@ fn bus_loop(
             // single miss suppresses host damping on the next tick; bursty
             // loss marks the joint degraded (damping off until a clean
             // window, logged) and the loop keeps running on firmware kd. Only
-            // a motor that falls silent for `SILENT_FEEDBACK_FAULT` faults
-            // both buses — the deviation abort has been blind on it for too
-            // long to keep commanding it. The gripper is intentionally
-            // excluded.
+            // a motor that falls silent for `SILENT_FEEDBACK_FAULT` takes the
+            // session limp — the core has been streaming stiffness to it
+            // blind for too long; gravity comp on every joint is the safe
+            // thing it can still do. The gripper is intentionally excluded.
             let mut any_degraded = false;
             for (idx, motor) in motors.iter().enumerate() {
                 if motor.gripper {
@@ -2028,14 +2130,18 @@ fn bus_loop(
                         }
                     }
                     FeedbackVerdict::Silent => {
-                        fault.store(1, Ordering::SeqCst);
-                        stop.store(true, Ordering::SeqCst);
-                        return Err(io::Error::other(format!(
-                            "{iface}: {} silent for {} consecutive ticks ({:.1} s) — motor unreachable; stopping rather than commanding it blind",
-                            motor.joint,
-                            health.consecutive_misses,
-                            health.consecutive_misses as f64 / cfg.loop_hz,
-                        )));
+                        // Repeats every tick past the limit; go_limp is
+                        // edge-triggered so only the first one reports.
+                        go_limp(
+                            limp,
+                            out_tx,
+                            &format!(
+                                "{iface}: {} silent for {} consecutive ticks ({:.1} s) — motor unreachable; going limp rather than commanding it stiff and blind",
+                                motor.joint,
+                                health.consecutive_misses,
+                                health.consecutive_misses as f64 / cfg.loop_hz,
+                            ),
+                        );
                     }
                 }
                 any_degraded |= health.degraded;
@@ -2067,8 +2173,35 @@ fn bus_loop(
         }
     })();
 
-    if !bus_dead {
+    // Torque comes off only for an explicit disarm on a healthy session. A
+    // fault on either bus, a signal, a lost client, or a protocol error all
+    // stop the stream and leave every motor on its last MIT command — holding
+    // on firmware gains, or limp with gravity feedforward if the session had
+    // gone limp — the classic-Python outcome when the host process died.
+    // A dead bus (e-stop) has nothing powered to hear a disable anyway.
+    let deliberate = disarm.load(Ordering::SeqCst)
+        && fault.load(Ordering::SeqCst) == 0
+        && !limp.load(Ordering::SeqCst);
+    if bus_dead {
+        // Nothing to say: the TX-stall fault message already covers it.
+    } else if deliberate {
         bringup::disable(&sock, &motors);
+    } else if limp.load(Ordering::SeqCst) {
+        send_text(
+            out_tx,
+            b'L',
+            &format!(
+                "{iface}: stopped streaming — motors left limp (kp = 0) with their last gravity feedforward (not disabled)"
+            ),
+        );
+    } else {
+        send_text(
+            out_tx,
+            b'L',
+            &format!(
+                "{iface}: stopped streaming — motors left holding their last command (not disabled)"
+            ),
+        );
     }
     drop(trace_tx);
     if let Some(handle) = trace_handle {

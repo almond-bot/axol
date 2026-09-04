@@ -8,20 +8,15 @@ still clamped on the item, and every motor left enabled. This script attaches
 to that already-enabled robot, opens each gripper one at a time (right first,
 then left) so an operator can catch the item, and finally disables all motors.
 
-It deliberately does NOT call ``Axol.enable()``: that would recalibrate the
-grippers (forcing them open and dropping the item) and reset the arm motors.
-Instead it only starts the CAN reader loops and talks to the gripper motors
-directly in raw motor radians, leaving the arms holding their last command.
-
-If ``rom.enable`` was run on a subset of joints (via ``--joints``), pass the
-same ``--joints`` here so only those motors are talked to and disabled. When
-the gripper is not among them there is nothing to release, so this just powers
-the selected motors down.
+It deliberately does NOT bring the realtime core up or call ``Axol.enable()``:
+that would recalibrate the grippers (forcing them open and dropping the item)
+and reset the arm motors. Instead it only opens the maintenance CAN proxies and
+talks to the gripper motors directly in raw motor radians, leaving the arms
+holding the last command the core left them with. The arms never move here.
 
 Run (right after rom.enable, while the motors are still enabled):
     uv run -m almond_axol.diagnostics.rom.disable
     uv run -m almond_axol.diagnostics.rom.disable --no-left
-    uv run -m almond_axol.diagnostics.rom.disable --joints wrist_1,wrist_2,wrist_3
 """
 
 import argparse
@@ -42,27 +37,6 @@ RATE_HZ = 100.0  # Hz
 OPEN_SPEED = 0.2 * 2 * math.pi  # rad/s — gradual, so the operator can catch the item
 OPEN_MAX_SPEED = 10.0  # rad/s — POSITION_FORCE velocity cap (smoothstep paces it)
 OPEN_TORQUE = 2.0  # Nm — POSITION_FORCE output cap while opening
-
-
-def parse_joints(spec: str | None) -> set[Joint]:
-    """Parse a comma-separated joint spec into a set of present :class:`Joint`.
-
-    ``None`` or empty selects every joint. Names match the joint enum values
-    (e.g. ``shoulder_1``, ``elbow``, ``gripper``).
-    """
-    if not spec:
-        return set(Joint)
-    by_value = {j.value: j for j in Joint}
-    selected: set[Joint] = set()
-    for raw in spec.split(","):
-        name = raw.strip().lower()
-        if not name:
-            continue
-        if name not in by_value:
-            valid = ", ".join(by_value)
-            raise SystemExit(f"Unknown joint '{name}'. Valid joints: {valid}")
-        selected.add(by_value[name])
-    return selected or set(Joint)
 
 
 async def open_gripper(arm: AxolArm, side: str) -> None:
@@ -101,91 +75,52 @@ async def open_gripper(arm: AxolArm, side: str) -> None:
     print(f"  {side} gripper open.")
 
 
-async def _disable(axol: Axol, present: set[Joint]) -> None:
-    """Disable the motors and close the buses, limited to the present joints.
-
-    A full set delegates to ``Axol.disable`` (its usual all-motor shutdown);
-    a subset only disables the motors that are actually on the bus so absent
-    ones are not waited on, then closes the buses.
-    """
-    if present == set(Joint):
-        await axol.disable()
-        return
-    tasks = []
-    for arm in (axol.left, axol.right):
-        if arm is not None:
-            tasks.extend(arm.motors[j].disable() for j in present)
-    try:
-        await asyncio.gather(*tasks)
-    except Exception:
-        pass
-    finally:
-        close_tasks = []
-        if axol.left is not None:
-            close_tasks.append(axol._left_bus.close())
-        if axol.right is not None:
-            close_tasks.append(axol._right_bus.close())
-        await asyncio.gather(*close_tasks)
-
-
 async def run(
     no_left: bool,
     no_right: bool,
-    present: set[Joint],
     web_prompts: bool = False,
     left_channel: str = CAN_LEFT,
     right_channel: str = CAN_RIGHT,
 ) -> None:
-    """Open each present gripper sequentially, then disable the present motors."""
+    """Open each gripper sequentially, then disable every motor."""
     axol = Axol(
         left_channel=None if no_left else left_channel,
         right_channel=None if no_right else right_channel,
     )
-    has_gripper = Joint.GRIPPER in present
 
-    # The motors are already enabled and holding (rom.enable left them up); only
-    # start the CAN reader loops so we can command them. Do NOT call enable().
-    bus_tasks = []
-    if axol.left is not None:
-        bus_tasks.append(axol._left_bus.start())
-    if axol.right is not None:
-        bus_tasks.append(axol._right_bus.start())
-    await asyncio.gather(*bus_tasks)
+    # The motors are already enabled and holding (rom.enable detached its
+    # realtime core with them up); only open the maintenance proxies so we can
+    # command them. Do NOT call enable().
+    await axol.connect()
 
     try:
-        if has_gripper:
-            targets: list[tuple[str, AxolArm]] = []
-            if axol.right is not None:
-                targets.append(("RIGHT", axol.right))
-            if axol.left is not None:
-                targets.append(("LEFT", axol.left))
+        targets: list[tuple[str, AxolArm]] = []
+        if axol.right is not None:
+            targets.append(("RIGHT", axol.right))
+        if axol.left is not None:
+            targets.append(("LEFT", axol.left))
 
-            for side, arm in targets:
-                instruction = (
-                    f"Get ready to catch the item, then open the {side} gripper."
+        for side, arm in targets:
+            instruction = f"Get ready to catch the item, then open the {side} gripper."
+            if web_prompts:
+                # The dashboard turns this marker into a Continue button and
+                # writes a line to our stdin when the operator clicks.
+                print(f"{PROMPT_MARKER} {instruction}", flush=True)
+                await asyncio.to_thread(sys.stdin.readline)
+            else:
+                await asyncio.to_thread(
+                    input, f"{instruction} Press Enter to continue ..."
                 )
-                if web_prompts:
-                    # The dashboard turns this marker into a Continue button and
-                    # writes a line to our stdin when the operator clicks.
-                    print(f"{PROMPT_MARKER} {instruction}", flush=True)
-                    await asyncio.to_thread(sys.stdin.readline)
-                else:
-                    await asyncio.to_thread(
-                        input, f"{instruction} Press Enter to continue ..."
-                    )
-                await open_gripper(arm, side)
+            await open_gripper(arm, side)
 
-            print("\nGrippers open — item released.")
-        else:
-            print("\nNo gripper in this run — nothing to release.")
+        print("\nGrippers open — item released.")
     finally:
         print("Disabling motors ...")
-        await _disable(axol, present)
+        await axol.disable()
         print("Motors disabled.")
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
-    valid_joints = [j.value for j in Joint]
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
     parser.add_argument(
@@ -201,12 +136,6 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="IFACE",
         help="SocketCAN interface for the right arm, for setups without the "
         "Axol hub CAN adapter (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--joints",
-        default=None,
-        help="Comma-separated joints present on the bus (must match the rom.enable run). "
-        f"Only these are talked to and disabled. Default: all. One of: {', '.join(valid_joints)}.",
     )
     parser.add_argument(
         "--web-prompts",
@@ -233,12 +162,10 @@ def run_cli(args: argparse.Namespace) -> None:
     """Run the gripper release routine from parsed arguments."""
     if args.no_left and args.no_right:
         raise SystemExit("Cannot disable both arms.")
-    present = parse_joints(args.joints)
     asyncio.run(
         run(
             no_left=args.no_left,
             no_right=args.no_right,
-            present=present,
             web_prompts=args.web_prompts,
             left_channel=args.left_channel,
             right_channel=args.right_channel,
