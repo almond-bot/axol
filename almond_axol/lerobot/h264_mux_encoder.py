@@ -79,6 +79,24 @@ _logger = logging.getLogger(__name__)
 # before giving up on that camera's mp4.
 _EOS_TIMEOUT_S = 30.0
 
+# Per-camera appsrc bound (bytes): how much encoded video may queue ahead of
+# the mux/filesink thread before push-buffer blocks the capture thread. This
+# is the recorder's entire tolerance for a storage stall. The all-intra
+# dataset branch runs ~21 Mbit/s per camera at SVGA@60 (peak ~31), so the
+# former 8 MiB held only ~2-3 s — the same window as the encoded-AU reader's
+# 120-frame (2 s) backlog limit, which is why a multi-second write stall
+# surfaced as "encoded-AU backlog exceeded" with the control loop healthy.
+# 64 MiB rides out ~20 s of stalled writes (eMMC/SD garbage collection,
+# dirty-page throttling behind a previous episode's writeback) for at most
+# 256 MiB across four cameras; a genuinely wedged pipeline still stops the
+# episode, just later.
+_APPSRC_MAX_BYTES = 64 * 1024 * 1024
+# Queue depth at which feed() starts warning that storage is falling behind
+# (one line per _APPSRC_PRESSURE_LOG_PERIOD_S per camera). In steady state the
+# queue holds at most a frame or two (~50 KB), so this only fires on a stall.
+_APPSRC_PRESSURE_WARN_BYTES = 4 * 1024 * 1024
+_APPSRC_PRESSURE_LOG_PERIOD_S = 2.0
+
 # How long finish() waits for the live stats worker to drain its queue. The
 # worker decodes keyframes as they arrive (~4/s), so the queue is near-empty at
 # episode end; this only bounds a wedged decoder.
@@ -271,6 +289,8 @@ class _CameraH264Muxer:
         self._count = 0
         self._stats_stride = max(1, round(fps / _STATS_SAMPLE_HZ))
         self._error: str | None = None
+        self._peak_queued = 0
+        self._last_pressure_log = 0.0
 
         # Live per-keyframe stats decode (see _StatsWorker); create it only after
         # the mux pipeline is successfully built so constructor failure cannot
@@ -331,10 +351,41 @@ class _CameraH264Muxer:
         )
         # Bound appsrc so a wedged pipeline surfaces as back-pressure, not
         # unbounded memory; block so we never silently drop a (dependency-bearing)
-        # encoded frame.
-        src.set_property("max-bytes", 8 * 1024 * 1024)
+        # encoded frame. The bound is the recorder's whole tolerance for a
+        # storage stall: filesink writes through the page cache, and when the
+        # device falls behind (eMMC/SD garbage collection, dirty-page throttling)
+        # the streaming thread parks in write(), this queue fills, and the next
+        # push-buffer blocks the capture thread. See _APPSRC_MAX_BYTES.
+        src.set_property("max-bytes", _APPSRC_MAX_BYTES)
         src.set_property("block", True)
         return pipeline, src
+
+    def queued_bytes(self) -> int:
+        """Bytes parked in appsrc waiting for the mux/filesink thread."""
+        if self._src is None:
+            return 0
+        return int(self._src.get_property("current-level-bytes"))
+
+    def _note_write_pressure(self) -> None:
+        """Warn (rate-limited) when the mux queue shows the disk falling behind."""
+        level = self.queued_bytes()
+        if level > self._peak_queued:
+            self._peak_queued = level
+        if level < _APPSRC_PRESSURE_WARN_BYTES:
+            return
+        now = time.perf_counter()
+        if now - self._last_pressure_log < _APPSRC_PRESSURE_LOG_PERIOD_S:
+            return
+        self._last_pressure_log = now
+        _logger.warning(
+            "dataset mux %s: %.1f MiB of encoded video queued ahead of filesink "
+            "(%.0f%% of the %d MiB bound) — storage is not keeping up with the "
+            "write; at the bound the capture thread blocks",
+            self.video_path.name,
+            level / 2**20,
+            100.0 * level / _APPSRC_MAX_BYTES,
+            _APPSRC_MAX_BYTES // 2**20,
+        )
 
     def feed(self, au: bytes) -> None:
         """Mux one access unit at the next constant-fps PTS.
@@ -360,6 +411,7 @@ class _CameraH264Muxer:
             )
         frame_index = self._count
         self._count += 1
+        self._note_write_pressure()
         if (
             self._stats_worker is not None
             and frame_index % self._stats_stride == 0
@@ -512,12 +564,16 @@ class _CameraH264Muxer:
             # Live worker produced nothing (deps/decode failure): fall back to
             # decoding the finalized file's keyframes.
             stats = self._compute_stats_from_file()
+        # peak-queue is the storage-headroom number for the take: bytes that
+        # sat in appsrc waiting on filesink at the worst moment. Tens of KB
+        # is healthy; MBs mean the disk stalled (see _APPSRC_MAX_BYTES).
         _logger.info(
-            "H264 mux finalize %s: eos=%.2fs stats=%.2fs (%d frames)",
+            "H264 mux finalize %s: eos=%.2fs stats=%.2fs (%d frames, peak-queue %.1f MiB)",
             self.video_path.name,
             t_eos - t0,
             time.perf_counter() - t_eos,
             self._count,
+            self._peak_queued / 2**20,
         )
         return self.video_path, stats
 
