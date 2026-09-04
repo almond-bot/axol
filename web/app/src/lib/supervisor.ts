@@ -53,10 +53,12 @@ export interface CommandSpec {
   episodeControl?: boolean
   /** Arg name that means "no hardware", or null when the robot is required. */
   simFlag?: string | null
-  /** Arg names that skip the arm-robot gates without being sim (cart_only). */
+  /** Arg names that skip the arm-robot gates without being sim (jelly_only). */
   robotFreeFlags?: string[]
   /** Driven from the VR headset, so the panel shows the connect hint. */
   usesHeadset?: boolean
+  /** Diagnostics-dashboard grouping: "helper" | "test" | "tuning". */
+  section?: string | null
 }
 
 /** Catalog category display order (matches serve/commands.py CATEGORY_ORDER). */
@@ -803,7 +805,7 @@ export interface OperationMeta {
   simCapable: boolean
   /** Arg that makes a run hardware-free; null when the robot is required. */
   simFlag: string | null
-  /** Args that skip the arm-robot gates without being sim (teleop's cart_only:
+  /** Args that skip the arm-robot gates without being sim (teleop's jelly_only:
    * real hardware, but the arms and their CAN bus are never touched). */
   robotFreeFlags: string[]
   /** Shows the episode start / save / discard controls while running. */
@@ -924,8 +926,8 @@ export function isSimRun(meta: OperationMeta, settings: Record<string, FormValue
 
 /**
  * Whether this run leaves the arms (and their CAN bus) untouched — sim, or a
- * robot-free flag like teleop's cart_only. Such a run skips the "Connect
- * Axol" and motor-fault gates; cart_only still drives real cart hardware.
+ * robot-free flag like teleop's jelly_only. Such a run skips the "Connect
+ * Axol" and motor-fault gates; jelly_only still drives real Jelly hardware.
  */
 export function isRobotFreeRun(meta: OperationMeta, settings: Record<string, FormValue>): boolean {
   if (isSimRun(meta, settings)) return true

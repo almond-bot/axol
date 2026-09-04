@@ -125,9 +125,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Left arm stiffness",
                 type="number",
                 help=(
-                    "Compliance ↔ stiffness blend in [0, 1] for the left arm. "
-                    "Match the value used at data-collection time when running "
-                    "a policy."
+                    "Compliance blend in [0, 1] for the left arm: 1 (default) "
+                    "runs the tuned gains, lower only adds compliance. Match "
+                    "the value used at data-collection time when running a "
+                    "policy."
                 ),
                 ui={"widget": "slider", "min": 0, "max": 1, "step": 0.05},
                 targets={
@@ -142,7 +143,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="robot.right_stiffness",
                 label="Right arm stiffness",
                 type="number",
-                help=("Compliance ↔ stiffness blend in [0, 1] for the right arm."),
+                help=(
+                    "Compliance blend in [0, 1] for the right arm: 1 (default) "
+                    "runs the tuned gains, lower only adds compliance."
+                ),
                 ui={"widget": "slider", "min": 0, "max": 1, "step": 0.05},
                 targets={
                     "teleop": ("axol.right_stiffness",),
@@ -263,21 +267,21 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
-                key="robot.cart_enabled",
-                label="Powered cart",
+                key="robot.jelly_enabled",
+                label="Jelly",
                 type="boolean",
                 help=(
-                    "This robot has the powered cart (x-drive omni base + "
+                    "This robot has Jelly (x-drive omni base + "
                     "telescoping lift). The headset thumbsticks then drive it "
                     "during teleop and data collection: left stick translates, "
                     "right stick x rotates, stick clicks run the lift. "
-                    "Operator mobility only — cart motion is never recorded "
-                    "into datasets and policies never control it. Cart "
-                    "parameters live under Advanced → Cart."
+                    "Operator mobility only — Jelly motion is never recorded "
+                    "into datasets and policies never control it. Jelly "
+                    "parameters live under Advanced → Jelly."
                 ),
                 targets={
-                    "teleop": ("cart.enabled",),
-                    "collect-data": (f"{_TELEOP_CFG}.cart.enabled",),
+                    "teleop": ("jelly.enabled",),
+                    "collect-data": (f"{_TELEOP_CFG}.jelly.enabled",),
                 },
             ),
             SettingDef(
@@ -358,13 +362,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="number",
                 help="Gravity compensation control-loop rate.",
                 targets={"gravity-comp": ("rate_hz",)},
-            ),
-            SettingDef(
-                key="robot.gravity_telemetry_hz",
-                label="Gravity telemetry rate (Hz)",
-                type="number",
-                help="Background motor telemetry rate during gravity compensation.",
-                targets={"gravity-comp": ("telemetry_hz",)},
             ),
         ),
     ),
@@ -810,11 +807,11 @@ ADVANCED_SECTIONS: tuple[AdvancedSection, ...] = (
         targets={"teleop": "kinematics", "collect-data": _KIN},
     ),
     AdvancedSection(
-        key="cart",
-        label="Cart",
+        key="jelly",
+        label="Jelly",
         ref_op="teleop",
-        ref_prefix="cart",
-        targets={"teleop": "cart", "collect-data": f"{_TELEOP_CFG}.cart"},
+        ref_prefix="jelly",
+        targets={"teleop": "jelly", "collect-data": f"{_TELEOP_CFG}.jelly"},
     ),
     AdvancedSection(
         key="vr_server",

@@ -34,7 +34,7 @@ from ..constants import (
 from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
 from .model import (
-    collision_activation_margins,
+    collision_cost_params,
     shared_robot,
     shared_robot_collision,
 )
@@ -113,6 +113,181 @@ _bounded_manipulability_cost = jaxls.Cost.factory(_bounded_manipulability_residu
 
 
 # ---------------------------------------------------------------------------
+# Self-collision cost with per-pair (possibly negative) activation starts
+# ---------------------------------------------------------------------------
+
+
+def _self_collision_residual(
+    vals: jaxls.VarValues,
+    robot: pk.Robot,
+    robot_coll: pk.collision.RobotCollision,
+    joint_var: jaxls.Var[jax.Array],
+    activation_start: jax.Array,
+    ramp_width: jax.Array,
+    weight: jax.Array | float,
+) -> jax.Array:
+    """pyroki's self-collision residual with decoupled activation and ramp.
+
+    Per pair: zero for clearance above ``activation_start``, a quartic ramp
+    over the ``ramp_width`` below it (C2 at both ends), then the full linear
+    slope. The ramp's derivative is smoothstep ``3u² - 2u³``: unlike the old
+    quadratic residual, its curvature also reaches zero at the shell edges.
+    This prevents the collision boundary itself from injecting a joint-
+    acceleration impulse while the arm approaches the base.
+
+    The activation/ramp decoupling lets pairs whose conservative capsules
+    already interpenetrate at the home pose use a *negative* activation start
+    (activate only when the pose gets closer than home). Pyroki's stock cost
+    bottoms out at zero, which kept the ``base <-> e2`` gradient permanently
+    active during ordinary front-of-torso work (see
+    :func:`.model.collision_cost_params`).
+    """
+    cfg = vals[joint_var]
+    d = robot_coll.compute_self_collision_distance(robot, cfg)
+    s = activation_start - d  # violation depth beyond the activation shell
+    # Integral of smoothstep(clip(s / width, 0, 1)). At u=1 this is
+    # width/2 with unit slope and zero curvature, matching the linear branch
+    # exactly through the second derivative.
+    u = jnp.clip(s / ramp_width, 0.0, 1.0)
+    smooth_ramp = ramp_width * (u**3 - 0.5 * u**4)
+    r = jnp.where(
+        s < ramp_width,
+        smooth_ramp,
+        s - 0.5 * ramp_width,
+    )
+    return (r * weight).flatten()
+
+
+_self_collision_cost = jaxls.Cost.factory(_self_collision_residual)
+
+
+@jax.jit
+def _base_collision_safe_step(
+    robot: pk.Robot,
+    robot_coll: pk.collision.RobotCollision,
+    q_from: jax.Array,
+    q_to: jax.Array,
+    clearance_floor: jax.Array,
+    max_joint_delta: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Project a rate-limited joint step along the base-clearance boundary.
+
+    The smooth collision residual steers IK away early, but it remains a soft
+    least-squares task. Check the proposed endpoint independently. If it would
+    cross a pair's calibrated floor, remove only the inward component of the
+    joint step using the clearance Jacobian; tangential motion survives, so
+    the arm can slide/reconfigure around the base rather than freezing. A
+    negative floor is valid for conservative capsules that overlap at the
+    physically safe home pose. Both the proposed step and any clearance
+    correction are scaled along their full joint-space direction to stay
+    within the per-call delta budget and the robot's joint limits.
+    """
+
+    guard_buffer = jnp.array(5e-4, dtype=q_from.dtype)
+
+    def bound_step(q_candidate: jax.Array) -> jax.Array:
+        """Shorten a step without changing its joint-space direction."""
+        delta = q_candidate - q_from
+        max_abs = jnp.max(jnp.abs(delta))
+        rate_scale = jnp.minimum(
+            1.0,
+            jnp.maximum(max_joint_delta, 0.0) / jnp.maximum(max_abs, 1e-12),
+        )
+        delta = delta * rate_scale
+
+        # Find the largest scalar that keeps every component inside its hard
+        # joint interval. Scaling the whole vector preserves the tangent
+        # projection; clipping individual joints could point it back into the
+        # base after the clearance calculation.
+        room = jnp.where(
+            delta > 0.0,
+            robot.joints.upper_limits - q_from,
+            q_from - robot.joints.lower_limits,
+        )
+        limit_scale = jnp.where(
+            delta == 0.0,
+            1.0,
+            jnp.maximum(room, 0.0) / jnp.maximum(jnp.abs(delta), 1e-12),
+        )
+        delta = delta * jnp.clip(jnp.min(limit_scale), 0.0, 1.0)
+        return q_from + delta
+
+    # The caller already rate-limits q_to, but applying the constraints at
+    # this boundary makes them part of the projection's contract and also
+    # enforces the solver's otherwise-soft joint limits.
+    q_to = bound_step(q_to)
+
+    def margin(q: jax.Array) -> jax.Array:
+        distances = robot_coll.compute_self_collision_distance(robot, q)
+        return jnp.min(distances - clearance_floor)
+
+    to_margin = margin(q_to)
+
+    def project_unsafe(_unused: None) -> jax.Array:
+        from_margin = margin(q_from)
+        delta = q_to - q_from
+        gradient = jax.grad(margin)(q_from)
+        gradient_sq = jnp.dot(gradient, gradient) + 1e-12
+        inward_step = jnp.dot(gradient, delta)
+        allowed_step = guard_buffer - from_margin
+        correction = jnp.maximum(allowed_step - inward_step, 0.0) / gradient_sq
+        q_slide = bound_step(q_from + delta + correction * gradient)
+        slide_margin = margin(q_slide)
+
+        def recover_existing(_unused: None) -> jax.Array:
+            improving = slide_margin > from_margin
+            return jnp.where(improving, q_slide, q_from)
+
+        def keep_safe(_unused: None) -> jax.Array:
+            def accept_slide(_unused: None) -> jax.Array:
+                return q_slide
+
+            def find_boundary(_unused: None) -> jax.Array:
+                # Clearance is mildly nonlinear in joint space. If the
+                # first-order tangent projection is still just inside the
+                # floor, retain its direction and shorten it to the boundary.
+                slide_delta = q_slide - q_from
+
+                def refine(_i: int, bounds: tuple[jax.Array, jax.Array]):
+                    low, high = bounds
+                    mid = 0.5 * (low + high)
+                    q_mid = q_from + mid * slide_delta
+                    mid_safe = margin(q_mid) >= 0.0
+                    return (
+                        jnp.where(mid_safe, mid, low),
+                        jnp.where(mid_safe, high, mid),
+                    )
+
+                lo, _ = jax.lax.fori_loop(
+                    0,
+                    8,
+                    refine,
+                    (
+                        jnp.array(0.0, dtype=q_from.dtype),
+                        jnp.array(1.0, dtype=q_from.dtype),
+                    ),
+                )
+                return q_from + lo * slide_delta
+
+            return jax.lax.cond(
+                slide_margin >= 0.0, accept_slide, find_boundary, operand=None
+            )
+
+        return jax.lax.cond(
+            from_margin < 0.0, recover_existing, keep_safe, operand=None
+        )
+
+    guard_active = to_margin < 0.0
+    q_safe = jax.lax.cond(
+        guard_active,
+        project_unsafe,
+        lambda _unused: q_to,
+        operand=None,
+    )
+    return q_safe, guard_active
+
+
+# ---------------------------------------------------------------------------
 # JIT-compiled core solve
 # ---------------------------------------------------------------------------
 
@@ -168,7 +343,8 @@ def _solve_ik(
     posture_weight: float,
     manipulability_weight: float,
     limit_weight: float,
-    self_collision_margin: jax.Array,
+    self_collision_start: jax.Array,
+    self_collision_ramp: jax.Array,
     self_collision_weight: float,
     elbow_weight_L: float,
     elbow_weight_R: float,
@@ -292,11 +468,12 @@ def _solve_ik(
 
     costs.append(pk.costs.limit_cost(robot, JointVar(0), weight=limit_weight))
     costs.append(
-        pk.costs.self_collision_cost(
+        _self_collision_cost(
             robot,
             robot_coll,
             JointVar(0),
-            margin=self_collision_margin,
+            activation_start=self_collision_start,
+            ramp_width=self_collision_ramp,
             weight=self_collision_weight,
         )
     )
@@ -493,11 +670,35 @@ class KinematicsSolver:
         # instead of re-tracing and re-running jaxls analysis.
         self.robot = shared_robot()
         self.robot_coll = shared_robot_collision()
-        self._collision_margins = jnp.asarray(
-            collision_activation_margins(
-                self.robot, self.robot_coll, config.self_collision_margin
-            )
+        starts, widths = collision_cost_params(
+            self.robot, self.robot_coll, config.self_collision_margin
         )
+        self._collision_starts = jnp.asarray(starts)
+        self._collision_ramps = jnp.asarray(widths)
+        # A soft cost normally turns every arm/base pair away. Independently
+        # hard-stop the physical contact pair found in the recorded cross-body
+        # run: either upper arm (e1) against base/s1. Its fitted capsule already
+        # overlaps at the safe straight-down pose, so the threshold is relative
+        # to that reference: at most 20 mm closer. The observed contact was
+        # 23-31 mm closer, leaving roughly 10 mm of model-space headroom.
+        q_home = jnp.zeros(self.robot.joints.num_actuated_joints)
+        home_distances = np.asarray(
+            self.robot_coll.compute_self_collision_distance(self.robot, q_home)
+        )
+        clearance_floor = np.full_like(starts, -np.inf)
+        for k, (i, j) in enumerate(
+            zip(
+                np.asarray(self.robot_coll.active_idx_i),
+                np.asarray(self.robot_coll.active_idx_j),
+            )
+        ):
+            a = self.robot_coll.link_names[int(i)]
+            b = self.robot_coll.link_names[int(j)]
+            arm_link = b if a in ("base", "s1") else a if b in ("base", "s1") else ""
+            if arm_link.endswith("_e1"):
+                clearance_floor[k] = home_distances[k] - 0.020
+        self._base_clearance_floor = jnp.asarray(clearance_floor)
+        self._base_collision_guard_active = False
 
         names = self.robot.links.names
         self.l_ee_idx = names.index(_LEFT_EE)
@@ -561,6 +762,7 @@ class KinematicsSolver:
         self._q_prev: np.ndarray | None = None
 
         self._warmup()
+        self._base_collision_guard_active = False
 
     def set_posture_pose(self, q: np.ndarray) -> None:
         """Set the global preferred posture used as a persistent attractor.
@@ -659,6 +861,7 @@ class KinematicsSolver:
         right_pose: Pose | None = None,
         left_elbow_pos: np.ndarray | None = None,
         right_elbow_pos: np.ndarray | None = None,
+        delta_scale: float = 1.0,
     ) -> np.ndarray:
         """Compute joint positions for absolute Cartesian end-effector targets.
 
@@ -679,6 +882,13 @@ class KinematicsSolver:
             right_pose: Same as ``left_pose`` for the right end-effector.
             left_elbow_pos: ``(3,)`` optional left elbow position hint in world frame.
             right_elbow_pos: ``(3,)`` optional right elbow position hint in world frame.
+            delta_scale: Multiplier on ``config.max_joint_delta`` for this
+                call. The per-call clamp is an implicit velocity limit at the
+                nominal solve cadence; when a solve arrives late the caller
+                should scale the budget by the actual elapsed time, otherwise
+                the effective joint speed silently collapses (a 30 ms solve
+                under the default clamp allows only ~1.1 rad/s instead of
+                4 rad/s) and the accumulated error releases as a lurch.
 
         Returns:
             Updated full ``(N,)`` joint array in radians.
@@ -761,7 +971,8 @@ class KinematicsSolver:
             cfg.posture_weight,
             cfg.manipulability_weight,
             cfg.limit_weight,
-            self._collision_margins,
+            self._collision_starts,
+            self._collision_ramps,
             cfg.self_collision_weight,
             elbow_w_l,
             elbow_w_r,
@@ -801,9 +1012,28 @@ class KinematicsSolver:
         # releasing with a velocity discontinuity.
         delta = q_result_np - q_current
         max_abs = float(np.max(np.abs(delta))) if delta.size else 0.0
-        if max_abs > cfg.max_joint_delta:
-            delta = delta * (cfg.max_joint_delta / max_abs)
+        delta_budget = cfg.max_joint_delta * delta_scale
+        if max_abs > delta_budget:
+            delta = delta * (delta_budget / max_abs)
         q_out = (q_current + delta).astype(np.float32)
+        q_out, guard_active_jax = _base_collision_safe_step(
+            self.robot,
+            self.robot_coll,
+            jnp.asarray(q_current, dtype=jnp.float32),
+            jnp.asarray(q_out, dtype=jnp.float32),
+            self._base_clearance_floor,
+            jnp.asarray(delta_budget, dtype=jnp.float32),
+        )
+        guard_active = bool(guard_active_jax)
+        if guard_active and not self._base_collision_guard_active:
+            _logger.warning(
+                "IK base-collision guard redirected a commanded step along "
+                "the arm/base clearance boundary"
+            )
+        elif not guard_active and self._base_collision_guard_active:
+            _logger.info("IK base-collision guard released")
+        self._base_collision_guard_active = guard_active
+        q_out = np.asarray(q_out, dtype=np.float32)
         return self.from_pyroki_order(q_out)
 
     def _elbow_fade(

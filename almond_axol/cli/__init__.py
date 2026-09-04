@@ -4,7 +4,9 @@ import argparse
 import importlib
 import sys
 
+from ..rt import install as rt_install
 from ..utils.dotenv import load_local_env
+from . import calibration as calibration_cmd
 from . import migrate_dataset as migrate_dataset_cmd
 from . import provision as provision_cmd
 from . import serve as serve_cmd
@@ -16,6 +18,7 @@ from .gst import install as gst_install
 from .jetson import setup as jetson_setup
 from .lift import goto as lift_goto
 from .lift import home as lift_home
+from .motion import add_parser as motion_add_parser
 from .motor import dump_config as motor_dump_config
 from .motor import flash as motor_flash
 from .motor import health as motor_health
@@ -23,7 +26,11 @@ from .motor import info as motor_info
 from .motor import restore_config as motor_restore_config
 from .motor import set_can_id, set_zero_pos
 from .motor import set_config as motor_set_config
+from .tune import factory as tune_factory
+from .tune import filter as tune_filter
 from .tune import friction, pid, repeatability
+from .tune import gravity as tune_gravity
+from .tune import motion as tune_motion
 from .zed import driver as zed_driver
 from .zed import install as zed_install
 
@@ -54,6 +61,16 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
     "diag.zed-cable": (
         "almond_axol.diagnostics.zed.cable",
         "Verify a ZED camera cable by validating captured frames.",
+    ),
+    "diag.teleop-jitter": (
+        "almond_axol.diagnostics.teleop_jitter",
+        "Attribute teleop jitter to a pipeline stage from a flight-recorder "
+        "capture (axol teleop --teleop.record PREFIX).",
+    ),
+    "diag.offline": (
+        "almond_axol.diagnostics.offline_suites",
+        "Offline wifi/filtering/kinematics analysis of a flight-recorder "
+        "capture, persisted as tuning runs for the diagnostics UI.",
     ),
 }
 
@@ -122,11 +139,18 @@ def main() -> None:
     zed_driver.add_parser(subparsers)
     gst_install.add_parser(subparsers)
     gst_build_zed.add_parser(subparsers)
+    rt_install.add_parser(subparsers)
     provision_cmd.add_parser(subparsers)
     jetson_setup.add_parser(subparsers)
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)
+    tune_gravity.add_parser(subparsers)
+    tune_factory.add_parser(subparsers)
+    calibration_cmd.add_parser(subparsers)
     repeatability.add_parser(subparsers)
+    tune_motion.add_parser(subparsers)
+    tune_filter.add_parser(subparsers)
+    motion_add_parser(subparsers)
     migrate_dataset_cmd.add_parser(subparsers)
     serve_cmd.add_parser(subparsers)
 

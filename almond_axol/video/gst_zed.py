@@ -5,17 +5,19 @@ This is the single, fast camera path the project unifies on. The Stereolabs
 (GPU) memory; an in-process GStreamer pipeline then tees that one zero-copy
 buffer to two consumers:
 
-* **encoded branch** — ``nvv4l2h264enc`` (NVENC) -> ``appsink``. The whole
-  grab -> encode chain stays on the GPU (~4.5 ms), and Python only ever sees
-  the encoded H.264 access units, which the WebRTC relay forwards as
-  pre-encoded packets (aiortc ``encoder.pack``). This is the headset view for
-  both teleop and data collection.
+* **encoded branch** — ``videorate`` fixes headset delivery at 30 fps, then
+  ``nvv4l2h264enc`` (NVENC) -> ``appsink``. The whole grab -> encode chain
+  stays on the GPU (~4.5 ms), and Python only ever sees the encoded H.264
+  access units, which the WebRTC relay forwards as pre-encoded packets
+  (aiortc ``encoder.pack``). This is the headset view for both teleop and data
+  collection; camera capture remains independent for recording and policies.
 * **dataset branch** — only built when the dataset / a policy needs the frames.
-  For the recorder it is a second GPU encode -> ``shmsink`` carrying H.264 AUs
-  (``_dataset_enc_shmsink``): the recorder just muxes them, so no raw copy or
-  re-encode crosses the boundary. For in-process consumers (inference, or the
-  pyshm fallback) it is instead ``nvvidconv`` -> RGBA ``appsink`` -> numpy. Each
-  RGBA frame carries a ``capture_perf_ts`` derived from the buffer PTS. We run a
+  For the recorder it is a second GPU encode -> ``gdppay`` -> ``shmsink``
+  carrying H.264 AUs *and their original PTS* (``_dataset_enc_shmsink``): the
+  recorder just muxes them, so no raw copy or re-encode crosses the boundary.
+  For in-process consumers (inference, or the pyshm fallback) it is instead
+  ``nvvidconv`` -> RGBA ``appsink`` -> numpy. Each RGBA frame carries a
+  ``capture_perf_ts`` derived from the buffer PTS. We run a
   patched ``zedxonesrc``/``zedsrc`` (``do-timestamp=false``) that stamps the
   PTS at the true sensor-exposure instant (``TIME_REFERENCE::IMAGE``) instead
   of host-receive time; :meth:`_cap_perf_from_pts` maps that running-time onto
@@ -42,13 +44,15 @@ gate use; without them callers fall back to the SDK ``ZedCamera``.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import queue
 import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from .hw_video import _bitrate_for, dataset_vbr_bitrate, hw_h264_available
+from .constants import HEADSET_STREAM_FPS
+from .hw_video import _bitrate_for, dataset_intra_vbr_bitrate, hw_h264_available
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -140,24 +144,58 @@ def _gi_available() -> bool:
         return False
 
 
-def zed_gst_available() -> bool:
+def _verified_sensor_timestamps_available(element: str) -> bool:
+    """True when runtime resolves ``gst.build-zed``'s stamped plugin binary."""
+    try:
+        from ..cli.gst.build_zed import sensor_timestamp_patch_installed
+
+        Gst, _ = _require_gst()
+        factory = Gst.ElementFactory.find(element)
+        plugin = None if factory is None else factory.get_plugin()
+        filename = None if plugin is None else plugin.get_filename()
+        return filename is not None and sensor_timestamp_patch_installed(
+            element, filename
+        )
+    except Exception:  # noqa: BLE001 - an unverifiable build is not exact
+        return False
+
+
+def zed_gst_available(*, require_sensor_timestamps: bool = False) -> bool:
     """True when PyGObject, NVENC, and the mono ``zedxonesrc`` element exist."""
     if not _gi_available() or not hw_h264_available():
         return False
     ok = _element_available("zedxonesrc")
-    if ok:
-        _logger.info("zed-gstreamer mono pipeline (zedxonesrc) available")
-    return ok
+    if not ok:
+        return False
+    if require_sensor_timestamps and not _verified_sensor_timestamps_available(
+        "zedxonesrc"
+    ):
+        _logger.warning(
+            "zedxonesrc is installed but its sensor-timestamp patch cannot be "
+            "verified; run `axol gst.build-zed` before collection/policy"
+        )
+        return False
+    _logger.info("zed-gstreamer mono pipeline (zedxonesrc) available")
+    return True
 
 
-def zed_stereo_gst_available() -> bool:
+def zed_stereo_gst_available(*, require_sensor_timestamps: bool = False) -> bool:
     """True when PyGObject, NVENC, and the stereo ``zedsrc`` element exist."""
     if not _gi_available() or not hw_h264_available():
         return False
     ok = _element_available("zedsrc")
-    if ok:
-        _logger.info("zed-gstreamer stereo pipeline (zedsrc) available")
-    return ok
+    if not ok:
+        return False
+    if require_sensor_timestamps and not _verified_sensor_timestamps_available(
+        "zedsrc"
+    ):
+        _logger.warning(
+            "zedsrc is installed but its sensor-timestamp patch cannot be "
+            "verified; run `axol gst.build-zed` before collection/policy"
+        )
+        return False
+    _logger.info("zed-gstreamer stereo pipeline (zedsrc) available")
+    return True
 
 
 def _element_available(element: str) -> bool:
@@ -378,17 +416,235 @@ def _raw_shmsink(socket_path: str) -> str:
     )
 
 
-# The dataset branch keeps a short keyframe interval (~0.25s): frequent IDRs let
-# LeRobot seek/decode the recorded video cheaply, and bound how long the recorder
-# waits for the first keyframe when an episode's valve opens. The encoder can't
-# be force-keyframed on demand on this L4T (the ``force-IDR`` signal segfaults and
-# force-key-unit events are ignored), so each episode simply begins at the next
-# periodic IDR; the reader drops the leading P-frames until then.
-_DATASET_IDR_INTERVAL_S = 0.25
+# Dataset AUs are all-intra. The Jetson encoder cannot be force-keyframed on
+# demand on this L4T (the ``force-IDR`` signal segfaults and force-key-unit
+# events are ignored), and its input/VIC pipeline retains a variable number of
+# frames after an upstream valve closes. With a predictive GOP that hidden tail
+# advances each encoder by a different amount, so the first recorder-visible
+# IDRs can describe exposures several camera ticks apart even though the raw
+# valves reopen on one shared timestamp. Making every dataset frame an IDR
+# removes that unobservable phase state and also lets the recorder discard a
+# leading independently-decodable AU when forming its row-zero camera cluster.
+# Both ``iframeinterval`` and ``idrinterval`` must be one: nvv4l2h264enc exposes
+# them as separate READY-only controls.
+_DATASET_GOP_FRAMES = 1
+# Before the recorder connects, tiny leaky queues around the dataset encoder are
+# intentional: the upstream branch queue keeps the camera tee fresh while the
+# valve is closed, and the output queue keeps NVENC returning its NVMM surfaces
+# while shmsink parks GDP's one-shot header. During an episode a short input
+# queue *after* a forced VIC copy absorbs NVENC startup jitter without retaining
+# a large pool of camera-owned/crop surfaces; the compressed output keeps a
+# longer cushion for recorder scheduling jitter. Both remain bounded and leaky
+# so a dead recorder cannot back-pressure Argus or the independent headset path.
+_DATASET_STARTUP_QUEUE_BUFFERS = 2
+_DATASET_ACTIVE_INPUT_QUEUE_MIN_BUFFERS = 15
+_DATASET_ACTIVE_INPUT_QUEUE_SECONDS = 0.5
+_DATASET_ACTIVE_OUTPUT_QUEUE_MIN_BUFFERS = 60
+_DATASET_ACTIVE_OUTPUT_QUEUE_SECONDS = 2
+# The VIC pool must exceed the downstream queue capacity so NVENC can retain its
+# input surfaces while a new buffer still reaches the queue and triggers its
+# downstream-leaky policy instead of blocking back into the camera tee. Eight
+# spare surfaces is a thin, undocumented allowance for NVENC retention across
+# four simultaneous all-intra 60 Hz encoders. Thirty-two provides bounded
+# headroom (about 28 MiB beyond the queue itself per SVGA branch) and keeps
+# backpressure behind the copied-surface boundary.
+_DATASET_VIC_INFLIGHT_SURFACES = 32
+# Opening every camera with a sequence of host-side property writes can straddle
+# multiple source frames. Arm a timestamp probe on every branch first, then let
+# each one open itself on its first exposure at/after one shared future instant.
+# 100 ms is ample time to install the handful of probes without making a record
+# press feel sluggish; the relay caller performs this wait away from control.
+_DATASET_ENABLE_LEAD_S = 0.100
+# The shared gate still has a bounded acknowledgement wait. A timeout means a
+# source stopped producing exposure timestamps, not ordinary scheduler jitter.
+_DATASET_GATE_TIMEOUT_S = 2.0
+# Every camera source element carries this name so the source-gap diagnostic
+# can find its pad. A sensor-timestamp step of 1.5 periods at the fastest
+# supported capture rate (60 Hz) is already a whole missing exposure.
+_SOURCE_ELEMENT_NAME = "camsrc"
+_SOURCE_GAP_WARN_MS = 25.0
+_GPU_DEVFREQ_GLOB = "/sys/class/devfreq/*.gpu"
+# The Linux thread name (``comm``) is truncated to this many characters, so
+# gst task threads named ``<element>:<pad>`` may only be matched on a prefix.
+_COMM_MAX = 15
+# The named queues whose consumer thread still holds an *un-copied* camera
+# surface: the stereo eye crops and the dataset source queues in front of the
+# VIC copy. Argus owns only a handful of those surfaces, so these queues are
+# two buffers deep and an overrun there is a lost exposure; everything after
+# the VIC copy has its own (deeper) buffering.
+_EXPOSURE_CRITICAL_QUEUES = (
+    "eye_l_cropq",
+    "eye_r_cropq",
+    "dsenc_srcq",
+    "dsenc_l_srcq",
+    "dsenc_r_srcq",
+)
 
 
-def _dataset_enc_shmsink(socket_path: str, w: int, h: int, fps: int, name: str) -> str:
-    """Encode the dataset stream on the GPU and ship H.264 AUs over ``shmsink``.
+def _task_thread_comm(element_name: str) -> str:
+    """The ``comm`` GStreamer gives the streaming thread of ``element_name``."""
+    return f"{element_name}:src"[:_COMM_MAX]
+
+
+def exposure_critical_thread_comms() -> frozenset[str]:
+    """``comm`` names of the relay threads that must run every capture period.
+
+    The camera source streaming thread plus the consumers of
+    :data:`_EXPOSURE_CRITICAL_QUEUES`. Used by the relay to give exactly this
+    chain real-time scheduling (see ``affinity.prioritize_capture_threads``).
+    """
+    return frozenset(
+        _task_thread_comm(name)
+        for name in (_SOURCE_ELEMENT_NAME, *_EXPOSURE_CRITICAL_QUEUES)
+    )
+
+
+def _thread_sched_wait_ns() -> int | None:
+    """Cumulative time this thread spent runnable-but-waiting (Linux only)."""
+    try:
+        with open("/proc/thread-self/schedstat") as f:
+            return int(f.read().split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _find_thread_by_comm(comm: str) -> int | None:
+    """TID of this process's thread named ``comm``, or ``None``."""
+    try:
+        entries = os.listdir("/proc/self/task")
+    except OSError:
+        return None
+    for entry in entries:
+        try:
+            with open(f"/proc/self/task/{entry}/comm") as f:
+                if f.read().strip() == comm:
+                    return int(entry)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _thread_sched_snapshot(tid: int) -> tuple[int, str, str] | None:
+    """``(runnable-wait ns, state letter, wchan)`` of a thread of this process.
+
+    ``state`` is ``R`` when the thread is runnable (running or waiting for a
+    CPU), ``S``/``D`` when it is blocked — for a VIC/NVENC dispatch thread that
+    means waiting on the hardware, and ``wchan`` names the kernel wait.
+    """
+    try:
+        with open(f"/proc/self/task/{tid}/schedstat") as f:
+            wait_ns = int(f.read().split()[1])
+        with open(f"/proc/self/task/{tid}/stat") as f:
+            state = f.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, ValueError, IndexError):
+        return None
+    try:
+        with open(f"/proc/self/task/{tid}/wchan") as f:
+            wchan = f.read().strip() or "-"
+    except OSError:
+        wchan = "-"
+    return wait_ns, state, wchan
+
+
+def _consumer_attribution(state: dict[str, Any], comm: str) -> str:
+    """Describe what a queue's consumer thread was doing at an overrun.
+
+    Sampled per overrun event (cheap: three procfs reads) and phrased so the
+    two causes read apart in the log: a consumer that is ``state=R`` with a CPU
+    wait close to the elapsed time was starved of a core; one that is
+    ``state=S``/``D`` in an ``nvhost``/fence wait with ~0 CPU wait was blocked
+    on the VIC/NVENC hardware or its memory path.
+    """
+    now = time.perf_counter()
+    tid = state.get("tid")
+    if tid is None:
+        tid = state["tid"] = _find_thread_by_comm(comm)
+        if tid is None:
+            return f"consumer {comm} not found"
+    snap = _thread_sched_snapshot(tid)
+    if snap is None:
+        state["tid"] = None
+        return f"consumer {comm} exited"
+    wait_ns, sched_state, wchan = snap
+    prev_t, prev_wait = state.get("t"), state.get("wait")
+    state["t"], state["wait"] = now, wait_ns
+    head = f"consumer {comm} state={sched_state} wchan={wchan}"
+    if prev_t is None or prev_wait is None or now - prev_t > 1.0:
+        return head
+    return (
+        f"{head}, CPU wait {(wait_ns - prev_wait) / 1e6:.1f}ms of the "
+        f"{(now - prev_t) * 1e3:.1f}ms since its previous overrun"
+    )
+
+
+def _gpu_clock_summary() -> str:
+    """``cur/max MHz`` of the Tegra GPU devfreq, or ``n/a`` off-Jetson."""
+    import glob
+
+    for node in glob.glob(_GPU_DEVFREQ_GLOB):
+        try:
+            with open(f"{node}/cur_freq") as f:
+                cur = int(f.read()) // 1_000_000
+            with open(f"{node}/max_freq") as f:
+                top = int(f.read()) // 1_000_000
+        except (OSError, ValueError):
+            continue
+        return f"{cur}/{top}MHz"
+    return "n/a"
+
+
+def _dataset_rate_limit(capture_fps: int, dataset_fps: int) -> str:
+    """Decimate the encoded dataset branch without synthesizing frames."""
+    if capture_fps <= 0 or dataset_fps <= 0:
+        raise ValueError("camera and dataset fps must be positive")
+    if dataset_fps > capture_fps:
+        raise ValueError(
+            f"dataset fps ({dataset_fps}) cannot exceed camera capture fps "
+            f"({capture_fps})"
+        )
+    if dataset_fps == capture_fps:
+        return ""
+    return (
+        f"videorate drop-only=true max-rate={dataset_fps} ! "
+        "video/x-raw(memory:NVMM),format=NV12,"
+        f"framerate={dataset_fps}/1 ! "
+    )
+
+
+def _dataset_input_queue(name: str) -> str:
+    """Named bounded queue between the dataset VIC copy and NVENC."""
+    return (
+        f"queue name={name}_inq leaky=downstream "
+        f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
+        "max-size-bytes=0 max-size-time=0"
+    )
+
+
+def _dataset_source_queue(name: str) -> str:
+    """Shallow named queue before the dataset valve/VIC ownership boundary."""
+    return (
+        f"queue name={name}_srcq leaky=downstream "
+        f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
+        "max-size-bytes=0 max-size-time=0"
+    )
+
+
+def _dataset_active_input_buffers(dataset_fps: int) -> int:
+    """Short converted-surface cushion for an active dataset encoder."""
+    return max(
+        _DATASET_ACTIVE_INPUT_QUEUE_MIN_BUFFERS,
+        math.ceil(_DATASET_ACTIVE_INPUT_QUEUE_SECONDS * max(1, dataset_fps)),
+    )
+
+
+def _dataset_enc_shmsink(
+    socket_path: str,
+    w: int,
+    h: int,
+    dataset_fps: int,
+    name: str,
+) -> str:
+    """Encode on the GPU and ship timestamped H.264 AUs over ``shmsink``.
 
     This replaces the raw-NV12 shmsink on the relay's dataset branch: the relay
     already holds the frame in NVMM, so a second NVENC branch (a GPU block, ~free
@@ -396,20 +652,52 @@ def _dataset_enc_shmsink(socket_path: str, w: int, h: int, fps: int, name: str) 
     raw copy) — and the recorder only *muxes* it (see
     :class:`~almond_axol.lerobot.h264_mux_encoder.H264MuxStreamingEncoder`) rather
     than re-encoding. ``nvvidconv`` must output NVMM for ``nvv4l2h264enc``; the
-    AU-aligned byte-stream is what the recorder's
-    :class:`~almond_axol.video.shm_frames.EncodedAuReader` expects. Runs in VBR
-    with a peak cap so the recorded dataset stays bounded and uniformly sized
-    across cameras even when one sensor is very noisy (see ``dataset_vbr_bitrate``).
+    AU-aligned byte-stream is wrapped in GStreamer Data Protocol by ``gdppay``.
+    Unlike bare ``shmsink``, GDP serializes each buffer's PTS (and its caps), so
+    the recorder can recover the sensor-exposure timestamp instead of using the
+    much later receive time. The whole path remains in GStreamer's C threads.
+
+    ``wait-for-connection=true`` is essential. ``gdppay`` emits its stream/caps
+    header only once; if shmsink discarded that header before the recorder's
+    late ``gdpdepay`` connection, the consumer could never parse the stream.
+    Waiting parks this branch's first GDP packet until the recorder attaches.
+    A leaky queue after the encoder keeps NVENC draining (and releases its NVMM
+    input surfaces) while that packet is parked; the queue must stay before
+    ``gdppay`` so it can never discard GDP's one-shot stream/caps header. The
+    short named queue between a forced VIC copy and NVENC decouples encoder
+    startup stalls from camera capture and the independent headset branch
+    without retaining the source camera's buffers. Both named queues grow only
+    while an episode is active.
+    The rate limiter deliberately stays upstream of the valve: it must continue
+    tracking the source timeline between episodes, otherwise reopening a stale
+    ``videorate`` can briefly pass capture-rate frames into a lower-rate dataset.
+    The valve is born open so startup reaches shmsink and parks the GDP header
+    before the parent later closes the branch between episodes.
+
+    Encoding runs in VBR with a peak cap so the recorded dataset stays bounded
+    and uniformly sized across cameras even when one sensor is very noisy. The
+    budget is the all-intra one (``dataset_intra_vbr_bitrate``): every frame is
+    an IDR here, so the predictive-GOP budget would leave each frame visibly
+    blocky.
     """
-    idr = max(1, round(fps * _DATASET_IDR_INTERVAL_S))
-    target, peak = dataset_vbr_bitrate(w, h, fps)
+    target, peak = dataset_intra_vbr_bitrate(w, h, dataset_fps)
+    input_buffers = _dataset_active_input_buffers(dataset_fps)
+    converter_buffers = input_buffers + _DATASET_VIC_INFLIGHT_SURFACES
     return (
-        f"nvvidconv ! video/x-raw(memory:NVMM),format=NV12,width={w},height={h} "
+        f"nvvidconv output-buffers={converter_buffers} ! "
+        f"video/x-raw(memory:NVMM),format=I420,width={w},height={h} "
+        f"! {_dataset_input_queue(name)} "
         f"! nvv4l2h264enc name={name} control-rate=0 "
         f"bitrate={target} peak-bitrate={peak} preset-level=1 "
-        f"insert-sps-pps=true insert-aud=true idrinterval={idr} maxperf-enable=true "
+        f"insert-sps-pps=true insert-aud=true "
+        f"iframeinterval={_DATASET_GOP_FRAMES} "
+        f"idrinterval={_DATASET_GOP_FRAMES} maxperf-enable=true "
         "! video/x-h264,stream-format=byte-stream,alignment=au "
-        f"! shmsink socket-path={socket_path} wait-for-connection=false "
+        f"! queue name={name}_outq leaky=downstream "
+        f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
+        "max-size-bytes=0 max-size-time=0 ! gdppay "
+        f"! shmsink name={name}_shmsink socket-path={socket_path} "
+        "wait-for-connection=true "
         "sync=false async=false"
     )
 
@@ -422,22 +710,24 @@ def _enc_branch(bitrate: int, fps: int, name: str = "venc") -> str:
     )
 
 
-# While an episode records, the relay runs an extra per-camera NVENC dataset
-# branch (GPU encode + shmsink) on top of the headset send, so the aiortc send
-# loop has less headroom and a full-bitrate headset feed jitters/stutters. The
-# headset stream is only a live monitor, so we drop its encoder bitrate while
-# recording: fewer bits -> fewer RTP packets -> proportionally less SRTP/send CPU,
-# handing the event loop back its headroom. The recorded dataset video is a
-# separate NVENC pipeline at full (capped-VBR) quality, so training data is
-# unaffected.
-_RECORDING_ENC_BITRATE_SCALE = 0.5
+def _stream_rate_limit(capture_fps: int, stream_fps: int) -> str:
+    """GStreamer prefix that fixes only the encoded branch at headset rate.
 
-
-def _set_enc_bitrate(pipeline: Any, name: str, bitrate: int) -> None:
-    """Set a named ``nvv4l2h264enc``'s target bitrate at runtime (best-effort)."""
-    enc = pipeline.get_by_name(name)
-    if enc is not None:
-        enc.set_property("bitrate", int(bitrate))
+    Faster capture is decimated without duplication. If a separately chosen
+    recording/policy rate is below the headset rate, ``videorate`` repeats the
+    latest frame so WebRTC still has an immutable 30 fps cadence. It changes
+    only timestamps/buffer selection; the NVMM frame remains GPU-resident.
+    Dataset/policy branches tee off before this element and therefore continue
+    at ``capture_fps``.
+    """
+    if stream_fps == capture_fps:
+        return ""
+    drop_only = "drop-only=true " if capture_fps > stream_fps else ""
+    return (
+        f"videorate {drop_only}max-rate={stream_fps} ! "
+        "video/x-raw(memory:NVMM),format=NV12,"
+        f"framerate={stream_fps}/1 ! "
+    )
 
 
 class _GstPipelineBase:
@@ -447,8 +737,425 @@ class _GstPipelineBase:
         self._gst: Any = None
         self._pipeline: Any = None
         self._clock: Any = None
+        # Constant affine mapping for this PLAYING pipeline:
+        # capture_perf_seconds = buffer_pts_ns / 1e9 + offset. ``perf_counter``
+        # is system-wide on our supported platforms, so the recorder process can
+        # apply the same offset to PTS recovered by gdpdepay.
+        self._pts_perf_offset_s: float | None = None
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
+        # Kept as a list for cancellation compatibility with an in-flight close.
+        # Dataset encoders are all-intra now, so current closes are immediate and
+        # never populate it.
+        self._dataset_disable: list[tuple[Any, int, threading.Event, Any, str]] = []
+        # One ``(sink_pad, probe_id, opened, cancelled, lock, status, valve,
+        # label)`` per dataset branch waiting for a common exposure boundary.
+        # ``lock`` serializes an opening callback with fail-close so a callback
+        # can never reopen a valve after an aborted multi-camera transaction.
+        self._dataset_enable: list[
+            tuple[
+                Any,
+                int,
+                threading.Event,
+                threading.Event,
+                threading.Lock,
+                dict[str, str | None],
+                Any,
+                str,
+            ]
+        ] = []
+        self._dataset_enabled = False
+        # Named gst queue overruns are the missing stage-level evidence when a
+        # later reader sees only a PTS hole. Values are reset at each episode;
+        # callbacks log only active/opening dataset branches.
+        self._dataset_queue_overruns: dict[str, int] = {}
+
+    def _cancel_dataset_disable(self) -> None:
+        """Remove any outstanding legacy dataset-close probes (best effort)."""
+        pending, self._dataset_disable = self._dataset_disable, []
+        for pad, probe_id, event, _valve, _label in pending:
+            if event.is_set():
+                continue  # a REMOVE return already detached this probe
+            try:
+                pad.remove_probe(probe_id)
+            except Exception:  # noqa: BLE001 - pipeline may be tearing down
+                pass
+
+    def _cancel_dataset_enable(self) -> None:
+        """Cancel a pending common-frame open and leave every valve closed."""
+        pending, self._dataset_enable = self._dataset_enable, []
+        for pad, probe_id, opened, cancelled, lock, status, valve, label in pending:
+            # The callback checks ``cancelled`` and changes the valve under this
+            # same lock. If it won the race, fail-close runs second and closes
+            # the valve; if cancellation won, the callback cannot reopen it.
+            with lock:
+                cancelled.set()
+                if status["error"] is None:
+                    status["error"] = f"dataset source {label!r} opening was cancelled"
+                valve.set_property("drop", True)
+                # Wake a concurrent finish waiter so abort/disconnect never
+                # leaves it sleeping until the full gate timeout.
+                opened.set()
+            try:
+                pad.remove_probe(probe_id)
+            except Exception:  # noqa: BLE001 - callback/pipeline may be exiting
+                pass
+
+    def _abort_dataset_enable(self, gates: tuple[tuple[str, str | None], ...]) -> None:
+        """Fail a multi-camera open closed, including branches already opened."""
+        self._cancel_dataset_enable()
+        self._dataset_enabled = False
+        if self._pipeline is None:
+            return
+        for valve_name, _encoder_name in gates:
+            valve = self._pipeline.get_by_name(valve_name)
+            if valve is not None:
+                valve.set_property("drop", True)
+        # Shrink only after every input valve is closed. Reducing a live input
+        # queue first could itself discard an exposure from the episode we are
+        # trying to fail closed.
+        self._set_dataset_queue_depths(gates, active=False)
+
+    def _set_dataset_queue_depths(
+        self,
+        gates: tuple[tuple[str, str | None], ...],
+        *,
+        active: bool,
+    ) -> None:
+        """Select bounded startup or active-episode encoder queue headroom.
+
+        Startup must remain aggressively leaky: the ordinary pre-valve branch
+        queue keeps the camera tee current while capture is disabled, and GDP's
+        header is parked behind the post-encoder output queue at
+        ``shmsink wait-for-connection=true`` before the recorder exists. During
+        an episode the reader is connected and flushed, so retain a short queue
+        of copied NVMM frames before NVENC and two seconds of compressed AUs
+        after it. Both queues stay bounded and downstream-leaky; exhausting
+        either still surfaces as a PTS/DISCONT capture failure.
+        """
+        if self._pipeline is None:
+            return
+        dataset_fps = max(1, int(getattr(self, "dataset_fps", 1)))
+        active_input_buffers = _dataset_active_input_buffers(dataset_fps)
+        active_output_buffers = max(
+            _DATASET_ACTIVE_OUTPUT_QUEUE_MIN_BUFFERS,
+            _DATASET_ACTIVE_OUTPUT_QUEUE_SECONDS * dataset_fps,
+        )
+        for _valve_name, encoder_name in gates:
+            if encoder_name is None:
+                continue
+            queue_depths = (
+                (
+                    f"{encoder_name}_inq",
+                    active_input_buffers,
+                    "input",
+                ),
+                (
+                    f"{encoder_name}_outq",
+                    active_output_buffers,
+                    "output",
+                ),
+            )
+            for queue_name, active_depth, side in queue_depths:
+                queue = self._pipeline.get_by_name(queue_name)
+                if queue is None:
+                    raise RuntimeError(
+                        f"missing dataset encoder {side} queue {queue_name}"
+                    )
+                queue.set_property("leaky", 2)  # downstream
+                queue.set_property(
+                    "max-size-buffers",
+                    active_depth if active else _DATASET_STARTUP_QUEUE_BUFFERS,
+                )
+                # Explicitly disable the queue defaults (10 MB / 1 s);
+                # otherwise either can undercut the frame-count bound.
+                queue.set_property("max-size-bytes", 0)
+                queue.set_property("max-size-time", 0)
+
+    def _attach_dataset_queue_diagnostics(
+        self, gates: tuple[tuple[str, str | None], ...]
+    ) -> None:
+        """Log the exact relay queue that sheds an active-episode frame.
+
+        Queue callbacks are event-only (no per-buffer Python probe), so they add
+        no steady-state GIL work to the relay. Counts are rate-limited to the
+        first and powers of two in case a failed recorder leaves a branch
+        overflowing until teardown.
+        """
+        if self._pipeline is None:
+            return
+        queue_valves: dict[str, Any] = {}
+        for valve_name, encoder_name in gates:
+            if encoder_name is None:
+                continue
+            valve = self._pipeline.get_by_name(valve_name)
+            if valve is None:
+                _logger.debug("dataset queue diagnostic missing valve %s", valve_name)
+                continue
+            for queue_name in (
+                f"{encoder_name}_srcq",
+                f"{encoder_name}_inq",
+                f"{encoder_name}_outq",
+            ):
+                queue_valves[queue_name] = valve
+            if encoder_name.startswith("dsenc_"):
+                queue_valves[f"eye_{encoder_name.rsplit('_', 1)[1]}_cropq"] = valve
+        owner = repr(self)
+        for queue_name, valve in sorted(queue_valves.items()):
+            queue = self._pipeline.get_by_name(queue_name)
+            if queue is None:
+                _logger.debug("dataset queue diagnostic missing %s", queue_name)
+                continue
+            self._dataset_queue_overruns.setdefault(queue_name, 0)
+            consumer_state: dict[str, Any] = {}
+
+            def on_overrun(
+                element: Any,
+                *,
+                label: str = queue_name,
+                branch_valve: Any = valve,
+                source: str = owner,
+                consumer: dict[str, Any] = consumer_state,
+            ) -> None:
+                # Source/crop queues are live before an episode. An overrun
+                # counts only after this branch's valve admits its first
+                # dataset exposure; one stereo eye can open before its sibling.
+                try:
+                    if bool(branch_valve.get_property("drop")):
+                        return
+                except Exception:  # noqa: BLE001 - diagnostics only
+                    return
+                count = self._dataset_queue_overruns.get(label, 0) + 1
+                self._dataset_queue_overruns[label] = count
+                # Sample the consumer on every overrun so the wait delta spans
+                # exactly the interval between two overruns, but log only the
+                # first and powers of two.
+                attribution = _consumer_attribution(consumer, _task_thread_comm(label))
+                if count != 1 and count & (count - 1):
+                    return
+                try:
+                    level = int(element.get_property("current-level-buffers"))
+                    limit = int(element.get_property("max-size-buffers"))
+                except Exception:  # noqa: BLE001 - diagnostics only
+                    level = limit = -1
+                _logger.warning(
+                    "dataset relay %s queue %s overrun #%d "
+                    "(level=%d, limit=%d); %s; an encoded exposure may be lost",
+                    source,
+                    label,
+                    count,
+                    level,
+                    limit,
+                    attribution,
+                )
+
+            try:
+                queue.connect("overrun", on_overrun)
+            except Exception as exc:  # noqa: BLE001 - diagnostics only
+                _logger.debug(
+                    "could not attach overrun diagnostic to %s: %s",
+                    queue_name,
+                    exc,
+                )
+
+    def _begin_dataset_enable(
+        self,
+        gates: tuple[tuple[str, str | None], ...],
+        target_perf_s: float,
+    ) -> None:
+        """Arm every branch to open on its first exposure at/after one instant.
+
+        Dataset valves receive sensor-exposure PTS even while dropping buffers.
+        Installing probes on all cameras before ``target_perf_s`` avoids the
+        one/two-frame phase error caused by sequential property writes. Each
+        camera has a different pipeline running-time origin, so the shared
+        system-wide ``perf_counter`` target is converted with that pipeline's
+        calibrated PTS offset.
+        """
+        self._cancel_dataset_disable()
+        if self._dataset_enabled:
+            # Relay commands are idempotent. Re-arming an already-open branch
+            # would close it until the next future boundary, dropping H.264 AUs
+            # from the live episode for no semantic state change.
+            return
+        self._cancel_dataset_enable()
+        if self._pipeline is None:
+            return
+        if not math.isfinite(target_perf_s):
+            raise ValueError("dataset enable target must be finite")
+        if self._pts_perf_offset_s is None:
+            raise RuntimeError(
+                "camera pipeline PTS/perf_counter mapping is unavailable"
+            )
+
+        # Round upward: a sub-nanosecond conversion error must not admit an
+        # exposure infinitesimally before the shared boundary.
+        target_pts = math.ceil((target_perf_s - self._pts_perf_offset_s) * 1e9)
+        armed: list[
+            tuple[
+                Any,
+                int,
+                threading.Event,
+                threading.Event,
+                threading.Lock,
+                dict[str, str | None],
+                Any,
+                str,
+            ]
+        ] = []
+        try:
+            for queue_name in self._dataset_queue_overruns:
+                self._dataset_queue_overruns[queue_name] = 0
+            # Expand both sides before any valve can admit the shared-boundary
+            # exposure. A partial property-update failure is caught below;
+            # abort closes all valves before restoring startup depths.
+            self._set_dataset_queue_depths(gates, active=True)
+            for valve_name, encoder_name in gates:
+                valve = self._pipeline.get_by_name(valve_name)
+                if valve is None:
+                    raise RuntimeError(f"missing dataset valve {valve_name!r}")
+                # A common-frame open is valid only from the known closed state.
+                # Closing here also makes repeated/partially failed requests
+                # deterministic instead of leaking an already-open frame.
+                valve.set_property("drop", True)
+                pad = valve.get_static_pad("sink")
+                if pad is None:
+                    raise RuntimeError(f"missing dataset valve pad {valve_name!r}")
+                opened = threading.Event()
+                cancelled = threading.Event()
+                transition_lock = threading.Lock()
+                status: dict[str, str | None] = {"error": None}
+                label = encoder_name or valve_name
+
+                def open_at_common_exposure(
+                    _pad: Any,
+                    info: Any,
+                    *,
+                    branch_valve: Any = valve,
+                    branch_opened: threading.Event = opened,
+                    branch_cancelled: threading.Event = cancelled,
+                    branch_lock: threading.Lock = transition_lock,
+                    branch_status: dict[str, str | None] = status,
+                    branch_label: str = label,
+                    threshold_pts: int = target_pts,
+                ) -> Any:
+                    buf = info.get_buffer()
+                    if buf is None:
+                        return self._gst.PadProbeReturn.OK
+                    if buf.pts == self._gst.CLOCK_TIME_NONE:
+                        with branch_lock:
+                            if not branch_cancelled.is_set():
+                                branch_status["error"] = (
+                                    f"dataset source {branch_label!r} has no exposure PTS"
+                                )
+                                branch_opened.set()
+                        return self._gst.PadProbeReturn.REMOVE
+                    if int(buf.pts) < threshold_pts:
+                        return self._gst.PadProbeReturn.OK
+                    with branch_lock:
+                        if branch_cancelled.is_set():
+                            return self._gst.PadProbeReturn.REMOVE
+                        # This is a sink-pad probe: changing ``drop`` before the
+                        # valve handles the current buffer admits this exposure,
+                        # not merely the following one.
+                        branch_valve.set_property("drop", False)
+                        branch_opened.set()
+                    return self._gst.PadProbeReturn.REMOVE
+
+                probe_id = pad.add_probe(
+                    self._gst.PadProbeType.BUFFER, open_at_common_exposure
+                )
+                if not probe_id:
+                    raise RuntimeError(
+                        f"could not install dataset enable probe on {valve_name!r}"
+                    )
+                armed.append(
+                    (
+                        pad,
+                        probe_id,
+                        opened,
+                        cancelled,
+                        transition_lock,
+                        status,
+                        valve,
+                        label,
+                    )
+                )
+        except Exception:
+            self._dataset_enable = armed
+            self._abort_dataset_enable(gates)
+            raise
+        self._dataset_enable = armed
+
+    def _finish_dataset_enable(self, deadline: float) -> None:
+        """Wait for all common-frame probes, failing the whole camera closed."""
+        # Keep the list published while waiting so a concurrent abort/disconnect
+        # can mark every transition cancelled and close its valve. Swapping it
+        # out here would let a later streaming callback reopen after fail-close.
+        pending = self._dataset_enable
+        failures: list[str] = []
+        for (
+            _pad,
+            _probe_id,
+            opened,
+            cancelled,
+            _lock,
+            status,
+            _valve,
+            label,
+        ) in pending:
+            remaining = max(0.0, deadline - time.perf_counter())
+            if not opened.wait(remaining) and not opened.is_set():
+                failures.append(f"{label}: timed out waiting for exposure boundary")
+                continue
+            error = status["error"]
+            if error is not None:
+                failures.append(error)
+            elif cancelled.is_set():
+                failures.append(f"{label}: exposure-boundary opening was cancelled")
+        if failures:
+            # Cancel only if this is still the transaction we waited on. A
+            # concurrent abort already closed it; a later begin owns a new list
+            # which this failed waiter must not touch.
+            if self._dataset_enable is pending:
+                self._cancel_dataset_enable()
+            raise RuntimeError("; ".join(failures))
+        if self._dataset_enable is pending:
+            self._dataset_enable = []
+        self._dataset_enabled = True
+
+    def _begin_dataset_disable(self, gates: tuple[tuple[str, str | None], ...]) -> None:
+        """Close every dataset input valve immediately.
+
+        Every encoded AU is an IDR, so there is no predictive GOP phase to park.
+        NVENC may still emit a small in-flight tail after the close; the reader's
+        quiet flush drains it before the next shared-timestamp open.
+        """
+        self._cancel_dataset_enable()
+        self._cancel_dataset_disable()
+        if self._pipeline is None:
+            return
+        try:
+            for valve_name, _encoder_name in gates:
+                valve = self._pipeline.get_by_name(valve_name)
+                if valve is None:
+                    raise RuntimeError(f"missing dataset valve {valve_name!r}")
+                valve.set_property("drop", True)
+        except Exception:
+            self._dataset_enabled = False
+            for valve_name, _encoder_name in gates:
+                valve = self._pipeline.get_by_name(valve_name)
+                if valve is not None:
+                    valve.set_property("drop", True)
+            self._set_dataset_queue_depths(gates, active=False)
+            raise
+        self._dataset_disable = []
+
+    def _finish_dataset_disable(self, deadline: float) -> None:
+        """Complete an immediate all-intra dataset close."""
+        del deadline
+        self._dataset_disable = []
+        self._dataset_enabled = False
 
     @property
     def alive(self) -> bool:
@@ -462,44 +1169,64 @@ class _GstPipelineBase:
         """ZedCamera-compatible: the pipeline is built and not torn down."""
         return self._pipeline is not None and not self._stop.is_set()
 
+    @property
+    def pts_perf_offset_s(self) -> float:
+        """Map this pipeline's running-time PTS seconds to ``perf_counter``.
+
+        The mapping is calibrated once after the pipeline reaches PLAYING and
+        remains valid for its lifetime (the pipeline is never paused/rebased).
+        It is safe to send to another process because Python's ``perf_counter``
+        is a system-wide monotonic clock on supported platforms.
+        """
+        if self._pts_perf_offset_s is None:
+            raise RuntimeError("gst pipeline PTS/perf_counter mapping is unavailable")
+        return self._pts_perf_offset_s
+
+    def _calibrate_pts_perf_offset(self) -> float | None:
+        """Return ``perf_counter_s - pipeline_running_time_s`` with low jitter.
+
+        Reading the two clocks is not atomic. Take several bracketed samples and
+        use the one with the shortest ``perf_counter`` bracket; its midpoint
+        bounds the cross-clock sampling error to half that (normally a few us).
+        The ZED source stamps exposure as pipeline running time, hence applying
+        this one offset recovers exposure time without any receive-time bias.
+        """
+        if self._clock is None or self._pipeline is None:
+            return None
+        base_ns = self._pipeline.get_base_time()
+        if base_ns == self._gst.CLOCK_TIME_NONE:
+            return None
+        best: tuple[int, float] | None = None
+        for _ in range(9):
+            perf_before_ns = time.perf_counter_ns()
+            clock_ns = self._clock.get_time()
+            perf_after_ns = time.perf_counter_ns()
+            if clock_ns == self._gst.CLOCK_TIME_NONE:
+                continue
+            bracket_ns = perf_after_ns - perf_before_ns
+            perf_mid_ns = (perf_before_ns + perf_after_ns) // 2
+            running_ns = clock_ns - base_ns
+            offset_s = (perf_mid_ns - running_ns) / 1e9
+            if best is None or bracket_ns < best[0]:
+                best = (bracket_ns, offset_s)
+        return None if best is None else best[1]
+
     def _cap_perf_from_pts(self, pts: int, recv_perf: float) -> float:
         """Map a buffer running-time PTS onto ``time.perf_counter`` seconds.
 
         With our patched ``zedxonesrc``/``zedsrc`` (and ``do-timestamp=false``),
         ``pts`` is the pipeline running-time of the true sensor-exposure instant
-        (``TIME_REFERENCE::IMAGE``), not host-receive time. The remaining
-        ``(clock_now_running - pts)`` is the glass-to-pull latency, a duration,
-        so subtracting it from the receive ``perf_counter`` yields the
-        sensor-capture timestamp on the ``perf_counter`` timeline -- parity with
-        the ZED SDK ``ZedCamera`` path, so image frames align with joint
-        samples.
+        (``TIME_REFERENCE::IMAGE``), not host-receive time. The offset calibrated
+        when the pipeline entered PLAYING maps that running-time directly onto
+        the system-wide ``perf_counter`` timeline -- parity with the ZED SDK
+        ``ZedCamera`` path, so image frames align with joint samples without
+        receive/encoder/scheduler latency in the result.
         """
-        if pts == self._gst.CLOCK_TIME_NONE or self._clock is None:
-            return recv_perf
-        running_now = self._clock.get_time() - self._pipeline.get_base_time()
-        latency_s = max(0, running_now - pts) / 1e9
-        return recv_perf - latency_s
-
-    def _measure_raw_latency_s(self, fps: int) -> float:
-        """Best-effort glass-to-pull latency (s) for shmsink-path frame stamps.
-
-        On the ``shmsink`` raw path the recorder gets no buffer PTS, so it can't
-        run :meth:`_cap_perf_from_pts`; it stamps ``recv_perf - latency_s``
-        instead. The pipeline's queried latency is a cheap, one-shot proxy for
-        that compensation (no per-frame cost); fall back to one frame interval
-        when the query is unavailable. A small constant bias here only shifts all
-        images uniformly vs the joint samples (both on the same perf_counter
-        clock), within the capture loop's frame tolerance.
-        """
-        try:
-            q = self._gst.Query.new_latency()
-            if self._pipeline.query(q):
-                _live, min_lat, _max_lat = q.parse_latency()
-                if min_lat is not None and min_lat != self._gst.CLOCK_TIME_NONE:
-                    return min_lat / 1e9
-        except Exception:  # noqa: BLE001 - latency query is best-effort
-            pass
-        return 1.0 / fps if fps else 0.0
+        if pts == self._gst.CLOCK_TIME_NONE:
+            raise RuntimeError("raw camera buffer has no sensor PTS")
+        if self._pts_perf_offset_s is None:
+            raise RuntimeError("gst pipeline PTS/perf_counter mapping is unavailable")
+        return pts / 1e9 + self._pts_perf_offset_s
 
     def _start_pull(self, name: str, sink_name: str, handler: Any) -> None:
         sink = self._pipeline.get_by_name(sink_name)
@@ -598,12 +1325,73 @@ class _GstPipelineBase:
         self._gst = Gst
         _logger.info("gst zed pipeline: %s", pipeline_str)
         self._pipeline = Gst.parse_launch(pipeline_str)
+        self._attach_source_gap_diagnostic()
+
+    def _attach_source_gap_diagnostic(self) -> None:
+        """Log every exposure the camera source itself fails to deliver.
+
+        The dataset queues report their own overruns, and the recorder detects
+        a missing AU downstream, but neither can say *where* a frame vanished
+        when no queue overran: that leaves the source element (the ZED SDK's
+        grab loop) or the camera link. This probe sits on the source pad, so a
+        sensor-timestamp gap here is a frame the source never produced. It
+        also attributes the miss: the source's streaming thread cannot call
+        ``grab()`` while descheduled, so if its ``schedstat`` wait time grew by
+        most of the gap it was starved of CPU; otherwise the time went inside
+        the SDK (GPU work, or a link/sensor frame that never arrived), which is
+        why the GPU clock — the one camera-path engine ``jetson.setup`` does
+        not pin — is logged alongside.
+        """
+        Gst = self._gst
+        source = self._pipeline.get_by_name(_SOURCE_ELEMENT_NAME)
+        if source is None:
+            return
+        pad = source.get_static_pad("src")
+        if pad is None:
+            return
+        state: dict[str, Any] = {"pts": None, "wait_ns": None}
+        label = repr(self)
+
+        def on_buffer(_pad: Any, info: Any) -> Any:
+            buf = info.get_buffer()
+            if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
+                return Gst.PadProbeReturn.OK
+            previous = state["pts"]
+            previous_wait = state["wait_ns"]
+            wait_ns = _thread_sched_wait_ns()
+            state["pts"] = buf.pts
+            state["wait_ns"] = wait_ns
+            if previous is None or buf.pts <= previous:
+                return Gst.PadProbeReturn.OK
+            gap_ms = (buf.pts - previous) / 1e6
+            if gap_ms < _SOURCE_GAP_WARN_MS:
+                return Gst.PadProbeReturn.OK
+            starved_ms = (
+                (wait_ns - previous_wait) / 1e6
+                if wait_ns is not None and previous_wait is not None
+                else None
+            )
+            _logger.warning(
+                "camera source %s skipped exposure(s): sensor PTS gap %.2fms; "
+                "source thread CPU wait since previous frame %s; gpu %s",
+                label,
+                gap_ms,
+                "unknown" if starved_ms is None else f"{starved_ms:.2f}ms",
+                _gpu_clock_summary(),
+            )
+            return Gst.PadProbeReturn.OK
+
+        try:
+            pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+        except Exception as exc:  # diagnostics never gate capture
+            _logger.debug("could not attach source gap diagnostic: %s", exc)
 
     def _play_and_wait(self, channels: tuple[_AUChannel, ...]) -> bool:
         Gst = self._gst
         self._pipeline.set_state(Gst.State.PLAYING)
         self._pipeline.get_state(Gst.SECOND * 5)
         self._clock = self._pipeline.get_pipeline_clock()
+        self._pts_perf_offset_s = self._calibrate_pts_perf_offset()
         # Ready when every encoded channel has produced its first AU (or, if
         # there are no encoded channels, give the raw branch a moment).
         deadline = time.perf_counter() + _READY_TIMEOUT_S
@@ -620,6 +1408,9 @@ class _GstPipelineBase:
 
     def disconnect(self) -> None:
         self._stop.set()
+        self._cancel_dataset_enable()
+        self._dataset_enabled = False
+        self._cancel_dataset_disable()
         for thread in self._threads:
             thread.join(timeout=2.0)
         self._threads.clear()
@@ -657,6 +1448,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         raw_sink: Any = None,
         raw_socket_path: str | None = None,
         raw_dims: tuple[int, int] | None = None,
+        dataset_fps: int | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _RESOLUTION_ENUM:
@@ -675,6 +1467,12 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         self.serial = serial
         self.resolution = resolution
         self.fps = fps
+        self.stream_fps = HEADSET_STREAM_FPS
+        self.dataset_fps = fps if dataset_fps is None else int(dataset_fps)
+        if self.dataset_fps <= 0 or self.dataset_fps > self.fps:
+            raise ValueError(
+                f"dataset fps must be in [1, {self.fps}], got {self.dataset_fps}"
+            )
         self.width, self.height = _RESOLUTION_DIMS[resolution]
         # The raw (dataset) branch can be downscaled on the VIC to cut the bytes
         # that cross to the control process; the encoded headset branch always
@@ -684,9 +1482,6 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         self._want_raw = want_raw
         self._raw_sink_override = raw_sink
         self._raw_socket_path = raw_socket_path
-        # Pipeline latency for the shmsink path's recorder-side frame stamps,
-        # measured once after the pipeline plays (see _measure_raw_latency_s).
-        self.raw_latency_s = 0.0
         self._enc = _AUChannel(lambda: self.alive) if want_encoded else None
         self._raw = (
             _RawBuffer(self.raw_width, self.raw_height)
@@ -699,16 +1494,19 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         return f"ZedGstCamera(serial={self.serial})"
 
     def _pipeline_str(self) -> str:
-        bitrate = _bitrate_for(self.width, self.height, self.fps)
-        self._enc_bitrate = bitrate
+        bitrate = _bitrate_for(self.width, self.height, self.stream_fps)
         src = (
-            f"zedxonesrc camera-sn={self.serial} "
+            f"zedxonesrc name={_SOURCE_ELEMENT_NAME} camera-sn={self.serial} "
             f"camera-resolution={_RESOLUTION_ENUM[self.resolution]} "
             f"camera-fps={self.fps} stream-type=1 do-timestamp=false "
             f"ctrl-auto-exposure-range-max={_MAX_AUTO_EXPOSURE_US} "
             "! video/x-raw(memory:NVMM),format=NV12"
         )
-        enc = f"{_QUEUE} ! {_enc_branch(bitrate, self.fps)} ! {_enc_appsink('enc')}"
+        rate = _stream_rate_limit(self.fps, self.stream_fps)
+        enc = (
+            f"{_QUEUE} ! {rate}"
+            f"{_enc_branch(bitrate, self.stream_fps)} ! {_enc_appsink('enc')}"
+        )
         # The dataset branch sits behind a `valve` so it can be gated shut at
         # runtime (see set_raw_enabled): its work is only needed while recording.
         # Defaults open so the SDK-less consumers (inference/run-policy) are
@@ -720,13 +1518,15 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         # _dataset_enc_shmsink). In-process raw consumers (inference/run-policy,
         # or the pyshm RawFrameWriter fallback) still take RGBA off an appsink.
         if self._raw_socket_path:
+            dataset_rate = _dataset_rate_limit(self.fps, self.dataset_fps)
             raw = (
-                f"{_QUEUE} ! valve name=rawvalve drop=false ! "
+                f"{_dataset_source_queue('dsenc')} ! {dataset_rate}"
+                "valve name=rawvalve drop=false ! "
                 + _dataset_enc_shmsink(
                     self._raw_socket_path,
                     self.raw_width,
                     self.raw_height,
-                    self.fps,
+                    self.dataset_fps,
                     "dsenc",
                 )
             )
@@ -742,6 +1542,40 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
             return f"{src} ! {enc}"
         return f"{src} ! {raw}"
 
+    def _raw_gates(self) -> tuple[tuple[str, str | None], ...]:
+        if not self._want_raw:
+            return ()
+        return (("rawvalve", "dsenc" if self._raw_socket_path else None),)
+
+    def begin_raw_disable(self) -> None:
+        """Close this camera's all-intra dataset input."""
+        self._begin_dataset_disable(self._raw_gates())
+
+    def finish_raw_disable(self, deadline: float) -> None:
+        """Complete a close previously armed by :meth:`begin_raw_disable`."""
+        try:
+            self._finish_dataset_disable(deadline)
+        finally:
+            self._set_dataset_queue_depths(self._raw_gates(), active=False)
+
+    def begin_raw_enable(self, target_perf_s: float) -> None:
+        """Arm this camera to open on a shared future exposure boundary."""
+        self._begin_dataset_enable(self._raw_gates(), target_perf_s)
+
+    def finish_raw_enable(self, deadline: float) -> None:
+        """Wait for a common-boundary open armed by :meth:`begin_raw_enable`."""
+        try:
+            self._finish_dataset_enable(deadline)
+        except Exception:
+            # Local callers do not have the relay's outer multi-camera abort.
+            # Preserve the same fail-closed queue/valve state either way.
+            self._abort_dataset_enable(self._raw_gates())
+            raise
+
+    def abort_raw_enable(self) -> None:
+        """Cancel an opening transaction and immediately close every branch."""
+        self._abort_dataset_enable(self._raw_gates())
+
     def set_raw_enabled(self, enabled: bool) -> None:
         """Open or close the dataset branch at runtime (no pipeline reconfig).
 
@@ -749,22 +1583,23 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         encode (shmsink path) or VIC RGBA convert + appsink copy (in-process path)
         never runs, so the relay costs no more than the encode-only (``axol
         teleop``) path. ``collect-data`` opens this only while an episode is
-        recording. While open, the headset encoder's bitrate is also scaled down
-        (see ``_RECORDING_ENC_BITRATE_SCALE``) to free send-loop CPU; it is
-        restored to full quality when recording stops.
+        recording. The independent 30 fps headset branch keeps the same bitrate
+        and spatial quality on both sides of this gate.
         """
         if not self._want_raw or self._pipeline is None:
             return
-        valve = self._pipeline.get_by_name("rawvalve")
-        if valve is not None:
-            valve.set_property("drop", not enabled)
-        if self._want_encoded:
-            scale = _RECORDING_ENC_BITRATE_SCALE if enabled else 1.0
-            _set_enc_bitrate(self._pipeline, "venc", self._enc_bitrate * scale)
+        if enabled:
+            target = time.perf_counter() + _DATASET_ENABLE_LEAD_S
+            self.begin_raw_enable(target)
+            self.finish_raw_enable(target + _DATASET_GATE_TIMEOUT_S)
+            return
+        self.begin_raw_disable()
+        self.finish_raw_disable(time.perf_counter() + _DATASET_GATE_TIMEOUT_S)
 
     def connect(self, warmup: bool = True) -> None:
         """Open the camera, start the pipeline, and block until it streams."""
         self._launch(self._pipeline_str())
+        self._attach_dataset_queue_diagnostics(self._raw_gates())
         if self._enc is not None:
             self._start_pull(
                 f"zedgst-{self.serial}-enc",
@@ -788,14 +1623,19 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
                 f"ZedGstCamera(serial={self.serial}) did not start streaming "
                 f"within {_READY_TIMEOUT_S:.0f}s (camera absent or in use?)."
             )
-        if self._raw_socket_path is not None:
-            self.raw_latency_s = self._measure_raw_latency_s(self.fps)
+        if self._want_raw and self._pts_perf_offset_s is None:
+            self.disconnect()
+            raise RuntimeError(
+                "camera pipeline could not calibrate its sensor-PTS clock"
+            )
         _logger.info(
-            "ZedGstCamera connected (sn=%d %dx%d @ %dfps, encoded=%s raw=%s).",
+            "ZedGstCamera connected (sn=%d %dx%d capture=%dfps stream=%dfps, "
+            "encoded=%s raw=%s).",
             self.serial,
             self.width,
             self.height,
             self.fps,
+            self.stream_fps,
             self._want_encoded,
             self._want_raw,
         )
@@ -873,6 +1713,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         left_raw_socket_path: str | None = None,
         right_raw_socket_path: str | None = None,
         raw_dims: tuple[int, int] | None = None,
+        dataset_fps: int | None = None,
         eyes: str = "both",
         encoded_eyes: "list[str] | tuple[str, ...] | None" = None,
         raw_eyes: "list[str] | tuple[str, ...] | None" = None,
@@ -941,6 +1782,12 @@ class ZedGstStereoCamera(_GstPipelineBase):
         self.serial = serial
         self.resolution = resolution
         self.fps = fps
+        self.stream_fps = HEADSET_STREAM_FPS
+        self.dataset_fps = fps if dataset_fps is None else int(dataset_fps)
+        if self.dataset_fps <= 0 or self.dataset_fps > self.fps:
+            raise ValueError(
+                f"dataset fps must be in [1, {self.fps}], got {self.dataset_fps}"
+            )
         self.width, self.height = _RESOLUTION_DIMS[resolution]
         # Per-eye downscale target for the raw (dataset) branch; encoded eyes keep
         # the full capture resolution. See ZedGstCamera for the rationale.
@@ -951,8 +1798,6 @@ class ZedGstStereoCamera(_GstPipelineBase):
         self._right_raw_sink = right_raw_sink
         self._left_raw_socket_path = left_raw_socket_path
         self._right_raw_socket_path = right_raw_socket_path
-        # Pipeline latency for the shmsink path's recorder-side frame stamps.
-        self.raw_latency_s = 0.0
 
         def eye(
             side: str, raw_sink: Any, socket_path: str | None
@@ -965,7 +1810,8 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 if side in self._raw_sides and raw_sink is None and socket_path is None
                 else None
             )
-            view = _GstEye(self, enc, raw, self.width, self.height, self.fps)
+            view_fps = self.fps if side in self._raw_sides else self.stream_fps
+            view = _GstEye(self, enc, raw, self.width, self.height, view_fps)
             return enc, raw, view
 
         # Only build the eye(s) named in ``self._sides``; the unbuilt eye's
@@ -988,7 +1834,12 @@ class ZedGstStereoCamera(_GstPipelineBase):
         if encoded_sbs:
             self._sbs_enc = _AUChannel(lambda: self.alive)
             self.sbs_view = _GstEye(
-                self, self._sbs_enc, None, self.width * 2, self.height, self.fps
+                self,
+                self._sbs_enc,
+                None,
+                self.width * 2,
+                self.height,
+                self.stream_fps,
             )
 
     def __repr__(self) -> str:
@@ -1007,13 +1858,17 @@ class ZedGstStereoCamera(_GstPipelineBase):
         eye_w, eye_h = self.width, self.height
         left = 0 if side == "left" else eye_w
         right = eye_w if side == "left" else eye_w * 2
-        bitrate = _bitrate_for(eye_w, eye_h, self.fps)
-        self._enc_bitrate = bitrate
+        bitrate = _bitrate_for(eye_w, eye_h, self.stream_fps)
+        rate = _stream_rate_limit(self.fps, self.stream_fps)
         caps = (
             f"video/x-raw(memory:NVMM),format=NV12,width={eye_w},height={eye_h},"
             "pixel-aspect-ratio=1/1"
         )
-        crop = f"{_QUEUE} ! nvvidconv left={left} right={right} top=0 bottom={eye_h} ! {caps}"
+        crop = (
+            f"queue name=eye_{sink_suffix}_cropq leaky=downstream "
+            "max-size-buffers=2 ! "
+            f"nvvidconv left={left} right={right} top=0 bottom={eye_h} ! {caps}"
+        )
         sock = (
             self._left_raw_socket_path
             if sink_suffix == "l"
@@ -1024,13 +1879,15 @@ class ZedGstStereoCamera(_GstPipelineBase):
         # behind a per-eye valve so set_raw_enabled can gate them while not
         # recording. See the mono _pipeline_str note.
         if sock:
+            dataset_rate = _dataset_rate_limit(self.fps, self.dataset_fps)
             raw = (
-                f"{_QUEUE} ! valve name=rawvalve_{sink_suffix} drop=false ! "
+                f"{_dataset_source_queue('dsenc_' + sink_suffix)} ! {dataset_rate}"
+                f"valve name=rawvalve_{sink_suffix} drop=false ! "
                 + _dataset_enc_shmsink(
                     sock,
                     self.raw_width,
                     self.raw_height,
-                    self.fps,
+                    self.dataset_fps,
                     "dsenc_" + sink_suffix,
                 )
             )
@@ -1043,13 +1900,15 @@ class ZedGstStereoCamera(_GstPipelineBase):
             )
         if want_encoded and want_raw:
             enc = (
-                f"{_QUEUE} ! {_enc_branch(bitrate, self.fps, 'venc_' + sink_suffix)} ! "
+                f"{_QUEUE} ! {rate}"
+                f"{_enc_branch(bitrate, self.stream_fps, 'venc_' + sink_suffix)} ! "
                 f"{_enc_appsink('enc_' + sink_suffix)}"
             )
             return f"{crop} ! tee name=t{sink_suffix}  t{sink_suffix}. ! {enc}  t{sink_suffix}. ! {raw}"
         if want_encoded:
             return (
-                f"{crop} ! {_enc_branch(bitrate, self.fps, 'venc_' + sink_suffix)} ! "
+                f"{crop} ! {rate}"
+                f"{_enc_branch(bitrate, self.stream_fps, 'venc_' + sink_suffix)} ! "
                 f"{_enc_appsink('enc_' + sink_suffix)}"
             )
         return f"{crop} ! {raw}"
@@ -1062,39 +1921,75 @@ class ZedGstStereoCamera(_GstPipelineBase):
         bitrate is twice the per-eye default (same total bits as two per-eye
         streams, just in one track).
         """
-        bitrate = 2 * _bitrate_for(self.width, self.height, self.fps)
-        self._sbs_bitrate = bitrate
+        bitrate = 2 * _bitrate_for(self.width, self.height, self.stream_fps)
+        rate = _stream_rate_limit(self.fps, self.stream_fps)
         return (
-            f"{_QUEUE} ! {_enc_branch(bitrate, self.fps, 'venc_s')} ! "
+            f"{_QUEUE} ! {rate}"
+            f"{_enc_branch(bitrate, self.stream_fps, 'venc_s')} ! "
             f"{_enc_appsink('enc_s')}"
         )
+
+    def _raw_gates(self) -> tuple[tuple[str, str | None], ...]:
+        gates: list[tuple[str, str | None]] = []
+        for side in self._raw_sides:
+            suffix = side[0]
+            socket_path = (
+                self._left_raw_socket_path
+                if side == "left"
+                else self._right_raw_socket_path
+            )
+            gates.append(
+                (f"rawvalve_{suffix}", f"dsenc_{suffix}" if socket_path else None)
+            )
+        return tuple(gates)
+
+    def begin_raw_disable(self) -> None:
+        """Close every all-intra dataset-eye input."""
+        self._begin_dataset_disable(self._raw_gates())
+
+    def finish_raw_disable(self, deadline: float) -> None:
+        """Complete a close previously armed by :meth:`begin_raw_disable`."""
+        try:
+            self._finish_dataset_disable(deadline)
+        finally:
+            self._set_dataset_queue_depths(self._raw_gates(), active=False)
+
+    def begin_raw_enable(self, target_perf_s: float) -> None:
+        """Arm both eyes to open on a shared future exposure boundary."""
+        self._begin_dataset_enable(self._raw_gates(), target_perf_s)
+
+    def finish_raw_enable(self, deadline: float) -> None:
+        """Wait for a common-boundary open armed by :meth:`begin_raw_enable`."""
+        try:
+            self._finish_dataset_enable(deadline)
+        except Exception:
+            self._abort_dataset_enable(self._raw_gates())
+            raise
+
+    def abort_raw_enable(self) -> None:
+        """Cancel an opening transaction and immediately close every eye."""
+        self._abort_dataset_enable(self._raw_gates())
 
     def set_raw_enabled(self, enabled: bool) -> None:
         """Open or close both eyes' dataset branches at runtime.
 
         See :meth:`ZedGstCamera.set_raw_enabled`: gates the per-eye ``valve``s so
         each eye's dataset encode (or VIC convert + appsink copy) only runs while
-        recording. The headset (encoded) eyes' bitrate is scaled down while
-        recording and restored after, for the same send-loop-headroom reason as
-        the mono path.
+        recording. The independent 30 fps headset branch is unchanged.
         """
         if not self._want_raw or self._pipeline is None:
             return
-        for side in self._raw_sides:
-            valve = self._pipeline.get_by_name(f"rawvalve_{side[0]}")
-            if valve is not None:
-                valve.set_property("drop", not enabled)
-        scale = _RECORDING_ENC_BITRATE_SCALE if enabled else 1.0
-        for side in self._encoded_sides:
-            _set_enc_bitrate(
-                self._pipeline, f"venc_{side[0]}", self._enc_bitrate * scale
-            )
-        if self._encoded_sbs:
-            _set_enc_bitrate(self._pipeline, "venc_s", self._sbs_bitrate * scale)
+        if enabled:
+            target = time.perf_counter() + _DATASET_ENABLE_LEAD_S
+            self.begin_raw_enable(target)
+            self.finish_raw_enable(target + _DATASET_GATE_TIMEOUT_S)
+            return
+        self.begin_raw_disable()
+        self.finish_raw_disable(time.perf_counter() + _DATASET_GATE_TIMEOUT_S)
 
     def _pipeline_str(self) -> str:
         src = (
-            f"zedsrc camera-sn={self.serial} "
+            f"zedsrc name={_SOURCE_ELEMENT_NAME} camera-sn={self.serial} "
             f"camera-resolution={_STEREO_RESOLUTION_ENUM[self.resolution]} "
             f"camera-fps={self.fps} stream-type=7 depth-mode=0 "
             "do-timestamp=false "
@@ -1108,6 +2003,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
 
     def connect(self, warmup: bool = True) -> None:
         self._launch(self._pipeline_str())
+        self._attach_dataset_queue_diagnostics(self._raw_gates())
         eye_specs = [
             (
                 "left",
@@ -1159,12 +2055,17 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 f"ZedGstStereoCamera(serial={self.serial}) did not start "
                 f"streaming within {_READY_TIMEOUT_S:.0f}s."
             )
-        if self._left_raw_socket_path or self._right_raw_socket_path:
-            self.raw_latency_s = self._measure_raw_latency_s(self.fps)
+        if self._want_raw and self._pts_perf_offset_s is None:
+            self.disconnect()
+            raise RuntimeError(
+                "camera pipeline could not calibrate its sensor-PTS clock"
+            )
         _logger.info(
-            "ZedGstStereoCamera connected (sn=%d %dx%d/eye @ %dfps).",
+            "ZedGstStereoCamera connected (sn=%d %dx%d/eye capture=%dfps "
+            "stream=%dfps).",
             self.serial,
             self.width,
             self.height,
             self.fps,
+            self.stream_fps,
         )

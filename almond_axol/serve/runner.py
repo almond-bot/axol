@@ -319,13 +319,26 @@ class _Capture:
         # child can't wedge shutdown.
         if self._reader is not None:
             self._reader.join(timeout=2.0)
+        # TextIOWrapper.close() must run while its underlying descriptor still
+        # exists. These wrappers use closefd=False, so closing them marks the
+        # Python object closed (and performs its final flush) without taking
+        # ownership of the saved fd. The old order closed the raw fd first;
+        # when GC later finalized the wrapper — often during a heavy Torch
+        # import at collect-data startup — its implicit flush raised an
+        # ignored ``OSError: [Errno 9] Bad file descriptor``.
+        for stream in (self._saved_out, self._saved_err):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._saved_out = self._saved_err = None
         for fd in (self._saved_out_fd, self._saved_err_fd):
             if fd is not None:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
-        self._saved_out = self._saved_err = None
         self._saved_out_fd = self._saved_err_fd = None
         self._reader = None
 
@@ -451,7 +464,7 @@ class OperationRunner:
                 )
 
         is_sim = cmd.sim_flag is not None and bool(args.get(cmd.sim_flag))
-        # A robot-free run (sim, or e.g. teleop's cart_only) never touches the
+        # A robot-free run (sim, or e.g. teleop's jelly_only) never touches the
         # arms, so the persistent robot link stays connected and its motor
         # telemetry keeps streaming while the op runs.
         robot_free = is_sim or any(
@@ -739,14 +752,11 @@ class OperationRunner:
         resolution — the size the dataset was recorded at and the policy was
         trained on.
 
-        A recording fps above the cameras' default capture rate raises each
-        *recording* camera's capture fps to match: on the encoded relay
-        transport dataset rows are paced by camera frame arrival, so
-        collect-data requires the recording fps to equal the capture rate —
-        without this, setting a higher recording fps in Settings would just
-        fail that validation. (Higher rates may still be rejected by the
-        camera at large capture resolutions; that surfaces as the same clear
-        validation error.)
+        Recording/policy fps is independent of the fixed 30 fps headset stream.
+        Cameras normally stay at their 60 fps capture rate and the dataset or
+        policy selects its configured cadence. A requested rate above the
+        default raises each recording camera's physical capture rate to match;
+        higher rates may still be rejected at large capture resolutions.
         """
         from ..lerobot.camera.configuration_zed import (
             ZED_RESOLUTION_DIMS,
@@ -802,10 +812,9 @@ class OperationRunner:
                 dims = ZED_RESOLUTION_DIMS[cap]
                 merged[f"{prefix}.width"] = dims[0]
                 merged[f"{prefix}.height"] = dims[1]
-            # Recording cameras must capture at least at the recording fps
-            # (rows are paced by frame arrival on the relay's encoded
-            # transport); raise their capture fps when the setting asks for
-            # more than the default rate.
+            # Recording cameras must capture at least at the recording/policy
+            # fps. Lower output rates are selected/decimated downstream; raise
+            # physical capture only when the setting exceeds the default.
             if records and recording_fps > default_capture_fps:
                 merged[f"{prefix}.fps"] = recording_fps
 

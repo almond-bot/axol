@@ -1,10 +1,11 @@
 """Per-run telemetry capture for diagnostics scripts that own the CAN bus.
 
-While a diagnostic script runs, ``axol serve``'s own telemetry sampler is
-paused (single-owner CAN bus), so the diagnostics dashboard can't observe the
-run. Scripts fill that gap themselves: :class:`TelemetryCsvLogger` samples the
-robot's *cached* motor state (populated by the script's own command/telemetry
-traffic — no extra CAN frames) into a wide-format CSV, and announces the file
+While a diagnostic script runs, ``axol serve``'s live stream falls back to
+its passive bus observers (decoding the script's own traffic at the dashboard
+sample rate). A script can still contribute a richer capture than that tap:
+:class:`TelemetryCsvLogger` samples the robot's *cached* motor state
+(populated by the script's own command/telemetry traffic — no extra CAN
+frames) into a wide-format CSV at its own cadence, and announces the file
 with a ``[telemetry] csv=<path>`` log line that the serve-side run store picks
 up when the session ends (see :mod:`almond_axol.serve.telemetry`).
 

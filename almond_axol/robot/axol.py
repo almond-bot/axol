@@ -12,6 +12,7 @@ import logging
 import math
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -27,7 +28,14 @@ from ..motor import (
 )
 from .base import RobotBase
 from .config import AxolConfig
-from .control import Differentiator, compute_friction
+from .control import (
+    DAMP_BP_Q,
+    DAMP_BP_W0,
+    VEL_CUTOFF_FREQ,
+    BandPass,
+    Differentiator,
+    compute_friction,
+)
 from .gravity import GravityCompensator
 
 _logger = logging.getLogger(__name__)
@@ -367,16 +375,139 @@ class AxolArm:
             for joint in Joint
             if config.has_gripper or joint != Joint.GRIPPER
         }
+        # The impedance-command encodings clamp kd to the firmware range
+        # silently, and there is no host-side fallback for the excess — an
+        # oversized kd is a config/calibration error, so shout once here
+        # rather than ship less damping than the tuner thinks they have.
+        for joint, motor in self.motors.items():
+            if joint == Joint.GRIPPER:
+                continue
+            jc = getattr(self._arm_config, joint.value)
+            if jc.kd > motor.kd_max:
+                _logger.warning(
+                    "%s %s: configured kd=%.2f exceeds the firmware max %.1f "
+                    "and will be clamped — lower kd, or add damping via "
+                    "kd_host where it is phase-safe",
+                    "left" if is_left else "right",
+                    joint.value,
+                    jc.kd,
+                    motor.kd_max,
+                )
         # q_des → v_des → a_des (commanded), and q_meas → v_meas. v_des feeds
         # the impedance-control velocity FF and the friction model; a_des
-        # feeds inertia FF (``j_eff``); v_meas feeds software damping
-        # (``kd_soft``) — all in :class:`JointConfig`.
-        self._vel_diff = Differentiator(n=len(list(Joint)))
-        self._accel_diff = Differentiator(n=len(list(Joint)))
-        self._meas_vel_diff = Differentiator(n=len(list(Joint)))
+        # feeds inertia FF (``j_eff``); v_meas feeds host-side damping
+        # (``kd_host``, needed on the shoulders where firmware kd can't damp
+        # the low-frequency resonance) — all in :class:`JointConfig`.
+        #
+        # v_meas differentiates the positions cached from impedance feedback
+        # frames against the frames' own CAN receive timestamps (see
+        # ``Differentiator.differentiate``): wall-clock differentiation turns
+        # scheduling jitter into velocity noise proportional to joint speed,
+        # which kd_host amplifies into torque chatter (measured ±1.3 Nm at
+        # 1 rad/s with kd_host=40). The motor-*reported* velocity is not
+        # used: MyActuator's firmware estimate lags too much to damp the
+        # shoulders' ~2.3 Hz resonance — feeding it to kd_host measured
+        # violently unstable (the same lag is why firmware kd underdelivers).
+        #
+        # Motor-facing paths (v_des impedance target, friction FF, a_des →
+        # j_eff FF) keep the slow pole. The host damping term instead gets
+        # its own chain — fast differentiators on both commanded and measured
+        # positions feeding a band-pass centred on each joint's own
+        # structural mode (``kd_host_hz``: ~3 Hz shoulders, 9.5 Hz elbow) —
+        # so kd_host arrives in phase at the mode it must damp without
+        # passing the delayed, anti-phase gain that excites 25-35 Hz
+        # structural modes (see the BandPass docstring in .control for the
+        # measured trade).
+        n_j = len(list(Joint))
+        self._vel_diff = Differentiator(n=n_j)
+        self._accel_diff = Differentiator(n=n_j)
+        self._vel_fast_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
+        self._meas_vel_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
+        # Host-damping band-pass centres: joints with an explicit kd_host_hz
+        # (structural modes — the elbow) keep it fixed; joints with None get
+        # pose-tracked centres each cycle (see motion_control: the shoulders'
+        # impedance mode ωn = √(kp/J(q)) moves 2.2 → 5.4 Hz between rest and
+        # raised-to-the-side, and a fixed rest centre delivered only ~14% of
+        # the damping in the 4.3-8.6 Hz teleop burst band). Config carries
+        # Hz (the operator-facing unit); the control math wants rad/s, so
+        # convert exactly once here.
+        self._damp_w0 = [
+            2 * math.pi * getattr(self._arm_config, j.value).kd_host_hz
+            if j != Joint.GRIPPER
+            and getattr(self._arm_config, j.value).kd_host_hz is not None
+            else DAMP_BP_W0
+            for j in Joint
+        ]
+        self._damp_w0_tracked = [
+            j != Joint.GRIPPER and getattr(self._arm_config, j.value).kd_host_hz is None
+            for j in Joint
+        ]
+        # Per-joint band-pass Q: the 0.8 default suits pose-tracked centres
+        # (an estimate deserves a wide net); a joint pinned on a measured
+        # ring can run narrower (higher q) so the damping stops reaching
+        # into the <1.5 Hz intentional-motion band and dragging the final
+        # approach.
+        self._damp_q = [
+            getattr(self._arm_config, j.value).kd_host_q
+            if j != Joint.GRIPPER
+            and getattr(self._arm_config, j.value).kd_host_q is not None
+            else DAMP_BP_Q
+            for j in Joint
+        ]
+        self._damp_bp = BandPass(n=n_j, w0=self._damp_w0, q=self._damp_q)
         self._last_q_commanded: np.ndarray | None = None
         self._gc_hold_q: np.ndarray | None = None
         self._gc_hold_free: frozenset[Joint] | None = None
+
+        # Reference reflected inertia normalizing the per-cycle kd_host
+        # schedule in motion_control(): per joint, the *maximum* over a
+        # coarse grid of arm shapes (shoulder/elbow combinations). Host
+        # damping is fully applied only near a joint's max-inertia pose,
+        # where its mode is slowest and the ~100 Hz host loop is safest,
+        # and tapers as J(q) drops and the mode speeds up. For every joint
+        # except shoulder_3 the max is at (or equal to) the rest pose, so
+        # this matches the previous rest-pose anchor exactly; shoulder_3 is
+        # inverted — at rest the forearm lies along its axis (J ≈ 3% of
+        # max, fast mode, host damping unstable) and the arm extended with
+        # the elbow bent is its max — so its schedule must anchor there.
+        j_link_rest = gravity_comp.gravity_and_inertia_arm(
+            np.zeros(len(ARM_JOINTS), dtype=np.float32), is_left=is_left
+        )[1].astype(np.float64)
+        self._inertia_ref = j_link_rest.copy()
+        for s1 in (0.0, 1.57, -1.57):
+            for s2 in (0.0, -1.57):
+                for s3 in (0.0, 1.57, -1.57):
+                    for el in (0.0, 1.2, -1.2):
+                        q = np.array([s1, s2, s3, el, 0.0, 0.0, 0.0], dtype=np.float32)
+                        ine = gravity_comp.gravity_and_inertia_arm(q, is_left=is_left)[
+                            1
+                        ].astype(np.float64)
+                        np.maximum(self._inertia_ref, ine, out=self._inertia_ref)
+
+        # Inertia-FF pose schedule. The tuned ``j_eff`` (fit at the rest
+        # pose) is the sum of two physically different terms: the reflected
+        # rotor inertia (motor rotor × gear², pose-independent — dominant on
+        # shoulder_3 and the elbow, whose tuned values exceed their link
+        # inertia severalfold) and the link-chain inertia J_link(q), which
+        # varies strongly with arm shape (shoulder_1: 1.06 kg·m² at rest →
+        # 0.81 elbow bent → ~0.02 raised to the side). Feeding a constant
+        # j_eff over-torques every acceleration transient away from the rest
+        # pose — measured as whole-arm jitter when shoulder_1 launches or
+        # stops with the arm reaching in front — so motion_control() scales
+        # the FF by (J_rotor + J_link(q)) / (J_rotor + J_link(0)): exactly
+        # the tuned value at the rest pose, tracking the true inertia
+        # elsewhere. The rotor term is anchored to the construction-time
+        # (calibrated, pre-blend) j_eff; runtime stiffness blending still
+        # applies multiplicatively through ``gains.j_eff``.
+        j_eff_cfg = np.array(
+            [getattr(self._arm_config, j.value).j_eff for j in ARM_JOINTS],
+            dtype=np.float64,
+        )
+        self._j_rotor = np.maximum(j_eff_cfg - j_link_rest, 0.0)
+        denom = self._j_rotor + j_link_rest
+        # Joints with no tuned j_eff and negligible link inertia (wrists):
+        # the scale multiplies j_eff = 0 anyway, so just avoid dividing by ~0.
+        self._j_ff_denom = np.where(denom > 1e-9, denom, 1.0)
 
         # Clipping arrays.  Arm joints are in joint frame (0 = rest position,
         # matching the URDF and ``arm_limits``); gripper entries are in raw
@@ -431,6 +562,20 @@ class AxolArm:
         # boot wrap into the joint's offset, and removes it from the set.
         self._unverified_zeros: set[Joint] = set(ARM_JOINTS) - EITHER_STOP_JOINTS
         self._offset_lock = asyncio.Lock()
+        # Realtime-core hook: production motion_control and
+        # gravity_compensate hand their per-joint 9-float tuples
+        # (p_des motor-frame, mode, kp, kd, gravity t_ff, the pose-scheduled
+        # damping coefficients kd_host/w0/q, and the pose-scaled j_eff) to
+        # this callable instead of sending on the CAN bus — the Rust core
+        # owns the wire and computes the velocity/friction/inertia/damping
+        # terms itself each tick from its own tracker and feedback states.
+        self._command_sink: (
+            Callable[
+                [list[tuple[float, ...]]],
+                None,
+            ]
+            | None
+        ) = None
 
     def _pad_gripper(self, values: list) -> list:
         """Insert a ``0.0`` placeholder in the gripper slot when absent.
@@ -749,7 +894,16 @@ class AxolArm:
         On the gripperless SKU the gripper calibration and mode switch are
         skipped (there is no gripper motor).
 
+        This is the motor-level half of :meth:`Axol.enable`: it does **not**
+        open the CAN bus. Callers driving arms individually must have
+        awaited :meth:`Axol.connect` (or :meth:`Axol.enable`) first;
+        otherwise the first motor read fails with a ``CanOperationError``
+        saying the bus is unopened or still starting.
+
         Raises:
+            can.CanOperationError: If the arm's CAN bus is not open — never
+                started, still starting, closed, or its ``axol-rt proxy``
+                child exited. The message names which.
             MotorError: If a holding motor is unreachable or in an unexpected
                 control mode (reconnecting targets the impedance workflow —
                 a session that died in another control mode needs
@@ -1142,44 +1296,176 @@ class AxolArm:
         # and acceleration feedforward via a second pass for inertia FF (rad/s²).
         # Velocities/accelerations are frame-invariant under a constant offset,
         # so we differentiate the joint-frame ``clipped`` array directly.
-        velocities = self._vel_diff.differentiate(list(clipped))
-        accelerations = self._accel_diff.differentiate(velocities)
-        # v_meas drives software velocity damping. The position cache is
-        # empty until the first set_impedance reply lands; fall back to v_des
-        # so the ``kd_soft`` term collapses to 0 for those first cycles.
-        try:
-            v_meas = self._meas_vel_diff.differentiate(list(self.positions))
-        except MotorError:
-            v_meas = list(velocities)
+        # Classic mode only: in realtime-core mode the trajectory the wire
+        # carries is rendered by the core's own tracker at 240 Hz, and the
+        # velocity/friction/inertia terms are computed there by applying
+        # these same low-pass derivative chains to the executed tracker
+        # position (this loop's 120 Hz differentiation of the pre-tracker
+        # target would be out of phase with the executed motion).
+        sink_mode = self._command_sink is not None
+        if not sink_mode:
+            velocities = self._vel_diff.differentiate(list(clipped))
+            accelerations = self._accel_diff.differentiate(velocities)
 
         # Gravity feedforward (Nm) for the seven arm joints, computed from the
         # full URDF chain so child links contribute to each parent joint's load.
         # ``arm_q`` is in joint frame, which matches the URDF convention.
         arm_q = clipped[: len(ARM_JOINTS)].astype(np.float32)
-        gravity = self._gravity_comp.gravity_arm(arm_q, is_left=self._is_left)
+        gravity, inertia = self._gravity_comp.gravity_and_inertia_arm(
+            arm_q, is_left=self._is_left
+        )
+
+        # kd_host schedule: host-side damping is only stable — and only
+        # needed — where the joint's reflected inertia is high. High inertia
+        # means a slow natural mode (ωn = √(kp/J), ~2.3 Hz for a hanging
+        # shoulder) that the motor's lagged internal velocity estimate can't
+        # damp but a ~100 Hz host loop can. As the pose moves mass onto a
+        # joint's axis, J collapses, ωn rises toward the host loop rate, and
+        # the one-cycle-stale host torque arrives out of phase — measured as
+        # sustained jitter on shoulder_1 with the arm raised to the side
+        # (kd_host=15 rang at 0.57° RMS; kd_host=0 was clean, firmware kd
+        # alone handles the fast mode fine). Scale each joint's kd_host by
+        # J(q)/J_ref (J_ref = per-joint max over arm shapes, see __init__),
+        # capped at 1 so the configured values are never exceeded. Constant
+        # damping *ratio* would only need √(J/J_ref), but the binding
+        # constraint at low J is phase-lag stability, not ζ — the linear
+        # taper reaches ~0 at the measured-unstable raised pose (J ratio
+        # 0.02) where √ would still deliver 14% — and the two rules differ
+        # by <25% at the moderate poses where damping matters.
+        host_scale = np.clip(inertia.astype(np.float64) / self._inertia_ref, 0.0, 1.0)
+
+        # Inertia-FF schedule (see __init__): rotor term constant, link term
+        # tracking J(q), normalized to 1 at the rest pose where j_eff was
+        # tuned. Unclipped above 1 on purpose — shoulder_3's link inertia
+        # peaks with the arm extended (up to ~1.6× its rest anchor), exactly
+        # where its acceleration FF is needed most.
+        j_scale = (self._j_rotor + inertia.astype(np.float64)) / self._j_ff_denom
+
+        # Host-damping band-pass centres for this cycle. Tracked joints (see
+        # __init__) follow their pose-dependent impedance mode by scaling the
+        # hardware-anchored rest centre by √(J_rest/J(q)) — j_scale is exactly
+        # (J_rotor + J(q))/(J_rotor + J_rest). Clamped: below ~12 rad/s the
+        # band starts dragging intentional motion, above 50 rad/s (~8 Hz) the
+        # loop's phase budget is spent and more centre only points the damper
+        # at modes it would excite.
+        damp_w0 = list(self._damp_w0)
+        for i in range(len(ARM_JOINTS)):
+            if self._damp_w0_tracked[i]:
+                damp_w0[i] = float(
+                    np.clip(DAMP_BP_W0 / math.sqrt(max(j_scale[i], 1e-6)), 12.0, 50.0)
+                )
+
+        # Host damping input: fast-differentiated commanded and measured
+        # velocities, band-passed at each joint's resonance (damp_w0 above).
+        # The measured side differentiates the positions cached from
+        # impedance feedback frames against the frames' own CAN receive
+        # timestamps (jitter-free — see ``Differentiator.differentiate``).
+        # Falls back to a zero damping input until every cache is filled by
+        # the first set_impedance replies.
+        #
+        # In realtime-core mode the damping *torque* is not computed here at
+        # all: damping is a phase race, and this loop's ~120 Hz sample plus
+        # the socket transport put the counter-torque ~14 ms behind the
+        # velocity it acts on — enough to push the shoulder burst band past
+        # 90° of loop phase, where the damper pumps the mode instead of
+        # damping it (the rt-teleop shaking of 2026-08-27). The core runs
+        # the identical filter chain (see rust/axol-rt/src/filter.rs,
+        # golden-tested against this module) at 240 Hz on the latest feedback,
+        # applying the result within one core tick; this side only *schedules*
+        # it, shipping the pose-scaled gain and band-pass centre/q per command.
+        if not sink_mode:
+            v_des_fast = self._vel_fast_diff.differentiate(list(clipped))
+            try:
+                pos_list: list[float] = []
+                ts_list: list[float] = []
+                for j in Joint:
+                    motor = self.motors.get(j)
+                    if motor is not None:
+                        pos_list.append(motor.position)
+                        ts_list.append(motor.feedback_ts)
+                    else:
+                        pos_list.append(0.0)
+                        ts_list.append(0.0)
+                v_meas_fast = self._meas_vel_diff.differentiate(pos_list, ts_list)
+            except MotorError:
+                v_meas_fast = list(v_des_fast)
+            v_damp = self._damp_bp.update(
+                [d - m for d, m in zip(v_des_fast, v_meas_fast)], w0=damp_w0
+            )
 
         # Convert arm joints to motor frame for the impedance command.  Gripper
         # offset is 0, so its raw motor value is unchanged.
         motor_targets = clipped - self._joint_offsets
 
-        def _mit_cmd(i: int, j: Joint):
+        if sink_mode:
+            # Production realtime-core mode: ship 9-float tuples to
+            # the sink — which streams them to the Rust core that owns the
+            # CAN bus. mode=1 (tracked): the core's own trapezoid tracker
+            # renders the trajectory toward p_des at 240 Hz and computes the
+            # velocity, friction, and inertia terms from its states — t_ff
+            # here carries *gravity only* (the slow, pose-shaped term this
+            # side owns). The damping coefficients and the pose-scaled
+            # inertia gain are the schedule the core applies each tick
+            # against its own fresh feedback (see the sink_mode comment
+            # above). Slot 7 carries the gripper's POSITION_FORCE command
+            # (motor-frame target, speed limit, torque limit); zeros on the
+            # gripperless SKU (the core has no gripper configured and
+            # ignores the slot).
+            sink_cmds: list[tuple[float, ...]] = []
+            for i, j in enumerate(ARM_JOINTS):
+                gains = getattr(self._arm_config, j.value)
+                sink_cmds.append(
+                    (
+                        float(motor_targets[i]),
+                        1.0,
+                        gains.kp,
+                        gains.kd,
+                        float(gravity[i]),
+                        float(host_scale[i]) * gains.kd_host,
+                        damp_w0[i],
+                        self._damp_q[i],
+                        gains.j_eff * float(j_scale[i]),
+                    )
+                )
+            if self._has_gripper:
+                sink_cmds.append(
+                    (
+                        float(motor_targets[gripper_i]),
+                        self._arm_config.gripper.max_speed,
+                        self._arm_config.gripper.torque_limit,
+                    )
+                    + (0.0,) * 6
+                )
+            else:
+                sink_cmds.append((0.0,) * 9)
+            self._command_sink(sink_cmds)
+            self._last_q_commanded = clipped
+            return
+
+        arm_cmds: list[tuple[float, float, float, float, float]] = []
+        for i, j in enumerate(ARM_JOINTS):
             gains = getattr(self._arm_config, j.value)
             f = gains.friction
+            # Host damping is exactly the configured kd_host, pose-scheduled.
+            # A kd beyond the firmware's range is clamped by the command
+            # encoding (and warned about at construction) — it is *not*
+            # rerouted into host damping: the delayed host torque is only
+            # phase-safe on the slow shoulder modes, so silently converting
+            # excess firmware damping into it could excite the very
+            # oscillation the oversized kd was meant to kill.
             t_ff = (
                 float(gravity[i])
                 + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
-                + gains.j_eff * accelerations[i]
-                + gains.kd_soft * (velocities[i] - v_meas[i])
+                + gains.j_eff * float(j_scale[i]) * accelerations[i]
+                + float(host_scale[i]) * gains.kd_host * v_damp[i]
             )
-            return self.motors[j].set_impedance(
-                float(motor_targets[i]),
-                velocities[i],
-                gains.kp,
-                gains.kd,
-                t_ff,
+            arm_cmds.append(
+                (float(motor_targets[i]), velocities[i], gains.kp, gains.kd, t_ff)
             )
 
-        tasks = [_mit_cmd(i, j) for i, j in enumerate(Joint) if j != Joint.GRIPPER]
+        tasks = [
+            self.motors[j].set_impedance(*arm_cmds[i]) for i, j in enumerate(ARM_JOINTS)
+        ]
         if self._has_gripper:
             tasks.append(
                 self.motors[Joint.GRIPPER].set_position_force(
@@ -1253,7 +1539,7 @@ class AxolArm:
         # frame before sending to the impedance controller.
         arm_offsets = self._joint_offsets[: len(ARM_JOINTS)]
 
-        tasks = []
+        arm_tuples: list[tuple[float, float, float, float, float]] = []
         for i, j in enumerate(ARM_JOINTS):
             if j in free_set:
                 p_des = float(arm_q[i] - arm_offsets[i])
@@ -1264,18 +1550,11 @@ class AxolArm:
                 gains = getattr(self._arm_config, j.value)
                 kp_cmd = gains.kp
                 kd_cmd = gains.kd
-            tasks.append(
-                self.motors[j].set_impedance(
-                    p_des,
-                    0.0,
-                    kp_cmd,
-                    kd_cmd,
-                    float(gravity[i]),
-                )
-            )
+            arm_tuples.append((p_des, 0.0, kp_cmd, kd_cmd, float(gravity[i])))
         # Hold the gripper softly so it does not drift open/closed — or drive
         # it to the requested opening, at the full configured torque so it can
         # actually grasp while the arm stays hand-guidable.
+        gripper_cmd: tuple[float, float, float] | None = None
         if self._has_gripper:
             gripper_i = self._gripper_i
             if gripper_target is None:
@@ -1287,13 +1566,33 @@ class AxolArm:
             gripper_pos_raw = self._limits_hi[gripper_i] + gripper_pos * (
                 self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
             )
-            tasks.append(
-                self.motors[Joint.GRIPPER].set_position_force(
-                    gripper_pos_raw,
-                    self._arm_config.gripper.max_speed,
-                    torque,
-                )
+            gripper_cmd = (
+                gripper_pos_raw,
+                self._arm_config.gripper.max_speed,
+                torque,
             )
+
+        if self._command_sink is not None:
+            # Realtime-core mode: the same tuples stream through the core
+            # (which owns the bus) instead of onto the wire from here. The
+            # arm tuples' second field is 0.0 = passthrough mode — p_des
+            # goes to the wire as-is with v_des = 0, no tracker and no
+            # friction/inertia terms (a hand-guided limp arm wants gravity
+            # feedforward only), and no damping coefficients (classic
+            # gravity comp runs firmware gains only).
+            sink_cmds = [t + (0.0,) * 4 for t in arm_tuples]
+            sink_cmds.append(
+                gripper_cmd + (0.0,) * 6 if gripper_cmd is not None else (0.0,) * 9
+            )
+            self._command_sink(sink_cmds)
+            return
+
+        tasks = [
+            self.motors[j].set_impedance(*arm_tuples[i])
+            for i, j in enumerate(ARM_JOINTS)
+        ]
+        if gripper_cmd is not None:
+            tasks.append(self.motors[Joint.GRIPPER].set_position_force(*gripper_cmd))
         await asyncio.gather(*tasks)
 
     def reset_gravity_hold(self) -> None:
@@ -1328,7 +1627,9 @@ class AxolArm:
         n = len(list(Joint))
         self._vel_diff = Differentiator(n=n)
         self._accel_diff = Differentiator(n=n)
-        self._meas_vel_diff = Differentiator(n=n)
+        self._vel_fast_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
+        self._meas_vel_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
+        self._damp_bp = BandPass(n=n, w0=self._damp_w0, q=self._damp_q)
 
     def torque_residuals(self) -> np.ndarray:
         """Measured minus model-gravity torque per arm joint, shape (7,).
@@ -1504,6 +1805,18 @@ class Axol(RobotBase):
         :meth:`enable` — which is idempotent and never drops joints that are
         already holding. Calling ``connect()`` first is optional:
         :meth:`enable` opens the buses itself.
+
+        Each bus is an ``axol-rt proxy`` child process of *this* Python
+        process — not a system daemon. It is spawned here and reaped by
+        :meth:`disconnect` / :meth:`disable`; ``axol-rt`` absent from ``ps``
+        just means no bus is open. Startup spawns the process and waits for
+        its ready handshake, so it takes a moment: motor I/O issued from
+        another task before this coroutine has returned fails with a
+        "CAN bus ... is still starting" error. Only the ``Axol``-level
+        methods open buses; the per-arm :meth:`AxolArm.enable` /
+        :meth:`AxolArm.disable` assume the bus is already open, so a
+        controller that toggles arms individually must await ``connect()``
+        (idempotent — safe to call again) before its first per-arm call.
         """
         bus_tasks = []
         if self.left is not None:

@@ -1,11 +1,11 @@
-"""Cart yaw-rate source from the ZED Box carrier board's BMI088 IMU.
+"""Jelly yaw-rate source from the ZED Box carrier board's BMI088 IMU.
 
-The powered cart's straight-line drift (uneven floor contact, omni-wheel
+Jelly's straight-line drift (uneven floor contact, omni-wheel
 effective-radius mismatch) is unobservable from wheel torque feedback — see
 ``almond_axol.diagnostics.base.floor_sim`` — so holding a heading needs an
 external yaw reference. The carrier board carries a Bosch BMI088 on its own
 i2c bus, driven by StereoLabs' ``bmi_spsc`` module, which is rigidly bolted
-to the cart and completely independent of the cameras: reading it costs no
+to Jelly and completely independent of the cameras: reading it costs no
 camera ownership, so the overhead ZED stays on the video relay's GPU-resident
 GStreamer pipeline.
 
@@ -26,12 +26,12 @@ teleop opens the device — so :meth:`open` starts it and needs write access to
 ``timer_control`` (see the class docstring).
 
 Mounting-orientation independence: rather than assuming which IMU axis is the
-cart's vertical, the gravity direction is estimated online from the
+Jelly's vertical, the gravity direction is estimated online from the
 accelerometer (low-passed, and only updated when the measured magnitude is
 close to 1 g so launch/brake transients don't bend it). The yaw rate is the
 angular-velocity component about that axis: ``rate = gyro · ĝ_up``, which is
-CCW-positive seen from above — the cart's +wz — for any rigid mounting. The
-board sits at ~31° on this robot, and measured against a hand-rotated cart the
+CCW-positive seen from above — Jelly's +wz — for any rigid mounting. The
+board sits at ~31° on this robot, and measured against a hand-rotated Jelly the
 projection tracks heading with the correct sign to within a degree.
 """
 
@@ -45,7 +45,6 @@ import struct
 import threading
 import time
 from typing import Callable
-
 
 _logger = logging.getLogger(__name__)
 
@@ -64,7 +63,7 @@ _GYRO_LSB = {0: 16.384, 1: 32.768, 2: 65.536, 3: 131.072, 4: 262.144}
 _ACCEL_FS_G = {0: 3.0, 1: 6.0, 2: 12.0, 3: 24.0}
 
 # Accept accelerometer samples within this band around 1 g for the gravity
-# estimate; outside it the cart is accelerating/braking and the sample would
+# estimate; outside it Jelly is accelerating/braking and the sample would
 # bend the vertical.
 _GRAVITY_BAND = (0.82, 1.18)  # g
 
@@ -74,13 +73,13 @@ _GRAVITY_ALPHA = 0.01
 
 # Ring drain period. Well under the ~5 s it takes 200 Hz to fill 1024 slots,
 # so the producer never stalls, and short enough that a sample reaches the
-# cart's 50 Hz command loop fresh.
+# Jelly's 50 Hz command loop fresh.
 _DRAIN_INTERVAL = 0.002
 
 
 _UDEV_RULE_PATH = "/etc/udev/rules.d/99-bmi-spsc.rules"
 _UDEV_RULE = """\
-# ZED Box carrier-board BMI088 — cart yaw reference (almond_axol.robot.gyro).
+# ZED Box carrier-board BMI088 — Jelly yaw reference (almond_axol.robot.gyro).
 # The driver ships /dev/spsc_bmi0 as root:imu already; only the sampling
 # timer's sysfs control is root-only. The consumer has to start that timer
 # itself (the ring stalls the producer once full, so it can't just be started
@@ -113,7 +112,7 @@ def install() -> None:
         return
     if not prime_sudo():
         _logger.warning(
-            "board IMU needs root to provision; the cart heading hold will be "
+            "board IMU needs root to provision; Jelly heading hold will be "
             "unavailable. Run manually: sudo chgrp imu %s && sudo chmod 0660 %s",
             control,
             control,
@@ -128,10 +127,10 @@ def install() -> None:
 
 
 class BoardYawRateSource:
-    """Streams the board BMI088's cart-frame yaw rate to a callback.
+    """Streams the board BMI088's Jelly-frame yaw rate to a callback.
 
     The callback fires from a daemon thread at up to the sensor's 200 Hz; it
-    must be cheap and thread-safe (``Cart.feed_yaw_rate`` only latches a
+    must be cheap and thread-safe (``Jelly.feed_yaw_rate`` only latches a
     tuple).
 
     :meth:`open` starts the driver's sampling timer, which means writing
@@ -239,7 +238,7 @@ class BoardYawRateSource:
             if head == tail:
                 # The driver stops its timer on an i2c error ("use
                 # timer_control to restart"), which otherwise looks exactly
-                # like a cart standing still. Distinguish and recover.
+                # like Jelly standing still. Distinguish and recover.
                 if time.monotonic() - last_sample > 1.0:
                     last_sample = time.monotonic()
                     if not self._sampler_running():

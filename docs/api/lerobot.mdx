@@ -67,7 +67,6 @@ with AxolRobot(config) as robot:
 |---|---|---|
 | `cameras` | `{}` | `ZedCameraConfig` instances keyed by name, each opening a locally attached ZED camera by serial number. A camera with `stereo=True` expands into two observation keys, `<name>_left` / `<name>_right`, backed by a single grab (see `ZedStereoCamera` below). |
 | `axol_config` | `AxolConfig()` | Per-joint gains and safety parameters forwarded to the hardware driver |
-| `telemetry_hz` | `120.0` | Background joint telemetry polling rate in Hz |
 | `observe_torques` | `False` | Include joint torques in `observation.state` |
 | `observe_cartesian` | `False` | Work in Cartesian end-effector space instead of 16 joint positions: observations report per-arm 6-axis EE poses (+ gripper) via FK, and `send_action()` accepts the same and resolves it to joint targets via IK |
 | `left_channel` | `"can_alm_axol_l"` | SocketCAN interface for the left arm |
@@ -78,7 +77,8 @@ with AxolRobot(config) as robot:
 
 | Method | Description |
 |---|---|
-| `get_observation()` | Returns joint positions (+ torques if enabled) and latest camera frames |
+| `get_observation()` | Returns fresh camera frames paired with the nearest sample from the Rust core's 240 Hz timestamped state history (+ torques if enabled) |
+| `get_observation_with_capture_timestamp()` | Returns that synchronized observation plus its median sensor-exposure time on the `perf_counter` clock |
 | `get_joint_observation()` | Returns joint positions only — no camera reads; use in the high-frequency teleop path |
 | `send_action(action)` | Sends joint position targets — or, with `observe_cartesian`, per-arm Cartesian EE poses resolved to joint targets via IK — via impedance control (arm) and position-force control (gripper) |
 | `positions` | `(left, right)` cached arm positions from telemetry, each shape `(8,)` |
@@ -136,7 +136,9 @@ Each grabbed frame carries two timestamps on the local `perf_counter` clock: `ca
 |---|---|
 | `read_latest(max_age_ms=500)` | Most recent frame, non-blocking; raises `TimeoutError` if it is older than `max_age_ms`. |
 | `read_latest_with_ts()` | `(frame, capture_perf_ts, receive_perf_ts)` for the most recent frame. |
-| `read_at_or_after(target_capture_perf_ts, timeout_ms=500)` | Block until a frame with `capture_perf_ts >= target` is available. Used by `collect-data` to align every camera and the joint sample on the same capture timeline. |
+| `read_at_or_after(target_capture_perf_ts, timeout_ms=500)` | Block until a frame with `capture_perf_ts >= target` is available. Collection and policy inference retain the returned exposure PTS and select robot state on that same timeline. |
+
+Policy observations do not sample joints before waiting for images. The Rust realtime core retains a bounded 240 Hz feedback history; after all fresh camera frames arrive, `AxolRobot.get_observation()` uses their median sensor-exposure time to select the nearest state (in joint space, before optional FK). Stale camera fallback, unbracketed state, and excessive camera/state skew raise instead of silently producing a train/inference timing mismatch.
 
 ## `ZedStereoCamera`
 

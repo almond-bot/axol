@@ -22,7 +22,8 @@ import jaxls
 import numpy as np
 import pyroki as pk
 
-from ..kinematics.solver import KinematicsSolver
+from ..kinematics.model import collision_cost_params
+from ..kinematics.solver import KinematicsSolver, _self_collision_cost
 
 
 @functools.partial(jax.jit, static_argnames=("max_iterations",))
@@ -33,7 +34,8 @@ def solve_path_step(
     q_current: jax.Array,
     rest_weight: float,
     limit_weight: float,
-    collision_margin: float,
+    collision_start: jax.Array,
+    collision_ramp: jax.Array,
     collision_weight: float,
     max_iterations: int,
 ) -> jax.Array:
@@ -47,11 +49,12 @@ def solve_path_step(
     costs = [
         pk.costs.rest_cost(JointVar(0), rest_pose=q_interp, weight=rest_weight),
         pk.costs.limit_cost(robot, JointVar(0), weight=limit_weight),
-        pk.costs.self_collision_cost(
+        _self_collision_cost(
             robot,
             robot_coll,
             JointVar(0),
-            margin=collision_margin,
+            activation_start=collision_start,
+            ramp_width=collision_ramp,
             weight=collision_weight,
         ),
     ]
@@ -109,8 +112,11 @@ def plan_collision_aware_trajectory(
         rest_weight:      Cost weight pulling each waypoint toward the
                           smoothstep target.
         limit_weight:     Cost weight on joint-limit violation.
-        collision_margin: Minimum clearance (m) enforced between collision
-                          bodies.
+        collision_margin: Default clearance (m) below which the collision
+                          cost activates; each pair's actual activation is
+                          derived from its home-pose clearance (see
+                          :func:`almond_axol.kinematics.model.collision_cost_params`),
+                          matching the interactive solver's behavior.
         collision_weight: Cost weight on self-collision penalty.
         max_iterations:   IK solver iterations per waypoint.
 
@@ -127,6 +133,11 @@ def plan_collision_aware_trajectory(
     duration = max(max_dist / speed, min_duration)
     n_steps = max(2, round(duration * rate))
 
+    starts, widths = collision_cost_params(
+        solver.robot, solver.robot_coll, collision_margin
+    )
+    starts_jax, widths_jax = jnp.asarray(starts), jnp.asarray(widths)
+
     trajectory: list[np.ndarray] = []
     q = q_from.copy()
     for i in range(n_steps):
@@ -140,7 +151,8 @@ def plan_collision_aware_trajectory(
             jnp.asarray(q),
             rest_weight,
             limit_weight,
-            collision_margin,
+            starts_jax,
+            widths_jax,
             collision_weight,
             max_iterations,
         )

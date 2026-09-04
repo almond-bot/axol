@@ -43,7 +43,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -55,6 +55,9 @@ from ..teleop.config import VRTeleopConfig
 from ..waypoints import Waypoint, WaypointSet
 from .config import LogLevel, normalize_bool_flags, parse
 from .gravity_comp import _resolve_free_joints
+
+if TYPE_CHECKING:
+    from ..rt import RtAxol
 
 _logger = logging.getLogger(__name__)
 
@@ -148,7 +151,6 @@ class WaypointsCmdConfig:
     """Arm joints to gravity-compensate while teaching; null frees all seven."""
     kd: float = 0.25
     rate_hz: float = 250.0
-    telemetry_hz: float = 500.0
     play_only: bool = False
     """Skip teaching and replay ``file`` straight away. Implied by ``sim``."""
     sim: bool = False
@@ -409,7 +411,7 @@ class _Session:
     def __init__(
         self,
         cfg: WaypointsCmdConfig,
-        robot: RobotBase,
+        robot: RobotBase | RtAxol,
         control: Control,
         stop_event: threading.Event,
     ) -> None:
@@ -932,23 +934,21 @@ async def _session(
     if cfg.sim:
         from ..robot.sim import Sim
 
-        robot: RobotBase = Sim()
+        robot: RobotBase | RtAxol = Sim()
     else:
         from ..robot import Axol
+        from ..rt import RtAxol
 
-        robot = Axol(
-            config=cfg.axol,
-            left_channel=cfg.left_channel,
-            right_channel=cfg.right_channel,
+        # Rust is the sole hardware backend for both teaching and playback.
+        robot = RtAxol(
+            Axol(
+                config=cfg.axol,
+                left_channel=cfg.left_channel,
+                right_channel=cfg.right_channel,
+            )
         )
 
     async with robot:
-        if not cfg.sim:
-            await robot.start_telemetry(cfg.telemetry_hz)
-            # Motors may still be rebooting from set_control_mode(); block
-            # until every one has answered a poll before driving them.
-            await robot.wait_for_telemetry()
-
         session = _Session(cfg, robot, control, stop_event)
         try:
             await session.run()

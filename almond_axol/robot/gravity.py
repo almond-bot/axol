@@ -118,6 +118,9 @@ class GravityCompensator:
         self._right_qpos_idx, self._right_dof_idx = self._joint_indices(
             urdf_arm_joint_names(is_left=False)
         )
+        # Scratch buffer for expanding MuJoCo's sparse qM into a dense matrix
+        # (see gravity_and_inertia_arm). nv is small (14), so this is cheap.
+        self._m_full = np.zeros((self._model.nv, self._model.nv))
 
     def _joint_indices(self, names: list[str]) -> tuple[list[int], list[int]]:
         qpos_idx: list[int] = []
@@ -192,3 +195,31 @@ class GravityCompensator:
         _, right = self.gravity(right_q=arm_q)
         assert right is not None
         return right
+
+    def gravity_and_inertia_arm(
+        self, arm_q: np.ndarray, *, is_left: bool
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Gravity torques *and* reflected inertia for one arm, in one pass.
+
+        The second array is the diagonal of the joint-space mass matrix
+        (kg·m², one entry per arm joint): how much inertia each joint
+        actually "sees" at this configuration. It varies strongly with pose —
+        e.g. shoulder_1's entry collapses toward zero when the arm is raised
+        to the side (the mass then lies along its axis) and is maximal with
+        the arm hanging. The production controller uses it to schedule
+        host-side damping (see ``AxolArm.motion_control``).
+
+        Both arrays come from the same MuJoCo forward pass as
+        :meth:`gravity_arm`, so calling this instead costs almost nothing
+        extra. Off-diagonal coupling terms are ignored — for damping
+        scheduling only the joint's own reflected inertia matters.
+        """
+        gravity = self.gravity_arm(arm_q, is_left=is_left)
+        # mj_fwdPosition (run inside gravity()) already computed the sparse
+        # factorized mass matrix; expand it and pull this arm's diagonal.
+        # MuJoCo 3.10 changes this call's signature and 3.11 drops qM: the
+        # pyproject `mujoco<3.10` bound is what keeps this valid.
+        mujoco.mj_fullM(self._model, self._m_full, self._data.qM)
+        dof_idx = self._left_dof_idx if is_left else self._right_dof_idx
+        inertia = np.array([self._m_full[i, i] for i in dof_idx], dtype=np.float32)
+        return gravity, inertia

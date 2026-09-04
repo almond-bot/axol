@@ -17,8 +17,18 @@ class VRTeleopConfig:
             ARM_JOINTS order (no gripper). Used as the reset target.
         rest_pose_right: Right arm rest configuration in radians, shape (7,) in
             ARM_JOINTS order (no gripper). Used as the reset target.
-        frequency: Control loop rate in Hz used by :meth:`VRTeleop.run` and
-            as waypoint density for reset trajectories.
+        frequency: Control (CAN command) loop rate in Hz used by
+            :meth:`VRTeleop.run` and as waypoint density for reset
+            trajectories. Each cycle sends 8 impedance/position commands per
+            arm bus whose replies carry all feedback — ~16 frames ≈ 2.1 ms
+            of bus time — so 120 Hz runs each 1 Mbps arm bus at ~25%
+            utilisation. A higher rate mainly buys the host damping loop
+            phase margin (its transport delay is one cycle).
+        ik_frequency: IK dispatch rate in Hz — how often VR frames are sent
+            to the IK subprocess. Decoupled from ``frequency``: solves cost
+            5-10 ms, so the solver can't follow the CAN rate; the control
+            loop interpolates between solutions (segment playback + the
+            trapezoidal output filter).
         reset_speed: Average joint velocity (rad/s) of the worst-case joint
             during a return-to-rest move. The smoothstep profile gives a
             peak joint velocity of ``1.5 * reset_speed``. Determines the
@@ -87,30 +97,32 @@ class VRTeleopConfig:
             any single joint can move toward a new IK target.  Defaults to
             1.0 rev/s (~360 °/s).
         teleop_max_accel: Maximum joint acceleration (rad/s²) enforced by the
-            trapezoidal filter.  Controls how quickly the commanded velocity
-            ramps up or down.  Defaults to 3.5 rev/s² (~1260 °/s²), giving a
-            ~0.3 s ramp from rest to full speed.
+            trapezoidal filter.  Defaults to 3.5 rev/s² (~1260 °/s²).  Since
+            the filter became a critically damped linear tracker, smoothness
+            comes from the tracker itself, not this clamp: replaying recorded
+            teleop showed resonance-band excitation identical at 2.0 and
+            3.5 rev/s², while the lower cap saturated ~4% of moving time —
+            felt as lag-then-surge "jumpiness" on fast moves (vibration
+            windows correlated 5.5× with saturation). Keep it high enough
+            that genuine motion never saturates; it is a safety ceiling.
         ik_alpha: Blend factor for the exponential moving average applied to
             the IK output before the trapezoidal filter.  Range ``(0, 1]``
             where ``1.0`` disables smoothing.  Lower values kill more
             high-frequency jitter at the cost of a small fixed lag
             (``~(1-alpha)/alpha`` frames).  Defaults to ``0.3`` (~20 ms lag
             at 120 Hz), favouring smoothness over minimum latency.
-        pose_min_cutoff: Minimum cutoff frequency (Hz) for the One Euro Filter
+        pose_cutoff: Pole frequency (Hz) of the lag-compensated low-pass
             applied to raw VR controller positions, quaternions, and elbow
-            positions **before** they enter the IK solver.  This is the
-            primary tremor / tracking-noise kill knob.  Lower values give
-            heavier smoothing at rest (more tremor rejection) at the cost of
-            slightly more lag when still.  Typical range: 0.5–3 Hz.  Defaults
-            to ``0.8`` Hz, favouring smoothness over minimum latency (the
-            fixed-lag smoother in the VR server's pose interpolator does the
-            heavy lifting upstream).
-        pose_beta: Speed coefficient for the One Euro Filter.  Raises the
-            filter cutoff proportionally to the signal's instantaneous speed,
-            keeping the filter transparent during fast intentional moves.
-            Increase if fast moves feel sticky.  Defaults to ``2.0`` so the
-            filter stays partially engaged during motion instead of opening
-            fully and passing noise through.
+            positions **before** they enter the IK solver (see
+            :class:`~almond_axol.teleop.filter.LagCompensatedLowPass` for why
+            this replaced the One Euro filter, and for the real-session
+            replay that set this value and the filter's lag-compensation
+            fraction).  Lower values reject more tremor but the trade is
+            steep — the raw stream's 3-12 Hz noise grows with hand speed
+            and sits barely 1.5 octaves above intentional motion — so this
+            stage only trims the band (~81% pass at 2.5 Hz); the resonance
+            itself is handled by pose-tracked host damping on the robot
+            side.
         position_multiplier: Scale factor applied to the controller's
             **position** displacement (not orientation) when mapping hand
             motion to the end-effector target.  ``1.0`` is 1:1 motion;
@@ -137,6 +149,22 @@ class VRTeleopConfig:
             reset.  The headset streams poses at 72+ Hz while presenting,
             so anything beyond a few hundred ms is a real gap, not jitter.
             ``0`` disables the timeout.  Defaults to ``0.5`` s.
+        record: File prefix for the teleop flight recorder (see
+            :mod:`almond_axol.teleop.recorder`).  A bare name (``rec1``)
+            records into ``~/.almond/recordings/``, where ``axol
+            motion.build`` finds it; a path prefix (``/tmp/jit``) is used
+            verbatim.  When set, every stage of the teleop pipeline — raw
+            VR pose, filtered pose, IK output, smoothed command, measured
+            joints, and the Rust core's motor-facing command/torque internals
+            — is captured to ``<prefix>_{ik,cmd,meas,rt}.npz``. The measured
+            and Rust stages run at the native 240 Hz core rate. The capture
+            covers the **latest engage→disengage segment** (last ~5 minutes
+            of it): recording starts at engagement, Python stages write on
+            disengage, the compact Rust stage finalizes when the core disarms,
+            and re-engaging starts the segment over. The same prefix overwrites
+            on the next run. For ``axol
+            motion.build`` or ``axol diag.offline``.  ``None`` (the
+            default) disables recording entirely.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -168,6 +196,7 @@ class VRTeleopConfig:
         )
     )
     frequency: float = 120.0
+    ik_frequency: float = 120.0
     reset_speed: float = 0.1 * 2 * math.pi
     reset_min_duration: float = 1.5
     reset_rest_weight: float = 50.0
@@ -184,8 +213,8 @@ class VRTeleopConfig:
     teleop_max_vel: float = 1.0 * 2 * math.pi
     teleop_max_accel: float = 3.5 * 2 * math.pi
     ik_alpha: float = 0.3
-    pose_min_cutoff: float = 0.8
-    pose_beta: float = 2.0
+    pose_cutoff: float = 2.5
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
     disengage_timeout: float = 0.5
+    record: str | None = None

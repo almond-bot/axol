@@ -21,20 +21,47 @@ from ..kinematics.config import KinematicsConfig
 from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
 from .config import VRTeleopConfig
-from .filter import OneEuroFilter
+from .filter import LagCompensatedLowPass
+from .recorder import make as _recorder_make
 from .trajectory import plan_collision_aware_trajectory
 
 _logger = logging.getLogger(__name__)
 
-# Freeze detection (see IKWorker._note_solve): warn when the solver keeps
-# returning its seed unchanged while the tracked targets move away — the
-# operator experiences the arm as stuck, then lurching once the solve breaks
-# free. Thresholds: how long the output must be frozen before warning, how far
-# the targets must have moved (so a still hand doesn't warn), and how often to
-# re-warn while the freeze persists.
+# Freeze handling (see IKWorker._note_solve): when one arm's solver output keeps
+# returning its seed unchanged while that arm's tracked target moves away, the
+# operator experiences a hold followed by a catch-up lurch. After a confirmed
+# run, automatically clutch that controller at the held IK pose: the snap frame
+# itself cannot move, future hand deltas retain the normal relative mapping, and
+# only the unexecuted motion accumulated during the freeze is discarded.
 _FREEZE_WARN_AFTER_S = 0.5
 _FREEZE_MIN_TARGET_DRIFT_M = 0.005
-_FREEZE_REWARN_EVERY_S = 2.0
+_FREEZE_MIN_TARGET_DRIFT_RAD = math.radians(5.0)
+
+# Tracking glitch rejection (see IKWorker._frame_snap_verdict): the VR pose
+# stream carries two kinds of both-hand discontinuity that the operator's
+# hands did not produce, both measured in recorded sessions:
+#
+#   * one-to-two-frame *blips* — the raw pose jumps 20-45 mm and bounces
+#     straight back (one headset emitted these on a strict 10 s period);
+#   * persistent world-frame *shifts* — a headset re-localization teleports
+#     both controllers (up to 96 mm observed, right after a 46 ms tracking
+#     dropout) and the offset never reverts.
+#
+# Followed naively, either kind lurches the arm (4.5° in 100 ms measured).
+# Detection: both hands must miss a constant-velocity prediction by more
+# than a noise floor plus what a generous hand acceleration could produce
+# over the frame gap (a single occluded controller snapping back is a
+# different failure with a different correct response — re-anchoring there
+# would bake its error in). A trigger opens a short *suspect window* during
+# which the arm holds and the frames are quarantined; the window then
+# resolves to discard (blip reverted), genuine-motion resume (offset kept
+# growing — e.g. a hard bimanual flick that beat the prediction), or a
+# confirmed frame shift (offset stable), which slides the engage anchors by
+# the measured offset so the EE targets stay exactly continuous.
+_SNAP_FLOOR_M = 0.010
+_SNAP_ACCEL_MAX = 25.0  # m/s², upper bound for genuine hand acceleration
+_SNAP_CONFIRM_FRAMES = 8  # suspect window length (~65 ms at 120 Hz)
+_SNAP_STABLE_RATIO = 0.5  # offset growth/size below this = shift, else motion
 
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
@@ -183,29 +210,41 @@ class IKWorker:
         self._active: dict[str, bool] = {"left": False, "right": False}
         self._hold_fk: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._hold_elbow_fk: dict[str, np.ndarray] = {}
-        # Freeze detection state: when the last solve returned its seed
-        # unchanged, `_freeze_since` holds the wall time the freeze started and
-        # `_freeze_targets` the EE/elbow target positions at that moment, so a
-        # warning fires only when the targets kept moving away (a still hand
-        # legitimately produces an unchanged solution).
-        self._freeze_since: float | None = None
-        self._freeze_targets: np.ndarray | None = None
-        self._freeze_next_warn: float = _FREEZE_WARN_AFTER_S
+        # Per-arm freeze state. A bimanual solve can leave one arm's joint slice
+        # bit-identical while the other progresses, so whole-vector detection
+        # both misses real freezes and cannot clutch only the affected mapping.
+        # Each target snapshot is (EE position, EE rotation, optional elbow).
+        self._freeze_since: dict[str, float] = {}
+        self._freeze_targets: dict[
+            str, tuple[np.ndarray, np.ndarray, np.ndarray | None]
+        ] = {}
         # Snap poses as (pos_3, rot_3x3) numpy tuples — no jaxlie overhead
         self._snap_ctrl: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._snap_fk: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._snap_elbow_ctrl: dict[str, np.ndarray] = {}
         self._snap_elbow_fk: dict[str, np.ndarray] = {}
+        # Tracking glitch detection state (see _frame_snap_verdict): last good
+        # raw controller positions, their (effective) timestamp, an EMA
+        # velocity per hand, and the in-progress suspect window, if any.
+        self._prev_raw: dict[str, np.ndarray] = {}
+        self._prev_raw_t: float | None = None
+        self._raw_vel: dict[str, np.ndarray] = {}
+        self._suspect: dict | None = None
+        # Wall time of the previous solve, for scaling the solver's per-call
+        # step clamp by the actual solve cadence (see delta_scale in step()).
+        self._last_solve_t: float | None = None
 
-        freq = config.frequency
-        mc = config.pose_min_cutoff
-        beta = config.pose_beta
-        self._f_l_pos = OneEuroFilter(freq, mc, beta)
-        self._f_l_quat = OneEuroFilter(freq, mc, beta)
-        self._f_r_pos = OneEuroFilter(freq, mc, beta)
-        self._f_r_quat = OneEuroFilter(freq, mc, beta)
-        self._f_l_elbow = OneEuroFilter(freq, mc, beta)
-        self._f_r_elbow = OneEuroFilter(freq, mc, beta)
+        # Pose-stream smoothing (see LagCompensatedLowPass for why this is a
+        # linear filter and not OneEuro). Nominal rate is the VR-frame / IK
+        # dispatch cadence, not the (faster) CAN control rate.
+        freq = config.ik_frequency
+        fc = config.pose_cutoff
+        self._f_l_pos = LagCompensatedLowPass(freq, fc)
+        self._f_l_quat = LagCompensatedLowPass(freq, fc)
+        self._f_r_pos = LagCompensatedLowPass(freq, fc)
+        self._f_r_quat = LagCompensatedLowPass(freq, fc)
+        self._f_l_elbow = LagCompensatedLowPass(freq, fc)
+        self._f_r_elbow = LagCompensatedLowPass(freq, fc)
 
         # Pre-settle the configured rest pose to the manipulability-balanced
         # IK fixed point. The configured pose has a non-zero manipulability
@@ -217,6 +256,27 @@ class IKWorker:
         self._rest_pose_left = q_settled[self._solver.left_indices].astype(np.float32)
         self._rest_pose_right = q_settled[self._solver.right_indices].astype(np.float32)
         self._solver.set_posture_pose(self.get_rest_q())
+
+        # Teleop flight recorder (--teleop.record, arriving here via
+        # the pickled config, see .recorder): taps the solve path at every
+        # stage boundary this process owns — raw VR pose, filtered pose,
+        # world EE target, IK output.
+        n = self._solver.num_joints
+        self._rec = _recorder_make(
+            config.record,
+            "ik",
+            {
+                "raw_l": 3,
+                "raw_r": 3,
+                "filt_l": 3,
+                "filt_r": 3,
+                "tgt_l": 3,
+                "tgt_r": 3,
+                "q": n,
+                "engaged": 2,
+                "solve_ms": 1,
+            },
+        )
 
     # -- Properties the main process needs ----------------------------------
 
@@ -252,56 +312,86 @@ class IKWorker:
         l_lock = bool(frame.l_lock)
         r_lock = bool(frame.r_lock)
 
+        # Flight recorder covers engaged segments only: the falling edge
+        # writes the _ik file, the rising edge starts a fresh segment.
+        if self._rec is not None:
+            self._rec.set_engaged(l_lock or r_lock)
+
         # Filter raw VR poses on *every* frame — engaged or not — so the
         # filters are always warm. They used to run only while engaged and be
         # reset on the engage rising edge, which fixed stale-state sweeps but
-        # made every engage a cold start: a fresh OneEuroFilter's derivative
-        # estimate is zero, pinning the cutoff at its minimum for the first
-        # few hundred ms regardless of hand speed, so moving immediately
-        # after engaging felt heavily over-smoothed. Continuous filtering
-        # keeps the state fresh (no stale sweep) and the derivative already
-        # tracking hand velocity at the engage snap (no cold start).
+        # made every engage a cold start: a fresh pose filter's velocity
+        # estimate is zero, so its lag-compensation feedforward is absent
+        # for the first few hundred ms and moving immediately after
+        # engaging felt heavily over-smoothed. Continuous filtering keeps
+        # the state fresh (no stale sweep) and the velocity estimate already
+        # tracking hand motion at the engage snap (no cold start).
         #
         # ``t`` is the frame's playout/capture stamp: frames reach this worker
         # at the irregular solve cadence, and timestamped updates keep that
         # timing jitter from being read as velocity jitter.
         t_s = (frame.t / 1000.0) if frame.t is not None else None
-        lp = self._f_l_pos.update(
-            np.array(
-                [frame.l_ee.position.x, frame.l_ee.position.y, frame.l_ee.position.z]
-            ),
-            t=t_s,
+        raw_l_pos = np.array(
+            [frame.l_ee.position.x, frame.l_ee.position.y, frame.l_ee.position.z]
         )
-        lq = self._f_l_quat.update(
-            np.array(
-                [
-                    frame.l_ee.quaternion.x,
-                    frame.l_ee.quaternion.y,
-                    frame.l_ee.quaternion.z,
-                    frame.l_ee.quaternion.w,
-                ]
-            ),
-            t=t_s,
+        raw_r_pos = np.array(
+            [frame.r_ee.position.x, frame.r_ee.position.y, frame.r_ee.position.z]
         )
+        raw_l_quat = np.array(
+            [
+                frame.l_ee.quaternion.x,
+                frame.l_ee.quaternion.y,
+                frame.l_ee.quaternion.z,
+                frame.l_ee.quaternion.w,
+            ]
+        )
+        raw_r_quat = np.array(
+            [
+                frame.r_ee.quaternion.x,
+                frame.r_ee.quaternion.y,
+                frame.r_ee.quaternion.z,
+                frame.r_ee.quaternion.w,
+            ]
+        )
+
+        verdict, off_l, off_r = self._frame_snap_verdict(raw_l_pos, raw_r_pos, t_s)
+        if verdict == "hold":
+            # Suspect frame: quarantine it (filters never see it) and hold the
+            # arm until the window resolves — a few tens of ms at most.
+            return q_current
+        if verdict == "shift":
+            # Confirmed world-frame shift: the hands didn't move, the VR world
+            # did. Nudge each position filter's state by the measured offset
+            # (its motion history is still valid — only the reference frame
+            # moved) and slide each engaged anchor by the same offset. Target
+            # math sees (filtered - anchor), so the EE targets stay *exactly*
+            # continuous: no step, no filter cold start. Re-snapping against
+            # FK instead would discard the servo lag (up to 60 mm during
+            # motion, measured) and yank the target by that much. Any
+            # rotational component of the shift is left to the quaternion
+            # filters to absorb gradually (observed shifts are translation-
+            # dominated).
+            assert off_l is not None and off_r is not None
+            self._f_l_pos.nudge(off_l)
+            self._f_r_pos.nudge(off_r)
+            if self._use_elbow:
+                self._f_l_elbow.nudge(off_l)
+                self._f_r_elbow.nudge(off_r)
+            for side, off in (("left", off_l), ("right", off_r)):
+                # VR (X=Down, Y=Left, Z=Forward) -> robot FLU, as in _vr_to_flu_np.
+                delta = np.array((off[2], off[1], -off[0]), dtype=np.float32)
+                if side in self._snap_ctrl:
+                    pos, rot = self._snap_ctrl[side]
+                    self._snap_ctrl[side] = (pos + delta, rot)
+                if self._snap_elbow_ctrl.get(side) is not None:
+                    self._snap_elbow_ctrl[side] = self._snap_elbow_ctrl[side] + delta
+
+        lp = self._f_l_pos.update(raw_l_pos, t=t_s)
+        lq = self._f_l_quat.update(raw_l_quat, t=t_s)
         lq = lq / np.linalg.norm(lq)
 
-        rp = self._f_r_pos.update(
-            np.array(
-                [frame.r_ee.position.x, frame.r_ee.position.y, frame.r_ee.position.z]
-            ),
-            t=t_s,
-        )
-        rq = self._f_r_quat.update(
-            np.array(
-                [
-                    frame.r_ee.quaternion.x,
-                    frame.r_ee.quaternion.y,
-                    frame.r_ee.quaternion.z,
-                    frame.r_ee.quaternion.w,
-                ]
-            ),
-            t=t_s,
-        )
+        rp = self._f_r_pos.update(raw_r_pos, t=t_s)
+        rq = self._f_r_quat.update(raw_r_quat, t=t_s)
         rq = rq / np.linalg.norm(rq)
 
         left_pos, left_rot = _vr_to_flu_np(*lp, *lq)
@@ -350,10 +440,17 @@ class IKWorker:
                 elbow_fk = self._solver.elbow_positions(q_current)
             return elbow_fk[0] if side == "left" else elbow_fk[1]
 
-        snapped = False
-        for side, lock, ctrl_pos, ctrl_rot, ctrl_e in (
-            ("left", l_lock, left_pos, left_rot, left_e),
-            ("right", r_lock, right_pos, right_rot, right_e),
+        snapped: list[list[int]] = []
+        for side, lock, ctrl_pos, ctrl_rot, ctrl_e, indices in (
+            ("left", l_lock, left_pos, left_rot, left_e, self._solver.left_indices),
+            (
+                "right",
+                r_lock,
+                right_pos,
+                right_rot,
+                right_e,
+                self._solver.right_indices,
+            ),
         ):
             if lock:
                 if not self._active[side]:
@@ -368,7 +465,7 @@ class IKWorker:
                         _ee(side),
                         _elbow(side) if self._use_elbow else None,
                     )
-                    snapped = True
+                    snapped.append(indices)
             else:
                 if self._active[side]:
                     self._active[side] = False
@@ -387,7 +484,19 @@ class IKWorker:
             # posture pose left at the previous engage would drag it through
             # the null space — a visible settle over the first frames even
             # with a still controller.
-            self._solver.set_posture_pose(q_current)
+            #
+            # Only the snapping arm's joint slice is re-pinned. The other arm
+            # may still be tracking, balanced between its EE target and the
+            # posture pull toward wherever *its* slice was last pinned; moving
+            # that pin to its current q drops the pull instantly and the arm
+            # relaxes to the pure EE/manipulability solution on the next
+            # solve — a visible twitch on the tracking arm every time the
+            # frozen one was re-engaged, growing with how far it had travelled
+            # since its own pin.
+            posture = self._solver.posture_pose
+            for indices in snapped:
+                posture[indices] = q_current[indices]
+            self._solver.set_posture_pose(posture)
             # An engage snap re-anchors that arm to q_current: return the
             # seed unchanged so the snap frame itself produces no motion
             # (matching the previous whole-session engage behaviour).
@@ -430,13 +539,31 @@ class IKWorker:
                 else self._hold_elbow_fk["right"]
             )
 
+        # The solver's max_joint_delta is a per-call clamp — an implicit
+        # velocity limit at the nominal cadence. Scale it by the actual time
+        # since the last solve so a slow solve (fast motion, contended CPU)
+        # doesn't silently strangle joint speed: with the clamp fixed, a
+        # 30 ms solve capped joints at ~1.1 rad/s, the target fell behind
+        # the hand, and the backlog released as a lurch — the "random
+        # jitter" bursts seen during fast wrist rotations. Capped at 4x so
+        # a multi-second stall can't authorize a giant step.
+        now = time.perf_counter()
+        delta_scale = 1.0
+        if self._last_solve_t is not None:
+            elapsed = now - self._last_solve_t
+            delta_scale = float(np.clip(elapsed * self._config.ik_frequency, 1.0, 4.0))
+        self._last_solve_t = now
+
+        solve_t0 = time.perf_counter()
         q_new = self._solver.ik(
             q_current,
             left_pose=(tl_pos, tl_rot),
             right_pose=(tr_pos, tr_rot),
             left_elbow_pos=elbow_l,
             right_elbow_pos=elbow_r,
+            delta_scale=delta_scale,
         )
+        solve_ms = (time.perf_counter() - solve_t0) * 1000.0
         # A frozen arm must not move at all: the hold-pose target keeps the
         # solve consistent (collision terms see the true pose), but the
         # joints themselves are pinned to the seed.
@@ -445,13 +572,114 @@ class IKWorker:
             q_new[self._solver.left_indices] = q_current[self._solver.left_indices]
         if not self._active["right"]:
             q_new[self._solver.right_indices] = q_current[self._solver.right_indices]
-        targets = [tl_pos, tr_pos]
-        if elbow_l is not None and elbow_r is not None:
-            targets += [elbow_l, elbow_r]
-        self._note_solve(
-            bool(np.array_equal(q_new, q_current)),
-            np.concatenate(targets),
-        )
+        # Detect and resolve seed-return stalls per arm. Re-snapshot only a
+        # stalled arm whose target actually moved: a still controller can
+        # legitimately sit at a collision or joint boundary, and the healthy
+        # arm must retain both its solved output and its controller mapping.
+        #
+        # Re-anchoring uses the *current filtered* controller pose and FK of the
+        # unchanged joint slice. At this sample _relative_target_np therefore
+        # returns that FK exactly (zero translation, identity rotation), so the
+        # clutch cannot introduce a command step. Motion after this sample is
+        # once again relative 1:1 (or with the configured multipliers); motion
+        # accumulated while the solver was unable to move is deliberately
+        # discarded instead of being released later as a lurch.
+        reanchor: list[
+            tuple[
+                str,
+                np.ndarray,
+                np.ndarray,
+                np.ndarray | None,
+                list[int],
+            ]
+        ] = []
+        for (
+            side,
+            ctrl_pos,
+            ctrl_rot,
+            ctrl_e,
+            target_pos,
+            target_rot,
+            target_e,
+            indices,
+        ) in (
+            (
+                "left",
+                left_pos,
+                left_rot,
+                left_e,
+                tl_pos,
+                tl_rot,
+                elbow_l,
+                self._solver.left_indices,
+            ),
+            (
+                "right",
+                right_pos,
+                right_rot,
+                right_e,
+                tr_pos,
+                tr_rot,
+                elbow_r,
+                self._solver.right_indices,
+            ),
+        ):
+            if not self._active[side]:
+                self._clear_freeze(side)
+                continue
+            arm_frozen = bool(np.array_equal(q_new[indices], q_current[indices]))
+            if self._note_solve(
+                side,
+                arm_frozen,
+                target_pos,
+                target_rot,
+                target_e,
+            ):
+                reanchor.append((side, ctrl_pos, ctrl_rot, ctrl_e, indices))
+
+        if reanchor:
+            # Keep the persistent posture attractor consistent with the new
+            # clutch origin, but update only re-anchored joint slices. Re-pinning
+            # the whole vector would unnecessarily perturb a healthy arm that
+            # made progress in this same bimanual solve.
+            posture = self._solver.posture_pose
+            for side, ctrl_pos, ctrl_rot, ctrl_e, indices in reanchor:
+                self._snap_arm(
+                    side,
+                    ctrl_pos,
+                    ctrl_rot,
+                    ctrl_e,
+                    _ee(side),
+                    _elbow(side) if self._use_elbow else None,
+                )
+                posture[indices] = q_current[indices]
+            self._solver.set_posture_pose(posture)
+        if self._rec is not None:
+            self._rec.record(
+                raw_l=np.array(
+                    [
+                        frame.l_ee.position.x,
+                        frame.l_ee.position.y,
+                        frame.l_ee.position.z,
+                    ]
+                ),
+                raw_r=np.array(
+                    [
+                        frame.r_ee.position.x,
+                        frame.r_ee.position.y,
+                        frame.r_ee.position.z,
+                    ]
+                ),
+                filt_l=lp,
+                filt_r=rp,
+                tgt_l=tl_pos,
+                tgt_r=tr_pos,
+                q=q_new,
+                engaged=np.array(
+                    [float(self._active["left"]), float(self._active["right"])]
+                ),
+                solve_ms=solve_ms,
+            )
         return q_new
 
     def compute_reset_trajectory(
@@ -483,10 +711,19 @@ class IKWorker:
         self._hold_fk = {}
         self._hold_elbow_fk = {}
         self._clear_freeze()
+        # A forced disengage (reset, stale stream) may never deliver another
+        # lock-less frame to step() — close the recording segment here too.
+        if self._rec is not None:
+            self._rec.set_engaged(False)
         self._snap_ctrl = {}
         self._snap_fk = {}
         self._snap_elbow_ctrl = {}
         self._snap_elbow_fk = {}
+        self._prev_raw = {}
+        self._prev_raw_t = None
+        self._raw_vel = {}
+        self._suspect = None
+        self._last_solve_t = None
         self._reset_pose_filters()
         # step() pins posture to q_current on each engage; an explicit reset
         # restores the default rest-pose attractor.
@@ -494,51 +731,211 @@ class IKWorker:
 
     # -- Internal -----------------------------------------------------------
 
-    def _clear_freeze(self) -> None:
-        """Forget any in-progress freeze run (disengage / engage / reset)."""
-        self._freeze_since = None
-        self._freeze_targets = None
-        self._freeze_next_warn = _FREEZE_WARN_AFTER_S
+    def _note_raw(self, raw_l: np.ndarray, raw_r: np.ndarray, t_eff: float) -> None:
+        """Fold a good frame into the raw-tracking state (position + EMA velocity)."""
+        if self._prev_raw and self._prev_raw_t is not None:
+            dt = min(max(t_eff - self._prev_raw_t, 0.002), 0.1)
+            for side, raw in (("left", raw_l), ("right", raw_r)):
+                v = (raw - self._prev_raw[side]) / dt
+                self._raw_vel[side] = 0.7 * self._raw_vel[side] + 0.3 * v
+        else:
+            self._raw_vel = {"left": np.zeros(3), "right": np.zeros(3)}
+        self._prev_raw = {"left": raw_l.copy(), "right": raw_r.copy()}
+        self._prev_raw_t = t_eff
 
-    def _note_solve(self, frozen: bool, targets: np.ndarray) -> None:
-        """Track seed-returning solves; WARN when the output freezes.
+    def _frame_snap_verdict(
+        self, raw_l: np.ndarray, raw_r: np.ndarray, t_s: float | None
+    ) -> tuple[str, np.ndarray | None, np.ndarray | None]:
+        """Classify this frame's raw poses: ``("ok"|"hold"|"shift", off_l, off_r)``.
+
+        Detection compares each hand against a constant-velocity prediction
+        from its EMA velocity; *both* hands missing it by more than a noise
+        floor plus plausible-acceleration displacement opens a suspect window
+        (see the module constants). During the window every frame returns
+        ``"hold"`` — the caller quarantines it — while the offsets against the
+        pre-trigger prediction accumulate. The window resolves three ways:
+
+        * the offset collapses back under the threshold → the glitch was a
+          transient blip; the quarantined frames are discarded ("ok");
+        * the offset kept *growing* → genuine motion that beat the predictor
+          (hard bimanual flick); tracking resumes from the live pose ("ok");
+        * the offset is *stable* → a persistent world-frame shift; returns
+          ``"shift"`` with the per-hand offsets so the caller can slide the
+          engage anchors and keep the EE targets continuous.
+        """
+        if t_s is not None:
+            t_eff = t_s
+        elif self._prev_raw_t is not None:
+            t_eff = self._prev_raw_t + 1.0 / self._config.ik_frequency
+        else:
+            t_eff = 0.0
+
+        if self._suspect is not None:
+            s = self._suspect
+            gap = min(max(t_eff - s["t0"], 0.002), 0.5)
+            threshold = _SNAP_FLOOR_M + 0.5 * _SNAP_ACCEL_MAX * gap * gap
+            off_l = raw_l - (s["pos"]["left"] + s["vel"]["left"] * gap)
+            off_r = raw_r - (s["pos"]["right"] + s["vel"]["right"] * gap)
+            if (
+                float(np.linalg.norm(off_l)) < threshold
+                or float(np.linalg.norm(off_r)) < threshold
+            ):
+                _logger.info(
+                    "VR tracking blip (%d frames) reverted — discarded.", s["n"]
+                )
+                self._suspect = None
+                self._note_raw(raw_l, raw_r, t_eff)
+                return ("ok", None, None)
+            s["offs"].append((off_l, off_r))
+            s["n"] += 1
+            if s["n"] < _SNAP_CONFIRM_FRAMES:
+                return ("hold", None, None)
+
+            # Window full: a stable offset means the world frame moved; a
+            # growing one means the hands are genuinely accelerating beyond
+            # the predictor. Both hands must agree for a shift.
+            def _stable(first: np.ndarray, last: np.ndarray) -> bool:
+                size = 0.5 * float(np.linalg.norm(first) + np.linalg.norm(last))
+                return float(np.linalg.norm(last - first)) < _SNAP_STABLE_RATIO * size
+
+            first_l, first_r = s["offs"][0]
+            last_l, last_r = s["offs"][-1]
+            is_shift = _stable(first_l, last_l) and _stable(first_r, last_r)
+            vel = dict(s["vel"])
+            self._suspect = None
+            self._prev_raw = {"left": raw_l.copy(), "right": raw_r.copy()}
+            self._prev_raw_t = t_eff
+            if is_shift:
+                # The hands continue their pre-shift motion in the new frame.
+                self._raw_vel = vel
+                _logger.warning(
+                    "VR world frame shifted %.0f/%.0f mm (L/R) — headset "
+                    "re-localization, not hand motion. Re-anchoring engaged "
+                    "arms in place.",
+                    float(np.linalg.norm(last_l)) * 1e3,
+                    float(np.linalg.norm(last_r)) * 1e3,
+                )
+                return ("shift", last_l, last_r)
+            self._raw_vel = {"left": np.zeros(3), "right": np.zeros(3)}
+            _logger.info(
+                "VR pose discontinuity resolved as genuine motion (offset "
+                "grew %.0f→%.0f mm); resuming.",
+                float(np.linalg.norm(first_l)) * 1e3,
+                float(np.linalg.norm(last_l)) * 1e3,
+            )
+            return ("ok", None, None)
+
+        prev_l = self._prev_raw.get("left")
+        prev_r = self._prev_raw.get("right")
+        if prev_l is not None and prev_r is not None and self._prev_raw_t is not None:
+            dt = min(max(t_eff - self._prev_raw_t, 0.002), 0.1)
+            threshold = _SNAP_FLOOR_M + 0.5 * _SNAP_ACCEL_MAX * dt * dt
+            off_l = raw_l - (prev_l + self._raw_vel["left"] * dt)
+            off_r = raw_r - (prev_r + self._raw_vel["right"] * dt)
+            if (
+                float(np.linalg.norm(off_l)) > threshold
+                and float(np.linalg.norm(off_r)) > threshold
+            ):
+                self._suspect = {
+                    "t0": self._prev_raw_t,
+                    "pos": {"left": prev_l.copy(), "right": prev_r.copy()},
+                    "vel": {
+                        "left": self._raw_vel["left"].copy(),
+                        "right": self._raw_vel["right"].copy(),
+                    },
+                    "offs": [(off_l, off_r)],
+                    "n": 1,
+                }
+                return ("hold", None, None)
+        self._note_raw(raw_l, raw_r, t_eff)
+        return ("ok", None, None)
+
+    def _clear_freeze(self, side: str | None = None) -> None:
+        """Forget one or all in-progress freeze runs."""
+        if side is None:
+            self._freeze_since.clear()
+            self._freeze_targets.clear()
+            return
+        self._freeze_since.pop(side, None)
+        self._freeze_targets.pop(side, None)
+
+    def _note_solve(
+        self,
+        side: str,
+        frozen: bool,
+        target_pos: np.ndarray,
+        target_rot: np.ndarray,
+        target_elbow: np.ndarray | None,
+    ) -> bool:
+        """Track one arm's seed-returning solves; request a safe clutch.
 
         A single unchanged solution is normal (e.g. the hand is still, or the
-        target is held against a constraint). The failure mode worth flagging is
-        a *run* of solves that return the seed while the EE/elbow targets keep
-        moving away — the operator sees the arm stop responding, and the
-        accumulated error is released as a lurch once a solve finally makes
-        progress (see ``KinematicsConfig`` for the tuning that minimises this).
+        target is held against a constraint). The failure mode worth handling
+        is a *run* of solves that returns this arm's seed while its EE/elbow
+        target keeps moving away. Once confirmed, the caller re-snapshots the
+        controller against FK of the held joints, acting like an automatic
+        clutch: no command step now, no accumulated catch-up later.
 
         Args:
-            frozen: True when this solve returned ``q_current`` bit-identically.
-            targets: Concatenated EE + elbow target positions (m) of this solve,
-                used to measure how far the targets drifted during the freeze.
+            side: ``"left"`` or ``"right"``.
+            frozen: True when this arm's solved joint slice returned its
+                ``q_current`` slice bit-identically.
+            target_pos: Current EE target position in metres.
+            target_rot: Current EE target rotation matrix.
+            target_elbow: Optional elbow target position in metres.
+
+        Returns:
+            True once the freeze duration and target-motion thresholds are met;
+            the caller should re-anchor this arm at the current sample.
         """
         if not frozen:
-            self._clear_freeze()
-            return
+            self._clear_freeze(side)
+            return False
         now = time.monotonic()
-        if self._freeze_since is None or self._freeze_targets is None:
-            self._freeze_since = now
-            self._freeze_targets = targets
-            return
-        duration = now - self._freeze_since
-        drift = float(np.max(np.abs(targets - self._freeze_targets)))
-        if duration >= self._freeze_next_warn and drift >= _FREEZE_MIN_TARGET_DRIFT_M:
-            _logger.warning(
-                "IK frozen for %.1fs: solver keeps returning its seed while the "
-                "EE/elbow targets moved %.0f mm — it cannot make progress "
-                "(target likely conflicts with the self-collision margin or "
-                "joint limits); the arm holds, then catches up in a lurch when "
-                "the solve breaks free.",
-                duration,
-                drift * 1e3,
+        start = self._freeze_targets.get(side)
+        if side not in self._freeze_since or start is None:
+            self._freeze_since[side] = now
+            self._freeze_targets[side] = (
+                target_pos.copy(),
+                target_rot.copy(),
+                None if target_elbow is None else target_elbow.copy(),
             )
-            self._freeze_next_warn = duration + _FREEZE_REWARN_EVERY_S
+            return False
+
+        duration = now - self._freeze_since[side]
+        start_pos, start_rot, start_elbow = start
+        pos_drift = float(np.linalg.norm(target_pos - start_pos))
+        if target_elbow is not None and start_elbow is not None:
+            pos_drift = max(
+                pos_drift,
+                float(np.linalg.norm(target_elbow - start_elbow)),
+            )
+        relative_rot = start_rot.T @ target_rot
+        cos_angle = float(np.clip((np.trace(relative_rot) - 1.0) * 0.5, -1.0, 1.0))
+        rot_drift = math.acos(cos_angle)
+        moved = (
+            pos_drift >= _FREEZE_MIN_TARGET_DRIFT_M
+            or rot_drift >= _FREEZE_MIN_TARGET_DRIFT_RAD
+        )
+        if duration < _FREEZE_WARN_AFTER_S or not moved:
+            return False
+
+        _logger.warning(
+            "IK %s arm frozen for %.1fs: its solver output stayed at the seed "
+            "while the EE/elbow target moved %.0f mm / %.1f deg (likely a "
+            "self-collision or joint-limit conflict). Re-anchoring the "
+            "controller at the held pose; motion accumulated during the "
+            "freeze is discarded to prevent a catch-up lurch.",
+            side,
+            duration,
+            pos_drift * 1e3,
+            math.degrees(rot_drift),
+        )
+        self._clear_freeze(side)
+        return True
 
     def _reset_pose_filters(self) -> None:
-        """Clear the OneEuroFilter state for every controller and elbow stream."""
+        """Clear the pose-filter state for every controller and elbow stream."""
         self._f_l_pos.reset()
         self._f_l_quat.reset()
         self._f_r_pos.reset()

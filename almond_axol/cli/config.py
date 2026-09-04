@@ -52,8 +52,8 @@ import numpy as np
 
 from ..constants import CAN_LEFT, CAN_RIGHT
 from ..kinematics.config import KinematicsConfig
-from ..robot.cart import CartConfig
 from ..robot.config import AxolConfig
+from ..robot.jelly import JellyConfig
 from ..teleop.config import VRTeleopConfig
 from ..vr.config import VRServerConfig
 
@@ -267,7 +267,7 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
 
 
 # Per-joint arm fields (``kp`` / ``kd`` / ``friction.*`` / ``mass`` / ``com``
-# / ``j_eff`` / ``kd_soft`` for the seven arm joints). For a config that
+# / ``j_eff`` / ``kd_host`` for the seven arm joints). For a config that
 # embeds ``AxolConfig`` these are ~140 of the ~165 generated options and
 # flood ``--help`` into illegibility. Matched anywhere in a dotted option
 # string so it works for both ``--axol.left.elbow.kp`` (teleop) and
@@ -292,12 +292,14 @@ _INCLUDE_HELP_PREFIX = "Config file for "
 # so we override them outright.
 _FIELD_HELP: dict[str, str] = {
     "left_stiffness": (
-        "Compliance<->stiffness blend in [0, 1]: a scalar (all arm joints) "
-        "or a 7-element list, one per joint."
+        "Compliance blend in [0, 1]: 1 (default) runs the tuned gains, lower "
+        "only adds compliance. A scalar (all arm joints) or a 7-element "
+        "list, one per joint."
     ),
     "right_stiffness": (
-        "Compliance<->stiffness blend in [0, 1]: a scalar (all arm joints) "
-        "or a 7-element list, one per joint."
+        "Compliance blend in [0, 1]: 1 (default) runs the tuned gains, lower "
+        "only adds compliance. A scalar (all arm joints) or a 7-element "
+        "list, one per joint."
     ),
     "max_step_rad": "Max change (rad) in any arm joint between consecutive commands.",
     "has_gripper": (
@@ -502,7 +504,8 @@ class TeleopCmdConfig:
     track (one decoder session on the headset) and rendered per-lens for
     true stereo. ``--resolution`` picks the capture resolution for all
     cameras (``SVGA`` / ``HD1080`` / ``HD1200``); ``null`` (the default)
-    keeps each camera's SDK default.
+    keeps each camera's SDK default. Headset streaming is fixed at 30 fps,
+    independently of the capture rate used by recording or policy cameras.
 
     ``--camera_eyes`` overrides which eye(s) of a stereo slot are streamed to
     the headset, keyed by slot (``both`` / ``left`` / ``right``) — e.g.
@@ -513,29 +516,29 @@ class TeleopCmdConfig:
     The VR WebSocket server (port, TLS certs) lives on the nested
     ``vr_server`` config — e.g. ``--vr_server.port 9000``.
 
-    Robots on the powered cart (x-drive base + telescoping lift) enable it
-    with ``--cart.enabled true``; the thumbsticks then drive the base (left
+    Robots on Jelly (x-drive base + telescoping lift) enable it
+    with ``--jelly.enabled true``; the thumbsticks then drive the base (left
     stick translates, right stick x rotates) and the stick clicks run the
     lift (left click down, right click up), independent of the arm engage
-    toggle. Cart parameters live on the nested ``cart`` config — e.g.
-    ``--cart.max_speed 5`` or ``--cart.channel can0``.
+    toggle. Jelly parameters live on the nested ``jelly`` config — e.g.
+    ``--jelly.max_speed 5`` or ``--jelly.channel can0``.
 
-    ``--cart_only`` drives *just* the cart: the arms are never constructed
+    ``--jelly_only`` drives *just* Jelly: the arms are never constructed
     and the Axol hub CAN channels are never touched — only the VR server
-    (thumbstick stream) and the cart run. Having a cart is implied, so
-    ``--cart.enabled`` is not consulted.
+    (thumbstick stream) and the Jelly run. Having Jelly is implied, so
+    ``--jelly.enabled`` is not consulted.
     """
 
     sim: bool = False
-    cart_only: bool = False
-    """Drive only the powered cart from the headset thumbsticks. The arms and
-    their CAN channels are left untouched (no Axol hub needed); the cart is
+    jelly_only: bool = False
+    """Drive only Jelly from the headset thumbsticks. The arms and their CAN
+    channels are left untouched (no Axol hub needed); Jelly is
     implied. Mutually exclusive with sim."""
     axol: AxolConfig = field(default_factory=AxolConfig)
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)
     vr_server: VRServerConfig = field(default_factory=VRServerConfig)
-    cart: CartConfig = field(default_factory=CartConfig)
+    jelly: JellyConfig = field(default_factory=JellyConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     cameras: dict[str, int] = field(default_factory=dict)
@@ -557,13 +560,29 @@ class GravityCompCmdConfig:
     the impedance gains used to hold non-free joints both come from the
     nested ``axol`` config — override them via e.g.
     ``--axol.left.elbow.kp 60`` or ``--axol.left_stiffness 0.8``.
+
+    ``record`` captures the hand-guided session with the same flight
+    recorder teleop uses (see :mod:`almond_axol.teleop.recorder`): the
+    measured arm-joint positions and torques are written to
+    ``<prefix>_gc.npz`` when the session ends. A bare name records into
+    ``~/.almond/recordings/``, where ``axol motion.build`` finds it — so a
+    reference motion can be built from a hand-guided demonstration instead
+    of a teleoperated one. The capture keeps the last ~5 minutes; the
+    still lead-in/lead-out is trimmed at build time.
     """
 
     axol: AxolConfig = field(default_factory=AxolConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     free_joints: list[str] | None = None
-    kd: float = 0.25
+    record: str | None = None
+    """Recording name for the hand-guided session — the measured joints are
+    captured so axol motion.build can turn them into a reference motion. A
+    bare name lands in ~/.almond/recordings/; empty disables recording."""
+    # 0.5 (was 0.25): residual gravity-model error away from the calibration
+    # pose shows as slow creep on low-friction joints (wrist_2) once kp=0 —
+    # creep speed is roughly error/kd, so doubling kd halves it without
+    # making hand-guiding feel heavy.
+    kd: float = 0.5
     rate_hz: float = 250.0
-    telemetry_hz: float = 500.0
     log_level: LogLevel = "INFO"

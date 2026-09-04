@@ -16,8 +16,9 @@ import dataclasses
 import inspect
 import json
 import re
+import types
 from dataclasses import MISSING
-from typing import Any
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import draccus
 
@@ -73,6 +74,8 @@ class Schema:
 
 
 def _humanize(key: str) -> str:
+    if key == "jelly_only":
+        return "Jelly only"
     return key.replace("_", " ")
 
 
@@ -166,7 +169,7 @@ def _field_docs(instance: Any) -> dict[str, str]:
     preceding comment) applies, and the CLI's curated overrides beat those.
     The curated map is keyed by bare field name — it exists to paper over
     draccus mis-extractions — so it must not shadow an explicit docstring on
-    an unrelated class that happens to reuse the name (``cart.max_speed`` vs
+    an unrelated class that happens to reuse the name (``jelly.max_speed`` vs
     the gripper's).
     """
     if not dataclasses.is_dataclass(instance):
@@ -197,6 +200,34 @@ def _leaf_type(value: Any) -> str:
     return "text"
 
 
+def _optional_numeric_keys(instance: Any) -> frozenset[str]:
+    """Dataclass field names declared ``float | None`` / ``int | None``.
+
+    Leaf types are inferred from the *current value*, so an optional numeric
+    field sitting at ``None`` (e.g. ``JointConfig.kd_host_hz``, where None
+    means "use the shared band-pass default") would degrade to a text field.
+    Besides the wrong input mode, that shattered the settings Advanced tab's
+    per-joint gain table: joints with the value set stayed numeric while the
+    rest became text, breaking the identical-numeric-columns clustering that
+    the table rendering keys on. The declared type keeps them numbers.
+    """
+    if not dataclasses.is_dataclass(instance) or isinstance(instance, type):
+        return frozenset()
+    try:
+        hints = get_type_hints(type(instance))
+    except Exception:
+        return frozenset()
+    out: set[str] = set()
+    for f in dataclasses.fields(instance):
+        hint = hints.get(f.name)
+        if get_origin(hint) not in (Union, types.UnionType):
+            continue
+        members = set(get_args(hint))
+        if type(None) in members and members <= {int, float, type(None)}:
+            out.add(f.name)
+    return frozenset(out)
+
+
 def _children(
     prefix: str,
     values: dict[str, Any],
@@ -208,6 +239,7 @@ def _children(
     docs = _field_docs(instance)
     out: list[dict[str, Any]] = []
     is_dc = dataclasses.is_dataclass(instance)
+    numeric_none = _optional_numeric_keys(instance)
     for key, value in values.items():
         if is_dc:
             child = getattr(instance, key, None)
@@ -216,7 +248,16 @@ def _children(
         else:
             child = None
         out.append(
-            _make_node(prefix, key, value, required, child, docs.get(key), dict_roots)
+            _make_node(
+                prefix,
+                key,
+                value,
+                required,
+                child,
+                docs.get(key),
+                dict_roots,
+                numeric_hint=key in numeric_none,
+            )
         )
     return out
 
@@ -229,6 +270,7 @@ def _make_node(
     instance: Any,
     help_text: str | None,
     dict_roots: set[str],
+    numeric_hint: bool = False,
 ) -> dict[str, Any]:
     full = f"{prefix}.{key}" if prefix else key
 
@@ -264,7 +306,7 @@ def _make_node(
             ftype = "text"
             default = json.dumps(value)
     else:
-        ftype = _leaf_type(value)
+        ftype = "number" if value is None and numeric_hint else _leaf_type(value)
         default = value
 
     return {
@@ -482,7 +524,15 @@ def _make_action_field(
         return node, key, {"t": "pos"}, required
 
     flag = action.option_strings[0]
-    spec = {"t": "optlist", "flag": flag} if is_list else {"t": "opt", "flag": flag}
+    if isinstance(action, argparse._AppendAction):
+        # Repeatable option (action="append", e.g. tune.motion's --gain):
+        # one text field whose whitespace-separated tokens each become their
+        # own ``--flag token`` pair.
+        spec = {"t": "optmany", "flag": flag}
+    elif is_list:
+        spec = {"t": "optlist", "flag": flag}
+    else:
+        spec = {"t": "opt", "flag": flag}
     node = _field(key, label, ftype, default, options, required, help_text)
     return node, key, spec, required
 

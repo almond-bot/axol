@@ -14,7 +14,7 @@ Up to four Axol buses, every one of them optional and independent:
     CAN channels on a single USB device:
       channel 0 (dev_id 0x0) -> can_alm_axol_l  (left arm)
       channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
-  - The powered cart's wheel bus: a single-channel candlelight adapter
+  - Jelly's wheel bus: a single-channel candlelight adapter
     (same generic VID/PID) carrying the four Damiao wheel motors at CAN
     IDs 0x01-0x04, named can_alm_axol_b.
   - The chest bus: another single-channel adapter, carrying the jelly_legs
@@ -37,14 +37,13 @@ gets through.
 """
 
 import re
-import socket
-import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 from ...constants import CAN_BASE, CAN_BRINGUP_SCRIPT, CAN_CHEST, CAN_LEFT, CAN_RIGHT
+from ...robot.identity import select_hub_serial
 from ...utils.sudo import run_root
 from . import driver
 
@@ -93,7 +92,7 @@ def _scan_adapters() -> dict[str, dict]:
     """Every attached gs_usb CAN adapter: serial -> {vid, pid, dev_ids}.
 
     The dual-channel Axol arm hub shows up as one serial with dev_ids {0, 1};
-    a single-channel adapter (the cart's wheel-bus CANable, a UMI rig, ...)
+    a single-channel adapter (Jelly's wheel-bus CANable, a UMI rig, ...)
     as one serial with {0}. Matched on the gs_usb driver rather than a VID/PID
     so CANable firmware variants that don't use the candlelight 1d50:606f IDs
     still count; the Jetson's built-in mttcan controller has no USB serial and
@@ -125,7 +124,7 @@ def _scan_adapters() -> dict[str, dict]:
 def _detect_serials() -> list[str]:
     """Serials of every attached *dual-channel* Axol adapter — hub candidates.
 
-    Single-channel devices (the cart's wheel-bus adapter, UMI rigs) share the
+    Single-channel devices (Jelly's wheel-bus adapter, UMI rigs) share the
     generic VID/PID but can never be the hub, so they are excluded rather
     than left to make the scan ambiguous.
     """
@@ -188,6 +187,18 @@ def _configured_serial() -> str | None:
     return _rules_serial_for(_CAN_L) or _rules_serial_for(_CAN_R)
 
 
+def hub_serial() -> str | None:
+    """The Axol hub adapter's USB serial — this robot's identity.
+
+    The hub travels with the arms, so its serial keys the robot's factory
+    calibration in the cloud (see :mod:`almond_axol.robot.calibration_cloud`)
+    across compute-host swaps. A configured serial wins only while it is
+    attached (or while no hub is attached); a different, unambiguous attached
+    hub replaces a stale pin.
+    """
+    return _resolve_hub_serial()
+
+
 def _configured_named_serial(name: str) -> str | None:
     """A single-channel adapter's serial as pinned by a previous setup.
 
@@ -219,17 +230,17 @@ def _resolve_hub_serial() -> str | None:
     picks in the same situation. Several attached candidates still raise,
     since that needs the interactive flow to disambiguate.
     """
-    configured = _configured_serial()
-    attached = _detect_serials()
-    if configured and (configured in attached or not attached):
-        return configured
-    if len(attached) == 1:
-        return attached[0]
-    if not attached:
-        return None
-    raise RuntimeError(
-        "Multiple CAN adapters found — run `axol can.setup` once to pick the Axol's"
-    )
+    return select_hub_serial(_configured_serial(), _detect_serials())
+
+
+def _stdin_is_tty() -> bool:
+    """True when an operator can answer ``input()`` prompts.
+
+    The web dashboard launches ``can.setup`` as a subprocess with a piped
+    stdin (no tty), where a prompt would block invisibly — the prompt text
+    has no trailing newline, so it never even reaches the streamed log.
+    """
+    return sys.stdin is not None and sys.stdin.isatty()
 
 
 def _find_serial() -> str | None:
@@ -237,25 +248,47 @@ def _find_serial() -> str | None:
     print(f"Scanning for the Almond Axol arm hub adapter ({_VID}:{_PID})...")
 
     unique = _detect_serials()
+    configured = _configured_serial()
 
     if not unique:
         # An unplugged hub on an already-configured host (e.g. re-running
-        # setup on a cart-only session) keeps its pinned serial — the udev
+        # setup on a Jelly-only session) keeps its pinned serial — the udev
         # rule and startup script stay valid for whenever it's reattached.
-        configured = _configured_serial()
         if configured:
             print(f"  No hub attached — keeping configured serial {configured}.")
             return configured
+        if not _stdin_is_tty():
+            print("  No arm hub found — continuing without one (Jelly/chest only).")
+            return None
         print(
             "\n  No arm hub found. Enter its serial manually, or leave blank "
-            "for a robot without one (cart/chest only):"
+            "for a robot without one (Jelly/chest only):"
         )
         return input("  Serial: ").strip() or None
 
     if len(unique) == 1:
-        print(f"  Found adapter — serial: {unique[0]}")
-        return unique[0]
+        serial = unique[0]
+        if configured and configured != serial:
+            print(
+                f"  Found adapter — serial: {serial} (replacing previously "
+                f"configured {configured}, which is not attached)."
+            )
+        else:
+            print(f"  Found adapter — serial: {serial}")
+        return serial
 
+    if not _stdin_is_tty():
+        # Same rules as the headless flow: an attached configured hub wins;
+        # several fresh candidates are genuinely ambiguous.
+        if configured in unique:
+            print(
+                f"  Multiple adapters found — keeping configured serial {configured}."
+            )
+            return configured
+        _die(
+            "Multiple arm hub adapters found and none matches the configured "
+            "serial. Run `axol can.setup` from a terminal to choose one."
+        )
     print("  Multiple adapters found:")
     for i, s in enumerate(unique):
         print(f"    [{i}] {s}")
@@ -290,53 +323,55 @@ _PROBE_WINDOW_S = 0.4
 def _probe(iface: str, frames: list[tuple[int, bytes]], match) -> bool:  # noqa: ANN001
     """Send probe frames on ``iface`` and wait briefly for a matching reply.
 
-    Raw SocketCAN (no python-can machinery needed for a one-shot probe).
+    The Rust CAN proxy owns SocketCAN even for this one-shot setup probe.
     Unanswered probes are harmless: the IDs used command nothing, and a
     frame left queued behind an unpowered bus is dropped by the bring-up
     script's interface flap.
     """
-    try:
-        s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
-        s.bind((iface,))
-    except OSError:
+    import asyncio
+
+    from ...motor import CanBus
+
+    async def run_probe() -> bool:
+        hit = asyncio.Event()
+        bus = CanBus(iface)
+
+        def on_message(message) -> None:  # noqa: ANN001
+            if match(message.arbitration_id, bytes(message.data)):
+                hit.set()
+
+        bus._add_listener(on_message)
+        try:
+            async with bus:
+                for _ in range(_PROBE_ATTEMPTS):
+                    for can_id, data in frames:
+                        await bus._send(can_id, data)
+                    try:
+                        await asyncio.wait_for(hit.wait(), _PROBE_WINDOW_S)
+                        return True
+                    except TimeoutError:
+                        pass
+        except Exception:  # noqa: BLE001 - unavailable/wedged means no probe reply
+            return False
         return False
-    try:
-        for _ in range(_PROBE_ATTEMPTS):
-            for can_id, data in frames:
-                try:
-                    s.send(
-                        struct.pack("<IB3x8s", can_id, len(data), data.ljust(8, b"\0"))
-                    )
-                except OSError:
-                    return False  # interface down / TX queue wedged
-            deadline = time.monotonic() + _PROBE_WINDOW_S
-            while (remaining := deadline - time.monotonic()) > 0:
-                s.settimeout(remaining)
-                try:
-                    frame = s.recv(16)
-                except (TimeoutError, OSError):
-                    break
-                can_id, dlc = struct.unpack("<IB3x", frame[:8])
-                if match(can_id & 0x7FF, frame[8 : 8 + dlc]):
-                    return True
-    finally:
-        s.close()
-    return False
+
+    return asyncio.run(run_probe())
 
 
 def _send_once(iface: str, can_id: int, data: bytes) -> None:
     """Fire one frame on ``iface`` and return; no reply expected."""
-    try:
-        s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
-        s.bind((iface,))
-    except OSError:
-        return
-    try:
-        s.send(struct.pack("<IB3x8s", can_id, len(data), data.ljust(8, b"\0")))
-    except OSError:
-        pass
-    finally:
-        s.close()
+    import asyncio
+
+    from ...motor import CanBus
+
+    async def send() -> None:
+        try:
+            async with CanBus(iface) as bus:
+                await bus._send(can_id, data)
+        except Exception:  # noqa: BLE001 - best-effort setup cleanup
+            pass
+
+    asyncio.run(send())
 
 
 def _probe_chest(iface: str) -> bool:
@@ -412,11 +447,11 @@ def _identify_adapter(serial: str) -> str | None:
     wheels = _probe_wheels(iface)
     chest = _probe_chest(iface)
     if chest and wheels:
-        # The pre-split combined cart bus (jelly_legs next to the wheels).
+        # The pre-split combined Jelly bus (jelly_legs next to the wheels).
         print(
             f"  WARNING: both the wheel motors and the jelly_legs board "
             f"answer on {iface} — treating it as the wheel bus. Point the "
-            f"lift at it explicitly (cart.lift_channel={_CAN_B}) or move "
+            f"lift at it explicitly (jelly.lift_channel={_CAN_B}) or move "
             f"the lift onto its own chest bus."
         )
         return "wheels"
@@ -453,7 +488,7 @@ def _write_udev_rules(
     # variants ship various VID/PIDs, and the serial already identifies the
     # exact adapter.
     for label, name, serial in (
-        ("Powered-cart wheel bus", _CAN_B, wheels_serial),
+        ("Jelly wheel bus", _CAN_B, wheels_serial),
         ("Chest bus (jelly_legs lift controller)", _CAN_C, chest_serial),
     ):
         if not serial:
@@ -612,7 +647,7 @@ def _write_cron_script() -> None:
     """Write the bring-up script covering all four interfaces.
 
     Every interface is optional and checked for presence at runtime, so one
-    script serves every hardware combination — arm-only, cart-only, chest-
+    script serves every hardware combination — arm-only, Jelly-only, chest-
     only, or all of them — and an unplugged adapter never blocks the rest.
     """
     print(f"Writing CAN startup script to {_CRON_SCRIPT}...")
@@ -970,28 +1005,43 @@ def ensure_setup(
 ) -> None:
     """Run the full CAN configuration non-interactively (for the control panel).
 
-    Mirrors :func:`run` but resolves the adapter serials without prompting.
-    The wheel-bus and chest adapters are only ever *re*-pinned here (from a
-    previous setup's rules or a live interface); identifying a new one needs
-    the interactive flow's probing — see :func:`_identify_adapter`.
+    Mirrors :func:`run` but never prompts: the hub is resolved by
+    attachment-aware detection (:func:`_resolve_hub_serial`) and the
+    single-channel wheel/chest adapters by probing their buses
+    (:func:`_find_single_serials`), so a replacement adapter — a new hub, a
+    new Jelly/chest CANable, or a different Axol plugged into this host — is
+    re-pinned on the next connect without the interactive flow. Only an
+    adapter whose bus doesn't answer (devices unpowered, unrelated hardware)
+    is left to the interactive ``axol can.setup``.
     """
     driver.ensure_driver()
     hub_serial = hub_serial or _resolve_hub_serial()
-    wheels_serial = wheels_serial or _configured_named_serial(_CAN_B)
-    chest_serial = chest_serial or _configured_named_serial(_CAN_C)
+    if wheels_serial is None and chest_serial is None:
+        wheels_serial, chest_serial = _find_single_serials(
+            hub_serial, interactive=False
+        )
+    else:
+        wheels_serial = wheels_serial or _configured_named_serial(_CAN_B)
+        chest_serial = chest_serial or _configured_named_serial(_CAN_C)
     if not (hub_serial or wheels_serial or chest_serial):
         raise RuntimeError("Robot not detected")
     _apply_setup(hub_serial, wheels_serial, chest_serial)
+    if hub_serial:
+        _pull_factory_calibration(hub_serial)
 
 
-def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None]:
-    """Interactively assign single-channel adapters to the wheel/chest buses.
+def _find_single_serials(
+    hub_serial: str | None, *, interactive: bool = True
+) -> tuple[str | None, str | None]:
+    """Assign single-channel adapters to the wheel/chest buses.
 
     Every attached adapter is probed, including adapters pinned by a previous
     setup. A positive device response wins over a stale pin; an attached but
     silent (or currently unplugged) configured adapter keeps its previous role
     as an unverified fallback. A new silent adapter is offered to the operator
-    instead of being guessed at, and may explicitly replace such a fallback.
+    instead of being guessed at, and may explicitly replace such a fallback
+    when ``interactive`` is true. Headless callers pass ``interactive=False``
+    so an invisible prompt cannot block them.
 
     Returns ``(wheels_serial, chest_serial)``, either of which may be None.
     """
@@ -1088,6 +1138,13 @@ def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None
     ]
     for serial in unidentified:
         print(f"  {serial}: nothing answered on this adapter's bus.")
+        if not interactive:
+            print(
+                "    Skipping — power the wheel motors / chest board and "
+                "reconnect, or run `axol can.setup` from a terminal to "
+                "assign it manually."
+            )
+            continue
         choice = (
             input(
                 f"    Assign it to the [w]heel bus ({_CAN_B}), the [c]hest "
@@ -1117,17 +1174,59 @@ def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None
     return wheels, chest
 
 
+def _pull_factory_calibration(serial: str) -> None:
+    """Best-effort fetch of this robot's factory calibration (public bucket).
+
+    Setup is the natural moment: the hub serial was just identified, and the
+    machine may be brand new to this robot. Keyless (the bucket is public)
+    and never fatal — an offline setup just keeps whatever cache exists.
+    """
+    from ...robot.calibration import (
+        FACTORY_CALIBRATION_PATH,
+        save_factory_calibration,
+    )
+    from ...robot.calibration_cloud import fetch_calibration
+
+    try:
+        document = fetch_calibration(serial)
+        # A confirmed cloud miss must also supersede a cache belonging to a
+        # robot previously attached to this host. The empty scoped document
+        # preserves the useful "none stored" result without stale values.
+        if document is None:
+            save_factory_calibration({"version": 1}, hub_serial=serial)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"  Factory calibration: not fetched ({exc})")
+        return
+    if document is None:
+        print(
+            f"  Factory calibration: none stored for hub {serial} "
+            "(run axol tune.factory at the factory)"
+        )
+        return
+    try:
+        save_factory_calibration(document, hub_serial=serial)
+    except (OSError, ValueError) as exc:
+        print(f"  Factory calibration: not cached ({exc})")
+        return
+    print(f"  Factory calibration: fetched into {FACTORY_CALIBRATION_PATH}")
+
+
 def run(_args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
     driver.ensure_driver()
     hub_serial = _find_serial()
-    wheels_serial, chest_serial = _find_single_serials(hub_serial)
+    wheels_serial, chest_serial = _find_single_serials(
+        hub_serial, interactive=_stdin_is_tty()
+    )
     if not (hub_serial or wheels_serial or chest_serial):
         _die(
             "No CAN adapters found or configured. Connect the arm hub, "
             "wheel-bus, or chest adapter and re-run."
         )
     _apply_setup(hub_serial, wheels_serial, chest_serial)
+
+    if hub_serial:
+        _pull_factory_calibration(hub_serial)
 
     print()
     print("Setup complete.")

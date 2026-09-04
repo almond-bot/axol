@@ -10,19 +10,25 @@ the robot returns home but keeps holding the item with the motors left enabled
 — run ``almond_axol.diagnostics.rom.disable`` afterwards to open the grippers
 and retrieve the item.
 
+The arms are driven through the Rust realtime core (``RtAxol``), the same
+control path as teleop: the core owns the CAN buses, renders the streamed
+targets at 240 Hz, and runs the host damping against fresh feedback. A soak
+therefore exercises exactly the controller the robot ships with.
+
 Select a subset of joints and/or a single arm:
-  --joints    Comma-separated joints present on the CAN bus (e.g.
-              wrist_1,wrist_2,wrist_3). Only these motors are enabled and
-              swept; every other joint is left untouched at home. Default: all.
+  --joints    Comma-separated joints to sweep (e.g. wrist_1,wrist_2,wrist_3).
+              The whole arm is still brought up and held — the realtime core
+              enables every motor on the bus — but only these joints move;
+              every other joint holds home. Default: all.
   --no-left / --no-right
               Skip an arm entirely. Only the remaining arm is opened, enabled,
               and swept. Cannot skip both.
 
-The grasp-an-item clamp (hold with force, then soak while holding) only runs on
-the full robot. Any subset run drops the grasp step and simply loops the
-range-of-motion sweeps for the selected joints; if the gripper is one of them it
-is cycled through its full open↔close range like any other joint (holding
-nothing, at the default gentle torque).
+The grasp-an-item clamp (hold with force, then soak while holding) only runs
+when every joint is selected. Any subset run drops the grasp step and simply
+loops the range-of-motion sweeps for the selected joints; if the gripper is one
+of them it is cycled through its full open↔close range like any other joint
+(holding nothing, at the default gentle torque).
 
 ``--web-prompts`` makes each hands-on gripper step emit a ``[prompt] ...``
 marker on stdout and then block on stdin, so the web dashboard can turn the
@@ -47,8 +53,7 @@ import time
 
 import numpy as np
 
-from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
-from ...motor import ControlMode
+from ...constants import CAN_LEFT, CAN_RIGHT, Joint
 from ...robot.axol import (
     ELBOW_LEFT_LIMITS,
     ELBOW_RIGHT_LIMITS,
@@ -57,9 +62,9 @@ from ...robot.axol import (
     SHOULDER_2_LEFT_LIMITS,
     SHOULDER_2_RIGHT_LIMITS,
     Axol,
-    AxolArm,
 )
 from ...robot.config import AxolConfig
+from ...rt import RtAxol
 from ..telemetry_log import TelemetryCsvLogger
 
 CONTROL_RATE_HZ = 100.0  # Hz
@@ -68,7 +73,14 @@ CONTROL_RATE_HZ = 100.0  # Hz
 # dashboard watches the log for this and turns it into a Continue button.
 PROMPT_MARKER = "[prompt]"
 
-AXOL_SPEED = 1.0  # rad/s
+# Sweep speed. 1.0 rad/s excites the shoulders' ~3 Hz structural mode: the
+# smoothstep acceleration of a 90° sweep at that speed has significant energy
+# at the resonance, producing a visible ~1.3 Nm RMS wobble during motion and
+# an arrival ring at every waypoint. Hardware A/B (mirrored shoulder_1 sweep,
+# s=1.0) measured 0.6 rad/s cutting the in-motion residual ~35% and halving
+# the arrival ring; host damping is already at its stability ceiling, so a
+# gentler trajectory is the only remaining lever.
+AXOL_SPEED = 0.6  # rad/s
 AXOL_PRE_POSE_SPEED = 0.3  # rad/s
 # Return-to-home speed, matching teleop's VRTeleopConfig.reset_speed so the
 # end-of-soak homing feels identical to a teleop return-to-rest.
@@ -95,8 +107,12 @@ NUM_JOINTS = len(list(Joint))
 FULL_JOINT_SET: frozenset[Joint] = frozenset(Joint)
 
 
+class CoreLimp(RuntimeError):
+    """The realtime core dropped the arms to gravity comp mid-run."""
+
+
 def parse_joints(spec: str | None) -> set[Joint]:
-    """Parse a comma-separated joint spec into a set of present :class:`Joint`.
+    """Parse a comma-separated joint spec into a set of joints to sweep.
 
     ``None`` or empty selects every joint. Names match the joint enum values
     (e.g. ``shoulder_1``, ``elbow``, ``gripper``).
@@ -116,156 +132,63 @@ def parse_joints(spec: str | None) -> set[Joint]:
     return selected or set(Joint)
 
 
-def _joint_frame(arm: AxolArm, idx: int, joint: Joint, raw: float) -> float:
-    """Convert a raw motor-frame reading to the public joint-frame value."""
-    if joint == Joint.GRIPPER:
-        gi = arm._gripper_i
-        return (raw - arm._limits_hi[gi]) / (arm._limits_lo[gi] - arm._limits_hi[gi])
-    return raw + float(arm._joint_offsets[idx])
-
-
 def home_pose() -> np.ndarray:
     return np.zeros(NUM_JOINTS, dtype=np.float32)
 
 
-class HardwareController:
-    """Motion facade over :class:`Axol` that restricts commands to a joint subset.
+async def _stream(
+    robot: RtAxol,
+    left_q: np.ndarray,  # rad
+    right_q: np.ndarray,  # rad
+) -> None:
+    """Ship one target pair to the core, refusing to keep "sweeping" limp arms.
 
-    Presents the same ``enable`` / ``disable`` / ``get_positions`` /
-    ``motion_control`` surface the ROM cycle drives on both backends, but only
-    ever touches the joints in ``present`` on hardware. When ``present`` is the
-    full joint set this delegates straight to :class:`Axol` so a normal run
-    keeps its full feedforward stack and max-step safety check; otherwise absent
-    motors are never enabled, commanded, or read (so they may be off the bus).
+    Once the core has gone limp (loss-of-trust fault: timing, a silent motor)
+    ``RtAxol.motion_control`` streams gravity comp instead of tracking, so the
+    arms would hang weightless while this script kept announcing sweeps. Stop
+    the run instead; the operator hand-guides the arms to rest.
     """
+    limp = robot.limp
+    if limp is not None:
+        raise CoreLimp(limp)
+    await robot.motion_control(left=left_q, right=right_q)
 
-    def __init__(self, axol: Axol, present: set[Joint]) -> None:
-        self._axol = axol
-        self._present = set(present)
-        self._full = self._present == set(Joint)
 
-    def _arms(self) -> list[AxolArm]:
-        return [a for a in (self._axol.left, self._axol.right) if a is not None]
+async def hold_pose(
+    robot: RtAxol,
+    left_q: np.ndarray,  # rad
+    right_q: np.ndarray,  # rad
+    seconds: float,
+) -> None:
+    """Hold a pose for ``seconds`` while keeping the command stream alive.
 
-    async def enable(self) -> None:
-        if self._full:
-            await self._axol.enable()
-            return
-        bus_tasks = []
-        if self._axol.left is not None:
-            bus_tasks.append(self._axol._left_bus.start())
-        if self._axol.right is not None:
-            bus_tasks.append(self._axol._right_bus.start())
-        await asyncio.gather(*bus_tasks)
-        await asyncio.gather(*[self._enable_arm(a) for a in self._arms()])
+    The core's watchdog would hold the last target on its own (tracker
+    converged, damping live), but streaming through the pause keeps every
+    hold identical to the moving segments — same cadence, same gravity
+    refresh — and surfaces a limp core immediately rather than at the next
+    sweep.
+    """
+    dt = 1.0 / CONTROL_RATE_HZ
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        await _stream(robot, left_q, right_q)
+        await asyncio.sleep(dt)
 
-    async def _enable_arm(self, arm: AxolArm) -> None:
-        motors = [arm.motors[j] for j in self._present]
-        # This subset path bypasses AxolArm.enable, so resolve/verify the
-        # present joints' encoder zeros (either-stop side detection +
-        # unset-zero rejection) before any torque is applied — position
-        # reads work on disabled motors.
-        await arm.resolve_joint_offsets(self._present)
-        await asyncio.gather(*[m.enable() for m in motors])
-        await asyncio.gather(
-            *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors]
-        )
-        if Joint.GRIPPER in self._present:
-            await arm._calibrate_gripper()
-            await arm.motors[Joint.GRIPPER].set_control_mode(ControlMode.POSITION_FORCE)
 
-    async def disable(self) -> None:
-        if self._full:
-            await self._axol.disable()
-            return
-        tasks = []
-        for arm in self._arms():
-            tasks.extend(arm.motors[j].disable() for j in self._present)
-        try:
-            await asyncio.gather(*tasks)
-        except Exception:
-            pass
-        finally:
-            close_tasks = []
-            if self._axol.left is not None:
-                close_tasks.append(self._axol._left_bus.close())
-            if self._axol.right is not None:
-                close_tasks.append(self._axol._right_bus.close())
-            await asyncio.gather(*close_tasks)
-
-    async def get_positions(self) -> tuple[np.ndarray, np.ndarray]:
-        """Current positions as (left, right); an absent arm reports home."""
-        left = (
-            await self._read_arm(self._axol.left)
-            if self._axol.left is not None
-            else home_pose()
-        )
-        right = (
-            await self._read_arm(self._axol.right)
-            if self._axol.right is not None
-            else home_pose()
-        )
-        return left, right
-
-    async def _read_arm(self, arm: AxolArm) -> np.ndarray:
-        if self._full:
-            return await arm.get_positions()
-        q = home_pose()
-        for i, j in enumerate(Joint):
-            if j in self._present:
-                q[i] = _joint_frame(arm, i, j, await arm.motors[j].get_position())
-        return q
-
-    async def motion_control(
-        self,
-        left: np.ndarray | None = None,
-        right: np.ndarray | None = None,
-    ) -> None:
-        if self._full:
-            await self._axol.motion_control(left=left, right=right)
-            return
-        tasks = []
-        if left is not None and self._axol.left is not None:
-            tasks.append(self._command_arm(self._axol.left, left))
-        if right is not None and self._axol.right is not None:
-            tasks.append(self._command_arm(self._axol.right, right))
-        if tasks:
-            await asyncio.gather(*tasks)
-
-    async def _command_arm(self, arm: AxolArm, q: np.ndarray) -> None:
-        """Gravity-compensated impedance hold for the present arm joints, plus a
-        position-force command to the gripper when it is present."""
-        q = q.copy()
-        arm_q = q[: len(ARM_JOINTS)].astype(np.float32)
-        gravity = arm._gravity_comp.gravity_arm(arm_q, is_left=arm._is_left)
-        offsets = arm._joint_offsets
-        tasks = []
-        for i, j in enumerate(ARM_JOINTS):
-            if j not in self._present:
-                continue
-            gains = getattr(arm._arm_config, j.value)
-            tasks.append(
-                arm.motors[j].set_impedance(
-                    float(q[i] - offsets[i]), 0.0, gains.kp, gains.kd, float(gravity[i])
-                )
-            )
-        if Joint.GRIPPER in self._present:
-            gi = arm._gripper_i
-            gripper_pos = arm._limits_hi[gi] + float(q[gi]) * (
-                arm._limits_lo[gi] - arm._limits_hi[gi]
-            )
-            tasks.append(
-                arm.motors[Joint.GRIPPER].set_position_force(
-                    gripper_pos,
-                    arm._arm_config.gripper.max_speed,
-                    arm._arm_config.gripper.torque_limit,
-                )
-            )
-        await asyncio.gather(*tasks)
+async def _stream_hold_forever(
+    robot: RtAxol,
+    left_q: np.ndarray,  # rad
+    right_q: np.ndarray,  # rad
+) -> None:
+    """Stream a static hold until cancelled (see :func:`hold_pose`)."""
+    dt = 1.0 / CONTROL_RATE_HZ
+    while True:
+        await _stream(robot, left_q, right_q)
+        await asyncio.sleep(dt)
 
 
 async def move_grippers(
-    robot: Axol | HardwareController,
+    robot: RtAxol,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_grip: float,  # normalized [0, 1] — 0 closed, 1 open
@@ -295,7 +218,7 @@ async def move_grippers(
         smooth = progress * progress * (3.0 - 2.0 * progress)
         left[gripper_index] = l0 + (left_grip - l0) * smooth
         right[gripper_index] = r0 + (right_grip - r0) * smooth
-        await robot.motion_control(left=left, right=right)
+        await _stream(robot, left, right)
         if progress >= 1.0:
             break
         await asyncio.sleep(dt)
@@ -303,7 +226,7 @@ async def move_grippers(
 
 
 async def sweep_to_target(
-    robot: Axol | HardwareController,
+    robot: RtAxol,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_target: np.ndarray,  # rad
@@ -311,30 +234,14 @@ async def sweep_to_target(
     speed: float,  # rad/s
     pause: float,  # seconds
 ) -> tuple[np.ndarray, np.ndarray]:
-    max_joint_delta = max(
-        float(np.max(np.abs(left_target - left_q))),
-        float(np.max(np.abs(right_target - right_q))),
-    )
-    duration = max(max_joint_delta / speed, 0.1)  # seconds
-    dt = 1.0 / CONTROL_RATE_HZ  # seconds
-    start_time = time.monotonic()
-    while True:
-        elapsed = time.monotonic() - start_time
-        progress = min(elapsed / duration, 1.0)
-        smooth = progress * progress * (3.0 - 2.0 * progress)
-        await robot.motion_control(
-            left=(left_q * (1 - smooth) + left_target * smooth).astype(np.float32),
-            right=(right_q * (1 - smooth) + right_target * smooth).astype(np.float32),
-        )
-        if progress >= 1.0:
-            break
-        await asyncio.sleep(dt)
-    await asyncio.sleep(pause)
+    await sweep_unchecked(robot, left_q, right_q, left_target, right_target, speed)
+    # Keep streaming through the waypoint pause (see hold_pose).
+    await hold_pose(robot, left_target, right_target, pause)
     return left_target.copy(), right_target.copy()
 
 
 async def sweep_unchecked(
-    robot: Axol | HardwareController,
+    robot: RtAxol,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_target: np.ndarray,  # rad
@@ -352,9 +259,10 @@ async def sweep_unchecked(
         elapsed = time.monotonic() - start_time
         progress = min(elapsed / duration, 1.0)
         smooth = progress * progress * (3.0 - 2.0 * progress)
-        await robot.motion_control(
-            left=(left_q * (1 - smooth) + left_target * smooth).astype(np.float32),
-            right=(right_q * (1 - smooth) + right_target * smooth).astype(np.float32),
+        await _stream(
+            robot,
+            (left_q * (1 - smooth) + left_target * smooth).astype(np.float32),
+            (right_q * (1 - smooth) + right_target * smooth).astype(np.float32),
         )
         if progress >= 1.0:
             break
@@ -372,7 +280,7 @@ def with_joint(
 
 
 async def sweep_joint_range(
-    robot: Axol | HardwareController,
+    robot: RtAxol,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     joint: Joint,
@@ -427,7 +335,7 @@ async def sweep_joint_range(
 
 
 async def run_rom_cycle(
-    robot: Axol | HardwareController,
+    robot: RtAxol,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     speed: float,  # rad/s
@@ -444,7 +352,8 @@ async def run_rom_cycle(
     Only joints in ``present`` are moved; every other joint stays at its
     current value. ``run_left`` / ``run_right`` gate which arm each mirrored
     sweep drives. Pre-poses that reposition a helper joint (shoulder_1 before
-    shoulder_3, elbow before the wrists) are skipped when that joint is absent.
+    shoulder_3, elbow before the wrists) are skipped when that joint is not
+    selected.
 
     When ``sweep_gripper`` is set the gripper is cycled through its full
     open↔close range at the end (holding nothing). This is left off for a
@@ -495,7 +404,7 @@ async def run_rom_cycle(
 
     if Joint.SHOULDER_3 in present:
         # The forward pre-pose uses shoulder_1; skip it when shoulder_1 is
-        # absent and sweep shoulder_3 in place instead.
+        # not selected and sweep shoulder_3 in place instead.
         s3_prepose = Joint.SHOULDER_1 in present
         if s3_prepose:
             print(
@@ -529,7 +438,7 @@ async def run_rom_cycle(
         await step(Joint.ELBOW, 0.0, 0.0)
 
     # The wrists are swept with the elbows bent to 90° so they clear the body;
-    # skip that pre-pose (and its return) when the elbow is off the bus.
+    # skip that pre-pose (and its return) when the elbow is not selected.
     wrist_joints = [
         j for j in (Joint.WRIST_1, Joint.WRIST_2, Joint.WRIST_3) if j in present
     ]
@@ -567,7 +476,7 @@ async def run_rom_cycle(
     return left_q, right_q
 
 
-async def return_home(robot: Axol | HardwareController) -> None:
+async def return_home(robot: RtAxol) -> None:
     """Ease the arms back to home from their current pose, keeping the grippers shut.
 
     Used to bring the robot to a safe home position while it stays clamped on
@@ -576,6 +485,8 @@ async def return_home(robot: Axol | HardwareController) -> None:
     """
     gripper_i = JOINT_INDEX[Joint.GRIPPER]
     cur_left, cur_right = await robot.get_positions()
+    cur_left = home_pose() if cur_left is None else cur_left
+    cur_right = home_pose() if cur_right is None else cur_right
     home_left = home_pose()
     home_right = home_pose()
     home_left[gripper_i] = cur_left[gripper_i]
@@ -586,35 +497,46 @@ async def return_home(robot: Axol | HardwareController) -> None:
     )
 
 
-async def close_buses(robot: Axol) -> None:
-    """Close the CAN buses without disabling the motors.
+async def _confirm(
+    instruction: str,
+    web_prompts: bool,
+    robot: RtAxol,
+    left_q: np.ndarray,  # rad
+    right_q: np.ndarray,  # rad
+) -> None:
+    """Block until the operator confirms a hands-on step, streaming the hold.
 
-    Stops the reader loops and shuts the sockets so the process can exit
-    cleanly, but sends no shutdown command — every motor keeps holding its last
-    command (arms at home, grippers clamped on the item) so ``rom.disable`` can
-    attach later and release it.
-    """
-    buses = []
-    if robot.left is not None:
-        buses.append(robot._left_bus)
-    if robot.right is not None:
-        buses.append(robot._right_bus)
-    await asyncio.gather(*(bus.close() for bus in buses))
-
-
-async def _confirm(instruction: str, web_prompts: bool) -> None:
-    """Block until the operator confirms a hands-on step.
+    The operator is touching the robot during these steps (placing the item in
+    a gripper), so the current pose keeps streaming while we wait (see
+    hold_pose).
 
     ``--web-prompts``: emit a ``[prompt]`` marker the dashboard turns into a
     Continue button, then block until it writes a line to our stdin. Otherwise
     fall back to an ordinary tty ``input()`` prompt. A closed stdin (EOF, e.g.
     the run is being stopped) unblocks and returns so teardown can proceed.
     """
-    if web_prompts:
-        print(f"{PROMPT_MARKER} {instruction}", flush=True)
-        await asyncio.to_thread(sys.stdin.readline)
-        return
-    await asyncio.to_thread(input, f"{instruction} Press Enter to continue ...")
+    hold = asyncio.ensure_future(_stream_hold_forever(robot, left_q, right_q))
+    try:
+        if web_prompts:
+            print(f"{PROMPT_MARKER} {instruction}", flush=True)
+            await asyncio.to_thread(sys.stdin.readline)
+        else:
+            await asyncio.to_thread(input, f"{instruction} Press Enter to continue ...")
+    finally:
+        hold.cancel()
+        try:
+            await hold
+        except asyncio.CancelledError:
+            pass
+
+
+async def _positions(robot: RtAxol) -> tuple[np.ndarray, np.ndarray]:
+    """Measured positions as (left, right); an absent arm reports home."""
+    left, right = await robot.get_positions()
+    return (
+        home_pose() if left is None else left,
+        home_pose() if right is None else right,
+    )
 
 
 async def run_axol(
@@ -629,9 +551,10 @@ async def run_axol(
     run_left = not no_left
     run_right = not no_right
     has_gripper = Joint.GRIPPER in present
-    # The grasp-an-item clamp (hold with force, soak while holding) only runs on
-    # the full robot. Any subset that includes the gripper instead sweeps it
-    # through its full open↔close range like any other joint (holding nothing).
+    # The grasp-an-item clamp (hold with force, soak while holding) only runs
+    # when every joint is selected. Any subset that includes the gripper
+    # instead sweeps it through its full open↔close range like any other joint
+    # (holding nothing).
     grasp = present == set(Joint)
     sweep_gripper = has_gripper and not grasp
 
@@ -660,14 +583,21 @@ async def run_axol(
         left_channel=None if no_left else left_channel,
         right_channel=None if no_right else right_channel,
     )
-    robot = HardwareController(axol, present)
+    # Production control path: the Rust core owns the buses and runs the
+    # 240 Hz loop; this script only streams targets (see the module docstring).
+    robot = RtAxol(axol)
     await robot.enable()
-    print("Motors enabled.")
-    await asyncio.sleep(2.0)
+    print("Motors enabled (realtime core armed).")
 
+    # The logger samples the motor caches, which the core's telemetry fills.
     logger = TelemetryCsvLogger(axol, "rom") if capture else None
     if logger is not None:
         logger.start()
+
+    # Settle for 2 s at the measured pose (RtAxol.enable already primed the
+    # core with one gravity-compensated hold there).
+    settle_left, settle_right = await _positions(robot)
+    await hold_pose(robot, settle_left, settle_right, 2.0)
 
     closed_left_q: np.ndarray | None = None
     closed_right_q: np.ndarray | None = None
@@ -683,7 +613,6 @@ async def run_axol(
     keep_enabled = False
 
     try:
-        home = home_pose()
         gripper_i = JOINT_INDEX[Joint.GRIPPER]
 
         # Ease the arms from wherever they actually are to home before anything
@@ -691,15 +620,13 @@ async def run_axol(
         # otherwise command home as a single stiff (s=1) impedance setpoint and
         # snap the arms there; sweep_unchecked ramps them in with a smoothstep
         # trajectory instead.
-        cur_left, cur_right = await robot.get_positions()
+        home = home_pose()
+        cur_left, cur_right = await _positions(robot)
         ready_left = home.copy()
         ready_right = home.copy()
-        if has_gripper:
-            ready_left[gripper_i] = 1.0
-            ready_right[gripper_i] = 1.0
-            print("Easing to home position (grippers open) ...")
-        else:
-            print("Easing to home position ...")
+        ready_left[gripper_i] = 1.0
+        ready_right[gripper_i] = 1.0
+        print("Easing to home position (grippers open) ...")
         await sweep_unchecked(
             robot, cur_left, cur_right, ready_left, ready_right, speed=AXOL_HOME_SPEED
         )
@@ -713,6 +640,9 @@ async def run_axol(
                 await _confirm(
                     "Position the item in the RIGHT gripper, then close it.",
                     web_prompts,
+                    robot,
+                    left_q,
+                    right_q,
                 )
                 left_q, right_q = await move_grippers(
                     robot, left_q, right_q, left_q[gripper_i], 0.0, GRIPPER_SPEED
@@ -721,6 +651,9 @@ async def run_axol(
                 await _confirm(
                     "Position the item in the LEFT gripper, then close it.",
                     web_prompts,
+                    robot,
+                    left_q,
+                    right_q,
                 )
                 left_q, right_q = await move_grippers(
                     robot, left_q, right_q, 0.0, right_q[gripper_i], GRIPPER_SPEED
@@ -731,7 +664,7 @@ async def run_axol(
         closed_right_q = right_q.copy()
 
         print("Starting ROM test in 5 s ...")
-        await asyncio.sleep(5.0)
+        await hold_pose(robot, left_q, right_q, 5.0)
 
         deadline = time.monotonic() + SOAK_DURATION
         cycle = 0
@@ -760,7 +693,7 @@ async def run_axol(
             print(f"\nCycle {cycle} complete.")
             if time.monotonic() < deadline:
                 print(f"Waiting {CYCLE_PAUSE}s ...")
-                await asyncio.sleep(CYCLE_PAUSE)
+                await hold_pose(robot, left_q, right_q, CYCLE_PAUSE)
 
         print(f"\n2-hour soak complete — {cycle} cycle(s) finished.")
 
@@ -782,18 +715,32 @@ async def run_axol(
         keep_enabled = grasp
 
     except (KeyboardInterrupt, asyncio.CancelledError):
-        if grasp:
-            print("\nInterrupted — returning home, keeping the item gripped ...")
+        if robot.limp is not None:
+            print(f"\nInterrupted — core is limp ({robot.limp}); not moving.")
         else:
-            print("\nInterrupted — returning home ...")
-        await return_home(robot)
-        keep_enabled = grasp
+            if grasp:
+                print("\nInterrupted — returning home, keeping the item gripped ...")
+            else:
+                print("\nInterrupted — returning home ...")
+            await return_home(robot)
+            keep_enabled = grasp
+
+    except CoreLimp as exc:
+        print(
+            f"\nRealtime core went limp ({exc}) — the arms are in gravity comp "
+            "and will not track. Hand-guide them to rest; the run is over."
+        )
 
     finally:
         if logger is not None:
             await logger.stop()
-        if keep_enabled:
-            await close_buses(axol)
+        if robot.limp is not None:
+            # Leaves the arms limp (kp = 0, gravity feedforward) — never a
+            # torque-off, and never a hold the operator can't move.
+            await robot.disable()
+            print("Arms left limp (gravity comp) — hand-guide them to rest.")
+        elif keep_enabled:
+            await robot.detach()
             print(
                 "\nMotors left enabled — robot is holding the item.\n"
                 "Run `uv run -m almond_axol.diagnostics.rom.disable` to open the "
@@ -809,8 +756,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--joints",
         default=None,
-        help="Comma-separated joints present on the bus (e.g. wrist_1,wrist_2,wrist_3). "
-        f"Only these are enabled and swept. Default: all. One of: {', '.join(valid_joints)}.",
+        help="Comma-separated joints to sweep (e.g. wrist_1,wrist_2,wrist_3). "
+        "The whole arm is brought up and held; only these move. Default: all. "
+        f"One of: {', '.join(valid_joints)}.",
     )
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")

@@ -24,7 +24,7 @@ class Joint(Enum):
 
 CAN_LEFT = "can_alm_axol_l"
 CAN_RIGHT = "can_alm_axol_r"
-# The powered cart's wheel bus (its own single-channel adapter, separate from
+# The Jelly's wheel bus (its own single-channel adapter, separate from
 # the arm hub), carrying the four Damiao wheel motors at IDs 0x01-0x04.
 # NB: kernel interface names are capped at 15 chars (IFNAMSIZ), so this can't
 # be the more readable "can_alm_axol_base".

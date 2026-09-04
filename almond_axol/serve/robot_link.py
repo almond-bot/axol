@@ -7,11 +7,25 @@ second (reachability, status, temperature, voltage), and samples position /
 velocity / torque at :data:`~.telemetry.SAMPLE_HZ` into the telemetry hub for
 the diagnostics dashboard.
 
+Bus access is split into command and observation. Exactly one process may
+*command* the motors at a time — request/response reads from two processes
+would cross-match replies — so while a task runs the link releases its
+command buses (see :meth:`RobotLink.release`) and stops polling. Observation
+is unrestricted: each arm also carries an always-open, never-transmitting
+:class:`~almond_axol.motor.BusObserver` that decodes the running task's own
+motor traffic, so live telemetry keeps streaming into the hub regardless of
+what owns command of the robot.
+
+The pollers also yield to control loops the link doesn't know about (e.g.
+``axol teleop`` launched from a terminal while the link is connected): the
+observer watches the command arbitration IDs, and any joint with fresh
+command traffic is dropped from the ping/sample sweeps — its telemetry comes
+from the passive tap instead — so the link adds zero bus load on a joint
+someone is driving, keeping the full bus budget available to the control
+rate.
+
 The link runs on its own asyncio event loop in a dedicated thread so the CAN
-reader loops and the ping timer never touch uvicorn's loop. While a task runs
-the buses are released (see :meth:`RobotLink.release`) — there is exactly one
-owner of the CAN bus at a time, matching "ping the motors every second unless
-we are running a task".
+reader loops and the ping timer never touch uvicorn's loop.
 """
 
 from __future__ import annotations
@@ -23,7 +37,11 @@ import time
 from typing import Any, Callable
 
 from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
-from ..motor import CanBus, Joint, Motor, MotorError
+from ..motor import BusObserver, CanBus, Joint, Motor, MotorError
+from ..motor.config import DamiaoParam
+from ..motor.damiao import DamiaoMotor
+from ..motor.myactuator import MyActuatorMotor, mit_ranges
+from ..teleop_activity import active_teleop
 from .telemetry import SAMPLE_HZ, TelemetryHub, motor_key
 
 _logger = logging.getLogger(__name__)
@@ -36,6 +54,21 @@ _PING_TIMEOUT_S = 0.5
 # Per-read timeout for the fast telemetry sweep. Tighter than the ping's: a
 # skipped sample is invisible on a chart, a flapping health dot is not.
 _SAMPLE_TIMEOUT_S = 0.2
+
+# Per-read timeout while syncing the observers' fixed-point decode ranges
+# from the motors at connect. Best-effort: an unanswered motor keeps the
+# conservative defaults and is retried on the next connect/reacquire.
+_RANGE_SYNC_TIMEOUT_S = 1.0
+
+# How recently a joint must have received a motion command for the link's
+# pollers to treat it as externally driven and go silent on it (data comes
+# from the passive observer instead). Covers control loops the link doesn't
+# know about — e.g. `axol teleop` launched from a terminal while the link is
+# connected — where every polled request/response would steal bus bandwidth
+# from the control rate. Commands only come from a commanding process (the
+# observer can't transmit and the link's polls never use command IDs), so
+# this can't self-suppress off the link's own traffic.
+_EXTERNAL_CMD_FRESH_S = 1.0
 
 # State machine surfaced to the UI.
 #   disconnected -> connecting -> connected
@@ -111,7 +144,9 @@ def scoped_motor_faults(
     (ignored in guided zeroing, which walks ``joints`` instead). A bench setup
     with only some motors on the bus can then run a scoped test without the
     absent motors' "unreachable" faults blocking the launch — while faults on
-    the motors the run *does* drive still block it.
+    the motors the run *does* drive still block it. Callers whose ``joints``
+    does not mean bus presence (the ROM soak: the realtime core brings up the
+    whole arm and ``--joints`` only selects what moves) drop that key first.
     """
     arm = str(args.get("arm") or "").strip().lower()
     if arm in ("left", "right"):
@@ -155,7 +190,12 @@ def _format_error(exc: BaseException) -> str:
 
 
 class _ArmLink:
-    """One arm's CAN bus plus its eight motors, kept open for pinging."""
+    """One arm's CAN buses: a command bus with its motors, plus a passive observer.
+
+    The command bus (and the request/response polling it enables) opens and
+    closes with bus ownership; the observer socket stays open from connect to
+    disconnect so the hub keeps receiving state while a task commands the arm.
+    """
 
     def __init__(self, channel: str, side: str) -> None:
         self.channel = channel
@@ -167,6 +207,7 @@ class _ArmLink:
         self._locks: dict[Joint, asyncio.Lock] = {}
         # joint name -> {"reachable": bool, "status": str | None, ...}
         self.health: dict[str, dict[str, Any]] = {}
+        self.observer: BusObserver | None = None
 
     @property
     def motors(self) -> dict[Joint, Motor]:
@@ -196,13 +237,106 @@ class _ArmLink:
         self._motors = {}
         self._locks = {}
 
+    async def open_observer(self, joints: list[Joint]) -> None:
+        """Start the passive observer socket. Idempotent across reacquires."""
+        if self.observer is None:
+            self.observer = BusObserver(self.channel, joints)
+        await self.observer.start()
+
+    async def close_observer(self) -> None:
+        if self.observer is not None:
+            try:
+                await self.observer.close()
+            except Exception as exc:  # noqa: BLE001 - teardown is best-effort
+                _logger.debug("closing %s observer failed: %s", self.channel, exc)
+            self.observer = None
+
+    async def sync_observer_ranges(self) -> None:
+        """Teach the observer each motor's fixed-point decode ranges.
+
+        The observer never transmits, so it can't learn the MIT scaling
+        ranges itself; while the link owns command it reads them the normal
+        request/response way — firmware version + model for MyActuator,
+        the PMAX/VMAX/TMAX registers for Damiao — and hands them over.
+        Best-effort per motor: an unanswered read keeps that joint on the
+        conservative defaults and is retried on the next connect/reacquire.
+        """
+        observer = self.observer
+        if observer is None:
+            return
+        for joint, motor in self._motors.items():
+            if observer.ranges_synced(joint):
+                continue
+            driver = motor._driver
+            try:
+                async with self._locks[joint]:
+                    if isinstance(driver, MyActuatorMotor):
+                        version = await asyncio.wait_for(
+                            motor.get_firmware_version(), _RANGE_SYNC_TIMEOUT_S
+                        )
+                        model = await asyncio.wait_for(
+                            motor.get_model(), _RANGE_SYNC_TIMEOUT_S
+                        )
+                        p_max, t_max = mit_ranges(version, model)
+                        observer.set_myactuator_ranges(joint, p_max, t_max)
+                    elif isinstance(driver, DamiaoMotor):
+                        p_max = await asyncio.wait_for(
+                            motor.read_config(DamiaoParam.PMAX), _RANGE_SYNC_TIMEOUT_S
+                        )
+                        v_max = await asyncio.wait_for(
+                            motor.read_config(DamiaoParam.VMAX), _RANGE_SYNC_TIMEOUT_S
+                        )
+                        t_max = await asyncio.wait_for(
+                            motor.read_config(DamiaoParam.TMAX), _RANGE_SYNC_TIMEOUT_S
+                        )
+                        observer.set_damiao_ranges(joint, p_max, v_max, t_max)
+            except (MotorError, asyncio.TimeoutError, OSError) as exc:
+                _logger.debug(
+                    "range sync for %s %s failed (%s) — observer keeps defaults",
+                    self.side,
+                    joint.name,
+                    exc,
+                )
+
     async def ping(self) -> dict[str, dict[str, Any]]:
         """Read each motor's status/temperature/voltage; never raises.
+
+        Joints currently driven by another process are not touched — every
+        request/response would steal bus bandwidth from that control loop —
+        and their health entry is synthesized from passively observed data
+        instead (Damiao feedback carries status + temperature; fields the
+        traffic doesn't cover keep their last polled value).
 
         Returns the slow-telemetry sweep keyed by ``arm:JOINT`` for the hub.
         """
         sweep: dict[str, dict[str, Any]] = {}
+        commanded: set[Joint] = set()
+        passive_slow: dict[Joint, dict[str, Any]] = {}
+        if self.observer is not None:
+            commanded = self.observer.commanded_joints(_EXTERNAL_CMD_FRESH_S)
+            passive_slow = self.observer.slow_snapshot()
         for joint, motor in self._motors.items():
+            if joint in commanded:
+                prev = self.health.get(joint.name, {})
+                observed = passive_slow.get(joint, {})
+                self.health[joint.name] = {
+                    # Command traffic (and its feedback) proves the motor is
+                    # alive without asking it anything.
+                    "reachable": True,
+                    "status": observed.get("status") or prev.get("status"),
+                    "temperature": (
+                        observed.get("temperature")
+                        if observed.get("temperature") is not None
+                        else prev.get("temperature")
+                    ),
+                    "voltage": (
+                        observed.get("voltage")
+                        if observed.get("voltage") is not None
+                        else prev.get("voltage")
+                    ),
+                }
+                sweep[motor_key(self.side, joint.name)] = self.health[joint.name]
+                continue
             reachable = True
             status: str | None = None
             temperature: float | None = None
@@ -233,7 +367,23 @@ class _ArmLink:
         return sweep
 
     async def sample(self) -> dict[str, list[float]]:
-        """One fast sweep: position / velocity / torque for every motor."""
+        """One fast sweep: position / velocity / torque for every motor.
+
+        Joints currently driven by another process (e.g. a teleop session
+        launched from a terminal while the link is connected) are not polled
+        — their control traffic already carries everything this sweep would
+        ask for, and the three request/response reads per joint would eat
+        into the bus bandwidth available to the control rate. Their values
+        come from the passive observer's decode of that traffic instead.
+        """
+        commanded: set[Joint] = set()
+        passive: dict[str, list[float]] = {}
+        if self.observer is not None:
+            commanded = self.observer.commanded_joints(_EXTERNAL_CMD_FRESH_S)
+            if commanded:
+                for joint, values in self.observer.fast_snapshot().items():
+                    if joint in commanded:
+                        passive[motor_key(self.side, joint.name)] = list(values)
 
         async def read(joint: Joint, motor: Motor) -> tuple[str, list[float] | None]:
             try:
@@ -252,9 +402,14 @@ class _ArmLink:
             return motor_key(self.side, joint.name), [pos, vel, torque]
 
         results = await asyncio.gather(
-            *(read(joint, motor) for joint, motor in self._motors.items())
+            *(
+                read(joint, motor)
+                for joint, motor in self._motors.items()
+                if joint not in commanded
+            )
         )
-        return {key: values for key, values in results if values is not None}
+        polled = {key: values for key, values in results if values is not None}
+        return {**passive, **polled}
 
 
 class RobotLink:
@@ -298,6 +453,11 @@ class RobotLink:
         self._thread.start()
         self._ping_task: asyncio.Task[Any] | None = None
         self._sample_task: asyncio.Task[Any] | None = None
+        # Publishes observer-decoded telemetry while a task owns command; runs
+        # from connect to disconnect (it idles while the link owns the bus).
+        self._publish_task: asyncio.Task[Any] | None = None
+        # One-shot best-effort observer range sync, fired on connect/reacquire.
+        self._sync_task: asyncio.Task[Any] | None = None
         self._lock = threading.Lock()
         # Joint set snapshotted when the buses open, so status() stays
         # consistent with the motors actually being pinged even if the
@@ -359,9 +519,9 @@ class RobotLink:
         return self.status()
 
     def disconnect(self) -> dict[str, Any]:
-        """Stop pinging and close the buses."""
+        """Stop pinging and close every bus, observers included."""
         try:
-            self._submit(self._stop_and_close())
+            self._submit(self._close_all())
         except Exception as exc:  # noqa: BLE001
             _logger.debug("robot disconnect cleanup failed: %s", exc)
         self._set_state(STATE_DISCONNECTED)
@@ -376,7 +536,9 @@ class RobotLink:
         return self.status()
 
     def release(self) -> None:
-        """Hand the CAN bus to a task: stop pinging and close the buses.
+        """Hand command of the CAN bus to a task: stop polling, close the
+        command buses. The passive observers stay open, so telemetry keeps
+        streaming from whatever traffic the task generates.
 
         No-op unless currently connected. The prior state is remembered so
         :meth:`reacquire` only reconnects if the link was up before the task.
@@ -386,12 +548,12 @@ class RobotLink:
                 return
         self._set_state(STATE_BUSY)
         try:
-            self._submit(self._stop_and_close())
+            self._submit(self._stop_polling())
         except Exception as exc:  # noqa: BLE001
             _logger.debug("robot release cleanup failed: %s", exc)
 
     def reacquire(self) -> None:
-        """Re-open the buses + ping loop after a task releases the bus."""
+        """Re-open the command buses + ping loop after a task releases the bus."""
         with self._lock:
             if self._state != STATE_BUSY:
                 return
@@ -503,24 +665,61 @@ class RobotLink:
         with self._lock:
             self._active_joints = joints
         for arm in self._arms:
+            # Observer first so no early feedback is missed; a no-op when it
+            # survived a release/reacquire cycle.
+            await arm.open_observer(joints)
             await arm.open(joints)
         if self._ping_task is None or self._ping_task.done():
             self._ping_task = asyncio.ensure_future(self._ping_loop())
         if self._sample_task is None or self._sample_task.done():
             self._sample_task = asyncio.ensure_future(self._sample_loop())
+        if self._publish_task is None or self._publish_task.done():
+            self._publish_task = asyncio.ensure_future(self._publish_loop())
+        # Range sync happens off the connect path: with the motors powered
+        # off, each read runs into its timeout, and 16 motors of that would
+        # stall connect for many seconds.
+        if self._sync_task is None or self._sync_task.done():
+            self._sync_task = asyncio.ensure_future(self._sync_observer_ranges())
 
-    async def _stop_and_close(self) -> None:
-        for task in (self._ping_task, self._sample_task):
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+    async def _sync_observer_ranges(self) -> None:
+        for arm in self._arms:
+            try:
+                await arm.sync_observer_ranges()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - sync is best-effort
+                _logger.debug("observer range sync for %s failed: %s", arm.side, exc)
+
+    async def _cancel(self, task: asyncio.Task[Any] | None) -> None:
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _stop_polling(self) -> None:
+        """Stop the request/response loops and close the command buses.
+
+        The observers (and the publish loop feeding on them) stay up — this
+        is the release path that hands command to a task while telemetry
+        keeps flowing.
+        """
+        for task in (self._ping_task, self._sample_task, self._sync_task):
+            await self._cancel(task)
         self._ping_task = None
         self._sample_task = None
+        self._sync_task = None
         for arm in self._arms:
             await arm.close()
+
+    async def _close_all(self) -> None:
+        """Full teardown: polling, publish loop, and the observer sockets."""
+        await self._stop_polling()
+        await self._cancel(self._publish_task)
+        self._publish_task = None
+        for arm in self._arms:
+            await arm.close_observer()
 
     async def _ping_loop(self) -> None:
         while True:
@@ -558,6 +757,71 @@ class RobotLink:
                 _logger.debug("telemetry sweep error: %s", exc)
             elapsed = self._loop.time() - start
             await asyncio.sleep(max(0.0, interval - elapsed))
+
+    async def _publish_loop(self) -> None:
+        """Feed motor state and on-wire timing from the passive observers.
+
+        Timing is sampled only after ``VRTeleop.run`` begins, which is after
+        PyRoKi has produced its first solution. This excludes the RT core's
+        bring-up/compile-time hold traffic while still
+        measuring ``axol teleop`` launched independently from a terminal.
+        Motor state only takes over here in BUSY: while the link owns the bus,
+        its normal sample loop already publishes values (and silently sources
+        externally commanded joints from the same observer).
+        """
+        interval = 1.0 / SAMPLE_HZ
+        slow_period = max(1, int(SAMPLE_HZ))  # ~1 Hz, matching the idle ping
+        tick = 0
+        timing_session: str | None = None
+        while True:
+            await asyncio.sleep(interval)
+            with self._lock:
+                busy = self._state == STATE_BUSY
+            tick += 1
+            try:
+                activity = active_teleop()
+                if activity is not None and activity.token != timing_session:
+                    timing_session = activity.token
+                    self.hub.start_timing_session()
+                elif activity is None:
+                    timing_session = None
+
+                if activity is not None:
+                    timing: dict[str, dict[str, Any]] = {}
+                    for arm in self._arms:
+                        if arm.observer is None:
+                            continue
+                        snapshot = arm.observer.timing_snapshot(
+                            since=activity.started_at
+                        )
+                        if snapshot is not None:
+                            timing[arm.side] = snapshot
+                    if timing:
+                        self.hub.push_timing(timing)
+
+                if not busy:
+                    continue
+                motors: dict[str, list[float]] = {}
+                for arm in self._arms:
+                    if arm.observer is None:
+                        continue
+                    for joint, values in arm.observer.fast_snapshot().items():
+                        motors[motor_key(arm.side, joint.name)] = list(values)
+                if motors:
+                    self.hub.push_frame(motors)
+                if tick % slow_period == 0:
+                    slow: dict[str, dict[str, Any]] = {}
+                    for arm in self._arms:
+                        if arm.observer is None:
+                            continue
+                        for joint, reading in arm.observer.slow_snapshot().items():
+                            slow[motor_key(arm.side, joint.name)] = reading
+                    if slow:
+                        self.hub.push_slow(slow)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                _logger.debug("observer publish error: %s", exc)
 
     # -- CAN bring-up -------------------------------------------------------
 

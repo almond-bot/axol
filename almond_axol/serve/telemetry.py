@@ -8,7 +8,9 @@ event loop, mirroring the Session log fan-out in :mod:`.manager`.
 
 Wire/message shapes (also served over REST for backfill):
 
-- fast frame, ~SAMPLE_HZ per second while the link owns the CAN bus::
+- fast frame, ~SAMPLE_HZ per second while the link is up — polled by the link
+  when it owns command of the CAN bus, decoded from the running task's own
+  traffic by the passive bus observers otherwise::
 
     {"type": "frame", "t": <epoch s>,
      "m": {"left:SHOULDER_1": [pos_rad, vel_rad_s, torque_nm], ...}}
@@ -22,6 +24,17 @@ Wire/message shapes (also served over REST for backfill):
 - link state transitions (why the stream went quiet)::
 
     {"type": "state", "state": "busy"}
+
+- passive on-wire control timing, ~10 Hz while the post-PyRoKi teleop run is
+  active::
+
+    {"type": "timing", "t": <epoch s>,
+     "arms": {"left": {"commandHz": 240.0, "feedbackHz": 240.0,
+                         "commandJitterP95Ms": 0.02,
+                         "commandBatchP95Ms": 0.8,
+                         "canCycleP95Ms": 2.2,
+                         "roundTripP95Ms": 1.4,
+                         "deadlineMisses": 0, "missedFeedback": 0}, ...}}
 
 A *diagnostics run* wraps a launched session (script) with the telemetry
 frames observed during its lifetime, persisted under
@@ -52,6 +65,11 @@ _logger = logging.getLogger(__name__)
 SAMPLE_HZ = 10.0
 # Ring buffer length: 10 minutes at SAMPLE_HZ.
 _BUFFER_FRAMES = int(SAMPLE_HZ * 600)
+# Slow (1 Hz) sweep ring: same 10-minute span, for temperature charting.
+_SLOW_BUFFER_FRAMES = 600
+# Control/CAN timing is published at the fast dashboard cadence and retained
+# for the same ten-minute comparison window.
+_TIMING_BUFFER_FRAMES = int(SAMPLE_HZ * 600)
 
 RUNS_DIR = Path.home() / ".almond" / "diagnostics" / "runs"
 
@@ -69,6 +87,9 @@ class TelemetryHub:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._frames: deque[dict[str, Any]] = deque(maxlen=_BUFFER_FRAMES)
+        # Slow-sweep history ({"t": ..., "m": {...}}), for temperature charts.
+        self._slow_frames: deque[dict[str, Any]] = deque(maxlen=_SLOW_BUFFER_FRAMES)
+        self._timing_frames: deque[dict[str, Any]] = deque(maxlen=_TIMING_BUFFER_FRAMES)
         # motor key -> latest slow reading (temperature/voltage/status/...).
         self._slow: dict[str, dict[str, Any]] = {}
         self._slow_t: float | None = None
@@ -89,6 +110,7 @@ class TelemetryHub:
         with self._lock:
             self._slow.update(motors)
             self._slow_t = now
+            self._slow_frames.append({"t": now, "m": motors})
         self._fanout({"type": "slow", "t": now, "m": motors})
 
     def push_state(self, state: str) -> None:
@@ -99,6 +121,19 @@ class TelemetryHub:
                 changed = True
         if changed:
             self._fanout({"type": "state", "state": state})
+
+    def push_timing(self, arms: dict[str, dict[str, Any]]) -> None:
+        """Publish passive on-wire command/feedback timing for active arms."""
+        frame = {"t": time.time(), "arms": arms}
+        with self._lock:
+            self._timing_frames.append(frame)
+        self._fanout({"type": "timing", **frame})
+
+    def start_timing_session(self) -> None:
+        """Clear the previous graph when a newly-ready teleop run starts."""
+        with self._lock:
+            self._timing_frames.clear()
+        self._fanout({"type": "timing_reset"})
 
     def clear_slow(self) -> None:
         with self._lock:
@@ -140,6 +175,9 @@ class TelemetryHub:
                 "slow": dict(self._slow),
                 "slowT": self._slow_t,
                 "latest": latest,
+                "timingLatest": (
+                    self._timing_frames[-1] if self._timing_frames else None
+                ),
             }
 
     def history(self, seconds: float, max_frames: int = 3000) -> list[dict[str, Any]]:
@@ -147,6 +185,24 @@ class TelemetryHub:
         cutoff = time.time() - seconds
         with self._lock:
             frames = [f for f in self._frames if f["t"] >= cutoff]
+        if len(frames) > max_frames:
+            stride = len(frames) / max_frames
+            frames = [frames[int(i * stride)] for i in range(max_frames)]
+        return frames
+
+    def slow_history(self, seconds: float) -> list[dict[str, Any]]:
+        """Buffered slow sweeps (temperature/voltage) from the last ``seconds``."""
+        cutoff = time.time() - seconds
+        with self._lock:
+            return [f for f in self._slow_frames if f["t"] >= cutoff]
+
+    def timing_history(
+        self, seconds: float, max_frames: int = 3000
+    ) -> list[dict[str, Any]]:
+        """Buffered on-wire timing frames from the last ``seconds``."""
+        cutoff = time.time() - seconds
+        with self._lock:
+            frames = [f for f in self._timing_frames if f["t"] >= cutoff]
         if len(frames) > max_frames:
             stride = len(frames) / max_frames
             frames = [frames[int(i * stride)] for i in range(max_frames)]
@@ -266,8 +322,8 @@ class DiagnosticsRunStore:
         csv_path = meta.get("telemetryCsv")
         if csv_path:
             csv_frames = _read_csv_frames(Path(csv_path))
-            # A script's own capture is denser and spans bus-owned time the
-            # server couldn't observe — prefer it when present.
+            # A script's own capture samples at its chosen cadence, denser
+            # than the passive-observer stream — prefer it when present.
             if csv_frames:
                 frames = csv_frames
         if len(frames) > max_frames:

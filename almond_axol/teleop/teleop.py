@@ -18,7 +18,7 @@ Typical usage::
 Or with custom components::
 
     async with VRTeleop(
-        Axol(),
+        RtAxol(Axol()),
         config=VRTeleopConfig(teleop_max_vel=2.0),
         vr_server_config=VRServerConfig(port=9000),
     ) as teleop:
@@ -41,17 +41,28 @@ import numpy as np
 
 from ..kinematics import KinematicsConfig
 from ..robot.base import RobotBase
-from ..robot.cart import Cart
+from ..robot.jelly import Jelly
 from ..robot.control import ContactWatchdog
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
+from ..teleop_activity import TeleopActivityMarker
 from .config import VRTeleopConfig
 from .core import VRTeleopCore
+from .recorder import make as _recorder_make
 from .worker import run_ik_worker
 
 _logger = logging.getLogger(__name__)
+
+# Hybrid pacing split (seconds): the control loop sleeps via asyncio until
+# this close to the deadline, then busy-finishes with a blocking time.sleep.
+# asyncio timer wakeups on this host measured 636 us late on average (p99
+# 2.3 ms — over half a 240 Hz cycle); time.sleep (nanosleep) lands within
+# tens of us. The blocking part caps event-loop starvation at ~1.5 ms per
+# cycle, and releases the GIL, so the VR/IK threads are unaffected. The
+# hybrid measured 79 us mean wakeup error, 8x better than plain asyncio.
+_FINE_SLEEP = 0.0015
 
 
 class VRTeleop:
@@ -65,7 +76,7 @@ class VRTeleop:
         config:            Teleop session parameters (rest poses, loop frequency).
         kinematics_config: IK solver parameters forwarded to the subprocess.
         vr_server_config:  VR WebSocket server parameters (port, TLS certs).
-        cart:              Powered cart (x-drive base + lift) for robots that
+        jelly:              Jelly (x-drive base + lift) for robots that
                            have one; ``None`` for a static base.
     """
 
@@ -76,7 +87,7 @@ class VRTeleop:
         config: VRTeleopConfig = VRTeleopConfig(),
         kinematics_config: KinematicsConfig = KinematicsConfig(),
         vr_server_config: VRServerConfig = VRServerConfig(),
-        cart: Cart | None = None,
+        jelly: Jelly | None = None,
     ) -> None:
         """Construct the teleoperation session.
 
@@ -88,17 +99,27 @@ class VRTeleop:
             config:            Teleop loop parameters (rest poses, frequency, velocity limits).
             kinematics_config: IK solver cost weights forwarded to the IK subprocess.
             vr_server_config:  VR WebSocket server parameters (port, TLS certs).
-            cart:              Powered cart (x-drive base + telescoping lift),
+            jelly:              Jelly (x-drive base + telescoping lift),
                                or ``None`` for a robot on a static base. When
                                present, the headset thumbsticks drive it: left
                                stick translates, right stick x rotates, stick
                                clicks run the lift (left down / right up).
-                               Deflection is the deadman — the cart is active
+                               Deflection is the deadman — Jelly is active
                                whenever a stick leaves its deadzone,
                                independent of the arm engage toggle.
         """
+        # Direct Python control-loop teleop is no longer supported. Keep this guard at
+        # the reusable API boundary so custom callers cannot silently bypass
+        # the production Rust core; Sim remains a valid alternate target.
+        from ..robot.axol import Axol
+
+        if isinstance(robot, Axol):
+            raise TypeError(
+                "VRTeleop hardware requires RtAxol(Axol()); direct Python "
+                "control has been removed"
+            )
         self._robot = robot
-        self._cart = cart
+        self._jelly = jelly
         self._config = config
         self._kinematics_config = kinematics_config
         self._vr_server = VRServer(vr_server_config)
@@ -130,6 +151,24 @@ class VRTeleop:
         # Event loop of the VR server thread, captured so the IK thread can
         # broadcast tracking-state changes to the headset.
         self._vr_loop: asyncio.AbstractEventLoop | None = None
+
+        # Teleop flight recorder (--teleop.record, see .recorder):
+        # taps the measured side per control tick — cached joint positions
+        # and torques (8 left + 8 right), refreshed by the impedance feedback
+        # frames so reading them costs no CAN traffic.
+        # RtAxol receives feedback at the native 240 Hz wire rate and owns the
+        # same `_meas.npz` stage when recording is on. Sim keeps this
+        # once-per-loop recorder.
+        self._robot_recorder = (
+            getattr(robot, "set_recording_engaged", None)
+            if getattr(robot, "records_measurements_at_control_rate", False)
+            else None
+        )
+        self._rec = (
+            None
+            if self._robot_recorder is not None
+            else _recorder_make(config.record, "meas", {"qm": 16, "tq": 16})
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -180,11 +219,11 @@ class VRTeleop:
         await loop.run_in_executor(None, self._vr_ready.wait)
 
         await self._robot.enable()
-        if self._cart is not None:
-            # After the arms so a cart failure (missing CAN interface, GPIO
+        if self._jelly is not None:
+            # After the arms so a Jelly failure (missing CAN interface, GPIO
             # chip) surfaces before the IK worker spins up; its command task
             # runs on this event loop.
-            await self._cart.enable()
+            await self._jelly.enable()
 
         pos_l, pos_r = await self._robot.get_positions()
         self._core.set_initial_grips(
@@ -260,11 +299,11 @@ class VRTeleop:
             self._vr_thread.join(timeout=5.0)
             self._vr_thread = None
 
-        if self._cart is not None:
+        if self._jelly is not None:
             try:
-                await self._cart.disable()
+                await self._jelly.disable()
             except Exception:  # noqa: BLE001 - never block the arm shutdown
-                _logger.exception("cart disable failed")
+                _logger.exception("Jelly disable failed")
         await self._robot.disable()
 
     async def __aenter__(self) -> VRTeleop:
@@ -411,6 +450,18 @@ class VRTeleop:
             else None
         )
 
+        # enable() has already received PyRoKi's first solution before run()
+        # can be entered. Publish this exact boundary for the independently
+        # running Diagnostics process: the RT core's earlier 240 Hz bring-up
+        # hold is safe robot traffic, but it is not a teleop-loop measurement.
+        # This lifecycle gates the production Rust-core capture.
+        activity = TeleopActivityMarker()
+        try:
+            activity.start()
+        except OSError as exc:
+            # Diagnostics must never prevent the robot's control loop from
+            # starting (read-only home, full disk, etc.).
+            _logger.warning("could not publish teleop timing boundary: %s", exc)
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
         # Track an absolute deadline so late wakeups are corrected in the next
         # cycle rather than accumulating as permanent drift.
@@ -423,6 +474,15 @@ class VRTeleop:
                 # contact (reset replans from wherever the arms are left).
                 # See VRTeleopCore.guarded_return.
                 if guard and self._core.is_resetting:
+                    # Reset/exit motion is deliberately outside the latest
+                    # engage segment. This branch bypasses the ordinary gate
+                    # update below, so close both measured recorders before
+                    # the guarded return starts instead of retaining its
+                    # several-second trip to rest in _meas/_rt.
+                    if self._robot_recorder is not None:
+                        self._robot_recorder(False)
+                    if self._rec is not None:
+                        self._rec.set_engaged(False)
                     await self._core.guarded_return(
                         send_step=_guard_send_step,
                         gravity_step=_guard_gravity_step,
@@ -442,7 +502,15 @@ class VRTeleop:
                 t_start = time.perf_counter()
                 left, right = self.step()
                 t_step = time.perf_counter()
+                if self._robot_recorder is not None:
+                    self._robot_recorder(self._core.teleop_enabled)
                 await self._robot.motion_control(left=left, right=right)
+
+                if self._rec is not None:
+                    # Segment gate: record only while engaged; the disengage
+                    # edge writes the _meas file (see recorder.set_engaged).
+                    self._rec.set_engaged(self._core.teleop_enabled)
+                    self._record_measured()
 
                 if track_watchdog is not None and left is not None:
                     tripped = track_watchdog.update(
@@ -537,13 +605,24 @@ class VRTeleop:
                     loop_times.clear()
                     last_log = now
 
-                await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+                # Hybrid pacing (see _FINE_SLEEP): asyncio for the bulk of
+                # the wait, precise blocking sleep for the last stretch. The
+                # zero-sleep on the hot path still yields once per cycle so
+                # sibling tasks (jelly, diag) can't be starved outright.
+                coarse = deadline - time.perf_counter() - _FINE_SLEEP
+                await asyncio.sleep(max(coarse, 0.0))
+                fine = deadline - time.perf_counter()
+                if fine > 0.0:
+                    time.sleep(fine)
                 slip = time.perf_counter() - deadline
                 if slip > max_slip:
                     max_slip = slip
         except asyncio.CancelledError:
             pass
         finally:
+            if self._robot_recorder is not None:
+                self._robot_recorder(False)
+            activity.stop()
             diag.stop()
             tegra.stop()
 
@@ -569,6 +648,29 @@ class VRTeleop:
             return None, None
         return out[:8], out[8:]
 
+    def _record_measured(self) -> None:
+        """Append one measured-side row to the teleop recorder (hardware only).
+
+        Reads the cached positions/torques the impedance feedback frames
+        refresh every cycle — no CAN traffic. Arms that don't expose the
+        cache (Sim, an absent arm, offsets not yet resolved) record NaN.
+        """
+        qm = np.full(16, np.nan, dtype=np.float32)
+        tq = np.full(16, np.nan, dtype=np.float32)
+        for sl, arm in (
+            (slice(0, 8), getattr(self._robot, "left", None)),
+            (slice(8, 16), getattr(self._robot, "right", None)),
+        ):
+            if arm is None:
+                continue
+            try:
+                qm[sl] = arm.positions
+                tq[sl] = arm.torques
+            except Exception:  # noqa: BLE001 - recording must never break the loop
+                pass
+        assert self._rec is not None
+        self._rec.record(qm=qm, tq=tq)
+
     # ------------------------------------------------------------------
     # VR frame callback (runs on every incoming frame)
     # ------------------------------------------------------------------
@@ -587,11 +689,11 @@ class VRTeleop:
             ):
                 self._vr_frame_times.pop(0)
         self._core.note_frame_reset(frame.reset)
-        if self._cart is not None:
-            # The stick → cart mapping lives on Cart (shared with the
+        if self._jelly is not None:
+            # The stick → Jelly mapping lives on Jelly (shared with the
             # collect-data flow). Resets force a stop so the base doesn't
             # creep while the arms replay their return-to-rest trajectory.
-            self._cart.apply_vr_frame(frame, resetting=self._core.is_resetting)
+            self._jelly.apply_vr_frame(frame, resetting=self._core.is_resetting)
 
     # ------------------------------------------------------------------
     # IK loop (daemon thread)

@@ -124,7 +124,41 @@ async def _dump_motor(
         )
         params[index.name] = value
 
-    return {"motor_id": motor_id, "type": kind, "raw": raw, "params": params}
+    record: dict[str, Any] = {
+        "motor_id": motor_id,
+        "type": kind,
+        "raw": raw,
+        "params": params,
+    }
+
+    # Internal loop gains live behind a separate command (MyActuator 0x30 /
+    # Damiao registers), not the parameter table above. The current loop tracks
+    # the torque setpoint that MIT-mode impedance produces, so its gains scale
+    # the effectiveness of every kp/kd we command — worth comparing per motor.
+    try:
+        gains = await motor.get_gains()
+    except Exception as e:
+        print(f"\n  loop gains: could not read — {e}")
+        return record
+
+    print("\n  loop gains:")
+    loop_gains: dict[str, float] = {}
+    for name in (
+        "current_kp",
+        "current_ki",
+        "speed_kp",
+        "speed_ki",
+        "position_kp",
+        "position_ki",
+        "position_kd",
+    ):
+        value = getattr(gains, name)
+        if value is None:
+            continue
+        print(f"  {name:<30} {value:>14.4f}")
+        loop_gains[name] = value
+    record["loop_gains"] = loop_gains
+    return record
 
 
 async def _run(args: argparse.Namespace) -> None:

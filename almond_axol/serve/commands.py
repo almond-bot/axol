@@ -8,12 +8,13 @@ whose imports fail (missing ``lerobot``, ZED SDK, mujoco, …) are simply marked
 unavailable so the rest of the catalog still loads.
 
 Only commands some UI surface actually launches belong here: the control
-panel's five operations, and the diagnostics dashboard's tests, CAN bring-up
-buttons, and motor calibration tools. Everything else — install-time commands
-(``gst.*``, ``jetson.setup``, ``can.driver``), the tuning suite (``tune.*``),
-one-off checks (``motor.info`` / ``motor.health``, whose read set the
-dashboard's motor tiles show live), the remote ``inference-server``, and
-``serve`` itself — stays CLI-only.
+panel's five operations, and the diagnostics dashboard's tests, tuning tools
+(``tune.pid`` / ``tune.friction``, whose ``--save`` writes this robot's
+calibration file), CAN bring-up buttons, and motor calibration tools.
+Everything else — install-time commands (``gst.*``, ``jetson.setup``,
+``can.driver``), ``tune.repeatability``, one-off checks (``motor.info`` /
+``motor.health``, whose read set the dashboard's motor tiles show live), the
+remote ``inference-server``, and ``serve`` itself — stays CLI-only.
 
 ``motor.restore-config`` is also CLI-only: it consumes a snapshot file, and a
 browser form can only name a path on the serve host, so the dashboard offers
@@ -83,6 +84,7 @@ class CommandDef:
         per_run_fields: tuple[str, ...] = (),
         settings_like: str | None = None,
         module: str = "almond_axol",
+        section: str | None = None,
     ) -> None:
         self.id = id
         self.cli = cli
@@ -126,7 +128,7 @@ class CommandDef:
         # robot.
         self.sim_flag = sim_flag
         # Arg names that mean "doesn't touch the arms" without being sim
-        # (teleop's cart_only): the run skips the robot link and the
+        # (teleop's jelly_only): the run skips the robot link and the
         # motor-fault gate but still drives real, non-arm hardware.
         self.robot_free_flags = robot_free_flags
         # Driven from the VR headset, so the panel tells the operator to point
@@ -147,6 +149,10 @@ class CommandDef:
         # ``python -m <module>`` target for the subprocess path, so a command
         # registered by a downstream package runs out of that package's CLI.
         self.module = module
+        # Dashboard grouping within the Diagnostics category:
+        # "helper" (utility moves like the lift), "test" (pass/fail checks
+        # like the ROM soak), or "tuning" (the tuning workbench's suites).
+        self.section = section
         self._loader = loader
 
     @property
@@ -304,7 +310,7 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "Teleoperation",
         "Drive the Axol from a VR headset. Enable simulation to preview in the "
-        "browser without hardware, or cart-only to drive just the powered cart.",
+        "browser without hardware, or Jelly-only to drive just Jelly.",
         "Operate",
         "draccus",
         _teleop,
@@ -314,22 +320,24 @@ COMMANDS: dict[str, CommandDef] = {
         camera_mode="teleop",
         streams_video=True,
         sim_flag="sim",
-        robot_free_flags=("cart_only",),
+        robot_free_flags=("jelly_only",),
         uses_headset=True,
-        per_run_fields=("sim", "cart_only"),
+        per_run_fields=("sim", "jelly_only"),
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",
         "gravity-comp",
         "Gravity compensation",
-        "Hold the arms in gravity-comp so they can be moved by hand.",
+        "Hold the arms in gravity-comp so they can be moved by hand. Set a "
+        "recording name to capture the hand-guided motion for Build motion "
+        "in the tuning workbench.",
         "Operate",
         "draccus",
         _gravity_comp,
         requires_hardware=True,
         entrypoint=_gravity_comp_run,
         execution="async",
-        per_run_fields=("free_joints",),
+        per_run_fields=("free_joints", "record"),
     ),
     "waypoints": CommandDef(
         "waypoints",
@@ -386,6 +394,7 @@ COMMANDS: dict[str, CommandDef] = {
         entrypoint=_collect_dagger_run,
         requires_cameras=True,
         camera_mode="argv",
+        streams_video=True,
         uses_headset=True,
         episode_control=_run_policy_control,
         per_run_fields=("policy_path", "policy_type", "task", "repo_id"),
@@ -417,7 +426,12 @@ COMMANDS: dict[str, CommandDef] = {
         requires_cameras=True,
         camera_mode="argv",
         episode_control=_run_policy_control,
-        per_run_fields=("policy_path", "policy_type", "task", "repo_id"),
+        per_run_fields=(
+            "policy_path",
+            "policy_type",
+            "task",
+            "repo_id",
+        ),
     ),
     # -- Diagnostics ----------------------------------------------------------
     "diag.rom-enable": CommandDef(
@@ -431,6 +445,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..diagnostics.rom.enable"),
         requires_hardware=True,
         drives_motors=True,
+        section="test",
     ),
     "diag.rom-disable": CommandDef(
         "diag.rom-disable",
@@ -442,6 +457,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..diagnostics.rom.disable"),
         requires_hardware=True,
         drives_motors=True,
+        section="test",
     ),
     "diag.lift-cycle": CommandDef(
         "diag.lift-cycle",
@@ -466,6 +482,140 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..diagnostics.zed.cable"),
         requires_hardware=True,
         uses_can_bus=False,
+        section="test",
+    ),
+    "tune.pid": CommandDef(
+        "tune.pid",
+        "tune.pid",
+        "PID tuning",
+        "Test impedance Kp/Kd candidates on one joint (sine or step tracking) "
+        "with production-matched feedforward, rank them, and optionally save "
+        "the best pair to this robot's calibration.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.pid"),
+        requires_hardware=True,
+        drives_motors=True,
+        section="tuning",
+    ),
+    "tune.friction": CommandDef(
+        "tune.friction",
+        "tune.friction",
+        "Friction identification",
+        "Identify one joint's friction model (Fc, k, Fv, Fo) with a "
+        "bidirectional velocity sweep, and optionally save it to this "
+        "robot's calibration. Run per joint, per arm, on every new robot.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.friction"),
+        requires_hardware=True,
+        drives_motors=True,
+        section="tuning",
+    ),
+    "tune.gravity": CommandDef(
+        "tune.gravity",
+        "tune.gravity",
+        "Gravity CoM identification",
+        "Fit one link's real centre of mass from a friction-cancelled torque "
+        "sweep, correcting the gravity feedforward — removes the static "
+        "droop the joint shows under load. Run distal→proximal; --save "
+        "writes the CoM to this robot's calibration.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.gravity"),
+        requires_hardware=True,
+        drives_motors=True,
+        section="tuning",
+    ),
+    "tune.factory": CommandDef(
+        "tune.factory",
+        "tune.factory",
+        "Factory calibration (all joints)",
+        "Friction + gravity identification for all 14 joints (both arms, "
+        "distal→proximal) in one run — saved to this robot's calibration "
+        "and uploaded to the cloud keyed by the hub adapter serial when "
+        "Supabase credentials are configured.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.factory"),
+        requires_hardware=True,
+        drives_motors=True,
+        section="tuning",
+    ),
+    "calibration.pull": CommandDef(
+        "calibration.pull",
+        "calibration.pull",
+        "Fetch factory calibration",
+        "Download this robot's factory calibration (friction + gravity, by "
+        "hub adapter serial) from the cloud into the local cache; every "
+        "config then overlays it under the local calibration file.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.calibration"),
+        requires_hardware=False,
+        uses_can_bus=False,
+        drives_motors=False,
+        section="helper",
+    ),
+    "tune.motion": CommandDef(
+        "tune.motion",
+        "tune.motion",
+        "Reference-motion replay",
+        "Replay a committed reference motion through the production control "
+        "path and score tracking accuracy and smoothness per joint — or run "
+        "it as IK, where the motion's Cartesian end-effector path is "
+        "re-solved live and the arms execute the solver's output. Override "
+        "gains per run to A/B-compare on the identical motion; every run is "
+        "saved for the Tuning charts.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.motion"),
+        requires_hardware=True,
+        drives_motors=True,
+        section="tuning",
+    ),
+    "tune.filter": CommandDef(
+        "tune.filter",
+        "tune.filter",
+        "Filter noise-rejection test",
+        "Inject network noise (jitter/outliers/stalls, before the pose "
+        "low-pass) or IK noise (solver churn/jumps, after it) — or both — "
+        "into a clean motion and replay through the production teleop "
+        "filter stack, offline, seeded and reproducible. Each source "
+        "enters at its real pipeline point, so they are testable "
+        "independently. Scores how much the stack removes, per joint.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.filter"),
+        uses_can_bus=False,
+        section="tuning",
+    ),
+    "motion.build": CommandDef(
+        "motion.build",
+        "motion.build",
+        "Build reference motion",
+        "Postprocess a recorded session (teleop's record option, or "
+        "gravity-comp's for a hand-guided one) into a reference motion: "
+        "clip to the engaged span / trim the still ends, resample, smooth, "
+        "and project through the collision-aware solver.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.motion"),
+        uses_can_bus=False,
+        section="tuning",
+    ),
+    "diag.offline": CommandDef(
+        "diag.offline",
+        "diag.offline",
+        "Offline pipeline analysis",
+        "Analyze a teleop flight-recorder capture without hardware: wifi "
+        "transport jitter, filter-stack pass-through and lag, or IK-injected "
+        "motion. Results save as tuning runs for the charts.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..diagnostics.offline_suites"),
+        uses_can_bus=False,
+        section="tuning",
     ),
     # The lift commands run on the chest CAN bus, not the arm hub, but they
     # still take the single bus-owner slot (uses_can_bus default) so physical
@@ -484,6 +634,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.lift.home"),
         requires_hardware=True,
+        section="helper",
     ),
     "lift.goto": CommandDef(
         "lift.goto",
@@ -495,6 +646,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.lift.goto"),
         requires_hardware=True,
+        section="helper",
     ),
     # -- Calibrate ----------------------------------------------------------
     "motor.set-zero-pos": CommandDef(
@@ -639,6 +791,7 @@ def command_specs() -> list[dict[str, Any]]:
             "simFlag": cmd.sim_flag,
             "robotFreeFlags": list(cmd.robot_free_flags),
             "usesHeadset": cmd.uses_headset,
+            "section": cmd.section,
         }
         try:
             schema = get_schema(cmd.id)
@@ -686,7 +839,9 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
     emit = get_schema(command_id).emit
 
     options: list[str] = []
-    positionals: list[str] = []
+    # key -> token; ordered by the schema below, not by the submitted dict,
+    # so commands with several positionals get them in declaration order.
+    positional_by_key: dict[str, str] = {}
     # ``root`` -> nested value tree assembled from its submitted leaves.
     dict_values: dict[str, dict[str, Any]] = {}
     for key, raw in args.items():
@@ -708,10 +863,13 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
             text = str(raw).strip()
             if text:
                 options.extend([spec["flag"], *text.split()])
+        elif kind == "optmany":
+            for token in str(raw).split():
+                options.extend([spec["flag"], token])
         elif kind == "pos":
             token = _format_value(raw)
             if token is not None:
-                positionals.append(token)
+                positional_by_key[key] = token
         elif kind == "dictleaf":
             if raw is None or (isinstance(raw, str) and raw.strip() == ""):
                 continue
@@ -728,4 +886,5 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
         # JSON is valid YAML, so draccus's value parser loads it as a dict and
         # deep-merges it over the dict field's defaults.
         options.extend([f"--{root}", json.dumps(tree)])
+    positionals = [positional_by_key[key] for key in emit if key in positional_by_key]
     return [*options, *positionals]

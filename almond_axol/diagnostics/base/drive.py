@@ -1,14 +1,14 @@
 """
 base.drive
 
-Drive the powered Axol Cart (x-drive omni base + telescoping lift) with a
+Drive Jelly (x-drive omni base + telescoping lift) with a
 Logitech gamepad.
 
-This is a thin gamepad frontend over :class:`almond_axol.robot.cart.Cart`,
+This is a thin gamepad frontend over :class:`almond_axol.robot.jelly.Jelly`,
 which owns all the control logic (slew limiting, x-drive mixing, the MIT
 park hold, PMAX widening, lift commands) — the same class VR teleop
 drives, so bench behavior and teleop behavior cannot drift apart. See the
-``cart`` module docstring for wheel CAN IDs, body-frame conventions, and
+``jelly`` module docstring for wheel CAN IDs, body-frame conventions, and
 the parking details.
 
 Controls (Logitech F310/F710 in XInput mode):
@@ -38,7 +38,7 @@ import asyncio
 import logging
 import os
 
-from ...robot.cart import DEFAULT_CHANNEL, WHEELS, Cart, CartConfig, deadzone
+from ...robot.jelly import DEFAULT_CHANNEL, WHEELS, Jelly, JellyConfig, deadzone
 from ...robot.lift import DOWN, STOP, UP
 
 # Logitech F310/F710 (XInput mode) under SDL/pygame.
@@ -79,26 +79,26 @@ def _init_gamepad(index: int):  # noqa: ANN202 — pygame typed lazily
     return pad
 
 
-def _status_line(cart: Cart, engaged: bool) -> str:
+def _status_line(jelly: Jelly, engaged: bool) -> str:
     if engaged:
         state = "DRIVE"
-    elif cart.parked:
+    elif jelly.parked:
         state = "PARKED (hold LB/RB)"
     else:
         state = "hold LB/RB to drive"
-    cmd = cart.body_cmd
+    cmd = jelly.body_cmd
     wheels = "  ".join(
         f"{w.name.split('_')[0][0]}{w.name.split('_')[1][0]}:{s:+6.2f}"
-        for w, s in zip(WHEELS, cart.wheel_speeds)
+        for w, s in zip(WHEELS, jelly.wheel_speeds)
     )
-    lift = {UP: "up", DOWN: "down", STOP: "--"}[cart.lift_dir]
+    lift = {UP: "up", DOWN: "down", STOP: "--"}[jelly.lift_dir]
     height = ""
-    if (status := cart.lift_status) is not None:
+    if (status := jelly.lift_status) is not None:
         pct = status.height_percent
         height = f" {pct:.1f}%" if pct is not None else " ---"
         if status.stall_fault:
             height += " STALL"
-    warn = "  [CMD ERR]" if cart.send_failed else ""
+    warn = "  [CMD ERR]" if jelly.send_failed else ""
     return (
         f"\r  {state:<22}  vx={cmd[0]:+.2f} vy={cmd[1]:+.2f} wz={cmd[2]:+.2f}"
         f"  |  {wheels} rad/s  |  lift:{lift}{height}{warn}  \033[K"
@@ -107,10 +107,10 @@ def _status_line(cart: Cart, engaged: bool) -> str:
 
 async def _input_loop(
     pad,  # noqa: ANN001 — pygame typed lazily
-    cart: Cart,
+    jelly: Jelly,
     dz: float,
 ) -> None:
-    """Poll the gamepad into ``cart.set_command`` until B is pressed."""
+    """Poll the gamepad into ``jelly.set_command`` until B is pressed."""
     import pygame
 
     interval = 1.0 / _DISPLAY_HZ
@@ -131,16 +131,16 @@ async def _input_loop(
             if pad.get_numhats() > _HAT_DPAD:
                 hat_y = pad.get_hat(_HAT_DPAD)[1]
                 lift_dir = UP if hat_y > 0 else DOWN if hat_y < 0 else STOP
-        cart.set_command(vx, vy, wz, lift_dir)
+        jelly.set_command(vx, vy, wz, lift_dir)
 
-        print(_status_line(cart, engaged), end="", flush=True)
+        print(_status_line(jelly, engaged), end="", flush=True)
         await asyncio.sleep(interval)
 
 
 async def _run(args: argparse.Namespace) -> None:
     pad = _init_gamepad(args.joystick)
 
-    config = CartConfig(
+    config = JellyConfig(
         channel=None if args.no_can else args.channel,
         max_speed=args.max_speed,
         turn_scale=args.turn_scale,
@@ -156,35 +156,35 @@ async def _run(args: argparse.Namespace) -> None:
     if args.no_can:
         print("--no-can: wheel motors disabled (gamepad + lift only).")
 
-    cart = Cart(config)
-    await cart.enable()
+    jelly = Jelly(config)
+    await jelly.enable()
 
-    # Same wiring as VR teleop (see cli/teleop.py's _wire_cart_imu): the board
+    # Same wiring as VR teleop (see cli/teleop.py's _wire_jelly_imu): the board
     # BMI088 feeds the heading hold; on failure the hold is simply inert.
     imu_src = None
     if args.imu:
         try:
             from ...robot.gyro import BoardYawRateSource
 
-            imu_src = BoardYawRateSource(cart.feed_yaw_rate)
+            imu_src = BoardYawRateSource(jelly.feed_yaw_rate)
             imu_src.open()
             print("--imu: board gyro feeding the heading hold.")
         except Exception as exc:  # noqa: BLE001 - heading hold is best-effort
             print(f"--imu: could not start the board gyro ({exc}); hold disabled.")
 
-    print("Cart enabled. Hold LB/RB to drive, D-pad for the lift, B to quit.")
+    print("Jelly enabled. Hold LB/RB to drive, D-pad for the lift, B to quit.")
     try:
-        await _input_loop(pad, cart, args.deadzone)
+        await _input_loop(pad, jelly, args.deadzone)
     finally:
         if imu_src is not None:
             imu_src.close()
-        await cart.disable()
-        print("Cart disabled.")
+        await jelly.disable()
+        print("Jelly disabled.")
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Drive the powered Axol Cart with a Logitech gamepad.",
+        description="Drive Jelly with a Logitech gamepad.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -249,15 +249,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--lift-channel",
-        default=CartConfig.lift_channel,
+        default=JellyConfig.lift_channel,
         help="SocketCAN interface of the chest bus carrying the jelly_legs "
-        f"lift controller (default: {CartConfig.lift_channel})",
+        f"lift controller (default: {JellyConfig.lift_channel})",
     )
     parser.add_argument(
         "--imu",
         action="store_true",
         help="Feed the heading hold from the board BMI088 gyro, as VR teleop "
-        "does with --cart.imu (see almond_axol.robot.gyro).",
+        "does with --jelly.imu (see almond_axol.robot.gyro).",
     )
     parser.add_argument(
         "--yaw-log",
@@ -267,7 +267,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    # The Cart and its yaw trace (--yaw-log) report through logging; without
+    # The Jelly and its yaw trace (--yaw-log) report through logging; without
     # a handler those INFO lines would be dropped silently.
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"

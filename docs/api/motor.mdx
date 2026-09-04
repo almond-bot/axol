@@ -1,9 +1,12 @@
 ---
 title: "almond_axol.motor"
-description: "Low-level async SocketCAN interface for individual motors."
+description: "Low-level async motor interface through the Rust CAN core."
 ---
 
-Low-level async SocketCAN interface for individual motors. Most users work through `Axol` — this layer is exposed for diagnostics, custom control modes, and bench testing individual motors.
+Low-level async interface for individual motors. The API is Python, but every
+CAN frame is sent and received by the Rust `axol-rt` transport; Python never
+opens SocketCAN. Most users work through `Axol` — this layer is exposed for
+diagnostics, custom control modes, and bench testing individual motors.
 
 ```python
 from almond_axol.motor import CanBus, Motor, ControlMode, MotorStatus, MotorGains, Joint

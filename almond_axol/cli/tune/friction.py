@@ -20,10 +20,16 @@ becomes ``Fo`` and the shape residual is reported as a sanity check on the
 At runtime:
     tff(q, v) = gravity_model(q) + Fc·tanh(0.1·k·v) + Fv·v + Fo
 
+Pass ``--save`` to persist the fitted parameters to this robot's calibration
+file (``~/.almond/calibration.json``); ``AxolConfig`` loads that file on
+construction, so the values take effect for every operation on this machine
+without touching ``config.py``. Friction is motor-specific — run this per
+joint, per arm, on every robot you build.
+
 Examples:
     axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8
-    axol tune.friction --r --joint elbow --kp 20 --kd 0.6
-    axol tune.friction --l --joint wrist_1 --velocities 0.2 0.6 1.0
+    axol tune.friction --r --joint elbow --kp 20 --kd 0.6 --save
+    axol tune.friction --l --joint wrist_1 --velocities 12 35 60
 """
 
 import argparse
@@ -36,116 +42,201 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import curve_fit
 
-from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ...constants import ARM_JOINTS
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
+from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig
 from ...robot.gravity import GravityCompensator
+from ...tuning import (
+    JointFrameMotor,
+    joint_frame_motors,
+    ramp_stages,
+    sweep_safety,
+)
+from ..motor import add_side_and_channel_arguments, resolve_channel
 
 _TAU = 2 * math.pi
 _RAMP_SPEED = 0.25  # rad/s
 _SWEEP_MARGIN = 0.05  # rad — don't sweep all the way to hard limits
+_SWEEP_DECEL = 3.0  # rad/s² — braking rate for the target at the end of a pass
 _WARMUP_FRACTION = 0.15  # skip first 15% of each pass for motor settling
 _RATE_HZ = 100.0
 _N_BINS = 40  # position bins for matching fwd/bwd samples
 
-# Default velocity sweep in rad/s (~0.02, 0.05, 0.1, 0.15, 0.2 rev/s)
-DEFAULT_VELOCITIES = [v * _TAU for v in [0.02, 0.05, 0.1, 0.15, 0.2]]
+# Default velocity sweep in deg/s (0.02, 0.05, 0.1, 0.15, 0.2 rev/s exactly).
+# The CLI speaks deg/s; the sweep internals run rad/s.
+DEFAULT_VELOCITIES_DEG = [v * 360.0 for v in [0.02, 0.05, 0.1, 0.15, 0.2]]
 
 
 async def _ramp_to(
-    motor: Motor,
+    motor: JointFrameMotor,
     kp: float,
     kd: float,
     target: float,
     duration: float = 2.0,
 ) -> None:
     start_pos = await motor.get_position()
-    dt = 1.0 / _RATE_HZ
-    t0 = time.monotonic()
-    while True:
-        t = time.monotonic() - t0
-        alpha = min(t / duration, 1.0)
-        await motor.set_impedance(
-            start_pos + alpha * (target - start_pos), 0.0, kp, kd, 0.0
-        )
-        if alpha >= 1.0:
-            break
-        await asyncio.sleep(dt)
+    count = max(2, math.ceil(duration * _RATE_HZ) + 1)
+    samples = [
+        (start_pos + i / (count - 1) * (target - start_pos), target, 0.0)
+        for i in range(count)
+    ]
+    await motor.run_experiment(
+        kp=kp,
+        kd=kd,
+        rate_hz=_RATE_HZ,
+        samples=samples,
+        differentiate=False,
+        feedforward=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 20.0, 0.8),
+    )
 
 
-async def _ramp_others(
-    motors: dict[Joint, Motor],
-    exclude: Joint,
-    targets: dict[Joint, float] | None = None,
+# Homing order: distal to proximal. This ordering is what makes commanding
+# the all-zero rest pose safe from *any* starting pose — straightening the
+# wrists and then the elbow first means each shoulder later swings an
+# already-straight arm, whose path down to vertical stays outboard of the
+# base. Zeroing everything at once can sweep a bent forearm through the
+# chassis (which is why shoulder_2/wrist_2 were historically left unhomed —
+# leaving every run to start from a partially unknown pose instead).
+_HOME_ORDER: tuple[Joint, ...] = (
+    Joint.WRIST_3,
+    Joint.WRIST_2,
+    Joint.WRIST_1,
+    Joint.ELBOW,
+    Joint.SHOULDER_3,
+    Joint.SHOULDER_2,
+    Joint.SHOULDER_1,
+)
+
+
+async def _ramp_verified(
+    motors: dict[Joint, JointFrameMotor], targets: dict[Joint, float]
 ) -> None:
-    """Move all joints except `exclude` to their target positions (default 0)."""
-    joints = [j for j in ARM_JOINTS if j != exclude]
-    t = targets or {}
-    pos_vals = await asyncio.gather(*[motors[j].get_position() for j in joints])
-    max_dist = max(
-        (abs(pos - t.get(j, 0.0)) for j, pos in zip(joints, pos_vals)), default=0.0
-    )
-    await asyncio.gather(
-        *[motors[j].set_position_velocity(t.get(j, 0.0), _RAMP_SPEED) for j in joints]
-    )
-    timeout = max_dist / _RAMP_SPEED + 2.0
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout:
-        await asyncio.sleep(0.1)
+    """Command joint-frame POSITION_VELOCITY targets and verify arrival.
+
+    Arrival is verified, not assumed: a position command sent right after
+    ``set_control_mode`` can be silently dropped (the MyActuator reset drops
+    torque and ignores commands for ~2 s), and a sweep started from an
+    unverified pose is how wrist_2 once met the base with its elbow
+    clearance move never executed. A dropped command gets one resend; a
+    joint still off target after that raises instead of moving on.
+    """
+    joints = list(targets)
+    if not joints:
+        return
+    positions: list[float] = []
+    for _attempt in range(2):
+        await asyncio.gather(
+            *[motors[j].set_position_velocity(targets[j], _RAMP_SPEED) for j in joints]
+        )
         positions = await asyncio.gather(*[motors[j].get_position() for j in joints])
-        if all(abs(pos - t.get(j, 0.0)) < 0.05 for j, pos in zip(joints, positions)):
-            break
+        max_dist = max(
+            (abs(pos - targets[j]) for j, pos in zip(joints, positions)),
+            default=0.0,
+        )
+        timeout = max_dist / _RAMP_SPEED + 2.0
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            await asyncio.sleep(0.1)
+            positions = await asyncio.gather(
+                *[motors[j].get_position() for j in joints]
+            )
+            if all(abs(pos - targets[j]) < 0.05 for j, pos in zip(joints, positions)):
+                return
+    stragglers = ", ".join(
+        f"{j.value} at {math.degrees(pos):+.1f}° "
+        f"(target {math.degrees(targets[j]):+.1f}°)"
+        for j, pos in zip(joints, positions)
+        if abs(pos - targets[j]) >= 0.05
+    )
+    raise RuntimeError(
+        f"joints never reached their target after a resend: {stragglers} "
+        f"— aborting before anything runs from an unsafe pose"
+    )
+
+
+async def _home_all(
+    motors: dict[Joint, JointFrameMotor], exclude: Joint | None = None
+) -> None:
+    """Ramp every joint to 0 (the rest pose), one at a time in ``_HOME_ORDER``.
+
+    Joints already at rest verify in one poll, so a mostly-homed arm costs
+    a fraction of a second per joint.
+    """
+    for j in _HOME_ORDER:
+        if j == exclude or j not in motors:
+            continue
+        await _ramp_verified(motors, {j: 0.0})
 
 
 async def _run_sweep_raw(
-    motor: Motor,
+    motor: JointFrameMotor,
     kp: float,
     kd: float,
     start_pos: float,
     velocity_rad_s: float,
     end_pos: float,
 ) -> list[tuple[float, float]]:
-    """Sweep from start_pos to end_pos at constant velocity.
+    """Sweep from start_pos to end_pos at constant velocity, then brake.
 
-    Returns list of ``(q_actual, tau_measured)``. The first
-    ``WARMUP_FRACTION`` of travel is discarded for motor settling.
-    ``tau_measured`` is read from the motor's feedback frame (motor-side
-    torque estimate), **not** computed from host-side ``kp·pos_err +
-    kd·vel_err`` — host-side numerical differentiation of position is
-    too noisy at the velocities we sweep, and the motor's own estimate is
-    already what we want.
+    The commanded target cruises at constant velocity and decelerates
+    smoothly (at ``_SWEEP_DECEL``) to rest exactly at ``end_pos``. Halting
+    the target abruptly instead lets the arm's momentum carry it past the
+    sweep limit at the higher velocities — into the robot base on capped
+    joints like shoulder_2 — because only the soft tuning-hold gains are
+    there to catch it.
+
+    Returns list of ``(q_actual, tau_measured)`` collected during the
+    constant-velocity cruise only (the braking phase is not at the sweep
+    velocity, so its samples would pollute the friction fit; the first
+    ``_WARMUP_FRACTION`` of the cruise is likewise discarded for motor
+    settling). ``tau_measured`` is read from the motor's feedback frame
+    (motor-side torque estimate), **not** computed from host-side
+    ``kp·pos_err + kd·vel_err`` — host-side numerical differentiation of
+    position is too noisy at the velocities we sweep, and the motor's own
+    estimate is already what we want.
     """
     travel = abs(end_pos - start_pos)
     if travel < 0.02:
         return []
-    total_time = travel / abs(velocity_rad_s)
-    warmup_time = total_time * _WARMUP_FRACTION
-    dt = 1.0 / _RATE_HZ
-
-    samples: list[tuple[float, float]] = []
-
-    t0 = time.monotonic()
-    while True:
-        now = time.monotonic()
-        t = now - t0
-        if t >= total_time:
-            break
-        loop_start = now
-
-        target = start_pos + velocity_rad_s * t
-        # set_impedance returns a feedback frame, which updates
-        # motor.position / motor.torque via the driver _on_feedback hook.
-        await motor.set_impedance(target, velocity_rad_s, kp, kd, 0.0)
-
-        if t >= warmup_time:
-            samples.append((motor.position, motor.torque))
-
-        spent = time.monotonic() - loop_start
-        if spent < dt:
-            await asyncio.sleep(dt - spent)
-
-    return samples
+    v = abs(velocity_rad_s)
+    sign = 1.0 if velocity_rad_s > 0 else -1.0
+    # Cap the braking distance to half the pass so short passes still cruise.
+    d_decel = min(0.5 * v * v / _SWEEP_DECEL, 0.5 * travel)
+    t_decel = 2.0 * d_decel / v
+    decel = v / t_decel if t_decel > 0 else 0.0
+    d_cruise = travel - d_decel
+    t_cruise = d_cruise / v
+    warmup_time = t_cruise * _WARMUP_FRACTION
+    count = max(1, math.ceil((t_cruise + t_decel) * _RATE_HZ))
+    program = []
+    cruise_mask = []
+    for i in range(count):
+        t = i / _RATE_HZ
+        if t <= t_cruise:
+            target = start_pos + sign * v * t
+            v_des = sign * v
+        else:
+            tau = t - t_cruise
+            v_brake = max(v - decel * tau, 0.0)
+            target = start_pos + sign * (d_cruise + v * tau - 0.5 * decel * tau * tau)
+            v_des = sign * v_brake
+        program.append((target, target, 0.0, v_des))
+        cruise_mask.append(warmup_time <= t <= t_cruise)
+    rows = await motor.run_experiment(
+        kp=kp,
+        kd=kd,
+        rate_hz=_RATE_HZ,
+        samples=program,
+        differentiate=False,
+        feedforward=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 20.0, 0.8),
+    )
+    return [
+        (row["actual"], row["torque"])
+        for row, keep in zip(rows, cruise_mask)
+        if keep and math.isfinite(row["actual"]) and math.isfinite(row["torque"])
+    ]
 
 
 def _bin_by_position(
@@ -273,7 +364,7 @@ def _fit_friction_halfdiff(
 
 
 async def _identify_joint(
-    motor: Motor,
+    motor: JointFrameMotor,
     joint: Joint,
     kp: float,
     kd: float,
@@ -301,8 +392,10 @@ async def _identify_joint(
     sweep_lo = lo + _SWEEP_MARGIN
     sweep_hi = hi - _SWEEP_MARGIN
 
-    print(f"\n  Joint limits: [{lo:.4f}, {hi:.4f}] rad")
-    print(f"  Sweep range:  [{sweep_lo:.4f}, {sweep_hi:.4f}] rad")
+    print(f"\n  Joint limits: [{math.degrees(lo):.1f}, {math.degrees(hi):.1f}]°")
+    print(
+        f"  Sweep range:  [{math.degrees(sweep_lo):.1f}, {math.degrees(sweep_hi):.1f}]°"
+    )
     print(f"  Kp={kp}  Kd={kd}")
 
     if sweep_hi - sweep_lo < 0.1:
@@ -333,7 +426,7 @@ async def _identify_joint(
 
     try:
         for v in velocities:
-            print(f"\n  v = {v:.3f} rad/s ...")
+            print(f"\n  v = {math.degrees(v):.1f} deg/s ...")
 
             # Ramp to sweep start with time proportional to distance
             cur = await motor.get_position()
@@ -396,9 +489,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    side = p.add_mutually_exclusive_group(required=True)
-    side.add_argument("--l", action="store_true")
-    side.add_argument("--r", action="store_true")
+    add_side_and_channel_arguments(p)
     p.add_argument(
         "--joint",
         required=True,
@@ -419,23 +510,23 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--velocities",
         type=float,
         nargs="+",
-        default=DEFAULT_VELOCITIES,
-        metavar="V",
-        help="Velocity setpoints in rad/s (default: ~0.1 0.3 0.6 0.9 1.3 rad/s)",
+        default=DEFAULT_VELOCITIES_DEG,
+        metavar="DEG_S",
+        help="Velocity setpoints in deg/s (default: 7.2 18 36 54 72)",
     )
     p.add_argument(
         "--lo",
         type=float,
         default=None,
-        metavar="RAD",
-        help="Override lower joint limit for the sweep (rad)",
+        metavar="DEG",
+        help="Override lower joint limit for the sweep (degrees)",
     )
     p.add_argument(
         "--hi",
         type=float,
         default=None,
-        metavar="RAD",
-        help="Override upper joint limit for the sweep (rad)",
+        metavar="DEG",
+        help="Override upper joint limit for the sweep (degrees)",
     )
     p.add_argument(
         "--dump-csv",
@@ -448,6 +539,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "without a value to auto-name as "
         "logs/friction_<side>_<joint>_<timestamp>.csv, or pass an explicit "
         "path.",
+    )
+    p.add_argument(
+        "--save",
+        action="store_true",
+        help="Save the fitted friction parameters to this robot's calibration "
+        f"file ({CALIBRATION_PATH}); they then override the shared defaults "
+        "on this machine",
     )
     p.set_defaults(func=run)
 
@@ -479,49 +577,50 @@ async def _run(args: argparse.Namespace) -> None:
     if dump_csv is not None:
         dump_csv.parent.mkdir(parents=True, exist_ok=True)
 
+    velocities_rad = [math.radians(v) for v in args.velocities]
+
     print(f"\nAxol friction identification — {side_str} {joint.value}")
-    print(f"  Velocity sweep: {[round(v, 3) for v in args.velocities]} rad/s")
+    print(f"  Velocity sweep: {[round(v, 1) for v in args.velocities]} deg/s")
     print(f"  Kp={kp}  Kd={kd}")
 
-    channel = CAN_LEFT if is_left else CAN_RIGHT
+    channel = resolve_channel(args)
 
     async with CanBus(channel) as bus:
-        motors = {j: Motor(bus, j) for j in ARM_JOINTS}
-        await asyncio.gather(*[m.enable() for m in motors.values()])
+        raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
+        await asyncio.gather(*[m.enable() for m in raw_motors.values()])
+        # Motor encoders are zeroed at end stops; the sweep ranges, gravity
+        # poses, and park targets below are joint frame (0 = rest), so wrap
+        # the motors in the frame conversion before any position I/O.
+        motors = await joint_frame_motors(raw_motors, is_left)
+        # Everything (test joint included) starts in POSITION_VELOCITY so the
+        # whole arm can be homed to the rest pose first — every run then
+        # starts from a known pose instead of wherever the operator (or a
+        # previous run) left the base-collision joints. The test joint
+        # switches to IMPEDANCE only after homing and the clearance move,
+        # because the MyActuator mode switch is a ~2 s reset that silently
+        # drops commands sent during it.
         await asyncio.gather(
             *[
-                motors[j].set_control_mode(
-                    ControlMode.IMPEDANCE
-                    if j == joint
-                    else ControlMode.POSITION_VELOCITY
-                )
-                for j in motors
+                m.set_control_mode(ControlMode.POSITION_VELOCITY)
+                for m in motors.values()
             ]
         )
 
         try:
-            # wrist_2: elbow at midpoint of its range so wrist_2 can sweep
-            # its full ±range without the forearm hitting the robot base.
-            other_targets: dict[Joint, float] = {}
-            if joint == Joint.WRIST_2:
-                elbow_lo, elbow_hi = arm_limits(Joint.ELBOW, is_left)
-                other_targets[Joint.ELBOW] = (elbow_lo + elbow_hi) / 2.0
-                print(
-                    f"  Moving elbow to {other_targets[Joint.ELBOW]:.3f} rad (midpoint of range) for wrist_2 clearance."
-                )
-            print("  Ramping other joints to start position ...")
-            await _ramp_others(motors, joint, other_targets)
-            await asyncio.sleep(1.0)
+            print("  Homing all joints to rest (distal to proximal) ...")
+            await _home_all(motors)
 
-            # shoulder_2 swings into the robot base on the inboard side; cap
-            # the sweep at 0 so it stays on the safe half of its range.
-            lo_default = hi_default = None
-            if joint == Joint.SHOULDER_2:
-                if is_left:
-                    hi_default = 0.0
-                else:
-                    lo_default = 0.0
-                print("  Capping shoulder_2 sweep at 0 rad to avoid the base.")
+            # Shared sweep-safety geometry (see sweep_safety): base-collision
+            # caps, camera clearance, and gravity-load poses. Staged ramps:
+            # proximal joints settle before the wrists rotate to their holds.
+            other_targets, lo_default, hi_default, notes = sweep_safety(joint, is_left)
+            for note in notes:
+                print(f"  {note}")
+            for stage in ramp_stages(other_targets):
+                await _ramp_verified(motors, stage)
+
+            await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
+            await asyncio.sleep(1.0)
 
             avg_samples, halfdiff_samples = await _identify_joint(
                 motors[joint],
@@ -529,9 +628,13 @@ async def _run(args: argparse.Namespace) -> None:
                 kp,
                 kd,
                 is_left,
-                args.velocities,
-                lo_override=args.lo if args.lo is not None else lo_default,
-                hi_override=args.hi if args.hi is not None else hi_default,
+                velocities_rad,
+                lo_override=math.radians(args.lo)
+                if args.lo is not None
+                else lo_default,
+                hi_override=math.radians(args.hi)
+                if args.hi is not None
+                else hi_default,
                 dump_csv=dump_csv,
             )
 
@@ -559,24 +662,62 @@ async def _run(args: argparse.Namespace) -> None:
                 print(f"    Fv = {Fv_out:.4f} Nm·s/rad  (viscous)")
 
             if friction_result is not None or Fo_result is not None:
-                print(f"\n  Add to config.py JointConfig.{joint.value}.friction:")
-                print(
-                    f"    FrictionParams(fc={Fc_out:.4f}, k={k_out:.2f}, "
-                    f"fv={Fv_out:.4f}, fo={Fo_out:.4f}),"
-                )
+                if args.save and friction_result is None:
+                    # Saving here would write Fc=k=Fv=0 into the calibration
+                    # file and override this robot's real friction values on
+                    # every later AxolConfig load.
+                    print(
+                        "\n  ! Friction fit failed — not saving (only Fo was "
+                        "estimated; zeros for Fc/k/Fv would override real "
+                        "calibration values)."
+                    )
+                elif args.save:
+                    path = update_joint_calibration(
+                        side_str,
+                        joint.value,
+                        friction={
+                            "fc": round(Fc_out, 4),
+                            "k": round(k_out, 2),
+                            "fv": round(Fv_out, 4),
+                            "fo": round(Fo_out, 4),
+                        },
+                    )
+                    print(f"\n  Saved to {path}")
+                    print(
+                        "  (loaded automatically by AxolConfig — every "
+                        "operation on this machine now uses these values)"
+                    )
+                else:
+                    print(
+                        f"\n  Fitted for {side_str} {joint.value} "
+                        "(re-run with --save to persist to this robot's calibration):"
+                    )
+                    print(
+                        f"    FrictionParams(fc={Fc_out:.4f}, k={k_out:.2f}, "
+                        f"fv={Fv_out:.4f}, fo={Fo_out:.4f}),"
+                    )
 
             print(f"{'─' * 50}")
 
         except KeyboardInterrupt:
             print("\n  Interrupted.")
         finally:
-            print("  Returning to 0 and disabling ...")
+            print("  Returning to rest and disabling ...")
+            # The test joint gets an impedance ramp only if it actually made
+            # it into IMPEDANCE mode (a homing failure aborts before the
+            # switch, and a Damiao in POSITION_VELOCITY ignores impedance
+            # frames); otherwise _home_all covers it like any other joint.
+            in_impedance = motors[joint].motor.mode == ControlMode.IMPEDANCE
+            if in_impedance:
+                try:
+                    await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
+                except Exception:
+                    pass
             try:
-                await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
-            except Exception:
-                pass
-            try:
-                await _ramp_others(motors, joint)
+                # Home the rest in the safe distal-to-proximal order,
+                # including the base-collision joints the old flow used to
+                # leave in place.
+                await _home_all(motors, exclude=joint if in_impedance else None)
             except Exception:
                 pass
             await asyncio.gather(

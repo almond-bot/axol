@@ -33,6 +33,7 @@ import multiprocessing
 import multiprocessing.connection
 import os
 import threading
+import time
 
 _logger = logging.getLogger(__name__)
 
@@ -85,21 +86,122 @@ def _open_sdk_camera(name: str, spec: dict) -> object | None:
     return None
 
 
-def _gsth264_meta(socket_path: str, width: int, height: int, fps: int) -> dict:
+def _set_dataset_branches_enabled(owned: list[object], enabled: bool) -> None:
+    """Gate every dataset branch as one fail-closed camera transaction.
+
+    Opening uses one future ``perf_counter`` instant for every physical camera.
+    Each gst camera installs all of its valve probes before any caller waits, so
+    the first admitted exposure is selected by sensor PTS instead of by a series
+    of host-side property writes which can straddle multiple 60 Hz frames.
+    """
+    if enabled:
+        from .gst_zed import _DATASET_ENABLE_LEAD_S, _DATASET_GATE_TIMEOUT_S
+
+        target = time.perf_counter() + _DATASET_ENABLE_LEAD_S
+        armed: list[object] = []
+        legacy: list[object] = []
+        errors: list[str] = []
+        for cam in owned:
+            if hasattr(cam, "begin_raw_enable") and hasattr(cam, "finish_raw_enable"):
+                try:
+                    cam.begin_raw_enable(target)
+                    armed.append(cam)
+                except Exception as exc:  # noqa: BLE001 - fail all branches below
+                    errors.append(f"{cam}: {exc}")
+            elif hasattr(cam, "set_raw_enabled"):
+                legacy.append(cam)
+
+        if not errors and armed and time.perf_counter() >= target:
+            errors.append(
+                "missed the shared dataset exposure boundary while arming cameras"
+            )
+
+        # A begin failure means the common barrier was not installed everywhere;
+        # do not admit frames on the cameras which did arm successfully.
+        if not errors:
+            for cam in legacy:
+                try:
+                    cam.set_raw_enabled(True)
+                except Exception as exc:  # noqa: BLE001 - fail all branches below
+                    errors.append(f"{cam}: {exc}")
+
+        if not errors:
+            deadline = target + _DATASET_GATE_TIMEOUT_S
+            for cam in armed:
+                try:
+                    cam.finish_raw_enable(deadline)
+                except Exception as exc:  # noqa: BLE001 - collect every failure
+                    errors.append(f"{cam}: {exc}")
+
+        if errors:
+            # Some peers may already have crossed the timestamp boundary. Abort
+            # all cameras, including completed ones whose local pending list is
+            # now empty, so the relay never acknowledges a partially open set.
+            close_errors: list[str] = []
+            for cam in owned:
+                try:
+                    if hasattr(cam, "abort_raw_enable"):
+                        cam.abort_raw_enable()
+                    elif hasattr(cam, "set_raw_enabled"):
+                        cam.set_raw_enabled(False)
+                except Exception as exc:  # noqa: BLE001 - report original too
+                    close_errors.append(f"{cam}: fail-close failed: {exc}")
+            raise RuntimeError("; ".join([*errors, *close_errors]))
+        return
+
+    # Keep the two-phase camera API even though all-intra closes are immediate:
+    # legacy/raw cameras can still need an arm followed by a bounded finish.
+    armed = []
+    errors = []
+    for cam in owned:
+        if hasattr(cam, "begin_raw_disable") and hasattr(cam, "finish_raw_disable"):
+            try:
+                cam.begin_raw_disable()
+                armed.append(cam)
+            except Exception as exc:  # noqa: BLE001 - finish other cameras
+                errors.append(f"{cam}: {exc}")
+        elif hasattr(cam, "set_raw_enabled"):
+            try:
+                cam.set_raw_enabled(False)
+            except Exception as exc:  # noqa: BLE001 - finish other cameras
+                errors.append(f"{cam}: {exc}")
+    # Matches gst_zed's gate bound for any legacy/raw finish transaction.
+    deadline = time.perf_counter() + 2.0
+    for cam in armed:
+        try:
+            cam.finish_raw_disable(deadline)
+        except Exception as exc:  # noqa: BLE001 - collect every failure
+            errors.append(f"{cam}: {exc}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
+def _gsth264_meta(
+    socket_path: str,
+    width: int,
+    height: int,
+    dataset_fps: int,
+    capture_fps: int,
+    pts_perf_offset_s: float,
+) -> dict:
     """Describe the encoded-H.264 shared-memory transport for one dataset source.
 
-    The relay encodes the dataset stream on the GPU and writes AU-aligned H.264
-    to ``socket_path`` via ``shmsink``; the recorder attaches an
-    :class:`~almond_axol.video.shm_frames.EncodedAuReader` and muxes it. Shared
-    memory carries no caps, but H.264 dimensions come from the SPS, so only the
-    dims (to size the dataset observation feature) and fps need to cross.
+    The relay encodes the dataset stream on the GPU and writes GDP-wrapped,
+    AU-aligned H.264 to ``socket_path`` via ``shmsink``; the recorder attaches an
+    :class:`~almond_axol.video.shm_frames.EncodedAuReader` and muxes it. GDP
+    preserves each GStreamer buffer's nanosecond PTS. ``pts_perf_offset_s`` is
+    the sender pipeline's fixed running-time-to-``perf_counter`` mapping, letting
+    the recorder convert that PTS to the same system-wide clock as joint/action
+    snapshots: ``capture_perf = pts / 1e9 + pts_perf_offset_s``.
     """
     return {
         "transport": "gstshm-h264",
         "socket_path": socket_path,
         "width": width,
         "height": height,
-        "fps": fps,
+        "fps": dataset_fps,
+        "capture_fps": capture_fps,
+        "pts_perf_offset_s": pts_perf_offset_s,
     }
 
 
@@ -168,10 +270,11 @@ def _open_gst_camera_raw(
     Like :func:`_open_gst_camera`, but additionally exports each source's raw
     frames to the recorder process for the dataset. Two transports:
 
-    * **gstshm** (``socket_dir`` set — gst's ``shm`` plugin is available): the raw
-      branch ends in a native ``shmsink`` (pure C), so the relay does **zero**
-      Python per raw frame and its interpreter stays free for the WebRTC send.
-      The recorder reads via ``shmsrc`` (:class:`GstShmFrameReader`).
+    * **gstshm** (``socket_dir`` set — gst's ``shm`` + GDP plugins are available):
+      the dataset branch GPU-encodes H.264, wraps it with ``gdppay``, and ends in
+      a native ``shmsink`` (pure C), so the relay does **zero** Python per frame
+      and its interpreter stays free for the WebRTC send. The recorder reads via
+      ``shmsrc ! gdpdepay`` (:class:`EncodedAuReader`); GDP retains exposure PTS.
     * **pyshm** (fallback): a Python pull loop copies each frame into a
       :class:`RawFrameWriter` shared-memory block (the older path; runs the copy
       in the relay's interpreter).
@@ -186,7 +289,7 @@ def _open_gst_camera_raw(
     path always had; the encoded headset branch is unaffected.
 
     Returns ``(owned_camera, {track: source}, [writers], {source: meta})`` — where
-    ``meta`` is the per-source dict from :func:`_gstshm_meta` / :func:`_pyshm_meta`
+    ``meta`` is the per-source dict from :func:`_gsth264_meta` / :func:`_pyshm_meta`
     — or ``None`` when the gst stack/camera is unavailable (the caller then falls
     back to the in-process camera pipeline).
     """
@@ -202,9 +305,9 @@ def _open_gst_camera_raw(
     serial = int(spec["serial"])
     resolution = spec.get("resolution") or "HD1200"
     stereo = bool(spec.get("stereo"))
-    if stereo and not zed_stereo_gst_available():
+    if stereo and not zed_stereo_gst_available(require_sensor_timestamps=True):
         return None
-    if not stereo and not zed_gst_available():
+    if not stereo and not zed_gst_available(require_sensor_timestamps=True):
         return None
     if resolution not in _RESOLUTION_DIMS:
         return None
@@ -222,6 +325,7 @@ def _open_gst_camera_raw(
             raw_w, raw_h = dw, dh
     raw_dims = (raw_w, raw_h)
     use_shm = socket_dir is not None and spec.get("raw_transport") != "pyshm"
+    dataset_fps = int(spec.get("dataset_fps", spec.get("fps", 60)))
     # A camera can opt out of either branch: stream-only (no raw / dataset) or
     # record-only (no encoded / headset). This path is only entered when the
     # camera records (see _relay_main), so the raw branch is always built; the
@@ -256,6 +360,7 @@ def _open_gst_camera_raw(
                     resolution,
                     fps,
                     raw_dims=raw_dims,
+                    dataset_fps=dataset_fps,
                     encoded_eyes=enc_sides,
                     raw_eyes=raw_sides,
                     encoded_sbs=sbs,
@@ -268,8 +373,16 @@ def _open_gst_camera_raw(
                 }
                 if sbs:
                     sources[f"{name}_sbs"] = cam.sbs_view
+                pts_perf_offset_s = cam.pts_perf_offset_s
                 raw_meta = {
-                    src: _gsth264_meta(socks[side], raw_w, raw_h, fps)
+                    src: _gsth264_meta(
+                        socks[side],
+                        raw_w,
+                        raw_h,
+                        dataset_fps,
+                        fps,
+                        pts_perf_offset_s,
+                    )
                     for side, src in raw_plan
                 }
                 return cam, sources, [], raw_meta
@@ -323,9 +436,19 @@ def _open_gst_camera_raw(
                     want_encoded=wants_stream,
                     raw_socket_path=sock,
                     raw_dims=raw_dims,
+                    dataset_fps=dataset_fps,
                 )
                 cam.connect()
-                meta = {name: _gsth264_meta(sock, raw_w, raw_h, fps)}
+                meta = {
+                    name: _gsth264_meta(
+                        sock,
+                        raw_w,
+                        raw_h,
+                        dataset_fps,
+                        fps,
+                        cam.pts_perf_offset_s,
+                    )
+                }
                 return cam, ({name: cam} if wants_stream else {}), [], meta
             writer = RawFrameWriter.create(raw_w, raw_h, cond)
             writers = [writer]
@@ -471,21 +594,27 @@ def _relay_main(
     # Keep the camera objects alive for the relay's lifetime; ``sources`` maps
     # the per-track names the headset sees to a video source per camera/eye.
     # Prefer the GPU-resident gst pipeline; fall back to the SDK grab — a bare
-    # ZedCamera/eye, which WebRTCManager adapts to a frame-driven NVENC source.
+    # ZedCamera/eye, which WebRTCManager samples on its fixed-rate NVENC track.
     owned: list[object] = []
     sources: dict[str, object] = {}
     writers: list[object] = []
     raw_meta: dict[str, dict] = {}
-    # Prefer the gst-native shmsink transport for raw frames: it exports each
-    # frame to the recorder in C, so the relay does zero Python per raw frame and
-    # the WebRTC send keeps the GIL it needs (the recording-feed fix). Falls back
-    # to the in-relay Python copy (RawFrameWriter) when gst's shm plugin is
-    # absent. A per-relay-PID dir holds one socket per source; removed on exit.
+    # Prefer the gst-native GDP/shmsink transport for dataset video: it encodes
+    # and exports every timestamped AU in C, so the relay does zero Python per
+    # dataset frame and the WebRTC send keeps the GIL it needs. Falls back to the
+    # in-relay Python raw-frame copy (RawFrameWriter) when any required gst
+    # element is absent. A per-relay-PID dir holds one socket per source.
     socket_dir: str | None = None
     if want_raw:
         from .gst_zed import _element_available
 
-        if _element_available("shmsink") and _element_available("shmsrc"):
+        # GDP is what preserves caps and sensor-exposure PTS across shm. All four
+        # elements are required as one transport; silently falling back to bare
+        # shm would recreate the receive-time synchronization regression.
+        if all(
+            _element_available(element)
+            for element in ("shmsink", "shmsrc", "gdppay", "gdpdepay")
+        ):
             import tempfile
 
             socket_dir = tempfile.mkdtemp(prefix="axol-raw-")
@@ -571,6 +700,10 @@ def _relay_main(
                 worst = 0.0
                 last = now
 
+    def _set_raw_enabled(enabled: bool) -> None:
+        """Gate every dataset branch at a coordinated exposure boundary."""
+        _set_dataset_branches_enabled(owned, bool(enabled))
+
     async def serve() -> None:
         loop = asyncio.get_running_loop()
         # The WebRTC send-health logger (packets sent / lost / RTT) and event-loop
@@ -611,21 +744,39 @@ def _relay_main(
                     await manager.close_all()
                 elif kind == "raw_enable":
                     _, enabled = msg
-                    for cam in owned:
-                        if hasattr(cam, "set_raw_enabled"):
-                            cam.set_raw_enabled(enabled)
+                    try:
+                        # Dataset gates can wait for a shared exposure boundary.
+                        # Keep that wait off aiortc's event loop so RTP, RTCP,
+                        # and signaling continue uninterrupted.
+                        await loop.run_in_executor(
+                            None, _set_raw_enabled, bool(enabled)
+                        )
+                    except Exception as exc:  # noqa: BLE001 - report to parent
+                        _logger.error("video relay: dataset gate failed: %s", exc)
+                        conn.send(("raw_enable_err", bool(enabled), str(exc)))
+                    else:
+                        conn.send(("raw_enable_ok", bool(enabled)))
             except Exception as exc:  # noqa: BLE001 - keep serving
                 _logger.error("video relay: error handling %s: %s", kind, exc)
         if manager is not None:
             await manager.close_all()
 
-    # Split the relay across its two cores: all Python threads (this WebRTC-send
-    # main thread + the encoded-AU pull loops) onto one, GStreamer's C threads
-    # (camera/NVENC and the recording raw-branch shm copy) onto the other, so the
-    # recording workload can't preempt the send. Done here — after the cameras'
-    # gst pipelines are PLAYING (all their threads exist) and right before the
-    # event loop runs on this thread.
+    # Keep all Python threads (this WebRTC-send main thread + encoded-AU pull
+    # loops) on one relay core, and spread GStreamer's much wider C thread pool
+    # over the other relay/background throughput cores. Done here — after the
+    # camera pipelines are PLAYING (their workers exist) and before this event
+    # loop starts.
     affinity.isolate_relay_cpu()
+    # The capture chain (source streaming thread, SDK workers, and the
+    # consumers of the two-buffer queues that still hold camera surfaces) must
+    # run every 60 Hz period or the exposure is lost; a CFS slot behind the
+    # encode pool is not guaranteed once recording starts, so it gets a
+    # real-time class of its own — confined to the camera cores, never the
+    # CPU that delivers the CAN adapters' replies (see
+    # prioritize_capture_threads / realtime_camera_cores).
+    from .gst_zed import exposure_critical_thread_comms
+
+    affinity.prioritize_capture_threads(exposure_critical_thread_comms())
 
     try:
         asyncio.run(serve())
@@ -703,11 +854,13 @@ class VideoRelayProcess:
 
         Args:
             cameras: Per-source spec: ``{name: {"serial": int,
-                "resolution": str, "fps": int, "stereo": bool}}``.
-            want_raw: Also publish each camera's raw RGB frames to shared memory
-                for the control process (data collection). Successfully exported
-                sources appear in :attr:`raw_cameras` as
-                :class:`~almond_axol.video.shm_frames.RawFrameReader` proxies.
+                "resolution": str, "fps": int, "stereo": bool}}``. ``fps``
+                is the physical capture/data rate; headset encoding is fixed
+                independently at 30 fps.
+            want_raw: Also publish each camera's dataset feed to shared memory
+                (encoded GDP/H.264 when available, raw RGB as fallback).
+                Successfully exported sources appear in :attr:`raw_cameras` as
+                lightweight camera proxies.
         """
         ctx = multiprocessing.get_context("spawn")
         self._conn, child_conn = ctx.Pipe()
@@ -737,13 +890,33 @@ class VideoRelayProcess:
         # + caps, or pyshm block name) and dims — exposed (with :attr:`raw_cond`)
         # so the recorder subprocess can attach its own consumer per source.
         self.raw_meta: dict[str, dict] = {}
-        if self._conn.poll(_READY_TIMEOUT_S):
-            msg = self._conn.recv()
-            if isinstance(msg, tuple) and msg[0] == "ready":
-                self.sources = list(msg[1])
-                raw_meta = msg[2] if len(msg) > 2 else {}
-                self.raw_meta = dict(raw_meta)
-                self._attach_raw_readers(raw_meta)
+        try:
+            deadline = time.perf_counter() + _READY_TIMEOUT_S
+            while True:
+                if self._conn.poll(0.1):
+                    try:
+                        msg = self._conn.recv()
+                    except (EOFError, OSError) as exc:
+                        raise RuntimeError("video relay exited during startup") from exc
+                    if not (isinstance(msg, tuple) and msg[0] == "ready"):
+                        raise RuntimeError(
+                            f"video relay sent unexpected ready message: {msg!r}"
+                        )
+                    self.sources = list(msg[1])
+                    raw_meta = msg[2] if len(msg) > 2 else {}
+                    self.raw_meta = dict(raw_meta)
+                    self._attach_raw_readers(raw_meta)
+                    break
+                if not self._proc.is_alive():
+                    raise RuntimeError(
+                        "video relay exited during startup "
+                        f"(exit code {self._proc.exitcode})"
+                    )
+                if time.perf_counter() >= deadline:
+                    raise RuntimeError("video relay did not become ready in time")
+        except BaseException:
+            self.shutdown()
+            raise
         if not self.sources and not self.raw_cameras:
             _logger.warning("video relay started no camera streams or raw sources")
         elif not self.sources:
@@ -817,6 +990,25 @@ class VideoRelayProcess:
             except (OSError, ValueError):
                 pass  # relay already gone
 
+    def _request_raw_enabled(self, enabled: bool) -> None:
+        """Synchronously gate dataset branches and surface alignment errors."""
+        with self._lock:
+            try:
+                self._conn.send(("raw_enable", enabled))
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("video relay is unavailable") from exc
+            if not self._conn.poll(_REQUEST_TIMEOUT_S):
+                raise TimeoutError("video relay did not acknowledge dataset gate")
+            try:
+                msg = self._conn.recv()
+            except (EOFError, OSError) as exc:
+                raise RuntimeError("video relay closed during dataset gate") from exc
+        if msg[:2] == ("raw_enable_ok", enabled):
+            return
+        if len(msg) >= 3 and msg[:2] == ("raw_enable_err", enabled):
+            raise RuntimeError(f"video relay dataset gate failed: {msg[2]}")
+        raise RuntimeError(f"unexpected video relay dataset-gate response: {msg}")
+
     # -- WebRTCManager interface --------------------------------------------
 
     async def create_offer(self, client_id: int) -> tuple[str, dict[str, str]]:
@@ -845,15 +1037,14 @@ class VideoRelayProcess:
     def set_raw_enabled(self, enabled: bool) -> None:
         """Open/close the raw dataset branch in the relay (recording only).
 
-        The raw RGBA branch (VIC convert + shared-memory copy for every camera)
-        is the bulk of the relay's CPU. ``collect-data`` keeps it closed during
-        the pre-record teleop phase — where nothing reads raw frames — so the
-        control loop keeps the spare cores it needs, then opens it while an
-        episode is actually recording. No-op if the relay has no raw sources.
+        The dataset branch (GPU encode + GDP/shared-memory transport, or raw
+        fallback) is unnecessary between episodes. ``collect-data`` keeps it
+        closed during pre-record teleop and opens it for each episode. No-op if
+        the relay has no dataset sources.
         """
         if not self.raw_cameras:
             return
-        self._send(("raw_enable", bool(enabled)))
+        self._request_raw_enabled(bool(enabled))
 
     # -- Lifecycle ------------------------------------------------------------
 

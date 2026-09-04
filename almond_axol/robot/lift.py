@@ -1,5 +1,5 @@
 """
-Telescoping lift on the powered Axol Cart — jelly_legs CAN driver.
+Telescoping lift on Jelly — jelly_legs CAN driver.
 
 The lift legs are driven by our own PCB (firmware: ``jelly_legs`` in the
 circuits-py repo, ``designs/jelly_legs/firmware``), which replaced the
@@ -141,7 +141,7 @@ def _decode_status(data: bytes) -> LiftStatus:
 class Lift:
     """Hold-to-move lift commands over the chest CAN bus.
 
-    Typical usage (from :class:`almond_axol.robot.cart.Cart`)::
+    Typical usage (from :class:`almond_axol.robot.jelly.Jelly`)::
 
         lift = Lift()
         await lift.start()
@@ -234,7 +234,7 @@ class Lift:
     async def start(self) -> None:
         """Open the chest bus and start the jog/status task.
 
-        Brings the interface up if it isn't yet (mirroring the cart's wheel
+        Brings the interface up if it isn't yet (mirroring Jelly's wheel
         bus); a missing interface raises ``RuntimeError`` naming it.
         """
         from ..cli.can.setup import bring_up_interfaces, iface_up
@@ -261,33 +261,33 @@ class Lift:
 
     async def close(self) -> None:
         """Stop the task and the legs, and close the bus."""
-        task_error: Exception | None = None
         if self._task is not None:
-            self._task.cancel()
+            task = self._task
+            self._task = None
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
-            except Exception as exc:  # preserve it, but clean up the bus first
-                task_error = exc
-            self._task = None
-        if self._bus is not None:
-            try:
-                await self._send(_OP_JOG, struct.pack("<h", 0))
-            except Exception:  # noqa: BLE001 - best-effort stop before close
-                pass
-            try:
-                # A diagnostic may have enabled receive-only broadcasts. Leave
-                # the shared CAN bus quiet for the next owner even if stopping
-                # the legs above failed.
-                await self._send(_OP_SET_RATE, struct.pack("<H", 0))
-            except Exception:  # noqa: BLE001 - best-effort bus cleanup
-                pass
-            await self._bus.close()
-            self._bus = None
-        self._direction = STOP
-        if task_error is not None:
-            raise task_error
+            except Exception as exc:  # noqa: BLE001 - still close the bus below
+                _logger.warning("lift: command task stopped with an error: %s", exc)
+        try:
+            if self._bus is not None:
+                try:
+                    await self._send(_OP_JOG, struct.pack("<h", 0))
+                except Exception:  # noqa: BLE001 - best-effort stop before close
+                    pass
+                try:
+                    # A diagnostic may have enabled receive-only broadcasts.
+                    # Leave the shared CAN bus quiet for the next owner even
+                    # if stopping the legs above failed.
+                    await self._send(_OP_SET_RATE, struct.pack("<H", 0))
+                except Exception:  # noqa: BLE001 - best-effort bus cleanup
+                    pass
+                await self._bus.close()
+                self._bus = None
+        finally:
+            self._direction = STOP
 
     async def home(self) -> None:
         """Start the firmware's two-ended homing sequence (takes ~1-2 min).
@@ -337,7 +337,7 @@ class Lift:
         """Latch the commanded direction. +1 = up, 0 = stop, -1 = down.
 
         Safe to call from any thread at any rate (a latch, like
-        ``Cart.set_command``); the driver task consumes the latest value.
+        ``Jelly.set_command``); the driver task consumes the latest value.
         Should the caller die mid-hold, the firmware's 300 ms jog deadman
         stops the legs on its own.
         """

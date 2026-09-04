@@ -50,12 +50,10 @@ def _default_robot_config() -> AxolRobotConfig:
 
     Replay neither records nor streams video — it just plays recorded
     actions back onto the arms — so no camera slots are seeded (an empty
-    ``cameras`` dict opens the arms only). ``telemetry_hz=0`` skips the
-    background poll loop: like ``collect-data``, a ``motion_control`` command
-    is issued every step, whose feedback frames keep the position cache fresh,
-    so the redundant telemetry transactions would only contend on the bus.
+    ``cameras`` dict opens the arms only). The Rust core supplies native-rate
+    feedback while replay targets stream.
     """
-    return AxolRobotConfig(telemetry_hz=0.0)
+    return AxolRobotConfig()
 
 
 @dataclass
@@ -81,7 +79,7 @@ class ReplayDatasetConfig:
     # reproducing the original timing; set a positive value to override it.
     fps: int = 0
     # Smooth playback by linearly interpolating between recorded actions and
-    # commanding the arms at ~120 Hz (the teleop control rate) instead of the
+    # commanding the arms at ~120 Hz (the teleop IK rate) instead of the
     # dataset fps. Episode timing is unchanged; only the command granularity
     # increases. Off by default (each recorded action is sent once, as-is).
     interpolate: bool = False

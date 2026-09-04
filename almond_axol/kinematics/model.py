@@ -39,18 +39,18 @@ _TORSO_LINKS: tuple[str, ...] = ("base", "s1")
 Self-collision on Axol is restricted to ``arm <-> torso`` pairs only.
 """
 
-# Home-pose penetration (m) beyond which a capsule pair is considered
-# overlapping by construction and excluded from self-collision. Pairs within
-# this tolerance merely graze at the (never-teleoped) straight-down home pose
-# due to conservative capsule fits and must keep their protection — see
-# _build_robot_collision.
-_CAPSULE_GRAZE_TOL = 0.003
+# The two shoulder links mount directly onto the torso. Their conservative
+# capsules overlap the base by construction and cannot be used as collision
+# constraints. Distal links must remain protected even when their fitted
+# capsule overlaps at the straight-down home pose: their clearance relative
+# to that known-safe pose still detects an arm folding into the base.
+_SHOULDER_MOUNT_SUFFIXES = ("_s2", "_s3")
 
 # Per-pair collision-cost activation distances are derived from each pair's
-# clearance at the home pose: ``clamp(home_clearance - _MARGIN_REST_BUFFER,
-# _MARGIN_FLOOR, default_margin)``. Pairs that *live* near their activation
-# shell (the wrists and grippers pass within 10-17 mm of the base during
-# ordinary close-over-table work, and the elbow capsules graze at rest) would
+# clearance at the home pose: ``min(home_clearance - _MARGIN_REST_BUFFER,
+# default_margin)``. Pairs that *live* near their activation shell (the
+# wrists and grippers pass within 10-17 mm of the base during ordinary
+# close-over-table work, and the elbow capsules graze at rest) would
 # otherwise keep the cost hinge active across the entire work envelope —
 # replaying recorded deburring sessions showed base<->wrist pairs inside a
 # uniform 25 mm activation for up to 59% of all frames, and every crossing of
@@ -58,7 +58,19 @@ _CAPSULE_GRAZE_TOL = 0.003
 # path-specific jitter. Deriving the margin from the home clearance keeps
 # such pairs silent in their normal envelope while pairs with generous
 # clearance keep the full early-warning distance.
-_MARGIN_FLOOR = 0.008
+#
+# The activation may be *negative*: ``base <-> e2`` (the elbow) reads
+# -1.4 mm at home because pyroki's conservative capsule fits already
+# interpenetrate there while the physical parts hang in free air. pyroki's
+# stock cost cannot activate below zero (its smoothing ramp spans [0,
+# margin]), so this pair used to be clamped to a +8 mm activation — leaving
+# its gradient permanently active at rest and across the whole
+# gripper-in-front-of-torso envelope, where it measurably tripled the
+# solver's per-tick output acceleration and kicked the elbow at every shell
+# crossing. The custom residual in .solver decouples the activation start
+# from the ramp width, so such pairs activate only when the pose actually
+# gets closer than home, while keeping the full linear pushback deeper in.
+_RAMP_WIDTH_MIN = 0.008
 _MARGIN_REST_BUFFER = 0.002
 
 _lock = threading.RLock()
@@ -89,13 +101,11 @@ def shared_robot_collision() -> pk.collision.RobotCollision:
     global _robot_coll
     with _lock:
         if _robot_coll is None:
-            _robot_coll = _build_robot_collision(_load_urdf(), shared_robot())
+            _robot_coll = _build_robot_collision(_load_urdf())
         return _robot_coll
 
 
-def _build_robot_collision(
-    urdf: yourdfpy.URDF, robot: pk.Robot
-) -> pk.collision.RobotCollision:
+def _build_robot_collision(urdf: yourdfpy.URDF) -> pk.collision.RobotCollision:
     """Build ``RobotCollision`` with self-collision restricted to torso<->arm pairs.
 
     Each Axol arm is a serial chain attached to a static torso (``base`` +
@@ -108,17 +118,14 @@ def _build_robot_collision(
     pairs are filtered out (cross-arm contacts are unreachable, within-arm
     is constrained by joint limits, and torso<->torso is rigidly fixed).
 
-    A second pass excludes any remaining pair that penetrates by more than
-    ``_CAPSULE_GRAZE_TOL`` at the home pose — those are over-conservative
-    capsule fits the IK can never separate (e.g. ``base <-> shoulder``
-    capsules that overlap by construction because the arms mount onto the
-    torso, at -12 mm and worse). Pairs that merely *graze* at the home pose
-    are kept: the home pose (arm hanging straight down) is one teleop never
-    occupies, and dropping a grazing pair removes its collision protection
-    everywhere. ``base <-> e2`` (the elbow) grazes at -1.4 mm and is exactly
-    the pair that keeps the elbow off the base — it used to be masked by the
-    operator elbow hint pulling the swivel outward; with elbow tracking
-    disabled it is the only thing standing between the elbow and the base.
+    Only the shoulder-mount links (``s2``/``s3``) are excluded. The old model
+    also discarded every distal pair whose conservative capsule happened to
+    overlap at the safe straight-down home pose. That removed ``base/s1 <->
+    e1`` — the upper-arm pair that physically contacted the base during a
+    cross-body reach — as well as ``base <-> w2``. The custom residual uses a
+    per-pair activation relative to home clearance, so those negative home
+    distances are usable: the cost is off at home and activates only when the
+    arm moves closer to the base than that known-safe reference.
     """
     link_names = [link.name for link in urdf.robot.links]
 
@@ -132,16 +139,11 @@ def _build_robot_collision(
     for i, a in enumerate(link_names):
         for b in link_names[i + 1 :]:
             keep = (is_torso(a) and is_arm(b)) or (is_torso(b) and is_arm(a))
+            arm_link = b if is_torso(a) else a if is_torso(b) else ""
+            if arm_link.endswith(_SHOULDER_MOUNT_SUFFIXES):
+                keep = False
             if not keep:
                 ignore.add((a, b))
-
-    rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
-    q0 = jnp.zeros(robot.joints.num_actuated_joints)
-    d = np.asarray(rc.compute_self_collision_distance(robot, q0))
-    ai = np.asarray(rc.active_idx_i)
-    aj = np.asarray(rc.active_idx_j)
-    for k in np.where(d < -_CAPSULE_GRAZE_TOL)[0]:
-        ignore.add((rc.link_names[ai[k]], rc.link_names[aj[k]]))
 
     rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
     _logger.info(
@@ -151,27 +153,33 @@ def _build_robot_collision(
     return rc
 
 
-def collision_activation_margins(
+def collision_cost_params(
     robot: pk.Robot, rc: pk.collision.RobotCollision, default_margin: float
-) -> np.ndarray:
-    """Per-pair collision-cost activation distances derived from home-pose clearance.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-pair ``(activation_start, ramp_width)`` for the smoothed collision cost.
 
-    ``clamp(home_clearance - _MARGIN_REST_BUFFER, _MARGIN_FLOOR,
-    default_margin)`` for each active pair — see the constants above for the
-    rationale. Cheap (one collision-distance evaluation), so callers compute
-    it per solver instance rather than caching it here: the result depends on
-    the configured ``default_margin``.
+    ``activation_start = min(home_clearance - _MARGIN_REST_BUFFER,
+    default_margin)`` for each active pair — possibly negative for pairs
+    whose conservative capsules already interpenetrate at home (see the
+    constants above). ``ramp_width`` is the distance over which the residual
+    ramps smoothly from zero to its full linear slope: equal to the activation
+    start where that start is generous, floored at ``_RAMP_WIDTH_MIN`` so
+    near-shell pairs keep a protective gradient onset.
+
+    Cheap (one collision-distance evaluation), so callers compute it per
+    solver instance rather than caching it here: the result depends on the
+    configured ``default_margin``.
     """
     q0 = jnp.zeros(robot.joints.num_actuated_joints)
     d = np.asarray(rc.compute_self_collision_distance(robot, q0))
-    floor = min(_MARGIN_FLOOR, default_margin)
-    margins = np.clip(d - _MARGIN_REST_BUFFER, floor, default_margin).astype(np.float32)
+    starts = np.minimum(d - _MARGIN_REST_BUFFER, default_margin).astype(np.float32)
+    widths = np.maximum(starts, _RAMP_WIDTH_MIN).astype(np.float32)
     _logger.info(
-        "Collision activation margins: %d of %d pairs below the default "
-        "%.0f mm (floor %.0f mm).",
-        int((margins < default_margin).sum()),
-        len(margins),
+        "Collision activation: %d of %d pairs below the default %.0f mm "
+        "(%d activate only inside their home-pose clearance).",
+        int((starts < default_margin).sum()),
+        len(starts),
         1e3 * default_margin,
-        1e3 * floor,
+        int((starts <= 0.0).sum()),
     )
-    return margins
+    return starts, widths

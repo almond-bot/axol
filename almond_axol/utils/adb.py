@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import grp
 import logging
-import os
 import pwd
 import shutil
 import subprocess
@@ -24,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .ports import VR_PORT
+from .rtprio import operator_user
 from .sudo import prime_sudo, run_root
 
 _logger = logging.getLogger(__name__)
@@ -74,25 +74,8 @@ def _read_rule() -> str:
 
 
 def _operator_user() -> str | None:
-    """Best-effort operator login to grant headset (``dialout``) access.
-
-    ``axol serve`` runs as root under systemd with no ``SUDO_USER``, so fall
-    back to the owner of the first ``/home/*`` entry — the same heuristic the
-    hosted installer uses to locate the operator's account.
-    """
-    user = os.environ.get("SUDO_USER")
-    if user and user != "root":
-        return user
-    try:
-        homes = sorted(Path("/home").iterdir())
-    except OSError:
-        return None
-    for home in homes:
-        try:
-            return home.owner()
-        except (KeyError, OSError):
-            continue
-    return None
+    """Best-effort operator login to grant headset (``dialout``) access."""
+    return operator_user()
 
 
 def _in_group(user: str, group: str) -> bool:

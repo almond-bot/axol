@@ -43,10 +43,25 @@ _MA_POS_CONTROL = 0xA4  # absolute position closed-loop control
 _MA_VELOCITY_CONTROL = 0xA2  # speed closed-loop control
 _MA_FUNCTION_CONTROL = 0x20  # function control; byte 1 = index, bytes 4-7 = value
 _MA_FC_SET_CANID = 0x05  # function control index: set CAN ID
-_MA_READ_GAINS = 0x30  # read all PID gains (uint8, bulk)
-_MA_WRITE_GAINS_ROM = (
-    0x32  # write all PID gains to ROM (uint8, bulk); persistent by command
-)
+# Loop-gain (PID parameter) access. Protocol V4.2 (2024-05) changed these from
+# a bulk read/write of six uint8 values to an indexed float32 per parameter:
+# request [cmd, index, 0, 0, 0, 0, 0, 0], reply echoes the index in byte 1 with
+# the little-endian float in bytes 4-7. Pre-V4.2 firmware instead replies with
+# the six uint8 gains in bytes 2-7 (byte 1 zero) — the index echo is how the
+# driver tells the two formats apart at runtime.
+_MA_READ_GAINS = 0x30
+_MA_WRITE_GAINS_ROM = 0x32  # persistent by command; 0x31 (RAM) is not used
+
+# Indexed float32 parameter indices for 0x30/0x31/0x32 (V4.2+).
+_MA_PID_IDX = {
+    "current_kp": 0x01,
+    "current_ki": 0x02,
+    "speed_kp": 0x04,
+    "speed_ki": 0x05,
+    "position_kp": 0x07,
+    "position_ki": 0x08,
+    "position_kd": 0x09,
+}
 _MA_SET_ACCELERATION = 0x43  # write acceleration to RAM and ROM; persistent by command
 
 # Configuration-parameter access. These two commands are absent from MyActuator's
@@ -97,17 +112,30 @@ _MA_FW_V44_VERSION = 2026042402
 
 # Unchanged across firmware versions.
 _MA_V_MAX = 45.0  # rad/s
+# kp decodes against 0-500 on ALL firmware. The V4.4 manual claims the MIT
+# kp range is 0-1000, but hardware behavior says otherwise (same story as
+# kd below): step-response torque measured on fleet motors matches
+# kp x error for kp encoded against 0-500 exactly — e.g. a 3° step at
+# kp=180 produced the predicted 6.9 Nm spring torque, where a 0-1000
+# decode would have delivered double. The torque scale itself is
+# independently validated by gravity calibration (t_ff in physical Nm
+# holds the arm to within millidegrees), so the kp fit is not a
+# torque-range artifact.
 _MA_KP_MAX = 500.0
+# kd decodes against 0-5 on ALL firmware. The V4.4 changelog claims the MIT
+# kd range widened to 0-50, but hardware behavior says otherwise: encoding
+# against 0-50 delivers one tenth of the requested damping (verified by the
+# tuning history — every gain tuned under the 0-50 encoding matched the
+# behavior of value/10 on the 0-5 scale).
+_MA_KD_MAX = 5.0
 
 # Legacy firmware (< V4.4).
 _MA_P_MAX_LEGACY = 12.5  # rad
-_MA_KD_MAX_LEGACY = 5.0
 _MA_T_MAX_LEGACY = 24.0  # Nm — fixed range for both t_ff and feedback torque
 
-# V4.4 firmware (>= _MA_FW_V44_VERSION). p_des and kd widened; the t_ff /
+# V4.4 firmware (>= _MA_FW_V44_VERSION). p_des widened; the t_ff /
 # feedback-torque range becomes ±(motor max torque) read from the model.
 _MA_P_MAX_V44 = 12.566  # rad
-_MA_KD_MAX_V44 = 50.0
 
 # Motor max torque (Nm) keyed by model series — the "X<n>" token found in the
 # 0xB5 model string (e.g. "RMD-X8-P20" -> 8). Used as the V4.4 t_ff range and
@@ -163,6 +191,19 @@ def _ma_error_to_status(error_code: int) -> MotorStatus:
     return MotorStatus.UNKNOWN
 
 
+def mit_ranges(version: int | None, model: str | None) -> tuple[float, float]:
+    """``(p_max, t_max)`` the given firmware scales MIT command/feedback against.
+
+    The single source of truth for the firmware-dependent ranges: used by the
+    driver's capability detection and by anything decoding feedback frames
+    without owning the motor (e.g. :class:`~.observer.BusObserver`, whose
+    ranges the serve robot link syncs from the motors' version/model reads).
+    """
+    if version is not None and version >= _MA_FW_V44_VERSION:
+        return _MA_P_MAX_V44, _model_max_torque(model)
+    return _MA_P_MAX_LEGACY, _MA_T_MAX_LEGACY
+
+
 def _model_max_torque(model: str | None) -> float:
     """Return the motor's max torque (Nm) inferred from its 0xB5 model string.
 
@@ -200,14 +241,14 @@ class MyActuatorMotor(MotorDriver):
         self._motor_id = motor_id
         self._kt = kt
         self._pending: dict[tuple[int, int], asyncio.Future[bytes]] = {}
-        self._on_feedback: Callable[[float, float], None] | None = None
+        self._on_feedback: Callable[[float, float, float, float], None] | None = None
 
         # Firmware-dependent MIT-command ranges. Default to the conservative
         # legacy ranges until enable() reads the firmware version and model.
         self._fw_version: int | None = None
         self._model: str | None = None
         self._p_max = _MA_P_MAX_LEGACY
-        self._kd_max = _MA_KD_MAX_LEGACY
+        self._kd_max = _MA_KD_MAX  # same on every firmware, see the constant
         self._t_max = _MA_T_MAX_LEGACY  # range for t_ff and feedback torque
         self._max_torque = _MA_DEFAULT_MAX_TORQUE  # motor's rated max torque (Nm)
 
@@ -223,10 +264,12 @@ class MyActuatorMotor(MotorDriver):
             if self._on_feedback is not None:
                 data = bytes(msg.data)
                 pos_int = (data[1] << 8) | data[2]
+                vel_int = (data[3] << 4) | (data[4] >> 4)
                 torq_int = ((data[4] & 0x0F) << 8) | data[5]
                 position = _uint_to_float(pos_int, -self._p_max, self._p_max, 16)
+                velocity = _uint_to_float(vel_int, -_MA_V_MAX, _MA_V_MAX, 12)
                 torque = _uint_to_float(torq_int, -self._t_max, self._t_max, 12)
-                self._on_feedback(position, torque)
+                self._on_feedback(position, velocity, torque, msg.timestamp)
             return
         key = (msg.arbitration_id, msg.data[0])
         fut = self._pending.pop(key, None)
@@ -357,18 +400,20 @@ class MyActuatorMotor(MotorDriver):
         self._fw_version = version
         self._model = model
         self._max_torque = _model_max_torque(model)
-        if version >= _MA_FW_V44_VERSION:
-            self._p_max = _MA_P_MAX_V44
-            self._kd_max = _MA_KD_MAX_V44
-            self._t_max = self._max_torque
-        else:
-            self._p_max = _MA_P_MAX_LEGACY
-            self._kd_max = _MA_KD_MAX_LEGACY
-            self._t_max = _MA_T_MAX_LEGACY
+        self._p_max, self._t_max = mit_ranges(version, model)
 
     # ------------------------------------------------------------------ #
     # Public API (implements MotorDriver)                                  #
     # ------------------------------------------------------------------ #
+
+    @property
+    def kd_max(self) -> float:
+        # 5 on every firmware. The V4.4 changelog advertises a widened 0-50
+        # kd range, but hardware decodes the 12-bit kd field against 0-5
+        # regardless of version — encoding against 0-50 silently delivered
+        # one tenth of the requested damping (all pre-rescale tuned kd
+        # values were set under that encoding; see config.py).
+        return self._kd_max
 
     async def enable(self) -> None:
         # Detect firmware version + model so the MIT command and feedback decode
@@ -538,27 +583,68 @@ class MyActuatorMotor(MotorDriver):
         await _send(_MA_ACC_VEL_PLAN, acceleration)
         await _send(_MA_DEC_VEL_PLAN, dec)
 
+    async def _read_gain_indexed(self, index: int) -> float | None:
+        """Read one loop gain via the V4.2+ indexed float32 format.
+
+        Returns None if the motor answered in the pre-V4.2 bulk format (no
+        index echo), so the caller can fall back to the legacy parse. All
+        gain reads share one response CAN ID — keep them sequential.
+        """
+        resp = await self._request(bytes([_MA_READ_GAINS, index, 0, 0, 0, 0, 0, 0]))
+        if resp[1] != index:
+            return None
+        return float(struct.unpack_from("<f", resp, 4)[0])
+
     async def get_gains(self) -> MotorGains:
-        resp = await self._request(self._cmd(_MA_READ_GAINS))
-        # Response bytes 2-7: current_kp, current_ki, speed_kp, speed_ki, pos_kp, pos_ki (uint8)
-        return MotorGains(
-            speed_kp=float(resp[4]),
-            speed_ki=float(resp[5]),
-            position_kp=float(resp[6]),
-            position_ki=float(resp[7]),
-            current_kp=float(resp[2]),
-            current_ki=float(resp[3]),
-        )
+        values: dict[str, float] = {}
+        for name, index in _MA_PID_IDX.items():
+            value = await self._read_gain_indexed(index)
+            if value is None:
+                # Pre-V4.2 firmware: one bulk frame carries all six gains.
+                resp = await self._request(self._cmd(_MA_READ_GAINS))
+                return MotorGains(
+                    speed_kp=float(resp[4]),
+                    speed_ki=float(resp[5]),
+                    position_kp=float(resp[6]),
+                    position_ki=float(resp[7]),
+                    current_kp=float(resp[2]),
+                    current_ki=float(resp[3]),
+                )
+            values[name] = value
+        return MotorGains(**values)
 
     async def set_gains(self, gains: MotorGains) -> None:
         # Command 0x32 writes directly to ROM — no separate store step needed.
+        # Probe the read format first so a V4.2+ motor never receives the
+        # legacy bulk frame (and vice versa), which would store garbage gains.
+        probe = await self._read_gain_indexed(_MA_PID_IDX["current_kp"])
+        if probe is not None:
+            writes = {
+                "speed_kp": gains.speed_kp,
+                "speed_ki": gains.speed_ki,
+                "position_kp": gains.position_kp,
+                "position_ki": gains.position_ki,
+            }
+            if gains.position_kd is not None:
+                writes["position_kd"] = gains.position_kd
+            if gains.current_kp is not None:
+                writes["current_kp"] = gains.current_kp
+            if gains.current_ki is not None:
+                writes["current_ki"] = gains.current_ki
+            for name, value in writes.items():
+                data = bytes(
+                    [_MA_WRITE_GAINS_ROM, _MA_PID_IDX[name], 0, 0]
+                ) + struct.pack("<f", float(value))
+                await self._request(data)
+            return
+
         current_kp = int(max(0, min(255, gains.current_kp or 0)))
         current_ki = int(max(0, min(255, gains.current_ki or 0)))
         speed_kp = int(max(0, min(255, gains.speed_kp)))
         speed_ki = int(max(0, min(255, gains.speed_ki)))
         pos_kp = int(max(0, min(255, gains.position_kp)))
         pos_ki = int(max(0, min(255, gains.position_ki)))
-        # SDK byte layout: [cmd, 0, cur_kp, cur_ki, spd_kp, spd_ki, pos_kp, pos_ki]
+        # Legacy SDK byte layout: [cmd, 0, cur_kp, cur_ki, spd_kp, spd_ki, pos_kp, pos_ki]
         data = bytes(
             [
                 _MA_WRITE_GAINS_ROM,

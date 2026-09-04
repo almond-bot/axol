@@ -397,8 +397,8 @@ export function AxolVRClient({
     const l_lock = (leftSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
     const r_lock = (rightSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
 
-    // Thumbstick state for the powered cart (xr-standard mapping: stick axes
-    // at axes[2]/[3], stick click at buttons[3]). Servers without a cart
+    // Thumbstick state for the Jelly (xr-standard mapping: stick axes
+    // at axes[2]/[3], stick click at buttons[3]). Servers without Jelly
     // configured simply ignore these fields.
     const l_stick_x = leftSource?.gamepad?.axes[2] ?? 0
     const l_stick_y = leftSource?.gamepad?.axes[3] ?? 0

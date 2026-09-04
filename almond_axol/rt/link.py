@@ -1,0 +1,353 @@
+"""Process + socket link to the ``axol-rt`` realtime core.
+
+Owns the ``axol-rt serve`` subprocess and the length-prefixed Unix-socket
+protocol (see ``rust/axol-rt/src/serve.rs`` for the wire format and the
+core's safety semantics).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import shutil
+import struct
+import subprocess
+import time
+from collections.abc import Callable
+from pathlib import Path
+
+_logger = logging.getLogger(__name__)
+
+# One telemetry entry per slot: pos (rad), vel (rad/s), tau (Nm), age_us.
+_FEEDBACK_SLOTS = 8
+_FEEDBACK_FMT = struct.Struct("<BB" + "3dI" * _FEEDBACK_SLOTS)
+
+#: One parsed telemetry slot: (position, velocity, torque, receive_ts) —
+#: receive_ts is the frame's CAN receive time reconstructed on this host's
+#: ``time.time()`` clock from the packet's per-slot age.
+FeedbackSlot = tuple[float, float, float, float]
+
+_CONNECT_TIMEOUT_S = 5.0
+# PREP includes the MyActuator reset settle (~2.2 s per bus, run serially).
+_PREP_TIMEOUT_S = 15.0
+_ARM_TIMEOUT_S = 15.0
+
+
+def find_binary() -> str:
+    """Locate ``axol-rt``: env override, this checkout's build, then PATH."""
+    env = os.environ.get("AXOL_RT_BIN")
+    if env:
+        return env
+    repo_build = (
+        Path(__file__).resolve().parents[2]
+        / "rust"
+        / "axol-rt"
+        / "target"
+        / "release"
+        / "axol-rt"
+    )
+    if repo_build.exists():
+        return str(repo_build)
+    on_path = shutil.which("axol-rt")
+    if on_path:
+        return on_path
+    raise FileNotFoundError(
+        "axol-rt binary not found — build it with "
+        "`cargo build --release` in rust/axol-rt, put it on PATH, or set "
+        "AXOL_RT_BIN"
+    )
+
+
+class RtLinkError(RuntimeError):
+    """The realtime core reported a fault or went away."""
+
+
+class RtLink:
+    """One ``axol-rt serve`` subprocess and its socket connection."""
+
+    def __init__(
+        self, binary: str | None = None, trace_prefix: str | None = None
+    ) -> None:
+        self._binary = binary or find_binary()
+        self._trace_prefix = trace_prefix
+        self._socket_path = f"/tmp/axol-rt-{os.getpid()}.sock"
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._states: asyncio.Queue[str] = asyncio.Queue()
+        self._fault: str | None = None
+        self._limp: str | None = None
+        # Called for each telemetry packet: (side, {slot: FeedbackSlot}).
+        self.on_feedback: Callable[[int, dict[int, FeedbackSlot]], None] | None = None
+
+    async def start(self) -> None:
+        """Launch the core and connect. The core is idle until configured."""
+        self._fault = None
+        self._limp = None
+        # stdout/stderr inherit the console: the core logs little, and what
+        # it does log (bring-up, faults) belongs in the teleop output.
+        env = dict(os.environ)
+        # Keep the motor deadlines independent of Python/IK/video scheduling.
+        # On every partitioned host (4+ cores — Jetson and Pi 5 alike)
+        # affinity.core_groups() reserves two CAN cores disjoint from Python
+        # control; the Rust process pins one bus thread to each and enters
+        # SCHED_FIFO on it. The binary carries CAP_SYS_NICE (`axol rt.install`
+        # sets it) so that works from any launcher; without it the core
+        # refuses to arm rather than run the phase-sensitive damping on CFS
+        # timing (see configure_bus_scheduling in serve.rs).
+        from ..utils.affinity import core_groups
+
+        groups = core_groups()
+        if groups is not None:
+            can_cores = sorted(groups["can"])
+            background_cores = sorted(groups["background"])
+            if background_cores:
+                # The Rust trace writers are spawned by the CAN threads. Give
+                # them an explicit throughput-safe destination so trace file
+                # flush/truncate work runs with the dataset recorder instead
+                # of inheriting either a CAN core or this process's realtime
+                # core. Rust validates and applies the mask before opening or
+                # writing the trace.
+                env["AXOL_RT_BACKGROUND_CPUS"] = ",".join(
+                    str(core) for core in background_cores
+                )
+            if len(can_cores) >= 2 and groups["can"].isdisjoint(groups["realtime"]):
+                env["AXOL_RT_CPU_LEFT"] = str(can_cores[0])
+                env["AXOL_RT_CPU_RIGHT"] = str(can_cores[1])
+                env["AXOL_RT_FIFO_PRIORITY"] = "20"
+        if self._trace_prefix is not None:
+            env["AXOL_RT_TRACE"] = f"{self._trace_prefix}_rt"
+            env["AXOL_RT_TRACE_GATED"] = "1"
+        # Own process group: a terminal Ctrl-C (and the serve manager's Stop,
+        # which SIGINTs the whole group) must reach *Python only*. The core
+        # treats SIGINT/SIGTERM as "exit holding", so if it shared our group
+        # the interrupt would kill the motor owner at the very moment the
+        # flow starts its return-to-rest ramp. Python still ends the core
+        # itself in close(); a Python that dies outright drops the socket and
+        # the core exits on the lost client, motors holding.
+        self._proc = subprocess.Popen(
+            [self._binary, "serve", "--socket", self._socket_path],
+            env=env,
+            process_group=0,
+        )
+        deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_S
+        while True:
+            try:
+                self._reader, self._writer = await asyncio.open_unix_connection(
+                    self._socket_path
+                )
+                break
+            except (ConnectionRefusedError, FileNotFoundError):
+                if self._proc.poll() is not None:
+                    raise RtLinkError(
+                        f"axol-rt exited during startup (code {self._proc.returncode})"
+                    ) from None
+                if asyncio.get_running_loop().time() > deadline:
+                    raise RtLinkError("timed out connecting to axol-rt") from None
+                await asyncio.sleep(0.05)
+        self._reader_task = asyncio.create_task(
+            self._read_loop(), name="rt-link-reader"
+        )
+
+    async def _read_loop(self) -> None:
+        assert self._reader is not None
+        try:
+            while True:
+                header = await self._reader.readexactly(4)
+                (size,) = struct.unpack("<I", header)
+                payload = await self._reader.readexactly(size)
+                tag = payload[:1]
+                if tag == b"F":
+                    if self.on_feedback is not None:
+                        side, slots = self._parse_feedback(payload)
+                        self.on_feedback(side, slots)
+                    continue
+                body = payload[1:].decode("utf-8", errors="replace")
+                if tag == b"S":
+                    if body.startswith("limp:"):
+                        # Loss-of-trust fault (timing, silent motor): the
+                        # core is still serving, but every arm joint is at
+                        # kp = 0 with the streamed gravity feedforward, and
+                        # stays that way for the session. Sends remain open —
+                        # RtAxol turns motion_control into gravity comp so
+                        # the t_ff keeps tracking the hand-guided pose.
+                        _logger.warning("axol-rt: %s", body)
+                        if self._limp is None:
+                            self._limp = body
+                    elif body.startswith("fault:"):
+                        # The core has stopped streaming on both buses and
+                        # left the motors on their last command (it never
+                        # disables on a fault). Latch the reason so the next
+                        # target/control action fails too, instead of
+                        # leaving a UI operation apparently alive after its
+                        # motor owner has stopped.
+                        _logger.info("axol-rt: %s", body)
+                        self._fault = body
+                    else:
+                        _logger.info("axol-rt: %s", body)
+                    self._states.put_nowait(body)
+                elif tag == b"L":
+                    _logger.info("axol-rt: %s", body)
+                else:
+                    _logger.warning("axol-rt: unknown message tag %r", tag)
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            _logger.info("axol-rt: connection closed")
+        except asyncio.CancelledError:
+            raise
+
+    @staticmethod
+    def _parse_feedback(payload: bytes) -> tuple[int, dict[int, FeedbackSlot]]:
+        """Decode one `F` telemetry packet (layout: see ``build_feedback``
+        in ``serve.rs`` and its ``feedback_packet_layout`` test).
+
+        Per-slot receive timestamps are reconstructed from the packet's
+        age_us fields against ``time.time()`` now — within socket transit
+        (~0.1 ms) of the frames' true CAN receive times, and mutually
+        consistent across slots, which is all downstream differentiation
+        needs.
+        """
+        vals = _FEEDBACK_FMT.unpack(payload[1:])
+        side, mask = vals[0], vals[1]
+        now = time.time()
+        slots: dict[int, FeedbackSlot] = {}
+        for i in range(_FEEDBACK_SLOTS):
+            if not mask & (1 << i):
+                continue
+            pos, vel, tau, age_us = vals[2 + i * 4 : 6 + i * 4]
+            slots[i] = (pos, vel, tau, now - age_us / 1e6)
+        return side, slots
+
+    @property
+    def fault(self) -> str | None:
+        """The latched ``fault: ...`` state from the core, if any.
+
+        Set once the core reports a fault; the bus threads have stopped
+        streaming and the motors are holding their last command. Teardown
+        consults this to leave them holding rather than disabling.
+        """
+        return self._fault
+
+    @property
+    def limp(self) -> str | None:
+        """The latched ``limp: ...`` state from the core, if any.
+
+        Set once the core has dropped every arm joint to kp = 0 with gravity
+        feedforward after a loss-of-trust fault. The link stays open — the
+        core still wants gravity-comp targets — but the session is over as
+        far as motion is concerned; teardown leaves the motors limp rather
+        than disabling.
+        """
+        return self._limp
+
+    def _send(self, payload: bytes, *, allow_faulted: bool = False) -> None:
+        if self._fault is not None and not allow_faulted:
+            raise RtLinkError(f"axol-rt: {self._fault}")
+        if self._writer is None or self._writer.is_closing():
+            raise RtLinkError("axol-rt link is not connected")
+        self._writer.write(struct.pack("<I", len(payload)) + payload)
+
+    async def _await_state(
+        self, expected: str, timeout: float, *, tolerate_fault: bool = False
+    ) -> None:
+        """Wait for a state message; a ``fault:`` state raises unless
+        ``tolerate_fault`` (teardown after a fault still wants the ack)."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise RtLinkError(f"timed out waiting for {expected!r} from axol-rt")
+            try:
+                state = await asyncio.wait_for(self._states.get(), remaining)
+            except asyncio.TimeoutError:
+                raise RtLinkError(
+                    f"timed out waiting for {expected!r} from axol-rt"
+                ) from None
+            if state == expected:
+                return
+            if state.startswith("fault:") and not tolerate_fault:
+                raise RtLinkError(f"axol-rt: {state}")
+            # Unrelated state (e.g. a stats line routed as state) — keep waiting.
+
+    async def configure(self, config_text: str) -> None:
+        self._send(b"C" + config_text.encode())
+        await self._await_state("config-ok", 5.0)
+
+    async def prep(self) -> None:
+        self._send(b"P")
+        await self._await_state("prepped", _PREP_TIMEOUT_S)
+
+    async def arm(self) -> None:
+        self._send(b"A")
+        await self._await_state("armed", _ARM_TIMEOUT_S)
+
+    async def disarm(self) -> None:
+        # Always deliverable, fault or not. On a healthy session `D` is the
+        # deliberate stop and the core disables the motors. After a fault the
+        # core's bus threads have already stopped *without* disabling, and
+        # while limp they are serving gravity comp; in both cases `D` only
+        # stops the threads and acks so teardown proceeds in order — torque
+        # stays as it is.
+        self._send(b"D", allow_faulted=True)
+        await self._await_state("disarmed", 5.0, tolerate_fault=True)
+
+    def send_target(
+        self,
+        side: int,
+        seq: int,
+        cmds: list[tuple[float, ...]],
+    ) -> None:
+        """Ship one arm's 8 slot tuples (p_des, mode, kp, kd, gravity t_ff,
+        kd_host, damp_w0, damp_q, j_eff; the gripper slot repurposes the
+        first three as target/speed/torque). mode ≥ 0.5 runs the core's
+        tracker + friction/inertia terms, 0 is passthrough (gravity comp).
+        Sync — safe to call from the event loop; the write is buffered."""
+        payload = struct.pack("<cBI", b"T", side, seq & 0xFFFFFFFF) + b"".join(
+            struct.pack("<9d", *cmd) for cmd in cmds
+        )
+        self._send(payload)
+
+    def set_recording_engaged(self, engaged: bool) -> None:
+        """Gate the automatic Rust trace to the current teleop segment."""
+        if self._trace_prefix is None:
+            return
+        if engaged:
+            self._send(struct.pack("<cBd", b"R", 1, time.monotonic()))
+        else:
+            self._send(struct.pack("<cB", b"R", 0))
+
+    async def close(self) -> None:
+        """Tear down the link and the core process."""
+        if self._reader_task is not None:
+            reader_task = self._reader_task
+            self._reader_task = None
+            reader_task.cancel()
+            try:
+                await reader_task
+            except asyncio.CancelledError:
+                pass
+            except BaseException:  # noqa: BLE001 - process teardown is mandatory
+                _logger.exception("axol-rt: reader failed during link teardown")
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception:  # noqa: BLE001 - still terminate the core
+                _logger.exception("axol-rt: writer failed during link teardown")
+            self._writer = None
+        if self._proc is not None:
+            if self._proc.poll() is None:
+                # SIGTERM → the core stops streaming and exits. It does not
+                # disable on a signal; a disarm (`D`) must already have run
+                # if torque-off was wanted.
+                self._proc.terminate()
+                try:
+                    await asyncio.to_thread(self._proc.wait, 5.0)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    await asyncio.to_thread(self._proc.wait)
+            self._proc = None
+        try:
+            os.unlink(self._socket_path)
+        except OSError:
+            pass

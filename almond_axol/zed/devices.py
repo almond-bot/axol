@@ -91,6 +91,16 @@ def _enumerate_worker(conn: "multiprocessing.connection.Connection") -> None:
     the parent can re-raise the same exception class — notably ``ImportError``
     for a missing pyzed, which the UI surfaces specially.
     """
+    # A spawned child inherits the host's affinity, and the serve process spans
+    # every core. Importing the SDK (CUDA init included) is a multi-hundred-ms
+    # CPU burst; keep it off the control, IK and CAN cores so an enumeration
+    # that does coincide with a live loop only costs throughput work.
+    try:
+        from ..utils import affinity
+
+        affinity.pin_background()
+    except Exception:  # noqa: BLE001 - best-effort; enumeration must still run
+        pass
     try:
         devices = list_zed_devices_inproc()
         conn.send(("ok", devices))

@@ -15,6 +15,8 @@ Episode boundaries work like `collect-data`: press the **record** button to star
 
 This command is configured via draccus. The policy side mirrors [`run-policy`](/cli/run-policy) (`--policy_path` / `--policy_type` / `--device`, but inference is in-process and synchronous), and the recording side mirrors [`collect-data`](/cli/collect-data) (the nested `robot_config` / `teleop_config` configs — cameras, per-joint gains, IK, VR server). Nest into them with dots or pass a whole-config file. See [Command configuration](/cli/configuration).
 
+Policy observations use the same exposure-time synchronization as `run-policy`: the median camera exposure selects the nearest 240 Hz robot-state sample. The inferred action is published to the recorder with that exposure timestamp, so DAgger policy rows do not pair later joint values with earlier images.
+
 | Flag | Description |
 |---|---|
 | `--policy_path PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID (required) |
@@ -23,12 +25,12 @@ This command is configured via draccus. The policy side mirrors [`run-policy`](/
 | `--repo_id <user>/<dataset>` | Dataset repo ID the episodes are recorded to (required). Point it at an existing dataset to **resume** it — new episodes append with the same resume/repair semantics as [`collect-data`](/cli/collect-data) |
 | `--subtasks '["step one", "step two"]'` | Ordered per-step instructions, as one inline JSON/YAML list. Typing a number `1..N` + Enter (or pushing it from the panel) switches the instruction sent to the policy mid-episode without ending it; the dataset's task string stays `--task`. Default: none |
 | `--episode_time_s INT` | Safety cap per episode in seconds (default: 600); hitting it saves the episode. Generous by default because DAgger episodes include interventions |
-| `--fps INT` | Policy and recording frame rate (default: 60). The policy and frozen states tick at this rate and the dataset is sampled at it, so it **must match** the camera capture rate and the fps the policy was trained on |
+| `--fps INT` | Policy and recording frame rate (default: 60). The policy and frozen states tick at this rate and the dataset is sampled at it, so it must match the policy's training fps. Camera capture may be faster, but cannot be slower. The independent headset stream remains fixed at 30 fps. |
 | `--teleop_hz INT` | Motor command rate while the operator is engaged — the intervention (teleop) state only (default: 120). Decoupled from `--fps` for smoother commanded motion, exactly like [`collect-data`](/cli/collect-data); the teleop smoothing frequency is pinned to this value. The policy and frozen states always tick at `--fps` |
 | `--policy_max_vel FLOAT` | Per-joint velocity ceiling (rad/s) for the envelope over the **policy's** arm actions (default: 6.2832 = 2π). Transparent for normal trained motion; it only engages on discontinuities — a policy outlier or a re-plan from a stale observation — so a bad action can't snap the arms. `0` disables it. Teleop actions are already shaped by the teleop smoothing stack |
 | `--policy_max_accel FLOAT` | Per-joint acceleration ceiling (rad/s²) for that policy-action envelope (default: 21.9911 = 7π) |
 | `--device STR` | PyTorch device for the in-process policy inference (default: `cuda`); use `cpu` for CPU inference |
-| `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution the **dataset** video is recorded at (default: `SVGA` = 960×600) — also the resolution the policy's observations arrive at. Downscaled from the camera capture on the GPU's VIC. Resuming an existing dataset keeps its original resolution regardless of this flag |
+| `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution the **dataset** video is recorded at (default: `SVGA` = 960×600) — also the resolution the policy's observations arrive at. Downscaled from the camera capture on the GPU's VIC; the independent full-resolution headset stream is fixed at 30 fps. Resuming an existing dataset keeps its original resolution regardless of this flag |
 | `--vcodec STR` | Video codec recorded for the dataset (default: per-platform — `h264` on Jetson/aarch64, `auto` elsewhere). Same capped-VBR NVENC encode path as [`collect-data`](/cli/collect-data) |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push_to_hub true` | Push the dataset to HuggingFace Hub when done |

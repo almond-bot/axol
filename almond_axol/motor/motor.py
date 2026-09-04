@@ -120,13 +120,18 @@ class Motor:
         motor_id = can_id if can_id is not None else cfg.motor_id
         self._driver = make_driver(bus, motor_id, kt=cfg.kt)
         self._position: float | None = None
+        self._velocity: float | None = None
         self._torque: float | None = None
+        self._feedback_ts: float | None = None
         self._telemetry_task: asyncio.Task | None = None
-        self._driver.set_feedback_callback(
-            lambda pos, torq: (
-                setattr(self, "_position", pos) or setattr(self, "_torque", torq)
-            )
-        )
+
+        def _cache_feedback(pos: float, vel: float, torq: float, ts: float) -> None:
+            self._position = pos
+            self._velocity = vel
+            self._torque = torq
+            self._feedback_ts = ts
+
+        self._driver.set_feedback_callback(_cache_feedback)
 
     async def enable(self) -> None:
         """Enable the motor and release the brake."""
@@ -308,6 +313,17 @@ class Motor:
             await asyncio.sleep(max(0.0, interval - elapsed))
 
     @property
+    def kd_max(self) -> float:
+        """Upper bound of the firmware's impedance ``kd`` range (Nm·s/rad).
+
+        ``set_impedance`` clamps ``kd`` to this silently: 5 on every motor
+        family and firmware (the MyActuator V4.4 changelog's widened 0-50 kd
+        range does not match hardware behavior — the field decodes against
+        0-5 on all versions).
+        """
+        return self._driver.kd_max
+
+    @property
     def telemetry_active(self) -> bool:
         """True while the background telemetry polling loop is running."""
         return self._telemetry_task is not None
@@ -328,6 +344,37 @@ class Motor:
                 f"No position data for {self.joint} — call start_telemetry() or send a set_impedance() command first"
             )
         return self._position
+
+    @property
+    def velocity(self) -> float:
+        """Latest cached motor-reported velocity (rad/s).
+
+        Populated by set_impedance() responses. This is the firmware's own
+        estimate — heavily filtered on MyActuator, so treat it as telemetry,
+        not a low-latency control signal (it lags too much to damp a ~2 Hz
+        resonance host-side; differentiate `position` against `feedback_ts`
+        for that instead).
+        """
+        if self._velocity is None:
+            raise MotorError(
+                f"No velocity data for {self.joint} — send a set_impedance() command first"
+            )
+        return self._velocity
+
+    @property
+    def feedback_ts(self) -> float:
+        """CAN receive timestamp (s, epoch) of the last cached feedback frame.
+
+        Differentiating cached positions against these timestamps — instead
+        of the wall clock at read time — removes the scheduling jitter
+        between frame arrival and consumption, which otherwise appears as
+        velocity noise proportional to joint speed.
+        """
+        if self._feedback_ts is None:
+            raise MotorError(
+                f"No feedback frame for {self.joint} — send a set_impedance() command first"
+            )
+        return self._feedback_ts
 
     @property
     def torque(self) -> float:
@@ -518,10 +565,8 @@ class Motor:
             p_des: Desired position (rad)
             v_des: Desired velocity (rad/s)
             kp:    Position stiffness [0, 500]
-            kd:    Velocity damping. The motor clamps this to its firmware's
-                   range: [0, 5] on Damiao and legacy MyActuator, [0, 50] on
-                   newer (V4.4+) MyActuator firmware. MyActuator detects this
-                   on enable() and scales the command to match.
+            kd:    Velocity damping, encoded against [0, 5] on every motor
+                   family and firmware; values above 5 are silently lost.
             t_ff:  Feedforward torque (Nm)
         """
         if self.mode != ControlMode.IMPEDANCE:

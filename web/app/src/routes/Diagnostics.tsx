@@ -25,6 +25,8 @@ import {
   type ActionMode,
 } from "@/components/diagnostics/diagnostic-actions"
 import { CanAdapterDialog } from "@/components/diagnostics/can-adapter-dialog"
+import { ControlHealth } from "@/components/diagnostics/control-health"
+import { TuningWorkbench } from "@/components/diagnostics/tuning-workbench"
 import {
   TelemetryChart,
   type ChartSeries,
@@ -71,6 +73,33 @@ const WINDOWS: { label: string; seconds: number }[] = [
   { label: "10m", seconds: 600 },
 ]
 
+/** The live chart's selectable metrics. `slow` charts the 1 Hz sweep buffer
+ * (temperature) instead of the 10 Hz fast frames. */
+const RAD2DEG = 180 / Math.PI
+
+const METRICS: {
+  key: string
+  label: string
+  title: string
+  unit: string
+  metric: number
+  /** Display multiplier — the stream carries radians, humans read degrees. */
+  scale?: number
+  slow?: boolean
+}[] = [
+  { key: "pos", label: "Position", title: "Position", unit: "°", metric: 0, scale: RAD2DEG },
+  { key: "vel", label: "Velocity", title: "Velocity", unit: "°/s", metric: 1, scale: RAD2DEG },
+  { key: "torque", label: "Torque", title: "Torque", unit: "Nm", metric: 2 },
+  {
+    key: "temp",
+    label: "Temp",
+    title: "Temperature",
+    unit: "°C",
+    metric: 0,
+    slow: true,
+  },
+]
+
 const STATE_BADGE: Record<
   RobotState,
   { variant: "success" | "warning" | "destructive" | "neutral"; text: string }
@@ -111,9 +140,10 @@ const HUB: Record<"left" | "right", string> = {
  * filtering and zoom/pan, one-click diagnostics with parameter dialogs, and
  * the recorded history of past runs.
  *
- * Telemetry streams whenever the idle robot link owns the CAN bus. While a
- * diagnostic or operation owns it the stream pauses (single owner) — charts
- * keep their history and show why.
+ * Telemetry streams whenever the robot link is up. Idle, the link polls the
+ * motors itself; while a diagnostic or operation owns command of the bus,
+ * the server decodes the task's own CAN traffic through a passive observer
+ * socket, so the charts stay live throughout.
  */
 export default function Diagnostics() {
   const toast = useToast()
@@ -125,6 +155,7 @@ export default function Diagnostics() {
   const [arm, setArm] = useState<ArmSide>(
     () => (localStorage.getItem("axolDiagArm") as ArmSide) || "left"
   )
+  const [metricKey, setMetricKey] = useState(() => localStorage.getItem("axolDiagMetric") || "pos")
   const [windowSec, setWindowSec] = useState(120)
   const [hiddenJoints, setHiddenJoints] = useState<Set<JointName>>(new Set())
   // Zoom/pan pins the charts to a fixed range; null follows the live edge.
@@ -151,7 +182,7 @@ export default function Diagnostics() {
   const promptTail = useMemo(() => {
     for (let i = activeLines.length - 1; i >= 0; i--) {
       const l = activeLines[i]
-      if (!l.trim() || l.startsWith("[serve]")) continue
+      if (!l.trim() || l.startsWith("[serve]") || l.startsWith("@@live")) continue
       return l.startsWith("[prompt] ") ? l.slice("[prompt] ".length).trim() : null
     }
     return null
@@ -171,7 +202,13 @@ export default function Diagnostics() {
   const activeLine =
     [...activeLines]
       .reverse()
-      .find((l) => l.trim() && !l.startsWith("[serve]") && !l.startsWith("[prompt] ")) ?? null
+      .find(
+        (l) =>
+          l.trim() &&
+          !l.startsWith("[serve]") &&
+          !l.startsWith("[prompt] ") &&
+          !l.startsWith("@@live")
+      ) ?? null
 
   const stream = useTelemetryStream(serverOk)
 
@@ -401,9 +438,13 @@ export default function Diagnostics() {
 
   const linkState = robot?.state ?? stream.state
   const stateBadge = STATE_BADGE[linkState] ?? STATE_BADGE.disconnected
+  // "busy" no longer silences the chart: the server keeps decoding the
+  // running task's own CAN traffic through a passive bus observer, so frames
+  // keep arriving whenever the task is actually commanding the motors. The
+  // note explains both the passive source and any lull between commands.
   const quietReason =
     linkState === "busy"
-      ? "paused — a test or operation owns the bus"
+      ? "a task owns command — live from passive bus tap"
       : linkState !== "connected"
         ? "robot link down"
         : null
@@ -415,6 +456,17 @@ export default function Diagnostics() {
   const diagCommands = useMemo(
     () => commands.filter((c) => c.category === "Diagnostics"),
     [commands]
+  )
+  // The Diagnostics category splits into three dashboard sections. A host
+  // that predates the section field sends none — everything then lands under
+  // Tests, which matches the old single-section layout.
+  const testCommands = useMemo(
+    () => diagCommands.filter((c) => (c.section ?? "test") === "test"),
+    [diagCommands]
+  )
+  const helperCommands = useMemo(
+    () => diagCommands.filter((c) => c.section === "helper"),
+    [diagCommands]
   )
   const canCommand = (id: string) => commands.find((c) => c.id === id) ?? null
 
@@ -583,10 +635,16 @@ export default function Diagnostics() {
     ? (commands.find((c) => c.id === activeRun.command)?.label ?? activeRun.command)
     : null
 
+  const metric = METRICS.find((m) => m.key === metricKey) ?? METRICS[0]
+  const chartFrames = metric.slow ? stream.slowFrames : stream.frames
+
   // Follow mode anchors the window to the newest sample; the page re-renders
   // on every stream tick, so the live edge advances with the data (and holds
   // still while the stream is paused). Zoom/pan pins a fixed range.
-  const lastT = stream.frames.length > 0 ? stream.frames[stream.frames.length - 1].t : windowSec
+  const motorLastT = chartFrames.length > 0 ? chartFrames[chartFrames.length - 1].t : 0
+  const timingLastT =
+    stream.timingFrames.length > 0 ? stream.timingFrames[stream.timingFrames.length - 1].t : 0
+  const lastT = Math.max(motorLastT, timingLastT) || windowSec
   const view: ChartView = pinnedView ?? { t0: lastT - windowSec, t1: lastT }
 
   return (
@@ -728,11 +786,39 @@ export default function Diagnostics() {
           ))}
         </section>
 
+        <ControlHealth
+          frames={stream.timingFrames}
+          version={stream.version}
+          nowT={lastT}
+          view={view}
+          onViewChange={setPinnedView}
+        />
+
         {/* Live charts */}
         <section className="flex flex-col gap-3">
           {/* One filter row scoping every chart below it. */}
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="mr-2 font-heading text-base font-semibold">Live telemetry</h2>
+            <div className="flex overflow-hidden rounded-md border border-white/10">
+              {METRICS.map((m) => (
+                <button
+                  key={m.key}
+                  type="button"
+                  onClick={() => {
+                    setMetricKey(m.key)
+                    localStorage.setItem("axolDiagMetric", m.key)
+                  }}
+                  className={cn(
+                    "px-2.5 py-1 text-xs transition-colors",
+                    metricKey === m.key
+                      ? "bg-[#eff483]/15 text-[#eff483]"
+                      : "text-white/50 hover:bg-white/[0.05]"
+                  )}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
             <div className="flex overflow-hidden rounded-md border border-white/10">
               {WINDOWS.map((w) => (
                 <button
@@ -785,63 +871,72 @@ export default function Diagnostics() {
           <p className="text-xs text-white/30">
             Scroll to zoom, drag to pan — zooming pauses the live follow until you go live again.
           </p>
-          {/* Stacked full-width so each chart gets real reading space; the
-              header button on each takes it truly full screen. */}
-          <div className="grid grid-cols-1 gap-4">
-            <TelemetryChart
-              title="Position"
-              unit="rad"
-              series={series}
-              frames={stream.frames}
-              version={stream.version}
-              metric={0}
-              view={view}
-              onViewChange={setPinnedView}
-              quietReason={quietReason}
-              height={300}
-            />
-            <TelemetryChart
-              title="Velocity"
-              unit="rad/s"
-              series={series}
-              frames={stream.frames}
-              version={stream.version}
-              metric={1}
-              view={view}
-              onViewChange={setPinnedView}
-              quietReason={quietReason}
-              height={300}
-            />
-            <TelemetryChart
-              title="Torque"
-              unit="Nm"
-              series={series}
-              frames={stream.frames}
-              version={stream.version}
-              metric={2}
-              view={view}
-              onViewChange={setPinnedView}
-              quietReason={quietReason}
-              height={300}
-            />
-          </div>
-        </section>
-
-        {/* Diagnostics actions */}
-        <section className="flex flex-col gap-3">
-          <h2 className="font-heading text-base font-semibold">Diagnostics</h2>
-          <DiagnosticActions
-            commands={diagCommands}
-            activeCommand={activeRun?.command ?? null}
-            activeSince={activeRun?.session.startedAt ?? null}
-            busy={launchBusy}
-            disabled={!serverOk || busyElsewhere}
-            hiddenKeys={configHiddenKeys}
-            pickerJoints={joints}
-            onLaunch={launch}
-            onStop={stopActive}
+          {/* One chart, toggled between metrics — the toggle row above picks
+              what it shows. Temperature reads the 1 Hz sweep buffer. */}
+          <TelemetryChart
+            title={metric.title}
+            unit={metric.unit}
+            series={series}
+            frames={chartFrames}
+            version={stream.version}
+            metric={metric.metric}
+            scale={metric.scale}
+            view={view}
+            onViewChange={setPinnedView}
+            quietReason={quietReason}
+            height={380}
+            gapBreakS={metric.slow ? 5 : undefined}
           />
         </section>
+
+        {/* Tests: pass/fail checks (ROM soaks, camera cable). */}
+        {testCommands.length > 0 && (
+          <section className="flex flex-col gap-3">
+            <h2 className="font-heading text-base font-semibold">Tests</h2>
+            <DiagnosticActions
+              commands={testCommands}
+              activeCommand={activeRun?.command ?? null}
+              activeSince={activeRun?.session.startedAt ?? null}
+              busy={launchBusy}
+              disabled={!serverOk || busyElsewhere}
+              hiddenKeys={configHiddenKeys}
+              pickerJoints={joints}
+              onLaunch={launch}
+              onStop={stopActive}
+            />
+          </section>
+        )}
+
+        {/* Helpers: utility moves (lift homing / height). */}
+        {helperCommands.length > 0 && (
+          <section className="flex flex-col gap-3">
+            <h2 className="font-heading text-base font-semibold">Helpers</h2>
+            <DiagnosticActions
+              commands={helperCommands}
+              activeCommand={activeRun?.command ?? null}
+              activeSince={activeRun?.session.startedAt ?? null}
+              busy={launchBusy}
+              disabled={!serverOk || busyElsewhere}
+              hiddenKeys={configHiddenKeys}
+              pickerJoints={joints}
+              onLaunch={launch}
+              onStop={stopActive}
+            />
+          </section>
+        )}
+
+        {/* Tuning workbench: inline sine/step/motion/analysis launches with
+            the resulting graphs, scorecards, and A/B compare in place. */}
+        <TuningWorkbench
+          enabled={serverOk}
+          commands={commands}
+          activeCommand={activeRun?.command ?? null}
+          busy={launchBusy}
+          disabled={busyElsewhere}
+          liveLines={activeLines}
+          onLaunch={launch}
+          onStop={stopActive}
+        />
 
         {/* Run history */}
         <RunHistory runs={runs} loading={runsLoading} onRefresh={refreshRuns} onClear={clearRuns} />

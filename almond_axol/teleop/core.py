@@ -42,6 +42,7 @@ import numpy as np
 from ..robot.control import ContactWatchdog
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
+from .recorder import make as _recorder_make
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 
@@ -96,8 +97,12 @@ class VRTeleopCore:
         self._broadcast = broadcast_tracking
 
         dt = 1.0 / config.frequency
-        self.ema_left = AlphaSmoothFilter(config.ik_alpha)
-        self.ema_right = AlphaSmoothFilter(config.ik_alpha)
+        # ik_alpha is specified as a per-tick blend at the historical 120 Hz
+        # control rate; convert it to this rate's per-tick alpha so the EMA's
+        # *time constant* — the thing that was tuned — is rate-invariant.
+        alpha = 1.0 - (1.0 - config.ik_alpha) ** (120.0 * dt)
+        self.ema_left = AlphaSmoothFilter(alpha)
+        self.ema_right = AlphaSmoothFilter(alpha)
         self.smooth_left = TrapezoidalFilter(
             config.teleop_max_vel, config.teleop_max_accel, dt
         )
@@ -183,6 +188,14 @@ class VRTeleopCore:
         # "no new frame from get_frame()" indistinguishable from an operator
         # holding perfectly still, so staleness must be measured at ingest.
         self._last_frame_time: float | None = None
+
+        # Teleop flight recorder (--teleop.record, see .recorder):
+        # taps the smoothing stages this class owns per control tick — the
+        # segment-rendered raw target, the EMA output, and the final guarded
+        # command (7 left + 7 right arm joints each).
+        self._rec = _recorder_make(
+            self.config.record, "cmd", {"tgt": 14, "ema": 14, "out": 14}
+        )
 
     # ------------------------------------------------------------------
     # Seeding (called once at connect, before the IK loop starts)
@@ -516,6 +529,12 @@ class VRTeleopCore:
         rate the setpoint stair-cases and the velocity feedforward turns each
         jump into a torque spike (jerk).
         """
+        # Flight recorder covers engaged segments only: gate before any early
+        # return so the disengage edge writes the _cmd file even while no
+        # target exists yet or a reset trajectory is playing.
+        if self._rec is not None:
+            self._rec.set_engaged(self.teleop_enabled)
+
         # Post-engage velocity ramp: smoothstep the cap from engage_max_vel to
         # teleop_max_vel across engage_duration. The old behaviour held the
         # low cap for the whole window and then stepped to full speed — error
@@ -584,7 +603,14 @@ class VRTeleopCore:
         out[7] = ema_l[7]
         out[8:15] = smoothed_r_arm
         out[15] = ema_r[7]
-        return self._guard_output(out)
+        out = self._guard_output(out)
+        if self._rec is not None:
+            self._rec.record(
+                tgt=np.concatenate([q[self.left_indices], q[self.right_indices]]),
+                ema=np.concatenate([ema_l[:7], ema_r[:7]]),
+                out=np.concatenate([out[:7], out[8:15]]),
+            )
+        return out
 
     def _guard_output(self, out: np.ndarray) -> np.ndarray:
         """Enforce the per-tick command-step contract on the arm joints.
@@ -866,7 +892,7 @@ class VRTeleopCore:
             on_ik_sample: Called with ``time.perf_counter()`` after each solve,
                 for the adapter's IK-rate readout.
         """
-        ik_interval = 1.0 / self.config.frequency
+        ik_interval = 1.0 / self.config.ik_frequency
         last_frame = None
         recv_timeout_count = 0
         last_dead_warn = 0.0

@@ -3,7 +3,7 @@ axol can.enable
 
 Runs the CAN startup script to bring up the Almond Axol CAN interfaces —
 every configured bus the host has: the arm hub pair (can_alm_axol_l/r), the
-cart wheel bus (can_alm_axol_b), and the chest bus (can_alm_axol_c), each
+Jelly wheel bus (can_alm_axol_b), and the chest bus (can_alm_axol_c), each
 skipped when its adapter isn't attached. Requires can.setup to have been run
 at least once to generate the script.
 
