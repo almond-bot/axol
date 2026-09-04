@@ -159,18 +159,19 @@ class VRTeleopConfig:
         box_align_duration: Seconds over which a box-mode engage blends the
             grippers from their current poses into the parallel
             configuration before the leader controller takes over 1:1.
-        box_elbow_out: Where box mode holds the elbows, in degrees from
-            straight down toward each arm's outboard side. The parallel,
-            fingers-forward gripper poses of box mode leave each arm's elbow
-            swivel free, and from a normal reach the solver's nearest
-            solution folds the elbows inward into the torso as the grippers
-            close on the box; this pins the swivel like a person carrying a
-            box with the elbows out. ``0`` hangs the elbows under the
-            shoulder-wrist line, ``90`` holds them out level. Live-adjustable
-            (headset settings panel / control panel).
+        box_elbow_out: Optional explicit elbow posture for box mode, in
+            degrees from straight down toward each arm's outboard side
+            (``0`` hangs the elbows under the shoulder-wrist line, ``90``
+            holds them out level). The parallel, fingers-forward gripper
+            poses of box mode leave each arm's elbow swivel free; by default
+            it is left alone — rest damping holds it, and the arm/torso
+            collision model (``KinematicsConfig.self_collision``) keeps it
+            off the base — but a nonzero ``box_elbow_weight`` steers it to
+            this angle with an IK elbow hint instead.
         box_elbow_weight: IK weight on that elbow hint (compare
-            ``KinematicsConfig.pos_weight`` 50 for the grippers and
-            ``posture_weight`` 5). ``0`` disables the hint.
+            ``KinematicsConfig.pos_weight`` 50 for the grippers). ``0`` (the
+            default) disables the hint; ``10`` is a sensible value if you want
+            a deliberately flared carry.
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest
@@ -312,7 +313,7 @@ class VRTeleopConfig:
     box_width_max: float = 0.70
     box_align_duration: float = 1.5
     box_elbow_out: float = 30.0
-    box_elbow_weight: float = 10.0
+    box_elbow_weight: float = 0.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi

@@ -75,8 +75,8 @@ See the [`teleop`](/cli/teleop) CLI command for the equivalent command-line entr
 | `box_width_speed` | `0.08` m/s | Rate the other stick's x changes the gripper-to-gripper width |
 | `box_width_min` / `box_width_max` | `0.10` / `0.70` m | Clamp on that width |
 | `box_align_duration` | `1.5` s | Smoothstep blend from the arms' actual poses into the parallel pair when engaging in box mode |
-| `box_elbow_out` | `30` ° | Box mode holds each elbow this far out from straight down, toward the arm's side, by feeding the IK a synthetic elbow hint (the current elbow rotated about the shoulder–wrist line) — keeps the elbows off the torso as the grippers close on the box. `0` hangs the elbows under the arm, `90` holds them level. A [live setting](/api/vr#live-session-settings) (**Elbows out**) |
-| `box_elbow_weight` | `10` | IK weight on that hint (gripper `pos_weight` is 50, `posture_weight` 5); `0` disables it |
+| `box_elbow_out` | `30` ° | Optional explicit elbow posture for box mode: how far out from straight down, toward the arm's side, an IK elbow hint holds each elbow (`0` under the arm, `90` level). Only used with a nonzero `box_elbow_weight`; by default the elbow swivel is left alone and the arm↔torso collision model (`KinematicsConfig.self_collision`) keeps it off the base |
+| `box_elbow_weight` | `0` | IK weight on that hint (gripper `pos_weight` is 50); `0` disables it, `10` gives a deliberately flared carry |
 
 <Note>
   **Engage behaviour.** From rest, both grip buttons together engage both arms. Once engaged, each grip acts **per arm** — a click toggles that arm between tracking and frozen (a frozen arm holds its pose and grasp while the other keeps tracking). Set `hold_to_engage` for a dead-man scheme instead: hold both grips to start, release one to freeze that arm, hold on to keep it going. A rising edge on the reset button triggers a trajectory back to the rest pose (collision-aware when `KinematicsConfig.self_collision` is on; joint-space with limits otherwise). In **box mode** a single grip engages both arms, blending them into the parallel pair first, and the pressed controller leads.

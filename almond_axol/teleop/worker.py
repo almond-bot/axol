@@ -981,20 +981,17 @@ class IKWorker:
         rot = rot.astype(np.float32)
         targets = box_targets(box, center, rot, now)
         elbows = self._box_elbow_hints(q_current, targets)
-        if not box.aligned or elbows is not None:
-            # The posture attractor is pinned at the engage pose. The align
-            # blend may need a large wrist turn away from it, and with a fixed
-            # attractor the pose and posture terms balance well short of the
-            # target (tens of mm at posture_weight 5 vs pos_weight 50) — so
-            # let the attractor follow q while aligning. With the elbow hints
-            # on, keep it following afterwards too: the hints take over the
-            # attractor's job of steering the arms' free swivel, and a pinned
-            # attractor would fight both them and the gripper targets
-            # (measured offline: a weight-10 hint moved the elbows not at all
-            # against the pinned pose, and the whole way with it following).
-            # Without hints it stays pinned where the blend ended, as the
-            # nullspace anchor.
-            self._solver.set_posture_pose(q_current)
+        # The posture attractor follows q for the whole of box mode. Pinned at
+        # the engage pose (normal teleop's behaviour) it balances the pose
+        # cost well short of the target — posture_weight 5 against pos_weight
+        # 50 left the grippers 20-45 mm apart from their slots and the pair
+        # twisted 5-13° in offline replays of a chest-height close, i.e. a
+        # visibly non-parallel grasp; following, the same closes land within
+        # 1 mm / 0.1°. The arms' free elbow swivel then has no attractor, and
+        # doesn't need one: rest damping holds it where it is, the arm/torso
+        # collision model keeps it off the base, and the optional elbow hint
+        # (box_elbow_weight > 0) steers it explicitly.
+        self._solver.set_posture_pose(q_current)
 
         delta_scale = 1.0
         if self._last_solve_t is not None:

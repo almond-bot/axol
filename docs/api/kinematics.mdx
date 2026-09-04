@@ -95,7 +95,7 @@ for q in plan_linear_segment(solver, q_a, q_b, speed=0.25, ang_speed=1.2, rate=2
 |---|---|---|
 | `pos_weight` | `50.0` | End-effector position tracking weight |
 | `ori_weight` | `10.0` | End-effector orientation tracking weight |
-| `elbow_weight` | `0.0` | Elbow hint tracking weight for the headset's elbow. `0` (the default) disables it — the headset's inferred elbow proved unreliable on hardware, so in plain teleop the arm's swivel is left to the posture attractor. When enabled, the hint is projected onto the robot's reachable elbow sphere and fades out above shoulder height (see `elbow_fade_band`). Independent of this, box mode passes its own synthetic "elbows out" hint with a per-call weight (`VRTeleopConfig.box_elbow_out` / `box_elbow_weight`, via `ik(elbow_weight=...)`, no fade) |
+| `elbow_weight` | `0.0` | Elbow hint tracking weight for the headset's elbow. `0` (the default) disables it — the headset's inferred elbow proved unreliable on hardware, so in plain teleop the arm's swivel is left to the posture attractor. When enabled, the hint is projected onto the robot's reachable elbow sphere and fades out above shoulder height (see `elbow_fade_band`). Independent of this, box mode can pass its own synthetic "elbows out" hint with a per-call weight (`VRTeleopConfig.box_elbow_out` / `box_elbow_weight`, off by default, via `ik(elbow_weight=...)`, no fade) |
 | `rest_weight` | `7.5` | Per-step damping; penalises deviation from `q_current` |
 | `posture_weight` | `5.0` | Persistent attractor to home pose (prevents null-space drift) |
 | `manipulability_weight` | `0.05` | Reward for configurations with high manipulability |

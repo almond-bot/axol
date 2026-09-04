@@ -607,7 +607,6 @@ class _FakeCore:
             "position_multiplier": 1.0,
             "teleop_max_vel": 6.283185307179586,
             "box_jog_speed": 0.15,
-            "box_elbow_out": 40.0,
         }
         self.set_calls: list[tuple[str, object]] = []
 
@@ -643,15 +642,6 @@ class LiveToggleTest(unittest.TestCase):
             live.apply("reengage", "toggle")
         with self.assertRaises(ValueError):
             live.apply("box_jog_speed", "toggle")
-
-    def test_elbows_out_is_published_and_range_checked(self) -> None:
-        core = _FakeCore()
-        live = LiveSettings(core, robot=object(), publish=lambda snapshot: None)
-        self.assertEqual(live.snapshot()["values"]["box_elbow_out"], 40.0)
-        live.apply("box_elbow_out", 55)
-        self.assertEqual(core.set_calls[-1], ("box_elbow_out", 55.0))
-        with self.assertRaises(ValueError):
-            live.apply("box_elbow_out", 120)
 
 
 if __name__ == "__main__":
