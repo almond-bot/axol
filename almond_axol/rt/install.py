@@ -334,7 +334,12 @@ def _grant_realtime(binary: Path) -> None:
     A dedicated CPU is not sufficient under Linux's normal scheduler: a
     SCHED_OTHER thread can still be suspended beyond the entire 4.17 ms motor
     period. File-scoped ``CAP_SYS_NICE`` lets ``axol-rt`` raise its own two CAN
-    threads without running the Python/UI/camera process as root.
+    threads without running the Python/UI/camera process as root, and
+    ``CAP_IPC_LOCK`` lets it ``mlockall`` its memory past the unprivileged
+    ``RLIMIT_MEMLOCK`` (8 MiB on most distros — less than its thread stacks)
+    so a page reclaimed under the recorder's I/O pressure can never fault a
+    CAN thread mid-tick. Without the second capability the core still runs,
+    unlocked, and says so.
     """
     if sys.platform != "linux":
         return
@@ -344,7 +349,7 @@ def _grant_realtime(binary: Path) -> None:
     if setcap is None:
         raise RuntimeError("setcap is required to grant axol-rt real-time scheduling")
 
-    cmd = [setcap, "cap_sys_nice=ep", str(binary)]
+    cmd = [setcap, "cap_sys_nice,cap_ipc_lock=ep", str(binary)]
     if os.geteuid() == 0:
         subprocess.run(cmd, check=True)
     elif sys.stdin is not None and sys.stdin.isatty():

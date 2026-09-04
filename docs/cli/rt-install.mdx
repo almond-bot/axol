@@ -9,12 +9,16 @@ Builds and installs the `axol-rt` Rust realtime core, the sole production hardwa
 axol rt.install
 ```
 
-On Linux this also grants the built `axol-rt` binary the narrowly scoped
-`CAP_SYS_NICE` capability used by its two CAN threads. An interactive
+On Linux this also grants the built `axol-rt` binary two narrowly scoped
+capabilities: `CAP_SYS_NICE`, used by its two CAN threads to enter their
+real-time scheduling class, and `CAP_IPC_LOCK`, which lets it lock its memory
+(`mlockall`) past the unprivileged `RLIMIT_MEMLOCK` so a page reclaimed under
+recording I/O pressure can never fault a CAN thread mid-tick. An interactive
 development install prompts for `sudo`; the production system service performs
 the step as root. The control core refuses to arm if its requested real-time
 scheduler cannot be established, so a normal scheduler pause can never occur
-after the motors enable.
+after the motors enable; a failed memory lock is only reported (the core runs
+unlocked, as every session did before it locked at all).
 
 Three concerns, each idempotent and self-gating:
 

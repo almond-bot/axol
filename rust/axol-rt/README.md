@@ -133,6 +133,35 @@ own trajectory and feedback states:
   operator moves them to rest and restarts. This is the classic
   contact-hold gravity comp, entered from the core side; limp is never
   cleared within a session and a disarm while limp leaves the motors limp.
+- **Late ticks degrade first, limp on repeat.** Timing gets the same
+  two-tier treatment as missed replies. A whole-cycle overrun (a tick that
+  wakes a full period or more late), three late ticks (> 0.5 ms) in a
+  row, or 8 of the last 32 late marks that *bus* timing-degraded: host
+  damping off on every joint of the bus until a clean 32-tick window, and
+  the overrun tick's tracker advances one nominal period with its
+  derivative chains re-seeded at rest — the motors held the previous
+  command across the gap, so there is no trajectory to differentiate and
+  no inertia or damping torque to compute from it. Firmware kp/kd and the
+  streamed gravity `t_ff` are untouched: the arm keeps holding. The
+  transition is a `W` warning line carrying the thread's own counters
+  across that wake (`src/stall.rs`: `/proc/thread-self/schedstat`
+  runnable-wait, `getrusage(RUSAGE_THREAD)` page faults and involuntary
+  switches, sampled every tick for ~2 µs) and what they read as —
+  *preempted*, *page fault*, or *kernel stall* — so a field log names the
+  subsystem to look at. A **second** overrun inside the window, or the
+  loop late on 16 of 32 ticks, is timing that stays unhealthy and takes
+  the session limp. (Before this, one overrun went straight to limp; the
+  2026-09-04 field record was a single 20–60 ms stall in an otherwise
+  perfect ~770k-tick session, each time while the dataset writer flushed
+  a save, and it cost a full stop/restart while the arms were holding
+  still.)
+- **Memory is locked.** `serve` calls `mlockall(MCL_CURRENT | MCL_FUTURE)`
+  before accepting its client, so a page reclaimed under the recorder's
+  I/O pressure can never fault a `SCHED_FIFO` bus thread mid-tick; the
+  per-tick reply bookkeeping is preallocated so the loop never grows the
+  heap. A failed lock (no `CAP_IPC_LOCK`, low `RLIMIT_MEMLOCK` on a dev
+  build) is reported on stdout and as a `W` line and the core runs
+  unlocked as it always did.
 - **Hard faults leave the last command in place.** A dead bus (e-stop),
   bring-up failure, protocol error, signal, or lost client stops the
   stream and exits with each motor holding its last MIT command on
@@ -219,17 +248,21 @@ write them, and the regular five-second status line reports any trace drops.
 `scan` and `bench` are strictly read-only — safe against a powered robot
 at rest. `hold` requires `--yes` to actuate. `serve` only actuates after
 the explicit config/prep/arm handshake. Only a deliberate disarm of a
-healthy session disables the motors (a disabled arm falls). A timing or
-silent-motor fault takes the session limp — gravity comp on every joint,
-still serving, so the operator can hand-guide the arms to rest; a dead
-bus, signal, or client loss stops the stream and leaves the arms holding
-their last command. Missed CAN replies degrade rather than fault: host
-damping is never computed from a stale sample, a joint missing 4 of the
-last 32 replies runs on firmware kd (logged, counted in the five-second
-stats line) until a clean window, and only a motor silent for a full second
-takes the session limp — bursty loss is expected while
-cameras and IK compilation contend for the same host and USB fabric during
-startup. `proxy` is the sole
+healthy session disables the motors (a disabled arm falls). Persistently
+unhealthy timing or a silent motor takes the session limp — gravity comp
+on every joint, still serving, so the operator can hand-guide the arms to
+rest; a dead bus, signal, or client loss stops the stream and leaves the
+arms holding their last command. Missed CAN replies and late ticks
+degrade rather than fault: host damping is never computed from a stale
+sample or across a lost tick, a joint missing 4 of the last 32 replies (or
+a bus with a whole-cycle overrun / 8 of 32 late ticks) runs on firmware kd
+(logged with the stall's attribution, counted in the five-second stats
+line) until a clean window, and only a motor silent for a full second, a
+second overrun within 32 ticks, or a loop late on half its ticks takes
+the session limp — bursty loss is expected while cameras and IK
+compilation contend for the same host and USB fabric during startup, and
+an isolated stall while the dataset writer flushes is not a reason to end
+a session whose arms were holding still. `proxy` is the sole
 frame transport for maintenance, tuning, firmware, and arm diagnostics;
 `jelly` owns Jelly's wheel bus, while the proxy carries its lift bus. Both use
 the realtime core's persistent-TX-stall detection and queue purge, aborting

@@ -365,6 +365,16 @@ const PHASE_STYLES: Record<string, { label: string; cls: string; kind: "dot" | "
       cls: "border-orange-400/60 bg-orange-400/15 text-orange-200",
       kind: "pulse",
     },
+    // The realtime core took the session limp on a loss-of-trust fault
+    // (persistently late control ticks, a silent motor): the arms are in
+    // gravity comp for good, nothing here restarts them — the operator
+    // hand-guides them to rest, then stops and starts the operation again.
+    // No episode buttons render in this phase; Stop is the only way out.
+    faulted: {
+      label: "Faulted",
+      cls: "border-red-500/60 bg-red-500/15 text-red-200",
+      kind: "pulse",
+    },
     saving: {
       label: "Saving",
       cls: "border-emerald-400/50 bg-emerald-400/10 text-emerald-200",
