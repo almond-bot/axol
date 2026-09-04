@@ -769,6 +769,9 @@ def _run(
 
         pos_l, pos_r = robot.positions
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
+        # The headset's live settings act on the hardware too (grip force):
+        # hand the teleoperator the arms now that the robot is up.
+        teleop.live_settings.set_robot(robot.axol)
         try:
             activity.start()
         except OSError as exc:

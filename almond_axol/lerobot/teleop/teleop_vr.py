@@ -54,6 +54,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from ...constants import Joint
 from ...robot.jelly import Jelly
 from ...teleop.core import VRTeleopCore
+from ...teleop.live import LiveSettings
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VRFrame, VRState
 from ...vr.server import VRServer
@@ -112,8 +113,16 @@ class AxolVRTeleop(Teleoperator):
         # in the shared core so this flow and native `axol teleop` (VRTeleop)
         # cannot drift apart.
         self._core = VRTeleopCore(
-            config.vr_teleop_config, _logger, self._broadcast_tracking
+            config.vr_teleop_config,
+            _logger,
+            self._broadcast_tracking,
+            lambda key, value: self._live.on_changed(key, value),
         )
+        # Live session settings (box mode, re-engage, reach, speed…) from the
+        # headset HUD / control panel. This teleoperator never holds the robot
+        # (LeRobot owns it), so the robot-side knobs (grip force) stay hidden
+        # here unless the owner hands it over via ``live_settings.set_robot``.
+        self._live = LiveSettings(self._core, None, self._publish_settings)
 
         # Jelly (x-drive base + telescoping lift), operator-only
         # mobility on robots that have one: the thumbsticks reposition the
@@ -201,6 +210,15 @@ class AxolVRTeleop(Teleoperator):
         return self._jelly
 
     @property
+    def live_settings(self) -> LiveSettings:
+        """The session's live settings (see :mod:`almond_axol.teleop.live`).
+
+        The collect-data entry point calls ``live_settings.set_robot(robot)``
+        once it owns the hardware, which exposes the grip-force control.
+        """
+        return self._live
+
+    @property
     def action_features(self) -> dict:
         return {key: float for key in self._left_pos_keys + self._right_pos_keys}
 
@@ -248,6 +266,8 @@ class AxolVRTeleop(Teleoperator):
         # Lock the headset HUD to data collection: the operator can record
         # episodes but can't switch back to plain teleop.
         self._vr_server.set_mode("data_collection")
+        self._vr_server.set_on_setting(self._live.apply)
+        self._live.announce()
         # Park early headset video requests until set_video_manager /
         # set_video_sources lands (they run after the caller's camera setup).
         self._vr_server.set_video_expected(self._video_expected)
@@ -546,6 +566,22 @@ class AxolVRTeleop(Teleoperator):
         except RuntimeError:
             pass  # event loop already shut down
 
+    def _publish_settings(self, snapshot: dict) -> None:
+        """Push the live-settings snapshot to every client and store it for
+        late joiners (see :class:`LiveSettings`)."""
+        if self._vr_server is None:
+            return
+        self._vr_server.set_announce("settings", snapshot)
+        if self._loop is None:
+            return
+        text = json.dumps({"type": "settings", "value": snapshot})
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._vr_server.broadcast_text(text), self._loop
+            )
+        except RuntimeError:
+            pass  # event loop already shut down
+
     def send_feedback_state(self, state: VRState) -> None:
         """Broadcast a state override to all connected VR clients.
 
@@ -668,8 +704,12 @@ class AxolVRTeleop(Teleoperator):
 
         if self._jelly is not None:
             # Shared stick → Jelly mapping (see Jelly.apply_vr_frame). Resets
-            # force a stop so the base doesn't creep during return-to-rest.
-            self._jelly.apply_vr_frame(frame, resetting=self._core.is_resetting)
+            # force a stop so the base doesn't creep during return-to-rest;
+            # in box mode the sticks jog the arm pair instead, so Jelly is
+            # held stopped the same way.
+            self._jelly.apply_vr_frame(
+                frame, resetting=self._core.is_resetting or self._core.box_mode
+            )
 
         # Episode state transitions
         prev = self._prev_state

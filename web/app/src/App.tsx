@@ -14,13 +14,19 @@ import { createXRStore, XR, XRLayer, useXR, useXRSessionFeatureEnabled } from "@
 import * as THREE from "three"
 import {
   AxolConnectionStatus,
+  type AxolJointSample,
   type AxolMode,
+  type AxolSettingDef,
+  type AxolSettings,
   AxolVRClient,
   AxolState,
   type ConfirmAction,
   axolHttpsOrigin,
+  formatSettingValue,
   useAxolControlChannel,
+  useAxolJoints,
   useAxolPoseSocket,
+  useAxolSettings,
   useAxolTracking,
   useAxolVideo,
   useAxolVRClient,
@@ -32,6 +38,7 @@ import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { SiteNav } from "@/components/site-nav"
+import { GhostRobot } from "@/components/vr/ghost-robot"
 import { authorizeCert } from "@/lib/cert-accept"
 import { cn } from "@/lib/utils"
 
@@ -916,15 +923,294 @@ function EpisodeDisplay({ episode }: { episode: number | null }) {
   )
 }
 
-function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode | null }) {
+// One clickable entry of the bottom tools row (see ToolsRow).
+function HudButton({
+  x,
+  y = -0.13,
+  label,
+  active,
+  accent,
+  onClick,
+}: {
+  x: number
+  y?: number
+  label: string
+  active?: boolean
+  /** Attention colour (e.g. the "aligned" cue) when not hovered. */
+  accent?: string
+  onClick: () => void
+}) {
+  const [hovered, setHovered] = useState(false)
+  return (
+    <HudText
+      position={[x, y, -0.5]}
+      fontSize={0.016}
+      fontWeight="bold"
+      color={hovered ? "yellow" : (accent ?? (active ? "#4ade80" : "white"))}
+      anchorX="center"
+      anchorY="bottom"
+      renderOrder={999}
+      material-depthTest={false}
+      {...hudBg}
+      onPointerOver={() => setHovered(true)}
+      onPointerOut={() => setHovered(false)}
+      onClick={onClick}
+    >
+      {label}
+    </HudText>
+  )
+}
+
+// Mirrors the worker's "grippers aligned" flag (from the ~20 Hz joints push)
+// into React state, changing only on edges so the HUD doesn't re-render per
+// frame. False until the server reports the pair geometry.
+function usePairAligned(jointsRef: RefObject<AxolJointSample | null>): boolean {
+  const [aligned, setAligned] = useState(false)
+  useFrame(() => {
+    const next = jointsRef.current?.pair?.aligned ?? false
+    if (next !== aligned) setAligned(next)
+  })
+  return aligned
+}
+
+// Bottom-of-view tools: the two most-used live settings (box mode, re-engage
+// ramp) as one-click toggles, the local ghost overlay toggle, and the entry
+// to the full settings panel. Server-mirrored settings are hidden until the
+// server announces them (an older server has no live settings).
+function ToolsRow({
+  settings,
+  onSet,
+  aligned,
+  ghost,
+  onToggleGhost,
+  onOpenSettings,
+}: {
+  settings: AxolSettings | null
+  onSet: (key: string, value: boolean | number | string) => void
+  aligned: boolean
+  ghost: boolean
+  onToggleGhost: () => void
+  onOpenSettings: () => void
+}) {
+  const boxMode = settings ? settings.values.box_mode === true : null
+  const reengage = settings ? String(settings.values.reengage ?? "") : null
+  return (
+    <>
+      {boxMode !== null && (
+        <HudButton
+          x={-0.16}
+          label={boxMode ? "Box: ON" : aligned ? "Box: OFF (aligned)" : "Box: OFF"}
+          active={boxMode}
+          accent={!boxMode && aligned ? "#38bdf8" : undefined}
+          onClick={() => onSet("box_mode", !boxMode)}
+        />
+      )}
+      {reengage !== null && reengage !== "" && (
+        <HudButton
+          x={-0.02}
+          label={reengage === "ramp" ? "Ramp: ON" : "Ramp: OFF"}
+          active={reengage === "ramp"}
+          onClick={() => onSet("reengage", reengage === "ramp" ? "clutch" : "ramp")}
+        />
+      )}
+      <HudButton
+        x={0.1}
+        label={ghost ? "Ghost: ON" : "Ghost: OFF"}
+        active={ghost}
+        onClick={onToggleGhost}
+      />
+      {settings !== null && <HudButton x={0.19} label="Settings" onClick={onOpenSettings} />}
+    </>
+  )
+}
+
+// Generic live-settings panel, rendered from the server's schema: one row per
+// setting with its label, current value, and [-] / [+] steppers (a boolean
+// toggles and a select cycles on either). Values are the server's — a click
+// sends a `set` and the row updates when the server echoes the change.
+function SettingsPanel({
+  settings,
+  onStep,
+  onDismiss,
+}: {
+  settings: AxolSettings
+  onStep: (def: AxolSettingDef, direction: 1 | -1) => void
+  onDismiss: () => void
+}) {
+  const rows = settings.schema
+  const rowH = 0.02
+  const W = 0.34
+  const H = 0.03 + rows.length * rowH
+  const top = 0.06
+  return (
+    <group position={[0, top, -0.5]}>
+      {/* Dismiss plane behind everything */}
+      <mesh position={[0, 0, -0.002]} renderOrder={996} onClick={onDismiss}>
+        <planeGeometry args={[2, 2]} />
+        <meshBasicMaterial transparent opacity={0} depthTest={false} side={THREE.DoubleSide} />
+      </mesh>
+      <mesh position={[0, -H / 2, -0.001]} renderOrder={998} onClick={(e) => e.stopPropagation()}>
+        <planeGeometry args={[W, H]} />
+        <meshBasicMaterial
+          color="black"
+          transparent
+          opacity={0.97}
+          depthTest={false}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
+      <HudText
+        position={[0, -0.004, 0]}
+        fontSize={0.013}
+        color="white"
+        fontWeight="bold"
+        anchorX="center"
+        anchorY="top"
+        renderOrder={1000}
+        material-depthTest={false}
+      >
+        SESSION SETTINGS
+      </HudText>
+      {rows.map((def, i) => {
+        const y = -0.024 - i * rowH
+        const value = settings.values[def.key]
+        const shown = formatSettingValue(def, value)
+        return (
+          <group key={def.key}>
+            <HudText
+              position={[-W / 2 + 0.012, y, 0]}
+              fontSize={0.012}
+              color="white"
+              anchorX="left"
+              anchorY="top"
+              renderOrder={1000}
+              material-depthTest={false}
+            >
+              {def.label}
+            </HudText>
+            <SettingsStepper x={0.045} y={y} label="-" onClick={() => onStep(def, -1)} />
+            <HudText
+              position={[0.095, y, 0]}
+              fontSize={0.012}
+              fontWeight="bold"
+              color={def.type === "boolean" ? (value ? "#4ade80" : "white") : "#e5e7eb"}
+              anchorX="center"
+              anchorY="top"
+              renderOrder={1000}
+              material-depthTest={false}
+              onClick={() => onStep(def, 1)}
+            >
+              {shown}
+            </HudText>
+            <SettingsStepper x={0.145} y={y} label="+" onClick={() => onStep(def, 1)} />
+          </group>
+        )
+      })}
+    </group>
+  )
+}
+
+function SettingsStepper({
+  x,
+  y,
+  label,
+  onClick,
+}: {
+  x: number
+  y: number
+  label: string
+  onClick: () => void
+}) {
+  const [hovered, setHovered] = useState(false)
+  return (
+    <HudText
+      position={[x, y, 0]}
+      fontSize={0.014}
+      fontWeight="bold"
+      color={hovered ? "yellow" : "#9ca3af"}
+      anchorX="center"
+      anchorY="top"
+      renderOrder={1000}
+      material-depthTest={false}
+      onPointerOver={() => setHovered(true)}
+      onPointerOut={() => setHovered(false)}
+      onClick={onClick}
+    >
+      {`[${label}]`}
+    </HudText>
+  )
+}
+
+// The tools row plus the settings panel it opens; a component of its own so
+// the per-frame "aligned" mirror (useFrame) lives inside the Canvas.
+function HudTools({
+  settings,
+  onSet,
+  jointsRef,
+  ghost,
+  onToggleGhost,
+  settingsOpen,
+  onOpenSettings,
+  onCloseSettings,
+  onStep,
+}: {
+  settings: AxolSettings | null
+  onSet: (key: string, value: boolean | number | string) => void
+  jointsRef: RefObject<AxolJointSample | null>
+  ghost: boolean
+  onToggleGhost: () => void
+  settingsOpen: boolean
+  onOpenSettings: () => void
+  onCloseSettings: () => void
+  onStep: (def: AxolSettingDef, direction: 1 | -1) => void
+}) {
+  const aligned = usePairAligned(jointsRef)
+  return (
+    <>
+      <ToolsRow
+        settings={settings}
+        onSet={onSet}
+        aligned={aligned}
+        ghost={ghost}
+        onToggleGhost={onToggleGhost}
+        onOpenSettings={onOpenSettings}
+      />
+      {settingsOpen && settings && (
+        <SettingsPanel settings={settings} onStep={onStep} onDismiss={onCloseSettings} />
+      )}
+    </>
+  )
+}
+
+function HelpPanel({
+  onDismiss,
+  mode,
+  boxMode,
+}: {
+  onDismiss: () => void
+  mode: AxolMode | null
+  boxMode: boolean
+}) {
   const W = 0.44
-  const H = 0.133
+  const H = 0.175
   const col = 0.11
   // Recording only exists in data collection; teleop drops the [A] hint.
-  const rightRows =
-    mode === "teleop"
-      ? "[Trigger]  Move Screen\n[2× Trigger]  Resize\n[B]  Reset Screens"
-      : "[A]  Start / Stop Rec\n[Trigger]  Move Screen\n[2× Trigger]  Resize\n[B]  Reset Screens"
+  const rightRows = [
+    ...(mode === "teleop" ? [] : ["[A]  Start / Stop Rec"]),
+    "[Trigger]  Move Screen",
+    "[2x Trigger]  Resize",
+    "[B]  Reset Screens",
+    ...(boxMode
+      ? ["[Grip]  Lead Both Arms", "[Lead Stick]  Jog Pair", "[Lead Click+Stick]  Up / Yaw"]
+      : ["[Grip]  Engage / Freeze Arm", "[Both Clicks]  Box Mode"]),
+  ].join("\n")
+  const leftRows = [
+    "[Y]  Exit VR",
+    "[X]  Reset Pose",
+    ...(boxMode
+      ? ["[Grip]  Lead Both Arms", "[Other Stick]  Up / Width", "[Both Clicks]  Box Mode"]
+      : ["[Grip]  Engage / Freeze Arm", "[Ramp]  Arm Comes To Hand", "[Settings]  Live Tuning"]),
+  ].join("\n")
 
   return (
     <group position={[0, -0.038, 0]}>
@@ -986,7 +1272,7 @@ function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode 
         material-depthTest={false}
         lineHeight={1.6}
       >
-        {`[Y]  Exit VR\n[X]  Reset Pose`}
+        {leftRows}
       </HudText>
       {/* Right buttons */}
       <HudText
@@ -1005,7 +1291,7 @@ function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode 
   )
 }
 
-function HelpIcon({ mode }: { mode: AxolMode | null }) {
+function HelpIcon({ mode, boxMode }: { mode: AxolMode | null; boxMode: boolean }) {
   const [open, setOpen] = useState(false)
 
   return (
@@ -1023,7 +1309,7 @@ function HelpIcon({ mode }: { mode: AxolMode | null }) {
       >
         ?
       </HudText>
-      {open && <HelpPanel onDismiss={() => setOpen(false)} mode={mode} />}
+      {open && <HelpPanel onDismiss={() => setOpen(false)} mode={mode} boxMode={boxMode} />}
     </group>
   )
 }
@@ -1184,7 +1470,22 @@ export default function App() {
   // Current 1-based episode number during data collection (null until the
   // server announces one; stays null in plain teleop).
   const [episode, setEpisode] = useState<number | null>(null)
+  // Ghost robot overlay (live joint state), remembered across sessions.
+  const [ghost, setGhost] = useState(() => localStorage.getItem("ghostRobot") === "1")
+  // In-headset live-settings panel.
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
+  const jointsRef = useAxolJoints(wsRef, status === AxolConnectionStatus.Open)
+  // Live session settings (box mode, re-engage, grip force, …) mirrored from
+  // the server: null until it announces them on connect. Every control here
+  // sends a `set` and shows the server's echoed value.
+  const {
+    settings,
+    setSetting,
+    step: stepSetting,
+  } = useAxolSettings(wsRef, status === AxolConnectionStatus.Open)
+  const boxMode = settings?.values.box_mode === true
+  const reengage = settings ? String(settings.values.reengage ?? "") : null
   // Controller poses can ride a wired USB `adb reverse` tunnel (localhost) to
   // avoid WiFi latency; camera video keeps using the LAN host above. The pose
   // socket comes up once the main connection is open and the operator opts in.
@@ -1235,6 +1536,25 @@ export default function App() {
   const handleUsbToggle = (next: boolean) => {
     setUsbPoses(next)
     localStorage.setItem("usbPoses", next ? "1" : "0")
+  }
+
+  const handleGhostToggle = () => {
+    setGhost((v) => {
+      localStorage.setItem("ghostRobot", v ? "0" : "1")
+      return !v
+    })
+  }
+
+  // Controller shortcut (both thumbsticks clicked): toggle box mode. Reads the
+  // latest mirrored value so it flips whatever the server currently has.
+  const settingsRef = useRef<AxolSettings | null>(null)
+  useEffect(() => {
+    settingsRef.current = settings
+  }, [settings])
+  const handleBothStickClick = () => {
+    const cur = settingsRef.current
+    if (!cur || !("box_mode" in cur.values)) return
+    setSetting("box_mode", cur.values.box_mode !== true)
   }
 
   return (
@@ -1345,6 +1665,27 @@ export default function App() {
                   rows={[
                     ["Y", "Exit VR"],
                     ["X", "Reset pose"],
+                    ...(boxMode
+                      ? ([
+                          ["Grip", "Lead both arms"],
+                          ["Stick (other)", "Pair up / down, width"],
+                        ] as [string, string][])
+                      : ([
+                          ["Grip", "Engage / freeze arm"],
+                          ...(reengage
+                            ? ([
+                                [
+                                  "Re-engage",
+                                  reengage === "ramp"
+                                    ? "Ramp: arm comes to hand"
+                                    : "Clutch: match hand to arm",
+                                ],
+                              ] as [string, string][])
+                            : []),
+                        ] as [string, string][])),
+                    ...(settings
+                      ? ([["Both stick clicks", "Toggle box mode"]] as [string, string][])
+                      : []),
                   ]}
                 />
                 <ControlHints
@@ -1356,6 +1697,12 @@ export default function App() {
                     ["Trigger", "Move screen"],
                     ["2× Trigger", "Resize screen"],
                     ["B", "Reset screens"],
+                    ...(boxMode
+                      ? ([
+                          ["Grip", "Lead both arms"],
+                          ["Stick (leader)", "Jog pair; click: up / yaw"],
+                        ] as [string, string][])
+                      : ([["Grip", "Engage / freeze arm"]] as [string, string][])),
                   ]}
                 />
               </div>
@@ -1403,17 +1750,34 @@ export default function App() {
               onPendingConfirm={setPendingConfirm}
               onMode={setVrMode}
               onEpisode={setEpisode}
+              onBothStickClick={handleBothStickClick}
               onExit={() => store.getState().session?.end()}
             />
             <ImmersiveCameraFeed wsRef={wsRef} />
             <XRHud>
               <ExitButton />
-              <HelpIcon mode={vrMode} />
+              <HelpIcon mode={vrMode} boxMode={boxMode} />
               <StateDisplay state={vrState} isRecordingPending={recordingPendingAt !== null} />
               <EpisodeDisplay episode={episode} />
               <CountdownDisplay recordingPendingAt={recordingPendingAt} />
               <ConfirmDisplay action={pendingConfirm} />
+              <HudTools
+                settings={settings}
+                onSet={setSetting}
+                jointsRef={jointsRef}
+                ghost={ghost}
+                onToggleGhost={handleGhostToggle}
+                settingsOpen={settingsOpen}
+                onOpenSettings={() => setSettingsOpen(true)}
+                onCloseSettings={() => setSettingsOpen(false)}
+                onStep={stepSetting}
+              />
             </XRHud>
+            <GhostRobot
+              enabled={ghost}
+              urdfBase={hostname.trim() ? `${axolHttpsOrigin(hostname, VR_WS_PORT)}/urdf` : ""}
+              jointsRef={jointsRef}
+            />
             <PoseVisualizer />
           </XR>
         </Suspense>

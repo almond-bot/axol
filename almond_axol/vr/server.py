@@ -40,8 +40,9 @@ from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from ..constants import URDF_PATH
 from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
 from ..utils.ports import open_listen_socket
 from .config import VRServerConfig
@@ -75,6 +76,7 @@ class VRServer:
         """
         self._port = config.port
         self._on_frame: Callable[[VRFrame], None] | None = None
+        self._on_setting: Callable[[str, Any], None] | None = None
         self._certfile = config.certfile or CERTFILE
         self._keyfile = config.keyfile or KEYFILE
 
@@ -100,6 +102,11 @@ class VRServer:
         # cleared — with a null broadcast — when the publisher disconnects.
         self._hud: dict[str, Any] | None = None
         self._hud_client: int | None = None
+
+        # Extra server-state messages announced to each client on connect
+        # (``{"type": key, "value": value}``), e.g. the live ``settings``; see
+        # :meth:`set_announce`. Live changes are broadcast separately.
+        self._announce: dict[str, Any] = {}
 
         # The headset streams identical frames (same ``seq``) over both the USB
         # tunnel and the network (WebRTC data channel / WebSocket). We process
@@ -209,6 +216,34 @@ class VRServer:
         call before :meth:`enable`.
         """
         self._mode = mode
+
+    def set_announce(self, msg_type: str, value: Any) -> None:
+        """Record a server-state message re-sent to every client on connect.
+
+        ``{"type": msg_type, "value": value}`` is pushed once per client in
+        the WebSocket accept handler (after ``mode``), so a headset joining
+        mid-session adopts the current state — e.g. ``settings`` — instead of
+        its own default. Live changes are pushed separately via
+        :meth:`broadcast_text`. Safe from any thread; ``None`` removes it.
+        """
+        if value is None:
+            self._announce.pop(msg_type, None)
+        else:
+            self._announce[msg_type] = value
+
+    def set_on_setting(self, callback: Callable[[str, Any], None] | None) -> None:
+        """Install the handler for ``{"type": "set", "key": k, "value": v}``.
+
+        Any client — the headset HUD, the control panel — may send one to
+        change a live session setting (box mode, re-engage behaviour, gripper
+        force, …; see :class:`~almond_axol.teleop.live.LiveSettings`). The
+        callback runs on the server's event-loop thread and must be quick and
+        thread-safe toward the control loops; it is expected to publish the
+        resulting state back with :meth:`set_announce` + :meth:`broadcast_text`
+        so every client (including the sender) converges on the server's
+        value. Safe to call after construction.
+        """
+        self._on_setting = callback
 
     def set_episode(self, episode: int | None) -> None:
         """Record the current episode number announced to headsets on connect.
@@ -569,6 +604,21 @@ class VRServer:
             await self._broadcast_hud(exclude=websocket)
             return
 
+        # Live session setting from any client (see set_on_setting). The
+        # handler publishes the resulting state itself; a rejected value is
+        # logged and the clients keep the last announced one.
+        if msg_type == "set":
+            key = obj.get("key")
+            if self._on_setting is None or not isinstance(key, str):
+                return
+            try:
+                self._on_setting(key, obj.get("value"))
+            except Exception as exc:  # noqa: BLE001 - one bad request, not the loop
+                _logger.warning(
+                    "Rejected setting %s=%r: %s", key, obj.get("value"), exc
+                )
+            return
+
         if self._webrtc is None:
             if msg_type == "webrtc-request":
                 if self._video_expected:
@@ -689,6 +739,26 @@ class VRServer:
             """Self-closing page the web UI opens to approve the self-signed cert."""
             return HTMLResponse(ACCEPT_PAGE_HTML)
 
+        @app.get("/urdf/{asset_path:path}", response_model=None)
+        async def _urdf_asset(asset_path: str) -> FileResponse | JSONResponse:
+            """Serve the robot URDF + STL meshes for the headset's ghost overlay.
+
+            Same files ``axol serve`` exposes at ``/api/urdf``, but from this
+            host/port: the headset only knows the teleop server's origin (and
+            has already accepted its certificate), and ``axol serve`` may not
+            be running.
+            """
+            base = URDF_PATH.parent.resolve()
+            target = (base / asset_path).resolve()
+            if not target.is_relative_to(base) or not target.is_file():
+                return JSONResponse({"error": "not found"}, status_code=404)
+            media = "model/stl" if target.suffix == ".stl" else "application/xml"
+            return FileResponse(
+                target,
+                media_type=media,
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
         @app.websocket("/ws")
         async def _ws(websocket: WebSocket) -> None:
             await websocket.accept()
@@ -707,6 +777,11 @@ class VRServer:
                     )
                 except Exception as exc:  # noqa: BLE001 - best-effort announce
                     _logger.warning("failed to send mode to client: %s", exc)
+            for key, value in list(server._announce.items()):
+                try:
+                    await websocket.send_text(json.dumps({"type": key, "value": value}))
+                except Exception as exc:  # noqa: BLE001 - best-effort announce
+                    _logger.warning("failed to send %s to client: %s", key, exc)
             # Likewise seed the current episode number so a headset joining
             # mid-session shows the right value immediately, not on the next
             # episode. Best-effort for the same reason as the mode announce.

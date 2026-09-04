@@ -39,6 +39,7 @@ export function AxolVRClient({
   onPendingConfirm,
   onMode,
   onEpisode,
+  onBothStickClick,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
@@ -61,6 +62,10 @@ export function AxolVRClient({
   // Called with the current 1-based episode number while collecting data (and
   // null if the server ever clears it). Drives the in-headset episode readout.
   onEpisode?: (episode: number | null) => void
+  // Rising edge of both thumbsticks clicked together — the controller
+  // shortcut for toggling box mode (the app sends the `set` message, see
+  // useAxolSettings). Only fires while presenting with both controllers.
+  onBothStickClick?: () => void
   onExit?: () => void
 }) {
   const { gl } = useThree()
@@ -87,6 +92,9 @@ export function AxolVRClient({
   // the "unset" sentinel (distinct from a real episode value or an explicit
   // null the server could send); replaced with the parsed value on each push.
   const serverEpisodeRef = useRef<number | null | -1>(-1)
+  // Both thumbsticks clicked on the previous frame (edge detection for the
+  // box-mode gesture).
+  const prevBothClickRef = useRef(false)
   // Track which WebSocket we have attached onmessage to avoid re-attaching.
   const wsWithHandlerRef = useRef<WebSocket | null>(null)
   // Change key of the last HUD state published to the server (see below).
@@ -114,7 +122,7 @@ export function AxolVRClient({
           try {
             const msg = JSON.parse(event.data as string) as {
               type: string
-              value: string | number | null
+              value: string | number | boolean | null
             }
             if (msg.type === "state") {
               serverStateRef.current = msg.value as AxolState
@@ -397,14 +405,20 @@ export function AxolVRClient({
     const l_lock = (leftSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
     const r_lock = (rightSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
 
-    // Thumbstick state for the Jelly (xr-standard mapping: stick axes
-    // at axes[2]/[3], stick click at buttons[3]). Servers without Jelly
-    // configured simply ignore these fields.
+    // Thumbstick state for the Jelly and the box-mode jog (xr-standard
+    // mapping: stick axes at axes[2]/[3], stick click at buttons[3]). Servers
+    // without Jelly configured simply ignore these fields.
     const l_stick_x = leftSource?.gamepad?.axes[2] ?? 0
     const l_stick_y = leftSource?.gamepad?.axes[3] ?? 0
     const r_stick_x = rightSource?.gamepad?.axes[2] ?? 0
+    const r_stick_y = rightSource?.gamepad?.axes[3] ?? 0
     const l_stick_click = leftSource?.gamepad?.buttons[3]?.pressed ?? false
     const r_stick_click = rightSource?.gamepad?.buttons[3]?.pressed ?? false
+
+    // Both sticks clicked together: box-mode toggle gesture (rising edge).
+    const bothClick = l_stick_click && r_stick_click
+    if (bothClick && !prevBothClickRef.current) onBothStickClick?.()
+    prevBothClickRef.current = bothClick
 
     // Serialise once so both transports carry the identical frame (same seq),
     // letting the server treat them as one stream and de-dupe to whichever
@@ -427,6 +441,7 @@ export function AxolVRClient({
       l_stick_x,
       l_stick_y,
       r_stick_x,
+      r_stick_y,
       l_stick_click,
       r_stick_click,
       seq: ++seqRef.current,

@@ -52,8 +52,67 @@ export type AxolPoseData = {
   l_stick_y?: number
   /** Right thumbstick x, [-1, 1], right = +1 — Jelly rotation. */
   r_stick_x?: number
+  /** Right thumbstick y, [-1, 1], pushed forward = -1 — box-mode jog only. */
+  r_stick_y?: number
   /** Left thumbstick pressed in — lift down while held. */
   l_stick_click?: boolean
-  /** Right thumbstick pressed in — lift up while held. */
+  /**
+   * Right thumbstick pressed in — lift up while held. Both sticks clicked
+   * together toggle box mode (the headset sends the `set` message itself, see
+   * `AxolVRClient.onBothStickClick`).
+   */
   r_stick_click?: boolean
+}
+
+/** Re-engage behaviour (the `reengage` live setting): "clutch" — a re-engaging
+ * arm stays put and the controller's current pose becomes its origin (you match
+ * the arm); "ramp" — the arm eases out to where the controller is under the
+ * mapping from its previous engage (the arm matches you). */
+export type AxolReengage = "clutch" | "ramp"
+
+/**
+ * One live session setting as published by the server (see `AxolSettings`).
+ * The schema is rendered generically by the HUD and the control panel: a
+ * boolean is a toggle, a select cycles/lists its `options`, a number steps
+ * between `min` and `max` by `step`.
+ */
+export type AxolSettingDef = {
+  key: string
+  label: string
+  type: "boolean" | "select" | "number"
+  help: string
+  options: string[]
+  min: number | null
+  max: number | null
+  step: number | null
+  unit: string
+}
+
+/**
+ * The server's live session settings, pushed as
+ * `{"type":"settings","value":AxolSettings}` on connect and after every change
+ * (from any client). Change one with `{"type":"set","key","value"}` — see
+ * `useAxolSettings`. The value set includes at least `box_mode` (boolean) and
+ * `reengage` (`AxolReengage`).
+ */
+export type AxolSettings = {
+  schema: AxolSettingDef[]
+  values: Record<string, boolean | number | string>
+}
+
+/**
+ * Live joint state the teleop server pushes ~20x/s as
+ * `{"type":"joints","value":AxolJointState}` — drives the in-headset ghost
+ * robot. `q` maps URDF joint names (e.g. `left_s1_0`) to radians; grips are
+ * normalised 0 (closed) – 1 (open). `pair` is the gripper-pair geometry from
+ * the IK worker: `aligned` when the grippers already face each other across a
+ * box-mode-sized gap (a good moment to switch to box mode), `width` in metres.
+ * Null until the worker's first report.
+ */
+export type AxolJointState = {
+  q: Record<string, number>
+  l_grip: number
+  r_grip: number
+  engaged: boolean
+  pair: { aligned: boolean; width: number } | null
 }

@@ -3,7 +3,7 @@ title: "almond_axol.kinematics"
 description: "Bimanual inverse kinematics solver using pyroki and JAX/jaxls."
 ---
 
-Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, builds a collision model, and JIT-compiles the solver during `__init__` — the first solver in a process takes a few seconds; subsequent calls (and subsequent solver instances) are fast.
+Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, builds a collision model (only with `self_collision=True`; base collision detection is off by default), and JIT-compiles the solver during `__init__` — the first solver in a process takes a few seconds; subsequent calls (and subsequent solver instances) are fast.
 
 <Note>
   Solver startup is cached at two levels, both automatic:
@@ -100,8 +100,9 @@ for q in plan_linear_segment(solver, q_a, q_b, speed=0.25, ang_speed=1.2, rate=2
 | `posture_weight` | `5.0` | Persistent attractor to home pose (prevents null-space drift) |
 | `manipulability_weight` | `0.05` | Reward for configurations with high manipulability |
 | `limit_weight` | `75.0` | Joint limit penalty weight |
-| `self_collision_margin` | `0.025` m | Minimum clearance between collision bodies. Kept below the arm–torso clearance of normal teleop poses so the collision cost isn't active during ordinary tracking |
-| `self_collision_weight` | `150.0` | Self-collision penalty weight |
+| `self_collision` | `False` | Whether the arm↔torso (`base` / `s1`) collision model is part of the solve at all. Off by default: no capsule model is built, the self-collision cost is left out of the IK graph, the hard upper-arm/base guard on the final step is skipped, and the return-to-rest planner interpolates in joint space with joint limits only (limits are still clamped every step). Set `True` to restore the collision-aware solve the two fields below tune |
+| `self_collision_margin` | `0.025` m | Minimum clearance between collision bodies (with `self_collision` on). Kept below the arm–torso clearance of normal teleop poses so the collision cost isn't active during ordinary tracking |
+| `self_collision_weight` | `150.0` | Self-collision penalty weight (with `self_collision` on) |
 | `max_iterations` | `8` | Solver iterations per `ik()` call |
 | `cost_tolerance` | `1e-4` | Convergence tolerance; small enough that only genuine convergence ends a solve (not a rejected step) |
 | `lambda_initial` | `1e-2` | Initial Levenberg–Marquardt damping for the per-tick solve |

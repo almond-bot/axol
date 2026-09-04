@@ -426,6 +426,41 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="teleop.box_mode",
+                label="Box mode at startup",
+                type="boolean",
+                help=(
+                    "Start sessions in box mode: the grippers face each other "
+                    "like two hands around a box and one grip drives both arms "
+                    "as a rigid pair (the other hand's grip hands over the "
+                    "lead). Thumbsticks jog the pair instead of driving the "
+                    "base. Can also be toggled live from the headset menu."
+                ),
+                targets={
+                    "teleop": ("teleop.box_mode",),
+                    "collect-data": (f"{_VRT}.box_mode",),
+                },
+            ),
+            SettingDef(
+                key="teleop.reengage",
+                label="Re-engage",
+                type="select",
+                options=("clutch", "ramp"),
+                help=(
+                    "What a grip does when an arm re-engages after a pause "
+                    "(a freeze, a walk-away, or the arm being moved by hand). "
+                    "clutch: the arm stays put and the controller's current "
+                    "pose becomes its new origin — you match the arm. ramp: "
+                    "the arm eases out to where your controller is under the "
+                    "mapping from its previous engage — the arm matches you. "
+                    "Can also be toggled live from the headset menu."
+                ),
+                targets={
+                    "teleop": ("teleop.reengage",),
+                    "collect-data": (f"{_VRT}.reengage",),
+                },
+            ),
+            SettingDef(
                 key="teleop.rest_pose_left",
                 label="Left arm rest pose",
                 type="text",

@@ -96,6 +96,7 @@ The headset only shows the feeds for cameras that are actually being streamed (s
 | — | Right thumbstick (x) | **Rotate Jelly** |
 | — | Left thumbstick (click) | **Lower** Jelly's telescoping lift while held |
 | — | Right thumbstick (click) | **Raise** Jelly's telescoping lift while held |
+| — | Both thumbsticks (click together) | Toggle [**box mode**](#box-mode) — the controller shortcut for the HUD's **Box** button |
 
 <Note>
   **Engaging and freezing arms.** Tracking always *starts* with both grips together from rest. Once engaged, the grips act **per arm**: a click freezes only that arm — it holds its pose and keeps its gripper where it is, so it can steady a grasped object while the other arm keeps working — and another click resumes it. A forced disengage (a reset, a [contact stop](/operations/teleop), or a dropped link) drops **both** arms and needs a deliberate both-grips re-engage. Prefer a dead-man feel? Turn on **Hold grips to engage** (the `hold_to_engage` setting, or `--teleop.hold_to_engage`) and each arm tracks only while you hold its grip.
@@ -106,8 +107,62 @@ The headset only shows the feeds for cameras that are actually being streamed (s
 </Note>
 
 <Note>
-  **A dropped link never moves the robot.** If the pose stream stops while tracking is engaged — you doff the headset, open the system menu, quit the app, or the link drops — the arms **auto-disengage** after about half a second and **hold position** wherever they are. When you return, re-engaging (both grips) takes a fresh snapshot, so the arms never jerk toward the controllers on the next entry; press **X** to send them back to the rest pose when you're ready.
+  **A dropped link never moves the robot.** If the pose stream stops while tracking is engaged — you doff the headset, open the system menu, quit the app, or the link drops — the arms **auto-disengage** after about half a second and **hold position** wherever they are. When you return, re-engaging (both grips) never jerks the arms toward the controllers: in the default *clutch* mode it takes a fresh snapshot, and in *ramp* mode it eases them over (see [Re-engaging](#re-engaging)); press **X** to send them back to the rest pose when you're ready.
 </Note>
+
+<a id="re-engaging"></a>
+
+## Re-engaging
+
+Every time a grip re-engages an arm — you froze it, walked away from the robot, or someone moved the arm by hand — your controller is somewhere and the arm is somewhere else, and the server has to reconcile the two. Two behaviours are available, both useful; the **Ramp** button on the HUD tool row (or the **Re-engage** row of the [session settings](#session-settings)) picks one for the session — the server owns it and echoes it back to every client, and the control panel's **Re-engage** setting / `--teleop.reengage` sets the startup default:
+
+| Ramp | Who moves | When to use it |
+|---|---|---|
+| **OFF** — *clutch* (default) | **You match the arm.** The arm stays exactly where it is; your controller's current pose becomes its new origin and only motion from then on counts. | You want the arm to stay put — it's holding something, or you just want to resume from where it is. To keep the same reach and comfort you had before the pause, bring your hand to roughly the arm's pose first: the **Ghost** overlay (below) or the passthrough view of the real arm shows you where that is. |
+| **ON** — *ramp* | **The arm matches you.** The mapping from the arm's previous engage is kept as a session anchor, and on the grip the arm eases out to where that mapping says your controller is now, then tracks 1:1. | After a hand-off or hand-guiding: hold your hands where you want the arms and grip — they come to you. The move is paced by `--teleop.reengage_ramp_speed` (0.15 m/s) with a `--teleop.reengage_ramp_min_s` (0.75 s) floor, and the target is live, so you can keep moving while the arm catches up. |
+
+In either mode the engage-edge frame itself never moves the arm. The ramp anchor is dropped by a reset / return to rest (the first grip afterwards snaps fresh, so the arms never jump out of rest), and box mode ignores the toggle — its engage already blends the pair into the parallel grasp.
+
+**Ghost overlay.** The **Ghost** HUD button overlays a translucent copy of the robot — the real URDF, posed from the joint state the server streams at 20 Hz (green while engaged, grey otherwise) — anchored to the floor in front of you at the robot's shoulder height. Use it to see the arms' true pose through the passthrough while lining up a clutch re-engage; the URDF and meshes are fetched from the VR server itself, so it works wherever the pose link does.
+
+<a id="box-mode"></a>
+
+## Box mode
+
+**Box mode** is for carrying something with both hands: the grippers face each other like two palms on a box and **one controller drives both arms as a rigid pair**. Toggle it with the **Box** button on the HUD tool row, by **clicking both thumbsticks together**, from the control panel's live [session settings](#session-settings), or start sessions in it with the control panel's **Box mode at startup** setting (`--teleop.box_mode`). The server owns the mode and echoes it back to every client, so the HUD toggle always shows the live state; switching modes disengages the arms.
+
+The natural moment to switch is once you've brought the grippers into the grasp with two-handed teleop: the **Box** button reads **Box: OFF (aligned)** (in blue) while the two grippers already face each other across a box-sized gap — the IK worker checks the pair geometry a few times a second — meaning the engage blend will barely move them. Click both sticks, grip once, and lead.
+
+While box mode is on:
+
+| Control | Action |
+|---|---|
+| Either grip | Press once to **engage**. The arms first blend into the parallel pair — same midpoint and width they have now, grippers facing each other — over `box_align_duration` (1.5 s), then the pressed controller **leads**: its motion moves the pair as one body (the usual clutch mapping, so only motion after the press counts). Press the *other* grip to hand over the lead to that controller; press the leading grip again to freeze. **X** returns to rest as usual |
+| Leader's trigger | Closes / opens **both** grippers together |
+| Leader's thumbstick | **Jog** the pair horizontally in its own frame: forward = away from the gripper-to-gripper line, left/right along it. Hold the stick **clicked** to jog **up/down** (y) and **yaw** the pair about its centre (x) instead |
+| Other thumbstick | Jog the pair **up/down** (y) and change the **width** between the grippers (x, push right = wider; clamped to `box_width_min`..`box_width_max`) |
+
+Jogging adds to the leader's motion, so you can hold the pair with one hand and nudge it with a stick. Jelly is inert in box mode — the thumbsticks belong to the arms. Speeds live under `--teleop.box_jog_speed` (m/s), `--teleop.box_jog_yaw_speed` (rad/s) and `--teleop.box_width_speed` (m/s).
+
+**After a hand-off.** When a person has taken the object or moved the arms by hand, the grippers rarely end up in a pair — but a box-mode engage doesn't care where they are: its first step is always the blend into a parallel, facing pair at the arms' current midpoint and width, so just grip again and the leader takes over once they're aligned.
+
+<a id="session-settings"></a>
+
+## Session settings
+
+A few settings are worth changing *during* a session rather than restarting for. They live behind the **Settings** button on the HUD tool row (a panel with `[-]` / `[+]` steppers; a toggle or a choice flips on either) and, identically, in the control panel's **Session settings** card next to the camera feeds — both talk to the same server state, so a change made at the desk shows up in the headset and vice versa. The two most-used ones, **Box** and **Ramp**, also sit directly on the tool row.
+
+| Setting | What it does |
+|---|---|
+| **Box mode** | One controller drives both arms as a parallel pair ([above](#box-mode)). Also: both stick clicks |
+| **Re-engage** | *clutch* / *ramp* — who moves when a grip re-engages ([above](#re-engaging)) |
+| **Hold to engage** | Grips as dead-man switches instead of toggles |
+| **Grip force** (Nm) | How hard a closed gripper squeezes — both hands, effective from the next control tick. Hardware only |
+| **Reach scale** (×) | Hand-motion multiplier: above 1 extends reach past your own, below 1 gives finer control |
+| **Arm speed** (rev/s) | Joint velocity cap while tracking — lower it for a careful, slow-motion pass |
+| **Jog speed** (m/s) | Box-mode thumbstick jog speed |
+
+The startup values come from the command line / the control panel's saved settings; live changes last for the session only. The list is defined once on the server (`almond_axol.teleop.live`) and both UIs render it from the published schema, so the panel and the headset can never disagree about what's adjustable.
 
 <a id="jelly"></a>
 
