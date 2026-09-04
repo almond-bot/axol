@@ -154,6 +154,12 @@ export function AxolVRClient({
             // ignore malformed messages
           }
         }
+        // The server's connect-time `mode` / `episode` announces may have
+        // arrived before this handler existed (this component mounts a render
+        // after the socket opens): ask for them again.
+        if (currentWs.readyState === WebSocket.OPEN) {
+          currentWs.send(JSON.stringify({ type: "get" }))
+        }
       }
     }
 
