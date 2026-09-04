@@ -894,7 +894,16 @@ class AxolArm:
         On the gripperless SKU the gripper calibration and mode switch are
         skipped (there is no gripper motor).
 
+        This is the motor-level half of :meth:`Axol.enable`: it does **not**
+        open the CAN bus. Callers driving arms individually must have
+        awaited :meth:`Axol.connect` (or :meth:`Axol.enable`) first;
+        otherwise the first motor read fails with a ``CanOperationError``
+        saying the bus is unopened or still starting.
+
         Raises:
+            can.CanOperationError: If the arm's CAN bus is not open — never
+                started, still starting, closed, or its ``axol-rt proxy``
+                child exited. The message names which.
             MotorError: If a holding motor is unreachable or in an unexpected
                 control mode (reconnecting targets the impedance workflow —
                 a session that died in another control mode needs
@@ -1796,6 +1805,18 @@ class Axol(RobotBase):
         :meth:`enable` — which is idempotent and never drops joints that are
         already holding. Calling ``connect()`` first is optional:
         :meth:`enable` opens the buses itself.
+
+        Each bus is an ``axol-rt proxy`` child process of *this* Python
+        process — not a system daemon. It is spawned here and reaped by
+        :meth:`disconnect` / :meth:`disable`; ``axol-rt`` absent from ``ps``
+        just means no bus is open. Startup spawns the process and waits for
+        its ready handshake, so it takes a moment: motor I/O issued from
+        another task before this coroutine has returned fails with a
+        "CAN bus ... is still starting" error. Only the ``Axol``-level
+        methods open buses; the per-arm :meth:`AxolArm.enable` /
+        :meth:`AxolArm.disable` assume the bus is already open, so a
+        controller that toggles arms individually must await ``connect()``
+        (idempotent — safe to call again) before its first per-arm call.
         """
         bus_tasks = []
         if self.left is not None:

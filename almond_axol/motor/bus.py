@@ -30,6 +30,16 @@ class CanBus:
     a length-prefixed Unix socket. Production control closes this maintenance
     proxy before the realtime core takes ownership, then reopens it only after
     the core has disarmed.
+
+    The proxy is **not a daemon**: it is a child process of *this* Python
+    process, spawned by :meth:`start` (``Axol.connect()`` / ``Axol.enable()``)
+    and reaped by :meth:`close` (``Axol.disconnect()`` / ``Axol.disable()``).
+    Its lifetime is the bus session, so ``axol-rt`` not appearing in ``ps``
+    means this process has no open bus — not that a service needs starting.
+    Startup spawns the process and waits for its ready handshake, so it is
+    asynchronous and takes a moment; any motor I/O issued before the awaited
+    ``start()`` returns fails with a "still starting" error rather than
+    waiting.
     """
 
     def __init__(self, channel: str) -> None:
@@ -44,6 +54,30 @@ class CanBus:
         self._closed_reason: str | None = None
         self._timing: dict | None = None
         self._experiment_waiter: asyncio.Future[list[dict]] | None = None
+        # Lifecycle, so a send on an unusable bus can say *why* it is
+        # unusable: never started, still starting, closed, or proxy died.
+        self._state = "unopened"
+
+    @property
+    def channel(self) -> str:
+        """SocketCAN interface name this bus proxies."""
+        return self._channel
+
+    @property
+    def is_open(self) -> bool:
+        """True once :meth:`start` has completed and the proxy is still alive."""
+        return self._state == "open" and not self._unavailable()
+
+    def _unavailable(self) -> bool:
+        # The socket connects before the proxy has opened the interface and
+        # sent its ready marker, so a live writer alone does not mean the bus
+        # can carry frames yet — hence the explicit state check.
+        return (
+            self._state != "open"
+            or self._writer is None
+            or self._writer.is_closing()
+            or self._closed_reason is not None
+        )
 
     async def start(self) -> None:
         """Start the Rust transport and wait until it owns the CAN socket."""
@@ -56,7 +90,9 @@ class CanBus:
 
         self._ready.clear()
         self._closed_reason = None
+        self._state = "starting"
         try:
+            binary = find_binary()
             # Own process group: the proxy has no signal handler, so a
             # terminal Ctrl-C or the serve manager's group SIGINT would kill
             # it outright and leave Python's interrupt cleanup (a return-home
@@ -65,7 +101,7 @@ class CanBus:
             # closed socket.
             self._proc = subprocess.Popen(
                 [
-                    find_binary(),
+                    binary,
                     "proxy",
                     "--socket",
                     self._socket_path,
@@ -75,9 +111,16 @@ class CanBus:
                 process_group=0,
             )
         except OSError as exc:
+            self._state = "closed"
             raise can.CanInitializationError(
                 f"could not start axol-rt proxy for {self._channel}: {exc}"
             ) from exc
+        _logger.info(
+            "starting axol-rt proxy for %s (pid %d, %s)",
+            self._channel,
+            self._proc.pid,
+            binary,
+        )
         deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_S
         while True:
             try:
@@ -91,7 +134,8 @@ class CanBus:
                     await self.close()
                     raise can.CanInitializationError(
                         f"axol-rt proxy exited while opening {self._channel} "
-                        f"(code {returncode})"
+                        f"(code {returncode}) — is the interface up? "
+                        f"(`ip link show {self._channel}`, `axol can.setup`)"
                     ) from None
                 if asyncio.get_running_loop().time() >= deadline:
                     await self.close()
@@ -114,15 +158,51 @@ class CanBus:
             reason = self._closed_reason
             await self.close()
             raise can.CanInitializationError(reason)
+        self._state = "open"
+        _logger.info("axol-rt proxy for %s ready", self._channel)
+
+    def _unavailable_reason(self) -> str:
+        """Explain why the bus cannot send right now, by lifecycle state."""
+        if self._closed_reason is not None:
+            return (
+                f"{self._closed_reason}; call Axol.connect() (CanBus.start()) "
+                "to reopen the bus"
+            )
+        if self._state == "unopened":
+            return (
+                f"CAN bus {self._channel} has not been opened: the axol-rt "
+                "proxy is a child process of this Python process started by "
+                "Axol.connect() / Axol.enable() (CanBus.start()), not a "
+                "daemon — await connect() before any motor I/O (per-arm "
+                "AxolArm.enable() does not open the bus itself)"
+            )
+        if self._state == "starting":
+            return (
+                f"CAN bus {self._channel} is still starting: the axol-rt proxy "
+                "has been spawned but has not finished its ready handshake — "
+                "await the in-flight Axol.connect() / CanBus.start() before "
+                "issuing motor I/O (calling connect() again is idempotent and "
+                "waits for it)"
+            )
+        return (
+            f"CAN bus {self._channel} was closed (Axol.disconnect() / "
+            "Axol.disable() / CanBus.close()); call Axol.connect() to reopen it"
+        )
 
     async def close(self) -> None:
         """Close the proxy connection and reap its Rust process."""
+        was_open = self._state not in ("unopened", "closed")
+        # A reason recorded before close() (proxy died under us) is worth
+        # keeping for the next send's error; the reader hitting EOF during
+        # our own teardown is not.
+        died_before_close = self._closed_reason is not None
+        self._state = "closed"
         if self._writer is not None:
             writer = self._writer
             try:
                 if not writer.is_closing():
                     try:
-                        self._send_message(b"Q")
+                        self._write_raw(b"Q")
                         await asyncio.wait_for(writer.drain(), 1.0)
                     except (ConnectionError, RuntimeError, TimeoutError):
                         pass
@@ -177,6 +257,10 @@ class CanBus:
             os.unlink(self._socket_path)
         except OSError:
             pass
+        if not died_before_close:
+            self._closed_reason = None
+        if was_open:
+            _logger.info("axol-rt proxy for %s closed", self._channel)
 
     async def __aenter__(self) -> CanBus:
         await self.start()
@@ -204,10 +288,8 @@ class CanBus:
 
     async def _send(self, arbitration_id: int, data: bytes) -> None:
         """Forward one standard CAN frame to the Rust-owned socket."""
-        if self._writer is None or self._writer.is_closing():
-            raise can.CanOperationError(
-                f"axol-rt proxy for {self._channel} is not connected"
-            )
+        if self._unavailable():
+            raise can.CanOperationError(self._unavailable_reason())
         if not 0 <= arbitration_id <= 0x7FF:
             raise ValueError(
                 f"standard CAN arbitration id out of range: {arbitration_id:#x}"
@@ -272,7 +354,7 @@ class CanBus:
             await self._writer.drain()
             return await waiter
         except asyncio.CancelledError:
-            if self._writer is not None and not self._writer.is_closing():
+            if not self._unavailable():
                 self._send_message(b"K")
                 try:
                     await asyncio.shield(self._writer.drain())
@@ -283,8 +365,13 @@ class CanBus:
             self._experiment_waiter = None
 
     def _send_message(self, payload: bytes) -> None:
-        if self._writer is None or self._writer.is_closing():
-            raise RuntimeError(f"CAN proxy for {self._channel} is not connected")
+        if self._unavailable():
+            raise RuntimeError(self._unavailable_reason())
+        self._write_raw(payload)
+
+    def _write_raw(self, payload: bytes) -> None:
+        """Frame and write without the lifecycle check (teardown's ``Q``)."""
+        assert self._writer is not None
         self._writer.write(struct.pack("<I", len(payload)) + payload)
 
     async def _read_loop(self) -> None:
@@ -397,6 +484,10 @@ class CanBus:
                 self._closed_reason = (
                     f"axol-rt proxy for {self._channel} disconnected: {exc}"
                 )
+            if self._state != "closed":
+                # Unexpected: the proxy went away under a live bus (not a
+                # close() we initiated). Say so now, not at the next send.
+                _logger.warning("%s", self._closed_reason)
             self._ready.set()
         except asyncio.CancelledError:
             raise
