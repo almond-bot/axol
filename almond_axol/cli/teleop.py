@@ -58,6 +58,39 @@ def _prepare_mantis_teleop(cfg: TeleopCmdConfig) -> None:
     apply_mantis_kinematics_profile(cfg.kinematics)
 
 
+def mantis_rig_channels(cfg: TeleopCmdConfig) -> tuple[str | None, str | None]:
+    """The two rig channels a Mantis run opens (Axol defaults map to the rig's)."""
+    from ..constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
+
+    left = cfg.left_channel
+    right = cfg.right_channel
+    if left == CAN_LEFT:
+        left = CAN_MANTIS_LEFT
+    if right == CAN_RIGHT:
+        right = CAN_MANTIS_RIGHT
+    return left, right
+
+
+def resolve_mantis_grippers_only(cfg: TeleopCmdConfig) -> str | None:
+    """Decide whether this Mantis teleop runs tracked or grippers-only.
+
+    A Mantis teleop needs only CAN: when the selected Lighthouse/Ultimate
+    source is not set up, the run falls back to mirroring the rig triggers
+    onto the grippers instead of refusing to start. Sets
+    ``cfg.mantis_grippers_only`` and returns the reason for a fallback (or
+    ``None`` when the operator asked for grippers-only or tracking is ready).
+    Idempotent, so the control-panel runner and the CLI can both call it.
+    """
+    if getattr(cfg, "mantis_grippers_only", False):
+        return None
+    from ..teleop.mantis_grippers import mantis_grippers_only_reason
+
+    reason = mantis_grippers_only_reason(str(cfg.mantis_source))
+    if reason is not None:
+        cfg.mantis_grippers_only = True
+    return reason
+
+
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a VR teleop session."""
     normalized_argv = normalize_bool_flags(argv, "sim", "mantis", "cart_only")
@@ -83,10 +116,23 @@ def main(argv: list[str]) -> None:
         # reader or waiting for live hardware. _run repeats this idempotently
         # because the control-panel runner calls it directly.
         _prepare_mantis_teleop(cfg)
+        reason = resolve_mantis_grippers_only(cfg)
+        if reason is not None:
+            _logger.warning(
+                "%s tracking is not set up (%s); running grippers only — the rig "
+                "triggers drive the grippers and no tracking starts.",
+                cfg.mantis_source,
+                reason,
+            )
 
     # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled
     # by the host installer + its boot service, not here — see
     # `axol jetson.setup` / `axol gst.install`. This entry point just runs.
+
+    if cfg.mantis and cfg.mantis_grippers_only:
+        # Nothing to connect to: no VR server runs in grippers-only mode.
+        asyncio.run(_run(cfg))
+        return
 
     hostname = socket.gethostname()
     host_ip = local_ip()
@@ -399,6 +445,17 @@ async def _run(cfg: TeleopCmdConfig) -> None:
     if cfg.mantis:
         _prepare_mantis_teleop(cfg)
 
+    if cfg.mantis and cfg.mantis_grippers_only:
+        # Grippers-only Mantis teleop: no VR server, tracker bridge, or
+        # cameras — the rig triggers drive the grippers over CAN until Stop.
+        from ..teleop.mantis_grippers import run_grippers_only
+        from ..utils.can_channels import require_mantis_channels
+
+        left, right = require_mantis_channels(mantis_rig_channels(cfg))
+        print(f"Mantis grippers only (no tracking): left={left} right={right}")
+        await run_grippers_only(left, right)
+        return
+
     if cfg.cart_only:
         if cfg.sim:
             raise ValueError(
@@ -418,14 +475,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         # grippers; the arms exist only as the headset's URDF overlay. Force
         # the same absolute-mapping profile collect-data --mantis uses so the
         # bench test exercises exactly what collection will.
-        from ..constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
-
-        left = cfg.left_channel
-        right = cfg.right_channel
-        if left == CAN_LEFT:
-            left = CAN_MANTIS_LEFT
-        if right == CAN_RIGHT:
-            right = CAN_MANTIS_RIGHT
+        left, right = mantis_rig_channels(cfg)
         robot = Mantis(config=cfg.axol, left_channel=left, right_channel=right)
     elif cfg.sim:
         robot = Sim()

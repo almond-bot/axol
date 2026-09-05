@@ -90,7 +90,8 @@ class OpStartRequest(BaseModel):
         }
 
     ``mantis_serials`` is a separate two-camera assignment used whenever the
-    operation's Mantis toggle is on; Axol continues to use ``serials``.
+    run's ``mantis`` flag is on (the panel sets it from its system-wide device
+    switch); Axol continues to use ``serials``.
     The ``stream`` / ``record`` maps decide per camera whether it takes part in
     each branch: ``false`` opts a camera out, ``true`` opts a mono camera in, and
     an eye name (``"both"`` / ``"left"`` / ``"right"``) opts a stereo camera in
@@ -443,20 +444,6 @@ def _prepare_motor_launch_args(
         if error is None:
             error = _lift_cycle_link_error(status, prepared, now=now)
         return prepared, error
-
-    if command_id == "diag.mantis-trigger":
-        for index, side in enumerate(("left", "right")):
-            key = f"{side}_channel"
-            override = _channel_override(prepared, key)
-            if override is not None and override != active[index]:
-                return (
-                    prepared,
-                    f"Mantis trigger's {side} CAN channel override ({override}) "
-                    f"does not match the connected survey ({active[index]}). "
-                    "Reconnect with the requested mapping before starting.",
-                )
-            prepared[key] = active[index]
-        return prepared, None
 
     if command_id == "motor.set-zero-pos":
         arm = str(prepared.get("arm") or "").strip().lower()

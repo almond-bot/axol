@@ -1158,12 +1158,7 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         cases = (
-            (
-                "diag.mantis-trigger",
-                "mantis",
-                {"joints": "SHOULDER_1"},
-                "GRIPPER",
-            ),
+            ("diag.rom-enable", "mantis", {"arm": "left"}, "GRIPPER"),
             ("diag.rom-enable", "axol", {"arm": "left"}, "SHOULDER_1"),
         )
         for command, profile, injected, joint in cases:
@@ -1211,11 +1206,6 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
                 {"target": "mantis", "left_channel": "can-wrong"},
                 "ROM's left CAN channel override",
             ),
-            (
-                "diag.mantis-trigger",
-                {"right_channel": "can-wrong"},
-                "Mantis trigger's right CAN channel override",
-            ),
         )
         for command, args, message in cases:
             with self.subTest(command=command, args=args):
@@ -1255,13 +1245,6 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
                 "right_channel": "can-mantis-right",
             },
         )
-
-        prepared, error = app_module._prepare_motor_launch_args(
-            "diag.mantis-trigger", mantis, {}, now=now
-        )
-        self.assertIsNone(error)
-        self.assertEqual(prepared["left_channel"], "can-mantis-left")
-        self.assertEqual(prepared["right_channel"], "can-mantis-right")
 
         axol = _Robot(
             channels=(None, "can-bench-right"),
@@ -2214,31 +2197,76 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         self.assertIn("recording enabled", session.error or "")
         self.assertIsNone(runner._thread)
 
-    def test_external_tracker_runtime_gate_runs_before_operation_thread(self) -> None:
-        runner = OperationRunner()
-        config = type(
-            "Config",
-            (),
-            {
-                "mantis": True,
-                "mantis_source": "lighthouse",
-                "left_channel": "can_mantis_l",
-                "right_channel": "can_mantis_r",
-            },
-        )()
+    def test_unready_tracker_runtime_runs_teleop_grippers_only(self) -> None:
+        # Teleop only needs CAN: an unusable Lighthouse/Ultimate runtime must
+        # not refuse the start, it drops tracking and skips the managed bridge.
+        robot = _Robot(profile="mantis", channels=("can_mantis_l", "can_mantis_r"))
+        runner = OperationRunner(robot_link=robot)
+        config = SimpleNamespace(
+            mantis=True,
+            mantis_source="lighthouse",
+            left_channel="can_mantis_l",
+            right_channel="can_mantis_r",
+        )
+        worker = Mock()
         with (
             patch.object(runner, "_build_config", return_value=config),
+            patch.object(runner, "_attach_cameras_to_teleop"),
             patch("almond_axol.cli.teleop._prepare_mantis_teleop"),
             patch(
                 "almond_axol.cli.mantis_bridge.require_mantis_tracker_readiness",
                 side_effect=RuntimeError("unsupported tracker runtime"),
             ),
+            patch(
+                "almond_axol.cli.mantis_bridge.set_managed_pose_source_id"
+            ) as pose_source,
+            patch(
+                "almond_axol.serve.runner.threading.Thread", return_value=worker
+            ) as thread,
         ):
             session = runner.start("teleop", {"mantis": True})
 
-        self.assertEqual(session.status, "error")
-        self.assertIn("unsupported tracker runtime", session.error or "")
-        self.assertIsNone(runner._thread)
+        self.assertEqual(session.status, "running")
+        self.assertTrue(config.mantis_grippers_only)
+        run_args = thread.call_args.kwargs["args"]
+        self.assertFalse(run_args[-1])
+        pose_source.assert_not_called()
+        self.assertTrue(
+            any(
+                "grippers only" in line and "unsupported tracker runtime" in line
+                for line in session.log
+            ),
+            list(session.log),
+        )
+        worker.start.assert_called_once_with()
+
+    def test_explicit_grippers_only_skips_the_tracker_gate(self) -> None:
+        robot = _Robot(profile="mantis", channels=("can_mantis_l", "can_mantis_r"))
+        runner = OperationRunner(robot_link=robot)
+        config = SimpleNamespace(
+            mantis=True,
+            mantis_source="lighthouse",
+            mantis_grippers_only=True,
+            left_channel="can_mantis_l",
+            right_channel="can_mantis_r",
+        )
+        worker = Mock()
+        with (
+            patch.object(runner, "_build_config", return_value=config),
+            patch.object(runner, "_attach_cameras_to_teleop"),
+            patch("almond_axol.cli.teleop._prepare_mantis_teleop"),
+            patch(
+                "almond_axol.cli.mantis_bridge.require_mantis_tracker_readiness"
+            ) as gate,
+            patch(
+                "almond_axol.serve.runner.threading.Thread", return_value=worker
+            ) as thread,
+        ):
+            session = runner.start("teleop", {"mantis": True})
+
+        self.assertEqual(session.status, "running")
+        gate.assert_not_called()
+        self.assertFalse(thread.call_args.kwargs["args"][-1])
 
     def test_nested_mantis_robot_profile_cannot_bypass_top_level_mode(self) -> None:
         robot = _Robot(profile="axol")
@@ -2350,6 +2378,10 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
             patch("almond_axol.cli.teleop._prepare_mantis_teleop"),
             patch("almond_axol.cli.mantis_bridge.require_mantis_tracker_readiness"),
             patch("almond_axol.cli.mantis_bridge.set_managed_pose_source_id"),
+            patch(
+                "almond_axol.teleop.mantis_grippers.mantis_grippers_only_reason",
+                return_value=None,
+            ),
             patch(
                 "almond_axol.serve.runner.threading.Thread", return_value=worker
             ) as thread,

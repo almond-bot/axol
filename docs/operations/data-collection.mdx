@@ -17,9 +17,9 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
 
 ## Before you start
 
-- **Axol installed** ([one-command install](/installation)), CAN up, and the active hardware profile verified. Mantis needs two distinct trigger/gripper channels, normally `can_mantis_l/r`.
-- **At least one ZED camera connected** over GMSL. Axol has overhead / left arm / right arm slots; Mantis has the separately stored Left Mantis / Right Mantis layout.
-- **The selected pose source set up.** Quest needs the VR TLS certificate authorized once. Lighthouse/Ultimate need their Linux runtime, two identified devices, and live trigger nodes. Production Mantis collection also requires an approved factory or measured tracker→TCP transform for both sides.
+- **Axol installed** ([one-command install](/installation)) and the selected device connected: **Axol**, or **Mantis** with its [hardware](/mantis/hardware) and [pose source](/mantis/tracking) set up (setup complete under **Mantis settings → Tracking**, and an approved factory or measured tracker→TCP transform for both sides).
+- **At least one ZED camera connected** over GMSL and assigned with **Record** enabled. Axol uses the overhead / left arm / right arm slots; Mantis uses the separately stored Left Mantis / Right Mantis layout.
+- **A Meta Quest** with the VR TLS certificate authorized once — for Axol, and for Mantis with the Quest source. Lighthouse/Ultimate Mantis collects with no headset.
 
 <Tip>
   List the connected cameras and their serials from Python:
@@ -28,16 +28,16 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
   python -c "from almond_axol.zed import list_zed_devices; print(list_zed_devices())"
   ```
 
-  If a camera was plugged in after boot and doesn't show up, restart the ZED X daemon (`sudo systemctl restart zed_x_daemon`), or press **Restart daemon** under **Axol Cameras** or **Mantis** in the control panel.
+  If a camera was plugged in after boot and doesn't show up, restart the ZED X daemon (`sudo systemctl restart zed_x_daemon`), or press **Restart daemon** under **Axol settings → Cameras** or **Mantis settings → Cameras** in the control panel.
 </Tip>
 
 ## Run it
 
 <Tabs>
-  <Tab title="Control Panel">
+  <Tab title="Axol">
     <Steps>
       <Step title="Connect the robot and assign cameras">
-        Connect the **Axol Host** and **Axol**, then open **Axol Cameras** and assign each detected camera to its slot (overhead / left arm / right arm) — at least one is required. Stereo ZED X cameras are detected automatically. See [Cameras](/guides/control-panel#cameras).
+        Connect the **Axol Host** and, with **Axol** selected on its tile, the robot. Open **Axol settings → Cameras** and assign each detected camera to its slot (overhead / left arm / right arm) — at least one with **Record** enabled. Stereo ZED X cameras are detected automatically. See [Cameras](/guides/control-panel#cameras).
       </Step>
 
       <Step title="Select Collect Data and fill the fields">
@@ -52,10 +52,8 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
     <Note>
       The session is locked to data collection; there's no mode toggle.
     </Note>
-  </Tab>
 
-  <Tab title="CLI">
-    On the robot machine:
+    **From the CLI**, on the robot machine:
 
     ```bash
     axol collect-data \
@@ -72,59 +70,56 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
 
     Connect the headset and record from the controllers — see [Recording an episode](#recording-an-episode). Press `Ctrl+C` to finish. See [`collect-data`](/cli/collect-data) for the full field list (`--fps`, `--teleop_hz`, stiffness, `--push_to_hub`) and [Command configuration](/cli/configuration) for the override syntax.
   </Tab>
+
+  <Tab title="Mantis">
+    Complete the [Mantis teleop acceptance](/operations/teleop) with the same source before creating training data. An unapproved CAD candidate, legacy unkeyed offset, generic absolute-mode sim, or start-pose-only alignment is not production calibration; the built-in VIVE factory transforms are approved values.
+
+    <Steps>
+      <Step title="Select Mantis and check its settings">
+        Press **Select** on the **Mantis** tile and let it connect. Click the tile's title to open **Mantis settings**: the pose source's setup flow must be complete under **Tracking** ([Mantis Tracking](/mantis/tracking)), the two CAN channels distinct under **CAN**, and at least one **Left Mantis / Right Mantis** camera assigned with **Record** enabled under **Cameras**.
+      </Step>
+
+      <Step title="Select Collect Data and fill the fields">
+        Pick **Collect Data** and set the **repo&nbsp;id** and **task** as for Axol. Start stays blocked until source setup, both transforms, the Mantis link, and the camera selection are ready; the "Before you can start" list names what is missing. `mantis_allow_uncalibrated` exists only for a calibration capture that will not enter training.
+      </Step>
+
+      <Step title="Start and bring up the source">
+        Press **Start**. Quest: connect and enter VR at [axol.almond.bot](https://axol.almond.bot); left/right comes from WebXR handedness. Lighthouse/Ultimate: power both trackers in the tracked volume and wait for two fresh poses **and** two trigger heartbeats — no headset required.
+      </Step>
+
+      <Step title="Record with the source's controls">
+        <Tabs>
+          <Tab title="Quest">
+            Hold the rigs at the start pose, release both controller grips, then press both to align and engage. Record with **A** exactly as on Axol — countdown, then **A** again to arm **Save episode?**, **X** to arm **Discard episode?** — or from the panel's episode buttons.
+          </Tab>
+          <Tab title="Lighthouse / Ultimate">
+            Hold the rigs where the take should begin, **squeeze both rig triggers together, then release both**. That one gesture fits the world→robot base transform at the rigs' pose, engages tracking, and — once the teleop core acknowledges the engage — starts the take. The physical grippers enable only for the take and are force-disabled again after every save, discard, stop, or error.
+
+            While recording, rapidly fully squeeze and release either trigger (or both together) **three times** to end and save, or **four times** to end and discard (the same outcome as the panel's **Discard episode**). Three presses resolve after a short pause so a fourth can still select discard. The saved episode ends where the first of the three squeezes *began* — the rows captured during the clicks are trimmed, so the gesture leaves no trace in the data. A triple press while idle does nothing; the panel's **Start recording** still requires an engaged rig.
+          </Tab>
+        </Tabs>
+      </Step>
+
+      <Step title="Treat any tracking or input break as a failed take">
+        A pose loss, stale trigger heartbeat, disengagement, or stale pose freezes the rig and fails the in-flight Mantis quality check. Restore both sides, then repeat the start gesture to re-anchor and open a clean take. After every take the virtual arms return to rest and tracking disengages, so each take starts with this gesture — wherever the rigs are at that moment. Nothing re-anchors and resumes automatically, and the grippers stay motor-disabled between takes.
+      </Step>
+    </Steps>
+
+    **From the CLI**, the run owns the managed bridge and trigger readers (the saved source is used when `--mantis_source` is omitted):
+
+    ```bash
+    axol collect-data --mantis true --mantis_source lighthouse \
+      --repo_id myorg/mantis-pick --task "Pick the part" \
+      --robot_config.cameras "{left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
+    ```
+
+    Change the source to `quest` or `ultimate` as needed; do not start a second `tracker.bridge`. See [`collect-data`](/cli/collect-data) and the [tracker reference](/cli/tracker).
+  </Tab>
 </Tabs>
-
-## Mantis collection: end-to-end
-
-Complete the matching [Mantis teleop acceptance](/operations/teleop#mantis-teleop-end-to-end) before creating training data. An unapproved CAD candidate, legacy unkeyed offset, generic absolute-mode sim, or start-pose-only alignment is not production calibration; the built-in VIVE factory transforms are approved values.
-
-<Steps>
-  <Step title="Select Mantis and assign its cameras">
-    In the control panel choose **Collect Data**, enable **Mantis**, then open **Settings → Mantis**. Select and save the pose source, verify the two distinct CAN channel fields, and assign **Left Mantis / Right Mantis** cameras. Those two slots are stored separately from the overhead / left arm / right arm layout in **Settings → Axol Cameras**. At least one Mantis camera must have recording enabled.
-
-    Set the repo id and task. Normal production start remains blocked until source setup, both transforms, the Mantis hardware link, and the camera selection are ready. `mantis_allow_uncalibrated` is only for a calibration capture that will not enter training.
-  </Step>
-
-  <Step title="Bring up the selected pose source">
-    <Tabs>
-      <Tab title="Quest">
-        Select **Quest**, start the operation, then connect and enter VR at [axol.almond.bot](https://axol.almond.bot). Left/right comes from WebXR handedness. Use the live common profile as **Quest calibration key**, then save both measured mounts with the Settings → Mantis transform editor under that exact `quest:&lt;reported-profile&gt;:grip` key; a different Touch generation or target-ray fallback is held rather than silently accepted. Hold the rigs at the start pose, release both controller grips, then press both to align/engage.
-      </Tab>
-
-      <Tab title="Lighthouse">
-        Select **Lighthouse** after installing libsurvive, pairing both VIVE Tracker 3.0 units, and completing **Identify trackers** in Settings → Mantis. The standard flat-back mount uses its factory transform automatically; save a per-device override only for a non-standard mount or refinement. Start and wait for two fresh tracker poses **and** two trigger heartbeats. Engagement is part of the start gesture below; there is no separate alignment step.
-      </Tab>
-
-      <Tab title="Ultimate">
-        Select **Ultimate** after the one-time Windows pair/map flow. In Settings → Mantis, install the runtime, save the private shared-map AP configuration, connect/power the dongle and trackers, complete guided **Identify trackers**, and choose **Run readiness check**. The standard flat-back mount automatically uses the approved 11 mm origin-adjusted factory transform under the pinned `wxyz` / z-up convention; measured entries are optional overrides. Start only with both trackers localized in the shared map and both trigger nodes live. Engagement is part of the start gesture below. See the [UI and CLI setup routes](/cli/tracker#vive-ultimate-tracker-setup-dongle--pyvut).
-      </Tab>
-    </Tabs>
-  </Step>
-
-  <Step title="Record with the source-appropriate control">
-    Quest uses **A** (or the panel's **Start recording**). With managed Lighthouse/Ultimate, hold the rigs where you want the take to begin, **squeeze both rig triggers together, then release both**. That one gesture fits the world→robot base transform at the rigs' current pose, engages tracking, and — once the teleop core acknowledges the engage — starts the take. The physical grippers enable only for the take and are force-disabled again after every save, discard, stop, or error. A triple press while idle does nothing; the panel's **Start recording** still requires an engaged rig.
-
-    While recording, rapidly fully squeeze and release either trigger — or both together — **three times** to end and save, or **four times** to end and discard (the same outcome as the panel's **Discard episode**). Three presses resolve after a short pause so a fourth can still select discard. The saved episode ends where the first of the three squeezes *began* — the rows captured during the clicks are trimmed before the save, so the gesture leaves no trace in the data.
-  </Step>
-
-  <Step title="Treat any tracking/input break as a failed take">
-    A pose loss, stale trigger heartbeat, disengagement, or stale pose freezes the rig and fails the in-flight Mantis quality check. Restore both sides, then repeat the start gesture (both triggers squeezed together, then released) to re-anchor and open a clean take. After every take the virtual arms return to rest and tracking disengages, so each take starts with this gesture — wherever the rigs are at that moment. Nothing re-anchors and resumes automatically.
-  </Step>
-</Steps>
-
-Direct CLI runs own the managed bridge and trigger readers:
-
-```bash
-axol collect-data --mantis true --mantis_source lighthouse \
-  --repo_id myorg/mantis-pick --task "Pick the part" \
-  --robot_config.cameras "{left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
-```
-
-Change the source to `quest` or `ultimate` as needed; do not start a second `tracker.bridge`. The [tracker guide](/cli/tracker) has all three setup routes and the exact calibration JSON schema.
 
 ## Quest controller layout
 
-For Axol and Quest-source Mantis, episodes can be driven from the Quest controllers (the control panel can take the same decisions — see [Driving from the panel](#driving-from-the-panel)). The movement controls are the same as in [teleoperation](/operations/teleop); data collection adds the **A** record button. Managed Lighthouse/Ultimate uses the rig-trigger gestures described above instead. The session is locked to data collection mode, so there's no mode toggle.
+For Axol and Quest-source Mantis, episodes can be driven from the Quest controllers (the control panel can take the same decisions — see [Driving from the panel](#driving-from-the-panel)). The movement controls are the same as in [teleoperation](/operations/teleop); data collection adds the **A** record button. Lighthouse/Ultimate Mantis uses the rig-trigger gestures in the Mantis tab above instead. The session is locked to data collection mode, so there's no mode toggle.
 
 <img src="/assets/quest.png" alt="Quest controller diagram" />
 
@@ -175,7 +170,7 @@ For Axol and Quest-source Mantis, episodes can be driven from the Quest controll
   </Step>
 </Steps>
 
-These return-to-rest/contact-watchdog steps describe the physical Axol arms. In Mantis mode there are no physical arms to home; use the source-specific alignment/recovery flow above, and both grippers are motor-disabled between takes.
+These return-to-rest/contact-watchdog steps describe the physical Axol arms. On Mantis there are no physical arms to home; each take starts with the source's [start gesture](/mantis/tracking#start-gesture-and-recovery), and both grippers are motor-disabled between takes.
 
 The HUD shows an **Episode N** readout (top-right) with the 1-based number of the episode you're about to record, so you always know where you are in the dataset.
 

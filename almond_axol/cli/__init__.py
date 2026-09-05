@@ -67,10 +67,6 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
         "almond_axol.diagnostics.zed.cable",
         "Verify a ZED camera cable by validating captured frames.",
     ),
-    "diag.mantis-trigger": (
-        "almond_axol.diagnostics.mantis.trigger",
-        "Drive the Mantis grippers from their triggers without tracking or cameras.",
-    ),
 }
 
 _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
