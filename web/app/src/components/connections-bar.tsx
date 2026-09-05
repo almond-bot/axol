@@ -1,6 +1,17 @@
-import { Cpu, Loader2, Plug, Power, RotateCcw, Server, Unplug } from "lucide-react"
+import {
+  Check,
+  Cpu,
+  Loader2,
+  Plug,
+  Power,
+  RotateCcw,
+  Server,
+  Settings2,
+  Unplug,
+} from "lucide-react"
 import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
+import type { SettingsScope } from "@/lib/settings-scope"
 import {
   restartHost,
   shutdownHost,
@@ -33,6 +44,8 @@ function Tile({
   children,
   statusEnd,
   statusContent,
+  badge,
+  onOpenSettings,
 }: {
   icon: ReactNode
   title: string
@@ -42,13 +55,43 @@ function Tile({
   children?: ReactNode
   statusEnd?: ReactNode
   statusContent?: ReactNode
+  /** Small marker next to the title (e.g. the selected device). */
+  badge?: ReactNode
+  /** Clicking the tile's title opens this connection's settings. */
+  onOpenSettings?: () => void
 }) {
+  const heading = (
+    <>
+      {icon}
+      <span className="font-mono">{title}</span>
+    </>
+  )
   return (
-    <div className="group relative flex h-fit min-w-0 flex-col gap-2 overflow-visible rounded-xl border border-white/10 bg-white/[0.02] p-3.5">
+    <div
+      className={cn(
+        "group relative flex h-fit min-w-0 flex-col gap-2 overflow-visible rounded-xl border border-white/10 bg-white/[0.02] p-3.5",
+        onOpenSettings && "transition-colors hover:border-white/20"
+      )}
+    >
       <div className="flex min-h-8 items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
-          {icon}
-          <span className="font-mono">{title}</span>
+        <div className="flex min-w-0 items-center gap-2">
+          {onOpenSettings ? (
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              title={`Open ${title} settings`}
+              aria-label={`Open ${title} settings`}
+              className="flex items-center gap-2 rounded-md text-xs tracking-widest text-white/40 uppercase transition-colors hover:text-white/80"
+            >
+              {heading}
+              <Settings2 className="size-3.5 text-white/30 transition-colors group-hover:text-white/60" />
+            </button>
+          ) : (
+            <div className="flex items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
+              {heading}
+            </div>
+          )}
+          {badge}
         </div>
         {children && <div className="shrink-0">{children}</div>}
       </div>
@@ -95,10 +138,63 @@ const POWER_ACTIONS: Record<
 }
 
 /**
+ * The system-wide device selection, shown on each hardware tile: the selected
+ * device carries a highlighted marker, the other offers Select. One choice for
+ * the whole panel (persisted with the shared settings) instead of a
+ * per-operation Mantis toggle — teleop and data collection follow it, and
+ * Axol-only operations wait until it is back on Axol.
+ */
+function DeviceSelect({
+  profile,
+  selected,
+  onSelect,
+  disabled,
+  disabledReason,
+  saving,
+}: {
+  profile: HardwareProfile
+  selected: boolean
+  onSelect?: (profile: HardwareProfile) => void
+  disabled: boolean
+  disabledReason?: string | null
+  saving: boolean
+}) {
+  if (selected) {
+    return (
+      <span
+        className="flex shrink-0 items-center gap-1 rounded-full bg-[#eff483]/15 px-1.5 py-0.5 font-mono text-[0.6rem] tracking-wider text-[#eff483] uppercase"
+        title="Every operation runs on this device"
+      >
+        {saving ? <Loader2 className="size-2.5 animate-spin" /> : <Check className="size-2.5" />}
+        selected
+      </span>
+    )
+  }
+  if (!onSelect) return null
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(profile)}
+      disabled={disabled}
+      title={
+        disabled
+          ? (disabledReason ?? undefined)
+          : "Run every operation on this device (Axol-only operations wait for Axol)."
+      }
+      className="shrink-0 rounded-full border border-white/15 px-1.5 py-0.5 font-mono text-[0.6rem] tracking-wider text-white/45 uppercase transition-colors hover:border-white/30 hover:text-white/80 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      select
+    </button>
+  )
+}
+
+/**
  * Connection tiles for the Axol Host and the two hardware profiles. Axol and
  * Mantis share one idle telemetry link, so connecting either hardware tile
- * switches that link to its CAN interfaces and motor set. Cameras and Quest
- * USB live in the Settings tabs below.
+ * switches that link to its CAN interfaces and motor set. Clicking a tile's
+ * title opens that connection's settings: Axol and Mantis each have their
+ * own, and the host tile opens the general (shared) settings. The hardware
+ * tiles also carry the system-wide device selection (see DeviceSelect).
  *
  * The host tile also carries the host power controls (restart / shut down,
  * each behind a confirmation) — the Disconnect button only drops this
@@ -117,6 +213,12 @@ export function ConnectionsBar({
   canProfiles,
   onRobotConnect,
   onRobotDisconnect,
+  selectedProfile,
+  onSelectProfile,
+  selectDisabled = false,
+  selectDisabledReason,
+  selectSaving = false,
+  onOpenSettings,
 }: {
   conn: ConnState
   host: string
@@ -134,6 +236,16 @@ export function ConnectionsBar({
   canProfiles?: CanProfileInventory | null
   onRobotConnect: (profile: HardwareProfile) => void
   onRobotDisconnect: () => void
+  /** The system-wide device selection, marked on its tile. */
+  selectedProfile?: HardwareProfile
+  /** Switches the system-wide device selection (offered on the other tile). */
+  onSelectProfile?: (profile: HardwareProfile) => void
+  selectDisabled?: boolean
+  selectDisabledReason?: string | null
+  /** The selection is being written to the host. */
+  selectSaving?: boolean
+  /** Opens the settings for a connection (only offered while online). */
+  onOpenSettings?: (scope: SettingsScope) => void
 }) {
   const toast = useToast()
   const online = conn === "ok"
@@ -216,6 +328,19 @@ export function ConnectionsBar({
         dot={dot}
         label={label}
         pulse={state === "connecting"}
+        badge={
+          selectedProfile ? (
+            <DeviceSelect
+              profile={profile}
+              selected={selectedProfile === profile}
+              onSelect={online ? onSelectProfile : undefined}
+              disabled={selectDisabled}
+              disabledReason={selectDisabledReason}
+              saving={selectSaving}
+            />
+          ) : undefined
+        }
+        onOpenSettings={online && onOpenSettings ? () => onOpenSettings(profile) : undefined}
         statusContent={
           active &&
           robot &&
@@ -267,6 +392,7 @@ export function ConnectionsBar({
         dot={wsDot}
         label={wsLabel}
         pulse={conn === "loading"}
+        onOpenSettings={online && onOpenSettings ? () => onOpenSettings("general") : undefined}
         statusEnd={
           online && version ? (
             <span className="font-mono text-[0.7rem] text-white/35" title={`v${version}`}>

@@ -9,6 +9,7 @@ import {
   Square,
 } from "lucide-react"
 import {
+  HARDWARE_PROFILE_ARG,
   fetchDatasets,
   fetchTrackerBindings,
   isRobotFreeRun,
@@ -21,6 +22,7 @@ import {
   type DatasetInfo,
   type EpisodeControlSpec,
   type FormValue,
+  type HardwareProfile,
   type MantisTrackerSource,
   type OperationMeta,
   type PolicyState,
@@ -46,13 +48,15 @@ function isMantisTrackerSource(value: string): value is MantisTrackerSource {
 /**
  * One operation's panel: just its per-run inputs (dataset / task / policy
  * identity) and Start/Stop. Everything reusable across runs — cameras, arm
- * behaviour, recording, inference — lives in the shared Settings dialog and is
- * folded in server-side at start.
+ * behaviour, recording, inference — lives in the shared Settings and is folded
+ * in server-side at start. Which hardware the run targets is the panel-wide
+ * device selection, not a per-operation toggle.
  */
 export function OperationPanel({
   meta,
   spec,
   settings,
+  hardwareProfile,
   mantisSource: configuredMantisSource,
   onChange,
   onReset,
@@ -78,7 +82,9 @@ export function OperationPanel({
   meta: OperationMeta
   spec: CommandSpec | null
   settings: Record<string, FormValue>
-  /** Shared Teleop & VR setting used when this is a Mantis run. */
+  /** The system-wide device selection every operation runs on. */
+  hardwareProfile: HardwareProfile
+  /** Shared Mantis tracking source used when this is a Mantis run. */
   mantisSource: string
   onChange: (key: string, value: FormValue) => void
   onReset: (key: string) => void
@@ -108,12 +114,21 @@ export function OperationPanel({
 }) {
   // Per-run inputs: every required field plus the op's curated run-identity
   // fields (repo id, task, policy path, episode, …) — required ones first.
-  const runFields = useMemo(() => (spec ? perRunFields(spec, meta) : []), [spec, meta])
+  // The device flag is never one of them, and Axol-only run modes (sim /
+  // cart-only) disappear while Mantis is selected.
+  const runFields = useMemo(
+    () => (spec ? perRunFields(spec, meta, hardwareProfile) : []),
+    [spec, meta, hardwareProfile]
+  )
   const liveArgs = live && session ? session.args : null
   const effectiveSettings: Record<string, FormValue> = liveArgs
     ? { ...settings, ...(liveArgs as Record<string, FormValue>) }
     : settings
-  const mantisMode = meta.supportsMantis && Boolean(effectiveSettings.mantis)
+  // A live run reports the device it was actually started on; otherwise the
+  // next run follows the panel-wide selection.
+  const mantisMode =
+    meta.supportsMantis &&
+    (liveArgs ? Boolean(liveArgs[HARDWARE_PROFILE_ARG]) : hardwareProfile === "mantis")
   const mantisSource =
     liveArgs && typeof liveArgs.mantis_source === "string"
       ? liveArgs.mantis_source
@@ -193,16 +208,18 @@ export function OperationPanel({
     }
   }, [wantsDatasets, datasets])
 
-  const isSim = isSimRun(meta, effectiveSettings)
+  // Sim and cart-only are Axol run modes: hidden and ignored on Mantis.
+  const isSim = !mantisMode && isSimRun(meta, effectiveSettings)
   // Sim, cart-only, and Mantis runs do not touch the Axol arm motors. Mantis
   // still needs its own live CAN link, however, so `robotFree` only controls
   // the Axol connection/fault gates below; it is not a general hardware-free
   // signal.
-  const robotFree = isRobotFreeRun(meta, effectiveSettings)
+  const robotFree = mantisMode || isRobotFreeRun(meta, effectiveSettings)
   const robotOk = robot?.state === "connected"
   const axolOk = robotOk && (robot?.profile ?? "axol") === "axol"
   const mantisOk = robotOk && robot?.profile === "mantis"
-  const cartOnly = meta.fields.includes("cart_only") && Boolean(effectiveSettings.cart_only)
+  const cartOnly =
+    !mantisMode && meta.fields.includes("cart_only") && Boolean(effectiveSettings.cart_only)
   // `usesHeadset` also identifies operations that run the camera relay. The
   // relay is useful in the panel for every real teleop/collection run,
   // including headset-free Lighthouse/Ultimate Mantis tracking.
@@ -238,7 +255,7 @@ export function OperationPanel({
     }
   }
   if (mantisMode && !trackerSource) {
-    blockers.push("Choose a valid Mantis tracker source in Settings → Mantis")
+    blockers.push("Choose a valid tracking source in Mantis settings → Tracking")
   } else if (mantisMode && currentTrackerReadinessState !== "ready") {
     blockers.push(
       currentTrackerReadinessState === "error"
@@ -286,7 +303,9 @@ export function OperationPanel({
         (currentTrackerReadiness.quest.datumStatus !== "configured" ||
           currentTrackerReadiness.quest.poseSpace !== "grip")
       ) {
-        blockers.push("Choose one quest:<WebXR-profile>:grip calibration key in Settings → Mantis")
+        blockers.push(
+          "Choose one quest:<WebXR-profile>:grip calibration key in Mantis settings → Tracking"
+        )
       }
     }
   }
@@ -295,8 +314,8 @@ export function OperationPanel({
   if (meta.requiresCameras && camCount < 1) {
     blockers.push(
       mantisMode
-        ? "Assign a camera and enable Record in Settings → Mantis"
-        : "Assign a camera and enable Record in Settings → Axol Cameras"
+        ? "Assign a camera and enable Record in Mantis settings → Cameras"
+        : "Assign a camera and enable Record in Axol settings → Cameras"
     )
   }
   for (const f of runFields) {
@@ -305,13 +324,13 @@ export function OperationPanel({
       if (v === undefined || String(v).trim() === "") blockers.push(`Set ${f.label}`)
     }
   }
-  // Teleop's run modes are mutually exclusive (the server refuses the start
-  // too); catch the combination before the Start button instead of after.
-  const modeFlags = ["sim", "mantis", "cart_only"].filter(
-    (f) => meta.fields.includes(f) && Boolean(settings[f])
+  // Teleop's Axol run modes are mutually exclusive (the server refuses the
+  // start too); catch the combination before the Start button instead of after.
+  const modeFlags = ["sim", "cart_only"].filter(
+    (f) => runFields.some((field) => field.key === f) && Boolean(settings[f])
   )
   if (modeFlags.length > 1) {
-    blockers.push("Sim, Mantis, and Cart only are mutually exclusive — enable only one")
+    blockers.push("Sim and Cart only are mutually exclusive — enable only one")
   }
 
   const editedCount = Object.keys(settings).length
@@ -322,8 +341,20 @@ export function OperationPanel({
       <Card className="gap-0 p-0">
         <div className="flex flex-col gap-4 border-b border-white/10 p-5 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <h2 className="font-heading text-lg font-semibold">{meta.label}</h2>
+              {/* Which hardware this run targets — the system-wide device
+                  selection, or the device a live run was started on. */}
+              <Badge
+                variant="neutral"
+                title={
+                  mantisMode
+                    ? "Runs on the handheld Mantis rigs (selected device)."
+                    : "Runs on the Axol arms."
+                }
+              >
+                {mantisMode ? "Mantis" : "Axol"}
+              </Badge>
               <StatusBadge session={live ? session : null} />
             </div>
             <p className="mt-2 max-w-prose text-sm text-white/55">{meta.description}</p>
@@ -926,7 +957,8 @@ function RunningHints({
           {dataCollection && (
             <p className="text-white/65">
               While recording, rapidly fully squeeze and release either Mantis trigger 3 times to
-              save the take, or 4 times to discard it. Start recording above requires an engaged rig.
+              save the take, or 4 times to discard it. Start recording above requires an engaged
+              rig.
             </p>
           )}
         </div>

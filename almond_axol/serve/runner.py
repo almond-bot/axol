@@ -584,7 +584,7 @@ class OperationRunner:
                 raise ValueError(
                     f"{op_id}'s parsed mantis={parsed_mantis} does not match "
                     f"the submitted mantis={mantis_mode}; select Mantis only "
-                    "through the operation's Mantis toggle"
+                    "through the control panel's Mantis tile"
                 )
             if cmd.requires_cameras and not self._has_recording_camera(cfg):
                 raise ValueError(
@@ -627,7 +627,7 @@ class OperationRunner:
                     raise ValueError(
                         f"{op_id}'s robot_config hardware profile does not match "
                         f"mantis={mantis_mode}; select Mantis only through the "
-                        "operation's Mantis toggle"
+                        "control panel's Mantis tile"
                     )
 
             is_sim = cmd.sim_flag is not None and parsed_flags.get(cmd.sim_flag, False)

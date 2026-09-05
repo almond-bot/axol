@@ -12,25 +12,21 @@ import {
   RadioTower,
   Save,
   Square,
-  Wrench,
 } from "lucide-react"
 import {
   fetchTrackerBindings,
   sendSessionInput,
   stopSession,
   useSessionLogs,
-  type MantisTrackerSource,
   type SessionInfo,
   type TrackerBackend,
   type TrackerBinding,
   type TrackerSourceReadiness,
-  type TrackerTransformReadiness,
 } from "@/lib/supervisor"
 import { startDiagnosticsRun } from "@/lib/telemetry"
 import { Button } from "@/components/ui/button"
 import { useToast } from "@/components/ui/toast"
 import { cn } from "@/lib/utils"
-import { TrackerCalibrationPanel } from "./tracker-calibration-panel"
 import { UltimateWifiPanel } from "./ultimate-wifi-panel"
 
 type SetupCommand =
@@ -41,16 +37,7 @@ type SetupCommand =
   | "tracker.ultimate.install"
   | "tracker.ultimate.check"
 
-type StepKey =
-  | "source"
-  | "runtime"
-  | "stations"
-  | "headset"
-  | "dongle"
-  | "wifi"
-  | "identify"
-  | "offset"
-  | "ready"
+type StepKey = "source" | "runtime" | "stations" | "headset" | "dongle" | "wifi" | "identify"
 
 interface FlowStep {
   key: StepKey
@@ -60,7 +47,6 @@ interface FlowStep {
   /** Shown next to the disabled Continue button while the step is unresolved. */
   pending: string
   body: ReactNode
-  final?: boolean
 }
 
 function backendFor(source: string): TrackerBackend | null {
@@ -101,7 +87,9 @@ function stepForCommand(command: string | undefined): StepKey | null {
     case "tracker.identify":
       return "identify"
     case "tracker.ultimate.check":
-      return "ready"
+      // The optional host check is launched from the CLI / Diagnostics now;
+      // while it runs, hold the flow on the step it validates.
+      return "dongle"
     default:
       return null
   }
@@ -115,12 +103,6 @@ function latestPrompt(lines: string[]): { index: number; text: string } | null {
     }
   }
   return null
-}
-
-function transformsApproved(transforms: TrackerTransformReadiness): boolean {
-  return (["left", "right"] as const).every(
-    (side) => transforms[side] === "factory" || transforms[side] === "measured"
-  )
 }
 
 function ago(epochSeconds: number): string {
@@ -494,44 +476,6 @@ export function TrackerBindingPanel({
     ),
   })
 
-  const offsetStep = (transforms: TrackerTransformReadiness, mount: string): FlowStep => {
-    const factoryOnly = transforms.left === "factory" && transforms.right === "factory"
-    return {
-      key: "offset",
-      title: "Gripper offset",
-      done: transformsApproved(transforms),
-      pending:
-        source === "quest"
-          ? "Save a bench-measured transform for both controllers"
-          : "Clear or fix the saved override so a factory or measured transform applies",
-      body: (
-        <StepBody>
-          {factoryOnly ? (
-            <p className="flex items-center gap-2 text-white/75">
-              <Check className="size-4 shrink-0 text-emerald-400" />
-              Using the built-in factory tracker → gripper transform for the {mount} on both sides.
-              Nothing to measure.
-            </p>
-          ) : (
-            <>
-              <p>
-                {source === "quest"
-                  ? "Quest has no factory constant: enter the gripper TCP measured in each controller's grip frame."
-                  : `The ${mount} normally uses the built-in factory transform. A saved per-unit entry is overriding or blocking it on at least one side; fix or remove it here.`}
-              </p>
-              <TransformBadges transforms={transforms} />
-              <TrackerCalibrationPanel
-                key={`${source}:${calibrationContextSaved ? "saved" : "draft"}:${readiness.quest.calibrationKey ?? ""}`}
-                source={source as MantisTrackerSource}
-                contextSaved={calibrationContextSaved}
-              />
-            </>
-          )}
-        </StepBody>
-      ),
-    }
-  }
-
   const identifyStep = (
     backendKey: TrackerBackend,
     blocker: string | null,
@@ -574,46 +518,6 @@ export function TrackerBindingPanel({
     }
   }
 
-  const readyStep = (extra?: ReactNode): FlowStep => ({
-    key: "ready",
-    title: "Test",
-    done: true,
-    pending: "",
-    final: true,
-    body: (
-      <StepBody>
-        <p className="flex items-center gap-2 text-white/80">
-          <Check className="size-4 shrink-0 text-emerald-400" />
-          {label} setup is complete on this host.
-        </p>
-        <p>
-          Run a short Mantis teleop with the workspace clear: hold both rigs at the rest pose with
-          both {source === "quest" ? "controllers" : "trackers"} visible, then{" "}
-          {source === "quest"
-            ? "release both grip buttons and press them together"
-            : "squeeze both triggers together and release them"}{" "}
-          to align and engage. Repeat that gesture after Reset or tracking loss.
-        </p>
-        {extra}
-        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
-          <Wrench className="size-4 text-white/50" />
-          <div className="min-w-48 flex-1">
-            <p className="text-sm font-medium text-white/75">Test triggers and grippers</p>
-            <p className="mt-1 text-xs leading-relaxed text-white/40">
-              Needs neither cameras nor tracking.
-            </p>
-          </div>
-          <a
-            href="/diagnostics"
-            className="inline-flex h-8 items-center justify-center gap-2 rounded-lg border border-white/10 px-3 text-[0.8rem] font-medium text-white/80 transition-colors hover:bg-white/[0.06]"
-          >
-            Open Diagnostics <ExternalLink className="size-3.5" />
-          </a>
-        </div>
-      </StepBody>
-    ),
-  })
-
   let steps: FlowStep[]
   if (source === "quest") {
     const q = readiness.quest
@@ -646,9 +550,9 @@ export function TrackerBindingPanel({
           <StepBody>
             <p>
               Put the Quest and this host on the same LAN (or connect USB-C with Developer Mode and
-              use the Quest USB tab). Start a Mantis teleop run, then in the Quest browser open{" "}
-              <span className="text-white/70">axol.almond.bot</span>, enter this host, connect, and
-              choose Enter VR. Hold both Touch controllers.
+              use the General settings → Quest tab). Start a Mantis teleop run, then in the Quest
+              browser open <span className="text-white/70">axol.almond.bot</span>, enter this host,
+              connect, and choose Enter VR. Hold both Touch controllers.
             </p>
             {live ? (
               <div className="flex flex-col gap-2 rounded-md border border-white/10 bg-black/20 p-2.5">
@@ -721,8 +625,6 @@ export function TrackerBindingPanel({
           </StepBody>
         ),
       },
-      offsetStep(q.transforms, "Quest controllers"),
-      readyStep(),
     ]
   } else if (source === "ultimate") {
     const u = readiness.ultimate
@@ -867,26 +769,6 @@ export function TrackerBindingPanel({
         ),
       },
       identifyStep("ultimate", identifyBlocker, u.installed),
-      offsetStep(u.transforms, "Ultimate flat-back mount"),
-      readyStep(
-        <div className="flex flex-col gap-2">
-          <p>
-            Optionally rerun the non-invasive host check; it does not open the dongle or prove live
-            poses.
-          </p>
-          <Button
-            variant="outline"
-            size="sm"
-            className="self-start"
-            onClick={() => launch("tracker.ultimate.check")}
-            disabled={!canAct}
-          >
-            {busy ? <Loader2 className="animate-spin" /> : <ListChecks />}
-            Run readiness check
-          </Button>
-          {progressFor("ready")}
-        </div>
-      ),
     ]
   } else {
     const l = readiness.lighthouse
@@ -975,10 +857,9 @@ export function TrackerBindingPanel({
           <StepBody>
             <ol className="flex flex-col gap-2">
               <SetupStep number={1}>
-                Power the base stations. Every Base Station 2.0 must show a different channel
-                number on the display on its back; the button next to it cycles 1–16. Two stations
-                on the same number cancel each other out, and libsurvive can only receive one of
-                them.
+                Power the base stations. Every Base Station 2.0 must show a different channel number
+                on the display on its back; the button next to it cycles 1–16. Two stations on the
+                same number cancel each other out, and libsurvive can only receive one of them.
               </SetupStep>
               <SetupStep number={2}>
                 Pair each Tracker 3.0 to its own Watchman dongle: connect only that dongle, unplug
@@ -988,8 +869,8 @@ export function TrackerBindingPanel({
               </SetupStep>
               <SetupStep number={3}>
                 Connect both dongles, power both trackers in view of the base stations, and use
-                Check base stations. It listens to libsurvive for 20 seconds and must see every
-                base station on its own channel.
+                Check base stations. It listens to libsurvive for 20 seconds and must see every base
+                station on its own channel.
               </SetupStep>
             </ol>
             <div className="flex flex-wrap gap-2">
@@ -1055,8 +936,6 @@ export function TrackerBindingPanel({
         ),
       },
       identifyStep("survive", null, l.installed),
-      offsetStep(l.transforms, "Tracker 3.0 flat-back mount"),
-      readyStep(),
     ]
   }
 
@@ -1101,21 +980,23 @@ function SetupFlow({
 }) {
   const firstUnresolved = steps.findIndex((step) => !step.done)
   // The furthest step the operator may open: the first unresolved one, or the
-  // final step once everything before it is confirmed.
+  // last step once everything is confirmed. The flow ends there — once the
+  // sides are identified, setup is complete.
   const reach = firstUnresolved === -1 ? steps.length - 1 : firstUnresolved
   const [chosen, setChosen] = useState(reach)
   const heldIndex = heldStep ? steps.findIndex((step) => step.key === heldStep) : -1
   const index = heldIndex >= 0 ? heldIndex : Math.min(chosen, reach)
   const step = steps[index]
-  const resolvedCount = steps.filter((s) => s.done && !s.final).length
-  const totalGated = steps.filter((s) => !s.final).length
+  const last = index === steps.length - 1
+  const complete = firstUnresolved === -1
+  const resolvedCount = steps.filter((s) => s.done).length
 
   return (
     <FlowCard
       title={title}
       aside={
-        <span className="text-[11px] text-white/40">
-          {resolvedCount}/{totalGated} steps resolved
+        <span className={cn("text-[11px]", complete ? "text-emerald-300/85" : "text-white/40")}>
+          {complete ? "Setup complete" : `${resolvedCount}/${steps.length} steps resolved`}
         </span>
       }
     >
@@ -1134,7 +1015,7 @@ function SetupFlow({
                   "flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors",
                   active
                     ? "border-[#eff483]/40 bg-[#eff483]/10 text-[#eff483]"
-                    : s.done && !s.final
+                    : s.done
                       ? "border-emerald-400/20 bg-emerald-400/[0.06] text-emerald-300/85 hover:bg-emerald-400/10"
                       : reachable
                         ? "border-white/15 text-white/60 hover:bg-white/[0.05]"
@@ -1144,14 +1025,10 @@ function SetupFlow({
                 <span
                   className={cn(
                     "flex size-4 items-center justify-center rounded-full font-mono text-[10px]",
-                    s.done && !s.final
-                      ? "bg-emerald-400/15"
-                      : active
-                        ? "bg-[#eff483]/15"
-                        : "bg-white/[0.07]"
+                    s.done ? "bg-emerald-400/15" : active ? "bg-[#eff483]/15" : "bg-white/[0.07]"
                   )}
                 >
-                  {s.done && !s.final ? <Check className="size-3" /> : i + 1}
+                  {s.done ? <Check className="size-3" /> : i + 1}
                 </span>
                 {s.title}
               </button>
@@ -1168,7 +1045,7 @@ function SetupFlow({
             Step {index + 1} of {steps.length}
           </span>
           <span className="text-sm font-medium text-white/85">{step.title}</span>
-          {step.done && !step.final && (
+          {step.done && (
             <span className="ml-auto flex items-center gap-1 text-[11px] text-emerald-300/85">
               <Check className="size-3" /> Resolved
             </span>
@@ -1186,20 +1063,24 @@ function SetupFlow({
         >
           <ChevronLeft /> Back
         </Button>
-        {!step.final && (
-          <>
-            {!step.done && step.pending && (
-              <span className="ml-auto text-[11px] text-amber-300/80">{step.pending}</span>
-            )}
-            <Button
-              size="sm"
-              className={step.done ? "ml-auto" : ""}
-              onClick={() => setChosen(index + 1)}
-              disabled={!step.done || heldIndex >= 0}
-            >
-              Continue <ChevronRight />
-            </Button>
-          </>
+        {!step.done && step.pending && (
+          <span className="ml-auto text-[11px] text-amber-300/80">{step.pending}</span>
+        )}
+        {last ? (
+          step.done && (
+            <span className="ml-auto flex items-center gap-1.5 text-xs text-emerald-300/85">
+              <Check className="size-3.5" /> {title} is complete on this host.
+            </span>
+          )
+        ) : (
+          <Button
+            size="sm"
+            className={step.done ? "ml-auto" : ""}
+            onClick={() => setChosen(index + 1)}
+            disabled={!step.done || heldIndex >= 0}
+          >
+            Continue <ChevronRight />
+          </Button>
         )}
       </div>
     </FlowCard>
@@ -1235,30 +1116,6 @@ function Notice({ children }: { children: ReactNode }) {
     <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs leading-relaxed text-amber-200/80">
       {children}
     </p>
-  )
-}
-
-function TransformBadges({ transforms }: { transforms: TrackerTransformReadiness }) {
-  return (
-    <div className="flex flex-wrap gap-1.5">
-      {(["left", "right"] as const).map((side) => {
-        const transform = transforms[side]
-        return (
-          <ReadinessBadge
-            key={side}
-            tone={
-              transform === "missing"
-                ? "error"
-                : transform === "candidate" || transform === "stale"
-                  ? "warning"
-                  : "ready"
-            }
-          >
-            {side === "left" ? "L" : "R"} mount {transform}
-          </ReadinessBadge>
-        )
-      })}
-    </div>
   )
 }
 

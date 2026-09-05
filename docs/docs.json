@@ -36,6 +36,13 @@
         ]
       },
       {
+        "group": "Mantis",
+        "pages": [
+          "mantis/hardware",
+          "mantis/tracking"
+        ]
+      },
+      {
         "group": "Remote Teleop",
         "pages": [
           "guides/remote-teleop"
@@ -59,44 +66,89 @@
             "group": "CLI Reference",
             "pages": [
               "cli/configuration",
-              "cli/serve",
-              "cli/can-setup",
-              "cli/can-enable",
-              "cli/can-driver",
-              "cli/lift-home",
-              "cli/lift-goto",
-              "cli/motor-info",
-              "cli/motor-health",
-              "cli/diag-rom-enable",
-              "cli/diag-rom-disable",
-              "cli/diag-mantis-trigger",
-              "cli/diag-lift-cycle",
-              "cli/diag-zed-cable",
-              "cli/motor-set-can-id",
-              "cli/motor-set-zero-pos",
-              "cli/motor-dump-config",
-              "cli/motor-set-config",
-              "cli/motor-restore-config",
-              "cli/motor-flash",
-              "cli/teleop",
-              "cli/tracker",
-              "cli/collect-data",
-              "cli/collect-dagger",
-              "cli/migrate-dataset",
-              "cli/replay-dataset",
-              "cli/run-policy",
-              "cli/inference-server",
-              "cli/provision",
-              "cli/zed-driver",
-              "cli/zed-install",
-              "cli/gst-install",
-              "cli/gst-build-zed",
-              "cli/jetson-setup",
-              "cli/tune-pid",
-              "cli/tune-friction",
-              "cli/tune-repeatability",
-              "cli/gravity-comp",
-              "cli/waypoints"
+              {
+                "group": "Operations",
+                "pages": [
+                  "cli/teleop",
+                  "cli/gravity-comp",
+                  "cli/waypoints",
+                  "cli/collect-data",
+                  "cli/collect-dagger",
+                  "cli/replay-dataset",
+                  "cli/run-policy",
+                  "cli/inference-server",
+                  "cli/migrate-dataset"
+                ]
+              },
+              {
+                "group": "Host",
+                "pages": [
+                  "cli/serve",
+                  "cli/provision",
+                  "cli/jetson-setup"
+                ]
+              },
+              {
+                "group": "CAN",
+                "pages": [
+                  "cli/can-setup",
+                  "cli/can-enable",
+                  "cli/can-driver"
+                ]
+              },
+              {
+                "group": "Motors",
+                "pages": [
+                  "cli/motor-info",
+                  "cli/motor-health",
+                  "cli/motor-set-can-id",
+                  "cli/motor-set-zero-pos",
+                  "cli/motor-dump-config",
+                  "cli/motor-set-config",
+                  "cli/motor-restore-config",
+                  "cli/motor-flash"
+                ]
+              },
+              {
+                "group": "Lift",
+                "pages": [
+                  "cli/lift-home",
+                  "cli/lift-goto"
+                ]
+              },
+              {
+                "group": "Cameras",
+                "pages": [
+                  "cli/zed-install",
+                  "cli/zed-driver",
+                  "cli/gst-install",
+                  "cli/gst-build-zed"
+                ]
+              },
+              {
+                "group": "Mantis tracking",
+                "pages": [
+                  "cli/tracker"
+                ]
+              },
+              {
+                "group": "Diagnostics",
+                "pages": [
+                  "cli/diag-rom-enable",
+                  "cli/diag-rom-disable",
+                  "cli/diag-mantis-trigger",
+                  "cli/diag-lift-cycle",
+                  "cli/diag-zed-cable"
+                ]
+              },
+              {
+                "group": "Tuning",
+                "pages": [
+                  "cli/tune-pid",
+                  "cli/tune-friction",
+                  "cli/tune-repeatability"
+                ]
+              }
             ]
           },
           {

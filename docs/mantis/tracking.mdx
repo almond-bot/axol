@@ -1,0 +1,147 @@
+---
+title: "Mantis Tracking"
+description: "Set up Meta Quest, VIVE Tracker 3.0 (Lighthouse), or VIVE Ultimate tracking as the Mantis pose source."
+---
+
+Every Mantis run needs a **pose source**: the tracking system that reports where each rig is. Mantis supports three, selected under **Mantis settings → Tracking** in the control panel (default: Lighthouse). Pick one per installation — the choice, its setup state, and its device bindings are all stored on the host, so teleoperation and data collection use the same source without per-run flags.
+
+| Source | Hardware | Tracking | Setup contract |
+|---|---|---|---|
+| **Quest** | Meta Quest controllers via WebXR | Headset inside-out tracking | Enter VR in the headset browser; handedness identifies left/right. No bridge, no Identify. |
+| **Lighthouse** | VIVE Tracker 3.0 | Outside-in, 1–2 SteamVR base stations | Pinned libsurvive runtime on the host, pair each tracker with its dongle, check base stations, identify sides. |
+| **Ultimate** | VIVE Ultimate Tracker | Inside-out SLAM, no base stations | One-time pair + room map in VIVE Hub on Windows; then the HTC dongle and pinned pyvut runtime on the host, private shared-map AP config, identify sides. |
+
+<Note>
+  Keep the product names distinct: **VIVE Tracker 3.0** is the Lighthouse device (there is no "Quest 3.0" tracker), **Meta Quest** is the WebXR source, and **VIVE Ultimate Tracker** is the inside-out source.
+</Note>
+
+Before starting, finish the [Mantis hardware setup](/mantis/hardware): the hub connected, **Mantis** selected on its tile, the CAN side mapping confirmed, and the trigger test passed. Then open **Mantis settings → Tracking**, choose the source, and press **Save settings**.
+
+## Set up the source
+
+The Tracking tab walks each source through a **step-by-step flow**. Each step resolves from what the host actually reports (not from ticking a box), **Continue** unlocks once it is resolved, a step that regresses later pulls the flow back to it, and the flow stays on a step while its action is running. Setup is complete once the sides are identified — or, for Quest, once the headset's calibration key is saved. The equivalent CLI commands are listed alongside; see the [tracker CLI reference](/cli/tracker) for their flags.
+
+<Tabs>
+  <Tab title="Quest">
+    Quest uses the headset's own controller tracking through WebXR, so there is no runtime to install and no tracker to bind — WebXR handedness assigns left and right. The only stored state is the **calibration key** that identifies the controller generation and pose datum.
+
+    <Steps>
+      <Step title="Source">
+        Choose **Quest** and **Save settings**. The Quest headset and the host must be on the same LAN (or use the wired [Quest-over-USB](/guides/quest-over-usb) link, managed under **General settings → Quest**).
+      </Step>
+      <Step title="Headset">
+        Start a Mantis teleop run, then in the Quest browser open [axol.almond.bot](https://axol.almond.bot), enter the host, connect, accept the host's certificate the first time, and choose **Enter VR**. Hold both Touch controllers.
+
+        The step shows each controller's reported WebXR profile and pose space and, when both match, a copyable **common calibration key** (for example `quest:oculus-touch-v3:grip`). Press **Use this key**, then **Save settings**. The step resolves once the saved key is a **grip-space** datum matching the live controllers; a stale report, a `target-ray` fallback, or two controllers reporting different keys is held rather than accepted.
+      </Step>
+    </Steps>
+
+    The client sends `gripSpace` poses (with `targetRaySpace` only as an older-runtime fallback), works without body/elbow tracking, and preserves lost optical tracking per side so the server can hold safely. Quest has **no factory tracker→gripper transform**: production collection needs a bench-measured transform for both controllers under the exact saved key — see [Transforms](#transforms).
+  </Tab>
+
+  <Tab title="Lighthouse">
+    Lighthouse tracks two **VIVE Tracker 3.0** units from 1–2 SteamVR base stations (1.0 or 2.0) with the pinned [libsurvive](https://github.com/collabora/libsurvive) runtime on the host. Mount the base stations with the whole Mantis workspace in view, and if you use two **Base Station 2.0** units, put them on **different channels** (the button on the back cycles 1–16) — two stations on one channel make poses jump or stall as soon as a rig moves.
+
+    <Steps>
+      <Step title="Source">
+        Choose **Lighthouse** and **Save settings**.
+      </Step>
+      <Step title="Runtime">
+        `axol provision` normally installs the pinned libsurvive build during installation. If the step is red, press **Install Lighthouse support** (CLI: [`axol tracker.install`](/cli/tracker#axol-trackerinstall)). It builds `survive-cli` at the pinned commit with Eigen and the native libusb backend, installs the Vive udev rule, and is safe to rerun — an existing pinned build is re-attested, not rebuilt.
+      </Step>
+      <Step title="Trackers">
+        Power the base stations. For each tracker, unplug it from USB so it blinks blue, plug its Watchman dongle into the host, and press **Pair tracker** (CLI: `axol tracker.pair`). Then, with both trackers powered and in view, press **Check base stations** (CLI: [`axol tracker.lighthouse.check`](/cli/tracker#axol-trackerlighthousecheck)): it listens for about 20 seconds and resolves only when it sees no shared channel, both base stations, and both trackers reporting. A failure names the channel to change and how.
+      </Step>
+      <Step title="Identify sides">
+        Press **Identify trackers** (CLI: [`axol tracker.identify --backend survive`](/cli/tracker#axol-trackeridentify)). Tracker addresses do not say which rig they are on, so Identify watches which tracker moves for each side: move **only the requested rig** during each 3-second capture. It refuses to bind while base stations share a channel. Setup is complete once both sides are bound.
+      </Step>
+    </Steps>
+
+    libsurvive calibrates the base-station world on first run — leave the trackers still and visible for a few seconds. The standard flat-back mount uses the **built-in factory transform**, so nothing needs measuring.
+  </Tab>
+
+  <Tab title="Ultimate">
+    **VIVE Ultimate Trackers** track themselves (inside-out SLAM) against a room map they share over a private access point, with no base stations or headset. There is no official Linux support; the host uses the community [pyvut](https://github.com/nijkah/pyvut) driver to talk to the **wireless dongle over USB HID**. Pairing and mapping are Windows-only, one-time operator steps; everything after that runs from the control panel.
+
+    <Steps>
+      <Step title="One time on Windows: pair">
+        On a Windows PC install SteamVR, enable its [null/virtual-headset driver](https://github.com/username223/SteamVRNoHeadset), install VIVE Streaming Hub, and install the **VIVE Ultimate Tracker service** inside VIVE Hub ([pinned pyvut setup](https://github.com/nijkah/pyvut/blob/fcfcd33f4c1f16b0d84f5f741dc1319abdc7942a/README.md#constructing-map-steamvr--vive---only-available-on-windows), [HTC pairing prerequisites](https://business.vive.com/us/support/ultimate-tracker/category_howto/pairing-ultimate-tracker-with-the-dongle.html)). Connect the wireless dongle and open **Settings → VIVE Ultimate Tracker → Trackers → Pair new**. Power on a tracker, wait through its green/blue startup flashes until the LED is solid blue, then hold Power for about two seconds until blue flashes again and pair it. Repeat for the second tracker on the same dongle.
+      </Step>
+      <Step title="One time on Windows: map">
+        Choose **Start setup → Create map**, establish the center, and scan the entire Mantis operating volume from both low/kneeling and standing heights while facing all four directions. Let the map auto-save (use Refine/Save if offered) and confirm both trackers regain full position + rotation after a power cycle. The pairing and map live on the trackers and move with them to the robot host.
+      </Step>
+      <Step title="Source">
+        Back in the control panel, choose **Ultimate** and **Save settings**.
+      </Step>
+      <Step title="Runtime">
+        Press **Install / Repair Ultimate support** (CLI: [`axol tracker.ultimate.install`](/cli/tracker#axol-trackerultimateinstall)). It installs the pinned pyvut commit, the `hid` Python binding, system HID libraries, and a persistent udev rule for dongle `0bb4:0350`; safe to rerun. Do not replace it with an unpinned `pip install` or a one-off `chmod /dev/hidraw*`.
+      </Step>
+      <Step title="Dongle">
+        Plug the same dongle into the host. The step resolves when the dongle is detected, its HID endpoint is accessible, and the operator has USB access. The one host-side step — adding the Axol login to the `dialout` group — is shown with its command because it needs a re-login.
+      </Step>
+      <Step title="Wi-Fi">
+        Save the trackers' **private shared-map AP** configuration: SSID, password, two-letter regulatory country, and Wi-Fi center frequency in MHz. These are **not** the Windows PC's network, the robot LAN, or your router. Upstream pyvut requires all four as fallback; with the USB-dongle transport the tracker firmware reports the active SLAM-host SSID/password/frequency and only the saved country is consumed directly. The password is masked and never read back, and the file is written as `~/.almond/tracker/ultimate_wifi.json` with mode `0600` (CLI/manual shape in the [reference](/cli/tracker#ultimate-wi-fi-file)).
+      </Step>
+      <Step title="Identify sides">
+        Power both trackers inside the mapped area and press **Identify trackers** (CLI: [`axol tracker.identify --backend ultimate`](/cli/tracker#axol-trackeridentify)). Move only the requested rig for each side; the addresses are saved separately from Lighthouse bindings. Setup is complete once both sides are bound. [`axol tracker.ultimate.check`](/cli/tracker#axol-trackerultimatecheck) is an optional non-invasive host check that reports the same dependency, USB, permission, binding, convention, and redacted AP-config state the Start gate uses.
+      </Step>
+    </Steps>
+
+    <Warning>
+      The dongle protocol is reverse-engineered and firmware-dependent. The pinned runtime and factory transform expect `wxyz` quaternions and a z-up SLAM world. Bench-check gravity, translations, and rotations before changing those settings, and never use the quaternion/up-axis toggle to compensate for a mount transform: a convention change disables the factory transform and makes saved Ultimate overrides stale, blocking production use until an override is saved under the active convention or the pinned convention is restored.
+    </Warning>
+
+    The standard flat-back mount uses the **built-in factory transform** (the Tracker 3.0 value with the 11 mm origin difference folded in); nothing needs measuring.
+  </Tab>
+</Tabs>
+
+The readiness the flow shows is also enforced by the operation backend: a direct CLI or REST start cannot bypass the runtime, permission, dongle/AP, binding, live-input, or production-transform gates.
+
+## Start gesture and recovery
+
+<Tabs>
+  <Tab title="Quest">
+    Hold both rigs at the agreed start pose, **release both controller grips, then press both grips together** to align and engage. The controller triggers operate the grippers. In data collection, **A** starts and confirms a take, exactly as on Axol.
+
+    If tracking is lost on either side, both sides freeze. Restore both, then release and press both grips again — recovery never resumes motion on its own. **Reset** returns to rest and needs the same fresh gesture.
+  </Tab>
+  <Tab title="Lighthouse / Ultimate">
+    A managed run does **not** move as soon as the trackers appear. Startup waits for **both fresh, fully tracked poses and both trigger heartbeats**. Then hold both rigs where the session should begin, **squeeze both rig triggers together, and release both**: on that release the world→robot base transform is fitted at the rigs' pose and tracking engages. In data collection the same gesture also starts the take (once the teleop core acknowledges the engage); while recording, rapidly fully squeeze and release either trigger **three times** to save or **four times** to discard.
+
+    A tracker-lock loss or stale trigger heartbeat freezes both sides. Restore both, then repeat the both-squeeze→release gesture; nothing re-anchors automatically. **Reset** returns to rest and requires the gesture again.
+
+    A Quest may still connect as a **view-only** passthrough / video / HUD client: its controller frames are ignored and never blend with the managed tracker bridge. Because there is no built-in Quest↔tracker world-registration procedure, the spatial URDF overlay is hidden for these sources by default.
+  </Tab>
+</Tabs>
+
+## Transforms
+
+Absolute (Mantis) IK solves the world yaw and translation at engage time, but it does **not** discover where the gripper TCP sits relative to the tracker. That rigid **tracker → TCP transform** must come from somewhere:
+
+| Source | Transform |
+|---|---|
+| Lighthouse (Tracker 3.0) | Built-in factory value for the flat-back mount — applied automatically after Identify. |
+| Ultimate | Built-in factory value `[0, 0.0465, -0.092, 0.7071068, 0, 0, 0.7071068]` for both sides (Tracker 3.0's mount rotation with the 11 mm origin rise), approved for the pinned `wxyz` / z-up convention. |
+| Quest | No factory value: measure the gripper TCP in each controller's grip frame and save it under the exact `quest:<reported-profile>:grip` key for both sides. |
+
+Overrides and Quest measurements live in `~/.almond/mantis/tcp_transform.json`, keyed per side by the identified device (`survive:<codename>`, `ultimate:<mac>`, or `quest:<profile>:grip`). `pos` is the gripper TCP origin in the tracker's local frame in **metres**; `quat` is the TCP orientation in that frame as **`[qx, qy, qz, qw]`**. The file is edited directly (or via `PUT /api/tracker/calibration/<source>`); the panel does not edit transforms. The full schema, the Ultimate convention rules, and the bring-up route for a missing constant (`--mantis_allow_uncalibrated true` for a calibration-only capture) are in the [tracker CLI reference](/cli/tracker#transform-file). Production `collect-data` refuses to start with a missing, stale, or unapproved transform on either side.
+
+## Acceptance
+
+Before recording training data, run a short **Mantis teleop** with the workspace clear and check, with the selected live source:
+
+1. Physical **left/right**, scale, every translation axis, wrist rotation, and tracker→TCP alignment. With Quest, the headset's live URDF overlay shows the virtual arms; with Lighthouse/Ultimate, use the control panel's mirrored view.
+2. **Recovery**: deliberately occlude or de-localize one side and confirm both freeze; restore tracking and confirm nothing moves until the start gesture is repeated.
+
+A source that jumps, drifts, swaps sides, or cannot recover cleanly is not ready for collection. `axol teleop --sim --teleop.absolute_mode true` is only a generic mapping demo, not acceptance — physical acceptance must use the real source with Mantis selected.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Teleoperation" icon="gamepad" href="/operations/teleop">
+    Run the Mantis acceptance from the control panel or CLI.
+  </Card>
+  <Card title="Data Collection" icon="record-vinyl" href="/operations/data-collection">
+    Record Mantis episodes to a LeRobot dataset.
+  </Card>
+</CardGroup>
