@@ -839,10 +839,20 @@ export default function ControlPanel() {
     }
   }
 
-  // The operations this host offers, and the selected one resolved against
-  // them: a stored selection the host doesn't have lands on its first
-  // operation instead of an empty panel.
-  const operations = useMemo(() => operationsFromCommands(commands), [commands])
+  // The operations this host offers on the selected device — Mantis hides the
+  // Axol-only ones — and the selected one resolved against them: a stored
+  // selection the host (or device) doesn't have lands on the first operation
+  // instead of an empty panel. A running Axol-only operation stays visible
+  // even if another operator selects Mantis mid-run, so it can be stopped.
+  const liveCommand = [status, session].find(
+    (s) => s && (s.status === "running" || s.status === "starting" || s.status === "stopping")
+  )?.command
+  const operations = useMemo(() => {
+    const all = operationsFromCommands(commands)
+    return hardwareProfile === "mantis"
+      ? all.filter((o) => o.supportsMantis || o.id === liveCommand)
+      : all
+  }, [commands, hardwareProfile, liveCommand])
   const meta = useMemo(
     () => operations.find((o) => o.id === selectedOp) ?? operations[0],
     [operations, selectedOp]
@@ -857,8 +867,7 @@ export default function ControlPanel() {
   // -- per-operation settings --
   const settings = useMemo(() => settingsByOp[opId] ?? loadOpSettings(opId), [settingsByOp, opId])
   // The device selection is system-wide: a Mantis-capable operation runs on
-  // Mantis whenever it is selected, and the idle link auto-connects to it. An
-  // Axol-only operation is blocked (in the panel) until Axol is selected.
+  // Mantis whenever it is selected, and the idle link auto-connects to it.
   const mantisMode = meta.supportsMantis && hardwareProfile === "mantis"
   const desiredHardwareProfile: HardwareProfile = hardwareProfile
 
@@ -1391,7 +1400,7 @@ export default function ControlPanel() {
       // never be blocked by camera detection, and sim never touches hardware.
       const mantisSelected = mantisMode
       if (hardwareProfile === "mantis" && !meta.supportsMantis) {
-        toast.error(`${meta.label} runs on Axol only — switch the device to Axol first.`)
+        toast.error(`${meta.label} runs on Axol only — select the Axol tile first.`)
         return
       }
       // Sim / cart-only are Axol run modes; they are hidden (and ignored) on

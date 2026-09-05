@@ -129,8 +129,6 @@ export function OperationPanel({
   const mantisMode =
     meta.supportsMantis &&
     (liveArgs ? Boolean(liveArgs[HARDWARE_PROFILE_ARG]) : hardwareProfile === "mantis")
-  // An Axol-only operation cannot start while Mantis is the selected device.
-  const axolOnlyBlocked = !live && hardwareProfile === "mantis" && !meta.supportsMantis
   const mantisSource =
     liveArgs && typeof liveArgs.mantis_source === "string"
       ? liveArgs.mantis_source
@@ -233,9 +231,7 @@ export function OperationPanel({
 
   const blockers: string[] = []
   if (!live && hostBlocker) blockers.push(`Wait: ${hostBlocker}`)
-  if (axolOnlyBlocked) {
-    blockers.push(`Select the Axol tile — ${meta.label} runs on Axol only`)
-  } else if (meta.requiresRobot && mantisMode && !mantisOk) {
+  if (meta.requiresRobot && mantisMode && !mantisOk) {
     blockers.push(
       robotOk && robot?.profile !== "mantis"
         ? "Connect Mantis (the current hardware link is Axol)"
@@ -350,16 +346,14 @@ export function OperationPanel({
               {/* Which hardware this run targets — the system-wide device
                   selection, or the device a live run was started on. */}
               <Badge
-                variant={axolOnlyBlocked ? "warning" : "neutral"}
+                variant="neutral"
                 title={
-                  axolOnlyBlocked
-                    ? `${meta.label} runs on Axol only; Mantis is the selected device.`
-                    : mantisMode
-                      ? "Runs on the handheld Mantis rigs (selected device)."
-                      : "Runs on the Axol arms."
+                  mantisMode
+                    ? "Runs on the handheld Mantis rigs (selected device)."
+                    : "Runs on the Axol arms."
                 }
               >
-                {mantisMode ? "Mantis" : axolOnlyBlocked ? "Axol only" : "Axol"}
+                {mantisMode ? "Mantis" : "Axol"}
               </Badge>
               <StatusBadge session={live ? session : null} />
             </div>
