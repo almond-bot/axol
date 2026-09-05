@@ -80,7 +80,7 @@ Complete the matching [Mantis teleop acceptance](/operations/teleop#mantis-teleo
 
 <Steps>
   <Step title="Select Mantis and assign its cameras">
-    In the control panel choose **Collect Data**, enable **Mantis**, then open **Settings → Mantis**. Select and save the pose source, verify the two distinct CAN channel fields, and assign **Left Mantis / Right Mantis** cameras. Those two slots are stored separately from the overhead / left arm / right arm layout in **Settings → Axol Cameras**. At least one Mantis camera must have recording enabled.
+    In the control panel set the **Device** switch to **Mantis**, choose **Collect Data**, then click the Mantis tile to open **Mantis settings**. Select and save the pose source under **Tracking**, verify the two distinct CAN channel fields under **CAN mapping**, and assign **Left Mantis / Right Mantis** cameras under **Cameras**. Those two slots are stored separately from the overhead / left arm / right arm layout in **Axol settings → Cameras**. At least one Mantis camera must have recording enabled.
 
     Set the repo id and task. Normal production start remains blocked until source setup, both transforms, the Mantis hardware link, and the camera selection are ready. `mantis_allow_uncalibrated` is only for a calibration capture that will not enter training.
   </Step>
@@ -88,7 +88,7 @@ Complete the matching [Mantis teleop acceptance](/operations/teleop#mantis-teleo
   <Step title="Bring up the selected pose source">
     <Tabs>
       <Tab title="Quest">
-        Select **Quest**, start the operation, then connect and enter VR at [axol.almond.bot](https://axol.almond.bot). Left/right comes from WebXR handedness. Use the live common profile as **Quest calibration key**, then save both measured mounts with the Settings → Mantis transform editor under that exact `quest:&lt;reported-profile&gt;:grip` key; a different Touch generation or target-ray fallback is held rather than silently accepted. Hold the rigs at the start pose, release both controller grips, then press both to align/engage.
+        Select **Quest**, start the operation, then connect and enter VR at [axol.almond.bot](https://axol.almond.bot). Left/right comes from WebXR handedness. Use the live common profile as **Quest calibration key**, then save both measured mounts in `~/.almond/mantis/tcp_transform.json` under that exact `quest:&lt;reported-profile&gt;:grip` key (see [Transforms and acceptance](/cli/tracker#transforms-and-acceptance)); a different Touch generation or target-ray fallback is held rather than silently accepted. Hold the rigs at the start pose, release both controller grips, then press both to align/engage.
       </Tab>
 
       <Tab title="Lighthouse">
@@ -96,7 +96,7 @@ Complete the matching [Mantis teleop acceptance](/operations/teleop#mantis-teleo
       </Tab>
 
       <Tab title="Ultimate">
-        Select **Ultimate** after the one-time Windows pair/map flow. In Settings → Mantis, install the runtime, save the private shared-map AP configuration, connect/power the dongle and trackers, complete guided **Identify trackers**, and choose **Run readiness check**. The standard flat-back mount automatically uses the approved 11 mm origin-adjusted factory transform under the pinned `wxyz` / z-up convention; measured entries are optional overrides. Start only with both trackers localized in the shared map and both trigger nodes live. Engagement is part of the start gesture below. See the [UI and CLI setup routes](/cli/tracker#vive-ultimate-tracker-setup-dongle--pyvut).
+        Select **Ultimate** after the one-time Windows pair/map flow. In Settings → Mantis, install the runtime, save the private shared-map AP configuration, connect/power the dongle and trackers, and complete guided **Identify trackers**; the flow ends there (`axol tracker.ultimate.check` is the optional non-invasive host check). The standard flat-back mount automatically uses the approved 11 mm origin-adjusted factory transform under the pinned `wxyz` / z-up convention; measured entries are optional overrides. Start only with both trackers localized in the shared map and both trigger nodes live. Engagement is part of the start gesture below. See the [UI and CLI setup routes](/cli/tracker#vive-ultimate-tracker-setup-dongle--pyvut).
       </Tab>
     </Tabs>
   </Step>

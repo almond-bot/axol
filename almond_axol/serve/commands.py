@@ -331,11 +331,13 @@ COMMANDS: dict[str, CommandDef] = {
         streams_video=True,
         sim_flag="sim",
         # mantis drives the handheld rig's own CAN buses (can_mantis_l/r), so
-        # like cart_only it never touches the arms or their motor faults.
+        # like cart_only it never touches the arms or their motor faults. It is
+        # not a per-run field: the panel derives it from the system-wide
+        # device selection (settings ``system.hardware_profile``).
         robot_free_flags=("cart_only", "mantis"),
         supports_mantis=True,
         uses_headset=True,
-        per_run_fields=("sim", "mantis", "cart_only"),
+        per_run_fields=("sim", "cart_only"),
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",
@@ -387,14 +389,15 @@ COMMANDS: dict[str, CommandDef] = {
         # the headset at this machine — and shows the relay's camera feeds.
         uses_headset=True,
         # mantis records with the handheld rig (its own CAN buses) — the Axol
-        # arms and their motor-fault gate are not involved.
+        # arms and their motor-fault gate are not involved. Like teleop, the
+        # flag comes from the panel's system-wide device selection.
         robot_free_flags=("mantis",),
         supports_mantis=True,
         # Panel-driven episodes (headset-off collection): the dashboard can
         # start recording and save or discard an episode, and mirrors the
         # headset HUD (phase, episode number, saved count).
         episode_control=_collect_data_control,
-        per_run_fields=("mantis", "repo_id", "task"),
+        per_run_fields=("repo_id", "task"),
     ),
     "collect-dagger": CommandDef(
         "collect-dagger",

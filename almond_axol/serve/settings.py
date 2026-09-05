@@ -891,6 +891,22 @@ SETTINGS: tuple[SettingCategory, ...] = (
         description="Logging and diagnostics.",
         settings=(
             SettingDef(
+                key="system.hardware_profile",
+                label="Active device",
+                type="select",
+                options=("axol", "mantis"),
+                help=(
+                    "Which hardware every operation runs on: the Axol arms or "
+                    "the handheld Mantis rigs. Set from the device switch on the "
+                    "control panel; teleop and data collection follow it, while "
+                    "Axol-only operations wait until it is back on Axol."
+                ),
+                # Not a config key: the panel translates it into each run's
+                # ``mantis`` flag, so it stays visible to every operator device.
+                targets={},
+                effective_default="axol",
+            ),
+            SettingDef(
                 key="system.log_level",
                 label="Log level",
                 type="select",

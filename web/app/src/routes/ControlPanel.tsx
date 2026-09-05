@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Loader2, RefreshCw } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
+  HARDWARE_PROFILE_ARG,
+  HARDWARE_PROFILE_SETTING,
   OPERATIONS,
   cameraCount,
   canDiscoveryRequestCanRetry,
@@ -17,13 +19,16 @@ import {
   fetchUpdateStatus,
   fetchUsbStatus,
   isSimRun,
+  loadLocalHardwareProfile,
   loadOpSettings,
   missingCameraSerials,
   operationsFromCommands,
+  parseHardwareProfile,
   perRunFields,
   probeUpdateStatus,
   robotConnect,
   robotDisconnect,
+  saveLocalHardwareProfile,
   saveOpSettings,
   saveSettings,
   sendEpisodeCommand,
@@ -72,11 +77,12 @@ import { InstallerMigrationBanner, UpdateBanner } from "@/components/update-bann
 import { VersionMismatchBanner } from "@/components/version-mismatch-banner"
 import { requiresInstallerMigration, showInstallerMigration } from "@/lib/update-migration"
 import { versionMismatch } from "@/lib/version"
-import { ConnectionsBar } from "@/components/connections-bar"
+import { ConnectionsBar, DeviceSwitch } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
-import { SettingsSection, type SettingsTab } from "@/components/settings/settings-section"
+import { SettingsSection } from "@/components/settings/settings-section"
+import { defaultSettingsTab, type SettingsScope, type SettingsTab } from "@/lib/settings-scope"
 import { SiteNav } from "@/components/site-nav"
 import { useToast } from "@/components/ui/toast"
 import { Button } from "@/components/ui/button"
@@ -217,6 +223,13 @@ export default function ControlPanel() {
   // cameras then fall back to the legacy localStorage flow.
   const [settingsSnap, setSettingsSnap] = useState<SettingsSnapshot | null>(null)
   const [settingsError, setSettingsError] = useState<string | null>(null)
+  // The system-wide device selection (Axol or Mantis) that every operation
+  // runs on. The host's shared settings are authoritative so all operator
+  // devices agree; this browser's copy covers hosts too old to store it.
+  const [localHardwareProfile, setLocalHardwareProfile] = useState<HardwareProfile>(() =>
+    loadLocalHardwareProfile()
+  )
+  const [hardwareProfileSaving, setHardwareProfileSaving] = useState(false)
   // Last ZED detection from the serve host (null until first detected), used to
   // verify the assigned serials are actually connected before a task starts.
   const [cameraDevices, setCameraDevices] = useState<CameraDevice[] | null>(null)
@@ -728,6 +741,53 @@ export default function ControlPanel() {
     settingsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
   }
 
+  // A connection tile opens its own settings scope on that scope's first tab.
+  function openSettingsScope(scope: SettingsScope) {
+    openSettings(defaultSettingsTab(scope))
+  }
+
+  // Whether the connected host's settings schema knows the device selection;
+  // an older host keeps it per-browser rather than failing the save.
+  const hostStoresHardwareProfile =
+    settingsSnap != null &&
+    !settingsError &&
+    settingsSnap.schema.some((cat) => cat.settings.some((s) => s.key === HARDWARE_PROFILE_SETTING))
+  // The host's value is the truth for every operator device (unset = Axol);
+  // this browser's copy only applies to hosts that cannot store it.
+  const hardwareProfile: HardwareProfile = hostStoresHardwareProfile
+    ? (parseHardwareProfile(settingsSnap?.values[HARDWARE_PROFILE_SETTING]) ?? "axol")
+    : localHardwareProfile
+
+  async function selectHardwareProfile(profile: HardwareProfile) {
+    const generation = connectionGenerationRef.current
+    setLocalHardwareProfile(profile)
+    saveLocalHardwareProfile(profile)
+    if (!hostStoresHardwareProfile || !settingsSnap) return
+    // Optimistic: the switch, the tiles, and the auto-connect target follow
+    // immediately; a failed save restores the stored values.
+    const priorValues = settingsSnap.values
+    setSettingsSnap((prev) =>
+      prev ? { ...prev, values: { ...prev.values, [HARDWARE_PROFILE_SETTING]: profile } } : prev
+    )
+    setHardwareProfileSaving(true)
+    try {
+      const snap = await saveSettings({ values: { [HARDWARE_PROFILE_SETTING]: profile } })
+      if (generation !== connectionGenerationRef.current) return
+      setSettingsSnap((prev) => ({
+        ...snap,
+        schema: prev?.schema ?? snap.schema,
+        advancedSchema: prev?.advancedSchema ?? snap.advancedSchema,
+      }))
+      if (snap.cameras) setCameras(snap.cameras)
+    } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
+      setSettingsSnap((prev) => (prev ? { ...prev, values: priorValues } : prev))
+      toast.error(`Could not save the device selection: ${String(e).replace(/^Error:\s*/, "")}`)
+    } finally {
+      if (generation === connectionGenerationRef.current) setHardwareProfileSaving(false)
+    }
+  }
+
   // Persist a settings-dialog save: cameras also mirror to localStorage (the
   // fallback for old hosts / offline), everything else goes to the serve host.
   async function handleSettingsSave(
@@ -796,8 +856,11 @@ export default function ControlPanel() {
 
   // -- per-operation settings --
   const settings = useMemo(() => settingsByOp[opId] ?? loadOpSettings(opId), [settingsByOp, opId])
-  const mantisMode = meta.supportsMantis && Boolean(settings.mantis)
-  const desiredHardwareProfile: HardwareProfile = mantisMode ? "mantis" : "axol"
+  // The device selection is system-wide: a Mantis-capable operation runs on
+  // Mantis whenever it is selected, and the idle link auto-connects to it. An
+  // Axol-only operation is blocked (in the panel) until Axol is selected.
+  const mantisMode = meta.supportsMantis && hardwareProfile === "mantis"
+  const desiredHardwareProfile: HardwareProfile = hardwareProfile
 
   const updateSettings = useCallback((op: OperationId, next: Record<string, FormValue>) => {
     setSettingsByOp((prev) => ({ ...prev, [op]: next }))
@@ -1326,8 +1389,14 @@ export default function ControlPanel() {
       // Only ops that actually require cameras (collect-data / run-policy) are
       // gated on them. Teleop streams whatever cameras are configured but must
       // never be blocked by camera detection, and sim never touches hardware.
-      const isSimSelected = isSimRun(meta, settings)
       const mantisSelected = mantisMode
+      if (hardwareProfile === "mantis" && !meta.supportsMantis) {
+        toast.error(`${meta.label} runs on Axol only — switch the device to Axol first.`)
+        return
+      }
+      // Sim / cart-only are Axol run modes; they are hidden (and ignored) on
+      // Mantis, so only an Axol run can be hardware-free here.
+      const isSimSelected = !mantisSelected && isSimRun(meta, settings)
       if (meta.requiresCameras && !isSimSelected) {
         // Reuse the detection we already ran (on connect / when the Cameras
         // dialog closed) instead of spawning a fresh enumeration on every start
@@ -1365,16 +1434,23 @@ export default function ControlPanel() {
 
       // Send only the panel's per-run fields — the shared settings (and any
       // advanced overrides) are folded in server-side, and stale keys from the
-      // old per-op localStorage must not shadow them.
-      const runKeys = new Set(spec ? perRunFields(spec, meta).map((f) => f.key) : [])
+      // old per-op localStorage must not shadow them. On Mantis the Axol-only
+      // run modes (sim / cart_only) are not per-run fields and stay out.
+      const runKeys = new Set(
+        spec ? perRunFields(spec, meta, hardwareProfile).map((f) => f.key) : []
+      )
       const args: Record<string, FormValue> = Object.fromEntries(
         Object.entries(settings).filter(([k]) => runKeys.has(k))
       )
-      // Snapshot the shared source into the session request. New hosts also
+      // The system-wide device selection becomes this run's hardware flag.
+      // Snapshot the shared tracking source alongside it: new hosts also
       // return their fully merged args, but this keeps live hints/reset
       // controls tied to the actual run even against an older serve host if
       // the operator edits the saved source mid-run.
-      if (mantisSelected) args.mantis_source = mantisSource
+      if (mantisSelected) {
+        args[HARDWARE_PROFILE_ARG] = true
+        args.mantis_source = mantisSource
+      }
       // Send the camera spec whenever any serial is assigned — collect-data /
       // run-policy need at least one, while teleop streams whichever are set to
       // the headset (and runs fine with none in sim). Newer hosts also hold the
@@ -1522,7 +1598,19 @@ export default function ControlPanel() {
           canProfiles={canProfiles}
           onRobotConnect={robotConnectClick}
           onRobotDisconnect={robotDisconnectClick}
+          selectedProfile={hardwareProfile}
+          onOpenSettings={openSettingsScope}
         />
+
+        {conn.state === "ok" && (
+          <DeviceSwitch
+            value={hardwareProfile}
+            onChange={(profile) => void selectHardwareProfile(profile)}
+            disabled={isLive || hardwareProfileSaving}
+            disabledReason={isLive ? "Stop the running operation to change the device." : null}
+            saving={hardwareProfileSaving}
+          />
+        )}
 
         {conn.state === "ok" && canDiscoveryNeedsRetry && (
           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
@@ -1599,11 +1687,12 @@ export default function ControlPanel() {
           meta={meta}
           spec={spec}
           settings={settings}
+          hardwareProfile={hardwareProfile}
           mantisSource={mantisSource}
           onChange={setSetting}
           onReset={resetSetting}
           onResetAll={resetAll}
-          onOpenSettings={() => openSettings(mantisMode ? "mantis" : "robot")}
+          onOpenSettings={() => openSettingsScope(hardwareProfile)}
           cameras={cameras}
           robot={robot}
           live={selectedLive}

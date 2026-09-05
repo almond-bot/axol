@@ -274,6 +274,52 @@ export async function restartHost(): Promise<{ ok: boolean }> {
 export type RobotState = "disconnected" | "connecting" | "connected" | "busy" | "error"
 export type HardwareProfile = "axol" | "mantis"
 
+/**
+ * The system-wide device selection — which hardware every operation runs on.
+ * Stored with the shared settings on the serve host under this key (so every
+ * operator device agrees), mirrored to localStorage for hosts too old to have
+ * it, and translated into each run's `mantis` flag at start.
+ */
+export const HARDWARE_PROFILE_SETTING = "system.hardware_profile"
+/** The per-run config flag the device selection becomes on Mantis-capable ops. */
+export const HARDWARE_PROFILE_ARG = "mantis"
+const HARDWARE_PROFILE_STORAGE = "axolHardwareProfile"
+
+export function parseHardwareProfile(value: unknown): HardwareProfile | null {
+  return value === "axol" || value === "mantis" ? value : null
+}
+
+export function loadLocalHardwareProfile(): HardwareProfile {
+  try {
+    return parseHardwareProfile(localStorage.getItem(HARDWARE_PROFILE_STORAGE)) ?? "axol"
+  } catch {
+    return "axol"
+  }
+}
+
+export function saveLocalHardwareProfile(profile: HardwareProfile): void {
+  try {
+    localStorage.setItem(HARDWARE_PROFILE_STORAGE, profile)
+  } catch {
+    // ignore storage failures (private mode / quota)
+  }
+}
+
+/** Per-run flags that only make sense on the Axol profile (sim / cart-only
+ *  drive the arm simulator or the cart, never the handheld rigs). */
+const AXOL_ONLY_RUN_FLAGS = new Set(["sim", "cart_only"])
+
+/**
+ * Whether a per-run field is shown/sent for the given device. The legacy
+ * `mantis` toggle is never per-run any more, and Axol-only run modes are
+ * hidden while Mantis is the selected device.
+ */
+export function runFieldVisible(key: string, profile: HardwareProfile): boolean {
+  if (key === HARDWARE_PROFILE_ARG) return false
+  if (profile === "mantis" && AXOL_ONLY_RUN_FLAGS.has(key)) return false
+  return true
+}
+
 export interface MotorHealth {
   arm: string
   joint: string
@@ -1218,7 +1264,7 @@ export const OPERATIONS: OperationMeta[] = [
     id: "teleop",
     label: "Teleoperation",
     description: "Drive Axol from VR; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
-    fields: ["sim", "mantis"],
+    fields: ["sim"],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: true,
@@ -1249,7 +1295,7 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Collect data",
     description:
       "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
-    fields: ["mantis", "repo_id", "task"],
+    fields: ["repo_id", "task"],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
@@ -1350,14 +1396,22 @@ export function curatedFields(spec: CommandSpec, meta: OperationMeta): SchemaFie
 /**
  * The fields an op panel shows (and the only args a start sends): the curated
  * per-run fields plus every required field, required first. Everything else
- * comes from the shared settings, folded in server-side.
+ * comes from the shared settings, folded in server-side. The device choice is
+ * system-wide, so its flag (and, on Mantis, the Axol-only run modes) is never
+ * one of them — even against a host that still lists it per run.
  */
-export function perRunFields(spec: CommandSpec, meta: OperationMeta): SchemaField[] {
+export function perRunFields(
+  spec: CommandSpec,
+  meta: OperationMeta,
+  profile: HardwareProfile = "axol"
+): SchemaField[] {
   const byKey = new Map(curatedFields(spec, meta).map((f) => [f.key, f]))
   for (const f of flattenFields(spec.schema)) {
     if (f.required && !byKey.has(f.key)) byKey.set(f.key, f)
   }
-  return [...byKey.values()].sort((a, b) => Number(b.required) - Number(a.required))
+  return [...byKey.values()]
+    .filter((f) => runFieldVisible(f.key, profile))
+    .sort((a, b) => Number(b.required) - Number(a.required))
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,7 +1423,14 @@ const OP_SETTINGS_PREFIX = "axolOp:"
 export function loadOpSettings(op: OperationId): Record<string, FormValue> {
   try {
     const raw = localStorage.getItem(`${OP_SETTINGS_PREFIX}${op}`)
-    if (raw) return JSON.parse(raw) as Record<string, FormValue>
+    if (raw) {
+      const parsed = JSON.parse(raw) as Record<string, FormValue>
+      // The Axol/Mantis choice used to be a per-operation toggle stored here.
+      // It is now the system-wide device selection, so a stale flag must not
+      // linger as an "edited" per-run value.
+      delete parsed[HARDWARE_PROFILE_ARG]
+      return parsed
+    }
   } catch {
     // ignore malformed storage
   }

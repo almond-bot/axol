@@ -90,7 +90,8 @@ class OpStartRequest(BaseModel):
         }
 
     ``mantis_serials`` is a separate two-camera assignment used whenever the
-    operation's Mantis toggle is on; Axol continues to use ``serials``.
+    run's ``mantis`` flag is on (the panel sets it from its system-wide device
+    switch); Axol continues to use ``serials``.
     The ``stream`` / ``record`` maps decide per camera whether it takes part in
     each branch: ``false`` opts a camera out, ``true`` opts a mono camera in, and
     an eye name (``"both"`` / ``"left"`` / ``"right"``) opts a stereo camera in
