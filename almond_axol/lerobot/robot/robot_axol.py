@@ -436,6 +436,19 @@ class AxolRobot(Robot):
         assert self._loop is not None, "connect() first"
         return self._loop
 
+    @property
+    def limp(self) -> str | None:
+        """Why the realtime core went limp, or ``None`` while it is healthy.
+
+        Mirrors :attr:`almond_axol.rt.RtAxol.limp`: once set, every arm joint
+        is at kp = 0 with the streamed gravity feedforward for the rest of
+        the session and :meth:`send_action` streams gravity comp instead of
+        tracking. Recording flows check this before promising motion (a
+        take started on a limp core records arms that will not move) and
+        surface it to the operator; ``None`` before :meth:`connect`.
+        """
+        return None if self._axol is None else self._axol.limp
+
     # ------------------------------------------------------------------
     # Observation / action
     # ------------------------------------------------------------------

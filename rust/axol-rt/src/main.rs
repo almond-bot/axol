@@ -28,6 +28,7 @@ mod proxy;
 mod safety;
 mod scan;
 mod serve;
+mod stall;
 mod timing;
 mod txn;
 

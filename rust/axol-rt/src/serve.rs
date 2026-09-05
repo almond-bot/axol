@@ -88,6 +88,8 @@
 //!                     gravity t_ff on every arm joint (see Safety); the
 //!                     client should keep streaming gravity-comp targets.
 //! - `L` + text        log line
+//! - `W` + text        warning line: a degraded transition worth the
+//!                     operator's attention (the client logs it at WARNING)
 //! - `F` + binary      telemetry, one per bus per tick while armed: side
 //!                     u8, valid-mask u8, then 8 x (pos f64, vel f64, tau
 //!                     f64, age_us u32) — the latest decoded feedback per
@@ -100,9 +102,9 @@
 //!   which is worse than any condition the checks detect. Torque comes off
 //!   only on an explicit `D` disarm of a healthy session (or an e-stop,
 //!   which removes motor power itself).
-//! - **Loss-of-trust faults go *limp*, not dead.** Unhealthy control timing
-//!   and a motor silent for a second both mean the core should no longer be
-//!   applying stiffness or phase-sensitive damping — so it stops doing
+//! - **A loss-of-trust fault goes *limp*, not dead.** A motor silent for a
+//!   second means the core should no longer be applying stiffness or
+//!   phase-sensitive damping to a joint it cannot see — so it stops doing
 //!   exactly that and nothing more: every arm joint on both buses goes to
 //!   kp = 0, firmware kd `LIMP_KD`, no host damping or inertia term, with
 //!   the streamed gravity `t_ff` still applied (Python keeps evaluating it
@@ -137,9 +139,28 @@
 //!   32 ticks) marks the joint *degraded* — host damping stays off until a
 //!   clean 32-tick window, the transition is logged, and the loop keeps
 //!   running on firmware kd. Only a motor silent for a full second takes
-//!   the session limp. Clustered late ticks and a full-cycle overrun go
-//!   limp the same way — phase-sensitive damping must not run on stale
-//!   timing, and limp mode has none.
+//!   the session limp.
+//! - **Late ticks degrade, never limp.** Timing gets feedback's degraded
+//!   tier and nothing above it. A whole-cycle overrun (a wake a full
+//!   period or more late), three late ticks in a row, or 8 of the last 32
+//!   late marks the *bus* timing-degraded: host damping off on every joint
+//!   of that bus until a clean 32-tick window, and the overrun tick's
+//!   tracker advances one nominal period with its derivative chains
+//!   re-seeded at rest — the motors held the previous command across the
+//!   gap, so there is no trajectory to differentiate. Firmware kp/kd and
+//!   the streamed gravity `t_ff` are untouched, so the arm keeps holding —
+//!   a late host is what the firmware is built to ride out, which is why
+//!   no amount of lateness is a loss of trust. The transition (and each
+//!   further overrun inside a degraded stretch, rate-limited) is logged as
+//!   a warning with the thread's own scheduler/memory counters across that
+//!   wake (`stall.rs`: runnable-wait, page faults, involuntary switches) so
+//!   the line says whether the loop was preempted, faulting, or blocked in
+//!   the kernel.
+//! - The process locks its memory (`mlockall`, `stall::lock_memory`) before
+//!   accepting a client, so a page reclaimed under the dataset writer's I/O
+//!   pressure can never fault a bus thread mid-tick. A failed lock (no
+//!   `CAP_IPC_LOCK`, low `RLIMIT_MEMLOCK` on a dev build) is logged and
+//!   the core runs unlocked as it always did.
 //! - The gripper is not commanded at all until the first target arrives
 //!   (matching classic mode, where it sits idle until motion_control).
 //! - Watchdog: no target for `watchdog_ms` holds the last target (the
@@ -164,6 +185,7 @@ use crate::filter::{self, BandPass, LpDiff, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
+use crate::stall;
 
 /// Pole (rad/s) of the motor-facing command derivatives — `CUTOFF_FREQ` in
 /// `almond_axol.robot.control`.  The slow pole keeps target-rate steps out of
@@ -198,7 +220,7 @@ const SILENT_FEEDBACK_FAULT: Duration = Duration::from_secs(1);
 /// five-second stats line carries the cumulative count regardless.
 const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// Firmware velocity damping (Nm·s/rad) on the arm joints while the core is
-/// *limp* — the fallback for a loss-of-trust fault (timing, silent motor).
+/// *limp* — the fallback for a loss-of-trust fault (a silent motor).
 /// Matches `VRTeleopConfig.reset_gravity_comp_kd`, the classic contact-hold
 /// gravity comp: enough to keep a hand-guided arm from feeling twitchy, far
 /// too little to hold it up. Gravity itself comes from the streamed `t_ff`.
@@ -210,7 +232,27 @@ const REPLY_GUARD: Duration = Duration::from_micros(150);
 /// A tick starting more than this far past its deadline is phase-degraded. Its
 /// host damping is suppressed even when feedback itself is fresh.
 const LATE_TICK: Duration = Duration::from_micros(500);
-const MAX_RECENT_LATE_TICKS: u32 = 8;
+/// Clustered lateness that marks a bus's *timing* degraded (host damping off
+/// on every joint of that bus until a clean 32-tick window): three late
+/// ticks in a row, or this many in the window. Not a fault — the same
+/// treatment bursty feedback loss gets. A whole-cycle overrun (a tick that
+/// wakes a full period or more late) degrades on its own: the sample/command
+/// ordering that tick was lost, so its damping and inertia terms are
+/// re-seeded rather than computed over the gap.
+const DEGRADED_RECENT_LATE_TICKS: u32 = 8;
+// Bad control timing never takes the session limp — degraded is the whole
+// response, however long it lasts. A late tick invalidates exactly the terms
+// degraded turns off (phase-sensitive damping, the derivative chains); the
+// motors themselves hold the last command on firmware kp/kd across any gap,
+// which is the same thing they do if the host dies. Limp is reserved for a
+// motor that has gone silent (`SILENT_FEEDBACK_FAULT`), where the core would
+// otherwise stream stiffness to a joint it cannot see. The field record
+// (2026-09-04) is single 20–60 ms stalls in otherwise perfect ~770k-tick
+// sessions, each while the dataset writer flushed a save; the old single-tick
+// limp turned each into a session-ending, hand-guide-and-restart fault while
+// the arms were holding still. Persistent lateness is still made visible: the
+// degraded warning carries the stall attribution, repeated overruns inside a
+// degraded stretch are logged (rate-limited), and the stats line counts them.
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -395,30 +437,61 @@ fn silent_feedback_limit(loop_hz: f64) -> u32 {
         .max(1.0) as u32
 }
 
+/// Outcome of one tick's wake-up timing for the bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimingVerdict {
+    /// Nothing to report: on time, an isolated late tick, or an ongoing
+    /// degraded stretch that has neither cleared nor worsened.
+    Steady,
+    /// Timing just became untrustworthy: host damping off on this bus until
+    /// a clean window (see `DEGRADED_RECENT_LATE_TICKS`).
+    Degraded,
+    /// A full clean window just closed out a degraded stretch.
+    Recovered,
+}
+
 #[derive(Clone, Copy, Default)]
 struct TimingHealth {
+    /// Ticks that woke more than `LATE_TICK` past their deadline.
     recent_late: u32,
+    /// Ticks that woke a whole period or more late.
+    recent_overruns: u32,
     consecutive_late: u8,
+    degraded: bool,
 }
 
 impl TimingHealth {
-    fn record(&mut self, on_time: bool) -> bool {
-        self.recent_late = (self.recent_late << 1) | u32::from(!on_time);
-        if on_time {
-            self.consecutive_late = 0;
-        } else {
+    /// Record one tick's wake-up lateness. The verdict includes the tick
+    /// itself: the degraded warning must describe the tick that triggered it.
+    ///
+    /// Mirrors `FeedbackHealth`'s degraded tier: hysteresis (it starts at an
+    /// overrun or a late cluster and only clears once the 32-tick window has
+    /// no late tick at all). Unlike feedback there is no fault tier above it
+    /// — see the note at `DEGRADED_RECENT_LATE_TICKS`.
+    fn record(&mut self, lateness: Duration, period: Duration) -> TimingVerdict {
+        let late = lateness > LATE_TICK;
+        let overrun = lateness >= period;
+        self.recent_late = (self.recent_late << 1) | u32::from(late);
+        self.recent_overruns = (self.recent_overruns << 1) | u32::from(overrun);
+        if late {
             self.consecutive_late = self.consecutive_late.saturating_add(1);
+        } else {
+            self.consecutive_late = 0;
         }
-        self.consecutive_late >= 3 || self.recent_late.count_ones() >= MAX_RECENT_LATE_TICKS
-    }
-
-    /// Record this tick before applying the immediate full-cycle limit.  The
-    /// ordering matters: the fault diagnostic must include the tick that
-    /// triggered it, even when `lateness >= period` is already sufficient to
-    /// stop the loop.
-    fn record_lateness(&mut self, lateness: Duration, period: Duration) -> bool {
-        let clustered_lateness = self.record(lateness <= LATE_TICK);
-        lateness >= period || clustered_lateness
+        let unhealthy = overrun
+            || self.consecutive_late >= 3
+            || self.recent_late.count_ones() >= DEGRADED_RECENT_LATE_TICKS;
+        match (self.degraded, unhealthy) {
+            (false, true) => {
+                self.degraded = true;
+                TimingVerdict::Degraded
+            }
+            (true, false) if self.recent_late == 0 => {
+                self.degraded = false;
+                TimingVerdict::Recovered
+            }
+            _ => TimingVerdict::Steady,
+        }
     }
 }
 
@@ -990,23 +1063,108 @@ mod tests {
         }
     }
 
+    const PERIOD: Duration = Duration::from_micros(4_167);
+    const ON_TIME: Duration = Duration::from_micros(50);
+    const LATE: Duration = Duration::from_micros(800);
+
     #[test]
-    fn timing_health_catches_clustered_late_ticks() {
+    fn timing_health_degrades_on_clustered_late_ticks_and_recovers() {
+        // Alternating late/on-time: the eighth late tick in the window
+        // degrades the bus (the old limp trip), and it stays degraded
+        // (Steady, not re-announced) while the pattern continues.
         let mut health = TimingHealth::default();
         for _ in 0..7 {
-            assert!(!health.record(false));
-            assert!(!health.record(true));
+            assert_eq!(health.record(LATE, PERIOD), TimingVerdict::Steady);
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
         }
-        assert!(health.record(false));
+        assert_eq!(health.record(LATE, PERIOD), TimingVerdict::Degraded);
+        assert!(health.degraded);
+
+        // Hysteresis: only a fully clean window (32 on-time ticks after the
+        // last late one) recovers.
+        for _ in 0..31 {
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+            assert!(health.degraded);
+        }
+        assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
+        assert!(!health.degraded);
+
+        // Three in a row degrades too.
+        let mut consecutive = TimingHealth::default();
+        assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
+        assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
+        assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Degraded);
     }
 
     #[test]
-    fn timing_health_counts_immediate_full_cycle_fault() {
+    fn timing_health_isolated_overrun_degrades_not_limps() {
+        // The field record: one 60 ms stall in an otherwise perfect stream.
         let mut health = TimingHealth::default();
-        let period = Duration::from_micros(4_167);
-        assert!(health.record_lateness(period, period));
+        for _ in 0..1000 {
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        assert_eq!(
+            health.record(Duration::from_millis(60), PERIOD),
+            TimingVerdict::Degraded
+        );
+        assert!(health.degraded);
+        assert_eq!(health.recent_overruns.count_ones(), 1);
         assert_eq!(health.recent_late.count_ones(), 1);
-        assert_eq!(health.consecutive_late, 1);
+        // The next tick is on time again; damping stays off for the window...
+        for _ in 0..31 {
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        // ...then comes back.
+        assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
+        assert_eq!(health.recent_overruns, 0);
+    }
+
+    #[test]
+    fn timing_health_never_escalates_past_degraded() {
+        // Repeated whole-cycle overruns inside one window: still degraded,
+        // never a fault — the loop stays in the degraded stretch (Steady,
+        // damping off) and the stretch is what the log reports.
+        let mut health = TimingHealth::default();
+        assert_eq!(health.record(PERIOD, PERIOD), TimingVerdict::Degraded);
+        for _ in 0..20 {
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        assert_eq!(health.record(PERIOD * 3, PERIOD), TimingVerdict::Steady);
+        assert!(health.degraded);
+        assert_eq!(health.recent_overruns.count_ones(), 2);
+        // The window must be clean again before it recovers.
+        for _ in 0..31 {
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
+
+        // Two overruns further apart than the window are two degraded
+        // episodes.
+        let mut spaced = TimingHealth::default();
+        assert_eq!(spaced.record(PERIOD, PERIOD), TimingVerdict::Degraded);
+        for _ in 0..31 {
+            assert_eq!(spaced.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        assert_eq!(spaced.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
+        assert_eq!(spaced.record(PERIOD, PERIOD), TimingVerdict::Degraded);
+
+        // Late on every other tick for a long stretch: one Degraded
+        // transition, then Steady for as long as it lasts.
+        let mut persistent = TimingHealth::default();
+        let mut verdicts = Vec::new();
+        for _ in 0..500 {
+            verdicts.push(persistent.record(LATE, PERIOD));
+            verdicts.push(persistent.record(ON_TIME, PERIOD));
+        }
+        assert_eq!(
+            verdicts
+                .iter()
+                .filter(|v| **v == TimingVerdict::Degraded)
+                .count(),
+            1
+        );
+        assert!(!verdicts.contains(&TimingVerdict::Recovered));
+        assert!(persistent.degraded);
     }
 
     #[test]
@@ -1204,12 +1362,36 @@ pub fn run(socket_path: &str) -> io::Result<()> {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
     }
     let _ = std::fs::remove_file(socket_path);
+    // Lock memory before anything the bus threads will touch is mapped:
+    // MCL_FUTURE then covers the socket buffers, the channel, and the
+    // threads' stacks as they are created (see the Safety notes).
+    let memory_locked = match stall::lock_memory() {
+        Ok(()) => {
+            println!("axol-rt serve: memory locked (mlockall)");
+            true
+        }
+        Err(err) => {
+            println!(
+                "axol-rt serve: could not lock memory ({err}); running unlocked — a page fault can stall a bus thread (grant CAP_IPC_LOCK / raise RLIMIT_MEMLOCK)"
+            );
+            false
+        }
+    };
     let listener = UnixListener::bind(socket_path)?;
     println!("axol-rt serve: listening on {socket_path}");
     let (mut stream, _) = listener.accept()?;
     println!("axol-rt serve: client connected");
 
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+    if !memory_locked {
+        // Repeat over the link so the warning lands in the session log, not
+        // only on the core's stdout.
+        send_text(
+            &out_tx,
+            b'W',
+            "memory not locked (mlockall failed) — a page fault can stall a bus thread; grant CAP_IPC_LOCK or raise RLIMIT_MEMLOCK",
+        );
+    }
     let writer = std::thread::spawn({
         let stream = stream.try_clone()?;
         move || writer_thread(stream, out_rx)
@@ -1237,7 +1419,7 @@ pub fn run(socket_path: &str) -> io::Result<()> {
     // motors holding their last MIT command on firmware gains — dropping
     // the arms is never an acceptable failure response.
     let disarm = Arc::new(AtomicBool::new(false));
-    // Set by a bus thread on a loss-of-trust fault (timing, silent motor):
+    // Set by a bus thread on a loss-of-trust fault (a silent motor):
     // both buses drop to gravity comp (kp = 0, streamed gravity t_ff) and
     // keep serving so the operator can hand-guide the arms to rest. Never
     // cleared within a session; a disarm in this state leaves the motors
@@ -1621,6 +1803,18 @@ fn bus_loop(
     let mut degraded_announced = [false; N_SLOTS];
     let mut next_degraded_log = Instant::now();
     let mut timing_health = TimingHealth::default();
+    let mut timing_degraded_ticks: u64 = 0;
+    let mut timing_degraded_episodes: u64 = 0;
+    let mut timing_announced = false;
+    let mut next_timing_log = Instant::now();
+    let mut overruns: u64 = 0;
+    // Per-thread scheduler/memory counters, sampled at every wake so a late
+    // tick can be attributed to what actually kept the thread off the CPU.
+    let mut stall_probe = stall::StallProbe::open();
+    // Per-tick reply bookkeeping, allocated once: the loop must not grow
+    // the heap (a fresh page is a fault, see `stall::lock_memory`).
+    let mut expected = vec![false; motors.len()];
+    let mut seen = vec![false; motors.len()];
     // Belt-and-braces: sends on a dead bus normally fail fast with ENOBUFS,
     // but if the socket sndbuf fills first a blocking write would hang the
     // loop; the timeout turns that into EAGAIN (treated as TX-full).
@@ -1659,26 +1853,78 @@ fn bus_loop(
             if !timing_on_time {
                 late += 1;
             }
-            // A whole-cycle overrun means the causal sample/command ordering
-            // has been lost; clustered lateness says the same more slowly.
-            // Phase-sensitive host damping must not run on that, so the
-            // session goes *limp*: kp = 0, firmware kd only, gravity from
-            // the streamed t_ff — no host damping to be out of phase. The
-            // operator hand-guides the arms to rest and restarts. Already
-            // limp: nothing left to protect, keep serving gravity comp.
-            let is_limp = limp.load(Ordering::SeqCst);
-            if timing_health.record_lateness(lateness, period) && !is_limp {
-                go_limp(
-                    limp,
-                    out_tx,
-                    &format!(
-                        "{iface}: control timing unhealthy ({:.3} ms late, {} of the last 32 ticks late) — going limp before phase-sensitive damping",
-                        lateness.as_secs_f64() * 1e3,
-                        timing_health.recent_late.count_ones(),
-                    ),
-                );
+            let overrun = lateness >= period;
+            if overrun {
+                overruns += 1;
             }
-            let is_limp = is_limp || limp.load(Ordering::SeqCst);
+            // Bracket this wake with the thread's own scheduler/memory
+            // counters (µs, before any bus work) so a late tick is attributed
+            // — preempted, page fault, kernel stall — not just measured.
+            let stall = stall_probe.sample();
+            // A whole-cycle overrun means the causal sample/command ordering
+            // was lost for this tick; clustered lateness says timing cannot be
+            // trusted more slowly. Phase-sensitive host damping must not run
+            // on either, so the bus goes *timing-degraded*: damping off on
+            // every joint until a clean window, and the overrun tick's command
+            // derivatives re-seeded rather than integrated across the gap
+            // (firmware kp/kd and the streamed gravity t_ff are unaffected,
+            // so the arm keeps holding). That is the whole response — timing
+            // never takes the session limp (see `DEGRADED_RECENT_LATE_TICKS`);
+            // a stretch that stays bad just stays degraded, with its repeat
+            // overruns logged so the persistence is visible.
+            let is_limp = limp.load(Ordering::SeqCst);
+            match timing_health.record(lateness, period) {
+                TimingVerdict::Steady => {
+                    if overrun && timing_health.degraded && began >= next_timing_log {
+                        next_timing_log = began + DEGRADED_LOG_INTERVAL;
+                        timing_announced = true;
+                        send_text(
+                            out_tx,
+                            b'W',
+                            &format!(
+                                "{iface}: control timing still degraded ({:.3} ms late, {} of the last 32 ticks late, {} whole-cycle overruns; {}) — host damping stays off on this bus; firmware gains hold",
+                                lateness.as_secs_f64() * 1e3,
+                                timing_health.recent_late.count_ones(),
+                                timing_health.recent_overruns.count_ones(),
+                                stall.describe(lateness),
+                            ),
+                        );
+                    }
+                }
+                TimingVerdict::Degraded => {
+                    timing_degraded_episodes += 1;
+                    // Rate-limited like the feedback transitions; the stats
+                    // line carries the cumulative counts regardless.
+                    timing_announced = began >= next_timing_log;
+                    if timing_announced {
+                        next_timing_log = began + DEGRADED_LOG_INTERVAL;
+                        send_text(
+                            out_tx,
+                            b'W',
+                            &format!(
+                                "{iface}: control timing degraded ({:.3} ms late, {} of the last 32 ticks late, {} whole-cycle overrun{}; {}) — host damping off on this bus until a clean window; firmware gains hold",
+                                lateness.as_secs_f64() * 1e3,
+                                timing_health.recent_late.count_ones(),
+                                timing_health.recent_overruns.count_ones(),
+                                if timing_health.recent_overruns.count_ones() == 1 { "" } else { "s" },
+                                stall.describe(lateness),
+                            ),
+                        );
+                    }
+                }
+                TimingVerdict::Recovered => {
+                    if std::mem::take(&mut timing_announced) {
+                        send_text(
+                            out_tx,
+                            b'L',
+                            &format!("{iface}: control timing recovered — host damping resumed"),
+                        );
+                    }
+                }
+            }
+            if timing_health.degraded {
+                timing_degraded_ticks += 1;
+            }
             ticks += 1;
 
             // Adopt a newly arrived target: latest-wins — the tracker
@@ -1728,8 +1974,18 @@ fn bus_loop(
 
             // Tick spacing for the damping chain (measured, not nominal —
             // a late tick then damps over the interval it actually covers).
+            // An overrun is the exception: the motors held the previous
+            // command for the whole gap, so the tracker advances one nominal
+            // period rather than rendering a max-velocity catch-up step over
+            // the wall-clock it lost, and the command derivatives are
+            // re-seeded (below) instead of differentiated across it.
             let tick_dt = prev_tick.map_or(0.0, |p| began.duration_since(p).as_secs_f64());
             prev_tick = Some(began);
+            let cmd_dt = if overrun {
+                period.as_secs_f64()
+            } else {
+                tick_dt
+            };
 
             // The user-facing flight recorder gates the verbose core trace to
             // the same engage segment as IK/cmd/meas. On each new segment the
@@ -1762,7 +2018,7 @@ fn bus_loop(
 
             // Send all commands back-to-back and remember exactly which
             // motors were successfully queued in this tick.
-            let mut expected = vec![false; motors.len()];
+            expected.fill(false);
             let mut trace_pending: [Option<TraceRow>; N_SLOTS] = [None; N_SLOTS];
             for (motor_index, m) in motors.iter().enumerate() {
                 let c = if is_limp && !m.gripper {
@@ -1811,48 +2067,62 @@ fn bus_loop(
                     // so a later mode switch starts transient-free.
                     let tracked = c.mode >= 0.5;
                     let p_cmd = if tracked {
-                        let (p, _, _) = trk[m.slot].update(c.p_des, tick_dt);
+                        let (p, _, _) = trk[m.slot].update(c.p_des, cmd_dt);
                         p
                     } else {
                         trk[m.slot].seed(c.p_des);
                         c.p_des
                     };
                     let d = &mut damp[m.slot];
-                    let (v_wire, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp) = if tracked {
-                        // Match classic AxolArm.motion_control: friction uses
-                        // the 20 rad/s low-pass position derivative, inertia
-                        // uses a second identical derivative, and damping
-                        // uses its independent 80 rad/s desired-velocity
-                        // derivative.  Only the source position/rate differ:
-                        // the core can use the trajectory it really sends.
-                        let v_cmd = d.v_cmd.update(p_cmd, tick_dt);
-                        let a_cmd = d.a_cmd.update(v_cmd, tick_dt);
-                        let v_cmd_fast = d.v_cmd_fast.update(p_cmd, tick_dt);
-                        let friction_ff = filter::friction(v_cmd, m.fc, m.k, m.fv, m.fo);
-                        let inertia_ff = c.j_eff * a_cmd;
-                        let damp_ok = feedback_fresh[m.slot]
-                            && timing_on_time
-                            && !feedback_health[m.slot].degraded;
-                        let v_damp = if damp_ok {
-                            d.bp.update(v_cmd_fast - d.vel_meas, c.damp_w0, c.damp_q, tick_dt)
-                        } else {
-                            // A missing frame makes measured velocity stale.
-                            // Reset rather than carrying band-pass energy into
-                            // the first tick after feedback recovers. While the
-                            // joint is degraded, damping stays off for the whole
-                            // stretch: re-engaging a freshly reset band-pass
-                            // every few ticks is a torque transient, not damping.
+                    let (v_wire, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp) =
+                        if tracked && overrun {
+                            // The gap since the last command is not a trajectory
+                            // segment the motor followed — it held. Re-prime the
+                            // derivative chains at rest here so the first tick
+                            // back carries no fictitious velocity, acceleration
+                            // (inertia torque), or band-pass energy; they ramp
+                            // in again from the next tick as tracking resumes.
+                            d.v_cmd.seed(p_cmd);
+                            d.a_cmd.seed(0.0);
+                            d.v_cmd_fast.seed(p_cmd);
                             d.bp.reset();
-                            0.0
+                            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                        } else if tracked {
+                            // Match classic AxolArm.motion_control: friction uses
+                            // the 20 rad/s low-pass position derivative, inertia
+                            // uses a second identical derivative, and damping
+                            // uses its independent 80 rad/s desired-velocity
+                            // derivative.  Only the source position/rate differ:
+                            // the core can use the trajectory it really sends.
+                            let v_cmd = d.v_cmd.update(p_cmd, tick_dt);
+                            let a_cmd = d.a_cmd.update(v_cmd, tick_dt);
+                            let v_cmd_fast = d.v_cmd_fast.update(p_cmd, tick_dt);
+                            let friction_ff = filter::friction(v_cmd, m.fc, m.k, m.fv, m.fo);
+                            let inertia_ff = c.j_eff * a_cmd;
+                            let damp_ok = feedback_fresh[m.slot]
+                                && timing_on_time
+                                && !timing_health.degraded
+                                && !feedback_health[m.slot].degraded;
+                            let v_damp = if damp_ok {
+                                d.bp.update(v_cmd_fast - d.vel_meas, c.damp_w0, c.damp_q, tick_dt)
+                            } else {
+                                // A missing frame makes measured velocity stale.
+                                // Reset rather than carrying band-pass energy into
+                                // the first tick after feedback recovers. While the
+                                // joint is degraded, damping stays off for the whole
+                                // stretch: re-engaging a freshly reset band-pass
+                                // every few ticks is a torque transient, not damping.
+                                d.bp.reset();
+                                0.0
+                            };
+                            (v_cmd, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp)
+                        } else {
+                            d.v_cmd.seed(p_cmd);
+                            d.a_cmd.seed(0.0);
+                            d.v_cmd_fast.seed(p_cmd);
+                            d.bp.reset();
+                            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                         };
-                        (v_cmd, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp)
-                    } else {
-                        d.v_cmd.seed(p_cmd);
-                        d.a_cmd.seed(0.0);
-                        d.v_cmd_fast.seed(p_cmd);
-                        d.bp.reset();
-                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-                    };
                     let damping_ff = c.kd_host * v_damp;
                     let t_ff = c.t_ff + friction_ff + inertia_ff + damping_ff;
                     if trace_this_tick && trace_tx.is_some() {
@@ -1940,7 +2210,7 @@ fn bus_loop(
             // must end the window at `reply_deadline`, never a jiffy or two
             // later, or the overrun lands on the next tick as lateness.
             let reply_deadline = began + period.saturating_sub(REPLY_GUARD);
-            let mut seen = vec![false; motors.len()];
+            seen.fill(false);
             let mut pending = expected.iter().filter(|&&value| value).count();
             while pending > 0 {
                 let now = Instant::now();
@@ -2111,7 +2381,7 @@ fn bus_loop(
                     out_tx,
                     b'L',
                     &format!(
-                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {missed} missed replies, {degraded_ticks} degraded ticks in {degraded_episodes} episodes, {rejected} rejected targets, {trace_dropped} trace drops, seq {:?}",
+                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {overruns} overruns, {timing_degraded_ticks} timing-degraded ticks in {timing_degraded_episodes} episodes, {missed} missed replies, {degraded_ticks} feedback-degraded ticks in {degraded_episodes} episodes, {rejected} rejected targets, {trace_dropped} trace drops, seq {:?}",
                         late as f64 / ticks as f64 * 100.0,
                         last_seq,
                     ),

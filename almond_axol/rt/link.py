@@ -190,6 +190,12 @@ class RtLink:
                     self._states.put_nowait(body)
                 elif tag == b"L":
                     _logger.info("axol-rt: %s", body)
+                elif tag == b"W":
+                    # A degraded transition the core wants noticed (timing
+                    # degraded with its stall attribution, memory not
+                    # locked): not a state change, but worth the journal's
+                    # WARNING level so a field log can be read for it.
+                    _logger.warning("axol-rt: %s", body)
                 else:
                     _logger.warning("axol-rt: unknown message tag %r", tag)
         except (asyncio.IncompleteReadError, ConnectionResetError):

@@ -143,7 +143,7 @@ async def _stream(
 ) -> None:
     """Ship one target pair to the core, refusing to keep "sweeping" limp arms.
 
-    Once the core has gone limp (loss-of-trust fault: timing, a silent motor)
+    Once the core has gone limp (loss-of-trust fault: a silent motor)
     ``RtAxol.motion_control`` streams gravity comp instead of tracking, so the
     arms would hang weightless while this script kept announcing sweeps. Stop
     the run instead; the operator hand-guides the arms to rest.
