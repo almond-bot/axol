@@ -64,13 +64,14 @@ Setting up a Mantis kit on a robot host that already has Axol [installed](/insta
 
 ### Testing the triggers and grippers
 
-Before setting up cameras or tracking, prove that each trigger drives its own gripper. This needs only CAN — no cameras, headset, trackers, or transforms:
+Before setting up cameras or tracking, prove that each trigger drives its own gripper. Mantis teleop needs only CAN for this: with Mantis selected, pick **Teleoperation** and press **Start**. While the selected tracking source is not set up, the panel shows a **Grippers only** notice and the run drives the grippers straight from the rig triggers — no cameras, headset, trackers, or transforms. From the CLI:
 
 ```bash
-axol diag.mantis-trigger
+axol teleop --mantis                        # grippers only until tracking is set up
+axol teleop --mantis --mantis_grippers_only true   # skip tracking even when it is
 ```
 
-Keep hands and objects clear before confirming the prompt: on first enable each gripper opens fully to find its hard stop, then squeezing a trigger closes its matching gripper proportionally. **Ctrl-C** stops and disables both grippers, and a lost trigger stream stops the test rather than holding a stale command. The same test is available in the [Diagnostics dashboard](/guides/diagnostics-dashboard) while Mantis is the connected profile. See [`diag.mantis-trigger`](/cli/diag-mantis-trigger).
+Keep hands and objects clear: once both triggers read live and released, each gripper opens fully to find its hard stop, then squeezing a trigger closes its matching gripper proportionally. **Stop** / **Ctrl-C** disables both grippers, and a lost trigger stream stops the run rather than holding a stale command.
 
 ### Mounting the cameras
 

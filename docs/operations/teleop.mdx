@@ -1,14 +1,14 @@
 ---
 title: "Teleoperation"
-description: "Drive Axol or validate a Mantis rig from Quest, Lighthouse, or Ultimate tracking."
+description: "Drive Axol, or run the Mantis rigs — grippers only over CAN, or tracked by Quest, Lighthouse, or Ultimate."
 ---
 
-Teleoperation drives the arms live from a Meta Quest headset. It runs on either device: **Axol** (the robot, or the browser **sim**) or **Mantis** (the handheld rigs, tracked by Quest, Lighthouse, or Ultimate — used to bring up the grippers and validate the pose source before collecting data). You can run either from the **web control panel** or the **CLI** (`axol teleop`).
+Teleoperation drives the arms live from a Meta Quest headset. It runs on either device: **Axol** (the robot, or the browser **sim**) or **Mantis** (the handheld rigs — used to bring up the grippers over CAN alone, then to validate the Quest, Lighthouse, or Ultimate pose source before collecting data). You can run either from the **web control panel** or the **CLI** (`axol teleop`).
 
 ## Before you start
 
 - **Axol installed** — the [one-command install](/installation) on the robot machine, or a [development install](/advanced/development-install) for sim.
-- **The device selected and connected.** The control panel's **Axol** / **Mantis** tile carries the system-wide device choice (**Select**) and brings up CAN and checks the motors on connect; on the CLI run [`axol can.setup`](/cli/can-setup) once. Mantis also needs its [hardware setup](/mantis/hardware) and a [pose source](/mantis/tracking) set up.
+- **The device selected and connected.** The control panel's **Axol** / **Mantis** tile carries the system-wide device choice (**Select**) and brings up CAN and checks the motors on connect; on the CLI run [`axol can.setup`](/cli/can-setup) once. Mantis needs its [hardware setup](/mantis/hardware); a [pose source](/mantis/tracking) is optional for teleop — without one the run drives the grippers only.
 - **A Meta Quest** with the [TLS certificate authorized](#authorize-the-tls-certificate) — for Axol, and for Mantis with the Quest source. Lighthouse and Ultimate Mantis need no headset (a Quest is optional as a view-only display).
 
 <Note>
@@ -65,19 +65,19 @@ The easiest way is from the app itself: when you press **Connect** and the certi
   </Tab>
 
   <Tab title="Mantis">
-    Mantis teleop enables only the two physical grippers; the Axol arms exist as an IK-driven URDF overlay. Use it to prove the exact source, side mapping, mount transform, and loss/recovery behavior that collection will use — the [acceptance checklist](/mantis/tracking#acceptance) is the goal of this run.
+    Mantis teleop enables only the two physical grippers; the Axol arms exist as an IK-driven URDF overlay. It needs only CAN to start: while the selected Lighthouse/Ultimate source is not set up, the run is **grippers only** — the rig triggers drive the grippers and no tracking, headset, or cameras are used. Once tracking is set up, the same run proves the exact source, side mapping, mount transform, and loss/recovery behavior that collection will use — the [acceptance checklist](/mantis/tracking#acceptance) is the goal.
 
     <Steps>
       <Step title="Select and connect Mantis">
-        Press **Select** on the **Mantis** tile; the panel connects the rigs automatically (or press **Connect**). The tile shows both grippers' CAN health. If you have not yet confirmed the side mapping and trigger test, do that first — see [Mantis Hardware](/mantis/hardware#selecting-and-connecting-mantis).
+        Press **Select** on the **Mantis** tile; the panel connects the rigs automatically (or press **Connect**). The tile shows both grippers' CAN health. If you have not yet confirmed the side mapping, do that first — see [Mantis Hardware](/mantis/hardware#selecting-and-connecting-mantis).
       </Step>
 
-      <Step title="Check the pose source">
-        Click the Mantis tile's title to open **Mantis settings → Tracking**. The selected source's setup flow must be complete (Lighthouse/Ultimate: sides identified; Quest: calibration key saved). If a step is red, finish it — [Mantis Tracking](/mantis/tracking) walks through each source. Wrist cameras, if any, are assigned under **Mantis settings → Cameras**.
+      <Step title="Start grippers only (first bring-up)">
+        With Mantis selected only **Teleoperation** and **Collect data** are listed. Pick **Teleoperation** (there is no sim or cart option on Mantis). Before tracking is set up the panel shows **Grippers only** with the tracking steps still to do; press **Start** anyway. Once both triggers read live and released, the grippers open to their hard stops (keep them clear), then each trigger closes its gripper proportionally. Squeeze the physical **left** trigger: if the **right** gripper moves, swap the CAN side mapping. Only a faulted gripper or a stale trigger heartbeat blocks this run.
       </Step>
 
-      <Step title="Select Teleoperation and Start">
-        With Mantis selected only **Teleoperation** and **Collect data** are listed. Pick **Teleoperation** (there is no sim or cart option on Mantis) and press **Start**. The "Before you can start" list names anything still missing — an unbound tracker, a stale trigger heartbeat, a faulted gripper. The run launches and owns the tracker bridge and both trigger readers.
+      <Step title="Set up the pose source">
+        Click the Mantis tile's title to open **Mantis settings → Tracking** and finish the selected source's setup flow (Lighthouse/Ultimate: sides identified; Quest: calibration key saved) — [Mantis Tracking](/mantis/tracking) walks through each source. Wrist cameras, if any, are assigned under **Mantis settings → Cameras**. With the flow complete the **Grippers only** notice disappears and the next **Start** owns the tracker bridge and both trigger readers.
       </Step>
 
       <Step title="Bring up the source">
@@ -98,12 +98,13 @@ The easiest way is from the app itself: when you press **Connect** and the certi
       </Step>
     </Steps>
 
-    **From the CLI**, the same run owns the selected bridge (the saved source is used when `--mantis_source` is omitted):
+    **From the CLI**, the same run owns the selected bridge (the saved source is used when `--mantis_source` is omitted), and falls back to grippers only when that source is not set up:
 
     ```bash
     axol teleop --mantis --mantis_source quest
     axol teleop --mantis --mantis_source lighthouse
     axol teleop --mantis --mantis_source ultimate
+    axol teleop --mantis --mantis_grippers_only true   # triggers → grippers, no tracking
     ```
 
     Do not launch a second `tracker.bridge` beside these commands. See [`teleop`](/cli/teleop) and the [tracker reference](/cli/tracker).

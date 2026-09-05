@@ -1,17 +1,14 @@
-"""Safety and dispatch tests for ``diag.mantis-trigger``."""
+"""Safety tests for grippers-only Mantis teleop (trigger → gripper mirror)."""
 
 from __future__ import annotations
 
 import unittest
 from collections.abc import Callable
-from io import StringIO
 from typing import Any
-from unittest import mock
 
 import numpy as np
 
-import almond_axol.cli as cli_entrypoint
-from almond_axol.diagnostics.mantis import trigger as mantis_trigger
+from almond_axol.teleop import mantis_grippers
 from almond_axol.robot.base import HardwareCleanupError
 
 
@@ -103,7 +100,7 @@ class _FakeRobot:
             raise self.disable_error
 
 
-class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
+class MantisGrippersOnlyTest(unittest.IsolatedAsyncioTestCase):
     async def test_maps_fresh_trigger_grips_without_trackers_or_cameras(self) -> None:
         readers: dict[str, _FakeReader] = {}
         robot: _FakeRobot | None = None
@@ -131,7 +128,7 @@ class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
             return robot
 
         with self.assertRaisesRegex(RuntimeError, "trigger|heartbeat|stale"):
-            await mantis_trigger._run(
+            await mantis_grippers.run_grippers_only(
                 "left-can",
                 "right-can",
                 reader_factory=reader_factory,
@@ -171,7 +168,7 @@ class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
             return robot
 
         with self.assertRaisesRegex(RuntimeError, "release|released|trigger"):
-            await mantis_trigger._run(
+            await mantis_grippers.run_grippers_only(
                 "left-can",
                 "right-can",
                 reader_factory=reader_factory,
@@ -202,7 +199,7 @@ class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
             return robot
 
         with self.assertRaisesRegex(RuntimeError, "trigger|heartbeat|frame"):
-            await mantis_trigger._run(
+            await mantis_grippers.run_grippers_only(
                 "left-can",
                 "right-can",
                 reader_factory=reader_factory,
@@ -236,7 +233,7 @@ class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
                 return robot
 
             with self.assertRaisesRegex(OSError, "motor offline"):
-                await mantis_trigger._run(
+                await mantis_grippers.run_grippers_only(
                     "left-can",
                     "right-can",
                     reader_factory=reader_factory,
@@ -262,7 +259,7 @@ class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
                 raise OSError("right trigger socket failed")
 
             with self.assertRaisesRegex(OSError, "right trigger socket failed"):
-                await mantis_trigger._run(
+                await mantis_grippers.run_grippers_only(
                     "left-can",
                     "right-can",
                     reader_factory=broken_reader_factory,
@@ -299,7 +296,7 @@ class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
                     return robot
 
                 with self.assertRaises(type(failure)):
-                    await mantis_trigger._run(
+                    await mantis_grippers.run_grippers_only(
                         "left-can",
                         "right-can",
                         reader_factory=reader_factory,
@@ -328,7 +325,7 @@ class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(
             HardwareCleanupError, "hardware ownership is uncertain"
         ) as raised:
-            await mantis_trigger._run(
+            await mantis_grippers.run_grippers_only(
                 "left-can",
                 "right-can",
                 reader_factory=reader_factory,
@@ -362,7 +359,7 @@ class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
             return robot
 
         with self.assertRaisesRegex(RuntimeError, "CAN ownership is uncertain"):
-            await mantis_trigger._run(
+            await mantis_grippers.run_grippers_only(
                 "left-can",
                 "right-can",
                 reader_factory=reader_factory,
@@ -376,42 +373,6 @@ class MantisTriggerTestCommandTest(unittest.IsolatedAsyncioTestCase):
         assert robot is not None
         self.assertEqual(robot.disable_calls, 1)
         self.assertTrue(all(reader.closed for reader in readers.values()))
-
-
-class MantisTriggerTestDispatchTest(unittest.TestCase):
-    def test_web_confirmation_emits_dashboard_marker_and_fails_closed(self) -> None:
-        output = StringIO()
-        with (
-            mock.patch.object(mantis_trigger.sys, "stdin", StringIO("\n")),
-            mock.patch("sys.stdout", output),
-        ):
-            mantis_trigger._confirm("left-can", "right-can", web_prompts=True)
-        self.assertIn("[prompt] Jaws are clear", output.getvalue())
-
-        with (
-            mock.patch.object(mantis_trigger.sys, "stdin", StringIO("")),
-            mock.patch("sys.stdout", StringIO()),
-            self.assertRaisesRegex(SystemExit, "not enabled"),
-        ):
-            mantis_trigger._confirm("left-can", "right-can", web_prompts=True)
-
-    def test_diag_command_is_dispatched_lazily_with_untouched_arguments(self) -> None:
-        diagnostic_module = mock.Mock()
-        argv = ["diag.mantis-trigger", "--yes", "--duration", "2"]
-
-        with (
-            mock.patch.object(cli_entrypoint, "load_local_env"),
-            mock.patch.object(
-                cli_entrypoint.importlib,
-                "import_module",
-                return_value=diagnostic_module,
-            ) as import_module,
-            mock.patch.object(cli_entrypoint.sys, "argv", ["axol", *argv]),
-        ):
-            cli_entrypoint.main()
-
-        import_module.assert_called_once_with("almond_axol.diagnostics.mantis.trigger")
-        diagnostic_module.main.assert_called_once_with(argv[1:])
 
 
 if __name__ == "__main__":

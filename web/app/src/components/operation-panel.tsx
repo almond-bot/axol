@@ -254,10 +254,14 @@ export function OperationPanel({
       blockers.push(`Fix motor fault: ${motorFaultLabel(f)}`)
     }
   }
+  // Tracker setup gates a Mantis *collection* (the server refuses it too).
+  // Mantis teleop only needs CAN: with tracking missing it drives the
+  // grippers from the rig triggers, so the same items are shown as a notice.
+  const trackerIssues: string[] = []
   if (mantisMode && !trackerSource) {
-    blockers.push("Choose a valid tracking source in Mantis settings → Tracking")
+    trackerIssues.push("Choose a valid tracking source in Mantis settings → Tracking")
   } else if (mantisMode && currentTrackerReadinessState !== "ready") {
-    blockers.push(
+    trackerIssues.push(
       currentTrackerReadinessState === "error"
         ? "Mantis tracker readiness is unavailable — reconnect the host or update Axol"
         : "Checking Mantis tracker readiness…"
@@ -267,25 +271,26 @@ export function OperationPanel({
     const ready = currentTrackerReadiness[trackerSource]
     if (trackerSource === "lighthouse") {
       const status = currentTrackerReadiness.lighthouse
-      if (!status.available) blockers.push("Install libsurvive in Mantis settings")
-      else if (!status.installed) blockers.push("Repair Lighthouse support in Mantis settings")
-      if (!status.udevReady) blockers.push("Install the Lighthouse Vive USB permissions rule")
-      if (!status.binding.complete) blockers.push("Identify left + right Lighthouse trackers")
+      if (!status.available) trackerIssues.push("Install libsurvive in Mantis settings")
+      else if (!status.installed) trackerIssues.push("Repair Lighthouse support in Mantis settings")
+      if (!status.udevReady) trackerIssues.push("Install the Lighthouse Vive USB permissions rule")
+      if (!status.binding.complete) trackerIssues.push("Identify left + right Lighthouse trackers")
     } else if (trackerSource === "ultimate") {
       const status = currentTrackerReadiness.ultimate
-      if (!status.nativeDependencies) blockers.push("Install the Ultimate native HID libraries")
+      if (!status.nativeDependencies)
+        trackerIssues.push("Install the Ultimate native HID libraries")
       if (!status.pythonHid || !status.apiCompatible)
-        blockers.push("Install the supported Ultimate Python runtime")
-      else if (!status.pinnedPyvut) blockers.push("Reinstall the pinned pyvut revision")
+        trackerIssues.push("Install the supported Ultimate Python runtime")
+      else if (!status.pinnedPyvut) trackerIssues.push("Reinstall the pinned pyvut revision")
       if (!status.logSuppression)
-        blockers.push("Install pyvut with credential-log suppression support")
-      if (!status.udevReady) blockers.push("Install the Ultimate USB permissions rule")
-      if (!status.operatorAccess) blockers.push("Grant this operator Ultimate dongle access")
-      if (!status.dongleConnected) blockers.push("Connect the Ultimate wireless dongle")
+        trackerIssues.push("Install pyvut with credential-log suppression support")
+      if (!status.udevReady) trackerIssues.push("Install the Ultimate USB permissions rule")
+      if (!status.operatorAccess) trackerIssues.push("Grant this operator Ultimate dongle access")
+      if (!status.dongleConnected) trackerIssues.push("Connect the Ultimate wireless dongle")
       else if (status.endpointStatus !== "accessible")
-        blockers.push("Make Ultimate HID interface 0 accessible")
-      if (status.wifiConfig !== "valid") blockers.push("Fix Ultimate shared-map Wi-Fi setup")
-      if (!status.binding.complete) blockers.push("Identify left + right Ultimate trackers")
+        trackerIssues.push("Make Ultimate HID interface 0 accessible")
+      if (status.wifiConfig !== "valid") trackerIssues.push("Fix Ultimate shared-map Wi-Fi setup")
+      if (!status.binding.complete) trackerIssues.push("Identify left + right Ultimate trackers")
     }
 
     const productionCollection = meta.id === "collect-data" && !settings.mantis_allow_uncalibrated
@@ -309,6 +314,11 @@ export function OperationPanel({
       }
     }
   }
+  const grippersOnlyTeleop = meta.id === "teleop" && mantisMode && trackerSource !== "quest"
+  // Only surface the grippers-only notice once readiness is actually known.
+  const grippersOnly =
+    grippersOnlyTeleop && currentTrackerReadinessState === "ready" && trackerIssues.length > 0
+  if (meta.id !== "teleop") blockers.push(...trackerIssues)
   // Collect-data / run-policy record whichever camera slots are assigned, so
   // at least one serial must be set before starting (the rest are optional).
   if (meta.requiresCameras && camCount < 1) {
@@ -449,6 +459,23 @@ export function OperationPanel({
                 </div>
               )}
 
+              {grippersOnly && !live && (
+                <div className="flex flex-col gap-1 rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs text-white/55">
+                  <span className="font-medium text-white/70">
+                    Grippers only — {trackerLabelFor(trackerSource)} tracking isn&apos;t set up
+                  </span>
+                  <p>
+                    Start drives both grippers from the rig triggers over CAN; no tracking, headset,
+                    or cameras are used. To add tracking, finish these in Mantis settings:
+                  </p>
+                  <ul className="list-inside list-disc">
+                    {trackerIssues.map((b) => (
+                      <li key={b}>{b}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               {/* Everything the operator watches during a session — episode
                   status/controls, the mirrored headset popups, and the live
                   camera feeds — grouped so it can expand to a fullscreen
@@ -472,6 +499,7 @@ export function OperationPanel({
                 usesHeadset={meta.usesHeadset}
                 mantisMode={mantisMode}
                 mantisSource={mantisSource}
+                grippersOnly={grippersOnly}
                 dataCollection={meta.id === "collect-data"}
                 session={live ? session : null}
                 isSim={isSim}
@@ -883,10 +911,15 @@ function EpisodeInputControl({
   )
 }
 
+function trackerLabelFor(source: string | null): string {
+  return source === "ultimate" ? "Ultimate" : "Lighthouse"
+}
+
 function RunningHints({
   usesHeadset,
   mantisMode,
   mantisSource,
+  grippersOnly,
   dataCollection,
   session,
   isSim,
@@ -896,6 +929,7 @@ function RunningHints({
   usesHeadset: boolean
   mantisMode: boolean
   mantisSource: string
+  grippersOnly: boolean
   dataCollection: boolean
   session: SessionInfo | null
   isSim: boolean
@@ -905,10 +939,17 @@ function RunningHints({
   if (!session || session.status !== "running") return null
   const viewerUrl = host ? `http://${host}:${viewerPort}` : ""
   const questMantis = mantisMode && mantisSource === "quest"
-  const managedMantis = mantisMode && !questMantis
-  const trackerLabel = mantisSource === "ultimate" ? "Ultimate" : "Lighthouse"
+  const managedMantis = mantisMode && !questMantis && !grippersOnly
+  const trackerLabel = trackerLabelFor(mantisSource)
   return (
     <div className="flex flex-col gap-3">
+      {mantisMode && grippersOnly && (
+        <p className="rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
+          Grippers only: once both triggers read live and released, the grippers calibrate against
+          their open stops (jaws move fully open — keep them clear), then each trigger closes its
+          gripper proportionally. No tracking runs; Stop disables both grippers.
+        </p>
+      )}
       {isSim && viewerUrl && (
         <a
           href={viewerUrl}

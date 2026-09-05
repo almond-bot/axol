@@ -445,20 +445,6 @@ def _prepare_motor_launch_args(
             error = _lift_cycle_link_error(status, prepared, now=now)
         return prepared, error
 
-    if command_id == "diag.mantis-trigger":
-        for index, side in enumerate(("left", "right")):
-            key = f"{side}_channel"
-            override = _channel_override(prepared, key)
-            if override is not None and override != active[index]:
-                return (
-                    prepared,
-                    f"Mantis trigger's {side} CAN channel override ({override}) "
-                    f"does not match the connected survey ({active[index]}). "
-                    "Reconnect with the requested mapping before starting.",
-                )
-            prepared[key] = active[index]
-        return prepared, None
-
     if command_id == "motor.set-zero-pos":
         arm = str(prepared.get("arm") or "").strip().lower()
         if arm not in ("left", "right"):

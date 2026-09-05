@@ -136,7 +136,6 @@
                 "pages": [
                   "cli/diag-rom-enable",
                   "cli/diag-rom-disable",
-                  "cli/diag-mantis-trigger",
                   "cli/diag-lift-cycle",
                   "cli/diag-zed-cable"
                 ]

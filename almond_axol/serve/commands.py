@@ -496,19 +496,6 @@ COMMANDS: dict[str, CommandDef] = {
         uses_can_bus=False,
         uses_cameras=True,
     ),
-    "diag.mantis-trigger": CommandDef(
-        "diag.mantis-trigger",
-        "diag.mantis-trigger",
-        "Mantis trigger check",
-        "Drive each Mantis gripper proportionally from its matching trigger; "
-        "no cameras or pose trackers required.",
-        "Diagnostics",
-        "argparse",
-        _argparse_loader("..diagnostics.mantis.trigger"),
-        requires_hardware=True,
-        drives_motors=True,
-        hardware_profiles=("mantis",),
-    ),
     # The lift commands run on the chest CAN bus, not the arm hub, but they
     # still take the single bus-owner slot (uses_can_bus default) so physical
     # motion is never launched concurrently with teleop or another

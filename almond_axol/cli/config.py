@@ -549,6 +549,12 @@ class TeleopCmdConfig:
     Settings → Mantis choice when saved; otherwise Lighthouse is the default.
     A config file or explicit CLI value wins. Quest connects through WebXR;
     Lighthouse and Ultimate start the corresponding local tracker bridge."""
+    mantis_grippers_only: bool = False
+    """Run Mantis teleop without tracking: the rig triggers drive the two
+    grippers over CAN and nothing else starts (no VR server, tracker bridge,
+    cameras, or transforms). Switched on automatically when the selected
+    Lighthouse/Ultimate source is not set up, so a Mantis teleop only ever
+    needs CAN; set it explicitly to skip tracking even when it is."""
     cart_only: bool = False
     """Drive only the powered cart from the headset thumbsticks. The arms and
     their CAN channels are left untouched (no Axol hub needed); the cart is
