@@ -101,8 +101,8 @@ Almost nothing you configure is actually per-run — camera assignment, arm stif
 | Tab | What's in it |
 |---|---|
 | **Tracking** | The Quest/Lighthouse/Ultimate pose source and its step-by-step setup flow (each step gated on host-reported readiness). Ultimate's protected private shared-map AP configuration can be saved without exposing the stored password. A live Quest run reports each controller's WebXR profile/space and a copyable common calibration key; use it as **Quest calibration key** so teleop and collection use the same selected datum. Measured tracker→TCP overrides live in `~/.almond/mantis/tcp_transform.json` and are edited per the [tracker CLI guide](/cli/tracker#transforms-and-acceptance), not in the panel. |
-| **CAN** | The logical left/right Mantis CAN interfaces (`can_mantis_l` / `can_mantis_r` by default); swap the two values to swap sides without moving cables. |
 | **Cameras** | The Left Mantis / Right Mantis camera layout, stored separately from the Axol layout. |
+| **CAN** | The logical left/right Mantis CAN interfaces (`can_mantis_l` / `can_mantis_r` by default); swap the two values to swap sides without moving cables. |
 
 **General settings** — the host, shared by both devices:
 
