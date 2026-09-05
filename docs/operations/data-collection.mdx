@@ -80,7 +80,7 @@ Complete the matching [Mantis teleop acceptance](/operations/teleop#mantis-teleo
 
 <Steps>
   <Step title="Select Mantis and assign its cameras">
-    In the control panel press **Select** on the **Mantis** tile, choose **Collect Data**, then click the Mantis tile to open **Mantis settings**. Select and save the pose source under **Tracking**, verify the two distinct CAN channel fields under **CAN mapping**, and assign **Left Mantis / Right Mantis** cameras under **Cameras**. Those two slots are stored separately from the overhead / left arm / right arm layout in **Axol settings → Cameras**. At least one Mantis camera must have recording enabled.
+    In the control panel press **Select** on the **Mantis** tile, choose **Collect Data**, then click the Mantis tile to open **Mantis settings**. Select and save the pose source under **Tracking**, verify the two distinct CAN channel fields under **CAN**, and assign **Left Mantis / Right Mantis** cameras under **Cameras**. Those two slots are stored separately from the overhead / left arm / right arm layout in **Axol settings → Cameras**. At least one Mantis camera must have recording enabled.
 
     Set the repo id and task. Normal production start remains blocked until source setup, both transforms, the Mantis hardware link, and the camera selection are ready. `mantis_allow_uncalibrated` is only for a calibration capture that will not enter training.
   </Step>

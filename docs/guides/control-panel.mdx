@@ -67,7 +67,7 @@ After discovery, if only Axol or only Mantis is present, the panel connects that
 
 A successful manual **Disconnect** pauses automatic reconnect for that exact hardware profile and saved CAN map across every open or newly opened panel. An explicit **Connect**, selecting a different detected profile on its tile, changing the saved map, or restarting `axol serve` starts a new automatic-connect intent. A successful manual **Connect** wins within the panel where it was clicked until that panel's device selection changes; another control panel can still make a later selection. This is intentionally last-writer-wins between operators, not a browser lease.
 
-- Enables the CAN interfaces — running [`can.setup`](/cli/can-setup) automatically the first time when an Axol Hub adapter is used and the host has not been configured. Axol channel overrides live under **Axol settings → Robot**; Mantis channel mapping lives under **Mantis settings → CAN mapping**. A non-hub SocketCAN adapter is brought up directly.
+- Enables the CAN interfaces — running [`can.setup`](/cli/can-setup) automatically the first time when an Axol Hub adapter is used and the host has not been configured. Axol channel overrides live under **Axol settings → Robot**; Mantis channel mapping lives under **Mantis settings → CAN**. A non-hub SocketCAN adapter is brought up directly.
 - Pings the active profile once per second while idle: all 16 Axol motors, or the two Mantis grippers. Each square combines CAN reachability and motor error status; hover it for details and temperature.
 
 **Motor faults block the active hardware profile.** The count includes only motors that are both reachable and error-free. While a required Axol motor or Mantis gripper is unreachable or faulted, that profile's hardware operation is blocked by both the panel and server. Sim teleop stays available.
@@ -101,14 +101,14 @@ Almost nothing you configure is actually per-run — camera assignment, arm stif
 | Tab | What's in it |
 |---|---|
 | **Tracking** | The Quest/Lighthouse/Ultimate pose source and its step-by-step setup flow (each step gated on host-reported readiness). Ultimate's protected private shared-map AP configuration can be saved without exposing the stored password. A live Quest run reports each controller's WebXR profile/space and a copyable common calibration key; use it as **Quest calibration key** so teleop and collection use the same selected datum. Measured tracker→TCP overrides live in `~/.almond/mantis/tcp_transform.json` and are edited per the [tracker CLI guide](/cli/tracker#transforms-and-acceptance), not in the panel. |
-| **CAN mapping** | The logical left/right Mantis CAN interfaces (`can_mantis_l` / `can_mantis_r` by default); swap the two values to swap sides without moving cables. |
+| **CAN** | The logical left/right Mantis CAN interfaces (`can_mantis_l` / `can_mantis_r` by default); swap the two values to swap sides without moving cables. |
 | **Cameras** | The Left Mantis / Right Mantis camera layout, stored separately from the Axol layout. |
 
 **General settings** — the host, shared by both devices:
 
 | Tab | What's in it |
 |---|---|
-| **Quest USB** | The optional [Quest-over-USB](#quest-usb) controller-pose link. |
+| **Quest** | The optional [Quest-over-USB](#quest-usb) controller-pose link. |
 | **Recording** | Dataset fps, video codec, push-to-hub, Rerun viewer address, and the non-root CLI dataset-root preference. Installed panel runs always use the sealed `/var/lib/almond-axol/datasets` store; external/custom roots are CLI-only. Setting the recording fps above the cameras' default 60 automatically raises the recording cameras' capture rate to match (the ZED X only supports rates above 60 at SVGA). |
 | **Inference** | Device, remote inference server host/port, episode length, chunking and aggregation. |
 | **System** | Log level. (The active-device selection is also stored here, but is edited with **Select** on the Axol / Mantis tiles.) |
@@ -151,7 +151,7 @@ The assignments and stream/record selection persist **on the host** with the res
 
 ### Quest USB
 
-The **Quest USB** tab (under **General settings**) manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the host sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only. Every frame is mirrored over cable and Wi-Fi with one producer id/sequence; the first copy wins and the duplicate is discarded. A dropped cable therefore fails over immediately with no reconnect, and a restored low-latency cable naturally wins again.
+The **Quest** tab (under **General settings**) manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the host sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only. Every frame is mirrored over cable and Wi-Fi with one producer id/sequence; the first copy wins and the duplicate is discarded. A dropped cable therefore fails over immediately with no reconnect, and a restored low-latency cable naturally wins again.
 
 The tab also carries the [headless](/guides/quest-headless) **Keep awake** / **Restore** buttons: with the headset plugged in and authorized, **Keep awake** disables its proximity sensor over adb so the VR session keeps running with the headset set down, and **Restore** brings normal sleep behavior back (a headset reboot also resets it).
 

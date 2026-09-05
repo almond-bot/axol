@@ -550,9 +550,9 @@ export function TrackerBindingPanel({
           <StepBody>
             <p>
               Put the Quest and this host on the same LAN (or connect USB-C with Developer Mode and
-              use the Quest USB tab). Start a Mantis teleop run, then in the Quest browser open{" "}
-              <span className="text-white/70">axol.almond.bot</span>, enter this host, connect, and
-              choose Enter VR. Hold both Touch controllers.
+              use the General settings → Quest tab). Start a Mantis teleop run, then in the Quest
+              browser open <span className="text-white/70">axol.almond.bot</span>, enter this host,
+              connect, and choose Enter VR. Hold both Touch controllers.
             </p>
             {live ? (
               <div className="flex flex-col gap-2 rounded-md border border-white/10 bg-black/20 p-2.5">

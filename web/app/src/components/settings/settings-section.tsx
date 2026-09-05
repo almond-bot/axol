@@ -99,8 +99,8 @@ function cameraProfilesAfterEdit(
 /**
  * The shared settings, directly on the control panel page, split by device:
  * **Axol** (cameras, arm behaviour, teleop & VR, rest pose, kinematics),
- * **Mantis** (tracking source and setup, CAN mapping, wrist cameras), and
- * **General** (Quest USB, recording, inference, system, Advanced). Each
+ * **Mantis** (tracking source and setup, CAN, wrist cameras), and
+ * **General** (Quest, recording, inference, system, Advanced). Each
  * connection tile opens its own scope. Values persist on the serve host
  * (~/.almond/settings.json) and are folded into every operation start, so
  * they're shared across operations and operator devices. Edits stage locally
@@ -270,7 +270,7 @@ export function SettingsSection({
 
   // Tabs within the active scope. Axol: hardware first (cameras), then arm
   // behaviour categories with the pose editor after Teleop & VR. Mantis: the
-  // tracking flow, CAN mapping, wrist cameras. General: Quest USB, the
+  // tracking flow, CAN, wrist cameras. General: Quest, the
   // remaining categories, and Advanced.
   const tabs: { key: SettingsTab; label: string }[] = []
   if (scope === "axol") {
@@ -283,11 +283,11 @@ export function SettingsSection({
   } else if (scope === "mantis") {
     tabs.push(
       { key: "mantis-tracking", label: "Tracking" },
-      { key: "mantis-can", label: "CAN mapping" },
+      { key: "mantis-can", label: "CAN" },
       { key: "mantis-cameras", label: "Cameras" }
     )
   } else {
-    tabs.push({ key: "usb", label: "Quest USB" })
+    tabs.push({ key: "usb", label: "Quest" })
     for (const cat of schema) {
       if (!AXOL_CATEGORY_KEYS.has(cat.key)) tabs.push({ key: cat.key, label: cat.label })
     }
