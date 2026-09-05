@@ -897,8 +897,8 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 options=("axol", "mantis"),
                 help=(
                     "Which hardware every operation runs on: the Axol arms or "
-                    "the handheld Mantis rigs. Set from the device switch on the "
-                    "control panel; teleop and data collection follow it, while "
+                    "the handheld Mantis rigs. Set with Select on the Axol / Mantis "
+                    "tile of the control panel; teleop and data collection follow it, while "
                     "Axol-only operations wait until it is back on Axol."
                 ),
                 # Not a config key: the panel translates it into each run's

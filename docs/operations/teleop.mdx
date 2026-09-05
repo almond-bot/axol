@@ -79,7 +79,7 @@ Mantis teleop enables only the two physical grippers; the Axol arms are an IK-dr
 
 <Steps>
   <Step title="Connect the Mantis hardware and map its sides">
-    In the panel, set the **Device** switch to **Mantis** (it applies to every operation) and connect the **Mantis** tile. Click the Mantis tile to open **Mantis settings**. Under **CAN mapping**, confirm the left and right CAN fields are non-empty and different; if squeezing the physical left rig moves the reported right input, swap those two interface values and reconnect. Each side's trigger reader follows the same mapping.
+    In the panel, press **Select** on the **Mantis** tile (it applies to every operation) and connect it. Click the Mantis tile to open **Mantis settings**. Under **CAN mapping**, confirm the left and right CAN fields are non-empty and different; if squeezing the physical left rig moves the reported right input, swap those two interface values and reconnect. Each side's trigger reader follows the same mapping.
 
     Before setting up cameras or trackers, run `axol diag.mantis-trigger` to prove that each physical trigger proportionally drives its matching gripper. This check needs only CAN and safely stops both grippers on **Ctrl-C** or a lost trigger stream; see the [`diag.mantis-trigger` reference](/cli/diag-mantis-trigger).
 

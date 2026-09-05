@@ -77,7 +77,7 @@ import { InstallerMigrationBanner, UpdateBanner } from "@/components/update-bann
 import { VersionMismatchBanner } from "@/components/version-mismatch-banner"
 import { requiresInstallerMigration, showInstallerMigration } from "@/lib/update-migration"
 import { versionMismatch } from "@/lib/version"
-import { ConnectionsBar, DeviceSwitch } from "@/components/connections-bar"
+import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
@@ -1599,18 +1599,12 @@ export default function ControlPanel() {
           onRobotConnect={robotConnectClick}
           onRobotDisconnect={robotDisconnectClick}
           selectedProfile={hardwareProfile}
+          onSelectProfile={(profile) => void selectHardwareProfile(profile)}
+          selectDisabled={isLive || hardwareProfileSaving}
+          selectDisabledReason={isLive ? "Stop the running operation to change the device." : null}
+          selectSaving={hardwareProfileSaving}
           onOpenSettings={openSettingsScope}
         />
-
-        {conn.state === "ok" && (
-          <DeviceSwitch
-            value={hardwareProfile}
-            onChange={(profile) => void selectHardwareProfile(profile)}
-            disabled={isLive || hardwareProfileSaving}
-            disabledReason={isLive ? "Stop the running operation to change the device." : null}
-            saving={hardwareProfileSaving}
-          />
-        )}
 
         {conn.state === "ok" && canDiscoveryNeedsRetry && (
           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">

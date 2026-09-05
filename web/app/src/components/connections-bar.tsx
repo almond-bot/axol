@@ -1,4 +1,14 @@
-import { Cpu, Loader2, Plug, Power, RotateCcw, Server, Settings2, Unplug } from "lucide-react"
+import {
+  Check,
+  Cpu,
+  Loader2,
+  Plug,
+  Power,
+  RotateCcw,
+  Server,
+  Settings2,
+  Unplug,
+} from "lucide-react"
 import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
 import type { SettingsScope } from "@/lib/settings-scope"
@@ -127,71 +137,54 @@ const POWER_ACTIONS: Record<
   },
 }
 
-const PROFILE_LABEL: Record<HardwareProfile, string> = { axol: "Axol", mantis: "Mantis" }
-
 /**
- * The system-wide device selection: which hardware every operation runs on.
- * One switch for the whole panel (persisted with the shared settings) instead
- * of a per-operation Mantis toggle — teleop and data collection follow it, and
+ * The system-wide device selection, shown on each hardware tile: the selected
+ * device carries a highlighted marker, the other offers Select. One choice for
+ * the whole panel (persisted with the shared settings) instead of a
+ * per-operation Mantis toggle — teleop and data collection follow it, and
  * Axol-only operations wait until it is back on Axol.
  */
-export function DeviceSwitch({
-  value,
-  onChange,
-  disabled = false,
+function DeviceSelect({
+  profile,
+  selected,
+  onSelect,
+  disabled,
   disabledReason,
-  saving = false,
+  saving,
 }: {
-  value: HardwareProfile
-  onChange: (profile: HardwareProfile) => void
-  disabled?: boolean
+  profile: HardwareProfile
+  selected: boolean
+  onSelect?: (profile: HardwareProfile) => void
+  disabled: boolean
   disabledReason?: string | null
-  /** The selection is being written to the host. */
-  saving?: boolean
+  saving: boolean
 }) {
+  if (selected) {
+    return (
+      <span
+        className="flex shrink-0 items-center gap-1 rounded-full bg-[#eff483]/15 px-1.5 py-0.5 font-mono text-[0.6rem] tracking-wider text-[#eff483] uppercase"
+        title="Every operation runs on this device"
+      >
+        {saving ? <Loader2 className="size-2.5 animate-spin" /> : <Check className="size-2.5" />}
+        selected
+      </span>
+    )
+  }
+  if (!onSelect) return null
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-2.5">
-      <div className="flex min-w-0 flex-col">
-        <span className="font-mono text-xs tracking-widest text-white/40 uppercase">Device</span>
-        <span className="text-xs text-white/45">
-          Every operation runs on the selected hardware; Axol-only operations wait for Axol.
-        </span>
-      </div>
-      <div className="flex items-center gap-2">
-        {saving && <Loader2 className="size-3.5 animate-spin text-white/40" />}
-        <div
-          role="radiogroup"
-          aria-label="Device"
-          title={disabled ? (disabledReason ?? undefined) : undefined}
-          className="flex rounded-lg border border-white/10 bg-white/[0.02] p-0.5"
-        >
-          {(["axol", "mantis"] as const).map((profile) => {
-            const active = profile === value
-            return (
-              <button
-                key={profile}
-                type="button"
-                role="radio"
-                aria-checked={active}
-                disabled={disabled}
-                onClick={() => {
-                  if (!active) onChange(profile)
-                }}
-                className={cn(
-                  "flex items-center gap-1.5 rounded-md px-3 py-1 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60",
-                  active
-                    ? "bg-[#eff483]/15 text-[#eff483]"
-                    : "text-white/60 hover:bg-white/[0.05] hover:text-white/85"
-                )}
-              >
-                <Cpu className="size-3.5" />
-                {PROFILE_LABEL[profile]}
-              </button>
-            )
-          })}
-        </div>
-      </div>
-    </div>
+    <button
+      type="button"
+      onClick={() => onSelect(profile)}
+      disabled={disabled}
+      title={
+        disabled
+          ? (disabledReason ?? undefined)
+          : "Run every operation on this device (Axol-only operations wait for Axol)."
+      }
+      className="shrink-0 rounded-full border border-white/15 px-1.5 py-0.5 font-mono text-[0.6rem] tracking-wider text-white/45 uppercase transition-colors hover:border-white/30 hover:text-white/80 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      select
+    </button>
   )
 }
 
@@ -200,7 +193,8 @@ export function DeviceSwitch({
  * Mantis share one idle telemetry link, so connecting either hardware tile
  * switches that link to its CAN interfaces and motor set. Clicking a tile's
  * title opens that connection's settings: Axol and Mantis each have their
- * own, and the host tile opens the general (shared) settings.
+ * own, and the host tile opens the general (shared) settings. The hardware
+ * tiles also carry the system-wide device selection (see DeviceSelect).
  *
  * The host tile also carries the host power controls (restart / shut down,
  * each behind a confirmation) — the Disconnect button only drops this
@@ -220,6 +214,10 @@ export function ConnectionsBar({
   onRobotConnect,
   onRobotDisconnect,
   selectedProfile,
+  onSelectProfile,
+  selectDisabled = false,
+  selectDisabledReason,
+  selectSaving = false,
   onOpenSettings,
 }: {
   conn: ConnState
@@ -240,6 +238,12 @@ export function ConnectionsBar({
   onRobotDisconnect: () => void
   /** The system-wide device selection, marked on its tile. */
   selectedProfile?: HardwareProfile
+  /** Switches the system-wide device selection (offered on the other tile). */
+  onSelectProfile?: (profile: HardwareProfile) => void
+  selectDisabled?: boolean
+  selectDisabledReason?: string | null
+  /** The selection is being written to the host. */
+  selectSaving?: boolean
   /** Opens the settings for a connection (only offered while online). */
   onOpenSettings?: (scope: SettingsScope) => void
 }) {
@@ -325,13 +329,15 @@ export function ConnectionsBar({
         label={label}
         pulse={state === "connecting"}
         badge={
-          selectedProfile === profile ? (
-            <span
-              className="shrink-0 rounded-full bg-[#eff483]/15 px-1.5 py-0.5 font-mono text-[0.6rem] tracking-wider text-[#eff483] uppercase"
-              title="Operations run on this device"
-            >
-              selected
-            </span>
+          selectedProfile ? (
+            <DeviceSelect
+              profile={profile}
+              selected={selectedProfile === profile}
+              onSelect={online ? onSelectProfile : undefined}
+              disabled={selectDisabled}
+              disabledReason={selectDisabledReason}
+              saving={selectSaving}
+            />
           ) : undefined
         }
         onOpenSettings={online && onOpenSettings ? () => onOpenSettings(profile) : undefined}

@@ -234,7 +234,7 @@ export function OperationPanel({
   const blockers: string[] = []
   if (!live && hostBlocker) blockers.push(`Wait: ${hostBlocker}`)
   if (axolOnlyBlocked) {
-    blockers.push(`Switch the device to Axol — ${meta.label} runs on Axol only`)
+    blockers.push(`Select the Axol tile — ${meta.label} runs on Axol only`)
   } else if (meta.requiresRobot && mantisMode && !mantisOk) {
     blockers.push(
       robotOk && robot?.profile !== "mantis"
