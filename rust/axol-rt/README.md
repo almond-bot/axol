@@ -123,9 +123,9 @@ own trajectory and feedback states:
   anything the checks detect. Torque comes off only on an explicit `D`
   disarm of a healthy session (the operator's deliberate stop) or an
   e-stop.
-- **Loss-of-trust faults go limp.** Unhealthy control timing or a motor
-  silent for a second means the core should stop applying stiffness and
-  phase-sensitive damping — so it does exactly that: every arm joint on
+- **A loss-of-trust fault goes limp.** A motor silent for a second means
+  the core should stop applying stiffness and phase-sensitive damping to a
+  joint it cannot see — so it does exactly that: every arm joint on
   both buses drops to kp = 0, firmware kd only, with the streamed gravity
   `t_ff` still applied, and the loop keeps running. It reports `limp: ...`;
   Python's `motion_control` switches to streaming gravity comp (gravity at
@@ -133,8 +133,8 @@ own trajectory and feedback states:
   operator moves them to rest and restarts. This is the classic
   contact-hold gravity comp, entered from the core side; limp is never
   cleared within a session and a disarm while limp leaves the motors limp.
-- **Late ticks degrade first, limp on repeat.** Timing gets the same
-  two-tier treatment as missed replies. A whole-cycle overrun (a tick that
+- **Late ticks degrade, never limp.** Timing gets missed replies'
+  degraded tier and nothing above it. A whole-cycle overrun (a tick that
   wakes a full period or more late), three late ticks (> 0.5 ms) in a
   row, or 8 of the last 32 late marks that *bus* timing-degraded: host
   damping off on every joint of the bus until a clean 32-tick window, and
@@ -148,13 +148,16 @@ own trajectory and feedback states:
   runnable-wait, `getrusage(RUSAGE_THREAD)` page faults and involuntary
   switches, sampled every tick for ~2 µs) and what they read as —
   *preempted*, *page fault*, or *kernel stall* — so a field log names the
-  subsystem to look at. A **second** overrun inside the window, or the
-  loop late on 16 of 32 ticks, is timing that stays unhealthy and takes
-  the session limp. (Before this, one overrun went straight to limp; the
-  2026-09-04 field record was a single 20–60 ms stall in an otherwise
-  perfect ~770k-tick session, each time while the dataset writer flushed
-  a save, and it cost a full stop/restart while the arms were holding
-  still.)
+  subsystem to look at; further overruns inside a degraded stretch are
+  logged the same way (rate-limited), and the five-second stats line
+  counts overruns and degraded ticks/episodes. No amount of lateness is a
+  loss of trust: a late tick invalidates exactly the terms degraded turns
+  off, and the motors ride out a late host on their own firmware gains —
+  the same thing they do if the host dies. (Before this, one overrun went
+  straight to limp; the 2026-09-04 field record was a single 20–60 ms
+  stall in an otherwise perfect ~770k-tick session, each time while the
+  dataset writer flushed a save, and it cost a full stop/restart while the
+  arms were holding still.)
 - **Memory is locked.** `serve` calls `mlockall(MCL_CURRENT | MCL_FUTURE)`
   before accepting its client, so a page reclaimed under the recorder's
   I/O pressure can never fault a `SCHED_FIFO` bus thread mid-tick; the
@@ -248,8 +251,8 @@ write them, and the regular five-second status line reports any trace drops.
 `scan` and `bench` are strictly read-only — safe against a powered robot
 at rest. `hold` requires `--yes` to actuate. `serve` only actuates after
 the explicit config/prep/arm handshake. Only a deliberate disarm of a
-healthy session disables the motors (a disabled arm falls). Persistently
-unhealthy timing or a silent motor takes the session limp — gravity comp
+healthy session disables the motors (a disabled arm falls). A silent
+motor takes the session limp — gravity comp
 on every joint, still serving, so the operator can hand-guide the arms to
 rest; a dead bus, signal, or client loss stops the stream and leaves the
 arms holding their last command. Missed CAN replies and late ticks
@@ -257,9 +260,8 @@ degrade rather than fault: host damping is never computed from a stale
 sample or across a lost tick, a joint missing 4 of the last 32 replies (or
 a bus with a whole-cycle overrun / 8 of 32 late ticks) runs on firmware kd
 (logged with the stall's attribution, counted in the five-second stats
-line) until a clean window, and only a motor silent for a full second, a
-second overrun within 32 ticks, or a loop late on half its ticks takes
-the session limp — bursty loss is expected while cameras and IK
+line) until a clean window, and only a motor silent for a full second
+takes the session limp — bursty loss is expected while cameras and IK
 compilation contend for the same host and USB fabric during startup, and
 an isolated stall while the dataset writer flushes is not a reason to end
 a session whose arms were holding still. `proxy` is the sole

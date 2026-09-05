@@ -102,9 +102,9 @@
 //!   which is worse than any condition the checks detect. Torque comes off
 //!   only on an explicit `D` disarm of a healthy session (or an e-stop,
 //!   which removes motor power itself).
-//! - **Loss-of-trust faults go *limp*, not dead.** Unhealthy control timing
-//!   and a motor silent for a second both mean the core should no longer be
-//!   applying stiffness or phase-sensitive damping — so it stops doing
+//! - **A loss-of-trust fault goes *limp*, not dead.** A motor silent for a
+//!   second means the core should no longer be applying stiffness or
+//!   phase-sensitive damping to a joint it cannot see — so it stops doing
 //!   exactly that and nothing more: every arm joint on both buses goes to
 //!   kp = 0, firmware kd `LIMP_KD`, no host damping or inertia term, with
 //!   the streamed gravity `t_ff` still applied (Python keeps evaluating it
@@ -140,21 +140,22 @@
 //!   clean 32-tick window, the transition is logged, and the loop keeps
 //!   running on firmware kd. Only a motor silent for a full second takes
 //!   the session limp.
-//! - **Late ticks degrade first, limp on repeat.** Timing gets the same
-//!   two-tier treatment as feedback. A whole-cycle overrun (a wake a full
+//! - **Late ticks degrade, never limp.** Timing gets feedback's degraded
+//!   tier and nothing above it. A whole-cycle overrun (a wake a full
 //!   period or more late), three late ticks in a row, or 8 of the last 32
 //!   late marks the *bus* timing-degraded: host damping off on every joint
 //!   of that bus until a clean 32-tick window, and the overrun tick's
 //!   tracker advances one nominal period with its derivative chains
 //!   re-seeded at rest — the motors held the previous command across the
 //!   gap, so there is no trajectory to differentiate. Firmware kp/kd and
-//!   the streamed gravity `t_ff` are untouched, so the arm keeps holding.
-//!   The transition is logged as a warning with the thread's own
-//!   scheduler/memory counters across that wake (`stall.rs`: runnable-wait,
-//!   page faults, involuntary switches) so the line says whether the loop
-//!   was preempted, faulting, or blocked in the kernel. A *second* overrun
-//!   inside the window, or the loop late on 16 of 32 ticks, is timing that
-//!   stays unhealthy and takes the session limp as above.
+//!   the streamed gravity `t_ff` are untouched, so the arm keeps holding —
+//!   a late host is what the firmware is built to ride out, which is why
+//!   no amount of lateness is a loss of trust. The transition (and each
+//!   further overrun inside a degraded stretch, rate-limited) is logged as
+//!   a warning with the thread's own scheduler/memory counters across that
+//!   wake (`stall.rs`: runnable-wait, page faults, involuntary switches) so
+//!   the line says whether the loop was preempted, faulting, or blocked in
+//!   the kernel.
 //! - The process locks its memory (`mlockall`, `stall::lock_memory`) before
 //!   accepting a client, so a page reclaimed under the dataset writer's I/O
 //!   pressure can never fault a bus thread mid-tick. A failed lock (no
@@ -219,7 +220,7 @@ const SILENT_FEEDBACK_FAULT: Duration = Duration::from_secs(1);
 /// five-second stats line carries the cumulative count regardless.
 const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// Firmware velocity damping (Nm·s/rad) on the arm joints while the core is
-/// *limp* — the fallback for a loss-of-trust fault (timing, silent motor).
+/// *limp* — the fallback for a loss-of-trust fault (a silent motor).
 /// Matches `VRTeleopConfig.reset_gravity_comp_kd`, the classic contact-hold
 /// gravity comp: enough to keep a hand-guided arm from feeling twitchy, far
 /// too little to hold it up. Gravity itself comes from the streamed `t_ff`.
@@ -239,17 +240,19 @@ const LATE_TICK: Duration = Duration::from_micros(500);
 /// ordering that tick was lost, so its damping and inertia terms are
 /// re-seeded rather than computed over the gap.
 const DEGRADED_RECENT_LATE_TICKS: u32 = 8;
-/// Timing that stays unhealthy is a loss of trust: a *second* whole-cycle
-/// overrun inside the window (two stalls within 133 ms), or the loop late on
-/// half its ticks, takes the session limp. One overrun does not: the field
-/// record (2026-09-04) is a single 20–60 ms stall in an otherwise perfect
-/// ~770k-tick session, each time while the dataset writer flushed a save,
-/// and answering it with a session-ending limp cost a full stop/restart per
-/// hiccup while the arms were holding still. Degraded covers what the
-/// overrun actually breaks (phase-sensitive terms); limp is for a loop that
-/// is demonstrably not being scheduled.
-const LIMP_RECENT_OVERRUNS: u32 = 2;
-const LIMP_RECENT_LATE_TICKS: u32 = 16;
+// Bad control timing never takes the session limp — degraded is the whole
+// response, however long it lasts. A late tick invalidates exactly the terms
+// degraded turns off (phase-sensitive damping, the derivative chains); the
+// motors themselves hold the last command on firmware kp/kd across any gap,
+// which is the same thing they do if the host dies. Limp is reserved for a
+// motor that has gone silent (`SILENT_FEEDBACK_FAULT`), where the core would
+// otherwise stream stiffness to a joint it cannot see. The field record
+// (2026-09-04) is single 20–60 ms stalls in otherwise perfect ~770k-tick
+// sessions, each while the dataset writer flushed a save; the old single-tick
+// limp turned each into a session-ending, hand-guide-and-restart fault while
+// the arms were holding still. Persistent lateness is still made visible: the
+// degraded warning carries the stall attribution, repeated overruns inside a
+// degraded stretch are logged (rate-limited), and the stats line counts them.
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -445,8 +448,6 @@ enum TimingVerdict {
     Degraded,
     /// A full clean window just closed out a degraded stretch.
     Recovered,
-    /// Timing is persistently unhealthy: take the session limp.
-    Limp,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -461,11 +462,12 @@ struct TimingHealth {
 
 impl TimingHealth {
     /// Record one tick's wake-up lateness. The verdict includes the tick
-    /// itself: a fault diagnostic must describe the tick that triggered it.
+    /// itself: the degraded warning must describe the tick that triggered it.
     ///
-    /// Mirrors `FeedbackHealth`: degradation has hysteresis (it starts at
-    /// an overrun or a late cluster and only clears once the 32-tick window
-    /// has no late tick at all), and the fault sits well above it.
+    /// Mirrors `FeedbackHealth`'s degraded tier: hysteresis (it starts at an
+    /// overrun or a late cluster and only clears once the 32-tick window has
+    /// no late tick at all). Unlike feedback there is no fault tier above it
+    /// — see the note at `DEGRADED_RECENT_LATE_TICKS`.
     fn record(&mut self, lateness: Duration, period: Duration) -> TimingVerdict {
         let late = lateness > LATE_TICK;
         let overrun = lateness >= period;
@@ -475,11 +477,6 @@ impl TimingHealth {
             self.consecutive_late = self.consecutive_late.saturating_add(1);
         } else {
             self.consecutive_late = 0;
-        }
-        if self.recent_overruns.count_ones() >= LIMP_RECENT_OVERRUNS
-            || self.recent_late.count_ones() >= LIMP_RECENT_LATE_TICKS
-        {
-            return TimingVerdict::Limp;
         }
         let unhealthy = overrun
             || self.consecutive_late >= 3
@@ -1123,19 +1120,26 @@ mod tests {
     }
 
     #[test]
-    fn timing_health_limps_on_repeated_overruns_or_persistent_lateness() {
-        // Two whole-cycle overruns inside the window: the loop is not being
-        // scheduled; the verdict names the tick that made it two.
+    fn timing_health_never_escalates_past_degraded() {
+        // Repeated whole-cycle overruns inside one window: still degraded,
+        // never a fault — the loop stays in the degraded stretch (Steady,
+        // damping off) and the stretch is what the log reports.
         let mut health = TimingHealth::default();
         assert_eq!(health.record(PERIOD, PERIOD), TimingVerdict::Degraded);
         for _ in 0..20 {
             assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
         }
-        assert_eq!(health.record(PERIOD * 3, PERIOD), TimingVerdict::Limp);
+        assert_eq!(health.record(PERIOD * 3, PERIOD), TimingVerdict::Steady);
+        assert!(health.degraded);
         assert_eq!(health.recent_overruns.count_ones(), 2);
+        // The window must be clean again before it recovers.
+        for _ in 0..31 {
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
 
         // Two overruns further apart than the window are two degraded
-        // episodes, not a fault.
+        // episodes.
         let mut spaced = TimingHealth::default();
         assert_eq!(spaced.record(PERIOD, PERIOD), TimingVerdict::Degraded);
         for _ in 0..31 {
@@ -1144,15 +1148,23 @@ mod tests {
         assert_eq!(spaced.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
         assert_eq!(spaced.record(PERIOD, PERIOD), TimingVerdict::Degraded);
 
-        // Late on half the window.
+        // Late on every other tick for a long stretch: one Degraded
+        // transition, then Steady for as long as it lasts.
         let mut persistent = TimingHealth::default();
         let mut verdicts = Vec::new();
-        for _ in 0..16 {
+        for _ in 0..500 {
             verdicts.push(persistent.record(LATE, PERIOD));
             verdicts.push(persistent.record(ON_TIME, PERIOD));
         }
-        assert!(verdicts.contains(&TimingVerdict::Degraded));
-        assert_eq!(verdicts[30], TimingVerdict::Limp);
+        assert_eq!(
+            verdicts
+                .iter()
+                .filter(|v| **v == TimingVerdict::Degraded)
+                .count(),
+            1
+        );
+        assert!(!verdicts.contains(&TimingVerdict::Recovered));
+        assert!(persistent.degraded);
     }
 
     #[test]
@@ -1407,7 +1419,7 @@ pub fn run(socket_path: &str) -> io::Result<()> {
     // motors holding their last MIT command on firmware gains — dropping
     // the arms is never an acceptable failure response.
     let disarm = Arc::new(AtomicBool::new(false));
-    // Set by a bus thread on a loss-of-trust fault (timing, silent motor):
+    // Set by a bus thread on a loss-of-trust fault (a silent motor):
     // both buses drop to gravity comp (kp = 0, streamed gravity t_ff) and
     // keep serving so the operator can hand-guide the arms to rest. Never
     // cleared within a session; a disarm in this state leaves the motors
@@ -1856,14 +1868,29 @@ fn bus_loop(
             // every joint until a clean window, and the overrun tick's command
             // derivatives re-seeded rather than integrated across the gap
             // (firmware kp/kd and the streamed gravity t_ff are unaffected,
-            // so the arm keeps holding). Only timing that stays unhealthy —
-            // a second overrun within the window, or late on half the ticks
-            // — takes the session *limp*: kp = 0, firmware kd, gravity from
-            // the streamed t_ff; the operator hand-guides the arms to rest
-            // and restarts. Already limp: nothing left to protect.
+            // so the arm keeps holding). That is the whole response — timing
+            // never takes the session limp (see `DEGRADED_RECENT_LATE_TICKS`);
+            // a stretch that stays bad just stays degraded, with its repeat
+            // overruns logged so the persistence is visible.
             let is_limp = limp.load(Ordering::SeqCst);
             match timing_health.record(lateness, period) {
-                TimingVerdict::Steady => {}
+                TimingVerdict::Steady => {
+                    if overrun && timing_health.degraded && began >= next_timing_log {
+                        next_timing_log = began + DEGRADED_LOG_INTERVAL;
+                        timing_announced = true;
+                        send_text(
+                            out_tx,
+                            b'W',
+                            &format!(
+                                "{iface}: control timing still degraded ({:.3} ms late, {} of the last 32 ticks late, {} whole-cycle overruns; {}) — host damping stays off on this bus; firmware gains hold",
+                                lateness.as_secs_f64() * 1e3,
+                                timing_health.recent_late.count_ones(),
+                                timing_health.recent_overruns.count_ones(),
+                                stall.describe(lateness),
+                            ),
+                        );
+                    }
+                }
                 TimingVerdict::Degraded => {
                     timing_degraded_episodes += 1;
                     // Rate-limited like the feedback transitions; the stats
@@ -1894,26 +1921,10 @@ fn bus_loop(
                         );
                     }
                 }
-                TimingVerdict::Limp => {
-                    if !is_limp {
-                        go_limp(
-                            limp,
-                            out_tx,
-                            &format!(
-                                "{iface}: control timing unhealthy ({:.3} ms late, {} of the last 32 ticks late, {} whole-cycle overruns; {}) — going limp before phase-sensitive damping",
-                                lateness.as_secs_f64() * 1e3,
-                                timing_health.recent_late.count_ones(),
-                                timing_health.recent_overruns.count_ones(),
-                                stall.describe(lateness),
-                            ),
-                        );
-                    }
-                }
             }
             if timing_health.degraded {
                 timing_degraded_ticks += 1;
             }
-            let is_limp = is_limp || limp.load(Ordering::SeqCst);
             ticks += 1;
 
             // Adopt a newly arrived target: latest-wins — the tracker
