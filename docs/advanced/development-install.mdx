@@ -25,16 +25,20 @@ source .venv/bin/activate
 
 ## Optional extras
 
-Install optional dependency groups as needed (the install script includes `lerobot` and `sim`):
+Install optional dependency groups as needed (the install script includes `lerobot`, `sim`, and `tracker`):
 
 | Extra | Contents | When to use |
 |---|---|---|
-| `lerobot` | LeRobot (from PyPI, >= 0.6.1) | `collect-data`, `run-policy` |
+| `lerobot` | LeRobot (from PyPI, pinned to 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
 
 ```bash
-uv sync --extra lerobot --extra sim   # everything
+uv sync --extra lerobot --extra sim --extra tracker   # hosted feature set
 ```
+
+<Warning>
+  PyPI's `torch==2.10.0` wheel is CPU-only on aarch64. On a Jetson, an exact `uv sync` also replaces an out-of-band Torch build with that locked CPU wheel. If local policy inference needs CUDA, manage a JetPack-compatible Torch + Torchvision build explicitly after dependency sync, and do not exact-sync that deployed environment again without a restoration plan. Remote inference and `--device cpu` work with the hosted dependency set.
+</Warning>
 
 <Note>
   Streaming the ZED camera feeds to the headset (`teleop --cameras`, `collect-data`) isn't a dependency extra — it needs the system GStreamer + camera stack, installed via [`axol provision`](/cli/provision) (see [Headset-video stack](#headset-video-stack) below).
@@ -60,7 +64,7 @@ Relaying the ZED cameras to the headset grabs and **NVENC**-encodes frames on th
 axol provision
 ```
 
-This runs the [Quest-over-USB](/guides/quest-over-usb) adb setup, the [`zed.driver`](/cli/zed-driver) ZED Box Duo camera-driver upgrade, the board-IMU group access (`gyro.install`, the [powered cart](/guides/vr-interface#powered-cart)'s heading-hold yaw source), [`zed.install`](/cli/zed-install), [`gst.install`](/cli/gst-install), and [`gst.build-zed`](/cli/gst-build-zed) in order; each self-gates and no-ops off the target hardware (no ZED SDK / `apt` / factory ZED Box Duo driver / board IMU). You can also run them individually.
+This runs the [Quest-over-USB](/guides/quest-over-usb) adb setup, the [`zed.driver`](/cli/zed-driver) ZED Box (Duo / Mini) camera-driver upgrade, the board-IMU group access (`gyro.install`, the [powered cart](/guides/vr-interface#powered-cart)'s heading-hold yaw source), [`zed.install`](/cli/zed-install), [`gst.install`](/cli/gst-install), and [`gst.build-zed`](/cli/gst-build-zed) in order; each self-gates and no-ops off the target hardware (no ZED SDK / `apt` / factory ZED Box driver / board IMU). You can also run them individually.
 
 On a Jetson, pin the NVENC/VIC and CPU clocks for low-latency encode and a steady IK loop (the install script wires this into the systemd unit so it re-runs at every boot):
 

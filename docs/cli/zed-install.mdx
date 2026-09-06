@@ -10,6 +10,8 @@ axol zed.install
 axol zed.install --force   # reinstall even when the matching version is present
 ```
 
+The matching wheel is downloaded over HTTPS through an exclusive temporary file and is accepted only when its distribution name, SDK version, Python/architecture tag, dependency names, native extension, and archive paths are valid. Stereolabs does not publish per-wheel signatures or checksums, so HTTPS remains the provenance boundary for these SDK-version-specific wheels; validation fails closed on unexpected metadata rather than installing it.
+
 | Flag | Description |
 |---|---|
 | `--force` | Reinstall pyzed even when the matching version is already present. Without it, the command is a no-op when the installed pyzed already matches the SDK. |

@@ -1,15 +1,15 @@
 ---
 title: "Teleoperation"
-description: "Drive Axol live from a VR headset — from the web control panel or the CLI, on real hardware or in sim."
+description: "Drive Axol from a VR headset, or run the Mantis rigs' grippers straight from their triggers."
 ---
 
-Teleoperation drives the robot live from a Meta Quest headset: the headset streams your hand and elbow pose to the SDK, which solves IK and commands the arms. You can run it two ways — from the **web control panel** (browser) or the **CLI** (`axol teleop`) — and against either the **real robot** or the **software simulator** (no hardware needed; the sim just swaps the motors for a browser visualizer).
+Teleoperation drives the arms live from a Meta Quest headset. It runs on either device: **Axol** (the robot, or the browser **sim**) or **Mantis** (the handheld rigs — teleop drives just the grippers from the rig triggers over CAN; tracking belongs to [data collection](/operations/data-collection)). You can run either from the **web control panel** or the **CLI** (`axol teleop`).
 
 ## Before you start
 
 - **Axol installed** — the [one-command install](/installation) on the robot machine, or a [development install](/advanced/development-install) for sim.
-- **CAN up and motors verified** (real robot only). The control panel does this for you on connect; on the CLI run [`axol can.setup`](/cli/can-setup) once, then check a motor with [`axol motor.info`](/cli/motor-info).
-- **A Meta Quest** on the same network, with the [TLS certificate authorized](#authorize-the-tls-certificate) once.
+- **The device selected and connected.** The control panel's **Axol** / **Mantis** tile carries the system-wide device choice (**Select**) and brings up CAN and checks the motors on connect; on the CLI run [`axol can.setup`](/cli/can-setup) once. Mantis needs its [hardware setup](/mantis/hardware) only — teleop never uses a pose source (that's [data collection](/operations/data-collection)'s job, set up under [Mantis Tracking](/mantis/tracking)).
+- **A Meta Quest** with the [TLS certificate authorized](#authorize-the-tls-certificate) — for Axol. Mantis teleop needs no headset.
 
 <Note>
   No CAN setup or motor check is needed in **sim** — there's no hardware to talk to.
@@ -24,14 +24,14 @@ The easiest way is from the app itself: when you press **Connect** and the certi
 ## Run it
 
 <Tabs>
-  <Tab title="Control Panel">
+  <Tab title="Axol">
     <Steps>
       <Step title="Connect the host and robot">
-        Open the control panel and connect the **Axol Host** — the panel then brings up the robot automatically (running `can.setup` the first time); if the **Axol** tile isn't green, press **Connect** on it. For **sim**, you can skip the robot connection. See the [Web Control Panel guide](/guides/control-panel#connections) for the connect flow.
+        Open the control panel and connect the **Axol Host**. With **Axol** selected on its tile, the panel brings up the robot automatically (running `can.setup` the first time); if the tile isn't green, press **Connect** on it. For **sim**, you can skip the robot connection. See the [Web Control Panel guide](/guides/control-panel#connections) for the connect flow.
       </Step>
 
       <Step title="(Optional) assign cameras">
-        To see the robot's camera feeds in the headset, open the **Cameras** settings tab and assign the ZED cameras to their slots. Skip this for camera-free teleop. See [Cameras](/guides/control-panel#cameras).
+        To see the robot's camera feeds in the headset, open **Axol settings → Cameras** and assign the ZED cameras to their overhead / left arm / right arm slots. Skip this for camera-free teleop. See [Cameras](/guides/control-panel#cameras).
       </Step>
 
       <Step title="Select Teleoperation and Start">
@@ -39,31 +39,23 @@ The easiest way is from the app itself: when you press **Connect** and the certi
       </Step>
 
       <Step title="Connect the headset">
-        Put on the Quest, open the VR app at [axol.almond.bot](https://axol.almond.bot), enter the host's address, and press **Connect** — then **Start** to enter the session.
+        Put on the Quest, open the VR app at [axol.almond.bot](https://axol.almond.bot), enter the host's address, and press **Connect** — then **Start** to enter the session. From rest, press both grips together to engage; the [controller layout](#quest-controller-layout) below has the rest.
       </Step>
     </Steps>
-  </Tab>
 
-  <Tab title="CLI">
-    <Steps>
-      <Step title="Start teleop">
-        On the robot machine:
+    **From the CLI**, on the robot machine:
 
-        ```bash
-        axol teleop
-        ```
+    ```bash
+    axol teleop
+    ```
 
-        For **sim**, add `--sim` — this opens a browser visualizer at [http://localhost:8002](http://localhost:8002) and runs the same VR server on port 8000, so you can drive the simulated robot from the headset exactly like the real one (great for verifying network and tracking before powering the robot):
+    For **sim**, add `--sim` — this opens a browser visualizer at [http://localhost:8002](http://localhost:8002) and runs the same VR server on port 8000, so you can drive the simulated robot from the headset exactly like the real one (great for verifying network and tracking before powering the robot):
 
-        ```bash
-        axol teleop --sim
-        ```
-      </Step>
+    ```bash
+    axol teleop --sim
+    ```
 
-      <Step title="Connect the headset">
-        The terminal prints the hostname and IP. Open the VR app at [axol.almond.bot](https://axol.almond.bot) on the headset, enter either address, and press **Connect**, then **Start**.
-      </Step>
-    </Steps>
+    The terminal prints the hostname and IP. Open the VR app at [axol.almond.bot](https://axol.almond.bot) on the headset, enter either address, and press **Connect**, then **Start**.
 
     <Tip>
       Have ZED cameras attached? Pass `--cameras "{overhead: 41234567, left_arm: 41234568, right_arm: 41234569}"` to relay the overhead and wrist feeds into the headset — all shown at once, each movable and resizable with the controllers. See [Camera views](/guides/vr-interface#camera-views).
@@ -71,9 +63,33 @@ The easiest way is from the app itself: when you press **Connect** and the certi
 
     See the [`teleop`](/cli/teleop) reference for the full flag list (stiffness, gripper limits, per-joint gains, config files).
   </Tab>
+
+  <Tab title="Mantis">
+    Mantis teleop is **grippers only, by design**: the rig triggers drive the two physical grippers over CAN, and no tracking, headset, or cameras are used. Use it to prove the hub wiring, the left/right side mapping, and gripper health. Tracked Mantis runs — pose source, engage gesture, mount transforms — are [data collection](/operations/data-collection)'s job, set up under [Mantis Tracking](/mantis/tracking).
+
+    <Steps>
+      <Step title="Select and connect Mantis">
+        Press **Select** on the **Mantis** tile; the panel connects the rigs automatically (or press **Connect**). The tile shows both grippers' CAN health. If you have not yet confirmed the side mapping, do that first — see [Mantis Hardware](/mantis/hardware#selecting-and-connecting-mantis).
+      </Step>
+
+      <Step title="Start and check the grippers">
+        With Mantis selected only **Teleoperation** and **Collect data** are listed. Pick **Teleoperation** (there is no sim or cart option on Mantis) and press **Start**. Once both triggers read live and released, the grippers open to their hard stops (keep them clear), then each trigger closes its gripper proportionally. Squeeze the physical **left** trigger: if the **right** gripper moves, swap the CAN side mapping. Only a faulted gripper or a stale trigger heartbeat blocks this run; **Stop** disables both grippers.
+      </Step>
+    </Steps>
+
+    **From the CLI** (the saved **Mantis settings** channel map is used automatically):
+
+    ```bash
+    axol teleop --mantis
+    ```
+
+    Ready to track the rigs? Finish the pose-source setup in [Mantis Tracking](/mantis/tracking), then run [Collect data](/operations/data-collection) — that operation owns the tracker bridge, the engage gesture, and the recording flow.
+  </Tab>
 </Tabs>
 
-## Controller layout
+## Quest controller layout
+
+The bindings below are for Axol. (Mantis teleop uses no headset — the rig triggers drive the grippers directly. For the tracked Mantis gestures used by data collection, see [Start gesture and recovery](/mantis/tracking#start-gesture-and-recovery).)
 
 <img src="/assets/quest.png" alt="Quest controller diagram" />
 

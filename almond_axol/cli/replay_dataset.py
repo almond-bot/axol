@@ -31,10 +31,15 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Any, Callable
 
+import numpy as np
 from lerobot.robots.config import RobotConfig
 
 from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..mantis.relative import quat_xyzw_to_rotvec
+from ..mantis.smoothing import rotvec_to_quat_xyzw
+from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from .config import LogLevel, parse
 
 _logger = logging.getLogger(__name__)
@@ -43,6 +48,60 @@ _logger = logging.getLogger(__name__)
 # so the arm receives setpoints at the same cadence it was driven with when
 # the episode was recorded.
 _INTERP_HZ = 120
+
+
+def _slerp_rotvec(start: np.ndarray, end: np.ndarray, alpha: float) -> np.ndarray:
+    """Interpolate two rotation vectors along the shortest path on SO(3)."""
+    q0 = rotvec_to_quat_xyzw(np.asarray(start, dtype=np.float64))
+    q1 = rotvec_to_quat_xyzw(np.asarray(end, dtype=np.float64))
+    dot = float(np.clip(np.dot(q0, q1), -1.0, 1.0))
+    if dot < 0.0:
+        # q and -q encode the same orientation. Pick the representative in the
+        # same quaternion hemisphere so interpolation follows the short arc.
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:
+        quat = q0 + alpha * (q1 - q0)
+        quat /= max(float(np.linalg.norm(quat)), 1e-12)
+    else:
+        theta = float(np.arccos(dot))
+        sin_theta = float(np.sin(theta))
+        quat = (
+            np.sin((1.0 - alpha) * theta) / sin_theta * q0
+            + np.sin(alpha * theta) / sin_theta * q1
+        )
+    return quat_xyzw_to_rotvec(quat)
+
+
+def _interpolate_action_values(
+    base: np.ndarray,
+    nxt: np.ndarray,
+    alpha: float,
+    action_names: list[str],
+) -> np.ndarray:
+    """Interpolate an action, using SO(3) for Cartesian EE orientations.
+
+    Joint targets, Cartesian positions, and grippers retain the existing
+    componentwise interpolation. Each complete ``*_ee.rx/.ry/.rz`` group is
+    then replaced with shortest-path orientation interpolation. This matters
+    at the canonical rotation-vector branch cut: adjacent equivalent poses can
+    be represented near ``+pi * axis`` and ``-pi * axis``, whose scalar midpoint
+    is the identity rather than the intended 180-degree orientation.
+    """
+    values = base + (nxt - base) * alpha
+    by_name = {name: i for i, name in enumerate(action_names)}
+    for name, rx in by_name.items():
+        if not name.endswith("_ee.rx"):
+            continue
+        prefix = name[: -len("rx")]
+        rotation_indices = [
+            by_name.get(f"{prefix}{axis}") for axis in ("rx", "ry", "rz")
+        ]
+        if any(index is None for index in rotation_indices):
+            continue
+        indices = [int(index) for index in rotation_indices if index is not None]
+        values[indices] = _slerp_rotvec(base[indices], nxt[indices], alpha)
+    return values
 
 
 def _default_robot_config() -> AxolRobotConfig:
@@ -133,11 +192,114 @@ def main(argv: list[str]) -> None:
         sys.exit(1)
 
 
+def _wait_for_replay_exit(
+    exit_event: threading.Event,
+    *,
+    timeout: float = 5.0,
+) -> tuple[bool, HardwareCleanupError | None]:
+    """Wait for the tracked robot-loop coroutine's own finalizer to run."""
+    if exit_event.wait(timeout=timeout):
+        return True, None
+    return False, HardwareCleanupError(
+        f"replay playback coroutine did not stop within {timeout:g}s; robot "
+        "hardware access may still be active"
+    )
+
+
+def _cleanup_replay_robot(
+    *,
+    playback_stopped: bool,
+    cleanup: Callable[[], None],
+) -> BaseException | None:
+    """Disconnect only after the robot-loop playback exit is proved."""
+    if not playback_stopped:
+        _logger.error(
+            "skipping robot disconnect because replay playback exit was not proved"
+        )
+        return None
+    try:
+        cleanup()
+    except BaseException as error:
+        _logger.exception("robot disconnect failed")
+        return error
+    return None
+
+
+def _finish_replay_cleanup(
+    *,
+    session_error: BaseException | None,
+    playback_failure: BaseException | None,
+    disconnect_failure: BaseException | None,
+    reset_failure: BaseException | None,
+) -> None:
+    """Propagate teardown failures without replacing a replay's primary error."""
+    if session_error is not None:
+        if playback_failure is not None:
+            session_error.add_note(
+                "additional replay playback cleanup failure: "
+                f"{type(playback_failure).__name__}: {playback_failure}"
+            )
+        if disconnect_failure is not None:
+            session_error.add_note(
+                "additional robot disconnect cleanup failure: "
+                f"{type(disconnect_failure).__name__}: {disconnect_failure}"
+            )
+        if reset_failure is not None:
+            session_error.add_note(
+                "additional IK reset worker cleanup failure: "
+                f"{type(reset_failure).__name__}: {reset_failure}"
+            )
+        uncertain = playback_failure or disconnect_failure or reset_failure
+        if uncertain is not None:
+            mark_hardware_cleanup_uncertain(session_error, uncertain)
+        return
+
+    if playback_failure is not None:
+        if disconnect_failure is not None:
+            playback_failure.add_note(
+                "additional robot disconnect cleanup failure: "
+                f"{type(disconnect_failure).__name__}: {disconnect_failure}"
+            )
+        if reset_failure is not None:
+            playback_failure.add_note(
+                "additional IK reset worker cleanup failure: "
+                f"{type(reset_failure).__name__}: {reset_failure}"
+            )
+        if isinstance(playback_failure, HardwareCleanupError):
+            raise playback_failure
+        raise HardwareCleanupError(
+            "replay playback did not stop; hardware ownership is uncertain"
+        ) from playback_failure
+
+    if disconnect_failure is not None:
+        error = HardwareCleanupError(
+            "robot disconnect failed; hardware ownership is uncertain"
+        )
+        if reset_failure is not None:
+            error.add_note(
+                "additional IK reset worker cleanup failure: "
+                f"{type(reset_failure).__name__}: {reset_failure}"
+            )
+        raise error from disconnect_failure
+    if reset_failure is not None:
+        raise HardwareCleanupError(
+            "IK reset worker did not stop; background ownership is uncertain"
+        ) from reset_failure
+
+
 def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) -> None:
     """Load the episode, return to rest, replay its actions, then return to rest."""
+    from ..utils.state_files import require_service_dataset_configuration
+
+    require_service_dataset_configuration()
+
+    from ..lerobot.robot.config_mantis import MantisRobotConfig
+
+    if isinstance(cfg.robot_config, MantisRobotConfig):
+        raise ValueError("replay-dataset does not support Mantis hardware")
+
     from pathlib import Path
 
-    import numpy as np
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME
     from lerobot.utils.utils import log_say
@@ -158,15 +320,30 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     # --root. LeRobotDataset only needs a valid-looking repo id once a root
     # is given, so the directory name stands in for it.
     from ..recording.datasets import is_dataset_dir, list_datasets
+    from ..utils.state_files import (
+        confine_service_dataset_path,
+        privileged_service_active,
+    )
 
     repo_path = Path(repo_id).expanduser()
-    if root is None and is_dataset_dir(repo_path):
+    hosted_service = privileged_service_active()
+    # Plain CLI users may replay an arbitrary local dataset by path. The root
+    # service must not probe an operator-supplied filesystem path before it has
+    # been confined to the configured LeRobot tree, so it deliberately skips
+    # this path shorthand and treats the value as a repo id instead.
+    if root is None and not hosted_service and is_dataset_dir(repo_path):
         root = str(repo_path)
         repo_id = repo_path.name
 
     # Verify the dataset is present and complete before loading (a clear error
     # beats LeRobotDataset's deeper failure, and mirrors collect-data's checks).
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+    if hosted_service:
+        dataset_root = confine_service_dataset_path(
+            dataset_root,
+            label="replay dataset root",
+        )
+        root = str(dataset_root)
     meta = dataset_root / "meta"
     if not (meta / "info.json").exists():
         available = list_datasets()
@@ -275,11 +452,10 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         )
 
     # Interpolated playback commands the arms at ~_INTERP_HZ (the teleop rate)
-    # by linearly blending between consecutive recorded actions. Episode timing
-    # is unchanged — substeps subdivide each recorded frame's period. Linear
-    # blending is exact for joint targets and a good small-step approximation
-    # for Cartesian poses (positions are linear; consecutive rotation vectors
-    # are close enough that lerp ~= slerp at these deltas).
+    # between consecutive recorded actions. Episode timing is unchanged —
+    # substeps subdivide each recorded frame's period. Joint targets, Cartesian
+    # positions, and grippers blend componentwise; Cartesian rotations follow
+    # the shortest path on SO(3), including across the rotation-vector pi cut.
     substeps = max(1, round(_INTERP_HZ / fps)) if cfg.interpolate else 1
 
     async def _play_episode() -> tuple[str, float] | None:
@@ -318,7 +494,13 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
                 if _stopped():
                     return None
                 deadline += send_period
-                values = base if sub == 0 else base + (nxt - base) * (sub / substeps)
+                values = (
+                    base
+                    if sub == 0
+                    else _interpolate_action_values(
+                        base, nxt, sub / substeps, action_names
+                    )
+                )
                 action = {name: float(values[i]) for i, name in enumerate(action_names)}
                 await robot.send_action_async(action)
                 if watchdog is not None:
@@ -336,6 +518,19 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
         return None
 
+    playback_done = threading.Event()
+    active_playback_future: Any | None = None
+    playback_stopped = True
+
+    async def _play_episode_tracked() -> tuple[str, float] | None:
+        try:
+            return await _play_episode()
+        finally:
+            # A concurrent Future can report cancellation before its event-loop
+            # task has actually unwound.  This finalizer, not Future.cancel(),
+            # is the ownership proof used by teardown.
+            playback_done.set()
+
     def _play_episode_blocking() -> tuple[str, float] | None:
         """Run the playback coroutine on the robot's loop; block until done.
 
@@ -344,17 +539,54 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         outer handler falls through to the return-to-rest teardown). Returns
         the playback watchdog's trip, or ``None``.
         """
-        fut = asyncio.run_coroutine_threadsafe(_play_episode(), robot.event_loop)
+        nonlocal active_playback_future, playback_stopped
+        playback_done.clear()
+        coroutine = _play_episode_tracked()
         try:
-            return fut.result()
+            fut = asyncio.run_coroutine_threadsafe(coroutine, robot.event_loop)
+        except BaseException:
+            coroutine.close()
+            raise
+        # Retain the exact Future until the tracked coroutine's finalizer
+        # proves exit. A timed-out interrupt deliberately does not cancel and
+        # discard it: teardown must stay away from the robot while it is live.
+        active_playback_future = fut
+        playback_stopped = False
+        try:
+            result = fut.result()
         except KeyboardInterrupt:
             stop_event.set()
             try:
                 fut.result(timeout=5.0)
-            except BaseException:  # noqa: BLE001 - best-effort unwind
-                fut.cancel()
+            except TimeoutError:
+                _logger.error(
+                    "replay playback did not acknowledge stop within 5s; "
+                    "retaining its Future and deferring robot teardown"
+                )
+            except BaseException as error:
+                # The operator's interrupt remains the primary outcome, but a
+                # completed playback fault is useful diagnostic context.
+                _logger.warning(
+                    "replay playback exited with an error while stopping: %s", error
+                )
+            if playback_done.is_set():
+                playback_stopped = True
+                active_playback_future = None
             raise
+        except BaseException:
+            if playback_done.is_set():
+                playback_stopped = True
+                active_playback_future = None
+            raise
+        if not playback_done.is_set():
+            raise HardwareCleanupError(
+                "replay Future completed before its coroutine exit could be proved"
+            )
+        playback_stopped = True
+        active_playback_future = None
+        return result
 
+    session_error: BaseException | None = None
     try:
         log_say("Connecting robot...")
         robot.connect()
@@ -422,6 +654,9 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
             _go_to_rest()
     except KeyboardInterrupt:
         pass
+    except BaseException as error:
+        session_error = error
+        raise
     finally:
         # Ignore SIGINT during cleanup so a second Ctrl+C can't abort partway
         # through the return-to-rest or teardown (mirrors run-policy).
@@ -432,28 +667,48 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         except (ValueError, OSError):
             pass
 
+        playback_failure: BaseException | None = None
+        if not playback_stopped:
+            playback_stopped, playback_failure = _wait_for_replay_exit(playback_done)
+            if playback_stopped:
+                active_playback_future = None
+
+        # Keep this exact reference reachable through the final ownership
+        # decision. When exit is unproved, the robot event loop also retains
+        # the submitted coroutine and OperationRunner locks the process after
+        # the HardwareCleanupError below.
+        _ = active_playback_future
+
         # Park the arm at rest before killing the operation, unless it's already
         # there (a loop iteration just ended at rest) or never moved (connect
         # failed). The reset is planned by the IK worker (a quick round-trip) and
         # then played locally, so it still completes if a slow stop's watchdog
         # force-kills the worker mid-move.
-        if robot.is_connected and not rested:
+        if playback_stopped and robot.is_connected and not rested:
             try:
                 _go_to_rest("Replay finished. Returning to rest pose.", final=True)
             except Exception:  # noqa: BLE001 - best-effort; still tear down
                 _logger.warning("return-to-rest during teardown failed", exc_info=True)
 
         log_say("Stopping.")
-        try:
-            robot.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
+        disconnect_failure = _cleanup_replay_robot(
+            playback_stopped=playback_stopped,
+            cleanup=robot.disconnect,
+        )
+        reset_failure: BaseException | None = None
         try:
             reset_controller.stop()
-        except Exception:  # noqa: BLE001
-            pass
+        except BaseException as exc:
+            _logger.exception("IK reset worker cleanup failed")
+            reset_failure = exc
 
         try:
             signal.signal(signal.SIGINT, signal.SIG_DFL)
         except (ValueError, OSError):
             pass
+        _finish_replay_cleanup(
+            session_error=session_error,
+            playback_failure=playback_failure,
+            disconnect_failure=disconnect_failure,
+            reset_failure=reset_failure,
+        )

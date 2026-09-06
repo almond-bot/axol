@@ -30,12 +30,13 @@ does not carry buffer PTS across the ``shmsink``/``shmsrc`` boundary, so this
 encoder assigns the PTS itself: the *k*-th access unit fed for a camera is muxed
 at ``pts = k / fps`` (``dts`` and ``duration`` to match). The caller
 (:func:`~almond_axol.recording.record_proc.run_encoded_capture_loop`) guarantees
-exactly one ``feed_frame`` per camera per dataset row (re-feeding the previous
-AU on a per-camera stall), so frame-count == row-count by construction. The mp4
-this muxer writes carries small per-frame PTS rounding (its timescale cannot
-represent ``1/fps`` exactly); the concat step re-stamps every frame onto an
-exact constant-fps grid so LeRobot's razor-thin per-row timestamp lookup holds
-(see :func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`).
+exactly one fresh ``feed_frame`` per camera per dataset row and aborts the take
+if any camera stalls, so frame-count == row-count without replaying an H.264
+packet. The mp4 this muxer writes carries small per-frame PTS rounding (its
+timescale cannot represent ``1/fps`` exactly); the concat step re-stamps every
+frame onto an exact constant-fps grid so LeRobot's razor-thin per-row timestamp
+lookup holds (see
+:func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`).
 
 Because the frames arrive pre-encoded, the first muxed AU of an episode must be
 an IDR or the mp4 is undecodable from frame 0; the relay forces a keyframe when
@@ -65,6 +66,7 @@ offline).
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import logging
 import queue
 import shutil
@@ -82,10 +84,32 @@ _logger = logging.getLogger(__name__)
 # before giving up on that camera's mp4.
 _EOS_TIMEOUT_S = 30.0
 
+# ``appsrc`` must block to preserve every dependency-bearing AU, but its action
+# signal therefore cannot run on the capture thread. A bounded feeder absorbs
+# normal mux jitter; persistent downstream backpressure fills it and turns into
+# a capture error instead of wedging robot/dataset shutdown forever.
+_FEED_QUEUE_MAX = 60
+_FEED_DRAIN_TIMEOUT_S = 10.0
+_FEED_ABORT_TIMEOUT_S = 2.0
+
 # How long finish() waits for the live stats worker to drain its queue. The
 # worker decodes keyframes as they arrive (~4/s), so the queue is near-empty at
 # episode end; this only bounds a wedged decoder.
 _STATS_JOIN_TIMEOUT_S = 10.0
+
+
+def _set_pipeline_state_checked(pipeline: Any, gst: Any, state: Any) -> None:
+    """Set Gst state, treating its non-exception FAILURE result as an error."""
+    result = pipeline.set_state(state)
+    state_change_return = getattr(gst, "StateChangeReturn", None)
+    failure = (
+        getattr(state_change_return, "FAILURE", None)
+        if state_change_return is not None
+        else None
+    )
+    if failure is not None and result == failure:
+        raise RuntimeError(f"GStreamer pipeline rejected state {state!s}")
+
 
 # Live stats decode queue depth. Keyframes arrive ~4/s and decode in ~10 ms, so
 # this never fills in practice; if it does (decoder wedged), further keyframes
@@ -131,6 +155,8 @@ class _StatsWorker:
     def __init__(self, name: str) -> None:
         self._name = name
         self._queue: queue.Queue[bytes | None] = queue.Queue(_STATS_QUEUE_MAX)
+        self._stop = threading.Event()
+        self._cancelled = threading.Event()
         self._failed = False
         self._stats = None
         self._pending: list[Any] = []
@@ -141,7 +167,7 @@ class _StatsWorker:
         self._thread.start()
 
     def feed(self, au: bytes) -> None:
-        if self._failed:
+        if self._failed or self._stop.is_set():
             return
         try:
             self._queue.put_nowait(au)
@@ -162,9 +188,6 @@ class _StatsWorker:
         except Exception as exc:  # noqa: BLE001 - deps missing -> no live stats
             _logger.warning("live video stats unavailable for %s: %s", self._name, exc)
             self._failed = True
-            # Drain until the sentinel so feeders/join never block.
-            while self._queue.get() is not None:
-                pass
             return
 
         def _flush() -> None:
@@ -172,8 +195,13 @@ class _StatsWorker:
                 self._stats.update(np.concatenate(self._pending, axis=0))
                 self._pending.clear()
 
-        while True:
-            au = self._queue.get()
+        while not self._cancelled.is_set():
+            try:
+                au = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._stop.is_set():
+                    break
+                continue
             if au is None:
                 break
             try:
@@ -189,9 +217,11 @@ class _StatsWorker:
             except Exception as exc:  # noqa: BLE001 - stats must never kill capture
                 _logger.warning("live stats decode failed for %s: %s", self._name, exc)
                 self._failed = True
-                while self._queue.get() is not None:
-                    pass
                 return
+            if self._stop.is_set() and self._queue.empty():
+                break
+        if self._cancelled.is_set():
+            return
         # An open GOP is impossible here (IDR-only feed); no draining decode
         # needed — flush the remainder and compute the result.
         try:
@@ -200,16 +230,28 @@ class _StatsWorker:
             _logger.warning("live stats flush failed for %s: %s", self._name, exc)
             self._failed = True
 
+    def _request_stop(self, *, cancel: bool) -> None:
+        """Stop accepting work and wake the worker without blocking on a full queue."""
+        if cancel:
+            self._cancelled.set()
+        self._stop.set()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            # A running worker will observe _stop after it drains the queue. A
+            # wedged worker is bounded by the caller's timed join below.
+            pass
+
     def result(self) -> dict | None:
         """Stop the worker, wait for the drain, and return the stats (or None)."""
-        self._queue.put(None)
+        self._request_stop(cancel=False)
         self._thread.join(timeout=_STATS_JOIN_TIMEOUT_S)
         if self._thread.is_alive() or self._failed or self._decoded == 0:
             return None
         return self._stats.get_statistics()
 
     def cancel(self) -> None:
-        self._queue.put(None)
+        self._request_stop(cancel=True)
         self._thread.join(timeout=1.0)
 
 
@@ -226,11 +268,11 @@ def hw_mux_encoder_available() -> bool:
 class _CameraH264Muxer:
     """One camera's ``appsrc -> h264parse -> mp4mux -> filesink`` pipeline.
 
-    ``feed`` pushes one pre-encoded access unit and assigns it the next
-    constant-fps PTS; all work is on gst's own threads / hardware blocks, so the
-    recorder does no per-frame encode or copy. Image-normalization stats are
-    decoded live from the fed IDR AUs on a background thread (see the module
-    "Image stats" note); :meth:`finish` just collects the result.
+    ``feed`` queues one pre-encoded access unit with its next constant-fps PTS.
+    A bounded feeder thread owns the potentially blocking ``appsrc`` push, so a
+    wedged downstream muxer cannot wedge the capture thread. Image-normalization
+    stats are decoded live from the fed IDR AUs on another background thread
+    (see the module "Image stats" note); :meth:`finish` drains both.
     """
 
     def __init__(self, video_path: Path, fps: int, want_stats: bool = True) -> None:
@@ -248,16 +290,71 @@ class _CameraH264Muxer:
         self._mux_timescale = fps * 1000
         self._count = 0
         self._error: str | None = None
-        self._last_au: bytes | None = None
+        self._feed_error: str | None = None
+        self._feed_error_lock = threading.Lock()
+        self._feed_queue: queue.Queue[tuple[int, bytes] | None] = queue.Queue(
+            _FEED_QUEUE_MAX
+        )
+        self._feed_stop = threading.Event()
+        self._feed_cancelled = threading.Event()
 
-        # Live per-keyframe stats decode (see _StatsWorker); the post-finalize
-        # file decode (_compute_stats_from_file) remains as the fallback.
         self._want_stats = want_stats
-        self._stats_worker = _StatsWorker(video_path.name) if want_stats else None
+        self._stats_worker: _StatsWorker | None = None
+        self._pipeline: Any | None = None
+        self._src: Any | None = None
+        self._feed_thread: threading.Thread | None = None
 
-        video_path.parent.mkdir(parents=True, exist_ok=True)
-        self._pipeline, self._src = self._build()
-        self._pipeline.set_state(self._gst.State.PLAYING)
+        try:
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            self._pipeline, self._src = self._build()
+            _set_pipeline_state_checked(
+                self._pipeline, self._gst, self._gst.State.PLAYING
+            )
+            # Start best-effort stats before the required feeder. Once the
+            # feeder thread starts there are no later fallible constructor
+            # steps that could strand its pipeline without returning an owner.
+            if want_stats:
+                self._stats_worker = _StatsWorker(video_path.name)
+            self._feed_thread = threading.Thread(
+                target=self._push_loop,
+                name=f"h264-mux-{video_path.stem}",
+                daemon=True,
+            )
+            self._feed_thread.start()
+        except BaseException as error:
+            if self._stats_worker is not None:
+                try:
+                    self._stats_worker.cancel()
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "stats-worker rollback failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            if self._feed_thread is not None:
+                self._request_feed_stop(cancel=True)
+            if self._pipeline is not None:
+                try:
+                    _set_pipeline_state_checked(
+                        self._pipeline, self._gst, self._gst.State.NULL
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "pipeline rollback failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            if self._feed_thread is not None:
+                try:
+                    self._feed_thread.join(timeout=_FEED_ABORT_TIMEOUT_S)
+                except RuntimeError:
+                    # Thread.start itself failed, so there is no live owner.
+                    pass
+                if self._feed_thread.is_alive():
+                    error.add_note(
+                        "appsrc feeder remained alive after constructor rollback"
+                    )
+                else:
+                    self._feed_thread = None
+            raise
         _logger.info(
             "H264 mux pipeline started: %s @ %dfps (stats=%s)",
             video_path.name,
@@ -276,55 +373,98 @@ class _CameraH264Muxer:
             "appsrc name=src is-live=false format=time do-timestamp=false "
             f"! h264parse ! {mux}"
         )
-        src = pipeline.get_by_name("src")
-        src.set_property(
-            "caps",
-            Gst.Caps.from_string("video/x-h264,stream-format=byte-stream,alignment=au"),
-        )
-        # Bound appsrc so a wedged pipeline surfaces as back-pressure, not
-        # unbounded memory; block so we never silently drop a (dependency-bearing)
-        # encoded frame.
-        src.set_property("max-bytes", 8 * 1024 * 1024)
-        src.set_property("block", True)
-        return pipeline, src
+        try:
+            src = pipeline.get_by_name("src")
+            src.set_property(
+                "caps",
+                Gst.Caps.from_string(
+                    "video/x-h264,stream-format=byte-stream,alignment=au"
+                ),
+            )
+            # Bound appsrc so a wedged pipeline surfaces as backpressure, not
+            # unbounded memory. push-buffer runs only on our bounded feeder
+            # thread; the capture thread never enters this blocking signal.
+            src.set_property("max-bytes", 8 * 1024 * 1024)
+            src.set_property("block", True)
+            return pipeline, src
+        except BaseException:
+            with contextlib.suppress(Exception):
+                pipeline.set_state(Gst.State.NULL)
+            raise
 
     def feed(self, au: bytes) -> None:
-        """Mux one access unit at the next constant-fps PTS.
-
-        Raises on a rejected push: the appsrc is blocking, so a non-OK flow
-        return means the pipeline is flushing or errored — the mp4 can no
-        longer contain one sample per fed AU, and continuing would silently
-        desync the video from the dataset rows. Aborting the episode (the
-        capture loop surfaces the error) is the only honest outcome.
-        """
-        Gst = self._gst
-        buf = Gst.Buffer.new_wrapped(au)
-        pts = self._count * self._dur
-        buf.pts = pts
-        buf.dts = pts
-        buf.duration = self._dur
-        ret = self._src.emit("push-buffer", buf)
-        if ret != Gst.FlowReturn.OK:
+        """Queue one fresh AU without entering blocking GStreamer code."""
+        if self._feed_error is not None:
+            raise RuntimeError(self._feed_error)
+        if self._feed_stop.is_set() or not self._feed_thread.is_alive():
             raise RuntimeError(
-                f"H264 muxer push returned {ret} for {self.video_path.name} at "
-                f"frame {self._count} — pipeline is flushing/errored, aborting "
-                "the episode"
+                f"H264 muxer feeder for {self.video_path.name} is not running"
             )
-        self._last_au = au
+        try:
+            self._feed_queue.put_nowait((self._count, au))
+        except queue.Full as exc:
+            message = (
+                f"H264 muxer feeder queue filled for {self.video_path.name}; "
+                "downstream appsrc is stalled, aborting the episode"
+            )
+            self._set_feed_error(message)
+            raise RuntimeError(message) from exc
         self._count += 1
         if self._stats_worker is not None and _au_is_idr(au):
             self._stats_worker.feed(au)
 
-    def feed_repeat(self) -> None:
-        """Re-mux the previous AU (a duplicate frame) to keep counts aligned.
+    def _set_feed_error(self, message: str) -> None:
+        with self._feed_error_lock:
+            if self._feed_error is None:
+                self._feed_error = message
+                _logger.error(message)
+        self._feed_stop.set()
 
-        The frame-driven capture loop calls this when a camera has no fresh AU
-        for a row, so every camera stays at the same frame index as the dataset
-        rows (the encoded analog of the raw path's "reuse last frame"). A repeated
-        AU decodes to the same image, so the mp4 stays valid.
-        """
-        if self._last_au is not None:
-            self.feed(self._last_au)
+    def _push_loop(self) -> None:
+        Gst = self._gst
+        while not self._feed_cancelled.is_set():
+            try:
+                item = self._feed_queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._feed_stop.is_set():
+                    return
+                continue
+            if item is None:
+                return
+            frame_index, au = item
+            try:
+                buf = Gst.Buffer.new_wrapped(au)
+                pts = frame_index * self._dur
+                buf.pts = pts
+                buf.dts = pts
+                buf.duration = self._dur
+                ret = self._src.emit("push-buffer", buf)
+                if ret != Gst.FlowReturn.OK:
+                    self._set_feed_error(
+                        f"H264 muxer push returned {ret} for "
+                        f"{self.video_path.name} at frame {frame_index}; "
+                        "pipeline is flushing/errored, aborting the episode"
+                    )
+                    return
+            except BaseException as exc:
+                self._set_feed_error(
+                    f"H264 muxer push failed for {self.video_path.name} at "
+                    f"frame {frame_index}: {exc}"
+                )
+                return
+            if self._feed_stop.is_set() and self._feed_queue.empty():
+                return
+
+    def _request_feed_stop(self, *, cancel: bool) -> None:
+        if cancel:
+            self._feed_cancelled.set()
+        self._feed_stop.set()
+        try:
+            self._feed_queue.put_nowait(None)
+        except queue.Full:
+            # A healthy feeder drains and observes _feed_stop. A feeder blocked
+            # in appsrc is released by setting the pipeline to NULL below.
+            pass
 
     def _compute_stats_from_file(self) -> dict | None:
         """Decode the finalized mp4's keyframes for image-normalization stats.
@@ -440,34 +580,137 @@ class _CameraH264Muxer:
     def _teardown(self, finalize: bool) -> None:
         Gst = self._gst
         if self._pipeline is None:
+            if self._feed_thread is not None and self._feed_thread.is_alive():
+                self._request_feed_stop(cancel=True)
+                self._feed_thread.join(timeout=_FEED_ABORT_TIMEOUT_S)
+                if self._feed_thread.is_alive():
+                    raise RuntimeError(
+                        f"H264 appsrc feeder for {self.video_path.name} remains "
+                        "alive after pipeline teardown"
+                    )
             return
-        try:
-            if finalize:
-                self._src.emit("end-of-stream")
-                bus = self._pipeline.get_bus()
-                msg = bus.timed_pop_filtered(
-                    int(_EOS_TIMEOUT_S * Gst.SECOND),
-                    Gst.MessageType.EOS | Gst.MessageType.ERROR,
+        pipeline = self._pipeline
+
+        if not finalize:
+            # Setting NULL is the cancellation primitive for a feeder blocked
+            # inside appsrc.emit("push-buffer"). Signal first, tear down the
+            # native pipeline, then prove the Python owner exited.
+            self._request_feed_stop(cancel=True)
+            state_error: BaseException | None = None
+            try:
+                _set_pipeline_state_checked(pipeline, Gst, Gst.State.NULL)
+            except BaseException as error:
+                state_error = error
+            self._feed_thread.join(timeout=_FEED_ABORT_TIMEOUT_S)
+            feeder_alive = self._feed_thread.is_alive()
+            if feeder_alive:
+                self._error = (
+                    f"appsrc feeder did not stop within "
+                    f"{_FEED_ABORT_TIMEOUT_S:g}s after cancellation"
                 )
-                if msg is None:
-                    # A wedged muxer that never flushes the moov atom: the file
-                    # on disk is not a complete mp4. Record it so finish()
-                    # raises instead of handing the truncated file to LeRobot.
-                    self._error = f"no EOS within {_EOS_TIMEOUT_S:.0f}s"
-                    _logger.error(
-                        "H264 muxer for %s did not EOS in %.0fs",
-                        self.video_path.name,
-                        _EOS_TIMEOUT_S,
+                _logger.error(
+                    "H264 muxer for %s: %s",
+                    self.video_path.name,
+                    self._error,
+                )
+            if not feeder_alive and state_error is None:
+                self._pipeline = None
+            if feeder_alive:
+                failure = RuntimeError(
+                    f"H264 muxer for {self.video_path.name}: {self._error}"
+                )
+                if state_error is not None:
+                    failure.add_note(
+                        "pipeline NULL transition also failed: "
+                        f"{type(state_error).__name__}: {state_error}"
                     )
-                elif msg.type == Gst.MessageType.ERROR:
-                    err, _ = msg.parse_error()
-                    self._error = str(err)
-                    _logger.error(
-                        "H264 muxer for %s errored: %s", self.video_path.name, err
-                    )
-        finally:
-            self._pipeline.set_state(Gst.State.NULL)
+                raise failure
+            if state_error is not None:
+                raise state_error
+            return
+
+        self._request_feed_stop(cancel=False)
+        self._feed_thread.join(timeout=_FEED_DRAIN_TIMEOUT_S)
+        if self._feed_thread.is_alive():
+            message = (
+                f"appsrc feeder did not drain within {_FEED_DRAIN_TIMEOUT_S:g}s; "
+                "downstream muxer is stalled"
+            )
+            self._set_feed_error(message)
+            self._feed_cancelled.set()
+            state_error: BaseException | None = None
+            try:
+                _set_pipeline_state_checked(pipeline, Gst, Gst.State.NULL)
+            except BaseException as error:
+                state_error = error
+            self._feed_thread.join(timeout=_FEED_ABORT_TIMEOUT_S)
+            if self._feed_thread.is_alive():
+                message += (
+                    f" and remained alive {_FEED_ABORT_TIMEOUT_S:g}s after "
+                    "pipeline cancellation"
+                )
+            if state_error is not None:
+                message += (
+                    "; pipeline NULL transition failed: "
+                    f"{type(state_error).__name__}: {state_error}"
+                )
+            self._error = message
+            if state_error is None and not self._feed_thread.is_alive():
+                self._pipeline = None
+            return
+
+        if self._feed_error is not None:
+            self._error = self._feed_error
+            _set_pipeline_state_checked(pipeline, Gst, Gst.State.NULL)
             self._pipeline = None
+            return
+
+        try:
+            self._src.emit("end-of-stream")
+            bus = pipeline.get_bus()
+            msg = bus.timed_pop_filtered(
+                int(_EOS_TIMEOUT_S * Gst.SECOND),
+                Gst.MessageType.EOS | Gst.MessageType.ERROR,
+            )
+            if msg is None:
+                # A wedged muxer that never flushes the moov atom: the file
+                # on disk is not a complete mp4. Record it so finish()
+                # raises instead of handing the truncated file to LeRobot.
+                self._error = f"no EOS within {_EOS_TIMEOUT_S:.0f}s"
+                _logger.error(
+                    "H264 muxer for %s did not EOS in %.0fs",
+                    self.video_path.name,
+                    _EOS_TIMEOUT_S,
+                )
+            elif msg.type == Gst.MessageType.ERROR:
+                err, _ = msg.parse_error()
+                self._error = str(err)
+                _logger.error(
+                    "H264 muxer for %s errored: %s", self.video_path.name, err
+                )
+        finally:
+            _set_pipeline_state_checked(pipeline, Gst, Gst.State.NULL)
+            self._pipeline = None
+
+
+def _remove_h264_staging(video_path: Path) -> None:
+    """Remove one exact temporary camera file/directory after cancellation."""
+    if not (video_path.exists() or video_path.parent.exists()):
+        return
+    from ..utils.state_files import (
+        privileged_service_active,
+        secure_rmdir,
+        secure_unlink,
+    )
+
+    if privileged_service_active():
+        # The episode directory is below an operator-owned dataset. Remove only
+        # the exact Axol-created file and an empty parent through pinned
+        # descriptors; never recurse through names that can be swapped.
+        secure_unlink(video_path, missing_ok=True)
+        secure_rmdir(video_path.parent, missing_ok=True)
+    else:
+        shutil.rmtree(str(video_path.parent), ignore_errors=True)
 
 
 class H264MuxStreamingEncoder:
@@ -506,23 +749,41 @@ class H264MuxStreamingEncoder:
             self.cancel_episode()
         temp_dir = Path(temp_dir)
         self._cams = {}
-        for video_key in video_keys:
-            ep_dir = Path(tempfile.mkdtemp(dir=temp_dir))
-            video_path = ep_dir / f"{video_key.replace('/', '_')}_streaming.mp4"
-            self._cams[video_key] = _CameraH264Muxer(
-                video_path, self.fps, self._want_stats
-            )
         self._episode_active = True
+        try:
+            for video_key in video_keys:
+                ep_dir = Path(tempfile.mkdtemp(dir=temp_dir))
+                video_path = ep_dir / f"{video_key.replace('/', '_')}_streaming.mp4"
+                try:
+                    camera = _CameraH264Muxer(
+                        video_path,
+                        self.fps,
+                        self._want_stats,
+                    )
+                except BaseException as error:
+                    try:
+                        _remove_h264_staging(video_path)
+                    except BaseException as cleanup_error:
+                        error.add_note(
+                            "additional failed-camera staging cleanup failure: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    raise
+                self._cams[video_key] = camera
+        except BaseException as error:
+            try:
+                self.cancel_episode()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "additional H264 episode-start rollback failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
 
     def feed_frame(self, video_key: str, au: bytes) -> None:
         if not self._episode_active:
             raise RuntimeError("No active episode. Call start_episode() first.")
         self._cams[video_key].feed(au)
-
-    def feed_repeat(self, video_key: str) -> None:
-        """Re-mux ``video_key``'s previous AU (per-camera stall; keep counts aligned)."""
-        if self._episode_active and video_key in self._cams:
-            self._cams[video_key].feed_repeat()
 
     def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
         """Finalize every camera's mp4; raises if any muxer failed to finalize.
@@ -552,12 +813,40 @@ class H264MuxStreamingEncoder:
     def cancel_episode(self) -> None:
         if not self._episode_active:
             return
-        for cam in self._cams.values():
-            cam.cancel()
-            if cam.video_path.parent.exists():
-                shutil.rmtree(str(cam.video_path.parent), ignore_errors=True)
-        self._cams = {}
-        self._episode_active = False
+        first_error: BaseException | None = None
+        remaining: dict[str, _CameraH264Muxer] = {}
+        for video_key, cam in self._cams.items():
+            camera_stopped = False
+            try:
+                cam.cancel()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                else:
+                    first_error.add_note(
+                        "additional H264 camera cancellation failure: "
+                        f"{type(error).__name__}: {error}"
+                    )
+            else:
+                camera_stopped = True
+            if camera_stopped:
+                try:
+                    _remove_h264_staging(cam.video_path)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                    else:
+                        first_error.add_note(
+                            "additional H264 staging cleanup failure: "
+                            f"{type(error).__name__}: {error}"
+                        )
+                else:
+                    continue
+            remaining[video_key] = cam
+        self._cams = remaining
+        self._episode_active = bool(remaining)
+        if first_error is not None:
+            raise first_error
 
     def close(self) -> None:
         if self._closed:

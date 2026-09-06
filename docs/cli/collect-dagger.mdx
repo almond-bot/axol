@@ -5,6 +5,17 @@ description: "DAgger data collection: a trained policy drives while the operator
 
 Runs a trained policy on the robot while the operator watches in VR and steps in to correct it, recording the whole session — policy segments **and** human corrections — to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. It's the [DAgger](https://arxiv.org/abs/1011.0686) loop: gather demonstrations exactly where the policy struggles, so a retrain fixes those failures. Inference runs in-process (one action per control tick), and everything else — cameras, recording, the guarded return-to-rest — follows [`collect-data`](/cli/collect-data). Loops until `Ctrl+C`.
 
+<Note>
+  Hosted runs are confined to `/var/lib/almond-axol/datasets`; direct non-root
+  CLI runs retain the operator's normal HuggingFace cache.
+</Note>
+
+<Warning>
+  Load only policy checkpoints and resumed datasets that you created or
+  obtained from a trusted source. Upstream model deserialization and dataset
+  parsing are not sandboxed.
+</Warning>
+
 The VR grip ("side") buttons drive the intervention during an episode: while the policy is driving, **either grip alone** freezes it (the robot holds pose and recording pauses); **both grips** hand control to the operator (teleop engages at the robot's current pose and recording resumes); **either grip alone** again hands it back to the policy. Nothing is recorded during the frozen gap, so the dataset flows straight from the policy's motion into the correction. Rows recorded while the operator drives are tagged with LeRobot's per-frame `intervention` flag.
 
 Episode boundaries work like `collect-data`: press the **record** button to start an episode (the policy starts driving and recording begins), press it again to save, or press it with the **reset** button held to discard and re-record. On stdin, `s` saves, `r` discards, and `q` discards and quits; `--episode_time_s` is a safety cap that saves the episode if nothing is pressed. With `--subtasks` supplied, typing a number `1..N` switches the policy's instruction mid-episode without ending it.
@@ -27,7 +38,7 @@ This command is configured via draccus. The policy side mirrors [`run-policy`](/
 | `--teleop_hz INT` | Motor command rate while the operator is engaged — the intervention (teleop) state only (default: 120). Decoupled from `--fps` for smoother commanded motion, exactly like [`collect-data`](/cli/collect-data); the teleop smoothing frequency is pinned to this value. The policy and frozen states always tick at `--fps` |
 | `--policy_max_vel FLOAT` | Per-joint velocity ceiling (rad/s) for the envelope over the **policy's** arm actions (default: 6.2832 = 2π). Transparent for normal trained motion; it only engages on discontinuities — a policy outlier or a re-plan from a stale observation — so a bad action can't snap the arms. `0` disables it. Teleop actions are already shaped by the teleop smoothing stack |
 | `--policy_max_accel FLOAT` | Per-joint acceleration ceiling (rad/s²) for that policy-action envelope (default: 21.9911 = 7π) |
-| `--device STR` | PyTorch device for the in-process policy inference (default: `cuda`); use `cpu` for CPU inference |
+| `--device STR` | PyTorch device for the in-process policy inference (default: `cuda`); use `cpu` with the hosted aarch64/Jetson CPU-only PyPI Torch build, or explicitly manage a JetPack-compatible Torch + Torchvision build |
 | `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution the **dataset** video is recorded at (default: `SVGA` = 960×600) — also the resolution the policy's observations arrive at. Downscaled from the camera capture on the GPU's VIC. Resuming an existing dataset keeps its original resolution regardless of this flag |
 | `--vcodec STR` | Video codec recorded for the dataset (default: per-platform — `h264` on Jetson/aarch64, `auto` elsewhere). Same capped-VBR NVENC encode path as [`collect-data`](/cli/collect-data) |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |

@@ -156,3 +156,54 @@ class KinematicsConfig:
     manip_damping_boost: float = 60.0
     limit_damping_margin: float = 0.12
     elbow_fade_band: float = 0.15
+
+
+# Solver values the Mantis profile forces (see
+# :func:`apply_mantis_kinematics_profile`). Tuned with ``scripts/mantis_ik_bench.py``
+# against a convergence floor that preserves the same collision and joint-limit
+# objective: the shipping step/iteration bounds stay within 6 mm p95 jaw-tip
+# error of that floor, with no null-space drift while the hand is still and a
+# per-tick solve that fits a 30 Hz collection tick on the Jetson.
+#
+# Rationale per field:
+#   pos/ori weight   Raised ~4x/12x over the arm defaults so the pose target
+#                    dominates the (default-strength) rest/posture
+#                    regularizers — raising the ratio shrinks tracking error;
+#                    weakening the regularizers instead unanchors the elbow
+#                    null space and destabilises the solve.
+#   manipulability   Off: it biases q away from the exact pose solution at
+#                    every tick (~7 mm at rest). Protecting a physical arm
+#                    from singular configs doesn't apply to a virtual one.
+#   collision margin The classic URDF's conservative PCA capsules are already
+#                    near or slightly overlapping at known-safe folded poses.
+#                    Reducing the default 2.5 cm activation distance to 2 cm
+#                    trims that artificial standoff while retaining the full
+#                    collision penalty. Recorded joints replay on the real
+#                    robot, so the collision weight is deliberately unchanged.
+#   max_joint_delta  ~1.4x the fastest bench hand motion so tracking never
+#                    saturates the per-tick clamp; still bounded so a bad
+#                    frame can't teleport the solution.
+#   max_iterations   12 (from 8): recovers convergence headroom the higher
+#                    weights consume, within the 30 Hz solve budget.
+MANTIS_KINEMATICS_OVERRIDES: dict[str, float | int] = {
+    "pos_weight": 200.0,
+    "ori_weight": 120.0,
+    "manipulability_weight": 0.0,
+    "self_collision_margin": 0.02,
+    "max_joint_delta": 0.05,
+    "max_iterations": 12,
+}
+
+
+def apply_mantis_kinematics_profile(config: KinematicsConfig) -> None:
+    """Apply the Mantis solver profile in place.
+
+    Shared by ``teleop --mantis`` and ``collect-data --mantis`` (the same way
+    :func:`almond_axol.teleop.config.apply_mantis_teleop_profile` is). Each
+    override is applied only when the field still holds its dataclass
+    default, so explicit ``--kinematics.<field>`` flags win over the profile.
+    """
+    defaults = KinematicsConfig()
+    for name, value in MANTIS_KINEMATICS_OVERRIDES.items():
+        if getattr(config, name) == getattr(defaults, name):
+            setattr(config, name, value)

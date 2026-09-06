@@ -5,6 +5,17 @@ description: "Run a trained policy autonomously on the robot with async inferenc
 
 Runs a trained policy autonomously on the robot using locally attached ZED cameras and LeRobot's async inference (`lerobot.async_inference`). By default a `PolicyServer` is launched in a child process on localhost; pass `--server_host` to use a remote [`inference-server`](/cli/inference-server) on a more powerful machine instead. Either way the parent drives a thin `RobotClient` subclass that streams observations (joint positions + camera frames) to the server and consumes the returned action chunks. Type `s` on stdin to save the rollout and end the episode, `r` to discard it — the arms drop **limp** for hand-repositioning (a failed rollout usually leaves them somewhere they shouldn't be); clear them, then press **Enter** to return to rest and re-record — or `q` to discard and quit. `--episode_time_s` is a safety cap that falls back to the same `[Enter]=save / r / q` prompt when no key has been pressed.
 
+<Note>
+  In the hosted service, `--repo_id` writes below the root-owned service
+  dataset boundary. Direct non-root CLI runs use the operator's normal cache.
+</Note>
+
+<Warning>
+  Load only policy checkpoints and existing rollout datasets that you created
+  or obtained from a trusted source. Upstream model deserialization and dataset
+  parsing are not sandboxed.
+</Warning>
+
 <Tip>
   For the end-to-end workflow — including offloading inference to a GPU machine — see the [Run Policy guide](/operations/run-policy).
 </Tip>
@@ -22,7 +33,7 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push_to_hub true` | Push rollout dataset to HuggingFace Hub when done |
 | `--vcodec STR` | Video codec recorded for saved rollout datasets (default: per-platform — `h264` on Jetson/aarch64, `auto` elsewhere). Only used with `--repo_id`. |
-| `--device STR` | PyTorch device for policy inference (default: `cuda`) |
+| `--device STR` | PyTorch device for policy inference (default: `cuda`). The hosted aarch64/Jetson dependency set has CPU-only PyPI Torch 2.10; use `cpu`, remote inference, or an explicitly managed JetPack-compatible Torch + Torchvision build |
 | `--server_host HOST` | Address of a remote [`inference-server`](/cli/inference-server). Default `null`: a `PolicyServer` child process is spawned on localhost. When set, `--policy_path` must be reachable from the server (e.g. a HF Hub repo ID) |
 | `--server_port INT` | Policy server port — for the localhost child process or the remote server (default: 8765) |
 | `--actions_per_chunk INT` | Number of actions returned per inference call (default: 50); capped by the policy's max action horizon |

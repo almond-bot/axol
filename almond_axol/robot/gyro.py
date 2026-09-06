@@ -46,7 +46,6 @@ import threading
 import time
 from typing import Callable
 
-
 _logger = logging.getLogger(__name__)
 
 DEVICE = "/dev/spsc_bmi0"

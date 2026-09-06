@@ -13,7 +13,7 @@ Episode control is exposed via get_teleop_events(), mapped from VRState
 transitions:
   - DATA_COLLECTION → RECORDING:         start recording (no event)
   - RECORDING → DATA_COLLECTION + reset: RERECORD_EPISODE (discard)
-  - RECORDING → DATA_COLLECTION:         TERMINATE_EPISODE + SUCCESS
+  - RECORDING → DATA_COLLECTION:         TERMINATE_EPISODE + SUCCESS/FAILURE
 
 After a TERMINATE_EPISODE the caller should push SAVING to the headset via
 send_feedback_state(VRState.SAVING) to block controls while writing the
@@ -52,10 +52,11 @@ from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...constants import Joint
+from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ...robot.cart import Cart
-from ...teleop.core import VRTeleopCore
+from ...teleop.core import TCPPoseSnapshot, VRTeleopCore
 from ...teleop.worker import run_ik_worker
-from ...vr.models import VRFrame, VRState
+from ...vr.models import VREpisodeOutcome, VRFrame, VRState
 from ...vr.server import VRServer
 from .config_vr import AxolVRTeleopConfig
 
@@ -93,6 +94,8 @@ class AxolVRTeleop(Teleoperator):
         # Async bridge
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
+        self._startup_done_event: threading.Event | None = None
+        self._cleanup_pending = False
 
         # VR + IK
         self._vr_server: VRServer | None = None
@@ -112,7 +115,10 @@ class AxolVRTeleop(Teleoperator):
         # in the shared core so this flow and native `axol teleop` (VRTeleop)
         # cannot drift apart.
         self._core = VRTeleopCore(
-            config.vr_teleop_config, _logger, self._broadcast_tracking
+            config.vr_teleop_config,
+            _logger,
+            self._broadcast_tracking,
+            self._broadcast_json,
         )
 
         # Powered cart (x-drive base + telescoping lift), operator-only
@@ -127,10 +133,18 @@ class AxolVRTeleop(Teleoperator):
         self._q_out = np.zeros(16, dtype=np.float32)
         self._q_lock = threading.Lock()
 
-        # Episode state
+        # Episode state. The three latches are set on the VR event-loop
+        # thread (_on_vr_frame) and read-then-cleared on the control loop
+        # (get_teleop_events); ``_event_lock`` makes that swap atomic so a
+        # press landing between the read and the clear is never lost.
         self._prev_state: VRState = VRState.TELEOP
+        self._event_lock = threading.Lock()
         self._rerecord_latch: bool = False
         self._terminate_latch: bool = False
+        self._failure_latch: bool = False
+        # Host perf_counter instant the terminated episode's data should end
+        # at (see VRFrame.episode_end_t_host); None keeps every row.
+        self._episode_end_t_host: float | None = None
         self._start_recording_latch: bool = False
 
         # Rolling ~2s windows of IK-solve and VR-frame timestamps, for the
@@ -182,7 +196,7 @@ class AxolVRTeleop(Teleoperator):
 
     @property
     def is_connected(self) -> bool:
-        return self._vr_server is not None
+        return self._vr_server is not None or self._cleanup_pending
 
     @property
     def is_calibrated(self) -> bool:
@@ -227,13 +241,81 @@ class AxolVRTeleop(Teleoperator):
         """
         loop = asyncio.new_event_loop()
         self._loop = loop
-        self._loop_thread = threading.Thread(
-            target=loop.run_forever, name="vr-axol-event-loop", daemon=True
-        )
-        self._loop_thread.start()
-        asyncio.run_coroutine_threadsafe(
-            self._connect_async(q_start_left, q_start_right), loop
-        ).result(timeout=120)
+        self._loop_thread = None
+        connect_future: Any | None = None
+        connect_done = threading.Event()
+
+        async def connect_tracked() -> None:
+            try:
+                await self._connect_async(q_start_left, q_start_right)
+            finally:
+                # concurrent.futures.Future.cancel() can report cancellation
+                # before the event-loop task has actually unwound.  Teardown
+                # uses this coroutine-owned signal as the exit proof instead.
+                connect_done.set()
+
+        try:
+            self._loop_thread = threading.Thread(
+                target=loop.run_forever,
+                name="vr-axol-event-loop",
+                daemon=True,
+            )
+            self._loop_thread.start()
+            self._startup_done_event = connect_done
+            connect_coroutine = connect_tracked()
+            try:
+                connect_future = asyncio.run_coroutine_threadsafe(
+                    connect_coroutine, loop
+                )
+            except BaseException:
+                self._startup_done_event = None
+                connect_coroutine.close()
+                raise
+            connect_future.result(timeout=120)
+            self._startup_done_event = None
+        except BaseException as setup_error:
+            cleanup_failures: list[tuple[str, BaseException]] = []
+            # A timeout or caller cancellation does not cancel the coroutine
+            # submitted to the dedicated loop.  Request cancellation before
+            # scheduling teardown so it cannot resume startup underneath the
+            # cleanup coroutine.
+            if connect_future is not None:
+                try:
+                    if not connect_future.done():
+                        connect_future.cancel()
+                except BaseException as cancel_error:
+                    cleanup_failures.append(
+                        ("startup-coroutine cancellation", cancel_error)
+                    )
+                # Give ordinary cancellation a brief graceful window. If it is
+                # blocked in the IK-ready pipe read, disconnect() closes the
+                # pipe/process and performs the authoritative final wait before
+                # stopping the event loop.
+                connect_done.wait(timeout=5.0)
+            try:
+                self.disconnect()
+            except BaseException as cleanup_error:
+                _logger.exception("AxolVRTeleop startup cleanup failed")
+                cleanup_failures.append(("resource teardown", cleanup_error))
+            if connect_future is not None and not connect_done.is_set():
+                cleanup_failures.append(
+                    (
+                        "startup coroutine",
+                        HardwareCleanupError(
+                            "teleop startup coroutine did not stop; background "
+                            "ownership is uncertain"
+                        ),
+                    )
+                )
+            if cleanup_failures:
+                _first_label, first_failure = cleanup_failures[0]
+                for label, failure in cleanup_failures:
+                    setup_error.add_note(
+                        f"additional teleop {label} cleanup failure: "
+                        f"{type(failure).__name__}: {failure}"
+                    )
+                mark_hardware_cleanup_uncertain(setup_error, first_failure)
+            raise
         _logger.info("AxolVRTeleop connected.")
 
     async def _connect_async(
@@ -246,6 +328,9 @@ class AxolVRTeleop(Teleoperator):
         # Lock the headset HUD to data collection: the operator can record
         # episodes but can't switch back to plain teleop.
         self._vr_server.set_mode("data_collection")
+        self._vr_server.set_pose_mode(
+            "absolute" if self.config.vr_teleop_config.absolute_mode else "relative"
+        )
         # Park early headset video requests until set_video_manager /
         # set_video_sources lands (they run after the caller's camera setup).
         self._vr_server.set_video_expected(self._video_expected)
@@ -260,20 +345,43 @@ class AxolVRTeleop(Teleoperator):
         parent_conn, child_conn = ctx.Pipe()
         self._parent_conn = parent_conn
 
-        process = ctx.Process(
-            target=run_ik_worker,
-            args=(
-                child_conn,
-                self.config.vr_teleop_config,
-                self.config.kinematics_config,
-                q_start_left,
-                q_start_right,
-            ),
-            daemon=True,
-        )
-        process.start()
-        child_conn.close()
+        try:
+            process = ctx.Process(
+                target=run_ik_worker,
+                args=(
+                    child_conn,
+                    self.config.vr_teleop_config,
+                    self.config.kinematics_config,
+                    q_start_left,
+                    q_start_right,
+                ),
+                daemon=True,
+            )
+        except BaseException as process_error:
+            try:
+                child_conn.close()
+            except BaseException as close_error:
+                process_error.add_note(
+                    "additional IK child-pipe close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        # Retain the exact object before start: if start succeeds but the
+        # following local pipe close raises, connect()'s internal unwind must
+        # still be able to terminate and reap the new child.
         self._ik_process = process
+        try:
+            process.start()
+        except BaseException as start_error:
+            try:
+                child_conn.close()
+            except BaseException as close_error:
+                start_error.add_note(
+                    "additional IK child-pipe close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        child_conn.close()
 
         # Receive ready message: ("ready", q_init, left_indices, right_indices, startup_traj)
         loop = asyncio.get_running_loop()
@@ -306,60 +414,349 @@ class AxolVRTeleop(Teleoperator):
         self._ik_thread = threading.Thread(
             target=self._ik_loop, daemon=True, name="vr-axol-ik-loop"
         )
-        self._ik_thread.start()
+        try:
+            self._ik_thread.start()
+        except BaseException as start_error:
+            # Thread.start() either completes and owns a native thread or
+            # fails before one exists.  Clear only after an explicit probe;
+            # otherwise connect()'s cleanup retains and handles it.
+            try:
+                thread_alive = self._ik_thread.is_alive()
+            except BaseException as probe_error:
+                start_error.add_note(
+                    "additional IK thread liveness-check failure: "
+                    f"{type(probe_error).__name__}: {probe_error}"
+                )
+                thread_alive = True
+            if not thread_alive:
+                self._ik_thread = None
+            raise
 
     def disconnect(self) -> None:
-        """Stop the IK subprocess and VR server."""
-        if self._loop is None:
+        """Stop owned resources and the dedicated event-loop thread.
+
+        Loop teardown runs even when asynchronous resource cleanup fails, so
+        a failed :meth:`connect` cannot leak the SDK's background thread.  The
+        cleanup-pending latch remains set whenever any ownership proof fails.
+        """
+        loop = self._loop
+        if loop is None:
+            if self._cleanup_pending:
+                raise RuntimeError(
+                    "AxolVRTeleop cleanup is incomplete; background ownership "
+                    "is uncertain and the process must not reconnect"
+                )
             return
-        asyncio.run_coroutine_threadsafe(self._disconnect_async(), self._loop).result(
-            timeout=15
+        failures: list[tuple[str, BaseException]] = []
+        loop_thread = self._loop_thread
+
+        try:
+            loop_thread_alive = bool(loop_thread is not None and loop_thread.is_alive())
+        except BaseException as error:
+            failures.append(("event-loop thread liveness check", error))
+            loop_thread_alive = True
+
+        cleanup_future: Any | None = None
+        if loop_thread_alive:
+            cleanup_coroutine = self._disconnect_async()
+            try:
+                cleanup_future = asyncio.run_coroutine_threadsafe(
+                    cleanup_coroutine, loop
+                )
+                cleanup_future.result(timeout=15)
+            except BaseException as error:
+                failures.append(("asynchronous cleanup", error))
+                if cleanup_future is None:
+                    cleanup_coroutine.close()
+                else:
+                    try:
+                        if not cleanup_future.done():
+                            cleanup_future.cancel()
+                    except BaseException as cancel_error:
+                        failures.append(
+                            ("asynchronous cleanup cancellation", cancel_error)
+                        )
+        elif any(
+            resource is not None
+            for resource in (
+                self._vr_server,
+                self._parent_conn,
+                self._ik_process,
+                self._ik_thread,
+            )
+        ):
+            failures.append(
+                (
+                    "asynchronous cleanup",
+                    RuntimeError(
+                        "event loop stopped before partial resources were released"
+                    ),
+                )
+            )
+
+        # A failed connect may have been cancelled while awaiting a blocking
+        # executor pipe read. Resource teardown above closes the pipe/process;
+        # now give the exact startup coroutine a final chance to run its
+        # finalizer before the loop is stopped. Future.cancel() alone is not an
+        # exit proof, and the event is retained when this check fails.
+        startup_done = getattr(self, "_startup_done_event", None)
+        if startup_done is not None:
+            if startup_done.wait(timeout=2.0):
+                self._startup_done_event = None
+            else:
+                failures.append(
+                    (
+                        "startup coroutine",
+                        HardwareCleanupError(
+                            "teleop startup coroutine did not stop after resource "
+                            "teardown"
+                        ),
+                    )
+                )
+
+        # The event loop is an independently-owned resource.  Always stop and
+        # join it, even if cart/VR/IK cleanup above raised, so direct SDK
+        # connect failures cannot strand a background thread or its port.
+        if loop_thread_alive:
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except BaseException as error:
+                failures.append(("event-loop stop", error))
+
+        thread_started = bool(
+            loop_thread is not None
+            and (getattr(loop_thread, "ident", None) is not None or loop_thread_alive)
         )
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._loop_thread is not None:
-            self._loop_thread.join(timeout=5)
-        self._loop = None
-        self._loop_thread = None
-        self._vr_server = None
+        if thread_started:
+            try:
+                loop_thread.join(timeout=5)
+            except BaseException as error:
+                failures.append(("event-loop thread join", error))
+        if loop_thread is not None:
+            try:
+                loop_thread_alive = loop_thread.is_alive()
+            except BaseException as error:
+                failures.append(("final event-loop thread liveness check", error))
+                loop_thread_alive = True
+        else:
+            loop_thread_alive = False
+
+        if loop_thread_alive:
+            failures.append(
+                (
+                    "event-loop thread",
+                    RuntimeError("VR event-loop thread did not stop"),
+                )
+            )
+        else:
+            try:
+                loop.close()
+            except BaseException as error:
+                failures.append(("event-loop close", error))
+            else:
+                self._loop = None
+                self._loop_thread = None
+
+        if failures:
+            self._cleanup_pending = True
+            label, first_failure = failures[0]
+            for extra_label, extra in failures[1:]:
+                first_failure.add_note(
+                    f"additional teleop {extra_label} cleanup failure: "
+                    f"{type(extra).__name__}: {extra}"
+                )
+            if isinstance(first_failure, HardwareCleanupError):
+                raise first_failure
+            raise RuntimeError(
+                f"teleop {label} failed; background ownership is uncertain"
+            ) from first_failure
+
+        self._cleanup_pending = False
         _logger.info("AxolVRTeleop disconnected.")
 
     async def _disconnect_async(self) -> None:
+        self._cleanup_pending = True
+        cleanup_failures: list[tuple[str, BaseException]] = []
+        hardware_failures: list[tuple[str, BaseException]] = []
+
+        # Stop new dispatches and turn the cart off before waiting on a worker
+        # which may be wedged in a third-party solve or pipe call.
         if self._ik_thread is not None:
             self._ik_stop.set()
-            await asyncio.get_running_loop().run_in_executor(
-                None, self._ik_thread.join, 3.0
-            )
-            self._ik_thread = None
-
-        if self._parent_conn is not None:
-            try:
-                # Drain in-flight worker responses before closing: the dispatch
-                # thread can stop mid solve, and closing a connection with
-                # unread data RSTs the peer — the worker's blocking recv then
-                # dies with ConnectionResetError instead of reading the None
-                # shutdown sentinel.
-                while self._parent_conn.poll(0):
-                    self._parent_conn.recv()
-                self._parent_conn.send(None)
-            except Exception:
-                pass
-            self._parent_conn.close()
-            self._parent_conn = None
-
-        if self._ik_process is not None:
-            self._ik_process.join(timeout=3.0)
-            if self._ik_process.is_alive():
-                self._ik_process.terminate()
-            self._ik_process = None
-
         if self._cart is not None:
             try:
                 await self._cart.disable()
-            except Exception:  # noqa: BLE001 - never block the VR teardown
+            except BaseException as exc:
                 _logger.exception("cart disable failed")
+                hardware_failures.append(("cart", exc))
 
-        if self._vr_server is not None:
-            await self._vr_server.disable()
+        thread = self._ik_thread
+        thread_alive = False
+        if thread is not None:
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, thread.join, 3.0)
+            except BaseException as exc:
+                cleanup_failures.append(("IK thread join", exc))
+            try:
+                thread_alive = thread.is_alive()
+            except BaseException as exc:
+                cleanup_failures.append(("IK thread liveness check", exc))
+                thread_alive = True
+            if not thread_alive:
+                self._ik_thread = None
+
+        if self._parent_conn is not None:
+            if self._ik_thread is None:
+                try:
+                    while self._parent_conn.poll(0):
+                        self._parent_conn.recv()
+                    self._parent_conn.send(None)
+                except BaseException:
+                    # Worker death/EOF is acceptable; the process liveness
+                    # check below is authoritative.
+                    pass
+            try:
+                self._parent_conn.close()
+            except BaseException as exc:
+                cleanup_failures.append(("IK pipe close", exc))
+            else:
+                self._parent_conn = None
+
+        process = self._ik_process
+        if process is not None:
+
+            def process_join(label: str, timeout: float) -> None:
+                try:
+                    process.join(timeout=timeout)
+                except BaseException as exc:
+                    cleanup_failures.append((label, exc))
+
+            def process_is_alive(label: str) -> bool:
+                try:
+                    return bool(process.is_alive())
+                except BaseException as exc:
+                    cleanup_failures.append((label, exc))
+                    return True
+
+            try:
+                process_started = process.pid is not None
+            except BaseException as exc:
+                cleanup_failures.append(("IK process pid check", exc))
+                process_started = True
+
+            if not process_started:
+                # multiprocessing guarantees pid remains None until a child
+                # was actually spawned.  Still probe rather than assuming, so
+                # an unexpected Process implementation fails closed.
+                process_alive = process_is_alive("unstarted IK process liveness check")
+            else:
+                process_join("IK process graceful join", 3.0)
+                process_alive = process_is_alive("IK process post-join liveness check")
+                if process_alive:
+                    try:
+                        process.terminate()
+                    except BaseException as exc:
+                        cleanup_failures.append(("IK process terminate", exc))
+                    process_join("IK process post-terminate join", 2.0)
+                    process_alive = process_is_alive(
+                        "IK process post-terminate liveness check"
+                    )
+                if process_alive:
+                    try:
+                        process.kill()
+                    except BaseException as exc:
+                        cleanup_failures.append(("IK process kill", exc))
+                    process_join("IK process post-kill join", 2.0)
+                    process_alive = process_is_alive(
+                        "IK process post-kill liveness check"
+                    )
+
+            if process_alive and not process_started:
+                # A nonstandard Process reported live despite having no pid;
+                # try the same strongest shutdown sequence before declaring
+                # ownership uncertain.
+                try:
+                    process.terminate()
+                except BaseException as exc:
+                    cleanup_failures.append(("IK process terminate", exc))
+                process_join("IK process post-terminate join", 2.0)
+                process_alive = process_is_alive(
+                    "IK process post-terminate liveness check"
+                )
+                if process_alive:
+                    try:
+                        process.kill()
+                    except BaseException as exc:
+                        cleanup_failures.append(("IK process kill", exc))
+                    process_join("IK process post-kill join", 2.0)
+                    process_alive = process_is_alive(
+                        "IK process post-kill liveness check"
+                    )
+
+            if process_alive:
+                cleanup_failures.append(
+                    ("IK process", RuntimeError("IK worker process did not stop"))
+                )
+            else:
+                self._ik_process = None
+
+        # A dispatch blocked in the pipe can become runnable only after the
+        # child is killed or the parent endpoint is closed.  The initial join
+        # therefore is not the ownership proof: join and probe the exact
+        # retained thread once more after those unblock actions, and clear its
+        # reference only when that final probe proves exit.
+        if thread is not None and thread_alive:
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, thread.join, 2.0)
+            except BaseException as exc:
+                cleanup_failures.append(("IK thread final join", exc))
+            try:
+                thread_alive = thread.is_alive()
+            except BaseException as exc:
+                cleanup_failures.append(("IK thread final liveness check", exc))
+                thread_alive = True
+            if thread_alive:
+                cleanup_failures.append(
+                    ("IK thread", RuntimeError("IK dispatch thread did not stop"))
+                )
+            else:
+                self._ik_thread = None
+
+        # The live dispatch thread calls into the VR server for render frames.
+        # Retain that dependency when thread exit is unproved; disconnect()
+        # still unwinds the independently-owned event-loop thread and latches
+        # the instance fail-closed for the remainder of the process.
+        if self._vr_server is not None and self._ik_thread is None:
+            try:
+                await self._vr_server.disable()
+            except BaseException as exc:
+                cleanup_failures.append(("VR server disable", exc))
+            else:
+                self._vr_server = None
+
+        if hardware_failures:
+            first_label, first_failure = hardware_failures[0]
+            for extra_label, extra in hardware_failures[1:] + cleanup_failures:
+                first_failure.add_note(
+                    f"additional teleop {extra_label} cleanup failure: "
+                    f"{type(extra).__name__}: {extra}"
+                )
+            if isinstance(first_failure, HardwareCleanupError):
+                raise first_failure
+            raise HardwareCleanupError(
+                f"teleop {first_label} disable failed; hardware ownership is uncertain"
+            ) from first_failure
+        if cleanup_failures:
+            label, first_failure = cleanup_failures[0]
+            for extra_label, extra in cleanup_failures[1:]:
+                first_failure.add_note(
+                    f"additional teleop {extra_label} cleanup failure: "
+                    f"{type(extra).__name__}: {extra}"
+                )
+            raise RuntimeError(
+                f"teleop {label} failed; background ownership is uncertain"
+            ) from first_failure
+        self._cleanup_pending = False
 
     # ------------------------------------------------------------------
     # Calibration / configuration (no-ops)
@@ -531,10 +928,24 @@ class AxolVRTeleop(Teleoperator):
         """
         if self._vr_server is None or self._loop is None:
             return
-        text = json.dumps({"type": "tracking", "value": enabled})
         try:
             asyncio.run_coroutine_threadsafe(
-                self._vr_server.broadcast_text(text), self._loop
+                self._vr_server.broadcast_tracking(enabled), self._loop
+            )
+        except RuntimeError:
+            pass  # event loop already shut down
+
+    def _broadcast_json(self, obj: dict[str, Any]) -> None:
+        """Push an arbitrary JSON message to the headset (fire-and-forget).
+
+        Used by the shared core for the URDF overlay state in absolute (Mantis)
+        mode. Safe to call from any thread.
+        """
+        if self._vr_server is None or self._loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._vr_server.broadcast_text(json.dumps(obj)), self._loop
             )
         except RuntimeError:
             pass  # event loop already shut down
@@ -621,23 +1032,104 @@ class AxolVRTeleop(Teleoperator):
             action[key] = float(q[offset + i])
         return action
 
+    def pose_capture_ts(self) -> float | None:
+        """Host-clock capture time of the pose behind the latest action.
+
+        ``time.perf_counter`` seconds, estimated by the VR server's pose
+        interpolator (``VRFrame.t_host``). Mantis data collection stamps dataset
+        rows with this so image exposure and pose share one capture timeline.
+        ``None`` before the first solve or when the client doesn't stamp
+        capture times.
+        """
+        return self._core.last_pose_host_ts
+
+    def tcp_poses(self) -> dict | None:
+        """Latest base-frame TCP target per side (absolute/Mantis mode only).
+
+        ``{"left": [x, y, z, qx, qy, qz, qw], "right": [...]}`` in the robot
+        base frame — the tracked ground-truth pose the IK solver chased for
+        the latest action. Mantis data collection records this per dataset row
+        so training can use raw TCP trajectories (e.g. Mantis-style relative EE
+        actions) independent of the joint solutions. ``None`` before the
+        first solve or outside absolute mode.
+        """
+        snapshot = self._core.last_tcp_snapshot
+        if snapshot is None:
+            return None
+        return {"left": list(snapshot.left), "right": list(snapshot.right)}
+
+    def tcp_pose_snapshot(self) -> TCPPoseSnapshot | None:
+        """Atomically read the latest immutable TCP pose and capture time.
+
+        The returned reference contains tuple-backed poses, so neither the IK
+        thread nor a caller can mutate a sample while data collection uses it.
+        """
+        return self._core.last_tcp_snapshot
+
+    def tcp_last_change_ts(self) -> float | None:
+        """Monotonic time the tracked TCP pose last took a *new* value.
+
+        ``time.perf_counter`` seconds of the last IK reply whose TCP differed
+        from the previous one (see :attr:`VRTeleopCore.last_tcp_change_ts`).
+        This is diagnostic only: a live operator may deliberately hold a
+        perfectly still pose, so data-quality checks use the capture heartbeat
+        from :meth:`pose_capture_ts` rather than treating unchanged TCP values
+        as stale. ``None`` before the first absolute-mode solve.
+        """
+        return self._core.last_tcp_change_ts
+
+    def tracking_sides(self) -> dict[str, bool]:
+        """Whether each controller/tracker contributed a currently live pose."""
+        return dict(self._core.last_tracking)
+
+    def trigger_sides(self) -> dict[str, bool]:
+        """Whether each managed Mantis trigger has a fresh CAN heartbeat.
+
+        Quest and legacy senders default both sides to live because their grip
+        input is part of the controller frame rather than a separate CAN node.
+        """
+        return dict(self._core.last_trigger_live)
+
+    def is_engaged(self) -> bool:
+        """Whether teleop tracking is currently engaged (both grips squeezed).
+
+        Mirrors the shared core's engage toggle. While disengaged the IK
+        target — and therefore the recorded TCP — holds still even though the
+        operator's hands move, and the *next* engage re-fits the world→base
+        transform; Mantis data collection uses this to count disengaged frames
+        and to flag mid-episode re-engages that invalidate an episode.
+        """
+        return self._core.teleop_enabled
+
     def get_teleop_events(self) -> dict[TeleopEvents | str, Any]:
         """Return episode control events derived from VRState transitions.
 
         Consumes and clears any latched events. Call once per control step.
+        The read-and-clear happens under ``_event_lock`` (shared with the VR
+        frame callback's latch writes), so a state transition arriving
+        between the read and the clear cannot be silently dropped.
         """
-        rerecord = self._rerecord_latch
-        terminate = self._terminate_latch
-        start_recording = self._start_recording_latch
-        self._rerecord_latch = False
-        self._terminate_latch = False
-        self._start_recording_latch = False
+        with self._event_lock:
+            rerecord = self._rerecord_latch
+            terminate = self._terminate_latch
+            failure = self._failure_latch
+            episode_end_t_host = self._episode_end_t_host
+            start_recording = self._start_recording_latch
+            self._rerecord_latch = False
+            self._terminate_latch = False
+            self._failure_latch = False
+            self._episode_end_t_host = None
+            self._start_recording_latch = False
         return {
             TeleopEvents.IS_INTERVENTION: False,
             TeleopEvents.TERMINATE_EPISODE: terminate,
-            TeleopEvents.SUCCESS: terminate,
+            TeleopEvents.SUCCESS: terminate and not failure,
+            TeleopEvents.FAILURE: failure,
             TeleopEvents.RERECORD_EPISODE: rerecord,
             "start_recording": start_recording,
+            # Where the terminated episode's data should be cut (host
+            # perf_counter seconds), or None to keep every captured row.
+            "episode_end_t_host": episode_end_t_host if terminate else None,
         }
 
     # ------------------------------------------------------------------
@@ -664,20 +1156,30 @@ class AxolVRTeleop(Teleoperator):
             # force a stop so the base doesn't creep during return-to-rest.
             self._cart.apply_vr_frame(frame, resetting=self._core.is_resetting)
 
-        # Episode state transitions
+        # Episode state transitions. Latch writes take _event_lock so they
+        # can't land inside get_teleop_events' read-then-clear and vanish.
         prev = self._prev_state
         curr = frame.state
         if prev == VRState.DATA_COLLECTION and curr == VRState.RECORDING:
-            self._start_recording_latch = True
+            with self._event_lock:
+                self._start_recording_latch = True
 
         if prev == VRState.RECORDING and curr == VRState.DATA_COLLECTION:
             if frame.reset:
                 # Discard episode — consume the reset so it doesn't trigger
                 # rest-pose move.
-                self._rerecord_latch = True
+                with self._event_lock:
+                    self._rerecord_latch = True
                 self._core.clear_reset_request()
             else:
-                self._terminate_latch = True
+                with self._event_lock:
+                    self._terminate_latch = True
+                    self._failure_latch = (
+                        frame.episode_outcome == VREpisodeOutcome.FAILURE
+                    )
+                    self._episode_end_t_host = (
+                        None if self._failure_latch else frame.episode_end_t_host
+                    )
         self._prev_state = curr
 
     # ------------------------------------------------------------------

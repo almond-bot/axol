@@ -7,13 +7,16 @@ Releases the item gripped by [`diag.rom-enable`](https://docs.almond.bot/cli/dia
 
 If the ROM test ran on a subset of joints (`--joints`), pass the same subset here so only those motors are addressed.
 
+Pass `--target mantis` after a Mantis gripper soak; this addresses only ID 8 on each selected Mantis bus.
+
 ```bash
 axol diag.rom-disable
 axol diag.rom-disable --joints wrist_1,wrist_2,wrist_3
 axol diag.rom-disable --web-prompts   # dashboard-driven "Continue" before each gripper opens
 axol diag.rom-disable --no-right --left-channel can0   # one arm on a non-hub CAN adapter
+axol diag.rom-disable --target mantis                 # both Mantis grippers
 ```
 
-`--left-channel` / `--right-channel` override the SocketCAN interface used for each arm (default: the Axol hub adapter's `can_alm_axol_l` / `can_alm_axol_r`); pass the same channels the `diag.rom-enable` run used.
+`--left-channel` / `--right-channel` override the SocketCAN interface used for each side. Defaults follow `--target`; pass the same target and channels the `diag.rom-enable` run used.
 
 By default each gripper-open step is an interactive `input()` prompt; `--web-prompts` makes it a `[prompt] …` marker the dashboard turns into a **Continue** button (set automatically from the dashboard).

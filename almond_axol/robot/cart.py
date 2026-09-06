@@ -43,16 +43,18 @@ if a wheel runs backwards on your cart, flip its entry in
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import math
 import time
+from collections.abc import Awaitable
 from dataclasses import dataclass
+from typing import Any
 
 from ..constants import CAN_BASE, CAN_CHEST
 from ..motor import CanBus, ControlMode, make_driver
 from ..motor.damiao import _DM_REG_PMAX
 from ..motor.driver import MotorDriver
+from .base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from .lift import DOWN, JOG_SPEED, STOP, UP, Lift, LiftStatus
 
 _logger = logging.getLogger(__name__)
@@ -85,6 +87,20 @@ _YAW_TRACE_HZ = 10.0
 # Seconds of driving with the IMU requested but no yaw sample ever fed
 # before the cart says the heading hold is dead.
 _YAW_SILENT_WARN_S = 3.0
+
+
+async def _gather_all_or_raise(*awaitables: Awaitable[Any]) -> None:
+    """Finish every parallel hardware command before surfacing a failure."""
+    results = await asyncio.gather(*awaitables, return_exceptions=True)
+    failures = [result for result in results if isinstance(result, BaseException)]
+    if failures:
+        first = failures[0]
+        for extra in failures[1:]:
+            first.add_note(
+                "additional parallel cart command failure: "
+                f"{type(extra).__name__}: {extra}"
+            )
+        raise first
 
 
 @dataclass(frozen=True)
@@ -338,6 +354,8 @@ class Cart:
         self._motors: list[MotorDriver] = []
         self._lift: Lift | None = None
         self._task: asyncio.Task | None = None
+        self._shutdown_pending = False
+        self._motors_disabled = False
 
         # Latched target, written from any thread (single-reference swap is
         # atomic under the GIL), consumed by the command task.
@@ -387,21 +405,35 @@ class Cart:
     async def enable(self) -> None:
         """Open the CAN bus, enable the wheel motors, init the lift, and start
         the command task."""
+        if self._shutdown_pending:
+            raise HardwareCleanupError(
+                "cart shutdown is incomplete; retry disable() before reconnecting"
+            )
+        if self._task is not None or self._bus is not None or self._motors:
+            raise RuntimeError("cart is already enabled")
         cfg = self._config
         if cfg.lift:
             # The chest bus is optional and independent of the wheels: a
             # missing/unpowered lift only costs the lift, never the drive.
             lift = Lift(cfg.lift_channel, cfg.lift_speed)
+            self._lift = lift
             try:
                 await lift.start()
-                self._lift = lift
-            except Exception as exc:  # noqa: BLE001 - lift is best-effort
-                await lift.close()
+            except BaseException as setup_error:
+                try:
+                    await lift.close()
+                except BaseException as cleanup_error:
+                    self._shutdown_pending = True
+                    mark_hardware_cleanup_uncertain(setup_error, cleanup_error)
+                    raise setup_error
+                self._lift = None
+                if not isinstance(setup_error, Exception):
+                    raise setup_error
                 _logger.warning(
                     "cart lift: could not open the chest bus %s (%s) — "
                     "the lift is disabled for this session",
                     cfg.lift_channel,
-                    exc,
+                    setup_error,
                 )
 
         try:
@@ -423,16 +455,17 @@ class Cart:
                     make_driver(self._bus, w.motor_id, motor_type="damiao")
                     for w in WHEELS
                 ]
+                self._motors_disabled = False
                 # Widen the position-mapping range (RAM only) before enable()
                 # reads it back, so multi-turn wheel positions stay valid for
                 # the MIT park hold.
-                await asyncio.gather(
+                await _gather_all_or_raise(
                     *[
                         m._write_register(_DM_REG_PMAX, _SESSION_PMAX)
                         for m in self._motors
                     ]
                 )
-                await asyncio.gather(*[m.enable() for m in self._motors])
+                await _gather_all_or_raise(*[m.enable() for m in self._motors])
                 for w, m in zip(WHEELS, self._motors):
                     if abs(m._p_max - _SESSION_PMAX) > 1.0:
                         _logger.warning(
@@ -442,24 +475,19 @@ class Cart:
                             m._p_max,
                             _SESSION_PMAX,
                         )
-                await asyncio.gather(
+                await _gather_all_or_raise(
                     *[m.set_control_mode(ControlMode.VELOCITY) for m in self._motors]
                 )
                 _logger.info("cart wheels enabled on %s", cfg.channel)
-        except BaseException:
+        except BaseException as setup_error:
             # A failed enable() propagates to the caller, who never calls
             # disable() — so everything opened above must be torn down here,
             # or the lift's CAN reader and jog task would keep running (and a
             # half-started wheel bus would stay open).
-            self._motors = []
-            if self._bus is not None:
-                with contextlib.suppress(Exception):
-                    await self._bus.close()
-                self._bus = None
-            if self._lift is not None:
-                with contextlib.suppress(Exception):
-                    await self._lift.close()
-                self._lift = None
+            try:
+                await self.disable()
+            except BaseException as cleanup_error:
+                mark_hardware_cleanup_uncertain(setup_error, cleanup_error)
             raise
 
         if cfg.yaw_hold_gain != 0.0:
@@ -475,15 +503,25 @@ class Cart:
 
     async def disable(self) -> None:
         """Stop the command task, stop and disable the wheels, release the lift."""
-        if self._task is not None:
-            self._task.cancel()
+        failures: list[tuple[str, BaseException]] = []
+
+        task = self._task
+        if task is not None:
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._task = None
+            except BaseException as exc:
+                failures.append(("command task", exc))
+            if task.done():
+                self._task = None
+            else:
+                failures.append(
+                    ("command task", RuntimeError("cart command task did not stop"))
+                )
 
-        if self._motors:
+        if self._motors and not self._motors_disabled:
             try:
                 # Leave impedance park (if held) and command a stop before
                 # disabling, mirroring the manual-drive teardown.
@@ -491,20 +529,55 @@ class Cart:
                     await self._unpark()
                 await asyncio.gather(*[m.set_velocity(0.0) for m in self._motors])
             except Exception:  # noqa: BLE001 - best-effort stop before disable
-                pass
+                _logger.exception("cart wheel stop command failed")
             try:
-                await asyncio.gather(*[m.disable() for m in self._motors])
-            except Exception:  # noqa: BLE001 - keep teardown going
-                _logger.exception("cart wheel disable failed")
-            self._motors = []
+                results = await asyncio.gather(
+                    *[m.disable() for m in self._motors], return_exceptions=True
+                )
+            except BaseException as exc:
+                failures.append(("wheel disable group", exc))
+                self._motors_disabled = False
+            else:
+                wheel_failures = [
+                    (f"{wheel.name} wheel disable", result)
+                    for wheel, result in zip(WHEELS, results)
+                    if isinstance(result, BaseException)
+                ]
+                failures.extend(wheel_failures)
+                self._motors_disabled = not wheel_failures
 
-        if self._bus is not None:
-            await self._bus.close()
-            self._bus = None
+        # Keep the wheel bus open until every torque-off is verified, so a
+        # later disable() call can retry rather than losing the only control
+        # path to a potentially energised motor.
+        if self._bus is not None and (not self._motors or self._motors_disabled):
+            try:
+                await self._bus.close()
+            except BaseException as exc:
+                failures.append(("wheel bus close", exc))
+            else:
+                self._bus = None
+                self._motors = []
+                self._motors_disabled = False
 
         if self._lift is not None:
-            await self._lift.close()
-            self._lift = None
+            try:
+                await self._lift.close()
+            except BaseException as exc:
+                failures.append(("lift close", exc))
+            else:
+                self._lift = None
+
+        self._shutdown_pending = bool(failures)
+        if failures:
+            label, first = failures[0]
+            for extra_label, extra in failures[1:]:
+                first.add_note(
+                    f"additional cart {extra_label} cleanup failure: "
+                    f"{type(extra).__name__}: {extra}"
+                )
+            raise HardwareCleanupError(
+                f"cart {label} failed; hardware ownership is uncertain"
+            ) from first
         _logger.info("cart disabled")
 
     # ------------------------------------------------------------------
@@ -525,10 +598,43 @@ class Cart:
         ``CartConfig.command_timeout`` the target decays to a full stop.
         """
 
-        def clamp(v: float) -> float:
-            return max(-1.0, min(1.0, float(v)))
+        def clamp(v: float, *, name: str) -> float:
+            if isinstance(v, bool):
+                raise ValueError(f"cart {name} command must be a finite number")
+            try:
+                value = float(v)
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"cart {name} command must be a finite number"
+                ) from exc
+            if not math.isfinite(value):
+                raise ValueError(f"cart {name} command must be a finite number")
+            return max(-1.0, min(1.0, value))
 
-        vx, vy, wz = clamp(vx), clamp(vy), clamp(wz)
+        try:
+            vx, vy, wz = (
+                clamp(vx, name="vx"),
+                clamp(vy, name="vy"),
+                clamp(wz, name="wz"),
+            )
+            if (
+                isinstance(lift, bool)
+                or not isinstance(lift, int)
+                or lift
+                not in {
+                    DOWN,
+                    STOP,
+                    UP,
+                }
+            ):
+                raise ValueError("cart lift command must be -1, 0, or 1")
+        except ValueError:
+            # Invalid input must fail toward a stop. In particular,
+            # ``min(1, NaN)`` evaluates to 1 in Python, so a naive clamp can
+            # turn a malformed network/SDK value into full cart speed.
+            self._target = (0.0, 0.0, 0.0, STOP)
+            self._target_time = time.monotonic()
+            raise
 
         # Snap near-cardinal translation onto the axis (see
         # CartConfig.axis_snap_deg): thumbstick flicks are rarely perfectly
@@ -543,7 +649,7 @@ class Cart:
                 vx = mag * math.cos(nearest)
                 vy = mag * math.sin(nearest)
 
-        self._target = (vx, vy, wz, int(lift))
+        self._target = (vx, vy, wz, lift)
         self._target_time = time.monotonic()
 
     def apply_vr_frame(self, frame, resetting: bool = False) -> None:  # noqa: ANN001
@@ -590,7 +696,16 @@ class Cart:
         the staleness window are ignored, so a dead sensor simply disables
         the hold rather than freezing a stale correction.
         """
-        self._yaw_rate = (float(rate), time.monotonic())
+        try:
+            value = float(rate)
+        except (OverflowError, TypeError, ValueError):
+            value = math.nan
+        if not math.isfinite(value):
+            # A malformed/dead IMU must disable heading hold, never inject a
+            # NaN into wheel mixing. Keep the motion target itself unchanged.
+            self._yaw_rate = None
+            return
+        self._yaw_rate = (value, time.monotonic())
         self._yaw_samples += 1
 
     # ------------------------------------------------------------------

@@ -414,17 +414,13 @@ export function TelemetryChart({
 
   // Tooltip placement: clamp inside the plot, flip sides near the right edge.
   const tooltipLeft =
-    hover && size.w > 0
-      ? PAD.left + ((hover.t - view.t0) / (view.t1 - view.t0 || 1)) * plotW
-      : 0
+    hover && size.w > 0 ? PAD.left + ((hover.t - view.t0) / (view.t1 - view.t0 || 1)) * plotW : 0
   const flip = tooltipLeft > size.w - 190
 
   const card = (
     // The Card surface is normally a translucent wash; full screen needs a
     // solid one so the page behind doesn't bleed through the plot.
-    <Card
-      className={cn("gap-3 p-4", expanded && "h-full w-full bg-[#161618]", className)}
-    >
+    <Card className={cn("gap-3 p-4", expanded && "h-full w-full bg-[#161618]", className)}>
       <div className="flex items-baseline gap-2">
         <h3 className="font-heading text-sm font-semibold">{title}</h3>
         <span className="text-xs text-white/35">{unit}</span>
@@ -469,9 +465,7 @@ export function TelemetryChart({
             className="pointer-events-none absolute top-2 z-10 w-44 rounded-md border border-white/10 bg-[#1c1c1c]/95 px-2.5 py-2 text-xs shadow-xl"
             style={flip ? { right: size.w - tooltipLeft + 8 } : { left: tooltipLeft + 8 }}
           >
-            <div className="mb-1 font-mono text-[0.65rem] text-white/40">
-              {fmtClock(hover.t)}
-            </div>
+            <div className="mb-1 font-mono text-[0.65rem] text-white/40">{fmtClock(hover.t)}</div>
             {series.map((s, i) => (
               <div key={s.key} className="flex items-center gap-2 leading-5">
                 <span

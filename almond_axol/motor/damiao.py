@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import struct
 from dataclasses import dataclass
 from enum import Enum
@@ -75,6 +76,8 @@ _DM_STATUS_MAP: dict[_DamiaoStatus, MotorStatus] = {
 
 def _float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
     """Encode a clamped float into a fixed-point uint for the MIT protocol byte layout."""
+    if not math.isfinite(x):
+        raise ValueError("cannot encode a non-finite motor command")
     x = max(x_min, min(x_max, x))
     return int((x - x_min) * ((1 << bits) - 1) / (x_max - x_min))
 
@@ -421,6 +424,10 @@ class DamiaoMotor(MotorDriver):
                     return
             except MotorError:
                 pass
+        raise MotorError(
+            f"Damiao motor {self._motor_id:#04x} did not confirm disabled "
+            f"after {max_attempts} attempts"
+        )
 
     async def get_control_mode(self) -> ControlMode:
         """Read the active control mode from the motor's register."""

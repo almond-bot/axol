@@ -15,8 +15,9 @@ Two Tegra defaults trade latency for power/throughput and hurt us:
   matching ~30% (measured 79 Hz vs 113 Hz pinned).
 
 Both ceilings are themselves capped by the ``nvpmodel`` power mode, so
-:func:`pin_realtime_clocks` first selects MAXN (mode 0) to uncap them, then
-pins the engine and CPU clocks to that max — fixing the latency / rate.
+:func:`pin_realtime_clocks` first selects MAXN SUPER when the active platform
+configuration provides it (otherwise MAXN) to uncap them, then pins the engine
+and CPU clocks to that max — fixing the latency / rate.
 Best-effort and cleared on reboot, so ``axol jetson.setup`` (which calls
 :func:`pin_realtime_clocks`) is run at boot from the host installer's systemd
 unit — not from teleop / serve.
@@ -25,6 +26,8 @@ unit — not from teleop / serve.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -38,12 +41,29 @@ _ENGINE_CLOCK_GLOBS = ("*.nvenc", "*.vic")
 
 # cpufreq governor that holds the cores at their max clock. The ceiling it
 # holds them at is whatever the active ``nvpmodel`` power mode allows, so we
-# select MAXN first (see :func:`_set_max_power_mode`) for the full benefit.
+# select the strongest configured mode first (see :func:`_set_max_power_mode`)
+# for the full benefit.
 _CPU_GOVERNOR = "performance"
 
-# nvpmodel power mode that uncaps the clock ceiling. MAXN is mode 0 on every
-# Jetson, so the governor and engine pins can reach the real max clocks.
+# Legacy fallback for configurations whose power-mode names cannot be read.
+# NVIDIA documents mode 0 as the generic maximum-power mode, but newer Super
+# configurations are not numerically uniform (for example, Orin Nano commonly
+# exposes MAXN_SUPER as mode 2). Prefer the names in ``nvpmodel.conf`` below.
 _MAXN_MODE = "0"
+
+# The active board/SKU-specific configuration is exposed at this canonical
+# path (normally a symlink into /etc/nvpmodel/). It is the source of truth for
+# which modes the installed BSP actually supports and their numeric IDs.
+_NVPMODEL_CONFIG = Path("/etc/nvpmodel.conf")
+
+_POWER_MODEL_RE = re.compile(
+    r"^[ \t]*<[ \t]*POWER_MODEL\b(?P<body>[^>\r\n]*)>",
+    re.IGNORECASE | re.MULTILINE,
+)
+_POWER_MODE_ID_RE = re.compile(r"\bID\s*=\s*(\d+)\b", re.IGNORECASE)
+_POWER_MODE_NAME_RE = re.compile(
+    r"""\bNAME\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))""", re.IGNORECASE
+)
 
 # Where nvpmodel persists the active mode across reboots (``pmode:%.4d``).
 # The nvpmodel boot service runs ``nvpmodel -f /etc/nvpmodel.conf`` with no
@@ -96,11 +116,14 @@ class _RootEscalator:
 
     def __init__(self, *, interactive: bool) -> None:
         self._interactive = interactive
-        self._primed = False
+        self._prime_attempted = False
 
     def _prime(self) -> None:
-        if self._interactive and not self._primed:
-            self._primed = prime_sudo()
+        if self._interactive and not self._prime_attempted:
+            # A declined/failed prompt must not be repeated for every clock
+            # or sysfs write in the same best-effort setup pass.
+            self._prime_attempted = True
+            prime_sudo()
 
     def write(self, path: Path, value: str) -> tuple[bool, str]:
         """Write ``value`` to ``path`` as root; return ``(ok, failure_detail)``.
@@ -114,13 +137,20 @@ class _RootEscalator:
             return True, ""
         except OSError as exc:
             detail = str(exc)
-        self._prime()
-        proc = subprocess.run(
-            ["sudo", "-n", "tee", str(path)],
-            input=value,
-            capture_output=True,
-            text=True,
-        )
+        # A root process cannot gain anything by retrying a failed system-file
+        # write through sudo (and minimal images may omit sudo entirely).
+        if os.geteuid() == 0:
+            return False, detail
+        try:
+            self._prime()
+            proc = subprocess.run(
+                ["sudo", "-n", "tee", str(path)],
+                input=value,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            return False, str(exc) or detail
         if proc.returncode == 0:
             return True, ""
         return False, (proc.stderr or "").strip() or detail
@@ -146,10 +176,21 @@ class _RootEscalator:
             detail = _combine_output(proc)
         except OSError as exc:
             detail = str(exc)
-        self._prime()
-        sudo = subprocess.run(
-            ["sudo", "-n", *argv], input=input_text, capture_output=True, text=True
-        )
+        # A root command's application failure is not a permission signal.
+        # Retrying it through sudo can repeat partial side effects; it can also
+        # raise on minimal images that correctly omit sudo for the root user.
+        if os.geteuid() == 0:
+            return False, detail
+        try:
+            self._prime()
+            sudo = subprocess.run(
+                ["sudo", "-n", *argv],
+                input=input_text,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            return False, str(exc) or detail
         if sudo.returncode == 0:
             return True, ""
         return False, _combine_output(sudo) or detail
@@ -168,14 +209,51 @@ def _query_power_mode(nvpmodel: str) -> str | None:
     return lines[-1] if lines else None
 
 
-def _set_max_power_mode(escalator: _RootEscalator) -> None:
-    """Select the MAXN ``nvpmodel`` power mode (uncaps the clock ceiling).
+def _preferred_max_power_mode() -> tuple[str, str]:
+    """Return ``(id, display_name)`` for the strongest configured mode.
 
-    Jetson-only and best-effort. MAXN is the prerequisite for the CPU
-    governor and engine pins below: ``nvpmodel`` caps the clock ceiling, so
-    without MAXN the ``performance`` governor merely holds the cores at a
-    lower mode's max. A no-op when already in MAXN (so no needless sudo
-    prompt) or when ``nvpmodel`` is absent.
+    ``nvpmodel`` mode IDs vary by Jetson module and flash configuration. Read
+    the active configuration rather than guessing from the hardware model:
+    prefer ``MAXN_SUPER``, then ordinary ``MAXN``. Fall back to the historically
+    documented mode 0 when the configuration is absent, unreadable, or does
+    not name either mode.
+    """
+    try:
+        config = _NVPMODEL_CONFIG.read_text()
+    except OSError as exc:
+        _logger.debug("cannot read %s: %s", _NVPMODEL_CONFIG, exc)
+        return _MAXN_MODE, "MAXN"
+
+    modes: dict[str, tuple[str, str]] = {}
+    for entry in _POWER_MODEL_RE.finditer(config):
+        body = entry.group("body")
+        mode_id = _POWER_MODE_ID_RE.search(body)
+        mode_name = _POWER_MODE_NAME_RE.search(body)
+        if mode_id is None or mode_name is None:
+            continue
+        raw_name = next(group for group in mode_name.groups() if group is not None)
+        canonical_name = re.sub(r"[^A-Z0-9]+", "_", raw_name.upper()).strip("_")
+        modes.setdefault(
+            canonical_name,
+            (mode_id.group(1), canonical_name.replace("_", " ")),
+        )
+
+    for preferred_name in ("MAXN_SUPER", "MAXN"):
+        if preferred_name in modes:
+            return modes[preferred_name]
+    return _MAXN_MODE, "MAXN"
+
+
+def _set_max_power_mode(escalator: _RootEscalator) -> None:
+    """Select the strongest configured ``nvpmodel`` power mode.
+
+    Jetson-only and best-effort. MAXN SUPER is preferred when the active
+    platform configuration supports it, with MAXN as the fallback. This is the
+    prerequisite for the CPU governor and engine pins below: ``nvpmodel`` caps
+    the clock ceiling, so without the maximum mode the ``performance``
+    governor merely holds the cores at a lower mode's max. A no-op when already
+    in the selected mode (so no needless sudo prompt) or when ``nvpmodel`` is
+    absent.
     """
     if not _is_jetson():
         _logger.debug("not a Jetson; leaving the nvpmodel power mode unchanged")
@@ -184,56 +262,65 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
     if nvpmodel is None:
         _logger.debug("nvpmodel not found; leaving the power mode unchanged")
         return
-    # Skip the (root-only) switch when the mode already reports MAXN — either
-    # live, or persisted for the next boot by a previous run (see below).
-    if _query_power_mode(nvpmodel) == _MAXN_MODE:
+    max_mode, max_mode_name = _preferred_max_power_mode()
+    # Skip the (root-only) switch when the selected maximum mode is active.
+    if _query_power_mode(nvpmodel) == max_mode:
         return
     # Answer "n" to any confirmation prompt. Once the GPU golden context
     # exists (always, by the time the installer or the boot ExecStartPre gets
-    # here — nvpmodel.service runs earlier in boot), switching to MAXN asks to
-    # reboot *now* (``DO YOU WANT TO REBOOT NOW? enter YES/yes to confirm:``).
+    # here — nvpmodel.service runs earlier in boot), switching maximum modes
+    # may ask to reboot *now* (``DO YOU WANT TO REBOOT NOW? enter YES/yes to
+    # confirm:``).
     # We must never reboot the box here -- jetson.setup runs mid-install (over
     # the operator's SSH session) and at boot, and an in-place reboot would
     # drop that session and restart the robot. Feeding stdin also stops the
     # interactive `axol jetson.setup` run from blocking on the prompt.
-    ok, detail = escalator.run([nvpmodel, "-m", _MAXN_MODE], input_text="n\n")
-    if _query_power_mode(nvpmodel) == _MAXN_MODE:
-        _logger.info("set Jetson power mode to MAXN (nvpmodel -m %s)", _MAXN_MODE)
+    ok, detail = escalator.run([nvpmodel, "-m", max_mode], input_text="n\n")
+    if _query_power_mode(nvpmodel) == max_mode:
+        _logger.info(
+            "set Jetson power mode to %s (nvpmodel -m %s)",
+            max_mode_name,
+            max_mode,
+        )
         return
     if ok or "reboot" in detail.lower():
         # Declining the reboot prompt CANCELS the switch — nvpmodel records
         # nothing, so left alone the mode would never change, on this boot or
         # any later one. Persist the mode ourselves in nvpmodel's status file:
         # the boot service applies the mode saved there before the GPU golden
-        # context exists, so MAXN takes effect cleanly on the next *natural*
-        # reboot (and the earlier -q short-circuit keeps re-runs quiet).
-        pending = f"pmode:{int(_MAXN_MODE):04d}"
+        # context exists, so the selected mode takes effect cleanly on the next
+        # *natural* reboot (and the earlier -q short-circuit keeps re-runs
+        # quiet).
+        pending = f"pmode:{int(max_mode):04d}"
         wrote, write_detail = escalator.write(_NVPMODEL_STATUS, pending)
         if wrote:
             _logger.warning(
-                "Jetson power mode MAXN needs a reboot to take effect — declined "
+                "Jetson power mode %s needs a reboot to take effect — declined "
                 "the in-place reboot so this session/robot isn't restarted, and "
-                "recorded MAXN in %s so it applies on the next reboot (the boot "
+                "recorded it in %s so it applies on the next reboot (the boot "
                 "service re-pins the clocks then). The engine/CPU pins below "
                 "still help at the current mode's ceiling.",
+                max_mode_name,
                 _NVPMODEL_STATUS,
             )
         else:
             _logger.warning(
-                "Jetson power mode MAXN needs a reboot, and recording it for the "
-                "next boot failed (%s) — fix manually with: sudo nvpmodel -m %s "
-                "(confirm the reboot prompt, or reboot afterwards).",
+                "Jetson power mode %s needs a reboot, and recording it for the "
+                "next boot failed (%s) — fix manually with: sudo nvpmodel -m "
+                "%s (confirm the reboot prompt, or reboot afterwards).",
+                max_mode_name,
                 write_detail or "write failed",
-                _MAXN_MODE,
+                max_mode,
             )
     else:
         _logger.warning(
-            "cannot set the Jetson power mode to MAXN (nvpmodel -m %s failed%s) — "
-            "the active mode caps the clock ceiling the performance governor and "
-            "engine pins can reach. Fix manually with: sudo nvpmodel -m %s",
-            _MAXN_MODE,
+            "cannot set the Jetson power mode to %s (nvpmodel -m %s failed%s) — "
+            "the active mode caps the clock ceiling the performance governor "
+            "and engine pins can reach. Fix manually with: sudo nvpmodel -m %s",
+            max_mode_name,
+            max_mode,
             f": {detail}" if detail else "",
-            _MAXN_MODE,
+            max_mode,
         )
 
 
@@ -294,13 +381,14 @@ def _pin_cpu(writer: _RootEscalator) -> None:
     if failed:
         # Report the count (not just the last core's error): a single line that
         # named only cpuN understated how many cores actually failed. EINVAL
-        # here is usually the clock-ceiling cap of a non-MAXN power mode, which
-        # clears once MAXN is active (it may be pending a reboot — the boot
-        # service re-pins then), so point there before the manual override.
+        # here is usually the clock-ceiling cap of a lower power mode, which
+        # clears once the maximum mode is active (it may be pending a reboot —
+        # the boot service re-pins then), so point there before the manual
+        # override.
         _logger.warning(
             "could not set %d CPU core(s) to the %s governor (last error: %s) — "
             "the schedutil default underclocks bursty control loops (~30%% lower "
-            "IK rate). This usually clears once the MAXN power mode is active "
+            "IK rate). This usually clears once the maximum power mode is active "
             "(it may be pending a reboot; the boot service re-pins then). If it "
             "persists, fix manually with: echo %s | sudo tee "
             "/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor",
@@ -327,18 +415,18 @@ def pin_engine_clocks(*, interactive: bool = False) -> None:
 
 
 def pin_realtime_clocks(*, interactive: bool = False) -> None:
-    """Select MAXN and pin engine **and** CPU clocks for the control loops.
+    """Select the maximum mode and pin engine and CPU clocks for control loops.
 
-    Selects the MAXN ``nvpmodel`` power mode (uncaps the clock ceiling), pins
-    NVENC/VIC (encode latency), and switches the CPUs to the ``performance``
-    governor (IK rate). All three are Jetson-only: MAXN selection and
-    CPU-governor pinning are gated on :func:`_is_jetson` so they never alter a
-    non-Tegra host, and engine pinning is a no-op without the Tegra devfreq
-    nodes. MAXN is selected first because it sets the ceiling the governor and
-    engine pins reach. Same best-effort / ``interactive`` escalation semantics
-    as :func:`pin_engine_clocks`; sudo is primed at most once across all of
-    them. Invoked via ``axol jetson.setup`` (host installer + boot service),
-    not from the teleop / collect-data / serve entry points.
+    Selects MAXN SUPER when configured (otherwise MAXN), pins NVENC/VIC (encode
+    latency), and switches the CPUs to the ``performance`` governor (IK rate).
+    All three are Jetson-only: power-mode selection and CPU-governor pinning
+    are gated on :func:`_is_jetson` so they never alter a non-Tegra host, and
+    engine pinning is a no-op without the Tegra devfreq nodes. The power mode
+    is selected first because it sets the ceiling the governor and engine pins
+    reach. Same best-effort / ``interactive`` escalation semantics as
+    :func:`pin_engine_clocks`; sudo is primed at most once across all of them.
+    Invoked via ``axol jetson.setup`` (host installer + boot service), not from
+    the teleop / collect-data / serve entry points.
     """
     escalator = _RootEscalator(interactive=interactive)
     _set_max_power_mode(escalator)

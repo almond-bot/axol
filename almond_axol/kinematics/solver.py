@@ -589,7 +589,7 @@ class KinematicsSolver:
     @property
     def num_joints(self) -> int:
         """Total number of actuated joints across both arms."""
-        return self.robot.joints.num_actuated_joints
+        return int(self._pyroki_index.size)
 
     # -- Joint-order conversion ----------------------------------------------
 
@@ -600,6 +600,7 @@ class KinematicsSolver:
         ``self.robot_coll`` objects directly (their joint limits, forward
         kinematics, and collision pairs are indexed in pyroki's own actuated
         order); every method on this class converts internally.
+
         """
         q = np.asarray(q, dtype=np.float32)
         out = np.empty_like(q)
@@ -834,8 +835,8 @@ class KinematicsSolver:
             dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
             kwargs["left_elbow_pos"] = dummy_elbow
             kwargs["right_elbow_pos"] = dummy_elbow
-        try:
-            self.ik(**kwargs)
-        except Exception:
-            pass
+        # Compilation/runtime failures here mean the worker cannot safely
+        # serve the first real pose. Propagate them instead of announcing a
+        # false-ready solver and leaving teleop frozen on its seed pose.
+        self.ik(**kwargs)
         _logger.info("IK solver ready.")

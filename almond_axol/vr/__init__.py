@@ -18,13 +18,14 @@ Usage
 """
 
 from .config import VRServerConfig
-from .models import VRFrame, VRPose, VRPosition, VRQuaternion, VRState
+from .models import VREpisodeOutcome, VRFrame, VRPose, VRPosition, VRQuaternion, VRState
 from .server import VRServer
 
 __all__ = [
     "VRServer",
     "VRServerConfig",
     "VRFrame",
+    "VREpisodeOutcome",
     "VRPose",
     "VRPosition",
     "VRQuaternion",

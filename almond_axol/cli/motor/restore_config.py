@@ -142,7 +142,8 @@ async def _run(args: argparse.Namespace) -> None:
     records = [
         r
         for r in snapshot.get("motors", [])
-        if args.id is None or int(r["motor_id"]) == args.id
+        if (args.id is None or int(r["motor_id"]) == args.id)
+        and (args.target != "mantis" or int(r["motor_id"]) == 8)
     ]
     if not records:
         print(f"no matching motors in {args.snapshot}")

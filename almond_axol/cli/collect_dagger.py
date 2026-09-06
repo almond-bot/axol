@@ -85,7 +85,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
-from ..lerobot.camera.configuration_zed import ZedCameraConfig
+from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS, ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.rollout import (
     IKResetController,
@@ -93,14 +93,24 @@ from ..lerobot.rollout import (
     latest_observation,
 )
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
-from ..recording import DatasetRecorderProcess, default_vcodec
+from ..recording import (
+    DatasetRecorderProcess,
+    default_vcodec,
+    restore_dataset_ownership,
+)
+from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
+from ..utils.network import local_ip
 from .collect_data import (
     _existing_dataset_resolution,
     _start_video_relay,
     check_resume_consistency,
 )
 from .config import DatasetResolution, LogLevel, PolicyType, parse
-from .run_policy import _GATE_CONTACT, _QueuePolicyControl, _StdinPolicyControl
+from .run_policy import (
+    _GATE_CONTACT,
+    _QueuePolicyControl,
+    _StdinPolicyControl,
+)
 
 if TYPE_CHECKING:
     from ..lerobot.robot.robot_axol import AxolRobot
@@ -120,6 +130,39 @@ _STATE_TELEOP = "teleop"
 # creates; the recorder tags each row from the control loop's published
 # intervention flag.
 INTERVENTION_FEATURE: dict[str, Any] = {"dtype": "bool", "shape": (1,), "names": None}
+
+
+def _require_dagger_resume_schema(dataset_root: Path) -> None:
+    """Fail closed when an existing dataset cannot store DAgger labels."""
+    import json
+
+    info_path = dataset_root / "meta" / "info.json"
+    try:
+        features = json.loads(info_path.read_text()).get("features", {})
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"Cannot resume the DAgger dataset at {dataset_root}: "
+            "meta/info.json could not be read. Repair the dataset or start a "
+            "new one with a different repo_id."
+        ) from exc
+
+    intervention = features.get("intervention") if isinstance(features, dict) else None
+    shape = intervention.get("shape") if isinstance(intervention, dict) else None
+    valid = (
+        isinstance(intervention, dict)
+        and intervention.get("dtype") == "bool"
+        and isinstance(shape, (list, tuple))
+        and tuple(shape) == (1,)
+    )
+    if not valid:
+        raise ValueError(
+            f"Cannot resume the DAgger dataset at {dataset_root}: it does not "
+            "declare the required per-frame bool[1] 'intervention' feature. "
+            "Continuing would silently leave new human-correction frames "
+            "unlabeled. Start a new DAgger dataset with a different repo_id, "
+            "or migrate every existing frame and meta/info.json to add that "
+            "feature before resuming."
+        )
 
 
 def _default_robot_config() -> AxolRobotConfig:
@@ -239,7 +282,12 @@ class DaggerPolicy(Protocol):
     """
 
     def connect(self, robot: "AxolRobot") -> None:
-        """Load/prepare the policy. Called once, after ``robot.connect()``."""
+        """Load/prepare the policy against the robot's declared features.
+
+        Called once before physical ``robot.connect()`` so an incompatible
+        action schema fails while actuators and cameras are still untouched.
+        Backends must not require live hardware from this method.
+        """
         ...
 
     def reset(self) -> None:
@@ -332,6 +380,27 @@ class _LocalPolicy:
             preprocessor_overrides={
                 "device_processor": {"device": self._device_str},
             },
+        )
+
+        # Most LeRobot policies retain only an action width. That is not a
+        # sufficient deployment contract: Axol's gripperless joint and
+        # Cartesian layouts are both 14-D. Recover the checkpoint's
+        # authoritative ordered names and require exact equality before this
+        # backend can ever produce an action for the configured robot.
+        from ..lerobot.action_schema import (
+            require_exact_action_schema,
+            resolve_policy_action_schema,
+        )
+
+        policy_schema = resolve_policy_action_schema(
+            self._path,
+            policy_config=policy.config,
+            processors=(preprocessor, postprocessor),
+        )
+        require_exact_action_schema(
+            policy_schema,
+            robot.action_features,
+            policy_label="DAgger policy",
         )
 
         action_features = hw_to_dataset_features(robot.action_features, ACTION)
@@ -482,15 +551,26 @@ class _DaggerControlLoop(threading.Thread):
         except Exception as exc:  # noqa: BLE001
             _logger.warning("Observation failed (%s); skipping tick.", exc)
             return None
+        if self.shutdown_event.is_set():
+            return None
 
         action_dict = self.policy.act(obs)
         if action_dict is None:
+            return None
+        # Policy inference may block in a backend/native runtime.  A stop that
+        # arrived while it was running must prevent the returned action from
+        # reaching hardware or the recorder.
+        if self.shutdown_event.is_set():
             return None
 
         if self.limiter is not None:
             action_dict = self.limiter.apply(action_dict)
 
+        if self.shutdown_event.is_set():
+            return None
         performed = self.robot.send_action(action_dict)
+        if self.shutdown_event.is_set():
+            return None
         # obs carries the joint keys the snapshot needs (camera frames in the
         # same dict are simply ignored by the snapshot writer's key list).
         self.recorder.publish(
@@ -505,20 +585,24 @@ class _DaggerControlLoop(threading.Thread):
         policy_period = 1.0 / float(self.fps)
         teleop_period = 1.0 / float(self.teleop_hz)
         last_action: dict[str, float] | None = None
+        last_dataset_action: dict[str, float] | None = None
         loop_times: list[float] = []
         last_rate_log = time.perf_counter()
 
-        # Anchor the policy velocity envelope at the robot's measured pose so
-        # the episode's first action can't jump either.
-        if self.limiter is not None:
-            self.limiter.seed(*self.robot.positions)
-
         try:
+            # Anchor the policy velocity envelope at the robot's measured pose
+            # so the episode's first action can't jump either. Keep this inside
+            # the fault boundary so startup failures reach the supervisor.
+            if self.limiter is not None:
+                self.limiter.seed(*self.robot.positions)
+
             while not self.shutdown_event.is_set():
                 t0 = time.perf_counter()
 
                 # --- episode end requested from the VR record button?
                 events = self.teleop.get_teleop_events()
+                if self.shutdown_event.is_set():
+                    return
                 if events[TeleopEvents.TERMINATE_EPISODE]:
                     self.vr_choice = "s"
                     return
@@ -576,36 +660,57 @@ class _DaggerControlLoop(threading.Thread):
                 period = teleop_period if self.state == _STATE_TELEOP else policy_period
 
                 # --- command the robot from the selected source
+                if self.shutdown_event.is_set():
+                    return
                 if self.state == _STATE_POLICY:
                     sent = self._policy_tick(t0)
                     if sent is None:
                         time.sleep(period)
                         continue
                     last_action = sent
+                    last_dataset_action = sent
                 elif self.state == _STATE_TELEOP:
                     joint_obs = self.robot.get_joint_observation()
                     action = self.teleop.get_action()
-                    performed = self.robot.send_action(action)
+                    if self.shutdown_event.is_set():
+                        return
+                    self.robot.send_action(action)
+                    if self.shutdown_event.is_set():
+                        return
+                    # Teleop always commands joint targets, even when the
+                    # policy/dataset action space is Cartesian. Keep those
+                    # exact joints on the hardware path, but convert the
+                    # recorder snapshot to the configured dataset space so a
+                    # Cartesian DAgger intervention has the same schema as the
+                    # surrounding policy rows.
+                    dataset_action = self.robot.action_to_dataset(action)
+                    if self.shutdown_event.is_set():
+                        return
                     # intervention=True: the recorder tags the rows this
                     # snapshot pairs with as human-driven (the dataset's
                     # per-frame ``intervention`` feature).
                     self.recorder.publish(
                         joint_obs,
-                        performed if performed is not None else action,
+                        dataset_action,
                         t0,
                         intervention=True,
                     )
                     last_action = action
+                    last_dataset_action = dataset_action
                 else:  # FROZEN — hold pose, keep the command cadence alive.
-                    if last_action is not None:
+                    if last_action is not None and last_dataset_action is not None:
+                        if self.shutdown_event.is_set():
+                            return
                         self.robot.send_action(last_action)
+                        if self.shutdown_event.is_set():
+                            return
                         # Keep the recorder's snapshot current with the live
                         # command: capture is gated in the recorder, but a row
                         # racing the takeover resume then pairs its frames
                         # with the action actually commanding the robot (the
                         # held action) instead of a stale pre-freeze snapshot.
                         self.recorder.publish(
-                            self.robot.get_joint_observation(), last_action, t0
+                            self.robot.get_joint_observation(), last_dataset_action, t0
                         )
 
                 # --- once-a-second rate readout (parity with collect-data)
@@ -714,17 +819,185 @@ def _idle_teleop_until_record(
 # ----------------------------------------------------------------------
 
 
+def _stop_dagger_control_worker(
+    worker: _DaggerControlLoop | None,
+    *,
+    timeout: float = 5.0,
+) -> tuple[bool, BaseException | None]:
+    """Request stop and return ``True`` only after worker exit is proved."""
+    if worker is None:
+        return True, None
+    failures: list[tuple[str, BaseException]] = []
+    try:
+        worker.shutdown_event.set()
+    except BaseException as error:
+        failures.append(("stop signal", error))
+    try:
+        if getattr(worker, "ident", None) is not None or worker.is_alive():
+            worker.join(timeout=timeout)
+    except BaseException as error:
+        failures.append(("join", error))
+    try:
+        alive = bool(worker.is_alive())
+    except BaseException as error:
+        failures.append(("liveness check", error))
+        alive = True
+
+    if alive:
+        error = RuntimeError(
+            f"DAgger control loop did not stop within {timeout:g}s; deferring "
+            "recorder mutation and robot/teleop/relay teardown until a final "
+            "exit proof"
+        )
+    elif failures:
+        error = RuntimeError(
+            "DAgger control-loop cleanup encountered an error after exit was proved"
+        )
+    else:
+        return True, None
+    for label, failure in failures:
+        error.add_note(
+            f"additional DAgger control {label} failure: "
+            f"{type(failure).__name__}: {failure}"
+        )
+    return not alive, error
+
+
+def _cleanup_dagger_resource(
+    *,
+    control_stopped: bool,
+    label: str,
+    cleanup: Callable[[], Any],
+) -> BaseException | None:
+    """Clean a control-owned resource only after the loop's exit proof."""
+    if not control_stopped:
+        _logger.error(
+            "skipping %s because DAgger control-loop exit was not proved", label
+        )
+        return None
+    try:
+        cleanup()
+    except BaseException as error:
+        _logger.exception("%s cleanup failed", label)
+        return error
+    return None
+
+
+def _finish_dagger_cleanup(
+    *,
+    session_error: BaseException | None,
+    disconnect_failure: BaseException | None,
+    teleop_failure: BaseException | None,
+    reset_failure: BaseException | None,
+    relay_failure: BaseException | None,
+    additional_failures: tuple[tuple[str, BaseException], ...] = (),
+) -> None:
+    """Propagate teardown failures without replacing a session's primary error."""
+    failures = [
+        (label, failure)
+        for label, failure in (
+            ("robot disconnect", disconnect_failure),
+            ("teleop disconnect", teleop_failure),
+            ("IK reset worker", reset_failure),
+            *additional_failures,
+            ("video relay", relay_failure),
+        )
+        if failure is not None
+    ]
+    if session_error is not None:
+        for label, failure in failures:
+            session_error.add_note(
+                f"additional {label} cleanup failure: "
+                f"{type(failure).__name__}: {failure}"
+            )
+        uncertain = (
+            disconnect_failure
+            or teleop_failure
+            or reset_failure
+            or next(
+                (
+                    failure
+                    for _label, failure in additional_failures
+                    if isinstance(failure, HardwareCleanupError)
+                ),
+                None,
+            )
+        )
+        if uncertain is not None:
+            mark_hardware_cleanup_uncertain(session_error, uncertain)
+        return
+
+    def add_remaining_notes(error: BaseException, selected: BaseException) -> None:
+        for label, failure in failures:
+            if failure is selected:
+                continue
+            error.add_note(
+                f"additional {label} cleanup failure: "
+                f"{type(failure).__name__}: {failure}"
+            )
+
+    if disconnect_failure is not None:
+        error = HardwareCleanupError(
+            "robot disconnect failed; hardware ownership is uncertain"
+        )
+        add_remaining_notes(error, disconnect_failure)
+        raise error from disconnect_failure
+    if reset_failure is not None:
+        error = (
+            reset_failure
+            if isinstance(reset_failure, HardwareCleanupError)
+            else HardwareCleanupError(
+                "IK reset worker did not stop; background ownership is uncertain"
+            )
+        )
+        add_remaining_notes(error, reset_failure)
+        if error is reset_failure:
+            raise error
+        raise error from reset_failure
+    hardware_failure = next(
+        (
+            failure
+            for _label, failure in additional_failures
+            if isinstance(failure, HardwareCleanupError)
+        ),
+        None,
+    )
+    if hardware_failure is not None:
+        add_remaining_notes(hardware_failure, hardware_failure)
+        raise hardware_failure
+    if teleop_failure is not None:
+        add_remaining_notes(teleop_failure, teleop_failure)
+        if isinstance(teleop_failure, HardwareCleanupError):
+            raise teleop_failure
+        raise RuntimeError(
+            "teleop disconnect failed; background ownership is uncertain"
+        ) from teleop_failure
+    if additional_failures:
+        _label, failure = additional_failures[0]
+        add_remaining_notes(failure, failure)
+        raise failure
+    if relay_failure is not None:
+        raise relay_failure
+
+
 def _run(
     cfg: DaggerConfig,
     stop_event: "threading.Event | None" = None,
     control: "_StdinPolicyControl | _QueuePolicyControl | None" = None,
 ) -> None:
+    from ..utils.state_files import require_service_dataset_configuration
+
+    require_service_dataset_configuration()
+
+    from ..lerobot.robot.config_mantis import MantisRobotConfig
+
+    if isinstance(cfg.robot_config, MantisRobotConfig):
+        raise ValueError("collect-dagger does not support Mantis hardware")
+
     import os
-    import shutil
     import socket
 
-    from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
-    from lerobot.utils.feature_utils import hw_to_dataset_features
+    from lerobot.utils.constants import HF_LEROBOT_HOME
     from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun
 
@@ -750,6 +1023,52 @@ def _run(
     root = cfg.root
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
+
+    # Resolve and validate the destination before camera enumeration, workers,
+    # the relay, or the robot can start. LeRobotDataset.resume keeps the existing
+    # schema and ignores the fresh feature dict supplied to the recorder, so a
+    # non-DAgger dataset cannot be made label-capable implicitly on resume.
+    dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+    from ..utils.state_files import (
+        confine_service_dataset_path,
+        privileged_service_active,
+    )
+
+    if privileged_service_active():
+        dataset_root = confine_service_dataset_path(
+            dataset_root,
+            label="DAgger dataset root",
+        )
+        root = str(dataset_root)
+    meta = dataset_root / "meta"
+    has_info = (meta / "info.json").exists()
+    is_complete = (
+        has_info and (meta / "tasks.parquet").exists() and (meta / "episodes").is_dir()
+    )
+    if has_info and not is_complete:
+        raise RuntimeError(
+            f"Incomplete dataset found at {dataset_root} (missing "
+            "tasks.parquet or episodes/). Move or delete that exact dataset "
+            "directory, then rerun to start fresh."
+        )
+    if dataset_root.exists() and not is_complete:
+        try:
+            # Atomic and deliberately non-recursive: only a provably empty
+            # directory may be cleared for LeRobotDataset.create. Never erase
+            # an arbitrary user-supplied --root just because it lacks Axol
+            # metadata.
+            from ..utils.state_files import secure_rmdir
+
+            secure_rmdir(dataset_root)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Refusing to create a DAgger dataset at {dataset_root}: the "
+                "existing path is not an empty directory. Choose a new --root, "
+                "or inspect and move/delete the existing data yourself."
+            ) from exc
+        log_say(f"Removed empty dataset directory at {dataset_root}.")
+    if is_complete:
+        _require_dagger_resume_schema(dataset_root)
 
     # Guarded return-to-rest knobs, read from the shared teleop config (the
     # same fields collect-data / `axol teleop` use — see VRTeleopConfig).
@@ -789,29 +1108,6 @@ def _run(
                 "recording for them in the Cameras dialog."
             )
 
-    # Resolve the dataset path and validate it up front (fail fast before we
-    # power the robot); defer create/resume until after robot.connect() so
-    # observation features pick up the cameras' auto-detected dimensions.
-    dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
-    meta = dataset_root / "meta"
-    has_info = (meta / "info.json").exists()
-    is_complete = (
-        has_info and (meta / "tasks.parquet").exists() and (meta / "episodes").is_dir()
-    )
-    if has_info and not is_complete:
-        raise RuntimeError(
-            f"Incomplete dataset found at {dataset_root} (missing "
-            f"tasks.parquet or episodes/). Delete the directory and "
-            f"rerun to start fresh:\n  rm -rf {dataset_root}"
-        )
-    if dataset_root.exists() and not is_complete:
-        log_say(f"Removing empty dataset directory at {dataset_root}.")
-        shutil.rmtree(dataset_root)
-    if is_complete:
-        # A crashed session can lose buffered episodes while info.json's count
-        # survives; resuming would number past the gap (see the check's doc).
-        check_resume_consistency(dataset_root)
-
     # A resumed dataset's image resolution is fixed by its metadata; pin the
     # relay's dataset branch to it (mirrors collect-data).
     dataset_resolution = cfg.dataset_resolution
@@ -834,6 +1130,51 @@ def _run(
             )
         dataset_resolution = existing
 
+    # Build (but do not connect) the robot/camera wrappers, then load and
+    # schema-check the local policy before starting the IK worker, camera
+    # relay, teleop, or CAN hardware. A same-width positional mismatch must
+    # fail while every physical actuator is still untouched.
+    # Propagate the SKU before constructing DaggerVRTeleop: it caches its
+    # action keys in __init__, so changing the config afterward is too late and
+    # would leave a gripperless robot paired with a gripper-bearing teleop schema.
+    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
+        cfg.teleop_config, AxolVRTeleopConfig
+    ):
+        cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
+
+    robot = AxolRobot(cfg.robot_config)
+    teleop = DaggerVRTeleop(cfg.teleop_config)
+    from ..recording.datasets import (
+        dataset_features_for_robot,
+        require_dataset_resume_schema,
+    )
+
+    width, height = ZED_RESOLUTION_DIMS[dataset_resolution]
+    recorder_features = dataset_features_for_robot(
+        robot,
+        image_shape=(height, width, 3),
+        extra_features={"intervention": INTERVENTION_FEATURE},
+    )
+    if is_complete:
+        require_dataset_resume_schema(
+            dataset_root,
+            recorder_features,
+            fps=fps,
+            # The recorder computes pose lag whenever an existing
+            # Mantis-derived dataset declares it.
+            allowed_extra_features=frozenset({"observation.pose_lag"}),
+        )
+        # A crashed session can lose buffered episodes while info.json's count
+        # survives. Repair only after the full schema proves this is the
+        # current run's intended dataset.
+        check_resume_consistency(dataset_root)
+    policy = _LocalPolicy(cfg.policy_path, cfg.policy_type, cfg.device, task)
+    try:
+        policy.connect(robot)
+    except BaseException:
+        policy.close()
+        raise
+
     # Pin the control process to its dedicated cores before any threads are
     # created, so the relay / recorder / NVENC work — all pinned to the other
     # cores by their own processes — can't preempt the control loops. Restored
@@ -844,49 +1185,30 @@ def _run(
         _orig_affinity = os.sched_getaffinity(0)
     except (AttributeError, OSError):
         _orig_affinity = None
-    affinity.pin_realtime()
-
-    hostname = socket.gethostname()
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
-        _s.connect(("8.8.8.8", 80))
-        local_ip = _s.getsockname()[0]
-    print("Connect the VR app (https://axol.almond.bot) to this machine:")
-    print(f"  Hostname : {hostname}.local")
-    print(f"  IP       : {local_ip}")
-
-    if rerun_ip:
-        init_rerun(session_name="axol_dagger", ip=rerun_ip, port=rerun_port)
-
-    # Start the IK reset worker first so its JAX JIT overlaps with the policy
-    # load, robot connect, and the teleop's own IK worker JIT. It owns the
-    # collision-aware homing between episodes (the teleop's reset path is
-    # disabled in DAgger mode — see almond_axol.teleop.dagger).
-    reset_controller = IKResetController()
-    reset_controller.start()
-    log_say("Started IK reset worker (collision-aware return-to-rest).")
-
-    # The teleop's action keys must match the robot's: propagate the SKU's
-    # gripper capability so the gripperless SKU commands/records no gripper
-    # channels (mirrors collect-data).
-    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
-        cfg.teleop_config, AxolVRTeleopConfig
-    ):
-        cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
-
-    # The out-of-process video relay owns the cameras and streams the headset
-    # view; its raw branch is forced onto the pyshm transport so the frames
-    # are readable HERE (policy observations) as well as by the recorder
-    # subprocess (dataset). Required — there is no in-process fallback (see
-    # the module docstring). A failure anywhere in this setup stage tears the
-    # relay and the reset worker down instead of leaking them (mirrors
-    # collect-data's setup-failure cleanup) — the reset worker is already
-    # running, and a started relay holds the cameras.
+    reset_controller: IKResetController | None = None
     relay = None
     try:
-        robot = AxolRobot(cfg.robot_config)
-        teleop = DaggerVRTeleop(cfg.teleop_config)
-        policy = _LocalPolicy(cfg.policy_path, cfg.policy_type, cfg.device, task)
+        affinity.pin_realtime()
 
+        hostname = socket.gethostname()
+        host_ip = local_ip()
+        print("Connect the VR app (https://axol.almond.bot) to this machine:")
+        print(f"  Hostname : {hostname}.local")
+        print(f"  IP       : {host_ip}")
+
+        if rerun_ip:
+            init_rerun(session_name="axol_dagger", ip=rerun_ip, port=rerun_port)
+
+        # Start the IK reset worker once the policy schema has been proven. Its
+        # JAX JIT overlaps with robot connect and the teleop's own IK worker
+        # JIT. It owns collision-aware homing between episodes.
+        reset_controller = IKResetController()
+        reset_controller.start()
+        log_say("Started IK reset worker (collision-aware return-to-rest).")
+
+        # The out-of-process video relay owns the cameras and streams the
+        # headset view. Its raw branch is forced onto pyshm so both this policy
+        # process and the recorder can read frames.
         relay = _start_video_relay(cfg, dataset_resolution, raw_transport="pyshm")
         expected = set(cfg.robot_config.observation_cameras().keys())
         if relay is None or not expected <= set(relay.raw_cameras):
@@ -898,19 +1220,67 @@ def _run(
                 "and check the camera serials."
             )
         robot.set_external_cameras({k: relay.raw_cameras[k] for k in expected})
-    except BaseException:
+        recorder_features = dataset_features_for_robot(
+            robot,
+            extra_features={"intervention": INTERVENTION_FEATURE},
+        )
+        if is_complete:
+            # The shared-memory readers now expose the exact downscaled shapes;
+            # verify the final contract before any CAN actuator is opened.
+            require_dataset_resume_schema(
+                dataset_root,
+                recorder_features,
+                fps=fps,
+                allowed_extra_features=frozenset({"observation.pose_lag"}),
+            )
+    except BaseException as setup_error:
+        setup_failures: list[tuple[str, BaseException]] = []
         if relay is not None:
-            relay.shutdown()
+            try:
+                relay.shutdown()
+            except BaseException as cleanup_error:
+                _logger.exception("video relay setup cleanup failed")
+                setup_failures.append(("video relay", cleanup_error))
+        if reset_controller is not None:
+            try:
+                reset_controller.stop()
+            except BaseException as cleanup_error:
+                _logger.exception("IK reset setup cleanup failed")
+                setup_failures.append(("IK reset worker", cleanup_error))
         try:
-            reset_controller.stop()
-        except Exception:  # noqa: BLE001
-            pass
+            policy.close()
+        except BaseException as cleanup_error:
+            _logger.exception("policy setup cleanup failed")
+            setup_failures.append(("policy", cleanup_error))
+        if _orig_affinity is not None:
+            try:
+                os.sched_setaffinity(0, _orig_affinity)
+            except OSError as cleanup_error:
+                setup_failures.append(("CPU affinity restore", cleanup_error))
+        for label, cleanup_error in setup_failures:
+            setup_error.add_note(
+                f"additional {label} cleanup failure: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        reset_failure = next(
+            (
+                failure
+                for label, failure in setup_failures
+                if label == "IK reset worker"
+            ),
+            None,
+        )
+        if reset_failure is not None:
+            mark_hardware_cleanup_uncertain(setup_error, reset_failure)
         raise
+
+    assert reset_controller is not None and relay is not None
 
     episodes_recorded = 0
     episode_idx = 0
     recorder: DatasetRecorderProcess | None = None
     control_thread: _DaggerControlLoop | None = None
+    control_worker_stopped = True
 
     def _return_to_rest_guarded(wait_retry: Callable[[], bool]) -> bool:
         """Guarded ``IKResetController`` home; ``False`` when aborted.
@@ -977,13 +1347,10 @@ def _run(
         finally:
             control.note_gate(_idle_gate_message())
 
+    session_error: BaseException | None = None
     try:
         log_say("Connecting robot...")
         robot.connect()
-
-        # Load the policy before the teleop connect so its checkpoint
-        # download / CUDA load doesn't contend with the IK worker's JIT.
-        policy.connect(robot)
 
         # Connect the VR teleop stack: the position source lets takeovers
         # sync the IK worker to the robot's measured pose, and the current
@@ -1004,26 +1371,6 @@ def _run(
         # this process. Mirrors collect-data.
         if is_complete:
             log_say(f"Resuming existing dataset at {dataset_root}.")
-            # An existing dataset's feature set is fixed; one created before
-            # the per-frame intervention flag existed can't gain it on resume
-            # (the recorder only tags rows when the dataset declares the
-            # feature) — interventions in new episodes would go untagged.
-            import json
-
-            try:
-                existing_features = json.loads((meta / "info.json").read_text()).get(
-                    "features", {}
-                )
-            except (OSError, ValueError):
-                existing_features = {}
-            if "intervention" not in existing_features:
-                _logger.warning(
-                    "resuming a dataset without the per-frame 'intervention' "
-                    "feature; new episodes won't carry LeRobot DAgger "
-                    "intervention tags (start a fresh dataset to record them)."
-                )
-        action_features = hw_to_dataset_features(robot.action_features, ACTION)
-        obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
         recorder = DatasetRecorderProcess(
             raw_cond=relay.raw_cond,
             raw_meta=relay.raw_meta,
@@ -1034,11 +1381,8 @@ def _run(
                 "root": root,
                 "dataset_root": str(dataset_root),
                 "is_complete": is_complete,
-                "features": {
-                    **action_features,
-                    **obs_features,
-                    "intervention": dict(INTERVENTION_FEATURE),
-                },
+                "features": recorder_features,
+                "allowed_resume_features": ["observation.pose_lag"],
                 "robot_type": robot.name,
                 "fps": fps,
                 "vcodec": vcodec,
@@ -1144,6 +1488,10 @@ def _run(
                 )
 
             teleop.set_intervention_allowed(True)
+            # Retain the exact worker and mark its resources owned before
+            # start(), so a partial thread-start failure also reaches the
+            # final liveness gate.
+            control_worker_stopped = False
             control_thread.start()
             control.begin_episode(_switch_subtask, len(subtasks))
 
@@ -1175,9 +1523,29 @@ def _run(
             except KeyboardInterrupt:
                 interrupted = True
 
-            control.end_episode()
-            control_thread.shutdown_event.set()
-            control_thread.join(timeout=5.0)
+            control_end_error: BaseException | None = None
+            try:
+                control.end_episode()
+            except BaseException as error:
+                control_end_error = error
+            control_worker_stopped, worker_stop_error = _stop_dagger_control_worker(
+                control_thread
+            )
+            if worker_stop_error is not None:
+                if control_thread.fatal_error is not None:
+                    worker_stop_error.add_note(
+                        "The control loop had already reported: "
+                        f"{type(control_thread.fatal_error).__name__}: "
+                        f"{control_thread.fatal_error}"
+                    )
+                if control_end_error is not None:
+                    worker_stop_error.add_note(
+                        "additional episode-control cleanup failure: "
+                        f"{type(control_end_error).__name__}: {control_end_error}"
+                    )
+                raise worker_stop_error
+            if control_end_error is not None:
+                raise control_end_error
             teleop.set_intervention_allowed(False)
             teleop.force_disengage()
             # Freeze the recorder's capture at a known row count: stops rows
@@ -1241,6 +1609,7 @@ def _run(
                 # (encoder frame drops). Discarded — keep the session up.
                 log_say(f"Episode NOT saved: {exc}")
                 continue
+            restore_dataset_ownership(dataset_root)
             episode_idx += 1
             episodes_recorded += 1
             control.note_saved()
@@ -1254,6 +1623,9 @@ def _run(
 
     except KeyboardInterrupt:
         pass
+    except BaseException as error:
+        session_error = error
+        raise
     finally:
         import signal
 
@@ -1263,49 +1635,98 @@ def _run(
             pass
 
         log_say("Stopping.")
-        try:
-            policy.close()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            robot.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            teleop.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            reset_controller.stop()
-        except Exception:  # noqa: BLE001
-            pass
+        cleanup_failures: list[tuple[str, BaseException]] = []
+
+        if not control_worker_stopped:
+            control_worker_stopped, final_worker_error = _stop_dagger_control_worker(
+                control_thread
+            )
+            if not control_worker_stopped:
+                ownership_error = HardwareCleanupError(
+                    "DAgger control loop remained alive after the final join; "
+                    "recorder and robot/teleop/relay ownership are uncertain"
+                )
+                if final_worker_error is not None:
+                    ownership_error.add_note(
+                        "additional final DAgger worker cleanup failure: "
+                        f"{type(final_worker_error).__name__}: {final_worker_error}"
+                    )
+                cleanup_failures.append(("DAgger control loop", ownership_error))
+            elif final_worker_error is not None:
+                cleanup_failures.append(("DAgger control loop", final_worker_error))
+
+        def _cleanup(
+            label: str,
+            cleanup: Callable[[], Any],
+            *,
+            requires_control_exit: bool = True,
+        ) -> BaseException | None:
+            error = _cleanup_dagger_resource(
+                control_stopped=control_worker_stopped or not requires_control_exit,
+                label=label,
+                cleanup=cleanup,
+            )
+            if error is not None:
+                cleanup_failures.append((label, error))
+            return error
+
+        _cleanup("policy", policy.close)
+        disconnect_failure = _cleanup("robot disconnect", robot.disconnect)
+        teleop_failure = _cleanup("teleop disconnect", teleop.disconnect)
+        reset_failure = _cleanup(
+            "IK reset worker",
+            reset_controller.stop,
+            requires_control_exit=False,
+        )
+        # Close the relay's raw/dataset branch before any reader detaches (a
+        # session error mid-episode leaves it open; see collect_data).
+        _cleanup("video relay raw branch", lambda: relay.set_raw_enabled(False))
         # Recorder owns the dataset: finalize (and empty-dataset cleanup)
         # happen in recorder.close(). Shut the relay down after it so the
         # recorder's shm readers never outlive their blocks.
         if recorder is not None:
-            try:
-                recorder.close()
-            except Exception:  # noqa: BLE001
-                _logger.exception("recorder close failed")
+            _cleanup("recorder", recorder.close)
+            _cleanup(
+                "dataset ownership restore",
+                lambda: restore_dataset_ownership(dataset_root),
+            )
         # Detach our own shared-memory readers (the robot's external cameras)
         # before their writer blocks go away with the relay, so the resource
         # tracker doesn't report them as leaked at exit.
-        for cam in relay.raw_cameras.values():
-            try:
-                cam.close()
-            except Exception:  # noqa: BLE001
-                pass
-        relay.shutdown()
+        for name, cam in relay.raw_cameras.items():
+            _cleanup(f"raw camera {name}", cam.close)
+        relay_failure = _cleanup("video relay", relay.shutdown)
 
         # Restore the process's original CPU affinity (the process may run
         # other operations after this one).
         if _orig_affinity is not None:
-            try:
-                os.sched_setaffinity(0, _orig_affinity)
-            except OSError:
-                pass
+            _cleanup(
+                "CPU affinity restore",
+                lambda: os.sched_setaffinity(0, _orig_affinity),
+                requires_control_exit=False,
+            )
 
         try:
             signal.signal(signal.SIGINT, signal.SIG_DFL)
         except (ValueError, OSError):
             pass
+        _finish_dagger_cleanup(
+            session_error=session_error,
+            disconnect_failure=disconnect_failure,
+            teleop_failure=teleop_failure,
+            reset_failure=reset_failure,
+            relay_failure=relay_failure,
+            additional_failures=tuple(
+                (label, failure)
+                for label, failure in cleanup_failures
+                if all(
+                    failure is not selected
+                    for selected in (
+                        disconnect_failure,
+                        teleop_failure,
+                        reset_failure,
+                        relay_failure,
+                    )
+                )
+            ),
+        )

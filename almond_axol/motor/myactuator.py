@@ -144,6 +144,8 @@ _MA_ERROR_MAP: list[tuple[int, MotorStatus]] = [
 
 def _float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
     """Encode a clamped float into a fixed-point uint for the MIT protocol byte layout."""
+    if not math.isfinite(x):
+        raise ValueError("cannot encode a non-finite motor command")
     x = max(x_min, min(x_max, x))
     return int((x - x_min) * ((1 << bits) - 1) / (x_max - x_min))
 

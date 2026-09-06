@@ -23,6 +23,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .paths import ALMOND_HOME_ENV, almond_home
 from .ports import VR_PORT
 from .sudo import prime_sudo, run_root
 
@@ -76,13 +77,20 @@ def _read_rule() -> str:
 def _operator_user() -> str | None:
     """Best-effort operator login to grant headset (``dialout``) access.
 
-    ``axol serve`` runs as root under systemd with no ``SUDO_USER``, so fall
-    back to the owner of the first ``/home/*`` entry — the same heuristic the
-    hosted installer uses to locate the operator's account.
+    ``axol serve`` runs as root under systemd with no ``SUDO_USER``, so use the
+    owner of its explicit ``ALMOND_HOME``. Older units without that environment
+    retain the first-``/home/*`` fallback.
     """
     user = os.environ.get("SUDO_USER")
     if user and user != "root":
         return user
+    if os.environ.get(ALMOND_HOME_ENV):
+        try:
+            user = almond_home().owner()
+            if user != "root":
+                return user
+        except (KeyError, OSError):
+            pass
     try:
         homes = sorted(Path("/home").iterdir())
     except OSError:

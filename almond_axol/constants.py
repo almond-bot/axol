@@ -38,8 +38,14 @@ CAN_CHEST = "can_alm_axol_c"
 # hotplug, and is also the sanctioned way to reset the interfaces at runtime:
 # it flaps both arm-hub channels *together* (flapping one at a time can wedge
 # the adapter's RX path). The CAN bus layer reuses it to purge stale TX frames
-# after an e-stop (see almond_axol/motor/bus.py).
-CAN_BRINGUP_SCRIPT: Path = Path.home() / ".almond" / "can" / "startup.sh"
+# after an e-stop (see almond_axol/motor/bus.py). It is executed as root by
+# cron/systemd, so it must live outside the operator-writable state tree.
+CAN_BRINGUP_SCRIPT: Path = Path("/etc/almond-axol/can/startup.sh")
+
+# Mantis handheld data-collection rig: one dual-channel adapter, each channel
+# wired to a single Damiao gripper (CAN ID 0x08, same as Joint.GRIPPER).
+CAN_MANTIS_LEFT = "can_mantis_l"
+CAN_MANTIS_RIGHT = "can_mantis_r"
 
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 
