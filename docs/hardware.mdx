@@ -1,6 +1,6 @@
 ---
-title: "Hardware Guide"
-description: "Overview and setup guide for Axol."
+title: "Axol Hardware"
+description: "Overview and setup guide for the Axol dual-arm robot, its mounts, and the Perception Kit."
 ---
 
 Axol is configured at order time from three choices:
@@ -20,7 +20,7 @@ Axol ships fully assembled and ready to mount. It attaches with four **M8×12 bo
 The back of the robot exposes the connectors used for power and camera control:
 
 - **2× GMSL2 ports** for the wrist cameras.
-- **1× XT90 connector** for power.
+- **1× XT90 connector** for power (**24V DC, 60A peak**).
 - **1× Locking USB-C connector** for control.
 
 ### Reference diagrams
@@ -180,6 +180,39 @@ Adjust the robot's height with the manual lift: insert the crank into the hole a
   Make sure the crank is inserted **all the way in** before turning it. It's easy to leave it partially seated, which can slip or damage the mechanism.
 </Warning>
 
+### Power
+
+This section applies to every configuration.
+
+Axol is powered at **24V DC, 60A peak** through the XT90 on the back of the robot. A matching supply ships in the box:
+
+| | |
+|---|---|
+| **Robot input** | 24V DC, 60A peak, XT90 |
+| **Included supply** | 1500W (24V, 62.5A) |
+| **DC cable** | 1.5m XT90 male–female |
+| **AC** | Power-supply AC cord |
+
+<Steps>
+  <Step title="Place the power supply">
+    Set the supply near the robot (on the cart, if you have one) so the XT90 cable comfortably reaches the back of the robot.
+  </Step>
+  <Step title="Connect DC">
+    Plug the XT90 cable from the robot into the power supply.
+  </Step>
+  <Step title="Connect AC">
+    Plug the AC cord from the supply into a wall outlet, then switch the supply on.
+  </Step>
+</Steps>
+
+<Note>
+  The supply is 1500W. Use a dedicated wall outlet.
+</Note>
+
+<Warning>
+  The Perception Kit's ZED Box is powered separately. Use the DC adapter that ships with it (**12–19V**, up to 60W).
+</Warning>
+
 ### Wiring
 
 This section applies to configurations with the **Perception Kit**.
@@ -187,8 +220,8 @@ This section applies to configurations with the **Perception Kit**.
 Place the ZED Box and the power supply near the robot (on Jelly, when fitted), then connect the cables:
 
 <Steps>
-  <Step title="Position the ZED Box and power supply">
-    Set the ZED Box and the power supply down so their cables comfortably reach the back of the robot.
+  <Step title="Position the ZED Box">
+    Set the ZED Box down so its camera, USB, and power cables comfortably reach the back of the robot.
   </Step>
   <Step title="Connect the head camera">
     Run the head camera's **GMSL** cable from the camera to the ZED Box.
@@ -196,15 +229,18 @@ Place the ZED Box and the power supply near the robot (on Jelly, when fitted), t
   <Step title="Connect the wrist cameras">
     Run the shorter **GMSL** cable from the wrist cameras to the GMSL port on the wrist.
   </Step>
-  <Step title="Connect the robot to the ZED Box and power">
-    From the back of the robot, run the **power** and **USB** cables to the ZED Box and power supply.
+  <Step title="Connect USB and ZED Box power">
+    From the back of the robot, run the **USB** cable to the ZED Box. Plug the ZED Box into its own DC adapter (see [Power](#power)).
   </Step>
 </Steps>
 
 ## Next steps
 
-<CardGroup cols={1}>
+<CardGroup cols={2}>
   <Card title="Installation" icon="download" href="/installation">
     Install Axol on the robot machine and open the web control panel.
+  </Card>
+  <Card title="Mantis Hardware" icon="hand" href="/mantis/hardware">
+    Set up the handheld Mantis rigs for collecting demonstrations without moving the robot.
   </Card>
 </CardGroup>

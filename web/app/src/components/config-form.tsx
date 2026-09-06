@@ -32,8 +32,8 @@ export interface FieldSuggestion {
  * A text input with an attached suggestion dropdown — one visual control, not
  * an input plus a separate picker. Focusing (or typing) opens a styled list
  * of suggestions filtered by the current text; clicking or Enter fills the
- * field, while any free-form text remains valid. Used for the dataset repo id
- * on the replay / collect-data panels.
+ * field, while any free-form text remains valid. Used for dataset repo ids on
+ * every operation panel.
  */
 function SuggestInput({
   id,

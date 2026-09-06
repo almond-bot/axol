@@ -311,8 +311,8 @@ function RunDetail({ id }: { id: string }) {
         </div>
       ) : (
         <p className="text-sm text-white/35">
-          No telemetry was captured for this run (the script owned the CAN bus and did not write
-          its own capture).
+          No telemetry was captured for this run (the script owned the CAN bus and did not write its
+          own capture).
         </p>
       )}
       <div>

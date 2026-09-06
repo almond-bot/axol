@@ -1,5 +1,5 @@
 import type { RefObject } from "react"
-import { useRef } from "react"
+import { useEffect, useRef } from "react"
 import { useFrame, useThree } from "@react-three/fiber"
 
 /**
@@ -39,6 +39,18 @@ export function useAxolTracking(wsRef: RefObject<WebSocket | null>): RefObject<b
   const prevEitherGripRef = useRef(false)
   // WebSocket we've attached the tracking listener to, to avoid re-attaching.
   const attachedWsRef = useRef<WebSocket | null>(null)
+  const listenerRef = useRef<((event: MessageEvent) => void) | null>(null)
+
+  useEffect(
+    () => () => {
+      if (attachedWsRef.current && listenerRef.current) {
+        attachedWsRef.current.removeEventListener("message", listenerRef.current)
+      }
+      attachedWsRef.current = null
+      listenerRef.current = null
+    },
+    []
+  )
 
   useFrame(() => {
     // Attach the tracking listener whenever the socket changes (added as an
@@ -46,13 +58,19 @@ export function useAxolTracking(wsRef: RefObject<WebSocket | null>): RefObject<b
     // engage state for the fresh connection.
     const ws = wsRef.current
     if (ws !== attachedWsRef.current) {
+      if (attachedWsRef.current && listenerRef.current) {
+        attachedWsRef.current.removeEventListener("message", listenerRef.current)
+      }
       attachedWsRef.current = ws
+      listenerRef.current = null
       engagedRef.current = false
       serverSeenRef.current = false
       mirrorEngagedRef.current = false
       prevBothGripsRef.current = false
       prevEitherGripRef.current = false
-      ws?.addEventListener("message", (event: MessageEvent) => {
+      if (!ws) return
+      const onMessage = (event: MessageEvent) => {
+        if (wsRef.current !== ws) return
         try {
           const msg = JSON.parse(event.data as string) as { type: string; value: unknown }
           if (msg.type === "tracking") {
@@ -62,7 +80,9 @@ export function useAxolTracking(wsRef: RefObject<WebSocket | null>): RefObject<b
         } catch {
           // ignore malformed messages
         }
-      })
+      }
+      listenerRef.current = onMessage
+      ws.addEventListener("message", onMessage)
     }
 
     const session = gl.xr.getSession()

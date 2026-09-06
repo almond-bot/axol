@@ -10,8 +10,12 @@ and receives action chunks back; the policy itself (``--policy_path`` /
 ``--policy_type`` / ``--device``) is selected by the *client*, so one server
 can serve different policies across sessions without restarting.
 
-    axol inference-server                 # listen on 0.0.0.0:8765
-    axol inference-server --port 9000
+This service has no transport authentication or encryption. Its non-loopback
+mode is for an isolated, trusted robot network protected by a host firewall;
+it must not be exposed to shared Wi-Fi or the public internet.
+
+    axol inference-server                              # listen on 0.0.0.0:8765
+    axol inference-server --host 192.168.1.99          # explicit LAN interface
 
 Then, on the robot:
 
@@ -34,7 +38,8 @@ class InferenceServerConfig:
 
     Args:
         host:      Interface to bind the gRPC server to. The default
-                   (0.0.0.0) accepts connections from the whole network.
+                   (0.0.0.0) accepts connections from the whole network;
+                   pass 127.0.0.1 to restrict the server to loopback.
         port:      gRPC port (must match run-policy's ``--server_port``).
         fps:       Action chunk rate; must match run-policy's ``--fps``.
         log_level: Python logging level.
@@ -51,13 +56,20 @@ def main(argv: list[str]) -> None:
     cfg = parse(InferenceServerConfig, argv)
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
-    from ..lerobot.inference_patch import disable_observation_similarity_filter
+    from ..lerobot.inference_patch import (
+        disable_observation_similarity_filter,
+        enable_action_schema_handshake,
+    )
 
     disable_observation_similarity_filter()
+    enable_action_schema_handshake()
 
+    # Register the Mantis relative-EE processor steps so checkpoints trained with
+    # `axol mantis.train` deserialize their processor pipelines here.
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve
 
+    from ..mantis import processor as _mantis_processor  # noqa: F401
     from ..utils.ports import reclaim_port
 
     # The gRPC port is fixed (it must match run-policy's ``--server_port``), so
@@ -68,6 +80,14 @@ def main(argv: list[str]) -> None:
     _logger.info(
         "Serving policy inference on %s:%d (Ctrl+C to stop).", cfg.host, cfg.port
     )
+    if cfg.host not in {"127.0.0.1", "::1", "localhost"}:
+        _logger.warning(
+            "Inference gRPC is plaintext and unauthenticated. Any reachable peer "
+            "can request supported checkpoint loads or impersonate the action "
+            "server. Allow only the intended robot IP through a host firewall on "
+            "an isolated trusted network; never expose this port to shared Wi-Fi "
+            "or the internet."
+        )
     try:
         serve(PolicyServerConfig(host=cfg.host, port=cfg.port, fps=cfg.fps))
     except KeyboardInterrupt:

@@ -109,6 +109,81 @@ def _snapshot_block_size(width: int, capacity: int = _SNAP_RING_CAPACITY) -> int
     )
 
 
+_GST_READER_STOP_TIMEOUT_S = 2.0
+
+
+def _set_gst_state_checked(pipeline: Any, gst: Any, state: Any, *, label: str) -> None:
+    """Change state and turn GStreamer's non-exception failure into an error."""
+    result = pipeline.set_state(state)
+    state_change_return = getattr(gst, "StateChangeReturn", None)
+    failure = (
+        getattr(state_change_return, "FAILURE", None)
+        if state_change_return is not None
+        else None
+    )
+    if failure is not None and result == failure:
+        raise RuntimeError(f"{label} GStreamer pipeline rejected state {state!s}")
+
+
+def _disconnect_gst_pull_reader(reader: Any, *, label: str) -> None:
+    """Stop one appsink pull owner without losing a live thread/pipeline.
+
+    Setting the pipeline to NULL first is the cancellation mechanism for a
+    native ``try-pull-sample`` call. Ownership fields are cleared only after
+    both that transition and thread exit are proved; retaining them lets the
+    recorder's second cleanup pass retry an uncertain teardown.
+    """
+    reader._stop.set()
+    pipeline = reader._pipeline
+    thread = reader._thread
+    primary_error: BaseException | None = None
+
+    def remember(error: BaseException) -> None:
+        nonlocal primary_error
+        if primary_error is None:
+            primary_error = error
+        else:
+            primary_error.add_note(
+                f"additional {label} teardown failure: {type(error).__name__}: {error}"
+            )
+
+    if pipeline is not None:
+        try:
+            _set_gst_state_checked(
+                pipeline,
+                reader._gst,
+                reader._gst.State.NULL,
+                label=label,
+            )
+        except BaseException as error:
+            remember(error)
+
+    if thread is not None:
+        try:
+            if thread.is_alive():
+                thread.join(timeout=_GST_READER_STOP_TIMEOUT_S)
+            thread_alive = thread.is_alive()
+        except BaseException as error:
+            remember(error)
+        else:
+            if thread_alive:
+                remember(
+                    RuntimeError(
+                        f"{label} pull thread did not stop within "
+                        f"{_GST_READER_STOP_TIMEOUT_S:g}s; reader ownership "
+                        "remains uncertain"
+                    )
+                )
+            else:
+                reader._thread = None
+
+    if primary_error is None:
+        reader._pipeline = None
+        reader._sink = None
+        return
+    raise primary_error
+
+
 def _block_size(width: int, height: int) -> int:
     return _HEADER_BYTES + 2 * width * height * _CHANNELS
 
@@ -355,12 +430,35 @@ class GstShmFrameReader:
 
     def connect(self, warmup: bool = True) -> None:
         """Start the shmsrc pipeline + pull thread (relay owns the camera)."""
-        self._sink = self._pipeline.get_by_name("raw")
-        self._pipeline.set_state(self._gst.State.PLAYING)
-        self._thread = threading.Thread(
-            target=self._pull_loop, name="recorder-shmsrc", daemon=True
-        )
-        self._thread.start()
+        del warmup
+        if self._pipeline is None:
+            raise RuntimeError("shmsrc raw-frame reader has already been closed")
+        if self._thread is not None:
+            raise RuntimeError("shmsrc raw-frame reader is already connected")
+        self._stop.clear()
+        try:
+            self._sink = self._pipeline.get_by_name("raw")
+            if self._sink is None:
+                raise RuntimeError("shmsrc raw-frame pipeline has no appsink 'raw'")
+            _set_gst_state_checked(
+                self._pipeline,
+                self._gst,
+                self._gst.State.PLAYING,
+                label="shmsrc raw-frame reader",
+            )
+            self._thread = threading.Thread(
+                target=self._pull_loop, name="recorder-shmsrc", daemon=True
+            )
+            self._thread.start()
+        except BaseException as error:
+            try:
+                self.disconnect()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "shmsrc raw-frame reader startup cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
 
     def _pull_loop(self) -> None:
         Gst = self._gst
@@ -449,17 +547,7 @@ class GstShmFrameReader:
         return self.read_at_or_after(0.0, timeout_ms=10000)[0]
 
     def disconnect(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        if self._pipeline is not None:
-            try:
-                self._pipeline.set_state(self._gst.State.NULL)
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                pass
-            self._pipeline = None  # type: ignore[assignment]
-        self._sink = None
+        _disconnect_gst_pull_reader(self, label="shmsrc raw-frame reader")
 
     # camera-compatible alias.
     close = disconnect
@@ -629,10 +717,17 @@ class EncodedAuReader:
         """Start shmsrc and verify that GDP delivers at least one coded AU."""
         self._sink = self._pipeline.get_by_name("au")
         self._pipeline.set_state(self._gst.State.PLAYING)
-        self._thread = threading.Thread(
-            target=self._pull_loop, name="recorder-au-shmsrc", daemon=True
-        )
-        self._thread.start()
+        try:
+            self._thread = threading.Thread(
+                target=self._pull_loop, name="recorder-au-shmsrc", daemon=True
+            )
+            self._thread.start()
+        except BaseException:
+            # A pipeline left PLAYING without its pull owner would hold the
+            # shm socket and leak the appsink backlog; roll back before
+            # surfacing the failure.
+            self.disconnect()
+            raise
         deadline = time.perf_counter() + 10.0
         while not self._first_sample.wait(0.05):
             with self._cond:
@@ -892,16 +987,7 @@ class EncodedAuReader:
         self._stop.set()
         with self._cond:
             self._cond.notify_all()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        if self._pipeline is not None:
-            try:
-                self._pipeline.set_state(self._gst.State.NULL)
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                pass
-            self._pipeline = None
-        self._sink = None
+        _disconnect_gst_pull_reader(self, label="encoded-AU reader")
 
     # camera-compatible alias.
     close = disconnect

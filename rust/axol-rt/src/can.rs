@@ -8,6 +8,13 @@ use std::io;
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
+/// `CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_ERR_FLAG` — the kernel ORs these into
+/// `can_frame.can_id`; a frame with any of them set is not a standard data
+/// frame.
+const CAN_FRAME_TYPE_FLAGS: u32 = 0xE000_0000;
+/// Standard-frame-format identifier mask (`CAN_SFF_MASK`).
+const CAN_SFF_MASK: u32 = 0x7FF;
+
 /// Classic CAN frame as the kernel defines it (`struct can_frame`).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -185,37 +192,47 @@ impl CanSock {
     }
 
     fn recv_with_flags(&self, flags: libc::c_int) -> io::Result<Option<Frame>> {
-        let mut frame = CanFrameRaw {
-            can_id: 0,
-            can_dlc: 0,
-            _pad: 0,
-            _res0: 0,
-            _res1: 0,
-            data: [0; 8],
-        };
-        let n = unsafe {
-            libc::recv(
-                self.fd,
-                &mut frame as *mut CanFrameRaw as *mut libc::c_void,
-                std::mem::size_of::<CanFrameRaw>(),
-                flags,
-            )
-        };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if matches!(
-                err.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ) {
-                return Ok(None);
+        loop {
+            let mut frame = CanFrameRaw {
+                can_id: 0,
+                can_dlc: 0,
+                _pad: 0,
+                _res0: 0,
+                _res1: 0,
+                data: [0; 8],
+            };
+            let n = unsafe {
+                libc::recv(
+                    self.fd,
+                    &mut frame as *mut CanFrameRaw as *mut libc::c_void,
+                    std::mem::size_of::<CanFrameRaw>(),
+                    flags,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) {
+                    return Ok(None);
+                }
+                return Err(err);
             }
-            return Err(err);
+            // Only standard 11-bit data frames carry motor traffic. An
+            // extended, remote-request, or error frame whose low bits happen
+            // to match a motor ID must not be mistaken for feedback (or, via
+            // the proxy, for a `can.setup` identity reply), so drop it and
+            // keep reading instead of masking the flags away.
+            if frame.can_id & CAN_FRAME_TYPE_FLAGS != 0 {
+                continue;
+            }
+            return Ok(Some(Frame {
+                id: frame.can_id & CAN_SFF_MASK,
+                data: frame.data,
+                len: frame.can_dlc,
+            }));
         }
-        Ok(Some(Frame {
-            id: frame.can_id & 0x7FF,
-            data: frame.data,
-            len: frame.can_dlc,
-        }))
     }
 
     /// Drop frames already queued without changing the receive timeout.

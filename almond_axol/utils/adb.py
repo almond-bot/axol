@@ -74,7 +74,12 @@ def _read_rule() -> str:
 
 
 def _operator_user() -> str | None:
-    """Best-effort operator login to grant headset (``dialout``) access."""
+    """Best-effort operator login to grant headset (``dialout``) access.
+
+    Delegates to :func:`~almond_axol.utils.rtprio.operator_user`, which also
+    resolves the owner of an explicit ``ALMOND_HOME`` for a root ``axol serve``
+    under systemd (no ``SUDO_USER``).
+    """
     return operator_user()
 
 

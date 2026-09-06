@@ -7,9 +7,10 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
 * ``adb``           — Android Debug Bridge + the Oculus udev rule, for
                       streaming Quest controller poses over a USB
                       ``adb reverse`` tunnel (see :mod:`almond_axol.utils.adb`).
-* ``zed.driver``    — replaces the ZED Box Duo's known-bad factory GMSL
-                      capture driver with the pinned release (takes effect on
-                      the next reboot; never reboots itself).
+* ``zed.driver``    — replaces a ZED Box's (Duo or Mini) outdated factory
+                      GMSL capture driver with the release pinned for the
+                      ZED SDK (takes effect on the next reboot; never reboots
+                      itself).
 * ``zed.install``   — the pyzed bindings (not on PyPI; needs the ZED SDK).
 * ``gst.install``   — the GStreamer + PyGObject ``appsink`` stack (PyGObject
                       builds against the system gobject-introspection and is
@@ -29,14 +30,18 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       ``LimitRTPRIO``); without it the relay silently runs
                       CFS and drops exposures under recording load (see
                       :mod:`almond_axol.utils.rtprio`).
+* ``tracker.install`` — pinned libsurvive + Vive USB permissions for Mantis
+                        Lighthouse tracking.
 
 Both the hosted installer (``web/app/public/install``) and the ``axol serve``
 self-updater (:mod:`almond_axol.serve.update`) run *this* command, so the set
 of steps lives in exactly one place and can't drift between them. Plain
-``axol provision`` keeps every step idempotent and best-effort (each self-gates
-on the ZED SDK / apt / NVENC), so it is safe to run on any host. The hosted
-installer and post-upgrade path add ``--require-rt``: optional hardware remains
-best-effort, but a failed required control-core install makes the command fail.
+``axol provision`` keeps every step idempotent (each self-gates on the ZED SDK /
+apt / NVENC), so it is safe to run on any host; a step that self-gates is not a
+failure, but a step that fails to repair the host is reported and makes the
+command exit non-zero once every other step has had its chance. The hosted
+installer and post-upgrade path pass ``--require-rt`` (accepted for
+compatibility: the required control-core install already fails the command).
 
 It does NOT pin Jetson clocks or steer the CAN adapters' interrupt — that's
 ``axol jetson.setup``, a per-boot runtime tweak owned by the systemd
@@ -45,13 +50,25 @@ It does NOT pin Jetson clocks or steer the CAN adapters' interrupt — that's
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from collections.abc import Callable
+import os
+import shutil
+import subprocess
+import sys
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from ..robot import gyro
 from ..rt import install as rt_install
 from ..utils import adb, rtprio
+from ..utils.host_update_lock import (
+    HOLDER_READY,
+    HostUpdateLockError,
+    host_update_lock,
+)
+from ..utils.sudo import prime_sudo, run_root
+from . import tracker_install
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
 from .zed import driver as zed_driver
@@ -63,6 +80,118 @@ _logger = logging.getLogger(__name__)
 # here keeps the no-SDK case quiet (zed.install otherwise hard-exits).
 _ZED_SDK = Path("/usr/local/zed")
 
+# Older releases generated these scripts below the operator-writable
+# ``~/.almond`` tree, then installed root cron/systemd references to them.  Do
+# not copy the scripts into the new privileged location: their bytes may have
+# been edited after setup.  Provisioning removes only exact references to the
+# known generated filenames; the next ``axol can.setup`` regenerates trusted
+# root-owned copies under /etc/almond-axol/can.
+_PRE_MANTIS_NAME = "u" + "mi"
+_LEGACY_CAN_SCRIPT_NAMES = frozenset(
+    {
+        "startup.sh",
+        "startup_mantis.sh",
+        f"startup_{_PRE_MANTIS_NAME}.sh",
+        "rp1-usb-quirk.sh",
+    }
+)
+_LEGACY_CAN_UNIT_FILES = (
+    Path("/etc/systemd/system/axol-can-up.service"),
+    Path("/etc/systemd/system/axol-can-mantis-up.service"),
+    Path(f"/etc/systemd/system/axol-can-{_PRE_MANTIS_NAME}-up.service"),
+    Path("/etc/systemd/system/axol-rp1-usb-quirk.service"),
+)
+
+
+def _is_legacy_operator_can_script(value: str) -> bool:
+    """Whether ``value`` is one exact historical ``~/.almond/can`` script."""
+    path = Path(value)
+    return bool(
+        path.is_absolute()
+        and path.name in _LEGACY_CAN_SCRIPT_NAMES
+        and path.parent.name == "can"
+        and path.parent.parent.name == ".almond"
+    )
+
+
+def _neutralize_legacy_can_root_execution() -> bool:
+    """Remove root execution references to operator-writable CAN scripts.
+
+    Returns ``True`` only when at least one reference was removed. Unrelated
+    root cron lines and systemd units are preserved byte-for-byte.
+    """
+    replacement_crontab: str | None = None
+
+    if shutil.which("crontab") is not None:
+        # Force a stable diagnostic so the normal "root has no crontab" case
+        # is distinguishable from a real inspection failure on localized
+        # hosts.  Unknown failures remain fatal.
+        current = run_root(["env", "LC_ALL=C", "crontab", "-l"])
+        if current.returncode == 0:
+            lines = (current.stdout or "").splitlines()
+            kept: list[str] = []
+            for line in lines:
+                prefix = "@reboot "
+                candidate = line[len(prefix) :] if line.startswith(prefix) else ""
+                if candidate and _is_legacy_operator_can_script(candidate):
+                    continue
+                kept.append(line)
+            if len(kept) != len(lines):
+                replacement_crontab = "\n".join(kept)
+                if kept:
+                    replacement_crontab += "\n"
+        elif "no crontab" not in (current.stderr or "").lower():
+            detail = (current.stderr or "").strip() or f"exit {current.returncode}"
+            raise RuntimeError(f"could not inspect root crontab: {detail}")
+
+    unsafe_units: list[Path] = []
+    exec_prefix = "ExecStart=/bin/bash "
+    for unit_file in _LEGACY_CAN_UNIT_FILES:
+        try:
+            lines = unit_file.read_text().splitlines()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(f"could not inspect {unit_file}: {exc}") from exc
+        unsafe = any(
+            line.startswith(exec_prefix)
+            and _is_legacy_operator_can_script(line[len(exec_prefix) :])
+            for line in lines
+        )
+        if not unsafe:
+            continue
+        unsafe_units.append(unit_file)
+
+    # Plan first, then prove every unsafe unit is stopped and disabled before
+    # removing any scheduler reference.  In particular, never delete a unit
+    # file while an attacker-modified legacy script may still be running: once
+    # the definition is gone a failed stop is harder to retry or diagnose.
+    for unit_file in unsafe_units:
+        run_root(["systemctl", "stop", unit_file.name], check=True)
+        run_root(["systemctl", "disable", unit_file.name], check=True)
+
+    for unit_file in unsafe_units:
+        run_root(["rm", "-f", str(unit_file)], check=True)
+    if unsafe_units:
+        run_root(["systemctl", "daemon-reload"], check=True)
+
+    if replacement_crontab is not None:
+        run_root(
+            ["crontab", "-"],
+            input_text=replacement_crontab,
+            check=True,
+        )
+
+    scrubbed = bool(unsafe_units) or replacement_crontab is not None
+    if scrubbed:
+        print(
+            "WARNING: Removed legacy root cron/systemd references to "
+            "operator-writable CAN scripts. Run `sudo axol can.setup` with "
+            "the adapters attached to restore boot/hotplug CAN bring-up from "
+            "root-owned /etc/almond-axol/can scripts."
+        )
+    return scrubbed
+
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``provision`` subcommand."""
@@ -70,20 +199,23 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         "provision",
         help=(
             "Install/refresh the non-PyPI + system pieces "
-            "(cameras, adb, board access, the operator's real-time scheduling "
-            "grant, and the axol-rt control core)."
+            "(cameras, adb, Lighthouse tracking, board access, the operator's "
+            "real-time scheduling grant, and the axol-rt control core)."
         ),
     )
     parser.add_argument(
         "--require-rt",
         action="store_true",
-        help="exit non-zero if the required axol-rt core cannot be installed",
+        help=(
+            "exit non-zero if the required axol-rt core cannot be installed "
+            "(accepted for compatibility; every failed step already does)"
+        ),
     )
     parser.set_defaults(func=run)
 
 
 def _step(label: str, fn: Callable[[], object]) -> bool:
-    """Run one step and report success, logging failures without stopping."""
+    """Run one step and report failure without preventing later repairs."""
     try:
         fn()
     except SystemExit as exc:  # a step (e.g. zed.install) may hard-exit on failure
@@ -96,43 +228,107 @@ def _step(label: str, fn: Callable[[], object]) -> bool:
     return True
 
 
+_HOLDER_COMMAND = [sys.executable, "-m", "almond_axol.utils.host_update_lock"]
+
+
+@contextlib.contextmanager
+def _sudo_held_update_lock() -> Iterator[None]:
+    """Own the root-only host update lock from an operator's terminal run.
+
+    The hosted installer and the managed ``axol serve`` are root and take the
+    lock directly. From a source checkout the steps must keep running as the
+    operator — their ``uv``, download caches, and venv — so only a small
+    holder process escalates. It prints a ready line once it owns the lock and
+    releases it when this process closes the pipe (or exits).
+    """
+    if not prime_sudo():
+        raise HostUpdateLockError(
+            "the host update lock needs sudo; rerun from a terminal that can "
+            "authorize it, or as root"
+        )
+    holder = subprocess.Popen(
+        ["sudo", "-n", *_HOLDER_COMMAND],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdin is not None and holder.stdout is not None
+    try:
+        ready = holder.stdout.readline().strip()
+        if ready != HOLDER_READY:
+            raise HostUpdateLockError("the lock holder did not start")
+        yield
+    finally:
+        holder.stdin.close()
+        holder.wait()
+
+
 def run(_args: object = None) -> None:
     """Run every provisioning step in order; each self-gates and is idempotent."""
     # Surface each step's INFO outcome (what was granted/installed, or already
     # in place) so a run at a customer site is verifiable from its output alone;
     # force=True in case an imported dependency already installed a handler.
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    lock = host_update_lock if os.geteuid() == 0 else _sudo_held_update_lock
+    try:
+        with lock():
+            _run_locked()
+    except HostUpdateLockError as exc:
+        raise SystemExit(f"Axol provisioning could not start: {exc}") from exc
+
+
+def _run_locked() -> None:
+    """Provision while the caller owns the host-wide mutation lock."""
+    # Security migration, not a best-effort dependency: if inspection or
+    # removal fails, abort provisioning rather than silently leaving a root
+    # scheduler pointed at an operator-writable executable.
+    _neutralize_legacy_can_root_execution()
+
+    failed: list[str] = []
+
+    def step(label: str, fn: Callable[[], object]) -> None:
+        if not _step(label, fn):
+            failed.append(label)
+
     # adb + the Oculus udev rule (which hands the headset to the `dialout`
     # group operators already have, so adb needs no extra group or re-login)
     # and adds the operator to that group — for streaming Quest controller
     # poses over a USB `adb reverse` tunnel (avoids WiFi latency). Self-gates
     # on apt-get.
-    _step("adb (Quest-over-USB)", adb.install)
-    # ZED Box Duo units ship with a known-bad factory GMSL capture driver;
-    # replace it with the pinned release. Self-gates on the factory package
-    # being present (ensure_driver, not run: a *quiet* no-op everywhere else)
-    # and never reboots — the new kernel driver loads on the next reboot, so
-    # it just prints a notice.
-    _step("ZED Box camera driver (zed.driver)", zed_driver.ensure_driver)
+    step("adb (Quest-over-USB)", adb.install)
+    step("Lighthouse tracking (tracker.install)", tracker_install.run)
+    # ZED Box units (Duo and Mini) ship with whatever GMSL capture driver was
+    # current at flash time, and the ZED SDK needs a matching one; replace an
+    # outdated driver with the pinned release. Self-gates on a stereolabs-zed*
+    # package being present (ensure_driver, not run: a *quiet* no-op everywhere
+    # else) and never reboots — the new kernel driver loads on the next reboot,
+    # so it just prints a notice.
+    step("ZED Box camera driver (zed.driver)", zed_driver.ensure_driver)
     # Group access to the board IMU's sampling timer, so teleop can start the
     # Jelly's yaw reference without root. Self-gates on the driver's presence.
-    _step("board IMU (gyro.install)", gyro.install)
+    step("board IMU (gyro.install)", gyro.install)
     # Persistent rtprio allowance for the operator's login, so a manual
     # `axol serve` can run the camera relay's capture chain SCHED_FIFO like
     # the systemd unit does (LimitRTPRIO). Applies at the next login.
-    _step("rtprio grant (utils.rtprio)", rtprio.install)
+    step("rtprio grant (utils.rtprio)", rtprio.install)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
-        _step("pyzed (zed.install)", zed_install.run)
+        step("pyzed (zed.install)", zed_install.run)
     else:
         print("No ZED SDK at /usr/local/zed; skipping pyzed + zed-gstreamer build.")
-    _step("GStreamer + PyGObject (gst.install)", gst_install.run)
+    step("GStreamer + PyGObject (gst.install)", gst_install.run)
     if have_sdk:
-        _step("patched zed-gstreamer plugins (gst.build-zed)", gst_build_zed.run)
+        step("patched zed-gstreamer plugins (gst.build-zed)", gst_build_zed.run)
     # The required axol-rt hardware control core: rustup toolchain if needed,
     # then build from the in-repo crate (dev checkout) or from the sources
-    # at the installed package's exact ref (tool installs). Self-gates on
-    # network/toolchain availability like every other step.
-    rt_ok = _step("axol-rt realtime core (rt.install)", rt_install.run)
-    if getattr(_args, "require_rt", False) and not rt_ok:
-        raise SystemExit(1)
+    # at the installed package's exact ref (tool installs). Like every other
+    # step it is reported rather than aborting the run, and any failure makes
+    # the command exit non-zero below.
+    step("axol-rt realtime core (rt.install)", rt_install.run)
+
+    if failed:
+        raise SystemExit(
+            "Provisioning failed for: "
+            + ", ".join(failed)
+            + ". See the log above, repair the host, and retry."
+        )

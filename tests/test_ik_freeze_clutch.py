@@ -94,6 +94,7 @@ def _step_worker() -> IKWorker:
         ik_frequency=120.0,
         position_multiplier=1.0,
         rotation_multiplier=1.0,
+        absolute_mode=False,
     )
     worker._solver = _SeedLeftSolver()
     worker._use_elbow = False

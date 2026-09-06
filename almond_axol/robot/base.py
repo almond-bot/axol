@@ -8,6 +8,31 @@ from typing import Self
 import numpy as np
 
 
+class HardwareCleanupError(RuntimeError):
+    """Hardware teardown failed, so another owner must not reacquire its bus."""
+
+
+_CLEANUP_UNCERTAIN_ATTR = "_axol_hardware_cleanup_uncertain"
+
+
+def mark_hardware_cleanup_uncertain(
+    error: BaseException, cleanup_error: BaseException
+) -> None:
+    """Preserve ``error`` while telling the runner that teardown also failed."""
+    setattr(error, _CLEANUP_UNCERTAIN_ATTR, True)
+    error.add_note(
+        "Robot cleanup also failed; hardware ownership is uncertain: "
+        f"{type(cleanup_error).__name__}: {cleanup_error}"
+    )
+
+
+def is_hardware_cleanup_uncertain(error: BaseException) -> bool:
+    """Whether an exception proves hardware handoff did not complete."""
+    return isinstance(error, HardwareCleanupError) or bool(
+        getattr(error, _CLEANUP_UNCERTAIN_ATTR, False)
+    )
+
+
 class RobotBase(ABC):
     """Common interface for the Axol hardware robot and the viser simulation.
 
@@ -38,7 +63,14 @@ class RobotBase(ABC):
 
     async def __aexit__(self, *_: object) -> None:
         """Exit the async context, disabling the robot via :meth:`disable`."""
-        await self.disable()
+        try:
+            await self.disable()
+        except HardwareCleanupError:
+            raise
+        except BaseException as exc:
+            raise HardwareCleanupError(
+                "robot disable failed; hardware ownership is uncertain"
+            ) from exc
 
     @abstractmethod
     async def get_positions(self) -> tuple[np.ndarray | None, np.ndarray | None]:

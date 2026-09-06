@@ -5,7 +5,13 @@ import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { cn } from "@/lib/utils"
-import { fetchCanInterfaces, type CanInterface, type RobotChannels } from "@/lib/supervisor"
+import {
+  fetchCanInterfaces,
+  fetchSettings,
+  type CanInterface,
+  type HardwareProfile,
+  type RobotChannels,
+} from "@/lib/supervisor"
 
 type ArmsMode = "both" | "left" | "right"
 
@@ -15,9 +21,37 @@ const ARMS_MODES: { key: ArmsMode; label: string }[] = [
   { key: "right", label: "Right only" },
 ]
 
-const DEFAULTS: Record<"left" | "right", string> = {
-  left: "can_alm_axol_l",
-  right: "can_alm_axol_r",
+const DEFAULTS: Record<HardwareProfile, Record<"left" | "right", string>> = {
+  axol: { left: "can_alm_axol_l", right: "can_alm_axol_r" },
+  mantis: { left: "can_mantis_l", right: "can_mantis_r" },
+}
+
+type ChannelDrafts = Record<HardwareProfile, Record<"left" | "right", string>>
+
+function channelsToDraft(
+  channels: RobotChannels | null | undefined,
+  profile: HardwareProfile
+): Record<"left" | "right", string> {
+  if (!channels) return { ...DEFAULTS[profile] }
+  return { left: channels.left ?? "", right: channels.right ?? "" }
+}
+
+function storedChannel(value: unknown, fallback: string): string {
+  if (value == null) return fallback
+  const text = String(value).trim()
+  if (!text) return fallback
+  return text.toLowerCase() === "null" || text.toLowerCase() === "none" ? "" : text
+}
+
+function storedProfileChannels(
+  values: Record<string, unknown>,
+  profile: HardwareProfile
+): Record<"left" | "right", string> {
+  const prefix = profile === "mantis" ? "mantis" : "robot"
+  return {
+    left: storedChannel(values[`${prefix}.left_channel`], DEFAULTS[profile].left),
+    right: storedChannel(values[`${prefix}.right_channel`], DEFAULTS[profile].right),
+  }
 }
 
 function initialMode(channels: RobotChannels | null | undefined): ArmsMode {
@@ -36,20 +70,29 @@ function initialMode(channels: RobotChannels | null | undefined): ArmsMode {
  * automatically, and interface names never need to be retyped per run.
  */
 export function CanAdapterDialog({
+  profile: initialProfile,
   channels,
   busy,
   onConnect,
   onClose,
 }: {
+  profile: HardwareProfile
   /** Currently configured interfaces (prefills the form); null when unknown. */
   channels: RobotChannels | null | undefined
   busy: boolean
-  onConnect: (channels: RobotChannels) => void
+  onConnect: (profile: HardwareProfile, channels: RobotChannels) => void
   onClose: () => void
 }) {
-  const [mode, setMode] = useState<ArmsMode>(() => initialMode(channels))
-  const [left, setLeft] = useState(channels?.left ?? DEFAULTS.left)
-  const [right, setRight] = useState(channels?.right ?? DEFAULTS.right)
+  const [profile, setProfile] = useState<HardwareProfile>(initialProfile)
+  const [mode, setMode] = useState<ArmsMode>(() =>
+    initialProfile === "axol" ? initialMode(channels) : "both"
+  )
+  const [drafts, setDrafts] = useState<ChannelDrafts>(() => ({
+    axol: initialProfile === "axol" ? channelsToDraft(channels, "axol") : { ...DEFAULTS.axol },
+    mantis:
+      initialProfile === "mantis" ? channelsToDraft(channels, "mantis") : { ...DEFAULTS.mantis },
+  }))
+  const [mappingsLoading, setMappingsLoading] = useState(true)
   const [detected, setDetected] = useState<CanInterface[] | null>(null)
   // Listing failed (offline host, or a serve release predating the
   // /api/can/interfaces endpoint) — different from "queried, none found".
@@ -57,6 +100,25 @@ export function CanAdapterDialog({
 
   useEffect(() => {
     let active = true
+    // Robot status only contains the currently active profile. Read the shared
+    // settings as well so changing tabs restores each profile's persisted
+    // custom mapping instead of replacing it with the built-in defaults.
+    fetchSettings()
+      .then(({ values }) => {
+        if (!active) return
+        const stored: ChannelDrafts = {
+          axol: storedProfileChannels(values, "axol"),
+          mantis: storedProfileChannels(values, "mantis"),
+        }
+        setDrafts(stored)
+        setMode(initialMode(stored.axol))
+      })
+      // An older host may not expose shared settings. Keep the current
+      // profile from robot status and the other profile's safe defaults.
+      .catch(() => undefined)
+      .finally(() => {
+        if (active) setMappingsLoading(false)
+      })
     fetchCanInterfaces()
       .then(({ interfaces }) => {
         if (active) setDetected(interfaces)
@@ -72,17 +134,39 @@ export function CanAdapterDialog({
     }
   }, [])
 
-  const wantLeft = mode !== "right"
-  const wantRight = mode !== "left"
-  const valid = (!wantLeft || left.trim() !== "") && (!wantRight || right.trim() !== "")
+  const { left, right } = drafts[profile]
+  const wantLeft = profile === "mantis" || mode !== "right"
+  const wantRight = profile === "mantis" || mode !== "left"
+  const leftChannel = left.trim()
+  const rightChannel = right.trim()
+  const mantisError =
+    profile !== "mantis"
+      ? null
+      : !leftChannel || !rightChannel
+        ? "Mantis requires a CAN interface for both grippers."
+        : leftChannel === rightChannel
+          ? "Mantis left and right must use two distinct CAN interfaces."
+          : null
+  const valid =
+    !mappingsLoading &&
+    (profile === "mantis"
+      ? mantisError === null
+      : (!wantLeft || leftChannel !== "") && (!wantRight || rightChannel !== ""))
 
   const selection: RobotChannels = useMemo(
     () => ({
-      left: wantLeft ? left.trim() : null,
-      right: wantRight ? right.trim() : null,
+      left: wantLeft ? leftChannel : null,
+      right: wantRight ? rightChannel : null,
     }),
-    [wantLeft, wantRight, left, right]
+    [wantLeft, wantRight, leftChannel, rightChannel]
   )
+
+  const setChannel = (side: "left" | "right", value: string) => {
+    setDrafts((current) => ({
+      ...current,
+      [profile]: { ...current[profile], [side]: value },
+    }))
+  }
 
   return (
     <div
@@ -97,10 +181,9 @@ export function CanAdapterDialog({
           <div className="flex flex-col gap-1">
             <h3 className="font-heading text-base font-semibold">CAN adapter</h3>
             <p className="text-sm leading-relaxed text-white/45">
-              Pick the SocketCAN interface of the adapter driving each arm — one adapter is enough
-              for a single arm (the other arm is then skipped everywhere). The mapping is saved and
-              applied to every diagnostic, calibration tool and operation; reopen this dialog to
-              change it. The Axol hub adapter&apos;s own interfaces are the prefilled defaults.
+              Choose Axol or Mantis, then the SocketCAN interface for each side. Axol mappings are
+              shared with robot operations; Mantis selection drives the diagnostics link without
+              changing the robot&apos;s saved channels.
             </p>
           </div>
           <Button
@@ -115,22 +198,54 @@ export function CanAdapterDialog({
         </div>
 
         <div className="flex self-start overflow-hidden rounded-md border border-white/10">
-          {ARMS_MODES.map((m) => (
+          {(["axol", "mantis"] as HardwareProfile[]).map((item) => (
             <button
-              key={m.key}
+              key={item}
               type="button"
-              onClick={() => setMode(m.key)}
+              onClick={() => setProfile(item)}
+              disabled={busy || mappingsLoading}
               className={cn(
-                "px-3 py-1.5 text-xs transition-colors",
-                mode === m.key
+                "px-3 py-1.5 text-xs capitalize transition-colors",
+                profile === item
                   ? "bg-[#eff483]/15 text-[#eff483]"
                   : "text-white/50 hover:bg-white/[0.05]"
               )}
             >
-              {m.label}
+              {item}
             </button>
           ))}
         </div>
+
+        {profile === "axol" ? (
+          <div className="flex self-start overflow-hidden rounded-md border border-white/10">
+            {ARMS_MODES.map((m) => (
+              <button
+                key={m.key}
+                type="button"
+                onClick={() => setMode(m.key)}
+                disabled={busy || mappingsLoading}
+                className={cn(
+                  "px-3 py-1.5 text-xs transition-colors",
+                  mode === m.key
+                    ? "bg-[#eff483]/15 text-[#eff483]"
+                    : "text-white/50 hover:bg-white/[0.05]"
+                )}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <p className="text-xs leading-relaxed text-white/45">
+            Mantis always connects both grippers over two distinct CAN interfaces.
+          </p>
+        )}
+
+        {mappingsLoading && (
+          <p className="flex items-center gap-1.5 text-xs text-white/40">
+            <Loader2 className="size-3 animate-spin" /> Loading saved mappings…
+          </p>
+        )}
 
         {detected != null && detected.length === 0 && (
           <p className="rounded-md border border-amber-400/25 bg-amber-400/[0.05] p-2.5 text-xs leading-relaxed text-amber-100/90">
@@ -145,28 +260,30 @@ export function CanAdapterDialog({
 
         {wantLeft && (
           <ChannelField
-            label="Left arm interface"
+            label={`Left ${profile === "mantis" ? "gripper" : "arm"} interface`}
             value={left}
             detected={detected ?? []}
-            disabled={busy}
-            onChange={setLeft}
+            disabled={busy || mappingsLoading}
+            onChange={(value) => setChannel("left", value)}
           />
         )}
         {wantRight && (
           <ChannelField
-            label="Right arm interface"
+            label={`Right ${profile === "mantis" ? "gripper" : "arm"} interface`}
             value={right}
             detected={detected ?? []}
-            disabled={busy}
-            onChange={setRight}
+            disabled={busy || mappingsLoading}
+            onChange={(value) => setChannel("right", value)}
           />
         )}
+
+        {mantisError && <p className="text-xs text-amber-300/80">{mantisError}</p>}
 
         <div className="flex items-center justify-end gap-2 pt-1">
           <Button variant="ghost" size="sm" onClick={onClose}>
             Cancel
           </Button>
-          <Button size="sm" onClick={() => onConnect(selection)} disabled={busy || !valid}>
+          <Button size="sm" onClick={() => onConnect(profile, selection)} disabled={busy || !valid}>
             {busy ? <Loader2 className="animate-spin" /> : <Plug />} Save &amp; connect
           </Button>
         </div>

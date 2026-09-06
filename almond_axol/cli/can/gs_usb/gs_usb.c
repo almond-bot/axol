@@ -27,6 +27,11 @@
 #define USB_CANDLELIGHT_VENDOR_ID  0x1209
 #define USB_CANDLELIGHT_PRODUCT_ID 0x2323
 
+/* CANable 2.0 running the stock canable2 firmware (github.com/normaldotcom/
+ * canable2) — gs_usb-compatible adapters like the Mantis rig's CAN board. */
+#define USB_CANABLE2_VENDOR_ID     0x16d0
+#define USB_CANABLE2_PRODUCT_ID    0x117e
+
 /* Endpoint addresses are read from the interface descriptor at probe time
  * (backport of upstream "can: gs_usb: gs_usb_probe(): read endpoints from
  * interface descriptor"). Older firmware uses EP1 IN / EP2 OUT, newer
@@ -868,7 +873,7 @@ static struct gs_can *gs_make_candev(unsigned int channel,
 	netdev->netdev_ops = &gs_usb_netdev_ops;
 
 	netdev->flags |= IFF_ECHO; /* we support full roundtrip echo */
-	netdev->dev_id = channel;  /* backport of upstream 04c9b00ba835
+	netdev->dev_id = channel;  /* backport of upstream acff76fa45b4
 				    * ("can: gs_usb: gs_make_candev(): set
 				    * netdev->dev_id") so userspace can tell
 				    * the two channels apart */
@@ -1078,6 +1083,8 @@ static const struct usb_device_id gs_usb_table[] = {
 				      USB_GSUSB_1_PRODUCT_ID, 0) },
 	{ USB_DEVICE_INTERFACE_NUMBER(USB_CANDLELIGHT_VENDOR_ID,
 				      USB_CANDLELIGHT_PRODUCT_ID, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(USB_CANABLE2_VENDOR_ID,
+				      USB_CANABLE2_PRODUCT_ID, 0) },
 	{} /* Terminating entry */
 };
 
@@ -1097,4 +1104,5 @@ MODULE_DESCRIPTION(
 "Socket CAN device driver for Geschwister Schneider Technologie-, "
 "Entwicklungs- und Vertriebs UG. USB2.0 to CAN interfaces\n"
 "and bytewerk.org candleLight USB CAN interfaces.");
+MODULE_VERSION("almond-5.15.148-hub2");
 MODULE_LICENSE("GPL v2");

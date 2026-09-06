@@ -663,7 +663,7 @@ class DatasetRecorderCaptureErrorTest(unittest.TestCase):
         with self.assertRaisesRegex(RecorderCaptureError, "alignment failed"):
             recorder.finish_episode()
 
-        self.assertEqual(conn.sent, [("finish_episode",)])
+        self.assertEqual(conn.sent, [("finish_episode", None)])
         self.assertEqual(recorder._capture_error, "camera alignment failed")
 
     def test_process_finish_non_capture_error_stays_fatal(self) -> None:

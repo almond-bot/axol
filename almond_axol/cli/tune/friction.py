@@ -54,6 +54,12 @@ from ...tuning import (
     ramp_stages,
     sweep_safety,
 )
+from ...utils.paths import almond_home
+from ...utils.state_files import (
+    privileged_service_active,
+    require_path_beneath,
+    secure_open_new_text,
+)
 from ..motor import add_side_and_channel_arguments, resolve_channel
 
 _TAU = 2 * math.pi
@@ -408,7 +414,7 @@ async def _identify_joint(
     csv_file = None
     csv_writer = None
     if dump_csv is not None:
-        csv_file = dump_csv.open("w", newline="")
+        csv_file = secure_open_new_text(dump_csv, newline="")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(
             [
@@ -575,7 +581,14 @@ async def _run(args: argparse.Namespace) -> None:
     elif args.dump_csv is not None:
         dump_csv = Path(args.dump_csv)
     if dump_csv is not None:
-        dump_csv.parent.mkdir(parents=True, exist_ok=True)
+        if privileged_service_active():
+            if not dump_csv.is_absolute():
+                dump_csv = almond_home() / dump_csv
+            dump_csv = require_path_beneath(
+                dump_csv,
+                almond_home(),
+                label="friction CSV output",
+            )
 
     velocities_rad = [math.radians(v) for v in args.velocities]
 

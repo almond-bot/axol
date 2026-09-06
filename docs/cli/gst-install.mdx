@@ -18,5 +18,5 @@ This command:
 The [one-command install](/installation) runs this for you. It is **not** run at `teleop` / `serve` startup — those entry points just run; install (the source-plugin build [`gst.build-zed`](/cli/gst-build-zed) and the Jetson clock setup [`jetson.setup`](/cli/jetson-setup)) is owned by the installer.
 
 <Note>
-  Best-effort and idempotent: it skips when the stack is already present, and is a no-op on machines without `apt-get`. When the gst stack is unavailable the cameras fall back to the ZED Python SDK grab path (higher latency).
+  Jetson-only, best-effort, and idempotent: it skips on non-L4T hosts, on machines without `apt-get`, and when the stack is already present. On a non-Jetson Linux workstation, seeing the ZED SDK at `/usr/local/zed` does not trigger installation of the Jetson-only NVENC elements; cameras use the ZED Python SDK path instead. When the gst stack is unavailable on a Jetson, that same SDK path is the higher-latency fallback.
 </Note>

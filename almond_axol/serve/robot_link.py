@@ -34,14 +34,26 @@ import asyncio
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
-from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..constants import (
+    ARM_JOINTS,
+    CAN_LEFT,
+    CAN_MANTIS_LEFT,
+    CAN_MANTIS_RIGHT,
+    CAN_RIGHT,
+)
 from ..motor import BusObserver, CanBus, Joint, Motor, MotorError
 from ..motor.config import DamiaoParam
 from ..motor.damiao import DamiaoMotor
 from ..motor.myactuator import MyActuatorMotor, mit_ranges
 from ..teleop_activity import active_teleop
+from ..utils.can_channels import (
+    require_distinct_axol_channels,
+    require_mantis_channels,
+)
+from .commands import flag_enabled
 from .telemetry import SAMPLE_HZ, TelemetryHub, motor_key
 
 _logger = logging.getLogger(__name__)
@@ -116,11 +128,6 @@ def motor_faults(
     return faults
 
 
-def _flag(value: Any) -> bool:
-    """A submitted form flag: real booleans or the string \"true\"."""
-    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
-
-
 def _joint_name_for_id(value: Any) -> str | None:
     """Joint name for a motor CAN id (0x01–0x08 in Joint order), else None."""
     try:
@@ -151,22 +158,22 @@ def scoped_motor_faults(
     arm = str(args.get("arm") or "").strip().lower()
     if arm in ("left", "right"):
         faults = [f for f in faults if f["arm"] == arm]
-    if _flag(args.get("no_left")):
+    if flag_enabled(args.get("no_left")):
         faults = [f for f in faults if f["arm"] != "left"]
-    if _flag(args.get("no_right")):
+    if flag_enabled(args.get("no_right")):
         faults = [f for f in faults if f["arm"] != "right"]
 
     joint_names: set[str] | None = None
     joints = args.get("joints")
     if isinstance(joints, str) and joints.strip():
         joint_names = {p.strip().upper() for p in joints.split(",") if p.strip()}
-    elif not _flag(args.get("guided")):
+    elif not flag_enabled(args.get("guided")):
         joint = _joint_name_for_id(args.get("id") or args.get("current_id"))
         if joint is not None:
             joint_names = {joint}
     if joint_names is not None:
         faults = [f for f in faults if f["joint"].upper() in joint_names]
-    elif _flag(args.get("guided")):
+    elif flag_enabled(args.get("guided")):
         # Guided zeroing without an explicit subset walks the seven arm
         # joints; the gripper is never touched (it has no zero to set), so
         # a gripper fault must not block the launch.
@@ -229,10 +236,10 @@ class _ArmLink:
 
     async def close(self) -> None:
         if self._bus is not None:
-            try:
-                await self._bus.close()
-            except Exception as exc:  # noqa: BLE001 - teardown is best-effort
-                _logger.debug("closing %s bus failed: %s", self.channel, exc)
+            # Retain the live/uncertain bus reference when close fails so the
+            # caller can retry and cannot mistake dropped Python state for
+            # exclusive hardware ownership.
+            await self._bus.close()
         self._bus = None
         self._motors = {}
         self._locks = {}
@@ -421,17 +428,31 @@ class RobotLink:
         right_channel: str | None = CAN_RIGHT,
         hub: TelemetryHub | None = None,
         has_gripper: Callable[[], bool] | None = None,
+        profile: str = "axol",
     ) -> None:
         """Construct the link.
 
         Args:
-            left_channel:  SocketCAN interface for the left arm; None disables.
-            right_channel: Same for the right arm.
+            left_channel:  SocketCAN interface for the left side; None disables.
+            right_channel: Same for the right side.
             hub:           Telemetry hub to publish sweeps into.
             has_gripper:   Callable returning whether this robot has grippers
                            (e.g. ``SettingsStore.has_gripper``), re-read on
                            every connect. ``None`` means always ``True``.
+            profile:       ``axol`` for all configured arm motors, or ``mantis``
+                           for only the two grippers at CAN ID 8.
         """
+        if profile not in ("axol", "mantis"):
+            raise ValueError(f"unknown hardware profile: {profile}")
+        if profile == "axol":
+            left_channel, right_channel = require_distinct_axol_channels(
+                (left_channel, right_channel)
+            )
+        else:
+            left_channel, right_channel = require_mantis_channels(
+                (left_channel, right_channel)
+            )
+        self._profile = profile
         self._has_gripper_provider = has_gripper
         self._arms: list[_ArmLink] = []
         if left_channel:
@@ -458,7 +479,15 @@ class RobotLink:
         self._publish_task: asyncio.Task[Any] | None = None
         # One-shot best-effort observer range sync, fired on connect/reacquire.
         self._sync_task: asyncio.Task[Any] | None = None
+        # A caller-side Future timeout only requests cancellation; the loop
+        # coroutine can still be unwinding.  Serialize open/close lifecycles
+        # on the owning loop so an immediate retry can never overlap it.
+        self._lifecycle_lock = asyncio.Lock()
         self._lock = threading.Lock()
+        # True from before the first bus open until every close completes.
+        # It deliberately means "open or uncertain": a timeout/cancellation
+        # must never be mistaken for proof that another hardware owner is safe.
+        self._buses_may_be_open = False
         # Joint set snapshotted when the buses open, so status() stays
         # consistent with the motors actually being pinged even if the
         # has_gripper setting is toggled mid-connection. None = link down;
@@ -476,6 +505,8 @@ class RobotLink:
         While the link is up this is the connect-time snapshot matching the
         opened motors; otherwise the current setting.
         """
+        if self._profile == "mantis":
+            return [Joint.GRIPPER]
         with self._lock:
             active = self._active_joints
         if active is not None:
@@ -487,7 +518,14 @@ class RobotLink:
     def _submit(self, coro: Any, timeout: float = 30.0) -> Any:
         """Run a coroutine on the link loop from any thread and wait for it."""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except BaseException:
+            # Most importantly, cancel cleanup that timed out before a caller
+            # retries it; two overlapping close coroutines are not evidence of
+            # exclusive CAN ownership. Cancel is harmless if it already ended.
+            future.cancel()
+            raise
 
     def _set_state(self, state: str, error: str | None = None) -> None:
         with self._lock:
@@ -500,9 +538,18 @@ class RobotLink:
     def connect(self) -> dict[str, Any]:
         """Bring up CAN, open the buses, and start the ping loop."""
         with self._lock:
-            if self._state in (STATE_CONNECTED, STATE_BUSY):
-                return self.status()
+            already_active = self._state in (STATE_CONNECTED, STATE_BUSY)
+            cleanup_needed = self._buses_may_be_open
+        if already_active:
+            return self.status()
         self._set_state(STATE_CONNECTING)
+        if cleanup_needed:
+            try:
+                self._submit(self._stop_and_close())
+            except Exception as exc:  # noqa: BLE001
+                self._set_state(STATE_ERROR, _format_error(exc))
+                _logger.warning("robot pre-connect cleanup failed: %s", exc)
+                return self.status()
         try:
             self._enable_can()
         except Exception as exc:  # noqa: BLE001 - report any bring-up failure
@@ -520,10 +567,15 @@ class RobotLink:
 
     def disconnect(self) -> dict[str, Any]:
         """Stop pinging and close every bus, observers included."""
+        with self._lock:
+            if self._state == STATE_BUSY:
+                raise RuntimeError("cannot disconnect while a task owns the robot bus")
         try:
             self._submit(self._close_all())
         except Exception as exc:  # noqa: BLE001
-            _logger.debug("robot disconnect cleanup failed: %s", exc)
+            self._set_state(STATE_ERROR, _format_error(exc))
+            _logger.warning("robot disconnect cleanup failed: %s", exc)
+            return self.status()
         self._set_state(STATE_DISCONNECTED)
         with self._lock:
             self._last_ping = None
@@ -544,13 +596,18 @@ class RobotLink:
         :meth:`reacquire` only reconnects if the link was up before the task.
         """
         with self._lock:
-            if self._state not in (STATE_CONNECTED,):
+            if self._state != STATE_CONNECTED and not self._buses_may_be_open:
                 return
         self._set_state(STATE_BUSY)
         try:
             self._submit(self._stop_polling())
         except Exception as exc:  # noqa: BLE001
-            _logger.debug("robot release cleanup failed: %s", exc)
+            # An operation must never open the same CAN buses after a failed
+            # telemetry shutdown.  Preserve the failure in status and let the
+            # runner abort before it starts a hardware worker.
+            self._set_state(STATE_ERROR, _format_error(exc))
+            _logger.warning("robot release failed: %s", exc)
+            raise RuntimeError(f"could not release robot link: {exc}") from exc
 
     def reacquire(self) -> None:
         """Re-open the command buses + ping loop after a task releases the bus."""
@@ -562,7 +619,7 @@ class RobotLink:
         except Exception as exc:  # noqa: BLE001
             self._set_state(STATE_ERROR, _format_error(exc))
             _logger.warning("robot reacquire failed: %s", exc)
-            return
+            raise RuntimeError(f"could not reacquire robot link: {exc}") from exc
         self._set_state(STATE_CONNECTED)
 
     def motor_faults(self) -> list[dict[str, Any]]:
@@ -575,7 +632,17 @@ class RobotLink:
         right = next((a.channel for a in self._arms if a.side == "right"), None)
         return left, right
 
-    def set_channels(self, left_channel: str | None, right_channel: str | None) -> None:
+    def profile(self) -> str:
+        """The hardware represented by this idle link: ``axol`` or ``mantis``."""
+        return self._profile
+
+    def set_channels(
+        self,
+        left_channel: str | None,
+        right_channel: str | None,
+        *,
+        profile: str = "axol",
+    ) -> None:
         """Swap the CAN interfaces the link uses (e.g. a non-Axol-hub adapter).
 
         A ``None`` channel disables that arm, so a single-adapter setup can run
@@ -583,18 +650,37 @@ class RobotLink:
         the link (or a task borrowing its bus) is up, since the open buses
         belong to the old interfaces.
         """
-        if self.channels() == (left_channel, right_channel):
+        if profile not in ("axol", "mantis"):
+            raise ValueError(f"unknown hardware profile: {profile}")
+        if profile == "axol":
+            left_channel, right_channel = require_distinct_axol_channels(
+                (left_channel, right_channel)
+            )
+        else:
+            left_channel, right_channel = require_mantis_channels(
+                (left_channel, right_channel)
+            )
+        if (
+            self.channels() == (left_channel, right_channel)
+            and self._profile == profile
+        ):
             return
         with self._lock:
             if self._state not in (STATE_DISCONNECTED, STATE_ERROR):
                 raise RuntimeError(
                     "disconnect the robot link before changing CAN interfaces"
                 )
+            if self._buses_may_be_open:
+                raise RuntimeError(
+                    "robot bus ownership is uncertain; retry disconnect before "
+                    "changing CAN interfaces"
+                )
             self._arms = []
             if left_channel:
                 self._arms.append(_ArmLink(left_channel, "left"))
             if right_channel:
                 self._arms.append(_ArmLink(right_channel, "right"))
+            self._profile = profile
         self.hub.clear_slow()
 
     def status(self) -> dict[str, Any]:
@@ -625,6 +711,7 @@ class RobotLink:
             "error": error,
             "lastPing": last_ping,
             "channels": {"left": left_channel, "right": right_channel},
+            "profile": self._profile,
             "hasGripper": Joint.GRIPPER in joints,
             "motors": motors,
             "motorCount": len(motors),
@@ -652,34 +739,51 @@ class RobotLink:
     def shutdown(self) -> None:
         """Tear down the link and stop the loop thread (server shutdown)."""
         try:
-            self.disconnect()
+            with self._lock:
+                busy = self._state == STATE_BUSY
+            if busy:
+                _logger.warning(
+                    "server stopped while a task still owned the robot bus; "
+                    "skipping detached-link cleanup"
+                )
+            else:
+                self.disconnect()
         finally:
             self._loop.call_soon_threadsafe(self._loop.stop)
 
     # -- loop-side coroutines ----------------------------------------------
 
     async def _open_and_start(self) -> None:
-        # Snapshot the joint set from the live setting for this connection;
-        # status() reports from the same snapshot until the link is torn down.
-        joints = list(Joint) if self._has_gripper() else list(ARM_JOINTS)
-        with self._lock:
-            self._active_joints = joints
-        for arm in self._arms:
-            # Observer first so no early feedback is missed; a no-op when it
-            # survived a release/reacquire cycle.
-            await arm.open_observer(joints)
-            await arm.open(joints)
-        if self._ping_task is None or self._ping_task.done():
-            self._ping_task = asyncio.ensure_future(self._ping_loop())
-        if self._sample_task is None or self._sample_task.done():
-            self._sample_task = asyncio.ensure_future(self._sample_loop())
-        if self._publish_task is None or self._publish_task.done():
-            self._publish_task = asyncio.ensure_future(self._publish_loop())
-        # Range sync happens off the connect path: with the motors powered
-        # off, each read runs into its timeout, and 16 motors of that would
-        # stall connect for many seconds.
-        if self._sync_task is None or self._sync_task.done():
-            self._sync_task = asyncio.ensure_future(self._sync_observer_ranges())
+        async with self._lifecycle_lock:
+            # Snapshot the joint set from the live setting for this connection;
+            # status() reports from the same snapshot until the link is torn down.
+            joints = self._joints()
+            with self._lock:
+                self._active_joints = joints
+                self._buses_may_be_open = bool(self._arms)
+                # A timestamp from before CAN ownership changed cannot
+                # authorize a new hardware operation. Only the ping loop's
+                # first complete post-open sweep makes this link fresh again.
+                self._last_ping = None
+            for arm in self._arms:
+                arm.health = {}
+            self.hub.clear_slow()
+            for arm in self._arms:
+                # Observer first so no early feedback is missed; a no-op when it
+                # survived a release/reacquire cycle.
+                await arm.open_observer(joints)
+                await arm.open(joints)
+            if self._ping_task is None or self._ping_task.done():
+                self._ping_task = asyncio.ensure_future(self._ping_loop())
+            if self._sample_task is None or self._sample_task.done():
+                self._sample_task = asyncio.ensure_future(self._sample_loop())
+            if self._publish_task is None or self._publish_task.done():
+                self._publish_task = asyncio.ensure_future(self._publish_loop())
+            # Range sync happens off the connect path: with the motors powered
+            # off, each read runs into its timeout, and 16 motors of that would
+            # stall connect for many seconds.
+            if self._sync_task is None or self._sync_task.done():
+                self._sync_task = asyncio.ensure_future(self._sync_observer_ranges())
 
     async def _sync_observer_ranges(self) -> None:
         for arm in self._arms:
@@ -690,13 +794,24 @@ class RobotLink:
             except Exception as exc:  # noqa: BLE001 - sync is best-effort
                 _logger.debug("observer range sync for %s failed: %s", arm.side, exc)
 
-    async def _cancel(self, task: asyncio.Task[Any] | None) -> None:
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+    async def _cancel(
+        self,
+        task: asyncio.Task[Any] | None,
+        failures: list[BaseException] | None = None,
+    ) -> None:
+        """Cancel ``task`` and wait for it; a non-cancel failure is collected
+        into ``failures`` (or re-raised when no list is given)."""
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except BaseException as exc:  # preserve but let teardown continue
+            if failures is None:
+                raise
+            failures.append(exc)
 
     async def _stop_polling(self) -> None:
         """Stop the request/response loops and close the command buses.
@@ -705,21 +820,50 @@ class RobotLink:
         is the release path that hands command to a task while telemetry
         keeps flowing.
         """
+        async with self._lifecycle_lock:
+            await self._stop_polling_locked()
+
+    async def _stop_polling_locked(self) -> None:
+        failures: list[BaseException] = []
         for task in (self._ping_task, self._sample_task, self._sync_task):
-            await self._cancel(task)
+            await self._cancel(task, failures)
         self._ping_task = None
         self._sample_task = None
         self._sync_task = None
-        for arm in self._arms:
-            await arm.close()
+        closed = await asyncio.gather(
+            *(arm.close() for arm in self._arms), return_exceptions=True
+        )
+        failures.extend(
+            result for result in closed if isinstance(result, BaseException)
+        )
+        if failures:
+            raise failures[0]
+
+    async def _stop_and_close(self) -> None:
+        """Full teardown: polling, publish loop, and the observer sockets.
+
+        ``_buses_may_be_open`` only drops once every command bus has verifiably
+        closed; a failed close keeps it set so the next connect retries the
+        cleanup instead of opening a second owner on the same CAN interfaces.
+        """
+        async with self._lifecycle_lock:
+            failures: list[BaseException] = []
+            try:
+                await self._stop_polling_locked()
+            except BaseException as exc:  # still tear the observers down
+                failures.append(exc)
+            await self._cancel(self._publish_task, failures)
+            self._publish_task = None
+            for arm in self._arms:
+                await arm.close_observer()
+            if not failures:
+                with self._lock:
+                    self._buses_may_be_open = False
+            if failures:
+                raise failures[0]
 
     async def _close_all(self) -> None:
-        """Full teardown: polling, publish loop, and the observer sockets."""
-        await self._stop_polling()
-        await self._cancel(self._publish_task)
-        self._publish_task = None
-        for arm in self._arms:
-            await arm.close_observer()
+        await self._stop_and_close()
 
     async def _ping_loop(self) -> None:
         while True:
@@ -731,12 +875,12 @@ class RobotLink:
                     slow.update(sweep)
                 if slow:
                     self.hub.push_slow(slow)
+                with self._lock:
+                    self._last_ping = time.time()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep the loop alive
                 _logger.debug("ping sweep error: %s", exc)
-            with self._lock:
-                self._last_ping = time.time()
             elapsed = self._loop.time() - start
             await asyncio.sleep(max(0.0, _PING_INTERVAL_S - elapsed))
 
@@ -833,6 +977,12 @@ class RobotLink:
             return False
         return all(iface_up(arm.channel) for arm in self._arms)
 
+    def _configured_interfaces_present(self) -> bool:
+        """True when every interface selected for this link currently exists."""
+        return bool(self._arms) and all(
+            (Path("/sys/class/net") / arm.channel).exists() for arm in self._arms
+        )
+
     def _uses_axol_hub(self) -> bool:
         """True when the link runs on the Axol hub's persistently-named pair.
 
@@ -841,7 +991,23 @@ class RobotLink:
         hub-specific ``can.setup`` (udev rules, interface renames, RX-wedge
         recovery), just plain SocketCAN interface configuration.
         """
-        return {arm.channel for arm in self._arms} == {CAN_LEFT, CAN_RIGHT}
+        return self._profile == "axol" and {arm.channel for arm in self._arms} == {
+            CAN_LEFT,
+            CAN_RIGHT,
+        }
+
+    def _uses_mantis_hub(self) -> bool:
+        """True when every selected bus belongs to the named Mantis hub."""
+        channels = {arm.channel for arm in self._arms}
+        return (
+            self._profile == "mantis"
+            and bool(channels)
+            and channels
+            <= {
+                CAN_MANTIS_LEFT,
+                CAN_MANTIS_RIGHT,
+            }
+        )
 
     def _enable_custom_can(self) -> None:
         """Bring up user-chosen CAN interfaces (no Axol hub adapter present).
@@ -884,10 +1050,32 @@ class RobotLink:
         Custom (non-Axol-hub) interfaces skip all of that: they just need to
         exist and be up (see :meth:`_enable_custom_can`).
         """
-        from ..cli.can.setup import bring_up_can, ensure_setup, rx_alive
+        from ..cli.can.setup import (
+            _MANTIS_PROFILE,
+            bring_up_can,
+            ensure_mantis_setup,
+            ensure_setup,
+            rx_alive,
+        )
 
         if not self._arms:
             raise RuntimeError("No CAN interfaces configured")
+        if self._uses_mantis_hub():
+            if (
+                not _MANTIS_PROFILE.cron_script.exists()
+                or not self._configured_interfaces_present()
+            ):
+                _logger.info(
+                    "Mantis CAN profile or named interfaces missing; running "
+                    "automatic setup."
+                )
+                ensure_mantis_setup()
+                return
+            if self._can_already_up() and rx_alive(_MANTIS_PROFILE):
+                _logger.info("Mantis CAN interfaces already up; grippers responding.")
+                return
+            bring_up_can(_MANTIS_PROFILE)
+            return
         if not self._uses_axol_hub():
             self._enable_custom_can()
             return

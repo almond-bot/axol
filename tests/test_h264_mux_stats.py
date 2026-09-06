@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import queue
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -7,7 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from almond_axol.lerobot.h264_mux_encoder import _CameraH264Muxer
+from almond_axol.lerobot.h264_mux_encoder import _FEED_QUEUE_MAX, _CameraH264Muxer
 
 _IDR = b"\x00\x00\x00\x01\x65\x88"
 
@@ -55,7 +57,23 @@ def _bare_muxer(src: _FakeSource) -> _CameraH264Muxer:
     muxer._stats_worker = None
     muxer._peak_queued = 0
     muxer._last_pressure_log = 0.0
+    # feed() only queues; a feeder thread does the (blocking) appsrc pushes.
+    muxer._feed_error = None
+    muxer._feed_error_lock = threading.Lock()
+    muxer._feed_queue = queue.Queue(_FEED_QUEUE_MAX)
+    muxer._feed_stop = threading.Event()
+    muxer._feed_cancelled = threading.Event()
+    muxer._feed_thread = threading.Thread(target=muxer._push_loop, daemon=True)
+    muxer._feed_thread.start()
     return muxer
+
+
+def _drain(muxer: _CameraH264Muxer) -> None:
+    """Let the feeder push every queued AU, then stop it."""
+    muxer._request_feed_stop(cancel=False)
+    muxer._feed_thread.join(timeout=5.0)
+    assert not muxer._feed_thread.is_alive()
+    assert muxer._feed_error is None, muxer._feed_error
 
 
 class _FakeStatsWorker:
@@ -105,6 +123,7 @@ class H264MuxStatsSamplingTest(unittest.TestCase):
 
         for _ in range(60):
             muxer.feed(_IDR)
+        _drain(muxer)
 
         self.assertEqual(muxer._src.pushed, 60)
         self.assertEqual(muxer._count, 60)
@@ -115,6 +134,7 @@ class H264MuxStatsSamplingTest(unittest.TestCase):
 
         muxer.feed(_IDR)
         muxer.feed(_IDR)
+        _drain(muxer)
 
         self.assertEqual(
             [buffer.pts for buffer in muxer._src.buffers],
@@ -149,6 +169,7 @@ class H264MuxStatsSamplingTest(unittest.TestCase):
         with self.assertLogs("almond_axol.lerobot.h264_mux_encoder", "WARNING") as cap:
             muxer.feed(_IDR)
         self.assertEqual(len(cap.records), 1)
+        _drain(muxer)
 
     def test_fallback_decodes_only_the_stats_stride(self) -> None:
         packets = [_FakePacket(index) for index in range(60)]

@@ -7,6 +7,7 @@ field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
 
     axol teleop                                       # real robot
     axol teleop --sim                                 # browser visualizer
+    axol teleop --mantis                              # Mantis rigs: triggers drive the grippers
     axol teleop --axol.left_stiffness 0.8
     axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
     axol teleop --teleop.position_multiplier 2.0      # scale hand motion 2x
@@ -21,6 +22,7 @@ import logging
 import socket
 from typing import TYPE_CHECKING, Any
 
+from ..utils.network import local_ip
 from .config import TeleopCmdConfig, normalize_bool_flags, parse
 
 if TYPE_CHECKING:
@@ -29,15 +31,45 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
-def _get_local_ip() -> str:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+def _prepare_mantis_teleop(cfg: TeleopCmdConfig) -> None:
+    """Validate the Mantis teleop flags before touching live hardware.
+
+    Mantis teleop is grippers-only by design: the rig triggers drive the two
+    grippers over CAN and nothing else starts (no tracking, VR server,
+    cameras, or transforms). Tracked Mantis runs belong to data collection.
+    """
+    if cfg.sim:
+        raise ValueError("--mantis and --sim are mutually exclusive")
+    if cfg.jelly_only:
+        raise ValueError(
+            "--mantis drives the handheld rig and --jelly_only drives Jelly — pick one"
+        )
+
+
+def mantis_rig_channels(cfg: TeleopCmdConfig) -> tuple[str | None, str | None]:
+    """The two rig channels a Mantis run opens (Axol defaults map to the rig's)."""
+    from ..constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
+
+    left = cfg.left_channel
+    right = cfg.right_channel
+    if left == CAN_LEFT:
+        left = CAN_MANTIS_LEFT
+    if right == CAN_RIGHT:
+        right = CAN_MANTIS_RIGHT
+    return left, right
 
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a VR teleop session."""
-    cfg = parse(TeleopCmdConfig, normalize_bool_flags(argv, "sim", "jelly_only"))
+    normalized_argv = normalize_bool_flags(argv, "sim", "mantis", "jelly_only")
+    cfg = parse(TeleopCmdConfig, normalized_argv)
+    if cfg.mantis:
+        # Inherit the host's saved rig CAN channel map (Settings → Mantis),
+        # below config-file/CLI overrides — same map the control panel uses.
+        from .mantis_bridge import load_direct_mantis_fallback
+
+        fallback, _ = load_direct_mantis_fallback(collection=False)
+        cfg = parse(TeleopCmdConfig, normalized_argv, fallback_overlay=fallback)
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop log_say() / INFO status lines.
@@ -47,11 +79,17 @@ def main(argv: list[str]) -> None:
     # by the host installer + its boot service, not here — see
     # `axol jetson.setup` / `axol gst.install`. This entry point just runs.
 
+    if cfg.mantis:
+        # Grippers-only: nothing to connect to (no VR server or tracking).
+        _prepare_mantis_teleop(cfg)
+        asyncio.run(_run(cfg))
+        return
+
     hostname = socket.gethostname()
-    local_ip = _get_local_ip()
+    host_ip = local_ip()
     print("Connect the VR app (https://axol.almond.bot) to this machine:")
     print(f"  Hostname : {hostname}.local")
-    print(f"  IP       : {local_ip}")
+    print(f"  IP       : {host_ip}")
 
     asyncio.run(_run(cfg))
 
@@ -337,6 +375,19 @@ async def _run_jelly_only(cfg: TeleopCmdConfig) -> None:
 async def _run(cfg: TeleopCmdConfig) -> None:
     from ..robot import Axol, Sim
     from ..teleop import VRTeleop
+
+    if cfg.mantis:
+        # Grippers-only Mantis teleop: no VR server, tracker bridge, or
+        # cameras — the rig triggers drive the grippers over CAN until Stop.
+        # Tracked Mantis runs belong to data collection.
+        _prepare_mantis_teleop(cfg)
+        from ..teleop.mantis_grippers import run_grippers_only
+        from ..utils.can_channels import require_mantis_channels
+
+        left, right = require_mantis_channels(mantis_rig_channels(cfg))
+        print(f"Mantis grippers only (no tracking): left={left} right={right}")
+        await run_grippers_only(left, right)
+        return
 
     if cfg.jelly_only:
         if cfg.sim:

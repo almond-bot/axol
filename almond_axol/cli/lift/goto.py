@@ -20,14 +20,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
+import time
 
 from . import (
     Interrupted,
     MotionNeverStarted,
+    StopNotVerified,
     add_channel_argument,
     fmt_status,
     interrupt_event,
     open_lift,
+    require_motion_preflight,
     watch_motion,
 )
 
@@ -69,24 +73,41 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 
 async def _run(args: argparse.Namespace) -> None:
-    if not 0.0 <= args.percent <= 100.0:
+    if not math.isfinite(args.percent) or not 0.0 <= args.percent <= 100.0:
         raise SystemExit("ERROR: --percent must be between 0 and 100.")
+    if not 0 <= args.speed <= 0xFFFF:
+        raise SystemExit("ERROR: --speed must be between 0 and 65535.")
     lift = await open_lift(args.channel)
     try:
         with interrupt_event() as interrupted:
-            st = lift.status
-            assert st is not None
-            if not st.homed:
-                raise SystemExit(
-                    "ERROR: the lift is not homed, so it has no height scale "
-                    "— run `axol lift.home` once first."
-                )
+            require_motion_preflight(
+                lift,
+                operation="position move",
+                require_homed=True,
+            )
             print(
                 f"Moving the lift to {args.percent:.1f}% of travel (Ctrl-C stops it)..."
             )
-            await lift.set_position(round(args.percent * 10), args.speed)
             moving = lambda s: s.moving or s.pos_move  # noqa: E731
+
+            async def verify_before_send() -> None:
+                if interrupted.is_set():
+                    raise Interrupted
+                require_motion_preflight(
+                    lift,
+                    operation="position move",
+                    require_homed=True,
+                )
+                if interrupted.is_set():
+                    raise Interrupted
+
             try:
+                await lift.set_position(
+                    round(args.percent * 10),
+                    args.speed,
+                    before_send=verify_before_send,
+                )
+                commanded_at = time.monotonic()
                 st = await watch_motion(
                     lift,
                     started=moving,
@@ -94,6 +115,7 @@ async def _run(args: argparse.Namespace) -> None:
                     start_timeout_s=_START_TIMEOUT_S,
                     timeout_s=_MOVE_TIMEOUT_S,
                     interrupted=interrupted,
+                    commanded_at=commanded_at,
                 )
             except MotionNeverStarted:
                 # A retarget to (near) the current height stops immediately
@@ -102,10 +124,10 @@ async def _run(args: argparse.Namespace) -> None:
                 st = lift.status
                 assert st is not None
             except Interrupted:
-                await lift.stop_motion()
                 raise SystemExit("\nInterrupted — lift stopped.") from None
+            except StopNotVerified as exc:
+                raise SystemExit(f"ERROR: {exc}.") from exc
             except TimeoutError:
-                await lift.stop_motion()
                 raise SystemExit(
                     f"ERROR: the move did not finish within "
                     f"{_MOVE_TIMEOUT_S:.0f}s — stopped it. Last status: "

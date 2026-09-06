@@ -213,33 +213,15 @@ class CanBus:
                         pass
             finally:
                 self._writer = None
+        # A cancellation of close() itself is held until the proxy process is
+        # reaped, then re-raised: a Stop that lands mid-teardown must not
+        # leave a bus-owning child behind.
+        external_cancel: asyncio.CancelledError | None = None
         if self._reader_task is not None:
             reader_task = self._reader_task
             self._reader_task = None
             if reader_task is not asyncio.current_task():
-                try:
-                    await asyncio.wait_for(reader_task, 1.0)
-                except TimeoutError:
-                    reader_task.cancel()
-                    try:
-                        await reader_task
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception:  # noqa: BLE001 - still reap the proxy
-                        _logger.exception(
-                            "axol-rt proxy reader for %s failed during teardown",
-                            self._channel,
-                        )
-                except asyncio.CancelledError:
-                    # Includes an already-cancelled reader. Teardown must still
-                    # reap the process; caller cancellation is handled by its
-                    # outer lifecycle owner.
-                    pass
-                except Exception:  # noqa: BLE001 - still reap the proxy
-                    _logger.exception(
-                        "axol-rt proxy reader for %s failed during teardown",
-                        self._channel,
-                    )
+                external_cancel = await self._reap_reader(reader_task)
         self._reader = None
         if self._proc is not None:
             if self._proc.poll() is None:
@@ -261,6 +243,45 @@ class CanBus:
             self._closed_reason = None
         if was_open:
             _logger.info("axol-rt proxy for %s closed", self._channel)
+        if external_cancel is not None:
+            raise external_cancel
+
+    async def _reap_reader(
+        self, reader_task: asyncio.Task[None]
+    ) -> asyncio.CancelledError | None:
+        """Let the reader exit on the proxy's EOF, cancelling it if it lingers.
+
+        Returns the ``CancelledError`` if close() itself was cancelled while
+        waiting, so the caller can finish reaping the process before
+        propagating it. The reader's own cancellation is never mistaken for
+        ours (``gather(return_exceptions=True)`` hands a child's cancellation
+        back as a value; only *our* cancellation raises).
+        """
+        external: asyncio.CancelledError | None = None
+        done: set[asyncio.Task[None]] = set()
+        try:
+            done, _pending = await asyncio.wait({reader_task}, timeout=1.0)
+        except asyncio.CancelledError as exc:
+            external = exc
+        if reader_task not in done:
+            reader_task.cancel()
+            try:
+                await asyncio.gather(reader_task, return_exceptions=True)
+            except asyncio.CancelledError as exc:
+                # gather re-cancelled the reader on our way out; give it one
+                # bounded chance to unwind, never block teardown on it.
+                if external is None:
+                    external = exc
+                await asyncio.wait({reader_task}, timeout=1.0)
+        if reader_task.done() and not reader_task.cancelled():
+            reader_error = reader_task.exception()
+            if reader_error is not None:
+                _logger.error(
+                    "axol-rt proxy reader for %s failed during teardown",
+                    self._channel,
+                    exc_info=reader_error,
+                )
+        return external
 
     async def __aenter__(self) -> CanBus:
         await self.start()
@@ -286,8 +307,16 @@ class CanBus:
         """Keep Rust timing at wire rate while forwarding state at ~30 Hz/ID."""
         self._send_message(b"O\x01")
 
-    async def _send(self, arbitration_id: int, data: bytes) -> None:
-        """Forward one standard CAN frame to the Rust-owned socket."""
+    async def _send(self, arbitration_id: int, data: bytes) -> bool:
+        """Forward one standard CAN frame to the Rust-owned socket.
+
+        Returns ``True`` once the frame has been handed to the proxy. An
+        unusable bus (never started, still starting, closed, proxy died)
+        raises ``CanOperationError`` rather than silently dropping the frame,
+        so one-shot safety commands such as the lift STOP fail closed; callers
+        that inspect the boolean (``Lift._send_required``) therefore never see
+        a deliberate drop reported as success.
+        """
         if self._unavailable():
             raise can.CanOperationError(self._unavailable_reason())
         if not 0 <= arbitration_id <= 0x7FF:
@@ -308,6 +337,7 @@ class CanBus:
             raise can.CanOperationError(
                 f"axol-rt proxy for {self._channel} disconnected"
             ) from exc
+        return True
 
     async def run_experiment(
         self,

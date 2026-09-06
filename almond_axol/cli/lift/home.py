@@ -23,14 +23,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import time
 
 from . import (
     Interrupted,
     MotionNeverStarted,
+    StopNotVerified,
     add_channel_argument,
     fmt_status,
     interrupt_event,
     open_lift,
+    require_motion_preflight,
     watch_motion,
 )
 
@@ -55,16 +58,32 @@ async def _run(args: argparse.Namespace) -> None:
     lift = await open_lift(args.channel)
     try:
         with interrupt_event() as interrupted:
-            st = lift.status
-            assert st is not None
+            st = require_motion_preflight(
+                lift,
+                operation="homing",
+                require_homed=False,
+            )
             if st.homed:
                 print(
                     "Lift is already homed (calibration persists in flash) — "
                     "re-homing anyway."
                 )
             print("Starting the homing sequence (~1-2 min; Ctrl-C aborts safely)...")
-            await lift.home()
+
+            async def verify_before_send() -> None:
+                if interrupted.is_set():
+                    raise Interrupted
+                require_motion_preflight(
+                    lift,
+                    operation="homing",
+                    require_homed=False,
+                )
+                if interrupted.is_set():
+                    raise Interrupted
+
             try:
+                await lift.home(before_send=verify_before_send)
+                commanded_at = time.monotonic()
                 st = await watch_motion(
                     lift,
                     started=lambda s: s.homing,
@@ -72,6 +91,7 @@ async def _run(args: argparse.Namespace) -> None:
                     start_timeout_s=_START_TIMEOUT_S,
                     timeout_s=_HOMING_TIMEOUT_S,
                     interrupted=interrupted,
+                    commanded_at=commanded_at,
                 )
             except MotionNeverStarted:
                 raise SystemExit(
@@ -79,13 +99,13 @@ async def _run(args: argparse.Namespace) -> None:
                     "are connected and 24 V is on, then re-run."
                 ) from None
             except Interrupted:
-                await lift.stop_motion()
                 raise SystemExit(
                     "\nInterrupted — homing aborted (rolled back to the "
                     "previous calibration)."
                 ) from None
+            except StopNotVerified as exc:
+                raise SystemExit(f"ERROR: {exc}.") from exc
             except TimeoutError:
-                await lift.stop_motion()
                 raise SystemExit(
                     f"ERROR: homing did not finish within "
                     f"{_HOMING_TIMEOUT_S:.0f}s — stopped it. Last status: "

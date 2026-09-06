@@ -25,7 +25,7 @@ No VR, cameras, or policy server are involved — replay only drives the arms, s
 ## Before you start
 
 - **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
-- **A recorded dataset** to replay — a local one under `--root` (`$HF_LEROBOT_HOME` by default), a **filesystem path** to a dataset directory anywhere on disk, or one pullable from the HuggingFace Hub by its `repo_id`. See [Data Collection](/operations/data-collection) to record one.
+- **A trusted recorded dataset** that you created or obtained from a source you trust — a local one under `--root` (`$HF_LEROBOT_HOME` by default), a **filesystem path** to a dataset directory anywhere on disk, or one pullable from the HuggingFace Hub by its `repo_id`. Upstream dataset loaders are not a sandbox for arbitrary repositories or directories. See [Data Collection](/operations/data-collection) to record one.
 
 ## Run it
 

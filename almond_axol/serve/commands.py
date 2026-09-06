@@ -8,13 +8,14 @@ whose imports fail (missing ``lerobot``, ZED SDK, mujoco, …) are simply marked
 unavailable so the rest of the catalog still loads.
 
 Only commands some UI surface actually launches belong here: the control
-panel's five operations, and the diagnostics dashboard's tests, tuning tools
-(``tune.pid`` / ``tune.friction``, whose ``--save`` writes this robot's
-calibration file), CAN bring-up buttons, and motor calibration tools.
-Everything else — install-time commands (``gst.*``, ``jetson.setup``,
-``can.driver``), ``tune.repeatability``, one-off checks (``motor.info`` /
-``motor.health``, whose read set the dashboard's motor tiles show live), the
-remote ``inference-server``, and ``serve`` itself — stays CLI-only.
+panel's five operations, Mantis tracker-runtime setup, and the diagnostics
+dashboard's tests, tuning tools (``tune.pid`` / ``tune.friction``, whose
+``--save`` writes this robot's calibration file), CAN bring-up buttons, and
+motor calibration tools. Everything else — install-time commands (``gst.*``,
+``jetson.setup``, ``can.driver``), ``tune.repeatability``, one-off checks
+(``motor.info`` / ``motor.health``, whose read set the dashboard's motor tiles
+show live), the remote ``inference-server``, and ``serve`` itself — stays
+CLI-only.
 
 ``motor.restore-config`` is also CLI-only: it consumes a snapshot file, and a
 browser form can only name a path on the serve host, so the dashboard offers
@@ -75,10 +76,13 @@ class CommandDef:
         entrypoint: Callable[[], Callable[..., Any]] | None = None,
         execution: str = "thread",
         requires_cameras: bool = False,
+        uses_cameras: bool = False,
         camera_mode: str = "none",
         streams_video: bool = False,
         sim_flag: str | None = None,
         robot_free_flags: tuple[str, ...] = (),
+        supports_mantis: bool = False,
+        hardware_profiles: tuple[str, ...] = ("axol", "mantis"),
         uses_headset: bool = False,
         episode_control: Callable[[], Callable[..., Any]] | None = None,
         per_run_fields: tuple[str, ...] = (),
@@ -112,6 +116,11 @@ class CommandDef:
         self.execution = execution
         # Needs at least one camera serial configured before it can start.
         self.requires_cameras = requires_cameras
+        # Owns local camera hardware for its full lifetime. Operations are
+        # already globally exclusive; subprocess commands need this explicit
+        # declaration so preview, detection, and daemon restart stay blocked
+        # until their process exits.
+        self.uses_cameras = uses_cameras
         # How the operator's camera spec reaches the config: "argv" folds
         # serials into the argv-style args (the cameras are required draccus
         # inputs), "teleop" attaches them to a built config's camera dict
@@ -131,6 +140,13 @@ class CommandDef:
         # (teleop's jelly_only): the run skips the robot link and the
         # motor-fault gate but still drives real, non-arm hardware.
         self.robot_free_flags = robot_free_flags
+        # Mantis is a runtime hardware mode only for plain teleop and data
+        # collection. Policy/DAgger may consume datasets produced by Mantis,
+        # but they always drive Axol hardware.
+        self.supports_mantis = supports_mantis
+        # Diagnostics can be constrained to the connected hardware profile;
+        # operations use their own config-driven Axol/Mantis selection.
+        self.hardware_profiles = hardware_profiles
         # Driven from the VR headset, so the panel tells the operator to point
         # the headset at this machine once the op is running.
         self.uses_headset = uses_headset
@@ -310,7 +326,8 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "Teleoperation",
         "Drive the Axol from a VR headset. Enable simulation to preview in the "
-        "browser without hardware, or Jelly-only to drive just Jelly.",
+        "browser without hardware, or Jelly-only to drive just Jelly. Mantis "
+        "drives the rig grippers from their triggers (no tracking).",
         "Operate",
         "draccus",
         _teleop,
@@ -320,7 +337,12 @@ COMMANDS: dict[str, CommandDef] = {
         camera_mode="teleop",
         streams_video=True,
         sim_flag="sim",
-        robot_free_flags=("jelly_only",),
+        # mantis drives the handheld rig's own CAN buses (can_mantis_l/r), so
+        # like jelly_only it never touches the arms or their motor faults. It is
+        # not a per-run field: the panel derives it from the system-wide
+        # device selection (settings ``system.hardware_profile``).
+        robot_free_flags=("jelly_only", "mantis"),
+        supports_mantis=True,
         uses_headset=True,
         per_run_fields=("sim", "jelly_only"),
     ),
@@ -362,7 +384,8 @@ COMMANDS: dict[str, CommandDef] = {
         "collect-data",
         "collect-data",
         "Collect data",
-        "Record teleoperation episodes to a LeRobot dataset with the local ZED cameras.",
+        "Record teleoperation episodes with local ZED cameras. Mantis supports "
+        "Quest, Lighthouse, or Ultimate tracking.",
         "Operate",
         "draccus",
         _collect_data,
@@ -374,6 +397,11 @@ COMMANDS: dict[str, CommandDef] = {
         # Recording is teleoperated, so the panel tells the operator to point
         # the headset at this machine — and shows the relay's camera feeds.
         uses_headset=True,
+        # mantis records with the handheld rig (its own CAN buses) — the Axol
+        # arms and their motor-fault gate are not involved. Like teleop, the
+        # flag comes from the panel's system-wide device selection.
+        robot_free_flags=("mantis",),
+        supports_mantis=True,
         # Panel-driven episodes (headset-off collection): the dashboard can
         # start recording and save or discard an episode, and mirrors the
         # headset HUD (phase, episode number, saved count).
@@ -470,6 +498,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..diagnostics.lift.cycle"),
         requires_hardware=True,
         drives_motors=True,
+        hardware_profiles=("axol",),
     ),
     "diag.zed-cable": CommandDef(
         "diag.zed-cable",
@@ -483,6 +512,7 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         uses_can_bus=False,
         section="test",
+        uses_cameras=True,
     ),
     "tune.pid": CommandDef(
         "tune.pid",
@@ -496,6 +526,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.tune.pid"),
         requires_hardware=True,
         drives_motors=True,
+        hardware_profiles=("axol",),
         section="tuning",
     ),
     "tune.friction": CommandDef(
@@ -510,6 +541,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.tune.friction"),
         requires_hardware=True,
         drives_motors=True,
+        hardware_profiles=("axol",),
         section="tuning",
     ),
     "tune.gravity": CommandDef(
@@ -525,6 +557,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.tune.gravity"),
         requires_hardware=True,
         drives_motors=True,
+        hardware_profiles=("axol",),
         section="tuning",
     ),
     "tune.factory": CommandDef(
@@ -540,6 +573,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.tune.factory"),
         requires_hardware=True,
         drives_motors=True,
+        hardware_profiles=("axol",),
         section="tuning",
     ),
     "calibration.pull": CommandDef(
@@ -572,6 +606,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.tune.motion"),
         requires_hardware=True,
         drives_motors=True,
+        hardware_profiles=("axol",),
         section="tuning",
     ),
     "tune.filter": CommandDef(
@@ -634,6 +669,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.lift.home"),
         requires_hardware=True,
+        hardware_profiles=("axol",),
         section="helper",
     ),
     "lift.goto": CommandDef(
@@ -646,6 +682,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.lift.goto"),
         requires_hardware=True,
+        hardware_profiles=("axol",),
         section="helper",
     ),
     # -- Calibrate ----------------------------------------------------------
@@ -659,6 +696,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.motor.set_zero_pos"),
         requires_hardware=True,
         drives_motors=True,
+        hardware_profiles=("axol",),
     ),
     "motor.set-can-id": CommandDef(
         "motor.set-can-id",
@@ -705,8 +743,78 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.motor.flash"),
         requires_hardware=True,
+        hardware_profiles=("axol",),
     ),
     # -- Setup --------------------------------------------------------------
+    "tracker.pair": CommandDef(
+        "tracker.pair",
+        "tracker.pair",
+        "Pair Lighthouse tracker",
+        "Pair a Vive Tracker with an HTC Watchman dongle without SteamVR.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_pair"),
+        requires_hardware=True,
+        uses_can_bus=False,
+    ),
+    "tracker.identify": CommandDef(
+        "tracker.identify",
+        "tracker.identify",
+        "Identify Mantis trackers",
+        "Bind the selected Lighthouse or Ultimate trackers to the left and "
+        "right Mantis with a guided motion capture.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_identify"),
+        requires_hardware=True,
+        uses_can_bus=False,
+    ),
+    "tracker.install": CommandDef(
+        "tracker.install",
+        "tracker.install",
+        "Install Lighthouse support",
+        "Build and install the pinned libsurvive runtime and Vive USB permissions.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_install"),
+        requires_hardware=False,
+        uses_can_bus=False,
+    ),
+    "tracker.lighthouse.check": CommandDef(
+        "tracker.lighthouse.check",
+        "tracker.lighthouse.check",
+        "Check Lighthouse base stations",
+        "Listen to libsurvive briefly and verify every base station uses a "
+        "different channel and both trackers report.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_lighthouse"),
+        requires_hardware=True,
+        uses_can_bus=False,
+    ),
+    "tracker.ultimate.install": CommandDef(
+        "tracker.ultimate.install",
+        "tracker.ultimate.install",
+        "Install Ultimate support",
+        "Install the pinned pyvut runtime, native HID libraries, and USB permissions.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_ultimate"),
+        requires_hardware=False,
+        uses_can_bus=False,
+    ),
+    "tracker.ultimate.check": CommandDef(
+        "tracker.ultimate.check",
+        "tracker.ultimate.check",
+        "Check Ultimate setup",
+        "Check the Ultimate runtime, dongle, permissions, Wi-Fi, and bindings "
+        "without opening the dongle or changing pairing state.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_ultimate"),
+        requires_hardware=False,
+        uses_can_bus=False,
+    ),
     "can.setup": CommandDef(
         "can.setup",
         "can.setup",
@@ -786,11 +894,15 @@ def command_specs() -> list[dict[str, Any]]:
             # back to their built-in list.
             "isOperation": cmd.is_operation,
             "requiresCameras": cmd.requires_cameras,
+            "usesCameras": cmd.uses_cameras,
             "perRunFields": list(cmd.per_run_fields),
             "episodeControl": cmd.has_episode_control,
             "simFlag": cmd.sim_flag,
             "robotFreeFlags": list(cmd.robot_free_flags),
+            "supportsMantis": cmd.supports_mantis,
+            "hardwareProfiles": list(cmd.hardware_profiles),
             "usesHeadset": cmd.uses_headset,
+            "streamsVideo": cmd.streams_video,
             "section": cmd.section,
         }
         try:
@@ -808,8 +920,64 @@ def command_specs() -> list[dict[str, Any]]:
     return specs
 
 
-def _truthy(value: Any) -> bool:
-    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+_TRUE_STRINGS = frozenset({"true", "yes", "on"})
+_FALSE_STRINGS = frozenset({"false", "no", "off"})
+
+
+def parse_boolean(value: Any, *, key: str = "boolean") -> bool:
+    """Parse exactly the boolean spellings accepted by draccus.
+
+    JSON booleans are canonical. String spellings remain supported for older
+    clients and direct form submissions, but are normalized before any safety
+    decision or argv emission. Integers and arbitrary truthy objects are
+    deliberately rejected: treating (for example) ``1`` differently in the
+    API gate and config parser can change which hardware profile a run opens.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+    raise ValueError(
+        f"{key} must be a boolean (true/false, yes/no, or on/off), not {value!r}"
+    )
+
+
+def flag_enabled(value: Any) -> bool:
+    """Interpret an optional submitted boolean with strict shared semantics."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return False
+    return parse_boolean(value)
+
+
+def normalize_boolean_args(command_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize every schema-declared boolean in one launch argument map.
+
+    Missing, JSON-null, and blank form values retain the config default by
+    being omitted. Every supplied value is otherwise converted to a real
+    ``bool`` or rejected before profile selection, fault scoping, or parsing.
+    """
+    boolean_keys: set[str] = set()
+
+    def collect(nodes: list[dict[str, Any]]) -> None:
+        for node in nodes:
+            if node.get("kind") == "group":
+                collect(node.get("children", []))
+            elif node.get("type") == "boolean":
+                boolean_keys.add(str(node["key"]))
+
+    collect(get_schema(command_id).nodes)
+    normalized = dict(args)
+    for key in boolean_keys & normalized.keys():
+        value = normalized[key]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            normalized.pop(key)
+            continue
+        normalized[key] = parse_boolean(value, key=key)
+    return normalized
 
 
 def _format_value(value: Any) -> str | None:
@@ -836,6 +1004,7 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
     """
     if command_id not in COMMANDS:
         raise KeyError(command_id)
+    args = normalize_boolean_args(command_id, args)
     emit = get_schema(command_id).emit
 
     options: list[str] = []
@@ -850,10 +1019,10 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
             continue
         kind = spec["t"]
         if kind == "flag":
-            if _truthy(raw):
+            if flag_enabled(raw):
                 options.append(spec["flag"])
         elif kind == "flag_off":
-            if not _truthy(raw):
+            if not flag_enabled(raw):
                 options.append(spec["flag"])
         elif kind == "choice":
             flag = spec["map"].get(str(raw).strip())

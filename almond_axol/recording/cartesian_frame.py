@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import math
-import os
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
+from ..utils.state_files import secure_atomic_write_json
 
 CARTESIAN_FRAME_ID = "flu-urdf-root-v0.1.32"
 """Forward-facing FLU world frame introduced by axol v0.1.32."""
@@ -36,6 +35,4 @@ def write_cartesian_frame_marker(
         data["recorded_by_axol_version"] = axol_version
 
     path = Path(dataset_root) / "meta" / "axol.json"
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(data, indent=4, ensure_ascii=False) + "\n")
-    os.replace(tmp, path)
+    secure_atomic_write_json(path, data, sort_keys=False, indent=4)

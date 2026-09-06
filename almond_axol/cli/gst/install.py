@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 
+from ...utils.jetson import _is_jetson
 from ...utils.sudo import prime_sudo
 
 _logger = logging.getLogger(__name__)
@@ -203,6 +204,13 @@ def run(_args: object = None) -> None:
     the ``zedxonesrc`` / ``zedsrc`` source elements come from
     ``axol gst.build-zed``; this command only verifies those are present.
     """
+    if not _is_jetson():
+        print(
+            "Not an NVIDIA Jetson (L4T); skipping the Jetson-only GStreamer "
+            "NVENC stack. Camera capture will use the ZED SDK fallback on "
+            "this host."
+        )
+        return
     if _gst_ok():
         print("GStreamer appsink + GDP + NVENC stack already available.")
         _note_zed_sources()
@@ -217,11 +225,9 @@ def run(_args: object = None) -> None:
         print("GStreamer appsink + GDP + NVENC stack installed.")
         _note_zed_sources()
     else:
-        print(
-            "WARNING: the GStreamer appsink + GDP + NVENC stack is still "
-            "unavailable. Ensure PyGObject, the GDP plugins (gdppay / "
+        raise SystemExit(
+            "The GStreamer appsink + GDP + NVENC stack is still unavailable "
+            "after installation. Ensure PyGObject, the GDP plugins (gdppay / "
             "gdpdepay), and the Jetson NVENC elements (nvvidconv / "
-            "nvv4l2h264enc) are installed. Camera video will fall back to the "
-            "ZED SDK path (higher latency) until then.",
-            file=sys.stderr,
+            "nvv4l2h264enc) are installed, then retry."
         )
