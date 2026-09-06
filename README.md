@@ -105,6 +105,11 @@ Each operation can be driven from the web control panel or the CLI:
 - [Run Policy](https://docs.almond.bot/operations/run-policy) — run a trained policy, local or remote inference
 - [DAgger Collection](https://docs.almond.bot/operations/dagger) — run a policy while correcting it from VR, recording the corrections
 
+### Mantis
+
+- [Mantis Hardware](https://docs.almond.bot/mantis/hardware) — handheld rigs for collecting demonstrations without moving the robot
+- [Mantis Tracking](https://docs.almond.bot/mantis/tracking) — set up Quest, Lighthouse, or Ultimate tracking as the pose source
+
 ### Remote Teleop
 
 - [Remote Teleop](https://docs.almond.bot/guides/remote-teleop) — drive over the internet by sideloading Tailscale on a Meta Quest
@@ -155,6 +160,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`gst.install`](https://docs.almond.bot/cli/gst-install)
 - [`gst.build-zed`](https://docs.almond.bot/cli/gst-build-zed)
 - [`jetson.setup`](https://docs.almond.bot/cli/jetson-setup)
+- [`tracker.*`](https://docs.almond.bot/cli/tracker) — Mantis tracker setup: bridge, identify, pair, install, and base-station / Ultimate checks
 - [`tune.pid`](https://docs.almond.bot/cli/tune-pid)
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
 - [`tune.repeatability`](https://docs.almond.bot/cli/tune-repeatability)
