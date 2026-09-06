@@ -107,7 +107,7 @@ You can also arm a watchdog for the **rollout itself** — while the policy is d
     axol inference-server --host 192.168.1.99
     ```
 
-    Replace the example with the inference machine's exact LAN IP. The default is loopback-only; with `--host`, it listens on that interface's port `8765` until `Ctrl+C`. See [`inference-server`](/cli/inference-server).
+    Replace the example with the inference machine's exact LAN IP, or omit `--host` to use the default `0.0.0.0` (all interfaces). It listens on port `8765` until `Ctrl+C`. See [`inference-server`](/cli/inference-server).
 
     Use remote inference only across an isolated trusted network (or authenticated VPN), with a host firewall allowing the robot IP alone. Axol replaces LeRobot 0.6's pickle transport with bounded, versioned messages, but gRPC still has no TLS/client authentication: a peer can request checkpoint loads or impersonate the server and return arbitrary robot actions, so shared or untrusted networks remain unsafe.
   </Step>

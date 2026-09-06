@@ -532,10 +532,9 @@ class OperationRunner:
             args = normalize_boolean_args(op_id, args)
 
             requested_mantis = flag_enabled(args.get("mantis"))
-            # Set while preparing a Mantis teleop whose tracker source is not
-            # set up: the run drives the grippers from CAN and starts no bridge.
+            # Mantis teleop is grippers-only by design: the run drives the
+            # grippers from CAN and starts no tracker bridge or VR server.
             grippers_only = False
-            grippers_only_reason: str | None = None
             if requested_mantis and not cmd.supports_mantis:
                 raise ValueError(
                     f"{op_id} does not support Mantis; use teleop or collect-data"
@@ -599,32 +598,14 @@ class OperationRunner:
             if mantis_mode:
                 if op_id == "collect-data":
                     from ..cli.collect_data import _prepare_mantis_collection
+                    from ..cli.mantis_bridge import (
+                        require_mantis_tracker_readiness,
+                        set_managed_pose_source_id,
+                    )
 
                     # Fail missing/ambiguous tracker→TCP calibration before
                     # releasing CAN or opening the managed tracker backend.
                     _prepare_mantis_collection(cfg)
-                elif op_id == "teleop":
-                    from ..cli.teleop import (
-                        _prepare_mantis_teleop,
-                        resolve_mantis_grippers_only,
-                    )
-
-                    # Resolve source identity, transform validation, and
-                    # viewer-world policy before a tracker process or CAN
-                    # owner starts. The operation repeats this idempotently.
-                    _prepare_mantis_teleop(cfg)
-                    # Teleop only needs CAN: an unset-up tracker source falls
-                    # back to driving the grippers from the rig triggers.
-                    grippers_only_reason = resolve_mantis_grippers_only(cfg)
-                from ..cli.mantis_bridge import (
-                    require_mantis_tracker_readiness,
-                    set_managed_pose_source_id,
-                )
-
-                _managed_mantis_run_channels(cfg)
-                if getattr(cfg, "mantis_grippers_only", False):
-                    grippers_only = True
-                else:
                     # Quest is checked live by the WebXR handshake. External
                     # sources must pass the same supported-runtime/access gate
                     # as direct CLI commands before releasing CAN or opening
@@ -632,6 +613,15 @@ class OperationRunner:
                     require_mantis_tracker_readiness(str(cfg.mantis_source))
                     if str(cfg.mantis_source) != "quest":
                         set_managed_pose_source_id(cfg)
+                elif op_id == "teleop":
+                    from ..cli.teleop import _prepare_mantis_teleop
+
+                    # Mantis teleop drives the grippers from the rig triggers
+                    # over CAN only; tracking belongs to data collection.
+                    _prepare_mantis_teleop(cfg)
+                    grippers_only = True
+
+                _managed_mantis_run_channels(cfg)
             robot_config = getattr(cfg, "robot_config", None)
             if robot_config is not None:
                 from ..lerobot.robot.config_mantis import MantisRobotConfig
@@ -696,8 +686,9 @@ class OperationRunner:
         # Best-effort: camera streaming is an optional add-on for teleop, and
         # the spec is now always present via the settings store — a host that
         # can't apply it (e.g. no ZED stack on a dev machine running sim) still
-        # gets a camera-less teleop instead of a failed start.
-        if cmd.camera_mode == "teleop":
+        # gets a camera-less teleop instead of a failed start. Grippers-only
+        # Mantis teleop starts no VR server, so it has no headset to feed.
+        if cmd.camera_mode == "teleop" and not grippers_only:
             try:
                 self._attach_cameras_to_teleop(cfg, cameras, session)
             except Exception as exc:  # noqa: BLE001
@@ -712,14 +703,8 @@ class OperationRunner:
         session.emit(f"[serve] starting {op_id} (in-process)")
         if grippers_only:
             session.emit(
-                "[serve] teleop: Mantis grippers only — "
-                + (
-                    f"{cfg.mantis_source} tracking is not set up "
-                    f"({grippers_only_reason}); "
-                    if grippers_only_reason
-                    else ""
-                )
-                + "the rig triggers drive the grippers and no tracking starts"
+                "[serve] teleop: Mantis grippers only — the rig triggers "
+                "drive the grippers and no tracking starts"
             )
 
         if needs_robot and self._robot_link is not None:
@@ -740,6 +725,7 @@ class OperationRunner:
             target = self._run_async
         else:
             target = self._run_thread
+        # Only Mantis data collection tracks; teleop is always grippers-only.
         mantis_source = str(getattr(cfg, "mantis_source", "lighthouse"))
         manage_bridge = mantis_mode and mantis_source != "quest" and not grippers_only
         run_args = (session, op_id, cfg, log_level, needs_robot, manage_bridge)

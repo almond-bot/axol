@@ -76,13 +76,6 @@ axol = "almond_axol.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["almond_axol"]
 
-# The control-panel updater downloads the exact target wheel, verifies PyPI's
-# advertised SHA-256, and executes this reviewed installer from that immutable
-# artifact. Keeping the browser endpoint as the one source file prevents the
-# first-install and update transactions from drifting.
-[tool.hatch.build.targets.wheel.force-include]
-"web/app/public/install" = "almond_axol/_installer.sh"
-
 # Keep source releases reproducible and limited to SDK inputs. Hatch's default
 # repository walk does not honor web/.gitignore, so a developer build could
 # otherwise ingest web/node_modules (including generated development TLS

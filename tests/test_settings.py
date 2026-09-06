@@ -12,8 +12,9 @@ from almond_axol.utils import certs, state_files
 
 
 class DiagnosticSettingsTest(unittest.TestCase):
-    def test_web_catalog_excludes_local_firmware_paths(self) -> None:
-        self.assertNotIn("motor.flash", COMMANDS)
+    def test_web_catalog_includes_motor_flash(self) -> None:
+        self.assertIn("motor.flash", COMMANDS)
+        self.assertEqual(COMMANDS["motor.flash"].hardware_profiles, ("axol",))
 
     def test_boolean_args_are_canonical_before_argv_emission(self) -> None:
         args = normalize_boolean_args(

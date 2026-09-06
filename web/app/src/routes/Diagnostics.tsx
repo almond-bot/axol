@@ -9,6 +9,7 @@ import {
   RefreshCw,
   SlidersHorizontal,
   Tag,
+  Upload,
   Wrench,
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -118,6 +119,7 @@ const PAGE_COMMAND_IDS = [
   "motor.set-zero-pos",
   "motor.dump-config",
   "motor.set-config",
+  "motor.flash",
 ]
 
 // The Axol hub adapter's persistent interface names (created by can.setup).
@@ -948,9 +950,24 @@ export default function Diagnostics() {
         },
       ],
     },
+    {
+      key: "flash",
+      command: "motor.flash",
+      label: "Flash firmware",
+      icon: Upload,
+      description:
+        "Overwrite one motor's firmware from a .bin file on the robot host. Leave " +
+        "the arm powered and idle — nothing else may use the bus. An interrupted " +
+        "flash leaves the motor in its bootloader until you run this again.",
+      // Running the dialog is the confirmation; the CLI prompt would otherwise
+      // block the session waiting on stdin.
+      presetArgs: { yes: true },
+    },
   ]
   const visibleMotorTools =
-    robot?.profile === "mantis" ? MOTOR_TOOLS.filter((tool) => tool.key !== "zero") : MOTOR_TOOLS
+    robot?.profile === "mantis"
+      ? MOTOR_TOOLS.filter((tool) => !["zero", "flash"].includes(tool.key))
+      : MOTOR_TOOLS
   const [motorTool, setMotorTool] = useState<string | null>(null)
   const openTool = MOTOR_TOOLS.find((t) => t.key === motorTool) ?? null
   const openToolSpec = openTool ? canCommand(openTool.command) : null

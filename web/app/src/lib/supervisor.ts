@@ -221,31 +221,6 @@ export async function fetchUpdateStatus(force = false): Promise<UpdateStatus> {
   return json(await fetch(apiUrl(`/api/update/status${force ? "?refresh=1" : ""}`)))
 }
 
-/**
- * Probe the update API before touching legacy polling endpoints. Servers from
- * v0.1.0 through v0.1.2 return 404 here, but `/api/info` and `/api/op/status`
- * trigger their unsafe main-tracking updater. `null` therefore means the UI
- * must stop and show the one-time hosted-installer migration.
- */
-export async function probeUpdateStatus(): Promise<UpdateStatus | null> {
-  let response: Response
-  try {
-    response = await fetch(apiUrl("/api/update/status"), {
-      signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
-    })
-  } catch (error) {
-    if (
-      error instanceof DOMException &&
-      (error.name === "TimeoutError" || error.name === "AbortError")
-    ) {
-      throw new Error(`no response from the host after ${CONNECT_TIMEOUT_MS / 1000}s`)
-    }
-    throw error
-  }
-  if (response.status === 404) return null
-  return json(response)
-}
-
 /** Trigger the on-demand upgrade; the server restarts onto new code when idle. */
 export async function startUpdate(): Promise<{ started: boolean }> {
   return json(await fetch(apiUrl("/api/update/start"), { method: "POST" }))

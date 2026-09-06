@@ -80,8 +80,8 @@ def _rewrite_header(data: bytes, update) -> bytes:  # type: ignore[no-untyped-de
 
 
 class InferenceObservationWireTest(unittest.TestCase):
-    def test_standalone_server_defaults_to_loopback(self) -> None:
-        self.assertEqual(InferenceServerConfig().host, "127.0.0.1")
+    def test_standalone_server_defaults_to_all_interfaces(self) -> None:
+        self.assertEqual(InferenceServerConfig().host, "0.0.0.0")
 
     def test_round_trip_preserves_numeric_state_text_and_images(self) -> None:
         encoded = encode_timed_observation(_observation(), FEATURES)

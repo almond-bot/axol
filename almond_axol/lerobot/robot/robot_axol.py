@@ -58,9 +58,9 @@ def default_tracking_ik_config() -> "KinematicsConfig":
     """Tracking-grade IK solver config for executing Cartesian policy actions.
 
     The ``KinematicsConfig`` defaults are the *soft* arm-teleop profile
-    (pos_weight=50, ori_weight=10, self_collision_margin=0.1): comfortable for
-    a human driving the arms, but it lets the rest/posture regularizers and
-    the 10 cm collision standoff shove commanded poses ~9 mm off target. A
+    (pos_weight=50, ori_weight=10, self_collision_margin=0.025): comfortable
+    for a human driving the arms, but it lets the rest/posture regularizers
+    and the collision standoff shove commanded poses ~9 mm off target. A
     policy replays absolute end-effector poses from its training data, so
     deployment needs the accurate-tracking weights instead. Those are exactly
     the Mantis overrides (pos_weight=200, ori_weight=120,

@@ -1,14 +1,11 @@
 """Grippers-only Mantis teleop: mirror the rig triggers onto the grippers.
 
-A Mantis teleop run needs only CAN to be useful — squeezing a rig's trigger
-closes its gripper — so tracking is optional. When the selected pose source
-is not set up (no runtime, no binding, no dongle …) or the operator asks for
-it explicitly, ``axol teleop --mantis`` runs this loop instead of the VR
-server + tracker bridge: it opens the trigger reader and gripper on each
-Mantis CAN channel, waits for both triggers to be fresh and released, then
-mirrors their analog values onto the physical grippers until stopped. It
-deliberately starts no VR server and needs no tracker binding, cameras,
-headset, or tracker-to-TCP transform.
+Mantis teleop is grippers-only by design — tracked Mantis runs belong to data
+collection. ``axol teleop --mantis`` runs this loop: it opens the trigger
+reader and gripper on each Mantis CAN channel, waits for both triggers to be
+fresh and released, then mirrors their analog values onto the physical
+grippers until stopped. It deliberately starts no VR server and needs no
+tracker binding, cameras, headset, or tracker-to-TCP transform.
 """
 
 from __future__ import annotations
@@ -32,38 +29,6 @@ _STATUS_INTERVAL_S = 0.25
 _TRIGGER_WAIT_TIMEOUT_S = 5.0
 # Match the release threshold used by the managed Mantis engage gesture.
 _RELEASED_GRIP_MIN = 0.8
-
-
-def mantis_grippers_only_reason(source: str) -> str | None:
-    """Why ``source`` cannot drive a tracked Mantis run right now, or ``None``.
-
-    Shared by the direct CLI and the control-panel runner so both make the
-    same call: a source whose supported runtime, access, or left/right
-    binding is missing falls back to :func:`run_grippers_only` instead of
-    refusing to start. Quest is checked live by the WebXR handshake and never
-    falls back here.
-    """
-    if source == "quest":
-        return None
-    from ..cli.mantis_bridge import require_mantis_tracker_readiness
-
-    try:
-        require_mantis_tracker_readiness(source)
-    except (RuntimeError, ValueError) as exc:
-        return str(exc)
-
-    from ..tracker import load_tracker_config
-    from ..tracker.config import select_tracker_backend
-
-    backend = {"lighthouse": "survive", "ultimate": "ultimate"}[source]
-    config = load_tracker_config()
-    select_tracker_backend(config, backend)
-    if (config.left is None or config.right is None) and not config.allow_single_side:
-        return (
-            f"no complete {source} tracker binding is saved (run Identify "
-            f"trackers or `axol tracker.identify --backend {backend}`)"
-        )
-    return None
 
 
 def _read_fresh_grips(readers: dict[str, Any]) -> tuple[dict[str, float], list[str]]:

@@ -14,7 +14,7 @@ This service has no transport authentication or encryption. Its non-loopback
 mode is for an isolated, trusted robot network protected by a host firewall;
 it must not be exposed to shared Wi-Fi or the public internet.
 
-    axol inference-server                              # loopback only
+    axol inference-server                              # listen on 0.0.0.0:8765
     axol inference-server --host 192.168.1.99          # explicit LAN interface
 
 Then, on the robot:
@@ -37,14 +37,15 @@ class InferenceServerConfig:
     """Config for ``axol inference-server``.
 
     Args:
-        host:      Interface to bind the gRPC server to. The safe default is
-                   loopback; remote inference requires an explicit LAN IP.
+        host:      Interface to bind the gRPC server to. The default
+                   (0.0.0.0) accepts connections from the whole network;
+                   pass 127.0.0.1 to restrict the server to loopback.
         port:      gRPC port (must match run-policy's ``--server_port``).
         fps:       Action chunk rate; must match run-policy's ``--fps``.
         log_level: Python logging level.
     """
 
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 8765
     fps: int = 60
     log_level: LogLevel = "INFO"

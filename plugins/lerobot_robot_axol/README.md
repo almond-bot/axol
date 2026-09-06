@@ -58,11 +58,8 @@ Use the in-place command above rather than rebuilding the Axol tool with
 would prune separately managed packages such as the VIVE Ultimate runtime or a
 JetPack-compatible CUDA Torch build. The hosted environment already contains
 the compatible Axol SDK/LeRobot dependencies, so `--no-deps` also prevents a
-plugin install from changing that running environment. Later hosted-installer
-or control-panel Axol updates detect a published plugin installed this way and
-preserve its exact version in the same transaction. A direct/VCS/custom plugin
-source blocks those force updates before mutation because its source cannot be
-reconstructed safely; update that deployment manually with the same source.
+plugin install from changing that running environment. An Axol update
+reinstalls the tool environment, so re-apply the plugin install afterwards.
 
 ## Usage
 

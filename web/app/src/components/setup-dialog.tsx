@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 
-export type ConnState = "loading" | "ok" | "err" | "idle" | "migration"
+export type ConnState = "loading" | "ok" | "err" | "idle"
 
 /**
  * One-time setup, kept out of the main layout: connect to the machine running
@@ -129,7 +129,6 @@ function ConnBadge({ state }: { state: ConnState }) {
   if (state === "ok") return <Badge variant="success">Connected</Badge>
   if (state === "err") return <Badge variant="destructive">Offline</Badge>
   if (state === "idle") return <Badge variant="neutral">Disconnected</Badge>
-  if (state === "migration") return <Badge variant="warning">Migration required</Badge>
   return <Badge variant="warning">Connecting…</Badge>
 }
 
@@ -149,9 +148,7 @@ export function ConnectionPill({
       ? host || "Connected"
       : state === "err"
         ? "Offline"
-        : state === "migration"
-          ? "Migration required"
-          : "Connecting…"
+        : "Connecting…"
   return (
     <button
       type="button"

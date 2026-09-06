@@ -212,6 +212,23 @@ export function SettingsSection({
     })
   }
 
+  // The pose-source dropdown commits on selection instead of staging: the
+  // tracker setup actions on the Tracking tab run host-side against the
+  // *persisted* settings, so a staged-only source would let Identify/Pair act
+  // on the wrong backend. Only this key is written — other staged edits keep
+  // waiting for the explicit Save. A failed write reverts the dropdown so the
+  // stored source stays authoritative.
+  async function saveMantisSource(key: string, value: SettingValue | null) {
+    const prior = draft?.values[key]
+    setValue(key, value)
+    try {
+      await onSave({ values: { [key]: value } })
+    } catch (e) {
+      setValue(key, prior === undefined ? null : prior)
+      toast.error(String(e).replace(/^Error:\s*/, ""))
+    }
+  }
+
   function exportFile() {
     if (!draft) return
     const blob = new Blob(
@@ -429,7 +446,7 @@ export function SettingsSection({
                   <SettingRow
                     field={mantisSourceField}
                     value={draft.values[mantisSourceField.key]}
-                    onChange={setValue}
+                    onChange={(key, value) => void saveMantisSource(key, value)}
                   />
                 )}
                 {draftMantisSource === "quest" && questTrackerKeyField && (

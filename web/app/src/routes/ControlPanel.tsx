@@ -25,7 +25,6 @@ import {
   operationsFromCommands,
   parseHardwareProfile,
   perRunFields,
-  probeUpdateStatus,
   robotConnect,
   robotDisconnect,
   saveLocalHardwareProfile,
@@ -73,9 +72,8 @@ import {
   shouldStartCanDiscovery,
   voidCanInventoryPolls,
 } from "@/lib/can-auto-connect"
-import { InstallerMigrationBanner, UpdateBanner } from "@/components/update-banner"
+import { UpdateBanner } from "@/components/update-banner"
 import { VersionMismatchBanner } from "@/components/version-mismatch-banner"
-import { requiresInstallerMigration, showInstallerMigration } from "@/lib/update-migration"
 import { versionMismatch } from "@/lib/version"
 import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
@@ -378,17 +376,6 @@ export default function ControlPanel() {
       setSettingsSnap(null)
       setSettingsError(null)
       try {
-        // Must be the first API probe. v0.1.0-v0.1.2 have no update endpoint,
-        // while their info/op-status endpoints start a destructive unpinned
-        // upgrade from main merely by being read.
-        const initialUpdate = await probeUpdateStatus()
-        if (generation !== connectionGenerationRef.current) return
-        if (initialUpdate === null) {
-          setConn({ state: "migration" })
-          setSetupOpen(false)
-          return
-        }
-        setUpdate(initialUpdate)
         const cmds = await fetchCommands()
         if (generation !== connectionGenerationRef.current) return
         setCommands(cmds)
@@ -1452,13 +1439,14 @@ export default function ControlPanel() {
         Object.entries(settings).filter(([k]) => runKeys.has(k))
       )
       // The system-wide device selection becomes this run's hardware flag.
-      // Snapshot the shared tracking source alongside it: new hosts also
-      // return their fully merged args, but this keeps live hints/reset
-      // controls tied to the actual run even against an older serve host if
-      // the operator edits the saved source mid-run.
+      // For collection, snapshot the shared tracking source alongside it:
+      // new hosts also return their fully merged args, but this keeps live
+      // hints/reset controls tied to the actual run even against an older
+      // serve host if the operator edits the saved source mid-run. Teleop
+      // never tracks (Mantis teleop is grippers-only), so it takes no source.
       if (mantisSelected) {
         args[HARDWARE_PROFILE_ARG] = true
-        args.mantis_source = mantisSource
+        if (meta.id === "collect-data") args.mantis_source = mantisSource
       }
       // Send the camera spec whenever any serial is assigned — collect-data /
       // run-policy need at least one, while teleop streams whichever are set to
@@ -1515,12 +1503,6 @@ export default function ControlPanel() {
   // hard-reloads once the backend is back on the new release.
   async function handleUpdate() {
     if (!update?.remoteVersion) return
-    if (requiresInstallerMigration(update.version)) {
-      toast.error(
-        "This server needs the one-time hosted-installer migration; run the command shown on the robot."
-      )
-      return
-    }
     const generation = connectionGenerationRef.current
     setUpdateAbandoned(false)
     setStartingUpdate(true)
@@ -1547,13 +1529,6 @@ export default function ControlPanel() {
   }
 
   const viewerHost = serverHost || hostInfo?.lanIp || ""
-  const connectedReleaseVersion = update?.version ?? hostInfo?.version ?? null
-  const installerMigrationRequired =
-    conn.state === "ok" &&
-    showInstallerMigration(
-      connectedReleaseVersion,
-      hostInfo?.releaseInstall ?? update?.enabled ?? false
-    )
   const mantisSource = String(settingsSnap?.values["teleop.mantis_source"] ?? "lighthouse")
   // Child settings actions can finish after their old-host tree unmounts.
   // Capture the generation represented by these callbacks so an old camera
@@ -1573,13 +1548,7 @@ export default function ControlPanel() {
     <div className="min-h-screen">
       <SiteNav current="control" />
       <main className="safe-x mx-auto flex max-w-5xl flex-col gap-6 py-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:py-8">
-        {conn.state === "migration" && <InstallerMigrationBanner version={null} />}
-
-        {installerMigrationRequired && (
-          <InstallerMigrationBanner version={connectedReleaseVersion} />
-        )}
-
-        {update?.updateAvailable && !installerMigrationRequired && (
+        {update?.updateAvailable && (
           <UpdateBanner
             update={update}
             updating={updating}
@@ -1590,7 +1559,7 @@ export default function ControlPanel() {
           />
         )}
 
-        {mismatch && !updating && !update?.updateAvailable && !installerMigrationRequired && (
+        {mismatch && !updating && !update?.updateAvailable && (
           <VersionMismatchBanner mismatch={mismatch} />
         )}
 

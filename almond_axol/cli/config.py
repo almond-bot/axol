@@ -537,24 +537,12 @@ class TeleopCmdConfig:
     """
 
     sim: bool = False
-    # Mantis bench mode: drive the two handheld grippers on can_mantis_l/r
-    # while the arms exist only as the VR client's URDF overlay — absolute
-    # pose mapping is forced on. mantis_source either waits for Quest WebXR or
-    # starts the selected tracker bridge; direct CLI and control-panel runs use
-    # the same managed behavior.
-    # No robot, no cameras, no recording. Mutually exclusive with --sim.
+    # Mantis teleop is grippers-only by design: the rig triggers drive the two
+    # handheld grippers on can_mantis_l/r over CAN, and nothing else starts —
+    # no tracking, VR server, cameras, or recording. Tracked Mantis runs are
+    # data collection's job (`axol collect-data --mantis`). Mutually exclusive
+    # with --sim.
     mantis: bool = False
-    mantis_source: MantisSource = "lighthouse"
-    """Pose source for Mantis mode. Direct Mantis runs inherit the host's
-    Settings → Mantis choice when saved; otherwise Lighthouse is the default.
-    A config file or explicit CLI value wins. Quest connects through WebXR;
-    Lighthouse and Ultimate start the corresponding local tracker bridge."""
-    mantis_grippers_only: bool = False
-    """Run Mantis teleop without tracking: the rig triggers drive the two
-    grippers over CAN and nothing else starts (no VR server, tracker bridge,
-    cameras, or transforms). Switched on automatically when the selected
-    Lighthouse/Ultimate source is not set up, so a Mantis teleop only ever
-    needs CAN; set it explicitly to skip tracking even when it is."""
     cart_only: bool = False
     """Drive only the powered cart from the headset thumbsticks. The arms and
     their CAN channels are left untouched (no Axol hub needed); the cart is

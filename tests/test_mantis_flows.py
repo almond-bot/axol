@@ -144,9 +144,10 @@ class MantisFlowTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             snapshot.left[0] = 3.0  # type: ignore[index]
 
-    def test_direct_mantis_teleop_disables_inherited_powered_cart(self) -> None:
-        cfg = TeleopCmdConfig(mantis=True)
-        cfg.cart.enabled = True
+    def test_mantis_teleop_is_grippers_only_and_rejects_other_modes(self) -> None:
+        # Mantis teleop never tracks: preparing it applies no teleop or
+        # kinematics profile (the grippers-only loop uses neither) and only
+        # validates the mutually exclusive run modes.
         with (
             mock.patch(
                 "almond_axol.teleop.config.apply_mantis_teleop_profile"
@@ -155,13 +156,15 @@ class MantisFlowTest(unittest.TestCase):
                 "almond_axol.kinematics.config.apply_mantis_kinematics_profile"
             ) as apply_kinematics,
         ):
-            teleop._prepare_mantis_teleop(cfg)
+            teleop._prepare_mantis_teleop(TeleopCmdConfig(mantis=True))
 
-        self.assertFalse(cfg.cart.enabled)
-        apply_teleop.assert_called_once_with(
-            cfg.teleop, tracker_source=cfg.mantis_source
-        )
-        apply_kinematics.assert_called_once_with(cfg.kinematics)
+        apply_teleop.assert_not_called()
+        apply_kinematics.assert_not_called()
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            teleop._prepare_mantis_teleop(TeleopCmdConfig(mantis=True, sim=True))
+        with self.assertRaisesRegex(ValueError, "pick one"):
+            teleop._prepare_mantis_teleop(TeleopCmdConfig(mantis=True, cart_only=True))
 
     def test_mantis_collection_disables_inherited_powered_cart(self) -> None:
         cfg = collect_data.CollectDataConfig(repo_id="test/repo", task="test")

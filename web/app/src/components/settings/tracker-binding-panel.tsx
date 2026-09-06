@@ -37,7 +37,7 @@ type SetupCommand =
   | "tracker.ultimate.install"
   | "tracker.ultimate.check"
 
-type StepKey = "source" | "runtime" | "stations" | "headset" | "dongle" | "wifi" | "identify"
+type StepKey = "runtime" | "stations" | "headset" | "dongle" | "wifi" | "identify"
 
 interface FlowStep {
   key: StepKey
@@ -133,7 +133,8 @@ export function TrackerBindingPanel({
   onHostSessionChange,
 }: {
   source: string
-  /** False when the source selector is only a local, unsaved draft. */
+  /** False while a source selection is still persisting to the host (the
+   * dropdown saves on change) or its write failed; setup actions hold. */
   sourceSaved: boolean
   /** Source plus profile-scoped Quest datum match the persisted host settings. */
   calibrationContextSaved: boolean
@@ -448,34 +449,6 @@ export function TrackerBindingPanel({
     )
   }
 
-  const saveStep = (): FlowStep => ({
-    key: "source",
-    title: "Source",
-    done: sourceSaved,
-    pending: "Save the selected source to this host",
-    body: (
-      <StepBody>
-        <p>
-          Selected pose source: <span className="text-white/85">{label}</span>.
-          {sourceSaved
-            ? " Saved on this host; runs and the setup actions below use it."
-            : " Save it so runs and the setup actions below use the same source."}
-        </p>
-        {!sourceSaved && (
-          <Button
-            size="sm"
-            className="self-start"
-            onClick={onSaveSettings}
-            disabled={!onSaveSettings || savingSettings}
-          >
-            {savingSettings ? <Loader2 className="animate-spin" /> : <Save />}
-            Save settings
-          </Button>
-        )}
-      </StepBody>
-    ),
-  })
-
   const identifyStep = (
     backendKey: TrackerBackend,
     blocker: string | null,
@@ -532,7 +505,6 @@ export function TrackerBindingPanel({
       q.poseSpace === "grip" &&
       !liveMismatch
     steps = [
-      saveStep(),
       {
         key: "headset",
         title: "Headset",
@@ -550,9 +522,11 @@ export function TrackerBindingPanel({
           <StepBody>
             <p>
               Put the Quest and this host on the same LAN (or connect USB-C with Developer Mode and
-              use the General settings → Quest tab). Start a Mantis teleop run, then in the Quest
-              browser open <span className="text-white/70">axol.almond.bot</span>, enter this host,
-              connect, and choose Enter VR. Hold both Touch controllers.
+              use the General settings → Quest tab). Start a Quest bring-up collection run — Collect
+              data with mantis_allow_uncalibrated set under Advanced (Mantis teleop never starts the
+              VR server) — then in the Quest browser open{" "}
+              <span className="text-white/70">axol.almond.bot</span>, enter this host, connect, and
+              choose Enter VR. Hold both Touch controllers.
             </p>
             {live ? (
               <div className="flex flex-col gap-2 rounded-md border border-white/10 bg-black/20 p-2.5">
@@ -642,7 +616,6 @@ export function TrackerBindingPanel({
               ? "reconnect the dongle and close any other process using its HID endpoint"
               : null
     steps = [
-      saveStep(),
       {
         key: "runtime",
         title: "Runtime",
@@ -788,7 +761,6 @@ export function TrackerBindingPanel({
       : true
     const stationChannels = survey ? Object.keys(survey.channels) : []
     steps = [
-      saveStep(),
       {
         key: "runtime",
         title: "Runtime",

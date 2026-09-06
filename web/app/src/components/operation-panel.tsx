@@ -222,8 +222,9 @@ export function OperationPanel({
     !mantisMode && meta.fields.includes("cart_only") && Boolean(effectiveSettings.cart_only)
   // `usesHeadset` also identifies operations that run the camera relay. The
   // relay is useful in the panel for every real teleop/collection run,
-  // including headset-free Lighthouse/Ultimate Mantis tracking.
-  const showFeeds = meta.usesHeadset && !isSim && !cartOnly
+  // including headset-free Lighthouse/Ultimate Mantis collection. Mantis
+  // teleop is grippers-only: no VR server or cameras run, so no feeds.
+  const showFeeds = meta.usesHeadset && !isSim && !cartOnly && !(mantisMode && meta.id === "teleop")
   const camCount = recordingCameraCount(cameras, mantisMode)
   const currentTrackerReadinessState =
     trackerReadinessSource === mantisSource ? trackerReadinessState : "loading"
@@ -255,19 +256,20 @@ export function OperationPanel({
     }
   }
   // Tracker setup gates a Mantis *collection* (the server refuses it too).
-  // Mantis teleop only needs CAN: with tracking missing it drives the
-  // grippers from the rig triggers, so the same items are shown as a notice.
+  // Mantis teleop never tracks — it drives the grippers from the rig
+  // triggers over CAN — so tracker readiness is irrelevant to it.
+  const trackerGated = mantisMode && meta.id !== "teleop"
   const trackerIssues: string[] = []
-  if (mantisMode && !trackerSource) {
+  if (trackerGated && !trackerSource) {
     trackerIssues.push("Choose a valid tracking source in Mantis settings → Tracking")
-  } else if (mantisMode && currentTrackerReadinessState !== "ready") {
+  } else if (trackerGated && currentTrackerReadinessState !== "ready") {
     trackerIssues.push(
       currentTrackerReadinessState === "error"
         ? "Mantis tracker readiness is unavailable — reconnect the host or update Axol"
         : "Checking Mantis tracker readiness…"
     )
   }
-  if (mantisMode && trackerSource && currentTrackerReadiness) {
+  if (trackerGated && trackerSource && currentTrackerReadiness) {
     const ready = currentTrackerReadiness[trackerSource]
     if (trackerSource === "lighthouse") {
       const status = currentTrackerReadiness.lighthouse
@@ -314,11 +316,7 @@ export function OperationPanel({
       }
     }
   }
-  const grippersOnlyTeleop = meta.id === "teleop" && mantisMode && trackerSource !== "quest"
-  // Only surface the grippers-only notice once readiness is actually known.
-  const grippersOnly =
-    grippersOnlyTeleop && currentTrackerReadinessState === "ready" && trackerIssues.length > 0
-  if (meta.id !== "teleop") blockers.push(...trackerIssues)
+  blockers.push(...trackerIssues)
   // Collect-data / run-policy record whichever camera slots are assigned, so
   // at least one serial must be set before starting (the rest are optional).
   if (meta.requiresCameras && camCount < 1) {
@@ -370,7 +368,9 @@ export function OperationPanel({
             <p className="mt-2 max-w-prose text-sm text-white/55">{meta.description}</p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-            {live && mantisMode && mantisSource !== "quest" && (
+            {/* Only Mantis collection owns a tracker bridge to reset;
+                Mantis teleop is grippers-only. */}
+            {live && mantisMode && mantisSource !== "quest" && meta.id === "collect-data" && (
               <Button variant="outline" onClick={() => onEpisode("bridge-reset")} disabled={busy}>
                 <RotateCcw /> Reset
               </Button>
@@ -459,30 +459,14 @@ export function OperationPanel({
                 </div>
               )}
 
-              {grippersOnly && !live && (
-                <div className="flex flex-col gap-1 rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs text-white/55">
-                  <span className="font-medium text-white/70">
-                    Grippers only — {trackerLabelFor(trackerSource)} tracking isn&apos;t set up
-                  </span>
-                  <p>
-                    Start drives both grippers from the rig triggers over CAN; no tracking, headset,
-                    or cameras are used. To add tracking, finish these in Mantis settings:
-                  </p>
-                  <ul className="list-inside list-disc">
-                    {trackerIssues.map((b) => (
-                      <li key={b}>{b}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
               {/* Everything the operator watches during a session — episode
                   status/controls, the mirrored headset popups, and the live
                   camera feeds — grouped so it can expand to a fullscreen
                   operator view (the headset-off replacement for the HUD). */}
-              {/* Sim has the browser viewer and cart-only has no video relay.
-                  Mantis still relays its configured wrist-camera feeds even
-                  when Lighthouse/Ultimate make the headset unnecessary. */}
+              {/* Sim has the browser viewer, cart-only has no video relay, and
+                  Mantis teleop is grippers-only (no cameras). Mantis collection
+                  still relays its configured wrist-camera feeds even when
+                  Lighthouse/Ultimate make the headset unnecessary. */}
               {live && (meta.episodeControl || showFeeds) && (
                 <OperatorDeck
                   label={meta.label}
@@ -499,7 +483,6 @@ export function OperationPanel({
                 usesHeadset={meta.usesHeadset}
                 mantisMode={mantisMode}
                 mantisSource={mantisSource}
-                grippersOnly={grippersOnly}
                 dataCollection={meta.id === "collect-data"}
                 session={live ? session : null}
                 isSim={isSim}
@@ -919,7 +902,6 @@ function RunningHints({
   usesHeadset,
   mantisMode,
   mantisSource,
-  grippersOnly,
   dataCollection,
   session,
   isSim,
@@ -929,7 +911,6 @@ function RunningHints({
   usesHeadset: boolean
   mantisMode: boolean
   mantisSource: string
-  grippersOnly: boolean
   dataCollection: boolean
   session: SessionInfo | null
   isSim: boolean
@@ -938,12 +919,14 @@ function RunningHints({
 }) {
   if (!session || session.status !== "running") return null
   const viewerUrl = host ? `http://${host}:${viewerPort}` : ""
-  const questMantis = mantisMode && mantisSource === "quest"
-  const managedMantis = mantisMode && !questMantis && !grippersOnly
+  // Mantis teleop is always grippers-only; tracking only runs for collection.
+  const grippersOnly = mantisMode && !dataCollection
+  const questMantis = mantisMode && dataCollection && mantisSource === "quest"
+  const managedMantis = mantisMode && dataCollection && !questMantis
   const trackerLabel = trackerLabelFor(mantisSource)
   return (
     <div className="flex flex-col gap-3">
-      {mantisMode && grippersOnly && (
+      {grippersOnly && (
         <p className="rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
           Grippers only: once both triggers read live and released, the grippers calibrate against
           their open stops (jaws move fully open — keep them clear), then each trigger closes its

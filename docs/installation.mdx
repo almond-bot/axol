@@ -40,7 +40,7 @@ curl https://axol.almond.bot/install -fsS | bash
 ```
 
 <Warning>
-  On aarch64/Jetson, the pinned PyPI `torch==2.10.0` wheel is CPU-only. Teleoperation, recording, and remote policy inference remain available, but local `run-policy` / `collect-dagger` CUDA inference requires an explicitly managed, JetPack-compatible Torch + Torchvision build (or use `--device cpu`). Once such a custom/CUDA build is present, the installer and control-panel updater refuse a force update before changing the environment rather than silently replacing it with the CPU wheel. Use remote inference until that platform-specific build is managed separately.
+  On aarch64/Jetson, the pinned PyPI `torch==2.10.0` wheel is CPU-only. Teleoperation, recording, and remote policy inference remain available, but local `run-policy` / `collect-dagger` CUDA inference requires an explicitly managed, JetPack-compatible Torch + Torchvision build (or use `--device cpu`). Reinstalling or updating replaces the environment, so re-apply such a custom build afterwards. Use remote inference until that platform-specific build is managed separately.
 </Warning>
 
 This one command:
@@ -60,18 +60,12 @@ When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to
 </Note>
 
 <Note>
-  Existing datasets under `~/.cache/huggingface/lerobot` remain available to the non-root CLI but are not migrated into the hosted store automatically. On upgrade, the installer detects them and stops instead of silently hiding them. After backing them up, acknowledge that they will remain CLI-only with `curl https://axol.almond.bot/install -fsS | sudo env AXOL_ACK_LEGACY_DATASETS=1 bash`; new panel recordings use the hosted store. Any previously configured external/custom panel dataset root is likewise CLI-only after this upgrade. Do not symlink a writable legacy tree into `/var/lib`.
+  Existing datasets under `~/.cache/huggingface/lerobot` remain available to the non-root CLI but are not migrated into the hosted store automatically; new panel recordings use the hosted store. Any previously configured external/custom panel dataset root is likewise CLI-only. Do not symlink a writable legacy tree into `/var/lib`.
 </Note>
 
 ### Staying up to date
 
-<Warning>
-  **One-time migration from v0.1.36 or earlier:** do not use that release's control-panel **Update** button. Its legacy updater cannot preserve the new tracker extra, a separately installed LeRobot plugin or Ultimate runtime, or a custom Jetson CUDA Torch build. Rerun the install command above instead; the hosted panel disables the unsafe button and shows the same command.
-</Warning>
-
-Installs track [GitHub releases](https://github.com/almond-bot/axol/releases), not individual commits. The server checks for a newer release in the background; when one exists, the control panel shows an update banner with the installed and latest versions (e.g. `v0.1.2 → v0.1.3`). Press **Update** to apply it — the server reinstalls at the new release tag, re-provisions, and restarts once idle. Nothing updates without that button press. Re-running the install command also upgrades to the latest release. On aarch64, either path checks for an existing CUDA/custom PyTorch only when the update is explicitly started and blocks before the force reinstall if it cannot preserve that deployment.
-
-Updates fail closed: if installation, provisioning, verification, or power fails mid-update, `axol.service` remains disabled and guarded across reboot instead of starting a partially updated environment. Correct the reported cause, then rerun the install command above; the installer removes the guard and starts the service only after the complete environment verifies successfully.
+Installs track [GitHub releases](https://github.com/almond-bot/axol/releases), not individual commits. The server checks for a newer release in the background; when one exists, the control panel shows an update banner with the installed and latest versions (e.g. `v0.1.2 → v0.1.3`). Press **Update** to apply it — the server reinstalls at the new release tag, re-provisions, and restarts once idle. Nothing updates without that button press. Re-running the install command also upgrades to the latest release.
 
 ```bash
 journalctl -u axol -f        # follow the service logs

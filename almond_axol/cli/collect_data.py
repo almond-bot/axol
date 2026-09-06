@@ -973,7 +973,7 @@ def main(argv: list[str]) -> None:
         fallback, quest_key = load_direct_mantis_fallback(collection=True)
         cfg = parse(CollectDataConfig, argv, fallback_overlay=fallback)
         if cfg.mantis_source == "quest" and quest_key is not None:
-            add_quest_key_to_direct_fallback(fallback, quest_key, collection=True)
+            add_quest_key_to_direct_fallback(fallback, quest_key)
             cfg = parse(CollectDataConfig, argv, fallback_overlay=fallback)
     # force=True: importing lerobot (at module load) installs a root handler
     # and leaves the root level at WARNING, which would otherwise make this a

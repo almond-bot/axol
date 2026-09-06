@@ -61,35 +61,33 @@ class MantisChannelFlowTest(unittest.TestCase):
                     collection=True
                 )
 
-        self.assertEqual(teleop_fallback["mantis_source"], "quest")
-        self.assertEqual(teleop_fallback["left_channel"], "can_mantis_r")
-        self.assertEqual(teleop_fallback["right_channel"], "can_mantis_l")
+        # Mantis teleop is grippers-only: it inherits only the channel map,
+        # never the tracking source or Quest datum.
+        self.assertEqual(
+            teleop_fallback,
+            {"left_channel": "can_mantis_r", "right_channel": "can_mantis_l"},
+        )
+        self.assertIsNone(quest_key)
+        self.assertEqual(collect_fallback["mantis_source"], "quest")
         self.assertEqual(
             collect_fallback["robot_config"],
             {"left_channel": "can_mantis_r", "right_channel": "can_mantis_l"},
         )
-        self.assertEqual(quest_key, "quest:oculus-touch-v3:grip")
-        self.assertEqual(collect_key, quest_key)
+        self.assertEqual(collect_key, "quest:oculus-touch-v3:grip")
 
     def test_direct_fallback_is_below_config_file_and_cli(self) -> None:
         fallback: dict[str, object] = {
-            "mantis_source": "quest",
             "left_channel": "saved-left",
             "right_channel": "saved-right",
         }
-        add_quest_key_to_direct_fallback(
-            fallback, "quest:saved-profile:grip", collection=False
-        )
         saved = parse(
             TeleopCmdConfig,
             ["--mantis", "true"],
             fallback_overlay=fallback,
         )
-        self.assertEqual(saved.mantis_source, "quest")
         self.assertEqual(
             (saved.left_channel, saved.right_channel), ("saved-left", "saved-right")
         )
-        self.assertEqual(saved.teleop.tracker_key, "quest:saved-profile:grip")
 
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "teleop.json"
@@ -97,10 +95,8 @@ class MantisChannelFlowTest(unittest.TestCase):
                 json.dumps(
                     {
                         "mantis": True,
-                        "mantis_source": "ultimate",
                         "left_channel": "file-left",
                         "right_channel": "file-right",
-                        "teleop": {"tracker_key": "file-key"},
                     }
                 )
             )
@@ -114,12 +110,10 @@ class MantisChannelFlowTest(unittest.TestCase):
                 ],
                 fallback_overlay=fallback,
             )
-        self.assertEqual(overridden.mantis_source, "ultimate")
         self.assertEqual(
             (overridden.left_channel, overridden.right_channel),
             ("cli-left", "file-right"),
         )
-        self.assertEqual(overridden.teleop.tracker_key, "file-key")
 
     def test_nested_collection_fallback_has_the_same_precedence(self) -> None:
         fallback: dict[str, object] = {
@@ -129,9 +123,7 @@ class MantisChannelFlowTest(unittest.TestCase):
                 "right_channel": "saved-right",
             },
         }
-        add_quest_key_to_direct_fallback(
-            fallback, "quest:saved-profile:grip", collection=True
-        )
+        add_quest_key_to_direct_fallback(fallback, "quest:saved-profile:grip")
         cfg = parse(
             CollectDataConfig,
             [
@@ -158,22 +150,31 @@ class MantisChannelFlowTest(unittest.TestCase):
             "quest:cli-profile:grip",
         )
 
-    def test_quest_key_is_applied_only_to_quest_mantis_runs(self) -> None:
+    def test_quest_key_is_applied_only_to_quest_mantis_collection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "settings.json")
             key = "quest:meta-quest-touch-plus:grip"
+            key_target = "teleop_config.vr_teleop_config.tracker_key"
             store.update(values={"mantis.quest_tracker_key": key})
 
             quest = store.merged_args(
+                "collect-data", {"mantis": True, "mantis_source": "quest"}
+            )
+            self.assertEqual(quest[key_target], key)
+            lighthouse = store.merged_args(
+                "collect-data", {"mantis": True, "mantis_source": "lighthouse"}
+            )
+            self.assertNotIn(key_target, lighthouse)
+            axol = store.merged_args("collect-data", {"mantis": False})
+            self.assertNotIn(key_target, axol)
+
+            # Teleop never receives tracking config (grippers-only on Mantis);
+            # a stale panel's snapshot of the saved source is dropped too.
+            teleop = store.merged_args(
                 "teleop", {"mantis": True, "mantis_source": "quest"}
             )
-            self.assertEqual(quest["teleop.tracker_key"], key)
-            lighthouse = store.merged_args(
-                "teleop", {"mantis": True, "mantis_source": "lighthouse"}
-            )
-            self.assertNotIn("teleop.tracker_key", lighthouse)
-            axol = store.merged_args("teleop", {"mantis": False})
-            self.assertNotIn("teleop.tracker_key", axol)
+            self.assertNotIn("teleop.tracker_key", teleop)
+            self.assertNotIn("mantis_source", teleop)
 
     def test_legacy_advanced_quest_key_migrates_to_visible_setting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

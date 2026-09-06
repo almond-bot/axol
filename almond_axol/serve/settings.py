@@ -471,14 +471,14 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="teleop.mantis_source",
                 label="Mantis tracking",
                 type="select",
-                options=("quest", "lighthouse", "ultimate"),
+                options=("lighthouse", "ultimate", "quest"),
                 help=(
-                    "Pose source used when Mantis is enabled for a run. "
-                    "Quest connects directly over WebXR; Lighthouse and "
-                    "Ultimate automatically start their tracker bridge."
+                    "Pose source used by Mantis data collection. Quest "
+                    "connects directly over WebXR; Lighthouse and Ultimate "
+                    "automatically start their tracker bridge. Mantis teleop "
+                    "never tracks — it drives the grippers from the triggers."
                 ),
                 targets={
-                    "teleop": ("mantis_source",),
                     "collect-data": ("mantis_source",),
                 },
             ),
@@ -489,11 +489,11 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 help=(
                     "Exact controller-local datum used by both saved mount "
                     "transforms: quest:<WebXR-profile>:grip. Start a Quest "
-                    "bring-up run and paste the live key shown below. This "
-                    "setting is applied only when Mantis tracking is Quest."
+                    "bring-up collection run and paste the live key shown "
+                    "below. This setting is applied only when Mantis "
+                    "tracking is Quest."
                 ),
                 targets={
-                    "teleop": ("teleop.tracker_key",),
                     "collect-data": (f"{_VRT}.tracker_key",),
                 },
             ),
@@ -1490,14 +1490,17 @@ class SettingsStore:
         # this removal, switching the UI to Lighthouse/Ultimate would keep a
         # Quest key as an explicit override and prevent those tracker-specific
         # transforms from resolving. Request args below may still make an
-        # intentional one-run override.
+        # intentional one-run override. (Teleop never receives tracking keys:
+        # Mantis teleop is grippers-only.)
         source = args.get("mantis_source", merged.get("mantis_source"))
-        if not mantis or source != "quest":
-            if target_op == "teleop":
-                merged.pop("teleop.tracker_key", None)
-            elif target_op == "collect-data":
-                merged.pop(f"{_VRT}.tracker_key", None)
+        if target_op == "collect-data" and (not mantis or source != "quest"):
+            merged.pop(f"{_VRT}.tracker_key", None)
         merged.update(args)
+        # Teleop has no tracking config: Mantis teleop is grippers-only.
+        # Older cached panels still snapshot the saved source into every
+        # Mantis start; drop it instead of failing the run's config parse.
+        if target_op == "teleop":
+            merged.pop("mantis_source", None)
 
         # A hosted root process must never honor saved or per-request paths for
         # TLS generation or LeRobot calibration state. Keep this after request

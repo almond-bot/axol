@@ -268,46 +268,24 @@ class _Runner:
 class _Updater:
     def __init__(self, is_idle: Any) -> None:
         self._is_idle = is_idle
-        self.blocked = False
-        self.active = False
         self.start_calls = 0
         self.provision_calls = 0
         self.version = "test"
         self.commit = "test"
         self.release_install = True
 
-    @property
-    def launches_blocked(self) -> bool:
-        return self.blocked
-
-    @property
-    def maintenance_active(self) -> bool:
-        return self.active
-
-    def launch_block_reason(self) -> str | None:
-        if not self.blocked:
-            return None
-        return "server maintenance is in progress"
-
-    async def ensure_provisioned(self) -> None:
+    def ensure_provisioned(self) -> None:
         self.provision_calls += 1
 
     async def status(self, *, force: bool = False) -> dict[str, Any]:
         del force
-        return {"state": "updating" if self.active else "idle"}
+        return {"state": "idle"}
 
     def start(self) -> tuple[bool, str | None]:
         self.start_calls += 1
-        if self.active:
-            return False, "server maintenance is already in progress"
         if not self._is_idle():
             return False, "server is busy; stop the running operation first"
-        self.blocked = True
-        self.active = True
         return True, None
-
-    async def shutdown(self) -> None:
-        pass
 
 
 class _FakeBridgeProcess:
@@ -416,21 +394,19 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
         transport = httpx.ASGITransport(app=_test_app(manager, runner, robot))
         return httpx.AsyncClient(transport=transport, base_url="http://test")
 
-    async def test_shutdown_drains_updater_before_sessions_and_hardware(self) -> None:
+    async def test_shutdown_drains_sessions_before_hardware(self) -> None:
         events: list[str] = []
         manager = _Manager()
         runner = _Runner()
         robot = _Robot()
-        updater = _Updater(lambda: True)
-        updater.shutdown = AsyncMock(side_effect=lambda: events.append("updater"))  # type: ignore[method-assign]
         runner.shutdown = AsyncMock(side_effect=lambda: events.append("runner"))  # type: ignore[method-assign]
         manager.shutdown = AsyncMock(side_effect=lambda: events.append("manager"))  # type: ignore[method-assign]
         robot.shutdown = Mock(side_effect=lambda: events.append("robot"))  # type: ignore[method-assign]
-        app = _test_app(manager, runner, robot, updater=updater)
+        app = _test_app(manager, runner, robot)
 
         await app.router.on_shutdown[-1]()
 
-        self.assertEqual(events, ["updater", "runner", "manager", "robot"])
+        self.assertEqual(events, ["runner", "manager", "robot"])
 
     async def test_operation_refuses_active_diagnostic_session(self) -> None:
         diagnostic = Session("tracker.identify", {})
@@ -631,91 +607,6 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("connected Axol survey is gripperless", response.json()["error"])
         self.assertEqual(runner.starts, 0)
         self.assertEqual(robot.releases, 0)
-
-    async def test_update_barrier_blocks_every_hardware_and_session_launch(
-        self,
-    ) -> None:
-        manager = _Manager()
-        runner = _Runner()
-        robot = _Robot()
-        updater = _Updater(lambda: True)
-        app = _test_app(manager, runner, robot, updater=updater)
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://test"
-        ) as client:
-            started = await client.post("/api/update/start")
-            requests = (
-                client.post(
-                    "/api/op/start",
-                    json={"op": "teleop", "args": {"sim": True}},
-                ),
-                client.post(
-                    "/api/diagnostics/run",
-                    json={"command": "diag.zed-cable", "args": {}},
-                ),
-                client.post("/api/run", json={"command": "diag.zed-cable", "args": {}}),
-                client.post("/api/robot/connect"),
-                client.post("/api/robot/disconnect"),
-                client.get("/api/can/interfaces"),
-                client.get("/api/robot/motors/left/shoulder_1"),
-                client.get("/api/cameras/detect"),
-                client.get("/api/cameras/preview/123"),
-                client.post("/api/cameras/restart-daemon"),
-                client.get("/api/tracker/bindings"),
-                client.get("/api/usb/status"),
-                client.post("/api/usb/connect"),
-                client.post("/api/usb/proximity", json={"disabled": True}),
-                client.post("/api/host/restart"),
-                client.post("/api/host/shutdown"),
-            )
-            responses = [await request for request in requests]
-
-        self.assertEqual(started.status_code, 200)
-        self.assertEqual(updater.start_calls, 1)
-        for response in responses:
-            self.assertEqual(response.status_code, 409, response.text)
-            self.assertIn("maintenance", response.json()["error"])
-        self.assertEqual(runner.starts, 0)
-        self.assertEqual(manager.sessions, [])
-        self.assertEqual(robot.connects, 0)
-        self.assertEqual(robot.disconnects, 0)
-
-    async def test_update_start_is_atomic_with_session_launch(self) -> None:
-        manager = _Manager()
-        manager.start_gate = asyncio.Event()
-        runner = _Runner()
-        updater = _Updater(lambda: True)
-        app = _test_app(manager, runner, updater=updater)
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://test"
-        ) as client:
-            launch = asyncio.create_task(
-                client.post(
-                    "/api/diagnostics/run",
-                    json={"command": "diag.zed-cable", "args": {}},
-                )
-            )
-            await manager.start_entered.wait()
-            update_request = asyncio.create_task(client.post("/api/update/start"))
-            await asyncio.sleep(0)
-            self.assertEqual(updater.start_calls, 0)
-
-            manager.start_gate.set()
-            launched = await launch
-            update_response = await update_request
-
-            manager.sessions[0].status = "exited"
-            while not manager.queues:
-                await asyncio.sleep(0)
-            await manager.queues[0].put(None)
-            await asyncio.sleep(0)
-
-        self.assertEqual(launched.status_code, 200)
-        self.assertEqual(update_response.status_code, 409)
-        self.assertIn("busy", update_response.json()["error"])
-        self.assertFalse(updater.blocked)
 
     async def test_zed_cable_session_holds_camera_lease_until_watcher_cleanup(
         self,
@@ -2197,26 +2088,25 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         self.assertIn("recording enabled", session.error or "")
         self.assertIsNone(runner._thread)
 
-    def test_unready_tracker_runtime_runs_teleop_grippers_only(self) -> None:
-        # Teleop only needs CAN: an unusable Lighthouse/Ultimate runtime must
-        # not refuse the start, it drops tracking and skips the managed bridge.
+    def test_mantis_teleop_never_starts_tracking(self) -> None:
+        # Mantis teleop is grippers-only by design: it never consults tracker
+        # readiness, never takes a pose-source token, and never manages the
+        # tracker bridge — even when the source is fully set up.
         robot = _Robot(profile="mantis", channels=("can_mantis_l", "can_mantis_r"))
         runner = OperationRunner(robot_link=robot)
         config = SimpleNamespace(
             mantis=True,
-            mantis_source="lighthouse",
             left_channel="can_mantis_l",
             right_channel="can_mantis_r",
         )
         worker = Mock()
         with (
             patch.object(runner, "_build_config", return_value=config),
-            patch.object(runner, "_attach_cameras_to_teleop"),
+            patch.object(runner, "_attach_cameras_to_teleop") as attach_cameras,
             patch("almond_axol.cli.teleop._prepare_mantis_teleop"),
             patch(
-                "almond_axol.cli.mantis_bridge.require_mantis_tracker_readiness",
-                side_effect=RuntimeError("unsupported tracker runtime"),
-            ),
+                "almond_axol.cli.mantis_bridge.require_mantis_tracker_readiness"
+            ) as gate,
             patch(
                 "almond_axol.cli.mantis_bridge.set_managed_pose_source_id"
             ) as pose_source,
@@ -2227,46 +2117,17 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
             session = runner.start("teleop", {"mantis": True})
 
         self.assertEqual(session.status, "running")
-        self.assertTrue(config.mantis_grippers_only)
         run_args = thread.call_args.kwargs["args"]
         self.assertFalse(run_args[-1])
+        gate.assert_not_called()
         pose_source.assert_not_called()
+        # Grippers-only runs start no VR server, so no cameras are attached.
+        attach_cameras.assert_not_called()
         self.assertTrue(
-            any(
-                "grippers only" in line and "unsupported tracker runtime" in line
-                for line in session.log
-            ),
+            any("grippers only" in line for line in session.log),
             list(session.log),
         )
         worker.start.assert_called_once_with()
-
-    def test_explicit_grippers_only_skips_the_tracker_gate(self) -> None:
-        robot = _Robot(profile="mantis", channels=("can_mantis_l", "can_mantis_r"))
-        runner = OperationRunner(robot_link=robot)
-        config = SimpleNamespace(
-            mantis=True,
-            mantis_source="lighthouse",
-            mantis_grippers_only=True,
-            left_channel="can_mantis_l",
-            right_channel="can_mantis_r",
-        )
-        worker = Mock()
-        with (
-            patch.object(runner, "_build_config", return_value=config),
-            patch.object(runner, "_attach_cameras_to_teleop"),
-            patch("almond_axol.cli.teleop._prepare_mantis_teleop"),
-            patch(
-                "almond_axol.cli.mantis_bridge.require_mantis_tracker_readiness"
-            ) as gate,
-            patch(
-                "almond_axol.serve.runner.threading.Thread", return_value=worker
-            ) as thread,
-        ):
-            session = runner.start("teleop", {"mantis": True})
-
-        self.assertEqual(session.status, "running")
-        gate.assert_not_called()
-        self.assertFalse(thread.call_args.kwargs["args"][-1])
 
     def test_nested_mantis_robot_profile_cannot_bypass_top_level_mode(self) -> None:
         robot = _Robot(profile="axol")
@@ -2334,66 +2195,30 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         self.assertEqual(robot.releases, 0)
         self.assertIsNone(runner._thread)
 
-    def test_parsed_mantis_source_controls_managed_bridge(self) -> None:
+    def test_mantis_string_boolean_still_enables_mantis_mode(self) -> None:
+        # "yes"/"true" strings must engage Mantis mode (releasing the Mantis
+        # link); teleop remains grippers-only, so no bridge is managed.
         robot = _Robot(profile="mantis", channels=("can_mantis_l", "can_mantis_r"))
         runner = OperationRunner(robot_link=robot)
         config = SimpleNamespace(
             mantis=True,
-            sim=False,
-            cart_only=False,
-            mantis_source="quest",
             left_channel="can_mantis_l",
             right_channel="can_mantis_r",
         )
         worker = Mock()
         with (
             patch.object(runner, "_build_config", return_value=config),
-            patch.object(runner, "_attach_cameras_to_teleop"),
             patch("almond_axol.cli.teleop._prepare_mantis_teleop"),
-            patch("almond_axol.cli.mantis_bridge.require_mantis_tracker_readiness"),
             patch(
                 "almond_axol.serve.runner.threading.Thread", return_value=worker
             ) as thread,
         ):
-            session = runner.start("teleop", {"mantis": True})
-
-        self.assertEqual(session.status, "running")
-        run_args = thread.call_args.kwargs["args"]
-        self.assertFalse(run_args[-1])
-        worker.start.assert_called_once_with()
-
-    def test_mantis_string_boolean_still_enables_managed_bridge(self) -> None:
-        robot = _Robot(profile="mantis", channels=("can_mantis_l", "can_mantis_r"))
-        runner = OperationRunner(robot_link=robot)
-        config = SimpleNamespace(
-            mantis=True,
-            mantis_source="lighthouse",
-            left_channel="can_mantis_l",
-            right_channel="can_mantis_r",
-        )
-        worker = Mock()
-        with (
-            patch.object(runner, "_build_config", return_value=config),
-            patch.object(runner, "_attach_cameras_to_teleop"),
-            patch("almond_axol.cli.teleop._prepare_mantis_teleop"),
-            patch("almond_axol.cli.mantis_bridge.require_mantis_tracker_readiness"),
-            patch("almond_axol.cli.mantis_bridge.set_managed_pose_source_id"),
-            patch(
-                "almond_axol.teleop.mantis_grippers.mantis_grippers_only_reason",
-                return_value=None,
-            ),
-            patch(
-                "almond_axol.serve.runner.threading.Thread", return_value=worker
-            ) as thread,
-        ):
-            session = runner.start(
-                "teleop", {"mantis": "yes", "mantis_source": "lighthouse"}
-            )
+            session = runner.start("teleop", {"mantis": "yes"})
 
         self.assertEqual(session.status, "running")
         self.assertEqual(robot.releases, 1)
         run_args = thread.call_args.kwargs["args"]
-        self.assertTrue(run_args[-1])
+        self.assertFalse(run_args[-1])
         worker.start.assert_called_once_with()
 
 

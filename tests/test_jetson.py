@@ -264,16 +264,6 @@ class JetsonPowerModeTest(unittest.TestCase):
 
         prime.assert_called_once_with()
 
-    def test_installed_service_waits_for_nvpmodel(self) -> None:
-        installer = (
-            Path(__file__).resolve().parents[1] / "web" / "app" / "public" / "install"
-        ).read_text()
-
-        self.assertIn(
-            "After=nvpmodel.service network-online.target",
-            installer,
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

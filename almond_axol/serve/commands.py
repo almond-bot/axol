@@ -319,8 +319,9 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "teleop",
         "Teleoperation",
-        "Drive the Axol from a VR headset. Mantis supports Quest, Lighthouse, "
-        "or Ultimate tracking; simulation previews without hardware.",
+        "Drive the Axol from a VR headset. Mantis drives the rig grippers "
+        "from their triggers (no tracking); simulation previews without "
+        "hardware.",
         "Operate",
         "draccus",
         _teleop,
@@ -573,6 +574,19 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.motor.set_config"),
         requires_hardware=True,
+    ),
+    "motor.flash": CommandDef(
+        "motor.flash",
+        "motor.flash",
+        "Flash firmware",
+        "Overwrite a MyActuator motor's firmware from a .bin on the robot host. "
+        "Nothing else may use the bus while it runs, and an interrupted flash "
+        "leaves the motor in its bootloader until the flash is re-run.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.motor.flash"),
+        requires_hardware=True,
+        hardware_profiles=("axol",),
     ),
     # -- Setup --------------------------------------------------------------
     "tracker.pair": CommandDef(

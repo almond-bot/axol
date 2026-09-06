@@ -7,7 +7,7 @@ The `axol tracker.*` commands are the CLI side of [Mantis Tracking](/mantis/trac
 
 | Command | Purpose | Panel equivalent |
 |---|---|---|
-| [`tracker.bridge`](#axol-trackerbridge) | Stream hardware-tracker poses and trigger values to the VR server. | Started and stopped automatically by a Mantis teleop / collect-data run. |
+| [`tracker.bridge`](#axol-trackerbridge) | Stream hardware-tracker poses and trigger values to the VR server. | Started and stopped automatically by a Mantis collect-data run. |
 | [`tracker.identify`](#axol-trackeridentify) | Bind the powered trackers to the left and right rig. | **Identify trackers** |
 | [`tracker.pair`](#axol-trackerpair) | Pair a VIVE Tracker 3.0 with its Watchman dongle. | **Pair tracker** |
 | [`tracker.install`](#axol-trackerinstall) | Build the pinned libsurvive runtime and Vive udev rule. | **Install Lighthouse support** |
@@ -15,7 +15,7 @@ The `axol tracker.*` commands are the CLI side of [Mantis Tracking](/mantis/trac
 | [`tracker.ultimate.install`](#axol-trackerultimateinstall) | Install the pinned pyvut runtime, HID binding, and dongle udev rule. | **Install / Repair Ultimate support** |
 | [`tracker.ultimate.check`](#axol-trackerultimatecheck) | Non-invasive Ultimate host readiness check. | — (CLI only) |
 
-Direct `axol teleop --mantis` and `axol collect-data --mantis true` runs inherit the source, channel map, bindings, and (for Quest) calibration key saved by the panel, own their bridge, and enforce the same readiness gates. Do **not** launch a second `tracker.bridge` beside a managed run — it stays view-only and cannot win pose control.
+Direct `axol collect-data --mantis true` runs inherit the source, channel map, bindings, and (for Quest) calibration key saved by the panel, own their bridge, and enforce the same readiness gates. Do **not** launch a second `tracker.bridge` beside a managed run — it stays view-only and cannot win pose control. (`axol teleop --mantis` never tracks: it drives the grippers from the rig triggers over CAN and starts no bridge.)
 
 ```bash
 # One-time per tracker family: bind physical trackers to sides.
@@ -23,9 +23,8 @@ axol tracker.identify --backend survive
 axol tracker.identify --backend ultimate
 
 # One command owns both the operation and its bridge.
-axol teleop --mantis --mantis_source lighthouse
-axol teleop --mantis --mantis_source ultimate
-axol teleop --mantis --mantis_source quest   # waits for the WebXR client
+axol collect-data --mantis true --repo_id myorg/bringup --task test \
+    --mantis_allow_uncalibrated true   # bring-up capture only, not training data
 ```
 
 Quest uses none of these commands: the headset's WebXR client is the pose source, and its calibration key is selected in the panel. Mantis is not supported by Collect DAgger or Run Policy.
@@ -186,7 +185,7 @@ Rules the loader enforces:
 - **Quest** production collection accepts only a `quest:<reported-profile>:grip` entry on both sides. A bare `quest` key, a different Touch profile, missing profile metadata, or a `target-ray` entry fails closed.
 - **Ultimate** entries must carry `ultimate_pose_convention` matching both the convention used during the measurement and the active `ultimate_quat_order` / `ultimate_up_axis`. A convention-less or mismatched entry is not authoritative and suppresses the factory fallback for that side until fixed or removed, because it may represent a non-standard mount.
 - An old unkeyed entry, a bare `survive` / `ultimate` key, or a same-family entry left behind after rebinding also suppresses the factory value for that side until it is re-keyed or deleted.
-- A standalone Advanced/CLI transform can support teleop bring-up, but production `collect-data` requires an active device-keyed override or an approved factory value on both sides; `--mantis_allow_uncalibrated true` is only for a calibration capture that will not be used for training.
+- A standalone Advanced/CLI transform can support a bring-up capture, but production `collect-data` requires an active device-keyed override or an approved factory value on both sides; `--mantis_allow_uncalibrated true` is only for a calibration capture that will not be used for training.
 
 ### Ultimate factory value
 

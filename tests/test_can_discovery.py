@@ -1122,7 +1122,7 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(robot.disconnects, 0)
         discover.assert_not_called()
 
-    async def test_diagnostic_and_maintenance_ownership_block_discovery(
+    async def test_diagnostic_ownership_blocks_discovery(
         self,
     ) -> None:
         attached = _state(
@@ -1148,25 +1148,6 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(diagnostic_block.status_code, 409)
         self.assertTrue(diagnostic_block.json()["retryable"])
-        self.assertEqual(robot.disconnects, 0)
-        discover.assert_not_called()
-
-        _app, robot, _runner, _manager, transport = self._transport()
-        with (
-            patch.object(app_module.os, "geteuid", return_value=0),
-            patch.object(app_module, "_list_can_interfaces", return_value=[]),
-            patch.object(app_module, "_attached_hub_state", return_value=attached),
-            patch.object(setup, "setup_detected_hubs", discover),
-        ):
-            async with httpx.AsyncClient(
-                transport=transport, base_url="http://test"
-            ) as client:
-                maintenance_started = await client.post("/api/update/start")
-                maintenance_block = await client.post("/api/can/discover")
-
-        self.assertEqual(maintenance_started.status_code, 200)
-        self.assertEqual(maintenance_block.status_code, 409)
-        self.assertIn("maintenance", maintenance_block.json()["error"])
         self.assertEqual(robot.disconnects, 0)
         discover.assert_not_called()
 

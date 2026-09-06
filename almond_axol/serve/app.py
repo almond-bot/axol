@@ -884,16 +884,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # Surfaces "update available" (a newer release tag, found via read-only
     # `git ls-remote --tags`) to the control panel via /api/update/status and
-    # delegates an on-demand exact release to a transient hosted-installer
-    # worker via /api/update/start. Nothing upgrades automatically. No-ops for
+    # applies an on-demand tag-pinned reinstall via /api/update/start,
+    # restarting the service. Nothing upgrades automatically. No-ops for
     # dev checkouts.
     updater = SelfUpdater(_is_idle)
-
-    def _maintenance_launch_response() -> JSONResponse | None:
-        reason = updater.launch_block_reason()
-        if reason is None:
-            return None
-        return JSONResponse({"error": reason}, status_code=409)
 
     def _discovery_running() -> bool:
         return can_discovery_task is not None and not can_discovery_task.done()
@@ -1007,11 +1001,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 return can_discovery_task
 
             await session_launch_reservation.acquire()
-            maintenance = _maintenance_launch_response()
             busy_reason: str | None = None
-            if maintenance is not None:
-                busy_reason = "host maintenance is active; retry CAN discovery later"
-            elif runner.is_running() or _diagnostic_session_active():
+            if runner.is_running() or _diagnostic_session_active():
                 busy_reason = (
                     "an operation or setup/diagnostics session owns hardware; "
                     "retry CAN discovery when it finishes"
@@ -1152,12 +1143,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
-        """Process readiness used by systemd's post-update verifier.
+        """Process readiness (version + pid) for external monitors.
 
-        This endpoint deliberately does not start lazy provisioning. During a
-        candidate boot the durable marker already blocks every hardware launch;
-        the verifier needs only to prove that the expected backend stayed up on
-        one stable systemd PID before it commits that candidate.
+        This endpoint deliberately does not start lazy provisioning.
         """
         return {
             "ready": True,
@@ -1168,14 +1156,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.get("/api/info")
     async def get_info() -> dict[str, Any]:
         """Identify the serve host so the UI can build reachable links/hints."""
-        # Self-heal a host whose legacy update path skipped this build's new
-        # provisioning steps; idempotent, once per process.
-        # Startup provisioning mutates the same live tool environment as an
-        # update. Enter it through the global launch reservation so it cannot
-        # begin between another endpoint's idle check and hardware start.
-        async with camera_reservation, session_launch_reservation:
-            if _is_idle() and not updater.launches_blocked:
-                await updater.ensure_provisioned()
+        # Self-heal a host that upgraded into this build from an older release
+        # (the old code never ran `axol provision`); idempotent, once per process.
+        updater.ensure_provisioned()
         return {
             "hostname": socket.gethostname(),
             "lanIp": _lan_ip(),
@@ -1203,11 +1186,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/update/start")
     async def update_start() -> JSONResponse:
-        """Delegate a user-initiated exact release to the hosted transaction."""
-        # Setting the updater's launch barrier and checking global idleness is
-        # atomic with every operation/session/camera launch below.
-        async with camera_reservation, session_launch_reservation:
-            started, reason = updater.start()
+        """Apply a user-initiated upgrade; the server restarts onto new code."""
+        started, reason = updater.start()
         if not started:
             return JSONResponse({"error": reason}, status_code=409)
         return JSONResponse({"started": True})
@@ -1223,12 +1203,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         blocking on a password prompt.
         """
         async with session_launch_reservation:
-            maintenance_reason = updater.launch_block_reason()
-            if maintenance_reason is not None:
-                return JSONResponse(
-                    {"error": f"cannot request a host {verb}: {maintenance_reason}"},
-                    status_code=409,
-                )
             if not _is_idle():
                 return JSONResponse(
                     {"error": "an operation or session is running — stop it first"},
@@ -1344,9 +1318,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     ) -> dict[str, Any] | JSONResponse:
         nonlocal manually_disconnected_target
         async with session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             if runner.is_running() or _diagnostic_session_active():
                 return JSONResponse(
                     {
@@ -1430,9 +1401,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def robot_disconnect() -> dict[str, Any] | JSONResponse:
         nonlocal manually_disconnected_target
         async with session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             if runner.is_running() or _diagnostic_session_active():
                 return JSONResponse(
                     {
@@ -1454,14 +1422,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         # mutation. Do not wait behind it: expose `running` so every tab
         # suppresses connection while the interfaces are being renamed.
         if _discovery_running():
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             return await _can_inventory(observe_discovery=False)
         async with session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             return await _can_inventory()
 
     @app.post("/api/can/discover", response_model=None)
@@ -1484,9 +1446,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def robot_motor_details(arm: str, joint: str) -> JSONResponse:
         """One-motor full readout (the ``motor.info`` set) over the idle link."""
         async with session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             try:
                 details = await asyncio.to_thread(robot.motor_details, arm, joint)
             except KeyError:
@@ -1581,15 +1540,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             )
 
         async with session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             # Subprocess-backed commands do not pass through OperationRunner,
             # so fold their declared shared settings here. This stays inside
-            # the maintenance reservation: schema loading may import command
-            # code from the tool environment an update replaces. It also must
-            # happen before profile/fault scoping and argv construction so the
-            # checks, process, session, and history share one effective launch.
+            # the launch reservation and must happen before profile/fault
+            # scoping and argv construction so the checks, process, session,
+            # and history share one effective launch.
             try:
                 launch_args = normalize_boolean_args(
                     command_id, settings.merged_args(command_id, args)
@@ -1754,9 +1709,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def cameras_detect() -> dict[str, Any] | JSONResponse:
         """List locally connected ZED cameras (serial, model, mono/stereo)."""
         async with camera_reservation, session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             if runner.is_running() or _camera_session_active():
                 return JSONResponse(
                     {"error": "cannot detect cameras while they are in use"},
@@ -1770,9 +1722,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         which physical camera a serial belongs to. Cameras are exclusive:
         refused while an operation may be using them."""
         async with camera_reservation, session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             if runner.is_running() or _camera_session_active():
                 return JSONResponse(
                     {"error": "cannot preview cameras while they are in use"},
@@ -1807,9 +1756,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def cameras_restart_daemon() -> JSONResponse:
         """Restart the ZED X daemon so cameras plugged in after boot enumerate."""
         async with camera_reservation, session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             if runner.is_running() or _camera_session_active():
                 return JSONResponse(
                     {"error": "cannot restart the ZED daemon while cameras are in use"},
@@ -2172,9 +2118,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             }
 
         async with session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             return await asyncio.to_thread(inspect)
 
     # -- datasets on disk (the operation panels' shared repo-id picker) --------
@@ -2227,9 +2170,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def usb_status() -> dict[str, Any] | JSONResponse:
         """adb device + reverse-tunnel status for the Quest-over-USB pose link."""
         async with session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             return _usb_status_dict(await asyncio.to_thread(adb.status))
 
     @app.post("/api/usb/connect", response_model=None)
@@ -2240,9 +2180,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         the USB-debugging authorization popup on the device.
         """
         async with session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             return _usb_status_dict(await asyncio.to_thread(adb.connect))
 
     @app.post("/api/usb/proximity")
@@ -2255,9 +2192,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         attached, authorized headset (same requirement as the pose tunnel).
         """
         async with session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             ok, error = await asyncio.to_thread(
                 adb.set_proximity_disabled, req.disabled
             )
@@ -2285,9 +2219,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 {"error": f"unknown operation: {req.op}"}, status_code=400
             )
         async with camera_reservation, session_launch_reservation:
-            maintenance = _maintenance_launch_response()
-            if maintenance is not None:
-                return maintenance
             if _diagnostic_session_active():
                 return JSONResponse(
                     {
@@ -2534,11 +2465,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
-        # Freeze maintenance first and reap any locally owned root child before
-        # tearing down the sessions/hardware it is gated against. A confirmed
-        # transient update worker is independently owned by systemd and is not
-        # stopped by this drain.
-        await updater.shutdown()
         if can_discovery_task is not None and not can_discovery_task.done():
             await asyncio.shield(can_discovery_task)
         await runner.shutdown()

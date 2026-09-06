@@ -3,7 +3,7 @@ title: "Mantis Tracking"
 description: "Set up Meta Quest, VIVE Tracker 3.0 (Lighthouse), or VIVE Ultimate tracking as the Mantis pose source."
 ---
 
-Every Mantis run needs a **pose source**: the tracking system that reports where each rig is. Mantis supports three, selected under **Mantis settings → Tracking** in the control panel (default: Lighthouse). Pick one per installation — the choice, its setup state, and its device bindings are all stored on the host, so teleoperation and data collection use the same source without per-run flags.
+Mantis **data collection** needs a **pose source**: the tracking system that reports where each rig is. (Mantis teleop never tracks — it drives the grippers straight from the rig triggers.) Mantis supports three sources, selected under **Mantis settings → Tracking** in the control panel (default: Lighthouse). Pick one per installation — the choice, its setup state, and its device bindings are all stored on the host, so every collection run uses the same source without per-run flags.
 
 | Source | Hardware | Tracking | Setup contract |
 |---|---|---|---|
@@ -15,7 +15,7 @@ Every Mantis run needs a **pose source**: the tracking system that reports where
   Keep the product names distinct: **VIVE Tracker 3.0** is the Lighthouse device (there is no "Quest 3.0" tracker), **Meta Quest** is the WebXR source, and **VIVE Ultimate Tracker** is the inside-out source.
 </Note>
 
-Before starting, finish the [Mantis hardware setup](/mantis/hardware): the hub connected, **Mantis** selected on its tile, the CAN side mapping confirmed, and the grippers-only teleop check passed. Then open **Mantis settings → Tracking**, choose the source, and press **Save settings**.
+Before starting, finish the [Mantis hardware setup](/mantis/hardware): the hub connected, **Mantis** selected on its tile, the CAN side mapping confirmed, and the grippers-only teleop check passed. Then open **Mantis settings → Tracking** and choose the source — the selection saves to the host immediately, so runs and the setup actions below always use it.
 
 ## Set up the source
 
@@ -27,10 +27,10 @@ The Tracking tab walks each source through a **step-by-step flow**. Each step re
 
     <Steps>
       <Step title="Source">
-        Choose **Quest** and **Save settings**. The Quest headset and the host must be on the same LAN (or use the wired [Quest-over-USB](/guides/quest-over-usb) link, managed under **General settings → Quest**).
+        Choose **Quest** (the selection saves immediately). The Quest headset and the host must be on the same LAN (or use the wired [Quest-over-USB](/guides/quest-over-usb) link, managed under **General settings → Quest**).
       </Step>
       <Step title="Headset">
-        Start a Mantis teleop run, then in the Quest browser open [axol.almond.bot](https://axol.almond.bot), enter the host, connect, accept the host's certificate the first time, and choose **Enter VR**. Hold both Touch controllers.
+        Start a Quest **bring-up collection run** — `axol collect-data --mantis --mantis_allow_uncalibrated true` (or Start **Collect data** with `mantis_allow_uncalibrated` set under Advanced); teleop never starts the VR server. Then in the Quest browser open [axol.almond.bot](https://axol.almond.bot), enter the host, connect, accept the host's certificate the first time, and choose **Enter VR**. Hold both Touch controllers.
 
         The step shows each controller's reported WebXR profile and pose space and, when both match, a copyable **common calibration key** (for example `quest:oculus-touch-v3:grip`). Press **Use this key**, then **Save settings**. The step resolves once the saved key is a **grip-space** datum matching the live controllers; a stale report, a `target-ray` fallback, or two controllers reporting different keys is held rather than accepted.
       </Step>
@@ -44,7 +44,7 @@ The Tracking tab walks each source through a **step-by-step flow**. Each step re
 
     <Steps>
       <Step title="Source">
-        Choose **Lighthouse** and **Save settings**.
+        Choose **Lighthouse** (the selection saves immediately).
       </Step>
       <Step title="Runtime">
         `axol provision` normally installs the pinned libsurvive build during installation. If the step is red, press **Install Lighthouse support** (CLI: [`axol tracker.install`](/cli/tracker#axol-trackerinstall)). It builds `survive-cli` at the pinned commit with Eigen and the native libusb backend, installs the Vive udev rule, and is safe to rerun — an existing pinned build is re-attested, not rebuilt.
@@ -71,7 +71,7 @@ The Tracking tab walks each source through a **step-by-step flow**. Each step re
         Choose **Start setup → Create map**, establish the center, and scan the entire Mantis operating volume from both low/kneeling and standing heights while facing all four directions. Let the map auto-save (use Refine/Save if offered) and confirm both trackers regain full position + rotation after a power cycle. The pairing and map live on the trackers and move with them to the robot host.
       </Step>
       <Step title="Source">
-        Back in the control panel, choose **Ultimate** and **Save settings**.
+        Back in the control panel, choose **Ultimate** (the selection saves immediately).
       </Step>
       <Step title="Runtime">
         Press **Install / Repair Ultimate support** (CLI: [`axol tracker.ultimate.install`](/cli/tracker#axol-trackerultimateinstall)). It installs the pinned pyvut commit, the `hid` Python binding, system HID libraries, and a persistent udev rule for dongle `0bb4:0350`; safe to rerun. Do not replace it with an unpinned `pip install` or a one-off `chmod /dev/hidraw*`.
@@ -128,18 +128,18 @@ Overrides and Quest measurements live in `~/.almond/mantis/tcp_transform.json`, 
 
 ## Acceptance
 
-Before recording training data, run a short **Mantis teleop** with the workspace clear and check, with the selected live source:
+Before recording training data, run a short **bring-up collection run** (`axol collect-data --mantis --mantis_allow_uncalibrated true`, discarding every take) with the workspace clear and check, with the selected live source:
 
 1. Physical **left/right**, scale, every translation axis, wrist rotation, and tracker→TCP alignment. With Quest, the headset's live URDF overlay shows the virtual arms; with Lighthouse/Ultimate, use the control panel's mirrored view.
 2. **Recovery**: deliberately occlude or de-localize one side and confirm both freeze; restore tracking and confirm nothing moves until the start gesture is repeated.
 
-A source that jumps, drifts, swaps sides, or cannot recover cleanly is not ready for collection. `axol teleop --sim --teleop.absolute_mode true` is only a generic mapping demo, not acceptance — physical acceptance must use the real source with Mantis selected.
+A source that jumps, drifts, swaps sides, or cannot recover cleanly is not ready for collection. Mantis teleop never tracks, and `axol teleop --sim --teleop.absolute_mode true` is only a generic mapping demo — physical acceptance must use the real source, Mantis selected, in a collection run.
 
 ## Next steps
 
 <CardGroup cols={2}>
   <Card title="Teleoperation" icon="gamepad" href="/operations/teleop">
-    Run the Mantis acceptance from the control panel or CLI.
+    Check the grippers from the rig triggers (no tracking).
   </Card>
   <Card title="Data Collection" icon="record-vinyl" href="/operations/data-collection">
     Record Mantis episodes to a LeRobot dataset.
