@@ -20,13 +20,23 @@ The rigs have no arms: the seven arm joints per side are virtual and echo the IK
 
 ### Tracker mounts
 
-The kit includes the mount for the pose source you purchased — Quest, Lighthouse (VIVE Tracker 3.0), or Ultimate.
+The kit includes the mount for the pose source you purchased — Quest, Lighthouse (VIVE Tracker 3.0), or Ultimate. If you purchased Mantis without a tracker, print your own mount (see [below](#printing-your-own-mount)).
 
 | Pose source | Mount | Tracker → gripper transform |
 |---|---|---|
 | **Meta Quest** controllers | The controller is rigidly mounted to the rig. | No factory constant — measured per controller generation (see [Mantis Tracking](/mantis/tracking#transforms)). |
 | **VIVE Tracker 3.0** (Lighthouse) | Flat-back mount in the controller's place. | Built-in factory transform; nothing to measure for the standard mount. |
 | **VIVE Ultimate Tracker** | Same flat-back mount and orientation as Tracker 3.0. | Built-in factory transform (includes the 11 mm origin difference from Tracker 3.0). |
+
+#### Printing your own mount
+
+If you ordered Mantis without a tracker and are supplying your own, you can 3D-print the mount instead. Download the STEP model for your pose source:
+
+- [Quest 3 controller mount](https://www.almond.bot/resources/mantis_quest_3_mount.step)
+- [VIVE Tracker 3.0 mount](https://www.almond.bot/resources/mantis_vive_3_mount.step)
+- [VIVE Ultimate Tracker mount](https://www.almond.bot/resources/mantis_vive_ultimate_mount.step)
+
+Each mount attaches to the rig with **M3×8 screws** ([McMaster-Carr 97763A813](https://www.mcmaster.com/97763A813/)). For the VIVE Ultimate Tracker, use the optional **1/4"-20 UNC screw-in mount** that HTC includes in the tracker's box to fasten the tracker to the printed mount.
 
 ## Installation
 
