@@ -221,9 +221,6 @@ export default function Diagnostics() {
     }
   }, [])
 
-  const [arm, setArm] = useState<ArmSide>(
-    () => (localStorage.getItem("axolDiagArm") as ArmSide) || "left"
-  )
   const [metricKey, setMetricKey] = useState(() => localStorage.getItem("axolDiagMetric") || "pos")
   const [windowSec, setWindowSec] = useState(120)
   const [hiddenJoints, setHiddenJoints] = useState<Set<JointName>>(new Set())
@@ -781,11 +778,6 @@ export default function Diagnostics() {
     sessionInventoryReady,
   ])
 
-  function selectArm(a: ArmSide) {
-    setArm(a)
-    localStorage.setItem("axolDiagArm", a)
-  }
-
   // The joints this robot actually has — the gripperless SKU drops GRIPPER
   // from the motor tiles, chart series, and `--joints` pickers.
   const joints = useMemo(
@@ -793,17 +785,19 @@ export default function Diagnostics() {
     [robot]
   )
 
-  const series: ChartSeries[] = useMemo(
-    () =>
+  // Both arms chart at once (a left/right pair per metric), so build one
+  // series list per side from the shared joint filter.
+  const seriesBySide: Record<ArmSide, ChartSeries[]> = useMemo(() => {
+    const forSide = (side: ArmSide) =>
       joints
         .filter((j) => !hiddenJoints.has(j))
         .map((joint) => ({
-          key: motorKey(arm, joint),
+          key: motorKey(side, joint),
           label: jointLabel(joint),
           color: JOINT_COLORS[joint],
-        })),
-    [arm, hiddenJoints, joints]
-  )
+        }))
+    return { left: forSide("left"), right: forSide("right") }
+  }, [hiddenJoints, joints])
 
   const linkState = robot?.state ?? stream.state
   const stateBadge = STATE_BADGE[linkState] ?? STATE_BADGE.disconnected
@@ -1268,23 +1262,6 @@ export default function Diagnostics() {
                 </button>
               ))}
             </div>
-            <div className="flex overflow-hidden rounded-md border border-white/10">
-              {(["left", "right"] as ArmSide[]).map((a) => (
-                <button
-                  key={a}
-                  type="button"
-                  onClick={() => selectArm(a)}
-                  className={cn(
-                    "px-2.5 py-1 text-xs capitalize transition-colors",
-                    arm === a
-                      ? "bg-[#eff483]/15 text-[#eff483]"
-                      : "text-white/50 hover:bg-white/[0.05]"
-                  )}
-                >
-                  {a} {robot?.profile === "mantis" ? "gripper" : "arm"}
-                </button>
-              ))}
-            </div>
             {pinnedView != null && (
               <Button
                 variant="ghost"
@@ -1300,21 +1277,44 @@ export default function Diagnostics() {
           <p className="text-xs text-white/30">
             Scroll to zoom, drag to pan — zooming pauses the live follow until you go live again.
           </p>
-          {/* One chart, toggled between metrics — the toggle row above picks
-              what it shows. Temperature reads the 1 Hz sweep buffer. */}
-          <TelemetryChart
-            title={metric.title}
-            unit={metric.unit}
-            series={series}
-            frames={chartFrames}
-            version={stream.version}
-            metric={metric.metric}
-            scale={metric.scale}
-            view={view}
-            onViewChange={setPinnedView}
-            quietReason={quietReason}
-            height={380}
-            gapBreakS={metric.slow ? 5 : undefined}
+          {/* One metric at a time — the toggle row above picks it (temperature
+              reads the 1 Hz sweep buffer) — charted as a left/right pair
+              sharing the same time view so both arms read at once; the header
+              button on each chart takes it truly full screen. */}
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            {(["left", "right"] as ArmSide[]).map((side) => (
+              <TelemetryChart
+                key={side}
+                title={`${metric.title} — ${side} ${robot?.profile === "mantis" ? "gripper" : "arm"}`}
+                unit={metric.unit}
+                series={seriesBySide[side]}
+                frames={chartFrames}
+                version={stream.version}
+                metric={metric.metric}
+                scale={metric.scale}
+                view={view}
+                onViewChange={setPinnedView}
+                quietReason={quietReason}
+                height={340}
+                gapBreakS={metric.slow ? 5 : undefined}
+              />
+            ))}
+          </div>
+        </section>
+
+        {/* Diagnostics actions */}
+        <section className="flex flex-col gap-3">
+          <h2 className="font-heading text-base font-semibold">Diagnostics</h2>
+          <DiagnosticActions
+            commands={diagCommands}
+            activeCommand={activeRun?.command ?? null}
+            activeSince={activeRun?.session.startedAt ?? null}
+            busy={launchBusy}
+            disabled={!serverOk || busyElsewhere}
+            hiddenKeys={configHiddenKeys}
+            pickerJoints={joints}
+            onLaunch={launch}
+            onStop={stopActive}
           />
         </section>
 

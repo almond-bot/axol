@@ -2078,11 +2078,6 @@ def _run(
     control: "_StdinPolicyControl | _QueuePolicyControl | None" = None,
 ) -> None:
     """Drive the full run-policy session: spawn the policy server, connect the robot, and run episodes."""
-    if getattr(cfg, "repo_id", None):
-        from ..utils.state_files import require_service_dataset_configuration
-
-        require_service_dataset_configuration()
-
     from ..lerobot.robot.config_mantis import MantisRobotConfig
 
     if isinstance(cfg.robot_config, MantisRobotConfig):
@@ -2137,24 +2132,9 @@ def _run(
     # the fps the checkpoint was trained at.
     _check_training_fps(cfg)
 
-    # The hosted service runs as root while its recording tree is writable by
-    # the operator. Never let a control-panel ``--root`` turn the third-party
-    # LeRobot writer into a root filesystem writer. This lexical/current-link
-    # gate is repeated in the recorder itself as defense in depth.
     dataset_root: Path | None = None
     if repo_id:
         dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
-        from ..utils.state_files import (
-            confine_service_dataset_path,
-            privileged_service_active,
-        )
-
-        if privileged_service_active():
-            dataset_root = confine_service_dataset_path(
-                dataset_root,
-                label="rollout dataset root",
-            )
-            root = str(dataset_root)
 
     # Finalize the camera set before the robot opens the cameras: prune the
     # unassigned placeholder slots (at least one must be set, and should be the

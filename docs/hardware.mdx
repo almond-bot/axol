@@ -184,12 +184,15 @@ Adjust the robot's height with the manual lift: insert the crank into the hole a
 
 This section applies to every configuration.
 
-Axol is powered at **24V DC, 60A peak** through the XT90 on the back of the robot. A matching supply ships in the box:
+Axol is powered at **24V DC, 60A peak** through the XT90 on the back of the robot. Two supplies are available, both 1500W (24V, 62.5A) with an XT90 output:
+
+- **[Standard Power Supply](https://www.almond.bot/standard-power-supply)** — the desktop supply that ships with Axol.
+- **[Industrial Power Supply](https://www.almond.bot/industrial-power-supply)** — an industrial-grade supply with a **dedicated E-Stop**, an **integrated power switch**, and a **brake resistor** that safely dissipates back current from the arms. Built for permanent installations and industrial cells.
 
 | | |
 |---|---|
 | **Robot input** | 24V DC, 60A peak, XT90 |
-| **Included supply** | 1500W (24V, 62.5A) |
+| **Supply output** | 1500W (24V, 62.5A) |
 | **DC cable** | 1.5m XT90 male–female |
 | **AC** | Power-supply AC cord |
 
@@ -200,10 +203,17 @@ Axol is powered at **24V DC, 60A peak** through the XT90 on the back of the robo
   <Step title="Connect DC">
     Plug the XT90 cable from the robot into the power supply.
   </Step>
-  <Step title="Connect AC">
-    Plug the AC cord from the supply into a wall outlet, then switch the supply on.
+  <Step title="Connect the E-Stop (Industrial Power Supply only)">
+    Plug the E-Stop into the supply and place it somewhere accessible. The supply will not turn on without the E-Stop connected.
+  </Step>
+  <Step title="Connect AC and power on">
+    Plug the AC cord from the supply into a wall outlet, then switch the supply on. On the Industrial Power Supply, press the integrated power switch to power the robot.
   </Step>
 </Steps>
+
+<Note>
+  On the Industrial Power Supply, pressing the E-Stop cuts arm power instantly. To restore power, release the E-Stop and press the power switch again.
+</Note>
 
 <Note>
   The supply is 1500W. Use a dedicated wall outlet.

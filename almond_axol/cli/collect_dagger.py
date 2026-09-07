@@ -1015,10 +1015,6 @@ def _run(
     stop_event: "threading.Event | None" = None,
     control: "_StdinPolicyControl | _QueuePolicyControl | None" = None,
 ) -> None:
-    from ..utils.state_files import require_service_dataset_configuration
-
-    require_service_dataset_configuration()
-
     from ..lerobot.robot.config_mantis import MantisRobotConfig
 
     if isinstance(cfg.robot_config, MantisRobotConfig):
@@ -1059,17 +1055,6 @@ def _run(
     # schema and ignores the fresh feature dict supplied to the recorder, so a
     # non-DAgger dataset cannot be made label-capable implicitly on resume.
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
-    from ..utils.state_files import (
-        confine_service_dataset_path,
-        privileged_service_active,
-    )
-
-    if privileged_service_active():
-        dataset_root = confine_service_dataset_path(
-            dataset_root,
-            label="DAgger dataset root",
-        )
-        root = str(dataset_root)
     meta = dataset_root / "meta"
     has_info = (meta / "info.json").exists()
     is_complete = (

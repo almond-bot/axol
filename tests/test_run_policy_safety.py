@@ -188,12 +188,6 @@ class RunPolicySafetyTest(unittest.TestCase):
                 )
                 stack.enter_context(
                     mock.patch(
-                        "almond_axol.utils.state_files."
-                        "require_service_dataset_configuration"
-                    )
-                )
-                stack.enter_context(
-                    mock.patch(
                         "almond_axol.utils.state_files.privileged_service_active",
                         return_value=False,
                     )

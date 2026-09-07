@@ -1941,22 +1941,6 @@ def run_encoded_capture_loop(
 def _open_dataset(config: dict) -> "LeRobotDataset":
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    from ..utils.state_files import (
-        confine_service_dataset_path,
-        privileged_service_active,
-    )
-
-    if privileged_service_active():
-        # Every current caller validates before hardware startup. Repeat the
-        # boundary at the final third-party write site so a future caller—or a
-        # separately spawned recorder with altered config—cannot bypass it.
-        dataset_root = confine_service_dataset_path(
-            Path(config["dataset_root"]),
-            label="recorder dataset root",
-        )
-        config["dataset_root"] = str(dataset_root)
-        config["root"] = str(dataset_root)
-
     rgb_encoder = make_rgb_encoder(config["vcodec"])
     if config["is_complete"]:
         # Defense in depth: callers validate before opening hardware, then the
