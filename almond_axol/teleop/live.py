@@ -70,7 +70,8 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         label="Box mode",
         type="boolean",
         help=(
-            "One controller drives both arms as a parallel-gripper pair; the "
+            "One controller drives both arms as a level parallel-gripper pair "
+            "by position only (the pair never rotates); the "
             "thumbsticks jog the pair while a grip leads and drive Jelly "
             "once it's frozen. Also toggled by clicking both "
             "thumbsticks together. Switching disengages the arms first."

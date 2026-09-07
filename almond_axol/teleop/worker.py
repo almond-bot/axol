@@ -28,7 +28,6 @@ from .box import (
     box_targets,
     elbow_swivel_hint,
     pair_aligned,
-    rodrigues,
     rotation_angle,
     smoothstep,
     snap_box,
@@ -1116,16 +1115,18 @@ class IKWorker:
         lp: np.ndarray,
         rp: np.ndarray,
     ) -> np.ndarray:
-        """Box-mode solve: one controller carries both grippers as a rigid pair.
+        """Box-mode solve: one controller carries both grippers as a level pair.
 
         On engage the pair is snapped from FK (:func:`snap_box`), the leader
         controller's pose is anchored, and the grippers are blended into the
-        side-clamping grasp (fingers forward, flat faces on the box) over
-        ``box_align_duration``. Afterwards the leader
-        gripper is driven by the usual per-arm clutch mapping
-        (:func:`_relative_target_np`, so one hand feels exactly like normal
-        teleop) and the box rides rigidly on it; the thumbsticks jog the pair
-        in the box's own horizontal frame (see :meth:`_integrate_jog`).
+        side-clamping grasp (fingers straight forward, level, flat faces on
+        the box) over ``box_align_duration``. Afterwards the leader hand's
+        *translation* drives the pair through the usual per-arm clutch mapping
+        (:func:`_relative_target_np`, so moving the hand feels exactly like
+        normal teleop) while its rotation is ignored: the pair never turns,
+        so lining up on a box is only a matter of where the hands are. The
+        thumbsticks jog the pair in the robot's horizontal frame (see
+        :meth:`_integrate_jog`).
         """
         leader = frame.box_leader
         assert leader in ("left", "right")
@@ -1163,25 +1164,22 @@ class IKWorker:
 
         box = self._box
         ctrl_pos, ctrl_rot = ctrl[leader]
-        lead_pos, lead_rot = _relative_target_np(
+        lead_pos, _lead_rot = _relative_target_np(
             ctrl_pos,
             ctrl_rot,
             *self._snap_ctrl[leader],
             *self._snap_fk[leader],
             position_multiplier=cfg.position_multiplier,
-            rotation_multiplier=cfg.rotation_multiplier,
         )
-        # The box is rigidly attached to the leader gripper's snap frame:
-        # carry the snap-time box pose along with the leader's world motion.
-        snap_pos, snap_rot = self._snap_fk[leader]
-        r_delta = lead_rot @ snap_rot.T
-        center = lead_pos + r_delta @ (box.center - snap_pos)
-        rot = r_delta @ box.rot
+        # Position only: the box centre is carried along with the leader
+        # gripper's translation since the snap, and its frame stays the
+        # robot's (box.rot is the identity) whatever the hand does — the
+        # controller's rotation never reaches the grippers.
+        snap_pos, _snap_rot = self._snap_fk[leader]
+        rot = box.rot
+        center = lead_pos + (box.center - snap_pos)
         self._integrate_jog(frame, box, rot, now)
         center = (center + box.jog_pos).astype(np.float32)
-        if box.jog_yaw:
-            rot = rodrigues(_UP, box.jog_yaw) @ rot
-        rot = rot.astype(np.float32)
         targets = box_targets(box, center, rot, now)
         elbows = self._box_elbow_hints(q_current, targets)
         # The posture attractor follows q for the whole of box mode. Pinned at
@@ -1273,11 +1271,12 @@ class IKWorker:
         """Accumulate this frame's thumbstick jog into ``box``.
 
         Leader stick: forward/back and left/right translate the pair in the
-        box's horizontal frame (forward = the box's ``+x``, perpendicular to
-        the gripper-to-gripper line) — a free 2-D jog, so diagonals work.
-        With the stick clicked in, forward/back moves the pair up/down and
-        left/right yaws it about its centre. The *other* stick's forward/back
-        moves the pair up/down and its left/right widens / narrows the grasp;
+        robot's horizontal frame (forward = ``+x``, away from the chest;
+        left/right along the gripper-to-gripper line) — a free 2-D jog, so
+        diagonals work. With the stick clicked in, forward/back moves the
+        pair up/down (left/right does nothing: the pair never rotates). The
+        *other* stick's forward/back moves the pair up/down and its left/right
+        widens / narrows the grasp;
         with *that* stick clicked in, left/right instead tilts the fingertips
         inward (left) / outward (right) — the grippers' yaw toward the box
         centre, ``BoxState.tilt``, written back to ``config.box_grip_tilt`` so
@@ -1285,8 +1284,8 @@ class IKWorker:
         *different* things (the clicked leader stick, the other stick) only
         its dominant axis counts, so a thumb pushing "left" with a little
         forward in it changes the width alone and never lifts the pair (see
-        :func:`_dominant_axis`). ``rot`` is the box rotation before this
-        frame's jog, used to resolve the horizontal frame.
+        :func:`_dominant_axis`). ``rot`` is the box rotation, used to resolve
+        the horizontal frame.
         """
         cfg = self._config
         dt = 0.0 if box.jog_t is None else min(max(now - box.jog_t, 0.0), _JOG_MAX_DT_S)
@@ -1315,18 +1314,15 @@ class IKWorker:
         if not (sx or sy or ox or oy):
             return
 
-        if box.jog_yaw:
-            rot = rodrigues(_UP, box.jog_yaw) @ rot
         fwd = np.array((rot[0, 0], rot[1, 0], 0.0))
         n = float(np.linalg.norm(fwd))
         fwd = fwd / n if n > 1e-6 else np.array((1.0, 0.0, 0.0))
         lat = np.cross(_UP, fwd)
 
         # Sticks report pushed-forward as -1 (WebXR), so negate y for "forward".
-        v_fwd = v_lat = v_up = yaw_rate = width_rate = tilt_rate = 0.0
+        v_fwd = v_lat = v_up = width_rate = tilt_rate = 0.0
         if click:
             v_up += -sy * cfg.box_jog_speed
-            yaw_rate += -sx * cfg.box_jog_yaw_speed  # push right = clockwise
         else:
             v_fwd += -sy * cfg.box_jog_speed
             v_lat += -sx * cfg.box_jog_speed  # push right = move right
@@ -1341,7 +1337,6 @@ class IKWorker:
         box.jog_pos = (
             box.jog_pos + dt * (v_fwd * fwd + v_lat * lat + v_up * _UP)
         ).astype(np.float32)
-        box.jog_yaw += dt * yaw_rate
         if width_rate:
             box.width = float(
                 np.clip(

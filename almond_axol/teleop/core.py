@@ -470,7 +470,6 @@ class VRTeleopCore:
             "reengage_ramp_speed",
             "reengage_ramp_min_s",
             "box_jog_speed",
-            "box_jog_yaw_speed",
             "box_width_speed",
             "box_align_duration",
             "box_grip_tilt",
@@ -791,7 +790,7 @@ class VRTeleopCore:
             self.r_grip = frame.r_grip
 
     def _update_engage_box(self, frame: object) -> None:
-        """Box-mode engage: one grip drives both arms as a rigid pair.
+        """Box-mode engage: one grip drives both arms as a level pair.
 
         Toggle scheme (default): a rising edge on *either* grip engages both
         arms with that hand as the leader; while engaged, a rising edge on

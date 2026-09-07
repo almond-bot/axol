@@ -113,21 +113,25 @@ class VRTeleopConfig:
             grippers are held as a parallel pair clamping the box between
             their sides — fingers pointing forward like two flat hands, the
             flat outer face of each closed gripper against the box, held by
-            friction — and *one* controller moves both arms as a rigid pair:
+            friction — and *one* controller moves both arms as a pair:
             either grip engages both arms with that hand as the leader (no
             both-grips gate; the other grip switches leader), and the
-            leader's trigger drives both grippers. On engage the grippers
-            first blend into the parallel configuration over
-            ``box_align_duration`` (from wherever they were, e.g. after
-            someone hand-guided the arms), then track the leader controller.
+            leader's trigger drives both grippers. Only the hand's
+            **position** is tracked: the pair never rotates — the grippers
+            stay level with the hands straight out (fingers along the
+            robot's forward axis), so lining up on a box is just a matter of
+            where the hands are. On engage the grippers first blend into
+            that configuration over ``box_align_duration`` (from wherever
+            they were, e.g. after someone hand-guided the arms), then follow
+            the leader controller's translation.
             While a grip is leading, the thumbsticks stop driving Jelly and
             become a **jog** instead (freeze the pair — click the leader's
             grip again — and they drive Jelly as usual, so the box can be
             carried across the room): the leader stick translates the pair
             in the horizontal plane
             (pushed forward = away from the torso, sideways = along the line
-            between the grippers); with the leader stick clicked in the same
-            axes become up/down and yaw. The other controller's stick moves
+            between the grippers); with the leader stick clicked in,
+            forward/back becomes up/down. The other controller's stick moves
             the pair up/down (y) and changes the gripper separation (x —
             right = wider); with that stick clicked in, x tilts the
             fingertips in/out instead (``box_grip_tilt``). On these, only the
@@ -151,8 +155,6 @@ class VRTeleopConfig:
         box_tilt_max: Largest tilt (degrees, either way) the jog allows.
         box_jog_speed: Jog translation speed (m/s) at full stick deflection
             in box mode.
-        box_jog_yaw_speed: Jog yaw rate (rad/s) at full stick deflection in
-            box mode.
         box_width_speed: Rate (m/s) the gripper separation changes at full
             stick deflection in box mode.
         box_width_min: Smallest gripper separation (m, between the two
@@ -366,7 +368,6 @@ class VRTeleopConfig:
     box_tilt_speed: float = 30.0
     box_tilt_max: float = 45.0
     box_jog_speed: float = 0.15
-    box_jog_yaw_speed: float = 0.6
     box_width_speed: float = 0.08
     box_width_min: float = 0.10
     box_width_max: float = 0.70

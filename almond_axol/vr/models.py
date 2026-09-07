@@ -175,7 +175,7 @@ class VRFrame(BaseModel):
         l_stick_click: Left thumbstick pressed in — lift down while held.
         r_stick_click: Right thumbstick pressed in — lift up while held.
             While a box-mode leader is engaged a click is a jog modifier
-            instead (leader stick: up/yaw; other stick: fingertip tilt);
+            instead (leader stick: up/down; other stick: fingertip tilt);
             with the pair frozen the sticks drive Jelly as usual. Both sticks clicked
             *together* toggle **box mode** (handled on the headset, which
             sends the ``set`` message; see

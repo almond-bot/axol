@@ -15,7 +15,7 @@ const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
 const BOTH_CLICK_DEBOUNCE_MS = 600
 // The two stick presses must land within this window of each other to count
 // as "clicked together". In box mode each stick's click is also a jog
-// modifier (leader: up / yaw, other: tilt), so a stick that has been held
+// modifier (leader: up / down, other: tilt), so a stick that has been held
 // for a while when the other one is pressed is a modifier, not the gesture.
 const BOTH_CLICK_TOGETHER_MS = 350
 

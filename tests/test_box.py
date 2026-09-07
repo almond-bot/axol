@@ -161,9 +161,15 @@ def _pair(width: float, face: float = 1.0, tilt: float = 0.0, yaw: float = 0.0):
 class PairAlignedTest(unittest.TestCase):
     def test_side_clamping_pair_is_aligned(self) -> None:
         for face in (1.0, -1.0):
-            for yaw in (0.0, 0.9):
-                left, right = _pair(0.3, face=face, yaw=yaw)
-                self.assertTrue(pair_aligned(left, right, 0.1, 0.7, 0.0, 25.0))
+            left, right = _pair(0.3, face=face)
+            self.assertTrue(pair_aligned(left, right, 0.1, 0.7, 0.0, 25.0))
+
+    def test_yawed_pair_is_not_aligned(self) -> None:
+        # The box frame is the robot's own: a pair turned away from straight
+        # forward would be squared up by the engage blend, so it isn't
+        # "aligned" even though the grippers are parallel to each other.
+        left, right = _pair(0.3, yaw=0.9)
+        self.assertFalse(pair_aligned(left, right, 0.1, 0.7, 0.0, 25.0))
 
     def test_facing_pair_is_not_aligned(self) -> None:
         # The old geometry — approach axes pointing at each other.
@@ -236,14 +242,33 @@ class SnapBoxTest(unittest.TestCase):
         np.testing.assert_allclose(at_end["left"][1], ideal["left"][1], atol=1e-6)
         self.assertTrue(state.aligned)
 
-    def test_box_frame_is_level_with_lateral_from_right_to_left(self) -> None:
+    def test_box_frame_is_the_robot_frame_at_the_midpoint(self) -> None:
+        # One gripper ahead of and above the other: the frame still does not
+        # turn (position-only box mode), only the centre and width follow.
         center, rot, width = box_frame(
             np.array((0.5, 0.2, 0.4)), np.array((0.3, -0.2, 0.2))
         )
         np.testing.assert_allclose(center, (0.4, 0.0, 0.3), atol=1e-6)
-        np.testing.assert_allclose(rot[:, 2], _UP, atol=1e-6)
-        self.assertGreater(float(rot[1, 1]), 0.0)
+        np.testing.assert_allclose(rot, np.eye(3), atol=1e-6)
         self.assertAlmostEqual(width, math.sqrt(0.04 + 0.16 + 0.04), places=6)
+
+    def test_snap_squares_a_skewed_pair_up_to_straight_forward(self) -> None:
+        # Grippers yawed 40° as a pair (one ahead of the other) snap to a box
+        # whose slots lie along the robot's y axis with fingers along +x.
+        left, right = _pair(0.3, yaw=0.7)
+        state = snap_box(
+            left, right, now=0.0, align_duration=1.0, width_min=0.1, width_max=0.7
+        )
+        np.testing.assert_allclose(state.rot, np.eye(3), atol=1e-6)
+        ideal = ideal_gripper_poses(
+            state.center, state.rot, state.width, state.grip_rel()
+        )
+        for side, sign in (("left", 1.0), ("right", -1.0)):
+            pos, rot = ideal[side]
+            np.testing.assert_allclose(approach_axis(rot), _FWD, atol=1e-6)
+            np.testing.assert_allclose(
+                pos, state.center + sign * 0.5 * state.width * _LAT, atol=1e-6
+            )
 
 
 class DominantAxisTest(unittest.TestCase):
@@ -260,7 +285,6 @@ def _jog_worker(leader: str = "left") -> IKWorker:
     worker = object.__new__(IKWorker)
     worker._config = types.SimpleNamespace(
         box_jog_speed=0.2,
-        box_jog_yaw_speed=1.0,
         box_width_speed=0.1,
         box_width_min=0.1,
         box_width_max=0.7,
@@ -494,7 +518,6 @@ class JogAxisLockTest(unittest.TestCase):
         self._jog(worker, box, _stick_frame(r_stick_x=0.95, r_stick_y=-0.35))
         self.assertGreater(box.width, 0.3)
         np.testing.assert_allclose(box.jog_pos, 0.0, atol=1e-7)
-        self.assertEqual(box.jog_yaw, 0.0)
 
     def test_width_stick_pushed_forward_with_a_side_leak_only_lifts(self) -> None:
         worker = _jog_worker("left")
@@ -507,11 +530,19 @@ class JogAxisLockTest(unittest.TestCase):
     def test_clicked_leader_stick_is_one_axis_at_a_time(self) -> None:
         worker = _jog_worker("left")
         box = _box_state()
+        # Mostly sideways with a forward leak: sideways does nothing while
+        # clicked (the pair never rotates), and the leak must not lift it.
         self._jog(
             worker, box, _stick_frame(l_stick_x=0.9, l_stick_y=-0.3, l_stick_click=True)
         )
-        self.assertNotEqual(box.jog_yaw, 0.0)
         np.testing.assert_allclose(box.jog_pos, 0.0, atol=1e-7)
+        self.assertEqual(box.width, 0.3)
+        # Mostly forward: lifts, and only lifts.
+        self._jog(
+            worker, box, _stick_frame(l_stick_x=0.3, l_stick_y=-0.9, l_stick_click=True)
+        )
+        self.assertGreater(float(box.jog_pos[2]), 0.0)
+        np.testing.assert_allclose(box.jog_pos[:2], 0.0, atol=1e-7)
 
     def test_free_leader_stick_keeps_diagonals(self) -> None:
         worker = _jog_worker("left")
@@ -616,6 +647,128 @@ class _FakeCore:
     def set_live(self, key: str, value: object) -> None:
         self.set_calls.append((key, value))
         self.values[key] = value
+
+
+class _RecordingSolver:
+    """Solver stub for ``_step_box``: fixed FK, ``ik`` records its targets."""
+
+    def __init__(self) -> None:
+        self.left_pose = (
+            np.array((0.40, 0.20, 0.30), np.float32),
+            _rot_z(0.5).astype(np.float32),
+        )
+        self.right_pose = (
+            np.array((0.40, -0.20, 0.30), np.float32),
+            _rot_x(-0.3).astype(np.float32),
+        )
+        self.calls: list[dict[str, object]] = []
+
+    def set_posture_pose(self, q: np.ndarray) -> None:
+        del q
+
+    def fk(self, q: np.ndarray):
+        del q
+        return self.left_pose, self.right_pose
+
+    def ik(self, q: np.ndarray, **kwargs: object) -> np.ndarray:
+        self.calls.append(kwargs)
+        return np.asarray(q, dtype=np.float32).copy()
+
+
+def _box_worker(leader: str = "left") -> IKWorker:
+    worker = object.__new__(IKWorker)
+    worker._config = types.SimpleNamespace(
+        ik_frequency=120.0,
+        position_multiplier=1.0,
+        rotation_multiplier=1.0,
+        box_align_duration=0.0,
+        box_width_min=0.1,
+        box_width_max=0.7,
+        box_grip_tilt=0.0,
+        box_tilt_speed=30.0,
+        box_tilt_max=45.0,
+        box_jog_speed=0.2,
+        box_width_speed=0.1,
+        box_elbow_out=30.0,
+        box_elbow_weight=0.0,
+    )
+    worker._solver = _RecordingSolver()
+    worker._rec = None
+    worker._active = {"left": True, "right": True}
+    worker._hold_fk = {}
+    worker._hold_elbow_fk = {}
+    worker._ramp = {}
+    worker._box = None
+    worker._box_leader = None
+    worker._freeze_since = {}
+    worker._freeze_targets = {}
+    worker._snap_ctrl = {}
+    worker._snap_fk = {}
+    worker._last_solve_t = None
+    # Engage snap with the leader controller at the origin, unrotated.
+    frame = _stick_frame()
+    frame.box_leader = leader
+    q = np.zeros(14, np.float32)
+    ctrl = {
+        "left": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
+        "right": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
+    }
+    worker._step_box(frame, q, ctrl, ctrl["left"][0], ctrl["right"][0])
+    return worker
+
+
+class PositionOnlyTrackingTest(unittest.TestCase):
+    """Box mode follows the leader hand's position and ignores its rotation:
+    the pair stays level with the fingers straight forward whatever the
+    controller does."""
+
+    def _targets(self, worker: IKWorker, ctrl_pos, ctrl_rot):
+        frame = _stick_frame()
+        frame.box_leader = "left"
+        ctrl = {
+            "left": (
+                np.asarray(ctrl_pos, np.float32),
+                np.asarray(ctrl_rot, np.float32),
+            ),
+            "right": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
+        }
+        worker._step_box(
+            frame, np.zeros(14, np.float32), ctrl, ctrl["left"][0], ctrl["right"][0]
+        )
+        call = worker._solver.calls[-1]
+        return call["left_pose"], call["right_pose"]
+
+    def _assert_straight_out(self, left, right, center) -> None:
+        for (pos, rot), sign in ((left, 1.0), (right, -1.0)):
+            np.testing.assert_allclose(approach_axis(rot), _FWD, atol=1e-6)
+            # Level: the flat clamping face (gripper X) is horizontal.
+            np.testing.assert_allclose(rot[:, 0] @ _UP, 0.0, atol=1e-6)
+            np.testing.assert_allclose(pos, center + sign * 0.2 * _LAT, atol=1e-6)
+
+    def test_snap_squares_the_grippers_up_from_an_arbitrary_pose(self) -> None:
+        worker = _box_worker()
+        left, right = self._targets(worker, np.zeros(3), np.eye(3))
+        self._assert_straight_out(left, right, np.array((0.4, 0.0, 0.3)))
+
+    def test_rotating_the_controller_changes_nothing(self) -> None:
+        worker = _box_worker()
+        base_left, base_right = self._targets(worker, np.zeros(3), np.eye(3))
+        for rot in (_rot_x(0.8), _rot_z(-1.2), _rot_x(0.4) @ _rot_z(2.0)):
+            left, right = self._targets(worker, np.zeros(3), rot)
+            np.testing.assert_allclose(left[0], base_left[0], atol=1e-6)
+            np.testing.assert_allclose(left[1], base_left[1], atol=1e-6)
+            np.testing.assert_allclose(right[0], base_right[0], atol=1e-6)
+            np.testing.assert_allclose(right[1], base_right[1], atol=1e-6)
+
+    def test_moving_the_controller_translates_the_level_pair(self) -> None:
+        worker = _box_worker()
+        base_left, base_right = self._targets(worker, np.zeros(3), np.eye(3))
+        # Any translation, with the hand twisted while it moves.
+        left, right = self._targets(worker, np.array((0.05, 0.10, -0.15)), _rot_x(0.9))
+        shift = left[0] - base_left[0]
+        self.assertGreater(float(np.linalg.norm(shift)), 0.1)
+        np.testing.assert_allclose(right[0] - base_right[0], shift, atol=1e-6)
+        self._assert_straight_out(left, right, np.array((0.4, 0.0, 0.3)) + shift)
 
 
 class LiveToggleTest(unittest.TestCase):

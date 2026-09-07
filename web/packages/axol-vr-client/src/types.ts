@@ -71,7 +71,7 @@ export type AxolPoseData = {
   l_stick_click?: boolean
   /**
    * Right thumbstick pressed in — lift up while held (in box mode: a jog
-   * modifier — leader stick up/yaw, other stick fingertip tilt). Both sticks
+   * modifier — leader stick up/down, other stick fingertip tilt). Both sticks
    * clicked together toggle box mode (the headset sends the `set` message
    * itself, see `AxolVRClient.onBothStickClick`).
    */

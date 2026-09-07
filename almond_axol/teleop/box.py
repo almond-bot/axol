@@ -6,14 +6,16 @@ robot's world frame (FLU:
 +x forward, +y left, +z up) using the ``(pos (3,), rot (3, 3))`` pose format
 :class:`~almond_axol.kinematics.solver.KinematicsSolver` speaks.
 
-The **box frame** sits at the midpoint of the two gripper mount frames. Its
-axes are ``x`` forward, ``y`` *lateral* — the horizontal direction from the
-right gripper to the left one — and ``z`` up. The grippers live at
-``center ± y * width / 2`` and hold the box the way two flat hands clamp its
-sides: the fingers point *forward* (the gripper link's ``-Z``, the direction
-the fingers point, goes along the box ``+x``) and the flat outer face of the
-closed fingers — the gripper link's ``±X`` side, the jaw's open/close axis —
-faces the box centre, so the box is held between the sides of the two
+The **box frame** sits at the midpoint of the two gripper mount frames and
+its axes are the robot's own: ``x`` forward, ``y`` lateral (left), ``z`` up.
+It never rotates — box mode controls the pair's *position* only, and the
+grippers are always held level with the hands straight out, so picking up a
+box is a matter of where the pair is, not how it is turned. The grippers
+live at ``center ± y * width / 2`` and hold the box the way two flat hands
+clamp its sides: the fingers point *forward* (the gripper link's ``-Z``, the
+direction the fingers point, goes along ``+x``) and the flat outer face of
+the closed fingers — the gripper link's ``±X`` side, the jaw's open/close
+axis — faces the box centre, so the box is held between the sides of the two
 grippers by friction. Which of the two flat faces (``+X`` or ``-X``) is
 turned toward the box is chosen per gripper as the one closest to its
 current rotation, so the wrist never flips through 180° to get there. An
@@ -32,9 +34,6 @@ Pose = tuple[np.ndarray, np.ndarray]
 
 _UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
 _LEFT = np.array((0.0, 1.0, 0.0), dtype=np.float32)
-# Below this horizontal separation the lateral axis is undefined; fall back
-# to world +y (the grippers are stacked vertically or coincident).
-_MIN_LATERAL_M = 1e-3
 
 
 def rodrigues(axis: np.ndarray, angle: float) -> np.ndarray:
@@ -53,26 +52,19 @@ def approach_axis(rot: np.ndarray) -> np.ndarray:
 def box_frame(
     left_pos: np.ndarray, right_pos: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """``(center, rotation, width)`` of the level box frame between two grippers.
+    """``(center, rotation, width)`` of the box frame between two grippers.
 
-    ``width`` is the full 3-D separation of the two mount frames, so two
-    grippers that start at different heights keep their spacing when the
-    frame levels them; ``rotation`` is yaw-only (``z`` up).
+    The frame is the robot's own (``rotation`` is the identity: ``x``
+    forward, ``y`` left, ``z`` up) centred between the two mount frames.
+    ``width`` is their full 3-D separation, so two grippers that start at
+    different heights, or one ahead of the other, keep their spacing when the
+    frame squares them up.
     """
     left_pos = np.asarray(left_pos, dtype=np.float64)
     right_pos = np.asarray(right_pos, dtype=np.float64)
     center = 0.5 * (left_pos + right_pos)
-    d = left_pos - right_pos
-    width = float(np.linalg.norm(d))
-    lat = d.copy()
-    lat[2] = 0.0
-    if np.linalg.norm(lat) < _MIN_LATERAL_M:
-        lat = _LEFT.astype(np.float64)
-    lat = lat / np.linalg.norm(lat)
-    up = _UP.astype(np.float64)
-    fwd = np.cross(lat, up)
-    rot = np.stack([fwd, lat, up], axis=1)
-    return center.astype(np.float32), rot.astype(np.float32), width
+    width = float(np.linalg.norm(left_pos - right_pos))
+    return center.astype(np.float32), np.eye(3, dtype=np.float32), width
 
 
 def rotation_angle(r0: np.ndarray, r1: np.ndarray) -> float:
@@ -113,16 +105,16 @@ def blend_pose(start: Pose, goal: Pose, alpha: float) -> Pose:
 class BoxState:
     """Box-mode tracking state, established at the engage snap.
 
-    ``center`` / ``rot`` are the box pose *at the snap*; the leader
-    controller's motion since its own snap is applied to them every frame
-    (the box rides rigidly on the leader gripper's clutch mapping, see
-    ``IKWorker``), then the accumulated stick jog — a world-frame offset
-    ``jog_pos`` and a yaw ``jog_yaw`` about the box centre — on top.
-    ``face`` records which flat face (``±1``, the gripper's ``±X`` side) each
-    gripper turns toward the box, chosen at the snap; ``tilt`` is the
-    grippers' inward yaw (rad), seeded from the config and jogged live.
-    Together they give each gripper's rotation relative to the box frame
-    (:meth:`grip_rel`), so the pair turns rigidly with the box.
+    ``center`` is the box centre *at the snap* and ``rot`` its (fixed,
+    identity) frame; the leader controller's translation since its own snap
+    is applied to the centre every frame (the box rides on the leader
+    gripper's clutch mapping, position only — the hand's rotation is
+    ignored, see ``IKWorker``), then the accumulated stick jog ``jog_pos``
+    (a world-frame offset) on top. ``face`` records which flat face (``±1``,
+    the gripper's ``±X`` side) each gripper turns toward the box, chosen at
+    the snap; ``tilt`` is the grippers' inward yaw (rad), seeded from the
+    config and jogged live. Together they give each gripper's rotation
+    relative to the box frame (:meth:`grip_rel`).
     ``align_start`` holds where each gripper actually was at the snap,
     expressed in the box frame, for the blend into the parallel
     configuration.
@@ -137,7 +129,6 @@ class BoxState:
     align_t0: float
     align_duration: float
     jog_pos: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
-    jog_yaw: float = 0.0
     # Wall time of the previous jog integration step (None before the first).
     jog_t: float | None = None
 
