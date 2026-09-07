@@ -25,6 +25,10 @@ The Tracking tab walks each source through a **step-by-step flow**. Each step re
   <Tab title="Quest">
     Quest uses the headset's own controller tracking through WebXR, so there is no runtime to install and no tracker to bind — WebXR handedness assigns left and right. The only stored state is the **calibration key** that identifies the controller generation and pose datum.
 
+    <Frame>
+      <img src="/assets/mantis_tracking_quest.png" alt="Mantis settings Tracking tab with the Quest source selected, showing the calibration key field and the Headset setup step" style={{ margin: "0 auto" }} />
+    </Frame>
+
     <Steps>
       <Step title="Source">
         Choose **Quest** (the selection saves immediately). The Quest headset and the host must be on the same LAN (or use the wired [Quest-over-USB](/guides/quest-over-usb) link, managed under **General settings → Quest**).
@@ -41,6 +45,10 @@ The Tracking tab walks each source through a **step-by-step flow**. Each step re
 
   <Tab title="Lighthouse">
     Lighthouse tracks two **VIVE Tracker 3.0** units from 1–2 SteamVR base stations (1.0 or 2.0) with the pinned [libsurvive](https://github.com/collabora/libsurvive) runtime on the host. Mount the base stations with the whole Mantis workspace in view, and if you use two **Base Station 2.0** units, put them on **different channels** (the button on the back cycles 1–16) — two stations on one channel make poses jump or stall as soon as a rig moves.
+
+    <Frame>
+      <img src="/assets/mantis_tracking_lighthouse.png" alt="Mantis settings Tracking tab with the Lighthouse source selected, on the first (Runtime) step of the setup flow" style={{ margin: "0 auto" }} />
+    </Frame>
 
     <Steps>
       <Step title="Source">
@@ -62,6 +70,10 @@ The Tracking tab walks each source through a **step-by-step flow**. Each step re
 
   <Tab title="Ultimate">
     **VIVE Ultimate Trackers** track themselves (inside-out SLAM) against a room map they share over a private access point, with no base stations or headset. There is no official Linux support; the host uses the community [pyvut](https://github.com/nijkah/pyvut) driver to talk to the **wireless dongle over USB HID**. Pairing and mapping are Windows-only, one-time operator steps; everything after that runs from the control panel.
+
+    <Frame>
+      <img src="/assets/mantis_tracking_ultimate.png" alt="Mantis settings Tracking tab with the Ultimate source selected, showing the four-step setup flow on the Runtime step" style={{ margin: "0 auto" }} />
+    </Frame>
 
     <Steps>
       <Step title="One time on Windows: pair">
