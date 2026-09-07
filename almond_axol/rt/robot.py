@@ -41,10 +41,10 @@ state, and ``gravity_compensate`` streams its tuples through the same
 command sink, so the contact watchdog, the limp contact hold, and the
 replanned reset all run against the core.
 
-Faults never drop the arms. When the core loses trust in its own loop
-(unhealthy timing, a motor silent for a second) it goes *limp* — every arm
-joint at kp = 0 with the streamed gravity feedforward, still serving — and
-reports ``limp: ...``. ``motion_control`` then streams gravity comp instead
+Faults never drop the arms. When the core loses trust in a motor (silent
+for a second) it goes *limp* — every arm joint at kp = 0 with the streamed
+gravity feedforward, still serving — and reports ``limp: ...``. Bad control
+timing never does: it only degrades (host damping off, logged). ``motion_control`` then streams gravity comp instead
 of tracking, so the arms stay weightless and hand-guidable while the
 operator moves them to rest and stops the session; ``disable`` leaves them
 limp rather than torquing off. A hard fault (dead bus, protocol error) or a

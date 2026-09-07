@@ -76,7 +76,7 @@ The screens are **world-anchored** — like TVs placed where you were looking wh
 - **Resize** a screen — grab the *same* screen with **both** triggers and move your hands apart to make it bigger or together to make it smaller.
 - **Reset** — press **B** (right controller) to re-anchor every screen to your current gaze and clear all moves and resizes.
 
-The headset only shows the feeds for cameras that are actually being streamed (set in the [control panel's Cameras settings tab](/guides/control-panel#cameras) or via the relevant CLI flags), so streaming only the overhead, say, shows just the overhead. While video is still negotiating — or any streamed camera hasn't produced its first frame — a global **Connecting cameras…** indicator shows; it clears once every streamed camera is live, and never appears when nothing is being streamed.
+The headset only shows feeds that are actually being streamed (set under [the Axol or Mantis Cameras tab](/guides/control-panel#cameras), or via the relevant CLI flags), so streaming only the overhead, say, shows just the overhead. While video is still negotiating — or any streamed camera hasn't produced its first frame — a global **Connecting cameras…** indicator shows; it clears once every streamed camera is live, and never appears when nothing is being streamed.
 
 ## Controller bindings
 
@@ -190,7 +190,7 @@ Robots equipped with **Jelly** (an x-drive omni-wheel base plus a telescoping li
 
 The sticks are their own **deadman**: the base only moves while a stick is deflected and coasts to a smooth stop the moment you let go, independent of whether arm tracking is engaged. The one exception is [box mode](#box-mode) while a grip is leading the pair, when the sticks jog the arms instead — freeze the pair to drive ([details](#driving-with-the-box)). Jelly motion is **operator mobility only** — it's never recorded into a dataset and a policy never controls it, so you can reposition the robot mid-session (during teleop *or* data collection) without touching the recorded data.
 
-Enable Jelly per robot from the control panel's **Jelly** toggle (Robot settings) or with [`axol teleop --jelly.enabled true`](/cli/teleop); the tunables live under **Advanced → Jelly** (or the `--jelly.*` flags). To drive **only** Jelly with the arms left untouched — no Axol hub needed — use the control panel's **Jelly only** checkbox or [`axol teleop --jelly_only`](/cli/teleop). See [`can.setup`](/cli/can-setup) for wiring Jelly's CAN adapter.
+Enable Jelly per robot from the control panel's **Jelly** toggle (**Axol settings → Robot**) or with [`axol teleop --jelly.enabled true`](/cli/teleop); the tunables live under **Advanced → Jelly** (or the `--jelly.*` flags). To drive **only** Jelly with the arms left untouched — no Axol hub needed — use the control panel's **Jelly only** checkbox or [`axol teleop --jelly_only`](/cli/teleop). See [`can.setup`](/cli/can-setup) for wiring Jelly's CAN adapter.
 
 The telescoping lift needs a one-time [`axol lift.home`](/cli/lift-home) calibration before it will move, and [`axol lift.goto`](/cli/lift-goto) raises it to the robot-install height; both are also on the panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics**.
 

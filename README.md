@@ -13,20 +13,22 @@ The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). 
 ## Requirements
 
 - **Linux**
-- **Python 3.13+**
+- **Python 3.12+** (the hosted installer bundles 3.13)
 - **(Optional) NVIDIA Jetson** (e.g. a ZED Box) — required for the GMSL-attached ZED cameras (data collection / policy inference).
 
 ## Installation
 
 ### One-command install (recommended)
 
-One command installs `uv`, the `axol` CLI (from PyPI, with every extra), and a root systemd service that keeps `axol serve` running at boot:
+One command installs `uv`, the `axol` CLI (from PyPI, with the `lerobot`, `sim`, and `tracker` extras), and a root systemd service that keeps `axol serve` running at boot:
 
 ```bash
 curl https://axol.almond.bot/install -fsS | bash
 ```
 
 Then open [axol.almond.bot](https://axol.almond.bot) and connect to the machine. The install tracks [releases](https://github.com/almond-bot/axol/releases): when a newer release exists, the control panel shows an update banner, and pressing **Update** reinstalls at the new release and restarts the server once idle.
+
+On aarch64/Jetson, PyPI's pinned Torch 2.10 wheel is CPU-only. Local CUDA policy inference needs an explicitly managed JetPack-compatible Torch + Torchvision build; otherwise use remote inference or `--device cpu`. The hosted update paths refuse to overwrite an existing custom/CUDA build.
 
 ### Development install
 
@@ -46,11 +48,12 @@ Install optional dependency groups as needed:
 
 | Extra | Contents | When to use |
 |---|---|---|
-| `lerobot` | LeRobot (from PyPI, >= 0.6.1) | `collect-data`, `run-policy` |
+| `lerobot` | LeRobot (from PyPI, pinned to 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
+| `tracker` | Lighthouse/Ultimate bridge dependencies | `tracker.bridge`, Mantis tracking |
 
 ```bash
-uv sync --extra lerobot --extra sim   # everything
+uv sync --extra lerobot --extra sim --extra tracker   # hosted feature set
 ```
 
 The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separately after the ZED SDK is installed:
@@ -102,6 +105,11 @@ Each operation can be driven from the web control panel or the CLI:
 - [Run Policy](https://docs.almond.bot/operations/run-policy) — run a trained policy, local or remote inference
 - [DAgger Collection](https://docs.almond.bot/operations/dagger) — run a policy while correcting it from VR, recording the corrections
 
+### Mantis
+
+- [Mantis Hardware](https://docs.almond.bot/mantis/hardware) — handheld rigs for collecting demonstrations without moving the robot
+- [Mantis Tracking](https://docs.almond.bot/mantis/tracking) — set up Quest, Lighthouse, or Ultimate tracking as the pose source
+
 ### Remote Teleop
 
 - [Remote Teleop](https://docs.almond.bot/guides/remote-teleop) — drive over the internet by sideloading Tailscale on a Meta Quest
@@ -152,6 +160,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`gst.install`](https://docs.almond.bot/cli/gst-install)
 - [`gst.build-zed`](https://docs.almond.bot/cli/gst-build-zed)
 - [`jetson.setup`](https://docs.almond.bot/cli/jetson-setup)
+- [`tracker.*`](https://docs.almond.bot/cli/tracker) — Mantis tracker setup: bridge, identify, pair, install, and base-station / Ultimate checks
 - [`tune.pid`](https://docs.almond.bot/cli/tune-pid)
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
 - [`tune.repeatability`](https://docs.almond.bot/cli/tune-repeatability)

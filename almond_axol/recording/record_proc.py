@@ -35,6 +35,7 @@ import multiprocessing.connection
 import os
 import platform
 import shutil
+import stat
 import threading
 import time
 from collections import deque
@@ -42,6 +43,8 @@ from fractions import Fraction
 from pathlib import Path
 from statistics import median
 from typing import TYPE_CHECKING, Any, Callable
+
+from ..utils.state_files import UnsafeStatePathError
 
 if TYPE_CHECKING:
     from lerobot.configs.video import RGBEncoderConfig
@@ -78,6 +81,85 @@ _ENCODED_START_TIMEOUT_S = 15.0
 _ENCODED_ROW_TIMEOUT_S = 1.0
 # How often the blocking AU read wakes to re-check stop_event.
 _ENCODED_POLL_MS = 100
+
+
+def _stop_capture_thread(
+    thread: threading.Thread | None,
+    stop: threading.Event | None,
+    *,
+    timeout: float = _CAPTURE_STOP_TIMEOUT_S,
+) -> threading.Thread | None:
+    """Stop one capture thread, returning ``None`` only after proven exit.
+
+    The returned value is intentionally assignment-friendly: the recorder may
+    write ``thread = _stop_capture_thread(thread, stop)``.  If the join bound is
+    exceeded this raises before that assignment, so the live thread reference
+    is retained and every destructive episode operation can fail closed until
+    a later retry proves it has exited.
+    """
+    if thread is None:
+        return None
+    if stop is None:
+        raise RuntimeError("capture thread exists without its stop event")
+    stop.set()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        raise RuntimeError(
+            f"capture thread did not stop within {timeout:g}s; refusing to "
+            "save, clear, or replace its live episode buffer"
+        )
+    return None
+
+
+def _shutdown_process(
+    process: Any,
+    *,
+    graceful_timeout: float,
+) -> tuple[bool, bool, list[tuple[str, BaseException]]]:
+    """Stop a child process while completing every independent shutdown step.
+
+    Returns ``(still_alive, forced, failures)``.  A failed join, liveness
+    probe, or terminate call does not prevent a later kill attempt: teardown
+    code uses this precisely when process ownership is already uncertain.
+    """
+    failures: list[tuple[str, BaseException]] = []
+    forced = False
+
+    def join(label: str, timeout: float) -> None:
+        try:
+            process.join(timeout=timeout)
+        except BaseException as error:
+            failures.append((label, error))
+
+    def is_alive(label: str) -> bool:
+        try:
+            return bool(process.is_alive())
+        except BaseException as error:
+            failures.append((label, error))
+            # Failure to prove exit must be treated as live so the next,
+            # stronger shutdown action is still attempted.
+            return True
+
+    join("graceful join", graceful_timeout)
+    alive = is_alive("post-join liveness check")
+    if alive:
+        forced = True
+        try:
+            process.terminate()
+        except BaseException as error:
+            failures.append(("terminate", error))
+        join("post-terminate join", 5.0)
+        alive = is_alive("post-terminate liveness check")
+    if alive:
+        try:
+            process.kill()
+        except BaseException as error:
+            failures.append(("kill", error))
+        join("post-kill join", 5.0)
+        alive = is_alive("post-kill liveness check")
+    return alive, forced, failures
+
+
 # A relay/source hiccup occasionally omits one or two all-intra AUs even while
 # the rest of the camera/control stack remains healthy.  Holding the last IDR
 # for those missing cadence slots is bounded corruption (at most 33 ms at
@@ -110,6 +192,23 @@ _SNAPSHOT_HISTORY_SIZE = 512
 # headroom for lower configured control rates, but surface clock/history failures
 # before they silently contaminate a whole episode.
 _STATE_ALIGNMENT_WARN_S = 0.050
+
+# A capture row that goes this long without a heartbeat is a stall worth a
+# stack trace: 30 frame periods at 60 fps, well under the 2 s encoded-AU
+# backlog limit and the 1 s row deadline that would otherwise end the episode
+# without saying what the capture thread was doing.
+_CAPTURE_ROW_STALL_S = 0.5
+
+
+class EpisodeDurabilityError(Exception):
+    """A saved episode could not be made crash-durable.
+
+    This is deliberately not a ``RuntimeError``: collection loops may recover
+    from ordinary per-episode validation failures by discarding the take and
+    continuing, but a failed parquet durability flush leaves dataset ownership
+    uncertain until orderly finalization. The recorder is terminal after this
+    error and may only be closed.
+    """
 
 
 class RecorderDatasetSaveError(RuntimeError):
@@ -889,6 +988,42 @@ def _wait_snapshot_nearest(
     return None
 
 
+def _describe_snapshot_miss(
+    target_ts: float,
+    read_latest: Callable[[], tuple[dict, dict, float, bool] | None],
+    now: float | None = None,
+) -> str:
+    """Say *why* no robot-state snapshot brackets ``target_ts``.
+
+    The bracket wait fails for two unrelated reasons that used to share one
+    message. Comparing the exposure against the newest published snapshot
+    tells them apart:
+
+    * the newest snapshot is *older* than the exposure — the control loop
+      stopped publishing state (a stall in the control process, not the
+      recorder), and no amount of recorder history could have helped;
+    * the newest snapshot is *newer* than the exposure — the exposure aged out
+      of the retained history, i.e. the recorder itself fell behind.
+    """
+    latest = read_latest()
+    if latest is None:
+        return "no robot-state snapshot has been published yet"
+    latest_ts = latest[2]
+    if latest_ts < target_ts:
+        age_ms = (target_ts - latest_ts) * 1e3
+        since_ms = ((now if now is not None else time.perf_counter()) - latest_ts) * 1e3
+        return (
+            "the control loop stopped publishing robot state: newest snapshot is "
+            f"{age_ms:.0f} ms older than the exposure ({since_ms:.0f} ms old now) "
+            "(control-process stall, not a recorder backlog)"
+        )
+    behind_ms = (latest_ts - target_ts) * 1e3
+    return (
+        f"the exposure is {behind_ms:.0f} ms behind the newest snapshot and has "
+        "aged out of the retained state history (recorder fell behind)"
+    )
+
+
 def _camera_alignment_limit(fps: int) -> float:
     """Maximum allowed exposure spread within a multi-camera dataset row."""
     return max(0.010, 1.5 / fps) if fps > 0 else 0.050
@@ -1119,8 +1254,19 @@ def run_capture_loop(
     record_event: "threading.Event | None" = None,
     frame_counter: "dict[str, int] | None" = None,
     on_error: Callable[[str], None] | None = None,
+    heartbeat: Callable[[], None] | None = None,
+    row_times: "list[float] | None" = None,
 ) -> None:
     """Capture dataset rows at ``fps`` Hz until ``stop_event`` is set.
+
+    ``row_times`` (optional) receives one capture-time append per appended row
+    (the row's camera exposure time on the ``perf_counter`` timeline) so the
+    recorder can cut a take at an operator gesture (see
+    :func:`trim_episode_after`).
+
+    ``heartbeat`` (optional) is called once per tick from this thread so a
+    :class:`~almond_axol.utils.stall_diag.StallWatchdog` can attribute a
+    stalled row (see :func:`run_encoded_capture_loop`).
 
     Each tick sleeps until ``T_n = recording_start + n/fps`` and waits for a
     frame with ``capture_perf_ts >= T_n`` from every camera. The row is paired
@@ -1194,6 +1340,8 @@ def run_capture_loop(
         cap_last_log = time.perf_counter()
 
         while not stop_event.is_set():
+            if heartbeat is not None:
+                heartbeat()
             if record_event is not None and not record_event.is_set():
                 # Paused: idle without capturing and drop the anchor so the
                 # tick clock re-anchors on resume (no timestamp gap).
@@ -1297,7 +1445,9 @@ def run_capture_loop(
                     return
                 raise RuntimeError(
                     "no retained robot-state snapshot brackets raw camera "
-                    f"exposure {row_capture_ts:.6f}; episode discarded"
+                    f"exposure {row_capture_ts:.6f}: "
+                    f"{_describe_snapshot_miss(row_capture_ts, read_snapshot)}; "
+                    "episode discarded"
                 )
             joint_obs, action, _snap_ts, intervention = snap
             snapshot_skew = abs(_snap_ts - row_capture_ts)
@@ -1327,6 +1477,8 @@ def run_capture_loop(
             dataset.add_frame(row)
             if frame_counter is not None:
                 frame_counter["n"] += 1
+            if row_times is not None:
+                row_times.append(row_capture_ts)
             frames_added += 1
             tick_cost_sum += time.perf_counter() - body_t0
             ticks_window += 1
@@ -1361,11 +1513,18 @@ def run_encoded_capture_loop(
     repair_events: "list[dict[str, Any]] | None" = None,
     on_error: Callable[[str], None] | None = None,
     on_armed: Callable[[], None] | None = None,
+    heartbeat: Callable[[], None] | None = None,
+    row_times: "list[float] | None" = None,
 ) -> None:
     """Frame-driven capture for the relay-encoded (gstshm-h264) transport.
 
-    ``frame_counter`` mirrors :func:`run_capture_loop`'s (a mutable
-    ``{"n": int}`` incremented per appended row). There is no ``record_event``
+    ``heartbeat`` (optional) is called once per row from this thread so a
+    :class:`~almond_axol.utils.stall_diag.StallWatchdog` can name what the
+    loop was doing if a row ever takes far longer than a frame period.
+
+    ``frame_counter`` and ``row_times`` mirror :func:`run_capture_loop`'s (a
+    mutable ``{"n": int}`` incremented per appended row, and one capture-time
+    append per row). There is no ``record_event``
     on this path: capture rows remain continuous within an episode even though
     each all-intra AU is independently decodable.
 
@@ -1476,6 +1635,8 @@ def run_encoded_capture_loop(
         last_log = time.perf_counter()
 
         while not stop_event.is_set():
+            if heartbeat is not None:
+                heartbeat()
             budget = _ENCODED_START_TIMEOUT_S if not primed else _ENCODED_ROW_TIMEOUT_S
             # One shared deadline for the whole row: with per-camera budgets the
             # serial reads compound (a stalled first camera would hand every
@@ -1693,7 +1854,8 @@ def run_encoded_capture_loop(
                     return
                 raise RuntimeError(
                     "no retained robot-state snapshot brackets camera exposure "
-                    f"{row_capture_ts:.6f}; recorder exceeded timestamp history"
+                    f"{row_capture_ts:.6f}: "
+                    f"{_describe_snapshot_miss(row_capture_ts, read_snapshot)}"
                 )
             joint_obs, action, _snap_ts, intervention = snap
             snapshot_skew = abs(_snap_ts - row_capture_ts)
@@ -1731,6 +1893,8 @@ def run_encoded_capture_loop(
                 event["concealed_ms"] = 1e3 * event["missing_frames"] / fps
             if frame_counter is not None:
                 frame_counter["n"] += 1
+            if row_times is not None:
+                row_times.append(row_capture_ts)
             rows_added += 1
             total_rows += 1
 
@@ -1779,6 +1943,18 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
 
     rgb_encoder = make_rgb_encoder(config["vcodec"])
     if config["is_complete"]:
+        # Defense in depth: callers validate before opening hardware, then the
+        # recorder rechecks immediately before LeRobot.resume. This closes the
+        # gap where changed metadata (or a future unchecked caller) could make
+        # resume silently retain a schema different from ``config['features']``.
+        from .datasets import require_dataset_resume_schema
+
+        require_dataset_resume_schema(
+            Path(config["dataset_root"]),
+            config["features"],
+            fps=int(config["fps"]),
+            allowed_extra_features=frozenset(config.get("allowed_resume_features", ())),
+        )
         return LeRobotDataset.resume(
             repo_id=config["repo_id"],
             root=config["dataset_root"],
@@ -1808,6 +1984,327 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
 
         write_cartesian_frame_marker(config["dataset_root"])
     return dataset
+
+
+def trim_episode_after(
+    dataset: "LeRobotDataset", row_times: list[float], cutoff: float
+) -> int:
+    """Drop the buffered rows captured after ``cutoff``; return how many.
+
+    Used when the operator ends a take with the trigger x3 gesture: the
+    bridge reports when the first click *began* (host ``perf_counter``), and
+    every row captured from that instant on shows the clicks — three gripper
+    close/open commands and the hand motion that goes with them — rather than
+    the task. ``row_times`` is the per-row capture-time list the capture loop
+    filled (see ``run_capture_loop``); the cut lands before the first row whose
+    capture time is past ``cutoff``, so a late row can never survive on the
+    strength of an earlier neighbour.
+
+    Only the row buffer is cut. The streamed video already holds the trailing
+    frames, and that is fine: LeRobot indexes each row's frame at
+    ``from_timestamp + k / fps`` and takes the episode's video span from the
+    file's real duration, so the extra pictures are simply never referenced,
+    and the next episode's span still starts where this file actually ends.
+
+    Call only after the capture thread has been stopped (the buffer must be
+    quiescent). Mutates ``row_times`` to match.
+    """
+    total = len(row_times)
+    keep = next((i for i, t in enumerate(row_times) if t > cutoff), total)
+    if keep >= total:
+        return 0
+    buffer = dataset.writer.episode_buffer
+    if buffer is None:
+        return 0
+    for values in buffer.values():
+        if isinstance(values, list):
+            del values[keep:]
+    buffer["size"] = keep
+    del row_times[keep:]
+    removed = total - keep
+    _logger.info(
+        "trimmed %d row(s) captured after the end gesture began (%.2f s at the "
+        "end of the take); %d row(s) kept",
+        removed,
+        removed / max(1, dataset.fps),
+        keep,
+    )
+    return removed
+
+
+def _maybe_smooth_episode(dataset: "LeRobotDataset", config: dict) -> None:
+    """Zero-phase low-pass the buffered episode's EE pose track before save.
+
+    Active only when the recorder config carries a positive ``smooth_ee_hz``
+    cutoff — collect-data sets it for Mantis sessions, where the pose track comes
+    from the VR tracker and carries broadband measurement noise on the order
+    of the per-frame motion. On-robot sessions (encoder FK) leave it unset.
+    See :func:`almond_axol.mantis.smoothing.smooth_episode_ee_poses`.
+    """
+    cutoff_hz = float(config.get("smooth_ee_hz") or 0.0)
+    if cutoff_hz <= 0.0:
+        return
+    from ..mantis.smoothing import smooth_episode_ee_poses
+
+    smooth_episode_ee_poses(
+        dataset.writer.episode_buffer, dataset.meta.features, config["fps"], cutoff_hz
+    )
+
+
+_DURABILITY_DIRECTORY_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+)
+_DURABILITY_FILE_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def _dataset_relative_file(path: str | Path, *, label: str) -> Path:
+    """Validate one metadata-derived path before descriptor-relative use."""
+    relative = Path(path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".."} for part in relative.parts)
+    ):
+        raise UnsafeStatePathError(
+            f"refusing unsafe {label} path from dataset metadata: {path!s}"
+        )
+    return relative
+
+
+def _episode_durability_files(
+    meta: Any, episode_row: dict[str, Any]
+) -> tuple[Path, list[Path]]:
+    """Resolve every file that makes the just-saved episode readable."""
+    # The dataset root is *our* configured location, and operators routinely
+    # reach it through a link (``~/datasets -> /mnt/ssd/datasets``, a linked
+    # ``/home``). The barrier walks the root's ancestors with O_NOFOLLOW, so a
+    # lexical path would hit ELOOP on that link and every save would fail as
+    # "not durable". Resolve the root once here; the no-follow discipline then
+    # applies to everything *inside* the dataset, which is what the metadata
+    # (untrusted-ish, rewritten each save) can influence.
+    root = Path(os.path.realpath(Path(meta.root).expanduser()))
+    if root == Path(root.anchor):
+        raise UnsafeStatePathError("dataset root may not be a filesystem root")
+
+    def relative(path: str | Path, label: str) -> Path:
+        return _dataset_relative_file(path, label=label)
+
+    data_chunk = int(episode_row["data/chunk_index"])
+    data_file = int(episode_row["data/file_index"])
+    meta_chunk = int(episode_row["meta/episodes/chunk_index"])
+    meta_file = int(episode_row["meta/episodes/file_index"])
+    files = [
+        relative(
+            meta.data_path.format(chunk_index=data_chunk, file_index=data_file),
+            "episode data",
+        ),
+        relative(
+            f"meta/episodes/chunk-{meta_chunk:03d}/file-{meta_file:03d}.parquet",
+            "episode metadata",
+        ),
+    ]
+
+    video_template = getattr(meta, "video_path", None)
+    for key in episode_row:
+        if not (key.startswith("videos/") and key.endswith("/chunk_index")):
+            continue
+        if not video_template:
+            raise UnsafeStatePathError(
+                "episode metadata names videos but the dataset has no video path"
+            )
+        video_key = key[len("videos/") : -len("/chunk_index")]
+        chunk_index = int(episode_row[key])
+        file_index = int(episode_row[f"videos/{video_key}/file_index"])
+        files.append(
+            relative(
+                video_template.format(
+                    video_key=video_key,
+                    chunk_index=chunk_index,
+                    file_index=file_index,
+                ),
+                f"episode video {video_key!r}",
+            )
+        )
+
+    # save_episode always rewrites info + aggregate stats. tasks.parquet is
+    # part of the episode's referential integrity whenever it names a task;
+    # syncing it every save is harmless and also covers a newly-added task.
+    files.extend(
+        [
+            relative("meta/info.json", "dataset info"),
+            relative("meta/stats.json", "dataset stats"),
+        ]
+    )
+    if episode_row.get("tasks"):
+        files.append(relative("meta/tasks.parquet", "dataset tasks"))
+
+    # A malformed metadata template must not make one path masquerade as two
+    # required pieces. Keep stable ordering for deterministic barriers/tests.
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in files:
+        if path in seen:
+            raise UnsafeStatePathError(
+                f"dataset metadata aliases multiple required files at {path}"
+            )
+        seen.add(path)
+        unique.append(path)
+    return root, unique
+
+
+def _fsync_episode_files(meta: Any, episode_row: dict[str, Any]) -> None:
+    """Power-loss barrier for an episode, without following dataset links.
+
+    All payload and metadata files are fsynced first. Their containing
+    directories (plus the lexical ancestors that may have been created with a
+    fresh dataset) are then fsynced deepest-first, which persists every file
+    and directory entry before a save acknowledgement can escape.
+    """
+    root, files = _episode_durability_files(meta, episode_row)
+    directory_fds: dict[tuple[str, ...], int] = {}
+    directory_entries: list[
+        tuple[tuple[str, ...], str, tuple[str, ...], tuple[int, int]]
+    ] = []
+    file_entries: list[tuple[tuple[str, ...], str, tuple[int, int]]] = []
+
+    try:
+        root_fd = os.open(root.anchor, _DURABILITY_DIRECTORY_FLAGS)
+        directory_fds[()] = root_fd
+        current: tuple[str, ...] = ()
+        for component in root.parts[1:]:
+            child_key = (*current, component)
+            child_fd = os.open(
+                component,
+                _DURABILITY_DIRECTORY_FLAGS,
+                dir_fd=directory_fds[current],
+            )
+            child_stat = os.fstat(child_fd)
+            directory_fds[child_key] = child_fd
+            directory_entries.append(
+                (
+                    current,
+                    component,
+                    child_key,
+                    (child_stat.st_dev, child_stat.st_ino),
+                )
+            )
+            current = child_key
+        root_key = current
+
+        for relative in files:
+            parent_key = root_key
+            for component in relative.parent.parts:
+                child_key = (*parent_key, component)
+                if child_key not in directory_fds:
+                    child_fd = os.open(
+                        component,
+                        _DURABILITY_DIRECTORY_FLAGS,
+                        dir_fd=directory_fds[parent_key],
+                    )
+                    child_stat = os.fstat(child_fd)
+                    directory_fds[child_key] = child_fd
+                    directory_entries.append(
+                        (
+                            parent_key,
+                            component,
+                            child_key,
+                            (child_stat.st_dev, child_stat.st_ino),
+                        )
+                    )
+                parent_key = child_key
+
+            name = relative.name
+            entry = os.stat(
+                name,
+                dir_fd=directory_fds[parent_key],
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                raise UnsafeStatePathError(
+                    f"refusing non-regular or hard-linked dataset file: {relative}"
+                )
+            descriptor = os.open(
+                name,
+                _DURABILITY_FILE_FLAGS,
+                dir_fd=directory_fds[parent_key],
+            )
+            try:
+                opened = os.fstat(descriptor)
+                identity = (opened.st_dev, opened.st_ino)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_nlink != 1
+                    or identity != (entry.st_dev, entry.st_ino)
+                ):
+                    raise UnsafeStatePathError(
+                        f"dataset file changed while opening it: {relative}"
+                    )
+                os.fsync(descriptor)
+                file_entries.append((parent_key, name, identity))
+            finally:
+                os.close(descriptor)
+
+        # File contents must reach stable storage before their names. Fsync all
+        # traversed directories deepest-first; ``/`` itself is not affected.
+        for key in sorted(directory_fds, key=len, reverse=True):
+            if key:
+                os.fsync(directory_fds[key])
+
+        # Detect substitutions during the barrier while every ancestor is
+        # still pinned. A symlink or different inode can never be acknowledged.
+        for parent_key, name, identity in file_entries:
+            current_entry = os.stat(
+                name,
+                dir_fd=directory_fds[parent_key],
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(current_entry.st_mode)
+                or current_entry.st_nlink != 1
+                or (current_entry.st_dev, current_entry.st_ino) != identity
+            ):
+                raise UnsafeStatePathError(
+                    f"dataset file changed during durability barrier: {name}"
+                )
+        for parent_key, name, child_key, identity in directory_entries:
+            current_entry = os.stat(
+                name,
+                dir_fd=directory_fds[parent_key],
+                follow_symlinks=False,
+            )
+            opened_directory = os.fstat(directory_fds[child_key])
+            if (
+                not stat.S_ISDIR(current_entry.st_mode)
+                or (current_entry.st_dev, current_entry.st_ino) != identity
+                or (opened_directory.st_dev, opened_directory.st_ino) != identity
+            ):
+                raise UnsafeStatePathError(
+                    f"dataset directory changed during durability barrier: {name}"
+                )
+    finally:
+        for descriptor in reversed(tuple(directory_fds.values())):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
+def _discard_episode_buffer(dataset: Any) -> str | None:
+    """Drop the buffered episode; return an error string instead of raising.
+
+    ``clear_episode_buffer`` also cancels the streaming encoder's in-flight
+    episode, and the H.264 muxer's ``cancel_episode`` raises when a camera's
+    pipeline refuses to stop or its staging cannot be removed. In the recorder
+    subprocess that exception would escape the command loop and take the whole
+    recorder (and session) down over a discard of data nobody wanted -- so
+    log it and hand the caller a message to attach to its reply instead. The
+    encoder keeps the cameras it could not cancel and retries on the next
+    ``start_episode``.
+    """
+    try:
+        dataset.clear_episode_buffer()
+    except Exception as error:  # noqa: BLE001 - keep the recorder alive
+        _logger.exception("discarding the buffered episode failed")
+        return f"episode discard failed: {type(error).__name__}: {error}"
+    return None
 
 
 def make_episode_durable(dataset: "LeRobotDataset") -> dict[str, Any]:
@@ -1847,6 +2344,10 @@ def make_episode_durable(dataset: "LeRobotDataset") -> dict[str, Any]:
     dataset.writer.close_writer()  # data parquet footer
     try:
         meta._close_writer()  # flush the metadata buffer + its footer
+        # Closing a writer only reaches the kernel's page cache. Explicitly
+        # persist every file that makes this episode readable, then all of the
+        # directory entries that name them, before returning a saved ack.
+        _fsync_episode_files(meta, last)
     except Exception:
         # Don't leave the metadata writer half-open: its file would stay
         # footerless (unreadable). Closing writes the footer over the row
@@ -2136,13 +2637,22 @@ def _finalize_dataset(
         dataset.push_to_hub()
     dataset_root = Path(config["dataset_root"])
     if not config["is_complete"] and episodes_recorded == 0 and dataset_root.exists():
-        try:
-            shutil.rmtree(dataset_root)
-            log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
-        except OSError as exc:
+        from ..utils.state_files import privileged_service_active
+
+        if privileged_service_active():
             _logger.warning(
-                "Failed to remove empty dataset at %s: %s", dataset_root, exc
+                "Keeping the empty dataset at %s because the hosted service "
+                "will not recursively delete operator-owned paths",
+                dataset_root,
             )
+        else:
+            try:
+                shutil.rmtree(dataset_root)
+                log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
+            except OSError as exc:
+                _logger.warning(
+                    "Failed to remove empty dataset at %s: %s", dataset_root, exc
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -2171,12 +2681,21 @@ class InProcessRecorder:
         # DatasetRecorderProcess.pause_episode/resume_episode/frame_count.
         self._record = threading.Event()
         self._frames: dict[str, int] = {"n": 0}
+        # Per-row capture times for the current episode (see trim_episode_after).
+        self._row_times: list[float] = []
         self._capture_error: str | None = None
         self._episodes_recorded = 0
+        self._fatal_error: EpisodeDurabilityError | None = None
+
+    def _require_usable(self) -> None:
+        fatal_error = getattr(self, "_fatal_error", None)
+        if fatal_error is not None:
+            raise fatal_error
 
     def publish(
         self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
     ) -> None:
+        self._require_usable()
         self._publisher.write(joint_obs, action, ts, intervention)
 
     def episode_count(self) -> int:
@@ -2185,10 +2704,12 @@ class InProcessRecorder:
     def start_episode(self, task: str) -> None:
         from ..lerobot.nvenc_encoder import reset_dropped_frames
 
+        self._require_usable()
         self._stop_capture()  # defensive: never overlap two capture threads
         self._dataset.clear_episode_buffer()
         self._record.set()
         self._frames["n"] = 0
+        self._row_times.clear()
         self._capture_error = None
         reset_dropped_frames()
         self._stop = threading.Event()
@@ -2207,6 +2728,7 @@ class InProcessRecorder:
                 record_event=self._record,
                 frame_counter=self._frames,
                 on_error=lambda message: setattr(self, "_capture_error", message),
+                row_times=self._row_times,
             ),
             name="axol-capture",
             daemon=True,
@@ -2231,27 +2753,46 @@ class InProcessRecorder:
         return self._frames["n"]
 
     def _stop_capture(self) -> None:
-        if self._thread is not None and self._stop is not None:
-            self._stop.set()
-            self._thread.join(timeout=_CAPTURE_STOP_TIMEOUT_S)
-            if self._thread.is_alive():
-                raise RuntimeError(
-                    "capture thread did not stop within 10s; refusing to "
-                    "finalize while dataset writes may still be in flight"
-                )
-            self._thread = None
+        # Match the subprocess recorder's fail-closed lifecycle: never block
+        # forever on a wedged camera read, and never forget the exact writer
+        # until a bounded retry proves it exited (the raise happens before the
+        # assignment, so ``_thread`` keeps pointing at the live writer).
+        self._thread = _stop_capture_thread(self._thread, self._stop)
         # Nothing records now: let the previous episode's verify continue.
         self._verifier.resume()
 
-    def finish_episode(self) -> int:
-        """Freeze capture without saving and return the exact buffered rows."""
+    def finish_episode(self, trim_after: float | None = None) -> int:
+        """Freeze capture without saving and return the exact buffered rows.
+
+        ``trim_after`` (host ``perf_counter`` seconds) additionally drops the
+        rows captured after that instant — the operator's end gesture — see
+        :func:`trim_episode_after`. The returned row count is post-trim.
+        Raises :class:`RecorderCaptureError` (after discarding the buffer) when
+        the capture thread failed mid-take.
+        """
+        self._require_usable()
         self._stop_capture()
         if self._capture_error is not None:
             self._dataset.clear_episode_buffer()
             raise RecorderCaptureError(
                 f"recorder capture failed: {self._capture_error}; episode discarded"
             )
+        if trim_after is not None:
+            trim_episode_after(self._dataset, self._row_times, trim_after)
+            self._frames["n"] = len(self._row_times)
         return self._frames["n"]
+
+    def stop_capture(self, trim_after: float | None = None) -> tuple[int, str | None]:
+        """Non-raising :meth:`finish_episode`: ``(rows, capture_error)``.
+
+        Session flows that decide on a take *before* asking LeRobot to save it
+        (Mantis) consume the capture verdict as a value; a failed capture
+        yields ``(0, message)`` with the buffer already discarded.
+        """
+        try:
+            return self.finish_episode(trim_after), None
+        except RecorderCaptureError as exc:
+            return 0, str(exc)
 
     def poll_capture_error(self) -> str | None:
         """Return an episode-local capture failure without blocking."""
@@ -2260,6 +2801,7 @@ class InProcessRecorder:
     def save_episode(self) -> None:
         from ..lerobot.nvenc_encoder import dropped_frames
 
+        self._require_usable()
         self._stop_capture()
         if self._capture_error is not None:
             self._dataset.clear_episode_buffer()
@@ -2277,46 +2819,228 @@ class InProcessRecorder:
                 "with its rows; episode discarded."
             )
         try:
+            _maybe_smooth_episode(self._dataset, self._config)
             _prepare_streaming_episode(self._dataset)
         except Exception:
             self._dataset.clear_episode_buffer()
             raise
         self._dataset.save_episode()
-        # Flush the episode to disk so a kill from here on can't lose it (see
-        # make_episode_durable). Best-effort: on failure the episode is still
-        # saved and its remaining rows reach disk at the next save or finalize
-        # (make_episode_durable leaves the writers consistent either way).
-        try:
-            self._verifier.submit(make_episode_durable(self._dataset))
-        except Exception:  # noqa: BLE001 - durability is best-effort
-            _logger.exception(
-                "could not fully flush the saved episode to disk; it completes "
-                "at the next save or finalize — do not kill this process"
-            )
+        # The write succeeded, so shutdown must preserve/finalize this episode
+        # even if the durability step below fails. This is an internal cleanup
+        # count, not a success acknowledgement to the caller.
         self._episodes_recorded += 1
+        # Flush the episode to disk *before* returning, so "saved" means
+        # "survives a kill" (see make_episode_durable). A failure is terminal:
+        # later saves could reuse uncertain writer state, so the recorder
+        # refuses further work and may only be closed.
+        try:
+            episode_row = make_episode_durable(self._dataset)
+        except Exception as error:
+            fatal_error = EpisodeDurabilityError(
+                "episode was written but could not be made crash-durable; "
+                "recording cannot continue safely"
+            )
+            self._fatal_error = fatal_error
+            _logger.exception(
+                "episode durability flush failed; terminating recording so "
+                "orderly finalization can recover the dataset"
+            )
+            raise fatal_error from error
+        self._verifier.submit(episode_row)
 
     def cancel_episode(self) -> None:
+        self._require_usable()
         self._stop_capture()
         self._dataset.clear_episode_buffer()
         self._capture_error = None
 
     def close(self) -> None:
-        self._stop_capture()
+        primary_error: BaseException | None = None
+        capture_stopped = False
         try:
-            # close() is also the Ctrl+C / panel-Stop escape hatch. The caller
-            # may never have reached finish/cancel, so always tear down a live
-            # streaming encoder and discard uncommitted rows before dataset
-            # finalization. This is idempotent after save_episode(), which
-            # creates a fresh buffer.
-            self._dataset.clear_episode_buffer()
-            _finalize_dataset(self._dataset, self._config, self._episodes_recorded)
-        finally:
+            self._stop_capture()
+        except BaseException as error:
+            primary_error = error
+        else:
+            capture_stopped = True
+
+        if capture_stopped:
+            try:
+                # close() is also the Ctrl+C / panel-Stop escape hatch. The
+                # caller may never have reached finish/cancel, so always tear
+                # down a live streaming encoder and discard uncommitted rows
+                # before dataset finalization. This is idempotent after
+                # save_episode(), which creates a fresh buffer.
+                self._dataset.clear_episode_buffer()
+                _finalize_dataset(self._dataset, self._config, self._episodes_recorded)
+            except BaseException as error:
+                primary_error = error
+        elif primary_error is not None:
+            primary_error.add_note(
+                "dataset finalization was skipped because capture-thread exit "
+                "could not be proved"
+            )
+
+        try:
             self._verifier.close()
+        except BaseException as error:
+            if primary_error is None:
+                primary_error = error
+            else:
+                primary_error.add_note(
+                    "additional recorder video verifier close failure: "
+                    f"{type(error).__name__}: {error}"
+                )
+        if primary_error is not None:
+            raise primary_error
 
 
 # ---------------------------------------------------------------------------
 # Recorder subprocess (relay path)
 # ---------------------------------------------------------------------------
+
+
+def _rollback_recorder_startup(
+    *,
+    cameras: dict[str, Any],
+    snap_reader: Any | None,
+    dataset: Any | None,
+    verifier: Any | None,
+    config: dict,
+    startup_error: BaseException,
+) -> None:
+    """Release every resource acquired before the recorder can report ready."""
+
+    def attempt(label: str, close: Callable[[], None]) -> None:
+        try:
+            close()
+        except BaseException as error:
+            startup_error.add_note(
+                f"recorder startup cleanup failed for {label}: "
+                f"{type(error).__name__}: {error}"
+            )
+
+    # Detach shmsrc consumers first so a failed recorder launch cannot leave
+    # the relay blocked waiting on a reader that will never consume another AU.
+    for name, camera in cameras.items():
+        attempt(f"camera {name}", camera.close)
+    if snap_reader is not None:
+        attempt("snapshot reader", snap_reader.close)
+    if verifier is not None:
+        attempt("video verifier", verifier.close)
+    if dataset is not None:
+        attempt(
+            "dataset finalization",
+            lambda: _finalize_dataset(dataset, config, episodes_recorded=0),
+        )
+
+
+def _cleanup_recorder_session(
+    *,
+    stop_capture: Callable[[], None],
+    dataset: Any,
+    config: dict,
+    episodes_recorded: int,
+    verifier: Any,
+    cameras: dict[str, Any],
+    snap_reader: Any,
+    before_finalize: Callable[[], None] | None = None,
+) -> None:
+    """Finish a recorder session, preserving errors after complete cleanup.
+
+    A capture thread owns the mutable episode buffer, so dataset finalization is
+    permitted only after its exit is proven. If its normal stop bound expires,
+    close every input reader to unblock a wedged read and retry the join before
+    deciding whether finalization is safe. ``before_finalize`` (discarding the
+    unsaved episode buffer) runs only once capture has stopped; its failure
+    also withholds finalization. All independent resources are then closed
+    even when stop/finalize fails; the first failure is re-raised after later
+    failures have been attached as notes, making the child exit non-zero for
+    :class:`DatasetRecorderProcess.close` to propagate.
+    """
+    primary_error: BaseException | None = None
+
+    def remember(label: str, error: BaseException) -> None:
+        nonlocal primary_error
+        if primary_error is None:
+            primary_error = error
+        else:
+            primary_error.add_note(
+                f"additional recorder {label} failure: {type(error).__name__}: {error}"
+            )
+
+    def close_readers() -> None:
+        for name, camera in cameras.items():
+            try:
+                camera.close()
+            except BaseException as error:
+                remember(f"camera {name} close", error)
+        try:
+            snap_reader.close()
+        except BaseException as error:
+            remember("snapshot reader close", error)
+
+    capture_stopped = False
+    try:
+        stop_capture()
+    except BaseException as error:
+        _logger.exception("recorder capture thread did not stop cleanly")
+        remember("capture stop", error)
+        # Camera/snapshot readers are the only blocking inputs used by the
+        # capture loop. Closing them is the best chance to wake a stuck read;
+        # then retry the exact retained thread rather than losing ownership.
+        close_readers()
+        try:
+            stop_capture()
+        except BaseException as retry_error:
+            _logger.exception("recorder capture thread still alive after reader close")
+            remember("capture stop retry", retry_error)
+        else:
+            capture_stopped = True
+    else:
+        capture_stopped = True
+
+    finalize_ok = capture_stopped
+    if capture_stopped and before_finalize is not None:
+        try:
+            before_finalize()
+        except BaseException as error:
+            _logger.exception(
+                "recorder failed to discard its unsaved episode; refusing "
+                "dataset finalization"
+            )
+            remember("episode discard", error)
+            finalize_ok = False
+
+    if finalize_ok:
+        try:
+            _finalize_dataset(dataset, config, episodes_recorded)
+        except BaseException as error:
+            _logger.exception("recorder failed to finalize the dataset")
+            remember("dataset finalize", error)
+    else:
+        # Finalizing concurrently with a live dataset writer (or over an
+        # undiscarded partial episode) can corrupt the buffer/files. The
+        # retained error is already primary; make the deliberate skip explicit.
+        assert primary_error is not None
+        primary_error.add_note(
+            "dataset finalization was skipped because the capture thread may "
+            "still own the episode buffer or the buffer could not be discarded"
+        )
+
+    try:
+        # Give the verifier its bounded chance to finish the last completed
+        # episode even when another teardown step failed.
+        verifier.close()
+    except BaseException as error:
+        remember("video verifier close", error)
+
+    # Idempotent reader closes complete the normal path and retry any close that
+    # was attempted early to wake a wedged capture thread.
+    close_readers()
+
+    if primary_error is not None:
+        raise primary_error
 
 
 def _recorder_main(
@@ -2332,12 +3056,24 @@ def _recorder_main(
     # control loop's cores; fall back to a positive nice where affinity isn't
     # available so it still never preempts the control loop / IK.
     from ..utils import affinity
+    from ..utils.stall_diag import GcHold, StallWatchdog, install_gc_pause_logger
 
     if not affinity.pin_background():
         try:
             os.nice(5)
         except (AttributeError, OSError):
             pass
+
+    # Stall attribution. A capture row that stops for seconds ends the episode
+    # ("encoded-AU backlog exceeded") without saying what the thread was doing;
+    # the watchdog logs its stack + kernel state while it is still stuck, and
+    # the gc hook names a stop-the-world collection if that is what paused it.
+    # Cyclic GC is held for the whole take (the per-row dicts/arrays are freed
+    # by refcount anyway) and swept between episodes, as the relay and
+    # run-policy already do for the same measured reason.
+    uninstall_gc_log = install_gc_pause_logger(_logger)
+    gc_hold = GcHold("recorder take", _logger)
+    watchdog: StallWatchdog | None = None
 
     from lerobot.processor import make_default_processors
 
@@ -2379,55 +3115,79 @@ def _recorder_main(
     # in the finally; the relay's rawvalve gates episode on/off, so the consumers
     # can run continuously and just idle when the valve is closed.
     cameras: dict[str, Any] = {}
-    for source, meta in raw_meta.items():
-        if meta["transport"] == "gstshm-h264":
-            cam = EncodedAuReader(
-                meta["socket_path"],
-                meta["width"],
-                meta["height"],
-                meta["fps"],
-                name=source,
-                pts_perf_offset_s=meta["pts_perf_offset_s"],
-                capture_fps=meta.get("capture_fps", meta["fps"]),
-            )
-            cam.connect()
-            cameras[source] = cam
-        elif meta["transport"] == "gstshm":
-            cam = GstShmFrameReader(
-                meta["socket_path"],
-                meta["caps"],
-                meta["width"],
-                meta["height"],
-                meta["fps"],
-                meta["latency_s"],
-            )
-            cam.connect()
-            cameras[source] = cam
-        else:
-            cameras[source] = RawFrameReader(
-                meta["shm_name"],
-                meta["width"],
-                meta["height"],
-                meta["fps"],
-                raw_cond,
-            )
-    snap_reader = SnapshotReader(
-        config["snapshot_shm_name"],
-        config["obs_keys"],
-        config["action_keys"],
-        config["snapshot_lock"],
-    )
-
-    if config["rerun_ip"]:
-        from lerobot.utils.visualization_utils import init_rerun
-
-        init_rerun(
-            session_name="axol_record", ip=config["rerun_ip"], port=config["rerun_port"]
+    snap_reader: Any | None = None
+    dataset: Any | None = None
+    verifier: Any | None = None
+    try:
+        for source, meta in raw_meta.items():
+            if meta["transport"] == "gstshm-h264":
+                cam = EncodedAuReader(
+                    meta["socket_path"],
+                    meta["width"],
+                    meta["height"],
+                    meta["fps"],
+                    name=source,
+                    pts_perf_offset_s=meta["pts_perf_offset_s"],
+                    capture_fps=meta.get("capture_fps", meta["fps"]),
+                )
+                # Retain ownership before the fallible connect so the outer
+                # rollback retries its own constructor-level cleanup if needed.
+                cameras[source] = cam
+                cam.connect()
+            elif meta["transport"] == "gstshm":
+                cam = GstShmFrameReader(
+                    meta["socket_path"],
+                    meta["caps"],
+                    meta["width"],
+                    meta["height"],
+                    meta["fps"],
+                    meta["latency_s"],
+                )
+                cameras[source] = cam
+                cam.connect()
+            else:
+                cameras[source] = RawFrameReader(
+                    meta["shm_name"],
+                    meta["width"],
+                    meta["height"],
+                    meta["fps"],
+                    raw_cond,
+                )
+        snap_reader = SnapshotReader(
+            config["snapshot_shm_name"],
+            config["obs_keys"],
+            config["action_keys"],
         )
 
-    dataset = _open_dataset(config)
-    verifier = _EpisodeVideoVerifier(config["dataset_root"])
-    conn.send(("ready", dataset.num_episodes))
+        if config["rerun_ip"]:
+            from lerobot.utils.visualization_utils import init_rerun
+
+            init_rerun(
+                session_name="axol_record",
+                ip=config["rerun_ip"],
+                port=config["rerun_port"],
+            )
+
+        dataset = _open_dataset(config)
+        verifier = _EpisodeVideoVerifier(config["dataset_root"])
+        conn.send(("ready", dataset.num_episodes))
+    except BaseException as startup_error:
+        _rollback_recorder_startup(
+            cameras=cameras,
+            snap_reader=snap_reader,
+            dataset=dataset,
+            verifier=verifier,
+            config=config,
+            startup_error=startup_error,
+        )
+        uninstall_gc_log()
+        raise
+
+    # Narrow Optional types after the transactional setup above. Every later
+    # path is protected by _cleanup_recorder_session's complete cleanup pass.
+    assert snap_reader is not None
+    assert dataset is not None
+    assert verifier is not None
 
     thread: threading.Thread | None = None
     stop: threading.Event | None = None
@@ -2441,6 +3201,8 @@ def _recorder_main(
     # P-frames reference, corrupting the mp4.
     record_event = threading.Event()
     frame_counter: dict[str, int] = {"n": 0}
+    # Per-row capture times for the current episode (see trim_episode_after).
+    row_times: list[float] = []
 
     def report_capture_error(message: str) -> None:
         """Publish the first capture failure without corrupting command replies."""
@@ -2451,16 +3213,17 @@ def _recorder_main(
             error_conn.send(message)
 
     def stop_capture() -> None:
-        nonlocal thread
-        if thread is not None and stop is not None:
-            stop.set()
-            thread.join(timeout=_CAPTURE_STOP_TIMEOUT_S)
-            if thread.is_alive():
-                raise RuntimeError(
-                    "capture thread did not stop within 10s; refusing to "
-                    "finalize while dataset writes may still be in flight"
-                )
-            thread = None
+        nonlocal thread, watchdog
+        if watchdog is not None:
+            watchdog.stop()
+            watchdog = None
+        # Assignment happens only after _stop_capture_thread has proved exit.
+        # On timeout it raises and leaves ``thread`` pointing at the live
+        # writer, which makes every destructive command below fail closed.
+        thread = _stop_capture_thread(thread, stop)
+        # The take is over: sweep the garbage deferred during it now, while
+        # nothing time-critical runs in this process.
+        gc_hold.end()
         # Nothing records now: let the previous episode's verify continue.
         verifier.resume()
 
@@ -2485,10 +3248,15 @@ def _recorder_main(
                 capture_repairs.clear()
                 record_event.set()
                 frame_counter["n"] = 0
+                row_times.clear()
                 from ..lerobot.nvenc_encoder import reset_dropped_frames
 
                 reset_dropped_frames()
                 stop = threading.Event()
+                gc_hold.begin()
+                watchdog = StallWatchdog(
+                    "recorder capture row", _CAPTURE_ROW_STALL_S, logger=_logger
+                )
                 loop_kwargs = dict(
                     cameras=cameras,
                     read_snapshot=snap_reader.read_latest,
@@ -2500,6 +3268,8 @@ def _recorder_main(
                     rerun_ip=config["rerun_ip"],
                     stop_event=stop,
                     on_error=report_capture_error,
+                    heartbeat=watchdog.beat,
+                    row_times=row_times,
                 )
                 loop_kwargs["frame_counter"] = frame_counter
                 if not encoded_mode:
@@ -2524,12 +3294,17 @@ def _recorder_main(
                     stop.set()
                     thread.join(timeout=2.0)
                     if not thread.is_alive():
+                        gc_hold.end()
                         verifier.resume()
                     detail = capture_error["v"] or "encoded readers did not arm"
                     conn.send(("error", detail))
                     continue
+                # Arm the watchdog only once the readers are flushed and
+                # armed: the pre-arm flush handshake legitimately blocks.
+                watchdog.start()
                 conn.send(("started",))
             elif kind == "finish_episode":
+                trim_after = msg[1] if len(msg) > 1 else None
                 try:
                     stop_capture()
                 except RuntimeError as exc:
@@ -2537,7 +3312,14 @@ def _recorder_main(
                 else:
                     finished_capture_error = capture_error["v"]
                     if finished_capture_error is not None:
-                        dataset.clear_episode_buffer()
+                        discard_error = _discard_episode_buffer(dataset)
+                        if discard_error is not None:
+                            finished_capture_error += f" ({discard_error})"
+                    elif trim_after is not None:
+                        # The take ended on the operator's end gesture: drop
+                        # the rows captured after its first click began.
+                        trim_episode_after(dataset, row_times, trim_after)
+                        frame_counter["n"] = len(row_times)
                     # Carry the post-join result on the command channel.  The
                     # notification pipe makes live polling prompt, but cannot
                     # be the finish authority: its delivery may race this
@@ -2605,6 +3387,7 @@ def _recorder_main(
                         # streaming video. Finalize/cache all supported mux
                         # results first so an EOS/count failure cannot leave
                         # orphan row data.
+                        _maybe_smooth_episode(dataset, config)
                         _prepare_streaming_episode(dataset)
                     except Exception as exc:  # safe: row commit has not begun
                         _logger.error("recorder video prepare failed: %s", exc)
@@ -2614,27 +3397,35 @@ def _recorder_main(
                         continue
                     try:
                         dataset.save_episode()
+                        # The dataset write happened even if the durability
+                        # flush below fails. Count it for shutdown recovery so
+                        # finalization verifies/preserves the episode instead
+                        # of treating a fresh dataset as empty.
+                        episodes_recorded += 1
                         # Flush the episode to disk *before* acknowledging the
-                        # save, so "saved" means "survives a kill". Best-effort:
-                        # if the flush itself fails the episode is still saved
-                        # in memory and its remaining rows reach disk at the
-                        # next save or finalize (make_episode_durable leaves
-                        # the writers in a consistent state either way), so
-                        # don't fail the session over it — but say so loudly.
+                        # save, so "saved" means "survives a kill". A failure
+                        # is terminal: later saves could reuse uncertain writer
+                        # state, so report a distinct fatal reply and unwind
+                        # through the recorder's orderly finalizer.
                         try:
                             episode_row = make_episode_durable(dataset)
-                        except Exception:  # noqa: BLE001 - durability is best-effort
-                            episode_row = None
-                            _logger.exception(
-                                "could not fully flush the saved episode to "
-                                "disk; it completes at the next save or "
-                                "finalize — do not kill this process"
+                        except Exception as error:
+                            fatal_error = EpisodeDurabilityError(
+                                "episode was written but could not be made "
+                                "crash-durable; recording cannot continue safely"
                             )
+                            _logger.exception(
+                                "episode durability flush failed; terminating "
+                                "the recorder so orderly finalization can "
+                                "recover the dataset"
+                            )
+                            save_poisoned = True
+                            conn.send(("fatal_durability", str(fatal_error)))
+                            raise fatal_error from error
                         _logger.info(
                             "save_episode took %.1fs", time.perf_counter() - t_save
                         )
-                        if episode_row is not None:
-                            verifier.submit(episode_row)
+                        verifier.submit(episode_row)
                         if capture_repairs:
                             _logger.warning(
                                 "saved episode %d with bounded camera-gap "
@@ -2648,8 +3439,12 @@ def _recorder_main(
                                 ),
                             )
                         capture_repairs.clear()
-                        episodes_recorded += 1
                         conn.send(("saved", dataset.num_episodes))
+                    except EpisodeDurabilityError:
+                        # Unwind through the finalizer with a non-zero exit so
+                        # the parent's close() also refuses to trust the
+                        # dataset, not just the poisoned episode handle.
+                        raise
                     except Exception as exc:  # irreversible writer state possible
                         _logger.exception(
                             "recorder dataset save failed after commit began; "
@@ -2664,61 +3459,43 @@ def _recorder_main(
                 except RuntimeError as exc:
                     conn.send(("error", str(exc)))
                     continue
-                dataset.clear_episode_buffer()
                 capture_repairs.clear()
+                discard_error = _discard_episode_buffer(dataset)
+                if discard_error is not None:
+                    conn.send(("error", discard_error))
+                    continue
                 conn.send(("cancelled",))
     finally:
         # Never close/finalize the dataset while its capture thread may still
-        # be inside add_frame/appsrc. A wedged child is ultimately terminated by
-        # the parent's bounded close(), but must not race cleanup in-process.
-        if thread is not None and stop is not None:
-            stop.set()
-            thread.join()
-            thread = None
-        # EOF, shutdown, and KeyboardInterrupt may all bypass the explicit
-        # cancel command. Always discard any uncommitted rows and cancel a live
-        # streaming encoder before finalizing; after a successful save this is
-        # an idempotent clear of the newly-created empty episode buffer.
-        buffer_discarded = False
+        # be inside add_frame/appsrc. _cleanup_recorder_session bounds the
+        # join, closes the readers to wake a wedged read, retries once, and
+        # skips finalization (raising) if the writer still cannot be proved
+        # gone; the parent's close() then reports a non-zero child exit.
+        finalize_config = config
+        if save_poisoned:
+            # Preserve a fresh first-save failure for inspection/repair and
+            # never upload a dataset whose writer indices may be partial.
+            finalize_config = {**config, "is_complete": True, "push_to_hub": False}
         try:
-            dataset.clear_episode_buffer()
-            buffer_discarded = True
-        except Exception:
-            _logger.exception(
-                "recorder failed to discard its unsaved episode; refusing "
-                "dataset finalization"
+            _cleanup_recorder_session(
+                stop_capture=stop_capture,
+                dataset=dataset,
+                config=finalize_config,
+                episodes_recorded=episodes_recorded,
+                verifier=verifier,
+                cameras=cameras,
+                snap_reader=snap_reader,
+                # EOF, shutdown, and KeyboardInterrupt may all bypass the
+                # explicit cancel command. Always discard any uncommitted rows
+                # and cancel a live streaming encoder before finalizing; after
+                # a successful save this is an idempotent clear of the
+                # newly-created empty episode buffer.
+                before_finalize=dataset.clear_episode_buffer,
             )
-        if buffer_discarded:
-            try:
-                finalize_config = config
-                if save_poisoned:
-                    # Preserve a fresh first-save failure for inspection/repair
-                    # and never upload a dataset whose writer indices may be
-                    # partial.
-                    finalize_config = {
-                        **config,
-                        "is_complete": True,
-                        "push_to_hub": False,
-                    }
-                _finalize_dataset(dataset, finalize_config, episodes_recorded)
-            except Exception:
-                # Never let this take the subprocess down before the cameras are
-                # released, but do not swallow it either: a failed finalize is
-                # how a session's episode metadata ends up unreadable, and
-                # suppressing it left the operator with only the downstream
-                # parquet error.
-                _logger.exception("recorder failed to finalize the dataset")
-        # After finalize (the dataset is already consistent on disk either
-        # way), give the verifier a bounded window to finish its ~1-episode
-        # backlog so a bad last take is still reported before exit.
-        verifier.close()
-        for cam in cameras.values():
+        finally:
+            uninstall_gc_log()
             with contextlib.suppress(Exception):
-                cam.close()
-        with contextlib.suppress(Exception):
-            snap_reader.close()
-        with contextlib.suppress(Exception):
-            error_conn.close()
+                error_conn.close()
 
 
 class DatasetRecorderProcess:
@@ -2741,73 +3518,130 @@ class DatasetRecorderProcess:
     ) -> None:
         from ..video.shm_frames import SnapshotWriter
 
-        ctx = multiprocessing.get_context("spawn")
-        # The same SemLock is inherited by writer and reader. Unlike a NumPy
-        # seqlock alone, this provides formal release/acquire ordering on the
-        # Jetson's ARM cores as well as x86.
-        self._snapshot_lock = ctx.Lock()
-        self._snap = SnapshotWriter(obs_keys, action_keys, self._snapshot_lock)
-        self._conn, child_conn = ctx.Pipe()
-        # Capture runs on a child thread while command/reply messages use
-        # ``_conn``. Keep failures on a dedicated one-way pipe so the hot
-        # control loop can poll them without stealing an expected command reply.
-        self._error_conn, child_error_conn = ctx.Pipe(duplex=False)
-        full_config = {
-            **config,
-            "raw_meta": raw_meta,
-            "obs_keys": obs_keys,
-            "action_keys": action_keys,
-            "snapshot_shm_name": self._snap.name,
-            "snapshot_lock": self._snapshot_lock,
-        }
-        self._proc = ctx.Process(
-            target=_recorder_main,
-            args=(child_conn, child_error_conn, raw_cond, full_config),
-            daemon=True,
-            name="dataset-recorder",
-        )
-        self._proc.start()
-        child_conn.close()
-        child_error_conn.close()
-        self._lock = threading.Lock()
-        self._episode_count = 0
-        self._capture_error: str | None = None
+        # Lock-free SPSC ring: the control loop's write never waits on the
+        # recorder, however long the recorder is descheduled (see
+        # shm_frames._SNAP_READ_ATTEMPTS for the history behind that).
+        snap = SnapshotWriter(obs_keys, action_keys)
+        conn: Any | None = None
+        child_conn: Any | None = None
+        error_conn: Any | None = None
+        child_error_conn: Any | None = None
+        proc: Any | None = None
+        started = False
         try:
-            deadline = time.perf_counter() + _READY_TIMEOUT_S
-            while True:
-                if self._conn.poll(0.1):
-                    try:
-                        msg = self._conn.recv()
-                    except (EOFError, OSError) as exc:
-                        raise RuntimeError(
-                            "recorder subprocess exited during startup"
-                        ) from exc
-                    if isinstance(msg, tuple) and msg[0] == "ready":
-                        self._episode_count = int(msg[1])
-                        break
+            ctx = multiprocessing.get_context("spawn")
+            conn, child_conn = ctx.Pipe()
+            # Capture runs on a child thread while command/reply messages use
+            # ``conn``. Keep failures on a dedicated one-way pipe so the hot
+            # control loop can poll them without stealing an expected command
+            # reply.
+            error_conn, child_error_conn = ctx.Pipe(duplex=False)
+            full_config = {
+                **config,
+                "raw_meta": raw_meta,
+                "obs_keys": obs_keys,
+                "action_keys": action_keys,
+                "snapshot_shm_name": snap.name,
+            }
+            proc = ctx.Process(
+                target=_recorder_main,
+                args=(child_conn, child_error_conn, raw_cond, full_config),
+                daemon=True,
+                name="dataset-recorder",
+            )
+            try:
+                proc.start()
+            except BaseException:
+                # multiprocessing normally publishes ``pid`` only once the
+                # child exists. If start failed after that boundary, treat it
+                # as started so the constructor still reaps it.
+                try:
+                    started = proc.pid is not None
+                except BaseException:
+                    started = True
+                raise
+            else:
+                started = True
+            child_conn.close()
+            child_error_conn.close()
+            if conn.poll(_READY_TIMEOUT_S):
+                try:
+                    msg = conn.recv()
+                except (EOFError, OSError) as exc:
+                    raise RuntimeError(
+                        "recorder subprocess exited during startup "
+                        f"(exit code {proc.exitcode})"
+                    ) from exc
+                if not (isinstance(msg, tuple) and msg[0] == "ready"):
                     raise RuntimeError(
                         f"recorder sent unexpected ready message: {msg!r}"
                     )
-                if not self._proc.is_alive():
-                    raise RuntimeError(
-                        "recorder subprocess exited during startup "
-                        f"(exit code {self._proc.exitcode})"
+                episode_count = int(msg[1])
+            else:
+                raise RuntimeError("recorder subprocess did not become ready in time")
+        except BaseException as setup_error:
+            cleanup_failures: list[tuple[str, BaseException]] = []
+
+            # A child that never completed the ready handshake cannot be
+            # adopted safely. Stop it before unlinking the snapshot shm; the
+            # process may already have attached to that block or opened the
+            # dataset near the end of initialization.
+            if started and proc is not None:
+                process_alive, _, process_failures = _shutdown_process(
+                    proc, graceful_timeout=0
+                )
+                cleanup_failures.extend(
+                    (f"subprocess {label}", error) for label, error in process_failures
+                )
+                if process_alive:
+                    cleanup_failures.append(
+                        (
+                            "subprocess",
+                            RuntimeError(
+                                "recorder subprocess remained alive after "
+                                "terminate/kill"
+                            ),
+                        )
                     )
-                if time.perf_counter() >= deadline:
-                    raise RuntimeError(
-                        "recorder subprocess did not become ready in time"
-                    )
-        except BaseException:
-            if self._proc.is_alive():
-                self._proc.terminate()
-            self._proc.join(timeout=5.0)
-            with contextlib.suppress(Exception):
-                self._conn.close()
-            with contextlib.suppress(Exception):
-                self._error_conn.close()
-            with contextlib.suppress(Exception):
-                self._snap.close()
+            local_cleanups: list[tuple[str, Callable[[], None]]] = []
+            if child_conn is not None:
+                local_cleanups.append(("child pipe", child_conn.close))
+            if child_error_conn is not None:
+                local_cleanups.append(("child error pipe", child_error_conn.close))
+            if conn is not None:
+                local_cleanups.append(("parent pipe", conn.close))
+            if error_conn is not None:
+                local_cleanups.append(("parent error pipe", error_conn.close))
+            local_cleanups.append(("snapshot shared memory", snap.close))
+            for label, cleanup in local_cleanups:
+                try:
+                    cleanup()
+                except BaseException as error:
+                    cleanup_failures.append((label, error))
+            for label, error in cleanup_failures:
+                setup_error.add_note(
+                    f"recorder constructor {label} cleanup failed: "
+                    f"{type(error).__name__}: {error}"
+                )
             raise
+
+        assert conn is not None
+        assert error_conn is not None
+        assert proc is not None
+        self._snap = snap
+        self._conn = conn
+        self._error_conn = error_conn
+        self._proc = proc
+        self._lock = threading.Lock()
+        self._episode_count = episode_count
+        self._capture_error: str | None = None
+        self._closed = False
+        self._fatal_error: EpisodeDurabilityError | None = None
+
+    def _require_usable(self) -> None:
+        fatal_error = getattr(self, "_fatal_error", None)
+        if fatal_error is not None:
+            raise fatal_error
 
     @property
     def pid(self) -> int | None:
@@ -2816,6 +3650,7 @@ class DatasetRecorderProcess:
     def publish(
         self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
     ) -> None:
+        self._require_usable()
         self._snap.write(joint_obs, action, ts, intervention)
 
     def episode_count(self) -> int:
@@ -2830,6 +3665,7 @@ class DatasetRecorderProcess:
         except (EOFError, OSError, ValueError):
             pass
         self._capture_error = None
+        self._require_usable()
         with self._lock:
             self._conn.send(("start_episode", task))
             if not self._conn.poll(_CMD_TIMEOUT_S):
@@ -2839,10 +3675,24 @@ class DatasetRecorderProcess:
             detail = msg[1] if len(msg) > 1 else repr(msg)
             raise RuntimeError(f"recorder start_episode failed: {detail}")
 
-    def finish_episode(self) -> int:
-        """Freeze capture and return the exact buffered row count."""
+    def finish_episode(self, trim_after: float | None = None) -> int:
+        """Freeze capture and return the exact buffered row count.
+
+        Call the moment an episode terminates — before any post-episode robot
+        motion (gripper valve close, return-to-rest) — so the recorder's
+        capture thread can't keep appending rows that pair a frozen snapshot
+        with later camera frames. ``save_episode`` / ``cancel_episode`` remain
+        valid afterwards and operate on the buffer as frozen here.
+
+        ``trim_after`` (host ``perf_counter`` seconds) additionally drops the
+        rows captured after that instant — the operator's end gesture — see
+        :func:`trim_episode_after`. The returned row count is post-trim.
+        Raises :class:`RecorderCaptureError` when the capture thread failed
+        mid-take (the recorder has already discarded the buffer).
+        """
+        self._require_usable()
         with self._lock:
-            self._conn.send(("finish_episode",))
+            self._conn.send(("finish_episode", trim_after))
             if not self._conn.poll(_CMD_TIMEOUT_S + 1.0):
                 raise RuntimeError("recorder did not stop episode capture in time")
             msg = self._conn.recv()
@@ -2860,6 +3710,18 @@ class DatasetRecorderProcess:
                 f"recorder capture failed: {capture_error}; episode discarded"
             )
         return int(msg[1])
+
+    def stop_capture(self, trim_after: float | None = None) -> tuple[int, str | None]:
+        """Non-raising :meth:`finish_episode`: ``(rows, capture_error)``.
+
+        Session flows that decide on a take *before* asking LeRobot to save it
+        (Mantis) consume the capture verdict as a value; a failed capture
+        yields ``(0, message)`` with the buffer already discarded.
+        """
+        try:
+            return self.finish_episode(trim_after), None
+        except RecorderCaptureError as exc:
+            return 0, str(exc)
 
     def poll_capture_error(self) -> str | None:
         """Return the first capture-thread failure for this episode, if any."""
@@ -2905,11 +3767,18 @@ class DatasetRecorderProcess:
         return self._episode_gate("frame_count", "frame_count")
 
     def save_episode(self) -> None:
+        self._require_usable()
         with self._lock:
             self._conn.send(("save_episode",))
             if not self._conn.poll(_SAVE_TIMEOUT_S):
                 raise RuntimeError("recorder did not finish save_episode in time")
             msg = self._conn.recv()
+            if isinstance(msg, tuple) and msg and msg[0] == "fatal_durability":
+                # The episode is on disk but not provably durable; the child
+                # is unwinding through its finalizer. Only close() may follow.
+                fatal_error = EpisodeDurabilityError(str(msg[1]))
+                self._fatal_error = fatal_error
+                raise fatal_error
         if not isinstance(msg, tuple) or not msg:
             raise RuntimeError(f"recorder save_episode sent unexpected reply: {msg!r}")
         if msg[0] == "saved":
@@ -2930,6 +3799,7 @@ class DatasetRecorderProcess:
             raise RuntimeError(f"recorder save_episode sent unexpected reply: {msg!r}")
 
     def cancel_episode(self) -> None:
+        self._require_usable()
         with self._lock:
             self._conn.send(("cancel_episode",))
             if not self._conn.poll(_SAVE_TIMEOUT_S):
@@ -2940,40 +3810,85 @@ class DatasetRecorderProcess:
             raise RuntimeError(f"recorder cancel_episode failed: {detail}")
 
     def close(self) -> None:
+        """Shut the recorder down; raise if the dataset cannot be trusted.
+
+        A child that had to be terminated (SIGTERM: it dies where it stands,
+        without running the finally that finalizes the dataset), or one that
+        died on its own (a crash, or the OOM killer) never finalized either.
+        Until this raised, join() returning instantly on an already-dead
+        process was indistinguishable from a clean shutdown, and the session
+        went on to validate and upload an unreadable dataset. Local cleanup
+        still runs to completion; ``_closed`` records whether it all succeeded
+        so a retry re-attempts only what did not.
+        """
+        if self._closed:
+            return
+        primary_error: BaseException | None = None
+
+        def remember(label: str, error: BaseException) -> None:
+            nonlocal primary_error
+            if primary_error is None:
+                primary_error = error
+            else:
+                primary_error.add_note(
+                    f"additional recorder parent {label} failure: "
+                    f"{type(error).__name__}: {error}"
+                )
+
         try:
             with self._lock:
                 self._conn.send(("shutdown",))
         except (OSError, ValueError):
+            # An already-dead child or closed pipe is diagnosed from exitcode
+            # after join; still finish every local cleanup.
             pass
-        self._proc.join(timeout=_SAVE_TIMEOUT_S)
-        if self._proc.is_alive():
-            # SIGTERM: the child dies where it stands, without running the
-            # finally that finalizes the dataset. Nothing here can recover from
-            # that, so at least say so — the alternative is an unreadable
-            # dataset with no explanation anywhere in the log.
-            _logger.error(
-                "recorder did not shut down within %.0fs — killing it; the "
-                "dataset was not finalized and its parquet files are likely "
-                "unreadable",
-                _SAVE_TIMEOUT_S,
+        except BaseException as error:
+            remember("shutdown request", error)
+
+        process_alive, forced, process_failures = _shutdown_process(
+            self._proc, graceful_timeout=_SAVE_TIMEOUT_S
+        )
+        for label, error in process_failures:
+            remember(f"subprocess {label}", error)
+
+        if process_alive:
+            remember(
+                "subprocess shutdown",
+                RuntimeError(
+                    "recorder subprocess remained alive after shutdown, terminate, "
+                    "and kill; dataset ownership is uncertain"
+                ),
             )
-            self._proc.terminate()
-            self._proc.join(timeout=5.0)
+        elif forced:
+            remember(
+                "subprocess shutdown",
+                RuntimeError(
+                    f"recorder did not shut down within {_SAVE_TIMEOUT_S:.0f}s and "
+                    "was forcibly terminated; dataset finalization is unverified "
+                    "and its parquet files are likely unreadable"
+                ),
+            )
         elif self._proc.exitcode:
-            # A child that died on its own (a crash, or the OOM killer) never
-            # ran its finalize either, and until now that was indistinguishable
-            # from a clean shutdown: join() returns instantly on an already-dead
-            # process, so the session went on to validate and upload as if all
-            # was well.
-            _logger.error(
-                "recorder subprocess exited with %s before shutdown — the "
-                "dataset was not finalized and its parquet files are likely "
-                "unreadable",
-                self._proc.exitcode,
+            remember(
+                "subprocess exit",
+                RuntimeError(
+                    f"recorder subprocess exited with {self._proc.exitcode}; "
+                    "dataset finalization failed or the recorder crashed"
+                ),
             )
-        with contextlib.suppress(Exception):
-            self._conn.close()
-        with contextlib.suppress(Exception):
-            self._error_conn.close()
-        with contextlib.suppress(Exception):
-            self._snap.close()
+
+        local_ok = True
+        for label, closer in (
+            ("pipe close", self._conn.close),
+            ("error pipe close", self._error_conn.close),
+            ("snapshot shared memory close", self._snap.close),
+        ):
+            try:
+                closer()
+            except BaseException as error:
+                local_ok = False
+                remember(label, error)
+
+        self._closed = not process_alive and local_ok
+        if primary_error is not None:
+            raise primary_error

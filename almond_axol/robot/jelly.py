@@ -578,10 +578,43 @@ class Jelly:
         ``JellyConfig.command_timeout`` the target decays to a full stop.
         """
 
-        def clamp(v: float) -> float:
-            return max(-1.0, min(1.0, float(v)))
+        def clamp(v: float, *, name: str) -> float:
+            if isinstance(v, bool):
+                raise ValueError(f"Jelly {name} command must be a finite number")
+            try:
+                value = float(v)
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Jelly {name} command must be a finite number"
+                ) from exc
+            if not math.isfinite(value):
+                raise ValueError(f"Jelly {name} command must be a finite number")
+            return max(-1.0, min(1.0, value))
 
-        vx, vy, wz = clamp(vx), clamp(vy), clamp(wz)
+        try:
+            vx, vy, wz = (
+                clamp(vx, name="vx"),
+                clamp(vy, name="vy"),
+                clamp(wz, name="wz"),
+            )
+            if (
+                isinstance(lift, bool)
+                or not isinstance(lift, int)
+                or lift
+                not in {
+                    DOWN,
+                    STOP,
+                    UP,
+                }
+            ):
+                raise ValueError("Jelly lift command must be -1, 0, or 1")
+        except ValueError:
+            # Invalid input must fail toward a stop. In particular,
+            # ``min(1, NaN)`` evaluates to 1 in Python, so a naive clamp can
+            # turn a malformed network/SDK value into full Jelly speed.
+            self._target = (0.0, 0.0, 0.0, STOP)
+            self._target_time = time.monotonic()
+            raise
 
         self._target = (vx, vy, wz, int(lift))
         self._target_time = time.monotonic()
@@ -630,7 +663,16 @@ class Jelly:
         the staleness window are ignored, so a dead sensor simply disables
         the hold rather than freezing a stale correction.
         """
-        self._yaw_rate = (float(rate), time.monotonic())
+        try:
+            value = float(rate)
+        except (OverflowError, TypeError, ValueError):
+            value = math.nan
+        if not math.isfinite(value):
+            # A malformed/dead IMU must disable heading hold, never inject a
+            # NaN into wheel mixing. Keep the motion target itself unchanged.
+            self._yaw_rate = None
+            return
+        self._yaw_rate = (value, time.monotonic())
         self._yaw_samples += 1
 
     # ------------------------------------------------------------------

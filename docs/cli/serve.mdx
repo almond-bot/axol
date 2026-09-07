@@ -13,7 +13,13 @@ axol serve --port 9000
 axol serve --open             # also open a browser window on startup
 axol serve --host 127.0.0.1   # localhost only
 axol serve --no-tls           # plain HTTP instead of HTTPS
+sudo "$(command -v axol)" serve              # hardware development (CAN setup, ZED daemon)
 ```
+
+The root development form lets the panel run CAN discovery/setup and restart
+the ZED daemon. Datasets go to `$HF_LEROBOT_HOME` (or the panel's **Dataset
+root** setting); when that lives in a user's home, each recording is handed
+back to that user after every episode save, as with the installed service.
 
 <Tip>
   For a guided walkthrough of the control panel — connecting the Axol host and Axol, assigning the cameras, and running each operation — see the [Web Control Panel guide](/guides/control-panel).
@@ -25,6 +31,10 @@ axol serve --no-tls           # plain HTTP instead of HTTPS
 | `--port INT` | Port to listen on. Default `8001`. |
 | `--open` | Open a browser window on startup. Off by default. |
 | `--no-tls` | Serve plain HTTP instead of HTTPS. TLS is on by default. |
+
+<Warning>
+  `axol serve` is a trusted-LAN control service, not a multi-user authenticated API. Keep ports 8000/8001 behind the robot network or a host firewall; do not expose them directly to the internet.
+</Warning>
 
 ## TLS
 
@@ -56,5 +66,5 @@ See [Development install → Build the web UI](/advanced/development-install#bui
 | `/api/*` | JSON + WebSocket API used by the UI. |
 
 <Note>
-  The operations launched from the panel run **in-process** inside the `serve` process — the same Python entry points as the [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`waypoints`](/cli/waypoints), [`collect-data`](/cli/collect-data), [`replay-dataset`](/cli/replay-dataset), and [`run-policy`](/cli/run-policy) CLI commands. Anything those commands need on the host (CAN, the `lerobot`/`sim` extras, ZED access) is required here too.
+  The operations launched from the panel run **in-process** inside the `serve` process — the same Python entry points as the [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`waypoints`](/cli/waypoints), [`collect-data`](/cli/collect-data), [`replay-dataset`](/cli/replay-dataset), and [`run-policy`](/cli/run-policy) CLI commands. Anything those commands need on the host (CAN, the `lerobot`/`sim`/`tracker` extras, ZED access) is required here too.
 </Note>

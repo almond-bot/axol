@@ -80,17 +80,25 @@ _SNAP_HEADER_BYTES = 64
 _SNAP_SLOT_META_DTYPE = np.dtype([("seq", "<u8"), ("generation", "<u8")])
 
 
-# How long the 120 Hz control thread may wait for the recorder to let go of the
-# snapshot lock before it skips that tick's sample. The recorder holds the lock
-# only for three bulk copies (~50 us), but it is a CFS thread on the loaded
-# background cores and can be descheduled mid-hold — a preemption there must
-# cost one control sample (the reader picks the nearest neighbour, 8 ms away),
-# never the session. Measured 2026-09-02: a 50 ms hold ended a 39-episode
-# collect-data run mid-take.
-_SNAP_LOCK_WAIT_S = 0.002
-# SemLock is not owner-death robust: a recorder SIGKILLed while reading leaves
-# the lock taken forever. Only a hold this long is treated as abandoned.
-_SNAP_LOCK_ABANDONED_S = 1.0
+# The ring is single-writer / single-reader and *lock-free*: the 120 Hz control
+# thread must never wait on the recorder. An earlier design shared a SemLock;
+# the recorder held it for three bulk copies (~50 us) but, being a CFS thread
+# on the loaded background cores, it was regularly descheduled mid-hold. On
+# 2026-09-03 that produced ~2,500 skipped control samples per hour and holds of
+# 50-113 ms; every hold over 50 ms left a camera exposure without a robot state
+# within ``_STATE_ALIGNMENT_WARN_S`` and discarded the episode (6 of 15 that
+# day). Now the reader copies the ring optimistically and re-validates the
+# slot metadata afterwards; a copy the writer raced is simply retaken.
+#
+# Retries only happen when a write overlapped the ~50 us copy (about 0.6 % of
+# reads at 120 Hz), so this bound is only reached if the reader is being
+# preempted over and over; the caller then treats the read as a transient miss.
+_SNAP_READ_ATTEMPTS = 16
+# The slot the writer is about to reuse (and the few after it, should the
+# reader have been descheduled for several control ticks mid-copy) may be
+# mid-write or already carry a newer generation. Skip forward over that many
+# oldest generations before declaring the copy unusable.
+_SNAP_OLDEST_SKIP = 8
 
 
 def _snapshot_block_size(width: int, capacity: int = _SNAP_RING_CAPACITY) -> int:
@@ -99,6 +107,81 @@ def _snapshot_block_size(width: int, capacity: int = _SNAP_RING_CAPACITY) -> int
         + capacity * _SNAP_SLOT_META_DTYPE.itemsize
         + capacity * width * np.dtype("<f8").itemsize
     )
+
+
+_GST_READER_STOP_TIMEOUT_S = 2.0
+
+
+def _set_gst_state_checked(pipeline: Any, gst: Any, state: Any, *, label: str) -> None:
+    """Change state and turn GStreamer's non-exception failure into an error."""
+    result = pipeline.set_state(state)
+    state_change_return = getattr(gst, "StateChangeReturn", None)
+    failure = (
+        getattr(state_change_return, "FAILURE", None)
+        if state_change_return is not None
+        else None
+    )
+    if failure is not None and result == failure:
+        raise RuntimeError(f"{label} GStreamer pipeline rejected state {state!s}")
+
+
+def _disconnect_gst_pull_reader(reader: Any, *, label: str) -> None:
+    """Stop one appsink pull owner without losing a live thread/pipeline.
+
+    Setting the pipeline to NULL first is the cancellation mechanism for a
+    native ``try-pull-sample`` call. Ownership fields are cleared only after
+    both that transition and thread exit are proved; retaining them lets the
+    recorder's second cleanup pass retry an uncertain teardown.
+    """
+    reader._stop.set()
+    pipeline = reader._pipeline
+    thread = reader._thread
+    primary_error: BaseException | None = None
+
+    def remember(error: BaseException) -> None:
+        nonlocal primary_error
+        if primary_error is None:
+            primary_error = error
+        else:
+            primary_error.add_note(
+                f"additional {label} teardown failure: {type(error).__name__}: {error}"
+            )
+
+    if pipeline is not None:
+        try:
+            _set_gst_state_checked(
+                pipeline,
+                reader._gst,
+                reader._gst.State.NULL,
+                label=label,
+            )
+        except BaseException as error:
+            remember(error)
+
+    if thread is not None:
+        try:
+            if thread.is_alive():
+                thread.join(timeout=_GST_READER_STOP_TIMEOUT_S)
+            thread_alive = thread.is_alive()
+        except BaseException as error:
+            remember(error)
+        else:
+            if thread_alive:
+                remember(
+                    RuntimeError(
+                        f"{label} pull thread did not stop within "
+                        f"{_GST_READER_STOP_TIMEOUT_S:g}s; reader ownership "
+                        "remains uncertain"
+                    )
+                )
+            else:
+                reader._thread = None
+
+    if primary_error is None:
+        reader._pipeline = None
+        reader._sink = None
+        return
+    raise primary_error
 
 
 def _block_size(width: int, height: int) -> int:
@@ -347,12 +430,35 @@ class GstShmFrameReader:
 
     def connect(self, warmup: bool = True) -> None:
         """Start the shmsrc pipeline + pull thread (relay owns the camera)."""
-        self._sink = self._pipeline.get_by_name("raw")
-        self._pipeline.set_state(self._gst.State.PLAYING)
-        self._thread = threading.Thread(
-            target=self._pull_loop, name="recorder-shmsrc", daemon=True
-        )
-        self._thread.start()
+        del warmup
+        if self._pipeline is None:
+            raise RuntimeError("shmsrc raw-frame reader has already been closed")
+        if self._thread is not None:
+            raise RuntimeError("shmsrc raw-frame reader is already connected")
+        self._stop.clear()
+        try:
+            self._sink = self._pipeline.get_by_name("raw")
+            if self._sink is None:
+                raise RuntimeError("shmsrc raw-frame pipeline has no appsink 'raw'")
+            _set_gst_state_checked(
+                self._pipeline,
+                self._gst,
+                self._gst.State.PLAYING,
+                label="shmsrc raw-frame reader",
+            )
+            self._thread = threading.Thread(
+                target=self._pull_loop, name="recorder-shmsrc", daemon=True
+            )
+            self._thread.start()
+        except BaseException as error:
+            try:
+                self.disconnect()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "shmsrc raw-frame reader startup cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
 
     def _pull_loop(self) -> None:
         Gst = self._gst
@@ -441,17 +547,7 @@ class GstShmFrameReader:
         return self.read_at_or_after(0.0, timeout_ms=10000)[0]
 
     def disconnect(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        if self._pipeline is not None:
-            try:
-                self._pipeline.set_state(self._gst.State.NULL)
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                pass
-            self._pipeline = None  # type: ignore[assignment]
-        self._sink = None
+        _disconnect_gst_pull_reader(self, label="shmsrc raw-frame reader")
 
     # camera-compatible alias.
     close = disconnect
@@ -621,10 +717,17 @@ class EncodedAuReader:
         """Start shmsrc and verify that GDP delivers at least one coded AU."""
         self._sink = self._pipeline.get_by_name("au")
         self._pipeline.set_state(self._gst.State.PLAYING)
-        self._thread = threading.Thread(
-            target=self._pull_loop, name="recorder-au-shmsrc", daemon=True
-        )
-        self._thread.start()
+        try:
+            self._thread = threading.Thread(
+                target=self._pull_loop, name="recorder-au-shmsrc", daemon=True
+            )
+            self._thread.start()
+        except BaseException:
+            # A pipeline left PLAYING without its pull owner would hold the
+            # shm socket and leak the appsink backlog; roll back before
+            # surfacing the failure.
+            self.disconnect()
+            raise
         deadline = time.perf_counter() + 10.0
         while not self._first_sample.wait(0.05):
             with self._cond:
@@ -884,16 +987,7 @@ class EncodedAuReader:
         self._stop.set()
         with self._cond:
             self._cond.notify_all()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        if self._pipeline is not None:
-            try:
-                self._pipeline.set_state(self._gst.State.NULL)
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                pass
-            self._pipeline = None
-        self._sink = None
+        _disconnect_gst_pull_reader(self, label="encoded-AU reader")
 
     # camera-compatible alias.
     close = disconnect
@@ -905,18 +999,16 @@ class SnapshotWriter:
     A bounded SPSC ring stores float64 records in the form
     ``[ts, *joint_obs_vals, *action_vals, intervention]`` (fixed key order;
     ``intervention`` is 0.0/1.0). Each slot has its own seqlock and logical
-    generation. A process-shared lock supplies the acquire/release memory
-    ordering required on Tegra/ARM; the slot seqlock remains a defensive layout
-    check. The 512-slot history spans >4 seconds at the 120 Hz control rate, and
-    its critical section is only one small fixed-width record.
+    generation, and the header's ``published`` high-water mark is advanced only
+    after a slot is complete. There is no lock: :meth:`write` never blocks on
+    the recorder (see :data:`_SNAP_READ_ATTEMPTS`); the reader detects a copy
+    it raced against by re-checking the slot metadata and retakes it. The
+    512-slot history spans >4 seconds at the 120 Hz control rate.
     """
 
-    def __init__(
-        self, obs_keys: list[str], action_keys: list[str], process_lock: Any
-    ) -> None:
+    def __init__(self, obs_keys: list[str], action_keys: list[str]) -> None:
         self._obs_keys = list(obs_keys)
         self._action_keys = list(action_keys)
-        self._lock = process_lock
         self._width = 2 + len(self._obs_keys) + len(self._action_keys)
         self._capacity = _SNAP_RING_CAPACITY
         self._shm = shared_memory.SharedMemory(
@@ -944,58 +1036,22 @@ class SnapshotWriter:
         self._header["width"][0] = self._width
         self._slot_meta.fill(0)
         self._next_generation = 1
-        # Start of the current run of lock misses (perf_counter) and its length.
-        self._miss_since: float | None = None
-        self._misses = 0
-        self.skipped = 0
 
     def write(
         self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
     ) -> bool:
-        """Pack and commit one snapshot under the shared memory-ordering lock.
+        """Pack and commit one snapshot; never blocks on the reader.
 
-        Returns ``False`` when the recorder still held the lock after
-        :data:`_SNAP_LOCK_WAIT_S` and this sample was skipped. A transient miss
-        is the recorder being descheduled mid-read; the control loop must keep
-        commanding the robot and the reader tolerates the gap. Raises only once
-        the lock has been unavailable for :data:`_SNAP_LOCK_ABANDONED_S`
-        straight, which means the recorder died holding it.
+        Always returns ``True`` (kept for call-site compatibility with the
+        earlier lock-based writer, which could skip a sample).
         """
-        if not self._lock.acquire(timeout=_SNAP_LOCK_WAIT_S):
-            now = time.perf_counter()
-            if self._miss_since is None:
-                self._miss_since = now
-            self._misses += 1
-            self.skipped += 1
-            if now - self._miss_since >= _SNAP_LOCK_ABANDONED_S:
-                raise RuntimeError(
-                    "recorder snapshot lock was not released within "
-                    f"{_SNAP_LOCK_ABANDONED_S:.0f}s; the recorder subprocess may "
-                    "have exited"
-                )
-            return False
-        try:
-            self._write_locked(joint_obs, action, ts, intervention)
-        finally:
-            self._lock.release()
-        if self._miss_since is not None:
-            # Log from the tick that recovered, not the one that missed, so a
-            # stall never grows by the cost of a log record.
-            _logger.warning(
-                "recorder held the snapshot lock for %.1fms; skipped %d control "
-                "snapshot(s) (%d this session)",
-                1e3 * (time.perf_counter() - self._miss_since),
-                self._misses,
-                self.skipped,
-            )
-            self._miss_since = None
-            self._misses = 0
+        self._write_slot(joint_obs, action, ts, intervention)
         return True
 
-    def _write_locked(
+    def _write_slot(
         self, joint_obs: dict, action: dict, ts: float, intervention: bool
     ) -> None:
-        """Pack one record; caller holds :attr:`_lock`."""
+        """Pack one record into the next slot and publish it."""
         generation = self._next_generation
         slot = (generation - 1) % self._capacity
         # seq is odd while this slot is being replaced and even once committed.
@@ -1045,9 +1101,10 @@ class SnapshotReader:
     ``(joint_obs, action, ts, intervention)`` tuple using the same key order.
     :meth:`read_latest` preserves the original single-slot API, while
     :meth:`read_nearest` selects the committed record nearest a camera capture
-    timestamp. Both return ``None`` before the first publication. Each query
-    copies the ring under the shared lock and searches the copy, keeping the
-    lock hold to a few microseconds (see :meth:`_copy_ring`).
+    timestamp. Both return ``None`` before the first publication, and also on
+    the (transient) failure to obtain a consistent copy of the ring — callers
+    retry; see :meth:`_copy_ring`. The reader never takes a lock the writer
+    would have to wait on.
     """
 
     def __init__(
@@ -1055,11 +1112,9 @@ class SnapshotReader:
         name: str,
         obs_keys: list[str],
         action_keys: list[str],
-        process_lock: Any,
     ) -> None:
         self._obs_keys = list(obs_keys)
         self._action_keys = list(action_keys)
-        self._lock = process_lock
         expected_width = 2 + len(self._obs_keys) + len(self._action_keys)
         self._shm = shared_memory.SharedMemory(name=name)
         self._header = np.ndarray((1,), dtype=_SNAP_HEADER_DTYPE, buffer=self._shm.buf)
@@ -1101,23 +1156,38 @@ class SnapshotReader:
         )
 
     def _copy_ring(self) -> "tuple[int, NDArray[Any], NDArray[Any]] | None":
-        """Copy the whole ring under the lock, then let callers search it.
+        """Take a consistent copy of the ring without blocking the writer.
 
-        The lock is held for one scalar read and two bulk ``ndarray.copy``
-        calls (~50 us for the usual 130 KiB) with no Python-level loop in
-        between, so the GIL cannot be handed to the recorder's encoder/verifier
-        threads mid-hold and the control thread's :meth:`SnapshotWriter.write`
-        is never made to wait on this process's scheduling. Because the writer
-        commits under the same lock, every slot in the copy is complete; the
-        seqlock checks below stay as a layout guard rather than a retry loop.
+        Optimistic read: snapshot ``published``, bulk-copy the slot metadata,
+        bulk-copy the data, then compare the live metadata against the copy.
+        The writer bumps a slot's ``seq`` (to odd) before touching its data and
+        again (to even) after, so any write that started or finished while the
+        data was being copied changes the metadata and fails the comparison —
+        the copy is then retaken. A write still in flight across the whole copy
+        leaves its slot's ``seq`` odd in the copy, and :meth:`_slot_of` rejects
+        that slot. Neither case can make the writer wait: a reader descheduled
+        mid-copy costs only itself a retry.
+
+        Every slot at or below the ``published`` we observed was complete
+        before the copy began, so the only slots a validated copy can misreport
+        are ones the writer has since reused, and those are the *oldest*
+        generations (:data:`_SNAP_OLDEST_SKIP`). Returns ``None`` before the
+        first publication or when :data:`_SNAP_READ_ATTEMPTS` consecutive
+        copies were raced; callers treat that as a transient miss.
         """
-        with self._lock:
+        for _ in range(_SNAP_READ_ATTEMPTS):
             published = int(self._header["published"][0])
             if published == 0:
                 return None
             meta = self._slot_meta.copy()
-            data = self._data.copy()
-        return published, meta, data
+            data = self._copy_data()
+            if np.array_equal(meta.view(np.uint64), self._slot_meta.view(np.uint64)):
+                return published, meta, data
+        return None
+
+    def _copy_data(self) -> "NDArray[Any]":
+        """Bulk-copy the data plane (split out so tests can race a write in)."""
+        return self._data.copy()
 
     def read_latest(self) -> tuple[dict, dict, float, bool] | None:
         """Return the newest committed snapshot, preserving the original API."""
@@ -1149,10 +1219,24 @@ class SnapshotReader:
         target_ts: float,
     ) -> tuple[dict, dict, float, bool] | None:
         """Find the nearest snapshot in a consistent ring copy."""
-        oldest = max(1, newest - self._capacity + 1)
-        oldest_ts = self._generation_ts(meta, data, oldest)
         newest_ts = self._generation_ts(meta, data, newest)
-        if oldest_ts is None or newest_ts is None:
+        if newest_ts is None:
+            return None
+        # The writer reuses the oldest slot next. If it was already mid-write
+        # when the copy was taken (odd ``seq``), or the copy was taken after
+        # ``published`` was read and a few newer generations landed there, the
+        # first generation(s) are not this copy's to use: give them up rather
+        # than reject the copy.
+        oldest = max(1, newest - self._capacity + 1)
+        oldest_ts = None
+        for _ in range(_SNAP_OLDEST_SKIP):
+            if oldest > newest:
+                return None
+            oldest_ts = self._generation_ts(meta, data, oldest)
+            if oldest_ts is not None:
+                break
+            oldest += 1
+        if oldest_ts is None:
             return None
         # Never silently clamp an exposure outside retained state history.
         # A target just newer than ``newest`` can be retried by the caller;

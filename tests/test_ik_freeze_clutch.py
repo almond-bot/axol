@@ -95,6 +95,7 @@ def _step_worker() -> IKWorker:
         position_multiplier=1.0,
         rotation_multiplier=1.0,
         reengage="clutch",
+        absolute_mode=False,
     )
     worker._solver = _SeedLeftSolver()
     worker._use_elbow = False

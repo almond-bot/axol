@@ -149,13 +149,76 @@ class RealtimeCameraCoresTest(TestCase):
         self.assertNotIn(min(groups["relay"]), cores)
 
     def test_smaller_layouts_still_avoid_cpu0(self) -> None:
-        # Below 8 cores CPU0 is a CAN core, so steering never changes the pool.
-        for n, expected in ((6, {4, 5}), (5, {3, 4}), (4, {3})):
+        # 6-7 cores: CPU0 is a CAN core, so steering never changes the pool.
+        # 5 cores: CPU0 is the relay's Python core and the interrupt CPU, so
+        # the one throughput core left is the whole pool. 4 cores (Pi 5): no
+        # CPU is free of control, CAN, relay-Python or the interrupt — no
+        # FIFO camera pool at all (the Pi runs no ZED cameras).
+        for n, expected in ((6, {4, 5}), (5, {2}), (4, None)):
             for irq_cpus in (None, {0}, {n - 1}):
                 self.assertEqual(self._cores(n, irq_cpus), expected, (n, irq_cpus))
 
     def test_none_when_partitioning_is_not_applicable(self) -> None:
         self.assertIsNone(self._cores(2, None))
+
+
+class CoreGroupsTest(TestCase):
+    """Every partitioned host gives the Rust core two CAN CPUs of its own."""
+
+    def test_can_cores_are_a_disjoint_pair_on_every_layout(self) -> None:
+        # rt.link only exports AXOL_RT_CPU_LEFT/RIGHT + the SCHED_FIFO request
+        # when there are two CAN cores disjoint from Python control. The old
+        # 4-5 core layout shared them (can == realtime), which left a Pi 5's
+        # bus loops as unpinned CFS threads: a 43.8 ms overrun sent the core
+        # limp mid-ROM-sweep, and every >0.5 ms late tick had already gated
+        # the shoulder host damping off.
+        for n in (4, 5, 6, 8, 12):
+            with patch.object(affinity.os, "cpu_count", return_value=n):
+                groups = affinity.core_groups()
+            assert groups is not None
+            self.assertEqual(len(groups["can"]), 2, n)
+            self.assertTrue(groups["can"].isdisjoint(groups["realtime"]), n)
+            self.assertTrue(groups["can"].isdisjoint(groups["ik"]), n)
+            self.assertTrue(groups["can"].isdisjoint(groups["relay"]), n)
+            self.assertTrue(groups["can"].isdisjoint(groups["background"]), n)
+            # Control never shares with throughput work either.
+            self.assertTrue(groups["realtime"].isdisjoint(groups["relay"]), n)
+            self.assertTrue(groups["realtime"].isdisjoint(groups["background"]), n)
+            # No CPU is invented, and the small layouts use every one.
+            used = set().union(
+                *(groups[g] for g in ("can", "realtime", "ik", "relay", "background"))
+            )
+            self.assertTrue(used <= set(range(n)), n)
+            if n <= 8:
+                self.assertEqual(used, set(range(n)), n)
+
+    def test_pi5_layout(self) -> None:
+        with patch.object(affinity.os, "cpu_count", return_value=4):
+            groups = affinity.core_groups()
+        self.assertEqual(
+            groups,
+            {
+                "can": {2, 3},
+                "realtime": {1},
+                "ik": {1},
+                "relay": {0},
+                "background": {0},
+                "irq": {0},
+            },
+        )
+
+    def test_five_core_layout_keeps_a_throughput_core(self) -> None:
+        with patch.object(affinity.os, "cpu_count", return_value=5):
+            groups = affinity.core_groups()
+        assert groups is not None
+        self.assertEqual(groups["can"], {3, 4})
+        self.assertEqual(groups["realtime"], {1})
+        self.assertEqual(groups["relay"], {0, 2})
+        self.assertEqual(groups["background"], {0, 2})
+
+    def test_none_below_four_cores(self) -> None:
+        with patch.object(affinity.os, "cpu_count", return_value=3):
+            self.assertIsNone(affinity.core_groups())
 
 
 class CanIrqCpuTest(TestCase):
@@ -173,7 +236,10 @@ class CanIrqCpuTest(TestCase):
                         return_value=irq_cpus,
                     ):
                         cameras = affinity.realtime_camera_cores()
-                    assert cameras is not None
+                    if cameras is None:
+                        # 4 cores: no FIFO camera pool exists at all.
+                        self.assertEqual(n, 4)
+                        continue
                     self.assertNotIn(target, cameras, (n, irq_cpus))
             assert groups is not None
             self.assertEqual(target, max(groups["can"]), n)

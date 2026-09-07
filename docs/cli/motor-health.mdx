@@ -3,13 +3,14 @@ title: "motor.health"
 description: "Probe every motor on both arms and report which responded."
 ---
 
-Probes all 16 motors (8 per arm) and reports which responded. For each motor it runs the same status reads as [`motor.info`](https://docs.almond.bot/cli/motor-info) — position, velocity, torque, temperature, voltage, error code, control mode, firmware version, and model — and prints `OK` if every read succeeds or the error string if any read fails.
+Probes all 16 Axol motors (8 per arm), or both Mantis grippers with `--target mantis`, and reports which responded. For each motor it runs the same status reads as [`motor.info`](https://docs.almond.bot/cli/motor-info) — position, velocity, torque, temperature, voltage, error code, control mode, firmware version, and model — and prints `OK` if every read succeeds or the error string if any read fails.
 
 The command iterates the left arm (`CAN_LEFT`) then the right arm (`CAN_RIGHT`), printing one line per joint. It exits with status `1` if any motor failed to respond, making it suitable for scripts and provisioning checks.
 
-`--left-channel` / `--right-channel` override the SocketCAN interface used for each arm, for setups without the Axol hub CAN adapter; `--no-left` / `--no-right` skip an arm entirely (e.g. a one-arm rig, so a missing arm doesn't fail the check).
+`--left-channel` / `--right-channel` override the SocketCAN interface used for each side; `--no-left` / `--no-right` skip one side. `--joints` restricts the Axol check to a comma-separated subset. Mantis always checks only ID 8 on `can_mantis_l` / `can_mantis_r` by default.
 
 ```bash
 axol motor.health
 axol motor.health --no-right --left-channel can0   # one arm on a non-hub CAN adapter
+axol motor.health --target mantis                   # both Mantis grippers
 ```

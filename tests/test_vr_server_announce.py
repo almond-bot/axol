@@ -1,10 +1,12 @@
-"""VRServer connect-time announces and the client's ``get`` re-request.
+"""VRServer connect-time announces and the client's session-config re-request.
 
 The web client installs its message listeners a render after the socket
 opens, so the announces the server pushes on accept can arrive before anyone
-listens (and ``settings`` is only re-sent on change). ``{"type": "get"}``
-asks for them again; these tests pin what it sends and that it goes only to
-the requesting client.
+listens (and ``settings`` is only re-sent on change).
+``{"type": "session-config-request"}`` asks for them again; these tests pin
+that :meth:`VRServer.set_announce` entries ride along with the built-in
+session config, in order, and that a replay goes only to the requesting
+client.
 """
 
 import asyncio
@@ -34,36 +36,42 @@ class AnnounceTest(unittest.TestCase):
         server.set_episode(3)
         return server
 
-    def test_send_announces_order_and_content(self) -> None:
+    def test_announce_rides_with_session_config(self) -> None:
         server = self._server()
         ws = _FakeSocket()
-        _run(server._send_announces(ws))
+        _run(server._send_session_config(ws))
+        types = [m["type"] for m in ws.sent]
+        # mode first, then the registered announces, then the built-ins.
+        self.assertEqual(types[:2], ["mode", "settings"])
+        self.assertIn("episode", types)
+        self.assertLess(types.index("settings"), types.index("episode"))
+        by_type = {m["type"]: m["value"] for m in ws.sent}
+        self.assertEqual(by_type["mode"], "teleop")
         self.assertEqual(
-            ws.sent,
-            [
-                {"type": "mode", "value": "teleop"},
-                {
-                    "type": "settings",
-                    "value": {"schema": [], "values": {"box_mode": True}},
-                },
-                {"type": "episode", "value": 3},
-            ],
+            by_type["settings"], {"schema": [], "values": {"box_mode": True}}
         )
+        self.assertEqual(by_type["episode"], 3)
 
-    def test_get_resends_to_requesting_client_only(self) -> None:
+    def test_set_announce_none_removes_entry(self) -> None:
+        server = self._server()
+        server.set_announce("settings", None)
+        ws = _FakeSocket()
+        _run(server._send_session_config(ws))
+        self.assertNotIn("settings", [m["type"] for m in ws.sent])
+
+    def test_request_replays_to_requesting_client_only(self) -> None:
         server = self._server()
         asker, other = _FakeSocket(), _FakeSocket()
         server._active_clients.update({asker, other})
-        _run(server._handle_message(asker, id(asker), json.dumps({"type": "get"})))
-        self.assertEqual(
-            [m["type"] for m in asker.sent], ["mode", "settings", "episode"]
+        _run(
+            server._handle_message(
+                asker, id(asker), json.dumps({"type": "session-config-request"})
+            )
         )
+        types = [m["type"] for m in asker.sent]
+        self.assertEqual(types[:2], ["mode", "settings"])
+        self.assertIn("episode", types)
         self.assertEqual(other.sent, [])
-
-    def test_nothing_to_announce_sends_nothing(self) -> None:
-        ws = _FakeSocket()
-        _run(VRServer()._send_announces(ws))
-        self.assertEqual(ws.sent, [])
 
     def test_send_failure_is_swallowed(self) -> None:
         class _Broken(_FakeSocket):
@@ -71,7 +79,7 @@ class AnnounceTest(unittest.TestCase):
                 raise RuntimeError("gone")
 
         server = self._server()
-        _run(server._send_announces(_Broken()))  # must not raise
+        _run(server._send_session_config(_Broken()))  # must not raise
 
 
 if __name__ == "__main__":

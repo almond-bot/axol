@@ -11,16 +11,20 @@ import {
   Upload,
 } from "lucide-react"
 import {
+  HARDWARE_PROFILE_SETTING,
   flattenFields,
   setQuestProximityDisabled,
   type AdvancedSection,
   type CameraDevice,
+  type CameraSlot,
   type CameraSpec,
   type FormValue,
+  type HardwareProfile,
   type SettingsCategory,
   type SettingsField,
   type SettingsPatch,
   type SettingsSnapshot,
+  type SessionInfo,
   type SettingValue,
   type UsbStatus,
 } from "@/lib/supervisor"
@@ -33,26 +37,74 @@ import { Switch } from "@/components/ui/switch"
 import { useToast } from "@/components/ui/toast"
 import { Card } from "@/components/ui/card"
 import { FieldRow, FlatSchemaForm } from "@/components/config-form"
-import { materializeCameraSpec } from "@/lib/camera-spec"
+import { materializeCameraSpec, type CameraProfileBySlot } from "@/lib/camera-spec"
+import {
+  AXOL_CATEGORY_KEYS,
+  SETTINGS_SCOPES,
+  defaultSettingsTab,
+  settingsScopeForTab,
+  type SettingsScope,
+  type SettingsTab,
+} from "@/lib/settings-scope"
 import { CamerasPanel } from "./cameras-panel"
 import { PosePanel } from "./pose-panel"
+import { TrackerBindingPanel } from "./tracker-binding-panel"
 import { cn } from "@/lib/utils"
 
-export type SettingsTab = string // "cameras" | "usb" | "pose" | "advanced" | a category key
+// Mantis-specific keys declared under the Teleop & VR schema category; they
+// render on the Mantis tabs instead.
+const MANTIS_SOURCE_KEYS = ["teleop.mantis_source", "mantis.quest_tracker_key"]
+const MANTIS_CHANNEL_KEYS = ["mantis.left_channel", "mantis.right_channel"]
+// Keys the card never edits: the device selection has its own switch above.
+const EXTERNALLY_MANAGED_KEYS = new Set([HARDWARE_PROFILE_SETTING])
 
 interface Draft {
   values: Record<string, SettingValue>
   cameras: CameraSpec
+  /** Layout whose controls most recently changed each shared logical slot. */
+  cameraProfiles: CameraProfileBySlot
   advanced: Record<string, FormValue>
 }
 
+const CAMERA_SLOTS: CameraSlot[] = ["overhead", "left_arm", "right_arm"]
+
+function assignedSerial(spec: CameraSpec, profile: HardwareProfile, slot: CameraSlot): string {
+  if (profile === "mantis" && slot !== "overhead") {
+    return spec.mantis_serials?.[slot] ?? spec.serials[slot]
+  }
+  return spec.serials[slot]
+}
+
+/** Attribute only the logical slots an edit actually touched to its layout. */
+function cameraProfilesAfterEdit(
+  before: CameraSpec,
+  after: CameraSpec,
+  current: CameraProfileBySlot,
+  profile: HardwareProfile
+): CameraProfileBySlot {
+  const next = { ...current }
+  for (const slot of CAMERA_SLOTS) {
+    // Mantis has no overhead assignment/control; an imported overhead change
+    // always belongs to the Axol layout even when imported from that tab.
+    const slotProfile = slot === "overhead" ? "axol" : profile
+    const assignmentChanged =
+      assignedSerial(before, slotProfile, slot) !== assignedSerial(after, slotProfile, slot)
+    const streamChanged = before.stream?.[slot] !== after.stream?.[slot]
+    const recordChanged = before.record?.[slot] !== after.record?.[slot]
+    if (assignmentChanged || streamChanged || recordChanged) next[slot] = slotProfile
+  }
+  return next
+}
+
 /**
- * The shared settings, tabbed directly on the control panel page: everything
- * that isn't a per-run input — Cameras, Quest USB, Robot, Teleop & VR, Rest
- * pose, Recording, Inference, System, plus per-op Advanced overrides. Values
- * persist on the serve host (~/.almond/settings.json) and are folded into
- * every operation start, so they're shared across operations and operator
- * devices. Edits stage locally until **Save**.
+ * The shared settings, directly on the control panel page, split by device:
+ * **Axol** (cameras, arm behaviour, teleop & VR, rest pose, kinematics),
+ * **Mantis** (tracking source and setup, wrist cameras, CAN), and
+ * **General** (Quest, recording, inference, system, Advanced). Each
+ * connection tile opens its own scope. Values persist on the serve host
+ * (~/.almond/settings.json) and are folded into every operation start, so
+ * they're shared across operations and operator devices. Edits stage locally
+ * until **Save**.
  */
 export function SettingsSection({
   open,
@@ -69,6 +121,9 @@ export function SettingsSection({
   usb,
   usbBusy,
   onUsbConnect,
+  actionBlocker,
+  activeCommandSession,
+  onCommandSessionChange,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -87,6 +142,11 @@ export function SettingsSection({
   usb: UsbStatus | null
   usbBusy: boolean
   onUsbConnect: () => void
+  /** Current host owner that prevents launching another setup action. */
+  actionBlocker: string | null
+  /** Active generic setup/diagnostic session, if any. */
+  activeCommandSession: SessionInfo | null
+  onCommandSessionChange: (session: SessionInfo | null) => void
 }) {
   const toast = useToast()
   const [draft, setDraft] = useState<Draft | null>(null)
@@ -110,6 +170,7 @@ export function SettingsSection({
   const seedDraft = (): Draft => ({
     values: { ...(snapshot?.values ?? {}) },
     cameras,
+    cameraProfiles: {},
     advanced: { ...(snapshot?.advanced ?? {}) },
   })
   const settingsResolved = snapshot !== null || supportError !== null
@@ -151,6 +212,23 @@ export function SettingsSection({
     })
   }
 
+  // The pose-source dropdown commits on selection instead of staging: the
+  // tracker setup actions on the Tracking tab run host-side against the
+  // *persisted* settings, so a staged-only source would let Identify/Pair act
+  // on the wrong backend. Only this key is written — other staged edits keep
+  // waiting for the explicit Save. A failed write reverts the dropdown so the
+  // stored source stays authoritative.
+  async function saveMantisSource(key: string, value: SettingValue | null) {
+    const prior = draft?.values[key]
+    setValue(key, value)
+    try {
+      await onSave({ values: { [key]: value } })
+    } catch (e) {
+      setValue(key, prior === undefined ? null : prior)
+      toast.error(String(e).replace(/^Error:\s*/, ""))
+    }
+  }
+
   function exportFile() {
     if (!draft) return
     const blob = new Blob(
@@ -175,60 +253,146 @@ export function SettingsSection({
     try {
       const data = JSON.parse(text)
       if (!data || typeof data !== "object") throw new Error("invalid settings file")
-      setDraft((d) =>
-        d
-          ? {
-              values: { ...(data.values ?? {}) },
-              cameras: (data.cameras as CameraSpec) ?? d.cameras,
-              advanced: { ...(data.advanced ?? {}) },
-            }
-          : d
-      )
+      setDraft((d) => {
+        if (!d) return d
+        const importedCameras = (data.cameras as CameraSpec) ?? d.cameras
+        const profile = scope === "mantis" ? "mantis" : "axol"
+        // The device selection is not part of the card; keep the stored one.
+        const values = { ...(data.values ?? {}) }
+        for (const key of EXTERNALLY_MANAGED_KEYS) {
+          delete values[key]
+          if (d.values[key] !== undefined) values[key] = d.values[key]
+        }
+        return {
+          values,
+          cameras: importedCameras,
+          cameraProfiles: cameraProfilesAfterEdit(
+            d.cameras,
+            importedCameras,
+            d.cameraProfiles,
+            profile
+          ),
+          advanced: { ...(data.advanced ?? {}) },
+        }
+      })
     } catch (e) {
       toast.error(`Import failed: ${e}`)
     }
   }
 
-  // Tab order: the hardware attached to the host first (Cameras, Quest USB),
-  // then the behaviour categories with the pose editor after Teleop & VR,
-  // then the per-op Advanced overrides.
-  const tabs: { key: SettingsTab; label: string }[] = [
-    { key: "cameras", label: "Cameras" },
-    { key: "usb", label: "Quest USB" },
-  ]
-  for (const cat of schema) {
-    tabs.push({ key: cat.key, label: cat.label })
-    if (cat.key === "teleop") tabs.push({ key: "pose", label: "Rest pose" })
+  // The scope is implied by the tab, so one piece of parent state ("which tab")
+  // is enough for a connection tile to open the right device's settings.
+  const scope = settingsScopeForTab(tab)
+  const scopeMeta = SETTINGS_SCOPES.find((s) => s.key === scope) ?? SETTINGS_SCOPES[0]
+
+  // Tabs within the active scope. Axol: hardware first (cameras), then arm
+  // behaviour categories with the pose editor after Teleop & VR. Mantis: the
+  // tracking flow, wrist cameras, CAN. General: Quest, the
+  // remaining categories, and Advanced.
+  const tabs: { key: SettingsTab; label: string }[] = []
+  if (scope === "axol") {
+    tabs.push({ key: "cameras", label: "Cameras" })
+    for (const cat of schema) {
+      if (!AXOL_CATEGORY_KEYS.has(cat.key)) continue
+      tabs.push({ key: cat.key, label: cat.label })
+      if (cat.key === "teleop") tabs.push({ key: "pose", label: "Rest pose" })
+    }
+  } else if (scope === "mantis") {
+    tabs.push(
+      { key: "mantis-tracking", label: "Tracking" },
+      { key: "mantis-cameras", label: "Cameras" },
+      { key: "mantis-can", label: "CAN" }
+    )
+  } else {
+    tabs.push({ key: "usb", label: "Quest" })
+    for (const cat of schema) {
+      if (!AXOL_CATEGORY_KEYS.has(cat.key)) tabs.push({ key: cat.key, label: cat.label })
+    }
+    tabs.push({ key: "advanced", label: "Advanced" })
   }
-  tabs.push({ key: "advanced", label: "Advanced" })
+
+  function selectScope(next: SettingsScope) {
+    onOpenChange(true)
+    if (next !== scope) onTabChange(defaultSettingsTab(next))
+  }
 
   const activeCategory = schema.find((c) => c.key === tab)
   const poseFields =
     schema.find((c) => c.key === "teleop")?.settings.filter((s) => s.ui.widget === "pose") ?? []
+  const teleopCategory = schema.find((c) => c.key === "teleop")
+  const mantisSourceField = teleopCategory?.settings.find((s) => s.key === "teleop.mantis_source")
+  const questTrackerKeyField = teleopCategory?.settings.find(
+    (s) => s.key === "mantis.quest_tracker_key"
+  )
+  const mantisChannelFields =
+    teleopCategory?.settings.filter((s) => MANTIS_CHANNEL_KEYS.includes(s.key)) ?? []
+  const defaultMantisSource = String(mantisSourceField?.default ?? "lighthouse")
+  const draftMantisSource = String(draft?.values["teleop.mantis_source"] ?? defaultMantisSource)
+  const storedMantisSource = String(snapshot?.values["teleop.mantis_source"] ?? defaultMantisSource)
+  const mantisSourceSaved = draftMantisSource === storedMantisSource
+  const draftQuestTrackerKey = String(draft?.values["mantis.quest_tracker_key"] ?? "")
+  const storedQuestTrackerKey = String(snapshot?.values["mantis.quest_tracker_key"] ?? "")
+  const mantisCalibrationContextSaved =
+    mantisSourceSaved &&
+    (draftMantisSource !== "quest" || draftQuestTrackerKey === storedQuestTrackerKey)
 
   return (
     <Card className="gap-0 p-0">
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={() => onOpenChange(!open)}
+      <div
         className={cn(
-          "flex w-full items-center justify-between gap-3 px-5 py-3.5 text-left",
+          "flex w-full items-center gap-3 px-5 py-3.5",
           open && "border-b border-white/10"
         )}
       >
-        <span className="font-mono text-xs tracking-widest text-white/40 uppercase">Settings</span>
-        <span className="ml-auto hidden text-xs text-white/35 sm:block">
-          shared by all operations on this robot
-        </span>
-        <ChevronDown
-          className={cn("size-4 shrink-0 text-white/45 transition-transform", open && "rotate-180")}
-        />
-      </button>
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => onOpenChange(!open)}
+          className="flex min-w-0 flex-1 items-center gap-3 text-left"
+        >
+          <span className="font-mono text-xs tracking-widest text-white/40 uppercase">
+            {scopeMeta.title}
+          </span>
+          <span className="hidden truncate text-xs text-white/35 md:block">
+            shared by all operations on this robot
+          </span>
+        </button>
+        <div
+          role="tablist"
+          aria-label="Settings scope"
+          className="flex shrink-0 rounded-lg border border-white/10 bg-white/[0.02] p-0.5"
+        >
+          {SETTINGS_SCOPES.map((s) => (
+            <button
+              key={s.key}
+              type="button"
+              role="tab"
+              aria-selected={open && s.key === scope}
+              onClick={() => selectScope(s.key)}
+              className={cn(
+                "rounded-md px-2.5 py-1 text-xs whitespace-nowrap transition-colors",
+                open && s.key === scope
+                  ? "bg-[#eff483]/10 text-[#eff483]"
+                  : "text-white/55 hover:bg-white/[0.05] hover:text-white/85"
+              )}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+        <button
+          type="button"
+          aria-label={open ? "Collapse settings" : "Expand settings"}
+          onClick={() => onOpenChange(!open)}
+          className="shrink-0 text-white/45 hover:text-white/80"
+        >
+          <ChevronDown className={cn("size-4 transition-transform", open && "rotate-180")} />
+        </button>
+      </div>
 
       {open && (
         <>
-          {/* Horizontal tab bar */}
+          {/* Horizontal tab bar within the active scope */}
           <nav className="flex gap-1 overflow-x-auto border-b border-white/10 px-3 py-2">
             {tabs.map((t) => (
               <button
@@ -250,16 +414,88 @@ export function SettingsSection({
           <div className="p-5">
             {!draft ? (
               <p className="text-sm text-white/40">Loading settings…</p>
-            ) : supportError && tab !== "cameras" && tab !== "usb" ? (
+            ) : supportError && tab !== "cameras" && tab !== "mantis-cameras" && tab !== "usb" ? (
               <UpdateRequired error={supportError} />
-            ) : tab === "cameras" ? (
+            ) : tab === "cameras" || tab === "mantis-cameras" ? (
               <CamerasPanel
                 spec={draft.cameras}
-                onChange={(spec) => setDraft((d) => (d ? { ...d, cameras: spec } : d))}
+                mantisMode={tab === "mantis-cameras"}
+                onChange={(spec) =>
+                  setDraft((d) =>
+                    d
+                      ? {
+                          ...d,
+                          cameras: spec,
+                          cameraProfiles: cameraProfilesAfterEdit(
+                            d.cameras,
+                            spec,
+                            d.cameraProfiles,
+                            tab === "mantis-cameras" ? "mantis" : "axol"
+                          ),
+                        }
+                      : d
+                  )
+                }
                 devices={devices}
                 detecting={detecting}
                 onRefresh={onRefresh}
               />
+            ) : tab === "mantis-tracking" ? (
+              <div className="flex flex-col gap-6">
+                {mantisSourceField && (
+                  <SettingRow
+                    field={mantisSourceField}
+                    value={draft.values[mantisSourceField.key]}
+                    onChange={(key, value) => void saveMantisSource(key, value)}
+                  />
+                )}
+                {draftMantisSource === "quest" && questTrackerKeyField && (
+                  <SettingRow
+                    field={questTrackerKeyField}
+                    value={draft.values[questTrackerKeyField.key]}
+                    onChange={setValue}
+                  />
+                )}
+                <TrackerBindingPanel
+                  source={draftMantisSource}
+                  sourceSaved={mantisSourceSaved}
+                  calibrationContextSaved={mantisCalibrationContextSaved}
+                  onQuestKeySelect={(key) => setValue("mantis.quest_tracker_key", key)}
+                  onSaveSettings={dirty ? save : undefined}
+                  savingSettings={saving}
+                  blockedReason={actionBlocker}
+                  hostSession={activeCommandSession}
+                  onHostSessionChange={onCommandSessionChange}
+                />
+              </div>
+            ) : tab === "mantis-can" ? (
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col gap-1.5">
+                  <Label>Logical left/right CAN mapping</Label>
+                  <p className="max-w-prose text-xs leading-relaxed text-white/40">
+                    Defaults are <span className="font-mono">can_mantis_l</span> and{" "}
+                    <span className="font-mono">can_mantis_r</span>. Swap the two interface values
+                    to swap logical left and right without moving cables; each side&apos;s trigger
+                    reader follows the same channel.
+                  </p>
+                </div>
+                {mantisChannelFields.length > 0 ? (
+                  <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
+                    {mantisChannelFields.map((field) => (
+                      <SettingRow
+                        key={field.key}
+                        field={field}
+                        value={draft.values[field.key]}
+                        onChange={setValue}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm text-white/40">
+                    This host does not expose a Mantis CAN mapping; update it to edit the channels.
+                  </p>
+                )}
+              </div>
             ) : tab === "usb" ? (
               <UsbPanel usb={usb} usbBusy={usbBusy} onUsbConnect={onUsbConnect} />
             ) : tab === "pose" ? (
@@ -281,7 +517,16 @@ export function SettingsSection({
                 }
               />
             ) : activeCategory ? (
-              <CategoryPanel category={activeCategory} values={draft.values} onChange={setValue} />
+              <CategoryPanel
+                category={activeCategory}
+                values={draft.values}
+                onChange={setValue}
+                excludeKeys={
+                  activeCategory.key === "teleop"
+                    ? [...MANTIS_SOURCE_KEYS, ...MANTIS_CHANNEL_KEYS]
+                    : [...EXTERNALLY_MANAGED_KEYS]
+                }
+              />
             ) : (
               <p className="text-sm text-white/40">Loading settings…</p>
             )}
@@ -339,20 +584,30 @@ function computePatch(
 ): SettingsPatch {
   const patch: SettingsPatch = {}
 
+  // The device selection saves through its own switch, possibly while this
+  // draft is dirty; it must never be written (or reset) from here.
   const before = snapshot?.values ?? {}
   const valuesPatch: Record<string, SettingValue | null> = {}
   for (const [k, v] of Object.entries(draft.values)) {
+    if (EXTERNALLY_MANAGED_KEYS.has(k)) continue
     if (JSON.stringify(before[k]) !== JSON.stringify(v)) valuesPatch[k] = v
   }
   for (const k of Object.keys(before)) {
+    if (EXTERNALLY_MANAGED_KEYS.has(k)) continue
     if (!(k in draft.values)) valuesPatch[k] = null
   }
   if (Object.keys(valuesPatch).length > 0) patch.values = valuesPatch
 
-  const camerasOut = materializeCameraSpec(draft.cameras, devices)
-  if (JSON.stringify(camerasOut) !== JSON.stringify(storedCameras)) {
-    patch.cameras = camerasOut
-    patch.camerasSet = true
+  // Only materialize after an actual camera edit, and use the layout whose
+  // controls produced each slot edit. The operation selected elsewhere is
+  // unrelated, and untouched explicit values may encode stereo eyes for the
+  // other hardware profile, so they must never be normalized opportunistically.
+  if (JSON.stringify(draft.cameras) !== JSON.stringify(storedCameras)) {
+    const camerasOut = materializeCameraSpec(draft.cameras, devices, draft.cameraProfiles)
+    if (JSON.stringify(camerasOut) !== JSON.stringify(storedCameras)) {
+      patch.cameras = camerasOut
+      patch.camerasSet = true
+    }
   }
 
   const beforeAdv = snapshot?.advanced ?? {}
@@ -517,12 +772,16 @@ function CategoryPanel({
   category,
   values,
   onChange,
+  excludeKeys = [],
 }: {
   category: SettingsCategory
   values: Record<string, SettingValue>
   onChange: (key: string, value: SettingValue | null) => void
+  excludeKeys?: string[]
 }) {
-  const fields = category.settings.filter((s) => s.ui.widget !== "pose")
+  const fields = category.settings.filter(
+    (s) => s.ui.widget !== "pose" && !excludeKeys.includes(s.key)
+  )
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">{category.description}</p>

@@ -25,7 +25,13 @@ import math
 import sys
 import time
 
-from ...constants import CAN_LEFT, CAN_RIGHT, Joint
+from ...constants import (
+    CAN_LEFT,
+    CAN_MANTIS_LEFT,
+    CAN_MANTIS_RIGHT,
+    CAN_RIGHT,
+    Joint,
+)
 from ...motor import ControlMode
 from ...robot.axol import Axol, AxolArm
 
@@ -124,18 +130,24 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
     parser.add_argument(
+        "--target",
+        choices=["axol", "mantis"],
+        default="axol",
+        help="Release the Axol or Mantis grippers (default: %(default)s).",
+    )
+    parser.add_argument(
         "--left-channel",
-        default=CAN_LEFT,
+        default=None,
         metavar="IFACE",
         help="SocketCAN interface for the left arm, for setups without the "
-        "Axol hub CAN adapter (default: %(default)s).",
+        "selected hardware's default bus.",
     )
     parser.add_argument(
         "--right-channel",
-        default=CAN_RIGHT,
+        default=None,
         metavar="IFACE",
         help="SocketCAN interface for the right arm, for setups without the "
-        "Axol hub CAN adapter (default: %(default)s).",
+        "selected hardware's default bus.",
     )
     parser.add_argument(
         "--web-prompts",
@@ -162,13 +174,18 @@ def run_cli(args: argparse.Namespace) -> None:
     """Run the gripper release routine from parsed arguments."""
     if args.no_left and args.no_right:
         raise SystemExit("Cannot disable both arms.")
+    defaults = (
+        (CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT)
+        if args.target == "mantis"
+        else (CAN_LEFT, CAN_RIGHT)
+    )
     asyncio.run(
         run(
             no_left=args.no_left,
             no_right=args.no_right,
             web_prompts=args.web_prompts,
-            left_channel=args.left_channel,
-            right_channel=args.right_channel,
+            left_channel=args.left_channel or defaults[0],
+            right_channel=args.right_channel or defaults[1],
         )
     )
 

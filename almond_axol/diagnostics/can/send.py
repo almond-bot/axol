@@ -6,12 +6,18 @@ and its CAN traffic, not a Python-side loop. Every motor of each selected arm
 must be on the bus (the core brings the whole arm up); only the chosen joint
 moves.
 
+``--target mantis`` drives the Mantis rig's handheld grippers instead
+(``RtMantis`` on ``can_mantis_l`` / ``can_mantis_r``): the core owns the
+gripper buses exactly as it does during a take, and only ``--joint gripper``
+is meaningful there.
+
 Run directly:
     uv run -m almond_axol.diagnostics.can.send --l --joint shoulder_1
     uv run -m almond_axol.diagnostics.can.send --r --joint elbow
     uv run -m almond_axol.diagnostics.can.send --joint elbow        # both arms
     uv run -m almond_axol.diagnostics.can.send --l --joint wrist_2 --hz 50
     uv run -m almond_axol.diagnostics.can.send --l --joint gripper --hz 100 --log-file can_send.log
+    uv run -m almond_axol.diagnostics.can.send --target mantis --l --joint gripper
 """
 
 from __future__ import annotations
@@ -29,10 +35,17 @@ from datetime import datetime
 
 import numpy as np
 
-from ...constants import CAN_LEFT, CAN_RIGHT, Joint
+from ...constants import (
+    CAN_LEFT,
+    CAN_MANTIS_LEFT,
+    CAN_MANTIS_RIGHT,
+    CAN_RIGHT,
+    Joint,
+)
 from ...robot.axol import Axol, arm_limits
 from ...robot.config import AxolConfig
-from ...rt import RtAxol
+from ...robot.mantis import Mantis
+from ...rt import RtAxol, RtMantis
 
 _BAR_WIDTH = 24
 _TAU = 2 * math.pi
@@ -228,8 +241,12 @@ async def _run(
     hz: int,
     log_file: str,
     display: bool = True,
+    target: str = "axol",
 ) -> None:
     log = _make_logger(log_file, __name__)
+    mantis = target == "mantis"
+    left_channel = CAN_MANTIS_LEFT if mantis else CAN_LEFT
+    right_channel = CAN_MANTIS_RIGHT if mantis else CAN_RIGHT
 
     def _asyncio_exc_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
         exc = context.get("exception")
@@ -251,8 +268,8 @@ async def _run(
     channels = [
         (side, ch, is_left)
         for side, ch, is_left, on in (
-            ("left", CAN_LEFT, True, run_left),
-            ("right", CAN_RIGHT, False, run_right),
+            ("left", left_channel, True, run_left),
+            ("right", right_channel, False, run_right),
         )
         if on
     ]
@@ -273,15 +290,27 @@ async def _run(
     cycle_count = 0
     send_error_count = 0
 
-    # ``resolved()`` applies the default stiffness blend at the ``Axol``
-    # construction boundary, so the core runs the same gains teleop does.
-    robot = RtAxol(
-        Axol(
-            config=AxolConfig(),
-            left_channel=CAN_LEFT if run_left else None,
-            right_channel=CAN_RIGHT if run_right else None,
+    robot: RtAxol | RtMantis
+    if mantis:
+        # Grippers-only core on the Mantis buses; ``enable`` (non-deferred)
+        # brings the grippers up and arms it, as a take does.
+        robot = RtMantis(
+            Mantis(
+                config=AxolConfig(),
+                left_channel=left_channel if run_left else None,
+                right_channel=right_channel if run_right else None,
+            )
         )
-    )
+    else:
+        # ``resolved()`` applies the default stiffness blend at the ``Axol``
+        # construction boundary, so the core runs the same gains teleop does.
+        robot = RtAxol(
+            Axol(
+                config=AxolConfig(),
+                left_channel=left_channel if run_left else None,
+                right_channel=right_channel if run_right else None,
+            )
+        )
     try:
         try:
             await robot.enable()
@@ -410,6 +439,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Cycle one joint through its limits via motion control."
     )
+    parser.add_argument(
+        "--target",
+        choices=["axol", "mantis"],
+        default="axol",
+        help="Hardware to drive: the robot arms (default) or the Mantis "
+        "grippers on can_mantis_l / can_mantis_r (gripper only).",
+    )
     side = parser.add_mutually_exclusive_group()
     side.add_argument("--l", action="store_true", help="Use left arm")
     side.add_argument("--r", action="store_true", help="Use right arm")
@@ -431,10 +467,12 @@ def main() -> None:
     args = parser.parse_args()
 
     cycle_joint = Joint(args.joint)
+    if args.target == "mantis" and cycle_joint != Joint.GRIPPER:
+        raise SystemExit("Mantis CAN send diagnostics can cycle only the gripper.")
     run_left = args.l or not args.r
     run_right = args.r or not args.l
     if run_left and run_right:
-        print("No side specified — running both arms.")
+        print("No side specified — running both sides.")
 
     try:
         asyncio.run(
@@ -444,6 +482,7 @@ def main() -> None:
                 cycle_joint=cycle_joint,
                 hz=args.hz,
                 log_file=args.log_file,
+                target=args.target,
             )
         )
     except KeyboardInterrupt:

@@ -53,7 +53,13 @@ import time
 
 import numpy as np
 
-from ...constants import CAN_LEFT, CAN_RIGHT, Joint
+from ...constants import (
+    CAN_LEFT,
+    CAN_MANTIS_LEFT,
+    CAN_MANTIS_RIGHT,
+    CAN_RIGHT,
+    Joint,
+)
 from ...robot.axol import (
     ELBOW_LEFT_LIMITS,
     ELBOW_RIGHT_LIMITS,
@@ -64,7 +70,8 @@ from ...robot.axol import (
     Axol,
 )
 from ...robot.config import AxolConfig
-from ...rt import RtAxol
+from ...robot.mantis import Mantis
+from ...rt import RtAxol, RtMantis
 from ..telemetry_log import TelemetryCsvLogger
 
 CONTROL_RATE_HZ = 100.0  # Hz
@@ -137,13 +144,13 @@ def home_pose() -> np.ndarray:
 
 
 async def _stream(
-    robot: RtAxol,
+    robot: RtAxol | RtMantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
 ) -> None:
     """Ship one target pair to the core, refusing to keep "sweeping" limp arms.
 
-    Once the core has gone limp (loss-of-trust fault: timing, a silent motor)
+    Once the core has gone limp (loss-of-trust fault: a silent motor)
     ``RtAxol.motion_control`` streams gravity comp instead of tracking, so the
     arms would hang weightless while this script kept announcing sweeps. Stop
     the run instead; the operator hand-guides the arms to rest.
@@ -155,7 +162,7 @@ async def _stream(
 
 
 async def hold_pose(
-    robot: RtAxol,
+    robot: RtAxol | RtMantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     seconds: float,
@@ -176,7 +183,7 @@ async def hold_pose(
 
 
 async def _stream_hold_forever(
-    robot: RtAxol,
+    robot: RtAxol | RtMantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
 ) -> None:
@@ -188,7 +195,7 @@ async def _stream_hold_forever(
 
 
 async def move_grippers(
-    robot: RtAxol,
+    robot: RtAxol | RtMantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_grip: float,  # normalized [0, 1] — 0 closed, 1 open
@@ -226,7 +233,7 @@ async def move_grippers(
 
 
 async def sweep_to_target(
-    robot: RtAxol,
+    robot: RtAxol | RtMantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_target: np.ndarray,  # rad
@@ -241,7 +248,7 @@ async def sweep_to_target(
 
 
 async def sweep_unchecked(
-    robot: RtAxol,
+    robot: RtAxol | RtMantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_target: np.ndarray,  # rad
@@ -280,7 +287,7 @@ def with_joint(
 
 
 async def sweep_joint_range(
-    robot: RtAxol,
+    robot: RtAxol | RtMantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     joint: Joint,
@@ -335,7 +342,7 @@ async def sweep_joint_range(
 
 
 async def run_rom_cycle(
-    robot: RtAxol,
+    robot: RtAxol | RtMantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     speed: float,  # rad/s
@@ -476,7 +483,7 @@ async def run_rom_cycle(
     return left_q, right_q
 
 
-async def return_home(robot: RtAxol) -> None:
+async def return_home(robot: RtAxol | RtMantis) -> None:
     """Ease the arms back to home from their current pose, keeping the grippers shut.
 
     Used to bring the robot to a safe home position while it stays clamped on
@@ -500,7 +507,7 @@ async def return_home(robot: RtAxol) -> None:
 async def _confirm(
     instruction: str,
     web_prompts: bool,
-    robot: RtAxol,
+    robot: RtAxol | RtMantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
 ) -> None:
@@ -530,7 +537,7 @@ async def _confirm(
             pass
 
 
-async def _positions(robot: RtAxol) -> tuple[np.ndarray, np.ndarray]:
+async def _positions(robot: RtAxol | RtMantis) -> tuple[np.ndarray, np.ndarray]:
     """Measured positions as (left, right); an absent arm reports home."""
     left, right = await robot.get_positions()
     return (
@@ -547,6 +554,7 @@ async def run_axol(
     capture: bool = True,
     left_channel: str = CAN_LEFT,
     right_channel: str = CAN_RIGHT,
+    target: str = "axol",
 ) -> None:
     run_left = not no_left
     run_right = not no_right
@@ -558,7 +566,7 @@ async def run_axol(
     grasp = present == set(Joint)
     sweep_gripper = has_gripper and not grasp
 
-    print("=== ROM TEST — PHYSICAL ROBOT ===")
+    print(f"=== ROM TEST — {target.upper()} ===")
     print("Make sure the area is clear.")
     arms_desc = (
         "both arms"
@@ -578,14 +586,27 @@ async def run_axol(
         # ROM sweep keeps the default (gentle) torque cap.
         config.left.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
         config.right.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
-    axol = Axol(
-        config=config,
-        left_channel=None if no_left else left_channel,
-        right_channel=None if no_right else right_channel,
-    )
     # Production control path: the Rust core owns the buses and runs the
     # 240 Hz loop; this script only streams targets (see the module docstring).
-    robot = RtAxol(axol)
+    robot: RtAxol | RtMantis
+    axol: Axol | Mantis
+    if target == "mantis":
+        # Grippers-only core on the Mantis buses; the seven arm joints per
+        # side are virtual (they latch the streamed targets), so the sweep
+        # helpers run unchanged and only the gripper physically moves.
+        axol = Mantis(
+            config=config,
+            left_channel=None if no_left else left_channel,
+            right_channel=None if no_right else right_channel,
+        )
+        robot = RtMantis(axol)
+    else:
+        axol = Axol(
+            config=config,
+            left_channel=None if no_left else left_channel,
+            right_channel=None if no_right else right_channel,
+        )
+        robot = RtAxol(axol)
     await robot.enable()
     print("Motors enabled (realtime core armed).")
 
@@ -763,18 +784,24 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
     parser.add_argument(
+        "--target",
+        choices=["axol", "mantis"],
+        default="axol",
+        help="Test the Axol arms or Mantis grippers (default: %(default)s).",
+    )
+    parser.add_argument(
         "--left-channel",
-        default=CAN_LEFT,
+        default=None,
         metavar="IFACE",
         help="SocketCAN interface for the left arm, for setups without the "
-        "Axol hub CAN adapter (default: %(default)s).",
+        "selected hardware's default bus.",
     )
     parser.add_argument(
         "--right-channel",
-        default=CAN_RIGHT,
+        default=None,
         metavar="IFACE",
         help="SocketCAN interface for the right arm, for setups without the "
-        "Axol hub CAN adapter (default: %(default)s).",
+        "selected hardware's default bus.",
     )
     parser.add_argument(
         "--web-prompts",
@@ -807,6 +834,15 @@ def run_cli(args: argparse.Namespace) -> None:
     if args.no_left and args.no_right:
         raise SystemExit("Cannot skip both arms.")
     present = parse_joints(args.joints)
+    if args.target == "mantis":
+        if args.joints and present != {Joint.GRIPPER}:
+            raise SystemExit("Mantis ROM supports only --joints gripper.")
+        present = {Joint.GRIPPER}
+    defaults = (
+        (CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT)
+        if args.target == "mantis"
+        else (CAN_LEFT, CAN_RIGHT)
+    )
     asyncio.run(
         run_axol(
             present=present,
@@ -814,8 +850,9 @@ def run_cli(args: argparse.Namespace) -> None:
             no_right=args.no_right,
             web_prompts=args.web_prompts,
             capture=not args.no_capture,
-            left_channel=args.left_channel,
-            right_channel=args.right_channel,
+            left_channel=args.left_channel or defaults[0],
+            right_channel=args.right_channel or defaults[1],
+            target=args.target,
         )
     )
 

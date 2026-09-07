@@ -27,6 +27,7 @@ import resource
 from pathlib import Path
 
 from .affinity import MAX_FIFO_PRIORITY
+from .paths import ALMOND_HOME_ENV, almond_home
 from .sudo import prime_sudo, run_root
 
 _logger = logging.getLogger(__name__)
@@ -37,15 +38,23 @@ LIMITS_PATH = Path("/etc/security/limits.d/50-axol-rtprio.conf")
 def operator_user() -> str | None:
     """Best-effort login of the operator that runs ``axol`` interactively.
 
-    ``SUDO_USER`` when provisioning runs under ``sudo``; otherwise (a root
-    ``axol serve`` under systemd, or the installer run directly as root) the
-    owner of the first ``/home/*`` entry — the same heuristic the hosted
-    installer uses to locate the dataset owner. ``None`` when neither
-    resolves.
+    ``SUDO_USER`` when provisioning runs under ``sudo``. A root ``axol serve``
+    under systemd has no ``SUDO_USER``, so next the owner of its explicit
+    ``ALMOND_HOME``. Otherwise (older units without that environment, or the
+    installer run directly as root) the owner of the first ``/home/*`` entry —
+    the same heuristic the hosted installer uses to locate the dataset owner.
+    ``None`` when none resolves.
     """
     user = os.environ.get("SUDO_USER")
     if user and user != "root":
         return user
+    if os.environ.get(ALMOND_HOME_ENV):
+        try:
+            user = almond_home().owner()
+            if user != "root":
+                return user
+        except (KeyError, OSError):
+            pass
     try:
         homes = sorted(Path("/home").iterdir())
     except OSError:

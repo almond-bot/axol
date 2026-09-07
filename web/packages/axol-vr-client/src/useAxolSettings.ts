@@ -19,8 +19,8 @@ export type AxolSettingValue = boolean | number | string
  * socket is accepted, while our listener is attached in an effect a render
  * after `connected` flips — on a fast link the push lands first and is lost,
  * and `settings` is only re-sent on change. So once the listener is in place
- * the hook asks for the announces again with `{"type":"get"}` (ignored by
- * older servers).
+ * the hook asks for the session config again with
+ * `{"type":"session-config-request"}` (ignored by older servers).
  *
  * `setSetting(key, value)` sends `{"type":"set","key","value"}` on the socket.
  * `step(def, direction)` is a helper for the generic controls: it computes the
@@ -57,9 +57,11 @@ export function useAxolSettings(
       }
     }
     ws.addEventListener("message", onMessage)
-    // Re-request the connect-time announces now that we're listening (the
-    // server's own copy may have arrived before this effect ran).
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "get" }))
+    // Re-request the connect-time session config now that we're listening
+    // (the server's own copy may have arrived before this effect ran).
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "session-config-request" }))
+    }
     return () => {
       ws.removeEventListener("message", onMessage)
       setSettings(null)

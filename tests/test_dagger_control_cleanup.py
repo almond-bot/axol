@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from almond_axol.cli.collect_dagger import (
     _DaggerControlLoop,
-    _stop_dagger_control_thread,
+    _stop_dagger_control_worker,
 )
 
 
@@ -47,9 +47,10 @@ class DaggerControlCleanupTest(unittest.TestCase):
         control_thread = _BlockingControlThread()
         control_thread.start()
 
-        stopped = _stop_dagger_control_thread(control_thread, timeout_s=1.0)
+        stopped, error = _stop_dagger_control_worker(control_thread, timeout=1.0)
 
         self.assertTrue(stopped)
+        self.assertIsNone(error)
         self.assertTrue(control_thread.shutdown_event.is_set())
         self.assertTrue(control_thread.stopped.is_set())
         self.assertFalse(control_thread.is_alive())
@@ -59,9 +60,10 @@ class DaggerControlCleanupTest(unittest.TestCase):
     ) -> None:
         control_thread = _BlockingControlThread()
 
-        stopped = _stop_dagger_control_thread(control_thread, timeout_s=0.0)
+        stopped, error = _stop_dagger_control_worker(control_thread, timeout=0.0)
 
         self.assertTrue(stopped)
+        self.assertIsNone(error)
         self.assertTrue(control_thread.shutdown_event.is_set())
 
 

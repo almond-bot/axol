@@ -17,6 +17,7 @@ from .config import (
     PositionForceConfig,
 )
 from .jelly import Jelly, JellyConfig
+from .mantis import Mantis, MantisGripperArm
 from .sim import Sim
 
 __all__ = [
@@ -35,4 +36,6 @@ __all__ = [
     "JointConfig",
     "PositionForceConfig",
     "Sim",
+    "Mantis",
+    "MantisGripperArm",
 ]
