@@ -581,17 +581,37 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="boolean",
                 help=(
                     "Start sessions in box mode: the grippers clamp the box "
-                    "between their sides like two flat hands (level, fingers "
-                    "straight forward) and one grip drives both arms by position "
-                    "and heading — the pair stays level (the other "
-                    "hand's grip hands over the lead). Thumbsticks set the grip "
-                    "width and fingertip tilt while a grip leads and drive the "
-                    "base once the pair is frozen. Can also be toggled "
-                    "live from the headset menu or both thumbstick clicks."
+                    "between their sides like two flat hands (level, the "
+                    "tool's contact face along the box side) and one grip "
+                    "drives both arms by position and heading — the pair "
+                    "stays level (the other hand's grip hands over the "
+                    "lead). Thumbsticks set the grip width and tilt trim "
+                    "while a grip leads and drive the base once the pair is "
+                    "frozen. Can also be toggled live from the headset menu "
+                    "or both thumbstick clicks."
                 ),
                 targets={
                     "teleop": ("teleop.box_mode",),
                     "collect-data": (f"{_VRT}.box_mode",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_tool",
+                label="Box-mode gripper",
+                type="select",
+                options=("parcel", "urdf"),
+                help=(
+                    "Which gripper is fitted, for box mode's contact "
+                    "geometry. parcel: the hinged-blade parcel gripper — each "
+                    "gripper is yawed so the folded blade's flat face lies "
+                    "along the box side and the grip width is measured "
+                    "between the two faces. urdf: the stock two-finger "
+                    "gripper — mounts are the width apart, fingers straight "
+                    "forward. Also switchable live from the headset menu."
+                ),
+                targets={
+                    "teleop": ("teleop.box_tool",),
+                    "collect-data": (f"{_VRT}.box_tool",),
                 },
             ),
             SettingDef(

@@ -20,9 +20,20 @@ the closed fingers — the gripper link's ``±X`` side, the jaw's open/close
 axis — faces the box centre, so the box is held between the sides of the two
 grippers by friction. Which of the two flat faces (``+X`` or ``-X``) is
 turned toward the box is chosen per gripper as the one closest to its
-current rotation, so the wrist never flips through 180° to get there. An
+current rotation, so the wrist never flips through 180° to get there (or
+pinned by the config, for a tool that only clamps with one side). An
 optional *tilt* yaws each gripper inward by a few degrees so the wedge-shaped
 finger face lies flush on the box side instead of touching along its heel.
+
+Where on the gripper the box is actually touched is the **tool geometry**
+(:class:`ToolGeometry`): the yaw at which the tool's contact face is
+parallel to the box side and where that face sits relative to the mount.
+``width`` is the separation of the two *contact faces* — the box size — and
+the mounts are placed behind them; ``tilt`` is a trim on top of the tool's
+flush yaw and pivots about the contact face, so trimming keeps the face
+where it is. The stock URDF gripper has a trivial geometry (the mount
+separation is the width, the flat side faces the box at tilt 0); the parcel
+gripper's is derived from its mechanism (:func:`parcel_tool`).
 """
 
 from __future__ import annotations
@@ -39,6 +50,85 @@ _LEFT = np.array((0.0, 1.0, 0.0), dtype=np.float32)
 # Below this horizontal separation the lateral axis is undefined; fall back
 # to world +y (the grippers are stacked vertically or coincident).
 _MIN_LATERAL_M = 1e-3
+
+
+@dataclass(frozen=True)
+class ToolGeometry:
+    """Where a gripper touches the box side, in its own mount frame.
+
+    Attributes:
+        flush_tilt: Inward yaw (rad) at which the tool's contact face is
+            parallel to the box side. Box mode holds each gripper at this
+            yaw plus the operator's tilt trim.
+        foot_fwd: Distance (m) along the fingers (the mount's ``-Z``) from
+            the mount origin to the *foot* — the point of the contact face
+            nearest the mount origin, with the gripper at ``flush_tilt``.
+        foot_in: The foot's distance (m) toward the box, along the flat
+            face turned toward it (the mount's ``±X``, see
+            :func:`side_clamp_rotation`).
+
+    The foot is what box mode places at ``±width / 2``: the two contact
+    faces are then ``width`` apart whatever tool is fitted, and the tilt
+    trim rotates the gripper about its foot so the face stays put.
+    """
+
+    flush_tilt: float = 0.0
+    foot_fwd: float = 0.0
+    foot_in: float = 0.0
+
+    def foot(self, face: float) -> np.ndarray:
+        """Mount-frame vector from the mount origin to the contact foot.
+
+        ``face`` (``±1``) is which flat side (``±X``) faces the box.
+        """
+        return np.array((face * self.foot_in, 0.0, -self.foot_fwd), dtype=np.float32)
+
+
+# The stock URDF gripper as box mode always modelled it: the mount
+# separation is the width and a flat side faces the box at tilt 0.
+URDF_TOOL = ToolGeometry()
+
+# Parcel gripper mechanism (from its CAD, metres): the moving blade's hinge
+# sits this far ahead of the mount flange, on the flange axis, and the blade's
+# contact face is this far from the hinge axis.
+PARCEL_PIVOT_FWD_M = 0.036
+PARCEL_FACE_R_M = 0.029
+
+
+def parcel_tool(
+    open_deg: float,
+    pivot_fwd: float = PARCEL_PIVOT_FWD_M,
+    face_r: float = PARCEL_FACE_R_M,
+) -> ToolGeometry:
+    """Contact geometry of the parcel gripper with its blade folded open.
+
+    The parcel gripper is two flat blades side by side along the fingers
+    direction: a fixed one on the mount axis and a hinged one that swings
+    toward the box side, about a vertical hinge ``pivot_fwd`` ahead of the
+    flange, until it meets its mechanical stop ``open_deg`` from closed.
+    Folded that far back it lies alongside the wrist, and the box side is
+    clamped by that blade's flat face — a large patch *behind* the hinge,
+    roughly centred on the wrist, so a straight lateral squeeze needs
+    almost no wrist moment to keep it flat. For the face to lie on the box
+    side the fixed blade must point ``180° - open_deg`` inward: that is the
+    flush tilt (38.5° at the CAD's 141.5° stop). The foot is the point of
+    the folded face nearest the mount origin: the face plane is ``face_r``
+    from the hinge, so its distance from the mount origin along its normal
+    is ``pivot_fwd * sin(open) + face_r``.
+
+    The fixed blade's tip is ahead of the hinge and, at the CAD stop, ~9 mm
+    *past* the face plane (it would sit exactly on it at ~146°), so with the
+    face flush it hooks the box's front corner or digs in; the tilt trim
+    backs the face off to touch tip-and-heel instead. Both flush at once
+    needs the stop at ~146° (see the config docs).
+    """
+    phi = math.radians(open_deg)
+    # Face normal toward the box, in (forward, inboard) mount coordinates:
+    # the blade closed has its face normal pointing outboard (toward the
+    # fixed blade); the fold turns it through ``phi`` toward the box.
+    n_fwd, n_in = math.sin(phi), -math.cos(phi)
+    c = pivot_fwd * math.sin(phi) + face_r
+    return ToolGeometry(flush_tilt=math.pi - phi, foot_fwd=c * n_fwd, foot_in=c * n_in)
 
 
 def rodrigues(axis: np.ndarray, angle: float) -> np.ndarray:
@@ -62,9 +152,9 @@ def box_frame(
     ``rotation`` is yaw-only (``z`` up, ``y`` along the horizontal direction
     from the right gripper to the left), so a pair whose hands are staggered
     fore/aft engages with that heading rather than being swung square.
-    ``width`` is the full 3-D separation of the two mount frames, so two
-    grippers that start at different heights keep their spacing when the
-    frame levels them.
+    ``width`` is the full 3-D separation of the two mount frames (the grip
+    width box mode tracks is the lateral separation of the tool's contact
+    faces instead, :func:`contact_width`).
     """
     left_pos = np.asarray(left_pos, dtype=np.float64)
     right_pos = np.asarray(right_pos, dtype=np.float64)
@@ -144,11 +234,13 @@ class BoxState:
     the leader gripper's clutch mapping, position and heading only, the
     hand's pitch and roll are ignored (see ``IKWorker``). The thumbsticks own
     the other two numbers:
-    ``width``, the gripper separation, and ``tilt``, the grippers' inward yaw
-    (rad, seeded from the config). ``face`` records which flat face (``±1``,
+    ``width``, the separation of the two contact faces (the box size), and
+    ``tilt``, the grippers' inward yaw trim (rad, seeded from the config) on
+    top of the tool's flush yaw. ``face`` records which flat face (``±1``,
     the gripper's ``±X`` side) each gripper turns toward the box, chosen at
-    the snap; with ``tilt`` it gives each gripper's rotation relative to the
-    box frame (:meth:`grip_rel`).
+    the snap; with ``tilt`` and ``tool`` it gives each gripper's rotation
+    relative to the box frame (:meth:`grip_rel`) and where its mount sits
+    behind the contact face (:meth:`feet`).
     ``align_start`` holds where each gripper actually was at the snap,
     expressed in the box frame, for the blend into the parallel
     configuration.
@@ -164,13 +256,19 @@ class BoxState:
     align_duration: float
     # Wall time of the previous stick integration step (None before the first).
     stick_t: float | None = None
+    tool: ToolGeometry = URDF_TOOL
 
     def grip_rel(self) -> dict[str, np.ndarray]:
         """Each gripper's rotation relative to the box frame (see :func:`side_clamp_rotation`)."""
+        yaw = self.tilt + self.tool.flush_tilt
         return {
-            side: side_clamp_rotation(sign, self.face[side], self.tilt)
+            side: side_clamp_rotation(sign, self.face[side], yaw)
             for side, sign in _SIDE_SIGN.items()
         }
+
+    def feet(self) -> dict[str, np.ndarray]:
+        """Each gripper's mount-frame contact-foot vector (see :class:`ToolGeometry`)."""
+        return {side: self.tool.foot(self.face[side]) for side in _SIDE_SIGN}
 
     @property
     def aligned(self) -> bool:
@@ -214,8 +312,14 @@ def side_clamp_rotation(sign: float, face: float, tilt: float) -> np.ndarray:
     return r0.astype(np.float32)
 
 
+Faces = dict[str, float]
+
+
 def parallel_grip_rel(
-    current: dict[str, np.ndarray], rot: np.ndarray, tilt: float
+    current: dict[str, np.ndarray],
+    rot: np.ndarray,
+    tilt: float,
+    faces: Faces | None = None,
 ) -> dict[str, np.ndarray]:
     """Box-relative rotations of the side-clamping gripper pair.
 
@@ -223,21 +327,34 @@ def parallel_grip_rel(
     and ``tilt`` the inward yaw (rad, see :func:`side_clamp_rotation`). Both
     flat faces of a gripper clamp equally well, so the one needing the
     smaller turn from ``current`` is used (:func:`choose_faces`) — the wrist
-    never has to roll through 180° to reach the grasp.
+    never has to roll through 180° to reach the grasp — unless ``faces``
+    pins a side's face (see :func:`choose_faces`).
     """
-    faces = choose_faces(current, rot, tilt)
+    chosen = choose_faces(current, rot, tilt, faces)
     return {
-        side: side_clamp_rotation(sign, faces[side], tilt)
+        side: side_clamp_rotation(sign, chosen[side], tilt)
         for side, sign in _SIDE_SIGN.items()
     }
 
 
 def choose_faces(
-    current: dict[str, np.ndarray], rot: np.ndarray, tilt: float
-) -> dict[str, float]:
-    """Per gripper, the flat face (``±1``) nearest its ``current`` world rotation."""
-    out: dict[str, float] = {}
+    current: dict[str, np.ndarray],
+    rot: np.ndarray,
+    tilt: float,
+    faces: Faces | None = None,
+) -> Faces:
+    """Per gripper, the flat face (``±1``) nearest its ``current`` world rotation.
+
+    ``faces`` optionally pins a side: a nonzero entry (``±1``) is used as is
+    (a tool that clamps with one particular side, like the parcel gripper's
+    hinged blade); ``0`` or a missing side picks the nearest face.
+    """
+    out: Faces = {}
     for side, sign in _SIDE_SIGN.items():
+        pinned = (faces or {}).get(side, 0.0)
+        if pinned:
+            out[side] = 1.0 if pinned > 0 else -1.0
+            continue
         out[side] = min(
             (1.0, -1.0),
             key=lambda face: rotation_angle(
@@ -247,6 +364,31 @@ def choose_faces(
     return out
 
 
+def contact_width(
+    left_pos: np.ndarray,
+    right_pos: np.ndarray,
+    rot: np.ndarray,
+    grip_rel: dict[str, np.ndarray],
+    feet: dict[str, np.ndarray],
+) -> float:
+    """Lateral separation of the two contact faces for mounts at these positions.
+
+    Each mount's foot is ``rot @ grip_rel[side] @ feet[side]`` from it (the
+    pair held in its box-mode rotations); the width is the distance between
+    the two feet along the box frame's lateral axis. With trivial feet
+    (:data:`URDF_TOOL`) it is the mounts' own lateral separation.
+    """
+    lat = np.asarray(rot, dtype=np.float64)[:, 1]
+    foot = {
+        side: np.asarray(pos, dtype=np.float64)
+        + np.asarray(rot, dtype=np.float64)
+        @ np.asarray(grip_rel[side], dtype=np.float64)
+        @ np.asarray(feet[side], dtype=np.float64)
+        for side, pos in (("left", left_pos), ("right", right_pos))
+    }
+    return float((foot["left"] - foot["right"]) @ lat)
+
+
 def pair_aligned(
     left: Pose,
     right: Pose,
@@ -254,19 +396,28 @@ def pair_aligned(
     width_max: float,
     tilt: float,
     tol_deg: float,
+    tool: ToolGeometry = URDF_TOOL,
+    faces: Faces | None = None,
 ) -> bool:
     """True when the grippers already form the side-clamping pair.
 
     Each gripper is within ``tol_deg`` of the rotation a box-mode engage
     would blend it to (fingers forward, a flat face toward the other
-    gripper; see :func:`parallel_grip_rel`) and their separation is inside
-    ``[width_min, width_max]`` — so switching to box mode from here costs
-    (almost) no alignment blend.
+    gripper; see :func:`parallel_grip_rel`) and their contact-face
+    separation is inside ``[width_min, width_max]`` — so switching to box
+    mode from here costs (almost) no alignment blend.
     """
-    _center, rot, width = box_frame(left[0], right[0])
+    _center, rot, _width = box_frame(left[0], right[0])
+    yaw = tilt + tool.flush_tilt
+    chosen = choose_faces({"left": left[1], "right": right[1]}, rot, yaw, faces)
+    rel = {
+        side: side_clamp_rotation(sign, chosen[side], yaw)
+        for side, sign in _SIDE_SIGN.items()
+    }
+    feet = {side: tool.foot(chosen[side]) for side in _SIDE_SIGN}
+    width = contact_width(left[0], right[0], rot, rel, feet)
     if not (width_min <= width <= width_max):
         return False
-    rel = parallel_grip_rel({"left": left[1], "right": right[1]}, rot, tilt)
     tol = math.radians(tol_deg)
     return all(
         rotation_angle(pose[1], rot @ rel[side]) <= tol
@@ -282,15 +433,28 @@ def snap_box(
     width_min: float,
     width_max: float,
     tilt: float = 0.0,
+    tool: ToolGeometry = URDF_TOOL,
+    faces: Faces | None = None,
 ) -> BoxState:
     """Build the box state for an engage snap from the current gripper poses.
 
-    ``tilt`` is the grippers' starting inward yaw in radians (see
-    :func:`side_clamp_rotation`); the thumbsticks change it live afterwards.
+    ``tilt`` is the grippers' starting inward yaw trim in radians (see
+    :func:`side_clamp_rotation`; the thumbsticks change it live afterwards),
+    ``tool`` the fitted gripper's contact geometry and ``faces`` any pinned
+    clamping faces (:func:`choose_faces`). The starting width is the
+    separation the contact faces would have with the mounts where they are,
+    so a pair already holding a box keeps its grip through the align blend.
     """
-    center, rot, width = box_frame(left[0], right[0])
+    center, rot, _width = box_frame(left[0], right[0])
+    yaw = tilt + tool.flush_tilt
+    face = choose_faces({"left": left[1], "right": right[1]}, rot, yaw, faces)
+    rel = {
+        side: side_clamp_rotation(sign, face[side], yaw)
+        for side, sign in _SIDE_SIGN.items()
+    }
+    feet = {side: tool.foot(face[side]) for side in _SIDE_SIGN}
+    width = contact_width(left[0], right[0], rot, rel, feet)
     width = float(np.clip(width, width_min, width_max))
-    face = choose_faces({"left": left[1], "right": right[1]}, rot, tilt)
     align_start = {
         side: (
             (rot.T @ (pose[0] - center)).astype(np.float32),
@@ -307,24 +471,34 @@ def snap_box(
         align_start=align_start,
         align_t0=now,
         align_duration=max(align_duration, 0.0),
+        tool=tool,
     )
 
 
 def ideal_gripper_poses(
-    center: np.ndarray, rot: np.ndarray, width: float, grip_rel: dict[str, np.ndarray]
+    center: np.ndarray,
+    rot: np.ndarray,
+    width: float,
+    grip_rel: dict[str, np.ndarray],
+    feet: dict[str, np.ndarray] | None = None,
 ) -> dict[str, Pose]:
-    """The parallel-gripper pair for a box pose: ``{"left": pose, "right": pose}``."""
+    """The parallel-gripper pair for a box pose: ``{"left": pose, "right": pose}``.
+
+    The contact feet (see :class:`ToolGeometry`) sit at ``center ± lateral *
+    width / 2``; each mount is its foot vector (``feet``, mount frame)
+    behind that, so a nonzero foot puts the *contact face*, not the mount,
+    ``width / 2`` from the centre. ``feet`` omitted means trivial feet (the
+    mounts themselves are the slots).
+    """
     half = 0.5 * width * rot[:, 1]
-    return {
-        "left": (
-            (center + half).astype(np.float32),
-            (rot @ grip_rel["left"]).astype(np.float32),
-        ),
-        "right": (
-            (center - half).astype(np.float32),
-            (rot @ grip_rel["right"]).astype(np.float32),
-        ),
-    }
+    out: dict[str, Pose] = {}
+    for side, sign in _SIDE_SIGN.items():
+        r = (rot @ grip_rel[side]).astype(np.float32)
+        slot = center + sign * half
+        if feet is not None:
+            slot = slot - r @ feet[side]
+        out[side] = (slot.astype(np.float32), r)
+    return out
 
 
 def box_targets(
@@ -336,7 +510,9 @@ def box_targets(
     snap (carried along with the box) into its parallel slot; afterwards the
     parallel pair is returned directly.
     """
-    ideal = ideal_gripper_poses(center, rot, state.width, state.grip_rel())
+    ideal = ideal_gripper_poses(
+        center, rot, state.width, state.grip_rel(), state.feet()
+    )
     alpha = state.align_alpha(now)
     if alpha >= 1.0:
         return ideal

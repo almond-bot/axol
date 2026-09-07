@@ -10,14 +10,18 @@ import unittest
 import numpy as np
 
 from almond_axol.teleop.box import (
+    URDF_TOOL,
     BoxState,
+    ToolGeometry,
     approach_axis,
     box_frame,
     box_targets,
+    choose_faces,
     elbow_swivel_hint,
     ideal_gripper_poses,
     pair_aligned,
     parallel_grip_rel,
+    parcel_tool,
     rodrigues,
     rotation_angle,
     side_clamp_rotation,
@@ -205,7 +209,10 @@ class SnapBoxTest(unittest.TestCase):
             left, right, now=0.0, align_duration=1.0, width_min=0.1, width_max=0.7
         )
         np.testing.assert_allclose(state.center, (0.4, 0.0, 0.3), atol=1e-6)
-        self.assertAlmostEqual(state.width, math.hypot(0.4, 0.1), places=6)
+        # The grip width is the lateral separation of the contact faces —
+        # for the URDF gripper, of the mounts — not their 3-D distance: the
+        # frame levels the pair, and the box is as wide as they are apart.
+        self.assertAlmostEqual(state.width, 0.4, places=6)
         ideal = ideal_gripper_poses(
             state.center, state.rot, state.width, state.grip_rel()
         )
@@ -285,6 +292,135 @@ class SnapBoxTest(unittest.TestCase):
         # Roll and pitch together do couple a little into the twist (the
         # swing-twist split is not an Euler yaw), but only a little.
         self.assertLess(abs(twist_about(_rot_x(0.6) @ rodrigues(_LAT, -0.3), _UP)), 0.1)
+
+
+def _parcel_pair(width: float, tool: ToolGeometry, face: float, tilt: float = 0.0):
+    """Ideal parcel-gripper pair for a square box frame at ``_pair``'s centre."""
+    rot = np.eye(3, dtype=np.float32)
+    center = np.array((0.4, 0.0, 0.3), dtype=np.float32)
+    rel = {
+        side: side_clamp_rotation(sign, face, tilt + tool.flush_tilt)
+        for side, sign in (("left", 1.0), ("right", -1.0))
+    }
+    feet = {side: tool.foot(face) for side in ("left", "right")}
+    return ideal_gripper_poses(center, rot, width, rel, feet)
+
+
+# Fixed blade tip in the mount frame: 138.5 mm along the fingers, 33.5 mm to
+# the outboard side of the mount axis (from the parcel gripper CAD).
+def _fixed_tip(face: float) -> np.ndarray:
+    return np.array((-face * 0.0335, 0.0, -0.1385), np.float32)
+
+
+class ParcelToolTest(unittest.TestCase):
+    """The parcel gripper's contact geometry: the folded blade's face is what
+    box mode places, ``width`` apart and parallel to the box side."""
+
+    def test_flush_yaw_is_the_supplement_of_the_fold(self) -> None:
+        self.assertAlmostEqual(
+            math.degrees(parcel_tool(141.5).flush_tilt), 38.5, places=6
+        )
+        self.assertAlmostEqual(math.degrees(parcel_tool(150.0).flush_tilt), 30.0)
+        self.assertEqual(URDF_TOOL.flush_tilt, 0.0)
+        np.testing.assert_array_equal(URDF_TOOL.foot(1.0), np.zeros(3))
+
+    def test_face_plane_is_half_a_width_from_the_centre(self) -> None:
+        tool = parcel_tool(141.5)
+        for face in (1.0, -1.0):
+            ideal = _parcel_pair(0.30, tool, face)
+            for side, sign in (("left", 1.0), ("right", -1.0)):
+                pos, rot = ideal[side]
+                foot = pos + rot @ tool.foot(face)
+                # The foot (nearest point of the face to the mount) is at
+                # ±width/2, level with the mount, on the box side of it.
+                self.assertAlmostEqual(float(foot[1]), sign * 0.15, places=6)
+                self.assertAlmostEqual(float(foot[0]), 0.4, places=6)
+                self.assertGreater(abs(float(pos[1])), 0.15)
+                # The face normal (mount → foot) points at the box centre.
+                n = rot @ tool.foot(face)
+                n = n / np.linalg.norm(n)
+                np.testing.assert_allclose(n, (0.0, -sign, 0.0), atol=1e-6)
+                # Blades vertical, fingers 38.5° inward of straight ahead.
+                fwd = approach_axis(rot)
+                self.assertAlmostEqual(float(fwd[2]), 0.0, places=6)
+                self.assertAlmostEqual(
+                    math.degrees(math.atan2(-sign * fwd[1], fwd[0])), 38.5, places=4
+                )
+
+    def test_fixed_tip_reaches_past_the_face_at_the_cad_stop(self) -> None:
+        # At the CAD's 141.5° stop the fixed blade's tip is ~9 mm past the
+        # face plane (inside the box); a 146.2° stop would put it on the plane.
+        for open_deg, past_mm in ((141.5, 9.0), (146.2, 0.0)):
+            tool = parcel_tool(open_deg)
+            pos, rot = _parcel_pair(0.30, tool, 1.0)["left"]
+            tip = pos + rot @ _fixed_tip(1.0)
+            self.assertAlmostEqual((0.15 - float(tip[1])) * 1e3, past_mm, delta=1.0)
+            self.assertGreater(float(tip[0]), 0.4 + 0.10)  # well ahead of the wrist
+
+    def test_tilt_trim_pivots_about_the_foot(self) -> None:
+        tool = parcel_tool(141.5)
+        flat = _parcel_pair(0.30, tool, 1.0)
+        trimmed = _parcel_pair(0.30, tool, 1.0, tilt=0.2)
+        for side in ("left", "right"):
+            p0, r0 = flat[side]
+            p1, r1 = trimmed[side]
+            np.testing.assert_allclose(
+                p0 + r0 @ tool.foot(1.0), p1 + r1 @ tool.foot(1.0), atol=1e-6
+            )
+            self.assertGreater(float(np.linalg.norm(p1 - p0)), 0.005)
+            self.assertAlmostEqual(rotation_angle(r0, r1), 0.2, places=6)
+
+    def test_snap_reads_the_width_off_the_faces_not_the_mounts(self) -> None:
+        tool = parcel_tool(141.5)
+        left, right = (_parcel_pair(0.30, tool, 1.0)[s] for s in ("left", "right"))
+        mount_sep = float(np.linalg.norm(left[0] - right[0]))
+        self.assertGreater(mount_sep, 0.36)
+        state = snap_box(
+            left,
+            right,
+            now=0.0,
+            align_duration=0.0,
+            width_min=0.1,
+            width_max=0.7,
+            tool=tool,
+            faces={"left": 1.0, "right": 1.0},
+        )
+        self.assertAlmostEqual(state.width, 0.30, places=6)
+        # Already in the grasp: the targets are exactly the current poses.
+        targets = box_targets(state, state.center, state.rot, now=0.0)
+        for side, pose in (("left", left), ("right", right)):
+            np.testing.assert_allclose(targets[side][0], pose[0], atol=1e-6)
+            np.testing.assert_allclose(targets[side][1], pose[1], atol=1e-6)
+        self.assertTrue(pair_aligned(left, right, 0.1, 0.7, 0.0, 1.0, tool=tool))
+        # The stock geometry would call this pair 38° off and 0.4 m wide.
+        self.assertFalse(pair_aligned(left, right, 0.1, 0.7, 0.0, 25.0))
+
+    def test_pinned_faces_override_the_nearest(self) -> None:
+        rot = np.eye(3, dtype=np.float32)
+        current = {
+            side: side_clamp_rotation(sign, 1.0, 0.0)
+            for side, sign in (("left", 1.0), ("right", -1.0))
+        }
+        self.assertEqual(choose_faces(current, rot, 0.0), {"left": 1.0, "right": 1.0})
+        self.assertEqual(
+            choose_faces(current, rot, 0.0, {"left": -1.0, "right": 0.0}),
+            {"left": -1.0, "right": 1.0},
+        )
+
+    def test_worker_builds_the_tool_and_faces_from_the_config(self) -> None:
+        worker = object.__new__(IKWorker)
+        worker._config = types.SimpleNamespace(
+            box_tool="parcel",
+            box_tool_open_deg=150.0,
+            box_face_left="-x",
+            box_face_right="auto",
+        )
+        self.assertAlmostEqual(math.degrees(worker._box_tool().flush_tilt), 30.0)
+        self.assertEqual(worker._box_faces(), {"left": -1.0, "right": 0.0})
+        worker._config.box_tool = "urdf"
+        worker._config.box_face_right = "+x"
+        self.assertIs(worker._box_tool(), URDF_TOOL)
+        self.assertEqual(worker._box_faces(), {"left": -1.0, "right": 1.0})
 
 
 class DominantAxisTest(unittest.TestCase):
@@ -649,6 +785,10 @@ class _FakeCore:
     def __init__(self) -> None:
         self.values = {
             "box_mode": True,
+            "box_tool": "parcel",
+            "box_tool_open_deg": 141.5,
+            "box_face_left": "auto",
+            "box_face_right": "auto",
             "reengage": "clutch",
             "hold_to_engage": False,
             "position_multiplier": 1.0,
@@ -699,6 +839,9 @@ def _box_worker(leader: str = "left") -> IKWorker:
         box_align_duration=0.0,
         box_width_min=0.1,
         box_width_max=0.7,
+        box_tool="urdf",
+        box_face_left="auto",
+        box_face_right="auto",
         box_grip_tilt=0.0,
         box_tilt_speed=30.0,
         box_tilt_max=45.0,

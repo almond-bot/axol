@@ -22,14 +22,22 @@ from ..kinematics.config import KinematicsConfig
 from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
 from .box import (
+    URDF_TOOL,
     BoxState,
+    Faces,
     Pose,
+    ToolGeometry,
     blend_pose,
+    box_frame,
     box_targets,
+    choose_faces,
+    contact_width,
     elbow_swivel_hint,
     pair_aligned,
+    parcel_tool,
     rodrigues,
     rotation_angle,
+    side_clamp_rotation,
     smoothstep,
     snap_box,
     twist_about,
@@ -1032,30 +1040,69 @@ class IKWorker:
         would blend it (see :func:`~almond_axol.teleop.box.pair_aligned`) —
         and the gap is inside the box-mode width range, so switching to box
         mode from here costs (almost) no alignment blend. ``width`` is the
-        mount separation in metres and ``tilt`` the pair's current inward
-        fingertip yaw in degrees (``config.box_grip_tilt``, which the sticks
-        write back to).
+        grip width in metres — the separation the fitted tool's contact
+        faces would have with the mounts where they are (the mount
+        separation itself for the URDF gripper) — and ``tilt`` the pair's
+        current inward tilt trim in degrees (``config.box_grip_tilt``, which
+        the sticks write back to).
         """
         left, right = self._solver.fk(q)
-        width = float(
-            np.linalg.norm(
-                np.asarray(right[0], dtype=np.float64)
-                - np.asarray(left[0], dtype=np.float64)
+        tool = self._box_tool()
+        faces = self._box_faces()
+        tilt = math.radians(self._config.box_grip_tilt)
+        _c, rot, sep = box_frame(left[0], right[0])
+        if sep <= 1e-3:
+            width = 0.0
+            aligned = False
+        else:
+            yaw = tilt + tool.flush_tilt
+            chosen = choose_faces({"left": left[1], "right": right[1]}, rot, yaw, faces)
+            rel = {
+                side: side_clamp_rotation(sign, chosen[side], yaw)
+                for side, sign in (("left", 1.0), ("right", -1.0))
+            }
+            width = contact_width(
+                left[0],
+                right[0],
+                rot,
+                rel,
+                {side: tool.foot(chosen[side]) for side in ("left", "right")},
             )
-        )
-        aligned = width > 1e-3 and pair_aligned(
-            left,
-            right,
-            width_min=self._config.box_width_min,
-            width_max=self._config.box_width_max,
-            tilt=math.radians(self._config.box_grip_tilt),
-            tol_deg=_ALIGNED_TOL_DEG,
-        )
+            aligned = pair_aligned(
+                left,
+                right,
+                width_min=self._config.box_width_min,
+                width_max=self._config.box_width_max,
+                tilt=tilt,
+                tol_deg=_ALIGNED_TOL_DEG,
+                tool=tool,
+                faces=faces,
+            )
         return {
             "aligned": bool(aligned),
             "width": round(width, 3),
             "tilt": round(float(self._config.box_grip_tilt), 1),
         }
+
+    def _box_tool(self) -> ToolGeometry:
+        """The fitted gripper's box-mode contact geometry (``config.box_tool``)."""
+        cfg = self._config
+        kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
+        if kind == "parcel":
+            return parcel_tool(float(getattr(cfg, "box_tool_open_deg", 141.5)))
+        if kind != "urdf":
+            _logger.warning(
+                "Unknown box_tool %r; using the URDF gripper geometry", cfg.box_tool
+            )
+        return URDF_TOOL
+
+    def _box_faces(self) -> Faces:
+        """Pinned clamping faces from ``config.box_face_left/right`` (0 = auto)."""
+        out: Faces = {}
+        for side in ("left", "right"):
+            raw = str(getattr(self._config, f"box_face_{side}", "auto")).strip()
+            out[side] = {"+x": 1.0, "-x": -1.0}.get(raw.lower(), 0.0)
+        return out
 
     def clear_engage(self) -> None:
         """Drop engage state without touching the (warm) pose filters.
@@ -1122,8 +1169,9 @@ class IKWorker:
 
         On engage the pair is snapped from FK (:func:`snap_box`), the leader
         controller's pose is anchored, and the grippers are blended into the
-        side-clamping grasp (fingers straight forward, level, flat faces on
-        the box) over ``box_align_duration``. Afterwards the leader hand
+        side-clamping grasp (level, the fitted tool's contact face along the
+        box side — ``config.box_tool``, read at each engage together with
+        the pinned faces) over ``box_align_duration``. Afterwards the leader hand
         drives the pair through the usual per-arm clutch mapping
         (:func:`_relative_target_np`, so moving the hand feels exactly like
         normal teleop) with two of its six degrees of freedom dropped: the
@@ -1154,6 +1202,8 @@ class IKWorker:
                 width_min=cfg.box_width_min,
                 width_max=cfg.box_width_max,
                 tilt=math.radians(cfg.box_grip_tilt),
+                tool=self._box_tool(),
+                faces=self._box_faces(),
             )
             self._box_leader = leader
             self._snap_ctrl = {leader: ctrl[leader]}

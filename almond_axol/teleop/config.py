@@ -137,25 +137,55 @@ class VRTeleopConfig:
             (``VRTeleopCore.set_box_mode``, the headset's **Box** button,
             both thumbstick clicks together, the control panel); this is the
             default it starts in.
-        box_grip_tilt: Starting inward yaw (degrees) of each gripper in box
-            mode. ``0`` points the fingers straight forward, parallel to each
-            other. The closed fingers are a wedge that narrows toward the
-            tip, so with a positive tilt the fingertips turn toward the box
-            centre and the finger's flat face lies flush on the box side
-            instead of touching along its heel; the wedge half-angle (~20°)
-            makes the face fully flat. Negative splays the tips outward.
-            Changed live with either thumbstick's forward/back (pull back =
-            inward, push forward = outward); the value carries over to the
-            next engage.
+        box_tool: Which gripper is fitted, for box mode's contact geometry
+            (:class:`~almond_axol.teleop.box.ToolGeometry`). ``"parcel"``
+            (the default): the parcel gripper — a fixed blade on the mount
+            axis and a hinged blade that folds back toward the box side to a
+            mechanical stop. Box mode yaws each gripper so the folded
+            blade's flat face lies parallel to the box side (``180° -
+            box_tool_open_deg`` inward) and measures the width between the
+            two faces, so the squeeze is a straight push of a flat patch
+            centred on the wrist. ``"urdf"``: the stock two-finger gripper
+            the URDF carries — the mounts themselves are ``width`` apart
+            and the flat side of the closed fingers faces the box at tilt 0.
+            Live-adjustable.
+        box_tool_open_deg: Parcel gripper only: how far (degrees from
+            closed) the hinged blade folds at its open stop. The CAD puts the
+            stop at 141.5°; the flush yaw is ``180°`` minus this. If a flat
+            face won't sit flat, read the tilt trim at which it does (HUD)
+            and *subtract* it from this value. At the CAD stop the fixed
+            blade's tip reaches ~9 mm past the face plane 13 cm ahead of the
+            wrist, so it hooks the box's front corner rather than lying on
+            the side; a stop at ~146° would put the tip on the plane.
+        box_face_left / box_face_right: Which flat side of each gripper
+            (the mount's ``"+x"`` or ``"-x"``) is turned toward the box.
+            ``"auto"`` picks whichever needs the smaller wrist turn at the
+            engage — right for the symmetric URDF gripper, a coin toss for
+            the parcel gripper, whose hinged blade is on one particular
+            side. If a parcel gripper engages with its fixed blade toward
+            the box (the blade folds away from it) or its motor cap
+            downward, pin that arm to the other side. Live-adjustable.
+        box_grip_tilt: Starting inward yaw trim (degrees) of each gripper in
+            box mode, on top of the tool's flush yaw. ``0`` holds the
+            tool's contact face parallel to the box side (for the URDF
+            gripper that is fingers straight forward; its closed fingers
+            are a wedge that narrows toward the tip, so ~20° there lies the
+            finger face flush instead of touching along its heel). Positive
+            turns the fingertips toward the box centre, negative splays them
+            outward; the gripper pivots about its contact face, so the trim
+            doesn't move the point of contact. Changed live with either
+            thumbstick's forward/back (pull back = inward, push forward =
+            outward); the value carries over to the next engage.
         box_tilt_speed: Rate (deg/s) the tilt changes at full stick
             deflection.
-        box_tilt_max: Largest tilt (degrees, either way) the sticks allow.
-        box_width_speed: Rate (m/s) the gripper separation changes at full
-            stick deflection in box mode.
-        box_width_min: Smallest gripper separation (m, between the two
-            gripper mount frames) the box-mode sticks allow.
-        box_width_max: Largest gripper separation (m) the box-mode sticks
+        box_tilt_max: Largest tilt trim (degrees, either way) the sticks
             allow.
+        box_width_speed: Rate (m/s) the grip width changes at full stick
+            deflection in box mode.
+        box_width_min: Smallest grip width (m, between the two grippers'
+            contact faces — for the URDF gripper, between the mount frames)
+            the box-mode sticks allow.
+        box_width_max: Largest grip width (m) the box-mode sticks allow.
         box_align_duration: Seconds over which a box-mode engage blends the
             grippers from their current poses into the parallel
             configuration before the leader controller takes over 1:1.
@@ -360,6 +390,10 @@ class VRTeleopConfig:
     reengage_ramp_speed: float = 0.15
     reengage_ramp_min_s: float = 0.75
     box_mode: bool = False
+    box_tool: str = "parcel"
+    box_tool_open_deg: float = 141.5
+    box_face_left: str = "auto"
+    box_face_right: str = "auto"
     box_grip_tilt: float = 0.0
     box_tilt_speed: float = 30.0
     box_tilt_max: float = 45.0

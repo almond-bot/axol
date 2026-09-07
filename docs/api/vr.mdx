@@ -82,7 +82,7 @@ During data collection the server likewise pushes the current **episode number**
 
 Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whenever the engage toggle changes, so the headset knows when the robot is being controlled — it uses this to only allow repositioning and resizing the camera screens (a trigger gesture) while tracking is disengaged.
 
-Teleop also streams the **arm joint state** at ~20 Hz — `{"type": "joints", "value": {"q": {"<urdf joint>": rad, ...}, "l_grip": 0..1, "r_grip": 0..1, "engaged": bool, "pair": {"aligned": bool, "width": m, "tilt": deg} | null}}` (measured positions when the robot reports them, else the commanded targets) — for the headset's **Ghost** overlay, a translucent copy of the robot posed from the live joints. `pair` is the gripper-pair geometry the IK worker reports a few times a second (`IKWorker.pair_status()`): `aligned` is true when the two grippers already form the box-mode pair — fingers forward, a flat face toward each other across a box-mode-sized gap — the HUD's **Box** button shows *(aligned)* then, since switching to [box mode](/guides/vr-interface#box-mode) from that pose costs no alignment blend; `tilt` is the pair's inward fingertip yaw in degrees (jogged live in box mode), shown on the same button while the mode is on. The URDF and its meshes are served from the same origin under `/urdf/` (`axol.urdf`, `meshes/*.stl`).
+Teleop also streams the **arm joint state** at ~20 Hz — `{"type": "joints", "value": {"q": {"<urdf joint>": rad, ...}, "l_grip": 0..1, "r_grip": 0..1, "engaged": bool, "pair": {"aligned": bool, "width": m, "tilt": deg} | null}}` (measured positions when the robot reports them, else the commanded targets) — for the headset's **Ghost** overlay, a translucent copy of the robot posed from the live joints. `pair` is the gripper-pair geometry the IK worker reports a few times a second (`IKWorker.pair_status()`): `aligned` is true when the two grippers already form the box-mode pair — level, the fitted tool's contact face toward each other across a box-mode-sized gap — the HUD's **Box** button shows *(aligned)* then, since switching to [box mode](/guides/vr-interface#box-mode) from that pose costs no alignment blend; `width` is the grip width (the separation the tool's contact faces would have with the mounts where they are) and `tilt` the pair's inward tilt trim in degrees (set live in box mode), shown on the same button while the mode is on. The URDF and its meshes are served from the same origin under `/urdf/` (`axol.urdf`, `meshes/*.stl`).
 
 ### Live session settings
 
@@ -95,6 +95,9 @@ The knobs an operator can turn *mid-session* — box mode, re-engage behaviour, 
 | Key | Type | Applies |
 |-----|------|---------|
 | `box_mode` | boolean | `VRTeleopCore.set_box_mode()` — switching disengages the arms first |
+| `box_tool` | `"parcel"` / `"urdf"` | which gripper box mode places (its [contact geometry](/guides/vr-interface#box-tool)); read at the next engage |
+| `box_tool_open_deg` | number, ° | parcel gripper's blade fold at its open stop (flush yaw = 180° − this); next engage |
+| `box_face_left` / `box_face_right` | `"auto"` / `"+x"` / `"-x"` | which flat side of each gripper faces the box; next engage |
 | `reengage` | `"clutch"` / `"ramp"` | `VRTeleopCore.set_reengage()` — next grip edge |
 | `hold_to_engage` | boolean | grips as dead-man switches vs. toggles |
 | `gripper_torque` | number, Nm | both grippers' `torque_limit` (read on every gripper command). Hardware only — hidden in sim |

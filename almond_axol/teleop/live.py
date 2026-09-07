@@ -78,6 +78,52 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         ),
     ),
     LiveSettingDef(
+        key="box_tool",
+        label="Box tool",
+        type="select",
+        options=("parcel", "urdf"),
+        help=(
+            "Gripper fitted, for box mode's contact geometry. parcel: the "
+            "hinged-blade parcel gripper — each gripper is yawed so the "
+            "folded blade's flat face lies along the box side and the width "
+            "is measured between the two faces. urdf: the stock two-finger "
+            "gripper — mounts are the width apart, fingers straight forward."
+        ),
+    ),
+    LiveSettingDef(
+        key="box_tool_open_deg",
+        label="Blade stop",
+        type="number",
+        min=120.0,
+        max=170.0,
+        step=0.5,
+        unit="°",
+        help=(
+            "Parcel gripper: fold angle of the hinged blade at its open stop "
+            "(CAD: 141.5°). The flush yaw is 180° minus this. If the face "
+            "sits flat only at a nonzero tilt trim, subtract that trim here."
+        ),
+    ),
+    LiveSettingDef(
+        key="box_face_left",
+        label="Left face",
+        type="select",
+        options=("auto", "+x", "-x"),
+        help=(
+            "Which flat side of the left gripper faces the box in box mode. "
+            "auto: whichever needs the smaller wrist turn. Pin it if the "
+            "parcel gripper engages with its fixed blade toward the box or "
+            "its motor cap down."
+        ),
+    ),
+    LiveSettingDef(
+        key="box_face_right",
+        label="Right face",
+        type="select",
+        options=("auto", "+x", "-x"),
+        help="Same as Left face, for the right gripper.",
+    ),
+    LiveSettingDef(
         key="reengage",
         label="Re-engage",
         type="select",
