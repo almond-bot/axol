@@ -54,7 +54,7 @@ _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 _HOLD_ORPHAN_GRACE_S = 30.0
 
 # Thumbstick deflection below which a stick counts as released — the same
-# deadzone the jog and Jelly apply, so "neutral" here means neither would act.
+# deadzone box mode and Jelly apply, so "neutral" here means neither would act.
 _STICK_NEUTRAL = 0.15
 
 
@@ -282,10 +282,10 @@ class VRTeleopCore:
         self._box_leader: str | None = None
         # Box mode hands the thumbsticks back to Jelly while nobody leads
         # (the pair is frozen holding the box) — but not until the operator
-        # has let the sticks go after the freeze, so a jog that was in
-        # progress when the leader's grip was clicked can't turn into a base
-        # command. Set when the lead drops, cleared by the first neutral
-        # frame; see :attr:`sticks_jog_pair`.
+        # has let the sticks go after the freeze, so a width or tilt change
+        # in progress when the leader's grip was clicked can't turn into a
+        # base command. Set when the lead drops, cleared by the first neutral
+        # frame; see :attr:`pair_owns_sticks`.
         self._box_sticks_held: bool = False
 
         # Re-engage behaviour ("clutch": the controller matches the arm,
@@ -469,7 +469,6 @@ class VRTeleopCore:
             "rotation_multiplier",
             "reengage_ramp_speed",
             "reengage_ramp_min_s",
-            "box_jog_speed",
             "box_width_speed",
             "box_align_duration",
             "box_grip_tilt",
@@ -579,11 +578,11 @@ class VRTeleopCore:
         return self.left_enabled or self.right_enabled
 
     @property
-    def sticks_jog_pair(self) -> bool:
+    def pair_owns_sticks(self) -> bool:
         """True while the thumbsticks belong to the arm pair, not to Jelly.
 
-        In :attr:`box_mode` the sticks jog the pair whenever a grip is
-        leading it. Once the leader freezes the pair (nobody leads), they go
+        In :attr:`box_mode` the sticks set the pair's width and fingertip
+        tilt whenever a grip is leading it. Once the leader freezes the pair (nobody leads), they go
         back to driving the base with the ordinary mapping — so the operator
         grabs the box, freezes, drives across the room, and leads again to
         adjust — after one frame with every stick released (see
@@ -801,10 +800,10 @@ class VRTeleopCore:
         while the other still holds). Both grippers follow the leader's
         trigger.
 
-        The thumbsticks jog the pair while someone leads and drive Jelly
-        while nobody does (:attr:`sticks_jog_pair`); the switch to Jelly
-        waits for a frame with the sticks released so a jog can't carry over
-        into base motion.
+        The thumbsticks set the grasp (width, tilt) while someone leads and
+        drive Jelly while nobody does (:attr:`pair_owns_sticks`); the switch
+        to Jelly waits for a frame with the sticks released so a stick held
+        for the grasp can't carry over into base motion.
         """
         l_lock = bool(frame.l_lock)
         r_lock = bool(frame.r_lock)

@@ -48,13 +48,13 @@ from ..robot.base import (
     RobotBase,
     mark_hardware_cleanup_uncertain,
 )
-from ..robot.jelly import Jelly
 from ..robot.control import ContactWatchdog
+from ..robot.jelly import Jelly
+from ..teleop_activity import TeleopActivityMarker
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
-from ..teleop_activity import TeleopActivityMarker
 from .config import VRTeleopConfig
 from .core import VRTeleopCore
 from .live import LiveSettings
@@ -1071,10 +1071,10 @@ class VRTeleop:
             # The stick → Jelly mapping lives on Jelly (shared with the
             # collect-data flow). Resets force a stop so the base doesn't
             # creep while the arms replay their return-to-rest trajectory;
-            # while a box-mode leader is jogging the arm pair with the sticks
+            # while a box-mode leader owns the sticks (grip width / tilt)
             # Jelly is held stopped the same way (frozen pair: sticks drive).
             self._jelly.apply_vr_frame(
-                frame, resetting=self._core.is_resetting or self._core.sticks_jog_pair
+                frame, resetting=self._core.is_resetting or self._core.pair_owns_sticks
             )
 
     # ------------------------------------------------------------------

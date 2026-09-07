@@ -26,7 +26,7 @@ finger face lies flush on the box side instead of touching along its heel.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -109,12 +109,12 @@ class BoxState:
     identity) frame; the leader controller's translation since its own snap
     is applied to the centre every frame (the box rides on the leader
     gripper's clutch mapping, position only — the hand's rotation is
-    ignored, see ``IKWorker``), then the accumulated stick jog ``jog_pos``
-    (a world-frame offset) on top. ``face`` records which flat face (``±1``,
+    ignored, see ``IKWorker``). The thumbsticks own the other two numbers:
+    ``width``, the gripper separation, and ``tilt``, the grippers' inward yaw
+    (rad, seeded from the config). ``face`` records which flat face (``±1``,
     the gripper's ``±X`` side) each gripper turns toward the box, chosen at
-    the snap; ``tilt`` is the grippers' inward yaw (rad), seeded from the
-    config and jogged live. Together they give each gripper's rotation
-    relative to the box frame (:meth:`grip_rel`).
+    the snap; with ``tilt`` it gives each gripper's rotation relative to the
+    box frame (:meth:`grip_rel`).
     ``align_start`` holds where each gripper actually was at the snap,
     expressed in the box frame, for the blend into the parallel
     configuration.
@@ -128,9 +128,8 @@ class BoxState:
     align_start: dict[str, Pose]
     align_t0: float
     align_duration: float
-    jog_pos: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
-    # Wall time of the previous jog integration step (None before the first).
-    jog_t: float | None = None
+    # Wall time of the previous stick integration step (None before the first).
+    stick_t: float | None = None
 
     def grip_rel(self) -> dict[str, np.ndarray]:
         """Each gripper's rotation relative to the box frame (see :func:`side_clamp_rotation`)."""
@@ -253,7 +252,7 @@ def snap_box(
     """Build the box state for an engage snap from the current gripper poses.
 
     ``tilt`` is the grippers' starting inward yaw in radians (see
-    :func:`side_clamp_rotation`); the jog changes it live afterwards.
+    :func:`side_clamp_rotation`); the thumbsticks change it live afterwards.
     """
     center, rot, width = box_frame(left[0], right[0])
     width = float(np.clip(width, width_min, width_max))

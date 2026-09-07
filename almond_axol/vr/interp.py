@@ -926,7 +926,7 @@ def _build_frame(
         # Cart input is control state, not delayed motion. Preserve the newest
         # thumbstick/click values exactly so interpolation cannot neutralize a
         # drive command or keep a stale lift command alive (the IK worker also
-        # reads them from this rendered frame for box-mode jogging).
+        # reads them from this rendered frame for box-mode width / tilt).
         l_stick_x=latest.l_stick_x,
         l_stick_y=latest.l_stick_y,
         r_stick_x=latest.r_stick_x,
@@ -971,8 +971,8 @@ _STICK_IDLE = 0.05
 
 
 def _same_control(a: VRFrame, b: VRFrame) -> bool:
-    # A deflected stick is never "unchanged": box-mode jogging integrates the
-    # stick over time in the IK worker, which only runs on a fresh frame, so a
+    # A deflected stick is never "unchanged": box mode integrates the stick
+    # (grip width / tilt) over time in the IK worker, which only runs on a fresh frame, so a
     # held stick with a still hand must keep producing new frames.
     if (
         abs(b.l_stick_x) > _STICK_IDLE

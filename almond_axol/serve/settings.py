@@ -584,9 +584,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "between their sides like two flat hands (level, fingers "
                     "straight forward) and one grip drives both arms by position "
                     "only — the pair never rotates (the other "
-                    "hand's grip hands over the lead). Thumbsticks jog the "
-                    "pair while a grip leads it and drive the base once the "
-                    "pair is frozen. Can also be toggled "
+                    "hand's grip hands over the lead). Thumbsticks set the grip "
+                    "width and fingertip tilt while a grip leads and drive the "
+                    "base once the pair is frozen. Can also be toggled "
                     "live from the headset menu or both thumbstick clicks."
                 ),
                 targets={

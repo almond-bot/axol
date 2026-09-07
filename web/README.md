@@ -114,7 +114,7 @@ Each frame sends a JSON message over the WebSocket:
   l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — Jelly strafe (ignored without Jelly)
   l_stick_y: number  // left thumbstick y, [-1, 1], pushed forward = -1 — Jelly drive
   r_stick_x: number  // right thumbstick x, [-1, 1], right = +1 — Jelly rotation
-  r_stick_y: number  // right thumbstick y, [-1, 1], pushed forward = -1 — box-mode jog only (Jelly ignores it)
+  r_stick_y: number  // right thumbstick y, [-1, 1], pushed forward = -1 — box-mode tilt only (Jelly ignores it)
   l_stick_click: boolean  // left thumbstick pressed in — lift down while held
   r_stick_click: boolean  // right thumbstick pressed in — lift up while held (both together: box-mode toggle, sent as a `set` message)
   pose_source_id: string       // stable logical Quest id shared by USB, WebRTC, network, and reconnects
@@ -166,14 +166,14 @@ Box mode is for carrying something with both hands: the grippers clamp the box b
 |---|---|
 | Either grip | Press once to **engage** — the arms first blend into the parallel pair (keeping the current midpoint and width), then the pressed controller **leads**: its movement moves the pair as one body (turning the controller does nothing). Press the *other* grip to hand over the lead to that controller; press the leading grip again to freeze. Press **X** to return to rest as usual |
 | Leader's trigger | Actuates **both** grippers together |
-| Leader's thumbstick | Jog the pair horizontally in the robot's frame (forward = away from the chest; left/right along the gripper-to-gripper line). Hold the stick **clicked** to jog **up/down** (y) instead |
-| Other thumbstick | Jog the pair **up/down** (y) or change the **width** between the grippers (x, push right = wider) — dominant axis only, so a width change never lifts the pair. Hold it **clicked** and push left/right to **tilt** the fingertips inward / outward instead (the **Box** button shows the tilt) |
+| Either thumbstick ← → | Change the **width** between the grippers (push right = wider) — how you clamp the box |
+| Either thumbstick ↑ ↓ | **Tilt** the fingertips: pull back = inward, push forward = outward (the **Box** button shows the tilt) |
 
-Jogging is additive to the controller's motion (both apply while engaged). The thumbsticks belong to the arms only *while a grip is leading*: press the leader's grip again to **freeze** the pair (the arms hold the box where it is) and the sticks drive Jelly with the normal mapping — so carrying is grab, freeze, drive, lead again to adjust. The hand-over waits until both sticks are released, so a jog in progress can't become base motion; squeeze the trigger before taking the lead back, since the grippers follow it. Leaving box mode (same gesture, or the **Box** button) disengages the arms; both grips together engage again as usual.
+Both sticks do the same, there are no click modifiers, and the sticks never move the pair — only the leading hand does; a stick's dominant axis alone counts, so width and tilt never change together. The thumbsticks belong to the arms only *while a grip is leading*: press the leader's grip again to **freeze** the pair (the arms hold the box where it is) and the sticks drive Jelly with the normal mapping — so carrying is grab, freeze, drive, lead again to adjust. The hand-over waits until both sticks are released, so a stick still held can't become base motion; squeeze the trigger before taking the lead back, since the grippers follow it. Leaving box mode (same gesture, or the **Box** button) disengages the arms; both grips together engage again as usual.
 
 ### Session settings
 
-The HUD's **Settings** button opens a panel of **live session settings** — box mode, re-engage behaviour, hold-to-engage, grip force (hardware only), reach scale, arm speed, box jog speed — with `[-]` / `[+]` steppers. The same list appears as a **Session settings** card in the control panel next to the camera feeds. Both are rendered generically from the schema the server publishes (`{"type":"settings"}`) and change values with `{"type":"set","key","value"}` on the VR socket, so a change from either side shows up on both and the server's echo is the single source of truth (a rejected value never echoes). Adding a knob is one entry in `almond_axol/teleop/live.py`.
+The HUD's **Settings** button opens a panel of **live session settings** — box mode, re-engage behaviour, hold-to-engage, grip force (hardware only), reach scale, arm speed — with `[-]` / `[+]` steppers. The same list appears as a **Session settings** card in the control panel next to the camera feeds. Both are rendered generically from the schema the server publishes (`{"type":"settings"}`) and change values with `{"type":"set","key","value"}` on the VR socket, so a change from either side shows up on both and the server's echo is the single source of truth (a rejected value never echoes). Adding a knob is one entry in `almond_axol/teleop/live.py`.
 
 ## State machine
 

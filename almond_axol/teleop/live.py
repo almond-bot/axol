@@ -72,8 +72,8 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         help=(
             "One controller drives both arms as a level parallel-gripper pair "
             "by position only (the pair never rotates); the "
-            "thumbsticks jog the pair while a grip leads and drive Jelly "
-            "once it's frozen. Also toggled by clicking both "
+            "thumbsticks set the grip width and fingertip tilt while a grip "
+            "leads and drive Jelly once it's frozen. Also toggled by clicking both "
             "thumbsticks together. Switching disengages the arms first."
         ),
     ),
@@ -138,16 +138,6 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
             "slow-motion session; the arm then lags a fast hand instead of "
             "following it."
         ),
-    ),
-    LiveSettingDef(
-        key="box_jog_speed",
-        label="Jog speed",
-        type="number",
-        min=0.05,
-        max=0.4,
-        step=0.05,
-        unit="m/s",
-        help="Box-mode thumbstick jog speed of the arm pair at full deflection.",
     ),
 )
 

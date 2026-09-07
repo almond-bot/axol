@@ -65,14 +65,13 @@ export type AxolPoseData = {
   l_stick_y?: number
   /** Right thumbstick x, [-1, 1], right = +1 — Jelly rotation. */
   r_stick_x?: number
-  /** Right thumbstick y, [-1, 1], pushed forward = -1 — box-mode jog only. */
+  /** Right thumbstick y, [-1, 1], pushed forward = -1 — box-mode tilt only. */
   r_stick_y?: number
   /** Left thumbstick pressed in — lift down while held. */
   l_stick_click?: boolean
   /**
-   * Right thumbstick pressed in — lift up while held (in box mode: a jog
-   * modifier — leader stick up/down, other stick fingertip tilt). Both sticks
-   * clicked together toggle box mode (the headset sends the `set` message
+   * Right thumbstick pressed in — lift up while held (nothing while a
+   * box-mode leader is engaged). Both sticks clicked together toggle box mode (the headset sends the `set` message
    * itself, see `AxolVRClient.onBothStickClick`).
    */
   r_stick_click?: boolean
@@ -123,7 +122,7 @@ export type AxolSettings = {
  * the IK worker: `aligned` when the grippers already form the box-mode pair
  * (fingers forward, a flat face toward each other across a box-mode-sized gap
  * — a good moment to switch to box mode), `width` in metres, `tilt` the pair's
- * inward fingertip yaw in degrees (jogged live in box mode). Null until the
+ * inward fingertip yaw in degrees (set live by the sticks in box mode). Null until the
  * worker's first report.
  */
 export type AxolJointState = {

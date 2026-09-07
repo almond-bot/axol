@@ -1,4 +1,4 @@
-"""Box-mode geometry, jog axis lock and the live-setting toggle."""
+"""Box-mode geometry, stick control (width / tilt) and the live-setting toggle."""
 
 from __future__ import annotations
 
@@ -281,10 +281,9 @@ class DominantAxisTest(unittest.TestCase):
         self.assertEqual(_dominant_axis(0.1, 0.5), (0.0, 0.5))
 
 
-def _jog_worker(leader: str = "left") -> IKWorker:
+def _stick_worker(leader: str = "left") -> IKWorker:
     worker = object.__new__(IKWorker)
     worker._config = types.SimpleNamespace(
-        box_jog_speed=0.2,
         box_width_speed=0.1,
         box_width_min=0.1,
         box_width_max=0.7,
@@ -370,7 +369,7 @@ class ElbowSwivelHintTest(unittest.TestCase):
 
 class BoxElbowHintsTest(unittest.TestCase):
     def _worker(self, weight: float = 10.0) -> IKWorker:
-        worker = _jog_worker()
+        worker = _stick_worker()
         worker._config.box_elbow_weight = weight
         worker._solver = types.SimpleNamespace(
             shoulder_positions=(_SHOULDER_L, _SHOULDER_R),
@@ -456,13 +455,13 @@ class SticksDriveJellyTest(unittest.TestCase):
             logging.getLogger("test"),
             broadcast_tracking=lambda _e: None,
         )
-        self.assertFalse(core.sticks_jog_pair)
+        self.assertFalse(core.pair_owns_sticks)
 
-    def test_unled_pair_drives_led_pair_jogs(self) -> None:
+    def test_unled_pair_drives_led_pair_owns_sticks(self) -> None:
         core = self._core()
-        self.assertFalse(core.sticks_jog_pair)  # box mode, nobody leading yet
+        self.assertFalse(core.pair_owns_sticks)  # box mode, nobody leading yet
         self._lead(core)
-        self.assertTrue(core.sticks_jog_pair)
+        self.assertTrue(core.pair_owns_sticks)
 
     def test_freeze_with_sticks_released_hands_over_at_once(self) -> None:
         core = self._core()
@@ -472,144 +471,145 @@ class SticksDriveJellyTest(unittest.TestCase):
             _stick_frame(l_lock=False, r_lock=True)
         )  # leader again: freeze
         self.assertFalse(core.teleop_enabled)
-        self.assertFalse(core.sticks_jog_pair)
+        self.assertFalse(core.pair_owns_sticks)
 
-    def test_freeze_mid_jog_waits_for_neutral_sticks(self) -> None:
+    def test_freeze_with_a_stick_held_waits_for_neutral_sticks(self) -> None:
         core = self._core()
         self._lead(core)
         core.update_engage(_stick_frame(l_lock=False, r_lock=False, r_stick_y=-0.8))
-        # Freeze while the jog stick is still pushed: Jelly must not inherit it.
+        # Freeze while a stick is still pushed: Jelly must not inherit it.
         core.update_engage(_stick_frame(l_lock=False, r_lock=True, r_stick_y=-0.8))
         self.assertFalse(core.teleop_enabled)
-        self.assertTrue(core.sticks_jog_pair)
+        self.assertTrue(core.pair_owns_sticks)
         # Still deflected (or clicked): still held back.
         core.update_engage(_stick_frame(l_lock=False, r_lock=True, r_stick_y=-0.5))
-        self.assertTrue(core.sticks_jog_pair)
+        self.assertTrue(core.pair_owns_sticks)
         core.update_engage(_stick_frame(l_lock=False, r_lock=True, l_stick_click=True))
-        self.assertTrue(core.sticks_jog_pair)
+        self.assertTrue(core.pair_owns_sticks)
         # Released: the sticks are Jelly's from here on.
         core.update_engage(_stick_frame(l_lock=False, r_lock=True))
-        self.assertFalse(core.sticks_jog_pair)
+        self.assertFalse(core.pair_owns_sticks)
         core.update_engage(_stick_frame(l_lock=False, r_lock=True, l_stick_y=-1.0))
-        self.assertFalse(core.sticks_jog_pair)
+        self.assertFalse(core.pair_owns_sticks)
 
     def test_forced_disengage_waits_for_neutral_sticks(self) -> None:
         core = self._core()
         self._lead(core)
         core._disengage_all("stale")
-        self.assertTrue(core.sticks_jog_pair)
+        self.assertTrue(core.pair_owns_sticks)
         core.update_engage(_stick_frame(l_lock=False, r_lock=False))
-        self.assertFalse(core.sticks_jog_pair)
+        self.assertFalse(core.pair_owns_sticks)
 
 
-class JogAxisLockTest(unittest.TestCase):
-    def _jog(
+class StickControlTest(unittest.TestCase):
+    """Box mode's sticks set the grip width (left/right) and fingertip tilt
+    (forward/back), on either stick, one axis at a time, and nothing else."""
+
+    def _sticks(
         self, worker: IKWorker, box: BoxState, frame: VRFrame, dt: float = 0.05
     ) -> None:
-        worker._integrate_jog(frame, box, box.rot, now=10.0)
-        worker._integrate_jog(frame, box, box.rot, now=10.0 + dt)
+        worker._integrate_sticks(frame, box, now=10.0)
+        worker._integrate_sticks(frame, box, now=10.0 + dt)
 
-    def test_width_stick_pushed_sideways_with_a_forward_leak_only_changes_width(
-        self,
-    ) -> None:
-        worker = _jog_worker("left")
+    def test_right_widens_left_narrows(self) -> None:
+        worker = _stick_worker()
         box = _box_state()
-        # Right (other) stick: hard right with a 35 % forward component.
-        self._jog(worker, box, _stick_frame(r_stick_x=0.95, r_stick_y=-0.35))
-        self.assertGreater(box.width, 0.3)
-        np.testing.assert_allclose(box.jog_pos, 0.0, atol=1e-7)
+        self._sticks(worker, box, _stick_frame(r_stick_x=1.0))
+        # 0.1 m/s for 50 ms.
+        self.assertAlmostEqual(box.width, 0.305, places=6)
+        self._sticks(worker, box, _stick_frame(l_stick_x=-1.0))
+        self.assertAlmostEqual(box.width, 0.3, places=6)
+        self.assertEqual(box.tilt, 0.0)
 
-    def test_width_stick_pushed_forward_with_a_side_leak_only_lifts(self) -> None:
-        worker = _jog_worker("left")
+    def test_pull_back_tilts_fingertips_inward_push_forward_outward(self) -> None:
+        worker = _stick_worker()
         box = _box_state()
-        self._jog(worker, box, _stick_frame(r_stick_x=0.3, r_stick_y=-0.9))
-        self.assertEqual(box.width, 0.3)
-        self.assertGreater(float(box.jog_pos[2]), 0.0)
-        np.testing.assert_allclose(box.jog_pos[:2], 0.0, atol=1e-7)
-
-    def test_clicked_leader_stick_is_one_axis_at_a_time(self) -> None:
-        worker = _jog_worker("left")
-        box = _box_state()
-        # Mostly sideways with a forward leak: sideways does nothing while
-        # clicked (the pair never rotates), and the leak must not lift it.
-        self._jog(
-            worker, box, _stick_frame(l_stick_x=0.9, l_stick_y=-0.3, l_stick_click=True)
-        )
-        np.testing.assert_allclose(box.jog_pos, 0.0, atol=1e-7)
-        self.assertEqual(box.width, 0.3)
-        # Mostly forward: lifts, and only lifts.
-        self._jog(
-            worker, box, _stick_frame(l_stick_x=0.3, l_stick_y=-0.9, l_stick_click=True)
-        )
-        self.assertGreater(float(box.jog_pos[2]), 0.0)
-        np.testing.assert_allclose(box.jog_pos[:2], 0.0, atol=1e-7)
-
-    def test_free_leader_stick_keeps_diagonals(self) -> None:
-        worker = _jog_worker("left")
-        box = _box_state()
-        self._jog(worker, box, _stick_frame(l_stick_x=0.7, l_stick_y=-0.7))
-        self.assertGreater(float(box.jog_pos[0]), 0.0)  # forward
-        self.assertLess(float(box.jog_pos[1]), 0.0)  # push right = move right (-y)
-        self.assertEqual(float(box.jog_pos[2]), 0.0)
-
-    def test_roles_follow_the_leader(self) -> None:
-        worker = _jog_worker("right")
-        box = _box_state()
-        # With the right hand leading, the left stick is the width stick.
-        self._jog(worker, box, _stick_frame(l_stick_x=-0.9, l_stick_y=0.2))
-        self.assertLess(box.width, 0.3)
-        np.testing.assert_allclose(box.jog_pos, 0.0, atol=1e-7)
-
-
-class TiltJogTest(unittest.TestCase):
-    def _jog(
-        self, worker: IKWorker, box: BoxState, frame: VRFrame, dt: float = 0.05
-    ) -> None:
-        worker._integrate_jog(frame, box, box.rot, now=10.0)
-        worker._integrate_jog(frame, box, box.rot, now=10.0 + dt)
-
-    def test_clicked_other_stick_left_tilts_fingertips_inward(self) -> None:
-        worker = _jog_worker("left")
-        box = _box_state()
-        self._jog(worker, box, _stick_frame(r_stick_x=-1.0, r_stick_click=True))
+        self._sticks(worker, box, _stick_frame(r_stick_y=1.0))
         # 30 deg/s for 50 ms.
         self.assertAlmostEqual(math.degrees(box.tilt), 1.5, places=5)
-        # Width and position untouched: the click swaps the stick's meaning.
         self.assertEqual(box.width, 0.3)
-        np.testing.assert_allclose(box.jog_pos, 0.0, atol=1e-7)
         # The target rotations follow: the left gripper's fingers now yaw
         # toward the centre (-y), the right's toward +y.
         rel = box.grip_rel()
         self.assertLess(float(approach_axis(rel["left"])[1]), 0.0)
         self.assertGreater(float(approach_axis(rel["right"])[1]), 0.0)
-
-    def test_right_tilts_outward_and_negative_is_allowed(self) -> None:
-        worker = _jog_worker("left")
-        box = _box_state()
-        self._jog(worker, box, _stick_frame(r_stick_x=1.0, r_stick_click=True))
+        self._sticks(worker, box, _stick_frame(l_stick_y=-1.0))
+        self.assertAlmostEqual(math.degrees(box.tilt), 0.0, places=5)
+        self._sticks(worker, box, _stick_frame(l_stick_y=-1.0))
         self.assertAlmostEqual(math.degrees(box.tilt), -1.5, places=5)
 
-    def test_tilt_is_clamped_and_written_back_to_the_config(self) -> None:
-        worker = _jog_worker("left")
+    def test_width_stick_with_a_forward_leak_only_changes_width(self) -> None:
+        worker = _stick_worker()
         box = _box_state()
-        frame = _stick_frame(r_stick_x=-1.0, r_stick_click=True)
-        worker._integrate_jog(frame, box, box.rot, now=0.0)
+        # Hard right with a 35 % forward component.
+        self._sticks(worker, box, _stick_frame(r_stick_x=0.95, r_stick_y=-0.35))
+        self.assertGreater(box.width, 0.3)
+        self.assertEqual(box.tilt, 0.0)
+
+    def test_tilt_stick_with_a_side_leak_only_tilts(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        self._sticks(worker, box, _stick_frame(l_stick_x=0.3, l_stick_y=0.9))
+        self.assertEqual(box.width, 0.3)
+        self.assertGreater(box.tilt, 0.0)
+
+    def test_both_sticks_add_but_never_exceed_full_deflection(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        self._sticks(worker, box, _stick_frame(l_stick_x=1.0, r_stick_x=1.0))
+        self.assertAlmostEqual(box.width, 0.305, places=6)
+        self._sticks(worker, box, _stick_frame(l_stick_x=0.5, r_stick_x=0.5))
+        self.assertAlmostEqual(box.width, 0.310, places=6)
+
+    def test_clicks_are_not_modifiers(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        for click in ("l_stick_click", "r_stick_click"):
+            self._sticks(worker, box, _stick_frame(**{click: True}))
+            self.assertEqual(box.width, 0.3)
+            self.assertEqual(box.tilt, 0.0)
+        # A clicked stick still does its ordinary job.
+        self._sticks(worker, box, _stick_frame(r_stick_x=1.0, r_stick_click=True))
+        self.assertGreater(box.width, 0.3)
+        self.assertEqual(box.tilt, 0.0)
+
+    def test_same_mapping_whichever_hand_leads(self) -> None:
+        for leader in ("left", "right"):
+            with self.subTest(leader=leader):
+                worker = _stick_worker(leader)
+                box = _box_state()
+                self._sticks(worker, box, _stick_frame(l_stick_x=-1.0))
+                self.assertLess(box.width, 0.3)
+                self._sticks(worker, box, _stick_frame(r_stick_y=1.0))
+                self.assertGreater(box.tilt, 0.0)
+
+    def test_resting_sticks_change_nothing(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        self._sticks(worker, box, _stick_frame(l_stick_x=0.1, r_stick_y=-0.1))
+        self.assertEqual(box.width, 0.3)
+        self.assertEqual(box.tilt, 0.0)
+
+    def test_width_is_clamped(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        frame = _stick_frame(r_stick_x=-1.0)
+        worker._integrate_sticks(frame, box, now=0.0)
+        for i in range(1, 100):  # 10 s at 0.1 m/s = 1 m requested
+            worker._integrate_sticks(frame, box, now=0.1 * i)
+        self.assertAlmostEqual(box.width, 0.1, places=6)
+
+    def test_tilt_is_clamped_and_written_back_to_the_config(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        frame = _stick_frame(r_stick_y=1.0)
+        worker._integrate_sticks(frame, box, now=0.0)
         for i in range(1, 200):  # 200 x 0.1 s at 30 deg/s = 600 deg requested
-            worker._integrate_jog(frame, box, box.rot, now=0.1 * i)
+            worker._integrate_sticks(frame, box, now=0.1 * i)
         self.assertAlmostEqual(math.degrees(box.tilt), 45.0, places=5)
         self.assertAlmostEqual(worker._config.box_grip_tilt, 45.0, places=5)
 
-    def test_clicked_other_stick_forward_does_nothing(self) -> None:
-        worker = _jog_worker("left")
-        box = _box_state()
-        self._jog(
-            worker, box, _stick_frame(r_stick_y=-1.0, r_stick_x=0.3, r_stick_click=True)
-        )
-        self.assertEqual(box.tilt, 0.0)
-        self.assertEqual(box.width, 0.3)
-        np.testing.assert_allclose(box.jog_pos, 0.0, atol=1e-7)
-
-    def test_jogged_tilt_seeds_the_next_engage(self) -> None:
+    def test_tilt_seeds_the_next_engage(self) -> None:
         left, right = _pair(0.3)
         state = snap_box(
             left,
@@ -637,7 +637,6 @@ class _FakeCore:
             "hold_to_engage": False,
             "position_multiplier": 1.0,
             "teleop_max_vel": 6.283185307179586,
-            "box_jog_speed": 0.15,
         }
         self.set_calls: list[tuple[str, object]] = []
 
@@ -687,7 +686,6 @@ def _box_worker(leader: str = "left") -> IKWorker:
         box_grip_tilt=0.0,
         box_tilt_speed=30.0,
         box_tilt_max=45.0,
-        box_jog_speed=0.2,
         box_width_speed=0.1,
         box_elbow_out=30.0,
         box_elbow_weight=0.0,
@@ -794,7 +792,7 @@ class LiveToggleTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             live.apply("reengage", "toggle")
         with self.assertRaises(ValueError):
-            live.apply("box_jog_speed", "toggle")
+            live.apply("position_multiplier", "toggle")
 
 
 if __name__ == "__main__":

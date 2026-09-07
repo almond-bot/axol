@@ -78,12 +78,12 @@ _SNAP_ACCEL_MAX = 25.0  # m/s², upper bound for genuine hand acceleration
 _SNAP_CONFIRM_FRAMES = 8  # suspect window length (~65 ms at 120 Hz)
 _SNAP_STABLE_RATIO = 0.5  # offset growth/size below this = shift, else motion
 
-# Box-mode jog (see IKWorker._step_box): stick deflections below this are
-# ignored so a resting stick never creeps the arm pair, and one integration
-# step is capped so a stalled frame stream can't authorise a large jump.
-_JOG_DEADZONE = 0.15
-_JOG_MAX_DT_S = 0.1
-_UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
+# Box-mode sticks (see IKWorker._integrate_sticks): stick deflections below
+# this are ignored so a resting stick never creeps the grip width or tilt,
+# and one integration step is capped so a stalled frame stream can't
+# authorise a large jump.
+_STICK_DEADZONE = 0.15
+_STICK_MAX_DT_S = 0.1
 
 # Gripper-pair status (see IKWorker.pair_status): reported to the core every
 # this many solved frames (~10 Hz at the 120 Hz cadence), and the tolerance
@@ -103,15 +103,15 @@ _RAMP_ANG_SPEED = 0.6  # rad/s
 
 
 def _dz(v: float) -> float:
-    """A thumbstick axis with the jog deadzone applied (``0.0`` when resting)."""
-    return 0.0 if abs(v) < _JOG_DEADZONE else float(v)
+    """A thumbstick axis with the deadzone applied (``0.0`` when resting)."""
+    return 0.0 if abs(v) < _STICK_DEADZONE else float(v)
 
 
 def _dominant_axis(x: float, y: float) -> tuple[float, float]:
     """Keep only the larger of a thumbstick's two axes (deadzoned).
 
-    For sticks whose axes drive different things (width vs. height), so the
-    off-axis leak of a thumb pushed "left" never also moves the other one.
+    The two axes drive different things (width vs. tilt), so the off-axis
+    leak of a thumb pushed "left" never also moves the other one.
     Ties go to ``x``.
     """
     x, y = _dz(x), _dz(y)
@@ -1001,7 +1001,7 @@ class IKWorker:
         """Live-update one :class:`VRTeleopConfig` field (``("set", …)`` message).
 
         Only fields this process reads at step time are meaningful here
-        (multipliers, box jog speeds, ramp pacing); the core validates the
+        (multipliers, box width/tilt rates, ramp pacing); the core validates the
         key before forwarding, so an unknown one is logged and ignored rather
         than raised.
         """
@@ -1030,8 +1030,8 @@ class IKWorker:
         and the gap is inside the box-mode width range, so switching to box
         mode from here costs (almost) no alignment blend. ``width`` is the
         mount separation in metres and ``tilt`` the pair's current inward
-        fingertip yaw in degrees (``config.box_grip_tilt``, which the jog
-        writes back to).
+        fingertip yaw in degrees (``config.box_grip_tilt``, which the sticks
+        write back to).
         """
         left, right = self._solver.fk(q)
         width = float(
@@ -1125,8 +1125,8 @@ class IKWorker:
         (:func:`_relative_target_np`, so moving the hand feels exactly like
         normal teleop) while its rotation is ignored: the pair never turns,
         so lining up on a box is only a matter of where the hands are. The
-        thumbsticks jog the pair in the robot's horizontal frame (see
-        :meth:`_integrate_jog`).
+        thumbsticks set the grip width and fingertip tilt (see
+        :meth:`_integrate_sticks`).
         """
         leader = frame.box_leader
         assert leader in ("left", "right")
@@ -1176,11 +1176,9 @@ class IKWorker:
         # robot's (box.rot is the identity) whatever the hand does — the
         # controller's rotation never reaches the grippers.
         snap_pos, _snap_rot = self._snap_fk[leader]
-        rot = box.rot
-        center = lead_pos + (box.center - snap_pos)
-        self._integrate_jog(frame, box, rot, now)
-        center = (center + box.jog_pos).astype(np.float32)
-        targets = box_targets(box, center, rot, now)
+        center = (lead_pos + (box.center - snap_pos)).astype(np.float32)
+        self._integrate_sticks(frame, box, now)
+        targets = box_targets(box, center, box.rot, now)
         elbows = self._box_elbow_hints(q_current, targets)
         # The posture attractor follows q for the whole of box mode. Pinned at
         # the engage pose (normal teleop's behaviour) it balances the pose
@@ -1265,78 +1263,42 @@ class IKWorker:
             for side, sign in (("left", 1.0), ("right", -1.0))
         }
 
-    def _integrate_jog(
-        self, frame: VRFrame, box: BoxState, rot: np.ndarray, now: float
-    ) -> None:
-        """Accumulate this frame's thumbstick jog into ``box``.
+    def _integrate_sticks(self, frame: VRFrame, box: BoxState, now: float) -> None:
+        """Accumulate this frame's thumbstick input into ``box``.
 
-        Leader stick: forward/back and left/right translate the pair in the
-        robot's horizontal frame (forward = ``+x``, away from the chest;
-        left/right along the gripper-to-gripper line) — a free 2-D jog, so
-        diagonals work. With the stick clicked in, forward/back moves the
-        pair up/down (left/right does nothing: the pair never rotates). The
-        *other* stick's forward/back moves the pair up/down and its left/right
-        widens / narrows the grasp;
-        with *that* stick clicked in, left/right instead tilts the fingertips
-        inward (left) / outward (right) — the grippers' yaw toward the box
-        centre, ``BoxState.tilt``, written back to ``config.box_grip_tilt`` so
-        the next engage starts from it. Where a stick's two axes drive
-        *different* things (the clicked leader stick, the other stick) only
-        its dominant axis counts, so a thumb pushing "left" with a little
-        forward in it changes the width alone and never lifts the pair (see
-        :func:`_dominant_axis`). ``rot`` is the box rotation, used to resolve
-        the horizontal frame.
+        Box mode's sticks do two things and nothing else, and both sticks
+        do the same, so it doesn't matter which hand leads: left/right sets
+        the **width** between the grippers (push right = wider, clamped to
+        ``box_width_min``..``box_width_max``) and forward/back the fingertip
+        **tilt** (pull back = tips inward, more pinch; push forward = outward,
+        ``BoxState.tilt``, written back to ``config.box_grip_tilt`` so the
+        next engage starts from it). Only a stick's dominant axis counts, so a
+        thumb pushing "left" with a little forward in it changes the width
+        alone (see :func:`_dominant_axis`); with both sticks deflected their
+        inputs add, capped at full deflection. Stick clicks mean nothing here
+        (the pair's position is the leader hand's job, not the sticks').
         """
         cfg = self._config
-        dt = 0.0 if box.jog_t is None else min(max(now - box.jog_t, 0.0), _JOG_MAX_DT_S)
-        box.jog_t = now
+        dt = (
+            0.0
+            if box.stick_t is None
+            else min(max(now - box.stick_t, 0.0), _STICK_MAX_DT_S)
+        )
+        box.stick_t = now
         if dt <= 0.0:
             return
 
-        if self._box_leader == "right":
-            sx, sy, click = (
-                _dz(frame.r_stick_x),
-                _dz(frame.r_stick_y),
-                frame.r_stick_click,
-            )
-            ox, oy = _dominant_axis(frame.l_stick_x, frame.l_stick_y)
-            o_click = frame.l_stick_click
-        else:
-            sx, sy, click = (
-                _dz(frame.l_stick_x),
-                _dz(frame.l_stick_y),
-                frame.l_stick_click,
-            )
-            ox, oy = _dominant_axis(frame.r_stick_x, frame.r_stick_y)
-            o_click = frame.r_stick_click
-        if click:
-            sx, sy = _dominant_axis(sx, sy)
-        if not (sx or sy or ox or oy):
+        lx, ly = _dominant_axis(frame.l_stick_x, frame.l_stick_y)
+        rx, ry = _dominant_axis(frame.r_stick_x, frame.r_stick_y)
+        if not (lx or ly or rx or ry):
             return
 
-        fwd = np.array((rot[0, 0], rot[1, 0], 0.0))
-        n = float(np.linalg.norm(fwd))
-        fwd = fwd / n if n > 1e-6 else np.array((1.0, 0.0, 0.0))
-        lat = np.cross(_UP, fwd)
+        x = float(np.clip(lx + rx, -1.0, 1.0))
+        y = float(np.clip(ly + ry, -1.0, 1.0))
+        # Sticks report pushed-forward as -1 (WebXR): pulled back is +1.
+        width_rate = x * cfg.box_width_speed  # push right = wider
+        tilt_rate = y * math.radians(cfg.box_tilt_speed)  # pull back = inward
 
-        # Sticks report pushed-forward as -1 (WebXR), so negate y for "forward".
-        v_fwd = v_lat = v_up = width_rate = tilt_rate = 0.0
-        if click:
-            v_up += -sy * cfg.box_jog_speed
-        else:
-            v_fwd += -sy * cfg.box_jog_speed
-            v_lat += -sx * cfg.box_jog_speed  # push right = move right
-        if o_click:
-            # Push left = fingertips inward (more pinch), right = outward —
-            # the same sense as the width axis (right opens).
-            tilt_rate += -ox * math.radians(cfg.box_tilt_speed)
-        else:
-            v_up += -oy * cfg.box_jog_speed
-            width_rate += ox * cfg.box_width_speed  # push right = wider
-
-        box.jog_pos = (
-            box.jog_pos + dt * (v_fwd * fwd + v_lat * lat + v_up * _UP)
-        ).astype(np.float32)
         if width_rate:
             box.width = float(
                 np.clip(
@@ -1346,7 +1308,7 @@ class IKWorker:
         if tilt_rate:
             limit = math.radians(abs(cfg.box_tilt_max))
             box.tilt = float(np.clip(box.tilt + dt * tilt_rate, -limit, limit))
-            # Carry the jogged tilt into the next engage (and pair_status).
+            # Carry the tilt into the next engage (and pair_status).
             cfg.box_grip_tilt = math.degrees(box.tilt)
 
     def _rest_fk_poses(

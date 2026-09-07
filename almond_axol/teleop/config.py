@@ -125,18 +125,14 @@ class VRTeleopConfig:
             they were, e.g. after someone hand-guided the arms), then follow
             the leader controller's translation.
             While a grip is leading, the thumbsticks stop driving Jelly and
-            become a **jog** instead (freeze the pair — click the leader's
-            grip again — and they drive Jelly as usual, so the box can be
-            carried across the room): the leader stick translates the pair
-            in the horizontal plane
-            (pushed forward = away from the torso, sideways = along the line
-            between the grippers); with the leader stick clicked in,
-            forward/back becomes up/down. The other controller's stick moves
-            the pair up/down (y) and changes the gripper separation (x —
-            right = wider); with that stick clicked in, x tilts the
-            fingertips in/out instead (``box_grip_tilt``). On these, only the
-            stick's dominant axis counts, so a width change never also lifts
-            the pair. The mode is a live setting
+            set the grasp instead (freeze the pair — click the leader's grip
+            again — and they drive Jelly as usual, so the box can be carried
+            across the room). Either stick does the same two things:
+            left/right changes the gripper separation (right = wider), and
+            forward/back tilts the fingertips (pull back = inward, push
+            forward = outward, ``box_grip_tilt``). Only the stick's dominant
+            axis counts, so a width change never also changes the tilt, and
+            stick clicks do nothing while leading. The mode is a live setting
             (``VRTeleopCore.set_box_mode``, the headset's **Box** button,
             both thumbstick clicks together, the control panel); this is the
             default it starts in.
@@ -147,19 +143,18 @@ class VRTeleopConfig:
             centre and the finger's flat face lies flush on the box side
             instead of touching along its heel; the wedge half-angle (~20°)
             makes the face fully flat. Negative splays the tips outward.
-            Jogged live with the other controller's stick clicked in (x:
-            left = inward, right = outward); the jogged value carries over to
-            the next engage.
+            Changed live with either thumbstick's forward/back (pull back =
+            inward, push forward = outward); the value carries over to the
+            next engage.
         box_tilt_speed: Rate (deg/s) the tilt changes at full stick
             deflection.
-        box_tilt_max: Largest tilt (degrees, either way) the jog allows.
-        box_jog_speed: Jog translation speed (m/s) at full stick deflection
-            in box mode.
+        box_tilt_max: Largest tilt (degrees, either way) the sticks allow.
         box_width_speed: Rate (m/s) the gripper separation changes at full
             stick deflection in box mode.
         box_width_min: Smallest gripper separation (m, between the two
-            gripper mount frames) the box-mode jog allows.
-        box_width_max: Largest gripper separation (m) the box-mode jog allows.
+            gripper mount frames) the box-mode sticks allow.
+        box_width_max: Largest gripper separation (m) the box-mode sticks
+            allow.
         box_align_duration: Seconds over which a box-mode engage blends the
             grippers from their current poses into the parallel
             configuration before the leader controller takes over 1:1.
@@ -367,7 +362,6 @@ class VRTeleopConfig:
     box_grip_tilt: float = 0.0
     box_tilt_speed: float = 30.0
     box_tilt_max: float = 45.0
-    box_jog_speed: float = 0.15
     box_width_speed: float = 0.08
     box_width_min: float = 0.10
     box_width_max: float = 0.70

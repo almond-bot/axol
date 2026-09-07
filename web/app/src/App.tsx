@@ -1026,7 +1026,7 @@ function ToolsRow({
   onSet: (key: string, value: boolean | number | string) => void
   aligned: boolean
   // Pair fingertip tilt (degrees); shown on the Box button while box mode is
-  // on so the jog (other stick clicked + left/right) has a readout.
+  // on so the stick control (either stick forward/back) has a readout.
   tilt: number
   ghost: boolean
   onToggleGhost: () => void
@@ -1252,7 +1252,7 @@ function HelpPanel({
     ...(viewOnly
       ? []
       : boxMode
-        ? ["[Grip]  Lead / Freeze Pair", "[Lead Stick]  Jog Pair", "[Lead Click+Stick]  Up / Down"]
+        ? ["[Grip]  Lead / Freeze Pair", "[Stick ←→]  Width", "[Stick ↑↓]  Tilt Out / In"]
         : ["[Grip]  Engage / Freeze Arm", "[Both Clicks]  Box Mode"]),
   ].join("\n")
   const leftRows = [
@@ -1264,8 +1264,8 @@ function HelpPanel({
           ...(boxMode
             ? [
                 "[Grip]  Lead / Freeze Pair",
-                "[Other Stick]  Up / Width",
-                "[Other Click+Stick]  Tilt In / Out",
+                "[Stick ←→]  Width",
+                "[Stick ↑↓]  Tilt Out / In",
                 "[Frozen: Sticks]  Drive Jelly",
                 "[Both Clicks]  Box Mode",
               ]
@@ -1799,7 +1799,7 @@ export default function App() {
                           ...(boxMode
                             ? ([
                                 ["Grip", "Lead both arms"],
-                                ["Stick (other)", "Pair up / down, width; click: tilt in / out"],
+                                ["Stick", "← → width; ↑ ↓ tilt out / in"],
                               ] as [string, string][])
                             : ([
                                 ["Grip", "Engage / freeze arm"],
@@ -1832,7 +1832,7 @@ export default function App() {
                     ...(boxMode
                       ? ([
                           ["Grip", "Lead both arms"],
-                          ["Stick (leader)", "Jog pair; click: up / down"],
+                          ["Stick", "← → width; ↑ ↓ tilt out / in"],
                         ] as [string, string][])
                       : ([["Grip", "Engage / freeze arm"]] as [string, string][])),
                   ]}

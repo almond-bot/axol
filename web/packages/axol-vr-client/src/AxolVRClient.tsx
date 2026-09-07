@@ -14,9 +14,9 @@ const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
 // Longer than a reflexive double click, shorter than a deliberate repeat.
 const BOTH_CLICK_DEBOUNCE_MS = 600
 // The two stick presses must land within this window of each other to count
-// as "clicked together". In box mode each stick's click is also a jog
-// modifier (leader: up / down, other: tilt), so a stick that has been held
-// for a while when the other one is pressed is a modifier, not the gesture.
+// as "clicked together": outside box mode a single click is Jelly's lift
+// (held), so a stick that has been held for a while when the other one is
+// pressed is the lift, not the gesture.
 const BOTH_CLICK_TOGETHER_MS = 350
 
 // Pose sinks (WebSocket and RTCDataChannel) both expose `.send(string)`; this is
@@ -570,7 +570,7 @@ export function AxolVRClient({
     const l_lock = (leftSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
     const r_lock = (rightSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
 
-    // Thumbstick state for the Jelly and the box-mode jog (xr-standard
+    // Thumbstick state for the Jelly and box mode's width / tilt (xr-standard
     // mapping: stick axes at axes[2]/[3], stick click at buttons[3]). Servers
     // without Jelly configured simply ignore these fields.
     const l_stick_x = leftSource?.gamepad?.axes[2] ?? 0
@@ -582,8 +582,8 @@ export function AxolVRClient({
 
     // Both sticks clicked together: box-mode toggle gesture. Fires on the
     // rising edge of "both down" when the two presses landed within
-    // BOTH_CLICK_TOGETHER_MS of each other (a stick already held as a jog
-    // modifier doesn't count), debounced by BOTH_CLICK_DEBOUNCE_MS.
+    // BOTH_CLICK_TOGETHER_MS of each other (a stick already held for the
+    // lift doesn't count), debounced by BOTH_CLICK_DEBOUNCE_MS.
     const now = performance.now()
     if (l_stick_click && !prevLClickRef.current) lClickAtRef.current = now
     if (r_stick_click && !prevRClickRef.current) rClickAtRef.current = now
