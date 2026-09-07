@@ -5,11 +5,6 @@ description: "DAgger data collection: a trained policy drives while the operator
 
 Runs a trained policy on the robot while the operator watches in VR and steps in to correct it, recording the whole session — policy segments **and** human corrections — to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. It's the [DAgger](https://arxiv.org/abs/1011.0686) loop: gather demonstrations exactly where the policy struggles, so a retrain fixes those failures. Inference runs in-process (one action per control tick), and everything else — cameras, recording, the guarded return-to-rest — follows [`collect-data`](/cli/collect-data). Loops until `Ctrl+C`.
 
-<Note>
-  Hosted runs are confined to `/var/lib/almond-axol/datasets`; direct non-root
-  CLI runs retain the operator's normal HuggingFace cache.
-</Note>
-
 <Warning>
   Load only policy checkpoints and resumed datasets that you created or
   obtained from a trusted source. Upstream model deserialization and dataset

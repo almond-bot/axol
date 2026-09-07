@@ -37,11 +37,7 @@ from ..constants import (
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
-from ..utils.state_files import (
-    mark_privileged_service,
-    privileged_service_active,
-    validated_service_dataset_root,
-)
+from ..utils.state_files import mark_privileged_service
 from ..utils.sudo import prime_sudo
 from .commands import (
     COMMANDS,
@@ -2126,19 +2122,16 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def get_datasets() -> dict[str, Any]:
         """LeRobot datasets on this host, newest first.
 
-        A hosted root service always scans its validated immutable dataset
-        store. A plain non-root embedding retains the shared ``recording.root``
-        setting/default used by direct CLI commands.
+        Scans the shared ``recording.root`` setting when set (the directory
+        collect-data writes to), otherwise the LeRobot cache dir — the same
+        place replay-dataset resolves a bare repo id against.
         """
         from pathlib import Path
 
         from ..recording.datasets import list_datasets
 
-        if privileged_service_active():
-            base = validated_service_dataset_root()
-        else:
-            stored_root = settings.snapshot()["values"].get("recording.root")
-            base = Path(str(stored_root)).expanduser() if stored_root else None
+        stored_root = settings.snapshot()["values"].get("recording.root")
+        base = Path(str(stored_root)).expanduser() if stored_root else None
         found = await asyncio.to_thread(list_datasets, base)
         return {
             "datasets": [

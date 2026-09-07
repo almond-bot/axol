@@ -669,36 +669,34 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("in use", response.json()["error"])
         detect.assert_not_called()
 
-    async def test_hosted_dataset_listing_ignores_custom_root_and_symlink(self) -> None:
-        boundary = Path("/var/lib/almond-axol/datasets")
-        with tempfile.TemporaryDirectory() as directory:
-            linked_root = Path(directory) / "custom-root"
-            linked_root.symlink_to("/etc", target_is_directory=True)
-            settings = _Settings(str(linked_root))
-            with (
-                patch.object(
-                    app_module, "privileged_service_active", return_value=True
-                ),
-                patch.object(
-                    app_module,
-                    "validated_service_dataset_root",
-                    return_value=boundary,
-                ),
-                patch(
-                    "almond_axol.recording.datasets.list_datasets",
-                    return_value=[],
-                ) as list_datasets,
-            ):
-                app = _test_app(_Manager(), _Runner(), settings=settings)
-                transport = httpx.ASGITransport(app=app)
-                async with httpx.AsyncClient(
-                    transport=transport,
-                    base_url="http://test",
-                ) as client:
-                    response = await client.get("/api/datasets")
+    async def test_dataset_listing_follows_the_recording_root_setting(self) -> None:
+        # The root service lists the same tree collect-data writes to: the
+        # ``recording.root`` setting, defaulting to HF_LEROBOT_HOME (the
+        # operator's ~/.cache/huggingface/lerobot) when unset.
+        for stored_root, expected in (
+            ("/home/operator/datasets", Path("/home/operator/datasets")),
+            (None, None),
+        ):
+            with self.subTest(stored_root=stored_root):
+                settings = _Settings(stored_root)
+                with (
+                    patch.object(app_module.os, "geteuid", return_value=0),
+                    patch.object(app_module.os, "umask"),
+                    patch(
+                        "almond_axol.recording.datasets.list_datasets",
+                        return_value=[],
+                    ) as list_datasets,
+                ):
+                    app = _test_app(_Manager(), _Runner(), settings=settings)
+                    transport = httpx.ASGITransport(app=app)
+                    async with httpx.AsyncClient(
+                        transport=transport,
+                        base_url="http://test",
+                    ) as client:
+                        response = await client.get("/api/datasets")
 
-        self.assertEqual(response.status_code, 200)
-        list_datasets.assert_called_once_with(boundary)
+                self.assertEqual(response.status_code, 200)
+                list_datasets.assert_called_once_with(expected)
 
     async def test_root_create_app_marks_privileged_embedding(self) -> None:
         with (
@@ -1555,20 +1553,14 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         self.assertEqual(link.channels(), (None, None))
         link.hub.clear_slow.assert_not_called()
 
-    def test_hosted_root_override_is_reflected_in_session_args(self) -> None:
-        boundary = Path("/var/lib/almond-axol/datasets")
+    def test_hosted_recording_root_is_reflected_in_session_args(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = SettingsStore(Path(directory) / "settings.json")
-            settings.update(values={"recording.root": "/home/operator/legacy"})
+            settings.update(values={"recording.root": "/home/operator/datasets"})
             runner = OperationRunner(settings=settings)
             with (
                 patch.object(
                     state_files, "privileged_service_active", return_value=True
-                ),
-                patch.object(
-                    state_files,
-                    "service_dataset_path_for_repo_id",
-                    return_value=boundary / "owner" / "dataset",
                 ),
                 patch.object(
                     runner,
@@ -1577,12 +1569,9 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
                 ),
                 patch.object(threading.Thread, "start"),
             ):
-                session = runner.start(
-                    "replay-dataset",
-                    {"repo_id": "owner/dataset", "root": "/etc"},
-                )
+                session = runner.start("replay-dataset", {"repo_id": "owner/dataset"})
 
-        self.assertEqual(session.args["root"], str(boundary / "owner" / "dataset"))
+        self.assertEqual(session.args["root"], "/home/operator/datasets")
 
     def test_robot_link_disconnect_refuses_busy_owner(self) -> None:
         link = object.__new__(RobotLink)

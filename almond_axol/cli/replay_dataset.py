@@ -289,10 +289,6 @@ def _finish_replay_cleanup(
 
 def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) -> None:
     """Load the episode, return to rest, replay its actions, then return to rest."""
-    from ..utils.state_files import require_service_dataset_configuration
-
-    require_service_dataset_configuration()
-
     from ..lerobot.robot.config_mantis import MantisRobotConfig
 
     if isinstance(cfg.robot_config, MantisRobotConfig):
@@ -320,30 +316,19 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     # --root. LeRobotDataset only needs a valid-looking repo id once a root
     # is given, so the directory name stands in for it.
     from ..recording.datasets import is_dataset_dir, list_datasets
-    from ..utils.state_files import (
-        confine_service_dataset_path,
-        privileged_service_active,
-    )
+    from ..utils.state_files import privileged_service_active
 
     repo_path = Path(repo_id).expanduser()
-    hosted_service = privileged_service_active()
     # Plain CLI users may replay an arbitrary local dataset by path. The root
-    # service must not probe an operator-supplied filesystem path before it has
-    # been confined to the configured LeRobot tree, so it deliberately skips
-    # this path shorthand and treats the value as a repo id instead.
-    if root is None and not hosted_service and is_dataset_dir(repo_path):
+    # service resolves repo ids against the configured LeRobot tree only, so it
+    # deliberately skips this path shorthand and treats the value as a repo id.
+    if root is None and not privileged_service_active() and is_dataset_dir(repo_path):
         root = str(repo_path)
         repo_id = repo_path.name
 
     # Verify the dataset is present and complete before loading (a clear error
     # beats LeRobotDataset's deeper failure, and mirrors collect-data's checks).
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
-    if hosted_service:
-        dataset_root = confine_service_dataset_path(
-            dataset_root,
-            label="replay dataset root",
-        )
-        root = str(dataset_root)
     meta = dataset_root / "meta"
     if not (meta / "info.json").exists():
         available = list_datasets()

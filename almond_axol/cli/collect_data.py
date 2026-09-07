@@ -1109,10 +1109,6 @@ def _run_session(
     with the VR headset events inside the episode loop; ``None`` (plain CLI)
     leaves the VR headset as the only episode-control source.
     """
-    from ..utils.state_files import require_service_dataset_configuration
-
-    require_service_dataset_configuration()
-
     import numpy as np
     from lerobot.processor import make_default_processors
     from lerobot.teleoperators.utils import TeleopEvents
@@ -1154,17 +1150,6 @@ def _run_session(
     rerun_port = cfg.rerun_port
 
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
-    from ..utils.state_files import (
-        confine_service_dataset_path,
-        privileged_service_active,
-    )
-
-    if privileged_service_active():
-        dataset_root = confine_service_dataset_path(
-            dataset_root,
-            label="recording dataset root",
-        )
-        root = str(dataset_root)
 
     # Flag physically-stereo ZED X before the relay/robot opens the cameras so
     # the relay and in-process fallback both use the stereo grab path. The pure

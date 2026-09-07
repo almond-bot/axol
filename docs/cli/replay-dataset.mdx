@@ -10,9 +10,9 @@ No cameras, teleop, or policy server are involved: replay only drives the arms, 
 Pass `--loop` to replay the episode continuously (returning to rest between takes) until you stop it with `Ctrl+C` (or **Stop** in the [control panel](/guides/control-panel)); either way the arm returns to the rest pose before the operation exits.
 
 <Note>
-  The hosted service only replays datasets below its root-owned store at
-  `/var/lib/almond-axol/datasets`; arbitrary filesystem paths remain available
-  to direct non-root CLI use.
+  The hosted control panel resolves `--repo_id` against the configured dataset
+  root only; passing a dataset *directory* as `--repo_id` is a direct-CLI
+  shorthand.
 </Note>
 
 <Warning>

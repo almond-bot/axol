@@ -1,16 +1,24 @@
-"""Expose root-recorded datasets without making their write path untrusted.
+"""Restore operator ownership of datasets recorded by the root service.
 
 The installer registers ``axol.service`` as root (it needs CAN bring-up, the
-ZED cameras, and realtime scheduling). Hosted LeRobot writes stay below a
-root-owned, non-writable ``/var/lib`` boundary so an operator cannot redirect a
-pathname open with a symlink race. After each save this module normalizes the
-tree to root ownership, operator-group read/traverse access, directories 2750,
-and files 0640. The login account can inspect/copy/upload datasets but cannot
-mutate the live writer tree.
+ZED cameras, and realtime scheduling) but points ``HF_LEROBOT_HOME`` at the
+installing user's ``~/.cache/huggingface/lerobot``, so datasets recorded from
+the control panel land root-owned inside a user directory. LeRobot writes the
+episode mp4s through ``mkstemp``, which is always mode 0600, so those aren't
+even world-readable like the parquet and meta files — the operator ends up
+needing sudo to copy, inspect, or upload their own recording.
 
-The historical direct-root CLI fallback still adopts files to the nearest
-non-root ancestor, but does so through pinned no-follow descriptors and rejects
-hard links/special files. Ordinary non-root CLI sessions are a no-op.
+:func:`restore_dataset_ownership` hands the tree back. The recording commands
+call it after every episode save — so even a crashed session leaves
+operator-owned files — and again after the dataset is finalized, which writes
+the last meta/stats files. The operator is identified as the owner of the
+nearest non-root ancestor (the lerobot home the installer created as the
+invoking user), and root-owned intermediates below it (the HuggingFace
+``<org>/`` directory LeRobot creates) are adopted too.
+
+Every traversal and chown goes through pinned no-follow directory descriptors
+and rejects hard links/special files, so a concurrent swap of a path component
+cannot redirect root's chown to an attacker-selected tree.
 
 A no-op unless running as root, so plain CLI sessions are untouched, and
 best-effort throughout: an episode save must never fail on a chown.
@@ -21,39 +29,18 @@ import os
 from pathlib import Path
 
 from ..utils.state_files import (
-    confine_service_dataset_path,
-    privileged_service_active,
     secure_chown_directory,
     secure_chown_tree,
     secure_directory_stat,
-    service_operator_gid,
 )
 
 _logger = logging.getLogger(__name__)
 
 
 def restore_dataset_ownership(dataset_root: Path) -> None:
-    """Make a root-recorded dataset safely readable (see module doc)."""
+    """Chown a root-recorded dataset tree back to the operator (see module doc)."""
     try:
         if os.geteuid() != 0:
-            return
-        if privileged_service_active():
-            dataset_root = confine_service_dataset_path(
-                dataset_root,
-                label="recorded dataset root",
-            )
-            gid = service_operator_gid()
-            # Hosted datasets remain root-owned and non-writable to the login
-            # account, closing all path-swap races in third-party writers. Give
-            # the operator's group read/traverse access after each save; files
-            # created by mkstemp(0600) become readable without becoming mutable.
-            secure_chown_tree(
-                dataset_root,
-                0,
-                gid,
-                directory_mode=0o2750,
-                file_mode=0o640,
-            )
             return
         # The operator owns the nearest non-root ancestor (the lerobot home the
         # installer created). All-root ancestry means the dataset really does

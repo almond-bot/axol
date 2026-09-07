@@ -13,17 +13,13 @@ axol serve --port 9000
 axol serve --open             # also open a browser window on startup
 axol serve --host 127.0.0.1   # localhost only
 axol serve --no-tls           # plain HTTP instead of HTTPS
-sudo "$(command -v axol)" serve              # hardware development; uses SUDO_USER
-axol serve --operator axoldev                 # explicit operator from a root shell
+sudo "$(command -v axol)" serve              # hardware development (CAN setup, ZED daemon)
 ```
 
 The root development form lets the panel run CAN discovery/setup and restart
-the ZED daemon. It records into the same fixed
-`/var/lib/almond-axol/datasets` boundary as the installed service; `--operator`
-selects the non-root account/group that receives read-only dataset access while
-the store remains root-owned and non-writable. A normal `sudo` launch infers
-that account from `SUDO_USER`; passing it explicitly also works from a root
-shell. Custom dataset roots are intentionally unavailable to a root serve.
+the ZED daemon. Datasets go to `$HF_LEROBOT_HOME` (or the panel's **Dataset
+root** setting); when that lives in a user's home, each recording is handed
+back to that user after every episode save, as with the installed service.
 
 <Tip>
   For a guided walkthrough of the control panel — connecting the Axol host and Axol, assigning the cameras, and running each operation — see the [Web Control Panel guide](/guides/control-panel).
@@ -35,7 +31,6 @@ shell. Custom dataset roots are intentionally unavailable to a root serve.
 | `--port INT` | Port to listen on. Default `8001`. |
 | `--open` | Open a browser window on startup. Off by default. |
 | `--no-tls` | Serve plain HTTP instead of HTTPS. TLS is on by default. |
-| `--operator USER` | Non-root account that may read datasets written by a manual root serve. Defaults to `SUDO_USER`; required when starting directly from a root shell. Ignored for non-root serves. |
 
 <Warning>
   `axol serve` is a trusted-LAN control service, not a multi-user authenticated API. Keep ports 8000/8001 behind the robot network or a host firewall; do not expose them directly to the internet.
