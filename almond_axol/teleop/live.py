@@ -78,6 +78,19 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         ),
     ),
     LiveSettingDef(
+        key="box_grasp",
+        label="Box grasp",
+        type="select",
+        options=("flush", "straight"),
+        help=(
+            "flush: the tool's contact face along the box side (parcel "
+            "gripper: the folded blade's face, grippers yawed 38.5° inward, "
+            "width between the faces). straight: fingers straight forward, "
+            "width between the mounts. Also toggled by clicking either "
+            "thumbstick while a grip leads; the pair blends over to it."
+        ),
+    ),
+    LiveSettingDef(
         key="box_tool",
         label="Box tool",
         type="select",

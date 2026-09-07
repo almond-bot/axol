@@ -174,9 +174,11 @@ class VRFrame(BaseModel):
             by Jelly; in box mode it tilts the fingertips.
         l_stick_click: Left thumbstick pressed in — lift down while held.
         r_stick_click: Right thumbstick pressed in — lift up while held.
-            While a box-mode leader is engaged the clicks do nothing (the
-            sticks set the grip width and tilt, no modifiers); with the pair
-            frozen the sticks drive Jelly as usual. Both sticks clicked
+            While a box-mode leader is engaged a single click (and release)
+            of either stick toggles the grasp (flush face / fingers straight,
+            ``box_grasp``) — the sticks themselves set the grip width and
+            tilt, no modifiers; with the pair frozen the sticks drive Jelly
+            as usual. Both sticks clicked
             *together* toggle **box mode** (handled on the headset, which
             sends the ``set`` message; see
             :meth:`almond_axol.vr.server.VRServer.set_on_setting`).

@@ -133,7 +133,8 @@ class VRTeleopConfig:
             forward/back tilts the fingertips (pull back = inward, push
             forward = outward, ``box_grip_tilt``). Only the stick's dominant
             axis counts, so a width change never also changes the tilt, and
-            stick clicks do nothing while leading. The mode is a live setting
+            a single stick click toggles the grasp (``box_grasp``: flush face
+            or fingers straight). The mode is a live setting
             (``VRTeleopCore.set_box_mode``, the headset's **Box** button,
             both thumbstick clicks together, the control panel); this is the
             default it starts in.
@@ -157,6 +158,18 @@ class VRTeleopConfig:
             blade's tip reaches ~9 mm past the face plane 13 cm ahead of the
             wrist, so it hooks the box's front corner rather than lying on
             the side; a stop at ~146° would put the tip on the plane.
+        box_grasp: Which of box mode's two grasps a session starts in.
+            ``"flush"`` (the default): the fitted tool's contact face along
+            the box side — for the parcel gripper the folded blade's face,
+            with the grippers yawed ``180° - box_tool_open_deg`` inward and
+            the width measured between the faces. ``"straight"``: fingers
+            straight forward (yaw 0), width between the mount frames — the
+            plain flat-hands grasp, for boxes the tips or the closed blades
+            take. Toggled live while a grip is leading by clicking (and
+            releasing) either thumbstick — a click that turns into the
+            both-sticks box-mode gesture doesn't count — or from the
+            settings; the pair blends into the new grasp over
+            ``box_align_duration``. The tilt trim applies on top of either.
         box_face_left / box_face_right: Which flat side of each gripper
             (the mount's ``"+x"`` or ``"-x"``) is turned toward the box.
             ``"auto"`` picks whichever needs the smaller wrist turn at the
@@ -392,6 +405,7 @@ class VRTeleopConfig:
     box_mode: bool = False
     box_tool: str = "parcel"
     box_tool_open_deg: float = 141.5
+    box_grasp: str = "flush"
     box_face_left: str = "auto"
     box_face_right: str = "auto"
     box_grip_tilt: float = 0.0

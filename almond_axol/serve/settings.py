@@ -615,6 +615,25 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="teleop.box_grasp",
+                label="Box-mode grasp",
+                type="select",
+                options=("flush", "straight"),
+                help=(
+                    "Which grasp a box-mode session starts in. flush: the "
+                    "fitted gripper's contact face along the box side (parcel "
+                    "gripper: the folded blade's face, grippers yawed 38.5° "
+                    "inward, width between the faces). straight: fingers "
+                    "straight forward, width between the mounts. In the "
+                    "headset a click of either thumbstick while leading "
+                    "toggles between the two; the arms blend over."
+                ),
+                targets={
+                    "teleop": ("teleop.box_grasp",),
+                    "collect-data": (f"{_VRT}.box_grasp",),
+                },
+            ),
+            SettingDef(
                 key="teleop.reengage",
                 label="Re-engage",
                 type="select",

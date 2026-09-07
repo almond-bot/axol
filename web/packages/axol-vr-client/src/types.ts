@@ -70,8 +70,9 @@ export type AxolPoseData = {
   /** Left thumbstick pressed in — lift down while held. */
   l_stick_click?: boolean
   /**
-   * Right thumbstick pressed in — lift up while held (nothing while a
-   * box-mode leader is engaged). Both sticks clicked together toggle box mode (the headset sends the `set` message
+   * Right thumbstick pressed in — lift up while held (while a box-mode
+   * leader is engaged a single click of either stick toggles the grasp, flush
+   * / straight). Both sticks clicked together toggle box mode (the headset sends the `set` message
    * itself, see `AxolVRClient.onBothStickClick`).
    */
   r_stick_click?: boolean
@@ -130,5 +131,5 @@ export type AxolJointState = {
   l_grip: number
   r_grip: number
   engaged: boolean
-  pair: { aligned: boolean; width: number; tilt: number } | null
+  pair: { aligned: boolean; width: number; tilt: number; grasp: string } | null
 }

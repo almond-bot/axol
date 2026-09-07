@@ -1029,6 +1029,10 @@ class IKWorker:
         except (TypeError, ValueError):
             _logger.warning("Ignoring live update %s=%r (bad value)", key, value)
             return
+        if key == "box_grasp" and coerced != current and self._box is not None:
+            # Switch grasps under a live pair the same way a stick click does:
+            # re-snap, so the arms blend into the new configuration.
+            self._box = None
         setattr(self._config, key, coerced)
 
     def pair_status(self, q: np.ndarray) -> dict:
@@ -1082,11 +1086,25 @@ class IKWorker:
             "aligned": bool(aligned),
             "width": round(width, 3),
             "tilt": round(float(self._config.box_grip_tilt), 1),
+            "grasp": self._box_grasp(),
         }
 
+    def _box_grasp(self) -> str:
+        """The current box-mode grasp, ``"flush"`` or ``"straight"`` (``config.box_grasp``)."""
+        raw = str(getattr(self._config, "box_grasp", "flush")).strip().lower()
+        return "straight" if raw == "straight" else "flush"
+
     def _box_tool(self) -> ToolGeometry:
-        """The fitted gripper's box-mode contact geometry (``config.box_tool``)."""
+        """The box-mode contact geometry for the current grasp and tool.
+
+        The ``"straight"`` grasp is the plain flat-hands geometry whatever is
+        fitted — fingers straight forward, width between the mounts
+        (:data:`URDF_TOOL`); ``"flush"`` uses the fitted tool's
+        (``config.box_tool``).
+        """
         cfg = self._config
+        if self._box_grasp() == "straight":
+            return URDF_TOOL
         kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
         if kind == "parcel":
             return parcel_tool(float(getattr(cfg, "box_tool_open_deg", 141.5)))
@@ -1179,7 +1197,9 @@ class IKWorker:
         vertical (:func:`twist_about`, applied about the pair's centre so a
         wrist turn lines the pair up with a box on the table without moving
         it), and stays level whatever the hand's pitch and roll. The thumbsticks set
-        the grip width and fingertip tilt (see :meth:`_integrate_sticks`).
+        the grip width and fingertip tilt (see :meth:`_integrate_sticks`), and
+        a single stick click switches between the flush and straight grasps
+        (:meth:`_stick_click_toggle`), re-running the blend.
         """
         leader = frame.box_leader
         assert leader in ("left", "right")
@@ -1215,9 +1235,21 @@ class IKWorker:
             self._clear_freeze()
             self._solver.set_posture_pose(q_current)
             self._last_solve_t = None
+            # A stick already held at the snap can't be the start of a grasp
+            # toggle (see _stick_click_toggle).
+            self._box.click_prev = (
+                bool(frame.l_stick_click),
+                bool(frame.r_stick_click),
+            )
             return q_current
 
         box = self._box
+        if self._stick_click_toggle(frame, box):
+            # Grasp switched: drop the pair state so the next frame re-snaps
+            # from FK and blends the arms into the new configuration (the
+            # leader re-anchors too, so nothing jumps). This frame holds.
+            self._box = None
+            return q_current
         ctrl_pos, ctrl_rot = ctrl[leader]
         snap_ctrl_pos, snap_ctrl_rot = self._snap_ctrl[leader]
         lead_pos, _lead_rot = _relative_target_np(
@@ -1327,6 +1359,37 @@ class IKWorker:
             for side, sign in (("left", 1.0), ("right", -1.0))
         }
 
+    def _stick_click_toggle(self, frame: VRFrame, box: BoxState) -> bool:
+        """Flip ``config.box_grasp`` on a single stick click; True if it flipped.
+
+        A click *and release* of either thumbstick while a grip leads toggles
+        between the ``"flush"`` and ``"straight"`` grasps. It fires on the
+        release, not the press, so that the both-sticks gesture (which the
+        headset turns into a box-mode toggle) can't also switch the grasp on
+        its way through: a press is *armed* only if the other stick is up,
+        and disarmed the moment both are down. A stick already held when
+        the pair snapped isn't armed either (``click_prev`` is seeded at the
+        snap).
+        """
+        now_l, now_r = bool(frame.l_stick_click), bool(frame.r_stick_click)
+        prev_l, prev_r = box.click_prev
+        box.click_prev = (now_l, now_r)
+        if now_l and now_r:
+            box.click_armed = False
+            return False
+        if (now_l and not prev_l) or (now_r and not prev_r):
+            # Rising edge with the other stick up: candidate toggle.
+            box.click_armed = True
+            return False
+        released = (prev_l and not now_l) or (prev_r and not now_r)
+        if released and box.click_armed and not (now_l or now_r):
+            box.click_armed = False
+            new = "straight" if self._box_grasp() == "flush" else "flush"
+            self._config.box_grasp = new
+            _logger.info("Box grasp: %s (stick click)", new)
+            return True
+        return False
+
     def _integrate_sticks(self, frame: VRFrame, box: BoxState, now: float) -> None:
         """Accumulate this frame's thumbstick input into ``box``.
 
@@ -1339,8 +1402,9 @@ class IKWorker:
         next engage starts from it). Only a stick's dominant axis counts, so a
         thumb pushing "left" with a little forward in it changes the width
         alone (see :func:`_dominant_axis`); with both sticks deflected their
-        inputs add, capped at full deflection. Stick clicks mean nothing here
-        (the pair's position is the leader hand's job, not the sticks').
+        inputs add, capped at full deflection. Stick clicks are not modifiers
+        (a single click toggles the grasp, :meth:`_stick_click_toggle`); the
+        pair's position is the leader hand's job, not the sticks'.
         """
         cfg = self._config
         dt = (

@@ -257,6 +257,11 @@ class BoxState:
     # Wall time of the previous stick integration step (None before the first).
     stick_t: float | None = None
     tool: ToolGeometry = URDF_TOOL
+    # Stick-click state for the grasp toggle (``IKWorker._stick_click_toggle``):
+    # last frame's (left, right) click flags and whether a single press is
+    # armed to toggle on its release.
+    click_prev: tuple[bool, bool] = (False, False)
+    click_armed: bool = False
 
     def grip_rel(self) -> dict[str, np.ndarray]:
         """Each gripper's rotation relative to the box frame (see :func:`side_clamp_rotation`)."""

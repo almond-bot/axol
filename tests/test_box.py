@@ -785,6 +785,7 @@ class _FakeCore:
     def __init__(self) -> None:
         self.values = {
             "box_mode": True,
+            "box_grasp": "flush",
             "box_tool": "parcel",
             "box_tool_open_deg": 141.5,
             "box_face_left": "auto",
@@ -944,6 +945,121 @@ class HandTrackingTest(unittest.TestCase):
         self.assertGreater(float(np.linalg.norm(shift)), 0.1)
         np.testing.assert_allclose(right[0] - base_right[0], shift, atol=1e-6)
         self._assert_straight_out(left, right, np.array((0.4, 0.0, 0.3)) + shift)
+
+
+class GraspToggleTest(unittest.TestCase):
+    """A single stick click (and release) while leading flips box mode's grasp
+    between flush and straight, and the pair re-snaps into it; the both-sticks
+    (leave box mode) gesture never does."""
+
+    def _step(self, worker: IKWorker, **clicks: bool) -> None:
+        frame = _stick_frame(**clicks)
+        frame.box_leader = "left"
+        ctrl = {
+            "left": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
+            "right": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
+        }
+        worker._step_box(
+            frame, np.zeros(14, np.float32), ctrl, ctrl["left"][0], ctrl["right"][0]
+        )
+
+    def _worker(self) -> IKWorker:
+        worker = _box_worker()
+        worker._config.box_tool = "parcel"
+        worker._config.box_tool_open_deg = 141.5
+        worker._config.box_grasp = "flush"
+        return worker
+
+    def test_click_and_release_toggles_and_resnaps(self) -> None:
+        worker = self._worker()
+        # _box_worker snapped with the "urdf" straight geometry; the parcel
+        # config above is read at the *next* snap, so force one first.
+        worker._box = None
+        self._step(worker)  # snap (flush)
+        self._step(worker)
+        self.assertAlmostEqual(
+            math.degrees(worker._box.tool.flush_tilt), 38.5, places=6
+        )
+        n_solves = len(worker._solver.calls)
+        self._step(worker, l_stick_click=True)  # press: armed, no toggle yet
+        self.assertEqual(worker._config.box_grasp, "flush")
+        self.assertIsNotNone(worker._box)
+        self._step(worker)  # release: toggle, pair state dropped
+        self.assertEqual(worker._config.box_grasp, "straight")
+        self.assertIsNone(worker._box)
+        self._step(worker)  # re-snap in the straight grasp
+        self.assertIsNotNone(worker._box)
+        self.assertEqual(worker._box.tool.flush_tilt, 0.0)
+        self.assertEqual(worker.pair_status(np.zeros(14))["grasp"], "straight")
+        # Solves happened before and after; the toggle and snap frames hold.
+        self._step(worker)
+        self.assertGreater(len(worker._solver.calls), n_solves)
+        # And the other stick toggles back.
+        self._step(worker, r_stick_click=True)
+        self._step(worker)
+        self.assertEqual(worker._config.box_grasp, "flush")
+
+    def test_both_sticks_do_not_toggle(self) -> None:
+        worker = self._worker()
+        self._step(worker)
+        self._step(worker, l_stick_click=True)  # first of the pair
+        self._step(worker, l_stick_click=True, r_stick_click=True)  # gesture
+        self._step(worker, r_stick_click=True)  # left released first
+        self._step(worker)  # right released
+        self.assertEqual(worker._config.box_grasp, "flush")
+        self.assertIsNotNone(worker._box)
+
+    def test_click_held_through_the_snap_does_not_toggle(self) -> None:
+        worker = self._worker()
+        worker._box = None
+        self._step(worker, l_stick_click=True)  # snap with the stick down
+        self._step(worker, l_stick_click=True)
+        self._step(worker)  # release
+        self.assertEqual(worker._config.box_grasp, "flush")
+        self.assertIsNotNone(worker._box)
+
+    def test_live_setting_change_resnaps_too(self) -> None:
+        worker = self._worker()
+        self._step(worker)
+        worker.set_config("box_grasp", "straight")
+        self.assertIsNone(worker._box)
+        worker.set_config("box_grasp", "straight")  # no-op: nothing to drop
+        self._step(worker)
+        self.assertIsNotNone(worker._box)
+        worker.set_config("box_tool_open_deg", 146.0)  # calibration: next engage
+        self.assertIsNotNone(worker._box)
+
+    def test_core_mirrors_the_workers_grasp(self) -> None:
+        notified: list[tuple[str, object]] = []
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+            broadcast_mode=lambda key, value: notified.append((key, value)),
+        )
+        q = np.zeros(14, np.float32)
+        core._unpack_solution(
+            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "straight"})
+        )
+        self.assertEqual(core.config.box_grasp, "straight")
+        self.assertEqual(notified[-1], ("box_grasp", "straight"))
+        # A request on its way to the worker is not undone by a stale report.
+        core.set_live("box_grasp", "flush")
+        core._apply_live_requests()
+        self.assertEqual(core.config.box_grasp, "flush")
+        core._unpack_solution(
+            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "straight"})
+        )
+        self.assertEqual(core.config.box_grasp, "flush")
+        core._unpack_solution(
+            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "flush"})
+        )
+        self.assertEqual(core.config.box_grasp, "flush")
+        # ...and once it has landed, the worker's word is final again.
+        core._unpack_solution(
+            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "straight"})
+        )
+        self.assertEqual(core.config.box_grasp, "straight")
 
 
 class LiveToggleTest(unittest.TestCase):
