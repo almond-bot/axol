@@ -56,7 +56,7 @@ When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to
 </Note>
 
 <Note>
-  Existing datasets under `~/.cache/huggingface/lerobot` remain available to the non-root CLI but are not migrated into the hosted store automatically; new panel recordings use the hosted store. Any previously configured external/custom panel dataset root is likewise CLI-only. Do not symlink a writable legacy tree into `/var/lib`.
+  Both the hosted panel and direct CLI runs store datasets under `~/.cache/huggingface/lerobot` (or the panel's **Dataset root** setting), so recordings made from either are visible in both.
 </Note>
 
 ### Staying up to date
