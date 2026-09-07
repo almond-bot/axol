@@ -191,9 +191,6 @@ export default function Diagnostics() {
     }
   }, [])
 
-  const [arm, setArm] = useState<ArmSide>(
-    () => (localStorage.getItem("axolDiagArm") as ArmSide) || "left"
-  )
   const [windowSec, setWindowSec] = useState(120)
   const [hiddenJoints, setHiddenJoints] = useState<Set<JointName>>(new Set())
   // Zoom/pan pins the charts to a fixed range; null follows the live edge.
@@ -744,11 +741,6 @@ export default function Diagnostics() {
     sessionInventoryReady,
   ])
 
-  function selectArm(a: ArmSide) {
-    setArm(a)
-    localStorage.setItem("axolDiagArm", a)
-  }
-
   // The joints this robot actually has — the gripperless SKU drops GRIPPER
   // from the motor tiles, chart series, and `--joints` pickers.
   const joints = useMemo(
@@ -756,17 +748,19 @@ export default function Diagnostics() {
     [robot]
   )
 
-  const series: ChartSeries[] = useMemo(
-    () =>
+  // Both arms chart at once (a left/right pair per metric), so build one
+  // series list per side from the shared joint filter.
+  const seriesBySide: Record<ArmSide, ChartSeries[]> = useMemo(() => {
+    const forSide = (side: ArmSide) =>
       joints
         .filter((j) => !hiddenJoints.has(j))
         .map((joint) => ({
-          key: motorKey(arm, joint),
+          key: motorKey(side, joint),
           label: jointLabel(joint),
           color: JOINT_COLORS[joint],
-        })),
-    [arm, hiddenJoints, joints]
-  )
+        }))
+    return { left: forSide("left"), right: forSide("right") }
+  }, [hiddenJoints, joints])
 
   const linkState = robot?.state ?? stream.state
   const stateBadge = STATE_BADGE[linkState] ?? STATE_BADGE.disconnected
@@ -1182,23 +1176,6 @@ export default function Diagnostics() {
                 </button>
               ))}
             </div>
-            <div className="flex overflow-hidden rounded-md border border-white/10">
-              {(["left", "right"] as ArmSide[]).map((a) => (
-                <button
-                  key={a}
-                  type="button"
-                  onClick={() => selectArm(a)}
-                  className={cn(
-                    "px-2.5 py-1 text-xs capitalize transition-colors",
-                    arm === a
-                      ? "bg-[#eff483]/15 text-[#eff483]"
-                      : "text-white/50 hover:bg-white/[0.05]"
-                  )}
-                >
-                  {a} {robot?.profile === "mantis" ? "gripper" : "arm"}
-                </button>
-              ))}
-            </div>
             {pinnedView != null && (
               <Button
                 variant="ghost"
@@ -1214,45 +1191,35 @@ export default function Diagnostics() {
           <p className="text-xs text-white/30">
             Scroll to zoom, drag to pan — zooming pauses the live follow until you go live again.
           </p>
-          {/* Stacked full-width so each chart gets real reading space; the
-              header button on each takes it truly full screen. */}
-          <div className="grid grid-cols-1 gap-4">
-            <TelemetryChart
-              title="Position"
-              unit="rad"
-              series={series}
-              frames={stream.frames}
-              version={stream.version}
-              metric={0}
-              view={view}
-              onViewChange={setPinnedView}
-              quietReason={quietReason}
-              height={300}
-            />
-            <TelemetryChart
-              title="Velocity"
-              unit="rad/s"
-              series={series}
-              frames={stream.frames}
-              version={stream.version}
-              metric={1}
-              view={view}
-              onViewChange={setPinnedView}
-              quietReason={quietReason}
-              height={300}
-            />
-            <TelemetryChart
-              title="Torque"
-              unit="Nm"
-              series={series}
-              frames={stream.frames}
-              version={stream.version}
-              metric={2}
-              view={view}
-              onViewChange={setPinnedView}
-              quietReason={quietReason}
-              height={300}
-            />
+          {/* Each metric is a left/right pair sharing the same time view, so
+              both arms read at once; the header button on each chart takes it
+              truly full screen. */}
+          <div className="flex flex-col gap-4">
+            {(
+              [
+                { title: "Position", unit: "rad", metric: 0 },
+                { title: "Velocity", unit: "rad/s", metric: 1 },
+                { title: "Torque", unit: "Nm", metric: 2 },
+              ] as const
+            ).map(({ title, unit, metric }) => (
+              <div key={title} className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                {(["left", "right"] as ArmSide[]).map((side) => (
+                  <TelemetryChart
+                    key={side}
+                    title={`${title} — ${side} ${robot?.profile === "mantis" ? "gripper" : "arm"}`}
+                    unit={unit}
+                    series={seriesBySide[side]}
+                    frames={stream.frames}
+                    version={stream.version}
+                    metric={metric}
+                    view={view}
+                    onViewChange={setPinnedView}
+                    quietReason={quietReason}
+                    height={300}
+                  />
+                ))}
+              </div>
+            ))}
           </div>
         </section>
 
