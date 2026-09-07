@@ -9,12 +9,6 @@ Axol and Mantis episodes can share one dataset. For each on-robot run, enable **
 
 You can launch either profile from the **web control panel** or the **CLI** (`axol collect-data`). Quest uses the **A** button for recording. Managed Lighthouse/Ultimate Mantis runs use rig-trigger gestures (both squeezed then released to engage and start; x3 to save, x4 to discard), and the control panel can drive every source with on-screen episode buttons.
 
-<Note>
-  Panel recordings use `/var/lib/almond-axol/datasets`, a root-owned store the
-  operator group can read but not mutate. CLI recordings run as the operator
-  and retain the usual user-cache location.
-</Note>
-
 ## Before you start
 
 - **Axol installed** ([one-command install](/installation)) and the selected device connected: **Axol**, or **Mantis** with its [hardware](/mantis/hardware) and [pose source](/mantis/tracking) set up (setup complete under **Mantis settings → Tracking**, and an approved factory or measured tracker→TCP transform for both sides).

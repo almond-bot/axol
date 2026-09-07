@@ -103,9 +103,6 @@ class CollectDataAffinityIntegrityTest(unittest.TestCase):
                     return_value=teleop,
                 ),
                 patch(
-                    "almond_axol.utils.state_files.require_service_dataset_configuration"
-                ),
-                patch(
                     "almond_axol.utils.state_files.privileged_service_active",
                     return_value=False,
                 ),

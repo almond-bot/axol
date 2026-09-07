@@ -766,9 +766,8 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="text",
                 help=(
                     "Local directory datasets are written to / read from. "
-                    "The installed root service always uses its sealed "
-                    "/var/lib/almond-axol/datasets store and ignores custom "
-                    "roots; custom paths remain available to non-root CLI runs."
+                    "Defaults to the LeRobot cache ($HF_LEROBOT_HOME, normally "
+                    "~/.cache/huggingface/lerobot)."
                 ),
                 effective_default=_lerobot_dataset_root,
                 targets={
@@ -1507,8 +1506,7 @@ class SettingsStore:
         # precedence so the security boundary is the final authority.
         from ..utils.state_files import privileged_service_active
 
-        hosted_service = privileged_service_active()
-        if hosted_service:
+        if privileged_service_active():
             _confine_hosted_runtime_paths(target_op, merged)
 
         # ``diag.lift-cycle`` is argparse-backed: unlike draccus, the literal
@@ -1527,22 +1525,4 @@ class SettingsStore:
                     merged.pop(channel_key, None)
                     merged[f"no_{side}"] = True
 
-        # Third-party dataset writers reopen names internally, so the hosted
-        # root service must always use the installer-sealed store. Stale saved
-        # values and request overrides remain valid for non-root embeddings,
-        # but cannot redirect (or merely break) panel operations. Aliases such
-        # as collect-dagger resolve through ``target_op`` above.
-        if target_op in {"collect-data", "run-policy", "replay-dataset"}:
-            from ..utils.state_files import service_dataset_path_for_repo_id
-
-            if hosted_service:
-                repo_id = merged.get("repo_id")
-                if repo_id:
-                    merged["root"] = str(service_dataset_path_for_repo_id(repo_id))
-                else:
-                    # run-policy may intentionally run without recording. A
-                    # stale/request root must not turn that into an implicit
-                    # dataset operation; required-repo operations will surface
-                    # their normal config error after this sanitization.
-                    merged.pop("root", None)
         return normalize_boolean_args(op_id, merged)
