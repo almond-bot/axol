@@ -20,7 +20,7 @@ A Mantis kit consists of:
 - **A pose source**, one of the three tracking systems described in [Mantis Tracking](/mantis/tracking): Quest controllers (no extra hardware), VIVE Tracker 3.0 with 1–2 SteamVR base stations, or VIVE Ultimate Trackers with their wireless dongle.
 - **(Optional) wrist cameras**: up to two ZED cameras assigned to the **Left Mantis / Right Mantis** slots, stored separately from the Axol camera layout.
 
-The rigs have no arms: the seven arm joints per side are virtual and echo the IK solution, while the gripper is real and observed from motor feedback. The trigger is a continuous squeeze, not a switch: `0.0` fully released (open) to `1.0` fully squeezed (closed). The trigger node self-calibrates at power-on, so there is nothing to calibrate host-side.
+Mantis has no arms. The arm joints in a recording are virtual, filled in from the IK solution, while the gripper is real and read from motor feedback. The trigger is analog: fully released is `0.0` (open), fully squeezed is `1.0` (closed). It calibrates itself at power-on, so there is nothing to set up on the host.
 
 ### Tracker mounts
 
@@ -52,7 +52,7 @@ Setting up a Mantis kit on a host with the Axol SDK [installed](/installation), 
 
 ### Using Mantis without a robot
 
-You don't need an Axol robot to collect data with Mantis: the rigs, hub, and a pose source are a complete data-collection setup on their own. Besides the kit, you need a **host machine**. Mantis uses the same one-command [install](/installation) as Axol, on Linux with systemd. The wrist cameras are ZED GMSL cameras and data collection needs at least one of them recording, so the host must be an NVIDIA Jetson with GMSL inputs (such as a ZED Box); the grippers, triggers, and tracking alone work on any Linux machine. The installer's robot-only steps no-op without robot hardware, and there is nothing arm-related to configure or calibrate.
+You don't need an Axol robot to collect data with Mantis: the rigs, hub, and a pose source are a complete data-collection setup on their own. Besides the kit, you need a **host machine**. Mantis uses the same one-command [install](/installation) as Axol, on Linux with systemd. The wrist cameras are ZED GMSL cameras and data collection needs at least one of them recording, so the host must be an NVIDIA Jetson with GMSL inputs (such as a ZED Box); the grippers, triggers, and tracking alone work on any Linux machine.
 
 On a host where Mantis is the only hardware attached, the [control panel](/guides/control-panel) identifies and connects it automatically, and with **Mantis** selected on its tile the panel offers exactly the two operations Mantis supports: **Teleoperation** (the grippers-only [trigger check](#testing-the-triggers-and-grippers), no tracking) and **[Data collection](/operations/data-collection)**. The Axol-only operations stay hidden.
 
