@@ -71,7 +71,7 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         type="boolean",
         help=(
             "One controller drives both arms as a level parallel-gripper pair "
-            "by position only (the pair never rotates); the "
+            "by position and heading (it stays level); the "
             "thumbsticks set the grip width and fingertip tilt while a grip "
             "leads and drive Jelly once it's frozen. Also toggled by clicking both "
             "thumbsticks together. Switching disengages the arms first."

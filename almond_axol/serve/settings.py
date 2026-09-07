@@ -583,7 +583,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "Start sessions in box mode: the grippers clamp the box "
                     "between their sides like two flat hands (level, fingers "
                     "straight forward) and one grip drives both arms by position "
-                    "only — the pair never rotates (the other "
+                    "and heading — the pair stays level (the other "
                     "hand's grip hands over the lead). Thumbsticks set the grip "
                     "width and fingertip tilt while a grip leads and drive the "
                     "base once the pair is frozen. Can also be toggled "

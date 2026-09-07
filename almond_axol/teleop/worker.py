@@ -28,9 +28,11 @@ from .box import (
     box_targets,
     elbow_swivel_hint,
     pair_aligned,
+    rodrigues,
     rotation_angle,
     smoothstep,
     snap_box,
+    twist_about,
 )
 from .config import VRTeleopConfig
 from .filter import LagCompensatedLowPass
@@ -84,6 +86,7 @@ _SNAP_STABLE_RATIO = 0.5  # offset growth/size below this = shift, else motion
 # authorise a large jump.
 _STICK_DEADZONE = 0.15
 _STICK_MAX_DT_S = 0.1
+_UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
 
 # Gripper-pair status (see IKWorker.pair_status): reported to the core every
 # this many solved frames (~10 Hz at the 120 Hz cadence), and the tolerance
@@ -1120,13 +1123,15 @@ class IKWorker:
         On engage the pair is snapped from FK (:func:`snap_box`), the leader
         controller's pose is anchored, and the grippers are blended into the
         side-clamping grasp (fingers straight forward, level, flat faces on
-        the box) over ``box_align_duration``. Afterwards the leader hand's
-        *translation* drives the pair through the usual per-arm clutch mapping
+        the box) over ``box_align_duration``. Afterwards the leader hand
+        drives the pair through the usual per-arm clutch mapping
         (:func:`_relative_target_np`, so moving the hand feels exactly like
-        normal teleop) while its rotation is ignored: the pair never turns,
-        so lining up on a box is only a matter of where the hands are. The
-        thumbsticks set the grip width and fingertip tilt (see
-        :meth:`_integrate_sticks`).
+        normal teleop) with two of its six degrees of freedom dropped: the
+        pair follows the hand's translation and its turn about the room's
+        vertical (:func:`twist_about`, applied about the pair's centre so a
+        wrist turn lines the pair up with a box on the table without moving
+        it), and stays level whatever the hand's pitch and roll. The thumbsticks set
+        the grip width and fingertip tilt (see :meth:`_integrate_sticks`).
         """
         leader = frame.box_leader
         assert leader in ("left", "right")
@@ -1164,21 +1169,30 @@ class IKWorker:
 
         box = self._box
         ctrl_pos, ctrl_rot = ctrl[leader]
+        snap_ctrl_pos, snap_ctrl_rot = self._snap_ctrl[leader]
         lead_pos, _lead_rot = _relative_target_np(
             ctrl_pos,
             ctrl_rot,
-            *self._snap_ctrl[leader],
+            snap_ctrl_pos,
+            snap_ctrl_rot,
             *self._snap_fk[leader],
             position_multiplier=cfg.position_multiplier,
         )
-        # Position only: the box centre is carried along with the leader
-        # gripper's translation since the snap, and its frame stays the
-        # robot's (box.rot is the identity) whatever the hand does — the
-        # controller's rotation never reaches the grippers.
+        # Position and heading only: the box centre is carried along with
+        # the leader gripper's translation since the snap, and the pair is
+        # turned about that centre by how far the hand has turned about the
+        # room's up axis since the snap (taken from the controller's own
+        # world-frame rotation — already in the robot's FLU frame here, see
+        # _vr_to_flu_np — not from the clutch-mapped gripper rotation, so it
+        # is a yaw whatever the gripper was doing at the snap). The hand's
+        # pitch and roll never reach the grippers, so the pair stays level
+        # with the fingers straight out.
         snap_pos, _snap_rot = self._snap_fk[leader]
         center = (lead_pos + (box.center - snap_pos)).astype(np.float32)
+        yaw = twist_about(ctrl_rot @ snap_ctrl_rot.T, _UP) * cfg.rotation_multiplier
+        rot = (rodrigues(_UP, yaw) @ box.rot).astype(np.float32) if yaw else box.rot
         self._integrate_sticks(frame, box, now)
-        targets = box_targets(box, center, box.rot, now)
+        targets = box_targets(box, center, rot, now)
         elbows = self._box_elbow_hints(q_current, targets)
         # The posture attractor follows q for the whole of box mode. Pinned at
         # the engage pose (normal teleop's behaviour) it balances the pose

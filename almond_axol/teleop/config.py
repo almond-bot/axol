@@ -116,14 +116,15 @@ class VRTeleopConfig:
             friction — and *one* controller moves both arms as a pair:
             either grip engages both arms with that hand as the leader (no
             both-grips gate; the other grip switches leader), and the
-            leader's trigger drives both grippers. Only the hand's
-            **position** is tracked: the pair never rotates — the grippers
-            stay level with the hands straight out (fingers along the
-            robot's forward axis), so lining up on a box is just a matter of
-            where the hands are. On engage the grippers first blend into
-            that configuration over ``box_align_duration`` (from wherever
-            they were, e.g. after someone hand-guided the arms), then follow
-            the leader controller's translation.
+            leader's trigger drives both grippers. The hand's **position**
+            and its **turn about vertical** are tracked, nothing else: the
+            pair stays level with the hands straight out whatever the hand's
+            pitch and roll, and turning the hand about the room's up axis
+            turns the pair about its centre to line it up with a box on the
+            table. On engage the grippers first blend into that
+            configuration over ``box_align_duration`` (from wherever they
+            were, e.g. after someone hand-guided the arms), then follow the
+            leader controller.
             While a grip is leading, the thumbsticks stop driving Jelly and
             set the grasp instead (freeze the pair — click the leader's grip
             again — and they drive Jelly as usual, so the box can be carried

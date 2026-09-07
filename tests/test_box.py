@@ -22,6 +22,7 @@ from almond_axol.teleop.box import (
     rotation_angle,
     side_clamp_rotation,
     snap_box,
+    twist_about,
 )
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore
@@ -160,16 +161,11 @@ def _pair(width: float, face: float = 1.0, tilt: float = 0.0, yaw: float = 0.0):
 
 class PairAlignedTest(unittest.TestCase):
     def test_side_clamping_pair_is_aligned(self) -> None:
+        # Whatever its heading: the box frame yaws with the pair.
         for face in (1.0, -1.0):
-            left, right = _pair(0.3, face=face)
-            self.assertTrue(pair_aligned(left, right, 0.1, 0.7, 0.0, 25.0))
-
-    def test_yawed_pair_is_not_aligned(self) -> None:
-        # The box frame is the robot's own: a pair turned away from straight
-        # forward would be squared up by the engage blend, so it isn't
-        # "aligned" even though the grippers are parallel to each other.
-        left, right = _pair(0.3, yaw=0.9)
-        self.assertFalse(pair_aligned(left, right, 0.1, 0.7, 0.0, 25.0))
+            for yaw in (0.0, 0.9):
+                left, right = _pair(0.3, face=face, yaw=yaw)
+                self.assertTrue(pair_aligned(left, right, 0.1, 0.7, 0.0, 25.0))
 
     def test_facing_pair_is_not_aligned(self) -> None:
         # The old geometry — approach axes pointing at each other.
@@ -242,33 +238,53 @@ class SnapBoxTest(unittest.TestCase):
         np.testing.assert_allclose(at_end["left"][1], ideal["left"][1], atol=1e-6)
         self.assertTrue(state.aligned)
 
-    def test_box_frame_is_the_robot_frame_at_the_midpoint(self) -> None:
-        # One gripper ahead of and above the other: the frame still does not
-        # turn (position-only box mode), only the centre and width follow.
+    def test_box_frame_is_level_with_lateral_from_right_to_left(self) -> None:
+        # One gripper ahead of and above the other: the frame is level (z up)
+        # and headed along the horizontal right-to-left direction.
         center, rot, width = box_frame(
             np.array((0.5, 0.2, 0.4)), np.array((0.3, -0.2, 0.2))
         )
         np.testing.assert_allclose(center, (0.4, 0.0, 0.3), atol=1e-6)
-        np.testing.assert_allclose(rot, np.eye(3), atol=1e-6)
+        np.testing.assert_allclose(rot[:, 2], _UP, atol=1e-6)
+        np.testing.assert_allclose(
+            rot[:, 1], np.array((0.2, 0.4, 0.0)) / math.hypot(0.2, 0.4), atol=1e-6
+        )
         self.assertAlmostEqual(width, math.sqrt(0.04 + 0.16 + 0.04), places=6)
 
-    def test_snap_squares_a_skewed_pair_up_to_straight_forward(self) -> None:
-        # Grippers yawed 40° as a pair (one ahead of the other) snap to a box
-        # whose slots lie along the robot's y axis with fingers along +x.
+    def test_snap_keeps_the_pairs_heading(self) -> None:
+        # A pair frozen at a 40° heading and led again must not swing back
+        # square: the snap frame is the pair's own heading, level.
         left, right = _pair(0.3, yaw=0.7)
         state = snap_box(
             left, right, now=0.0, align_duration=1.0, width_min=0.1, width_max=0.7
         )
-        np.testing.assert_allclose(state.rot, np.eye(3), atol=1e-6)
+        np.testing.assert_allclose(state.rot, _rot_z(0.7), atol=1e-6)
         ideal = ideal_gripper_poses(
             state.center, state.rot, state.width, state.grip_rel()
         )
-        for side, sign in (("left", 1.0), ("right", -1.0)):
-            pos, rot = ideal[side]
-            np.testing.assert_allclose(approach_axis(rot), _FWD, atol=1e-6)
+        for side in ("left", "right"):
             np.testing.assert_allclose(
-                pos, state.center + sign * 0.5 * state.width * _LAT, atol=1e-6
+                ideal[side][0], (left if side == "left" else right)[0], atol=1e-6
             )
+            np.testing.assert_allclose(
+                ideal[side][1], (left if side == "left" else right)[1], atol=1e-6
+            )
+
+    def test_twist_about_extracts_the_yaw_of_a_tilted_hand(self) -> None:
+        # Pure yaw comes back exactly, however the hand is otherwise held
+        # (a turn about the room's up is a turn about the room's up whatever
+        # the hand's pitch at the time), and a pure roll or pitch has none.
+        for yaw in (0.0, 0.4, -1.2, 2.5):
+            self.assertAlmostEqual(twist_about(_rot_z(yaw), _UP), yaw, places=6)
+            for tilt in (_rot_x(0.6), rodrigues(_LAT, -0.8)):
+                self.assertAlmostEqual(
+                    twist_about(_rot_z(yaw) @ tilt, _UP), yaw, places=6
+                )
+        self.assertAlmostEqual(twist_about(_rot_x(0.8), _UP), 0.0, places=6)
+        self.assertAlmostEqual(twist_about(rodrigues(_LAT, 0.8), _UP), 0.0, places=6)
+        # Roll and pitch together do couple a little into the twist (the
+        # swing-twist split is not an Euler yaw), but only a little.
+        self.assertLess(abs(twist_about(_rot_x(0.6) @ rodrigues(_LAT, -0.3), _UP)), 0.1)
 
 
 class DominantAxisTest(unittest.TestCase):
@@ -715,10 +731,10 @@ def _box_worker(leader: str = "left") -> IKWorker:
     return worker
 
 
-class PositionOnlyTrackingTest(unittest.TestCase):
-    """Box mode follows the leader hand's position and ignores its rotation:
-    the pair stays level with the fingers straight forward whatever the
-    controller does."""
+class HandTrackingTest(unittest.TestCase):
+    """Box mode follows the leader hand's position and its turn about
+    vertical, and ignores its pitch and roll: the pair stays level with the
+    fingers straight out whatever else the controller does."""
 
     def _targets(self, worker: IKWorker, ctrl_pos, ctrl_rot):
         frame = _stick_frame()
@@ -748,15 +764,33 @@ class PositionOnlyTrackingTest(unittest.TestCase):
         left, right = self._targets(worker, np.zeros(3), np.eye(3))
         self._assert_straight_out(left, right, np.array((0.4, 0.0, 0.3)))
 
-    def test_rotating_the_controller_changes_nothing(self) -> None:
+    def test_pitching_or_rolling_the_controller_changes_nothing(self) -> None:
         worker = _box_worker()
         base_left, base_right = self._targets(worker, np.zeros(3), np.eye(3))
-        for rot in (_rot_x(0.8), _rot_z(-1.2), _rot_x(0.4) @ _rot_z(2.0)):
+        for rot in (_rot_x(0.8), rodrigues(_LAT, -0.7)):
             left, right = self._targets(worker, np.zeros(3), rot)
             np.testing.assert_allclose(left[0], base_left[0], atol=1e-6)
             np.testing.assert_allclose(left[1], base_left[1], atol=1e-6)
             np.testing.assert_allclose(right[0], base_right[0], atol=1e-6)
             np.testing.assert_allclose(right[1], base_right[1], atol=1e-6)
+
+    def test_turning_the_controller_turns_the_pair_about_its_centre(self) -> None:
+        worker = _box_worker()
+        center = np.array((0.4, 0.0, 0.3))
+        for yaw in (0.5, -1.0):
+            with self.subTest(yaw=yaw):
+                # Turned about the room's up, and tilted as well: only the
+                # turn counts.
+                left, right = self._targets(
+                    worker, np.zeros(3), _rot_z(yaw) @ _rot_x(0.3)
+                )
+                r = _rot_z(yaw)
+                for (pos, rot), sign in ((left, 1.0), (right, -1.0)):
+                    np.testing.assert_allclose(approach_axis(rot), r @ _FWD, atol=1e-6)
+                    np.testing.assert_allclose(rot[:, 0] @ _UP, 0.0, atol=1e-6)  # level
+                    np.testing.assert_allclose(
+                        pos, center + sign * 0.2 * (r @ _LAT), atol=1e-6
+                    )
 
     def test_moving_the_controller_translates_the_level_pair(self) -> None:
         worker = _box_worker()
