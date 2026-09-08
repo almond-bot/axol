@@ -353,11 +353,10 @@ class ZedTracker:
     gravity as the origin, so the reported translation's x–y is the ground
     plane whatever the mount's pitch.
 
-    ``tracker`` picks the SDK's tracking generation: ``gen3-2d`` / ``gen3``
-    (visual-inertial SLAM, with or without the 2D ground constraint; needs no
-    depth) or ``gen2`` / ``gen1`` (the depth-based odometers — GEN_1 in
-    particular is meant for low-texture scenes, which a camera looking down at
-    a plain floor is). ``depth_mode`` is any ``sl.DEPTH_MODE`` name; the
+    ``tracker`` picks the SDK's tracking generation: ``gen3`` / ``gen3-2d``
+    (visual-inertial SLAM, without or with the 2D ground constraint — which
+    never initialized on the cart, whose base rocks; needs no depth) or
+    ``gen2`` / ``gen1`` (the depth-based odometers, deprecated in SDK 5.x). ``depth_mode`` is any ``sl.DEPTH_MODE`` name; the
     neural modes trigger a one-off multi-minute model optimization on a
     Jetson. Stationary noise is tiny in every configuration (tens of microns
     on the ZED Box); what differs is how well *motion along the optical axis*
@@ -368,7 +367,7 @@ class ZedTracker:
     def __init__(
         self,
         serial: int,
-        tracker: str = "gen3-2d",
+        tracker: str = "gen3",
         depth_mode: str = "NONE",
         resolution: str = "SVGA",
         fps: int = 60,
@@ -1021,11 +1020,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--tracker",
         choices=sorted(TRACKERS),
-        default="gen3-2d",
-        help="ZED positional-tracking generation: gen3-2d / gen3 (visual-inertial "
-        "SLAM, no depth needed; 2d adds the ground-plane constraint), gen2 / gen1 "
-        "(depth-based odometry — gen1 targets low-texture scenes such as a plain "
-        "floor). Compare with the report's consistency table (default: gen3-2d)",
+        default="gen3",
+        help="ZED positional-tracking generation: gen3 / gen3-2d (visual-inertial "
+        "SLAM, no depth needed; 2d adds a ground-plane constraint that fails to "
+        "initialize if the base rocks), gen2 / gen1 (depth-based odometry, both "
+        "deprecated in SDK 5.x). Compare with the report's consistency table "
+        "(default: gen3)",
     )
     parser.add_argument(
         "--depth-mode",
