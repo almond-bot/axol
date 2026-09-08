@@ -148,6 +148,8 @@ async def _run(args: argparse.Namespace) -> None:
         decel=args.decel,
         jerk=args.jerk,
         wheel_scale=tuple(args.wheel_scale),
+        traction=args.traction,
+        traction_log=args.traction_log,
         deadzone=args.deadzone,
         hold_kp=args.hold_kp,
         hold_kd=args.hold_kd,
@@ -234,6 +236,19 @@ def main(argv: list[str] | None = None) -> None:
         default=CartConfig.jerk,
         help="Limit on the ramp rate's rate of change (S-curve), full-stick "
         f"units per second²; 0 for a plain trapezoid (default: {CartConfig.jerk})",
+    )
+    parser.add_argument(
+        "--traction",
+        action=argparse.BooleanOptionalAction,
+        default=CartConfig.traction,
+        help="Ease the ramp while a wheel has lost the floor, judged from motor "
+        f"torque (default: {CartConfig.traction})",
+    )
+    parser.add_argument(
+        "--traction-log",
+        action="store_true",
+        help="Log the traction guard per stroke (which wheel went light, how far "
+        "the ramp was eased)",
     )
     parser.add_argument(
         "--wheel-scale",

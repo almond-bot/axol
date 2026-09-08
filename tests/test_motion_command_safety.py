@@ -982,6 +982,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
                 enable=AsyncMock(side_effect=setup_error if index == 1 else None),
                 set_control_mode=AsyncMock(),
                 set_velocity=AsyncMock(),
+                set_feedback_callback=Mock(),
                 disable=AsyncMock(side_effect=cleanup_error if index == 0 else None),
             )
             motors.append(motor)

@@ -55,11 +55,15 @@ and radius spread, the real 50 Hz loop — ranked them):
   measured by ``axol diag.base-calibrate`` (the cart drives six short strokes
   tracked by the overhead ZED) or fitted from tape-measured strokes with
   :func:`solve_wheel_scale`.
-- *Diagonal unloading* — on a wobbly floor one diagonal pair lifts, and the
-  loaded pair can only push along its shared 45° axis, so the base slides
-  sideways while it accelerates and straightens once cruising. No wheel
-  command can fix it while the pair is unloaded; the lever is gentler
-  acceleration (``accel``/``jerk``), which also keeps launches smooth.
+- *Diagonal unloading* — one diagonal pair goes light (a wobbly floor, or
+  the weight shift of a launch/stop on a tall base whose mass sits off the
+  wheelbase centre — measured on the cart: 6–28° of veer at the default
+  ramp, under 2° at a third of it), and the loaded pair can only push along
+  its shared 45° axis, so the base slides sideways while it accelerates and
+  straightens once cruising. No wheel command can fix it while the pair is
+  unloaded; the lever is gentler acceleration, applied automatically while a
+  wheel reads light by the torque-based :class:`TractionGuard`
+  (``CartConfig.traction``), or standing (``accel``/``jerk``).
 """
 
 from __future__ import annotations
@@ -68,7 +72,7 @@ import asyncio
 import logging
 import math
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -219,16 +223,36 @@ class VectorRamp:
         self.jerk = jerk
         self.dt = dt
         self.vel = [0.0, 0.0, 0.0]  # command rate of change (normalized/s)
+        self.limit = 0.0  # rate limit in force on the last step (after scaling)
 
-    def step(self, cmd: list[float], target: tuple[float, ...]) -> None:
-        """Advance ``cmd`` one interval toward ``target`` (in place)."""
+    @property
+    def rate(self) -> float:
+        """Magnitude of the command's current rate of change (normalized/s)."""
+        return math.sqrt(sum(v * v for v in self.vel))
+
+    def step(
+        self,
+        cmd: list[float],
+        target: tuple[float, ...],
+        accel_scale: float = 1.0,
+        decel_scale: float = 1.0,
+    ) -> None:
+        """Advance ``cmd`` one interval toward ``target`` (in place).
+
+        ``accel_scale`` / ``decel_scale`` (in (0, 1]) ease the respective rate
+        limit for this step — the traction guard's lever. The jerk limit is
+        untouched, so an easing that arrives mid-ramp is itself felt as a
+        smooth change of acceleration rather than a step.
+        """
         deltas = [t - c for t, c in zip(target, cmd)]
         norm = math.sqrt(sum(d * d for d in deltas))
         if norm <= 0.0:
             self.vel = [0.0, 0.0, 0.0]
+            self.limit = 0.0
             return
         toward_zero = sum(d * c for d, c in zip(deltas, cmd)) < 0.0
-        limit = self.decel if toward_zero else self.accel
+        limit = self.decel * decel_scale if toward_zero else self.accel * accel_scale
+        self.limit = limit
         if self.jerk > 0.0:
             speed = min(limit, math.sqrt(2.0 * self.jerk * norm))
             want = [d / norm * speed for d in deltas]
@@ -251,6 +275,138 @@ class VectorRamp:
         self.vel = vel
         for i, s in enumerate(step):
             cmd[i] += s
+
+
+# The guard never eases braking below this fraction of ``decel``: a stop that
+# slides a little beats one that takes twice as long, and the command-timeout
+# safety path (dead operator → decay to zero) rides on decel too.
+_TRACTION_DECEL_FLOOR = 0.5
+# The guard judges only while the ramp is moving the command at no less than
+# this fraction of its (scaled) rate limit — the heart of a launch or stop,
+# where the wheels share a large net force. In the S-curve's tails the net
+# force fades and individual torques cross zero, which is not a lift.
+_TRACTION_MIN_RAMP_FRAC = 0.3
+# Recovery time constant of the guard's scale while the ramp is idle.
+_TRACTION_IDLE_RECOVER_S = 0.3
+
+
+class TractionGuard:
+    """Eases the command ramp while a wheel has lost the floor.
+
+    A four-wheel x-drive on a rigid frame is statically indeterminate, and a
+    tall base with its mass off the wheelbase centre transfers a good share of
+    its weight front↔back whenever it accelerates or brakes along x (``m·a·h/L``
+    — ~10% per 0.5 m/s² with the mass a metre up on a 0.4 m wheelbase). The
+    wheel that goes light spins without pushing, and the two wheels that share
+    a drive diagonal with it and each other become the only ones pushing: they
+    can only push along their diagonal, so the base veers toward it until the
+    lifted wheel lands. No wheel command can push through a wheel that isn't
+    touching the floor; what does work is asking for less acceleration while
+    it's light (measured on the cart: a 0.5/s ramp veered 6–28°, 0.15/s under
+    2°, 0.08/s within noise). This guard does that automatically, so the ramp
+    can stay brisk whenever the floor takes it.
+
+    Detection is from the motors' torque feedback, which every velocity
+    command's reply carries at no bus cost. A wheel carrying its share of the
+    load — accelerating the base or, at cruise, rolling against its share of
+    the rolling resistance — shows a torque in proportion; one in the air
+    shows only its own inertia and bearing drag. So the wheel with the
+    smallest ``|τ|`` is judged light when it falls under ``light`` × the mean
+    ``|τ|`` of the four, provided that mean exceeds ``torque_min`` (below it,
+    at a gentle cruise or a standstill, the torques say nothing and the guard
+    stands down). Torque alone suffices: the same relation holds for any
+    command mix, since a wheel's expected torque always scales with its load.
+
+    A wheel has to look light for ``confirm`` consecutive cycles before the
+    guard acts: every wheel's torque passes through zero when a ramp turns
+    around (the rear pair goes from braking to driving as a stop completes),
+    and for a cycle or two that looks exactly like a lift. A real lift lasts
+    the whole ramp.
+
+    The output is a scale on the ramp's rate limits. It drops toward
+    ``floor`` within ``drop_s`` of a wheel being confirmed light (fast — the
+    lift takes ~0.2 s to turn into a slide) and recovers toward 1 once all
+    four carry load: over ``recover_s`` while the ramp is still moving (slow,
+    so a launch hunts at most once rather than chattering), and within a few
+    tenths of a second once it isn't, so an easing picked up in the last
+    moments of a stop — where the unloaded end's torque fades first, which
+    looks light and is harmless — doesn't soften the next launch. Braking is
+    eased by the same scale but never below :data:`_TRACTION_DECEL_FLOOR`.
+    """
+
+    def __init__(
+        self,
+        light: float,
+        floor: float,
+        torque_min: float,
+        dt: float,
+        drop_s: float = 0.1,
+        recover_s: float = 1.5,
+        confirm: int = 3,
+    ) -> None:
+        if not (0.0 < light < 1.0):
+            raise ValueError("traction light ratio must be in (0, 1)")
+        if not (0.0 < floor <= 1.0):
+            raise ValueError("traction floor must be in (0, 1]")
+        if not (torque_min >= 0.0 and dt > 0.0 and drop_s > 0.0 and recover_s > 0.0):
+            raise ValueError(
+                "traction torque_min must be >= 0; dt, drop_s, recover_s > 0"
+            )
+        self.light = light
+        self.floor = floor
+        self.torque_min = torque_min
+        self.dt = dt
+        self.drop_s = drop_s
+        self.recover_s = recover_s
+        self.confirm = max(1, confirm)
+        self._streak = 0  # consecutive cycles with a light wheel
+        self.scale = 1.0
+        self.light_wheel: int | None = None  # WHEELS index judged light this cycle
+        # Last reading's mean |τ|, and its lightest wheel (index, |τ|, ratio to
+        # the mean) whether or not it was judged light — for the log.
+        self.mean_torque = 0.0
+        self.light_index = 0
+        self.light_torque = 0.0
+        self.light_ratio = 1.0
+
+    @property
+    def decel_scale(self) -> float:
+        return max(self.scale, _TRACTION_DECEL_FLOOR)
+
+    def update(self, torques: Sequence[float] | None, ramping: bool = True) -> float:
+        """Feed this cycle's per-wheel torques (Nm, :data:`WHEELS` order, or
+        ``None`` when there is no fresh reading) and return the ramp scale.
+
+        ``ramping`` says the command is being moved at a substantial rate
+        (see :data:`_TRACTION_MIN_RAMP_FRAC`). Only then is the judgement
+        made: while accelerating or braking the wheels share a large net force
+        and each one's torque tracks its load, but at cruise the net force is
+        just rolling resistance and the torques are dominated by the wheels
+        working against each other (a heading-hold nudge, a hair of speed
+        inconsistency), which says nothing about the floor — and the ramp
+        scale is moot then anyway, so the guard recovers.
+        """
+        light: int | None = None
+        if ramping and torques is not None and len(torques) == len(WHEELS):
+            mags = [abs(t) for t in torques]
+            mean = sum(mags) / len(mags)
+            i = min(range(len(mags)), key=mags.__getitem__)
+            self.mean_torque = mean
+            self.light_index = i
+            self.light_torque = mags[i]
+            self.light_ratio = mags[i] / mean if mean > 0.0 else 1.0
+            if mean >= self.torque_min and mags[i] < self.light * mean:
+                light = i
+        self._streak = self._streak + 1 if light is not None else 0
+        if self._streak < self.confirm:
+            light = None
+        self.light_wheel = light
+        if light is not None:
+            self.scale += (self.floor - self.scale) * min(1.0, self.dt / self.drop_s)
+        else:
+            recover = self.recover_s if ramping else _TRACTION_IDLE_RECOVER_S
+            self.scale += (1.0 - self.scale) * min(1.0, self.dt / recover)
+        return self.scale
 
 
 def stroke_rows(
@@ -375,6 +531,26 @@ class CartConfig:
                          radius spread is ~2 cm per 3 m. Measure with
                          :func:`solve_wheel_scale` from two tape-measured
                          strokes; ``(1, 1, 1, 1)`` is uncalibrated.
+        traction:        Ease the ramp while a wheel has lost the floor, judged
+                         from the motors' torque feedback (see
+                         :class:`TractionGuard`). A wheel that lifts under the
+                         weight shift of a launch or a stop can't push, and the
+                         base veers along the remaining pair's diagonal; asking
+                         for less acceleration while it's light is the only
+                         wheel-level remedy. On by default; it does nothing on
+                         a floor and load that keep all four wheels down.
+        traction_light:  A wheel whose ``|torque|`` is below this fraction of
+                         the four wheels' mean counts as light. A loaded wheel
+                         carries its share (~1 Nm on a launch); one in the air
+                         shows only its inertia and bearing drag (~0.1 Nm).
+        traction_floor:  The guard never eases ``accel`` below this fraction.
+                         (Braking has its own, fixed floor of 0.5.)
+        traction_torque_min: Mean ``|torque|`` (Nm) below which the wheels say
+                         nothing about load (gentle cruise, standstill) and the
+                         guard stands down.
+        traction_log:    Log the guard: a line whenever it starts easing and a
+                         per-stroke summary (min ratio, which wheel, how far the
+                         ramp was eased). For tuning; off in normal operation.
         axis_snap_deg:   Translation headings within this many degrees of a
                          cardinal axis (forward/back/left/right) are snapped
                          onto that axis, absorbing off-axis thumb error during
@@ -430,6 +606,11 @@ class CartConfig:
     decel: float = 1.0
     jerk: float = 2.0
     wheel_scale: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
+    traction: bool = True
+    traction_light: float = 0.35
+    traction_floor: float = 0.2
+    traction_torque_min: float = 0.3
+    traction_log: bool = False
     axis_snap_deg: float = 15.0
     imu: bool = True
     yaw_hold_gain: float = 2.0
@@ -469,6 +650,90 @@ class CartConfig:
                 f"({len(WHEELS)} wheels)"
             )
         self.wheel_scale = tuple(float(s) for s in scale)
+        if self.traction:
+            # Same checks as the guard itself, surfaced at config time.
+            TractionGuard(
+                self.traction_light,
+                self.traction_floor,
+                self.traction_torque_min,
+                1.0 / self.frequency,
+            )
+
+
+class _TractionLog:
+    """Per-stroke trace of the traction guard (see ``CartConfig.traction_log``).
+
+    Logs once when the guard first eases within a stroke (which wheel, its
+    torque against the mean) and a summary when the stroke ends: peak mean
+    torque, the lightest any wheel got, how far and how long the ramp was
+    eased. Strokes where the guard never had enough torque to judge are
+    summarized too — that's how ``traction_torque_min`` gets tuned.
+    """
+
+    def __init__(self) -> None:
+        self._active = False
+        self._reset()
+
+    def _reset(self) -> None:
+        self._t0 = time.monotonic()
+        self._peak_mean = 0.0
+        self._min_ratio = 1.0
+        self._min_wheel: int | None = None
+        self._min_scale = 1.0
+        self._eased_cycles = 0
+        self._judged_cycles = 0
+        self._announced = False
+
+    def update(self, guard: TractionGuard, *, driving: bool) -> None:
+        if driving and not self._active:
+            self._active = True
+            self._reset()
+        elif not driving and self._active:
+            self._active = False
+            self._summarize()
+            return
+        if not self._active:
+            return
+        mean = guard.mean_torque
+        self._peak_mean = max(self._peak_mean, mean)
+        if mean >= guard.torque_min:
+            self._judged_cycles += 1
+        if guard.light_wheel is not None:
+            self._eased_cycles += 1
+            self._min_scale = min(self._min_scale, guard.scale)
+            if not self._announced:
+                self._announced = True
+                _logger.info(
+                    "traction: %s light (%.2f of %.2f Nm mean) — easing the ramp",
+                    WHEELS[guard.light_wheel].name,
+                    abs(guard.light_torque),
+                    mean,
+                )
+        if mean >= guard.torque_min and guard.light_ratio < self._min_ratio:
+            self._min_ratio = guard.light_ratio
+            self._min_wheel = guard.light_index
+
+    def _summarize(self) -> None:
+        dur = time.monotonic() - self._t0
+        if self._judged_cycles == 0:
+            _logger.info(
+                "traction: stroke %.1fs — never judged (peak mean |τ| %.2f Nm < "
+                "torque_min); lower traction_torque_min if wheels lifted",
+                dur,
+                self._peak_mean,
+            )
+            return
+        wheel = WHEELS[self._min_wheel].name if self._min_wheel is not None else "none"
+        _logger.info(
+            "traction: stroke %.1fs — peak mean |τ| %.2f Nm, lightest %s at %.2f of "
+            "mean, eased %d cycles to %.2f× accel",
+            dur,
+            self._peak_mean,
+            wheel,
+            self._min_ratio,
+            self._eased_cycles,
+            self._min_scale,
+        )
 
 
 class _YawLog:
@@ -607,9 +872,16 @@ class Cart:
         self._yaw_rate: tuple[float, float] | None = None
         self._yaw_samples = 0
 
+        # Latest torque reported by each wheel (Nm, WHEELS order), written by
+        # the drivers' feedback callbacks — every command's reply carries one —
+        # and read by the traction guard. None until a wheel has replied.
+        self._torques: list[float | None] = [None] * len(WHEELS)
+
         # Introspection for status displays (updated by the command task).
         self.body_cmd: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.wheel_speeds: list[float] = [0.0] * len(WHEELS)
+        self.wheel_torques: list[float] = [0.0] * len(WHEELS)
+        self.traction_scale: float = 1.0
         self.yaw_correction: float = 0.0
         self.lift_dir: int = STOP
         self.parked: bool = False
@@ -694,6 +966,9 @@ class Cart:
                     for w in WHEELS
                 ]
                 self._motors_disabled = False
+                self._torques = [None] * len(WHEELS)
+                for i, m in enumerate(self._motors):
+                    m.set_feedback_callback(self._torque_sink(i))
                 # Widen the position-mapping range (RAM only) before enable()
                 # reads it back, so multi-turn wheel positions stay valid for
                 # the MIT park hold.
@@ -945,6 +1220,12 @@ class Cart:
         velocities = await asyncio.gather(*[m.get_velocity() for m in self._motors])
         return list(positions), list(velocities)
 
+    def _torque_sink(self, index: int) -> Callable[[float, float], None]:
+        def sink(_position: float, torque: float) -> None:
+            self._torques[index] = torque
+
+        return sink
+
     def feed_yaw_rate(self, rate: float) -> None:
         """Latch an external yaw-rate sample (rad/s, CCW positive from above).
 
@@ -1020,6 +1301,19 @@ class Cart:
         cfg = self._config
         interval = 1.0 / cfg.frequency
         ramp = VectorRamp(cfg.accel, cfg.decel, cfg.jerk, interval)
+        guard = (
+            TractionGuard(
+                cfg.traction_light,
+                cfg.traction_floor,
+                cfg.traction_torque_min,
+                interval,
+            )
+            if cfg.traction
+            else None
+        )
+        traction_log = (
+            _TractionLog() if cfg.traction_log and guard is not None else None
+        )
         cmd = [0.0, 0.0, 0.0]  # ramped (vx, vy, wz), normalized [-1, 1]
         hold_pos: list[float] | None = None  # per-wheel park anchors (rad)
         yaw_err = 0.0  # integrated heading error (rad) since the stroke start
@@ -1037,13 +1331,32 @@ class Cart:
             if time.monotonic() - self._target_time > cfg.command_timeout:
                 vx, vy, wz, lift_dir = 0.0, 0.0, 0.0, STOP
 
+            # Traction guard: judge last cycle's torque replies (only while the
+            # wheels are in velocity mode — a parked hold's torques say nothing
+            # about the floor) and ease the ramp while a wheel is light.
+            accel_scale = decel_scale = 1.0
+            if guard is not None:
+                fresh = hold_pos is None and all(t is not None for t in self._torques)
+                torques = [t for t in self._torques if t is not None] if fresh else None
+                ramping = (
+                    ramp.limit > 0.0
+                    and ramp.rate >= _TRACTION_MIN_RAMP_FRAC * ramp.limit
+                )
+                accel_scale = guard.update(torques, ramping)
+                decel_scale = guard.decel_scale
+                if torques is not None:
+                    self.wheel_torques = torques
+                self.traction_scale = accel_scale
+
             # Ramp the (vx, vy, wz) command as a single vector (direction
             # preserved), accel/decel asymmetric, jerk-limited — see
             # VectorRamp.
-            ramp.step(cmd, (vx, vy, wz))
+            ramp.step(cmd, (vx, vy, wz), accel_scale, decel_scale)
 
             moving = any(abs(c) >= 1e-3 for c in cmd)
             driving = moving or any(abs(t) >= 1e-3 for t in (vx, vy, wz))
+            if traction_log is not None and guard is not None:
+                traction_log.update(guard, driving=driving)
 
             # Heading hold on an external yaw reference. NB: deliberately
             # *not* torque feedback — a simulation study of this exact plant
@@ -1051,7 +1364,9 @@ class Cart:
             # diagonal, radius-mismatch path curvature) are unobservable from
             # wheel torque, while a gyro heading hold fixes everything
             # fixable (see the removed diagnostics/base/floor_sim.py in git
-            # history). While translating with
+            # history). (Torque does reveal the *unloading* itself, which is
+            # what the traction guard above acts on — by easing, not by
+            # steering.) While translating with
             # no commanded rotation, integrate the fed yaw rate into the
             # heading error since the stroke began and steer it out;
             # re-reference on stops and commanded turns (the operator is

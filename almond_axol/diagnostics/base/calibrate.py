@@ -996,6 +996,8 @@ async def _run(args: argparse.Namespace) -> int:
                 axis_snap_deg=0.0,
                 accel=args.accel,
                 decel=args.accel,
+                traction=args.traction,
+                traction_log=args.traction_log,
             )
         )
         await cart.enable()
@@ -1122,6 +1124,20 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "second (CartConfig.accel/decel). Lower it to test whether a veer comes "
         "from load transfer under acceleration lifting a wheel "
         f"(default: {CartConfig.accel})",
+    )
+    parser.add_argument(
+        "--traction",
+        action=argparse.BooleanOptionalAction,
+        default=CartConfig.traction,
+        help="Cart traction guard (eases the ramp while a wheel has lost the "
+        "floor, judged from motor torque). --no-traction drives the strokes "
+        f"with the plain ramp for an A/B (default: {CartConfig.traction})",
+    )
+    parser.add_argument(
+        "--traction-log",
+        action="store_true",
+        help="Log the traction guard per stroke: peak mean wheel torque, the "
+        "lightest wheel's share, how far the ramp was eased",
     )
     parser.add_argument(
         "--tracker",

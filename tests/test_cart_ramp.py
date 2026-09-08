@@ -11,6 +11,7 @@ from almond_axol.robot.cart import (
     WHEEL_SIGNS,
     WHEELS,
     CartConfig,
+    TractionGuard,
     VectorRamp,
     mix,
     solve_wheel_scale,
@@ -125,6 +126,86 @@ class VectorRampTests(unittest.TestCase):
                 VectorRamp(dt=DT, **kwargs)
 
 
+class TractionGuardTests(unittest.TestCase):
+    LOADED = [1.0, -1.0, 1.0, -1.0]  # a launch: every wheel carries ~1 Nm
+    LIFTED = [0.06, -1.3, 1.3, -1.3]  # FL in the air, the rest pick up its share
+
+    def make(self) -> TractionGuard:
+        return TractionGuard(light=0.35, floor=0.2, torque_min=0.3, dt=DT)
+
+    def test_loaded_wheels_leave_the_ramp_alone(self) -> None:
+        g = self.make()
+        for _ in range(50):
+            self.assertEqual(g.update(self.LOADED, ramping=True), 1.0)
+        self.assertIsNone(g.light_wheel)
+
+    def test_lifted_wheel_is_confirmed_then_eases_to_the_floor(self) -> None:
+        g = self.make()
+        scales = [g.update(self.LIFTED, ramping=True) for _ in range(30)]
+        # two cycles of grace (a torque zero-crossing), then the drop
+        self.assertEqual(scales[:2], [1.0, 1.0])
+        self.assertLess(scales[2], 1.0)
+        self.assertEqual(g.light_wheel, 0)  # front_left
+        self.assertAlmostEqual(scales[-1], 0.2, places=2)
+        # braking is eased too, but never below its own floor
+        self.assertAlmostEqual(g.decel_scale, 0.5, places=6)
+
+    def test_zero_crossing_does_not_trip_it(self) -> None:
+        g = self.make()
+        g.update(self.LIFTED, ramping=True)
+        g.update(self.LIFTED, ramping=True)
+        self.assertEqual(g.update(self.LOADED, ramping=True), 1.0)
+        self.assertIsNone(g.light_wheel)
+
+    def test_recovers_slowly_while_ramping_and_fast_when_idle(self) -> None:
+        g = self.make()
+        for _ in range(30):
+            g.update(self.LIFTED, ramping=True)
+        ramping = TractionGuard(0.35, 0.2, 0.3, DT)
+        ramping.scale = g.scale
+        idle = TractionGuard(0.35, 0.2, 0.3, DT)
+        idle.scale = g.scale
+        for _ in range(25):  # half a second
+            ramping.update(self.LOADED, ramping=True)
+            idle.update(self.LOADED, ramping=False)
+        self.assertLess(ramping.scale, 0.6)
+        self.assertGreater(idle.scale, 0.8)
+
+    def test_stands_down_below_torque_min_and_off_the_ramp(self) -> None:
+        g = self.make()
+        quiet = [0.01, -0.1, 0.1, -0.1]  # cruise: mean below torque_min
+        for _ in range(10):
+            self.assertEqual(g.update(quiet, ramping=True), 1.0)
+        for _ in range(10):
+            self.assertEqual(g.update(self.LIFTED, ramping=False), 1.0)
+        for _ in range(10):
+            self.assertEqual(g.update(None, ramping=True), 1.0)
+
+    def test_scaled_ramp_is_slower(self) -> None:
+        full = VectorRamp(0.5, 1.0, 0.0, DT)
+        eased = VectorRamp(0.5, 1.0, 0.0, DT)
+        a, b = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+        for _ in range(10):
+            full.step(a, (1.0, 0.0, 0.0))
+            eased.step(b, (1.0, 0.0, 0.0), accel_scale=0.2)
+        self.assertAlmostEqual(b[0] / a[0], 0.2, places=6)
+        self.assertGreater(full.rate, 0.0)
+        self.assertAlmostEqual(eased.limit, 0.1, places=9)
+
+    def test_rejects_bad_parameters(self) -> None:
+        for kwargs in (
+            dict(light=1.0),
+            dict(light=0.0),
+            dict(floor=0.0),
+            dict(floor=1.5),
+            dict(torque_min=-1.0),
+        ):
+            args = dict(light=0.35, floor=0.2, torque_min=0.3, dt=DT)
+            args.update(kwargs)
+            with self.assertRaises(ValueError):
+                TractionGuard(**args)
+
+
 class CartConfigTests(unittest.TestCase):
     def test_defaults_are_asymmetric_and_hold_is_on(self) -> None:
         cfg = CartConfig()
@@ -143,6 +224,15 @@ class CartConfigTests(unittest.TestCase):
         ):
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 CartConfig(**kwargs)
+
+    def test_traction_is_on_by_default_and_validated(self) -> None:
+        cfg = CartConfig()
+        self.assertTrue(cfg.traction)
+        with self.assertRaises(ValueError):
+            CartConfig(traction_light=1.2)
+        with self.assertRaises(ValueError):
+            CartConfig(traction_floor=0.0)
+        CartConfig(traction=False, traction_light=1.2)  # ignored when off
 
     def test_rejects_malformed_wheel_scale(self) -> None:
         for scale in ((1.0, 1.0, 1.0), (1.0, 1.0, 1.0, 3.0), (1.0, 1.0, 1.0, 0.0)):
