@@ -867,14 +867,16 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             for session in manager.list()
         )
 
-    def _is_idle() -> bool:
+    def _is_idle(*, ignore_cleanup_lockout: bool = False) -> bool:
         """Safe to hand host ownership to the updater: no operation running.
 
         A connected robot is fine -- the hosted transaction stops the service
         and the candidate reconnects after verification; only an in-flight
-        operation must not be interrupted.
+        operation must not be interrupted. ``ignore_cleanup_lockout`` is for
+        the callers that exist to *end* a hardware-cleanup lockout rather than
+        to start work behind it (see :func:`_host_power`).
         """
-        if runner.is_running():
+        if runner.is_running(ignore_cleanup_lockout=ignore_cleanup_lockout):
             return False
         return not _diagnostic_session_active()
 
@@ -1197,9 +1199,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         run would drop the arms. The hosted install runs as root; a dev serve
         escalates via ``sudo -n`` so a headless context fails fast instead of
         blocking on a password prompt.
+
+        A hardware-cleanup lockout does not refuse it: the lockout reserves the
+        robot's CAN buses until this process is gone, and restarting the host
+        is one of the two documented ways out of it (the other is
+        ``/api/op/clear-lockout``).
         """
         async with session_launch_reservation:
-            if not _is_idle():
+            if not _is_idle(ignore_cleanup_lockout=True):
                 return JSONResponse(
                     {"error": "an operation or session is running — stop it first"},
                     status_code=409,
@@ -2203,7 +2210,63 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             "running": runner.is_running(),
             "session": session.to_dict() if session else None,
             "policy": runner.policy_state(),
+            "lockout": runner.hardware_cleanup_lockout(),
         }
+
+    @app.post("/api/op/clear-lockout")
+    async def op_clear_lockout() -> JSONResponse:
+        """Lift the hardware-cleanup lockout once the motors read torque-free.
+
+        The lockout exists because an operation could not confirm it disabled
+        the motors, so nothing may reopen the CAN buses behind it. Cutting
+        motor power is exactly that case with the torque already gone, so this
+        proves it rather than assuming it: reacquire the idle link, ping every
+        motor, and only release the reservation when each one reads disabled or
+        does not answer at all. A motor that answers and is not disabled is
+        still holding torque nobody supervises, and keeps the lockout.
+        """
+        async with session_launch_reservation:
+            if not runner.hardware_cleanup_lockout():
+                return JSONResponse(
+                    {"error": "no hardware cleanup lockout is active"},
+                    status_code=409,
+                )
+            if runner.is_running(ignore_cleanup_lockout=True):
+                return JSONResponse(
+                    {"error": "an operation is still running — stop it first"},
+                    status_code=409,
+                )
+            try:
+                await asyncio.to_thread(robot.reacquire)
+                status = await asyncio.to_thread(robot.probe)
+            except RuntimeError as exc:
+                return JSONResponse(
+                    {
+                        "error": "could not reach the motors to prove they are "
+                        f"disabled; the lockout stands: {exc}"
+                    },
+                    status_code=409,
+                )
+            live = [
+                m
+                for m in status["motors"]
+                if m["reachable"] and m["status"] != "DISABLED"
+            ]
+            if live:
+                return JSONResponse(
+                    {
+                        "error": "these motors still answer and are not disabled, "
+                        "so the lockout stands: "
+                        + ", ".join(
+                            f"{m['arm']} {m['joint'].lower()}"
+                            f" ({str(m['status']).replace('_', ' ').lower()})"
+                            for m in live
+                        ),
+                    },
+                    status_code=409,
+                )
+            runner.clear_hardware_cleanup_lockout()
+            return JSONResponse({"cleared": True})
 
     @app.post("/api/op/start")
     async def op_start(req: OpStartRequest) -> JSONResponse:

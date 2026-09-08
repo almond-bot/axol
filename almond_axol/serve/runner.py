@@ -464,7 +464,7 @@ class OperationRunner:
     def unsubscribe(self, session: Session, q: "asyncio.Queue[str | None]") -> None:
         session.subscribers.discard(q)
 
-    def is_running(self) -> bool:
+    def is_running(self, *, ignore_cleanup_lockout: bool = False) -> bool:
         # "stopping" still counts as running: the op owns the CAN bus until its
         # worker thread unwinds, so a new op must not start until it's gone.
         # An exception records the terminal error before the worker finishes
@@ -482,12 +482,24 @@ class OperationRunner:
         # In particular, Process.start() may fail after partially creating the
         # child, and multiprocessing rejects is_alive() on an unstarted object.
         bridge_owned = self._bridge_process is not None
-        return (
-            active_status
-            or worker_alive
-            or bridge_owned
-            or self._hardware_cleanup_uncertain
-        )
+        # The lockout reserves the robot, not the host: the operations that
+        # exist to end it — host power, and the lockout clear itself — pass
+        # ``ignore_cleanup_lockout`` so they see only live work.
+        locked_out = self._hardware_cleanup_uncertain and not ignore_cleanup_lockout
+        return active_status or worker_alive or bridge_owned or locked_out
+
+    def hardware_cleanup_lockout(self) -> bool:
+        """Whether an unverified hardware teardown is still reserving the robot."""
+        return self._hardware_cleanup_uncertain
+
+    def clear_hardware_cleanup_lockout(self) -> None:
+        """Release the lockout once the motors have been proven torque-free.
+
+        The caller owns that proof (see the ``/api/op/clear-lockout`` probe);
+        this only drops the reservation the failed teardown left behind.
+        """
+        with self._lock:
+            self._hardware_cleanup_uncertain = False
 
     # -- lifecycle ----------------------------------------------------------
 

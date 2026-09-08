@@ -460,6 +460,19 @@ class RobotLink:
             raise RuntimeError(f"could not reacquire robot link: {exc}") from exc
         self._set_state(STATE_CONNECTED)
 
+    def probe(self) -> dict[str, Any]:
+        """Ping every motor now and return the resulting :meth:`status`.
+
+        The idle ping already refreshes health once a second; this forces one
+        sweep so a caller that must decide on *current* motor state (the
+        cleanup-lockout clear) never reads a snapshot from before it asked.
+        """
+        with self._lock:
+            if self._state != STATE_CONNECTED:
+                raise RuntimeError(f"robot link is {self._state}")
+        self._submit(self._ping_once())
+        return self.status()
+
     def motor_faults(self) -> list[dict[str, Any]]:
         """Current motor faults (see :func:`motor_faults`); [] when not connected."""
         return self.status()["faults"]
@@ -640,18 +653,22 @@ class RobotLink:
             if failures:
                 raise failures[0]
 
+    async def _ping_once(self) -> None:
+        """One health sweep of every arm, published to the hub."""
+        sweeps = await asyncio.gather(*(arm.ping() for arm in self._arms))
+        slow: dict[str, dict[str, Any]] = {}
+        for sweep in sweeps:
+            slow.update(sweep)
+        if slow:
+            self.hub.push_slow(slow)
+        with self._lock:
+            self._last_ping = time.time()
+
     async def _ping_loop(self) -> None:
         while True:
             start = self._loop.time()
             try:
-                sweeps = await asyncio.gather(*(arm.ping() for arm in self._arms))
-                slow: dict[str, dict[str, Any]] = {}
-                for sweep in sweeps:
-                    slow.update(sweep)
-                if slow:
-                    self.hub.push_slow(slow)
-                with self._lock:
-                    self._last_ping = time.time()
+                await self._ping_once()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep the loop alive
