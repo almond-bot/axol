@@ -817,8 +817,10 @@ _PANEL_START_COUNTDOWN_S = 3.0
 # Control-tick heartbeat age that counts as a stall worth a stack trace: six
 # ticks at 120 Hz. The recorder pairs each camera exposure with the state
 # snapshot the control loop published within 50 ms of it and gives up after a
-# 100 ms wait, so a tick gap this long is already what ends an episode
-# ("no retained robot-state snapshot brackets camera exposure").
+# 100 ms wait, so a tick gap this long is already enough to make the recorder
+# drop a dataset row ("no retained robot-state snapshot brackets camera
+# exposure") — no longer fatal to the episode (see record_proc.py), but still
+# worth a stack trace so a chronic stall gets tracked down.
 _TICK_STALL_S = 0.05
 
 # Buttons the panel renders per phase (see EpisodeControls in the web app):

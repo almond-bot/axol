@@ -102,7 +102,14 @@ class EncodedAuReaderDiscontinuityTest(unittest.TestCase):
         self.assertFalse(reader._seen_first_au)
         self.assertIsNone(reader._error)
 
-    def test_episode_discontinuity_after_first_idr_remains_fatal(self) -> None:
+    def test_episode_discontinuity_after_first_idr_is_counted_not_fatal(self) -> None:
+        """An upstream drop costs the lost exposure, not the episode.
+
+        The DISCONT-flagged AU itself is intact (all-intra) and is delivered;
+        the capture loop sees the PTS gap in front of it and repeats the prior
+        IDR. The reader only counts the loss so the end-of-take quality summary
+        can attribute the hole to the transport.
+        """
         reader = _reader()
         reader._flush_requested.set()
         reader._complete_flush()
@@ -118,17 +125,44 @@ class EncodedAuReaderDiscontinuityTest(unittest.TestCase):
         self.assertEqual(reader.pending, 2)
         self.assertEqual(reader._delivered, 2)
         self.assertIsNone(reader._error)
+        self.assertEqual(reader.lost_exposures, 0)
 
         _pull(
             reader,
-            [_FakeBuffer(_IDR, 1_048_000_000, discont=True)],
+            [_FakeBuffer(_IDR, 1_064_000_000, discont=True)],
         )
 
-        self.assertEqual(reader.pending, 0)
-        with self.assertRaisesRegex(
-            RuntimeError, "encoded-AU discontinuity.*near frame 2"
-        ):
-            reader.read_next_au(timeout_ms=0)
+        self.assertEqual(reader.pending, 3)
+        self.assertEqual(reader._delivered, 3)
+        self.assertIsNone(reader._error)
+        self.assertEqual(reader.lost_exposures, 1)
+        # The AU after the drop is still delivered, with its own exposure PTS,
+        # so the capture loop can measure the hole in front of it.
+        reader.read_next_au(timeout_ms=0)
+        reader.read_next_au(timeout_ms=0)
+        _au, capture_ts, _recv = reader.read_next_au(timeout_ms=0)
+        self.assertAlmostEqual(capture_ts, 1.064)
+
+        reader.reset_lost_exposures()
+        self.assertEqual(reader.lost_exposures, 0)
+
+    def test_lost_timestamp_mid_episode_drops_that_au_only(self) -> None:
+        reader = _reader()
+        reader._flush_requested.set()
+        reader._complete_flush()
+
+        _pull(
+            reader,
+            [
+                _FakeBuffer(_IDR, 1_016_000_000),
+                _FakeBuffer(_IDR, 0),  # gdpdepay normalized a lost PTS to 0
+                _FakeBuffer(_IDR, 1_048_000_000),
+            ],
+        )
+
+        self.assertEqual(reader.pending, 2)
+        self.assertIsNone(reader._error)
+        self.assertEqual(reader.lost_exposures, 1)
 
     def test_predictive_frame_violates_all_intra_contract(self) -> None:
         reader = _reader()
