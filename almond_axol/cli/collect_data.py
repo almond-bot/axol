@@ -2330,7 +2330,6 @@ def _run_session(
             announce=log_say,
             on_contact=_guard_on_contact,
             hold_tick=_guard_hold_tick,
-            vr_alive=teleop.vr_alive,
         )
 
     async def _return_home_loop() -> None:
@@ -2348,8 +2347,7 @@ def _run_session(
 
         The hold leaves the operator's reset press latched, so the guarded
         return that follows plans from wherever the arms were hand-guided; on
-        an orphaned/stopped hold nothing is latched and the return is skipped
-        (the arms hold position where they are).
+        a stopped hold nothing is latched and the return is skipped.
         """
         robot.set_control_trace_active(True)
         try:
@@ -2361,7 +2359,6 @@ def _run_session(
                 announce=log_say,
                 on_contact=_guard_on_contact,
                 hold_tick=_guard_hold_tick,
-                vr_alive=teleop.vr_alive,
             )
             if teleop.is_resetting:
                 await _guarded_return()

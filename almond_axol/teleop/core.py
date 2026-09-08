@@ -47,12 +47,6 @@ from .recorder import make as _recorder_make
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 
-# How long a guarded-return contact hold keeps waiting for a reset press
-# after the VR frame stream has gone dead (headset exited XR or died —
-# nobody is left to press reset). Long enough to free a hooked gripper
-# calmly; then the hold settles into a position hold where the arms are.
-_HOLD_ORPHAN_GRACE_S = 30.0
-
 # Thumbstick deflection below which a stick counts as released — the same
 # deadzone box mode and Jelly apply, so "neutral" here means neither would act.
 _STICK_NEUTRAL = 0.15
@@ -1194,7 +1188,6 @@ class VRTeleopCore:
         announce: Callable[[str], None],
         on_contact: Callable[[], None] | None = None,
         hold_tick: Callable[[], None] | None = None,
-        vr_alive: Callable[[], bool] | None = None,
         move_timeout_s: float = 30.0,
     ) -> None:
         """Play the pending return-to-rest guarded by the contact watchdog.
@@ -1209,7 +1202,9 @@ class VRTeleopCore:
         :class:`~almond_axol.robot.control.ContactWatchdog`) cancels it
         where it is and drops the arms into a limp gravity-comp hold. The
         operator hand-guides them clear and presses reset, which replans
-        from wherever they were left.
+        from wherever they were left. The hold has no timeout: if the
+        headset has left VR (or the link died) the arms simply stay limp
+        until the operator is back in the headset and presses reset.
 
         Args:
             send_step: Advance the flow's control pipeline by one step —
@@ -1229,13 +1224,6 @@ class VRTeleopCore:
                 (e.g. unblock the headset's reset button).
             hold_tick: Flow hook run every hold cycle (e.g. consume teleop
                 events so a stray record press is answered).
-            vr_alive: Whether VR frames are still arriving. When given, a
-                contact hold whose frame stream has been dead for a grace
-                period is *orphaned* — the reset press that ends it can
-                never come (the headset left VR or died mid-move) — so the
-                hold settles into a position hold where the arms are and
-                the guarded return ends; reconnecting and pressing reset
-                resumes the normal path. ``None`` waits indefinitely.
             move_timeout_s: Cap on each individual play attempt.
         """
         interval = 1.0 / self.config.frequency
@@ -1276,7 +1264,6 @@ class VRTeleopCore:
                 announce=announce,
                 on_contact=on_contact,
                 hold_tick=hold_tick,
-                vr_alive=vr_alive,
             )
             if hold != "reset":
                 return
@@ -1292,7 +1279,6 @@ class VRTeleopCore:
         announce: Callable[[str], None],
         on_contact: Callable[[], None] | None = None,
         hold_tick: Callable[[], None] | None = None,
-        vr_alive: Callable[[], bool] | None = None,
     ) -> None:
         """Limp gravity-comp hold after a *tracking-time* contact trip.
 
@@ -1317,7 +1303,6 @@ class VRTeleopCore:
             announce=announce,
             on_contact=on_contact,
             hold_tick=hold_tick,
-            vr_alive=vr_alive,
         )
         if hold == "reset":
             # The reset press that ended the hold is still latched
@@ -1334,13 +1319,15 @@ class VRTeleopCore:
         announce: Callable[[str], None],
         on_contact: Callable[[], None] | None,
         hold_tick: Callable[[], None] | None,
-        vr_alive: Callable[[], bool] | None,
     ) -> str:
-        """Shared limp-hold engine: ``reset`` | ``orphaned`` | ``stopped``.
+        """Shared limp-hold engine: ``reset`` | ``stopped``.
 
         Freezes the IK pipeline, holds the arms limp until a reset press
-        (or the flow stops / the hold is orphaned), then hands position
-        control back re-synced to wherever the operator left the arms.
+        (or the flow stops), then hands position control back re-synced to
+        wherever the operator left the arms. There is deliberately no
+        timeout: a headset that has left VR (or a dead link) leaves the arms
+        in gravity comp — free to hand-guide, never stiffening on their own
+        — until the operator is back in the headset and presses reset.
         """
         interval = 1.0 / self.config.frequency
         # Freeze the IK pipeline before the arms go limp — a reset
@@ -1353,26 +1340,11 @@ class VRTeleopCore:
             on_contact()
         announce("Contact. Arms are free — press reset to continue.")
         deadline = time.perf_counter()
-        orphan_since: float | None = None
-        orphaned = False
         while not stopped() and not self.reset_pending:
             deadline += interval
             await gravity_step()
             if hold_tick is not None:
                 hold_tick()
-            # Orphaned hold: the VR frame stream is dead (headset left
-            # VR or died mid-move), so the reset press that ends
-            # this hold can never arrive. After the grace period,
-            # stop waiting and settle where the arms are.
-            if vr_alive is not None:
-                now = time.perf_counter()
-                if vr_alive():
-                    orphan_since = None
-                elif orphan_since is None:
-                    orphan_since = now
-                elif now - orphan_since >= _HOLD_ORPHAN_GRACE_S:
-                    orphaned = True
-                    break
             await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
         if stopped():
             return "stopped"
@@ -1380,18 +1352,11 @@ class VRTeleopCore:
         # the arms: clear the stale command history (max-step safety
         # check) and re-seed the pipeline from the measured
         # positions, so the first commands hold the true pose with
-        # no transient — and, on a reset press, the replan starts
-        # from it.
+        # no transient and the replan starts from it.
         reset_command_state()
         pos_l, pos_r = get_positions()
         self.resync_to_positions(pos_l, pos_r)
         self.resume_ik()
-        if orphaned:
-            announce(
-                "No headset connected — holding position here. "
-                "Reconnect and press reset to return to rest."
-            )
-            return "orphaned"
         return "reset"
 
     # ------------------------------------------------------------------
