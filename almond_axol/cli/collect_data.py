@@ -73,12 +73,14 @@ from typing import TYPE_CHECKING, Any
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
+from ..constants import PARK_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import (
     ZED_RESOLUTION_DIMS,
     ZedCameraConfig,
     resolution_for_dims,
 )
 from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..lerobot.rollout import arms_reporting
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..recording import (
     DatasetRecorderProcess,
@@ -2103,6 +2105,28 @@ def _run_session(
         teleop.request_reset()
         await _guarded_return()
 
+    async def _park_before_disconnect() -> None:
+        """Teardown return: the post-episode move, bounded and unattended.
+
+        The session has already stopped by the time this runs, so a deadline
+        bounds the move — well inside the caller's stop grace — and none of
+        the operator hooks are offered: there is nobody left at the headset
+        or the panel to answer a contact hold.
+        """
+        deadline = time.perf_counter() + PARK_TIMEOUT_S
+        teleop.request_reset()
+        await teleop.guarded_return(
+            send_step=_guard_send_step,
+            gravity_step=_guard_gravity_step,
+            torque_residuals=robot.torque_residuals,
+            reset_command_state=robot.reset_command_state,
+            get_positions=lambda: robot.positions,
+            stopped=lambda: time.perf_counter() >= deadline,
+            announce=log_say,
+            vr_alive=teleop.vr_alive,
+            move_timeout_s=PARK_TIMEOUT_S,
+        )
+
     async def _contact_hold_loop() -> None:
         """Tracking contact: hold limp until reset, then return to rest guarded.
 
@@ -2385,6 +2409,16 @@ def _run_session(
             )
         raise
     finally:
+        # Ignore SIGINT during cleanup so a second Ctrl+C can't abandon the
+        # arms partway through the return-to-rest below, or abort the
+        # disconnect/teardown that follows it.
+        import signal
+
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+
         log_say("Stopping.")
 
         cleanup_failures: list[tuple[str, BaseException]] = []
@@ -2401,6 +2435,42 @@ def _run_session(
 
         if imu_src is not None:
             _cleanup("board gyro", imu_src.close)
+        # Park before the torque comes off: ``disconnect()`` disables the
+        # motors, and arms left raised drop under gravity.
+        #
+        # Skipped on Mantis (handheld grippers, no arms to park), when the
+        # arms are already at rest, when a limp contact hold left them in the
+        # operator's hands, when the IK worker that plans the move is gone, or
+        # when the bus no longer reports a pose to plan from. The rest states
+        # come off the teleop core here, rather than off an ``IKResetController``
+        # as in run-policy and collect-dagger, because this flow's rest moves
+        # are planned by the teleop IK worker.
+        #
+        # Bounded twice: by the deadline the coroutine installs, and by the
+        # hard wait below. Every failure is swallowed, so the disconnect that
+        # follows happens either way and a lost park costs only what was lost
+        # before it existed.
+        try:
+            if (
+                not mantis_mode
+                and not teleop.at_rest
+                and not teleop.ik_paused
+                and teleop.ik_worker_alive
+                and arms_reporting(robot)
+            ):
+                log_say("Returning to rest before disabling the arms.")
+                park = asyncio.run_coroutine_threadsafe(
+                    _park_before_disconnect(), robot.event_loop
+                )
+                try:
+                    park.result(timeout=PARK_TIMEOUT_S + 1.0)
+                finally:
+                    # A park that overran its own deadline must stop
+                    # commanding before the disconnect below disables the
+                    # motors underneath it. A no-op once it has finished.
+                    park.cancel()
+        except BaseException:
+            _logger.exception("return to rest before disconnect failed")
         _cleanup("robot disconnect", robot.disconnect)
         _cleanup("teleop disconnect", teleop.disconnect)
         # Close the relay's dataset branch BEFORE the recorder detaches its
@@ -2420,6 +2490,11 @@ def _run_session(
         )
         if relay is not None:
             _cleanup("video relay", relay.shutdown)
+
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
 
         robot_failure = next(
             (

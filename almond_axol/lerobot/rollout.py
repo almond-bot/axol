@@ -19,6 +19,8 @@ the same episode plumbing without duplicating it:
   want the freshest frame rather than a timestamp-aligned one.
 - :func:`stdin_watcher` — ``s`` / ``r`` / ``q`` keystroke watcher with
   no-block ``select`` polling.
+- :func:`arms_reporting` — whether the arms still report a pose, the
+  liveness check every flow's teardown return-to-rest starts from.
 
 All four are LeRobot-flavoured: the capture thread depends on
 ``lerobot.datasets.lerobot_dataset.LeRobotDataset``, ``build_dataset_frame``,
@@ -46,6 +48,20 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
+def arms_reporting(robot: "AxolRobot") -> bool:
+    """True while the arms still report a pose to plan a move from.
+
+    The teardown return-to-rest each flow plays before it torques the motors
+    off asks this first: a closed or stalled bus leaves the position cache
+    unreadable, and a move planned from nothing is worse than no move at all.
+    """
+    try:
+        robot.positions
+    except BaseException:
+        return False
+    return True
+
+
 class IKResetController:
     """Collision-aware return-to-rest, backed by an IK worker subprocess.
 
@@ -69,6 +85,17 @@ class IKResetController:
         self._left_indices: list[int] | None = None
         self._right_indices: list[int] | None = None
         self._ready = False
+        self._arms_limp = False
+
+    @property
+    def arms_limp(self) -> bool:
+        """True while the arms were last left limp in a gravity-comp hold.
+
+        Set by every hold this controller streams and cleared by the next
+        play, so a caller winding down can tell whether the arms are its to
+        move or already in the operator's hands.
+        """
+        return self._arms_limp
 
     def start(self) -> None:
         """Spawn the IK worker subprocess. Non-blocking; pair with ``wait_ready``."""
@@ -241,6 +268,8 @@ class IKResetController:
         from ..robot.control import ContactWatchdog
         from ..teleop.filter import ResetInterpolator
 
+        self._arms_limp = False
+
         assert self._conn is not None
         assert self._q_init is not None
         assert self._left_indices is not None
@@ -329,6 +358,7 @@ class IKResetController:
                 "the arms hold where the move stopped."
             )
             return False
+        self._arms_limp = True
         result: dict[str, bool] = {}
         waiter: threading.Thread | None = None
         if wait_retry is not None:
