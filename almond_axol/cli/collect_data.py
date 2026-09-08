@@ -92,7 +92,13 @@ from ..teleop.core import TCPPoseSnapshot
 from ..utils import affinity
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
-from .config import DatasetResolution, LogLevel, MantisSource, parse
+from .config import (
+    DatasetResolution,
+    LogLevel,
+    MantisSource,
+    normalize_bool_flags,
+    parse,
+)
 
 if TYPE_CHECKING:
     from ..lerobot.robot.robot_axol import AxolRobot
@@ -963,6 +969,9 @@ Control = _NullCollectControl | _QueueCollectControl
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a data-collection session."""
+    # Accept the bare ``--mantis`` / ``--mantis_allow_uncalibrated`` spelling
+    # that ``axol teleop --mantis`` already takes.
+    argv = normalize_bool_flags(argv, "mantis", "mantis_allow_uncalibrated")
     cfg = parse(CollectDataConfig, argv)
     if cfg.mantis:
         from .mantis_bridge import (
