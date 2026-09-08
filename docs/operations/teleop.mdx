@@ -111,6 +111,10 @@ The bindings below are for Axol. (Mantis teleop uses no headset — the rig trig
 </Note>
 
 <Note>
+  **Stopping parks the arms.** Ending the session — **Stop** in the control panel, `Ctrl+C` on the CLI — returns the arms to the rest pose and only then torques the motors off, so raised arms no longer drop under gravity on the way out. The move is the same guarded return described above, capped at 3 s so it always finishes inside the panel's stop window; if it runs out of time or hits something, the arms are torqued off where they are. It is skipped when there is nothing to park or no safe way to park it: in `--sim`, when the arms are already at rest, when a contact hold has left them limp in your hands, when the IK worker that plans the path has died, or when the CAN bus has stopped reporting positions.
+</Note>
+
+<Note>
   **Contact stop while driving (opt-in).** The return-to-rest guard above is always on; you can also arm a watchdog for the **tracking** phase itself — while you're actively driving the arms. It's **off by default**, since teleop pushes on the scene on purpose. Set the **Teleop contact stop** in the control panel's **Axol settings → Robot** (`--teleop.teleop_torque_threshold` on the CLI; the panel suggests `16` Nm) and a sustained torque past the threshold **disengages tracking** and drops the arms into the same limp gravity-comp hold — hand-guide them clear, then press **X** to return to rest and carry on. `0` (the default) leaves it off. Hardware only.
 </Note>
 
