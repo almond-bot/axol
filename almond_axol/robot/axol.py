@@ -57,7 +57,21 @@ GRIPPER_TRAVEL = math.radians(290)
 _GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm
 _GRIPPER_CALIB_STEP = 0.005  # rad per step
 _GRIPPER_CALIB_SETTLE = 0.001  # s per step
-_GRIPPER_CALIB_MAX_STEPS = math.ceil(GRIPPER_TRAVEL / _GRIPPER_CALIB_STEP)
+# Sweep headroom beyond the nominal travel. Torque only builds once the jaw
+# is against the open stop and the impedance target keeps moving past it, so
+# a gripper that starts at the closed stop needs budget *after* covering
+# GRIPPER_TRAVEL or the sweep ends with the jaws open but no stop detected.
+# Also absorbs unit-to-unit travel variation (~0.035 rad measured). Costs
+# ~60 ms in the no-stop failure case and nothing on success (the loop exits
+# at the torque threshold).
+_GRIPPER_CALIB_OVERTRAVEL = 0.3  # rad
+_GRIPPER_CALIB_MAX_STEPS = math.ceil(
+    (GRIPPER_TRAVEL + _GRIPPER_CALIB_OVERTRAVEL) / _GRIPPER_CALIB_STEP
+)
+# A sweep that moved at least this fraction of GRIPPER_TRAVEL without meeting
+# the torque threshold ran out of jaw, not out of budget: the fingers are not
+# coupled to the motor. Anything shorter stalled against something.
+_GRIPPER_CALIB_FULL_TRAVEL_FRACTION = 0.9
 
 # Impedance gains used only during gripper open-stop calibration.
 _GRIPPER_CALIB_KP = 50.0
@@ -191,19 +205,25 @@ async def calibrate_gripper_open_stop(motor: Motor) -> float:
     """Find a gripper's open hard-stop and return its raw motor position (rad).
 
     Steps the motor incrementally toward open until the torque magnitude
-    reaches ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop). Exhausting the
-    full expected travel without observing that stop fails calibration rather
-    than treating an arbitrary final encoder reading as the open position.
-    Shared by :class:`AxolArm` and the Mantis
+    reaches ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop). The sweep
+    budget is the full expected travel plus ``_GRIPPER_CALIB_OVERTRAVEL`` so a
+    gripper starting at the closed stop still has room to press into the open
+    one. Exhausting that budget without observing the stop fails calibration
+    rather than treating an arbitrary final encoder reading as the open
+    position. Shared by :class:`AxolArm` and the Mantis
     (:mod:`almond_axol.robot.mantis`), whose grippers are the same Damiao unit.
 
     Must be called with the motor already enabled and in IMPEDANCE mode.
 
     Raises:
         MotorError: If the full calibration sweep completes without detecting
-            the open hard-stop torque threshold.
+            the open hard-stop torque threshold. The message distinguishes a
+            motor that covered the whole travel range unopposed (fingers not
+            coupled to the shaft) from one that stalled short of it
+            (obstruction or slipping coupling).
     """
-    target = await motor.get_position()
+    start = await motor.get_position()
+    target = start
     stop_found = False
     last_torque = 0.0
     for _ in range(_GRIPPER_CALIB_MAX_STEPS):
@@ -216,16 +236,31 @@ async def calibrate_gripper_open_stop(motor: Motor) -> float:
         if abs(last_torque) >= _GRIPPER_TORQUE_THRESHOLD:
             stop_found = True
             break
+    final = await motor.get_position()
     if not stop_found:
         commanded_travel = _GRIPPER_CALIB_MAX_STEPS * _GRIPPER_CALIB_STEP
+        travelled = start - final
+        if travelled >= _GRIPPER_CALIB_FULL_TRAVEL_FRACTION * GRIPPER_TRAVEL:
+            hint = (
+                "The motor moved through the whole open/close range without "
+                "meeting resistance — check that the fingers are fitted and "
+                "coupled to the motor shaft"
+            )
+        else:
+            hint = (
+                "The motor stopped short of the full range without reaching "
+                "the torque threshold — check for an obstruction between the "
+                "jaws or a slipping coupling"
+            )
         raise MotorError(
             "Gripper open-stop calibration failed: no hard stop was detected "
-            f"during the {commanded_travel:.3f} rad sweep "
-            f"(last torque {last_torque:.3f} Nm, required "
-            f"{_GRIPPER_TORQUE_THRESHOLD:.3f} Nm); the gripper remains "
+            f"during the {commanded_travel:.3f} rad sweep (motor moved "
+            f"{travelled:.3f} rad of the {GRIPPER_TRAVEL:.3f} rad range; last "
+            f"torque {last_torque:.3f} Nm, required "
+            f"{_GRIPPER_TORQUE_THRESHOLD:.3f} Nm). {hint}; the gripper remains "
             "uncalibrated"
         )
-    return await motor.get_position()
+    return final
 
 
 def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
