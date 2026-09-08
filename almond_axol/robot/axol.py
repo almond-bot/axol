@@ -1509,13 +1509,18 @@ class AxolArm:
 
         ``caps`` maps arm joints to a torque (Nm); joints absent from it (or
         all of them, with ``None`` / ``{}``) keep only their configured
-        ``JointConfig.torque_limit``. The cap rides each tracked command to
-        the realtime core, which clamps the wire position to within
-        ``cap / kp`` of the measured one (``filter::cap_spring``), so a
-        joint blocked by whatever it is pressing on leans with at most
-        ``cap`` — the tighter of this and the configured cap. Gravity
-        feedforward is outside it. Box mode uses this on the shoulder joints
-        that carry the lateral squeeze while the arms clamp a box.
+        ``JointConfig.torque_limit``. Two layers enforce a cap. Here, each
+        :meth:`motion_control` first backs the whole arm's command off toward
+        the measured pose until every capped joint's spring torque
+        (``kp`` × run-ahead) is within its cap, keeping the arm's shape (see
+        :meth:`_back_off_to_spring_caps`). The cap then also rides the
+        command to the realtime core, which clamps that joint's wire
+        position to within ``cap / kp`` of measured (``filter::cap_spring``)
+        — the hard guarantee, per joint. So a joint blocked by whatever it
+        is pressing on leans with at most ``cap`` — the tighter of this and
+        the configured cap. Gravity feedforward is outside it. Box mode uses
+        this on the shoulder joints that carry the lateral squeeze while the
+        arms clamp a box.
 
         Applies from the next :meth:`motion_control`; realtime-core mode
         only (the classic CAN path has no spring cap). Non-positive or
@@ -1534,6 +1539,56 @@ class AxolArm:
     def spring_caps(self) -> dict[Joint, float]:
         """The live per-joint spring-torque caps (see :meth:`set_spring_caps`)."""
         return dict(self._spring_caps)
+
+    def _back_off_to_spring_caps(self, q_cmd: np.ndarray) -> np.ndarray:
+        """Pull the *whole arm's* command back toward measured until every
+        capped joint's spring torque is within its cap.
+
+        ``q_cmd`` is the joint-frame target (gripper slot included, and left
+        alone). A capped joint's spring torque is ``kp`` times its run-ahead
+        (command minus measured); where that exceeds the cap, the run-ahead
+        of every arm joint is scaled by the same factor, so the command moves
+        along the joint-space line from the measured pose toward the target
+        and the arm keeps the *shape* the target had. Clamping the capped
+        joints alone — which is all the realtime core can do, per joint —
+        would leave the others driving to a pose the capped ones never
+        reach: with a box held between the grippers, the two shoulders give
+        while the elbow and wrists don't, and the gripper rolls and yaws by
+        the shoulders' deficit (several degrees for a few centimetres of
+        width jogged past contact), so a flat contact face ends up pressing
+        along one edge. Backed off as a whole, the arm presses with the
+        bounded force at the orientation the target asked for, deflected
+        only by its ordinary compliance. The core's per-joint clamp stays
+        underneath as the hard guarantee.
+
+        With nothing pressing back the run-ahead is servo lag, well inside
+        the caps at box-mode speeds; a fast move that does exceed one is
+        slowed uniformly rather than distorted. Measured positions come from
+        the impedance feedback caches; until they are available the command
+        passes through untouched.
+        """
+        try:
+            measured = self.positions
+        except MotorError:
+            return q_cmd
+        n_arm = len(ARM_JOINTS)
+        run_ahead = q_cmd[:n_arm] - measured[:n_arm]
+        if not np.all(np.isfinite(run_ahead)):
+            return q_cmd
+        scale = 1.0
+        for joint, cap in self._spring_caps.items():
+            i = ARM_JOINTS.index(joint)
+            kp = float(getattr(self._arm_config, joint.value).kp)
+            if kp <= 0.0:
+                continue
+            excess = abs(float(run_ahead[i])) * kp
+            if excess > cap:
+                scale = min(scale, cap / excess)
+        if scale >= 1.0:
+            return q_cmd
+        out = q_cmd.copy()
+        out[:n_arm] = measured[:n_arm] + scale * run_ahead
+        return out
 
     async def motion_control(self, q: np.ndarray) -> None:
         """Send control commands to all joints concurrently.
@@ -1591,6 +1646,10 @@ class AxolArm:
             q[gripper_i] = 0.0
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
 
+        sink_mode = self._command_sink is not None
+        if sink_mode and self._spring_caps:
+            clipped = self._back_off_to_spring_caps(clipped)
+
         # Velocity feedforward via differentiation of commanded positions (rad/s),
         # and acceleration feedforward via a second pass for inertia FF (rad/s²).
         # Velocities/accelerations are frame-invariant under a constant offset,
@@ -1601,7 +1660,6 @@ class AxolArm:
         # these same low-pass derivative chains to the executed tracker
         # position (this loop's 120 Hz differentiation of the pre-tracker
         # target would be out of phase with the executed motion).
-        sink_mode = self._command_sink is not None
         if not sink_mode:
             velocities = self._vel_diff.differentiate(list(clipped))
             accelerations = self._accel_diff.differentiate(velocities)

@@ -410,6 +410,7 @@ class ParcelToolTest(unittest.TestCase):
     def test_worker_builds_the_tool_and_faces_from_the_config(self) -> None:
         worker = object.__new__(IKWorker)
         worker._config = types.SimpleNamespace(
+            box_grasp="flush",
             box_tool="parcel",
             box_tool_open_deg=150.0,
             box_face_left="-x",
@@ -875,6 +876,15 @@ def _box_worker(leader: str = "left") -> IKWorker:
     return worker
 
 
+def _ctrl_turn(yaw: float) -> np.ndarray:
+    """A controller rotation of ``yaw`` about the room's up.
+
+    Controller rotations reach ``_step_box`` in the frame ``_vr_to_flu_np``
+    produces, where the VR world's up (+y) is the *second* axis — not FLU.
+    """
+    return rodrigues(np.array((0.0, 1.0, 0.0)), yaw)
+
+
 class HandTrackingTest(unittest.TestCase):
     """Box mode follows the leader hand's position and its turn about
     vertical, and ignores its pitch and roll: the pair stays level with the
@@ -911,7 +921,12 @@ class HandTrackingTest(unittest.TestCase):
     def test_pitching_or_rolling_the_controller_changes_nothing(self) -> None:
         worker = _box_worker()
         base_left, base_right = self._targets(worker, np.zeros(3), np.eye(3))
-        for rot in (_rot_x(0.8), rodrigues(_LAT, -0.7)):
+        # In the controller frame the two horizontal axes are its first and
+        # third: a rotation about either is a pitch or a roll of the hand.
+        # (The third is the one a rotation about FLU's up would be — a
+        # regression check: pitching the hand up and down used to turn the
+        # pair.)
+        for rot in (_rot_x(0.8), _rot_z(0.8), rodrigues((0.0, 0.0, 1.0), -0.7)):
             left, right = self._targets(worker, np.zeros(3), rot)
             np.testing.assert_allclose(left[0], base_left[0], atol=1e-6)
             np.testing.assert_allclose(left[1], base_left[1], atol=1e-6)
@@ -924,9 +939,10 @@ class HandTrackingTest(unittest.TestCase):
         for yaw in (0.5, -1.0):
             with self.subTest(yaw=yaw):
                 # Turned about the room's up, and tilted as well: only the
-                # turn counts.
+                # turn counts, and a left turn of the hand is a left turn of
+                # the pair (FLU +z, counter-clockwise from above).
                 left, right = self._targets(
-                    worker, np.zeros(3), _rot_z(yaw) @ _rot_x(0.3)
+                    worker, np.zeros(3), _ctrl_turn(yaw) @ _rot_x(0.3)
                 )
                 r = _rot_z(yaw)
                 for (pos, rot), sign in ((left, 1.0), (right, -1.0)):
@@ -969,6 +985,30 @@ class GraspToggleTest(unittest.TestCase):
         worker._config.box_tool_open_deg = 141.5
         worker._config.box_grasp = "flush"
         return worker
+
+    def test_a_session_starts_straight_and_a_click_goes_flush(self) -> None:
+        self.assertEqual(VRTeleopConfig().box_grasp, "straight")
+        worker = _box_worker()
+        worker._config.box_tool = "parcel"
+        worker._config.box_tool_open_deg = 141.5
+        self.assertFalse(hasattr(worker._config, "box_grasp"))  # the fallback
+        self.assertEqual(worker._box_grasp(), "straight")
+        worker._config.box_grasp = "nonsense"
+        self.assertEqual(worker._box_grasp(), "straight")
+        worker._config.box_grasp = VRTeleopConfig().box_grasp
+        worker._box = None
+        self._step(worker)  # snap: fingers straight out, 0°
+        self.assertEqual(worker._box.tool.flush_tilt, 0.0)
+        self._step(worker, l_stick_click=True)
+        self._step(worker)  # release: to flush (38.5°) ...
+        self.assertEqual(worker._config.box_grasp, "flush")
+        self._step(worker)
+        self.assertAlmostEqual(
+            math.degrees(worker._box.tool.flush_tilt), 38.5, places=6
+        )
+        self._step(worker, l_stick_click=True)
+        self._step(worker)  # ... and back
+        self.assertEqual(worker._config.box_grasp, "straight")
 
     def test_click_and_release_toggles_and_resnaps(self) -> None:
         worker = self._worker()
@@ -1038,28 +1078,29 @@ class GraspToggleTest(unittest.TestCase):
             broadcast_mode=lambda key, value: notified.append((key, value)),
         )
         q = np.zeros(14, np.float32)
-        core._unpack_solution(
-            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "straight"})
-        )
-        self.assertEqual(core.config.box_grasp, "straight")
-        self.assertEqual(notified[-1], ("box_grasp", "straight"))
-        # A request on its way to the worker is not undone by a stale report.
-        core.set_live("box_grasp", "flush")
-        core._apply_live_requests()
-        self.assertEqual(core.config.box_grasp, "flush")
-        core._unpack_solution(
-            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "straight"})
-        )
-        self.assertEqual(core.config.box_grasp, "flush")
+        self.assertEqual(core.config.box_grasp, "straight")  # the default
         core._unpack_solution(
             (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "flush"})
         )
         self.assertEqual(core.config.box_grasp, "flush")
-        # ...and once it has landed, the worker's word is final again.
+        self.assertEqual(notified[-1], ("box_grasp", "flush"))
+        # A request on its way to the worker is not undone by a stale report.
+        core.set_live("box_grasp", "straight")
+        core._apply_live_requests()
+        self.assertEqual(core.config.box_grasp, "straight")
+        core._unpack_solution(
+            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "flush"})
+        )
+        self.assertEqual(core.config.box_grasp, "straight")
         core._unpack_solution(
             (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "straight"})
         )
         self.assertEqual(core.config.box_grasp, "straight")
+        # ...and once it has landed, the worker's word is final again.
+        core._unpack_solution(
+            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "flush"})
+        )
+        self.assertEqual(core.config.box_grasp, "flush")
 
 
 class LiveToggleTest(unittest.TestCase):

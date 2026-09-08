@@ -94,7 +94,15 @@ _SNAP_STABLE_RATIO = 0.5  # offset growth/size below this = shift, else motion
 # authorise a large jump.
 _STICK_DEADZONE = 0.15
 _STICK_MAX_DT_S = 0.1
+# The robot's up (FLU +z), for box-frame rotations.
 _UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
+# The room's up in the frame the controller rotations are held in. Those
+# come out of ``_vr_to_flu_np``, which permutes the VR world's axes so that
+# the clutch mapping (``_relative_target_np``) reads controller-local deltas
+# — it does *not* turn the world frame into FLU: the VR world's +y (up) stays
+# the second axis. Anything that looks at a controller's rotation in world
+# terms (box mode's turn about vertical) must use this axis, not ``_UP``.
+_CTRL_UP = np.array((0.0, 1.0, 0.0), dtype=np.float32)
 
 # Gripper-pair status (see IKWorker.pair_status): reported to the core every
 # this many solved frames (~10 Hz at the 120 Hz cadence), and the tolerance
@@ -1090,9 +1098,9 @@ class IKWorker:
         }
 
     def _box_grasp(self) -> str:
-        """The current box-mode grasp, ``"flush"`` or ``"straight"`` (``config.box_grasp``)."""
-        raw = str(getattr(self._config, "box_grasp", "flush")).strip().lower()
-        return "straight" if raw == "straight" else "flush"
+        """The current box-mode grasp, ``"straight"`` or ``"flush"`` (``config.box_grasp``)."""
+        raw = str(getattr(self._config, "box_grasp", "straight")).strip().lower()
+        return "flush" if raw == "flush" else "straight"
 
     def _box_tool(self) -> ToolGeometry:
         """The box-mode contact geometry for the current grasp and tool.
@@ -1264,14 +1272,20 @@ class IKWorker:
         # the leader gripper's translation since the snap, and the pair is
         # turned about that centre by how far the hand has turned about the
         # room's up axis since the snap (taken from the controller's own
-        # world-frame rotation — already in the robot's FLU frame here, see
-        # _vr_to_flu_np — not from the clutch-mapped gripper rotation, so it
-        # is a yaw whatever the gripper was doing at the snap). The hand's
-        # pitch and roll never reach the grippers, so the pair stays level
-        # with the fingers straight out.
+        # world-frame rotation, not from the clutch-mapped gripper rotation,
+        # so it is a yaw whatever the gripper was doing at the snap). The
+        # controller frame's up is the VR world's +y (_CTRL_UP): the poses
+        # out of _vr_to_flu_np are not in FLU, and twisting about FLU +z
+        # there would read the hand's *pitch* as the turn. The turn is a
+        # right-handed angle about up in either frame, so it applies to the
+        # box frame about the robot's +z unchanged. The hand's pitch and roll
+        # never reach the grippers, so the pair stays level with the fingers
+        # straight out.
         snap_pos, _snap_rot = self._snap_fk[leader]
         center = (lead_pos + (box.center - snap_pos)).astype(np.float32)
-        yaw = twist_about(ctrl_rot @ snap_ctrl_rot.T, _UP) * cfg.rotation_multiplier
+        yaw = (
+            twist_about(ctrl_rot @ snap_ctrl_rot.T, _CTRL_UP) * cfg.rotation_multiplier
+        )
         rot = (rodrigues(_UP, yaw) @ box.rot).astype(np.float32) if yaw else box.rot
         self._integrate_sticks(frame, box, now)
         targets = box_targets(box, center, rot, now)

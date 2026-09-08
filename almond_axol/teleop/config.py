@@ -159,13 +159,13 @@ class VRTeleopConfig:
             wrist, so it hooks the box's front corner rather than lying on
             the side; a stop at ~146° would put the tip on the plane.
         box_grasp: Which of box mode's two grasps a session starts in.
-            ``"flush"`` (the default): the fitted tool's contact face along
-            the box side — for the parcel gripper the folded blade's face,
-            with the grippers yawed ``180° - box_tool_open_deg`` inward and
-            the width measured between the faces. ``"straight"``: fingers
-            straight forward (yaw 0), width between the mount frames — the
-            plain flat-hands grasp, for boxes the tips or the closed blades
-            take. Toggled live while a grip is leading by clicking (and
+            ``"straight"`` (the default): fingers straight forward (yaw 0),
+            width between the mount frames — the plain flat-hands grasp,
+            for boxes the tips or the closed blades take. ``"flush"``: the
+            fitted tool's contact face along the box side — for the parcel
+            gripper the folded blade's face, with the grippers yawed ``180°
+            - box_tool_open_deg`` inward and the width measured between the
+            faces. Toggled live while a grip is leading by clicking (and
             releasing) either thumbstick — a click that turns into the
             both-sticks box-mode gesture doesn't count — or from the
             settings; the pair blends into the new grasp over
@@ -224,10 +224,15 @@ class VRTeleopConfig:
             return-to-rest. Closing the grip width onto a box drives the IK
             targets *into* it; without a cap the arms then press with
             ``kp`` times the run-ahead (~6 N per centimetre of width past
-            contact, and rising). With it, the realtime core keeps each
-            capped joint's commanded position within ``cap / kp`` of its
-            measured one, so the pair leans on the box with a bounded
-            squeeze however far the width is jogged in. Rough clamp force
+            contact, and rising). With it, each command is first backed off
+            toward the measured pose — the whole arm by one factor, so it
+            keeps its shape and the contact face its orientation
+            (``AxolArm._back_off_to_spring_caps``) — until the capped
+            joints' spring is within the cap, and the realtime core then
+            also keeps each capped joint's commanded position within
+            ``cap / kp`` of its measured one, so the pair leans on the box
+            with a bounded squeeze however far the width is jogged in and
+            the face stays flat on it. Rough clamp force
             per side: the cap divided by the shoulder's lever to the
             gripper — ~0.65 m with the arms down, ~0.45 m carrying
             forward — so ``4`` Nm is roughly 6–9 N a side; the arms give
@@ -425,7 +430,7 @@ class VRTeleopConfig:
     box_mode: bool = False
     box_tool: str = "parcel"
     box_tool_open_deg: float = 141.5
-    box_grasp: str = "flush"
+    box_grasp: str = "straight"
     box_face_left: str = "auto"
     box_face_right: str = "auto"
     box_grip_tilt: float = 0.0

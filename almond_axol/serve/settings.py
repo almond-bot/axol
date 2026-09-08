@@ -618,15 +618,16 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="teleop.box_grasp",
                 label="Box-mode grasp",
                 type="select",
-                options=("flush", "straight"),
+                options=("straight", "flush"),
                 help=(
-                    "Which grasp a box-mode session starts in. flush: the "
-                    "fitted gripper's contact face along the box side (parcel "
-                    "gripper: the folded blade's face, grippers yawed 38.5° "
-                    "inward, width between the faces). straight: fingers "
-                    "straight forward, width between the mounts. In the "
-                    "headset a click of either thumbstick while leading "
-                    "toggles between the two; the arms blend over."
+                    "Which grasp a box-mode session starts in. straight (the "
+                    "default): fingers straight forward (0°), width between "
+                    "the mounts. flush: the fitted gripper's contact face "
+                    "along the box side (parcel gripper: the folded blade's "
+                    "face, grippers yawed 38.5° inward, width between the "
+                    "faces). In the headset a click of either thumbstick "
+                    "while leading toggles between the two; the arms blend "
+                    "over."
                 ),
                 targets={
                     "teleop": ("teleop.box_grasp",),

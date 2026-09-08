@@ -157,6 +157,67 @@ class ArmCommandTest(unittest.TestCase):
         # spring; held ones sit on their snapshot at config gains).
         self.assertEqual([c[-1] for c in cmds], [0.0] * 8)
 
+    def _arm_at(self, measured: np.ndarray):
+        """A sink-mode arm whose feedback caches read ``measured`` (joint frame)."""
+        arm, sent = self._arm_with_sink()
+        for i, j in enumerate(ARM_JOINTS):
+            arm.motors[j]._position = float(measured[i])
+        arm._unverified_zeros = set()
+        arm._unresolved_offsets = set()
+        return arm, sent
+
+    def test_whole_arm_backs_off_so_a_capped_joint_stays_within_its_cap(self) -> None:
+        """The pair is jogged into a box: the target runs ahead of measured on
+        every joint, most on shoulder_2. The command is pulled back along the
+        joint-space line toward measured — the same fraction on every joint —
+        until shoulder_2's spring is at its cap. The gripper is untouched."""
+        measured = np.array([0.1, -0.2, 0.05, 0.4, 0.0, 0.1, -0.1, 0.0], np.float32)
+        arm, sent = self._arm_at(measured)
+        arm.set_spring_caps({Joint.SHOULDER_2: 4.0, Joint.SHOULDER_3: 4.0})
+        kp_s2 = arm._arm_config.shoulder_2.kp
+        # 6 Nm of shoulder_2 spring asked for; the elbow and wrist_2 run ahead too.
+        run_ahead = np.array([0.0, -6.0 / kp_s2, 0.002, 0.03, 0.0, -0.02, 0.0, 0.0])
+        target = measured + run_ahead.astype(np.float32)
+        target[7] = 0.7  # gripper, normalized
+        asyncio.run(arm.motion_control(target))
+        cmds = sent[-1]
+        sent_arm = np.array([c[0] for c in cmds[:7]])  # motor frame == joint frame here
+        expected_scale = 4.0 / 6.0
+        np.testing.assert_allclose(
+            sent_arm, measured[:7] + expected_scale * run_ahead[:7], atol=1e-6
+        )
+        # shoulder_2 sits exactly at cap / kp from measured; shoulder_3 (also
+        # capped, but within it) is scaled by the same factor as everyone.
+        self.assertAlmostEqual(abs(sent_arm[1] - measured[1]) * kp_s2, 4.0, places=5)
+        self.assertAlmostEqual(cmds[7][0], arm._gripper_to_raw(0.7), places=6)
+
+    def test_within_the_caps_nothing_changes(self) -> None:
+        measured = np.array([0.1, -0.2, 0.05, 0.4, 0.0, 0.1, -0.1, 0.0], np.float32)
+        arm, sent = self._arm_at(measured)
+        arm.set_spring_caps({Joint.SHOULDER_2: 4.0, Joint.SHOULDER_3: 4.0})
+        kp_s2 = arm._arm_config.shoulder_2.kp
+        target = measured.copy()
+        target[1] += 3.9 / kp_s2  # under the cap
+        target[3] += 0.2  # a big elbow run-ahead — not capped, not scaled
+        asyncio.run(arm.motion_control(target))
+        sent_arm = np.array([c[0] for c in sent[-1][:7]])
+        np.testing.assert_allclose(sent_arm, target[:7], atol=1e-6)
+
+    def test_no_caps_or_no_feedback_means_no_back_off(self) -> None:
+        measured = np.zeros(8, np.float32)
+        arm, sent = self._arm_at(measured)
+        target = measured.copy()
+        target[1] = 0.1  # 25 Nm of shoulder_2 spring, uncapped
+        arm.set_spring_caps(None)
+        asyncio.run(arm.motion_control(target))
+        self.assertAlmostEqual(sent[-1][1][0], 0.1, places=6)
+        # Caps on, but the encoder zeros aren't resolved yet: pass through.
+        arm.set_spring_caps({Joint.SHOULDER_2: 4.0})
+        arm._unresolved_offsets = {Joint.SHOULDER_2}
+        asyncio.run(arm.motion_control(target))
+        self.assertAlmostEqual(sent[-1][1][0], 0.1, places=6)
+        arm._unresolved_offsets = set()
+
     def test_robot_level_setter_reaches_both_arms(self) -> None:
         self.robot.set_spring_caps({Joint.SHOULDER_2: 3.0})
         self.assertEqual(self.robot.left.spring_caps, {Joint.SHOULDER_2: 3.0})

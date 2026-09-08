@@ -95,7 +95,7 @@ The knobs an operator can turn *mid-session* — box mode, re-engage behaviour, 
 | Key | Type | Applies |
 |-----|------|---------|
 | `box_mode` | boolean | `VRTeleopCore.set_box_mode()` — switching disengages the arms first |
-| `box_grasp` | `"flush"` / `"straight"` | the tool's contact face along the box side vs. fingers straight forward; a live pair blends over to it. Also toggled by a stick click, which the worker reports back so the value stays in sync |
+| `box_grasp` | `"straight"` / `"flush"` | fingers straight forward (the default) vs. the tool's contact face along the box side; a live pair blends over to it. Also toggled by a stick click, which the worker reports back so the value stays in sync |
 | `box_tool` | `"parcel"` / `"urdf"` | which gripper box mode places (its [contact geometry](/guides/vr-interface#box-tool)); read at the next engage |
 | `box_tool_open_deg` | number, ° | parcel gripper's blade fold at its open stop (flush yaw = 180° − this); next engage |
 | `box_face_left` / `box_face_right` | `"auto"` / `"+x"` / `"-x"` | which flat side of each gripper faces the box; next engage |
