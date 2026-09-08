@@ -139,7 +139,14 @@ def run(args: argparse.Namespace) -> None:
                 "ssl_keyfile": tls_files.keyfile,
             }
         config = uvicorn.Config(
-            app, host=args.host, port=args.port, log_level="info", **ssl_kwargs
+            app,
+            host=args.host,
+            port=args.port,
+            log_level="info",
+            # Without a bound uvicorn waits forever for open streaming
+            # WebSockets, so `systemctl stop axol` sat until its 240s kill.
+            timeout_graceful_shutdown=5,
+            **ssl_kwargs,
         )
         server = uvicorn.Server(config)
         server.run(sockets=[sock])

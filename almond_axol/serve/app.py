@@ -635,6 +635,10 @@ _CAN_DISCOVERY_STATUSES = {
     "error",
 }
 _CAN_DISCOVERY_FORCE_RETRY_SECONDS = 2.0
+# Discovery renames interfaces under a udev lock it can lose to a slow or
+# wedged host. Shutdown joins it so the rename is not cut in half, but the
+# join is bounded: systemd kills the service outright if the stop overruns.
+_CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass
@@ -2506,7 +2510,17 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         if can_discovery_task is not None and not can_discovery_task.done():
-            await asyncio.shield(can_discovery_task)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(can_discovery_task),
+                    _CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                _logger.warning(
+                    "CAN hardware discovery did not finish within %.0fs; "
+                    "shutting down without it",
+                    _CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS,
+                )
         await runner.shutdown()
         await manager.shutdown()
         await asyncio.to_thread(robot.shutdown)
