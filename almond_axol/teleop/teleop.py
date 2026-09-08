@@ -41,6 +41,7 @@ import time
 
 import numpy as np
 
+from ..constants import PARK_TIMEOUT_S
 from ..kinematics import KinematicsConfig
 from ..robot.base import (
     HardwareCleanupError,
@@ -58,6 +59,10 @@ from .core import VRTeleopCore
 from .worker import run_ik_worker
 
 _logger = logging.getLogger(__name__)
+
+# How long teardown waits for the arms to report their positions before it
+# treats the bus as gone and skips the return-to-rest.
+_BUS_PROBE_TIMEOUT_S = 0.5
 
 
 @contextlib.contextmanager
@@ -381,6 +386,11 @@ class VRTeleop:
         cleanup_failures: list[tuple[str, BaseException]] = []
         hardware_failures: list[tuple[str, BaseException]] = []
 
+        # Park before anything is torn down: the return-to-rest is planned by
+        # the IK worker and played by the IK dispatch thread, both of which the
+        # shutdown below stops.
+        await self._park_arms()
+
         # Stop new work first, then turn the hardware off before waiting on
         # background workers.  A wedged IK reader must not delay torque-off.
         if self._ik_thread is not None:
@@ -637,6 +647,101 @@ class VRTeleop:
         self._vr_server.set_video_manager(manager)
 
     # ------------------------------------------------------------------
+    # Guarded return-to-rest bindings
+    # ------------------------------------------------------------------
+
+    def _guard_supported(self) -> bool:
+        """True when this target can play a guarded return-to-rest.
+
+        The guarded engine needs torque feedback and gravity comp — hardware
+        (Axol) only. The Sim target has neither, and nothing physical to
+        protect, so its resets play through the plain path instead.
+        """
+        return all(
+            hasattr(self._robot, attr)
+            for attr in (
+                "torque_residuals",
+                "gravity_compensate",
+                "reset_command_state",
+            )
+        )
+
+    async def _guard_send_step(self) -> None:
+        left, right = self.step()
+        if left is not None:
+            await self._robot.motion_control(left=left, right=right)
+
+    async def _guard_gravity_step(self) -> None:
+        await self._robot.gravity_compensate(  # type: ignore[attr-defined]
+            kd=self._config.reset_gravity_comp_kd
+        )
+
+    def _guard_positions(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        left_arm = getattr(self._robot, "left", None)
+        right_arm = getattr(self._robot, "right", None)
+        return (
+            left_arm.positions if left_arm is not None else None,
+            right_arm.positions if right_arm is not None else None,
+        )
+
+    def _guard_vr_alive(self) -> bool:
+        # Frames within the last ~2s: a Y-exit ends the XR session (the
+        # stream stops instantly), so a contact hold on the way out has
+        # no headset left to press reset — the engine settles it instead
+        # of waiting forever.
+        with self._vr_frame_times_lock:
+            last = self._vr_frame_times[-1] if self._vr_frame_times else None
+        return last is not None and (time.perf_counter() - last) < 2.0
+
+    async def _park_arms(self) -> None:
+        """Return the arms to rest before the torque comes off.
+
+        Raised arms drop under gravity the moment they are disabled, so
+        teardown parks them first. The move is skipped when there is nothing
+        to park or no safe way to park it: a target with no guarded engine
+        (Sim), arms already limp for hand-guiding (a contact hold — pulling
+        them would fight the operator), a dead IK worker (nothing can plan the
+        path), arms already at rest, or a bus that no longer reports positions.
+
+        The whole move is capped at :data:`PARK_TIMEOUT_S` and every failure is
+        swallowed, so the torque-off that follows is never delayed past the
+        caller's stop grace and never skipped. Losing the park costs only what
+        was already lost before it existed.
+        """
+        if not self._guard_supported():
+            return
+        if self._core.ik_paused or self._core.at_rest:
+            return
+        if self._ik_process is None or not self._ik_process.is_alive():
+            return
+        try:
+            left, right = await asyncio.wait_for(
+                self._robot.get_positions(), timeout=_BUS_PROBE_TIMEOUT_S
+            )
+            if left is None and right is None:
+                return
+            _logger.info("Returning the arms to rest before torque-off.")
+            deadline = time.perf_counter() + PARK_TIMEOUT_S
+            self._core.request_reset()
+            await self._core.guarded_return(
+                send_step=self._guard_send_step,
+                gravity_step=self._guard_gravity_step,
+                torque_residuals=self._robot.torque_residuals,  # type: ignore[attr-defined]
+                reset_command_state=self._robot.reset_command_state,  # type: ignore[attr-defined]
+                get_positions=self._guard_positions,
+                stopped=lambda: time.perf_counter() >= deadline,
+                announce=_logger.info,
+                vr_alive=self._guard_vr_alive,
+                move_timeout_s=PARK_TIMEOUT_S,
+            )
+        except BaseException:
+            _logger.warning(
+                "return to rest before torque-off did not finish; disabling "
+                "the arms where they are",
+                exc_info=True,
+            )
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
@@ -670,45 +775,7 @@ class VRTeleop:
         tegra = TegraStatsDiag(_logger)
         tegra.start()
 
-        # Guarded return-to-rest needs torque feedback and gravity comp —
-        # hardware (Axol) only. The Sim target has neither (and nothing
-        # physical to protect), so its resets play through the normal path
-        # below.
-        guard = all(
-            hasattr(self._robot, attr)
-            for attr in (
-                "torque_residuals",
-                "gravity_compensate",
-                "reset_command_state",
-            )
-        )
-
-        async def _guard_send_step() -> None:
-            left, right = self.step()
-            if left is not None:
-                await self._robot.motion_control(left=left, right=right)
-
-        async def _guard_gravity_step() -> None:
-            await self._robot.gravity_compensate(  # type: ignore[attr-defined]
-                kd=self._config.reset_gravity_comp_kd
-            )
-
-        def _guard_positions() -> tuple[np.ndarray | None, np.ndarray | None]:
-            left_arm = getattr(self._robot, "left", None)
-            right_arm = getattr(self._robot, "right", None)
-            return (
-                left_arm.positions if left_arm is not None else None,
-                right_arm.positions if right_arm is not None else None,
-            )
-
-        def _guard_vr_alive() -> bool:
-            # Frames within the last ~2s: a Y-exit ends the XR session (the
-            # stream stops instantly), so a contact hold on the way out has
-            # no headset left to press reset — the engine settles it instead
-            # of waiting forever.
-            with self._vr_frame_times_lock:
-                last = self._vr_frame_times[-1] if self._vr_frame_times else None
-            return last is not None and (time.perf_counter() - last) < 2.0
+        guard = self._guard_supported()
 
         # Tracking-phase contact watchdog (hardware only, opt-in — the
         # threshold defaults to 0 = off): the same sustained-torque trip the
@@ -734,14 +801,14 @@ class VRTeleop:
                 # See VRTeleopCore.guarded_return.
                 if guard and self._core.is_resetting:
                     await self._core.guarded_return(
-                        send_step=_guard_send_step,
-                        gravity_step=_guard_gravity_step,
+                        send_step=self._guard_send_step,
+                        gravity_step=self._guard_gravity_step,
                         torque_residuals=self._robot.torque_residuals,  # type: ignore[attr-defined]
                         reset_command_state=self._robot.reset_command_state,  # type: ignore[attr-defined]
-                        get_positions=_guard_positions,
+                        get_positions=self._guard_positions,
                         stopped=lambda: False,  # unwound by task cancellation
                         announce=_logger.info,
-                        vr_alive=_guard_vr_alive,
+                        vr_alive=self._guard_vr_alive,
                     )
                     # Re-anchor pacing after the excursion so the next cycle
                     # doesn't try to catch up on the elapsed time.
@@ -768,12 +835,12 @@ class VRTeleop:
                             self._config.teleop_torque_threshold,
                         )
                         await self._core.contact_hold(
-                            gravity_step=_guard_gravity_step,
+                            gravity_step=self._guard_gravity_step,
                             reset_command_state=self._robot.reset_command_state,  # type: ignore[attr-defined]
-                            get_positions=_guard_positions,
+                            get_positions=self._guard_positions,
                             stopped=lambda: False,  # unwound by task cancellation
                             announce=_logger.info,
-                            vr_alive=_guard_vr_alive,
+                            vr_alive=self._guard_vr_alive,
                         )
                         track_watchdog = ContactWatchdog(
                             self._config.teleop_torque_threshold
