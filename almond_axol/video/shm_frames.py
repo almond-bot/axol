@@ -683,6 +683,13 @@ class EncodedAuReader:
         self._since_keyframe = 0
         self._delivered = 0
         self._seen_first_au = False
+        # Exposures the transport lost or delivered unusable *within the
+        # current episode* (an upstream drop marked DISCONT, an AU that could
+        # not be mapped, a PTS the sender lost). Under the recorder's fail-open
+        # policy these are not fatal: the capture loop sees the resulting PTS
+        # gap and repeats the prior IDR into it. Counted here so the recorder's
+        # end-of-take quality summary can attribute the hole to the transport.
+        self._lost_exposures = 0
         # gdpdepay restores the sender's serialized caps and buffer metadata.
         # Keep a fixed H.264 filter as an integrity check; h264parse re-derives
         # dimensions from the SPS and preserves the exposure PTS.
@@ -702,6 +709,38 @@ class EncodedAuReader:
     def frames_are_independent(self) -> bool:
         """Whether callers may discard an AU without breaking later frames."""
         return self._expected_gop == 1
+
+    @property
+    def lost_exposures(self) -> int:
+        """Exposures the transport lost or delivered unusable this episode."""
+        with self._cond:
+            return self._lost_exposures
+
+    def reset_lost_exposures(self) -> None:
+        """Start a new episode's transport-loss count."""
+        with self._cond:
+            self._lost_exposures = 0
+
+    def _note_lost_exposure(self, what: str) -> None:
+        """Count a single unusable/lost exposure and say so; not fatal.
+
+        The exposure's cadence slot is simply empty from the recorder's point
+        of view — the same PTS gap a source-side drop leaves — and the capture
+        loop conceals it. Only the transport itself failing (pipeline error,
+        no/invalid PTS on every AU, a predictive picture on an all-intra
+        contract) remains a reader error.
+        """
+        with self._cond:
+            self._lost_exposures += 1
+            count = self._lost_exposures
+        _logger.warning(
+            "encoded-AU reader %s: %s near frame %d; the capture loop will "
+            "conceal the missing exposure (%d lost this episode)",
+            self._name,
+            what,
+            self._delivered,
+            count,
+        )
 
     @property
     def is_connected(self) -> bool:
@@ -843,10 +882,8 @@ class EncodedAuReader:
             discont = buf.has_flags(Gst.BufferFlags.DISCONT)
             ok, mapinfo = buf.map(Gst.MapFlags.READ)
             if not ok:
-                self._fail(
-                    f"encoded AU on {self._name} could not be mapped; an "
-                    "encoded exposure was lost"
-                )
+                if self._episode_cutoff_active and self._seen_first_au:
+                    self._note_lost_exposure("an AU could not be mapped")
                 continue
             try:
                 au = bytes(mapinfo.data)
@@ -875,13 +912,16 @@ class EncodedAuReader:
             # gdppay/gdpdepay normalizes a missing input PTS to zero. Zero is a
             # legitimate value only for the pipeline's very first frame; once
             # flush() establishes an episode boundary, seeing it means the
-            # sender lost a timestamp. Silently filtering it as an old frame
-            # would also destroy exact exposure/row accounting.
+            # sender lost this AU's timestamp. The AU cannot be placed on the
+            # row grid, so it is dropped and counted: the capture loop sees
+            # the PTS gap and conceals the exposure instead of silently
+            # filing the AU as an old frame (which would break exposure/row
+            # accounting) or ending the take over one lost timestamp.
             if buf.pts == 0 and self._episode_cutoff_active:
-                self._fail(
-                    f"encoded AU on {self._name} reset to PTS 0; exact "
-                    "image/state alignment is unavailable"
-                )
+                if self._seen_first_au:
+                    self._note_lost_exposure(
+                        "an AU arrived with PTS 0 (timestamp lost)"
+                    )
                 continue
             capture_perf = buf.pts / 1e9 + self._pts_perf_offset_s
             if not np.isfinite(capture_perf):
@@ -928,15 +968,16 @@ class EncodedAuReader:
                         self._fail_keyframe_gap()
                         continue
                 # A shmsrc DISCONT after the first AU means an upstream buffer was
-                # dropped between the relay and here. Even though later all-intra
-                # frames decode, row/exposure accounting is no longer exact. Surface
-                # it (the first AU legitimately carries the startup discontinuity).
+                # dropped between the relay and here. This AU itself is intact
+                # (all-intra), and the exposure(s) before it are simply absent:
+                # the capture loop sees the PTS gap and repeats the prior IDR
+                # into it. Count it so the loss is attributed to the transport
+                # rather than the source (the first AU legitimately carries the
+                # startup discontinuity).
                 if discont and self._seen_first_au:
-                    self._fail(
-                        f"encoded-AU discontinuity on {self._name} near frame "
-                        f"{self._delivered}; an upstream frame was dropped"
+                    self._note_lost_exposure(
+                        "shmsrc marked a discontinuity (an upstream frame was dropped)"
                     )
-                    continue
                 if len(self._queue) >= self._queue_limit:
                     self._error = (
                         f"encoded-AU backlog on {self._name} exceeded "
@@ -965,8 +1006,11 @@ class EncodedAuReader:
         Returns ``(au_bytes, capture_perf_ts, recv_perf_ts)``. The capture time
         is the sender's sensor-exposure PTS mapped onto ``perf_counter``; receive
         time is retained for latency diagnostics. Raises :class:`RuntimeError`
-        on any transport/PTS/reference discontinuity and :class:`TimeoutError`
-        if no fresh AU arrives in time. Predictive AUs are never duplicated.
+        on a transport failure (pipeline error, predictive picture on the
+        all-intra contract, no/invalid PTS, or a backlog the recorder stopped
+        draining) and :class:`TimeoutError` if no fresh AU arrives in time. A
+        single lost or unusable exposure is counted (:attr:`lost_exposures`)
+        and left for the capture loop to conceal, not raised.
         """
         deadline = time.perf_counter() + timeout_ms / 1000.0
         with self._cond:

@@ -164,21 +164,22 @@ def _shutdown_process(
 # the rest of the camera/control stack remains healthy.  Holding the last IDR
 # for those missing cadence slots is bounded corruption (at most 33 ms at
 # 60 Hz) and, unlike accepting the future AU early, does not shift that camera
-# against every subsequent robot-state/dataset row.  A single hole longer than
-# two frames is fatal, and so is a camera that is losing frames faster than a
-# rare hiccup: the ZED sources have been observed dropping one exposure every
-# one to four seconds during a teleoperated take (both stereo eyes together,
-# so the loss is in the source, not the relay's queues or transport), and a
-# fixed handful of events per episode aborted every take within seconds and
-# homed the arms mid-teleop.  The budget is therefore a rate: a burst of
-# events inside a short window, or concealed frames above a small fraction of
-# the episode, means the stream is unhealthy and still fails closed.
-_ENCODED_MAX_CONCEALED_FRAMES_PER_EVENT = 2
+# against every subsequent robot-state/dataset row.  The ZED sources have been
+# observed dropping one exposure every one to four seconds during a
+# teleoperated take (both stereo eyes together, so the loss is in the source,
+# not the relay's queues or transport), and a fixed handful of events per
+# episode aborted every take within seconds and homed the arms mid-teleop.
+# The budget below is therefore a rate: a burst of events inside a short
+# window, or concealed frames above a small fraction of the episode, marks the
+# stream as unhealthy.  Under the fail-open policy (see _CAMERA_LOSS_FATAL_S)
+# that no longer ends the take — the hole is still repaired — but the event is
+# logged at ERROR and counted so the source gets looked at.  Holes of any
+# length up to _ENCODED_MAX_CONCEALED_GAP_S are repaired the same way; only a
+# hole longer than that ends the episode.
 _ENCODED_MAX_CONCEALMENT_EVENTS_PER_WINDOW = 3
 _ENCODED_CONCEALMENT_WINDOW_S = 2.0
 _ENCODED_MIN_CONCEALED_FRAMES_PER_CAMERA = 6
 _ENCODED_MAX_CONCEALED_FRACTION = 0.02
-_ENCODED_GAP_GRID_TOLERANCE_FRAMES = 0.25
 # A just-arrived exposure can precede the newest control snapshot by one control
 # tick. Briefly poll the state ring for the upper bracket; never clamp outside
 # its retained range.
@@ -192,6 +193,26 @@ _SNAPSHOT_HISTORY_SIZE = 512
 # headroom for lower configured control rates, but surface clock/history failures
 # before they silently contaminate a whole episode.
 _STATE_ALIGNMENT_WARN_S = 0.050
+
+# Fail-open recording policy. A take is a scarce, operator-driven artefact; a
+# single imperfect row is not. Both capture loops therefore *mitigate* every
+# per-row defect they can (repeat the prior IDR into a bounded hole, discard a
+# stale AU and take the next one, hold the previous row's state when the exact
+# bracket is gone, and as a last resort drop the row for every camera at once
+# so the streams stay index-aligned) and record it in the
+# episode's capture-quality counters (logged at the end of the take and, for
+# the worst cases, per event) so it can be tracked down later — without ending
+# the episode. Only a *drastic* loss ends a take: a camera that delivers no
+# usable exposure for this long, or a control loop that publishes no state for
+# this long. Those match the "silent motor" threshold the realtime core uses
+# to go limp — past that point the rows would describe a robot nobody is
+# observing.
+_CAMERA_LOSS_FATAL_S = 1.0
+_STATE_LOSS_FATAL_S = 1.0
+# Concealment past the historical per-camera budget is still applied (the
+# alternative is discarding the take), but the log escalates from WARNING to
+# ERROR once per camera per episode so an unhealthy source stands out.
+_ENCODED_MAX_CONCEALED_GAP_S = _CAMERA_LOSS_FATAL_S
 
 # A capture row that goes this long without a heartbeat is a stall worth a
 # stack trace: 30 frame periods at 60 fps, well under the 2 s encoded-AU
@@ -1024,96 +1045,258 @@ def _describe_snapshot_miss(
     )
 
 
+def _classify_snapshot_miss(
+    target_ts: float,
+    read_latest: Callable[[], tuple[dict, dict, float, bool] | None],
+    now: float | None = None,
+) -> tuple[str, bool, tuple[dict, dict, float, bool] | None]:
+    """Describe a bracket miss and decide whether it ends the take.
+
+    Returns ``(detail, fatal, latest)`` from a *single* ``read_latest`` so the
+    logged attribution and the decision can never disagree (the writer may
+    publish between two reads).
+
+    Only one miss is drastic enough to end an episode: the control loop has
+    published nothing for :data:`_STATE_LOSS_FATAL_S` — the robot is moving
+    (or not) with nobody recording its state, and every later row would pair a
+    fresh image with the same stale pose. Everything else is a per-row defect:
+    the exposure aged out of the ring while the recorder was descheduled, the
+    ring copy raced the writer for every retry, or the writer paused briefly
+    and has since resumed. Those cost one row (or one row's exact pairing),
+    not the take.
+    """
+    latest = read_latest()
+    detail = _describe_snapshot_miss(target_ts, lambda: latest, now)
+    if latest is None:
+        # Nothing readable right now. Mid-episode this is a transient (a raced
+        # ring copy); the startup wait already proved the writer publishes.
+        return detail, False, None
+    reference = now if now is not None else time.perf_counter()
+    silent_for = reference - latest[2]
+    fatal = silent_for >= _STATE_LOSS_FATAL_S
+    if fatal:
+        detail += (
+            f"; no robot state has been published for {silent_for:.2f}s "
+            f"(limit {_STATE_LOSS_FATAL_S:.1f}s)"
+        )
+    return detail, fatal, latest
+
+
+class _RowStatePairer:
+    """Choose the robot state for one dataset row under the fail-open policy.
+
+    The normal case is the snapshot nearest the row's camera exposure, within
+    :data:`_STATE_ALIGNMENT_WARN_S`. When that is unavailable (the exact
+    bracket aged out of the ring, the ring copy raced the writer, the writer
+    paused briefly) the fallbacks are, in order:
+
+    1. **Hold the previous row's state** if it is still within the same
+       tolerance of this exposure. That is at most one or two frames stale —
+       no worse than a pairing the loop accepts on any ordinary row — and, like
+       repeating the prior IDR for a lost exposure, it keeps the row so the
+       dataset's ``frame_index / fps`` timeline stays true to wall time.
+    2. **Drop the row** (every camera together, so mp4s and parquet stay
+       index-aligned) when nothing within tolerance exists and the transport
+       allows skipping an AU.
+    3. **Keep the row with the degraded pairing** on a predictive stream that
+       cannot skip an AU.
+
+    Each outcome is counted in ``quality`` and logged with the row's reason so
+    it can be tracked down later.
+    """
+
+    def __init__(
+        self, *, label: str, can_drop: bool, quality: "dict[str, int] | None"
+    ) -> None:
+        self._label = label
+        self._can_drop = can_drop
+        self._quality = quality
+        self._last_fresh: tuple[dict, dict, float, bool] | None = None
+        self._held_run = 0
+        self.misses = 0
+
+    def resolve(
+        self,
+        row_capture_ts: float,
+        candidate: tuple[dict, dict, float, bool] | None,
+        miss_detail: str | None,
+    ) -> tuple[tuple[dict, dict, float, bool] | None, float]:
+        """Return ``(snapshot, skew_s)``; ``snapshot`` is ``None`` to drop the row.
+
+        ``candidate`` is the best snapshot available (the nearest bracket, or
+        the newest published when no bracket exists); ``miss_detail`` carries
+        :func:`_classify_snapshot_miss`'s attribution when the bracket was
+        missing.
+        """
+        skew = abs(candidate[2] - row_capture_ts) if candidate is not None else math.inf
+        if skew <= _STATE_ALIGNMENT_WARN_S:
+            self._last_fresh = candidate
+            self._held_run = 0
+            return candidate, skew
+        self.misses += 1
+        if miss_detail is not None:
+            reason = (
+                f"no retained robot-state snapshot brackets {self._label} "
+                f"{row_capture_ts:.6f}: {miss_detail}"
+            )
+        else:
+            reason = (
+                f"nearest robot state is {skew * 1e3:.1f}ms from the {self._label} "
+                f"(limit {_STATE_ALIGNMENT_WARN_S * 1e3:.1f}ms)"
+            )
+        if self._last_fresh is not None:
+            held_skew = abs(self._last_fresh[2] - row_capture_ts)
+            if held_skew <= _STATE_ALIGNMENT_WARN_S:
+                self._held_run += 1
+                _note_quality(self._quality, "rows_with_held_state")
+                _logger.warning(
+                    "holding the previous row's robot state for this dataset row "
+                    "(%.1fms from the %s, %d consecutive): %s (%d state pairing "
+                    "miss(es) this episode)",
+                    held_skew * 1e3,
+                    self._label,
+                    self._held_run,
+                    reason,
+                    self.misses,
+                )
+                return self._last_fresh, held_skew
+        if self._can_drop or candidate is None:
+            key = (
+                "rows_dropped_state_miss"
+                if miss_detail is not None
+                else "rows_dropped_state_skew"
+            )
+            _note_quality(self._quality, key)
+            _logger.warning(
+                "dropping one dataset row: %s (%d state pairing miss(es) this episode)",
+                reason,
+                self.misses,
+            )
+            return None, skew
+        _note_quality(self._quality, "rows_kept_with_state_skew")
+        _logger.warning(
+            "keeping dataset row with a %.1fms state skew (a predictive stream "
+            "cannot skip the row): %s (%d state pairing miss(es) this episode)",
+            skew * 1e3,
+            reason,
+            self.misses,
+        )
+        return candidate, skew
+
+
+def _note_quality(quality: "dict[str, int] | None", key: str, n: int = 1) -> int:
+    """Bump one capture-quality counter; returns the new value (0 if unused)."""
+    if quality is None:
+        return 0
+    value = quality.get(key, 0) + n
+    quality[key] = value
+    return value
+
+
+def format_capture_quality(quality: "dict[str, int]") -> str:
+    """One-line summary of an episode's mitigated capture defects."""
+    if not quality:
+        return "clean (no mitigated capture defects)"
+    return ", ".join(f"{key}={value}" for key, value in sorted(quality.items()))
+
+
+def _log_capture_quality(
+    quality: "dict[str, int]",
+    rows: int,
+    cameras: "dict[str, Any]",
+    capture_error: str | None,
+) -> None:
+    """Summarize a finished take's mitigated defects in one log line.
+
+    Folds in each encoded reader's transport-side losses (upstream frames the
+    relay dropped before the recorder saw them) so the summary covers the
+    whole path. INFO for a clean take, WARNING when anything was mitigated —
+    the operator did not see any of it, so this line is how a take that needs
+    a second look gets found later.
+    """
+    for cam_key, cam in cameras.items():
+        lost = getattr(cam, "lost_exposures", 0)
+        if isinstance(lost, int) and lost > 0:
+            quality[f"{cam_key}.transport_lost_exposures"] = lost
+    summary = format_capture_quality(quality)
+    if capture_error is not None:
+        _logger.warning(
+            "capture quality: %d row(s) before the take ended on %s; %s",
+            rows,
+            capture_error,
+            summary,
+        )
+    elif quality:
+        _logger.warning("capture quality: %d row(s); %s", rows, summary)
+    else:
+        _logger.info("capture quality: %d row(s); %s", rows, summary)
+
+
 def _camera_alignment_limit(fps: int) -> float:
     """Maximum allowed exposure spread within a multi-camera dataset row."""
     return max(0.010, 1.5 / fps) if fps > 0 else 0.050
 
 
-def _validate_encoded_cadence_step(
-    name: str,
+def _missing_cadence_slots(
+    *,
+    previous_ts: float,
+    capture_ts: float,
+    fps: int,
+    capture_fps: int,
+) -> int:
+    """Number of dataset cadence slots skipped between two consecutive AUs.
+
+    Zero for a normal step (including the alternating source-frame spacings a
+    non-divisor decimation such as 60 -> 50 legitimately produces: its largest
+    planned spacing plus a quarter source interval is allowed). Otherwise the
+    gap is rounded to the nearest whole number of dataset periods — source PTS
+    jitter is far below half a period, so a real loss is never mistaken for
+    jitter or vice versa — and the count of slots with no exposure is
+    returned. Callers decide how to repair the hole; this helper only measures
+    it.
+    """
+    if fps <= 0 or not math.isfinite(previous_ts) or not math.isfinite(capture_ts):
+        return 0
+    delta = capture_ts - previous_ts
+    if delta <= 0:
+        return 0
+    if capture_fps > fps:
+        planned_steps = (capture_fps + fps - 1) // fps
+        gap_limit = (planned_steps + 0.25) / capture_fps
+        if delta <= gap_limit:
+            return 0
+    periods = int(math.floor(delta * fps + 0.5))
+    return max(0, periods - 1)
+
+
+def _encoded_cadence_deviation(
     *,
     first_ts: float,
-    previous_ts: float,
     capture_ts: float,
     intervals: int,
     fps: int,
     capture_fps: int,
-) -> None:
-    """Fail closed when one encoded exposure is missing or off cadence."""
-    if not math.isfinite(capture_ts):
-        raise RuntimeError(f"camera {name!r} produced an invalid capture timestamp")
-    delta = capture_ts - previous_ts
-    if delta <= 0:
-        raise RuntimeError(
-            f"camera {name!r} capture PTS did not advance "
-            f"({delta * 1e3:.2f}ms); episode discarded"
-        )
-    # A non-divisor decimation (e.g. 60 -> 50) legitimately alternates
-    # source-frame spacings. Allow its largest planned spacing plus a quarter
-    # source interval. A whole extra source interval means a selected frame was
-    # lost.
-    planned_steps = (capture_fps + fps - 1) // fps
-    gap_limit = (planned_steps + 0.25) / capture_fps
-    if delta > gap_limit:
-        raise RuntimeError(
-            f"camera {name!r} dropped an encoded frame: capture PTS jumped "
-            f"{delta * 1e3:.2f}ms (limit {gap_limit * 1e3:.2f}ms); "
-            "episode discarded"
-        )
+) -> str | None:
+    """Describe a long-run cadence drift off the dataset grid, else ``None``.
+
+    videorate preserves the selected source PTS. Its phase may differ from an
+    ideal dataset-rate grid by roughly one source interval, but sustained
+    capture-rate output (for example after reopening a stale downstream
+    videorate) must not be silently stretched onto the dataset timeline. The
+    caller logs the deviation and re-anchors the check; it is not fatal.
+    """
     elapsed = capture_ts - first_ts
-    # videorate preserves the selected source PTS. Its phase may differ from
-    # an ideal dataset-rate grid by roughly one source interval, but sustained
-    # capture-rate output (for example after reopening a stale downstream
-    # videorate) must not be silently stretched onto the dataset timeline.
     cadence_slack = 1.5 / capture_fps
     minimum_elapsed = intervals / fps - cadence_slack
     maximum_elapsed = intervals / fps + cadence_slack
-    if elapsed < minimum_elapsed or elapsed > maximum_elapsed:
-        direction = "too fast" if elapsed < minimum_elapsed else "too slow"
-        raise RuntimeError(
-            f"camera {name!r} encoded cadence is {direction}: "
-            f"{intervals + 1} frames span {elapsed * 1e3:.2f}ms at requested "
-            f"{fps}fps (allowed {max(0.0, minimum_elapsed) * 1e3:.2f}–"
-            f"{maximum_elapsed * 1e3:.2f}ms); episode discarded"
-        )
-
-
-def _concealable_encoded_gap_frames(
-    *,
-    previous_ts: float,
-    capture_ts: float,
-    fps: int,
-    capture_fps: int,
-    frames_are_independent: bool,
-) -> int:
-    """Return the number of bounded missing cadence slots, else zero.
-
-    This is intentionally narrower than the cadence validator.  A repair is
-    safe for the encoded transport only when every source frame is a standalone
-    IDR and the dataset consumes every captured exposure.  Rate-converted
-    streams can legitimately alternate source-frame spacings, so they retain
-    the exact/fail-closed path rather than having that selection pattern
-    mistaken for loss.
-    """
-    if (
-        not frames_are_independent
-        or fps <= 0
-        or capture_fps != fps
-        or not math.isfinite(previous_ts)
-        or not math.isfinite(capture_ts)
-    ):
-        return 0
-    delta = capture_ts - previous_ts
-    if delta <= 0:
-        return 0
-    periods = round(delta * fps)
-    missing = periods - 1
-    if not 1 <= missing <= _ENCODED_MAX_CONCEALED_FRAMES_PER_EVENT:
-        return 0
-    residual = abs(delta - periods / fps)
-    if residual > _ENCODED_GAP_GRID_TOLERANCE_FRAMES / capture_fps:
-        return 0
-    return missing
+    if minimum_elapsed <= elapsed <= maximum_elapsed:
+        return None
+    direction = "too fast" if elapsed < minimum_elapsed else "too slow"
+    return (
+        f"{direction}: {intervals + 1} frames span {elapsed * 1e3:.2f}ms at "
+        f"requested {fps}fps (allowed {max(0.0, minimum_elapsed) * 1e3:.2f}–"
+        f"{maximum_elapsed * 1e3:.2f}ms)"
+    )
 
 
 def _concealment_within_budget(
@@ -1166,8 +1349,6 @@ def _align_independent_encoded_start(
     if len(packets) <= 1:
         return packets, dropped
     boundary = max(packet[1] for packet in packets.values())
-    first_ts = {name: packet[1] for name, packet in packets.items()}
-    intervals = dict.fromkeys(packets, 0)
     for name in packets:
         while packets[name][1] < boundary:
             previous_ts = packets[name][1]
@@ -1176,17 +1357,27 @@ def _align_independent_encoded_start(
                 raise TimeoutError(
                     f"camera {name!r} did not catch up to the row-zero exposure window"
                 )
-            next_interval = intervals[name] + 1
-            _validate_encoded_cadence_step(
-                name,
-                first_ts=first_ts[name],
+            if not math.isfinite(packet[1]) or packet[1] <= previous_ts:
+                # Unusable prefix AU (no/duplicate timestamp): nothing before
+                # row zero is recorded, so just keep advancing.
+                dropped[name] = dropped.get(name, 0) + 1
+                continue
+            missing = _missing_cadence_slots(
                 previous_ts=previous_ts,
                 capture_ts=packet[1],
-                intervals=next_interval,
                 fps=fps,
                 capture_fps=capture_fps[name],
             )
-            intervals[name] = next_interval
+            if missing:
+                # A hole in the discarded prefix costs nothing; note it so a
+                # camera that is already losing exposures at start is visible.
+                _logger.info(
+                    "camera %r skipped %d exposure(s) before row zero (PTS gap "
+                    "%.2fms); nothing recorded yet, continuing alignment",
+                    name,
+                    missing,
+                    1e3 * (packet[1] - previous_ts),
+                )
             packets[name] = packet
             dropped[name] = dropped.get(name, 0) + 1
     return packets, dropped
@@ -1256,6 +1447,7 @@ def run_capture_loop(
     on_error: Callable[[str], None] | None = None,
     heartbeat: Callable[[], None] | None = None,
     row_times: "list[float] | None" = None,
+    quality: "dict[str, int] | None" = None,
 ) -> None:
     """Capture dataset rows at ``fps`` Hz until ``stop_event`` is set.
 
@@ -1272,9 +1464,16 @@ def run_capture_loop(
     frame with ``capture_perf_ts >= T_n`` from every camera. The row is paired
     with the joint/action snapshot nearest the median camera exposure, rather
     than whichever control tick happens to be latest after camera delivery.
-    Every row requires one fresh frame per camera; a timeout/stale frame aborts
-    the episode instead of silently duplicating images or state. Any fatal error
-    is reported via ``on_error``.
+    Every row requires one fresh frame per camera. Under the fail-open policy
+    (see :data:`_CAMERA_LOSS_FATAL_S`) a tick whose frames are missing, stale,
+    or unsynchronized is *skipped* — no image and no row is written for any
+    camera, so the dataset stays self-consistent — and a tick without an exact
+    state bracket holds the previous row's state while that is within
+    tolerance (:class:`_RowStatePairer`), else is skipped too. Everything is
+    counted in ``quality``. Only a camera that produces no fresh frame
+    for :data:`_CAMERA_LOSS_FATAL_S`, a transport failure, or a control loop
+    silent for :data:`_STATE_LOSS_FATAL_S` ends the episode (reported via
+    ``on_error``).
 
     ``record_event`` (optional) gates mid-episode capture: while cleared the
     loop idles without appending rows, and on the next set it re-anchors its
@@ -1328,6 +1527,12 @@ def run_capture_loop(
         timeout_ms = int(2 * frame_interval * 1000 + 200)
         recording_start: float | None = None
         last_capture_ts: dict[str, float] = {}
+        # When each camera last produced a usable fresh frame (perf_counter):
+        # a camera silent for _CAMERA_LOSS_FATAL_S ends the take; anything
+        # shorter costs the ticks it missed.
+        last_fresh_frame_at: dict[str, float] = dict.fromkeys(
+            cameras, time.perf_counter()
+        )
         tick = 0
 
         tick_cost_sum = 0.0
@@ -1337,6 +1542,11 @@ def run_capture_loop(
         snapshot_skew_max = 0.0
         camera_skew_max = 0.0
         skew_warning_issued = False
+        # The raw path writes each row's images itself, so skipping a tick is
+        # always alignment-safe.
+        state_pairer = _RowStatePairer(
+            label="raw camera exposure", can_drop=True, quality=quality
+        )
         cap_last_log = time.perf_counter()
 
         while not stop_event.is_set():
@@ -1352,7 +1562,14 @@ def run_capture_loop(
             if recording_start is None:
                 # First tick, or first tick after a resume: anchor so the
                 # current tick's target is "now" and the cadence continues.
-                recording_start = time.perf_counter() - tick * frame_interval
+                anchor = time.perf_counter()
+                recording_start = anchor - tick * frame_interval
+                # The camera-silence clock measures time *while capturing*.
+                # Nobody read the cameras during a pause, so a pause longer
+                # than _CAMERA_LOSS_FATAL_S must not turn the first late frame
+                # after resume into a discarded take.
+                for cam_key in last_fresh_frame_at:
+                    last_fresh_frame_at[cam_key] = anchor
 
             now = time.perf_counter()
             if now - cap_last_log >= 1.0:
@@ -1388,75 +1605,112 @@ def run_capture_loop(
             body_t0 = time.perf_counter()
             frames: dict[str, tuple[Any, float, float]] = {}
             capture_ts: list[float] = []
+            # Set when this tick cannot become a row. The tick is skipped for
+            # every camera at once (no image, no row), which keeps the dataset
+            # self-consistent; the reason is logged and counted.
+            skip_tick: tuple[str, str] | None = None
             for cam_key, cam in cameras.items():
                 try:
                     frame, cap_ts, recv_ts = cam.read_at_or_after(
                         target_perf_ts, timeout_ms=timeout_ms
                     )
-                except (TimeoutError, RuntimeError) as exc:
-                    raise RuntimeError(
+                except TimeoutError as exc:
+                    silent_for = time.perf_counter() - last_fresh_frame_at[cam_key]
+                    if silent_for >= _CAMERA_LOSS_FATAL_S:
+                        raise RuntimeError(
+                            f"camera {cam_key!r} produced no fresh frame for "
+                            f"{silent_for:.2f}s (limit {_CAMERA_LOSS_FATAL_S:.1f}s, "
+                            f"last miss at tick {tick}: {exc}); episode discarded"
+                        ) from exc
+                    skip_tick = (
+                        f"{cam_key}.ticks_without_frame",
                         f"camera {cam_key!r} produced no fresh frame for tick "
+                        f"{tick} ({exc}; silent for {silent_for * 1e3:.0f}ms)",
+                    )
+                    break
+                except RuntimeError as exc:
+                    # The frame transport itself failed (not a late frame).
+                    raise RuntimeError(
+                        f"camera {cam_key!r} frame transport failed at tick "
                         f"{tick}: {exc}; episode discarded"
                     ) from exc
                 if not np.isfinite(cap_ts):
-                    raise RuntimeError(
-                        f"camera {cam_key!r} produced an invalid capture timestamp"
+                    skip_tick = (
+                        f"{cam_key}.ticks_with_invalid_timestamp",
+                        f"camera {cam_key!r} produced an invalid capture "
+                        f"timestamp at tick {tick}",
                     )
+                    break
                 previous = last_capture_ts.get(cam_key)
                 if previous is not None and cap_ts <= previous:
-                    raise RuntimeError(
+                    skip_tick = (
+                        f"{cam_key}.ticks_with_stale_frame",
                         f"camera {cam_key!r} repeated a stale frame at tick {tick} "
-                        f"(PTS delta {(cap_ts - previous) * 1e3:.2f}ms); "
-                        "episode discarded"
+                        f"(PTS delta {(cap_ts - previous) * 1e3:.2f}ms)",
                     )
+                    break
+                last_fresh_frame_at[cam_key] = time.perf_counter()
                 frames[cam_key] = (frame, cap_ts, recv_ts)
                 capture_ts.append(cap_ts)
                 last_capture_ts[cam_key] = cap_ts
 
-            if capture_ts:
-                row_capture_ts = float(median(capture_ts))
+            if skip_tick is None and capture_ts:
                 camera_skew = max(capture_ts) - min(capture_ts)
                 camera_skew_max = max(camera_skew_max, camera_skew)
                 camera_limit = _camera_alignment_limit(fps)
                 if camera_skew > camera_limit:
-                    raise RuntimeError(
+                    skip_tick = (
+                        "ticks_with_camera_skew",
                         "raw camera exposures are not synchronized "
                         f"(spread {camera_skew * 1e3:.1f}ms, limit "
-                        f"{camera_limit * 1e3:.1f}ms); episode discarded"
+                        f"{camera_limit * 1e3:.1f}ms) at tick {tick}",
                     )
-                snap = _wait_snapshot_nearest(
-                    row_capture_ts,
-                    read_snapshot,
-                    read_snapshot_nearest,
-                    stop_event,
+            if skip_tick is not None:
+                key, reason = skip_tick
+                skipped = _note_quality(quality, key)
+                _logger.warning(
+                    "skipping one dataset tick: %s (%d such tick(s) this episode)",
+                    reason,
+                    skipped,
                 )
-            elif not cameras:
+                tick += 1
+                continue
+
+            if capture_ts:
+                row_capture_ts = float(median(capture_ts))
+            else:
                 # Joint-only datasets have no exposure clock; retain their
                 # original scheduled-tick association.
                 row_capture_ts = target_perf_ts
-                snap = _wait_snapshot_nearest(
-                    row_capture_ts,
-                    read_snapshot,
-                    read_snapshot_nearest,
-                    stop_event,
-                )
+            snap = _wait_snapshot_nearest(
+                row_capture_ts,
+                read_snapshot,
+                read_snapshot_nearest,
+                stop_event,
+            )
+            miss_detail: str | None = None
             if snap is None:
                 if stop_event.is_set():
                     return
-                raise RuntimeError(
-                    "no retained robot-state snapshot brackets raw camera "
-                    f"exposure {row_capture_ts:.6f}: "
-                    f"{_describe_snapshot_miss(row_capture_ts, read_snapshot)}; "
-                    "episode discarded"
+                miss_detail, fatal, snap = _classify_snapshot_miss(
+                    row_capture_ts, read_snapshot
                 )
+                if fatal:
+                    raise RuntimeError(
+                        "no retained robot-state snapshot brackets raw camera "
+                        f"exposure {row_capture_ts:.6f}: {miss_detail}; episode "
+                        "discarded"
+                    )
+            # A missing or distant bracket is a transient: hold the previous
+            # row's state, or skip this one tick — never the take. See
+            # _RowStatePairer.
+            snap, snapshot_skew = state_pairer.resolve(
+                row_capture_ts, snap, miss_detail
+            )
+            if snap is None:
+                tick += 1
+                continue
             joint_obs, action, _snap_ts, intervention = snap
-            snapshot_skew = abs(_snap_ts - row_capture_ts)
-            if snapshot_skew > _STATE_ALIGNMENT_WARN_S:
-                raise RuntimeError(
-                    "nearest robot state is too far from raw camera exposure "
-                    f"({snapshot_skew * 1e3:.1f}ms, limit "
-                    f"{_STATE_ALIGNMENT_WARN_S * 1e3:.1f}ms); episode discarded"
-                )
             snapshot_skew_sum += snapshot_skew
             snapshot_skew_max = max(snapshot_skew_max, snapshot_skew)
 
@@ -1515,6 +1769,7 @@ def run_encoded_capture_loop(
     on_armed: Callable[[], None] | None = None,
     heartbeat: Callable[[], None] | None = None,
     row_times: "list[float] | None" = None,
+    quality: "dict[str, int] | None" = None,
 ) -> None:
     """Frame-driven capture for the relay-encoded (gstshm-h264) transport.
 
@@ -1534,16 +1789,25 @@ def run_encoded_capture_loop(
     camera per dataset row. GDP preserves each AU's sensor-exposure PTS; the row
     is paired with the joint/action snapshot nearest the median camera exposure,
     independent of encoder, shm, and scheduler latency. The blocking per-camera
-    read naturally paces the loop to the dataset cadence. A timeout, missing PTS,
-    cross-camera phase error, or excessive state skew aborts the episode.  The
-    sole exception is a bounded one/two-frame hole on an equal-rate all-intra
-    camera, within a per-camera rate budget (no burst of events inside a short
-    window, concealed frames a small fraction of the episode): the prior IDR is
-    repeated on the missing cadence slots while the future AU is held,
-    preserving all subsequent image/camera/state alignment. The repair is
-    warned and returned through ``repair_events`` for a save-time audit log;
-    larger holes, a camera past its budget, predictive, rate-converted,
-    transport, or non-grid losses remain fatal.
+    read naturally paces the loop to the dataset cadence.
+
+    Fail-open policy (see :data:`_CAMERA_LOSS_FATAL_S`): per-row defects are
+    mitigated and counted in ``quality``, never fatal. A hole in an all-intra
+    camera's exposures is concealed by repeating the prior IDR on the missing
+    cadence slots while the future AU is held (preserving every later
+    image/camera/state alignment; audited through ``repair_events``); past the
+    per-camera rate budget the repair still happens but is logged at ERROR. A
+    stale or duplicate AU is discarded and the next one taken. A camera that
+    lags its peers by a frame is advanced to them. A row whose exact
+    robot-state bracket is gone holds the previous row's state while that is
+    still within the alignment tolerance (:class:`_RowStatePairer`), keeping
+    the ``frame_index / fps`` timeline true. A row whose exposures still do
+    not line up, or with no state within tolerance, is dropped for *every*
+    camera at once (the mp4s and the parquet stay index-aligned) — or, on a
+    predictive stream that cannot skip an AU, kept with the degraded pairing.
+    What does end the take: a camera with no usable exposure
+    for :data:`_CAMERA_LOSS_FATAL_S`, a hole that long, a control loop silent
+    for :data:`_STATE_LOSS_FATAL_S`, or a transport/encoder failure.
 
     The muxer assigns each AU a constant-fps PTS (``k / fps``), so the mp4
     timeline is exact regardless of arrival jitter; its physical exposure PTS is
@@ -1616,6 +1880,55 @@ def run_encoded_capture_loop(
         previous_packets: dict[str, tuple[bytes, float, float]] = {}
         first_capture_ts: dict[str, float] = {}
         capture_intervals: dict[str, int] = {}
+
+        def read_usable_au(
+            cam_key: str, cam: Any, deadline: float
+        ) -> tuple[bytes, float, float] | None:
+            """Pop AUs until one carries a finite exposure newer than the last.
+
+            An AU whose PTS is not finite, or did not advance past the previous
+            exposure (a duplicated or reordered frame), cannot be placed on the
+            row grid. It is discarded and counted, and the next AU is taken;
+            ``deadline`` bounds the retries, so a camera that only produces
+            unusable AUs still ends the take through the row timeout.
+            """
+            previous = previous_capture_ts.get(cam_key)
+            while True:
+                packet = read_au(cam, deadline)
+                if packet is None:
+                    return None
+                cap_ts = packet[1]
+                if np.isfinite(cap_ts) and (previous is None or cap_ts > previous):
+                    return packet
+                skipped = _note_quality(quality, f"{cam_key}.unusable_aus_skipped")
+                if not np.isfinite(cap_ts):
+                    why = "is not a finite timestamp"
+                else:
+                    why = (
+                        "did not advance past the previous exposure "
+                        f"({(cap_ts - previous) * 1e3:+.2f}ms)"
+                    )
+                _logger.warning(
+                    "camera %r: discarding an AU whose exposure %s; taking the "
+                    "next one (%d unusable AU(s) skipped this episode)",
+                    cam_key,
+                    why,
+                    skipped,
+                )
+
+        def reanchor_cadence(cam_key: str) -> None:
+            """Restart the long-run cadence check after an out-of-band skip."""
+            first_capture_ts.pop(cam_key, None)
+            capture_intervals.pop(cam_key, None)
+
+        # Dropping a whole row (every camera's AU together) keeps the mp4s and
+        # the parquet index-aligned only if no stream needs that AU to decode
+        # the next one. Predictive streams instead keep the row and degrade
+        # the state pairing.
+        row_drop_is_safe = all(
+            bool(getattr(cam, "frames_are_independent", False))
+            for cam in cameras.values()
+        )
         # A detected future AU stays here until every missing logical cadence
         # slot has emitted the previous independently-decodable IDR.  Reading
         # peers continues normally, so the existing cross-camera validator
@@ -1632,6 +1945,9 @@ def run_encoded_capture_loop(
         snapshot_skew_sum = 0.0
         snapshot_skew_max = 0.0
         camera_skew_max = 0.0
+        state_pairer = _RowStatePairer(
+            label="camera exposure", can_drop=row_drop_is_safe, quality=quality
+        )
         last_log = time.perf_counter()
 
         while not stop_event.is_set():
@@ -1663,7 +1979,7 @@ def run_encoded_capture_loop(
                         packet = future
                         del held_packets[cam_key]
                 else:
-                    packet = read_au(cam, row_deadline)
+                    packet = read_usable_au(cam_key, cam, row_deadline)
                 if packet is None:
                     if stop_event.is_set():
                         return
@@ -1671,11 +1987,6 @@ def run_encoded_capture_loop(
                     raise RuntimeError(
                         f"camera {cam_key!r} produced no fresh encoded frame "
                         f"within {budget:.1f}s during {phase}; episode discarded"
-                    )
-                _au, cap_ts, _recv_ts = packet
-                if not np.isfinite(cap_ts):
-                    raise RuntimeError(
-                        f"camera {cam_key!r} produced an invalid capture timestamp"
                     )
                 packets[cam_key] = packet
                 pending = cam.pending
@@ -1744,26 +2055,55 @@ def run_encoded_capture_loop(
                     previous = previous_packets[cam_key]
                     camera = cameras[cam_key]
                     capture_fps = int(getattr(camera, "capture_fps", fps))
-                    missing = _concealable_encoded_gap_frames(
+                    missing = _missing_cadence_slots(
                         previous_ts=previous[1],
                         capture_ts=packet[1],
                         fps=fps,
                         capture_fps=capture_fps,
-                        frames_are_independent=bool(
-                            getattr(camera, "frames_are_independent", False)
-                        ),
                     )
+                    if missing == 0:
+                        continue
+                    gap_s = packet[1] - previous[1]
+                    if gap_s > _ENCODED_MAX_CONCEALED_GAP_S:
+                        # Drastic: the camera produced nothing for as long as
+                        # the row timeout tolerates; the rows in between would
+                        # be a frozen image over a moving robot.
+                        raise RuntimeError(
+                            f"camera {cam_key!r} delivered no exposure for "
+                            f"{gap_s:.2f}s (limit "
+                            f"{_ENCODED_MAX_CONCEALED_GAP_S:.1f}s): capture PTS "
+                            f"jumped {gap_s * 1e3:.1f}ms at dataset row "
+                            f"{total_rows}; episode discarded"
+                        )
+                    if not bool(getattr(camera, "frames_are_independent", False)):
+                        # A predictive AU can neither be repeated nor skipped
+                        # without breaking the decode chain: accept the hole
+                        # and say so. This camera now leads the row grid.
+                        unrepaired = _note_quality(
+                            quality, f"{cam_key}.unrepaired_missing_frames", missing
+                        )
+                        _logger.error(
+                            "camera %r lost %d exposure(s) at dataset row %d "
+                            "(PTS gap %.2fms) on a predictive stream that cannot "
+                            "be repaired; its video now leads the row grid by "
+                            "%d frame(s) for the rest of the episode",
+                            cam_key,
+                            missing,
+                            total_rows,
+                            1e3 * gap_s,
+                            unrepaired,
+                        )
+                        continue
                     already_concealed = concealed_frames.get(cam_key, 0)
                     prior_rows = concealment_rows.setdefault(cam_key, [])
-                    if missing == 0 or not _concealment_within_budget(
+                    within_budget = _concealment_within_budget(
                         event_rows=prior_rows,
                         row=total_rows,
                         concealed_frames=already_concealed,
                         missing=missing,
                         total_rows=total_rows,
                         fps=fps,
-                    ):
-                        continue
+                    )
                     event: dict[str, Any] = {
                         "camera": cam_key,
                         "frame_index": total_rows,
@@ -1771,9 +2111,10 @@ def run_encoded_capture_loop(
                         # This keeps a save that lands midway through a two-row
                         # repair honest, and records nothing if add_frame fails.
                         "missing_frames": 0,
-                        "gap_ms": 1e3 * (packet[1] - previous[1]),
+                        "gap_ms": 1e3 * gap_s,
                         "concealed_ms": 0.0,
                         "method": "repeat_previous_idr",
+                        "within_budget": within_budget,
                     }
                     held_packets[cam_key] = (packet, missing - 1, event)
                     packets[cam_key] = (
@@ -1784,17 +2125,76 @@ def run_encoded_capture_loop(
                     synthetic_repairs[cam_key] = event
                     concealed_frames[cam_key] = already_concealed + missing
                     prior_rows.append(total_rows)
-                    _logger.warning(
-                        "camera %r omitted %d all-intra frame(s) at dataset "
-                        "row %d (PTS gap %.2fms); repeating the prior IDR for "
-                        "%.2fms and holding the future AU to preserve camera/"
-                        "state alignment",
-                        cam_key,
-                        missing,
-                        total_rows,
-                        event["gap_ms"],
-                        1e3 * missing / fps,
-                    )
+                    _note_quality(quality, f"{cam_key}.concealed_frames", missing)
+                    if within_budget:
+                        _logger.warning(
+                            "camera %r omitted %d all-intra frame(s) at dataset "
+                            "row %d (PTS gap %.2fms); repeating the prior IDR for "
+                            "%.2fms and holding the future AU to preserve camera/"
+                            "state alignment",
+                            cam_key,
+                            missing,
+                            total_rows,
+                            event["gap_ms"],
+                            1e3 * missing / fps,
+                        )
+                    else:
+                        # Past the rate budget the source is unhealthy. The
+                        # fail-open policy still repairs the hole rather than
+                        # discarding the take, but says so at ERROR (once per
+                        # camera per episode, then WARNING) so it gets fixed.
+                        over = _note_quality(
+                            quality, f"{cam_key}.concealment_over_budget_events"
+                        )
+                        _logger.log(
+                            logging.ERROR if over == 1 else logging.WARNING,
+                            "camera %r is losing exposures faster than a rare "
+                            "hiccup: %d more frame(s) omitted at dataset row %d "
+                            "(PTS gap %.2fms, %d concealed so far this episode, "
+                            "%d over-budget event(s)); repeating the prior IDR "
+                            "anyway under the fail-open policy — check the "
+                            "camera source",
+                            cam_key,
+                            missing,
+                            total_rows,
+                            event["gap_ms"],
+                            already_concealed + missing,
+                            over,
+                        )
+
+            camera_limit = _camera_alignment_limit(fps)
+            if primed and row_drop_is_safe and len(packets) > 1:
+                # A camera whose exposure trails its peers by more than the
+                # alignment limit has an extra AU in its stream (a source clock
+                # running fast, or a startup phase the row-zero alignment did
+                # not see). On an all-intra stream the surplus AU can simply be
+                # skipped: advance the camera until it rejoins the row.
+                newest = max(packet[1] for packet in packets.values())
+                for cam_key, packet in tuple(packets.items()):
+                    if cam_key in held_packets:
+                        continue  # a planned synthetic slot; never advance it
+                    while packet[1] < newest - camera_limit:
+                        candidate = read_au(cameras[cam_key], row_deadline)
+                        if candidate is None:
+                            break  # nothing queued: the skew check decides
+                        if not np.isfinite(candidate[1]) or candidate[1] <= packet[1]:
+                            _note_quality(quality, f"{cam_key}.unusable_aus_skipped")
+                            continue
+                        skipped = _note_quality(
+                            quality, f"{cam_key}.exposures_skipped_to_realign"
+                        )
+                        _logger.warning(
+                            "camera %r exposure trails the row by %.2fms at "
+                            "dataset row %d; skipping it and taking the next AU "
+                            "(%d skipped to realign this episode)",
+                            cam_key,
+                            1e3 * (newest - packet[1]),
+                            total_rows,
+                            skipped,
+                        )
+                        packet = candidate
+                        packets[cam_key] = packet
+                        reanchor_cadence(cam_key)
 
             aus = {name: packet[0] for name, packet in packets.items()}
             capture_ts = {name: packet[1] for name, packet in packets.items()}
@@ -1805,18 +2205,37 @@ def run_encoded_capture_loop(
                 capture_fps = max(
                     fps, int(getattr(cameras[cam_key], "capture_fps", fps))
                 )
-                if previous is not None:
+                first_ts = first_capture_ts.get(cam_key)
+                if previous is not None and first_ts is not None:
                     intervals = capture_intervals[cam_key] + 1
-                    _validate_encoded_cadence_step(
-                        cam_key,
-                        first_ts=first_capture_ts[cam_key],
-                        previous_ts=previous,
+                    deviation = _encoded_cadence_deviation(
+                        first_ts=first_ts,
                         capture_ts=cap_ts,
                         intervals=intervals,
                         fps=fps,
                         capture_fps=capture_fps,
                     )
-                    capture_intervals[cam_key] = intervals
+                    if deviation is None:
+                        capture_intervals[cam_key] = intervals
+                    else:
+                        # The long-run cadence drifted off the dataset grid
+                        # (e.g. a decimated source briefly delivering at its
+                        # capture rate). Not fatal: log, count, and re-anchor
+                        # so the check keeps watching from here.
+                        reanchors = _note_quality(
+                            quality, f"{cam_key}.cadence_reanchors"
+                        )
+                        _logger.warning(
+                            "camera %r encoded cadence is %s at dataset row %d; "
+                            "re-anchoring the cadence check (%d re-anchor(s) "
+                            "this episode)",
+                            cam_key,
+                            deviation,
+                            total_rows,
+                            reanchors,
+                        )
+                        first_capture_ts[cam_key] = cap_ts
+                        capture_intervals[cam_key] = 0
                 else:
                     first_capture_ts[cam_key] = cap_ts
                     capture_intervals[cam_key] = 0
@@ -1831,16 +2250,39 @@ def run_encoded_capture_loop(
                 else 0.0
             )
             camera_skew_max = max(camera_skew_max, camera_skew)
-            camera_limit = _camera_alignment_limit(fps)
             if camera_skew > camera_limit:
                 detail = ", ".join(
                     f"{name}={1e3 * (ts - row_capture_ts):+.1f}ms"
                     for name, ts in sorted(capture_ts.items())
                 )
-                raise RuntimeError(
-                    f"camera exposures are not synchronized (spread "
-                    f"{camera_skew * 1e3:.1f}ms, limit "
-                    f"{camera_limit * 1e3:.1f}ms; {detail}); episode discarded"
+                if row_drop_is_safe:
+                    # The exposures still do not form one row after the
+                    # realignment above. Pairing them with a single state
+                    # would be wrong for at least one camera; dropping every
+                    # camera's AU together costs one row and keeps the mp4s
+                    # and parquet index-aligned.
+                    dropped = _note_quality(quality, "rows_dropped_camera_skew")
+                    _logger.warning(
+                        "dropping one dataset row: camera exposures are not "
+                        "synchronized (spread %.1fms, limit %.1fms; %s; %d "
+                        "row(s) dropped for skew this episode)",
+                        camera_skew * 1e3,
+                        camera_limit * 1e3,
+                        detail,
+                        dropped,
+                    )
+                    continue
+                # A predictive stream needs this AU muxed; keep the row and
+                # accept the skew (the state pairs with the median exposure).
+                accepted = _note_quality(quality, "rows_kept_with_camera_skew")
+                _logger.error(
+                    "camera exposures are not synchronized (spread %.1fms, "
+                    "limit %.1fms; %s) and a predictive stream cannot skip the "
+                    "row; keeping it (%d skewed row(s) kept this episode)",
+                    camera_skew * 1e3,
+                    camera_limit * 1e3,
+                    detail,
+                    accepted,
                 )
 
             snap = _wait_snapshot_nearest(
@@ -1849,22 +2291,29 @@ def run_encoded_capture_loop(
                 read_snapshot_nearest,
                 stop_event,
             )
+            miss_detail: str | None = None
             if snap is None:
                 if stop_event.is_set():
                     return
-                raise RuntimeError(
-                    "no retained robot-state snapshot brackets camera exposure "
-                    f"{row_capture_ts:.6f}: "
-                    f"{_describe_snapshot_miss(row_capture_ts, read_snapshot)}"
+                miss_detail, fatal, snap = _classify_snapshot_miss(
+                    row_capture_ts, read_snapshot
                 )
+                if fatal:
+                    raise RuntimeError(
+                        "no retained robot-state snapshot brackets camera "
+                        f"exposure {row_capture_ts:.6f}: {miss_detail}; episode "
+                        "discarded"
+                    )
+            # A missing or distant bracket is a transient (the exposure aged
+            # out of the ring while the recorder was descheduled, a raced ring
+            # copy, a brief writer pause): hold the previous row's state, or
+            # drop this one row — never the take. See _RowStatePairer.
+            snap, snapshot_skew = state_pairer.resolve(
+                row_capture_ts, snap, miss_detail
+            )
+            if snap is None:
+                continue
             joint_obs, action, _snap_ts, intervention = snap
-            snapshot_skew = abs(_snap_ts - row_capture_ts)
-            if snapshot_skew > _STATE_ALIGNMENT_WARN_S:
-                raise RuntimeError(
-                    "nearest robot state is too far from camera exposure "
-                    f"({snapshot_skew * 1e3:.1f}ms, limit "
-                    f"{_STATE_ALIGNMENT_WARN_S * 1e3:.1f}ms); episode discarded"
-                )
             snapshot_skew_sum += snapshot_skew
             snapshot_skew_max = max(snapshot_skew_max, snapshot_skew)
 
@@ -2683,6 +3132,8 @@ class InProcessRecorder:
         self._frames: dict[str, int] = {"n": 0}
         # Per-row capture times for the current episode (see trim_episode_after).
         self._row_times: list[float] = []
+        # Mitigated per-row defects of the current take (see _CAMERA_LOSS_FATAL_S).
+        self._quality: dict[str, int] = {}
         self._capture_error: str | None = None
         self._episodes_recorded = 0
         self._fatal_error: EpisodeDurabilityError | None = None
@@ -2710,6 +3161,7 @@ class InProcessRecorder:
         self._record.set()
         self._frames["n"] = 0
         self._row_times.clear()
+        self._quality.clear()
         self._capture_error = None
         reset_dropped_frames()
         self._stop = threading.Event()
@@ -2729,6 +3181,7 @@ class InProcessRecorder:
                 frame_counter=self._frames,
                 on_error=lambda message: setattr(self, "_capture_error", message),
                 row_times=self._row_times,
+                quality=self._quality,
             ),
             name="axol-capture",
             daemon=True,
@@ -2757,7 +3210,15 @@ class InProcessRecorder:
         # forever on a wedged camera read, and never forget the exact writer
         # until a bounded retry proves it exited (the raise happens before the
         # assignment, so ``_thread`` keeps pointing at the live writer).
+        was_capturing = self._thread is not None
         self._thread = _stop_capture_thread(self._thread, self._stop)
+        if was_capturing:
+            _log_capture_quality(
+                self._quality,
+                self._frames["n"],
+                dict(getattr(self._robot, "cameras", None) or {}),
+                self._capture_error,
+            )
         # Nothing records now: let the previous episode's verify continue.
         self._verifier.resume()
 
@@ -3193,6 +3654,10 @@ def _recorder_main(
     stop: threading.Event | None = None
     capture_error: dict[str, str | None] = {"v": None}
     capture_repairs: list[dict[str, Any]] = []
+    # Mitigated per-row defects of the current take (see _CAMERA_LOSS_FATAL_S);
+    # summarized once when capture stops so a take that needed repairs is easy
+    # to find in the session log.
+    capture_quality: dict[str, int] = {}
     episodes_recorded = 0
     save_poisoned = False
     # Mid-episode capture gate + row counter (see run_capture_loop). The gate
@@ -3220,7 +3685,12 @@ def _recorder_main(
         # Assignment happens only after _stop_capture_thread has proved exit.
         # On timeout it raises and leaves ``thread`` pointing at the live
         # writer, which makes every destructive command below fail closed.
+        was_capturing = thread is not None
         thread = _stop_capture_thread(thread, stop)
+        if was_capturing:
+            _log_capture_quality(
+                capture_quality, frame_counter["n"], cameras, capture_error["v"]
+            )
         # The take is over: sweep the garbage deferred during it now, while
         # nothing time-critical runs in this process.
         gc_hold.end()
@@ -3246,6 +3716,11 @@ def _recorder_main(
                 dataset.clear_episode_buffer()
                 capture_error["v"] = None
                 capture_repairs.clear()
+                capture_quality.clear()
+                for cam in cameras.values():
+                    reset_lost = getattr(cam, "reset_lost_exposures", None)
+                    if callable(reset_lost):
+                        reset_lost()
                 record_event.set()
                 frame_counter["n"] = 0
                 row_times.clear()
@@ -3270,6 +3745,7 @@ def _recorder_main(
                     on_error=report_capture_error,
                     heartbeat=watchdog.beat,
                     row_times=row_times,
+                    quality=capture_quality,
                 )
                 loop_kwargs["frame_counter"] = frame_counter
                 if not encoded_mode:
@@ -3428,13 +3904,17 @@ def _recorder_main(
                         verifier.submit(episode_row)
                         if capture_repairs:
                             _logger.warning(
-                                "saved episode %d with bounded camera-gap "
-                                "repair(s): %s",
+                                "saved episode %d with camera-gap repair(s): %s",
                                 dataset.num_episodes - 1,
                                 ", ".join(
                                     f"{event['camera']}@row "
                                     f"{event['frame_index']}="
                                     f"{event['missing_frames']} frame(s)"
+                                    + (
+                                        ""
+                                        if event.get("within_budget", True)
+                                        else " (over budget)"
+                                    )
                                     for event in capture_repairs
                                 ),
                             )
