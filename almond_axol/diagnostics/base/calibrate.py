@@ -899,6 +899,8 @@ async def _run(args: argparse.Namespace) -> int:
                 imu=False,
                 yaw_hold_gain=0.0,
                 axis_snap_deg=0.0,
+                accel=args.accel,
+                decel=args.accel,
             )
         )
         await cart.enable()
@@ -1016,6 +1018,15 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Wheel rotation lever arm (a+b)/√2 in metres, if known; otherwise "
         "it is fitted from the rotation strokes",
+    )
+    parser.add_argument(
+        "--accel",
+        type=float,
+        default=CartConfig.accel,
+        help="Command ramp rate for both launch and stop, full-stick units per "
+        "second (CartConfig.accel/decel). Lower it to test whether a veer comes "
+        "from load transfer under acceleration lifting a wheel "
+        f"(default: {CartConfig.accel})",
     )
     parser.add_argument(
         "--tracker",
