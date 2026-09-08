@@ -740,15 +740,6 @@ class VRTeleop:
                 right_arm.positions if right_arm is not None else None,
             )
 
-        def _guard_vr_alive() -> bool:
-            # Frames within the last ~2s: if the headset leaves mid-move (Y
-            # exit, doffed, link drop) the stream stops instantly, so a
-            # contact hold has no headset left to press reset — the engine
-            # settles it instead of waiting forever.
-            with self._vr_frame_times_lock:
-                last = self._vr_frame_times[-1] if self._vr_frame_times else None
-            return last is not None and (time.perf_counter() - last) < 2.0
-
         # Tracking-phase contact watchdog (hardware only, opt-in — the
         # threshold defaults to 0 = off): the same sustained-torque trip the
         # guarded return uses, but active while the operator drives (or
@@ -801,7 +792,6 @@ class VRTeleop:
                         get_positions=_guard_positions,
                         stopped=lambda: False,  # unwound by task cancellation
                         announce=_logger.info,
-                        vr_alive=_guard_vr_alive,
                     )
                     # Re-anchor pacing after the excursion so the next cycle
                     # doesn't try to catch up on the elapsed time.
@@ -841,7 +831,6 @@ class VRTeleop:
                             get_positions=_guard_positions,
                             stopped=lambda: False,  # unwound by task cancellation
                             announce=_logger.info,
-                            vr_alive=_guard_vr_alive,
                         )
                         track_watchdog = ContactWatchdog(
                             self._config.teleop_torque_threshold
