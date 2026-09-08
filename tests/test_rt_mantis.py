@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from almond_axol.constants import RT_PROTO_VERSION, RT_TARGET_FIELDS
 from almond_axol.motor import ControlMode
 from almond_axol.robot.axol import GRIPPER_TRAVEL
 from almond_axol.robot.mantis import Mantis, MantisGripperArm
@@ -209,8 +210,10 @@ class RtMantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(self.rt.armed)
         (link,) = _FakeLink.instances
+        lines = link.config.splitlines()
+        self.assertEqual(lines[0], f"proto {RT_PROTO_VERSION}")
         self.assertEqual(
-            link.config.splitlines()[3:],
+            lines[4:],
             ["gripper 0 can_mantis_l 8", "gripper 1 can_mantis_r 8"],
         )
         # Python bring-up (enable / POSITION_FORCE / first target / read)
@@ -228,7 +231,8 @@ class RtMantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.left.core_driven and self.right.core_driven)
         self.assertEqual(self.rt._fb_packets, [1, 1])
         self.assertEqual(link.targets[0][2][7][:3], (1.0, 10.0, 0.5))
-        self.assertEqual(link.targets[0][2][:7], [(0.0,) * 9] * 7)
+        self.assertEqual(len(link.targets[0][2][7]), RT_TARGET_FIELDS)
+        self.assertEqual(link.targets[0][2][:7], [(0.0,) * RT_TARGET_FIELDS] * 7)
 
     async def test_motion_control_streams_through_the_core_only(self) -> None:
         await self.rt.connect()

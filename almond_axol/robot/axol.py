@@ -11,11 +11,11 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, RT_TARGET_FIELDS
 from ..motor import (
     CanBus,
     ControlMode,
@@ -694,12 +694,13 @@ class AxolArm:
         self._unverified_zeros: set[Joint] = set(ARM_JOINTS) - EITHER_STOP_JOINTS
         self._offset_lock = asyncio.Lock()
         # Realtime-core hook: production motion_control and
-        # gravity_compensate hand their per-joint 9-float tuples
-        # (p_des motor-frame, mode, kp, kd, gravity t_ff, the pose-scheduled
-        # damping coefficients kd_host/w0/q, and the pose-scaled j_eff) to
-        # this callable instead of sending on the CAN bus — the Rust core
-        # owns the wire and computes the velocity/friction/inertia/damping
-        # terms itself each tick from its own tracker and feedback states.
+        # gravity_compensate hand their per-joint RT_TARGET_FIELDS-float
+        # tuples (p_des motor-frame, mode, kp, kd, gravity t_ff, the
+        # pose-scheduled damping coefficients kd_host/w0/q, the pose-scaled
+        # j_eff, and the per-command spring cap) to this callable instead of
+        # sending on the CAN bus — the Rust core owns the wire and computes
+        # the velocity/friction/inertia/damping terms itself each tick from
+        # its own tracker and feedback states.
         self._command_sink: (
             Callable[
                 [list[tuple[float, ...]]],
@@ -707,6 +708,10 @@ class AxolArm:
             ]
             | None
         ) = None
+        # Session-scoped spring-torque caps (Nm) per arm joint, on top of the
+        # configured ``JointConfig.torque_limit``: rides every tracked
+        # command as its tau_cap field (see set_spring_caps). Empty = none.
+        self._spring_caps: dict[Joint, float] = {}
 
     def _pad_gripper(self, values: list) -> list:
         """Insert a ``0.0`` placeholder in the gripper slot when absent.
@@ -1499,6 +1504,37 @@ class AxolArm:
             ]
         )
 
+    def set_spring_caps(self, caps: Mapping[Joint, float] | None) -> None:
+        """Cap the impedance *spring* torque of chosen arm joints, live.
+
+        ``caps`` maps arm joints to a torque (Nm); joints absent from it (or
+        all of them, with ``None`` / ``{}``) keep only their configured
+        ``JointConfig.torque_limit``. The cap rides each tracked command to
+        the realtime core, which clamps the wire position to within
+        ``cap / kp`` of the measured one (``filter::cap_spring``), so a
+        joint blocked by whatever it is pressing on leans with at most
+        ``cap`` — the tighter of this and the configured cap. Gravity
+        feedforward is outside it. Box mode uses this on the shoulder joints
+        that carry the lateral squeeze while the arms clamp a box.
+
+        Applies from the next :meth:`motion_control`; realtime-core mode
+        only (the classic CAN path has no spring cap). Non-positive or
+        non-finite values are treated as "no cap".
+        """
+        clean: dict[Joint, float] = {}
+        for joint, cap in (caps or {}).items():
+            if joint == Joint.GRIPPER:
+                raise ValueError("spring caps apply to arm joints, not the gripper")
+            value = float(cap)
+            if math.isfinite(value) and value > 0.0:
+                clean[joint] = value
+        self._spring_caps = clean
+
+    @property
+    def spring_caps(self) -> dict[Joint, float]:
+        """The live per-joint spring-torque caps (see :meth:`set_spring_caps`)."""
+        return dict(self._spring_caps)
+
     async def motion_control(self, q: np.ndarray) -> None:
         """Send control commands to all joints concurrently.
 
@@ -1661,19 +1697,20 @@ class AxolArm:
         motor_targets = clipped - self._joint_offsets
 
         if sink_mode:
-            # Production realtime-core mode: ship 9-float tuples to
-            # the sink — which streams them to the Rust core that owns the
-            # CAN bus. mode=1 (tracked): the core's own trapezoid tracker
-            # renders the trajectory toward p_des at 240 Hz and computes the
-            # velocity, friction, and inertia terms from its states — t_ff
-            # here carries *gravity only* (the slow, pose-shaped term this
-            # side owns). The damping coefficients and the pose-scaled
-            # inertia gain are the schedule the core applies each tick
-            # against its own fresh feedback (see the sink_mode comment
-            # above). Slot 7 carries the gripper's POSITION_FORCE command
-            # (motor-frame target, speed limit, torque limit); zeros on the
-            # gripperless SKU (the core has no gripper configured and
-            # ignores the slot).
+            # Production realtime-core mode: ship RT_TARGET_FIELDS-float
+            # tuples to the sink — which streams them to the Rust core that
+            # owns the CAN bus. mode=1 (tracked): the core's own trapezoid
+            # tracker renders the trajectory toward p_des at 240 Hz and
+            # computes the velocity, friction, and inertia terms from its
+            # states — t_ff here carries *gravity only* (the slow, pose-shaped
+            # term this side owns). The damping coefficients and the
+            # pose-scaled inertia gain are the schedule the core applies each
+            # tick against its own fresh feedback (see the sink_mode comment
+            # above). The last field is the per-command spring-torque cap
+            # (see set_spring_caps; 0 = only the configured cap). Slot 7
+            # carries the gripper's POSITION_FORCE command (motor-frame
+            # target, speed limit, torque limit); zeros on the gripperless
+            # SKU (the core has no gripper configured and ignores the slot).
             sink_cmds: list[tuple[float, ...]] = []
             for i, j in enumerate(ARM_JOINTS):
                 gains = getattr(self._arm_config, j.value)
@@ -1688,19 +1725,20 @@ class AxolArm:
                         damp_w0[i],
                         self._damp_q[i],
                         gains.j_eff * float(j_scale[i]),
+                        self._spring_caps.get(j, 0.0),
                     )
                 )
             if self._has_gripper:
+                gripper_cmd = (
+                    float(motor_targets[gripper_i]),
+                    self._arm_config.gripper.max_speed,
+                    self._arm_config.gripper.torque_limit,
+                )
                 sink_cmds.append(
-                    (
-                        float(motor_targets[gripper_i]),
-                        self._arm_config.gripper.max_speed,
-                        self._arm_config.gripper.torque_limit,
-                    )
-                    + (0.0,) * 6
+                    gripper_cmd + (0.0,) * (RT_TARGET_FIELDS - len(gripper_cmd))
                 )
             else:
-                sink_cmds.append((0.0,) * 9)
+                sink_cmds.append((0.0,) * RT_TARGET_FIELDS)
             self._command_sink(sink_cmds)
             self._last_q_commanded = clipped
             return
@@ -1840,10 +1878,14 @@ class AxolArm:
             # goes to the wire as-is with v_des = 0, no tracker and no
             # friction/inertia terms (a hand-guided limp arm wants gravity
             # feedforward only), and no damping coefficients (classic
-            # gravity comp runs firmware gains only).
-            sink_cmds = [t + (0.0,) * 4 for t in arm_tuples]
+            # gravity comp runs firmware gains only), and no per-command
+            # spring cap (the held joints sit on their snapshot at config
+            # gains; the free ones have no spring to cap).
+            sink_cmds = [t + (0.0,) * (RT_TARGET_FIELDS - len(t)) for t in arm_tuples]
             sink_cmds.append(
-                gripper_cmd + (0.0,) * 6 if gripper_cmd is not None else (0.0,) * 9
+                gripper_cmd + (0.0,) * (RT_TARGET_FIELDS - len(gripper_cmd))
+                if gripper_cmd is not None
+                else (0.0,) * RT_TARGET_FIELDS
             )
             self._command_sink(sink_cmds)
             return
@@ -2643,6 +2685,15 @@ class Axol(RobotBase):
             self.left.reset_command_state()
         if self.right is not None:
             self.right.reset_command_state()
+
+    def set_spring_caps(self, caps: Mapping[Joint, float] | None) -> None:
+        """Set the live per-joint spring-torque caps on both arms.
+
+        See :meth:`AxolArm.set_spring_caps`; ``None`` clears them.
+        """
+        for arm in (self.left, self.right):
+            if arm is not None:
+                arm.set_spring_caps(caps)
 
     def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Per-arm measured-minus-gravity torques, ``(left, right)``.

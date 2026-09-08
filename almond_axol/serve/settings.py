@@ -634,6 +634,27 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="teleop.box_squeeze_torque",
+                label="Box squeeze cap (Nm)",
+                type="number",
+                help=(
+                    "Box mode: cap on the shoulder torque that squeezes the "
+                    "box (shoulder_2 and shoulder_3 on each arm — the joints "
+                    "a sideways push at the gripper loads; the joints that "
+                    "lift the box are untouched). Jogging the width past "
+                    "contact then leans on the box with at most this torque "
+                    "instead of pressing harder the further you jog. In "
+                    "clamp force that is roughly the cap ÷ the shoulder's "
+                    "0.45–0.65 m lever: 4 Nm ≈ 6–9 N a side. Raise it if "
+                    "boxes slip out; 0 disables. Also adjustable live from "
+                    "the headset menu (Squeeze cap). Hardware only."
+                ),
+                targets={
+                    "teleop": ("teleop.box_squeeze_torque",),
+                    "collect-data": (f"{_VRT}.box_squeeze_torque",),
+                },
+            ),
+            SettingDef(
                 key="teleop.reengage",
                 label="Re-engage",
                 type="select",

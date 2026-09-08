@@ -789,6 +789,33 @@ class VRTeleop:
             )
         )
 
+        # Box mode's squeeze limit (VRTeleopConfig.box_squeeze_torque): the
+        # core says which joints to cap and by how much for the current
+        # state (box mode on, not resetting); the robot carries the caps to
+        # the realtime core on every command. Written only on change, and
+        # cleared when the loop ends so a robot object outliving this
+        # session is not left capped. Sim / classic targets have no caps.
+        set_caps = getattr(self._robot, "set_spring_caps", None)
+        caps_applied: dict | None = None
+
+        def _sync_spring_caps() -> None:
+            nonlocal caps_applied
+            if set_caps is None:
+                return
+            want = self._core.spring_caps()
+            if want != caps_applied:
+                set_caps(want)
+                caps_applied = want
+                if want:
+                    cap = next(iter(want.values()))
+                    _logger.info(
+                        "Box squeeze cap on: %.1f Nm on %s",
+                        cap,
+                        ", ".join(j.value for j in want),
+                    )
+                else:
+                    _logger.info("Box squeeze cap off")
+
         async def _guard_send_step() -> None:
             left, right = self.step()
             if left is not None:
@@ -851,6 +878,9 @@ class VRTeleop:
                         self._robot_recorder(False)
                     if self._rec is not None:
                         self._rec.set_engaged(False)
+                    # A return wants the shoulders' full authority (the core
+                    # reports no caps while resetting).
+                    _sync_spring_caps()
                     await self._core.guarded_return(
                         send_step=_guard_send_step,
                         gravity_step=_guard_gravity_step,
@@ -871,6 +901,7 @@ class VRTeleop:
                 t_step = time.perf_counter()
                 if self._robot_recorder is not None:
                     self._robot_recorder(self._core.teleop_enabled)
+                _sync_spring_caps()
                 await self._robot.motion_control(left=left, right=right)
 
                 if self._rec is not None:
@@ -988,6 +1019,8 @@ class VRTeleop:
         finally:
             if self._robot_recorder is not None:
                 self._robot_recorder(False)
+            if set_caps is not None and caps_applied:
+                set_caps(None)
             activity.stop()
             diag.stop()
             tegra.stop()

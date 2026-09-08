@@ -39,9 +39,13 @@ async def session(name, actions):
         w.write(struct.pack("<I", len(payload)) + payload)
 
     async def recv():
-        (size,) = struct.unpack("<I", await r.readexactly(4))
-        p = await r.readexactly(size)
-        return p[:1], p[1:].decode()
+        # Skip `W` notices (e.g. mlockall refused on an unprivileged dev box):
+        # RtLink logs them; the state (`S`) messages are what we assert on.
+        while True:
+            (size,) = struct.unpack("<I", await r.readexactly(4))
+            p = await r.readexactly(size)
+            if p[:1] != b"W":
+                return p[:1], p[1:].decode()
 
     result = await actions(send, recv, w)
     w.close()
@@ -53,11 +57,10 @@ async def session(name, actions):
     return proc.returncode, out.decode(), result
 
 
-cfg = (
-    b"C"
-    + b"loop_hz 240\n"
-    + b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 inf\n"
+joint_line = (
+    b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 inf\n"
 )
+cfg = b"C" + b"proto 2\n" + b"loop_hz 240\n" + joint_line
 
 
 async def clean(send, recv, w):
@@ -70,10 +73,18 @@ async def clean(send, recv, w):
 async def skewed(send, recv, w):
     send(cfg)
     await recv()
-    # A previous-generation 8-field target against the 9-field core.
-    send(struct.pack("<cBI", b"T", 0, 1) + struct.pack("<8d", *([0.0] * 8)) * 8)
+    # A previous-generation 9-field target against the 10-field core.
+    send(struct.pack("<cBI", b"T", 0, 1) + struct.pack("<9d", *([0.0] * 9)) * 8)
     await asyncio.sleep(0.5)
     return "sent skewed target"
+
+
+async def undeclared(send, recv, w):
+    # A client too old to declare its wire protocol must be refused at
+    # configure time — before bring-up — not at its first target.
+    send(b"C" + b"loop_hz 240\n" + joint_line)
+    await asyncio.sleep(0.5)
+    return "sent config without proto"
 
 
 def check_feedback_parse():
@@ -117,4 +128,10 @@ rc, out, msg = asyncio.run(session("skewed", skewed))
 print(f"skewed target:    rc={rc} ({msg})")
 print("core output:", out.strip().splitlines()[-1] if out.strip() else "(none)")
 assert rc != 0, "core must exit nonzero on protocol error"
+
+rc, out, msg = asyncio.run(session("undeclared", undeclared))
+print(f"undeclared proto: rc={rc} ({msg})")
+print("core output:", out.strip().splitlines()[-1] if out.strip() else "(none)")
+assert rc != 0, "core must refuse a config without a proto line"
+assert "proto" in out, out
 print("protocol-level checks OK")

@@ -40,12 +40,24 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from ..constants import Joint
 from ..robot.control import ContactWatchdog
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 from .recorder import make as _recorder_make
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
+
+# The arm joints box mode's squeeze cap (``VRTeleopConfig.box_squeeze_torque``)
+# applies to. In the side-clamp poses — arms hanging or reaching forward,
+# grippers parallel — a lateral force at the gripper is carried almost
+# entirely by shoulder_2 (the abduction axis: ~0.45-0.68 Nm per N over the
+# working range) with shoulder_3 (upper-arm twist) next (~0.1-0.3 Nm/N),
+# while a held box's weight goes to shoulder_1 and the elbow (shoulder_2 sees
+# ≤ 0.12 Nm/N of it). Capping these two bounds the squeeze without starving
+# the joints that lift the box; the elbow, which shares both loads, is left
+# uncapped, and the wrists keep their configured 5 Nm.
+BOX_SQUEEZE_JOINTS: tuple[Joint, ...] = (Joint.SHOULDER_2, Joint.SHOULDER_3)
 
 # Thumbstick deflection below which a stick counts as released — the same
 # deadzone box mode and Jelly apply, so "neutral" here means neither would act.
@@ -459,7 +471,9 @@ class VRTeleopCore:
     # Config fields that may change while a session runs. ``core`` fields are
     # read live by this class; ``worker`` fields are also forwarded to the IK
     # subprocess (whose config is a pickled copy) as ``("set", key, value)``.
-    _LIVE_CORE_FIELDS = frozenset({"hold_to_engage", "teleop_max_vel"})
+    _LIVE_CORE_FIELDS = frozenset(
+        {"hold_to_engage", "teleop_max_vel", "box_squeeze_torque"}
+    )
     _LIVE_WORKER_FIELDS = frozenset(
         {
             "position_multiplier",
@@ -594,6 +608,24 @@ class VRTeleopCore:
         writes the state is harmless.
         """
         return self.box_mode and (self._box_leader is not None or self._box_sticks_held)
+
+    def spring_caps(self) -> dict[Joint, float] | None:
+        """Per-joint spring-torque caps the arms should run under right now.
+
+        Box mode's squeeze limit: ``config.box_squeeze_torque`` (Nm) on each
+        of :data:`BOX_SQUEEZE_JOINTS`, in force the whole time box mode is
+        on — leading, frozen holding a box, or between engages — except
+        during a return-to-rest (:attr:`is_resetting`), whose joint-space
+        move wants the shoulders' full authority. ``None`` means no caps
+        (plain teleop, box mode with the cap set to 0, a reset). The
+        adapter applies the result to the robot before each control tick
+        (``set_spring_caps``); the caps ride the next command to the
+        realtime core. Cheap and pure — safe to call every cycle.
+        """
+        cap = float(self.config.box_squeeze_torque)
+        if not self.box_mode or self.is_resetting or not (cap > 0.0):
+            return None
+        return {joint: cap for joint in BOX_SQUEEZE_JOINTS}
 
     def _disengage_all(self, log_message: str | None = None) -> None:
         """Disengage both arms and clear the edge/ramp state (IK thread).

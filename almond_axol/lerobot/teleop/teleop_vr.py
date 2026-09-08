@@ -882,6 +882,16 @@ class AxolVRTeleop(Teleoperator):
         """
         await self._core.contact_hold(**kwargs)
 
+    def spring_caps(self) -> dict[Joint, float] | None:
+        """Per-joint spring-torque caps the arms should run under right now.
+
+        Thin passthrough to :meth:`VRTeleopCore.spring_caps`: box mode's
+        squeeze cap on the shoulders while clamping a box, ``None`` when
+        nothing is capped. ``collect-data`` hands the result to
+        ``Axol.set_spring_caps`` on change, the same as native teleop.
+        """
+        return self._core.spring_caps()
+
     # ------------------------------------------------------------------
     # Teleoperator interface
     # ------------------------------------------------------------------

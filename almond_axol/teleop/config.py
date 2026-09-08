@@ -215,6 +215,26 @@ class VRTeleopConfig:
             ``KinematicsConfig.pos_weight`` 50 for the grippers). ``0`` (the
             default) disables the hint; ``10`` is a sensible value if you want
             a deliberately flared carry.
+        box_squeeze_torque: Cap (Nm) on the impedance spring torque of the
+            joints that squeeze the box — ``shoulder_2`` and ``shoulder_3``
+            on each arm (see ``BOX_SQUEEZE_JOINTS`` in
+            :mod:`almond_axol.teleop.core`), which carry almost all of a
+            lateral force at the gripper and almost none of a held box's
+            weight — whenever box mode is on and the arms are not on a
+            return-to-rest. Closing the grip width onto a box drives the IK
+            targets *into* it; without a cap the arms then press with
+            ``kp`` times the run-ahead (~6 N per centimetre of width past
+            contact, and rising). With it, the realtime core keeps each
+            capped joint's commanded position within ``cap / kp`` of its
+            measured one, so the pair leans on the box with a bounded
+            squeeze however far the width is jogged in. Rough clamp force
+            per side: the cap divided by the shoulder's lever to the
+            gripper — ~0.65 m with the arms down, ~0.45 m carrying
+            forward — so ``4`` Nm is roughly 6–9 N a side; the arms give
+            way rather than push harder. Gravity feedforward and the other
+            joints' configured caps (the wrists' 5 Nm) are unaffected.
+            ``0`` disables. Live-adjustable (headset menu / control panel);
+            realtime-core hardware only.
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest
@@ -417,6 +437,7 @@ class VRTeleopConfig:
     box_align_duration: float = 1.5
     box_elbow_out: float = 30.0
     box_elbow_weight: float = 0.0
+    box_squeeze_torque: float = 4.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi

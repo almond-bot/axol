@@ -137,6 +137,24 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         help="Same as Left face, for the right gripper.",
     ),
     LiveSettingDef(
+        key="box_squeeze_torque",
+        label="Squeeze cap",
+        type="number",
+        min=0.0,
+        max=20.0,
+        step=0.5,
+        unit="Nm",
+        help=(
+            "Box mode: cap on the shoulder torque that squeezes the box "
+            "(shoulder_2 and shoulder_3, the joints a sideways push at the "
+            "gripper loads). Jogging the width past contact then leans on "
+            "the box with at most this instead of pressing harder and "
+            "harder — roughly the cap ÷ 0.5 m in clamp force per side, so "
+            "4 Nm ≈ 6–9 N. Raise it if boxes slip; 0 turns it off. "
+            "Hardware only."
+        ),
+    ),
+    LiveSettingDef(
         key="reengage",
         label="Re-engage",
         type="select",
@@ -257,13 +275,25 @@ class LiveSettings:
             getattr(a._arm_config, "gripper", None) is not None for a in self._arms()
         )
 
+    def _has_spring_caps(self) -> bool:
+        # The squeeze cap rides the realtime core's command tuples; only a
+        # robot that can carry it (Axol / RtAxol, not the sim) shows the knob.
+        return callable(getattr(self._robot, "set_spring_caps", None))
+
+    def _hidden(self, d: LiveSettingDef) -> bool:
+        if d.key == "gripper_torque":
+            return not self._has_gripper_torque()
+        if d.key == "box_squeeze_torque":
+            return not self._has_spring_caps()
+        return False
+
     # -- Public API ----------------------------------------------------------
 
     def schema(self) -> list[dict[str, Any]]:
         """The settings available in *this* session (robot-side ones only on hardware)."""
         out = []
         for d in LIVE_SETTINGS:
-            if d.key == "gripper_torque" and not self._has_gripper_torque():
+            if self._hidden(d):
                 continue
             entry = asdict(d)
             entry.pop("source")
@@ -275,6 +305,8 @@ class LiveSettings:
         """Current value of every published setting, in wire units."""
         vals: dict[str, Any] = {}
         for d in LIVE_SETTINGS:
+            if self._hidden(d):
+                continue
             if d.key == "gripper_torque":
                 arms = [a for a in self._arms() if a._arm_config.gripper is not None]
                 if not arms:
@@ -312,14 +344,14 @@ class LiveSettings:
         d = _DEFS.get(key)
         if d is None:
             raise KeyError(f"unknown live setting {key!r}")
+        if self._hidden(d):
+            raise ValueError(f"{d.key} is not adjustable on this robot")
         if d.type == "boolean" and value == "toggle":
             coerced = not bool(self.values().get(d.key))
         else:
             coerced = self._coerce(d, value)
         if d.key == "gripper_torque":
             arms = [a for a in self._arms() if a._arm_config.gripper is not None]
-            if not arms:
-                raise ValueError("gripper torque is not adjustable on this robot")
             for arm in arms:
                 # Read on every gripper command (see AxolArm.motion_control),
                 # so the new cap applies from the next control tick.
