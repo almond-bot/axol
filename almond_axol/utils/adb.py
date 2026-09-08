@@ -4,8 +4,11 @@ The Quest headset can stream controller poses to the robot over a USB cable
 instead of WiFi, sidestepping the 802.11 power-save buffering behind the
 ~150 ms pose gaps. The mechanism is ``adb reverse``: the headset's
 ``localhost:8000`` is forwarded over the cable to the robot's VR server, so the
-WebXR app reaches it at ``wss://localhost:8000``. Camera video still rides the
-LAN (WebRTC can't cross the TCP port-forward), so USB is pose-only.
+WebXR app reaches it at ``wss://localhost:8000``. The control panel's
+``localhost:8001`` is forwarded too, so the headset can reach the shared
+self-signed certificate even when no operation is running to hold port 8000
+open. Camera video still rides the LAN (WebRTC can't cross the TCP
+port-forward), so USB is pose-only.
 
 This module is the single place that knows how to install adb (used by
 ``axol provision``) and how to query/establish the reverse tunnel (used by the
@@ -24,15 +27,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .paths import ALMOND_HOME_ENV, almond_home
-from .ports import VR_PORT
+from .ports import CONTROL_PORT, VR_PORT
 from .sudo import prime_sudo, run_root
 
 _logger = logging.getLogger(__name__)
 
-# ``VR_PORT`` (the port we forward the headset's loopback copy of) is owned by
-# ``utils.ports`` so the tunnel target and the VR server's bind can't drift.
+# The forwarded ports are owned by ``utils.ports`` so the tunnel targets and
+# the servers' binds can't drift.
 __all__ = [
     "VR_PORT",
+    "CONTROL_PORT",
+    "TUNNEL_PORTS",
     "AdbStatus",
     "install",
     "status",
@@ -60,6 +65,12 @@ _OCULUS_RULE = (
 # Android udev rules. Those use ``plugdev``; our Oculus rule above supersedes
 # them for the Quest's vendor id.
 _APT_PACKAGES = ("adb", "android-sdk-platform-tools-common")
+
+# Ports forwarded to the headset's loopback. The VR server (``VR_PORT``) carries
+# the poses, but it only exists while a teleop or collect operation runs — the
+# control panel (``CONTROL_PORT``) is always up, so it is the origin a freshly
+# cabled headset can reach to authorize the shared self-signed certificate.
+TUNNEL_PORTS = (VR_PORT, CONTROL_PORT)
 
 
 def _adb() -> str | None:
@@ -185,7 +196,7 @@ class AdbStatus:
 
     @property
     def ready(self) -> bool:
-        """True when a headset is authorized and the pose tunnel is live."""
+        """True when a headset is authorized and the tunnels are live."""
         return self.state == "device" and self.reverse_active
 
 
@@ -218,16 +229,19 @@ def _first_device() -> tuple[str | None, str]:
     return None, "none"
 
 
-def _reverse_active(port: int) -> bool:
+def _reverse_active(ports: tuple[int, ...]) -> bool:
+    """True when every port in ``ports`` is forwarded to the host."""
     proc = _run(["reverse", "--list"])
     if proc is None or proc.returncode != 0:
         return False
-    needle = f"tcp:{port} tcp:{port}"
-    return any(needle in line for line in proc.stdout.splitlines())
+    listed = proc.stdout.splitlines()
+    return all(
+        any(f"tcp:{port} tcp:{port}" in line for line in listed) for port in ports
+    )
 
 
-def status(port: int = VR_PORT) -> AdbStatus:
-    """Return the current adb device + reverse-tunnel status."""
+def status(ports: tuple[int, ...] = TUNNEL_PORTS) -> AdbStatus:
+    """Return the adb device state and whether every ``ports`` tunnel is up."""
     if _adb() is None:
         return AdbStatus(
             installed=False, serial=None, state="none", reverse_active=False
@@ -237,7 +251,7 @@ def status(port: int = VR_PORT) -> AdbStatus:
         installed=True,
         serial=serial,
         state=state,
-        reverse_active=_reverse_active(port),
+        reverse_active=_reverse_active(ports),
     )
 
 
@@ -268,22 +282,24 @@ def set_proximity_disabled(disabled: bool) -> tuple[bool, str | None]:
     return True, None
 
 
-def connect(port: int = VR_PORT) -> AdbStatus:
-    """Establish the reverse tunnel (headset localhost:port → this host:port).
+def connect(ports: tuple[int, ...] = TUNNEL_PORTS) -> AdbStatus:
+    """Establish a reverse tunnel per port (headset localhost:port → host:port).
 
     The first adb command against a freshly connected headset also triggers the
     USB-debugging authorization popup on the device. Returns the resulting
     status so the caller can surface "authorize on headset" vs "ready".
 
-    Self-healing: any existing reverse for this port is removed first, then a
+    Self-healing: any existing reverse for a port is removed first, then a
     fresh one is added. ``adb reverse`` keys on the device-side spec, so a plain
     re-add already replaces a prior mapping, but removing first also clears a
     *wedged* tunnel (e.g. one left pointing at a server we since reclaimed/killed
     on a different run) so reconnect reliably yields a working forward rather
     than trusting whatever stale state the device held.
     """
-    # ``--remove`` of a non-existent reverse exits non-zero; that's expected and
-    # harmless (``_run`` only warns on spawn/timeout errors, not exit codes).
-    _run(["reverse", "--remove", f"tcp:{port}"])
-    _run(["reverse", f"tcp:{port}", f"tcp:{port}"])
-    return status(port)
+    for port in ports:
+        # ``--remove`` of a non-existent reverse exits non-zero; that's expected
+        # and harmless (``_run`` only warns on spawn/timeout errors, not exit
+        # codes).
+        _run(["reverse", "--remove", f"tcp:{port}"])
+        _run(["reverse", f"tcp:{port}", f"tcp:{port}"])
+    return status(ports)

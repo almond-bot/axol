@@ -128,6 +128,33 @@ def create_self_signed_cert(certfile: str, keyfile: str) -> None:
         secure_atomic_write_bytes(keyfile, temporary_key.read_bytes(), mode=0o600)
 
 
+def certificate_lacks_san(certfile: str) -> bool:
+    """True when ``certfile`` carries no ``subjectAltName`` extension.
+
+    Certificates issued before the SAN was added match no hostname at all in
+    Chromium, so the Quest headset can never accept one — not even on
+    ``localhost``. Such a certificate is rotated rather than reused. Anything
+    unreadable (no openssl, an unparseable file) answers False so a host that
+    cannot be inspected is left alone instead of regenerating on every start.
+
+    The timeout matters on the unprivileged path, where the certificate path is
+    operator-owned: without it a path pointed at a FIFO would hang the read —
+    and with it, ``axol serve`` starts on the certificate it already has.
+    """
+    try:
+        proc = subprocess.run(
+            ["openssl", "x509", "-in", certfile, "-noout", "-ext", "subjectAltName"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    return "Subject Alternative Name" not in proc.stdout
+
+
 def prepare_tls_files(certfile: str, keyfile: str) -> PreparedTLSFiles:
     """Return TLS files that remain stable until :meth:`close` is called.
 
@@ -139,7 +166,8 @@ def prepare_tls_files(certfile: str, keyfile: str) -> PreparedTLSFiles:
     ``/tmp`` is explicit so an operator-controlled ``TMPDIR`` cannot choose
     the privileged staging parent.
 
-    If either default file is genuinely absent, the pair is generated with
+    If either default file is genuinely absent — or the existing certificate
+    predates the ``subjectAltName`` extension — the pair is generated with
     :func:`create_self_signed_cert` and then snapshotted.  An unsafe existing
     entry fails before generation, so it is never silently replaced.
     """
@@ -154,7 +182,8 @@ def prepare_tls_files(certfile: str, keyfile: str) -> PreparedTLSFiles:
     )
     if not requires_snapshot:
         generated = False
-        if not os.path.isfile(certfile) or not os.path.isfile(keyfile):
+        missing = not os.path.isfile(certfile) or not os.path.isfile(keyfile)
+        if missing or certificate_lacks_san(certfile):
             create_self_signed_cert(certfile, keyfile)
             generated = True
         return PreparedTLSFiles(certfile, keyfile, generated=generated)
@@ -176,7 +205,10 @@ def prepare_tls_files(certfile: str, keyfile: str) -> PreparedTLSFiles:
             except FileNotFoundError:
                 missing = True
 
-        if missing:
+        # Inspect the snapshot, not the source: the copy above already proved
+        # it safe, and re-reading the operator-owned path would reopen the
+        # check/use race the snapshot exists to close.
+        if missing or certificate_lacks_san(str(snapshot_cert)):
             # All existing entries were already proven safe above.  The
             # no-follow atomic writer also rechecks them during publication.
             create_self_signed_cert(certfile, keyfile)
