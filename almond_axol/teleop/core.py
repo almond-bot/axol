@@ -875,7 +875,7 @@ class VRTeleopCore:
             vr_alive: Whether VR frames are still arriving. When given, a
                 contact hold whose frame stream has been dead for a grace
                 period is *orphaned* — the reset press that ends it can
-                never come (a Y-exit return, a headset that died) — so the
+                never come (the headset left VR or died mid-move) — so the
                 hold settles into a position hold where the arms are and
                 the guarded return ends; reconnecting and pressing reset
                 resumes the normal path. ``None`` waits indefinitely.
@@ -1003,8 +1003,8 @@ class VRTeleopCore:
             await gravity_step()
             if hold_tick is not None:
                 hold_tick()
-            # Orphaned hold: the VR frame stream is dead (Y-exit
-            # return, headset died), so the reset press that ends
+            # Orphaned hold: the VR frame stream is dead (headset left
+            # VR or died mid-move), so the reset press that ends
             # this hold can never arrive. After the grace period,
             # stop waiting and settle where the arms are.
             if vr_alive is not None:

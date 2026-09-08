@@ -741,10 +741,10 @@ class VRTeleop:
             )
 
         def _guard_vr_alive() -> bool:
-            # Frames within the last ~2s: a Y-exit ends the XR session (the
-            # stream stops instantly), so a contact hold on the way out has
-            # no headset left to press reset — the engine settles it instead
-            # of waiting forever.
+            # Frames within the last ~2s: if the headset leaves mid-move (Y
+            # exit, doffed, link drop) the stream stops instantly, so a
+            # contact hold has no headset left to press reset — the engine
+            # settles it instead of waiting forever.
             with self._vr_frame_times_lock:
                 last = self._vr_frame_times[-1] if self._vr_frame_times else None
             return last is not None and (time.perf_counter() - last) < 2.0
@@ -778,8 +778,8 @@ class VRTeleop:
         deadline = time.perf_counter()
         try:
             while True:
-                # Every rest move — the startup trajectory, an X reset, the
-                # Y-exit reset — plays through the shared guarded engine on
+                # Every rest move — the startup trajectory, an X reset, a
+                # programmatic request_reset — plays through the shared guarded engine on
                 # hardware: torque watchdog, and a limp gravity-comp hold on
                 # contact (reset replans from wherever the arms are left).
                 # See VRTeleopCore.guarded_return.

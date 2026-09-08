@@ -90,7 +90,7 @@ The headset only shows feeds that are actually being streamed (set under [the Ax
 | 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it — grabbing one screen with **both** triggers **resizes** it |
 | 5 | X | **Reset** pose; cancels a recording countdown. While recording, arms the **Discard episode?** confirmation — press **X** again to discard and re-record, or **A** to cancel and keep recording |
 | 6 | A | **Record**: start a take (3-second countdown). While recording, arms the **Save episode?** confirmation — press **A** again to save, or **X** to cancel and keep recording. **Data collection only** (no effect during plain teleop) |
-| 7 | Y | **Exit** the XR session — sends a reset first, so the arms return to rest and disengage instead of holding the last pose and jerking on the next entry |
+| 7 | Y | **Exit** the XR session. The arms stay where they are: once the pose stream stops they auto-disengage and hold position (see below), and re-engaging never jerks them. Press **X** first if you want them back at rest |
 | — | Right **B** | **Reset the camera screens** — re-anchor to your current gaze and clear all moves + resizes |
 | — | Left thumbstick | **Drive Jelly** — push to move forward/back and strafe (robots with [Jelly](#jelly) only; deadman, so the base stops when released) |
 | — | Right thumbstick (x) | **Rotate Jelly** |

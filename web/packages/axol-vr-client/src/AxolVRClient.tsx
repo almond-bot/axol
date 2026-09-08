@@ -240,8 +240,8 @@ export function AxolVRClient({
     if (!frame || !refSpace) return
 
     // Do not read buttons or ship a pose until this connection's datum is
-    // known. In particular, deferring button-edge tracking means a held Y exit
-    // still sends its reliable return-to-rest frame after config arrives.
+    // known. In particular, deferring button-edge tracking means a held X
+    // reset still sends its frame after config arrives.
     if (!poseModeReadyRef.current || !poseSourceKindReadyRef.current) {
       if (poseModeFallbackAtRef.current === null) {
         poseModeFallbackAtRef.current = monotonicNowMs() + POSE_MODE_REPLAY_WAIT_MS
@@ -403,13 +403,13 @@ export function AxolVRClient({
       }
     }
 
-    // Y (left) — return home, disable, then exit XR. Piggy-back a reset on this
-    // frame (same as X) so the backend plans a move back to rest and disengages
-    // before we end the session; otherwise the arms hold the last commanded pose
-    // and jerk when teleop is next entered. The session is ended only after the
-    // frame carrying this reset is sent below (see the exit-on-send paths).
+    // Y (left) — exit XR. Deliberately *no* reset: the arms stay where they
+    // are (the server auto-disengages within disengage_timeout once the pose
+    // stream stops and holds position), and re-engaging never jerks them
+    // toward the controllers (clutch/ramp). Press X for a return to rest.
+    // The session is ended only after this frame is sent (see below), so the
+    // server sees the final button state.
     if (yEdge) {
-      reset = true
       // Abandon any armed confirmation on the way out of the session.
       if (pendingConfirmRef.current !== null) {
         pendingConfirmRef.current = null
@@ -614,20 +614,10 @@ export function AxolVRClient({
     }
     publishHudIfEstablished()
 
-    // End the XR session only now that the Y-press reset frame has been sent, so
-    // the backend receives the return-to-rest before the pose stream stops.
-    if (yEdge) {
-      // This exit frame carries the return-to-rest reset and is the last one
-      // sent — no later frame can re-carry it. The preferred pose channel is
-      // deliberately unreliable (maxRetransmits: 0), so one dropped datagram
-      // would leave VR with the robot still engaged mid-air; duplicate the
-      // frame over the reliable WebSocket too (the server de-dupes by seq).
-      const ws = wsRef.current
-      if (ws && ws.readyState === WebSocket.OPEN && netSink !== ws) {
-        ws.send(payload)
-      }
-      onExit?.()
-    }
+    // End the XR session only now that the exit frame has been sent. It carries
+    // no reset — the arms hold position where they are once the pose stream
+    // stops (server-side auto-disengage) — so a dropped datagram costs nothing.
+    if (yEdge) onExit?.()
   })
 
   return null
