@@ -63,6 +63,7 @@ import logging
 import math
 import os
 import queue
+import signal
 import socket
 import threading
 import time
@@ -73,12 +74,14 @@ from typing import TYPE_CHECKING, Any
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
+from ..constants import PARK_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import (
     ZED_RESOLUTION_DIMS,
     ZedCameraConfig,
     resolution_for_dims,
 )
 from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..lerobot.rollout import arms_reporting
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..recording import (
     DatasetRecorderProcess,
@@ -2524,6 +2527,47 @@ def _run_session(
         finally:
             robot.set_control_trace_active(False)
 
+    async def _park_before_disconnect() -> None:
+        """Teardown return: the post-episode move, bounded and unattended.
+
+        The session has already stopped by the time this runs, so a deadline
+        bounds the move and none of the operator hooks are offered: there is
+        nobody left at the headset or the panel to answer a contact hold, so
+        a contact trip ends the park at once instead of holding limp until
+        the deadline — the torque-off follows either way.
+        """
+        deadline = time.perf_counter() + PARK_TIMEOUT_S
+        contact = False
+
+        def _on_contact() -> None:
+            nonlocal contact
+            contact = True
+
+        # A both-grips squeeze mid-park would steer the arms off the path.
+        teleop.block_engage()
+        try:
+            if not teleop.is_resetting:
+                teleop.request_reset()
+            await teleop.guarded_return(
+                send_step=_guard_send_step,
+                gravity_step=_guard_gravity_step,
+                torque_residuals=robot.torque_residuals,
+                reset_command_state=robot.reset_command_state,
+                get_positions=lambda: robot.positions,
+                stopped=lambda: contact or time.perf_counter() >= deadline,
+                # The hold's "press reset" prompt has no one to read it here.
+                announce=lambda msg: None if contact else _logger.info(msg),
+                on_contact=_on_contact,
+                move_timeout_s=PARK_TIMEOUT_S,
+            )
+            if contact:
+                _logger.warning(
+                    "return to rest before disconnect stopped on contact; "
+                    "disabling the arms where they are"
+                )
+        finally:
+            teleop.unblock_engage()
+
     async def _contact_hold_loop() -> None:
         """Tracking contact: hold limp until reset, then return to rest guarded.
 
@@ -2851,6 +2895,17 @@ def _run_session(
             )
         raise
     finally:
+        # Ignore SIGINT during cleanup so a second Ctrl+C can't abandon the
+        # arms partway through the return-to-rest below, or abort the
+        # disconnect/teardown that follows it. (Under ``axol serve`` this
+        # runs off the main thread, where handlers can't change — and where
+        # there is no Ctrl+C to guard against.)
+        previous_sigint: Any = None
+        try:
+            previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+
         _logger.info("Stopping.")
 
         cleanup_failures: list[tuple[str, BaseException]] = []
@@ -2875,6 +2930,43 @@ def _run_session(
             _cleanup("board gyro", imu_src.close)
         _cleanup("teleop activity marker", activity.stop)
         _cleanup("control trace", lambda: robot.set_control_trace_active(False))
+        # Park before the torque comes off: ``disconnect()`` disables the
+        # motors, and arms left raised drop under gravity.
+        #
+        # Skipped on Mantis (handheld grippers, no arms to park), when the
+        # arms are already at rest, when a limp contact hold left them in the
+        # operator's hands, when the IK worker that plans the move is gone, or
+        # when the bus no longer reports a pose to plan from. A stop that
+        # lands mid-reset finishes that move. The rest states come off the
+        # teleop core here, rather than off an ``IKResetController`` as in
+        # run-policy and collect-dagger, because this flow's rest moves are
+        # planned by the teleop IK worker.
+        #
+        # Bounded twice: by the deadline the coroutine installs, and by the
+        # hard wait below. Every failure is swallowed, so the disconnect that
+        # follows happens either way and a lost park costs only what was lost
+        # before it existed.
+        try:
+            if (
+                not mantis_mode
+                and (not teleop.at_rest or teleop.is_resetting)
+                and not teleop.ik_paused
+                and teleop.ik_worker_alive
+                and arms_reporting(robot)
+            ):
+                _logger.info("Returning to rest before disabling the arms.")
+                park = asyncio.run_coroutine_threadsafe(
+                    _park_before_disconnect(), robot.event_loop
+                )
+                try:
+                    park.result(timeout=PARK_TIMEOUT_S + 1.0)
+                finally:
+                    # A park that overran its own deadline must stop
+                    # commanding before the disconnect below disables the
+                    # motors underneath it. A no-op once it has finished.
+                    park.cancel()
+        except BaseException:
+            _logger.exception("return to rest before disconnect failed")
         _cleanup("robot disconnect", robot.disconnect)
         _cleanup("teleop disconnect", teleop.disconnect)
         # Close the relay's dataset branch BEFORE the recorder detaches its
@@ -2894,6 +2986,12 @@ def _run_session(
         )
         if relay is not None:
             _cleanup("video relay", relay.shutdown)
+
+        if previous_sigint is not None:
+            try:
+                signal.signal(signal.SIGINT, previous_sigint)
+            except (ValueError, OSError):
+                pass
 
         robot_failure = next(
             (
