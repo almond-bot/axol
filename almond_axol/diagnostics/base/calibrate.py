@@ -762,7 +762,10 @@ def fit_robust(strokes: list[Stroke], lever_m: float | None = None) -> Calibrati
     gone. The returned
     calibration's ``residuals`` cover *every* input stroke (dropped ones
     evaluated against the final solution) and ``dropped`` lists their indices;
-    ``rms_*`` describe the kept strokes.
+    ``rms_*`` describe the kept strokes. Attribution needs repetition: with a
+    single pass a slip's residual splits between the forward and back (or left
+    and right) strokes and either may be dropped, so record ``--repeat 2`` or
+    more when the floor is doubtful.
     """
     kept = list(range(len(strokes)))
     dropped: list[int] = []

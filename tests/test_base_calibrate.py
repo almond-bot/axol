@@ -135,7 +135,12 @@ class FitCalibrationTests(unittest.TestCase):
         cal = fit_calibration(strokes)
         self.assertTrue(cal.suspect)
         self.assertGreater(cal.rms_translation_m, 0.02 * cal.stroke_length_m)
-        # ...and the robust fit identifies and drops that stroke.
+        # With a single repetition the residual splits evenly between the
+        # forward and back strokes, so the robust fit can only drop one of
+        # the pair; a second repetition makes the culprit unambiguous.
+        self.assertIn(fit_robust(strokes).dropped, ([2], [3]))
+        strokes = synth_strokes(make_plan(1.5, math.radians(90), 0.25, 0.2, 2))
+        strokes[2].dy_m += 0.15
         self.assertEqual(fit_robust(strokes).dropped, [2])
 
     def test_rejects_strokes_that_do_not_determine_the_mount(self) -> None:
