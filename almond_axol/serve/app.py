@@ -2247,10 +2247,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     },
                     status_code=409,
                 )
+            # ``reachable is False`` is the proof this needs (the motor is
+            # unpowered); ``None`` means the probe produced no reading for it,
+            # which proves nothing and must keep the lockout.
             live = [
                 m
                 for m in status["motors"]
-                if m["reachable"] and m["status"] != "DISABLED"
+                if m["reachable"] is not False and m["status"] != "DISABLED"
             ]
             if live:
                 return JSONResponse(

@@ -298,7 +298,9 @@ export function runFieldVisible(key: string, profile: HardwareProfile): boolean 
 export interface MotorHealth {
   arm: string
   joint: string
-  reachable: boolean
+  /** null while a task owns the CAN bus: nobody is reading this motor, so its
+   *  reachability is unknown rather than last-known. */
+  reachable: boolean | null
   /** MotorStatus name from the idle ping (e.g. "OK", "OVER_TEMPERATURE"). */
   status: string | null
   temperature: number | null

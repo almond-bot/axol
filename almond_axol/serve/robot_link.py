@@ -78,6 +78,10 @@ def motor_faults(
         return []
     faults: list[dict[str, Any]] = []
     for m in motors:
+        if m["reachable"] is None:
+            # Unknown while a task owns the bus — nothing was read, so there is
+            # nothing to fault on.
+            continue
         if not m["reachable"]:
             problem = "unreachable"
         elif m["status"] not in _HEALTHY_MOTOR_STATUSES:
@@ -432,6 +436,12 @@ class RobotLink:
 
         No-op unless currently connected. The prior state is remembered so
         :meth:`reacquire` only reconnects if the link was up before the task.
+
+        Once the buses are handed over the collected health is dropped: it
+        describes motors this link no longer reads, and keeping it would let
+        the panel show a motor as reachable at its pre-handover voltage for
+        the whole run — including after its power was cut mid-task. A release
+        that fails keeps it, since that link never gave the buses up.
         """
         with self._lock:
             if self._state != STATE_CONNECTED and not self._buses_may_be_open:
@@ -446,6 +456,9 @@ class RobotLink:
             self._set_state(STATE_ERROR, _format_error(exc))
             _logger.warning("robot release failed: %s", exc)
             raise RuntimeError(f"could not release robot link: {exc}") from exc
+        for arm in self._arms:
+            arm.health = {}
+        self.hub.clear_slow()
 
     def reacquire(self) -> None:
         """Re-open the buses + ping loop after a task releases the bus."""
@@ -544,17 +557,21 @@ class RobotLink:
         for arm in self._arms:
             for joint in joints:
                 h = arm.health.get(joint.name, {})
+                # No health at all means nobody is reading this motor (a task
+                # owns the bus): unknown, reported as null rather than as a
+                # reachable/unreachable claim this link cannot make.
+                reachable = h.get("reachable")
                 motors.append(
                     {
                         "arm": arm.side,
                         "joint": joint.name,
-                        "reachable": bool(h.get("reachable", False)),
+                        "reachable": None if reachable is None else bool(reachable),
                         "status": h.get("status"),
                         "temperature": h.get("temperature"),
                         "voltage": h.get("voltage"),
                     }
                 )
-        reachable = sum(1 for m in motors if m["reachable"])
+        reachable = sum(1 for m in motors if m["reachable"] is True)
         left_channel, right_channel = self.channels()
         return {
             "state": state,
