@@ -22,6 +22,7 @@ from almond_axol.diagnostics.base.calibrate import (
     camera_heading_axes,
     consistency_report,
     fit_calibration,
+    fit_robust,
     heading_change,
     make_plan,
     read_strokes,
@@ -130,10 +131,12 @@ class FitCalibrationTests(unittest.TestCase):
     def test_slip_shows_up_as_residual(self) -> None:
         plan = make_plan(1.5, math.radians(90), 0.25, 0.2, 1)
         strokes = synth_strokes(plan)
-        strokes[2].dy_m += 0.03  # forward stroke slid 3 cm sideways
+        strokes[2].dy_m += 0.15  # forward stroke slid 15 cm sideways
         cal = fit_calibration(strokes)
         self.assertTrue(cal.suspect)
-        self.assertGreater(cal.rms_translation_m, 0.004)
+        self.assertGreater(cal.rms_translation_m, 0.02 * cal.stroke_length_m)
+        # ...and the robust fit identifies and drops that stroke.
+        self.assertEqual(fit_robust(strokes).dropped, [2])
 
     def test_rejects_strokes_that_do_not_determine_the_mount(self) -> None:
         plan = [
@@ -198,6 +201,40 @@ class GeometryTests(unittest.TestCase):
         r0 = self._camera_rotation(math.radians(10), math.radians(60))
         r1 = self._camera_rotation(math.radians(-35), math.radians(60))
         self.assertAlmostEqual(math.degrees(heading_change(r0, r1)), -45.0, places=9)
+
+
+class RobustFitTests(unittest.TestCase):
+    def test_slipped_stroke_is_dropped_and_radii_recovered(self) -> None:
+        radii = [0.0640, 0.0645, 0.0648, 0.0645]
+        strokes = synth_strokes(
+            make_plan(0.7, math.radians(90), 0.25, 0.2, 3), radii=radii
+        )
+        # A wheel slipping on one "right" stroke: the body moved 6 cm less
+        # along y and slid 6 cm in x, wheels turned as commanded.
+        bad = [i for i, s in enumerate(strokes) if s.name == "right"][-1]
+        strokes[bad].dx_m -= 0.06
+        strokes[bad].dy_m += 0.06
+        naive = fit_calibration(strokes)
+        robust = fit_robust(strokes)
+        self.assertEqual(robust.dropped, [bad])
+        self.assertEqual(len(robust.residuals), len(strokes))
+        for got, want in zip(robust.wheel_scale, true_scale(radii)):
+            self.assertAlmostEqual(got, want, places=4)
+        self.assertGreater(naive.radius_spread, robust.radius_spread)
+        self.assertGreater(
+            math.hypot(*robust.residuals[bad][:2]), 0.05
+        )  # the outlier's residual is reported against the clean solution
+
+    def test_clean_strokes_drop_nothing(self) -> None:
+        strokes = synth_strokes(make_plan(0.7, math.radians(90), 0.25, 0.2, 2))
+        self.assertEqual(fit_robust(strokes).dropped, [])
+
+    def test_never_drops_below_solvable(self) -> None:
+        strokes = synth_strokes(make_plan(0.7, math.radians(90), 0.25, 0.2, 1))
+        strokes[2].dy_m += 0.2
+        cal = fit_robust(strokes)
+        # 6 strokes → at most int(0.2 * 6) = 1 drop; 5 strokes still solve
+        self.assertLessEqual(len(cal.dropped), 1)
 
 
 class ConsistencyTests(unittest.TestCase):

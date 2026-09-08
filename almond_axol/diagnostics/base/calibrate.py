@@ -68,6 +68,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
@@ -94,13 +95,26 @@ _SETTLE_TIMEOUT_S = 15.0
 # A stroke must leave this much headroom to the ±PMAX position mapping, or a
 # wheel could wrap mid-stroke and corrupt its odometry (~40 rad is 1.5 m).
 _PMAX_HEADROOM_RAD = 80.0
-# Fit quality above which the result is flagged as suspect.
-_WARN_RESIDUAL_M = 0.004
+# Fit quality above which the result is flagged as suspect. Translation is
+# judged relative to the strokes' length: on the cart a clean 0.7 m stroke
+# leaves ~8 mm (1.1%) of micro-slip and tracker noise, and slip scales with
+# distance.
+_WARN_RESIDUAL_FRAC = 0.02
 _WARN_RESIDUAL_RAD = math.radians(0.3)
+# Outlier rejection (see fit_robust): a stroke whose translation residual
+# exceeds this multiple of the median — and this fraction of the stroke
+# length, so noise-floor residuals never qualify — is dropped; never more
+# than this share of the strokes.
+_OUTLIER_FACTOR = 3.0
+_OUTLIER_MIN_FRAC = 0.005
+_OUTLIER_MAX_FRAC = 0.2
 # Tracking-consistency limits (see consistency_report): spread of the
 # camera-motion / wheel-turns ratio within one stroke direction, and how far
 # off its axis a translation stroke may point while the heading barely moved.
-_WARN_RATIO_SPREAD = 0.03
+# Meant to catch gross failures (the cart lifting a wheel gave 10–26%); clean
+# runs of six strokes sit at 0.5–2.5%, and a single mildly slipping stroke is
+# the outlier rejection's job.
+_WARN_RATIO_SPREAD = 0.05
 _WARN_OFF_AXIS_RAD = math.radians(5.0)
 
 # --tracker choices → (sl.POSITIONAL_TRACKING_MODE name, enable_2d_ground_mode)
@@ -150,6 +164,8 @@ class Calibration:
     residuals: list[tuple[float, float, float]] = field(default_factory=list)
     rms_translation_m: float = 0.0
     rms_heading_rad: float = 0.0
+    stroke_length_m: float = 1.0  # mean translation-stroke displacement
+    dropped: list[int] = field(default_factory=list)  # outlier stroke indices
 
     @property
     def radius_spread(self) -> float:
@@ -159,7 +175,7 @@ class Calibration:
     @property
     def suspect(self) -> bool:
         return (
-            self.rms_translation_m > _WARN_RESIDUAL_M
+            self.rms_translation_m > _WARN_RESIDUAL_FRAC * self.stroke_length_m
             or self.rms_heading_rad > _WARN_RESIDUAL_RAD
         )
 
@@ -291,7 +307,11 @@ def fit_calibration(strokes: list[Stroke], lever_m: float | None = None) -> Cali
 
     scales = radii.mean() / radii
     scales /= scales.mean()
+    lengths = [
+        math.hypot(s.dx_m, s.dy_m) for s in strokes if not s.name.startswith("rotate")
+    ]
     return Calibration(
+        stroke_length_m=sum(lengths) / len(lengths) if lengths else 1.0,
         radii_m=[float(r) for r in radii],
         wheel_scale=[float(s) for s in scales],
         camera_offset_m=(rx, ry),
@@ -710,7 +730,66 @@ def _wheel_labels() -> list[str]:
     return ["".join(part[0].upper() for part in w.name.split("_")) for w in WHEELS]
 
 
-def consistency_report(strokes: list[Stroke]) -> tuple[list[str], bool]:
+def stroke_residual(cal: Calibration, s: Stroke) -> tuple[float, float, float]:
+    """Model-minus-measurement for one stroke under a fitted calibration.
+
+    Same equations as :func:`fit_calibration` evaluated at its solution:
+    ``(ex, ey)`` in metres (body-start frame), ``et`` in radians.
+    """
+    kx, ky, kw = arc_rows(s.turns, s.dtheta_rad)
+    c, sn = math.cos(cal.camera_yaw_rad), math.sin(cal.camera_yaw_rad)
+    dx = c * s.dx_m - sn * s.dy_m
+    dy = sn * s.dx_m + c * s.dy_m
+    ct, st = math.cos(s.dtheta_rad), math.sin(s.dtheta_rad)
+    rx, ry = cal.camera_offset_m
+    r = np.asarray(cal.radii_m)
+    ex = float(np.dot(kx, r)) + (ct - 1.0) * rx - st * ry - dx
+    ey = float(np.dot(ky, r)) + st * rx + (ct - 1.0) * ry - dy
+    et = (float(np.dot(kw, r)) - s.dtheta_rad * cal.lever_m) / cal.lever_m
+    return ex, ey, et
+
+
+def fit_robust(strokes: list[Stroke], lever_m: float | None = None) -> Calibration:
+    """:func:`fit_calibration` with outlier strokes dropped.
+
+    On a real floor the odd stroke slips — a wheel crosses a seam or a cable
+    and delivers a few centimetres less than it turned — and one such stroke
+    biases the radii more than a dozen clean ones can pull back. So the fit is
+    repeated, each time dropping the stroke whose translation residual stands
+    furthest above the median (more than ``_OUTLIER_FACTOR`` times it, and at
+    least ``_OUTLIER_MIN_FRAC`` of the stroke length so a noise-floor fit is
+    left alone), until none does or ``_OUTLIER_MAX_FRAC`` of the strokes are
+    gone. The returned
+    calibration's ``residuals`` cover *every* input stroke (dropped ones
+    evaluated against the final solution) and ``dropped`` lists their indices;
+    ``rms_*`` describe the kept strokes.
+    """
+    kept = list(range(len(strokes)))
+    dropped: list[int] = []
+    max_drop = int(_OUTLIER_MAX_FRAC * len(strokes))
+    cal = fit_calibration(strokes, lever_m)
+    while len(dropped) < max_drop:
+        norms = [math.hypot(ex, ey) for ex, ey, _ in cal.residuals]
+        median = float(np.median(norms))
+        worst = max(range(len(kept)), key=lambda j: norms[j])
+        floor = max(_OUTLIER_FACTOR * median, _OUTLIER_MIN_FRAC * cal.stroke_length_m)
+        if norms[worst] <= floor:
+            break
+        trial = kept[:worst] + kept[worst + 1 :]
+        try:
+            cal = fit_calibration([strokes[i] for i in trial], lever_m)
+        except ValueError:
+            break  # dropping it would leave the system underdetermined
+        dropped.append(kept[worst])
+        kept = trial
+    cal.residuals = [stroke_residual(cal, s) for s in strokes]
+    cal.dropped = sorted(dropped)
+    return cal
+
+
+def consistency_report(
+    strokes: list[Stroke], skip: Iterable[int] = ()
+) -> tuple[list[str], bool]:
     """Sanity-check the camera against the wheels, direction by direction.
 
     Within one stroke direction the wheels always turn in the same pattern,
@@ -721,10 +800,14 @@ def consistency_report(strokes: list[Stroke]) -> tuple[list[str], bool]:
     while the heading barely changed, means the tracker lost the plot in that
     direction (a down-looking camera sees little parallax for motion along its
     optical axis), or a wheel slipped. Either way the fit is not to be trusted.
-    Returns the table lines and whether anything tripped.
+    Returns the table lines and whether anything tripped. Strokes whose index
+    is in ``skip`` (outliers the fit dropped) are left out.
     """
+    skipped = set(skip)
     groups: dict[str, list[Stroke]] = {}
-    for s in strokes:
+    for i, s in enumerate(strokes):
+        if i in skipped:
+            continue
         key = (
             "spin"
             if s.name.startswith("rotate")
@@ -783,15 +866,23 @@ def format_report(strokes: list[Stroke], cal: Calibration, serial: int) -> str:
     lines.append(
         "  stroke        wheels (rad)                        camera dx/dy (m)   dθ (°)   resid (mm, mm, °)"
     )
-    for s, (ex, ey, et) in zip(strokes, cal.residuals):
+    for i, (s, (ex, ey, et)) in enumerate(zip(strokes, cal.residuals)):
         turns = " ".join(f"{t:+7.2f}" for t in s.turns)
         lines.append(
             f"  {s.name:<12} {turns}   {s.dx_m:+.3f} {s.dy_m:+.3f}   "
             f"{math.degrees(s.dtheta_rad):+7.2f}   "
             f"{ex * 1e3:+5.1f} {ey * 1e3:+5.1f} {math.degrees(et):+.2f}"
+            + ("   dropped" if i in cal.dropped else "")
         )
     lines.append("")
-    consistency, inconsistent = consistency_report(strokes)
+    if cal.dropped:
+        lines.append(
+            f"  dropped {len(cal.dropped)} outlier stroke(s) — "
+            + ", ".join(f"#{i + 1} {strokes[i].name}" for i in cal.dropped)
+            + " — whose residual stood far above the rest (a wheel slipped there)."
+        )
+        lines.append("")
+    consistency, inconsistent = consistency_report(strokes, cal.dropped)
     lines += consistency
     lines.append("")
     radii = "  ".join(f"{lab} {r * 1e3:.2f}" for lab, r in zip(labels, cal.radii_m))
@@ -803,7 +894,8 @@ def format_report(strokes: list[Stroke], cal: Calibration, serial: int) -> str:
         f"  camera mount          {rx:+.3f} m fwd, {ry:+.3f} m left of the drive "
         f"centre, yaw {math.degrees(cal.camera_yaw_rad):+.2f}°",
         f"  rotation lever (a+b)/√2  {cal.lever_m:.3f} m",
-        f"  fit residual          {cal.rms_translation_m * 1e3:.1f} mm rms, "
+        f"  fit residual          {cal.rms_translation_m * 1e3:.1f} mm rms "
+        f"({cal.rms_translation_m / cal.stroke_length_m * 100:.1f}% of stroke), "
         f"{math.degrees(cal.rms_heading_rad):.2f}° rms",
     ]
     if cal.suspect or inconsistent:
@@ -938,11 +1030,11 @@ async def _run(args: argparse.Namespace) -> int:
 def _report_and_save(
     strokes: list[Stroke], serial: int, args: argparse.Namespace
 ) -> int:
-    cal = fit_calibration(strokes, args.lever)
+    cal = fit_robust(strokes, args.lever)
     print(format_report(strokes, cal, serial))
     if not args.save:
         return 0
-    _, inconsistent = consistency_report(strokes)
+    _, inconsistent = consistency_report(strokes, cal.dropped)
     if cal.suspect or inconsistent:
         if not sys.stdin.isatty():
             print("Not saving a suspect fit; rerun to retry.")
