@@ -109,7 +109,7 @@ Each frame sends a JSON message over the WebSocket:
   r_pose_profile: string | null
   l_pose_space: "grip" | "target-ray" // relative Axol keeps targetRaySpace; absolute Mantis uses calibrated gripSpace
   r_pose_space: "grip" | "target-ray"
-  reset:   boolean   // true on the frame X (reset) or Y (exit) was pressed — Y piggy-backs a reset so the arms return to rest before the session ends
+  reset:   boolean   // true on the frame X (reset) was pressed (or an A-confirmed discard); Y (exit) does not reset — the arms hold position
   state:   "teleop" | "data_collection" | "recording"  // client-driven; "saving" is server-pushed via feedback message
   l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — Jelly strafe (ignored without Jelly)
   l_stick_y: number  // left thumbstick y, [-1, 1], pushed forward = -1 — Jelly drive
@@ -138,7 +138,7 @@ The operating mode (teleop vs. data collection) is **announced by the server on 
 | 3 | Left trigger | Actuate left gripper; while tracking is disengaged, point at a camera screen and hold to **move** it — grab one screen with **both** triggers to **resize** it |
 | 4 | Right trigger | Actuate right gripper; while tracking is disengaged, point at a camera screen and hold to **move** it — grab one screen with **both** triggers to **resize** it |
 | 5 | Left **X** | Reset pose; cancels a recording countdown. While recording, arms the **Discard episode?** confirmation — press **X** again to discard and re-record, or **A** to cancel and keep recording |
-| 7 | Left **Y** | Exit the XR session — sends a reset first, so the arms return to rest and disengage instead of holding the last pose |
+| 7 | Left **Y** | Exit the XR session — no reset; the arms auto-disengage when the pose stream stops and hold position (press **X** first to return to rest) |
 | 6 | Right **A** | **Record**: start a take (3-second countdown). While recording, arms the **Save episode?** confirmation — press **A** again to save, or **X** to cancel and keep recording — **data collection only** (no effect during plain teleop) |
 | — | Right **B** | Re-anchor the camera screens to your current gaze and clear all moves + resizes |
 | — | Left thumbstick | Drive Jelly: forward/back + strafe (robots fitted with Jelly only; deadman — the base stops when released) |
