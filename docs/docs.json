@@ -137,7 +137,8 @@
                   "cli/diag-rom-enable",
                   "cli/diag-rom-disable",
                   "cli/diag-lift-cycle",
-                  "cli/diag-zed-cable"
+                  "cli/diag-zed-cable",
+                  "cli/diag-base-calibrate"
                 ]
               },
               {

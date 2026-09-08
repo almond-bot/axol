@@ -141,6 +141,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable)
 - [`diag.lift-cycle`](https://docs.almond.bot/cli/diag-lift-cycle)
 - [`diag.zed-cable`](https://docs.almond.bot/cli/diag-zed-cable)
+- [`diag.base-calibrate`](https://docs.almond.bot/cli/diag-base-calibrate)
 - [`motor.set-can-id`](https://docs.almond.bot/cli/motor-set-can-id)
 - [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos)
 - [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config)

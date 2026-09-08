@@ -497,6 +497,25 @@ COMMANDS: dict[str, CommandDef] = {
         uses_can_bus=False,
         uses_cameras=True,
     ),
+    # Drives the cart's wheels (their own CAN bus) while tracking the overhead
+    # ZED's pose, so it owns both the bus slot and the cameras. drives_motors
+    # stays False like the lift commands: the arm-motor fault gate is
+    # irrelevant to the base.
+    "diag.base-calibrate": CommandDef(
+        "diag.base-calibrate",
+        "diag.base-calibrate",
+        "Calibrate cart wheels",
+        "Spin and drive the cart through six short strokes while the overhead "
+        "ZED tracks its pose, then fit the per-wheel radius corrections "
+        "(cart.wheel_scale) that stop it sliding sideways. Needs ~2 m of clear "
+        "floor around the cart.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..diagnostics.base.calibrate"),
+        requires_hardware=True,
+        uses_cameras=True,
+        hardware_profiles=("axol",),
+    ),
     # The lift commands run on the chest CAN bus, not the arm hub, but they
     # still take the single bus-owner slot (uses_can_bus default) so physical
     # motion is never launched concurrently with teleop or another

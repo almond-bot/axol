@@ -11,12 +11,12 @@ fixed by convention:
 
 :class:`Cart` exposes a latched command interface: any thread calls
 :meth:`Cart.set_command` with a normalized body velocity + lift direction,
-and an internal asyncio task (started by :meth:`Cart.enable`) applies slew
+and an internal asyncio task (started by :meth:`Cart.enable`) applies ramp
 limiting, x-drive mixing, and the park/unpark state machine at
 ``CartConfig.frequency``:
 
 - While the command is non-zero the wheels track it in VELOCITY mode.
-- When the slew-limited command reaches zero (and the wheels are measured
+- When the ramp-limited command reaches zero (and the wheels are measured
   slow), the wheels are parked: switched to MIT/impedance mode and held at
   their current positions by the motor's internal high-bandwidth position
   loop, so the base does not roll under load.
@@ -38,6 +38,28 @@ Body-frame convention: +x forward, +y left, +wz counter-clockwise. The
 mixing assumes each wheel's positive spin has a forward (+x) component;
 if a wheel runs backwards on your cart, flip its entry in
 :data:`WHEEL_SIGNS`.
+
+Straight-line drift. Three mechanisms make an x-drive veer on a real floor,
+and they need different fixes (an uneven-floor simulation of this exact
+plant — wobbly-table load redistribution, tanh traction, per-wheel stiction
+and radius spread, the real 50 Hz loop — ranked them):
+
+- *Rotation* — corrected by the gyro heading hold (``CartConfig.imu``,
+  ``yaw_hold_gain``). The single largest factor: without it the heading
+  wanders several degrees per stroke.
+- *Effective-radius mismatch* — four omni wheels never wear identically, and
+  a 3% spread slides the base sideways ~2 cm per 3 m even with the heading
+  held, because the wheels' speeds are mutually inconsistent and the free
+  rollers absorb the difference. Unobservable from the wheels themselves
+  (each tracks its command perfectly); corrected by ``CartConfig.wheel_scale``,
+  measured by ``axol diag.base-calibrate`` (the cart drives six short strokes
+  tracked by the overhead ZED) or fitted from tape-measured strokes with
+  :func:`solve_wheel_scale`.
+- *Diagonal unloading* — on a wobbly floor one diagonal pair lifts, and the
+  loaded pair can only push along its shared 45° axis, so the base slides
+  sideways while it accelerates and straightens once cruising. No wheel
+  command can fix it while the pair is unloaded; the lever is gentler
+  acceleration (``accel``/``jerk``), which also keeps launches smooth.
 """
 
 from __future__ import annotations
@@ -137,20 +159,183 @@ def deadzone(value: float, threshold: float) -> float:
 
 
 def mix(
-    vx: float, vy: float, wz: float, max_speed: float, turn_scale: float
+    vx: float,
+    vy: float,
+    wz: float,
+    max_speed: float,
+    turn_scale: float,
+    wheel_scale: tuple[float, float, float, float] | None = None,
 ) -> list[float]:
     """Map normalized body command ([-1, 1] each) to per-wheel rad/s.
 
     The raw mix can exceed 1 when translation and rotation combine, so the
     whole set is scaled down together to preserve the motion direction while
-    keeping every wheel within ``max_speed``.
+    keeping every wheel within ``max_speed``. ``wheel_scale`` (in
+    :data:`WHEELS` order) then multiplies each wheel to compensate its
+    effective-radius error — see ``CartConfig.wheel_scale``.
     """
     wz *= turn_scale
     raw = [
         WHEEL_SIGNS[w.motor_id] * (w.mx * vx + w.my * vy + w.mw * wz) for w in WHEELS
     ]
     scale = max(1.0, max(abs(r) for r in raw))
-    return [r / scale * max_speed for r in raw]
+    speeds = [r / scale * max_speed for r in raw]
+    if wheel_scale is not None:
+        speeds = [s * k for s, k in zip(speeds, wheel_scale)]
+    return speeds
+
+
+class VectorRamp:
+    """Rate- and jerk-limited ramp of the normalized (vx, vy, wz) command.
+
+    The command is slewed as a single vector — the step's magnitude is capped
+    but its direction kept — so a mostly-forward command with a small lateral
+    part doesn't finish its lateral ramp first and veer before straightening.
+
+    Two rate limits apply: ``accel`` while the step moves the command away
+    from zero (its projection onto the current command is non-negative) and
+    ``decel`` while it moves toward zero, so stops and speed reductions can
+    be brisker than launches. A reversal uses ``decel`` down to zero, then
+    ``accel`` out the other side.
+
+    With ``jerk`` > 0 the command's rate of change is itself a state — a
+    velocity vector in command space — that may only change by ``jerk`` per
+    second. It is steered toward the limit speed along the remaining delta,
+    capped at √(2·jerk·remaining) so it reaches zero exactly as the command
+    reaches its target: an S-shaped profile with no acceleration step at
+    either end of a launch or stop, including a stick released mid-launch
+    (the rate swings smoothly through zero instead of flipping sign).
+    ``jerk`` = 0 is the plain trapezoid.
+
+    All quantities are in normalized command units (full stick = 1) per
+    second / second².
+    """
+
+    def __init__(self, accel: float, decel: float, jerk: float, dt: float) -> None:
+        if not (accel > 0.0 and decel > 0.0 and jerk >= 0.0 and dt > 0.0):
+            raise ValueError("ramp needs accel > 0, decel > 0, jerk >= 0, dt > 0")
+        self.accel = accel
+        self.decel = decel
+        self.jerk = jerk
+        self.dt = dt
+        self.vel = [0.0, 0.0, 0.0]  # command rate of change (normalized/s)
+
+    def step(self, cmd: list[float], target: tuple[float, ...]) -> None:
+        """Advance ``cmd`` one interval toward ``target`` (in place)."""
+        deltas = [t - c for t, c in zip(target, cmd)]
+        norm = math.sqrt(sum(d * d for d in deltas))
+        if norm <= 0.0:
+            self.vel = [0.0, 0.0, 0.0]
+            return
+        toward_zero = sum(d * c for d, c in zip(deltas, cmd)) < 0.0
+        limit = self.decel if toward_zero else self.accel
+        if self.jerk > 0.0:
+            speed = min(limit, math.sqrt(2.0 * self.jerk * norm))
+            want = [d / norm * speed for d in deltas]
+            dv = [w - v for w, v in zip(want, self.vel)]
+            dv_norm = math.sqrt(sum(x * x for x in dv))
+            max_dv = self.jerk * self.dt
+            if dv_norm > max_dv:
+                dv = [x * max_dv / dv_norm for x in dv]
+            vel = [v + x for v, x in zip(self.vel, dv)]
+        else:
+            vel = [d / norm * limit for d in deltas]
+        step = [v * self.dt for v in vel]
+        advance = sum(s * d for s, d in zip(step, deltas)) / norm
+        if advance >= norm:
+            # Would reach or pass the target this interval: land on it. The
+            # velocity state is zeroed so a fresh target starts from rest.
+            cmd[:] = list(target)
+            self.vel = [0.0, 0.0, 0.0]
+            return
+        self.vel = vel
+        for i, s in enumerate(step):
+            cmd[i] += s
+
+
+def stroke_rows(
+    turns: tuple[float, float, float, float] | list[float],
+) -> tuple[list[float], list[float], list[float]]:
+    """Kinematic rows mapping the wheels' effective radii to a stroke's motion.
+
+    ``turns`` is each wheel's net rotation over the stroke (rad, in
+    :data:`WHEELS` order, motor convention — as reported by the drivers, before
+    ``WHEEL_SIGNS``). Returns three 4-vectors ``(kx, ky, kw)`` such that, with
+    ``R`` the wheels' effective radii, the body moved ``kx·R`` forward and
+    ``ky·R`` left and turned ``kw·R / lever`` CCW (``lever`` the wheel's
+    rotation lever arm, ``(a + b) / √2`` for a wheelbase of ``2a`` × ``2b``).
+
+    Surface travel of wheel *i* along its drive axis is
+    ``u_i = (mx·x + my·y)/√2 + mw·lever·θ`` (the mixing rows are ±1 stand-ins
+    for the true ±1/√2 drive directions). That 4×3 map has orthogonal columns
+    (norms² 2, 2, 4·lever²), so its least-squares inverse is the transpose
+    scaled per column — which is what these rows are, with ``u_i = R_i·φ_i``.
+    """
+    if len(turns) != len(WHEELS):
+        raise ValueError("each stroke needs one wheel rotation per wheel")
+    phi = [WHEEL_SIGNS[w.motor_id] * float(t) for w, t in zip(WHEELS, turns)]
+    kx = [w.mx * p / (2.0 * math.sqrt(2.0)) for w, p in zip(WHEELS, phi)]
+    ky = [w.my * p / (2.0 * math.sqrt(2.0)) for w, p in zip(WHEELS, phi)]
+    kw = [w.mw * p / 4.0 for w, p in zip(WHEELS, phi)]
+    return kx, ky, kw
+
+
+def solve_wheel_scale(
+    strokes: list[tuple[tuple[float, float, float, float], float, float, float]],
+    lever_m: float,
+) -> tuple[float, float, float, float]:
+    """Fit per-wheel speed scales from measured straight strokes.
+
+    Each stroke is ``(wheel_turns, forward_m, left_m, heading_rad)``:
+    the four wheels' net rotation (rad, in :data:`WHEELS` order, motor
+    convention — i.e. as reported by the drivers, before ``WHEEL_SIGNS``),
+    and the body displacement actually measured over the stroke: forward and
+    leftward distance (tape measure against the start marks, body frame at
+    stroke start) and net heading change (gyro, CCW positive). ``lever_m`` is
+    the wheel's rotation lever arm, ``(a + b) / √2`` for a wheelbase of
+    ``2a`` × ``2b``.
+
+    Inverting the x-drive kinematics, the body displacement is a fixed linear
+    map of the wheels' surface travel ``R_i·φ_i`` (``R_i`` the *effective*
+    radius of wheel *i*), so each stroke gives three linear equations in the
+    four ``R_i`` (see :func:`stroke_rows`); two strokes in different directions
+    (forward and left) determine them. The returned scales are ``R̄ / R_i``
+    normalized to a mean of 1 — multiply wheel *i*'s command by its scale and
+    the wheels become mutually consistent, which is what removes the lateral
+    slide (the common-mode radius only rescales ``max_speed``, so it's
+    deliberately not resolved).
+
+    The measurements can come from a tape measure and the gyro, or — without
+    marking the floor — from the overhead ZED's positional tracking via
+    ``axol diag.base-calibrate`` (:mod:`almond_axol.diagnostics.base.calibrate`),
+    which also solves for the camera's mounting offset.
+
+    Raises ``ValueError`` if the strokes don't determine the radii (fewer than
+    two, or all in one direction).
+    """
+    import numpy as np
+
+    if lever_m <= 0.0:
+        raise ValueError("lever_m must be positive")
+    rows: list[list[float]] = []
+    rhs: list[float] = []
+    for turns, fwd, left, heading in strokes:
+        kx, ky, kw = stroke_rows(turns)
+        rows.extend([kx, ky, kw])
+        rhs.extend([fwd, left, heading * lever_m])
+    a = np.array(rows)
+    b = np.array(rhs)
+    if len(strokes) < 2 or np.linalg.matrix_rank(a) < len(WHEELS):
+        raise ValueError(
+            "wheel radii are not determined by these strokes — record at least "
+            "two, in different directions (e.g. forward and left)"
+        )
+    radii, *_ = np.linalg.lstsq(a, b, rcond=None)
+    if not np.all(np.isfinite(radii)) or np.any(radii <= 0.0):
+        raise ValueError("fit produced a non-positive wheel radius — check the signs")
+    scales = radii.mean() / radii
+    scales /= scales.mean()
+    return tuple(float(s) for s in scales)
 
 
 @dataclass
@@ -166,9 +351,30 @@ class CartConfig:
                          disables the wheels entirely (lift-only cart).
         max_speed:       Peak wheel speed (rad/s) at a full-deflection command.
         turn_scale:      Rotation weight relative to translation, in [0, 1].
-        slew:            Max change of the normalized body command per second;
-                         limits accel/decel so command steps ramp the wheels.
-                         The default takes 2s from rest to full deflection.
+        accel:           Ramp rate of the normalized body command while it
+                         grows away from zero, in full-stick units per second.
+                         The default takes 2 s from rest to full deflection.
+                         Gentler launches also slide less sideways on uneven
+                         floors (an unloaded diagonal can't take up lateral
+                         force; see the module docstring).
+        decel:           Ramp rate while the command shrinks toward zero
+                         (stick released, speed reduced, or reversed). Faster
+                         than ``accel`` so stops are brisk: the default halts
+                         from full stick in 1 s (plus the jerk tail).
+        jerk:            Limit on how fast the ramp rate itself changes, in
+                         full-stick units per second². Turns the trapezoid
+                         into an S-curve with no acceleration step at either
+                         end of a launch or stop, which is what the operator
+                         feels as "smooth". The default reaches ``accel`` in
+                         0.25 s and adds ~0.3 s to a stop. 0 disables.
+        wheel_scale:     Per-wheel command multipliers, in :data:`WHEELS`
+                         order (front-left, front-right, back-left,
+                         back-right), compensating each wheel's effective
+                         radius. Wheels that aren't mutually consistent slide
+                         the base sideways even with the heading held — a 3%
+                         radius spread is ~2 cm per 3 m. Measure with
+                         :func:`solve_wheel_scale` from two tape-measured
+                         strokes; ``(1, 1, 1, 1)`` is uncalibrated.
         axis_snap_deg:   Translation headings within this many degrees of a
                          cardinal axis (forward/back/left/right) are snapped
                          onto that axis, absorbing off-axis thumb error during
@@ -179,6 +385,9 @@ class CartConfig:
                          for the heading hold (wired by teleop; see
                          ``almond_axol.robot.gyro``). Independent of the
                          cameras — the overhead ZED keeps its gst pipeline.
+                         On by default: without a yaw reference the hold is
+                         inert and the heading wanders several degrees per
+                         stroke. A missing gyro only logs a warning.
         yaw_hold_gain:   Heading-hold feedback gain, normalized wz per rad of
                          heading error. While translating without a commanded
                          rotation, the yaw rate fed via :meth:`Cart.feed_yaw_rate`
@@ -217,9 +426,12 @@ class CartConfig:
     channel: str | None = DEFAULT_CHANNEL
     max_speed: float = 20.0
     turn_scale: float = 1.0
-    slew: float = 0.5
+    accel: float = 0.5
+    decel: float = 1.0
+    jerk: float = 2.0
+    wheel_scale: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
     axis_snap_deg: float = 15.0
-    imu: bool = False
+    imu: bool = True
     yaw_hold_gain: float = 2.0
     yaw_hold_max: float = 0.3
     yaw_log: bool = False
@@ -231,6 +443,32 @@ class CartConfig:
     lift: bool = True
     lift_channel: str = CAN_CHEST
     lift_speed: int = JOG_SPEED
+
+    def __post_init__(self) -> None:
+        # A non-positive ramp rate is not "no ramp" — it's a command that
+        # never changes, and for decel that is a cart that never stops.
+        for name in ("accel", "decel"):
+            value = getattr(self, name)
+            if not (isinstance(value, (int, float)) and math.isfinite(value)):
+                raise ValueError(f"cart {name} must be a finite number")
+            if value <= 0.0:
+                raise ValueError(f"cart {name} must be positive (got {value})")
+        if not (
+            isinstance(self.jerk, (int, float))
+            and math.isfinite(self.jerk)
+            and self.jerk >= 0.0
+        ):
+            raise ValueError("cart jerk must be a finite number >= 0")
+        scale = tuple(self.wheel_scale)
+        if len(scale) != len(WHEELS) or not all(
+            isinstance(s, (int, float)) and math.isfinite(s) and 0.5 <= s <= 2.0
+            for s in scale
+        ):
+            raise ValueError(
+                "cart wheel_scale needs one finite value in [0.5, 2] per wheel "
+                f"({len(WHEELS)} wheels)"
+            )
+        self.wheel_scale = tuple(float(s) for s in scale)
 
 
 class _YawLog:
@@ -687,6 +925,26 @@ class Cart:
             lift = STOP
         self.set_command(vx, vy, wz, lift)
 
+    async def read_wheels(self) -> tuple[list[float], list[float]]:
+        """Read every wheel's current position and velocity from the motors.
+
+        Returns ``(positions, velocities)`` in :data:`WHEELS` order, motor
+        convention (rad and rad/s as the drivers report them, before
+        ``WHEEL_SIGNS``). Positions are multi-turn within the session's widened
+        ±PMAX mapping (see the module docstring), so differences between two
+        reads are the wheels' net rotation — the odometry the wheel-radius
+        calibration (``axol diag.base-calibrate``) pairs with the camera's
+        measured displacement. Safe to call while the command task is driving;
+        the feedback requests interleave with its command frames.
+
+        Raises ``RuntimeError`` if the wheels are not enabled.
+        """
+        if not self._motors:
+            raise RuntimeError("cart wheels are not enabled")
+        positions = await asyncio.gather(*[m.get_position() for m in self._motors])
+        velocities = await asyncio.gather(*[m.get_velocity() for m in self._motors])
+        return list(positions), list(velocities)
+
     def feed_yaw_rate(self, rate: float) -> None:
         """Latch an external yaw-rate sample (rad/s, CCW positive from above).
 
@@ -747,10 +1005,10 @@ class Cart:
         )
 
     async def _command_loop(self) -> None:
-        """Apply slew limiting, mixing, park/unpark, and lift edges at the
+        """Apply ramp limiting, mixing, park/unpark, and lift edges at the
         configured rate.
 
-        While driving the wheels track the slew-limited command in VELOCITY
+        While driving the wheels track the ramp-limited command in VELOCITY
         mode. Once the command has ramped to zero (and the wheels are measured
         slow) they are parked: held at their current positions by the motor's
         internal MIT position loop with ``hold_kp``/``hold_kd``. The hold
@@ -761,8 +1019,8 @@ class Cart:
         """
         cfg = self._config
         interval = 1.0 / cfg.frequency
-        max_delta = cfg.slew * interval
-        cmd = [0.0, 0.0, 0.0]  # slewed (vx, vy, wz), normalized [-1, 1]
+        ramp = VectorRamp(cfg.accel, cfg.decel, cfg.jerk, interval)
+        cmd = [0.0, 0.0, 0.0]  # ramped (vx, vy, wz), normalized [-1, 1]
         hold_pos: list[float] | None = None  # per-wheel park anchors (rad)
         yaw_err = 0.0  # integrated heading error (rad) since the stroke start
         yaw_bias = 0.0  # gyro bias estimate (rad/s), learned while stopped
@@ -779,19 +1037,10 @@ class Cart:
             if time.monotonic() - self._target_time > cfg.command_timeout:
                 vx, vy, wz, lift_dir = 0.0, 0.0, 0.0, STOP
 
-            # Slew the (vx, vy, wz) command as a single vector: cap the step's
-            # magnitude but keep its direction. Ramping each axis at its own
-            # fixed rate distorts direction — a mostly-forward command with a
-            # small lateral part would finish the lateral ramp almost
-            # instantly while forward is still climbing, veering the base
-            # sideways before it straightens out.
-            deltas = [t - c for t, c in zip((vx, vy, wz), cmd)]
-            norm = math.sqrt(sum(d * d for d in deltas))
-            if norm > max_delta:
-                k = max_delta / norm
-                deltas = [d * k for d in deltas]
-            for i, d in enumerate(deltas):
-                cmd[i] += d
+            # Ramp the (vx, vy, wz) command as a single vector (direction
+            # preserved), accel/decel asymmetric, jerk-limited — see
+            # VectorRamp.
+            ramp.step(cmd, (vx, vy, wz))
 
             moving = any(abs(c) >= 1e-3 for c in cmd)
             driving = moving or any(abs(t) >= 1e-3 for t in (vx, vy, wz))
@@ -868,7 +1117,12 @@ class Cart:
                 )
 
             speeds = mix(
-                cmd[0], cmd[1], cmd[2] + yaw_corr, cfg.max_speed, cfg.turn_scale
+                cmd[0],
+                cmd[1],
+                cmd[2] + yaw_corr,
+                cfg.max_speed,
+                cfg.turn_scale,
+                cfg.wheel_scale,
             )
 
             if self._lift is not None:
