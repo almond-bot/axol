@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -53,7 +54,7 @@ _RECONNECT_REMIND_S = 30.0
 # The two are told apart by duration: at 1 Mbit/s a healthy full queue
 # (txqueuelen 512) drains in ~65 ms, so ENOBUFS persisting across sends for
 # longer than this means nothing is draining — the bus is dead.
-_STALL_DETECT_S = 1.0
+STALL_DETECT_S = 1.0
 
 # Transient overflows come in bursts at telemetry rates; warn at most this
 # often so congestion doesn't flood the log with one line per dropped frame.
@@ -73,6 +74,36 @@ _FLUSH_DEDUPE_S = 3.0
 _flush_lock = asyncio.Lock()
 _last_flush_monotonic = 0.0
 
+# Channels currently stalled, across every bus this process owns. A stall is
+# the motors losing power, which no single bus owner can see on its own: the
+# arms are driven from an operation's own Axol instance while the serve layer
+# supervising it holds no bus at all. Process-wide, so any supervisor can read
+# it (see ``stalled_channels``). Buses run their readers on whichever event
+# loop their owner uses — an operation's, the idle link's thread — so the lock
+# keeps a read from racing a bus flagging or clearing its own stall.
+_stall_lock = threading.Lock()
+_stalled_channels: set[str] = set()
+
+
+def _set_stalled(channel: str, stalled: bool) -> None:
+    """Record whether *channel*'s bus is stalled right now."""
+    with _stall_lock:
+        if stalled:
+            _stalled_channels.add(channel)
+        else:
+            _stalled_channels.discard(channel)
+
+
+def stalled_channels() -> frozenset[str]:
+    """CAN channels whose bus is stalled right now: no node is ACKing frames.
+
+    A stall means the motors are unpowered (the e-stop) — see
+    :meth:`CanBus._mark_stalled`. It clears when a probe frame is ACKed again
+    (power restored) or when the bus is closed.
+    """
+    with _stall_lock:
+        return frozenset(_stalled_channels)
+
 
 def _error_code(exc: BaseException) -> int | None:
     """Extract the errno from a python-can or OS-level exception."""
@@ -91,7 +122,7 @@ def _tx_queue_full(exc: BaseException) -> bool:
     """True when *exc* means the interface's TX queue is full (``ENOBUFS``).
 
     Whether that's transient host-side congestion or a dead bus is decided
-    by how long it persists — see :data:`_STALL_DETECT_S`.
+    by how long it persists — see :data:`STALL_DETECT_S`.
     """
     return _error_code(exc) == errno.ENOBUFS
 
@@ -123,7 +154,7 @@ class CanBus:
 
     A stalled bus — the e-stop cutting motor power so nothing ACKs frames and
     the kernel TX queue fills (``ENOBUFS`` persisting past
-    :data:`_STALL_DETECT_S`, past any transient congestion) — is handled the
+    :data:`STALL_DETECT_S`, past any transient congestion) — is handled the
     same way, with two extra steps: the queued (now stale) motion commands are purged by
     flapping the interface, and sends stay dropped until a probe frame is
     actually ACKed on the wire again. Without the purge, up to ``txqueuelen``
@@ -163,7 +194,7 @@ class CanBus:
         self._next_tx_full_warn = 0.0
         # Loop time of the first ENOBUFS in the current burst (None outside
         # one); a successful send resets it. Overflow persisting longer than
-        # _STALL_DETECT_S means the queue isn't draining — bus dead (e-stop).
+        # STALL_DETECT_S means the queue isn't draining — bus dead (e-stop).
         self._enobufs_since: float | None = None
 
     async def start(self) -> None:
@@ -183,6 +214,9 @@ class CanBus:
 
     async def close(self) -> None:
         """Stop the reader loop and shut down the socket."""
+        # A closed bus reports nothing: its stall belongs to the owner that is
+        # going away, not to whoever opens this channel next.
+        _set_stalled(self._channel, False)
         external_cancel: asyncio.CancelledError | None = None
         reader_error: BaseException | None = None
         if self._reader_task is not None:
@@ -280,13 +314,13 @@ class CanBus:
         The frame is dropped either way — commands time out upstream
         (``MotorError``) and resume. Transient host-side congestion drains
         within milliseconds, so overflow persisting across sends for
-        :data:`_STALL_DETECT_S` means no node is ACKing (e-stop) and stall
+        :data:`STALL_DETECT_S` means no node is ACKing (e-stop) and stall
         recovery (purge + probe) takes over.
         """
         now = asyncio.get_running_loop().time()
         if self._enobufs_since is None:
             self._enobufs_since = now
-        elif now - self._enobufs_since >= _STALL_DETECT_S:
+        elif now - self._enobufs_since >= STALL_DETECT_S:
             self._enobufs_since = None
             self._mark_stalled(exc)
             return
@@ -316,6 +350,7 @@ class CanBus:
         if self._stalled:
             return
         self._stalled = True
+        _set_stalled(self._channel, True)
         # Also flag lost so the pump exits and hands control to the recovery
         # path; _reconnect clears it once the socket is reopened, while
         # _stalled keeps sends dropped until the bus is proven alive.
@@ -525,6 +560,7 @@ class CanBus:
         finally:
             probe_bus.shutdown()
         self._stalled = False
+        _set_stalled(self._channel, False)
         _logger.warning(
             "CAN %s: bus is ACKing again after %.1fs — resuming commands",
             self._channel,
