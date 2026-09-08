@@ -97,6 +97,19 @@ _PMAX_HEADROOM_RAD = 80.0
 # Fit quality above which the result is flagged as suspect.
 _WARN_RESIDUAL_M = 0.004
 _WARN_RESIDUAL_RAD = math.radians(0.3)
+# Tracking-consistency limits (see consistency_report): spread of the
+# camera-motion / wheel-turns ratio within one stroke direction, and how far
+# off its axis a translation stroke may point while the heading barely moved.
+_WARN_RATIO_SPREAD = 0.03
+_WARN_OFF_AXIS_RAD = math.radians(5.0)
+
+# --tracker choices → (sl.POSITIONAL_TRACKING_MODE name, enable_2d_ground_mode)
+TRACKERS: dict[str, tuple[str, bool]] = {
+    "gen3-2d": ("GEN_3", True),
+    "gen3": ("GEN_3", False),
+    "gen2": ("GEN_2", False),
+    "gen1": ("GEN_1", False),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -340,18 +353,31 @@ class ZedTracker:
     gravity as the origin, so the reported translation's x–y is the ground
     plane whatever the mount's pitch.
 
-    Tracking runs the SDK's GEN_3 visual-inertial SLAM with depth computation
-    off and the 2D ground constraint on. Depth is not what makes the tracker
-    accurate — GEN_3 doesn't use it, and Stereolabs recommend disabling it so
-    no frames are dropped (measured on the ZED Box: GEN_2 with PERFORMANCE
-    depth ran at 55 Hz, fused no IMU and sat at 0.09 mm stationary noise;
-    GEN_3 without depth held 60 Hz, fused the IMU, 0.02 mm with the ground
-    mode). It also avoids the multi-minute neural-model optimization a depth
-    mode would trigger on first use.
+    ``tracker`` picks the SDK's tracking generation: ``gen3-2d`` / ``gen3``
+    (visual-inertial SLAM, with or without the 2D ground constraint; needs no
+    depth) or ``gen2`` / ``gen1`` (the depth-based odometers — GEN_1 in
+    particular is meant for low-texture scenes, which a camera looking down at
+    a plain floor is). ``depth_mode`` is any ``sl.DEPTH_MODE`` name; the
+    neural modes trigger a one-off multi-minute model optimization on a
+    Jetson. Stationary noise is tiny in every configuration (tens of microns
+    on the ZED Box); what differs is how well *motion along the optical axis*
+    is tracked, which only a driven comparison shows — see the consistency
+    table in the report.
     """
 
-    def __init__(self, serial: int, resolution: str = "SVGA", fps: int = 60) -> None:
+    def __init__(
+        self,
+        serial: int,
+        tracker: str = "gen3-2d",
+        depth_mode: str = "NONE",
+        resolution: str = "SVGA",
+        fps: int = 60,
+    ) -> None:
+        if tracker not in TRACKERS:
+            raise ValueError(f"tracker must be one of {sorted(TRACKERS)}")
         self.serial = serial
+        self.tracker = tracker
+        self.depth_mode = depth_mode
         self.resolution = resolution
         self.fps = fps
         self._cam: Any = None
@@ -370,19 +396,20 @@ class ZedTracker:
         init.set_from_serial_number(self.serial)
         init.camera_resolution = getattr(sl.RESOLUTION, self.resolution)
         init.camera_fps = self.fps
-        init.depth_mode = sl.DEPTH_MODE.NONE
+        init.depth_mode = getattr(sl.DEPTH_MODE, self.depth_mode)
         init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
         init.coordinate_units = sl.UNIT.METER
         err = cam.open(init)
         if err != sl.ERROR_CODE.SUCCESS:
             raise ConnectionError(f"failed to open ZED {self.serial}: {err}")
+        generation, ground_2d = TRACKERS[self.tracker]
         track = sl.PositionalTrackingParameters()
         track.enable_area_memory = False  # no relocalization jumps mid-stroke
         track.enable_imu_fusion = True
         track.set_gravity_as_origin = True
         track.enable_pose_smoothing = False
-        track.mode = sl.POSITIONAL_TRACKING_MODE.GEN_3
-        track.enable_2d_ground_mode = True  # a floor robot: solve in the plane
+        track.mode = getattr(sl.POSITIONAL_TRACKING_MODE, generation)
+        track.enable_2d_ground_mode = ground_2d
         err = cam.enable_positional_tracking(track)
         if err != sl.ERROR_CODE.SUCCESS:
             cam.close()
@@ -684,6 +711,73 @@ def _wheel_labels() -> list[str]:
     return ["".join(part[0].upper() for part in w.name.split("_")) for w in WHEELS]
 
 
+def consistency_report(strokes: list[Stroke]) -> tuple[list[str], bool]:
+    """Sanity-check the camera against the wheels, direction by direction.
+
+    Within one stroke direction the wheels always turn in the same pattern,
+    so the ratio of camera-measured motion to wheel rotation must come out
+    the same every time (heading per radian for spins, metres per radian for
+    translations) — whatever the radii are. A spread beyond a few percent, or
+    a translation stroke whose measured displacement points well off its axis
+    while the heading barely changed, means the tracker lost the plot in that
+    direction (a down-looking camera sees little parallax for motion along its
+    optical axis), or a wheel slipped. Either way the fit is not to be trusted.
+    Returns the table lines and whether anything tripped.
+    """
+    groups: dict[str, list[Stroke]] = {}
+    for s in strokes:
+        key = (
+            "spin"
+            if s.name.startswith("rotate")
+            else "forward/back"
+            if s.name in ("forward", "back")
+            else "left/right"
+        )
+        groups.setdefault(key, []).append(s)
+    lines = ["  tracking consistency (camera motion per wheel radian, by direction):"]
+    bad = False
+    for key, group in groups.items():
+        ratios = []
+        off_axis = 0.0
+        for s in group:
+            turns = float(np.mean(np.abs(s.turns)))
+            if turns <= 0.0:
+                continue
+            if key == "spin":
+                ratios.append(abs(s.dtheta_rad) / turns)
+            else:
+                ratios.append(math.hypot(s.dx_m, s.dy_m) / turns)
+                axis = math.atan2(s.dy_m, s.dx_m)
+                if key == "left/right":
+                    axis -= math.copysign(math.pi / 2, axis)
+                axis = (axis + math.pi / 2) % math.pi - math.pi / 2
+                if abs(s.dtheta_rad) < math.radians(2.0):
+                    off_axis = max(off_axis, abs(axis))
+        if not ratios:
+            continue
+        spread = (max(ratios) - min(ratios)) / (sum(ratios) / len(ratios))
+        flag = ""
+        if spread > _WARN_RATIO_SPREAD or off_axis > _WARN_OFF_AXIS_RAD:
+            bad = True
+            flag = "  <-- inconsistent"
+        unit = "rad/rad" if key == "spin" else "m/rad"
+        axis_txt = (
+            "" if key == "spin" else f", worst off-axis {math.degrees(off_axis):.1f}°"
+        )
+        lines.append(
+            f"    {key:<13} {min(ratios):.4f}–{max(ratios):.4f} {unit}  "
+            f"spread {spread * 100:.1f}%{axis_txt}{flag}"
+        )
+    if bad:
+        lines.append(
+            "    The camera's motion doesn't agree with the wheels in the flagged "
+            "direction(s): the tracker is unreliable there (try another --tracker /"
+            " --depth-mode, more texture in view) or a wheel slipped. Radii fitted "
+            "from these strokes are not meaningful."
+        )
+    return lines, bad
+
+
 def format_report(strokes: list[Stroke], cal: Calibration, serial: int) -> str:
     labels = _wheel_labels()
     lines = [f"Wheel calibration — {len(strokes)} strokes, ZED {serial}", ""]
@@ -698,6 +792,9 @@ def format_report(strokes: list[Stroke], cal: Calibration, serial: int) -> str:
             f"{ex * 1e3:+5.1f} {ey * 1e3:+5.1f} {math.degrees(et):+.2f}"
         )
     lines.append("")
+    consistency, inconsistent = consistency_report(strokes)
+    lines += consistency
+    lines.append("")
     radii = "  ".join(f"{lab} {r * 1e3:.2f}" for lab, r in zip(labels, cal.radii_m))
     scales = "  ".join(f"{lab} {s:.4f}" for lab, s in zip(labels, cal.wheel_scale))
     rx, ry = cal.camera_offset_m
@@ -710,11 +807,16 @@ def format_report(strokes: list[Stroke], cal: Calibration, serial: int) -> str:
         f"  fit residual          {cal.rms_translation_m * 1e3:.1f} mm rms, "
         f"{math.degrees(cal.rms_heading_rad):.2f}° rms",
     ]
-    if cal.suspect:
+    if cal.suspect or inconsistent:
         lines += [
             "",
-            "  WARNING: residuals are large — the wheels slipped or the camera lost "
-            "track during a stroke. Repeat on flatter floor before trusting this.",
+            "  WARNING: do not apply this result — "
+            + (
+                "the camera and wheels disagree (see the consistency table)."
+                if inconsistent
+                else "residuals are large: the wheels slipped or the camera lost "
+                "track during a stroke. Repeat on flatter floor."
+            ),
         ]
     lines += [
         "",
@@ -733,8 +835,17 @@ def save_wheel_scale(scale: list[float]) -> Path:
     return SETTINGS_PATH
 
 
-def write_strokes(path: Path, strokes: list[Stroke], serial: int) -> None:
-    payload = {"zed_serial": serial, "strokes": [asdict(s) for s in strokes]}
+def write_strokes(
+    path: Path,
+    strokes: list[Stroke],
+    serial: int,
+    tracking: dict[str, Any] | None = None,
+) -> None:
+    payload = {
+        "zed_serial": serial,
+        "tracking": tracking or {},
+        "strokes": [asdict(s) for s in strokes],
+    }
     path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
@@ -767,7 +878,12 @@ async def _run(args: argparse.Namespace) -> int:
     if not args.yes:
         input("Press Enter to start (Ctrl-C to abort) ")
 
-    tracker = ZedTracker(serial)
+    tracking = {
+        "tracker": args.tracker,
+        "depth_mode": args.depth_mode,
+        "resolution": args.resolution,
+    }
+    tracker = ZedTracker(serial, **tracking)
     print(f"Opening ZED {serial} for positional tracking…", flush=True)
     tracker.open()
     strokes: list[Stroke] = []
@@ -802,7 +918,7 @@ async def _run(args: argparse.Namespace) -> int:
     except (StrokeError, ConnectionError, TimeoutError) as exc:
         print(f"\nAborted: {exc}")
         if strokes and args.out:
-            write_strokes(Path(args.out), strokes, serial)
+            write_strokes(Path(args.out), strokes, serial, tracking)
             print(f"Partial strokes written to {args.out}")
         return 1
     finally:
@@ -812,20 +928,28 @@ async def _run(args: argparse.Namespace) -> int:
         tracker.close()
 
     if args.out:
-        write_strokes(Path(args.out), strokes, serial)
+        write_strokes(Path(args.out), strokes, serial, tracking)
         print(f"Strokes written to {args.out}")
-    cal = fit_calibration(strokes, args.lever)
     print()
+    return _report_and_save(strokes, serial, args)
+
+
+def _report_and_save(
+    strokes: list[Stroke], serial: int, args: argparse.Namespace
+) -> int:
+    cal = fit_calibration(strokes, args.lever)
     print(format_report(strokes, cal, serial))
-    if args.save:
-        if cal.suspect:
-            if not sys.stdin.isatty():
-                print("Not saving a suspect fit (large residuals); rerun to retry.")
-                return 1
-            if input("Residuals are large. Save anyway? [y/N] ").strip().lower() != "y":
-                return 1
-        path = save_wheel_scale(cal.wheel_scale)
-        print(f"Saved cart.wheel_scale to {path}")
+    if not args.save:
+        return 0
+    _, inconsistent = consistency_report(strokes)
+    if cal.suspect or inconsistent:
+        if not sys.stdin.isatty():
+            print("Not saving a suspect fit; rerun to retry.")
+            return 1
+        if input("The fit is suspect. Save anyway? [y/N] ").strip().lower() != "y":
+            return 1
+    path = save_wheel_scale(cal.wheel_scale)
+    print(f"Saved cart.wheel_scale to {path}")
     return 0
 
 
@@ -895,6 +1019,28 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "it is fitted from the rotation strokes",
     )
     parser.add_argument(
+        "--tracker",
+        choices=sorted(TRACKERS),
+        default="gen3-2d",
+        help="ZED positional-tracking generation: gen3-2d / gen3 (visual-inertial "
+        "SLAM, no depth needed; 2d adds the ground-plane constraint), gen2 / gen1 "
+        "(depth-based odometry — gen1 targets low-texture scenes such as a plain "
+        "floor). Compare with the report's consistency table (default: gen3-2d)",
+    )
+    parser.add_argument(
+        "--depth-mode",
+        default="NONE",
+        help="ZED depth mode (sl.DEPTH_MODE name). gen3 needs none; gen1/gen2 want "
+        "PERFORMANCE or a NEURAL mode (first use of a neural mode optimizes its "
+        "model for minutes) (default: NONE)",
+    )
+    parser.add_argument(
+        "--resolution",
+        default="SVGA",
+        help="ZED capture resolution (sl.RESOLUTION name; SVGA, HD1080, HD1200) "
+        "(default: SVGA)",
+    )
+    parser.add_argument(
         "--out",
         default=None,
         help="Write the raw strokes as JSON here (refit later with --refit)",
@@ -935,10 +1081,9 @@ def run_cli(args: argparse.Namespace) -> None:
     if args.refit:
         strokes = read_strokes(Path(args.refit))
         serial = json.loads(Path(args.refit).read_text()).get("zed_serial", 0)
-        cal = fit_calibration(strokes, args.lever)
-        print(format_report(strokes, cal, serial))
-        if args.save:
-            print(f"Saved cart.wheel_scale to {save_wheel_scale(cal.wheel_scale)}")
+        code = _report_and_save(strokes, serial, args)
+        if code:
+            raise SystemExit(code)
         return
 
     try:

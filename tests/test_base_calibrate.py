@@ -20,6 +20,7 @@ from almond_axol.diagnostics.base.calibrate import (
     StrokePlan,
     arc_rows,
     camera_heading_axes,
+    consistency_report,
     fit_calibration,
     heading_change,
     make_plan,
@@ -197,6 +198,27 @@ class GeometryTests(unittest.TestCase):
         r0 = self._camera_rotation(math.radians(10), math.radians(60))
         r1 = self._camera_rotation(math.radians(-35), math.radians(60))
         self.assertAlmostEqual(math.degrees(heading_change(r0, r1)), -45.0, places=9)
+
+
+class ConsistencyTests(unittest.TestCase):
+    def test_clean_strokes_are_consistent(self) -> None:
+        strokes = synth_strokes(make_plan(0.7, math.radians(90), 0.25, 0.2, 3))
+        lines, bad = consistency_report(strokes)
+        self.assertFalse(bad)
+        self.assertEqual(len(lines), 4)  # header + spin + forward/back + left/right
+
+    def test_tracker_losing_the_forward_axis_is_flagged(self) -> None:
+        strokes = synth_strokes(make_plan(0.7, math.radians(90), 0.25, 0.2, 2))
+        # One forward stroke measured 28° off-axis and short, heading unchanged:
+        # what a down-looking camera did on the real cart.
+        fwd = next(s for s in strokes if s.name == "forward")
+        fwd.dx_m, fwd.dy_m = 0.645, 0.344
+        lines, bad = consistency_report(strokes)
+        self.assertTrue(bad)
+        self.assertTrue(
+            any("forward/back" in ln and "inconsistent" in ln for ln in lines)
+        )
+        self.assertFalse(any("spin" in ln and "inconsistent" in ln for ln in lines))
 
 
 class PlumbingTests(unittest.TestCase):

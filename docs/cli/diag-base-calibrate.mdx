@@ -25,6 +25,7 @@ The report lists every stroke with its fit residual, the effective radii in mill
 | `--repeat N` | Run the six-stroke sequence N times; all strokes go into one fit. |
 | `--serial` | Stereo ZED to track with. Defaults to the configured overhead camera, else the only stereo ZED connected. Positional tracking needs a stereo ZED X; a mono ZED-X One won't do. |
 | `--lever M` | Wheel rotation lever arm `(a+b)/√2` if known; otherwise fitted from the spins. |
+| `--tracker`, `--depth-mode`, `--resolution` | ZED tracking configuration: `gen3-2d` (default) / `gen3` are the SDK's visual-inertial SLAM (no depth needed; `2d` adds the ground-plane constraint), `gen2` / `gen1` the depth-based odometers (pair with `--depth-mode PERFORMANCE`; `gen1` targets low-texture scenes such as a plain floor). Use the report's **tracking consistency** table to compare: within one stroke direction the ratio of camera motion to wheel rotation must repeat to within a few percent, and translation strokes must point along their axis. A camera looking down at a plain floor sees little parallax for motion along its own optical axis, so forward/back is the direction to watch. |
 | `--out FILE`, `--refit FILE` | Dump the raw strokes as JSON / fit a dump without driving. |
 | `--save`, `-y` | Persist `cart.wheel_scale` into the control panel's saved settings; skip the confirmation prompts. |
 
