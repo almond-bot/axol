@@ -198,7 +198,7 @@ wheels = [
 
 [[package]]
 name = "almond-axol"
-version = "0.1.39"
+version = "0.1.40"
 source = { editable = "." }
 dependencies = [
     { name = "aiortc" },
