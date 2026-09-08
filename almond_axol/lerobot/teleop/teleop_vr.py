@@ -1258,4 +1258,17 @@ class AxolVRTeleop(Teleoperator):
             self._ik_stop,
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,
+            get_squeeze=self._squeeze_fraction,
         )
+
+    def _squeeze_fraction(self) -> tuple[float, float] | None:
+        """Box mode's per-arm squeeze as a fraction of the cap; see
+        ``VRTeleop._squeeze_fraction``. The robot is the one ``collect-data``
+        attached through ``live_settings.set_robot``; ``None`` before that, on
+        the Mantis rig (no arms) and in the sim."""
+        robot = self._live.robot
+        torques: list[np.ndarray | None] = []
+        for side in ("left", "right"):
+            fn = getattr(getattr(robot, side, None), "spring_torques", None)
+            torques.append(fn() if callable(fn) else None)
+        return self._core.squeeze_fraction((torques[0], torques[1]))

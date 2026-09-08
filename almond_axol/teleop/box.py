@@ -39,7 +39,7 @@ gripper's is derived from its mechanism (:func:`parcel_tool`).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -243,7 +243,11 @@ class BoxState:
     behind the contact face (:meth:`feet`).
     ``align_start`` holds where each gripper actually was at the snap,
     expressed in the box frame, for the blend into the parallel
-    configuration.
+    configuration. ``squeeze_tilt`` is a further per-gripper inward yaw
+    (rad) the worker adds while the arm is pressing on the box — the
+    fingertips leaning in as the squeeze builds so the tip keeps its share
+    of the contact (see ``IKWorker._squeeze_tilt``); like the trim it pivots
+    about the contact face.
     """
 
     center: np.ndarray
@@ -262,12 +266,17 @@ class BoxState:
     # armed to toggle on its release.
     click_prev: tuple[bool, bool] = (False, False)
     click_armed: bool = False
+    squeeze_tilt: dict[str, float] = field(
+        default_factory=lambda: {"left": 0.0, "right": 0.0}
+    )
 
     def grip_rel(self) -> dict[str, np.ndarray]:
         """Each gripper's rotation relative to the box frame (see :func:`side_clamp_rotation`)."""
         yaw = self.tilt + self.tool.flush_tilt
         return {
-            side: side_clamp_rotation(sign, self.face[side], yaw)
+            side: side_clamp_rotation(
+                sign, self.face[side], yaw + self.squeeze_tilt.get(side, 0.0)
+            )
             for side, sign in _SIDE_SIGN.items()
         }
 

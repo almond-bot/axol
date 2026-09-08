@@ -225,6 +225,263 @@ class ArmCommandTest(unittest.TestCase):
         self.robot.set_spring_caps(None)
         self.assertEqual(self.robot.right.spring_caps, {})
 
+    def test_spring_torques_read_the_capped_command_over_measured(self) -> None:
+        """kp times (sent command - measured), so a capped joint reads its cap."""
+        measured = np.array([0.1, -0.2, 0.05, 0.4, 0.0, 0.1, -0.1, 0.0], np.float32)
+        arm, _ = self._arm_at(measured)
+        arm._last_q_commanded = None
+        self.assertIsNone(arm.spring_torques())  # nothing sent yet
+        arm.set_spring_caps({Joint.SHOULDER_2: 4.0, Joint.SHOULDER_3: 4.0})
+        kp_s2 = arm._arm_config.shoulder_2.kp
+        kp_el = arm._arm_config.elbow.kp
+        target = measured.copy()
+        target[1] -= 6.0 / kp_s2  # asks for 6 Nm: backed off to the 4 Nm cap
+        target[3] += 0.03
+        asyncio.run(arm.motion_control(target))
+        tau = arm.spring_torques()
+        self.assertEqual(tau.shape, (7,))
+        self.assertAlmostEqual(
+            float(tau[1]), -4.0, places=4
+        )  # signed toward the command
+        self.assertAlmostEqual(float(tau[3]), 0.03 * (4.0 / 6.0) * kp_el, places=3)
+        self.assertAlmostEqual(float(tau[0]), 0.0, places=6)
+        arm._unresolved_offsets = {Joint.SHOULDER_2}
+        self.assertIsNone(arm.spring_torques())  # no trusted feedback
+        arm._unresolved_offsets = set()
+
+
+class SqueezeLeanTest(unittest.TestCase):
+    """As the squeeze builds the fingertips lean in, about the contact face.
+
+    The arm's compliance yaws a squeezing hand outward, lifting the parcel
+    gripper's tip off the box; the worker adds ``box_squeeze_tilt`` times the
+    fraction of the cap in use as extra inward yaw per gripper.
+    """
+
+    def test_core_reads_the_fraction_off_shoulder_2(self) -> None:
+        core = _core(box_mode=True)  # 4 Nm cap
+        i = ARM_JOINTS.index(Joint.SHOULDER_2)
+        left = np.zeros(7, np.float32)
+        right = np.zeros(7, np.float32)
+        left[i] = -2.0  # sign is the arm's; only the magnitude squeezes
+        right[i] = 1.0
+        left[0] = 9.0  # shoulder_1 (lifting the box) doesn't count
+        self.assertEqual(core.squeeze_fraction((left, right)), (0.5, 0.25))
+        right[i] = 40.0  # more than the cap can't be: the back-off keeps it at 1
+        self.assertEqual(core.squeeze_fraction((left, right)), (0.5, 1.0))
+        self.assertIsNone(core.squeeze_fraction((left, None)))
+        core.set_live("box_squeeze_torque", 0.0)
+        core._apply_live_requests()
+        self.assertIsNone(core.squeeze_fraction((left, right)))
+        self.assertIsNone(_core().squeeze_fraction((left, right)))  # not box mode
+
+    def _worker(self, lean_deg: float = 2.0):
+        from almond_axol.teleop.worker import IKWorker
+
+        worker = object.__new__(IKWorker)
+        worker._config = SimpleNamespace(box_squeeze_tilt=lean_deg, ik_frequency=120.0)
+        worker._squeeze = None
+        return worker
+
+    def _box(self):
+        from almond_axol.teleop.box import BoxState
+
+        return BoxState(
+            center=np.array((0.4, 0.0, 0.3), np.float32),
+            rot=np.eye(3, dtype=np.float32),
+            width=0.3,
+            face={"left": 1.0, "right": 1.0},
+            tilt=0.0,
+            align_start={},
+            align_t0=0.0,
+            align_duration=0.0,
+        )
+
+    def test_worker_leans_each_side_by_its_own_squeeze(self) -> None:
+        worker = self._worker(lean_deg=2.0)
+        box = self._box()
+        worker._squeeze_tilt(box)  # no report yet (the sim): nothing
+        self.assertEqual(box.squeeze_tilt, {"left": 0.0, "right": 0.0})
+        worker.note_squeeze(1.0, 0.5)
+        for _ in range(400):  # > 3 s at 120 Hz: the low-pass has settled
+            worker._squeeze_tilt(box)
+        self.assertAlmostEqual(box.squeeze_tilt["left"], np.radians(2.0), places=5)
+        self.assertAlmostEqual(box.squeeze_tilt["right"], np.radians(1.0), places=5)
+        # Filtered: one report doesn't move it all the way.
+        worker.note_squeeze(0.0, 0.5)
+        worker._squeeze_tilt(box)
+        self.assertGreater(box.squeeze_tilt["left"], 0.5 * np.radians(2.0))
+        # Out-of-range reports are clipped to the cap fraction.
+        worker.note_squeeze(7.0, -1.0)
+        self.assertEqual(worker._squeeze, {"left": 1.0, "right": 0.0})
+        # Turned off live: the lean is dropped at once.
+        worker._config.box_squeeze_tilt = 0.0
+        worker._squeeze_tilt(box)
+        self.assertEqual(box.squeeze_tilt, {"left": 0.0, "right": 0.0})
+
+    def test_lean_moves_the_tip_in_and_leaves_the_face_where_it_was(self) -> None:
+        from almond_axol.teleop.box import ideal_gripper_poses, parcel_tool
+
+        tool = parcel_tool(141.5)
+        box = self._box()
+        box.tool = tool
+        feet = {side: tool.foot(1.0) for side in ("left", "right")}
+
+        def poses():
+            return ideal_gripper_poses(
+                box.center, box.rot, box.width, box.grip_rel(), feet
+            )
+
+        flat = poses()
+        box.squeeze_tilt = {"left": np.radians(1.5), "right": 0.0}
+        leaned = poses()
+        # Fixed blade tip in the mount frame (see tests/test_box.py).
+        tip = np.array((-0.0335, 0.0, -0.1385), np.float32)
+        p0, r0 = flat["left"]
+        p1, r1 = leaned["left"]
+        np.testing.assert_allclose(
+            p0 + r0 @ feet["left"], p1 + r1 @ feet["left"], atol=1e-6
+        )
+        tip0 = p0 + r0 @ tip
+        tip1 = p1 + r1 @ tip
+        # Left gripper: inward is -y. 1.5° over 13.8 cm ≈ 3.6 mm.
+        self.assertLess(float(tip1[1]), float(tip0[1]) - 0.003)
+        self.assertAlmostEqual(float(tip1[2]), float(tip0[2]), places=6)  # level
+        # The other gripper is untouched by this side's squeeze.
+        np.testing.assert_allclose(leaned["right"][0], flat["right"][0], atol=1e-7)
+        np.testing.assert_allclose(leaned["right"][1], flat["right"][1], atol=1e-7)
+
+    def test_loop_forwards_the_squeeze_ahead_of_each_frame_in_box_mode(self) -> None:
+        from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
+
+        core = _core(box_mode=True, ik_frequency=2000.0)
+        core.q = np.zeros(16, np.float32)
+        identity = VRQuaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        zero = VRPosition(x=0.0, y=0.0, z=0.0)
+        frame = VRFrame(
+            l_ee=VRPose(position=zero, quaternion=identity),
+            r_ee=VRPose(position=zero, quaternion=identity),
+            l_elbow=zero,
+            r_elbow=zero,
+            l_lock=False,
+            r_lock=False,
+        )
+        sent: list[object] = []
+        stop = threading.Event()
+
+        class Conn:
+            def send(self, msg):
+                sent.append(msg)
+
+            def poll(self, _t):
+                return True
+
+            def recv(self):
+                if len(sent) >= 6:
+                    stop.set()  # after this reply the loop sees the stop
+                return (np.zeros(16, np.float32), None)
+
+        readings = iter([(0.25, 0.0), None, (1.0, 0.5)])
+
+        def get_squeeze():
+            return next(readings, (1.0, 0.5))
+
+        # The loop dispatches a frame once per object: hand it a fresh copy.
+        core.run_ik_loop(
+            Conn(), frame.model_copy, stop, lambda: True, lambda _t: None, get_squeeze
+        )
+        squeezes = [m for m in sent if isinstance(m, tuple) and m[0] == "squeeze"]
+        frames = [m for m in sent if not isinstance(m, tuple)]
+        self.assertGreaterEqual(len(frames), 3)
+        self.assertEqual(squeezes[0], ("squeeze", 0.25, 0.0))
+        # A None reading sends nothing for that frame; the next one resumes.
+        self.assertEqual(squeezes[1], ("squeeze", 1.0, 0.5))
+        self.assertEqual(len(squeezes), len(frames) - 1)
+        # Each squeeze immediately precedes its frame.
+        for i, m in enumerate(sent[:-1]):
+            if isinstance(m, tuple) and m[0] == "squeeze":
+                self.assertNotIsInstance(sent[i + 1], tuple)
+
+    def test_loop_sends_nothing_outside_box_mode_or_without_a_hook(self) -> None:
+        from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
+
+        identity = VRQuaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        zero = VRPosition(x=0.0, y=0.0, z=0.0)
+        frame = VRFrame(
+            l_ee=VRPose(position=zero, quaternion=identity),
+            r_ee=VRPose(position=zero, quaternion=identity),
+            l_elbow=zero,
+            r_elbow=zero,
+            l_lock=False,
+            r_lock=False,
+        )
+        for box_mode, hook in ((False, lambda: (1.0, 1.0)), (True, None)):
+            core = _core(box_mode=box_mode, ik_frequency=2000.0)
+            core.q = np.zeros(16, np.float32)
+            sent: list[object] = []
+            stop = threading.Event()
+
+            class Conn:
+                def send(self, msg):
+                    sent.append(msg)
+
+                def poll(self, _t):
+                    return True
+
+                def recv(self):
+                    if len(sent) >= 3:
+                        stop.set()
+                    return (np.zeros(16, np.float32), None)
+
+            core.run_ik_loop(
+                Conn(), frame.model_copy, stop, lambda: True, lambda _t: None, hook
+            )
+            self.assertFalse(
+                any(isinstance(m, tuple) and m[0] == "squeeze" for m in sent)
+            )
+
+    def test_live_setting_is_published_with_the_cap(self) -> None:
+        core = _core(box_mode=True)
+        hardware = LiveSettings(
+            core, SimpleNamespace(set_spring_caps=lambda c: None), lambda s: None
+        )
+        sim = LiveSettings(core, object(), lambda s: None)
+        self.assertIn("box_squeeze_tilt", {d["key"] for d in hardware.schema()})
+        self.assertEqual(hardware.values()["box_squeeze_tilt"], 1.0)
+        self.assertNotIn("box_squeeze_tilt", {d["key"] for d in sim.schema()})
+        hardware.apply("box_squeeze_tilt", 2.5)
+        core._apply_live_requests()
+        self.assertEqual(core.config.box_squeeze_tilt, 2.5)
+        # It's a worker field: forwarded to the IK subprocess as a "set".
+        self.assertIn(("box_squeeze_tilt", 2.5), core._worker_updates)
+
+    def test_adapters_read_the_arms_spring_torques(self) -> None:
+        i = ARM_JOINTS.index(Joint.SHOULDER_2)
+        left = np.zeros(7, np.float32)
+        right = np.zeros(7, np.float32)
+        left[i] = 2.0
+        right[i] = -3.0
+        robot = SimpleNamespace(
+            left=SimpleNamespace(spring_torques=lambda: left),
+            right=SimpleNamespace(spring_torques=lambda: right),
+        )
+        core = _core(box_mode=True)
+        teleop = object.__new__(VRTeleop)
+        teleop._core = core
+        teleop._robot = robot
+        self.assertEqual(teleop._squeeze_fraction(), (0.5, 0.75))
+        teleop._robot = object()  # the sim: no such reading
+        self.assertIsNone(teleop._squeeze_fraction())
+
+        from almond_axol.lerobot.teleop.teleop_vr import AxolVRTeleop
+
+        lerobot = object.__new__(AxolVRTeleop)
+        lerobot._core = core
+        lerobot._live = LiveSettings(core, None, lambda s: None)
+        self.assertIsNone(lerobot._squeeze_fraction())  # robot not attached yet
+        lerobot._live.set_robot(robot)
+        self.assertEqual(lerobot._squeeze_fraction(), (0.5, 0.75))
+
 
 class WireTest(unittest.TestCase):
     def test_target_packet_is_ten_doubles_per_slot(self) -> None:

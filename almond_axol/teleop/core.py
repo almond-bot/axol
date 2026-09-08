@@ -40,7 +40,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from ..constants import Joint
+from ..constants import ARM_JOINTS, Joint
 from ..robot.control import ContactWatchdog
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
@@ -490,6 +490,7 @@ class VRTeleopCore:
             "box_grip_tilt",
             "box_tilt_speed",
             "box_tilt_max",
+            "box_squeeze_tilt",
             "box_elbow_out",
             "box_elbow_weight",
         }
@@ -626,6 +627,33 @@ class VRTeleopCore:
         if not self.box_mode or self.is_resetting or not (cap > 0.0):
             return None
         return {joint: cap for joint in BOX_SQUEEZE_JOINTS}
+
+    def squeeze_fraction(
+        self, spring_torques: tuple[np.ndarray | None, np.ndarray | None]
+    ) -> tuple[float, float] | None:
+        """How hard each arm is squeezing, as a fraction of the squeeze cap.
+
+        ``spring_torques`` is ``(left, right)`` per-joint spring torque
+        (``ARM_JOINTS`` order, see ``AxolArm.spring_torques``). The squeeze
+        an arm exerts on a box shows up almost entirely as spring torque on
+        ``shoulder_2`` (the abduction axis — ~0.45–0.68 Nm per N at the
+        gripper), so its magnitude over ``config.box_squeeze_torque`` is the
+        fraction of the allowed squeeze in use: 0 with nothing pressing
+        back, 1 at the cap (the cap back-off keeps it there). ``None`` when
+        box mode is off, the cap is 0, or either side has no reading. Fed
+        to the IK worker each frame in box mode, which leans the fingertips
+        in by ``box_squeeze_tilt`` times it (see ``IKWorker._step_box``).
+        """
+        cap = float(self.config.box_squeeze_torque)
+        if not self.box_mode or not (cap > 0.0):
+            return None
+        i = ARM_JOINTS.index(Joint.SHOULDER_2)
+        out: list[float] = []
+        for tau in spring_torques:
+            if tau is None or len(tau) <= i or not np.isfinite(tau[i]):
+                return None
+            out.append(min(abs(float(tau[i])) / cap, 1.0))
+        return out[0], out[1]
 
     def _disengage_all(self, log_message: str | None = None) -> None:
         """Disengage both arms and clear the edge/ramp state (IK thread).
@@ -1402,6 +1430,7 @@ class VRTeleopCore:
         stop_event: threading.Event,
         process_alive: Callable[[], bool],
         on_ik_sample: Callable[[float], None],
+        get_squeeze: Callable[[], tuple[float, float] | None] | None = None,
     ) -> None:
         """Dispatch VR frames to the IK subprocess and publish raw targets.
 
@@ -1418,6 +1447,12 @@ class VRTeleopCore:
             process_alive: Returns ``False`` if the IK subprocess has died.
             on_ik_sample: Called with ``time.perf_counter()`` after each solve,
                 for the adapter's IK-rate readout.
+            get_squeeze: Optional; returns how hard each arm is squeezing
+                as a fraction of the squeeze cap (see
+                :meth:`squeeze_fraction`), or ``None``. Read before every
+                frame while box mode is on and forwarded to the worker as
+                ``("squeeze", left, right)`` so it can lean the fingertips
+                into the box as the squeeze builds. Hardware flows only.
         """
         ik_interval = 1.0 / self.config.ik_frequency
         last_frame = None
@@ -1589,6 +1624,14 @@ class VRTeleopCore:
                     for key, value in self._worker_updates:
                         conn.send(("set", key, value))
                     self._worker_updates = []
+                if get_squeeze is not None and self.box_mode:
+                    try:
+                        squeeze = get_squeeze()
+                    except Exception:  # noqa: BLE001 - never stall the solve
+                        self._logger.exception("squeeze readout failed")
+                        squeeze = None
+                    if squeeze is not None:
+                        conn.send(("squeeze", float(squeeze[0]), float(squeeze[1])))
                 conn.send(frame_to_send)
                 result = recv_with_timeout(conn, _IK_RECV_TIMEOUT, stop_event)
                 if result is not None:

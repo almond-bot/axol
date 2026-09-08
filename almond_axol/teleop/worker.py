@@ -94,6 +94,10 @@ _SNAP_STABLE_RATIO = 0.5  # offset growth/size below this = shift, else motion
 # authorise a large jump.
 _STICK_DEADZONE = 0.15
 _STICK_MAX_DT_S = 0.1
+# Low-pass time constant for the squeeze-driven fingertip lean (see
+# IKWorker._squeeze_tilt): the shoulder spring-torque readout it follows
+# carries encoder jitter worth a few percent of the cap.
+_SQUEEZE_TILT_TAU_S = 0.15
 # The robot's up (FLU +z), for box-frame rotations.
 _UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
 # The room's up in the frame the controller rotations are held in. Those
@@ -348,6 +352,11 @@ class IKWorker:
         # snap and which controller leads it. None while not in box tracking.
         self._box: BoxState | None = None
         self._box_leader: str | None = None
+        # How hard each arm is squeezing, as a fraction of the squeeze cap,
+        # as last reported by the core (``("squeeze", left, right)``; see
+        # VRTeleopCore.squeeze_fraction). None until the first report — the
+        # sim never sends one.
+        self._squeeze: dict[str, float] | None = None
 
         # Absolute (Mantis) mode state: the world-anchored base transform solved
         # at engage — ``(R_wb, t_wb)`` maps base-frame FLU coordinates into the
@@ -1288,6 +1297,7 @@ class IKWorker:
         )
         rot = (rodrigues(_UP, yaw) @ box.rot).astype(np.float32) if yaw else box.rot
         self._integrate_sticks(frame, box, now)
+        self._squeeze_tilt(box)
         targets = box_targets(box, center, rot, now)
         elbows = self._box_elbow_hints(q_current, targets)
         # The posture attractor follows q for the whole of box mode. Pinned at
@@ -1452,6 +1462,50 @@ class IKWorker:
             box.tilt = float(np.clip(box.tilt + dt * tilt_rate, -limit, limit))
             # Carry the tilt into the next engage (and pair_status).
             cfg.box_grip_tilt = math.degrees(box.tilt)
+
+    def note_squeeze(self, left: float, right: float) -> None:
+        """Record how hard each arm is squeezing (fraction of the cap, 0..1).
+
+        Sent by the core before each frame in box mode on hardware (see
+        ``VRTeleopCore.run_ik_loop``); read by :meth:`_squeeze_tilt`.
+        """
+        self._squeeze = {
+            "left": float(np.clip(left, 0.0, 1.0)),
+            "right": float(np.clip(right, 0.0, 1.0)),
+        }
+
+    def _squeeze_tilt(self, box: BoxState) -> None:
+        """Lean each gripper's fingertips into the box as its squeeze builds.
+
+        A squeeze is a lateral force at the gripper, and the arm's compliance
+        answers it by yawing the hand *outward* a little (the upper-arm twist
+        and the wrists give in the direction that carries the hand away from
+        the box). With the parcel gripper that lifts the fixed blade's tip —
+        13 cm ahead of the wrist — off the box by more than a millimetre at
+        the squeeze cap, while the folded blade's face beside the wrist takes
+        the whole load: first touch is tip and face together, a harder
+        squeeze is face only. The pair's target yaw therefore leans inward by
+        ``config.box_squeeze_tilt`` (degrees at the full cap) times the
+        fraction of the cap the arm is using, per gripper, pivoting about the
+        contact face so the face stays put and only the tip moves in. The
+        fraction comes from the core (:meth:`note_squeeze`, the shoulder's
+        actual spring torque over the cap): nothing is added before contact
+        or in the sim, and the cap back-off keeps it at 1 however far the
+        width is jogged in. First-order low-passed (~0.15 s) so feedback
+        jitter doesn't chatter the wrists.
+        """
+        cfg = self._config
+        full = math.radians(float(getattr(cfg, "box_squeeze_tilt", 0.0)))
+        if not full or self._squeeze is None:
+            if any(box.squeeze_tilt.values()):
+                box.squeeze_tilt = {"left": 0.0, "right": 0.0}
+            return
+        dt = 1.0 / max(float(cfg.ik_frequency), 1.0)
+        alpha = min(dt / _SQUEEZE_TILT_TAU_S, 1.0)
+        for side in ("left", "right"):
+            want = full * self._squeeze[side]
+            have = box.squeeze_tilt[side]
+            box.squeeze_tilt[side] = have + alpha * (want - have)
 
     def _rest_fk_poses(
         self,
@@ -2020,6 +2074,8 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "set":
                 worker.set_config(str(msg[1]), msg[2])
+            elif isinstance(msg, tuple) and msg[0] == "squeeze":
+                worker.note_squeeze(float(msg[1]), float(msg[2]))
             elif isinstance(msg, tuple) and msg[0] == "reset":
                 q_current = np.asarray(msg[1], dtype=np.float32)
                 traj = worker.compute_reset_trajectory(q_current, q_rest)

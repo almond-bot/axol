@@ -656,6 +656,29 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="teleop.box_squeeze_tilt",
+                label="Box squeeze lean (°)",
+                type="number",
+                help=(
+                    "Box mode: extra inward lean of each gripper's fingertips "
+                    "at the full squeeze cap, scaled by how much of the cap "
+                    "the arm is using. A squeezing arm yaws its hand outward "
+                    "a little as it gives, which lifts the parcel gripper's "
+                    "tip (13 cm ahead of the wrist) off the box and leaves "
+                    "the folded blade's face by the wrist carrying the whole "
+                    "load; leaning the tip back in as the squeeze builds — "
+                    "about the contact face, so the face stays put — keeps "
+                    "both in contact. Raise it if the tip still lifts as you "
+                    "squeeze, lower it if the face by the wrist lifts "
+                    "instead; 0 disables. Also live from the headset menu "
+                    "(Squeeze lean). Hardware only."
+                ),
+                targets={
+                    "teleop": ("teleop.box_squeeze_tilt",),
+                    "collect-data": (f"{_VRT}.box_squeeze_tilt",),
+                },
+            ),
+            SettingDef(
                 key="teleop.reengage",
                 label="Re-engage",
                 type="select",
