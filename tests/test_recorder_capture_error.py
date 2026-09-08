@@ -1162,6 +1162,7 @@ class RawCaptureLoopFailOpenTest(unittest.TestCase):
         fps: int = 60,
         bracket_missing: Callable[[float], bool] = lambda _ts: False,
         latest_ts: Callable[[], float] = time.perf_counter,
+        record_event: threading.Event | None = None,
     ) -> tuple[_CaptureDataset, list[str], dict[str, int]]:
         stop = threading.Event()
         dataset = _CaptureDataset(stop, stop_after=rows)
@@ -1193,6 +1194,7 @@ class RawCaptureLoopFailOpenTest(unittest.TestCase):
                 task="test",
                 rerun_ip=None,
                 stop_event=stop,
+                record_event=record_event,
                 on_error=errors.append,
                 quality=quality,
             )
@@ -1260,6 +1262,43 @@ class RawCaptureLoopFailOpenTest(unittest.TestCase):
         self.assertEqual(states[0], states[1])
         self.assertGreater(states[2], states[1])
         self.assertEqual(quality, {"rows_with_held_state": 1})
+
+    def test_pause_is_not_counted_as_camera_silence(self) -> None:
+        """A late frame right after a long pause skips a tick, not the take.
+
+        The camera-silence clock must measure time while capturing: nobody
+        reads the cameras during a record_event pause (the DAgger freeze this
+        path exists to survive), so a pause longer than _CAMERA_LOSS_FATAL_S
+        followed by one late frame is an ordinary skipped tick.
+        """
+        record = threading.Event()
+        record.set()
+        paused = threading.Event()
+
+        class _PausingCamera(_RawCamera):
+            def read_at_or_after(
+                self, target_perf_ts: float, timeout_ms: float
+            ) -> tuple[object, float, float]:
+                result = super().read_at_or_after(target_perf_ts, timeout_ms)
+                if self.calls == 2 and not paused.is_set():
+                    # Row 1 is captured; now pause the take for longer than
+                    # the fatal limit, and make the first frame after the
+                    # resume a late one.
+                    paused.set()
+                    record.clear()
+                    threading.Timer(0.06, record.set).start()
+                    self.script.append(TimeoutError)
+                return result
+
+        cam = _PausingCamera([])
+        with patch("almond_axol.recording.record_proc._CAMERA_LOSS_FATAL_S", 0.03):
+            dataset, errors, quality = self._run_raw(
+                {"cam": cam}, rows=3, record_event=record
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(dataset.rows), 3)
+        self.assertEqual(quality, {"cam.ticks_without_frame": 1})
 
     def test_camera_silent_for_the_loss_limit_ends_the_take(self) -> None:
         cam = _RawCamera([TimeoutError] * 4)

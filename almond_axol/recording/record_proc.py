@@ -1562,7 +1562,14 @@ def run_capture_loop(
             if recording_start is None:
                 # First tick, or first tick after a resume: anchor so the
                 # current tick's target is "now" and the cadence continues.
-                recording_start = time.perf_counter() - tick * frame_interval
+                anchor = time.perf_counter()
+                recording_start = anchor - tick * frame_interval
+                # The camera-silence clock measures time *while capturing*.
+                # Nobody read the cameras during a pause, so a pause longer
+                # than _CAMERA_LOSS_FATAL_S must not turn the first late frame
+                # after resume into a discarded take.
+                for cam_key in last_fresh_frame_at:
+                    last_fresh_frame_at[cam_key] = anchor
 
             now = time.perf_counter()
             if now - cap_last_log >= 1.0:
