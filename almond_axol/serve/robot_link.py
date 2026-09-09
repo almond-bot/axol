@@ -78,6 +78,10 @@ def motor_faults(
         return []
     faults: list[dict[str, Any]] = []
     for m in motors:
+        if m["reachable"] is None:
+            # Unknown while a task owns the bus — nothing was read, so there is
+            # nothing to fault on.
+            continue
         if not m["reachable"]:
             problem = "unreachable"
         elif m["status"] not in _HEALTHY_MOTOR_STATUSES:
@@ -432,6 +436,12 @@ class RobotLink:
 
         No-op unless currently connected. The prior state is remembered so
         :meth:`reacquire` only reconnects if the link was up before the task.
+
+        Once the buses are handed over the collected health is dropped: it
+        describes motors this link no longer reads, and keeping it would let
+        the panel show a motor as reachable at its pre-handover voltage for
+        the whole run — including after its power was cut mid-task. A release
+        that fails keeps it, since that link never gave the buses up.
         """
         with self._lock:
             if self._state != STATE_CONNECTED and not self._buses_may_be_open:
@@ -446,12 +456,20 @@ class RobotLink:
             self._set_state(STATE_ERROR, _format_error(exc))
             _logger.warning("robot release failed: %s", exc)
             raise RuntimeError(f"could not release robot link: {exc}") from exc
+        for arm in self._arms:
+            arm.health = {}
+        self.hub.clear_slow()
 
-    def reacquire(self) -> None:
-        """Re-open the buses + ping loop after a task releases the bus."""
+    def reacquire(self) -> bool:
+        """Re-open the buses + ping loop after a task releases the bus.
+
+        Returns ``True`` when this call reconnected, ``False`` when there was
+        nothing to reacquire (the link was not handed to a task), so a caller
+        that only borrowed the buses knows whether it has to give them back.
+        """
         with self._lock:
             if self._state != STATE_BUSY:
-                return
+                return False
         try:
             self._submit(self._open_and_start())
         except Exception as exc:  # noqa: BLE001
@@ -459,6 +477,20 @@ class RobotLink:
             _logger.warning("robot reacquire failed: %s", exc)
             raise RuntimeError(f"could not reacquire robot link: {exc}") from exc
         self._set_state(STATE_CONNECTED)
+        return True
+
+    def probe(self) -> dict[str, Any]:
+        """Ping every motor now and return the resulting :meth:`status`.
+
+        The idle ping already refreshes health once a second; this forces one
+        sweep so a caller that must decide on *current* motor state (the
+        cleanup-lockout clear) never reads a snapshot from before it asked.
+        """
+        with self._lock:
+            if self._state != STATE_CONNECTED:
+                raise RuntimeError(f"robot link is {self._state}")
+        self._submit(self._ping_once())
+        return self.status()
 
     def motor_faults(self) -> list[dict[str, Any]]:
         """Current motor faults (see :func:`motor_faults`); [] when not connected."""
@@ -531,17 +563,21 @@ class RobotLink:
         for arm in self._arms:
             for joint in joints:
                 h = arm.health.get(joint.name, {})
+                # No health at all means nobody is reading this motor (a task
+                # owns the bus): unknown, reported as null rather than as a
+                # reachable/unreachable claim this link cannot make.
+                reachable = h.get("reachable")
                 motors.append(
                     {
                         "arm": arm.side,
                         "joint": joint.name,
-                        "reachable": bool(h.get("reachable", False)),
+                        "reachable": None if reachable is None else bool(reachable),
                         "status": h.get("status"),
                         "temperature": h.get("temperature"),
                         "voltage": h.get("voltage"),
                     }
                 )
-        reachable = sum(1 for m in motors if m["reachable"])
+        reachable = sum(1 for m in motors if m["reachable"] is True)
         left_channel, right_channel = self.channels()
         return {
             "state": state,
@@ -640,18 +676,22 @@ class RobotLink:
             if failures:
                 raise failures[0]
 
+    async def _ping_once(self) -> None:
+        """One health sweep of every arm, published to the hub."""
+        sweeps = await asyncio.gather(*(arm.ping() for arm in self._arms))
+        slow: dict[str, dict[str, Any]] = {}
+        for sweep in sweeps:
+            slow.update(sweep)
+        if slow:
+            self.hub.push_slow(slow)
+        with self._lock:
+            self._last_ping = time.time()
+
     async def _ping_loop(self) -> None:
         while True:
             start = self._loop.time()
             try:
-                sweeps = await asyncio.gather(*(arm.ping() for arm in self._arms))
-                slow: dict[str, dict[str, Any]] = {}
-                for sweep in sweeps:
-                    slow.update(sweep)
-                if slow:
-                    self.hub.push_slow(slow)
-                with self._lock:
-                    self._last_ping = time.time()
+                await self._ping_once()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep the loop alive

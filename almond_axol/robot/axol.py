@@ -104,6 +104,31 @@ async def _await_all_hardware_actions(*actions: Awaitable[object]) -> None:
             raise result
 
 
+async def _arm_is_unpowered(arm: "AxolArm", bus: CanBus) -> bool:
+    """True when *arm*'s bus is stalled and no motor on it answers a status read.
+
+    Distinguishes the ways a torque-off can fail to confirm: motor power was
+    removed (the e-stop, so every read times out and the torque is gone
+    already), or a powered motor is refusing to disable (which no read can
+    excuse, and which must keep the caller's cleanup uncertain).
+
+    Both signals are required. Timeouts alone are not proof: a lost CAN
+    interface (the hub dropping off USB) makes every read time out in exactly
+    the same way while the motors stay powered and holding torque. Only the
+    bus can tell the two apart — it declares a stall when nothing on the wire
+    ACKs its frames, which needs every node to be dark.
+    """
+    if not bus.stalled:
+        return False
+    results = await asyncio.gather(
+        *(motor.get_error_code() for motor in arm.motors.values()),
+        return_exceptions=True,
+    )
+    # A powered motor answers this read with its status; only one that never
+    # replies raises MotorError, so an all-MotorError sweep is a dead bus.
+    return bool(results) and all(isinstance(result, MotorError) for result in results)
+
+
 async def _rollback_newly_enabled_motors(
     motors: list[tuple[str, Motor]], setup_error: BaseException
 ) -> list[tuple[str, Motor, BaseException]]:
@@ -1838,6 +1863,12 @@ class Axol(RobotBase):
         caller can retry.  Once torque-off has been verified, a close failure
         is likewise retained and retryable without sending motor commands over
         a bus that may already have closed successfully.
+
+        An arm whose motors have all gone silent is the one unconfirmed
+        torque-off that is not uncertain: its power is off (the e-stop), so
+        there is no torque left to own.  That arm is logged as unpowered and
+        the buses close normally; an arm with a motor still answering keeps
+        raising, so a live motor refusing to disable still locks the hardware.
         """
         self._shutdown_pending = True
         telemetry_tasks = []
@@ -1858,15 +1889,28 @@ class Axol(RobotBase):
             # failed enable() whose rollback did not confirm
             # (_startup_rollback_pending): every motor on each arm is
             # commanded, so a verified pass here settles them too.
-            tasks = []
+            arms: list[tuple[str, AxolArm, CanBus]] = []
             if self.left is not None:
-                tasks.append(self.left.disable())
+                arms.append(("left", self.left, self._left_bus))
             if self.right is not None:
-                tasks.append(self.right.disable())
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            motor_failures = [
-                result for result in results if isinstance(result, BaseException)
-            ]
+                arms.append(("right", self.right, self._right_bus))
+            results = await asyncio.gather(
+                *(arm.disable() for _, arm, _ in arms), return_exceptions=True
+            )
+            motor_failures = []
+            for (side, arm, bus), result in zip(arms, results):
+                if not isinstance(result, BaseException):
+                    continue
+                if await _arm_is_unpowered(arm, bus):
+                    _logger.warning(
+                        "%s arm did not confirm torque-off and no motor answers "
+                        "on its bus — the arm is unpowered (e-stop?), so its "
+                        "torque is already gone: %s",
+                        side,
+                        result,
+                    )
+                    continue
+                motor_failures.append(result)
             if not motor_failures:
                 self._motors_disabled = True
                 self._startup_rollback_pending = None

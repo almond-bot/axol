@@ -7,6 +7,7 @@ import {
   OPERATIONS,
   cameraCount,
   canDiscoveryRequestCanRetry,
+  clearOperationLockout,
   detectCameras,
   discoverCanHardware,
   fetchCanInterfaces,
@@ -251,6 +252,14 @@ export default function ControlPanel() {
   // run-policy episode phase/count, from the server so the episode controls are
   // correct on any computer (not just the tab that started the run).
   const [policy, setPolicy] = useState<PolicyState | null>(null)
+  // The server could not confirm an operation disabled the motors and keeps
+  // the robot reserved until the motors are proven torque-free (or it restarts).
+  const [lockout, setLockout] = useState(false)
+  const [lockoutBusy, setLockoutBusy] = useState(false)
+  // The server's own view of whether the runner is busy (`op.running`). It
+  // outlives the session's live status: the worker is still tearing down after
+  // the session reads error/exited, and a lockout keeps it true after that.
+  const [opBusy, setOpBusy] = useState(false)
   const [busy, setBusy] = useState(false)
   // Short label shown on the Start button while a start is being prepared (e.g.
   // "Checking cameras…"), so the wait isn't an opaque spinner — mirrors the
@@ -424,6 +433,8 @@ export default function ControlPanel() {
             setSelectedOp(op.session.command as OperationId)
           }
           setPolicy(op.running ? op.policy : null)
+          setLockout(op.lockout === true)
+          setOpBusy(op.running)
         })
         .catch(() => {})
     },
@@ -1258,23 +1269,37 @@ export default function ControlPanel() {
   // exited even if the logs WebSocket drops its final status frame. The stop
   // itself returns immediately server-side, so this is what flips the button
   // back to Start once the op has actually torn down.
+  //
+  // Keep polling past the session's terminal status for as long as the server
+  // still reports the runner busy. The session reads error before teardown
+  // finishes (the stall watchdog marks it seconds earlier), and the cleanup
+  // lockout is only decided at the end of that teardown — so a poll gated on
+  // the live session alone would stop on `lockout: false` and never see the
+  // flag flip, leaving Start returning 409 with no Re-check control shown.
+  // A lockout keeps `op.running` true, so this also tracks it being cleared.
   useEffect(() => {
-    if (conn.state !== "ok" || !isLive) return
+    if (conn.state !== "ok" || !(isLive || opBusy)) return
     let active = true
-    const t = setInterval(() => {
+    const tick = () => {
       fetchOpStatus()
         .then((op) => {
           if (!active) return
           if (op.session) setSession(op.session)
           setPolicy(op.running ? op.policy : null)
+          setLockout(op.lockout === true)
+          setOpBusy(op.running)
         })
         .catch(() => {})
-    }, 1500)
+    }
+    // Sample once up front so a run that ends within the first interval still
+    // records the server as busy and the teardown is followed to its end.
+    tick()
+    const t = setInterval(tick, 1500)
     return () => {
       active = false
       clearInterval(t)
     }
-  }, [conn.state, isLive])
+  }, [conn.state, isLive, opBusy])
 
   // Refresh the update status the moment an operation starts or stops, so the
   // server's idle state (and thus the banner's blocked state) becomes current
@@ -1490,6 +1515,30 @@ export default function ControlPanel() {
     }
   }
 
+  // Ask the server to re-check the motors and drop the hardware-cleanup
+  // reservation. It refuses while any motor still answers and is not disabled,
+  // so a failure here is the robot saying it is still torqued, not a UI error.
+  async function handleClearLockout() {
+    const generation = connectionGenerationRef.current
+    setLockoutBusy(true)
+    try {
+      await clearOperationLockout()
+      if (generation !== connectionGenerationRef.current) return
+      setLockout(false)
+      toast.success("Motors read torque-free — the robot is available again.")
+      fetchRobotStatus()
+        .then((value) => {
+          if (generation === connectionGenerationRef.current) setRobot(value)
+        })
+        .catch(() => {})
+    } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
+      toast.error(String(e))
+    } finally {
+      if (generation === connectionGenerationRef.current) setLockoutBusy(false)
+    }
+  }
+
   function handleEpisode(command: string) {
     const generation = connectionGenerationRef.current
     sendEpisodeCommand(command).catch((e) => {
@@ -1652,6 +1701,25 @@ export default function ControlPanel() {
             <span className="font-mono text-amber-200">{runningOp}</span> is currently running. Stop
             it before starting another operation.
           </p>
+        )}
+
+        {lockout && (
+          <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3 text-xs text-red-200/80 sm:flex-row sm:items-center sm:justify-between">
+            <p>
+              The last operation could not confirm it disabled the motors, so the robot stays
+              reserved. If motor power was cut (the PSU e-stop), re-check the motors to release it.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              disabled={lockoutBusy}
+              onClick={handleClearLockout}
+            >
+              {lockoutBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+              Re-check motors
+            </Button>
+          </div>
         )}
 
         <OperationPanel

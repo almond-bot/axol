@@ -868,13 +868,22 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         )
 
     def _is_idle() -> bool:
-        """Safe to hand host ownership to the updater: no operation running.
+        """Safe to restart or power off the host: no operation running.
 
         A connected robot is fine -- the hosted transaction stops the service
         and the candidate reconnects after verification; only an in-flight
         operation must not be interrupted.
+
+        A hardware-cleanup lockout does not make the host busy either. The
+        lockout reserves the robot's CAN buses for as long as *this process*
+        lives, and ending the process (host restart, shutdown, self-update) is
+        one of the two documented ways out of it. Every caller here -- the
+        updater's ``idle`` flag that the panel's host tile gates on, the update
+        itself, and :func:`_host_power` -- restarts the process rather than
+        starting work behind the lockout, which ``runner.is_running()`` still
+        refuses.
         """
-        if runner.is_running():
+        if runner.is_running(ignore_cleanup_lockout=True):
             return False
         return not _diagnostic_session_active()
 
@@ -1197,6 +1206,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         run would drop the arms. The hosted install runs as root; a dev serve
         escalates via ``sudo -n`` so a headless context fails fast instead of
         blocking on a password prompt.
+
+        A hardware-cleanup lockout does not refuse it (see :func:`_is_idle`):
+        restarting the host is one of the two documented ways out of it (the
+        other is ``/api/op/clear-lockout``).
         """
         async with session_launch_reservation:
             if not _is_idle():
@@ -2203,7 +2216,78 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             "running": runner.is_running(),
             "session": session.to_dict() if session else None,
             "policy": runner.policy_state(),
+            "lockout": runner.hardware_cleanup_lockout(),
         }
+
+    @app.post("/api/op/clear-lockout")
+    async def op_clear_lockout() -> JSONResponse:
+        """Lift the hardware-cleanup lockout once the motors read torque-free.
+
+        The lockout exists because an operation could not confirm it disabled
+        the motors, so nothing may reopen the CAN buses behind it. Cutting
+        motor power is exactly that case with the torque already gone, so this
+        proves it rather than assuming it: reacquire the idle link, ping every
+        motor, and only release the reservation when each one reads disabled or
+        does not answer at all. A motor that answers and is not disabled is
+        still holding torque nobody supervises, and keeps the lockout.
+
+        The probe borrows the buses. While the lockout stands the failed
+        operation may still hold them, and the idle link is not meant to sit
+        on the same channels for longer than it takes to look: if the lockout
+        is refused, a link this call reconnected is handed back (``busy``)
+        exactly as it was before the probe.
+        """
+
+        async def refuse(error: str, *, reacquired: bool) -> JSONResponse:
+            if reacquired:
+                try:
+                    await asyncio.to_thread(robot.release)
+                except RuntimeError as exc:
+                    error = f"{error}; also could not hand the buses back: {exc}"
+            return JSONResponse({"error": error}, status_code=409)
+
+        async with session_launch_reservation:
+            if not runner.hardware_cleanup_lockout():
+                return JSONResponse(
+                    {"error": "no hardware cleanup lockout is active"},
+                    status_code=409,
+                )
+            if runner.is_running(ignore_cleanup_lockout=True):
+                return JSONResponse(
+                    {"error": "an operation is still running — stop it first"},
+                    status_code=409,
+                )
+            reacquired = False
+            try:
+                reacquired = await asyncio.to_thread(robot.reacquire)
+                status = await asyncio.to_thread(robot.probe)
+            except RuntimeError as exc:
+                return await refuse(
+                    "could not reach the motors to prove they are disabled; "
+                    f"the lockout stands: {exc}",
+                    reacquired=reacquired,
+                )
+            # ``reachable is False`` is the proof this needs (the motor is
+            # unpowered); ``None`` means the probe produced no reading for it,
+            # which proves nothing and must keep the lockout.
+            live = [
+                m
+                for m in status["motors"]
+                if m["reachable"] is not False and m["status"] != "DISABLED"
+            ]
+            if live:
+                return await refuse(
+                    "these motors still answer and are not disabled, "
+                    "so the lockout stands: "
+                    + ", ".join(
+                        f"{m['arm']} {m['joint'].lower()}"
+                        f" ({str(m['status']).replace('_', ' ').lower()})"
+                        for m in live
+                    ),
+                    reacquired=reacquired,
+                )
+            runner.clear_hardware_cleanup_lockout()
+            return JSONResponse({"cleared": True})
 
     @app.post("/api/op/start")
     async def op_start(req: OpStartRequest) -> JSONResponse:

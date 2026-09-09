@@ -266,6 +266,7 @@ class LiftStatusModeTest(unittest.IsolatedAsyncioTestCase):
         reader_task = asyncio.create_task(reader())
         socket = SimpleNamespace(shutdown=Mock())
         bus = object.__new__(CanBus)
+        bus._channel = "can_alm_lift"
         bus._reader_task = reader_task
         bus._bus = socket
 
@@ -294,6 +295,7 @@ class LiftStatusModeTest(unittest.IsolatedAsyncioTestCase):
         lift._task = asyncio.create_task(command_task())
         socket = SimpleNamespace(send=Mock(), shutdown=Mock())
         bus = object.__new__(CanBus)
+        bus._channel = "can_alm_lift"
         bus._reader_task = asyncio.create_task(asyncio.Event().wait())
         bus._bus = socket
         bus._lost = False

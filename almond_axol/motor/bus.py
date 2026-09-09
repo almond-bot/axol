@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
+import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Callable
 
@@ -53,7 +55,7 @@ _RECONNECT_REMIND_S = 30.0
 # The two are told apart by duration: at 1 Mbit/s a healthy full queue
 # (txqueuelen 512) drains in ~65 ms, so ENOBUFS persisting across sends for
 # longer than this means nothing is draining — the bus is dead.
-_STALL_DETECT_S = 1.0
+STALL_DETECT_S = 1.0
 
 # Transient overflows come in bursts at telemetry rates; warn at most this
 # often so congestion doesn't flood the log with one line per dropped frame.
@@ -70,8 +72,61 @@ _PROBE_POLL_S = 0.25
 # buses stall together (they share the e-stop), the second one can skip it.
 _FLUSH_DEDUPE_S = 3.0
 
-_flush_lock = asyncio.Lock()
+# One flush lock per event loop, never a single shared one. A bus runs its
+# reader on whichever loop its owner uses — an operation's loop while it holds
+# the arms, the idle link's loop afterwards — and an ``asyncio.Lock`` binds to
+# the loop that first awaits it. A module-level lock therefore raises "bound to
+# a different event loop" on the next owner, and worse, stays held when the
+# loop it was acquired on goes away, so every later flush fails. The lock only
+# has to serialise the two arms of one operation, which do share a loop; the
+# ``_last_flush_monotonic`` window below dedupes across loops.
+_flush_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+_flush_locks_guard = threading.Lock()
 _last_flush_monotonic = 0.0
+
+
+def _flush_lock_for_running_loop() -> asyncio.Lock:
+    """Return this event loop's flush lock, creating it on first use."""
+    loop = asyncio.get_running_loop()
+    with _flush_locks_guard:
+        lock = _flush_locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            _flush_locks[loop] = lock
+        return lock
+
+
+# Channels currently stalled, across every bus this process owns. A stall is
+# the motors losing power, which no single bus owner can see on its own: the
+# arms are driven from an operation's own Axol instance while the serve layer
+# supervising it holds no bus at all. Process-wide, so any supervisor can read
+# it (see ``stalled_channels``). Buses run their readers on whichever event
+# loop their owner uses — an operation's, the idle link's thread — so the lock
+# keeps a read from racing a bus flagging or clearing its own stall.
+_stall_lock = threading.Lock()
+_stalled_channels: set[str] = set()
+
+
+def _set_stalled(channel: str, stalled: bool) -> None:
+    """Record whether *channel*'s bus is stalled right now."""
+    with _stall_lock:
+        if stalled:
+            _stalled_channels.add(channel)
+        else:
+            _stalled_channels.discard(channel)
+
+
+def stalled_channels() -> frozenset[str]:
+    """CAN channels whose bus is stalled right now: no node is ACKing frames.
+
+    A stall means the motors are unpowered (the e-stop) — see
+    :meth:`CanBus._mark_stalled`. It clears when a probe frame is ACKed again
+    (power restored) or when the bus is closed.
+    """
+    with _stall_lock:
+        return frozenset(_stalled_channels)
 
 
 def _error_code(exc: BaseException) -> int | None:
@@ -91,9 +146,23 @@ def _tx_queue_full(exc: BaseException) -> bool:
     """True when *exc* means the interface's TX queue is full (``ENOBUFS``).
 
     Whether that's transient host-side congestion or a dead bus is decided
-    by how long it persists — see :data:`_STALL_DETECT_S`.
+    by how long it persists — see :data:`STALL_DETECT_S`.
+
+    Two forms reach us. A direct ``send`` failure carries ``ENOBUFS``. But
+    python-can's SocketCAN backend also retries a partial write for its send
+    timeout and then raises ``CanOperationError("Transmit buffer full")`` with
+    no errno attached (``socketcan.py``, 4.x), which is the form a dead bus
+    produces in practice. Missing it re-raises out of :meth:`CanBus._send`
+    instead of dropping the frame, so the command never times out upstream and
+    the bus never gets to declare the stall.
     """
-    return _error_code(exc) == errno.ENOBUFS
+    if _error_code(exc) == errno.ENOBUFS:
+        return True
+    # The message is the only signal python-can gives in the second form.
+    # tradeoff: matching text is fragile across python-can releases (the
+    # dependency is a ``>=4.6.1,<5`` range, not an exact pin), so the tests pin
+    # both forms and a wording change fails loudly rather than silently.
+    return isinstance(exc, can.CanOperationError) and "buffer full" in str(exc).lower()
 
 
 def _iface_is_up(channel: str) -> bool:
@@ -123,7 +192,7 @@ class CanBus:
 
     A stalled bus — the e-stop cutting motor power so nothing ACKs frames and
     the kernel TX queue fills (``ENOBUFS`` persisting past
-    :data:`_STALL_DETECT_S`, past any transient congestion) — is handled the
+    :data:`STALL_DETECT_S`, past any transient congestion) — is handled the
     same way, with two extra steps: the queued (now stale) motion commands are purged by
     flapping the interface, and sends stay dropped until a probe frame is
     actually ACKed on the wire again. Without the purge, up to ``txqueuelen``
@@ -147,6 +216,12 @@ class CanBus:
             channel: SocketCAN interface name, e.g. ``"can_alm_axol_l"``.
         """
         self._channel = channel
+        # A fresh bus has observed no stall. Without this reset a bus that was
+        # abandoned open on a dead event loop (a failed teardown that kept the
+        # lockout's buses) leaves its channel flagged for the rest of the
+        # process, and every later stall on the channel is invisible to
+        # ``stalled_channels`` readers because the set add is idempotent.
+        _set_stalled(channel, False)
         self._bus: can.BusABC | None = can.Bus(channel=channel, bustype="socketcan")
         self._listeners: list[Callable[[can.Message], None]] = []
         self._reader_task: asyncio.Task | None = None
@@ -163,8 +238,24 @@ class CanBus:
         self._next_tx_full_warn = 0.0
         # Loop time of the first ENOBUFS in the current burst (None outside
         # one); a successful send resets it. Overflow persisting longer than
-        # _STALL_DETECT_S means the queue isn't draining — bus dead (e-stop).
+        # STALL_DETECT_S means the queue isn't draining — bus dead (e-stop).
         self._enobufs_since: float | None = None
+
+    @property
+    def channel(self) -> str:
+        """SocketCAN interface name this bus is open on."""
+        return self._channel
+
+    @property
+    def stalled(self) -> bool:
+        """Whether *this* bus has declared a stall: nothing on the wire is ACKing.
+
+        Set only by ENOBUFS persisting past :data:`STALL_DETECT_S`, which needs
+        every node on the bus to be silent (the motors are unpowered). A lost
+        interface (USB drop) drops sends the same way but does not set this —
+        the motors may well still be powered and holding torque.
+        """
+        return self._stalled
 
     async def start(self) -> None:
         """Start the background frame-dispatch loop. Idempotent.
@@ -183,6 +274,9 @@ class CanBus:
 
     async def close(self) -> None:
         """Stop the reader loop and shut down the socket."""
+        # A closed bus reports nothing: its stall belongs to the owner that is
+        # going away, not to whoever opens this channel next.
+        _set_stalled(self._channel, False)
         external_cancel: asyncio.CancelledError | None = None
         reader_error: BaseException | None = None
         if self._reader_task is not None:
@@ -280,13 +374,13 @@ class CanBus:
         The frame is dropped either way — commands time out upstream
         (``MotorError``) and resume. Transient host-side congestion drains
         within milliseconds, so overflow persisting across sends for
-        :data:`_STALL_DETECT_S` means no node is ACKing (e-stop) and stall
+        :data:`STALL_DETECT_S` means no node is ACKing (e-stop) and stall
         recovery (purge + probe) takes over.
         """
         now = asyncio.get_running_loop().time()
         if self._enobufs_since is None:
             self._enobufs_since = now
-        elif now - self._enobufs_since >= _STALL_DETECT_S:
+        elif now - self._enobufs_since >= STALL_DETECT_S:
             self._enobufs_since = None
             self._mark_stalled(exc)
             return
@@ -316,6 +410,7 @@ class CanBus:
         if self._stalled:
             return
         self._stalled = True
+        _set_stalled(self._channel, True)
         # Also flag lost so the pump exits and hands control to the recovery
         # path; _reconnect clears it once the socket is reopened, while
         # _stalled keeps sends dropped until the bus is proven alive.
@@ -425,7 +520,7 @@ class CanBus:
         and up; without it, flap just this channel.
         """
         global _last_flush_monotonic
-        async with _flush_lock:
+        async with _flush_lock_for_running_loop():
             script_exists = CAN_BRINGUP_SCRIPT.exists()
             if (
                 script_exists
@@ -525,6 +620,7 @@ class CanBus:
         finally:
             probe_bus.shutdown()
         self._stalled = False
+        _set_stalled(self._channel, False)
         _logger.warning(
             "CAN %s: bus is ACKing again after %.1fs — resuming commands",
             self._channel,
