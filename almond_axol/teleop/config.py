@@ -240,22 +240,6 @@ class VRTeleopConfig:
             joints' configured caps (the wrists' 5 Nm) are unaffected.
             ``0`` disables. Live-adjustable (headset menu / control panel);
             realtime-core hardware only.
-        box_squeeze_tilt: Extra inward yaw (degrees) of each gripper at the
-            full squeeze cap, scaled linearly by how much of the cap that
-            arm is using (its ``shoulder_2`` spring torque over
-            ``box_squeeze_torque``). A squeeze is a lateral force at the
-            gripper, and a compliant arm meets it by yawing the hand
-            outward a little — the tip of the parcel gripper's fixed blade,
-            13 cm ahead of the wrist, lifts off the box by more than a
-            millimetre at the cap while the folded blade's face by the
-            wrist takes the whole load. Leaning the fingertips in as the
-            squeeze builds (pivoting about the contact face, so the face
-            stays put) cancels that and lets the tip carry its share:
-            at first touch nothing is added, at the cap the full value.
-            Tune by eye: raise it if the tip still lifts as you squeeze,
-            lower it if the face by the wrist lifts instead. ``0``
-            disables. Live-adjustable; realtime-core hardware only (the sim
-            has no compliance and reports no squeeze).
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest
@@ -459,7 +443,6 @@ class VRTeleopConfig:
     box_elbow_out: float = 30.0
     box_elbow_weight: float = 0.0
     box_squeeze_torque: float = 4.0
-    box_squeeze_tilt: float = 1.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi

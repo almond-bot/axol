@@ -1540,36 +1540,6 @@ class AxolArm:
         """The live per-joint spring-torque caps (see :meth:`set_spring_caps`)."""
         return dict(self._spring_caps)
 
-    def spring_torques(self) -> np.ndarray | None:
-        """The impedance spring torque each arm joint is exerting right now.
-
-        ``kp`` times the run-ahead of the last position command over the
-        measured position, per arm joint (Nm, ``ARM_JOINTS`` order, signed
-        toward the command). This is the part of the joint torque the arm
-        applies *because it is being held off its target* — pressing on a
-        box, or lagging a fast move — as opposed to the gravity feedforward.
-        ``None`` until a command has been sent and the feedback caches hold
-        positions. Realtime-core mode reads the command the wire carried
-        (after any spring-cap back-off), so a capped joint reads at most its
-        cap. Box mode uses the squeeze joints' values to lean the fingertips
-        into the box as the squeeze builds (``box_squeeze_tilt``).
-        """
-        if self._last_q_commanded is None:
-            return None
-        try:
-            measured = self.positions
-        except MotorError:
-            return None
-        n_arm = len(ARM_JOINTS)
-        run_ahead = self._last_q_commanded[:n_arm] - measured[:n_arm]
-        if not np.all(np.isfinite(run_ahead)):
-            return None
-        kp = np.array(
-            [float(getattr(self._arm_config, j.value).kp) for j in ARM_JOINTS],
-            dtype=np.float64,
-        )
-        return (kp * run_ahead.astype(np.float64)).astype(np.float32)
-
     def _back_off_to_spring_caps(self, q_cmd: np.ndarray) -> np.ndarray:
         """Pull the *whole arm's* command back toward measured until every
         capped joint's spring torque is within its cap.

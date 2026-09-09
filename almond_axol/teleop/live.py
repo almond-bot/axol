@@ -155,25 +155,6 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         ),
     ),
     LiveSettingDef(
-        key="box_squeeze_tilt",
-        label="Squeeze lean",
-        type="number",
-        min=0.0,
-        max=6.0,
-        step=0.25,
-        unit="°",
-        help=(
-            "Box mode: extra inward lean of the fingertips at the full "
-            "squeeze cap, scaled by how much of the cap each arm is using. "
-            "A squeezing arm yaws its hand outward a little as it gives, "
-            "which lifts the parcel gripper's tip off the box and leaves "
-            "the face by the wrist carrying everything; this leans the tip "
-            "back in as the squeeze builds, about the contact face. Raise "
-            "it if the tip still lifts as you squeeze, lower it if the "
-            "face by the wrist lifts instead; 0 turns it off. Hardware only."
-        ),
-    ),
-    LiveSettingDef(
         key="reengage",
         label="Re-engage",
         type="select",
@@ -302,15 +283,9 @@ class LiveSettings:
     def _hidden(self, d: LiveSettingDef) -> bool:
         if d.key == "gripper_torque":
             return not self._has_gripper_torque()
-        if d.key in ("box_squeeze_torque", "box_squeeze_tilt"):
-            # The lean follows the squeeze the cap bounds — same robots.
+        if d.key == "box_squeeze_torque":
             return not self._has_spring_caps()
         return False
-
-    @property
-    def robot(self) -> Any:
-        """The robot the robot-side settings act on (``None`` until attached)."""
-        return self._robot
 
     # -- Public API ----------------------------------------------------------
 
