@@ -19,7 +19,7 @@ import can
 import httpx
 
 from almond_axol.motor import CanBus, MotorError, MotorStatus
-from almond_axol.motor.bus import _tx_queue_full
+from almond_axol.motor.bus import _flush_lock_for_running_loop, _tx_queue_full
 from almond_axol.robot.axol import Axol
 from almond_axol.robot.base import HardwareCleanupError
 from almond_axol.serve import app as app_module
@@ -148,6 +148,49 @@ class TxQueueFullClassificationTest(unittest.TestCase):
     def test_unrelated_can_errors_are_left_alone(self) -> None:
         self.assertFalse(_tx_queue_full(can.CanOperationError("Failed to transmit")))
         self.assertFalse(_tx_queue_full(OSError(errno.ENODEV, "No such device")))
+
+
+class FlushLockLoopAffinityTest(unittest.TestCase):
+    """The flush lock must not outlive the loop that took it.
+
+    A bus is owned by an operation's loop while it holds the arms and by the
+    idle link's loop afterwards. A single module-level ``asyncio.Lock`` binds
+    to the first of those and then rejects the second, which strands every
+    later reconnect behind "bound to a different event loop".
+    """
+
+    def test_each_loop_gets_its_own_lock(self) -> None:
+        async def take() -> asyncio.Lock:
+            lock = _flush_lock_for_running_loop()
+            async with lock:
+                return lock
+
+        first = asyncio.run(take())
+        second = asyncio.run(take())
+
+        self.assertIsNot(first, second)
+
+    def test_the_same_loop_reuses_one_lock(self) -> None:
+        async def take_twice() -> tuple[asyncio.Lock, asyncio.Lock]:
+            return _flush_lock_for_running_loop(), _flush_lock_for_running_loop()
+
+        first, second = asyncio.run(take_twice())
+
+        self.assertIs(first, second)
+
+    def test_a_dead_loop_does_not_strand_the_next_one(self) -> None:
+        # Acquire without releasing, exactly as a loop torn down mid-flush
+        # leaves it, then prove a fresh loop can still flush.
+        async def acquire_and_abandon() -> None:
+            await _flush_lock_for_running_loop().acquire()
+
+        asyncio.run(acquire_and_abandon())
+
+        async def flush_again() -> bool:
+            async with _flush_lock_for_running_loop():
+                return True
+
+        self.assertTrue(asyncio.run(flush_again()))
 
 
 class _LockedOutLink:

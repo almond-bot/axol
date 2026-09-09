@@ -7,6 +7,7 @@ import errno
 import logging
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Callable
 
@@ -71,8 +72,31 @@ _PROBE_POLL_S = 0.25
 # buses stall together (they share the e-stop), the second one can skip it.
 _FLUSH_DEDUPE_S = 3.0
 
-_flush_lock = asyncio.Lock()
+# One flush lock per event loop, never a single shared one. A bus runs its
+# reader on whichever loop its owner uses — an operation's loop while it holds
+# the arms, the idle link's loop afterwards — and an ``asyncio.Lock`` binds to
+# the loop that first awaits it. A module-level lock therefore raises "bound to
+# a different event loop" on the next owner, and worse, stays held when the
+# loop it was acquired on goes away, so every later flush fails. The lock only
+# has to serialise the two arms of one operation, which do share a loop; the
+# ``_last_flush_monotonic`` window below dedupes across loops.
+_flush_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+_flush_locks_guard = threading.Lock()
 _last_flush_monotonic = 0.0
+
+
+def _flush_lock_for_running_loop() -> asyncio.Lock:
+    """Return this event loop's flush lock, creating it on first use."""
+    loop = asyncio.get_running_loop()
+    with _flush_locks_guard:
+        lock = _flush_locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            _flush_locks[loop] = lock
+        return lock
+
 
 # Channels currently stalled, across every bus this process owns. A stall is
 # the motors losing power, which no single bus owner can see on its own: the
@@ -474,7 +498,7 @@ class CanBus:
         and up; without it, flap just this channel.
         """
         global _last_flush_monotonic
-        async with _flush_lock:
+        async with _flush_lock_for_running_loop():
             script_exists = CAN_BRINGUP_SCRIPT.exists()
             if (
                 script_exists
