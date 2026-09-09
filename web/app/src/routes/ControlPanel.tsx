@@ -256,6 +256,10 @@ export default function ControlPanel() {
   // the robot reserved until the motors are proven torque-free (or it restarts).
   const [lockout, setLockout] = useState(false)
   const [lockoutBusy, setLockoutBusy] = useState(false)
+  // The server's own view of whether the runner is busy (`op.running`). It
+  // outlives the session's live status: the worker is still tearing down after
+  // the session reads error/exited, and a lockout keeps it true after that.
+  const [opBusy, setOpBusy] = useState(false)
   const [busy, setBusy] = useState(false)
   // Short label shown on the Start button while a start is being prepared (e.g.
   // "Checking cameras…"), so the wait isn't an opaque spinner — mirrors the
@@ -430,6 +434,7 @@ export default function ControlPanel() {
           }
           setPolicy(op.running ? op.policy : null)
           setLockout(op.lockout === true)
+          setOpBusy(op.running)
         })
         .catch(() => {})
     },
@@ -1264,24 +1269,37 @@ export default function ControlPanel() {
   // exited even if the logs WebSocket drops its final status frame. The stop
   // itself returns immediately server-side, so this is what flips the button
   // back to Start once the op has actually torn down.
+  //
+  // Keep polling past the session's terminal status for as long as the server
+  // still reports the runner busy. The session reads error before teardown
+  // finishes (the stall watchdog marks it seconds earlier), and the cleanup
+  // lockout is only decided at the end of that teardown — so a poll gated on
+  // the live session alone would stop on `lockout: false` and never see the
+  // flag flip, leaving Start returning 409 with no Re-check control shown.
+  // A lockout keeps `op.running` true, so this also tracks it being cleared.
   useEffect(() => {
-    if (conn.state !== "ok" || !isLive) return
+    if (conn.state !== "ok" || !(isLive || opBusy)) return
     let active = true
-    const t = setInterval(() => {
+    const tick = () => {
       fetchOpStatus()
         .then((op) => {
           if (!active) return
           if (op.session) setSession(op.session)
           setPolicy(op.running ? op.policy : null)
           setLockout(op.lockout === true)
+          setOpBusy(op.running)
         })
         .catch(() => {})
-    }, 1500)
+    }
+    // Sample once up front so a run that ends within the first interval still
+    // records the server as busy and the teardown is followed to its end.
+    tick()
+    const t = setInterval(tick, 1500)
     return () => {
       active = false
       clearInterval(t)
     }
-  }, [conn.state, isLive])
+  }, [conn.state, isLive, opBusy])
 
   // Refresh the update status the moment an operation starts or stops, so the
   // server's idle state (and thus the banner's blocked state) becomes current
