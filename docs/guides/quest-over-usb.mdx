@@ -38,11 +38,11 @@ When USB is selected, the headset sends every pose frame over **both** the cable
     In the [control panel](/guides/control-panel#quest-usb), the **Quest** tab under **General settings** shows the headset state. The first time, accept the **Allow USB debugging?** prompt in the headset (check **Always allow from this computer**). Once authorized, the tunnels come up **automatically** and the status turns green (*Controller over USB*); the tab's **Connect** button is a manual fallback / reconnect.
   </Step>
 
-  <Step title="Accept the certificate on localhost">
-    In the headset browser, open `https://localhost:8001` — the control panel, reached over the cable — and proceed past the certificate warning. This confirms the tunnel is up and gets the self-signed certificate accepted while nothing else has to be running.
+  <Step title="Confirm the tunnel on localhost">
+    In the headset browser, open `https://localhost:8001` — the control panel, reached over the cable — and proceed past the certificate warning. If the panel loads, the tunnel is up. This works while nothing else is running, and it also lets you drive the panel from the headset.
 
     <Note>
-      Do this before anything else. The browser's override is per-origin (scheme + host + port), so accepting `:8001` does not cover `:8000`, but reaching the panel on `localhost` proves the cable path works — and it is the origin that is always available.
+      Do this before anything else. The browser's override is per-origin (scheme + host + port), so accepting `:8001` does not cover `:8000` — the USB pose link gets its own approval in a later step. Reaching the panel on `localhost` is what proves the cable path works, and it is the origin that is always available.
     </Note>
   </Step>
 
@@ -51,7 +51,7 @@ When USB is selected, the headset sends every pose frame over **both** the cable
   </Step>
 
   <Step title="Authorize the USB certificate">
-    The USB link uses `wss://localhost:8000`. The certificate is the one you just accepted, but the browser's approval is **per-origin**, so this port needs its own. Until it's approved the app runs on Wi-Fi and shows *WiFi fallback — USB link down*. Tap **Authorize USB certificate** and proceed past the warning (equivalently, open `https://localhost:8000` in the headset browser). The status then flips to *controller over cable*.
+    The USB link uses `wss://localhost:8000`. It serves the same certificate you just saw on `:8001`, but the browser's approval is **per-origin**, so this port needs its own. Until it's approved the app runs on Wi-Fi and shows *WiFi fallback — USB link down*. Tap **Authorize USB certificate** and proceed past the warning (equivalently, open `https://localhost:8000` in the headset browser). The status then flips to *controller over cable*.
 
     <Warning>
       Port 8000 only exists while a teleop or data-collection operation is running — the VR server is started and stopped with the operation, not by `axol serve`. Start the operation from the control panel first, otherwise the certificate page cannot load and the poses stay on Wi-Fi.

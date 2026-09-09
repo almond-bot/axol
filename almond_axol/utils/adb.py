@@ -5,10 +5,12 @@ instead of WiFi, sidestepping the 802.11 power-save buffering behind the
 ~150 ms pose gaps. The mechanism is ``adb reverse``: the headset's
 ``localhost:8000`` is forwarded over the cable to the robot's VR server, so the
 WebXR app reaches it at ``wss://localhost:8000``. The control panel's
-``localhost:8001`` is forwarded too, so the headset can reach the shared
-self-signed certificate even when no operation is running to hold port 8000
-open. Camera video still rides the LAN (WebRTC can't cross the TCP
-port-forward), so USB is pose-only.
+``localhost:8001`` is forwarded too: port 8000 exists only while an operation
+runs, so the panel is what proves the cable path works while idle, and it lets
+the headset load the panel over the cable. It does not stand in for the pose
+certificate — browser overrides are per-origin including port, so
+``https://localhost:8000`` still needs its own approval. Camera video still
+rides the LAN (WebRTC can't cross the TCP port-forward), so USB is pose-only.
 
 This module is the single place that knows how to install adb (used by
 ``axol provision``) and how to query/establish the reverse tunnel (used by the
@@ -69,7 +71,9 @@ _APT_PACKAGES = ("adb", "android-sdk-platform-tools-common")
 # Ports forwarded to the headset's loopback. The VR server (``VR_PORT``) carries
 # the poses, but it only exists while a teleop or collect operation runs — the
 # control panel (``CONTROL_PORT``) is always up, so it is the origin a freshly
-# cabled headset can reach to authorize the shared self-signed certificate.
+# cabled headset can reach to confirm the tunnel is live (and to use the panel
+# over the cable). Its certificate approval does not carry over to ``VR_PORT``:
+# browser overrides are per-origin, port included.
 TUNNEL_PORTS = (VR_PORT, CONTROL_PORT)
 
 

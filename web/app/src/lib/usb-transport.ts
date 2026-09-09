@@ -1,11 +1,12 @@
 /**
- * Gating for the wired Quest-over-USB pose link.
+ * Certificate-origin helpers for the wired Quest-over-USB pose link.
  *
  * The USB link runs over `adb reverse`, so the headset reaches the VR server at
  * `https://localhost:8000` no matter what the WiFi connection is doing. Its
  * self-signed certificate is therefore a separate origin from the LAN host's,
  * and it can — and must — be authorized before the operator connects, otherwise
- * the poses silently fall back to WiFi.
+ * the poses silently fall back to WiFi. The LAN host origin is still required
+ * for the session itself and camera video, so both buttons stay available.
  */
 
 /** Origin whose certificate the headset must trust for the USB pose link. */
