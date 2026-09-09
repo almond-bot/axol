@@ -159,9 +159,9 @@ def _tx_queue_full(exc: BaseException) -> bool:
     if _error_code(exc) == errno.ENOBUFS:
         return True
     # The message is the only signal python-can gives in the second form.
-    # tradeoff: matching text is fragile across python-can releases; the pinned
-    # dependency makes that visible at upgrade time, and the tests below pin
-    # both forms so a wording change fails loudly rather than silently.
+    # tradeoff: matching text is fragile across python-can releases (the
+    # dependency is a ``>=4.6.1,<5`` range, not an exact pin), so the tests pin
+    # both forms and a wording change fails loudly rather than silently.
     return isinstance(exc, can.CanOperationError) and "buffer full" in str(exc).lower()
 
 

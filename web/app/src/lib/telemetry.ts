@@ -67,6 +67,8 @@ export interface TelemetryFrame {
 
 /** Slow (1 Hz) per-motor reading piggybacked on the health ping. */
 export interface SlowReading {
+  /** Always a bool here, unlike `MotorHealth.reachable`: a motor nobody is
+   *  reading is dropped from the slow map entirely rather than sent as null. */
   reachable: boolean
   status: string | null
   temperature: number | null
