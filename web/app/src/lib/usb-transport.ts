@@ -16,9 +16,11 @@ export function usbCertOrigin(port: number): string {
 /**
  * Whether to offer the LAN host's certificate button.
  *
- * In USB mode the host origin is the wrong one to authorize, so only the USB
- * button is shown.
+ * USB carries the controller poses only: the session itself, and all camera
+ * video, still run over `wss://{hostname}:8000`. So the host certificate has to
+ * be authorizable in USB mode too — hiding it there leaves a headset that has
+ * not already trusted the LAN origin with no way to connect at all.
  */
-export function hostCertAuthorizeVisible(usbSelected: boolean, hostname: string): boolean {
-  return !usbSelected && hostname.trim() !== ""
+export function hostCertAuthorizeVisible(hostname: string): boolean {
+  return hostname.trim() !== ""
 }

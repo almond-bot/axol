@@ -8,12 +8,11 @@ test("the USB certificate is always authorized on localhost, never the LAN addre
   assert.equal(usbCertOrigin(8001), "https://localhost:8001")
 })
 
-test("the host certificate button is hidden in USB mode", () => {
-  assert.equal(hostCertAuthorizeVisible(true, "axol-host.local"), false)
-  assert.equal(hostCertAuthorizeVisible(false, "axol-host.local"), true)
+test("the host certificate button stays available in USB mode", () => {
+  assert.equal(hostCertAuthorizeVisible("axol-host.local"), true)
 })
 
 test("the host certificate button needs a host to authorize", () => {
-  assert.equal(hostCertAuthorizeVisible(false, ""), false)
-  assert.equal(hostCertAuthorizeVisible(false, "   "), false)
+  assert.equal(hostCertAuthorizeVisible(""), false)
+  assert.equal(hostCertAuthorizeVisible("   "), false)
 })

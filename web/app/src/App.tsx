@@ -1461,11 +1461,11 @@ export default function App() {
                 <p className="rounded-lg border border-red-400/25 bg-red-400/10 p-3 text-xs text-red-300">
                   Could not connect to <span className="font-mono">{hostname || "the server"}</span>
                   . Check that <span className="font-mono">axol teleop</span> is running
-                  {hostCertAuthorizeVisible(usbPoses, hostname)
+                  {hostCertAuthorizeVisible(hostname)
                     ? ", then authorize its self-signed certificate below."
                     : "."}
                 </p>
-                {hostCertAuthorizeVisible(usbPoses, hostname) && (
+                {hostCertAuthorizeVisible(hostname) && (
                   <Button
                     variant="outline"
                     className="w-full"
