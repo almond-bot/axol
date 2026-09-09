@@ -1661,21 +1661,38 @@ def _run_session(
     def _stopped() -> bool:
         return (stop_event is not None and stop_event.is_set()) or loop_stop.is_set()
 
-    # Box mode's squeeze cap (VRTeleopConfig.box_squeeze_torque): the teleop
-    # core says which joints run under a per-command spring-torque cap right
-    # now, and the robot is told on change only — same as native teleop. The
-    # Mantis rig has no arms to cap and no setter, so this is a no-op there.
+    # Box mode's squeeze limits (VRTeleopConfig.box_squeeze_torque /
+    # box_squeeze_force): the teleop core says which joints run under a
+    # per-command spring-torque cap right now and where the tool touches the
+    # box with what force, and the robot is told on change only — same as
+    # native teleop. The Mantis rig has no arms and no setters, so this is a
+    # no-op there.
     caps_applied: dict[Joint, float] | None = None
+    squeeze_applied: tuple | None = None
 
     def _sync_spring_caps() -> None:
-        nonlocal caps_applied
-        set_caps = getattr(getattr(robot, "axol", None), "set_spring_caps", None)
-        if set_caps is None:
-            return
-        caps = teleop.spring_caps()
-        if caps != caps_applied:
-            set_caps(caps)
-            caps_applied = caps
+        nonlocal caps_applied, squeeze_applied
+        axol = getattr(robot, "axol", None)
+        set_caps = getattr(axol, "set_spring_caps", None)
+        if set_caps is not None:
+            caps = teleop.spring_caps()
+            if caps != caps_applied:
+                set_caps(caps)
+                caps_applied = caps
+        set_squeeze = getattr(axol, "set_squeeze", None)
+        if set_squeeze is not None:
+            squeeze = teleop.squeeze()
+            key = (
+                None
+                if squeeze is None
+                else (tuple(tuple(map(float, c)) for c in squeeze[0]), squeeze[1])
+            )
+            if key != squeeze_applied:
+                if squeeze is None:
+                    set_squeeze(None)
+                else:
+                    set_squeeze(squeeze[0], squeeze[1])
+                squeeze_applied = key
 
     # Worst single-iteration stall and scheduler slip within each window. `gap`
     # is the longest time between consecutive loop iterations (a starved control

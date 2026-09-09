@@ -61,7 +61,7 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 
@@ -662,6 +662,22 @@ class RtAxol:
         from the next :meth:`motion_control`.
         """
         self._robot.set_spring_caps(caps)
+
+    def set_squeeze(
+        self, contacts: Sequence[np.ndarray] | None, force_cap: float = float("inf")
+    ) -> None:
+        """Box mode's squeeze shaping on both arms (see ``Axol.set_squeeze``).
+
+        The shaping is pure command math on the Python side — the wire
+        carries the shaped positions like any other — so it needs nothing
+        from the core beyond the measured positions it already streams.
+        """
+        self._robot.set_squeeze(contacts, force_cap)
+
+    @property
+    def squeeze_forces(self) -> tuple[float, float]:
+        """``(left, right)`` squeeze force (N) the last shaped commands apply."""
+        return self._robot.squeeze_forces
 
     def reset_gravity_hold(self) -> None:
         """Re-snapshot the gravity-comp hold setpoint (pure Python state)."""

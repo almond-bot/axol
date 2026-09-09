@@ -29,12 +29,16 @@ import numpy as np
 from ..constants import (
     ARM_JOINTS,
     URDF_PATH,
+    Joint,
     urdf_arm_joint_names,
     urdf_body_name,
 )
 from .config import AxolConfig
 
 _logger = logging.getLogger(__name__)
+
+_GRIPPER = Joint.GRIPPER
+_WRIST_3 = Joint.WRIST_3
 
 
 __all__ = ["GravityCompensator"]
@@ -66,6 +70,44 @@ def _body_inertials_from_config(
         for joint in ARM_JOINTS:
             jc = getattr(arm, joint.value)
             out[urdf_body_name(joint, is_left=is_left)] = (jc.mass, jc.com)
+    return out
+
+
+def _rpy_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """URDF ``rpy`` (fixed-axis XYZ: R = Rz(yaw) Ry(pitch) Rx(roll)) to a matrix."""
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return rz @ ry @ rx
+
+
+def _gripper_mount_offsets(
+    urdf_text: str,
+) -> dict[bool, tuple[np.ndarray, np.ndarray]]:
+    """The fixed gripper-link transform on each wrist, ``{is_left: (xyz, R)}``.
+
+    The gripper is a fixed URDF joint on ``*_w2`` — the frame the IK solver
+    targets and the tool geometry (contact points) is expressed in. MuJoCo
+    fuses a fixed-jointed body into its parent at load time, so the frame
+    is reconstructed here from the URDF's ``<joint name="left_gripper_0">``
+    origin (``xyz`` in metres, ``rpy`` in radians) rather than looked up as
+    a body.
+    """
+    out: dict[bool, tuple[np.ndarray, np.ndarray]] = {}
+    for is_left in (True, False):
+        name = urdf_body_name(_GRIPPER, is_left=is_left) + "_0"
+        m = re.search(
+            rf'<joint name="{re.escape(name)}"[^>]*>\s*<origin xyz="([^"]+)" rpy="([^"]+)"',
+            urdf_text,
+        )
+        if m is None:
+            raise RuntimeError(f"Fixed joint {name!r} not found in URDF")
+        xyz = np.array([float(v) for v in m.group(1).split()], dtype=np.float64)
+        rpy = [float(v) for v in m.group(2).split()]
+        out[is_left] = (xyz, _rpy_to_matrix(*rpy))
     return out
 
 
@@ -121,6 +163,58 @@ class GravityCompensator:
         # Scratch buffer for expanding MuJoCo's sparse qM into a dense matrix
         # (see gravity_and_inertia_arm). nv is small (14), so this is cheap.
         self._m_full = np.zeros((self._model.nv, self._model.nv))
+        # Gripper mount frame (see mount_jacobian): the wrist body it is
+        # fused into, its fixed offset, and Jacobian scratch buffers.
+        self._mount_offset = _gripper_mount_offsets(_load_urdf_text())
+        self._wrist_body = {
+            is_left: mujoco.mj_name2id(
+                self._model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                urdf_body_name(_WRIST_3, is_left=is_left),
+            )
+            for is_left in (True, False)
+        }
+        self._jacp = np.zeros((3, self._model.nv))
+        self._jacr = np.zeros((3, self._model.nv))
+
+    def mount_jacobian(
+        self, arm_q: np.ndarray, *, is_left: bool
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Gripper mount pose and geometric Jacobian for one arm.
+
+        Returns ``(position, rotation, J)``: the mount frame's origin (m) and
+        rotation matrix in the robot base frame at ``arm_q`` (``(7,)``, joint
+        frame, :data:`ARM_JOINTS` order), and the ``(6, 7)`` Jacobian mapping
+        arm joint rates to the mount origin's linear velocity (rows 0–2)
+        and angular velocity (rows 3–5), both in the base frame. The mount
+        frame is the URDF gripper link — the frame the IK solver targets and
+        the tool's contact points are given in.
+
+        ``J.T @ wrench`` is the joint torque a wrench (force, moment about
+        the mount origin) applied at the mount costs each joint; box mode's
+        squeeze shaping (:mod:`almond_axol.robot.squeeze`) uses it to place
+        the arm's contact force where the tool actually touches the box.
+        Pure kinematics (``mj_kinematics``), so only this arm's joints are
+        touched and the call is cheap enough for the control loop.
+        """
+        if len(arm_q) != len(ARM_JOINTS):
+            raise ValueError(
+                f"arm_q must have {len(ARM_JOINTS)} elements, got {len(arm_q)}"
+            )
+        qpos_idx = self._left_qpos_idx if is_left else self._right_qpos_idx
+        dof_idx = self._left_dof_idx if is_left else self._right_dof_idx
+        for i, qi in enumerate(qpos_idx):
+            self._data.qpos[qi] = float(arm_q[i])
+        mujoco.mj_kinematics(self._model, self._data)
+        mujoco.mj_comPos(self._model, self._data)
+        body = self._wrist_body[is_left]
+        offset, r_off = self._mount_offset[is_left]
+        r_wrist = self._data.xmat[body].reshape(3, 3)
+        position = self._data.xpos[body] + r_wrist @ offset
+        rotation = r_wrist @ r_off
+        mujoco.mj_jac(self._model, self._data, self._jacp, self._jacr, position, body)
+        jac = np.vstack((self._jacp[:, dof_idx], self._jacr[:, dof_idx]))
+        return position.copy(), rotation, jac
 
     def _joint_indices(self, names: list[str]) -> tuple[list[int], list[int]]:
         qpos_idx: list[int] = []

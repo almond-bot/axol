@@ -234,11 +234,40 @@ class VRTeleopConfig:
             with a bounded squeeze however far the width is jogged in and
             the face stays flat on it. Rough clamp force
             per side: the cap divided by the shoulder's lever to the
-            gripper — ~0.65 m with the arms down, ~0.45 m carrying
-            forward — so ``4`` Nm is roughly 6–9 N a side; the arms give
+            gripper — ~0.65 m with the arms down, ~0.3 m with the box
+            raised — so ``6`` Nm is roughly 9–20 N a side; the arms give
             way rather than push harder. Gravity feedforward and the other
             joints' configured caps (the wrists' 5 Nm) are unaffected.
             ``0`` disables. Live-adjustable (headset menu / control panel);
+            realtime-core hardware only. This is the hard, per-joint
+            backstop; the squeeze *force* the operator feels is set by
+            ``box_squeeze_force`` below, which bounds it consistently
+            across poses (the shoulder's lever to the gripper halves as
+            the box is raised, so a fixed torque alone would let the force
+            double).
+        box_squeeze_force: The clamp force (N) each arm presses the box
+            with once the grip width is jogged in past contact, whatever
+            the pose — and *where* it presses. The arm's springs exert their
+            force at the gripper mount, but the tool touches the box
+            elsewhere: the parcel gripper with its folded blade's face
+            beside the wrist and the fixed blade's tip 13 cm further along
+            the side. A plain squeeze (a lateral run-ahead of the whole
+            gripper) is a force through the mount and so through the face
+            alone; the tip carries only what the arm's stiffness coupling
+            adds — a fraction of a newton — and lifts off as the squeeze
+            grows, the pinch the operator sees. Box mode therefore
+            *shapes* every command in realtime-core mode
+            (``Axol.set_squeeze``, :mod:`almond_axol.robot.squeeze`): the
+            part of the run-ahead that presses into the box is estimated
+            through the arm's Jacobian, replaced by the same total force
+            shared evenly over the tool's contact points (the moment that
+            puts it through their centroid rides the wrists), and held at
+            this cap — the tighter of it and what the spring caps allow
+            under that even split. The rest of the command (carrying the
+            box, servo lag) is untouched. ``8`` N a side holds a light
+            parcel with margin; raise it if boxes slip, lower it to be
+            gentler. ``0`` disables the shaping (the torque cap alone
+            then bounds the squeeze, pose-dependently). Live-adjustable;
             realtime-core hardware only.
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
@@ -442,7 +471,8 @@ class VRTeleopConfig:
     box_align_duration: float = 1.5
     box_elbow_out: float = 30.0
     box_elbow_weight: float = 0.0
-    box_squeeze_torque: float = 4.0
+    box_squeeze_torque: float = 6.0
+    box_squeeze_force: float = 8.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi

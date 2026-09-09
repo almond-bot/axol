@@ -42,6 +42,7 @@ import numpy as np
 
 from ..constants import Joint
 from ..robot.control import ContactWatchdog
+from .box import URDF_TOOL, parcel_tool
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 from .recorder import make as _recorder_make
@@ -472,7 +473,7 @@ class VRTeleopCore:
     # read live by this class; ``worker`` fields are also forwarded to the IK
     # subprocess (whose config is a pickled copy) as ``("set", key, value)``.
     _LIVE_CORE_FIELDS = frozenset(
-        {"hold_to_engage", "teleop_max_vel", "box_squeeze_torque"}
+        {"hold_to_engage", "teleop_max_vel", "box_squeeze_torque", "box_squeeze_force"}
     )
     _LIVE_WORKER_FIELDS = frozenset(
         {
@@ -626,6 +627,32 @@ class VRTeleopCore:
         if not self.box_mode or self.is_resetting or not (cap > 0.0):
             return None
         return {joint: cap for joint in BOX_SQUEEZE_JOINTS}
+
+    def squeeze(self) -> tuple[list[np.ndarray], float] | None:
+        """Box mode's squeeze shaping for the robot: ``(contacts, force cap)``.
+
+        The fitted tool's contact points on the box side (gripper mount
+        frame, ``face = +1``; see :meth:`ToolGeometry.contacts`) for the
+        current grasp, and ``config.box_squeeze_force`` (N). The adapter
+        hands these to the robot (``set_squeeze``), which places each arm's
+        clamp force through the contacts' centroid and holds it at the cap
+        (:mod:`almond_axol.robot.squeeze`). ``None`` outside box mode,
+        during a return-to-rest, and with the force cap set to 0 — shaping
+        off. Cheap and pure — safe to call every cycle; the adapter applies
+        it on change.
+        """
+        force = float(self.config.box_squeeze_force)
+        if not self.box_mode or self.is_resetting or not (force > 0.0):
+            return None
+        cfg = self.config
+        grasp = str(getattr(cfg, "box_grasp", "straight")).strip().lower()
+        kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
+        tool = (
+            parcel_tool(float(getattr(cfg, "box_tool_open_deg", 141.5)))
+            if kind == "parcel"
+            else URDF_TOOL
+        )
+        return tool.contacts(grasp), force
 
     def _disengage_all(self, log_message: str | None = None) -> None:
         """Disengage both arms and clear the edge/ramp state (IK thread).

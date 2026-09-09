@@ -644,15 +644,35 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "a sideways push at the gripper loads; the joints that "
                     "lift the box are untouched). Jogging the width past "
                     "contact then leans on the box with at most this torque "
-                    "instead of pressing harder the further you jog. In "
+                    "instead of pressing harder the further you jog — the "
+                    "per-joint backstop under the squeeze force below. In "
                     "clamp force that is roughly the cap ÷ the shoulder's "
-                    "0.45–0.65 m lever: 4 Nm ≈ 6–9 N a side. Raise it if "
-                    "boxes slip out; 0 disables. Also adjustable live from "
+                    "0.3–0.65 m lever. 0 disables. Also adjustable live from "
                     "the headset menu (Squeeze cap). Hardware only."
                 ),
                 targets={
                     "teleop": ("teleop.box_squeeze_torque",),
                     "collect-data": (f"{_VRT}.box_squeeze_torque",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_squeeze_force",
+                label="Box squeeze force (N)",
+                type="number",
+                help=(
+                    "Box mode: how hard each arm clamps the box once the "
+                    "width is jogged in past contact — the same at any pose "
+                    "— and shared evenly over the gripper's contact points "
+                    "(the parcel gripper's face by the wrist and its tip) "
+                    "instead of the face alone, so the tip stays on the box "
+                    "as you squeeze. Raise it if boxes slip out, lower it to "
+                    "be gentler; 0 turns the shaping off. Also adjustable "
+                    "live from the headset menu (Squeeze force). Hardware "
+                    "only."
+                ),
+                targets={
+                    "teleop": ("teleop.box_squeeze_force",),
+                    "collect-data": (f"{_VRT}.box_squeeze_force",),
                 },
             ),
             SettingDef(

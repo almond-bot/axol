@@ -892,6 +892,15 @@ class AxolVRTeleop(Teleoperator):
         """
         return self._core.spring_caps()
 
+    def squeeze(self) -> tuple[list[np.ndarray], float] | None:
+        """Box mode's squeeze shaping ``(contacts, force cap)`` for the robot.
+
+        Thin passthrough to :meth:`VRTeleopCore.squeeze`; ``collect-data``
+        hands the result to ``Axol.set_squeeze`` on change, the same as
+        native teleop.
+        """
+        return self._core.squeeze()
+
     # ------------------------------------------------------------------
     # Teleoperator interface
     # ------------------------------------------------------------------

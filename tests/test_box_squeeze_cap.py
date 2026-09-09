@@ -60,12 +60,12 @@ class CoreDecisionTest(unittest.TestCase):
         # Leading, frozen or between engages alike: the pair may be
         # clamping a box in any of them.
         self.assertEqual(
-            core.spring_caps(), {Joint.SHOULDER_2: 4.0, Joint.SHOULDER_3: 4.0}
+            core.spring_caps(), {Joint.SHOULDER_2: 6.0, Joint.SHOULDER_3: 6.0}
         )
         self.assertFalse(core.teleop_enabled)
 
-    def test_default_is_four_newton_metres(self) -> None:
-        self.assertEqual(VRTeleopConfig().box_squeeze_torque, 4.0)
+    def test_default_is_six_newton_metres(self) -> None:
+        self.assertEqual(VRTeleopConfig().box_squeeze_torque, 6.0)
 
     def test_zero_disables(self) -> None:
         core = _core(box_mode=True, box_squeeze_torque=0.0)
@@ -282,7 +282,7 @@ class LiveSettingTest(unittest.TestCase):
         )
         sim = LiveSettings(core, object(), lambda s: None)
         self.assertIn("box_squeeze_torque", {d["key"] for d in hardware.schema()})
-        self.assertEqual(hardware.values()["box_squeeze_torque"], 4.0)
+        self.assertEqual(hardware.values()["box_squeeze_torque"], 6.0)
         self.assertNotIn("box_squeeze_torque", {d["key"] for d in sim.schema()})
         self.assertNotIn("box_squeeze_torque", sim.values())
         with self.assertRaises(ValueError):
@@ -309,7 +309,7 @@ class LeRobotTeleoperatorTest(unittest.TestCase):
         teleop = object.__new__(AxolVRTeleop)
         teleop._core = _core(box_mode=True)
         self.assertEqual(
-            teleop.spring_caps(), {Joint.SHOULDER_2: 4.0, Joint.SHOULDER_3: 4.0}
+            teleop.spring_caps(), {Joint.SHOULDER_2: 6.0, Joint.SHOULDER_3: 6.0}
         )
         teleop._core.request_reset()
         self.assertIsNone(teleop.spring_caps())
@@ -320,12 +320,16 @@ class _FakeRobot:
 
     def __init__(self) -> None:
         self.caps: list[dict | None] = []
+        self.squeezes: list[tuple | None] = []
         self.commands = 0
         self.left = None
         self.right = None
 
     def set_spring_caps(self, caps):
         self.caps.append(caps)
+
+    def set_squeeze(self, contacts, force_cap=float("inf")):
+        self.squeezes.append(None if contacts is None else (len(contacts), force_cap))
 
     async def motion_control(self, left=None, right=None):
         self.commands += 1
@@ -379,21 +383,25 @@ class TeleopLoopTest(unittest.TestCase):
                     await asyncio.sleep(0.005)
                 # Plain teleop: nothing has been sent to the robot's caps.
                 self.assertEqual(robot.caps, [])
+                self.assertEqual(robot.squeezes, [])
                 core.set_live("box_mode", True)
                 core._apply_live_requests()
                 n = robot.commands
                 while robot.commands < n + 3:
                     await asyncio.sleep(0.005)
                 self.assertEqual(
-                    robot.caps, [{Joint.SHOULDER_2: 4.0, Joint.SHOULDER_3: 4.0}]
+                    robot.caps, [{Joint.SHOULDER_2: 6.0, Joint.SHOULDER_3: 6.0}]
                 )
-                core.set_live("box_squeeze_torque", 6.0)
+                # ... and the squeeze shaping: the parcel gripper's two
+                # contacts in the default straight grasp, at the force cap.
+                self.assertEqual(robot.squeezes, [(2, 8.0)])
+                core.set_live("box_squeeze_torque", 5.0)
                 core._apply_live_requests()
                 n = robot.commands
                 while robot.commands < n + 3:
                     await asyncio.sleep(0.005)
                 self.assertEqual(
-                    robot.caps[-1], {Joint.SHOULDER_2: 6.0, Joint.SHOULDER_3: 6.0}
+                    robot.caps[-1], {Joint.SHOULDER_2: 5.0, Joint.SHOULDER_3: 5.0}
                 )
                 self.assertEqual(len(robot.caps), 2)  # written on change only
                 core.set_live("box_mode", False)
@@ -414,6 +422,8 @@ class TeleopLoopTest(unittest.TestCase):
                 await task
                 self.assertEqual(robot.caps[-1], None)
                 self.assertEqual(len(robot.caps), 5)
+                # The shaping followed box mode the same way: on, off, on, cleared.
+                self.assertEqual(robot.squeezes, [(2, 8.0), None, (2, 8.0), None])
 
         asyncio.run(scenario())
 

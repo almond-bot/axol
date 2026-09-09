@@ -67,14 +67,26 @@ class ToolGeometry:
             face turned toward it (the mount's ``±X``, see
             :func:`side_clamp_rotation`).
 
+        tip_fwd: Distance (m) along the fingers from the mount origin to the
+            tool's far contact point — the parcel gripper's fixed-blade tip,
+            which meets the box together with the face. ``0`` for a tool
+            that touches at the foot alone.
+        tip_in: That point's offset (m) along the mount's face axis, on the
+            ``face = +1`` side (negative = across the mount axis from the
+            box).
+
     The foot is what box mode places at ``±width / 2``: the two contact
     faces are then ``width`` apart whatever tool is fitted, and the tilt
-    trim rotates the gripper about its foot so the face stays put.
+    trim rotates the gripper about its foot so the face stays put. The
+    :meth:`contacts` are what the squeeze shaping shares the clamp force
+    over (:mod:`almond_axol.robot.squeeze`).
     """
 
     flush_tilt: float = 0.0
     foot_fwd: float = 0.0
     foot_in: float = 0.0
+    tip_fwd: float = 0.0
+    tip_in: float = 0.0
 
     def foot(self, face: float) -> np.ndarray:
         """Mount-frame vector from the mount origin to the contact foot.
@@ -82,6 +94,30 @@ class ToolGeometry:
         ``face`` (``±1``) is which flat side (``±X``) faces the box.
         """
         return np.array((face * self.foot_in, 0.0, -self.foot_fwd), dtype=np.float32)
+
+    def tip(self, face: float) -> np.ndarray:
+        """Mount-frame vector from the mount origin to the far contact point."""
+        return np.array((face * self.tip_in, 0.0, -self.tip_fwd), dtype=np.float32)
+
+    def contacts(self, grasp: str, face: float = 1.0) -> list[np.ndarray]:
+        """Where this tool touches the box side in the given grasp, mount frame.
+
+        ``"flush"``: the contact face's foot and, if the tool has one, the
+        far tip — the two points the parcel gripper presses with. Any other
+        grasp (``"straight"``, fingers straight along the box): the mount
+        axis where it meets the box side and, again, the far end of the
+        fingers — the fixed blade lying along the box. The squeeze shaping
+        shares the clamp force evenly over these.
+        """
+        if grasp == "flush":
+            pts = [self.foot(face)]
+            if self.tip_fwd:
+                pts.append(self.tip(face))
+            return pts
+        pts = [np.zeros(3, dtype=np.float32)]
+        if self.tip_fwd:
+            pts.append(np.array((0.0, 0.0, -self.tip_fwd), dtype=np.float32))
+        return pts
 
 
 # The stock URDF gripper as box mode always modelled it: the mount
@@ -93,6 +129,11 @@ URDF_TOOL = ToolGeometry()
 # contact face is this far from the hinge axis.
 PARCEL_PIVOT_FWD_M = 0.036
 PARCEL_FACE_R_M = 0.029
+# The fixed blade's tip: this far along the fingers from the mount flange,
+# and this far across the mount axis from the box side (the blade sits on the
+# outboard side of the axis).
+PARCEL_TIP_FWD_M = 0.1385
+PARCEL_TIP_IN_M = -0.0335
 
 
 def parcel_tool(
@@ -128,7 +169,13 @@ def parcel_tool(
     # fixed blade); the fold turns it through ``phi`` toward the box.
     n_fwd, n_in = math.sin(phi), -math.cos(phi)
     c = pivot_fwd * math.sin(phi) + face_r
-    return ToolGeometry(flush_tilt=math.pi - phi, foot_fwd=c * n_fwd, foot_in=c * n_in)
+    return ToolGeometry(
+        flush_tilt=math.pi - phi,
+        foot_fwd=c * n_fwd,
+        foot_in=c * n_in,
+        tip_fwd=PARCEL_TIP_FWD_M,
+        tip_in=PARCEL_TIP_IN_M,
+    )
 
 
 def rodrigues(axis: np.ndarray, angle: float) -> np.ndarray:

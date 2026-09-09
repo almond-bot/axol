@@ -145,12 +145,27 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         step=0.5,
         unit="Nm",
         help=(
-            "Box mode: cap on the shoulder torque that squeezes the box "
+            "Box mode: hard cap on the shoulder torque that squeezes the box "
             "(shoulder_2 and shoulder_3, the joints a sideways push at the "
-            "gripper loads). Jogging the width past contact then leans on "
-            "the box with at most this instead of pressing harder and "
-            "harder — roughly the cap ÷ 0.5 m in clamp force per side, so "
-            "4 Nm ≈ 6–9 N. Raise it if boxes slip; 0 turns it off. "
+            "gripper loads) — the per-joint backstop under the squeeze "
+            "force. Roughly the cap ÷ the shoulder's lever (0.3–0.65 m) in "
+            "clamp force. 0 turns it off. Hardware only."
+        ),
+    ),
+    LiveSettingDef(
+        key="box_squeeze_force",
+        label="Squeeze force",
+        type="number",
+        min=0.0,
+        max=40.0,
+        step=1.0,
+        unit="N",
+        help=(
+            "Box mode: how hard each arm clamps the box once the width is "
+            "jogged in past contact, at any pose, and shared evenly over "
+            "the gripper's contact points (the parcel gripper's face by the "
+            "wrist and its tip) instead of the face alone. Raise it if "
+            "boxes slip, lower it to be gentler; 0 turns the shaping off. "
             "Hardware only."
         ),
     ),
@@ -285,6 +300,8 @@ class LiveSettings:
             return not self._has_gripper_torque()
         if d.key == "box_squeeze_torque":
             return not self._has_spring_caps()
+        if d.key == "box_squeeze_force":
+            return not callable(getattr(self._robot, "set_squeeze", None))
         return False
 
     # -- Public API ----------------------------------------------------------

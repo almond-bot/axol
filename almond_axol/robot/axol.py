@@ -11,7 +11,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -38,6 +38,7 @@ from .control import (
     compute_friction,
 )
 from .gravity import GravityCompensator
+from .squeeze import SqueezeSpec, orient_contacts, shape_squeeze
 
 _logger = logging.getLogger(__name__)
 
@@ -470,6 +471,12 @@ class AxolArm:
     ``(8,)`` array) are ignored and gripper reads report ``0.0``.
     """
 
+    # Box mode's squeeze shaping for the next command (see set_squeeze /
+    # _shape_squeeze): None outside box mode. Class defaults so a partially
+    # built instance behaves as "off".
+    _squeeze: SqueezeSpec | None = None
+    _squeeze_force: float = 0.0
+
     def __init__(
         self,
         bus: CanBus,
@@ -712,6 +719,12 @@ class AxolArm:
         # configured ``JointConfig.torque_limit``: rides every tracked
         # command as its tau_cap field (see set_spring_caps). Empty = none.
         self._spring_caps: dict[Joint, float] = {}
+        self._squeeze = None
+        self._squeeze_force = 0.0  # force (N) the last shaped command applies
+        self._kp_vector = np.array(
+            [float(getattr(self._arm_config, j.value).kp) for j in ARM_JOINTS],
+            dtype=np.float64,
+        )
 
     def _pad_gripper(self, values: list) -> list:
         """Insert a ``0.0`` placeholder in the gripper slot when absent.
@@ -1540,6 +1553,80 @@ class AxolArm:
         """The live per-joint spring-torque caps (see :meth:`set_spring_caps`)."""
         return dict(self._spring_caps)
 
+    def set_squeeze(self, spec: SqueezeSpec | None) -> None:
+        """Shape the next commands' squeeze onto the tool's contact points.
+
+        Box mode's clamp: while a :class:`SqueezeSpec` is set, each
+        :meth:`motion_control` re-expresses the part of its run-ahead that
+        presses the gripper into the box (along ``spec.normal``) as the same
+        total force divided evenly over ``spec.contacts`` — so the far tip of
+        the tool and the face by the wrist both carry it instead of the face
+        alone — and holds that force at ``spec.force_cap`` (and within the
+        spring caps' equivalent, see :meth:`set_spring_caps`). See
+        :mod:`almond_axol.robot.squeeze`. The robot-level
+        :meth:`Axol.set_squeeze` derives each arm's spec (the normal from the
+        two measured mount positions) every command; ``None`` turns it off.
+        Realtime-core mode only.
+        """
+        self._squeeze = spec
+        if spec is None:
+            self._squeeze_force = 0.0
+
+    @property
+    def squeeze_force(self) -> float:
+        """Squeeze force (N) the last shaped command applies (0 when not shaping)."""
+        return self._squeeze_force
+
+    def _shape_squeeze(self, q_cmd: np.ndarray) -> np.ndarray:
+        """Apply :func:`shape_squeeze` to a joint-frame command (see :meth:`set_squeeze`).
+
+        The Jacobian and mount rotation are evaluated at the *measured* pose
+        (the wrench acts there); the run-ahead is ``q_cmd`` over measured.
+        Passes ``q_cmd`` through untouched until measured positions are
+        available or if the shaping fails for any reason — a squeeze that
+        is merely unshaped is the behaviour before this existed, and the
+        spring caps still bound it.
+        """
+        spec = self._squeeze
+        if spec is None:
+            return q_cmd
+        try:
+            measured = self.positions
+        except MotorError:
+            return q_cmd
+        n_arm = len(ARM_JOINTS)
+        q_meas = measured[:n_arm].astype(np.float64)
+        run_ahead = q_cmd[:n_arm].astype(np.float64) - q_meas
+        if not np.all(np.isfinite(run_ahead)):
+            return q_cmd
+        try:
+            _pos, rotation, jac = self._gravity_comp.mount_jacobian(
+                q_meas, is_left=self._is_left
+            )
+            contacts = orient_contacts(spec.contacts, rotation, spec.normal)
+            caps = {ARM_JOINTS.index(j): cap for j, cap in self._spring_caps.items()}
+            kp = self._kp_vector
+            result = shape_squeeze(
+                kp * run_ahead,
+                kp,
+                jac,
+                rotation,
+                spec.normal,
+                contacts,
+                caps,
+                spec.force_cap,
+            )
+        except Exception:  # noqa: BLE001 - never let shaping stop the command stream
+            _logger.exception("squeeze shaping failed; sending the command unshaped")
+            self._squeeze = None
+            return q_cmd
+        self._squeeze_force = result.force
+        if not np.all(np.isfinite(result.tau)):
+            return q_cmd
+        out = q_cmd.copy()
+        out[:n_arm] = (q_meas + result.tau / kp).astype(out.dtype)
+        return out
+
     def _back_off_to_spring_caps(self, q_cmd: np.ndarray) -> np.ndarray:
         """Pull the *whole arm's* command back toward measured until every
         capped joint's spring torque is within its cap.
@@ -1647,6 +1734,13 @@ class AxolArm:
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
 
         sink_mode = self._command_sink is not None
+        if sink_mode and self._squeeze is not None:
+            # Box mode: put the clamp force where the tool touches the box
+            # and hold it at the force cap (see set_squeeze), then the
+            # per-joint spring caps as the layer underneath.
+            clipped = np.clip(
+                self._shape_squeeze(clipped), self._limits_lo, self._limits_hi
+            )
         if sink_mode and self._spring_caps:
             clipped = self._back_off_to_spring_caps(clipped)
 
@@ -2062,6 +2156,12 @@ class Axol(RobotBase):
         right_channel: SocketCAN interface name for the right arm.
     """
 
+    # Box mode's squeeze shaping (see set_squeeze): the tool's contact
+    # points (mount frame, face = +1) and the force cap; None = off. Class
+    # defaults so a partially built instance behaves as "off".
+    _squeeze_contacts: tuple[np.ndarray, ...] | None = None
+    _squeeze_force_cap: float = float("inf")
+
     def __init__(
         self,
         config: AxolConfig = AxolConfig(),
@@ -2130,6 +2230,8 @@ class Axol(RobotBase):
         # connect()/enable()/disconnect() refuse until disable() verifies
         # torque-off (arm-wide, which covers these motors) and clears it.
         self._startup_rollback_pending: list[tuple[str, Motor]] | None = None
+        self._squeeze_contacts = None
+        self._squeeze_force_cap = float("inf")
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
@@ -2679,10 +2781,101 @@ class Axol(RobotBase):
             targets.append(
                 (self.right, _validated_motion_target(right, label="right arm"))
             )
+        if self._squeeze_contacts is not None:
+            self._refresh_squeeze_specs()
         if targets:
             await _await_all_hardware_actions(
                 *(arm.motion_control(q) for arm, q in targets)
             )
+
+    def set_squeeze(
+        self,
+        contacts: Sequence[np.ndarray] | None,
+        force_cap: float = float("inf"),
+    ) -> None:
+        """Turn box mode's squeeze shaping on (or off) for both arms.
+
+        ``contacts`` are the fitted tool's contact points on the box, in the
+        gripper mount frame for the tool's ``face = +1`` side (the parcel
+        gripper in the flush grasp: the folded blade's face by the wrist and
+        the fixed blade's tip); ``None`` turns shaping off. ``force_cap`` is
+        the squeeze force limit per arm (N). From then on every
+        :meth:`motion_control` derives each arm's :class:`SqueezeSpec` — the
+        inward normal is the line between the two arms' measured mount
+        positions — and each arm places its clamp force through the
+        contacts' centroid and holds it at the cap (see
+        :meth:`AxolArm.set_squeeze`, :mod:`almond_axol.robot.squeeze`).
+        Needs both arms and their measured positions; with either missing
+        the arms squeeze unshaped, bounded by the spring caps alone.
+        Realtime-core mode only.
+        """
+        if contacts is None:
+            if self._squeeze_contacts is not None:
+                _logger.info("box squeeze shaping off")
+            self._squeeze_contacts = None
+            for arm in (self.left, self.right):
+                if arm is not None:
+                    arm.set_squeeze(None)
+            return
+        pts = tuple(np.asarray(c, dtype=np.float64).reshape(3) for c in contacts)
+        if not pts:
+            raise ValueError("set_squeeze needs at least one contact point")
+        cap = float(force_cap) if force_cap > 0.0 else float("inf")
+        changed = self._squeeze_contacts is None or (
+            cap != self._squeeze_force_cap
+            or len(pts) != len(self._squeeze_contacts)
+            or any(
+                not np.array_equal(a, b) for a, b in zip(pts, self._squeeze_contacts)
+            )
+        )
+        self._squeeze_contacts = pts
+        self._squeeze_force_cap = cap
+        if changed:
+            _logger.info(
+                "box squeeze shaping on: %d contact point(s), force cap %s N",
+                len(pts),
+                f"{cap:.1f}" if math.isfinite(cap) else "none",
+            )
+
+    @property
+    def squeeze_forces(self) -> tuple[float, float]:
+        """``(left, right)`` squeeze force (N) the last shaped commands apply."""
+        return (
+            self.left.squeeze_force if self.left is not None else 0.0,
+            self.right.squeeze_force if self.right is not None else 0.0,
+        )
+
+    def _refresh_squeeze_specs(self) -> None:
+        """Hand each arm this command's :class:`SqueezeSpec` (see :meth:`set_squeeze`)."""
+        spec_l: SqueezeSpec | None = None
+        spec_r: SqueezeSpec | None = None
+        if (
+            self._squeeze_contacts is not None
+            and self.left is not None
+            and self.right is not None
+        ):
+            try:
+                n_arm = len(ARM_JOINTS)
+                q_l = self.left.positions[:n_arm].astype(np.float64)
+                q_r = self.right.positions[:n_arm].astype(np.float64)
+                p_l = self._gravity_comp.mount_jacobian(q_l, is_left=True)[0]
+                p_r = self._gravity_comp.mount_jacobian(q_r, is_left=False)[0]
+                across = p_r - p_l
+                dist = float(np.linalg.norm(across))
+                if np.isfinite(dist) and dist > 0.02:
+                    normal = across / dist
+                    spec_l = SqueezeSpec(
+                        normal, self._squeeze_contacts, self._squeeze_force_cap
+                    )
+                    spec_r = SqueezeSpec(
+                        -normal, self._squeeze_contacts, self._squeeze_force_cap
+                    )
+            except MotorError:
+                pass
+        if self.left is not None:
+            self.left.set_squeeze(spec_l)
+        if self.right is not None:
+            self.right.set_squeeze(spec_r)
 
     async def gravity_compensate(
         self,
@@ -2749,9 +2942,26 @@ class Axol(RobotBase):
 
         See :meth:`AxolArm.set_spring_caps`; ``None`` clears them.
         """
+        before = {
+            side: dict(arm.spring_caps)
+            for side, arm in (("left", self.left), ("right", self.right))
+            if arm is not None
+        }
         for arm in (self.left, self.right):
             if arm is not None:
                 arm.set_spring_caps(caps)
+        after = {
+            side: dict(arm.spring_caps)
+            for side, arm in (("left", self.left), ("right", self.right))
+            if arm is not None
+        }
+        if after != before:
+            shown = next(iter(after.values()), {})
+            _logger.info(
+                "spring caps: %s",
+                ", ".join(f"{j.name.lower()} {c:g} Nm" for j, c in shown.items())
+                or "none",
+            )
 
     def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Per-arm measured-minus-gravity torques, ``(left, right)``.
