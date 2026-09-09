@@ -72,7 +72,7 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         help=(
             "One controller drives both arms as a level parallel-gripper pair "
             "by position and heading (it stays level); the "
-            "thumbsticks set the grip width and fingertip tilt while a grip "
+            "thumbsticks set the grip width while a grip "
             "leads and drive Jelly once it's frozen. Also toggled by clicking both "
             "thumbsticks together. Switching disengages the arms first."
         ),
@@ -114,7 +114,7 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         help=(
             "Parcel gripper: fold angle of the hinged blade at its open stop "
             "(CAD: 141.5°). The flush yaw is 180° minus this. If the face "
-            "sits flat only at a nonzero tilt trim, subtract that trim here."
+            "sits flat only with a box_grip_tilt trim, fold that trim in here."
         ),
     ),
     LiveSettingDef(

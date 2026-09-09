@@ -378,6 +378,48 @@ class RobotPairTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             robot.set_squeeze([], 8.0)
 
+    def test_rt_robot_refreshes_the_specs_too(self) -> None:
+        """The hardware path (RtAxol) commands the arms directly, bypassing
+        Axol.motion_control — it must still hand each arm its spec, or the
+        shaping silently never runs on the robot."""
+        from almond_axol.rt.robot import RtAxol
+
+        robot = Axol(AxolConfig())
+        sent: list[tuple] = []
+        for arm in (robot.left, robot.right):
+            arm._command_sink = sent.append
+            arm._joint_offsets = np.zeros(8, dtype=np.float32)
+            arm._unverified_zeros = set()
+            arm._unresolved_offsets = set()
+            for motor in arm.motors.values():
+                motor._position = 0.0
+        rt = object.__new__(RtAxol)
+        rt._robot = robot
+        rt._link = SimpleNamespace(limp=None)
+        rt._limp_announced = False
+        robot.set_squeeze(parcel_tool(141.5).contacts("flush"), 8.0)
+        rest = np.zeros(8, np.float32)
+        with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:
+            asyncio.run(rt.motion_control(rest, rest))
+            # Press in: both commands run ahead toward the other arm (at
+            # q = 0 shoulder_2 swings either mount toward -y).
+            left_in, right_in = rest.copy(), rest.copy()
+            s2 = ARM_JOINTS.index(Joint.SHOULDER_2)
+            left_in[s2] = 0.05
+            right_in[s2] = -0.05
+            asyncio.run(rt.motion_control(left_in, right_in))
+            self.assertGreater(max(robot.squeeze_forces), 0.5)
+            asyncio.run(rt.motion_control(left_in, right_in))  # logs last tick's
+        self.assertIsNotNone(robot.left._squeeze)
+        self.assertIsNotNone(robot.right._squeeze)
+        self.assertLess(robot.left._squeeze.normal[1], -0.9)
+        self.assertEqual(len(sent), 6)
+        # And the arms report what they press with in the log so a
+        # deployment can be checked without a force gauge.
+        self.assertTrue(
+            any("box squeeze:" in line for line in logs.output), logs.output
+        )
+
 
 class ToolContactsTest(unittest.TestCase):
     def test_parcel_flush_is_face_and_tip(self) -> None:

@@ -989,28 +989,23 @@ function HudButton({
 }
 
 // Mirrors the worker's pair geometry (from the ~20 Hz joints push) into React
-// state — the "grippers aligned" flag, the tilt trim (whole degrees) and the
-// grasp ("flush" / "straight") — changing only on edges so the HUD doesn't
-// re-render per frame. Aligned is false, the tilt 0 and the grasp "" until
-// the server reports the pair geometry.
+// state — the "grippers aligned" flag and the grasp ("flush" / "straight")
+// — changing only on edges so the HUD doesn't re-render per frame. Aligned
+// is false and the grasp "" until the server reports the pair geometry.
 function usePairStatus(jointsRef: RefObject<AxolJointSample | null>): {
   aligned: boolean
-  tilt: number
   grasp: string
 } {
   const [aligned, setAligned] = useState(false)
-  const [tilt, setTilt] = useState(0)
   const [grasp, setGrasp] = useState("")
   useFrame(() => {
     const pair = jointsRef.current?.pair
     const nextAligned = pair?.aligned ?? false
     if (nextAligned !== aligned) setAligned(nextAligned)
-    const nextTilt = Math.round(pair?.tilt ?? 0)
-    if (nextTilt !== tilt) setTilt(nextTilt)
     const nextGrasp = pair?.grasp ?? ""
     if (nextGrasp !== grasp) setGrasp(nextGrasp)
   })
-  return { aligned, tilt, grasp }
+  return { aligned, grasp }
 }
 
 // Tools row (second HUD line, under Exit / ? / status): the two most-used
@@ -1022,7 +1017,6 @@ function ToolsRow({
   settings,
   onSet,
   aligned,
-  tilt,
   grasp,
   ghost,
   onToggleGhost,
@@ -1031,10 +1025,8 @@ function ToolsRow({
   settings: AxolSettings | null
   onSet: (key: string, value: boolean | number | string) => void
   aligned: boolean
-  // Pair tilt trim (degrees) and grasp ("flush" / "straight"); shown on the
-  // Box button while box mode is on so the stick controls (forward/back for
-  // the trim, a click for the grasp) have a readout.
-  tilt: number
+  // Pair grasp ("flush" / "straight"); shown on the Box button while box
+  // mode is on so the stick-click toggle has a readout.
   grasp: string
   ghost: boolean
   onToggleGhost: () => void
@@ -1043,7 +1035,7 @@ function ToolsRow({
   const boxMode = settings ? settings.values.box_mode === true : null
   const reengage = settings ? String(settings.values.reengage ?? "") : null
   const boxLabel = boxMode
-    ? `Box: ON (${grasp ? `${grasp} ` : ""}${tilt > 0 ? "+" : ""}${tilt}°)`
+    ? `Box: ON${grasp ? ` (${grasp})` : ""}`
     : aligned
       ? "Box: OFF (aligned)"
       : "Box: OFF"
@@ -1217,14 +1209,13 @@ function HudTools({
   onCloseSettings: () => void
   onStep: (def: AxolSettingDef, direction: 1 | -1) => void
 }) {
-  const { aligned, tilt, grasp } = usePairStatus(jointsRef)
+  const { aligned, grasp } = usePairStatus(jointsRef)
   return (
     <>
       <ToolsRow
         settings={settings}
         onSet={onSet}
         aligned={aligned}
-        tilt={tilt}
         grasp={grasp}
         ghost={ghost}
         onToggleGhost={onToggleGhost}
@@ -1261,7 +1252,7 @@ function HelpPanel({
     ...(viewOnly
       ? []
       : boxMode
-        ? ["[Grip]  Lead / Freeze Pair", "[Stick ←→]  Width", "[Stick ↑↓]  Tilt Out / In"]
+        ? ["[Grip]  Lead / Freeze Pair", "[Stick ←→]  Width", "[Stick Click]  Flush / Straight"]
         : ["[Grip]  Engage / Freeze Arm", "[Both Clicks]  Box Mode"]),
   ].join("\n")
   const leftRows = [
@@ -1274,7 +1265,7 @@ function HelpPanel({
             ? [
                 "[Grip]  Lead / Freeze Pair",
                 "[Stick ←→]  Width",
-                "[Stick ↑↓]  Tilt Out / In",
+                "[Stick Click]  Flush / Straight",
                 "[Frozen: Sticks]  Drive Jelly",
                 "[Both Clicks]  Box Mode",
               ]
@@ -1808,7 +1799,7 @@ export default function App() {
                           ...(boxMode
                             ? ([
                                 ["Grip", "Lead both arms"],
-                                ["Stick", "← → width; ↑ ↓ tilt out / in"],
+                                ["Stick", "← → width"],
                                 ["Stick click", "Flush / straight grasp"],
                               ] as [string, string][])
                             : ([
@@ -1842,7 +1833,7 @@ export default function App() {
                     ...(boxMode
                       ? ([
                           ["Grip", "Lead both arms"],
-                          ["Stick", "← → width; ↑ ↓ tilt out / in"],
+                          ["Stick", "← → width"],
                           ["Stick click", "Flush / straight grasp"],
                         ] as [string, string][])
                       : ([["Grip", "Engage / freeze arm"]] as [string, string][])),

@@ -585,7 +585,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "tool's contact face along the box side) and one grip "
                     "drives both arms by position and heading — the pair "
                     "stays level (the other hand's grip hands over the "
-                    "lead). Thumbsticks set the grip width and tilt trim "
+                    "lead). Thumbsticks set the grip width "
                     "while a grip leads and drive the base once the pair is "
                     "frozen. Can also be toggled live from the headset menu "
                     "or both thumbstick clicks."

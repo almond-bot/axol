@@ -65,7 +65,7 @@ export type AxolPoseData = {
   l_stick_y?: number
   /** Right thumbstick x, [-1, 1], right = +1 — Jelly rotation. */
   r_stick_x?: number
-  /** Right thumbstick y, [-1, 1], pushed forward = -1 — box-mode tilt only. */
+  /** Right thumbstick y, [-1, 1], pushed forward = -1 (unused by the server today). */
   r_stick_y?: number
   /** Left thumbstick pressed in — lift down while held. */
   l_stick_click?: boolean
@@ -122,14 +122,14 @@ export type AxolSettings = {
  * normalised 0 (closed) – 1 (open). `pair` is the gripper-pair geometry from
  * the IK worker: `aligned` when the grippers already form the box-mode pair
  * (fingers forward, a flat face toward each other across a box-mode-sized gap
- * — a good moment to switch to box mode), `width` in metres, `tilt` the pair's
- * inward fingertip yaw in degrees (set live by the sticks in box mode). Null until the
- * worker's first report.
+ * — a good moment to switch to box mode), `width` in metres, `grasp` the
+ * grasp in force (`"flush"` / `"straight"`). Null until the worker's first
+ * report.
  */
 export type AxolJointState = {
   q: Record<string, number>
   l_grip: number
   r_grip: number
   engaged: boolean
-  pair: { aligned: boolean; width: number; tilt: number; grasp: string } | null
+  pair: { aligned: boolean; width: number; grasp: string } | null
 }

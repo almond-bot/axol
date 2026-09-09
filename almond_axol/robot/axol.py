@@ -2161,6 +2161,7 @@ class Axol(RobotBase):
     # defaults so a partially built instance behaves as "off".
     _squeeze_contacts: tuple[np.ndarray, ...] | None = None
     _squeeze_force_cap: float = float("inf")
+    _squeeze_log_t: float = 0.0
 
     def __init__(
         self,
@@ -2781,8 +2782,7 @@ class Axol(RobotBase):
             targets.append(
                 (self.right, _validated_motion_target(right, label="right arm"))
             )
-        if self._squeeze_contacts is not None:
-            self._refresh_squeeze_specs()
+        self.refresh_squeeze()
         if targets:
             await _await_all_hardware_actions(
                 *(arm.motion_control(q) for arm, q in targets)
@@ -2845,15 +2845,20 @@ class Axol(RobotBase):
             self.right.squeeze_force if self.right is not None else 0.0,
         )
 
-    def _refresh_squeeze_specs(self) -> None:
-        """Hand each arm this command's :class:`SqueezeSpec` (see :meth:`set_squeeze`)."""
+    def refresh_squeeze(self) -> None:
+        """Hand each arm this command's :class:`SqueezeSpec` (see :meth:`set_squeeze`).
+
+        Called by :meth:`motion_control` — and by anything that commands the
+        arms directly (``RtAxol.motion_control``) — before each command
+        while shaping is on; a no-op otherwise. Also logs the force the arms
+        are applying, about once a second while they press.
+        """
+        if self._squeeze_contacts is None:
+            return
+        self._log_squeeze_force()
         spec_l: SqueezeSpec | None = None
         spec_r: SqueezeSpec | None = None
-        if (
-            self._squeeze_contacts is not None
-            and self.left is not None
-            and self.right is not None
-        ):
+        if self.left is not None and self.right is not None:
             try:
                 n_arm = len(ARM_JOINTS)
                 q_l = self.left.positions[:n_arm].astype(np.float64)
@@ -2876,6 +2881,23 @@ class Axol(RobotBase):
             self.left.set_squeeze(spec_l)
         if self.right is not None:
             self.right.set_squeeze(spec_r)
+
+    def _log_squeeze_force(self) -> None:
+        """Log the shaped squeeze force at ~1 Hz while either arm presses (> 0.5 N)."""
+        left, right = self.squeeze_forces
+        now = time.monotonic()
+        pressing = max(left, right) > 0.5
+        if pressing and now - self._squeeze_log_t >= 1.0:
+            self._squeeze_log_t = now
+            cap = self._squeeze_force_cap
+            _logger.info(
+                "box squeeze: left %.1f N, right %.1f N (cap %s)",
+                left,
+                right,
+                f"{cap:.1f} N" if math.isfinite(cap) else "none",
+            )
+        elif not pressing:
+            self._squeeze_log_t = 0.0  # log the first press right away
 
     async def gravity_compensate(
         self,

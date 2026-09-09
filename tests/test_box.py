@@ -441,8 +441,6 @@ def _stick_worker(leader: str = "left") -> IKWorker:
         box_width_min=0.1,
         box_width_max=0.7,
         box_grip_tilt=0.0,
-        box_tilt_speed=30.0,
-        box_tilt_max=45.0,
         box_elbow_out=40.0,
         box_elbow_weight=10.0,
     )
@@ -556,13 +554,13 @@ class BoxElbowHintsTest(unittest.TestCase):
         )
 
 
-def _box_state(width: float = 0.3) -> BoxState:
+def _box_state(width: float = 0.3, tilt: float = 0.0) -> BoxState:
     return BoxState(
         center=np.array((0.4, 0.0, 0.3), np.float32),
         rot=np.eye(3, dtype=np.float32),
         width=width,
         face={"left": 1.0, "right": 1.0},
-        tilt=0.0,
+        tilt=tilt,
         align_start={},
         align_t0=0.0,
         align_duration=0.0,
@@ -655,8 +653,8 @@ class SticksDriveJellyTest(unittest.TestCase):
 
 
 class StickControlTest(unittest.TestCase):
-    """Box mode's sticks set the grip width (left/right) and fingertip tilt
-    (forward/back), on either stick, one axis at a time, and nothing else."""
+    """Box mode's sticks set the grip width (left/right), on either stick,
+    and nothing else: forward/back is inert (the grasp sets the yaw)."""
 
     def _sticks(
         self, worker: IKWorker, box: BoxState, frame: VRFrame, dt: float = 0.05
@@ -674,22 +672,26 @@ class StickControlTest(unittest.TestCase):
         self.assertAlmostEqual(box.width, 0.3, places=6)
         self.assertEqual(box.tilt, 0.0)
 
-    def test_pull_back_tilts_fingertips_inward_push_forward_outward(self) -> None:
+    def test_forward_back_changes_nothing(self) -> None:
         worker = _stick_worker()
         box = _box_state()
-        self._sticks(worker, box, _stick_frame(r_stick_y=1.0))
-        # 30 deg/s for 50 ms.
-        self.assertAlmostEqual(math.degrees(box.tilt), 1.5, places=5)
-        self.assertEqual(box.width, 0.3)
-        # The target rotations follow: the left gripper's fingers now yaw
-        # toward the centre (-y), the right's toward +y.
+        for frame in (
+            _stick_frame(r_stick_y=1.0),
+            _stick_frame(l_stick_y=-1.0),
+            _stick_frame(l_stick_y=1.0, r_stick_y=1.0),
+        ):
+            self._sticks(worker, box, frame)
+            self.assertEqual(box.tilt, 0.0)
+            self.assertEqual(box.width, 0.3)
+        self.assertEqual(worker._config.box_grip_tilt, 0.0)
+
+    def test_config_tilt_trim_yaws_the_fingertips(self) -> None:
+        # The trim is a fixed calibration: positive turns the left gripper's
+        # fingers toward the centre (-y), the right's toward +y.
+        box = _box_state(tilt=math.radians(1.5))
         rel = box.grip_rel()
         self.assertLess(float(approach_axis(rel["left"])[1]), 0.0)
         self.assertGreater(float(approach_axis(rel["right"])[1]), 0.0)
-        self._sticks(worker, box, _stick_frame(l_stick_y=-1.0))
-        self.assertAlmostEqual(math.degrees(box.tilt), 0.0, places=5)
-        self._sticks(worker, box, _stick_frame(l_stick_y=-1.0))
-        self.assertAlmostEqual(math.degrees(box.tilt), -1.5, places=5)
 
     def test_width_stick_with_a_forward_leak_only_changes_width(self) -> None:
         worker = _stick_worker()
@@ -699,12 +701,12 @@ class StickControlTest(unittest.TestCase):
         self.assertGreater(box.width, 0.3)
         self.assertEqual(box.tilt, 0.0)
 
-    def test_tilt_stick_with_a_side_leak_only_tilts(self) -> None:
+    def test_forward_stick_with_a_side_leak_does_not_creep_the_width(self) -> None:
         worker = _stick_worker()
         box = _box_state()
         self._sticks(worker, box, _stick_frame(l_stick_x=0.3, l_stick_y=0.9))
         self.assertEqual(box.width, 0.3)
-        self.assertGreater(box.tilt, 0.0)
+        self.assertEqual(box.tilt, 0.0)
 
     def test_both_sticks_add_but_never_exceed_full_deflection(self) -> None:
         worker = _stick_worker()
@@ -733,8 +735,8 @@ class StickControlTest(unittest.TestCase):
                 box = _box_state()
                 self._sticks(worker, box, _stick_frame(l_stick_x=-1.0))
                 self.assertLess(box.width, 0.3)
-                self._sticks(worker, box, _stick_frame(r_stick_y=1.0))
-                self.assertGreater(box.tilt, 0.0)
+                self._sticks(worker, box, _stick_frame(r_stick_x=1.0))
+                self.assertAlmostEqual(box.width, 0.3, places=6)
 
     def test_resting_sticks_change_nothing(self) -> None:
         worker = _stick_worker()
@@ -751,16 +753,6 @@ class StickControlTest(unittest.TestCase):
         for i in range(1, 100):  # 10 s at 0.1 m/s = 1 m requested
             worker._integrate_sticks(frame, box, now=0.1 * i)
         self.assertAlmostEqual(box.width, 0.1, places=6)
-
-    def test_tilt_is_clamped_and_written_back_to_the_config(self) -> None:
-        worker = _stick_worker()
-        box = _box_state()
-        frame = _stick_frame(r_stick_y=1.0)
-        worker._integrate_sticks(frame, box, now=0.0)
-        for i in range(1, 200):  # 200 x 0.1 s at 30 deg/s = 600 deg requested
-            worker._integrate_sticks(frame, box, now=0.1 * i)
-        self.assertAlmostEqual(math.degrees(box.tilt), 45.0, places=5)
-        self.assertAlmostEqual(worker._config.box_grip_tilt, 45.0, places=5)
 
     def test_tilt_seeds_the_next_engage(self) -> None:
         left, right = _pair(0.3)
@@ -845,8 +837,6 @@ def _box_worker(leader: str = "left") -> IKWorker:
         box_face_left="auto",
         box_face_right="auto",
         box_grip_tilt=0.0,
-        box_tilt_speed=30.0,
-        box_tilt_max=45.0,
         box_width_speed=0.1,
         box_elbow_out=30.0,
         box_elbow_weight=0.0,
@@ -1079,27 +1069,21 @@ class GraspToggleTest(unittest.TestCase):
         )
         q = np.zeros(14, np.float32)
         self.assertEqual(core.config.box_grasp, "straight")  # the default
-        core._unpack_solution(
-            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "flush"})
-        )
+        core._unpack_solution((q, {"aligned": False, "width": 0.3, "grasp": "flush"}))
         self.assertEqual(core.config.box_grasp, "flush")
         self.assertEqual(notified[-1], ("box_grasp", "flush"))
         # A request on its way to the worker is not undone by a stale report.
         core.set_live("box_grasp", "straight")
         core._apply_live_requests()
         self.assertEqual(core.config.box_grasp, "straight")
-        core._unpack_solution(
-            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "flush"})
-        )
+        core._unpack_solution((q, {"aligned": False, "width": 0.3, "grasp": "flush"}))
         self.assertEqual(core.config.box_grasp, "straight")
         core._unpack_solution(
-            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "straight"})
+            (q, {"aligned": False, "width": 0.3, "grasp": "straight"})
         )
         self.assertEqual(core.config.box_grasp, "straight")
         # ...and once it has landed, the worker's word is final again.
-        core._unpack_solution(
-            (q, {"aligned": False, "width": 0.3, "tilt": 0.0, "grasp": "flush"})
-        )
+        core._unpack_solution((q, {"aligned": False, "width": 0.3, "grasp": "flush"}))
         self.assertEqual(core.config.box_grasp, "flush")
 
 

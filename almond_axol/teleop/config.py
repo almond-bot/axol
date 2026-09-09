@@ -128,13 +128,10 @@ class VRTeleopConfig:
             While a grip is leading, the thumbsticks stop driving Jelly and
             set the grasp instead (freeze the pair — click the leader's grip
             again — and they drive Jelly as usual, so the box can be carried
-            across the room). Either stick does the same two things:
-            left/right changes the gripper separation (right = wider), and
-            forward/back tilts the fingertips (pull back = inward, push
-            forward = outward, ``box_grip_tilt``). Only the stick's dominant
-            axis counts, so a width change never also changes the tilt, and
-            a single stick click toggles the grasp (``box_grasp``: flush face
-            or fingers straight). The mode is a live setting
+            across the room). Either stick does the same thing: left/right
+            changes the gripper separation (right = wider; forward/back does
+            nothing), and a single stick click toggles the grasp
+            (``box_grasp``: flush face or fingers straight). The mode is a live setting
             (``VRTeleopCore.set_box_mode``, the headset's **Box** button,
             both thumbstick clicks together, the control panel); this is the
             default it starts in.
@@ -178,21 +175,17 @@ class VRTeleopConfig:
             side. If a parcel gripper engages with its fixed blade toward
             the box (the blade folds away from it) or its motor cap
             downward, pin that arm to the other side. Live-adjustable.
-        box_grip_tilt: Starting inward yaw trim (degrees) of each gripper in
-            box mode, on top of the tool's flush yaw. ``0`` holds the
-            tool's contact face parallel to the box side (for the URDF
-            gripper that is fingers straight forward; its closed fingers
-            are a wedge that narrows toward the tip, so ~20° there lies the
-            finger face flush instead of touching along its heel). Positive
-            turns the fingertips toward the box centre, negative splays them
-            outward; the gripper pivots about its contact face, so the trim
-            doesn't move the point of contact. Changed live with either
-            thumbstick's forward/back (pull back = inward, push forward =
-            outward); the value carries over to the next engage.
-        box_tilt_speed: Rate (deg/s) the tilt changes at full stick
-            deflection.
-        box_tilt_max: Largest tilt trim (degrees, either way) the sticks
-            allow.
+        box_grip_tilt: Fixed inward yaw trim (degrees) of each gripper in
+            box mode, on top of the grasp's yaw (``straight`` 0°, ``flush``
+            the tool's flush tilt). ``0`` holds the tool's contact face
+            parallel to the box side (for the URDF gripper that is fingers
+            straight forward; its closed fingers are a wedge that narrows
+            toward the tip, so ~20° there lies the finger face flush instead
+            of touching along its heel). Positive turns the fingertips
+            toward the box centre, negative splays them outward; the gripper
+            pivots about its contact face, so the trim doesn't move the
+            point of contact. A calibration constant, not a live control —
+            the sticks no longer change it.
         box_width_speed: Rate (m/s) the grip width changes at full stick
             deflection in box mode.
         box_width_min: Smallest grip width (m, between the two grippers'
@@ -463,8 +456,6 @@ class VRTeleopConfig:
     box_face_left: str = "auto"
     box_face_right: str = "auto"
     box_grip_tilt: float = 0.0
-    box_tilt_speed: float = 30.0
-    box_tilt_max: float = 45.0
     box_width_speed: float = 0.08
     box_width_min: float = 0.10
     box_width_max: float = 0.70

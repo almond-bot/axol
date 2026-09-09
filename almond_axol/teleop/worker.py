@@ -89,7 +89,7 @@ _SNAP_CONFIRM_FRAMES = 8  # suspect window length (~65 ms at 120 Hz)
 _SNAP_STABLE_RATIO = 0.5  # offset growth/size below this = shift, else motion
 
 # Box-mode sticks (see IKWorker._integrate_sticks): stick deflections below
-# this are ignored so a resting stick never creeps the grip width or tilt,
+# this are ignored so a resting stick never creeps the grip width,
 # and one integration step is capped so a stalled frame stream can't
 # authorise a large jump.
 _STICK_DEADZONE = 0.15
@@ -129,9 +129,9 @@ def _dz(v: float) -> float:
 def _dominant_axis(x: float, y: float) -> tuple[float, float]:
     """Keep only the larger of a thumbstick's two axes (deadzoned).
 
-    The two axes drive different things (width vs. tilt), so the off-axis
-    leak of a thumb pushed "left" never also moves the other one.
-    Ties go to ``x``.
+    Only ``x`` (the grip width) is acted on, but a thumb pushed mostly
+    forward with a little sideways in it should not creep the width either,
+    so the smaller axis is zeroed. Ties go to ``x``.
     """
     x, y = _dz(x), _dz(y)
     if abs(x) >= abs(y):
@@ -1020,7 +1020,7 @@ class IKWorker:
         """Live-update one :class:`VRTeleopConfig` field (``("set", …)`` message).
 
         Only fields this process reads at step time are meaningful here
-        (multipliers, box width/tilt rates, ramp pacing); the core validates the
+        (multipliers, box width rate, ramp pacing); the core validates the
         key before forwarding, so an unknown one is logged and ignored rather
         than raised.
         """
@@ -1054,9 +1054,8 @@ class IKWorker:
         mode from here costs (almost) no alignment blend. ``width`` is the
         grip width in metres — the separation the fitted tool's contact
         faces would have with the mounts where they are (the mount
-        separation itself for the URDF gripper) — and ``tilt`` the pair's
-        current inward tilt trim in degrees (``config.box_grip_tilt``, which
-        the sticks write back to).
+        separation itself for the URDF gripper) — and ``grasp`` the grasp in
+        force (``"straight"`` / ``"flush"``).
         """
         left, right = self._solver.fk(q)
         tool = self._box_tool()
@@ -1093,7 +1092,6 @@ class IKWorker:
         return {
             "aligned": bool(aligned),
             "width": round(width, 3),
-            "tilt": round(float(self._config.box_grip_tilt), 1),
             "grasp": self._box_grasp(),
         }
 
@@ -1205,7 +1203,7 @@ class IKWorker:
         vertical (:func:`twist_about`, applied about the pair's centre so a
         wrist turn lines the pair up with a box on the table without moving
         it), and stays level whatever the hand's pitch and roll. The thumbsticks set
-        the grip width and fingertip tilt (see :meth:`_integrate_sticks`), and
+        the grip width (see :meth:`_integrate_sticks`), and
         a single stick click switches between the flush and straight grasps
         (:meth:`_stick_click_toggle`), re-running the blend.
         """
@@ -1407,17 +1405,17 @@ class IKWorker:
     def _integrate_sticks(self, frame: VRFrame, box: BoxState, now: float) -> None:
         """Accumulate this frame's thumbstick input into ``box``.
 
-        Box mode's sticks do two things and nothing else, and both sticks
-        do the same, so it doesn't matter which hand leads: left/right sets
-        the **width** between the grippers (push right = wider, clamped to
-        ``box_width_min``..``box_width_max``) and forward/back the fingertip
-        **tilt** (pull back = tips inward, more pinch; push forward = outward,
-        ``BoxState.tilt``, written back to ``config.box_grip_tilt`` so the
-        next engage starts from it). Only a stick's dominant axis counts, so a
-        thumb pushing "left" with a little forward in it changes the width
-        alone (see :func:`_dominant_axis`); with both sticks deflected their
-        inputs add, capped at full deflection. Stick clicks are not modifiers
-        (a single click toggles the grasp, :meth:`_stick_click_toggle`); the
+        Box mode's sticks do one thing, and both sticks do the same, so it
+        doesn't matter which hand leads: left/right sets the **width**
+        between the grippers (push right = wider, clamped to
+        ``box_width_min``..``box_width_max``). Forward/back does nothing —
+        the grippers' yaw is the grasp's (``straight`` 0°, ``flush`` the
+        tool's flush tilt) plus the fixed ``config.box_grip_tilt`` trim, not
+        a live control. Only a stick's dominant axis counts, so a thumb
+        pushing "left" with a little forward in it still changes the width
+        (see :func:`_dominant_axis`); with both sticks deflected their inputs
+        add, capped at full deflection. Stick clicks are not modifiers (a
+        single click toggles the grasp, :meth:`_stick_click_toggle`); the
         pair's position is the leader hand's job, not the sticks'.
         """
         cfg = self._config
@@ -1430,28 +1428,19 @@ class IKWorker:
         if dt <= 0.0:
             return
 
-        lx, ly = _dominant_axis(frame.l_stick_x, frame.l_stick_y)
-        rx, ry = _dominant_axis(frame.r_stick_x, frame.r_stick_y)
-        if not (lx or ly or rx or ry):
+        lx, _ly = _dominant_axis(frame.l_stick_x, frame.l_stick_y)
+        rx, _ry = _dominant_axis(frame.r_stick_x, frame.r_stick_y)
+        if not (lx or rx):
             return
 
         x = float(np.clip(lx + rx, -1.0, 1.0))
-        y = float(np.clip(ly + ry, -1.0, 1.0))
-        # Sticks report pushed-forward as -1 (WebXR): pulled back is +1.
         width_rate = x * cfg.box_width_speed  # push right = wider
-        tilt_rate = y * math.radians(cfg.box_tilt_speed)  # pull back = inward
-
         if width_rate:
             box.width = float(
                 np.clip(
                     box.width + dt * width_rate, cfg.box_width_min, cfg.box_width_max
                 )
             )
-        if tilt_rate:
-            limit = math.radians(abs(cfg.box_tilt_max))
-            box.tilt = float(np.clip(box.tilt + dt * tilt_rate, -limit, limit))
-            # Carry the tilt into the next engage (and pair_status).
-            cfg.box_grip_tilt = math.degrees(box.tilt)
 
     def _rest_fk_poses(
         self,

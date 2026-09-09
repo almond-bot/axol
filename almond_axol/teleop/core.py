@@ -289,7 +289,7 @@ class VRTeleopCore:
         self._box_leader: str | None = None
         # Box mode hands the thumbsticks back to Jelly while nobody leads
         # (the pair is frozen holding the box) — but not until the operator
-        # has let the sticks go after the freeze, so a width or tilt change
+        # has let the sticks go after the freeze, so a width change
         # in progress when the leader's grip was clicked can't turn into a
         # base command. Set when the lead drops, cleared by the first neutral
         # frame; see :attr:`pair_owns_sticks`.
@@ -311,8 +311,8 @@ class VRTeleopCore:
         self._worker_updates: list[tuple[str, object]] = []
 
         # Latest gripper-pair geometry from the worker (see
-        # ``IKWorker.pair_status``): ``{"aligned": bool, "width": m, "tilt":
-        # deg, "grasp": str}``, or None before the first report. Read by the
+        # ``IKWorker.pair_status``): ``{"aligned": bool, "width": m,
+        # "grasp": str}``, or None before the first report. Read by the
         # adapter for the headset; ``grasp`` is mirrored into the config
         # (see ``_mirror_grasp``), with a request on its way to the worker
         # remembered here so stale reports can't undo it.
@@ -489,8 +489,6 @@ class VRTeleopCore:
             "box_face_left",
             "box_face_right",
             "box_grip_tilt",
-            "box_tilt_speed",
-            "box_tilt_max",
             "box_elbow_out",
             "box_elbow_weight",
         }
@@ -598,8 +596,8 @@ class VRTeleopCore:
     def pair_owns_sticks(self) -> bool:
         """True while the thumbsticks belong to the arm pair, not to Jelly.
 
-        In :attr:`box_mode` the sticks set the pair's width and fingertip
-        tilt whenever a grip is leading it. Once the leader freezes the pair (nobody leads), they go
+        In :attr:`box_mode` the sticks set the pair's width whenever a
+        grip is leading it. Once the leader freezes the pair (nobody leads), they go
         back to driving the base with the ordinary mapping — so the operator
         grabs the box, freezes, drives across the room, and leads again to
         adjust — after one frame with every stick released (see
@@ -863,7 +861,7 @@ class VRTeleopCore:
         while the other still holds). Both grippers follow the leader's
         trigger.
 
-        The thumbsticks set the grasp (width, tilt) while someone leads and
+        The thumbsticks set the grip width while someone leads and
         drive Jelly while nobody does (:attr:`pair_owns_sticks`); the switch
         to Jelly waits for a frame with the sticks released so a stick held
         for the grasp can't carry over into base motion.
