@@ -2224,7 +2224,22 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         motor, and only release the reservation when each one reads disabled or
         does not answer at all. A motor that answers and is not disabled is
         still holding torque nobody supervises, and keeps the lockout.
+
+        The probe borrows the buses. While the lockout stands the failed
+        operation may still hold them, and the idle link is not meant to sit
+        on the same channels for longer than it takes to look: if the lockout
+        is refused, a link this call reconnected is handed back (``busy``)
+        exactly as it was before the probe.
         """
+
+        async def refuse(error: str, *, reacquired: bool) -> JSONResponse:
+            if reacquired:
+                try:
+                    await asyncio.to_thread(robot.release)
+                except RuntimeError as exc:
+                    error = f"{error}; also could not hand the buses back: {exc}"
+            return JSONResponse({"error": error}, status_code=409)
+
         async with session_launch_reservation:
             if not runner.hardware_cleanup_lockout():
                 return JSONResponse(
@@ -2236,16 +2251,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     {"error": "an operation is still running — stop it first"},
                     status_code=409,
                 )
+            reacquired = False
             try:
-                await asyncio.to_thread(robot.reacquire)
+                reacquired = await asyncio.to_thread(robot.reacquire)
                 status = await asyncio.to_thread(robot.probe)
             except RuntimeError as exc:
-                return JSONResponse(
-                    {
-                        "error": "could not reach the motors to prove they are "
-                        f"disabled; the lockout stands: {exc}"
-                    },
-                    status_code=409,
+                return await refuse(
+                    "could not reach the motors to prove they are disabled; "
+                    f"the lockout stands: {exc}",
+                    reacquired=reacquired,
                 )
             # ``reachable is False`` is the proof this needs (the motor is
             # unpowered); ``None`` means the probe produced no reading for it,
@@ -2256,17 +2270,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 if m["reachable"] is not False and m["status"] != "DISABLED"
             ]
             if live:
-                return JSONResponse(
-                    {
-                        "error": "these motors still answer and are not disabled, "
-                        "so the lockout stands: "
-                        + ", ".join(
-                            f"{m['arm']} {m['joint'].lower()}"
-                            f" ({str(m['status']).replace('_', ' ').lower()})"
-                            for m in live
-                        ),
-                    },
-                    status_code=409,
+                return await refuse(
+                    "these motors still answer and are not disabled, "
+                    "so the lockout stands: "
+                    + ", ".join(
+                        f"{m['arm']} {m['joint'].lower()}"
+                        f" ({str(m['status']).replace('_', ' ').lower()})"
+                        for m in live
+                    ),
+                    reacquired=reacquired,
                 )
             runner.clear_hardware_cleanup_lockout()
             return JSONResponse({"cleared": True})

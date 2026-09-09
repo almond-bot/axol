@@ -454,8 +454,11 @@ class OperationRunner:
         self._episode_control: Any = None
         # A command reported that its hardware disconnect/disable did not
         # complete.  The command may still own one or both CAN buses, so no
-        # later operation may start and the idle RobotLink must not reacquire
-        # them.  Only restarting the serve process can re-establish ownership.
+        # later operation may start and the idle RobotLink does not reacquire
+        # them on its own.  Two ways out: restarting the serve process, or
+        # ``/api/op/clear-lockout``, which borrows the buses just long enough
+        # to prove every motor is torque-free (disabled or unpowered) and
+        # hands them back if it cannot (see clear_hardware_cleanup_lockout).
         self._hardware_cleanup_uncertain = False
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --

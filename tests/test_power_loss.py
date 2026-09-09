@@ -221,6 +221,7 @@ class _LockedOutLink:
         self._motors = motors
         self.state = STATE_BUSY
         self.reacquires = 0
+        self.releases = 0
         self.probes = 0
 
     def profile(self) -> str:
@@ -240,9 +241,12 @@ class _LockedOutLink:
             "motors": self._motors,
         }
 
-    def reacquire(self) -> None:
+    def reacquire(self) -> bool:
+        if self.state != STATE_BUSY:
+            return False
         self.reacquires += 1
         self.state = STATE_CONNECTED
+        return True
 
     def probe(self) -> dict[str, Any]:
         self.probes += 1
@@ -251,6 +255,7 @@ class _LockedOutLink:
         return self.status()
 
     def release(self) -> None:
+        self.releases += 1
         self.state = STATE_BUSY
 
     def motor_faults(self) -> list[dict[str, Any]]:
@@ -349,6 +354,27 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("wrist_2", response.json()["error"])
         self.assertTrue(runner.hardware_cleanup_lockout())
         self.assertTrue(runner.is_running())
+        # The probe only borrowed the buses: a refused lockout hands them back
+        # so the idle link is not left sitting on channels the failed
+        # operation may still hold.
+        self.assertEqual(robot.reacquires, 1)
+        self.assertEqual(robot.releases, 1)
+        self.assertEqual(robot.state, STATE_BUSY)
+
+    async def test_clear_lockout_keeps_a_link_it_did_not_reconnect(self) -> None:
+        # The operator connected the panel themselves before asking; a refusal
+        # must not yank that connection away.
+        robot = _LockedOutLink([_motor("WRIST_2", reachable=True, status="OK")])
+        robot.state = STATE_CONNECTED
+        runner = self._locked_out_runner(robot)
+
+        async with await self._client(runner, robot) as client:
+            response = await client.post("/api/op/clear-lockout")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(robot.reacquires, 0)
+        self.assertEqual(robot.releases, 0)
+        self.assertEqual(robot.state, STATE_CONNECTED)
 
     async def test_clear_lockout_releases_once_every_motor_is_silent(self) -> None:
         robot = _LockedOutLink(
@@ -377,6 +403,8 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertTrue(runner.hardware_cleanup_lockout())
+        self.assertEqual(robot.releases, 1)
+        self.assertEqual(robot.state, STATE_BUSY)
 
 
 class BusStallWatchdogTest(unittest.TestCase):

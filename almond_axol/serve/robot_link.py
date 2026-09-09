@@ -460,11 +460,16 @@ class RobotLink:
             arm.health = {}
         self.hub.clear_slow()
 
-    def reacquire(self) -> None:
-        """Re-open the buses + ping loop after a task releases the bus."""
+    def reacquire(self) -> bool:
+        """Re-open the buses + ping loop after a task releases the bus.
+
+        Returns ``True`` when this call reconnected, ``False`` when there was
+        nothing to reacquire (the link was not handed to a task), so a caller
+        that only borrowed the buses knows whether it has to give them back.
+        """
         with self._lock:
             if self._state != STATE_BUSY:
-                return
+                return False
         try:
             self._submit(self._open_and_start())
         except Exception as exc:  # noqa: BLE001
@@ -472,6 +477,7 @@ class RobotLink:
             _logger.warning("robot reacquire failed: %s", exc)
             raise RuntimeError(f"could not reacquire robot link: {exc}") from exc
         self._set_state(STATE_CONNECTED)
+        return True
 
     def probe(self) -> dict[str, Any]:
         """Ping every motor now and return the resulting :meth:`status`.
