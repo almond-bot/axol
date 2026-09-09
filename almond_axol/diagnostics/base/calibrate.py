@@ -150,6 +150,10 @@ class Stroke:
     dtheta_rad: float
     duration_s: float = 0.0
     confidence: float = 0.0
+    # 50 Hz trace of the drive while the stroke ran, one row per cycle:
+    # [t_s, |body cmd|, traction scale, τ_FL, τ_FR, τ_BL, τ_BR (Nm)]. Written
+    # to --out for looking at what the wheels did on a stroke that veered.
+    trace: list[list[float]] = field(default_factory=list)
 
 
 @dataclass
@@ -613,8 +617,21 @@ def ramp_stop_time(cmd_norm: float, decel: float, jerk: float) -> float:
     return t
 
 
+def _trace_row(cart: Cart, t0: float) -> list[float]:
+    return [
+        round(time.monotonic() - t0, 3),
+        round(math.sqrt(sum(c * c for c in cart.body_cmd)), 4),
+        round(cart.traction_scale, 3),
+        *[round(t, 3) for t in cart.wheel_torques],
+    ]
+
+
 async def _settle(
-    cart: Cart, tracker: ZedTracker, hold_s: float, odometer: Odometer | None = None
+    cart: Cart,
+    tracker: ZedTracker,
+    hold_s: float,
+    odometer: Odometer | None = None,
+    trace: tuple[list[list[float]], float] | None = None,
 ) -> PoseSample:
     """Command a stop and wait until the wheels and the camera are still.
 
@@ -622,7 +639,9 @@ async def _settle(
     until the ramp has run out, every wheel reads slower than
     ``_SETTLE_WHEEL_RAD_S``, and the camera has moved less than
     ``_SETTLE_MOVE_M`` over the last ``hold_s`` seconds. Feeds every pose to
-    ``odometer`` so the ramp-down's motion is counted. Returns the final pose.
+    ``odometer`` so the ramp-down's motion is counted, and appends drive
+    rows to ``trace`` (rows, t0) while the ramp-down runs. Returns the final
+    pose.
     """
     # Slower than the drive loop: the zero command only has to beat the
     # cart's command_timeout, and the wheel poll is four feedback requests.
@@ -635,6 +654,8 @@ async def _settle(
         if odometer is not None:
             odometer.update(sample)
         ramp_done = all(abs(c) < 1e-3 for c in cart.body_cmd)
+        if trace is not None and not ramp_done:
+            trace[0].append(_trace_row(cart, trace[1]))
         wheels_still = False
         if ramp_done:
             _, velocities = await cart.read_wheels()
@@ -677,8 +698,10 @@ async def run_stroke(
     t0 = time.monotonic()
     rate = 0.0  # smoothed progress rate (m/s or rad/s)
     last_progress, last_time = 0.0, t0
+    trace: list[list[float]] = []
     while True:
         cart.set_command(*plan.command)
+        trace.append(_trace_row(cart, t0))
         sample = tracker.latest()
         if not sample.ok:
             cart.set_command(0.0, 0.0, 0.0)
@@ -706,7 +729,7 @@ async def run_stroke(
         await asyncio.sleep(interval)
     duration = time.monotonic() - t0
 
-    end_pose = await _settle(cart, tracker, pause_s, odometer)
+    end_pose = await _settle(cart, tracker, pause_s, odometer, (trace, t0))
     turns1, _ = await cart.read_wheels()
 
     forward, left = camera_heading_axes(start_pose.rotation)
@@ -718,6 +741,7 @@ async def run_stroke(
         dy_m=float(delta @ left),
         dtheta_rad=odometer.theta,
         duration_s=duration,
+        trace=trace,
         confidence=min(start_pose.confidence, end_pose.confidence),
     )
 
