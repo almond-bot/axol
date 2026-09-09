@@ -441,6 +441,109 @@ class LiftStatusModeTest(unittest.IsolatedAsyncioTestCase):
 
         lift._send.assert_not_awaited()
 
+    async def _run_ticks(self, lift: Lift, ticks: int) -> None:
+        """Run ``_run`` for ``ticks`` iterations (the sleep ends the loop)."""
+        remaining = [ticks]
+
+        async def sleep(_seconds: float) -> None:
+            remaining[0] -= 1
+            if remaining[0] <= 0:
+                raise asyncio.CancelledError
+
+        with (
+            patch.object(lift_module.asyncio, "sleep", sleep),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await lift._run()
+
+    def _motion_frames(self, send: AsyncMock) -> list:
+        """Sent opcodes with the status poll filtered out."""
+        return [
+            c for c in send.await_args_list if c.args[0] != lift_module._OP_GET_STATUS
+        ]
+
+    async def test_detached_lift_sends_no_motion_frames(self) -> None:
+        """No command source yet → nothing but the status poll on the bus."""
+        lift = Lift()
+        lift._send = AsyncMock()  # type: ignore[method-assign]
+
+        await self._run_ticks(lift, 3)
+
+        self.assertEqual(self._motion_frames(lift._send), [])
+        self.assertFalse(lift.streaming)
+
+    async def test_attached_source_streams_a_motion_frame_every_tick(self) -> None:
+        lift = Lift(jog_speed=500)
+        lift._send = AsyncMock()  # type: ignore[method-assign]
+
+        lift.command(lift_module.UP)
+        await self._run_ticks(lift, 3)
+        jog = call(lift_module._OP_JOG, struct.pack("<h", 500))
+        self.assertEqual(self._motion_frames(lift._send), [jog, jog, jog])
+        self.assertTrue(lift.streaming)
+
+        # Release: the canonical STOP, then an idle STOP keepalive every tick
+        # for as long as the source keeps saying "stopped".
+        lift._send.reset_mock()
+        lift.command(lift_module.STOP)
+        await self._run_ticks(lift, 3)
+        stop = call(lift_module._OP_STOP)
+        self.assertEqual(self._motion_frames(lift._send), [stop, stop, stop])
+
+    async def test_idle_stream_never_cancels_a_one_shot_move(self) -> None:
+        lift = Lift()
+        lift._bus = SimpleNamespace()
+        lift._send = AsyncMock()  # type: ignore[method-assign]
+        lift.command(lift_module.STOP)  # a source is attached and idle
+        await self._run_ticks(lift, 1)
+        lift._send.reset_mock()
+
+        await lift.set_position(500)
+        lift._send.reset_mock()
+        await self._run_ticks(lift, 3)
+
+        self.assertEqual(self._motion_frames(lift._send), [])
+
+    async def test_suspend_stops_once_then_goes_silent(self) -> None:
+        lift = Lift()
+        lift._send = AsyncMock()  # type: ignore[method-assign]
+        lift.command(lift_module.DOWN)
+        await self._run_ticks(lift, 2)
+        lift._send.reset_mock()
+
+        lift.suspend()
+        await self._run_ticks(lift, 4)
+
+        self.assertEqual(self._motion_frames(lift._send), [call(lift_module._OP_STOP)])
+        self.assertFalse(lift.streaming)
+
+        # Suspending an already-idle, already-stopped lift sends nothing.
+        lift._send.reset_mock()
+        lift.suspend()
+        await self._run_ticks(lift, 2)
+        self.assertEqual(self._motion_frames(lift._send), [])
+
+        # A new command re-attaches the source and the stream resumes.
+        lift.command(lift_module.UP)
+        await self._run_ticks(lift, 1)
+        self.assertEqual(
+            self._motion_frames(lift._send),
+            [call(lift_module._OP_JOG, struct.pack("<h", lift_module.JOG_SPEED))],
+        )
+
+    async def test_suspend_aborts_an_active_one_shot(self) -> None:
+        lift = Lift()
+        lift._bus = SimpleNamespace()
+        lift._send = AsyncMock()  # type: ignore[method-assign]
+        await lift.home()
+        lift._send.reset_mock()
+
+        lift.suspend()
+        await self._run_ticks(lift, 2)
+
+        self.assertEqual(self._motion_frames(lift._send), [call(lift_module._OP_STOP)])
+        self.assertFalse(lift._one_shot_active)
+
     async def test_rejects_out_of_range_status_periods(self) -> None:
         with self.assertRaisesRegex(ValueError, "0 and 65535"):
             Lift(status_period_ms=-1)
