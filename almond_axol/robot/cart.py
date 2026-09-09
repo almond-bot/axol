@@ -20,9 +20,22 @@ limiting, x-drive mixing, and the park/unpark state machine at
   slow), the wheels are parked: switched to MIT/impedance mode and held at
   their current positions by the motor's internal high-bandwidth position
   loop, so the base does not roll under load.
-- If no fresh command arrives within ``command_timeout`` the target is
-  forced to zero (streaming sources that die mid-motion cannot leave the
-  base driving).
+- If no fresh command arrives within ``command_timeout`` the command source
+  is treated as dead. The lift gets one STOP and then nothing. Wheels that
+  were *driving* get one zero-velocity command and then the cart goes
+  **silent on CAN** for them — no keepalive, no re-send of the last (stale)
+  command. That silence is deliberate: every wheel motor is armed with a
+  ``can_timeout_ms`` loss-of-comms alarm at enable time (and the jelly_legs
+  jog has its own 300 ms deadman), so a motor that stops hearing from the
+  host torques off on its own. The motor-side timeout is the safety layer
+  against a runaway; the host's job is to never feed it with anything but a
+  live motion command. Once the trip has happened and the wheels have
+  stopped rolling they are re-enabled straight into the park hold.
+- The park hold itself is exempt from the link requirement: it is a fixed
+  position anchor with no velocity in it, so a parked cart keeps holding
+  whether or not a headset is attached (a cart free to roll is the hazard
+  there, not a runaway). When the source returns, driving resumes from
+  rest.
 
 Damiao position commands/feedback are mapped into ±PMAX (12.5 rad from
 factory — about two wheel turns), which drive wheels escape almost
@@ -51,8 +64,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..constants import CAN_BASE, CAN_CHEST
-from ..motor import CanBus, ControlMode, make_driver
-from ..motor.damiao import _DM_REG_PMAX
+from ..motor import CanBus, ControlMode, MotorError, MotorStatus, make_driver
+from ..motor.config import DAMIAO_TIMEOUT_MS_PER_UNIT
+from ..motor.damiao import _DM_REG_PMAX, _DM_REG_TIMEOUT
 from ..motor.driver import MotorDriver
 from .base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from .lift import DOWN, JOG_SPEED, STOP, UP, Lift, LiftStatus
@@ -87,6 +101,22 @@ _YAW_TRACE_HZ = 10.0
 # Seconds of driving with the IMU requested but no yaw sample ever fed
 # before the cart says the heading hold is dead.
 _YAW_SILENT_WARN_S = 3.0
+
+# Minimum spacing between wheel re-enable attempts while the command source is
+# live but a wheel keeps reporting a fault (dead bus, motor unpowered). Each
+# attempt is several CAN round trips and blocks the command task while its
+# requests time out, so it must not run every cycle.
+_WHEEL_RECOVER_MIN_S = 1.0
+
+# Spacing of attempts to anchor tripped wheels into the park hold while no
+# command source is attached (each attempt polls every wheel's velocity; a
+# base still rolling on a slope is retried until it settles).
+_PARK_RETRY_S = 0.2
+
+# Wheel statuses the cart clears and re-enables on its own: the two the CAN
+# timeout leaves behind. Anything else (over-current, over-temperature,
+# under-voltage) is a real fault that stays put until an operator looks.
+_RECOVERABLE_WHEEL_STATUSES = frozenset({MotorStatus.LOST_COMM, MotorStatus.DISABLED})
 
 
 async def _gather_all_or_raise(*awaitables: Awaitable[Any]) -> None:
@@ -197,10 +227,34 @@ class CartConfig:
         hold_kp:         Position stiffness (Nm/rad) of the parked MIT hold;
                          0 disables parking (wheels just idle in velocity mode).
         hold_kd:         Damping (Nm·s/rad) of the parked MIT hold.
-        frequency:       Wheel command task rate in Hz.
+        frequency:       Wheel command task rate in Hz. Every cycle while the
+                         command source is live sends one command frame to
+                         each wheel (velocity, or the parked hold), which is
+                         what keeps the wheels' ``can_timeout_ms`` alarm fed.
         command_timeout: Seconds without a fresh :meth:`Cart.set_command`
-                         before the target is forced to zero (and the lift
-                         stopped). Protects against a dead command source.
+                         before the command source is considered dead. On
+                         that edge the lift gets a STOP and, if the wheels
+                         were driving, they get a single zero-velocity
+                         command and then **nothing** on CAN — no keepalive,
+                         no re-send of the stale command — so the motors' own
+                         timeouts (``can_timeout_ms``; the lift's 300 ms jog
+                         deadman) trip and torque off, and a wedged host can
+                         never keep the base driving. Tripped wheels are then
+                         re-enabled into the park hold once they have stopped.
+                         A cart that was already parked keeps its hold. Must
+                         comfortably exceed the source's frame period (a
+                         headset streams at 72-90 Hz, with occasional 50-100
+                         ms WiFi gaps).
+        can_timeout_ms:  Loss-of-comms alarm (Damiao ``TIMEOUT`` register)
+                         written to every wheel motor at enable time and read
+                         back to verify (RAM only, re-applied each session).
+                         A wheel that goes this long without a command frame
+                         faults ``LOST_COMM`` and torques off by itself — the
+                         safety layer that does not depend on this process
+                         running. Must be > 0 and well above one command
+                         period (``1000 / frequency`` ms); enable refuses
+                         otherwise. When the source comes back the cart
+                         clears the fault and re-enables the wheels.
         lift:            Whether the telescoping lift is present (the
                          jelly_legs board on the chest CAN bus, see
                          :mod:`almond_axol.robot.lift`). The chest bus being
@@ -227,7 +281,8 @@ class CartConfig:
     hold_kp: float = 60.0
     hold_kd: float = 1.5
     frequency: float = 50.0
-    command_timeout: float = 0.3
+    command_timeout: float = 0.2
+    can_timeout_ms: float = 200.0
     lift: bool = True
     lift_channel: str = CAN_CHEST
     lift_speed: int = JOG_SPEED
@@ -346,6 +401,15 @@ class Cart:
     owns all bus/GPIO traffic. Values are normalized to [-1, 1] (body frame:
     +x forward, +y left, +wz CCW) and scaled by ``CartConfig.max_speed`` /
     ``turn_scale``; ``lift`` is +1 up / 0 stop / -1 down.
+
+    The command source must keep calling :meth:`set_command` (at least every
+    ``CartConfig.command_timeout``) for the cart to send any *motion*: with
+    no live source the wheels are never given a velocity, and wheels that
+    were driving when the source vanished are left to their ``can_timeout_ms``
+    loss-of-comms alarm, which torques them off. The stationary park hold is
+    the one thing sent without a source — it anchors the base in place and
+    carries no velocity, so it is kept (or re-established once tripped wheels
+    have stopped) until the source returns.
     """
 
     def __init__(self, config: CartConfig = CartConfig()) -> None:
@@ -361,6 +425,10 @@ class Cart:
         # atomic under the GIL), consumed by the command task.
         self._target: tuple[float, float, float, int] = (0.0, 0.0, 0.0, STOP)
         self._target_time: float = 0.0
+        # The last VR frame object mapped by apply_vr_frame. A frame that is
+        # handed over twice (a poller re-reading the server's latest frame,
+        # say) must not count as a fresh command.
+        self._last_vr_frame: object | None = None
 
         # Latest external yaw-rate sample (rad/s CCW, monotonic timestamp),
         # written from any thread; None until a sensor feeds one. The counter
@@ -377,6 +445,11 @@ class Cart:
         self.parked: bool = False
         self.park_failed: bool = False
         self.send_failed: bool = False
+        # True while the command source is fresh (commands are streaming to
+        # the wheels/lift); False means the cart is silent on CAN.
+        self.linked: bool = False
+        # Wheels currently reporting a fault the cart could not clear.
+        self.wheel_faults: dict[str, MotorStatus] = {}
 
     @property
     def config(self) -> CartConfig:
@@ -412,6 +485,24 @@ class Cart:
         if self._task is not None or self._bus is not None or self._motors:
             raise RuntimeError("cart is already enabled")
         cfg = self._config
+        if cfg.channel is not None:
+            # The motor-side timeout is the safety layer; refuse a config that
+            # disables it or that the command stream cannot reliably feed.
+            period_ms = 1000.0 / cfg.frequency
+            if not math.isfinite(cfg.can_timeout_ms) or cfg.can_timeout_ms <= 0.0:
+                raise ValueError(
+                    "cart can_timeout_ms must be a positive number — the wheel "
+                    "loss-of-comms alarm is the runaway safety layer and cannot "
+                    "be disabled"
+                )
+            if cfg.can_timeout_ms < 2.0 * period_ms:
+                raise ValueError(
+                    f"cart can_timeout_ms ({cfg.can_timeout_ms:g} ms) must be at "
+                    f"least twice the command period ({period_ms:g} ms at "
+                    f"{cfg.frequency:g} Hz), or a single late cycle trips the wheels"
+                )
+        if not math.isfinite(cfg.command_timeout) or cfg.command_timeout <= 0.0:
+            raise ValueError("cart command_timeout must be a positive number")
         if cfg.lift:
             # The chest bus is optional and independent of the wheels: a
             # missing/unpowered lift only costs the lift, never the drive.
@@ -456,6 +547,10 @@ class Cart:
                     for w in WHEELS
                 ]
                 self._motors_disabled = False
+                # Arm the loss-of-comms alarm first (RAM only, so it is
+                # re-applied every session and never depends on flash state),
+                # and prove every wheel took it before any torque is applied.
+                await self._arm_can_timeout()
                 # Widen the position-mapping range (RAM only) before enable()
                 # reads it back, so multi-turn wheel positions stay valid for
                 # the MIT park hold.
@@ -465,7 +560,7 @@ class Cart:
                         for m in self._motors
                     ]
                 )
-                await _gather_all_or_raise(*[m.enable() for m in self._motors])
+                await self._enable_for_velocity(self._motors)
                 for w, m in zip(WHEELS, self._motors):
                     if abs(m._p_max - _SESSION_PMAX) > 1.0:
                         _logger.warning(
@@ -475,10 +570,12 @@ class Cart:
                             m._p_max,
                             _SESSION_PMAX,
                         )
-                await _gather_all_or_raise(
-                    *[m.set_control_mode(ControlMode.VELOCITY) for m in self._motors]
+                _logger.info(
+                    "cart wheels enabled on %s (loss-of-comms alarm %.0f ms: the "
+                    "wheels torque off on their own when the command stream stops)",
+                    cfg.channel,
+                    cfg.can_timeout_ms,
                 )
-                _logger.info("cart wheels enabled on %s", cfg.channel)
         except BaseException as setup_error:
             # A failed enable() propagates to the caller, who never calls
             # disable() — so everything opened above must be torn down here,
@@ -500,6 +597,52 @@ class Cart:
             )
 
         self._task = asyncio.create_task(self._command_loop(), name="cart-command")
+
+    @staticmethod
+    async def _enable_for_velocity(motors: list[MotorDriver]) -> None:
+        """Enable wheels into VELOCITY mode without replaying a stale target.
+
+        A Damiao keeps its last command target across a fault or a torque-off
+        and ``enable()`` alone can act on it; only a control-mode *switch*
+        zeroes the command state. So: switch to IMPEDANCE first (MIT with
+        zero gains is torque-free), enable, then switch to VELOCITY — a
+        second zeroing — so the first thing the wheel ever acts on is the
+        next frame the command loop sends.
+        """
+        await _gather_all_or_raise(
+            *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors]
+        )
+        await _gather_all_or_raise(*[m.enable() for m in motors])
+        await _gather_all_or_raise(
+            *[m.set_control_mode(ControlMode.VELOCITY) for m in motors]
+        )
+
+    async def _arm_can_timeout(self) -> None:
+        """Write the loss-of-comms alarm to every wheel and verify the readback.
+
+        RAM-only on purpose: the value is re-asserted on every enable, so the
+        safety layer never depends on what a motor happens to have in flash.
+        A wheel that does not read back the requested value fails the enable
+        — driving with an unverified timeout is exactly the runaway case.
+        """
+        ticks = round(self._config.can_timeout_ms / DAMIAO_TIMEOUT_MS_PER_UNIT)
+        await _gather_all_or_raise(
+            *[m._write_register(_DM_REG_TIMEOUT, ticks) for m in self._motors]
+        )
+        readback = await asyncio.gather(
+            *[m._read_register(_DM_REG_TIMEOUT) for m in self._motors]
+        )
+        mismatched = [
+            f"{w.name}={int(value) * DAMIAO_TIMEOUT_MS_PER_UNIT:g}ms"
+            for w, value in zip(WHEELS, readback)
+            if int(value) != ticks
+        ]
+        if mismatched:
+            raise MotorError(
+                f"cart wheel CAN timeout readback mismatch (wanted "
+                f"{self._config.can_timeout_ms:g} ms): {', '.join(mismatched)} — "
+                "refusing to drive without the loss-of-comms safety layer"
+            )
 
     async def disable(self) -> None:
         """Stop the command task, stop and disable the wheels, release the lift."""
@@ -523,6 +666,10 @@ class Cart:
 
         if self._motors and not self._motors_disabled:
             try:
+                # A wheel whose CAN timeout tripped while the source was away
+                # sits in LOST_COMM; the torque-off below is only confirmed
+                # from a clean DISABLED status, so clear the fault first.
+                await asyncio.gather(*[m.clear_errors() for m in self._motors])
                 # Leave impedance park (if held) and command a stop before
                 # disabling, mirroring the manual-drive teardown.
                 if self.parked:
@@ -593,9 +740,15 @@ class Cart:
             wz:   Counter-clockwise rotation, [-1, 1].
             lift: +1 raise, 0 stop, -1 lower.
 
-        Safe to call from any thread at any rate. The command task consumes
-        the latest value; if no fresh command arrives within
-        ``CartConfig.command_timeout`` the target decays to a full stop.
+        Safe to call from any thread at any rate — but it must be called
+        *continuously* while the source is alive, including while it is
+        commanding zero. The command task consumes the latest value and
+        streams it to the wheels; if no fresh command arrives within
+        ``CartConfig.command_timeout`` the source is treated as dead: driving
+        wheels are stopped once and then left to their CAN timeout, parked
+        wheels keep their hold (see :class:`Cart`). Re-sending an old command from a
+        source that has actually lost its input is a bug: that is what keeps
+        the wheels' loss-of-comms alarm from tripping.
         """
 
         def clamp(v: float, *, name: str) -> float:
@@ -668,8 +821,16 @@ class Cart:
                        base doesn't creep during the return to rest.
 
         Thread-safe (only latches the target); staleness is handled by the
-        command task, so a dead frame stream times out to a full stop.
+        command task, so a dead frame stream times out to a stop and then to
+        CAN silence. Only a *new* frame counts as a live source: call this
+        from the server's on-frame callback, once per received frame. The
+        same frame object handed over again (a poller re-reading the latest
+        frame after the headset went quiet) is ignored rather than refreshing
+        the deadline — that would be a stale command dressed up as a fresh one.
         """
+        if frame is self._last_vr_frame:
+            return
+        self._last_vr_frame = frame
         if resetting or frame.reset:
             self.set_command(0.0, 0.0, 0.0, STOP)
             return
@@ -712,7 +873,7 @@ class Cart:
     # Command task
     # ------------------------------------------------------------------
 
-    async def _park(self) -> list[float] | None:
+    async def _park(self, *, reenable: bool = False) -> list[float] | None:
         """Switch the wheels to the MIT position hold at their current positions.
 
         Returns the per-wheel anchor positions, or None if parking is not
@@ -723,6 +884,14 @@ class Cart:
         - a wheel reports a position too close to the widened ±PMAX mapping
           limit, where a wrapped/clamped anchor would mean a phantom position
           error at full torque (sets :attr:`park_failed`; not retried).
+
+        With ``reenable`` the wheels are expected to be torqued off (their
+        CAN timeout tripped after the command source went away) and are
+        brought back for the hold: the mode is switched to IMPEDANCE *first*
+        — a mode switch zeroes the motor's command state, and MIT with zero
+        gains is torque-free — and only then re-enabled, so no velocity target
+        can be replayed by the enable. The hold frames that follow are the
+        only thing the wheels then act on.
         """
         velocities = await asyncio.gather(*[m.get_velocity() for m in self._motors])
         if any(abs(v) > _PARK_MAX_WHEEL_SPEED for v in velocities):
@@ -738,7 +907,19 @@ class Cart:
         await asyncio.gather(
             *[m.set_control_mode(ControlMode.IMPEDANCE) for m in self._motors]
         )
+        if reenable:
+            await _gather_all_or_raise(*[m.enable() for m in self._motors])
         return list(positions)
+
+    async def _send_hold(self, hold_pos: list[float]) -> None:
+        """Send one cycle of the MIT park hold to every wheel."""
+        cfg = self._config
+        await asyncio.gather(
+            *[
+                m.set_impedance(p, 0.0, cfg.hold_kp, cfg.hold_kd, 0.0)
+                for m, p in zip(self._motors, hold_pos)
+            ]
+        )
 
     async def _unpark(self) -> None:
         """Return parked wheels to VELOCITY mode (clears the motors' command state)."""
@@ -746,18 +927,111 @@ class Cart:
             *[m.set_control_mode(ControlMode.VELOCITY) for m in self._motors]
         )
 
+    async def _stop_wheels_once(self) -> None:
+        """Send the single zero-velocity command that precedes CAN silence.
+
+        Failures are logged, not retried: the point of what follows is that
+        the wheels stop on their own without another frame from us.
+        """
+        if not self._motors:
+            return
+        try:
+            await asyncio.gather(*[m.set_velocity(0.0) for m in self._motors])
+            self.send_failed = False
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the motor timeout covers a lost stop
+            self.send_failed = True
+            _logger.warning(
+                "cart: stop command on source loss failed to send — relying on "
+                "the wheels' %.0f ms loss-of-comms alarm",
+                self._config.can_timeout_ms,
+            )
+
+    async def _recover_wheels(self) -> tuple[bool, bool]:
+        """Clear and re-enable wheels the CAN timeout (or a torque-off) left
+        faulted, so a returning command source can drive again.
+
+        Asks each wheel for its status and re-runs the enable sequence (see
+        :meth:`_enable_for_velocity`) on those reporting ``LOST_COMM`` or
+        ``DISABLED``, then reads the status back so the cached feedback
+        reflects the re-enabled state. Other faults are reported in
+        :attr:`wheel_faults` and left alone — an over-current or thermal trip
+        is not ours to clear blindly.
+
+        Returns ``(healthy, touched)``: whether every wheel is now enabled
+        and fault-free, and whether any wheel was actually re-enabled (the
+        caller only restarts its slew ramp / park state in that case).
+        """
+        faults: dict[str, MotorStatus]
+        touched = False
+        try:
+            statuses = await asyncio.gather(*[m.get_error_code() for m in self._motors])
+            tripped = [
+                (w, m)
+                for w, m, status in zip(WHEELS, self._motors, statuses)
+                if status in _RECOVERABLE_WHEEL_STATUSES
+            ]
+            if tripped:
+                _logger.info(
+                    "cart: re-enabling wheels after loss-of-comms trip: %s",
+                    ", ".join(w.name for w, _ in tripped),
+                )
+                touched = True
+                await self._enable_for_velocity([m for _, m in tripped])
+                statuses = await asyncio.gather(
+                    *[m.get_error_code() for m in self._motors]
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - dead bus / unpowered wheels
+            faults = {w.name: MotorStatus.UNKNOWN for w in WHEELS}
+            if faults != self.wheel_faults:
+                _logger.warning(
+                    "cart: wheels not answering or refusing to re-enable (%s) — "
+                    "the base stays torqued off until they do",
+                    exc,
+                )
+            self.wheel_faults = faults
+            return False, touched
+
+        faults = {
+            w.name: status
+            for w, status in zip(WHEELS, statuses)
+            if status is not MotorStatus.OK
+        }
+        if faults and faults != self.wheel_faults:
+            _logger.warning(
+                "cart: wheel fault(s) the cart will not clear on its own: %s",
+                ", ".join(f"{name}={status.value}" for name, status in faults.items()),
+            )
+        self.wheel_faults = faults
+        return not faults, touched
+
     async def _command_loop(self) -> None:
         """Apply slew limiting, mixing, park/unpark, and lift edges at the
-        configured rate.
+        configured rate — while, and only while, the command source is live.
 
         While driving the wheels track the slew-limited command in VELOCITY
         mode. Once the command has ramped to zero (and the wheels are measured
         slow) they are parked: held at their current positions by the motor's
-        internal MIT position loop with ``hold_kp``/``hold_kd``. The hold
-        command is re-sent every cycle to keep the lost-comm watchdog fed.
-        Holding in the motor's own loop (rather than an outer software loop
-        over CAN) is what makes the wheel rigid instead of giving first and
-        correcting after.
+        internal MIT position loop with ``hold_kp``/``hold_kd``. Holding in
+        the motor's own loop (rather than an outer software loop over CAN) is
+        what makes the wheel rigid instead of giving first and correcting
+        after. Every cycle sends one frame per wheel (velocity or hold), which
+        is also what feeds the wheels' loss-of-comms alarm.
+
+        The live-source requirement applies to *motion*. When the latched
+        command goes stale while driving (VELOCITY mode) the loop stops the
+        wheels once, suspends the lift, and then sends nothing: the wheels'
+        CAN timeout trips and torques them off. Once that has certainly
+        happened and the wheels have stopped rolling they are re-enabled
+        straight into the park hold (IMPEDANCE mode set before enable, so
+        nothing but the hold can act). A stationary hold is not a runaway
+        risk, so a parked cart keeps its hold whether or not a source is
+        attached — the hold frames are the one thing streamed without a live
+        source, and they carry no velocity. When a fresh command arrives the
+        loop re-enables any wheel still tripped and ramps up from rest.
         """
         cfg = self._config
         interval = 1.0 / cfg.frequency
@@ -769,15 +1043,138 @@ class Cart:
         yaw_log = _YawLog() if cfg.yaw_log else None
         warned_silent = False
         t_loop0 = time.monotonic()
+        linked = False  # the source was fresh on the previous cycle
+        next_recover = 0.0  # earliest time for the next wheel re-enable attempt
+        wheels_ok = not self._motors  # every wheel enabled and healthy
+        # The trip is certain this long after the last velocity frame; then the
+        # wheels are torque-off and merely need to stop rolling before being
+        # anchored into the park hold.
+        trip_settle = cfg.can_timeout_ms / 1e3 + 2.0 * interval
+        # Unlinked and not holding: when the last velocity frame went out, and
+        # when to next try anchoring. Freshly enabled wheels have never been
+        # given a velocity, so with no source yet they are anchored on the very
+        # first cycle rather than left to trip first.
+        silent_since = t_loop0 - trip_settle
+        next_park = 0.0
 
         while True:
             t_iter = time.perf_counter()
+            now = time.monotonic()
+
+            fresh = now - self._target_time <= cfg.command_timeout
+            if not fresh:
+                if linked:
+                    # The source died (teleop thread gone, headset stream
+                    # dropped, wedged poller). The lift is released either way.
+                    # Driving wheels get one stop, then silence: from here the
+                    # CAN timeout is what stops them — never a re-sent stale
+                    # command. Parked wheels keep their hold: it is an anchor,
+                    # not a motion, and dropping it would only free the base.
+                    linked = False
+                    if self._lift is not None:
+                        self._lift.suspend()
+                    if hold_pos is None:
+                        _logger.info(
+                            "cart: command source silent for %.0f ms while "
+                            "driving — stopping and going quiet on CAN (wheels "
+                            "torque off after %.0f ms, then re-anchor)",
+                            cfg.command_timeout * 1e3,
+                            cfg.can_timeout_ms,
+                        )
+                        await self._stop_wheels_once()
+                        silent_since = now
+                        next_park = now + trip_settle
+                        wheels_ok = False  # the silence is about to trip them
+                        next_recover = 0.0
+                    else:
+                        _logger.info(
+                            "cart: command source silent for %.0f ms while "
+                            "parked — keeping the park hold",
+                            cfg.command_timeout * 1e3,
+                        )
+                cmd = [0.0, 0.0, 0.0]
+                yaw_err = 0.0
+                self.linked = False
+                self.body_cmd = (0.0, 0.0, 0.0)
+                self.wheel_speeds = [0.0] * len(WHEELS)
+                self.yaw_correction = 0.0
+                self.lift_dir = STOP
+
+                if self._motors:
+                    try:
+                        if hold_pos is not None and any(
+                            m.last_status in _RECOVERABLE_WHEEL_STATUSES
+                            for m in self._motors
+                        ):
+                            # The hold lapsed anyway (a stall of this loop past
+                            # the CAN timeout): the wheels are torque-off, so
+                            # treat them like a tripped drive and re-anchor.
+                            _logger.warning(
+                                "cart: park hold lapsed (wheel loss-of-comms) — "
+                                "re-anchoring"
+                            )
+                            hold_pos = None
+                            wheels_ok = False
+                            silent_since = now
+                            next_park = now + trip_settle
+                        if hold_pos is not None:
+                            await self._send_hold(hold_pos)
+                            self.send_failed = False
+                        elif (
+                            cfg.hold_kp > 0.0
+                            and not self.park_failed
+                            and now >= next_park
+                            and now - silent_since >= trip_settle
+                        ):
+                            next_park = now + _PARK_RETRY_S
+                            hold_pos = await self._park(reenable=True)
+                            if hold_pos is not None:
+                                wheels_ok = True
+                                self.wheel_faults = {}
+                                await self._send_hold(hold_pos)
+                                self.send_failed = False
+                                _logger.info(
+                                    "cart: wheels re-enabled into the park hold "
+                                    "(no command source)"
+                                )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 - retried next window
+                        self.send_failed = True
+                        next_park = now + _PARK_RETRY_S
+                self.parked = hold_pos is not None
+                await asyncio.sleep(interval)
+                continue
+
+            if not linked:
+                linked = True
+                self.linked = True
+                _logger.info("cart: command source live — resuming control")
 
             vx, vy, wz, lift_dir = self._target
-            # A dead command source (teleop thread gone, headset stream
-            # dropped) must not leave the base driving: decay to a stop.
-            if time.monotonic() - self._target_time > cfg.command_timeout:
-                vx, vy, wz, lift_dir = 0.0, 0.0, 0.0, STOP
+
+            # A wheel the CAN timeout tripped (a source outage, or a stall of
+            # this very loop) reports LOST_COMM on the feedback it echoes for
+            # each command; re-enable it before commanding it, and ramp from
+            # rest since it has stopped.
+            if self._motors:
+                if wheels_ok and any(
+                    m.last_status in _RECOVERABLE_WHEEL_STATUSES for m in self._motors
+                ):
+                    wheels_ok = False
+                    next_recover = 0.0
+                    _logger.warning(
+                        "cart: a wheel dropped out of enable mid-stream "
+                        "(loss-of-comms or torque-off) — re-enabling"
+                    )
+                if not wheels_ok and now >= next_recover:
+                    next_recover = now + _WHEEL_RECOVER_MIN_S
+                    wheels_ok, reenabled = await self._recover_wheels()
+                    if reenabled:
+                        # Those wheels stopped and are back in VELOCITY mode:
+                        # ramp from rest and let the park re-anchor them all.
+                        cmd = [0.0, 0.0, 0.0]
+                        hold_pos = None
 
             # Slew the (vx, vy, wz) command as a single vector: cap the step's
             # magnitude but keep its direction. Ramping each axis at its own
@@ -887,14 +1284,7 @@ class Cart:
                         if hold_pos is None:
                             hold_pos = await self._park()
                         if hold_pos is not None:
-                            await asyncio.gather(
-                                *[
-                                    m.set_impedance(
-                                        p, 0.0, cfg.hold_kp, cfg.hold_kd, 0.0
-                                    )
-                                    for m, p in zip(self._motors, hold_pos)
-                                ]
-                            )
+                            await self._send_hold(hold_pos)
                     if hold_pos is None:
                         await asyncio.gather(
                             *[m.set_velocity(s) for m, s in zip(self._motors, speeds)]

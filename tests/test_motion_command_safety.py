@@ -937,6 +937,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         disable_error = RuntimeError("front-left torque-off timed out")
         motors = [
             SimpleNamespace(
+                clear_errors=AsyncMock(),
                 set_velocity=AsyncMock(),
                 disable=AsyncMock(
                     side_effect=[disable_error, None] if index == 0 else None
@@ -979,6 +980,9 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             motor = SimpleNamespace(
                 _p_max=400.0,
                 _write_register=AsyncMock(),
+                # TIMEOUT readback: 200 ms in 50 µs ticks.
+                _read_register=AsyncMock(return_value=4000),
+                clear_errors=AsyncMock(),
                 enable=AsyncMock(side_effect=setup_error if index == 1 else None),
                 set_control_mode=AsyncMock(),
                 set_velocity=AsyncMock(),
