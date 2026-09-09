@@ -867,16 +867,23 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             for session in manager.list()
         )
 
-    def _is_idle(*, ignore_cleanup_lockout: bool = False) -> bool:
-        """Safe to hand host ownership to the updater: no operation running.
+    def _is_idle() -> bool:
+        """Safe to restart or power off the host: no operation running.
 
         A connected robot is fine -- the hosted transaction stops the service
         and the candidate reconnects after verification; only an in-flight
-        operation must not be interrupted. ``ignore_cleanup_lockout`` is for
-        the callers that exist to *end* a hardware-cleanup lockout rather than
-        to start work behind it (see :func:`_host_power`).
+        operation must not be interrupted.
+
+        A hardware-cleanup lockout does not make the host busy either. The
+        lockout reserves the robot's CAN buses for as long as *this process*
+        lives, and ending the process (host restart, shutdown, self-update) is
+        one of the two documented ways out of it. Every caller here -- the
+        updater's ``idle`` flag that the panel's host tile gates on, the update
+        itself, and :func:`_host_power` -- restarts the process rather than
+        starting work behind the lockout, which ``runner.is_running()`` still
+        refuses.
         """
-        if runner.is_running(ignore_cleanup_lockout=ignore_cleanup_lockout):
+        if runner.is_running(ignore_cleanup_lockout=True):
             return False
         return not _diagnostic_session_active()
 
@@ -1200,13 +1207,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         escalates via ``sudo -n`` so a headless context fails fast instead of
         blocking on a password prompt.
 
-        A hardware-cleanup lockout does not refuse it: the lockout reserves the
-        robot's CAN buses until this process is gone, and restarting the host
-        is one of the two documented ways out of it (the other is
-        ``/api/op/clear-lockout``).
+        A hardware-cleanup lockout does not refuse it (see :func:`_is_idle`):
+        restarting the host is one of the two documented ways out of it (the
+        other is ``/api/op/clear-lockout``).
         """
         async with session_launch_reservation:
-            if not _is_idle(ignore_cleanup_lockout=True):
+            if not _is_idle():
                 return JSONResponse(
                     {"error": "an operation or session is running — stop it first"},
                     status_code=409,

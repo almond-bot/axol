@@ -338,17 +338,32 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
     async def _client(
         self, runner: OperationRunner, robot: _LockedOutLink
     ) -> httpx.AsyncClient:
-        updater = _Updater(lambda: True)
+        client, _updater = await self._client_and_updater(runner, robot)
+        return client
+
+    async def _client_and_updater(
+        self, runner: OperationRunner, robot: _LockedOutLink
+    ) -> tuple[httpx.AsyncClient, _Updater]:
+        """The API client plus the updater double built with the app's real
+        ``_is_idle``, which is what the panel's host tile gates on."""
+        updaters: list[_Updater] = []
+
+        def make_updater(is_idle: Any) -> _Updater:
+            updater = _Updater(is_idle)
+            updaters.append(updater)
+            return updater
+
         with (
             patch.object(app_module, "SessionManager", return_value=_Manager()),
             patch.object(app_module, "OperationRunner", return_value=runner),
             patch.object(app_module, "SettingsStore", return_value=_Settings()),
             patch.object(app_module, "RobotLink", return_value=robot),
-            patch.object(app_module, "SelfUpdater", return_value=updater),
+            patch.object(app_module, "SelfUpdater", side_effect=make_updater),
         ):
             app = app_module.create_app()
         transport = httpx.ASGITransport(app=app)
-        return httpx.AsyncClient(transport=transport, base_url="http://test")
+        (updater,) = updaters
+        return httpx.AsyncClient(transport=transport, base_url="http://test"), updater
 
     async def test_host_restart_is_offered_while_the_lockout_holds(self) -> None:
         robot = _LockedOutLink([_motor("SHOULDER_1", reachable=False, status=None)])
@@ -363,6 +378,20 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
                 response = await client.post("/api/host/restart")
 
         self.assertEqual(response.status_code, 200)
+
+    async def test_host_reads_idle_while_the_lockout_holds(self) -> None:
+        # The panel disables the Restart / Shutdown confirmation on
+        # ``update.idle``. The lockout reserves the robot, not the host, and
+        # ending the process is a documented way out of it, so the host must
+        # not read busy or the API exemption above is unreachable from the UI.
+        robot = _LockedOutLink([_motor("SHOULDER_1", reachable=False, status=None)])
+        runner = self._locked_out_runner(robot)
+
+        client, updater = await self._client_and_updater(runner, robot)
+        async with client:
+            self.assertTrue(updater._is_idle())
+        # The lockout still reserves the robot; only the host is free.
+        self.assertTrue(runner.is_running())
 
     async def test_clear_lockout_refuses_while_a_motor_still_answers(self) -> None:
         robot = _LockedOutLink(
