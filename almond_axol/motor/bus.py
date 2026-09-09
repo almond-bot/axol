@@ -123,8 +123,22 @@ def _tx_queue_full(exc: BaseException) -> bool:
 
     Whether that's transient host-side congestion or a dead bus is decided
     by how long it persists — see :data:`STALL_DETECT_S`.
+
+    Two forms reach us. A direct ``send`` failure carries ``ENOBUFS``. But
+    python-can's SocketCAN backend also retries a partial write for its send
+    timeout and then raises ``CanOperationError("Transmit buffer full")`` with
+    no errno attached (``socketcan.py``, 4.x), which is the form a dead bus
+    produces in practice. Missing it re-raises out of :meth:`CanBus._send`
+    instead of dropping the frame, so the command never times out upstream and
+    the bus never gets to declare the stall.
     """
-    return _error_code(exc) == errno.ENOBUFS
+    if _error_code(exc) == errno.ENOBUFS:
+        return True
+    # The message is the only signal python-can gives in the second form.
+    # tradeoff: matching text is fragile across python-can releases; the pinned
+    # dependency makes that visible at upgrade time, and the tests below pin
+    # both forms so a wording change fails loudly rather than silently.
+    return isinstance(exc, can.CanOperationError) and "buffer full" in str(exc).lower()
 
 
 def _iface_is_up(channel: str) -> bool:

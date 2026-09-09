@@ -7,6 +7,7 @@ must do when that happens while an operation owns the CAN buses.
 from __future__ import annotations
 
 import asyncio
+import errno
 import threading
 import time
 import unittest
@@ -14,9 +15,11 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import can
 import httpx
 
 from almond_axol.motor import CanBus, MotorError, MotorStatus
+from almond_axol.motor.bus import _tx_queue_full
 from almond_axol.robot.axol import Axol
 from almond_axol.robot.base import HardwareCleanupError
 from almond_axol.serve import app as app_module
@@ -119,6 +122,32 @@ class DisableClassificationTest(unittest.IsolatedAsyncioTestCase):
 
         # Both buses stay open: the failure has to remain retryable.
         self.assertFalse(any(bus.closed for bus in buses))
+
+
+class TxQueueFullClassificationTest(unittest.TestCase):
+    """Both shapes python-can gives a full TX queue must be recognised.
+
+    Missing either one re-raises out of ``CanBus._send`` instead of dropping
+    the frame, so the command never times out upstream as a ``MotorError`` and
+    the bus never accumulates the overflow that declares the stall — which
+    takes the watchdog and the unpowered classification down with it.
+    """
+
+    def test_errno_form_is_recognised(self) -> None:
+        exc = can.CanOperationError("send failed", error_code=errno.ENOBUFS)
+
+        self.assertTrue(_tx_queue_full(exc))
+
+    def test_message_only_form_is_recognised(self) -> None:
+        # python-can's SocketCAN backend raises exactly this, with no errno,
+        # after retrying a partial write for its send timeout.
+        exc = can.CanOperationError("Transmit buffer full")
+
+        self.assertTrue(_tx_queue_full(exc))
+
+    def test_unrelated_can_errors_are_left_alone(self) -> None:
+        self.assertFalse(_tx_queue_full(can.CanOperationError("Failed to transmit")))
+        self.assertFalse(_tx_queue_full(OSError(errno.ENODEV, "No such device")))
 
 
 class _LockedOutLink:
