@@ -560,7 +560,7 @@ class Cart:
                         for m in self._motors
                     ]
                 )
-                await _gather_all_or_raise(*[m.enable() for m in self._motors])
+                await self._enable_for_velocity(self._motors)
                 for w, m in zip(WHEELS, self._motors):
                     if abs(m._p_max - _SESSION_PMAX) > 1.0:
                         _logger.warning(
@@ -570,9 +570,6 @@ class Cart:
                             m._p_max,
                             _SESSION_PMAX,
                         )
-                await _gather_all_or_raise(
-                    *[m.set_control_mode(ControlMode.VELOCITY) for m in self._motors]
-                )
                 _logger.info(
                     "cart wheels enabled on %s (loss-of-comms alarm %.0f ms: the "
                     "wheels torque off on their own when the command stream stops)",
@@ -600,6 +597,25 @@ class Cart:
             )
 
         self._task = asyncio.create_task(self._command_loop(), name="cart-command")
+
+    @staticmethod
+    async def _enable_for_velocity(motors: list[MotorDriver]) -> None:
+        """Enable wheels into VELOCITY mode without replaying a stale target.
+
+        A Damiao keeps its last command target across a fault or a torque-off
+        and ``enable()`` alone can act on it; only a control-mode *switch*
+        zeroes the command state. So: switch to IMPEDANCE first (MIT with
+        zero gains is torque-free), enable, then switch to VELOCITY — a
+        second zeroing — so the first thing the wheel ever acts on is the
+        next frame the command loop sends.
+        """
+        await _gather_all_or_raise(
+            *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors]
+        )
+        await _gather_all_or_raise(*[m.enable() for m in motors])
+        await _gather_all_or_raise(
+            *[m.set_control_mode(ControlMode.VELOCITY) for m in motors]
+        )
 
     async def _arm_can_timeout(self) -> None:
         """Write the loss-of-comms alarm to every wheel and verify the readback.
@@ -932,19 +948,23 @@ class Cart:
                 self._config.can_timeout_ms,
             )
 
-    async def _recover_wheels(self) -> bool:
+    async def _recover_wheels(self) -> tuple[bool, bool]:
         """Clear and re-enable wheels the CAN timeout (or a torque-off) left
         faulted, so a returning command source can drive again.
 
-        Asks each wheel for its status and re-runs the enable sequence (clear
-        errors, enable, VELOCITY mode) on those reporting ``LOST_COMM`` or
+        Asks each wheel for its status and re-runs the enable sequence (see
+        :meth:`_enable_for_velocity`) on those reporting ``LOST_COMM`` or
         ``DISABLED``, then reads the status back so the cached feedback
         reflects the re-enabled state. Other faults are reported in
         :attr:`wheel_faults` and left alone — an over-current or thermal trip
-        is not ours to clear blindly. Returns True when every wheel is
-        enabled and healthy.
+        is not ours to clear blindly.
+
+        Returns ``(healthy, touched)``: whether every wheel is now enabled
+        and fault-free, and whether any wheel was actually re-enabled (the
+        caller only restarts its slew ramp / park state in that case).
         """
         faults: dict[str, MotorStatus]
+        touched = False
         try:
             statuses = await asyncio.gather(*[m.get_error_code() for m in self._motors])
             tripped = [
@@ -957,10 +977,8 @@ class Cart:
                     "cart: re-enabling wheels after loss-of-comms trip: %s",
                     ", ".join(w.name for w, _ in tripped),
                 )
-                await _gather_all_or_raise(*[m.enable() for _, m in tripped])
-                await _gather_all_or_raise(
-                    *[m.set_control_mode(ControlMode.VELOCITY) for _, m in tripped]
-                )
+                touched = True
+                await self._enable_for_velocity([m for _, m in tripped])
                 statuses = await asyncio.gather(
                     *[m.get_error_code() for m in self._motors]
                 )
@@ -975,7 +993,7 @@ class Cart:
                     exc,
                 )
             self.wheel_faults = faults
-            return False
+            return False, touched
 
         faults = {
             w.name: status
@@ -988,7 +1006,7 @@ class Cart:
                 ", ".join(f"{name}={status.value}" for name, status in faults.items()),
             )
         self.wheel_faults = faults
-        return not faults
+        return not faults, touched
 
     async def _command_loop(self) -> None:
         """Apply slew limiting, mixing, park/unpark, and lift edges at the
@@ -1151,9 +1169,12 @@ class Cart:
                     )
                 if not wheels_ok and now >= next_recover:
                     next_recover = now + _WHEEL_RECOVER_MIN_S
-                    wheels_ok = await self._recover_wheels()
-                    cmd = [0.0, 0.0, 0.0]
-                    hold_pos = None
+                    wheels_ok, reenabled = await self._recover_wheels()
+                    if reenabled:
+                        # Those wheels stopped and are back in VELOCITY mode:
+                        # ramp from rest and let the park re-anchor them all.
+                        cmd = [0.0, 0.0, 0.0]
+                        hold_pos = None
 
             # Slew the (vx, vy, wz) command as a single vector: cap the step's
             # magnitude but keep its direction. Ramping each axis at its own

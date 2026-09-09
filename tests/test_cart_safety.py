@@ -84,6 +84,12 @@ class CartCanTimeoutArmingTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn((_DM_REG_TIMEOUT, ticks), writes)
                 motor._read_register.assert_awaited_with(_DM_REG_TIMEOUT)
                 motor.enable.assert_awaited_once()
+                # A mode switch is what zeroes a Damiao's command state, so
+                # the enable is bracketed by one: no stale target replays.
+                self.assertEqual(
+                    [c.args[0] for c in motor.set_control_mode.await_args_list],
+                    [ControlMode.IMPEDANCE, ControlMode.VELOCITY],
+                )
         finally:
             await cart.disable()
 
@@ -341,7 +347,12 @@ class CartCommandLoopSilenceTest(unittest.IsolatedAsyncioTestCase):
 
             for motor in motors:
                 motor.enable.assert_awaited_once()
-                motor.set_control_mode.assert_awaited_with(ControlMode.VELOCITY)
+                # IMPEDANCE before the enable zeroes the stale velocity target
+                # the trip left behind; VELOCITY after zeroes it again.
+                self.assertEqual(
+                    [c.args[0] for c in motor.set_control_mode.await_args_list],
+                    [ControlMode.IMPEDANCE, ControlMode.VELOCITY],
+                )
                 # Recovery happens before the first velocity frame.
                 self.assertGreater(motor.set_velocity.await_count, 0)
             self.assertEqual(cart.wheel_faults, {})
@@ -362,6 +373,48 @@ class CartCommandLoopSilenceTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 cart.wheel_faults, {WHEELS[1].name: MotorStatus.OVER_CURRENT}
             )
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+    async def test_persistent_fault_does_not_reset_slew_or_drop_the_hold(
+        self,
+    ) -> None:
+        """A no-op recovery attempt (nothing re-enabled) must not disturb the
+        wheels that are fine: the park hold stays and the ramp is not restarted."""
+        motors = [_wheel() for _ in WHEELS]
+        motors[1].last_status = MotorStatus.OVER_CURRENT
+        cart = Cart(_fast_config(hold_kp=60.0, slew=0.5))
+        task = self._start(cart, motors)
+        try:
+            # Park under a live zero command, then sit through more than one
+            # recovery window (1 s) with the fault still latched.
+            t_end = time.monotonic() + cart_module._WHEEL_RECOVER_MIN_S + 0.3
+            while time.monotonic() < t_end:
+                cart.set_command(0.0, 0.0, 0.0)
+                await asyncio.sleep(0.002)
+            self.assertTrue(cart.parked)
+            for motor in motors:
+                # Parked exactly once; never un-parked by a failed recovery.
+                self.assertEqual(
+                    [c.args[0] for c in motor.set_control_mode.await_args_list],
+                    [ControlMode.IMPEDANCE],
+                )
+                motor.enable.assert_not_awaited()
+            self.assertGreater(motors[1].get_error_code.await_count, 1)  # retried
+
+            # Now drive: the ramp must climb monotonically across a recovery
+            # window rather than snapping back to rest every second.
+            t_end = time.monotonic() + cart_module._WHEEL_RECOVER_MIN_S + 0.3
+            while time.monotonic() < t_end:
+                cart.set_command(1.0, 0.0, 0.0)
+                await asyncio.sleep(0.002)
+            speeds = [
+                c.args[0] for c in motors[0].set_velocity.await_args_list if c.args[0]
+            ]
+            self.assertGreater(len(speeds), 10)
+            self.assertEqual(speeds, sorted(speeds))
         finally:
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
