@@ -1,4 +1,5 @@
 import {
+  Fragment,
   Suspense,
   useEffect,
   useMemo,
@@ -1488,20 +1489,23 @@ function ConfirmDisplay({ action }: { action: ConfirmAction | null }) {
   )
 }
 
+// One controller's button legend. The rows share a key column (so the
+// labels line up whatever the longest key is) and the label column wraps —
+// the card is narrow, and some keys ("Both stick clicks") are wide.
 function ControlHints({ title, rows }: { title: string; rows: [string, string][] }) {
   return (
     <div className="rounded-lg border border-white/10 bg-white/[0.02] p-3">
       <div className="mb-1.5 font-mono text-[0.65rem] tracking-widest text-white/40 uppercase">
         {title}
       </div>
-      <div className="flex flex-col gap-1">
+      <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2.5 gap-y-1">
         {rows.map(([key, label]) => (
-          <div key={key} className="flex items-center gap-2">
-            <kbd className="flex h-5 min-w-5 items-center justify-center rounded border border-white/15 bg-white/[0.06] px-1 font-mono text-[0.65rem] whitespace-nowrap text-white/70">
+          <Fragment key={key}>
+            <kbd className="flex h-5 min-w-5 items-center justify-center justify-self-start rounded border border-white/15 bg-white/[0.06] px-1.5 font-mono text-[0.65rem] whitespace-nowrap text-white/70">
               {key}
             </kbd>
-            <span className="text-white/60">{label}</span>
-          </div>
+            <span className="leading-snug text-white/60">{label}</span>
+          </Fragment>
         ))}
       </div>
     </div>
@@ -1784,7 +1788,7 @@ export default function App() {
             )}
 
             {status === AxolConnectionStatus.Open && (
-              <div className="grid grid-cols-2 gap-3 text-left text-xs">
+              <div className="flex flex-col gap-3 text-left text-xs">
                 <ControlHints
                   title="Left"
                   rows={
