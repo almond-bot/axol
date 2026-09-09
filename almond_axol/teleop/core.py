@@ -390,6 +390,17 @@ class VRTeleopCore:
             or self.reset_interp.is_active()
         )
 
+    @property
+    def at_rest(self) -> bool:
+        """True while the last completed move left the arms in the rest pose.
+
+        Cleared the moment tracking engages and set again when a reset
+        trajectory is adopted or played out, so it answers "would a
+        return-to-rest move the arms at all?" — the question a teardown park
+        asks before commanding anything.
+        """
+        return self._at_rest
+
     # ------------------------------------------------------------------
     # IK pipeline pause (out-of-band moves)
     # ------------------------------------------------------------------
@@ -412,6 +423,16 @@ class VRTeleopCore:
         iteration, planning from the (re-synced) current ``q``.
         """
         self._ik_paused = False
+
+    @property
+    def ik_paused(self) -> bool:
+        """True while the IK pipeline is frozen for an out-of-band move.
+
+        The pause brackets every limp gravity-comp hold, so this doubles as
+        "the arms are hand-guidable rather than position-controlled" — a
+        teardown park must not pull limp arms anywhere.
+        """
+        return self._ik_paused
 
     # ------------------------------------------------------------------
     # Engage toggle + IK target (IK thread)

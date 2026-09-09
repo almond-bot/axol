@@ -34,12 +34,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from lerobot.robots.config import RobotConfig
 
+from ..constants import PARK_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.rollout import (
     ActionPublisher,
     IKResetController,
     RolloutCaptureThread,
+    arms_reporting,
 )
 from ..recording import (
     EpisodeDurabilityError,
@@ -2282,6 +2284,9 @@ def _run(
     episode_workers: list[tuple[str, Any]] = []
     episode_workers_stopped = True
     session_error: BaseException | None = None
+    # Disabling raised arms drops them under gravity, so the cleanup below
+    # returns them to rest first — but only when they are somewhere else.
+    arms_at_rest = True
     try:
         if rerun_ip:
             init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
@@ -2324,16 +2329,29 @@ def _run(
         reset_controller.start()
         log_say("Started IK reset worker (collision-aware return-to-rest).")
 
-        def _return_to_rest_guarded() -> bool:
-            """Guarded return to rest; ``False`` when the operator aborted."""
+        def _return_to_rest_guarded(*, final: bool = False) -> bool:
+            """Guarded return to rest; ``False`` when the operator aborted.
+
+            ``final=True`` is the teardown park played on the way out. The
+            stop flag is already set by then, so a deadline bounds the move
+            instead — well inside the caller's stop grace — and there is no
+            operator left to answer a contact retry.
+            """
+            nonlocal arms_at_rest
             assert reset_controller is not None
-            return reset_controller.return_to_rest(
+            deadline = time.perf_counter() + PARK_TIMEOUT_S
+            arms_at_rest = reset_controller.return_to_rest(
                 robot,
                 torque_threshold=cfg.reset_torque_threshold,
                 gravity_comp_kd=cfg.reset_gravity_comp_kd,
-                stopped=stop_event.is_set,
-                wait_retry=control.await_contact_clear,
+                stopped=(
+                    (lambda: time.perf_counter() >= deadline)
+                    if final
+                    else stop_event.is_set
+                ),
+                wait_retry=None if final else control.await_contact_clear,
             )
+            return arms_at_rest
 
         _wait_for_port(server_host, server_port, timeout=30.0)
 
@@ -2477,6 +2495,8 @@ def _run(
                     ("observation", obs_thread),
                 ]
                 episode_workers_stopped = False
+                # The policy is about to drive the arms off the rest pose.
+                arms_at_rest = False
                 receiver_thread.start()
                 control_thread.start()
                 obs_thread.start()
@@ -2716,6 +2736,33 @@ def _run(
                 cleanup_failures = []
         else:
             cleanup_failures = []
+        # Park before the torque comes off: ``disconnect()`` disables the
+        # motors, and arms left raised drop under gravity.
+        #
+        # Skipped when the arms are already at rest, when a limp hold left
+        # them in the operator's hands, when the bus no longer reports a pose
+        # to plan from, or when a live episode worker may still be inside the
+        # robot. (``collect-data`` reads the same three states off its teleop
+        # core instead, because its rest moves are planned by the teleop IK
+        # worker rather than by this out-of-band reset controller.)
+        #
+        # Bounded by the deadline ``final=True`` installs, polled once per
+        # control cycle whose own robot call the driver caps at 1 s. Every
+        # failure is swallowed, so the disconnect below happens either way and
+        # a lost park costs only what was lost before it existed.
+        try:
+            if (
+                episode_workers_stopped
+                and not arms_at_rest
+                and reset_controller is not None
+                and not reset_controller.arms_limp
+                and arms_reporting(robot)
+            ):
+                log_say("Returning to rest before disabling the arms.")
+                _return_to_rest_guarded(final=True)
+        except BaseException:
+            _logger.exception("return to rest before disconnect failed")
+
         # ``disconnect()`` is null-safe and idempotent; always call it so a
         # ``connect()`` that bailed mid-enable doesn't leak the asyncio
         # event-loop thread or any already-opened CAN buses. The one exception

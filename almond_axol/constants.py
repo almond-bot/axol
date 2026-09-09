@@ -49,6 +49,16 @@ CAN_MANTIS_RIGHT = "can_mantis_r"
 
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 
+# Cap on the return-to-rest a flow plays while shutting down, before it torques
+# the arms off. The serve runner gives a stopping operation 6 s to exit
+# (``_STOP_GRACE_S``) and then reports it as still stopping, so the park has to
+# finish well inside that window with room left for the rest of the teardown.
+# The deadline is polled once per control cycle, and a cycle's own robot call
+# is capped at 1 s by the driver, so a park costs at most this plus a second.
+# A park that overruns is abandoned and the arms are torqued off where they are
+# — the pre-existing behaviour — so the cap can never make shutdown worse.
+PARK_TIMEOUT_S: float = 3.0
+
 
 URDF_PATH: Path = Path(__file__).resolve().parent / "kinematics" / "urdf" / "axol.urdf"
 

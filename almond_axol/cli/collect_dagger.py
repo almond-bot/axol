@@ -85,11 +85,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
+from ..constants import PARK_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS, ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.rollout import (
     IKResetController,
     PolicyActionLimiter,
+    arms_reporting,
     latest_observation,
 )
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
@@ -1266,21 +1268,38 @@ def _run(
     recorder: DatasetRecorderProcess | None = None
     control_thread: _DaggerControlLoop | None = None
     control_worker_stopped = True
+    # Disabling raised arms drops them under gravity, so the cleanup below
+    # returns them to rest first — but only when they are somewhere else.
+    arms_at_rest = True
 
-    def _return_to_rest_guarded(wait_retry: Callable[[], bool]) -> bool:
+    def _return_to_rest_guarded(
+        wait_retry: Callable[[], bool] | None, *, final: bool = False
+    ) -> bool:
         """Guarded ``IKResetController`` home; ``False`` when aborted.
 
         Plays with the torque watchdog live; on contact the arms drop into a
         limp gravity-comp hold until ``wait_retry`` answers (``True`` =
         replan from wherever they were hand-guided to) or the run stops.
+
+        ``final=True`` is the teardown park played on the way out. The stop
+        flag is already set by then, so a deadline bounds the move instead —
+        well inside the caller's stop grace — and there is no operator left
+        to answer a contact retry.
         """
-        return reset_controller.return_to_rest(
+        nonlocal arms_at_rest
+        deadline = time.perf_counter() + PARK_TIMEOUT_S
+        arms_at_rest = reset_controller.return_to_rest(
             robot,
             torque_threshold=reset_torque_threshold,
             gravity_comp_kd=reset_gravity_comp_kd,
-            stopped=stop_event.is_set,
+            stopped=(
+                (lambda: time.perf_counter() >= deadline)
+                if final
+                else stop_event.is_set
+            ),
             wait_retry=wait_retry,
         )
+        return arms_at_rest
 
     def _gate_retry() -> bool:
         """Contact-hold retry via the continue gate (terminal Enter / panel)."""
@@ -1477,6 +1496,8 @@ def _run(
             # start(), so a partial thread-start failure also reaches the
             # final liveness gate.
             control_worker_stopped = False
+            # The policy is about to drive the arms off the rest pose.
+            arms_at_rest = False
             control_thread.start()
             control.begin_episode(_switch_subtask, len(subtasks))
 
@@ -1571,7 +1592,8 @@ def _run(
             # An aborted home (stop / declined retry) must not discard a
             # fully-recorded episode: fall through to the save/discard
             # decision either way; the session loop then winds down on the
-            # stop flag.
+            # stop flag. The outcome still reaches the teardown park, which
+            # reads the ``arms_at_rest`` the call updates.
             _return_to_rest_guarded(_gate_retry)
 
             if choice == "r":
@@ -1656,6 +1678,32 @@ def _run(
             return error
 
         _cleanup("policy", policy.close)
+        # Park before the torque comes off: ``disconnect()`` disables the
+        # motors, and arms left raised drop under gravity.
+        #
+        # Skipped when the arms are already at rest, when a limp hold left
+        # them in the operator's hands, when the bus no longer reports a pose
+        # to plan from, or when a live control worker may still be inside the
+        # robot. (``collect-data`` reads the same three states off its teleop
+        # core instead, because its rest moves are planned by the teleop IK
+        # worker rather than by this out-of-band reset controller.)
+        #
+        # Bounded by the deadline ``final=True`` installs, polled once per
+        # control cycle whose own robot call the driver caps at 1 s. Every
+        # failure is swallowed, so the disconnect below happens either way and
+        # a lost park costs only what was lost before it existed.
+        try:
+            if (
+                control_worker_stopped
+                and not arms_at_rest
+                and reset_controller is not None
+                and not reset_controller.arms_limp
+                and arms_reporting(robot)
+            ):
+                log_say("Returning to rest before disabling the arms.")
+                _return_to_rest_guarded(None, final=True)
+        except BaseException:
+            _logger.exception("return to rest before disconnect failed")
         disconnect_failure = _cleanup("robot disconnect", robot.disconnect)
         teleop_failure = _cleanup("teleop disconnect", teleop.disconnect)
         reset_failure = _cleanup(
