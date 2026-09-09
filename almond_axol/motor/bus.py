@@ -216,6 +216,12 @@ class CanBus:
             channel: SocketCAN interface name, e.g. ``"can_alm_axol_l"``.
         """
         self._channel = channel
+        # A fresh bus has observed no stall. Without this reset a bus that was
+        # abandoned open on a dead event loop (a failed teardown that kept the
+        # lockout's buses) leaves its channel flagged for the rest of the
+        # process, and every later stall on the channel is invisible to
+        # ``stalled_channels`` readers because the set add is idempotent.
+        _set_stalled(channel, False)
         self._bus: can.BusABC | None = can.Bus(channel=channel, bustype="socketcan")
         self._listeners: list[Callable[[can.Message], None]] = []
         self._reader_task: asyncio.Task | None = None

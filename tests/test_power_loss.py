@@ -19,7 +19,11 @@ import can
 import httpx
 
 from almond_axol.motor import CanBus, MotorError, MotorStatus
-from almond_axol.motor.bus import _flush_lock_for_running_loop, _tx_queue_full
+from almond_axol.motor.bus import (
+    _flush_lock_for_running_loop,
+    _tx_queue_full,
+    stalled_channels,
+)
 from almond_axol.robot.axol import Axol
 from almond_axol.robot.base import HardwareCleanupError
 from almond_axol.serve import app as app_module
@@ -143,6 +147,28 @@ class DisableClassificationTest(unittest.IsolatedAsyncioTestCase):
             await axol.disable()
 
         self.assertFalse(any(bus.closed for bus in buses))
+
+
+class FreshBusStallFlagTest(unittest.TestCase):
+    def test_opening_a_bus_clears_a_stale_stall_on_its_channel(self) -> None:
+        # A bus abandoned open on a dead loop (a failed teardown that kept its
+        # buses) never clears its stall. The next bus on that channel is the
+        # one whose state matters, and it has seen no stall yet.
+        stale = object.__new__(CanBus)
+        stale._channel = "can-stale-test"
+        stale._stalled = False
+        stale._lost = False
+        stale._wake = asyncio.Event()
+        stale._mark_stalled(OSError("ENOBUFS"))
+        self.addCleanup(lambda: asyncio.run(_discard_stall(stale)))
+        self.assertIn("can-stale-test", stalled_channels())
+
+        with patch("almond_axol.motor.bus.can.Bus"):
+            fresh = CanBus("can-stale-test")
+
+        self.assertNotIn("can-stale-test", stalled_channels())
+        self.assertFalse(fresh.stalled)
+        self.assertEqual(fresh.channel, "can-stale-test")
 
 
 class TxQueueFullClassificationTest(unittest.TestCase):
