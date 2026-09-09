@@ -104,14 +104,22 @@ async def _await_all_hardware_actions(*actions: Awaitable[object]) -> None:
             raise result
 
 
-async def _arm_is_unpowered(arm: "AxolArm") -> bool:
-    """True when no motor on *arm* answers a status read.
+async def _arm_is_unpowered(arm: "AxolArm", bus: CanBus) -> bool:
+    """True when *arm*'s bus is stalled and no motor on it answers a status read.
 
-    Distinguishes the two ways a torque-off can fail to confirm: motor power
-    was removed (the e-stop, so every read times out and the torque is gone
+    Distinguishes the ways a torque-off can fail to confirm: motor power was
+    removed (the e-stop, so every read times out and the torque is gone
     already), or a powered motor is refusing to disable (which no read can
     excuse, and which must keep the caller's cleanup uncertain).
+
+    Both signals are required. Timeouts alone are not proof: a lost CAN
+    interface (the hub dropping off USB) makes every read time out in exactly
+    the same way while the motors stay powered and holding torque. Only the
+    bus can tell the two apart — it declares a stall when nothing on the wire
+    ACKs its frames, which needs every node to be dark.
     """
+    if not bus.stalled:
+        return False
     results = await asyncio.gather(
         *(motor.get_error_code() for motor in arm.motors.values()),
         return_exceptions=True,
@@ -1881,19 +1889,19 @@ class Axol(RobotBase):
             # failed enable() whose rollback did not confirm
             # (_startup_rollback_pending): every motor on each arm is
             # commanded, so a verified pass here settles them too.
-            arms = [
-                (side, arm)
-                for side, arm in (("left", self.left), ("right", self.right))
-                if arm is not None
-            ]
+            arms: list[tuple[str, AxolArm, CanBus]] = []
+            if self.left is not None:
+                arms.append(("left", self.left, self._left_bus))
+            if self.right is not None:
+                arms.append(("right", self.right, self._right_bus))
             results = await asyncio.gather(
-                *(arm.disable() for _, arm in arms), return_exceptions=True
+                *(arm.disable() for _, arm, _ in arms), return_exceptions=True
             )
             motor_failures = []
-            for (side, arm), result in zip(arms, results):
+            for (side, arm, bus), result in zip(arms, results):
                 if not isinstance(result, BaseException):
                     continue
-                if await _arm_is_unpowered(arm):
+                if await _arm_is_unpowered(arm, bus):
                     _logger.warning(
                         "%s arm did not confirm torque-off and no motor answers "
                         "on its bus — the arm is unpowered (e-stop?), so its "

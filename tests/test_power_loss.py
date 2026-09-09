@@ -38,11 +38,17 @@ from .test_serve_session_reservation import _Manager, _Settings, _Updater
 
 
 class _FakeBus:
-    """Stands in for the SocketCAN transport: no socket, just open/closed."""
+    """Stands in for the SocketCAN transport: no socket, just open/closed.
+
+    ``stalled`` mirrors :attr:`CanBus.stalled`: the bus has seen its TX queue
+    stop draining because no node ACKs (motor power gone). A bus whose
+    interface merely dropped off USB times out the same way without it.
+    """
 
     def __init__(self, channel: str) -> None:
         self.channel = channel
         self.closed = False
+        self.stalled = False
 
     async def start(self) -> None:
         pass
@@ -105,6 +111,8 @@ def _axol_with_drivers(driver_for: Any) -> tuple[Axol, list[_FakeBus]]:
 class DisableClassificationTest(unittest.IsolatedAsyncioTestCase):
     async def test_unpowered_arms_leave_no_cleanup_uncertainty(self) -> None:
         axol, buses = _axol_with_drivers(lambda _channel: _FakeDriver(powered=False))
+        for bus in buses:
+            bus.stalled = True
 
         await axol.disable()
 
@@ -116,11 +124,24 @@ class DisableClassificationTest(unittest.IsolatedAsyncioTestCase):
             "can-right": lambda: _FakeDriver(accepts_disable=False),
         }
         axol, buses = _axol_with_drivers(lambda channel: drivers[channel]())
+        for bus in buses:
+            bus.stalled = True
 
         with self.assertRaises(MotorError):
             await axol.disable()
 
         # Both buses stay open: the failure has to remain retryable.
+        self.assertFalse(any(bus.closed for bus in buses))
+
+    async def test_silent_motors_on_an_unstalled_bus_still_raise(self) -> None:
+        # Every read times out but the bus never declared a stall: that is the
+        # CAN interface dropping off USB, not motor power going away. The
+        # motors may still be holding torque, so this must stay uncertain.
+        axol, buses = _axol_with_drivers(lambda _channel: _FakeDriver(powered=False))
+
+        with self.assertRaises(MotorError):
+            await axol.disable()
+
         self.assertFalse(any(bus.closed for bus in buses))
 
 

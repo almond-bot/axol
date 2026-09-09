@@ -176,8 +176,8 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         robot.right = right
         robot._shutdown_pending = False
         robot._motors_disabled = True
-        robot._left_bus = SimpleNamespace(close=AsyncMock())
-        robot._right_bus = SimpleNamespace(close=AsyncMock())
+        robot._left_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
+        robot._right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
 
         with self.assertRaisesRegex(RuntimeError, "right arm enable failed") as raised:
             await robot.enable()
@@ -229,8 +229,8 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         robot = object.__new__(Axol)
         robot.left = left
         robot.right = right
-        robot._left_bus = SimpleNamespace(close=AsyncMock())
-        robot._right_bus = SimpleNamespace(close=AsyncMock())
+        robot._left_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
+        robot._right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
         robot._shutdown_pending = True
         robot._motors_disabled = False
         robot._startup_rollback_pending = [("left.wrist_2", cold_motor)]
@@ -287,8 +287,8 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         robot.connect = AsyncMock()
         robot.left = left
         robot.right = right
-        robot._left_bus = SimpleNamespace(close=AsyncMock())
-        robot._right_bus = SimpleNamespace(close=AsyncMock())
+        robot._left_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
+        robot._right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
         robot._shutdown_pending = False
         robot._motors_disabled = False
         robot._startup_rollback_pending = None
@@ -339,8 +339,8 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         robot.connect = AsyncMock()
         robot.left = left
         robot.right = right
-        robot._left_bus = SimpleNamespace(close=AsyncMock())
-        robot._right_bus = SimpleNamespace(close=AsyncMock())
+        robot._left_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
+        robot._right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
         robot._shutdown_pending = False
         robot._motors_disabled = False
         robot._startup_rollback_pending = None
@@ -375,8 +375,8 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         robot = object.__new__(Axol)
         robot.left = left
         robot.right = right
-        robot._left_bus = SimpleNamespace(close=AsyncMock())
-        robot._right_bus = SimpleNamespace(close=AsyncMock())
+        robot._left_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
+        robot._right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
         robot._shutdown_pending = True
         robot._motors_disabled = False
         robot._startup_rollback_pending = [("left.wrist_2", cold_motor)]
@@ -470,8 +470,8 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         robot._shutdown_pending = False
         robot.left = SimpleNamespace(stop_telemetry=fail_stop)
         robot.right = SimpleNamespace(stop_telemetry=blocked_stop)
-        robot._left_bus = SimpleNamespace(close=AsyncMock())
-        robot._right_bus = SimpleNamespace(close=AsyncMock())
+        robot._left_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
+        robot._right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
 
         task = asyncio.create_task(robot.disconnect())
         await sibling_started.wait()
@@ -944,8 +944,8 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             )
             for index in range(4)
         ]
-        bus = SimpleNamespace(close=AsyncMock())
-        lift = SimpleNamespace(close=AsyncMock())
+        bus = SimpleNamespace(close=AsyncMock(), stalled=False)
+        lift = SimpleNamespace(close=AsyncMock(), stalled=False)
         cart = Cart(CartConfig(lift=False))
         cart._motors = motors
         cart._bus = bus
@@ -1035,8 +1035,10 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             disable=AsyncMock(side_effect=[disable_error, None]),
         )
         right = SimpleNamespace(stop_telemetry=AsyncMock(), disable=AsyncMock())
-        left_bus = SimpleNamespace(close=AsyncMock())
-        right_bus = SimpleNamespace(close=AsyncMock())
+        # Unstalled buses: the failed disable is a live motor refusing, not a
+        # power cut, so disable() must not excuse it as unpowered.
+        left_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
+        right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
         robot = object.__new__(Axol)
         robot.left = left
         robot.right = right
@@ -1068,7 +1070,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         left = SimpleNamespace(stop_telemetry=AsyncMock(), disable=AsyncMock())
         right = SimpleNamespace(stop_telemetry=AsyncMock(), disable=AsyncMock())
         left_bus = SimpleNamespace(close=AsyncMock(side_effect=[close_error, None]))
-        right_bus = SimpleNamespace(close=AsyncMock())
+        right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
         robot = object.__new__(Axol)
         robot.left = left
         robot.right = right
@@ -1145,8 +1147,8 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             disable=AsyncMock(),
         )
         right = SimpleNamespace(force_disable=AsyncMock(), disable=AsyncMock())
-        left_bus = SimpleNamespace(close=AsyncMock())
-        right_bus = SimpleNamespace(close=AsyncMock())
+        left_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
+        right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
         robot = object.__new__(Mantis)
         robot.left = left
         robot.right = right
@@ -1283,7 +1285,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         left_bus = SimpleNamespace(
             close=AsyncMock(side_effect=[close_error, None]),
         )
-        right_bus = SimpleNamespace(close=AsyncMock())
+        right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
         robot = object.__new__(Mantis)
         robot.left = left
         robot.right = right

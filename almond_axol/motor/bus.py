@@ -235,6 +235,22 @@ class CanBus:
         # STALL_DETECT_S means the queue isn't draining — bus dead (e-stop).
         self._enobufs_since: float | None = None
 
+    @property
+    def channel(self) -> str:
+        """SocketCAN interface name this bus is open on."""
+        return self._channel
+
+    @property
+    def stalled(self) -> bool:
+        """Whether *this* bus has declared a stall: nothing on the wire is ACKing.
+
+        Set only by ENOBUFS persisting past :data:`STALL_DETECT_S`, which needs
+        every node on the bus to be silent (the motors are unpowered). A lost
+        interface (USB drop) drops sends the same way but does not set this —
+        the motors may well still be powered and holding torque.
+        """
+        return self._stalled
+
     async def start(self) -> None:
         """Start the background frame-dispatch loop. Idempotent.
 
