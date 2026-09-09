@@ -889,6 +889,12 @@ class Cart:
         self.send_failed: bool = False
 
     @property
+    def decel_in_force(self) -> float:
+        """Braking rate the ramp would use right now (``decel`` eased by the
+        traction guard, if it is acting) — for stopping-distance estimates."""
+        return self._config.decel * max(self.traction_scale, _TRACTION_DECEL_FLOOR)
+
+    @property
     def config(self) -> CartConfig:
         """The configuration this cart was constructed with (read-only use)."""
         return self._config

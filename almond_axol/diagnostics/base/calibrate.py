@@ -673,7 +673,7 @@ async def run_stroke(
 
     odometer = Odometer(start_pose, plan.rotation)
     interval = 1.0 / _COMMAND_HZ
-    decel, jerk = cart.config.decel, cart.config.jerk
+    jerk = cart.config.jerk
     t0 = time.monotonic()
     rate = 0.0  # smoothed progress rate (m/s or rad/s)
     last_progress, last_time = 0.0, t0
@@ -691,9 +691,10 @@ async def run_stroke(
             last_progress, last_time = progress, now
         # Stop early by the distance the ramp-down will still cover, so the
         # stroke lands near its target instead of overshooting by the whole
-        # decel ramp (which at a brisk speed can be most of a metre).
+        # decel ramp (which at a brisk speed can be most of a metre). The
+        # braking rate is whatever the traction guard currently allows.
         cmd_norm = math.sqrt(sum(c * c for c in cart.body_cmd))
-        coast = 0.5 * rate * ramp_stop_time(cmd_norm, decel, jerk)
+        coast = 0.5 * rate * ramp_stop_time(cmd_norm, cart.decel_in_force, jerk)
         if progress + coast >= plan.target:
             break
         if now - t0 > timeout_s:
