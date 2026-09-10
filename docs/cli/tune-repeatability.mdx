@@ -14,7 +14,7 @@ Repeatability test for the **left arm**: moves rest → pose **A** once, then bo
 | `--dwell-b FLOAT` | Seconds to hold at pose B before returning to A (default: 3.0) |
 | `--rate FLOAT` | Control loop / waypoint rate in Hz — higher = finer steps and smoother playback at the same speed (default: 250) |
 | `--speed FLOAT` | Average joint speed in rad/s of the worst-case joint; peak is 1.5× this (default: ~0.31) |
-| `--stiffness FLOAT` | Arm stiffness scale 0–1 — lower softens the motors and reduces tracking jitter (default: 0.5) |
+| `--stiffness FLOAT` | Arm stiffness scale 0–1 — lower softens the motors and reduces tracking jitter (default: 1.0, the tuned production gains) |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 ```bash

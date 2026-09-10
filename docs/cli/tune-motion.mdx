@@ -1,0 +1,49 @@
+---
+title: "tune.motion"
+description: "Replay a committed reference motion through the production control path and score tracking accuracy and smoothness per joint."
+---
+
+Replays a [reference motion](/cli/motion-build) through the production Rust-core `motion_control` path — impedance gains, gravity/friction/inertia feedforward, and host-side damping all come from the same `AxolConfig` production uses — and scores **tracking accuracy** and **smoothness** per joint. Because the motion is identical from run to run and robot to robot, this is the deterministic A/B loop that ad-hoc teleop testing can't give you: override one gain with `--gain`, replay, and compare the numbers (and graphs, in the diagnostics dashboard).
+
+Every run persists a tuning-run artifact (full per-joint time series + metrics) under `~/.almond/diagnostics/tuning/` for charting and side-by-side comparison.
+
+The arm moves to the motion's start and back to rest on collision-aware planned trajectories; a contact watchdog aborts playback if a sustained torque residual says the arm is pushing on something that isn't in the plan.
+
+| Flag | Description |
+|---|---|
+| `--motion NAME` | Committed motion name (`axol motion.list`) or a path to a motion `.npz` (required) |
+| `--gain [SIDE.]JOINT.FIELD=VALUE` | Override one gain for this run, e.g. `left.elbow.kd=4.5` or `shoulder_3.kd_host=8` (no side = both arms). Fields: `kp`, `kd`, `kd_host`, `kd_host_hz`, `kd_host_q`, `j_eff`. Repeatable |
+| `--stiffness S` | Stiffness-slider position in `[0, 1]` for both arms (default: 1.0, the production default — the tuned gains, where gain overrides land exactly; lower only adds compliance) |
+| `--ik` | Drive the run through the IK solver: each waypoint's end-effector poses (FK of the reference, with elbow hints) are re-solved to joints exactly like teleop's pose→joints loop, and the arms execute the *solver's* output — still scored against the clean reference, so IK reconstruction error and tracking error show up together. Per-solve times and the solved-vs-reference deviation are stored on the run (`ik_solve_ms_*`, `ik_dev_*`) |
+| `--noise MODE` | Corrupt the motion before streaming it, at the noise source's real pipeline entry point: `network` (jitter/outliers/stalls), `ik` (solver churn/jumps), `combined`, or `none` (default). Deterministic per `--seed` |
+| `--filter` | Replay the (possibly corrupted) stream through the production teleop filter stack (pose low-pass → EMA → trapezoid) before streaming — the hardware version of [`tune.filter`](/cli/tune-filter): the arm physically shows what the stack removes and what it costs in lag. Off streams it raw |
+| `--seed N` | RNG seed for `--noise` — identical seed, identical corrupted stream (default: 0) |
+| `--label TEXT` | Free-form note stored on the run artifact |
+| `--torque-threshold NM` | Contact watchdog threshold (default: 8.0; 0 disables) |
+| `--no-save-run` | Don't persist the run artifact (dry run) |
+| `--no-gripper` | Run on the gripperless SKU |
+
+```bash
+axol tune.motion --motion reach-and-place                             # baseline run
+axol tune.motion --motion reach-and-place --gain left.elbow.kd=4.5    # A/B a gain
+axol tune.motion --motion reach-and-place --gain shoulder_3.kd_host=8 --label "s3 damp"
+axol tune.motion --motion reach-and-place --noise network             # raw noise, no filters
+axol tune.motion --motion reach-and-place --noise network --filter    # same noise, stack on
+axol tune.motion --motion reach-and-place --ik                        # IK solver in the loop
+```
+
+With `--noise`, `--filter`, and/or `--ik` the run is still scored against the *clean* reference, and the artifact stores the stream actually sent alongside it — the dashboard charts overlay commanded (clean), sent, and actual per joint, so the filters' cleanup (and their lag) — or the IK solver's reconstruction of the Cartesian path — is directly visible on hardware. `--ik` re-solves the whole chain (warm-started, like teleop) before playback starts, so a slow solve can't stretch the command pacing; solve-time stats land on the run artifact instead.
+
+## Reading the scorecard
+
+| Column | Meaning |
+|---|---|
+| `RMS °` | Tracking error vs the reference |
+| `lagfree °` | Error after removing the measured command→measurement delay — separates sluggishness from inaccuracy |
+| `lag ms` | That delay (cross-correlation of commanded vs measured velocity) |
+| `jitter °` | 3–15 Hz band RMS of the error — the vibration the operator feels |
+| `amp` | Measured / commanded mid-band motion: > 1 means the arm adds energy (rings), < 1 means it filters |
+| `trq HF` | Cycle-to-cycle torque chatter (Nm RMS) |
+| `buzz °` / `@Hz` | Sustained ≥ 20 Hz motion — what you *hear*. Median over 0.5 s windows of the high-band RMS, so a limit cycle that buzzes through the run stands out while one-off reversal transients wash out; `@Hz` is where the loud windows agree. Healthy joints sit near 0.005°; an audible limit cycle (e.g. wrist_2 near its firmware kd clamp, ~110 Hz) reads 2–5× that |
+
+Joints the motion never exercises (under 1° of commanded travel) show `-` in the tracking columns — a parked joint tracks meaninglessly well — but keep their row and are still scored for buzz and torque chatter, which is exactly where a hold-pose limit cycle shows up.

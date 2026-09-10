@@ -115,7 +115,7 @@ export function OperationPanel({
   // Per-run inputs: every required field plus the op's curated run-identity
   // fields (repo id, task, policy path, episode, …) — required ones first.
   // The device flag is never one of them, and Axol-only run modes (sim /
-  // cart-only) disappear while Mantis is selected.
+  // Jelly-only) disappear while Mantis is selected.
   const runFields = useMemo(
     () => (spec ? perRunFields(spec, meta, hardwareProfile) : []),
     [spec, meta, hardwareProfile]
@@ -208,9 +208,9 @@ export function OperationPanel({
     }
   }, [wantsDatasets, datasets])
 
-  // Sim and cart-only are Axol run modes: hidden and ignored on Mantis.
+  // Sim and Jelly-only are Axol run modes: hidden and ignored on Mantis.
   const isSim = !mantisMode && isSimRun(meta, effectiveSettings)
-  // Sim, cart-only, and Mantis runs do not touch the Axol arm motors. Mantis
+  // Sim, Jelly-only, and Mantis runs do not touch the Axol arm motors. Mantis
   // still needs its own live CAN link, however, so `robotFree` only controls
   // the Axol connection/fault gates below; it is not a general hardware-free
   // signal.
@@ -218,13 +218,13 @@ export function OperationPanel({
   const robotOk = robot?.state === "connected"
   const axolOk = robotOk && (robot?.profile ?? "axol") === "axol"
   const mantisOk = robotOk && robot?.profile === "mantis"
-  const cartOnly =
-    !mantisMode && meta.fields.includes("cart_only") && Boolean(effectiveSettings.cart_only)
+  const jellyOnly =
+    !mantisMode && meta.fields.includes("jelly_only") && Boolean(effectiveSettings.jelly_only)
   // `usesHeadset` also identifies operations that run the camera relay. The
   // relay is useful in the panel for every real teleop/collection run,
   // including headset-free Lighthouse/Ultimate Mantis collection. Mantis
   // teleop is grippers-only: no VR server or cameras run, so no feeds.
-  const showFeeds = meta.usesHeadset && !isSim && !cartOnly && !(mantisMode && meta.id === "teleop")
+  const showFeeds = meta.usesHeadset && !isSim && !jellyOnly && !(mantisMode && meta.id === "teleop")
   const camCount = recordingCameraCount(cameras, mantisMode)
   const currentTrackerReadinessState =
     trackerReadinessSource === mantisSource ? trackerReadinessState : "loading"
@@ -334,11 +334,11 @@ export function OperationPanel({
   }
   // Teleop's Axol run modes are mutually exclusive (the server refuses the
   // start too); catch the combination before the Start button instead of after.
-  const modeFlags = ["sim", "cart_only"].filter(
+  const modeFlags = ["sim", "jelly_only"].filter(
     (f) => runFields.some((field) => field.key === f) && Boolean(settings[f])
   )
   if (modeFlags.length > 1) {
-    blockers.push("Sim and Cart only are mutually exclusive — enable only one")
+    blockers.push("Sim and Jelly only are mutually exclusive — enable only one")
   }
 
   const editedCount = Object.keys(settings).length
@@ -463,7 +463,7 @@ export function OperationPanel({
                   status/controls, the mirrored headset popups, and the live
                   camera feeds — grouped so it can expand to a fullscreen
                   operator view (the headset-off replacement for the HUD). */}
-              {/* Sim has the browser viewer, cart-only has no video relay, and
+              {/* Sim has the browser viewer, Jelly-only has no video relay, and
                   Mantis teleop is grippers-only (no cameras). Mantis collection
                   still relays its configured wrist-camera feeds even when
                   Lighthouse/Ultimate make the headset unnecessary. */}
@@ -571,6 +571,16 @@ const PHASE_STYLES: Record<string, { label: string; cls: string; kind: "dot" | "
     limp: {
       label: "Limp",
       cls: "border-orange-400/60 bg-orange-400/15 text-orange-200",
+      kind: "pulse",
+    },
+    // The realtime core took the session limp on a loss-of-trust fault
+    // (persistently late control ticks, a silent motor): the arms are in
+    // gravity comp for good, nothing here restarts them — the operator
+    // hand-guides them to rest, then stops and starts the operation again.
+    // No episode buttons render in this phase; Stop is the only way out.
+    faulted: {
+      label: "Faulted",
+      cls: "border-red-500/60 bg-red-500/15 text-red-200",
       kind: "pulse",
     },
     saving: {

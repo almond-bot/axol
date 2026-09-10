@@ -113,6 +113,7 @@
                 "pages": [
                   "cli/serve",
                   "cli/provision",
+                  "cli/rt-install",
                   "cli/jetson-setup"
                 ]
               },
@@ -164,6 +165,8 @@
                 "pages": [
                   "cli/diag-rom-enable",
                   "cli/diag-rom-disable",
+                  "cli/diag-teleop-jitter",
+                  "cli/diag-offline",
                   "cli/diag-lift-cycle",
                   "cli/diag-zed-cable"
                 ]
@@ -173,6 +176,11 @@
                 "pages": [
                   "cli/tune-pid",
                   "cli/tune-friction",
+                  "cli/tune-gravity",
+                  "cli/tune-factory",
+                  "cli/tune-motion",
+                  "cli/tune-filter",
+                  "cli/motion-build",
                   "cli/tune-repeatability"
                 ]
               }

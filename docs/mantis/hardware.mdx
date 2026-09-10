@@ -22,6 +22,8 @@ A Mantis kit consists of:
 
 Mantis has no arms. The arm joints in a recording are virtual, filled in from the IK solution, while the gripper is real and read from motor feedback. The trigger is analog: fully released is `0.0` (open), fully squeezed is `1.0` (closed). It calibrates itself at power-on, so there is nothing to set up on the host.
 
+The grippers are driven by the same `axol-rt` realtime core as the robot's arms (see [Provision](/cli/provision)): for the duration of each take — and for a Mantis teleop run — the core owns the two gripper CAN interfaces and streams the POSITION_FORCE commands at 240 Hz, while Python only reads the triggers and trackers and hands it normalised targets. Between takes the grippers are torque-off and the core is stopped; the one-time open-stop calibration and the torque-off checks run from Python on the idle bus. The trigger reader's receive-only socket shares each interface with the core (the kernel duplicates frames to every open socket, and the core ignores the trigger node's ID).
+
 ### Tracker mounts
 
 The kit includes the mount for the pose source you purchased: Quest, Lighthouse (VIVE Tracker 3.0), or Ultimate. If you purchased Mantis without a tracker, print your own mount (see [below](#printing-your-own-mount)).

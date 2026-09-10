@@ -15,12 +15,21 @@ POSITION_FORCE mode from the trigger value and observed from motor feedback,
 exactly like on the robot. Datasets recorded through this class therefore have
 the same schema as robot-collected ones (state/action = 16 joint positions),
 with the arm-state channel equal to the commanded IK solution.
+
+On hardware this class is the *maintenance* half of the driver: bus
+ownership between takes, gripper bring-up and calibration, torque-off
+verification. The per-tick POSITION_FORCE command stream runs through the
+Rust realtime core — :class:`almond_axol.rt.RtMantis` wraps a ``Mantis``,
+arms ``axol-rt`` on the two gripper buses for the duration of a take, and
+installs a command sink on each :class:`MantisGripperArm` so
+``motion_control`` hands its gripper tuple to the core instead of the wire.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 
 import numpy as np
 
@@ -60,8 +69,17 @@ class MantisGripperArm:
     """
 
     def __init__(self, bus: CanBus, gripper_config: PositionForceConfig) -> None:
+        self._bus = bus
         self._motor = Motor(bus, Joint.GRIPPER)
         self._gripper_config = gripper_config
+        # Realtime-core mode (:class:`almond_axol.rt.RtMantis`): while the
+        # core is armed on this bus, ``_send_gripper_target`` hands the
+        # gripper's POSITION_FORCE tuple (motor-frame target, speed limit,
+        # torque limit) to this callable in the core's 8-slot command shape
+        # instead of putting it on the wire — the core owns the bus and
+        # paces the command/feedback cadence itself. ``None`` = classic
+        # Python bus path (bring-up, calibration, pre-open, torque-off).
+        self._command_sink: Callable[[list[tuple[float, ...]]], None] | None = None
         # Raw motor radians of the open / closed hard-stops, found on enable()
         # by the same torque-stop sweep the robot gripper uses.
         self._open_pos = 0.0
@@ -181,6 +199,25 @@ class MantisGripperArm:
         return self._calibrated
 
     @property
+    def channel(self) -> str:
+        """SocketCAN interface this gripper sits on."""
+        return self._bus.channel
+
+    @property
+    def motor(self) -> Motor:
+        """The real gripper motor (the realtime core fills its feedback cache)."""
+        return self._motor
+
+    @property
+    def gripper_config(self) -> PositionForceConfig:
+        return self._gripper_config
+
+    @property
+    def core_driven(self) -> bool:
+        """True while a realtime core owns this bus and streams the commands."""
+        return self._command_sink is not None
+
+    @property
     def positions(self) -> np.ndarray:
         """Latest positions, shape (8,) in Joint order (cached gripper feedback)."""
         out = np.empty(_N_ARM + 1, dtype=np.float32)
@@ -201,10 +238,16 @@ class MantisGripperArm:
         return out
 
     async def get_positions(self) -> np.ndarray:
-        """Actively read the gripper position; virtual arm joints as stored."""
+        """Actively read the gripper position; virtual arm joints as stored.
+
+        While Python telemetry polls the motor, or while the realtime core
+        owns the bus and streams feedback into the cache, this returns the
+        cached sample instead — Python must not put a read on a bus the
+        240 Hz core is pacing.
+        """
         out = np.empty(_N_ARM + 1, dtype=np.float32)
         out[:_N_ARM] = self._virtual_arm
-        if self._telemetry_active:
+        if self._telemetry_active or self._command_sink is not None:
             out[_N_ARM] = self._normalized_position()
         else:
             raw = await self._motor.get_position()
@@ -271,11 +314,17 @@ class MantisGripperArm:
             self._open_pos - self._closed_pos
         )
         raw = float(np.clip(raw, self._open_pos, self._closed_pos))
-        await self._motor.set_position_force(
-            raw,
-            self._gripper_config.max_speed,
-            self._gripper_config.torque_limit,
-        )
+        cmd = (raw, self._gripper_config.max_speed, self._gripper_config.torque_limit)
+        if self._command_sink is not None:
+            # Realtime-core mode: the core's target carries one 9-tuple per
+            # slot in Joint order. The seven arm slots are virtual here (the
+            # core has no arm motors configured and ignores them); slot 7 is
+            # the gripper's POSITION_FORCE command.
+            sink_cmds: list[tuple[float, ...]] = [(0.0,) * 9 for _ in range(_N_ARM)]
+            sink_cmds.append(cmd + (0.0,) * 6)
+            self._command_sink(sink_cmds)
+            return
+        await self._motor.set_position_force(*cmd)
 
 
 class Mantis(RobotBase):
@@ -335,6 +384,24 @@ class Mantis(RobotBase):
         if right_channel is not None:
             self._right_bus = CanBus(right_channel)
             self.right = MantisGripperArm(self._right_bus, config.right.gripper)
+
+    @property
+    def buses(self) -> list[CanBus]:
+        """The per-side gripper buses that are configured (left first)."""
+        return [b for b in (self._left_bus, self._right_bus) if b is not None]
+
+    @property
+    def arms(self) -> dict[str, MantisGripperArm]:
+        """Configured sides by name (``"left"`` / ``"right"``)."""
+        return {
+            side: arm
+            for side, arm in (("left", self.left), ("right", self.right))
+            if arm is not None
+        }
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
 
     # -- Lifecycle -------------------------------------------------------------
 

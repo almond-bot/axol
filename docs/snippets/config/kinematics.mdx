@@ -5,7 +5,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}pos_weight</F> | `50.0` | Weight on end-effector position error. |
 | <F>--{prefix}ori_weight</F> | `10.0` | Weight on end-effector orientation error. |
 | <F>--{prefix}elbow_weight</F> | `0` (off) | Weight on the headset's elbow-position hint. Off by default because the hint is unreliable on hardware. |
-| <F>--{prefix}rest_weight</F> | `7.5` | Damping toward the current pose. Higher is steadier, lower tracks faster. |
+| <F>--{prefix}rest_weight</F> | `15.0` | Damping toward the current pose. Higher is steadier, lower tracks faster. |
 | <F>--{prefix}posture_weight</F> | `5.0` | Pull toward the home posture, preventing slow drift. |
 | <F>--{prefix}manipulability_weight</F> | `0.05` | Keeps the arm away from singular poses. Forced `0` in Mantis mode. |
 | <F>--{prefix}limit_weight</F> | `75.0` | Penalty on joint-limit violations. |

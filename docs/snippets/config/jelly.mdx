@@ -16,7 +16,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}hold_kp</F> | `60.0` | Stiffness (Nm/rad) holding the wheels when parked. `0` leaves them idle. |
 | <F>--{prefix}hold_kd</F> | `1.5` | Damping (Nm·s/rad) of the parked hold. |
 | <F>--{prefix}frequency</F> | `50.0` | Wheel command rate (Hz). |
-| <F>--{prefix}command_timeout</F> | `0.2` | Seconds without a stick command before the cart stops. |
+| <F>--{prefix}command_timeout</F> | `0.2` | Seconds without a stick command before Jelly stops. |
 | <F>--{prefix}can_timeout_ms</F> | `200.0` | Motor-side loss-of-comms timeout (ms). Stops the wheels even if the host hangs. |
 | <F>--{prefix}lift</F> | `true` | The lift is present. |
 | <F>--{prefix}lift_channel</F> | `can_alm_axol_c` | CAN interface of the lift controller. |

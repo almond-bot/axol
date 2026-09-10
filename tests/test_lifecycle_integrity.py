@@ -237,7 +237,7 @@ class VRStartupIntegrityTest(unittest.IsolatedAsyncioTestCase):
         teleop._ik_stop = threading.Event()
         teleop._parent_conn = None
         teleop._ik_process = None
-        teleop._cart = None
+        teleop._jelly = None
         teleop._robot = SimpleNamespace(enable=AsyncMock(), disable=AsyncMock())
         return teleop
 
@@ -348,7 +348,7 @@ class LeRobotVRStartupIntegrityTest(unittest.TestCase):
         teleop._ik_process = None
         teleop._ik_thread = None
         teleop._ik_stop = threading.Event()
-        teleop._cart = None
+        teleop._jelly = None
         return teleop
 
     @staticmethod
@@ -559,6 +559,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
                     "width": 640,
                     "height": 480,
                     "fps": 60,
+                    "pts_perf_offset_s": 0.0,
                 }
                 for source in sources
             },
@@ -593,7 +594,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             patch.object(record_proc, "_open_dataset") as open_dataset,
             self.assertRaisesRegex(KeyboardInterrupt, "startup interrupted"),
         ):
-            record_proc._recorder_main(conn, object(), config)
+            record_proc._recorder_main(conn, Mock(), object(), config)
 
         first.close.assert_called_once_with()
         second.close.assert_called_once_with()
@@ -635,7 +636,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             patch.object(record_proc, "_finalize_dataset") as finalize,
             self.assertRaisesRegex(RuntimeError, "ready reply failed") as raised,
         ):
-            record_proc._recorder_main(conn, object(), config)
+            record_proc._recorder_main(conn, Mock(), object(), config)
 
         self.assertIs(raised.exception, startup_error)
         camera.close.assert_called_once_with()
@@ -776,7 +777,8 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             recorder = object.__new__(InProcessRecorder)
             recorder._thread = None
             recorder._stop = None
-            recorder._capture_error = {"v": None}
+            recorder._capture_error = None
+            recorder._row_times = []
             recorder._dataset = dataset
             recorder._config = {"smooth_ee_hz": 0.0}
             recorder._verifier = Mock()
@@ -867,11 +869,11 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
                 "cannot continue safely",
             ) as raised,
         ):
-            record_proc._recorder_main(conn, object(), config)
+            record_proc._recorder_main(conn, Mock(), object(), config)
 
         self.assertIs(raised.exception.__cause__, durability_error)
         self.assertEqual(conn.send.call_args_list[0], call(("ready", 7)))
-        self.assertEqual(conn.send.call_args_list[1][0][0][0], "fatal")
+        self.assertEqual(conn.send.call_args_list[1][0][0][0], "fatal_durability")
         self.assertFalse(
             any(args[0][0] == "saved" for args, _ in conn.send.call_args_list)
         )
@@ -882,9 +884,11 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
         recorder = object.__new__(DatasetRecorderProcess)
         recorder._lock = threading.Lock()
         recorder._conn = Mock()
+        recorder._error_conn = Mock()
+        recorder._error_conn.poll.return_value = False
         recorder._conn.poll.return_value = True
         recorder._conn.recv.return_value = (
-            "fatal",
+            "fatal_durability",
             "episode was written but could not be made crash-durable",
         )
         recorder._episode_count = 4
@@ -1000,6 +1004,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
         recorder._closed = False
         recorder._lock = threading.Lock()
         recorder._conn = Mock()
+        recorder._error_conn = Mock()
         recorder._snap = Mock()
         recorder._proc = Mock(exitcode=1)
         recorder._proc.is_alive.return_value = False
@@ -1017,6 +1022,8 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
         recorder = object.__new__(DatasetRecorderProcess)
         recorder._lock = threading.Lock()
         recorder._conn = Mock()
+        recorder._error_conn = Mock()
+        recorder._error_conn.poll.return_value = False
         recorder._conn.poll.return_value = True
         recorder._conn.recv.side_effect = [
             ("error", "old capture thread is still alive"),
@@ -1040,7 +1047,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
         verifier_error = RuntimeError("verifier close failed")
         recorder = object.__new__(InProcessRecorder)
         recorder._stop_capture = Mock()
-        recorder._dataset = object()
+        recorder._dataset = Mock()
         recorder._config = {}
         recorder._episodes_recorded = 2
         recorder._verifier = Mock()
@@ -1079,6 +1086,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
         recorder._closed = False
         recorder._lock = threading.Lock()
         recorder._conn = Mock()
+        recorder._error_conn = Mock()
         recorder._snap = Mock()
         recorder._snap.close.side_effect = [RuntimeError("shm close failed"), None]
         recorder._proc = Mock(exitcode=0)
@@ -1127,7 +1135,8 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             [call(timeout=0), call(timeout=5.0)],
         )
         child_conn.close.assert_called()
-        parent_conn.close.assert_called_once_with()
+        # ctx.Pipe returns the same pair for the command and error pipes.
+        self.assertEqual(parent_conn.close.call_count, 2)
         snap.close.assert_called_once_with()
 
     def test_constructor_pipe_failure_closes_snapshot_shared_memory(self) -> None:

@@ -24,8 +24,10 @@ Because the reinstall rebuilds the tool environment, anything that isn't a
 declared PyPI dependency is dropped and must be reinstalled before we restart
 onto the new code (pyzed, PyGObject), along with the patched zedxonesrc/zedsrc
 plugins. Rather than enumerate those steps here, this just shells out to ``axol
-provision`` -- the single provisioning path the hosted installer also runs, so
-the two can't drift. Every step there is idempotent and self-gating.
+provision --require-rt`` -- the single provisioning path the hosted installer
+also runs, so the two can't drift. Its optional hardware steps are idempotent
+and self-gating; the flag makes a required RT build or capability failure block
+the restart instead of remaining warning-only.
 
 The read-only ``git ls-remote --tags`` indicator is deliberately separate from
 the *destructive* reinstall: the reinstall rebuilds (and so prunes
@@ -33,11 +35,11 @@ pyzed/PyGObject from) the env on every run, so it only runs when the operator
 explicitly asks. The cheap ``ls-remote`` can poll freely without touching the
 steady-state install.
 
-``axol provision`` runs both after an upgrade *and* once at startup. The startup
-run matters for a host that upgraded *into* the GStreamer-pipeline build from an
+Provisioning runs both after an upgrade *and* once at startup. The startup run
+matters for a host that upgraded *into* the GStreamer-pipeline build from an
 older release: that upgrade was performed by the *old* code, which knew nothing
-about ``axol provision`` -- so the new code self-heals on its first control-panel
-contact after the restart.
+about this provisioning path -- so the new code self-heals on its first
+control-panel contact after the restart.
 
 Dev checkouts (``uv run axol serve`` from a clone) are untouched: the package
 metadata then points at a local directory, not an index or git install, and
@@ -466,7 +468,9 @@ class SelfUpdater:
             # The reinstall rebuilt the env, so reprovision before restarting
             # onto the new code (pyzed/PyGObject were pruned).
             self._phase = "provisioning"
-            await self._provision()
+            if not await self._provision(require_rt=True):
+                self._fail("required axol-rt provisioning failed; see service logs")
+                return
 
             # The install succeeded, so the target tag is what's on disk now.
             # Deliberately don't re-read the installed version through
@@ -499,35 +503,49 @@ class SelfUpdater:
         if self._provision_started or not self.enabled:
             return
         self._provision_started = True
-        asyncio.create_task(self._provision())
+        asyncio.create_task(self._provision_on_startup(), name="axol-startup-provision")
 
-    async def _provision(self) -> None:
-        """Run ``axol provision`` in the background (the single provisioning path).
+    async def _provision_on_startup(self) -> None:
+        """Run the strict startup heal and surface failure in update status."""
+        if await self._provision(require_rt=True):
+            return
+        # If an update began while the startup heal held the environment lock,
+        # its own strict provision pass will report the authoritative outcome.
+        if self._state != "updating":
+            self._fail("required axol-rt provisioning failed; see service logs")
+
+    async def _provision(self, *, require_rt: bool = False) -> bool:
+        """Provision system deps, optionally requiring a working ``axol-rt``.
 
         The upgrade reinstall rebuilds the tool env and drops everything that
         isn't a PyPI dependency (pyzed, PyGObject); ``axol provision`` reinstalls
         them and (re)builds the patched zedxonesrc/zedsrc plugins. It is the
-        exact command the hosted installer runs, so the two can't drift, and it
-        is idempotent + self-gating (a no-op without the ZED SDK / apt / NVENC).
-        Takes ``_env_lock`` so it can't overlap another provision or the
-        upgrade reinstall (both also rewrite the tool env).
+        exact command the hosted installer runs, so the two can't drift. Its
+        steps are warning-only and self-gating by default; ``require_rt`` adds
+        the CLI's ``--require-rt`` flag because, unlike an optional camera
+        stack, the control core must be current before an update can restart.
+        Return whether the command succeeded. Takes ``_env_lock`` so it can't
+        overlap another provision or the upgrade reinstall (both also rewrite
+        the tool env).
         """
         axol = shutil.which("axol")
         if axol is None:
             _logger.warning("self-update: axol not on PATH; cannot provision")
-            return
+            return False
+        command = [axol, "provision"]
+        if require_rt:
+            command.append("--require-rt")
         async with self._env_lock:
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    axol,
-                    "provision",
+                    *command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                 )
                 out, _ = await proc.communicate()
             except OSError as exc:
-                _logger.warning("self-update: could not run axol provision: %s", exc)
-                return
+                _logger.warning("self-update: could not run axol provisioning: %s", exc)
+                return False
         if proc.returncode != 0:
             tail = out.decode("utf-8", "replace").strip().splitlines()
             _logger.warning(
@@ -535,8 +553,10 @@ class SelfUpdater:
                 proc.returncode,
                 tail[-1] if tail else "no output",
             )
-        else:
-            _logger.info("self-update: provisioning complete")
+            return False
+        suffix = " (axol-rt verified)" if require_rt else ""
+        _logger.info("self-update: provisioning complete%s", suffix)
+        return True
 
     def _maybe_restart(self) -> None:
         if not self._is_idle():

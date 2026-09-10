@@ -3,7 +3,7 @@ Axol robot as a LeRobot Robot.
 
 AxolRobot wraps the async Axol hardware driver behind LeRobot's synchronous
 Robot interface. A background thread runs a dedicated asyncio event loop so
-Axol's CAN telemetry keeps streaming while get_observation() and send_action()
+Rust-core telemetry keeps streaming while get_observation() and send_action()
 block synchronously on the calling thread.
 
 Typical usage::
@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from ...kinematics.config import KinematicsConfig
     from ...kinematics.fk import AxolForwardKinematics
     from ...kinematics.solver import KinematicsSolver
+    from ...rt import RtAxol, RtMantis
 
 _logger = logging.getLogger(__name__)
 
@@ -98,6 +99,11 @@ _EE_AXES = ("x", "y", "z", "rx", "ry", "rz")
 _LEFT_EE_KEYS = [f"left_ee.{a}" for a in _EE_AXES]
 _RIGHT_EE_KEYS = [f"right_ee.{a}" for a in _EE_AXES]
 
+# Policy observations should normally select a state within half a 240 Hz
+# telemetry interval. Leave bounded scheduling headroom while rejecting a
+# broken clock/history instead of silently pairing a stale state.
+_POLICY_STATE_ALIGNMENT_LIMIT_S = 0.020
+
 
 class AxolRobot(Robot):
     """LeRobot Robot wrapping the Axol dual-arm hardware.
@@ -137,7 +143,7 @@ class AxolRobot(Robot):
         self._left_trq_keys = [f"left_{j.value}.trq" for j in joints]
         self._right_trq_keys = [f"right_{j.value}.trq" for j in joints]
         self._ik_config = ik_config
-        self._axol: Axol | None = None
+        self._axol: RtAxol | RtMantis | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._connect_future: Future[None] | None = None
@@ -164,8 +170,15 @@ class AxolRobot(Robot):
         # went through. Joint-action clients (teleop, collect-data, joint
         # policies) are untouched: their pipelines already shape commands
         # upstream, and double-filtering a tuned path buys nothing.
-        self._cart_shapers: tuple[TrapezoidalFilter, TrapezoidalFilter] | None = None
-        self._cart_last_send: float = 0.0
+        self._cartesian_shapers: tuple[TrapezoidalFilter, TrapezoidalFilter] | None = (
+            None
+        )
+        self._cartesian_last_send: float = 0.0
+        # Optional flight-recorder prefix configured by collect-data before
+        # connect(). RtAxol owns the 240 Hz measured + motor-facing traces;
+        # keeping this runtime-only avoids exposing a diagnostics plumbing
+        # detail as part of LeRobot's persistent robot configuration schema.
+        self._control_trace: str | None = None
 
     def _build_cameras(self) -> tuple[dict, list]:
         """Build the camera set, expanding any stereo camera into two eyes.
@@ -210,8 +223,10 @@ class AxolRobot(Robot):
         cams = self.config.observation_cameras().values()
         needs_mono = any(eye is None for _, eye in cams)
         needs_stereo = any(eye is not None for _, eye in cams)
-        available = (not needs_mono or zed_gst_available()) and (
-            not needs_stereo or zed_stereo_gst_available()
+        available = (
+            not needs_mono or zed_gst_available(require_sensor_timestamps=True)
+        ) and (
+            not needs_stereo or zed_stereo_gst_available(require_sensor_timestamps=True)
         )
         if backend == "gst" and not available:
             _logger.warning(
@@ -395,37 +410,40 @@ class AxolRobot(Robot):
 
         _logger.info("AxolRobot connected.")
 
-    def _build_hardware(self) -> Axol:
-        """Construct the hardware driver. Overridden by the Mantis subclass."""
-        return Axol(
-            self.config.axol_config,
-            left_channel=self.config.left_channel,
-            right_channel=self.config.right_channel,
+    def _build_hardware(self) -> RtAxol | RtMantis:
+        """Construct the realtime-core-backed driver.
+
+        LeRobot uses the same sole production backend as teleop: the Rust
+        core owns CAN at 240 Hz while Python streams policy/teleop targets.
+        Overridden by the Mantis subclass (grippers-only core).
+        """
+        from ...rt import RtAxol as _RtAxol
+
+        return _RtAxol(
+            Axol(
+                self.config.axol_config,
+                left_channel=self.config.left_channel,
+                right_channel=self.config.right_channel,
+            ),
+            max_vel=VRTeleopConfig.teleop_max_vel,
+            max_accel=VRTeleopConfig.teleop_max_accel,
+            record=self._control_trace,
         )
 
     async def _connect_async(self) -> None:
         self._axol = self._build_hardware()
         await self._axol.enable()
-        if self.config.telemetry_hz > 0:
-            await self._axol.start_telemetry(
-                self.config.telemetry_hz, torque=self.config.observe_torques
-            )
-            await self._axol.wait_for_telemetry()
-        else:
-            # No background poll loop: rely on motion_control replies (every
-            # impedance/gripper command returns a feedback frame) to keep the
-            # position/torque cache fresh, exactly like `axol teleop`. This
-            # removes ~telemetry_hz × 16 redundant CAN transactions/sec that
-            # otherwise contend with motion_control on the bus and the loop.
-            #
-            # Seed the cache before the first cached read: get_positions() uses
-            # register reads that return values but don't populate the .position
-            # cache (only feedback frames do), and command sends are
-            # fire-and-forget, so issue one hold-in-place motion_control to
-            # elicit feedback from every motor and wait for those frames to land.
-            pos_l, pos_r = await self._axol.get_positions()
-            await self._axol.motion_control(left=pos_l, right=pos_r)
-            await self._axol.wait_for_telemetry()
+
+    def configure_control_trace(self, prefix: str | None) -> None:
+        """Configure the Rust flight-recorder prefix before :meth:`connect`."""
+        if self.is_connected:
+            raise RuntimeError("control trace must be configured before connect")
+        self._control_trace = prefix
+
+    def set_control_trace_active(self, active: bool) -> None:
+        """Gate the Rust/measured trace after IK startup has completed."""
+        if self._axol is not None:
+            self._axol.set_recording_engaged(active)
 
     def disconnect(self) -> None:
         """Disable motors, stop telemetry, close CAN buses, and disconnect cameras."""
@@ -536,6 +554,19 @@ class AxolRobot(Robot):
         assert self._loop is not None, "connect() first"
         return self._loop
 
+    @property
+    def limp(self) -> str | None:
+        """Why the realtime core went limp, or ``None`` while it is healthy.
+
+        Mirrors :attr:`almond_axol.rt.RtAxol.limp`: once set, every arm joint
+        is at kp = 0 with the streamed gravity feedforward for the rest of
+        the session and :meth:`send_action` streams gravity comp instead of
+        tracking. Recording flows check this before promising motion (a
+        take started on a limp core records arms that will not move) and
+        surface it to the operator; ``None`` before :meth:`connect`.
+        """
+        return None if self._axol is None else self._axol.limp
+
     # ------------------------------------------------------------------
     # Observation / action
     # ------------------------------------------------------------------
@@ -603,8 +634,21 @@ class AxolRobot(Robot):
         assert self._axol.left is not None
         assert self._axol.right is not None
 
-        left_pos = self._axol.left.positions
-        right_pos = self._axol.right.positions
+        return self._joint_state_from_arrays(
+            self._axol.left.positions,
+            self._axol.right.positions,
+            self._axol.left.torques if self.config.observe_torques else None,
+            self._axol.right.torques if self.config.observe_torques else None,
+        )
+
+    def _joint_state_from_arrays(
+        self,
+        left_pos: np.ndarray,
+        right_pos: np.ndarray,
+        left_trq: np.ndarray | None = None,
+        right_trq: np.ndarray | None = None,
+    ) -> RobotObservation:
+        """Build joint/Cartesian features from one coherent state snapshot."""
 
         obs: RobotObservation = {}
         if self.config.observe_cartesian:
@@ -616,8 +660,8 @@ class AxolRobot(Robot):
                 obs[key] = float(right_pos[i])
 
         if self.config.observe_torques:
-            left_trq = self._axol.left.torques
-            right_trq = self._axol.right.torques
+            if left_trq is None or right_trq is None:
+                raise RuntimeError("timestamped telemetry snapshot has no torques")
             for i, key in enumerate(self._left_trq_keys):
                 obs[key] = float(left_trq[i])
             for i, key in enumerate(self._right_trq_keys):
@@ -637,55 +681,57 @@ class AxolRobot(Robot):
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
-        """Return cached joint state and timestamp-aligned camera frames.
+        """Return camera frames paired to nearest timestamped robot state.
 
         Cameras are sampled with :meth:`ZedCamera.read_at_or_after` against a
-        shared ``time.perf_counter()`` target so every frame in the
-        observation shares the same capture instant — matching the alignment
-        guarantee that ``collect-data`` writes into the training dataset. If a
-        camera fails to produce a qualifying frame within ``timeout_ms``, we
-        fall back to ``read_latest()`` so a single stale camera doesn't stall
-        inference.
+        shared ``time.perf_counter()`` target. Their median sensor-exposure time
+        selects the nearest entry from the Rust core's 240 Hz feedback history,
+        matching collection's exposure-driven association. A missing/stale
+        camera or unbracketed state aborts the observation; policy inference
+        must never continue on a silently mismatched image/state pair.
         """
-        observation, _pose_lag = self._get_observation_with_pose_lag(
-            require_camera_timestamps=False
-        )
+        observation, _capture_ts, _state_ts = self._get_synchronized_observation()
         return observation
+
+    @check_if_not_connected
+    def get_observation_with_capture_timestamp(
+        self,
+    ) -> tuple[RobotObservation, float]:
+        """Return a synchronized observation and its canonical capture time.
+
+        The timestamp is the median sensor-exposure time of the returned camera
+        frames, on the system-wide ``perf_counter`` clock. This atomic API is
+        used by DAgger so the recorder dates the inferred action at the same
+        instant as the images and historical joints supplied to the policy.
+        """
+        observation, capture_ts, _state_ts = self._get_synchronized_observation()
+        return observation, capture_ts
 
     @check_if_not_connected
     def get_observation_with_pose_lag(self) -> tuple[RobotObservation, float]:
         """Return one observation and its signed pose-to-image capture skew.
 
-        The lag is the freshest camera exposure timestamp minus the timestamp
-        immediately before the cached joint sample, on the shared
-        ``perf_counter`` timeline.  It is returned out-of-band rather than
-        inserted into the observation so policy feature dictionaries remain
-        unchanged.  Keeping the metadata in the return value also binds it to
-        this exact call when inference and rollout capture read concurrently.
-
-        A timestamped ``read_latest_with_ts`` fallback is required here: a
-        rollout row that declares ``observation.pose_lag`` must never silently
-        substitute zero when a camera timed out and supplied a stale frame.
+        The lag is the median camera exposure timestamp minus the timestamp of
+        the Rust core feedback sample the joint state was taken from, on the
+        shared ``perf_counter`` timeline. It is returned out-of-band rather
+        than inserted into the observation so policy feature dictionaries
+        remain unchanged, and binding it to this exact call keeps it consistent
+        when inference and rollout capture read concurrently. Because the
+        joint state is selected from retained telemetry nearest the exposure,
+        the skew is bounded by ``_POLICY_STATE_ALIGNMENT_LIMIT_S``.
         """
-        observation, pose_lag = self._get_observation_with_pose_lag(
-            require_camera_timestamps=True
-        )
-        if pose_lag is None:
-            raise RuntimeError(
-                "one or more cameras did not report a capture timestamp; "
-                "refusing to fabricate pose_lag"
-            )
-        return observation, pose_lag
+        observation, capture_ts, state_ts = self._get_synchronized_observation()
+        return observation, capture_ts - state_ts
 
-    def _get_observation_with_pose_lag(
-        self, *, require_camera_timestamps: bool
-    ) -> tuple[RobotObservation, float | None]:
-        """Read an observation, optionally requiring complete camera timing."""
+    def _get_synchronized_observation(
+        self,
+    ) -> tuple[RobotObservation, float, float]:
+        """Build one synchronized observation; return (obs, exposure, state) times."""
         target_ts = time.perf_counter()
-
-        obs = self._joint_state()
-        camera_capture_timestamps: list[float] = []
-
+        if not self.cameras:
+            return self._joint_state(), target_ts, target_ts
+        frames: dict[str, np.ndarray] = {}
+        capture_ts: list[float] = []
         for cam_key, cam in self.cameras.items():
             cam_fps = getattr(cam, "fps", None) or 30
             timeout_ms = int(2 * 1000.0 / cam_fps + 200)
@@ -694,51 +740,53 @@ class AxolRobot(Robot):
                     target_ts, timeout_ms=timeout_ms
                 )
             except (TimeoutError, RuntimeError) as exc:
-                _logger.debug(
-                    "get_observation: %s read_at_or_after(%.6f) failed (%s); "
-                    "falling back to read_latest().",
-                    cam_key,
-                    target_ts,
-                    exc,
+                raise RuntimeError(
+                    f"policy camera {cam_key!r} produced no fresh frame: {exc}"
+                ) from exc
+            if not np.isfinite(cap_ts):
+                raise RuntimeError(
+                    f"policy camera {cam_key!r} produced an invalid capture timestamp"
                 )
-                if not require_camera_timestamps:
-                    frame = cam.read_latest()
-                    cap_ts = None
-                else:
-                    read_latest_with_ts = getattr(cam, "read_latest_with_ts", None)
-                    if not callable(read_latest_with_ts):
-                        raise RuntimeError(
-                            f"camera {cam_key!r} cannot report the capture "
-                            "timestamp of its fallback frame; refusing to "
-                            "fabricate pose_lag"
-                        ) from exc
-                    frame, cap_ts, recv_ts = read_latest_with_ts()
-                    # Preserve read_latest()'s normal stale-frame guard while
-                    # retaining the timestamp belonging to this exact copy.
-                    recv_ts = float(recv_ts)
-                    if not np.isfinite(recv_ts):
-                        raise RuntimeError(
-                            f"camera {cam_key!r} returned a non-finite receive "
-                            "timestamp for its fallback frame"
-                        )
-                    age_ms = (time.perf_counter() - recv_ts) * 1e3
-                    if age_ms > 500:
-                        raise TimeoutError(
-                            f"latest {cam_key!r} frame is {age_ms:.0f}ms old (> 500ms)"
-                        )
-            obs[cam_key] = frame
-            if cap_ts is not None:
-                capture_ts = float(cap_ts)
-                if not np.isfinite(capture_ts):
-                    raise RuntimeError(
-                        f"camera {cam_key!r} returned a non-finite capture timestamp"
-                    )
-                camera_capture_timestamps.append(capture_ts)
+            frames[cam_key] = frame
+            capture_ts.append(cap_ts)
 
-        if len(camera_capture_timestamps) != len(self.cameras):
-            return obs, None
-        freshest_capture_ts = max(camera_capture_timestamps, default=target_ts)
-        return obs, freshest_capture_ts - target_ts
+        row_capture_ts = float(np.median(capture_ts))
+        camera_skew = max(capture_ts) - min(capture_ts)
+        slowest_fps = min(
+            float(getattr(cam, "fps", None) or 30) for cam in self.cameras.values()
+        )
+        camera_limit = max(0.010, 1.5 / slowest_fps)
+        if camera_skew > camera_limit:
+            raise RuntimeError(
+                "policy camera exposures are not synchronized "
+                f"(spread {camera_skew * 1e3:.1f}ms, limit "
+                f"{camera_limit * 1e3:.1f}ms)"
+            )
+
+        assert self._axol is not None
+        state = self._axol.state_nearest(row_capture_ts)
+        if state is None:
+            raise RuntimeError(
+                "no retained robot telemetry brackets policy camera exposure "
+                f"{row_capture_ts:.6f}"
+            )
+        left_pos, right_pos, left_trq, right_trq, state_ts = state
+        state_skew = abs(state_ts - row_capture_ts)
+        if state_skew > _POLICY_STATE_ALIGNMENT_LIMIT_S:
+            raise RuntimeError(
+                "nearest robot telemetry is too far from policy camera exposure "
+                f"({state_skew * 1e3:.1f}ms, limit "
+                f"{_POLICY_STATE_ALIGNMENT_LIMIT_S * 1e3:.1f}ms)"
+            )
+        obs = self._joint_state_from_arrays(
+            left_pos,
+            right_pos,
+            left_trq if self.config.observe_torques else None,
+            right_trq if self.config.observe_torques else None,
+        )
+        obs.update(frames)
+
+        return obs, row_capture_ts, float(state_ts)
 
     def _ensure_ik(self) -> KinematicsSolver:
         """Lazily build the IK solver used to resolve Cartesian action targets.
@@ -848,10 +896,10 @@ class AxolRobot(Robot):
         # from the actual measured positions — which also zeroes the velocity
         # — rather than ramping from a stale command at a stale speed.
         now = time.monotonic()
-        gap = now - self._cart_last_send
-        self._cart_last_send = now
-        if self._cart_shapers is None:
-            self._cart_shapers = (
+        gap = now - self._cartesian_last_send
+        self._cartesian_last_send = now
+        if self._cartesian_shapers is None:
+            self._cartesian_shapers = (
                 TrapezoidalFilter(
                     VRTeleopConfig.teleop_max_vel, VRTeleopConfig.teleop_max_accel, 0.0
                 ),
@@ -860,7 +908,7 @@ class AxolRobot(Robot):
                 ),
             )
             gap = float("inf")
-        shaper_l, shaper_r = self._cart_shapers
+        shaper_l, shaper_r = self._cartesian_shapers
         if gap > 0.25:
             shaper_l.reset(seed=np.asarray(left_cur, dtype=np.float32)[:7])
             shaper_r.reset(seed=np.asarray(right_cur, dtype=np.float32)[:7])

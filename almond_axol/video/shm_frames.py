@@ -1,26 +1,26 @@
-"""Shared-memory transport for raw camera frames across the relay boundary.
+"""Camera and state transport across the relay/recorder boundary.
 
-``collect-data`` needs the ZED cameras' raw frames in the **control** process
-(to write the dataset), but running the camera grab + NVENC encode + aiortc
-WebRTC in that process starves the teleop/IK loops (see
-:mod:`almond_axol.video.video_proc`). The relay subprocess therefore owns the
-cameras and does all the heavy work; this module ships the raw frames it produces
-back to the recorder process through shared memory — NV12 on the gst-native
-``shmsink``/``shmsrc`` transport (:class:`GstShmFrameReader`), or RGB on the
-``multiprocessing`` fallback (:class:`RawFrameReader`) — so the recorder only ever
-copies a frame out of shared memory at the 60 Hz capture rate while recording,
-never on the hot control path.
+``collect-data`` needs camera samples and matching robot state in its recorder,
+but running camera grab + NVENC encode + aiortc WebRTC in the control process
+starves the teleop/IK loops (see :mod:`almond_axol.video.video_proc`). The relay
+subprocess therefore owns the cameras and does all the heavy work. The primary
+path carries GDP-wrapped H.264 access units and their sensor PTS from ``shmsink``
+to :class:`EncodedAuReader`; legacy/fallback paths carry raw NV12 or RGB frames.
+A separate bounded snapshot ring carries the control loop's timestamped
+joint/action history, so the recorder can choose the state nearest each exposure
+without touching the hot control path.
 
-Layout (one :class:`SharedMemory` block per camera source):
+Raw-frame fallback layout (one :class:`SharedMemory` block per camera source):
 
-    [ meta: seq, slot, cap_ts, recv_ts ][ buffer 0 ][ buffer 1 ]
+    [ meta: seq, slot, cap_ts, recv_ts, slot0_seq, slot1_seq ]
+    [ buffer 0 ][ buffer 1 ]
 
 The two frame buffers are double-buffered: the writer always fills the buffer
 the reader isn't pointed at, then publishes the new ``slot`` + timestamps under
 a shared :class:`multiprocessing.Condition` and notifies. A reader copies out of
-the published slot *outside* the lock; double-buffering guarantees the writer
-won't reuse that slot for a full extra frame (~16 ms at 60 fps), far longer than
-a ~1 ms 6 MB copy, and a post-copy sequence recheck retries on the rare overlap.
+the published slot *outside* the lock. The per-slot odd/even sequence marks reuse
+before the writer touches pixels and is checked again after the copy, so even a
+reader delayed across multiple camera frames detects and retries a torn copy.
 
 Timestamps are ``time.perf_counter`` seconds. On Linux that is
 ``CLOCK_MONOTONIC``, which shares an origin across processes, so a ``cap_ts``
@@ -32,7 +32,6 @@ the dataset relies on.
 from __future__ import annotations
 
 import logging
-import math
 import threading
 import time
 from collections import deque
@@ -49,7 +48,14 @@ _logger = logging.getLogger(__name__)
 # Meta header: a single structured record at the front of each block. Padded to
 # 64 bytes so the frame buffers start cache-line aligned.
 _META_DTYPE = np.dtype(
-    [("seq", "<i8"), ("slot", "<i8"), ("cap_ts", "<f8"), ("recv_ts", "<f8")]
+    [
+        ("seq", "<i8"),
+        ("slot", "<i8"),
+        ("cap_ts", "<f8"),
+        ("recv_ts", "<f8"),
+        ("slot0_seq", "<u8"),
+        ("slot1_seq", "<u8"),
+    ]
 )
 _HEADER_BYTES = 64
 
@@ -57,26 +63,52 @@ _HEADER_BYTES = 64
 # only what the dataset stores crosses the boundary.
 _CHANNELS = 3
 
-# Snapshot channel header: a single int64 sequence counter, padded to 16 bytes so
-# the float64 payload that follows stays 8-byte aligned.
-_SNAP_META_DTYPE = np.dtype([("seq", "<i8")])
-_SNAP_HEADER_BYTES = 16
+# Snapshot history retains a little over four seconds at the 120 Hz control rate.
+# Camera AUs normally arrive only a few frames late, but this leaves generous
+# headroom for encoder / recorder startup and short scheduling stalls while
+# keeping the block tiny (roughly 130 KiB for the usual 28-value snapshot).
+_SNAP_RING_CAPACITY = 512
 
-# A healthy local camera/encode/shared-memory path is measured in milliseconds.
-# Treat anything above this generous ceiling as corrupt metadata: subtracting an
-# arbitrary large value can select the oldest entry in the finite snapshot ring.
-_MAX_CAPTURE_LATENCY_S = 5.0
-# A pipeline/perf-clock co-sample can differ by a few microseconds. Keep a
-# generous bound for scheduler jitter, but never let a recovered timestamp make
-# dataset pairing meaningfully future-dated.
-_MAX_CAPTURE_FUTURE_S = 0.05
-_GST_CLOCK_TIME_NONE = (1 << 64) - 1
-# The snapshot ring holds about 0.5 s at the 120 Hz control rate. Abort an
-# encoded take before its oldest undelivered AU can age out of that history;
-# silently dropping an AU is not an option because later H.264 pictures may
-# reference it. This also puts a hard ceiling on memory if row processing
-# stalls while the GStreamer pull thread keeps draining shmsrc.
-_MAX_ENCODED_AU_BACKLOG_S = 0.25
+# Header publication is separate from each slot's seqlock. A writer commits a
+# slot first, then advances ``published``; readers use ``generation`` to reject a
+# slot that wrapped while they were inspecting it. All fields are naturally
+# aligned, fixed-width values so the same layout is valid in both processes.
+_SNAP_HEADER_DTYPE = np.dtype(
+    [("published", "<u8"), ("capacity", "<u4"), ("width", "<u4")]
+)
+_SNAP_HEADER_BYTES = 64
+_SNAP_SLOT_META_DTYPE = np.dtype([("seq", "<u8"), ("generation", "<u8")])
+
+
+# The ring is single-writer / single-reader and *lock-free*: the 120 Hz control
+# thread must never wait on the recorder. An earlier design shared a SemLock;
+# the recorder held it for three bulk copies (~50 us) but, being a CFS thread
+# on the loaded background cores, it was regularly descheduled mid-hold. On
+# 2026-09-03 that produced ~2,500 skipped control samples per hour and holds of
+# 50-113 ms; every hold over 50 ms left a camera exposure without a robot state
+# within ``_STATE_ALIGNMENT_WARN_S`` and discarded the episode (6 of 15 that
+# day). Now the reader copies the ring optimistically and re-validates the
+# slot metadata afterwards; a copy the writer raced is simply retaken.
+#
+# Retries only happen when a write overlapped the ~50 us copy (about 0.6 % of
+# reads at 120 Hz), so this bound is only reached if the reader is being
+# preempted over and over; the caller then treats the read as a transient miss.
+_SNAP_READ_ATTEMPTS = 16
+# The slot the writer is about to reuse (and the few after it, should the
+# reader have been descheduled for several control ticks mid-copy) may be
+# mid-write or already carry a newer generation. Skip forward over that many
+# oldest generations before declaring the copy unusable.
+_SNAP_OLDEST_SKIP = 8
+
+
+def _snapshot_block_size(width: int, capacity: int = _SNAP_RING_CAPACITY) -> int:
+    return (
+        _SNAP_HEADER_BYTES
+        + capacity * _SNAP_SLOT_META_DTYPE.itemsize
+        + capacity * width * np.dtype("<f8").itemsize
+    )
+
+
 _GST_READER_STOP_TIMEOUT_S = 2.0
 
 
@@ -152,71 +184,6 @@ def _disconnect_gst_pull_reader(reader: Any, *, label: str) -> None:
     raise primary_error
 
 
-def _capture_perf_from_receive(recv_perf: float, latency_s: object) -> float:
-    """Estimate capture time from receipt time and measured pipeline latency.
-
-    Invalid, non-finite, or negative latency metadata is treated as unavailable,
-    preserving the historical receipt-time fallback instead of producing a
-    future, NaN, or otherwise unusable snapshot lookup timestamp.
-    """
-    if isinstance(latency_s, bool):
-        return recv_perf
-    try:
-        latency = float(latency_s)
-    except (TypeError, ValueError):
-        return recv_perf
-    if (
-        not math.isfinite(latency)
-        or latency < 0.0
-        or latency > _MAX_CAPTURE_LATENCY_S
-        or latency > recv_perf
-    ):
-        return recv_perf
-    return recv_perf - latency
-
-
-def _capture_perf_from_gst_pts(
-    recv_perf: float,
-    pts_ns: object,
-    pts_origin_perf: object,
-    fallback_latency_s: object,
-) -> float:
-    """Map a GDP-preserved sensor PTS onto the shared ``perf_counter`` clock.
-
-    ``pts_ns`` is running time in the camera relay's GStreamer pipeline;
-    ``pts_origin_perf`` is that pipeline's running-time zero co-sampled on the
-    Linux monotonic/perf-counter timeline. Corrupt, absent, implausibly stale,
-    or future metadata falls back to the prior receipt-minus-latency estimate.
-    """
-    fallback = _capture_perf_from_receive(recv_perf, fallback_latency_s)
-    if isinstance(pts_ns, bool) or isinstance(pts_origin_perf, bool):
-        return fallback
-    try:
-        pts = float(pts_ns)
-        origin = float(pts_origin_perf)
-    except (TypeError, ValueError):
-        return fallback
-    if (
-        not math.isfinite(pts)
-        or not math.isfinite(origin)
-        or pts < 0.0
-        or pts >= _GST_CLOCK_TIME_NONE
-        or origin < 0.0
-    ):
-        return fallback
-    capture_perf = origin + pts / 1e9
-    if (
-        not math.isfinite(capture_perf)
-        or capture_perf < 0.0
-        or capture_perf > recv_perf + _MAX_CAPTURE_FUTURE_S
-        or recv_perf - capture_perf > _MAX_CAPTURE_LATENCY_S
-    ):
-        return fallback
-    # A tiny positive clock-sampling error is harmless, but never ask the joint
-    # snapshot ring for a frame that has not yet been received.
-    return min(capture_perf, recv_perf)
-
-
 def _block_size(width: int, height: int) -> int:
     return _HEADER_BYTES + 2 * width * height * _CHANNELS
 
@@ -241,6 +208,8 @@ class RawFrameWriter:
         self._next_slot = 0
         self._meta["seq"][0] = 0
         self._meta["slot"][0] = 0
+        self._meta["slot0_seq"][0] = 0
+        self._meta["slot1_seq"][0] = 0
 
     @classmethod
     def create(cls, width: int, height: int, cond: Any) -> "RawFrameWriter":
@@ -254,11 +223,21 @@ class RawFrameWriter:
         for this call); the ``[:, :, :3]`` copy into shared memory drops alpha.
         """
         slot = self._next_slot
+        slot_seq_field = "slot0_seq" if slot == 0 else "slot1_seq"
+        # Mark this physical slot busy before touching its pixels. Readers copy
+        # outside the shared lock; the odd/even slot generation lets them
+        # detect reuse that has started but is not published yet.
+        with self._cond:
+            slot_seq = int(self._meta[slot_seq_field][0])
+            if slot_seq & 1:
+                slot_seq += 1
+            self._meta[slot_seq_field][0] = slot_seq + 1
         np.copyto(self._bufs[slot], rgba[:, :, :_CHANNELS])
         with self._cond:
             self._meta["slot"][0] = slot
             self._meta["cap_ts"][0] = cap_ts
             self._meta["recv_ts"][0] = recv_ts
+            self._meta[slot_seq_field][0] = slot_seq + 2
             self._meta["seq"][0] += 1
             self._cond.notify_all()
         self._next_slot = 1 - slot
@@ -315,6 +294,10 @@ class RawFrameReader:
                     cap = float(self._meta["cap_ts"][0])
                     if seq > 0 and cap >= target:
                         slot = int(self._meta["slot"][0])
+                        slot_seq_field = "slot0_seq" if slot == 0 else "slot1_seq"
+                        slot_seq = int(self._meta[slot_seq_field][0])
+                        if slot_seq & 1:
+                            continue
                         recv = float(self._meta["recv_ts"][0])
                         break
                     remaining = deadline - time.perf_counter()
@@ -326,10 +309,11 @@ class RawFrameReader:
                         )
                     self._cond.wait(remaining)
             frame = self._copy_slot(slot)
-            # Double-buffer reuse only happens two frames later; if the writer
-            # lapped us mid-copy (seq advanced by >=2), the copy may be torn —
-            # retry against the new latest frame.
-            if int(self._meta["seq"][0]) - seq < 2:
+            # Reacquire for a formal ARM memory barrier before checking whether
+            # the writer lapped this out-of-lock copy and reused its slot.
+            with self._cond:
+                slot_stable = int(self._meta[slot_seq_field][0]) == slot_seq
+            if slot_stable:
                 return frame, cap, recv
 
     def read_latest_with_ts(self) -> tuple["NDArray[Any]", float, float]:
@@ -339,10 +323,16 @@ class RawFrameReader:
                 if seq == 0:
                     raise RuntimeError("shared-memory camera has no frames yet.")
                 slot = int(self._meta["slot"][0])
+                slot_seq_field = "slot0_seq" if slot == 0 else "slot1_seq"
+                slot_seq = int(self._meta[slot_seq_field][0])
+                if slot_seq & 1:
+                    continue
                 cap = float(self._meta["cap_ts"][0])
                 recv = float(self._meta["recv_ts"][0])
             frame = self._copy_slot(slot)
-            if int(self._meta["seq"][0]) - seq < 2:
+            with self._cond:
+                slot_stable = int(self._meta[slot_seq_field][0]) == slot_seq
+            if slot_stable:
                 return frame, cap, recv
 
     def read_latest(self, max_age_ms: int = 500) -> "NDArray[Any]":
@@ -563,6 +553,25 @@ class GstShmFrameReader:
     close = disconnect
 
 
+def _au_has_nal_type(au: bytes, wanted: range | tuple[int, ...]) -> bool:
+    """Return whether an Annex-B access unit contains a requested NAL type."""
+    i, n = 0, len(au)
+    while i + 3 < n:
+        if au[i] == 0 and au[i + 1] == 0:
+            if au[i + 2] == 1:
+                if (au[i + 3] & 0x1F) in wanted:
+                    return True
+                i += 4
+                continue
+            if au[i + 2] == 0 and i + 4 < n and au[i + 3] == 1:
+                if (au[i + 4] & 0x1F) in wanted:
+                    return True
+                i += 5
+                continue
+        i += 1
+    return False
+
+
 def _au_has_coded_slice(au: bytes) -> bool:
     """True if the Annex-B access unit contains a VCL (coded-picture) NAL.
 
@@ -572,66 +581,48 @@ def _au_has_coded_slice(au: bytes) -> bool:
     the dataset valve closes. Such an AU decodes to *no* picture, so muxing it as
     a dataset frame would occupy a PTS slot without yielding a retrievable frame
     and desync frame-count from row-count. Delivering only AUs with a coded slice
-    keeps them aligned; if a coded picture is then missing, the capture loop
-    aborts the take rather than replaying another AU. VCL NAL types are 1-5
-    (non-IDR .. IDR).
+    keeps them aligned; a starved coded stream aborts the episode because a
+    predictive AU cannot safely be duplicated. VCL NAL types are 1-5 (non-IDR
+    .. IDR).
 
     Note: this only guards the one-AU-per-row count. The separate per-row
     timestamp precision the dataset needs (frame *k* within LeRobot's tolerance
     of ``k / fps``) is handled by the constant-fps re-stamp in the concat step
     (:func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`).
     """
-    i, n = 0, len(au)
-    while i + 3 < n:
-        if au[i] == 0 and au[i + 1] == 0:
-            if au[i + 2] == 1:
-                if 1 <= (au[i + 3] & 0x1F) <= 5:
-                    return True
-                i += 4
-                continue
-            if au[i + 2] == 0 and i + 4 < n and au[i + 3] == 1:
-                if 1 <= (au[i + 4] & 0x1F) <= 5:
-                    return True
-                i += 5
-                continue
-        i += 1
-    return False
+    return _au_has_nal_type(au, range(1, 6))
+
+
+def _au_is_idr(au: bytes) -> bool:
+    """True only for an H.264 IDR AU, not merely a non-delta I-picture."""
+    return _au_has_nal_type(au, (5,))
 
 
 class EncodedAuReader:
     """Recorder-side source of the relay's pre-encoded H.264 access units.
 
-    The relay's dataset branch encodes each camera to H.264 on the GPU and writes
-    the access units to shared memory with gst's native (C) ``shmsink`` — no
-    Python and no raw frame copy on the relay, and ~1 MB/s across the boundary
-    instead of the ~51 MB/s the old raw NV12 path cost. This reader runs the
-    matching ``shmsrc`` consumer in the **recorder** process and hands the AUs to
+    The relay's dataset branch encodes each camera to H.264 on the GPU, wraps the
+    access units (including PTS/flags/caps) with ``gdppay``, and writes them to
+    shared memory with gst's native (C) ``shmsink`` — no Python and no raw frame
+    copy on the relay, and ~1 MB/s across the boundary instead of the ~51 MB/s
+    the old raw NV12 path cost. This reader runs the matching ``shmsrc !
+    gdpdepay`` consumer in the **recorder** process and hands the AUs to
     :class:`~almond_axol.lerobot.h264_mux_encoder.H264MuxStreamingEncoder`, which
     just muxes them (no re-encode).
 
-    Unlike the raw :class:`GstShmFrameReader` (which serves ``read_at_or_after`` —
-    *selecting* the frame nearest a target time and dropping the rest), an encoded
-    stream cannot drop frames: every P-frame depends on its predecessors. So this
-    reader delivers **every** AU strictly **in order** via :meth:`read_next_au`,
-    and the capture loop is frame-driven (one AU consumed per dataset row). A
-    dedicated pull thread drains the (non-leaky) appsink into an in-process queue
-    so a momentarily slow consumer grows the queue rather than dropping AUs and
-    corrupting the stream.
+    The dataset encoder is all-intra, so every AU is independently decodable.
+    This reader still delivers AUs strictly in order via :meth:`read_next_au`;
+    the capture loop consumes one per dataset row after it discards any leading
+    AUs needed to form a synchronized row-zero cluster. A dedicated pull thread
+    drains the (non-leaky) appsink. Before the first episode flush it discards
+    validated startup AUs; afterwards it fills an in-process bounded queue.
 
-    Each episode's mp4 must start on a keyframe (a leading P-frame is
-    undecodable), so after :meth:`flush` the reader drops AUs until the next IDR.
-    The relay can't force a keyframe on demand (the ``nvv4l2h264enc`` ``force-IDR``
-    signal segfaults and force-key-unit events are ignored on L4T), so the dataset
-    encoder runs a short ``idrinterval``; the episode's rows simply begin at the
-    first IDR after the valve opens (a sub-``idrinterval`` start delay, no
-    misalignment — video and joints both start there). GDP restores each AU's
-    sensor PTS after ``shmsrc``. The relay also supplies the corresponding
-    pipeline-running-time origin on the shared ``perf_counter`` clock, so this
-    reader can pair the image with the nearest joint snapshot at exposure time
-    rather than Python receipt time. Missing or implausible PTS/origin metadata
-    falls back to ``recv_perf - latency_s`` (and ultimately receipt time). The
-    mp4's own timeline is the constant-fps PTS the muxer assigns, independent of
-    this pairing timestamp.
+    Each episode's mp4 starts on an IDR, and every following picture is also an
+    IDR. GDP restores the original sensor-exposure PTS after shm;
+    ``pts_perf_offset_s`` maps that pipeline running-time onto the system-wide
+    ``perf_counter`` clock used by joint/action snapshots. The mp4's own timeline
+    remains the constant-fps PTS the muxer assigns, independent of this physical
+    capture timestamp.
     """
 
     def __init__(
@@ -641,54 +632,114 @@ class EncodedAuReader:
         height: int,
         fps: int,
         name: str | None = None,
-        latency_s: float = 0.0,
-        pts_origin_perf: float | None = None,
+        *,
+        pts_perf_offset_s: float,
+        capture_fps: int | None = None,
     ) -> None:
-        from .gst_zed import _DATASET_IDR_INTERVAL_S, _require_gst
+        from .gst_zed import _DATASET_GOP_FRAMES, _require_gst
 
         self._gst, _ = _require_gst()
         self.width = width
         self.height = height
         self.fps = fps
+        self.capture_fps = fps if capture_fps is None else int(capture_fps)
+        if self.capture_fps < self.fps or self.fps <= 0:
+            raise ValueError(
+                f"capture fps ({self.capture_fps}) must be at least dataset "
+                f"fps ({self.fps})"
+            )
         self._name = name or socket_path
-        self._latency_s = latency_s
-        self._pts_origin_perf = pts_origin_perf
-        self._queue: deque[tuple[bytes, float]] = deque()
+        self._pts_perf_offset_s = float(pts_perf_offset_s)
+        if not np.isfinite(self._pts_perf_offset_s):
+            raise ValueError("PTS/perf_counter offset must be finite")
+        self._queue: deque[tuple[bytes, float, float]] = deque()
+        # Never let a capture-loop failure turn into unbounded compressed-frame
+        # growth while the operator continues moving before ending the take.
+        # Overflow is fatal because it loses exposure/row alignment, even though
+        # every retained all-intra frame remains independently decodable.
+        self._queue_limit = max(60, 2 * fps)
         self._cond = threading.Condition()
-        # Parked until the capture loop arms it with ``flush()``: the relay's
-        # valve opens (and its first IDR lands) before the recorder has its
-        # muxers up and its loop draining, so anything that arrives while no
-        # consumer exists is dropped silently instead of being counted as a
-        # backlog fault. ``disarm()`` parks it again when the loop exits.
-        self._armed = False
+        # Episode-start drain handshake. While the relay valve is closed the
+        # pull worker discards until appsink has been quiet for one full poll,
+        # then atomically arms the next actual IDR. This prevents an unobserved
+        # old IDR in the GDP/shm tail from becoming the next episode's row zero.
+        self._flush_requested = threading.Event()
+        self._flush_complete = threading.Event()
         self._await_keyframe = True
-        self._stream_error: str | None = None
+        self._error: str | None = None
+        self._permanent_error: str | None = None
+        self._minimum_capture_perf = float("-inf")
+        self._latest_capture_perf = float("-inf")
+        self._episode_cutoff_active = False
+        self._first_sample = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._sink: Any = None
-        # Keyframe-cadence integrity guard. The relay forces an IDR every
-        # ``_DATASET_IDR_INTERVAL_S`` (see gst_zed), so a run of more than
-        # ~1.5x that many frames without a keyframe means a *keyframe was lost
-        # upstream* — and every frame muxed until the next IDR references that
-        # missing reference, so those dataset rows won't decode. Latch a stream
-        # error that ``read_next_au`` raises into the capture loop; the whole take
-        # must be discarded because already-delivered orphaned pictures cannot be
-        # repaired. ``_delivered`` is the running AU index for diagnostics.
-        self._expected_gop = max(1, round(fps * _DATASET_IDR_INTERVAL_S))
+        # The relay promises an all-intra dataset stream. Verify that contract in
+        # the reader too: accepting one predictive picture would make startup
+        # realignment unsafe and reintroduce the hidden encoder-GOP phase race.
+        self._expected_gop = max(1, int(_DATASET_GOP_FRAMES))
         self._gop_warn_at = self._expected_gop + max(2, self._expected_gop // 2)
-        self._max_pending_aus = max(2, round(fps * _MAX_ENCODED_AU_BACKLOG_S))
         self._since_keyframe = 0
         self._delivered = 0
         self._seen_first_au = False
-        self._discont_count = 0
-        # GDP restores both the producer caps and GstBuffer timing/flags after
-        # shmsrc. h264parse re-derives the dimensions from the SPS as before.
-        # drop=false: never discard an AU (it would break H.264 decode); the pull
-        # thread keeps the appsink drained so it rarely back-pressures shmsrc.
+        # Exposures the transport lost or delivered unusable *within the
+        # current episode* (an upstream drop marked DISCONT, an AU that could
+        # not be mapped, a PTS the sender lost). Under the recorder's fail-open
+        # policy these are not fatal: the capture loop sees the resulting PTS
+        # gap and repeats the prior IDR into it. Counted here so the recorder's
+        # end-of-take quality summary can attribute the hole to the transport.
+        self._lost_exposures = 0
+        # gdpdepay restores the sender's serialized caps and buffer metadata.
+        # Keep a fixed H.264 filter as an integrity check; h264parse re-derives
+        # dimensions from the SPS and preserves the exposure PTS.
+        # drop=false: never discard an exposure silently; the pull thread keeps
+        # the appsink drained so it rarely back-pressures shmsrc.
+        caps = (
+            f"video/x-h264,stream-format=byte-stream,alignment=au,"
+            f"width={width},height={height},framerate={fps}/1"
+        )
         self._pipeline = self._gst.parse_launch(
             f"shmsrc socket-path={socket_path} is-live=true do-timestamp=false "
-            "! application/x-gdp ! gdpdepay ! h264parse "
+            f"! gdpdepay ! {caps} ! h264parse "
             "! appsink name=au emit-signals=false max-buffers=60 drop=false sync=false"
+        )
+
+    @property
+    def frames_are_independent(self) -> bool:
+        """Whether callers may discard an AU without breaking later frames."""
+        return self._expected_gop == 1
+
+    @property
+    def lost_exposures(self) -> int:
+        """Exposures the transport lost or delivered unusable this episode."""
+        with self._cond:
+            return self._lost_exposures
+
+    def reset_lost_exposures(self) -> None:
+        """Start a new episode's transport-loss count."""
+        with self._cond:
+            self._lost_exposures = 0
+
+    def _note_lost_exposure(self, what: str) -> None:
+        """Count a single unusable/lost exposure and say so; not fatal.
+
+        The exposure's cadence slot is simply empty from the recorder's point
+        of view — the same PTS gap a source-side drop leaves — and the capture
+        loop conceals it. Only the transport itself failing (pipeline error,
+        no/invalid PTS on every AU, a predictive picture on an all-intra
+        contract) remains a reader error.
+        """
+        with self._cond:
+            self._lost_exposures += 1
+            count = self._lost_exposures
+        _logger.warning(
+            "encoded-AU reader %s: %s near frame %d; the capture loop will "
+            "conceal the missing exposure (%d lost this episode)",
+            self._name,
+            what,
+            self._delivered,
+            count,
         )
 
     @property
@@ -702,166 +753,137 @@ class EncodedAuReader:
             return len(self._queue)
 
     def connect(self, warmup: bool = True) -> None:
-        """Start the shmsrc pipeline + pull thread (relay owns the camera)."""
-        del warmup
-        if self._pipeline is None:
-            raise RuntimeError("encoded-AU reader has already been closed")
-        if self._thread is not None:
-            raise RuntimeError("encoded-AU reader is already connected")
-        self._stop.clear()
+        """Start shmsrc and verify that GDP delivers at least one coded AU."""
+        self._sink = self._pipeline.get_by_name("au")
+        self._pipeline.set_state(self._gst.State.PLAYING)
         try:
-            self._sink = self._pipeline.get_by_name("au")
-            if self._sink is None:
-                raise RuntimeError("encoded-AU pipeline has no appsink 'au'")
-            _set_gst_state_checked(
-                self._pipeline,
-                self._gst,
-                self._gst.State.PLAYING,
-                label="encoded-AU reader",
-            )
             self._thread = threading.Thread(
                 target=self._pull_loop, name="recorder-au-shmsrc", daemon=True
             )
             self._thread.start()
-        except BaseException as error:
-            try:
-                self.disconnect()
-            except BaseException as cleanup_error:
-                error.add_note(
-                    "encoded-AU reader startup cleanup failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
+        except BaseException:
+            # A pipeline left PLAYING without its pull owner would hold the
+            # shm socket and leak the appsink backlog; roll back before
+            # surfacing the failure.
+            self.disconnect()
             raise
+        deadline = time.perf_counter() + 10.0
+        while not self._first_sample.wait(0.05):
+            with self._cond:
+                error = self._permanent_error or self._error
+            if error is not None:
+                self.disconnect()
+                raise RuntimeError(error)
+            if time.perf_counter() >= deadline:
+                self.disconnect()
+                raise TimeoutError(
+                    f"encoded-AU reader {self._name} received no GDP/H.264 "
+                    "sample within 10s"
+                )
+        with self._cond:
+            error = self._permanent_error or self._error
+        if error is not None:
+            self.disconnect()
+            raise RuntimeError(error)
+
+    def begin_flush(self) -> None:
+        """Begin discarding transport tail while the relay valve is closed."""
+        with self._cond:
+            self._flush_complete.clear()
+            self._flush_requested.set()
+            self._queue.clear()
+            self._cond.notify_all()
+
+    def finish_flush(self, timeout_s: float = 2.0) -> None:
+        """Wait until the pull worker observes a full quiet appsink interval."""
+        if not self._flush_complete.wait(timeout_s):
+            raise TimeoutError(
+                f"encoded-AU reader {self._name} did not drain before episode start"
+            )
+        with self._cond:
+            error = self._permanent_error or self._error
+        if error is not None:
+            raise RuntimeError(error)
 
     def flush(self) -> None:
-        """Arm the reader for an episode: drop stragglers, wait for an IDR.
+        """Drain old AUs and re-arm keyframe-wait (call at episode start).
 
-        Call from the capture loop right before it starts draining. Between
-        episodes the reader is parked (see :meth:`disarm`) and the relay's
-        valve is shut; on the next episode the valve opens and the encoder's
-        short ``idrinterval`` yields a keyframe within a fraction of a second.
-        Clearing here discards anything that slipped in before the loop was
-        ready so the episode's first delivered AU is a fresh IDR, and from this
-        point on every accepted AU must be consumed (the backlog guard applies).
+        ``_minimum_capture_perf`` is the newest sensor PTS this reader had
+        already observed, not the host time at which ``flush`` runs. Exposure
+        necessarily predates delivery, so a wall-time cutoff would reject the
+        freshly reopened IDR and delay row zero by another frame. Queue clearing,
+        strictly newer PTS, and the all-intra requirement together reject the
+        previous episode's tail without confusing transport latency for age.
         """
+        self.begin_flush()
+        self.finish_flush()
+
+    def _complete_flush(self) -> None:
+        """Commit a requested flush after appsink has gone quiet."""
         with self._cond:
-            self._reset_sequence_locked()
-            self._armed = True
-
-    def disarm(self) -> None:
-        """Park the reader: drop what is queued and ignore AUs until :meth:`flush`.
-
-        The capture loop calls this when it exits (save, discard, or failure).
-        The relay closes its valve moments later, but AUs keep arriving until
-        it does -- and nobody is draining -- so without parking, the backlog
-        guard would latch a spurious "episode aborted" against a take that has
-        already ended (or, at construction, one that has not started yet).
-        """
-        with self._cond:
-            self._reset_sequence_locked()
-            self._armed = False
-
-    def _reset_sequence_locked(self) -> None:
-        self._queue.clear()
-        self._await_keyframe = True
-        self._since_keyframe = 0
-        self._seen_first_au = False
-        self._discont_count = 0
-        self._stream_error = None
-        self._cond.notify_all()
-
-    def _fail_stream_locked(self, message: str) -> None:
-        """Latch one episode-fatal bitstream error while ``_cond`` is held."""
-        if self._stream_error is None:
-            self._stream_error = message
+            if not self._flush_requested.is_set():
+                return
             self._queue.clear()
-            _logger.error(message)
-        self._cond.notify_all()
+            self._await_keyframe = True
+            self._since_keyframe = 0
+            self._seen_first_au = False
+            self._minimum_capture_perf = self._latest_capture_perf
+            self._episode_cutoff_active = True
+            # Transport errors are permanent. Episode-local continuity errors
+            # may recover after the relay closes immediately before an IDR.
+            self._error = self._permanent_error
+            self._flush_requested.clear()
+            self._flush_complete.set()
+            self._cond.notify_all()
 
-    def _accept_access_unit(
-        self,
-        au: bytes,
-        capture_perf: float,
-        *,
-        is_keyframe: bool,
-        discont: bool,
-    ) -> None:
-        """Validate and queue one coded picture from the pull thread."""
+    def _fail(self, message: str, *, permanent: bool = False) -> None:
+        """Wake consumers with a fatal integrity error; keep draining gst."""
         with self._cond:
-            if not self._armed or self._stream_error is not None:
-                return
-            if self._await_keyframe:
-                if not is_keyframe:
-                    return  # wait for the episode's first IDR
-                self._await_keyframe = False
-                self._since_keyframe = 0
-            elif is_keyframe:
-                self._since_keyframe = 0
-            else:
-                self._since_keyframe += 1
-                if self._since_keyframe >= self._gop_warn_at:
-                    self._fail_stream_locked(
-                        f"encoded-AU keyframe gap on {self._name} near frame "
-                        f"{self._delivered}: {self._since_keyframe} frames since "
-                        f"the last keyframe (the relay emits one every "
-                        f"~{self._expected_gop}); episode aborted because the "
-                        "H.264 reference chain is no longer trustworthy"
-                    )
-                    return
+            if permanent:
+                self._permanent_error = message
+            if self._error is None:
+                self._error = message
+            self._queue.clear()
+            self._cond.notify_all()
 
-            # The first AU after every flush may legitimately carry DISCONT at
-            # the valve/segment boundary. A later DISCONT is *not* proof that a
-            # coded picture was lost: the relay's ``queue leaky=downstream``
-            # sits upstream of the dataset encoder, so a raw frame it sheds
-            # under load marks the next buffer DISCONT while the H.264
-            # reference chain (built after that point) stays intact, and
-            # shmsrc itself never drops bytes. Aborting the take here threw
-            # away good episodes; the keyframe-cadence guard above is what
-            # catches a genuinely broken bitstream. Log it (rate-limited) and
-            # keep the picture.
-            if discont and self._seen_first_au:
-                self._discont_count += 1
-                if self._discont_count in (1, 10) or self._discont_count % 100 == 0:
-                    _logger.warning(
-                        "encoded-AU discontinuity on %s near frame %d (%d this "
-                        "episode); upstream frame shed, bitstream still valid",
-                        self._name,
-                        self._delivered,
-                        self._discont_count,
-                    )
-
-            if len(self._queue) >= self._max_pending_aus:
-                self._fail_stream_locked(
-                    f"encoded-AU backlog on {self._name} exceeded "
-                    f"{self._max_pending_aus} pending pictures near frame "
-                    f"{self._delivered}; episode aborted before stale image/pose "
-                    "pairing or unbounded memory growth"
-                )
-                return
-
-            self._seen_first_au = True
-            self._queue.append((au, capture_perf))
-            self._delivered += 1
-            self._cond.notify()
+    def _check_bus_error(self) -> None:
+        bus = self._pipeline.get_bus() if self._pipeline is not None else None
+        if bus is None:
+            return
+        msg = bus.pop_filtered(self._gst.MessageType.ERROR | self._gst.MessageType.EOS)
+        if msg is None:
+            return
+        if msg.type == self._gst.MessageType.ERROR:
+            err, debug = msg.parse_error()
+            detail = f": {debug}" if debug else ""
+            reason = f"{err}{detail}"
+        else:
+            reason = "unexpected end of stream"
+        self._fail(
+            f"encoded-AU GStreamer pipeline failed on {self._name}: {reason}",
+            permanent=True,
+        )
 
     def _pull_loop(self) -> None:
         Gst = self._gst
         while not self._stop.is_set():
+            flush_was_requested = self._flush_requested.is_set()
             sample = self._sink.emit("try-pull-sample", Gst.SECOND // 2)
             if sample is None:
+                self._check_bus_error()
+                # The whole quiet interval must begin after begin_flush(). A
+                # request arriving near the end of an already-running empty
+                # pull cannot certify that no delayed tail follows it.
+                if flush_was_requested and self._flush_requested.is_set():
+                    self._complete_flush()
                 continue  # valve shut (not recording) or starting up — idle
             recv_perf = time.perf_counter()
             buf = sample.get_buffer()
-            capture_perf = _capture_perf_from_gst_pts(
-                recv_perf,
-                buf.pts,
-                self._pts_origin_perf,
-                self._latency_s,
-            )
-            is_keyframe = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
             discont = buf.has_flags(Gst.BufferFlags.DISCONT)
             ok, mapinfo = buf.map(Gst.MapFlags.READ)
             if not ok:
+                if self._episode_cutoff_active and self._seen_first_au:
+                    self._note_lost_exposure("an AU could not be mapped")
                 continue
             try:
                 au = bytes(mapinfo.data)
@@ -872,95 +894,219 @@ class EncodedAuReader:
             # frame short of the dataset rows. See _au_has_coded_slice.
             if not _au_has_coded_slice(au):
                 continue
-            self._accept_access_unit(
-                au,
-                capture_perf,
-                is_keyframe=is_keyframe,
-                discont=discont,
-            )
+            is_idr = _au_is_idr(au)
+            if self.frames_are_independent and not is_idr:
+                self._fail(
+                    f"encoded AU on {self._name} is predictive but the dataset "
+                    "encoder is configured all-intra",
+                    permanent=True,
+                )
+                continue
+            if buf.pts == Gst.CLOCK_TIME_NONE:
+                self._fail(
+                    f"encoded AU on {self._name} has no PTS; exact "
+                    "image/state alignment is unavailable",
+                    permanent=True,
+                )
+                continue
+            # gdppay/gdpdepay normalizes a missing input PTS to zero. Zero is a
+            # legitimate value only for the pipeline's very first frame; once
+            # flush() establishes an episode boundary, seeing it means the
+            # sender lost this AU's timestamp. The AU cannot be placed on the
+            # row grid, so it is dropped and counted: the capture loop sees
+            # the PTS gap and conceals the exposure instead of silently
+            # filing the AU as an old frame (which would break exposure/row
+            # accounting) or ending the take over one lost timestamp.
+            if buf.pts == 0 and self._episode_cutoff_active:
+                if self._seen_first_au:
+                    self._note_lost_exposure(
+                        "an AU arrived with PTS 0 (timestamp lost)"
+                    )
+                continue
+            capture_perf = buf.pts / 1e9 + self._pts_perf_offset_s
+            if not np.isfinite(capture_perf):
+                self._fail(
+                    f"encoded AU on {self._name} has invalid PTS",
+                    permanent=True,
+                )
+                continue
+            # Publish readiness only after the timestamp has passed every
+            # transport-integrity check.  connect() polls errors separately;
+            # setting this event before _fail() creates a race where a malformed
+            # first AU can make startup appear successful.
+            self._first_sample.set()
+            with self._cond:
+                prior_latest = self._latest_capture_perf
+                self._latest_capture_perf = max(prior_latest, capture_perf)
+                if (
+                    self._flush_requested.is_set()
+                    or capture_perf <= self._minimum_capture_perf
+                    or self._error is not None
+                ):
+                    continue
+                # Before the first episode boundary, the relay's output queue
+                # may intentionally shed AUs while shmsink waits for this late
+                # reader. GStreamer marks the resumed stream DISCONT, and there
+                # may be more than one such buffer. These startup AUs are never
+                # recorded: the initial closed-valve flush below establishes a
+                # strictly newer PTS cutoff and re-arms the first-IDR gate. Drain
+                # them here so their expected discontinuities and volume cannot
+                # fail connect() or overflow the bounded episode queue. Transport
+                # and timestamp validation above remains fail-closed.
+                if not self._episode_cutoff_active:
+                    continue
+                if self._await_keyframe:
+                    if not is_idr:
+                        continue  # wait for the episode's first IDR
+                    self._await_keyframe = False
+                    self._since_keyframe = 0
+                elif is_idr:
+                    self._since_keyframe = 0
+                else:
+                    self._since_keyframe += 1
+                    if self._since_keyframe == self._gop_warn_at:
+                        self._fail_keyframe_gap()
+                        continue
+                # A shmsrc DISCONT after the first AU means an upstream buffer was
+                # dropped between the relay and here. This AU itself is intact
+                # (all-intra), and the exposure(s) before it are simply absent:
+                # the capture loop sees the PTS gap and repeats the prior IDR
+                # into it. Count it so the loss is attributed to the transport
+                # rather than the source (the first AU legitimately carries the
+                # startup discontinuity).
+                if discont and self._seen_first_au:
+                    self._note_lost_exposure(
+                        "shmsrc marked a discontinuity (an upstream frame was dropped)"
+                    )
+                if len(self._queue) >= self._queue_limit:
+                    self._error = (
+                        f"encoded-AU backlog on {self._name} exceeded "
+                        f"{self._queue_limit} frames; capture stopped draining "
+                        "the encoded stream"
+                    )
+                    self._queue.clear()
+                    self._cond.notify_all()
+                    continue
+                self._seen_first_au = True
+                self._queue.append((au, capture_perf, recv_perf))
+                self._delivered += 1
+                self._cond.notify()
 
-    def read_next_au(self, timeout_ms: float = 500) -> tuple[bytes, float]:
+    def _fail_keyframe_gap(self) -> None:
+        """Reject a stream that lost a periodic IDR upstream."""
+        self._fail(
+            f"encoded-AU keyframe gap on {self._name} near frame "
+            f"{self._delivered}: {self._since_keyframe} frames since the last "
+            f"keyframe (expected about {self._expected_gop})"
+        )
+
+    def read_next_au(self, timeout_ms: float = 500) -> tuple[bytes, float, float]:
         """Pop the next access unit in order; block up to ``timeout_ms``.
 
-        Returns ``(au_bytes, capture_ts)``. ``capture_ts`` is the GDP-preserved
-        sensor PTS mapped to ``perf_counter``; invalid metadata falls back to
-        receipt time minus the relay-reported pipeline latency (or receipt time
-        when that is unavailable). Raises :class:`TimeoutError` if no AU arrives
-        in time; the caller aborts the episode because skipping or replaying an
-        H.264 picture would break the decoder reference chain.
+        Returns ``(au_bytes, capture_perf_ts, recv_perf_ts)``. The capture time
+        is the sender's sensor-exposure PTS mapped onto ``perf_counter``; receive
+        time is retained for latency diagnostics. Raises :class:`RuntimeError`
+        on a transport failure (pipeline error, predictive picture on the
+        all-intra contract, no/invalid PTS, or a backlog the recorder stopped
+        draining) and :class:`TimeoutError` if no fresh AU arrives in time. A
+        single lost or unusable exposure is counted (:attr:`lost_exposures`)
+        and left for the capture loop to conceal, not raised.
         """
         deadline = time.perf_counter() + timeout_ms / 1000.0
         with self._cond:
-            while not self._queue and self._stream_error is None:
+            while not self._queue:
+                if self._error is not None:
+                    raise RuntimeError(self._error)
+                if self._stop.is_set():
+                    raise RuntimeError(f"encoded-AU reader {self._name} is closed")
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
                     raise TimeoutError(
                         f"encoded-AU reader timed out after {timeout_ms:.1f}ms."
                     )
                 self._cond.wait(remaining)
-            if self._stream_error is not None:
-                raise RuntimeError(self._stream_error)
             return self._queue.popleft()
 
     def disconnect(self) -> None:
+        self._stop.set()
+        with self._cond:
+            self._cond.notify_all()
         _disconnect_gst_pull_reader(self, label="encoded-AU reader")
 
     # camera-compatible alias.
     close = disconnect
 
 
-# Snapshot ring depth: ~0.5 s of history at the 120 Hz control rate — plenty
-# for the recorder's nearest-timestamp pose↔image pairing (the match target is
-# within a frame interval or two of "now").
-_SNAP_RING_SLOTS = 64
-
-
 class SnapshotWriter:
-    """Control-process side: publish joint/action snapshots into a shm ring.
+    """Control-process side: publish timestamped joint/action snapshots.
 
-    A lock-free seqlock ring over one shared-memory block: ``_SNAP_RING_SLOTS``
-    slots of float64s
-    (``[ts, *joint_obs_vals, *action_vals, intervention]`` in fixed key order),
-    each guarded by its own seq counter, plus a global committed-write count.
-    The intervention value is 0.0/1.0 for DAgger collection. The control loop
-    calls :meth:`write` every tick; the recorder reads either the newest
-    snapshot or the one nearest a camera frame's capture time. Single-writer /
-    single-reader.
+    A bounded SPSC ring stores float64 records in the form
+    ``[ts, *joint_obs_vals, *action_vals, intervention]`` (fixed key order;
+    ``intervention`` is 0.0/1.0). Each slot has its own seqlock and logical
+    generation, and the header's ``published`` high-water mark is advanced only
+    after a slot is complete. There is no lock: :meth:`write` never blocks on
+    the recorder (see :data:`_SNAP_READ_ATTEMPTS`); the reader detects a copy
+    it raced against by re-checking the slot metadata and retakes it. The
+    512-slot history spans >4 seconds at the 120 Hz control rate.
     """
 
     def __init__(self, obs_keys: list[str], action_keys: list[str]) -> None:
         self._obs_keys = list(obs_keys)
         self._action_keys = list(action_keys)
-        n = len(self._obs_keys) + len(self._action_keys)
-        self._slot_len = 2 + n
-        header_bytes = _SNAP_HEADER_BYTES + 8 * _SNAP_RING_SLOTS
+        self._width = 2 + len(self._obs_keys) + len(self._action_keys)
+        self._capacity = _SNAP_RING_CAPACITY
         self._shm = shared_memory.SharedMemory(
-            create=True, size=header_bytes + 8 * _SNAP_RING_SLOTS * self._slot_len
+            create=True, size=_snapshot_block_size(self._width, self._capacity)
         )
         self.name = self._shm.name
-        self._meta = np.ndarray((1,), dtype=_SNAP_META_DTYPE, buffer=self._shm.buf)
-        self._slot_seq = np.ndarray(
-            (_SNAP_RING_SLOTS,),
-            dtype="<i8",
+        self._header = np.ndarray((1,), dtype=_SNAP_HEADER_DTYPE, buffer=self._shm.buf)
+        self._slot_meta = np.ndarray(
+            (self._capacity,),
+            dtype=_SNAP_SLOT_META_DTYPE,
             buffer=self._shm.buf,
             offset=_SNAP_HEADER_BYTES,
         )
+        data_offset = (
+            _SNAP_HEADER_BYTES + self._capacity * _SNAP_SLOT_META_DTYPE.itemsize
+        )
         self._data = np.ndarray(
-            (_SNAP_RING_SLOTS, self._slot_len),
+            (self._capacity, self._width),
             dtype="<f8",
             buffer=self._shm.buf,
-            offset=header_bytes,
+            offset=data_offset,
         )
-        self._meta["seq"][0] = 0  # committed-write count
-        self._slot_seq[:] = 0
+        self._header["published"][0] = 0
+        self._header["capacity"][0] = self._capacity
+        self._header["width"][0] = self._width
+        self._slot_meta.fill(0)
+        self._next_generation = 1
 
     def write(
         self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
+    ) -> bool:
+        """Pack and commit one snapshot; never blocks on the reader.
+
+        Always returns ``True`` (kept for call-site compatibility with the
+        earlier lock-based writer, which could skip a sample).
+        """
+        self._write_slot(joint_obs, action, ts, intervention)
+        return True
+
+    def _write_slot(
+        self, joint_obs: dict, action: dict, ts: float, intervention: bool
     ) -> None:
-        """Pack one snapshot into the next ring slot (per-slot seqlock)."""
-        c = int(self._meta["seq"][0])
-        slot = c % _SNAP_RING_SLOTS
-        self._slot_seq[slot] += 1  # odd: write in progress
+        """Pack one record into the next slot and publish it."""
+        generation = self._next_generation
+        slot = (generation - 1) % self._capacity
+        # seq is odd while this slot is being replaced and even once committed.
+        # It never resets on ring wrap, preventing an ABA match during a read.
+        seq = int(self._slot_meta["seq"][slot])
+        if seq & 1:
+            # A prior write can only be abandoned by an exception while packing
+            # caller data. Keep that generation unreadable, but recover the slot
+            # for a later successful write without ever publishing partial data.
+            seq += 1
+        self._slot_meta["seq"][slot] = seq + 1
         d = self._data[slot]
         d[0] = ts
         i = 1
@@ -971,63 +1117,233 @@ class SnapshotWriter:
             d[i] = action[k]
             i += 1
         d[i] = 1.0 if intervention else 0.0
-        self._slot_seq[slot] += 1  # even: committed
-        self._meta["seq"][0] = c + 1
+        self._slot_meta["generation"][slot] = generation
+        self._slot_meta["seq"][slot] = seq + 2
+        # Publish only after the complete slot is visible. Readers that observed
+        # the prior high-water mark can still safely read that older generation.
+        self._header["published"][0] = generation
+        self._next_generation += 1
 
     def close(self) -> None:
-        self._meta = None  # type: ignore[assignment]
-        self._slot_seq = None  # type: ignore[assignment]
+        self._header = None  # type: ignore[assignment]
+        self._slot_meta = None  # type: ignore[assignment]
         self._data = None  # type: ignore[assignment]
+        if self._shm is None:
+            return
         try:
             self._shm.close()
             self._shm.unlink()
         except Exception:  # noqa: BLE001 - best-effort teardown
             pass
+        self._shm = None  # type: ignore[assignment]
 
 
 class SnapshotReader:
-    """Recorder-subprocess side: read joint/action snapshots from the shm ring.
+    """Recorder-subprocess side: query timestamped joint/action history.
 
     Attaches to a :class:`SnapshotWriter`'s block by name and reconstructs the
-    ``(joint_obs, action, ts, intervention)`` using the same key order. Returns
-    ``None`` before the first write (mirroring the in-process publisher).
+    ``(joint_obs, action, ts, intervention)`` tuple using the same key order.
+    :meth:`read_latest` preserves the original single-slot API, while
+    :meth:`read_nearest` selects the committed record nearest a camera capture
+    timestamp. Both return ``None`` before the first publication, and also on
+    the (transient) failure to obtain a consistent copy of the ring — callers
+    retry; see :meth:`_copy_ring`. The reader never takes a lock the writer
+    would have to wait on.
     """
 
-    def __init__(self, name: str, obs_keys: list[str], action_keys: list[str]) -> None:
+    def __init__(
+        self,
+        name: str,
+        obs_keys: list[str],
+        action_keys: list[str],
+    ) -> None:
         self._obs_keys = list(obs_keys)
         self._action_keys = list(action_keys)
-        n = len(self._obs_keys) + len(self._action_keys)
-        self._slot_len = 2 + n
-        header_bytes = _SNAP_HEADER_BYTES + 8 * _SNAP_RING_SLOTS
+        expected_width = 2 + len(self._obs_keys) + len(self._action_keys)
         self._shm = shared_memory.SharedMemory(name=name)
-        self._meta = np.ndarray((1,), dtype=_SNAP_META_DTYPE, buffer=self._shm.buf)
-        self._slot_seq = np.ndarray(
-            (_SNAP_RING_SLOTS,),
-            dtype="<i8",
+        self._header = np.ndarray((1,), dtype=_SNAP_HEADER_DTYPE, buffer=self._shm.buf)
+        self._capacity = int(self._header["capacity"][0])
+        self._width = int(self._header["width"][0])
+        if self._capacity <= 0 or self._width != expected_width:
+            self._header = None  # type: ignore[assignment]
+            self._shm.close()
+            self._shm = None  # type: ignore[assignment]
+            raise ValueError(
+                "snapshot shared-memory layout does not match the supplied keys "
+                f"(capacity={self._capacity}, width={self._width}, "
+                f"expected_width={expected_width})."
+            )
+        expected_size = _snapshot_block_size(self._width, self._capacity)
+        if self._shm.size < expected_size:
+            actual_size = self._shm.size
+            self._header = None  # type: ignore[assignment]
+            self._shm.close()
+            self._shm = None  # type: ignore[assignment]
+            raise ValueError(
+                "snapshot shared-memory block is smaller than its declared layout "
+                f"({actual_size} < {expected_size})."
+            )
+        self._slot_meta = np.ndarray(
+            (self._capacity,),
+            dtype=_SNAP_SLOT_META_DTYPE,
             buffer=self._shm.buf,
             offset=_SNAP_HEADER_BYTES,
         )
+        data_offset = (
+            _SNAP_HEADER_BYTES + self._capacity * _SNAP_SLOT_META_DTYPE.itemsize
+        )
         self._data = np.ndarray(
-            (_SNAP_RING_SLOTS, self._slot_len),
+            (self._capacity, self._width),
             dtype="<f8",
             buffer=self._shm.buf,
-            offset=header_bytes,
+            offset=data_offset,
         )
 
-    def _read_slot(self, slot: int) -> np.ndarray | None:
-        """Copy one slot consistently (per-slot seqlock), or ``None`` on miss."""
-        for _ in range(8):
-            s1 = int(self._slot_seq[slot])
-            if s1 == 0:
-                return None  # never written
-            if s1 & 1:
-                continue  # writer mid-write
-            snap = np.array(self._data[slot], dtype="<f8")
-            if int(self._slot_seq[slot]) == s1:
-                return snap
+    def _copy_ring(self) -> "tuple[int, NDArray[Any], NDArray[Any]] | None":
+        """Take a consistent copy of the ring without blocking the writer.
+
+        Optimistic read: snapshot ``published``, bulk-copy the slot metadata,
+        bulk-copy the data, then compare the live metadata against the copy.
+        The writer bumps a slot's ``seq`` (to odd) before touching its data and
+        again (to even) after, so any write that started or finished while the
+        data was being copied changes the metadata and fails the comparison —
+        the copy is then retaken. A write still in flight across the whole copy
+        leaves its slot's ``seq`` odd in the copy, and :meth:`_slot_of` rejects
+        that slot. Neither case can make the writer wait: a reader descheduled
+        mid-copy costs only itself a retry.
+
+        Every slot at or below the ``published`` we observed was complete
+        before the copy began, so the only slots a validated copy can misreport
+        are ones the writer has since reused, and those are the *oldest*
+        generations (:data:`_SNAP_OLDEST_SKIP`). Returns ``None`` before the
+        first publication or when :data:`_SNAP_READ_ATTEMPTS` consecutive
+        copies were raced; callers treat that as a transient miss.
+        """
+        for _ in range(_SNAP_READ_ATTEMPTS):
+            published = int(self._header["published"][0])
+            if published == 0:
+                return None
+            meta = self._slot_meta.copy()
+            data = self._copy_data()
+            if np.array_equal(meta.view(np.uint64), self._slot_meta.view(np.uint64)):
+                return published, meta, data
         return None
 
-    def _to_dicts(self, snap: np.ndarray) -> tuple[dict, dict, float, bool]:
+    def _copy_data(self) -> "NDArray[Any]":
+        """Bulk-copy the data plane (split out so tests can race a write in)."""
+        return self._data.copy()
+
+    def read_latest(self) -> tuple[dict, dict, float, bool] | None:
+        """Return the newest committed snapshot, preserving the original API."""
+        ring = self._copy_ring()
+        if ring is None:
+            return None
+        published, meta, data = ring
+        snap = self._generation(meta, data, published)
+        return None if snap is None else self._unpack(snap)
+
+    def read_nearest(self, target_ts: float) -> tuple[dict, dict, float, bool] | None:
+        """Return the committed snapshot closest to ``target_ts``.
+
+        Snapshot timestamps are monotonic ``perf_counter`` values, so a binary
+        search over the copied ring finds the bracketing generations in
+        O(log capacity).
+        """
+        ring = self._copy_ring()
+        if ring is None:
+            return None
+        published, meta, data = ring
+        return self._nearest_in(meta, data, published, target_ts)
+
+    def _nearest_in(
+        self,
+        meta: "NDArray[Any]",
+        data: "NDArray[Any]",
+        newest: int,
+        target_ts: float,
+    ) -> tuple[dict, dict, float, bool] | None:
+        """Find the nearest snapshot in a consistent ring copy."""
+        newest_ts = self._generation_ts(meta, data, newest)
+        if newest_ts is None:
+            return None
+        # The writer reuses the oldest slot next. If it was already mid-write
+        # when the copy was taken (odd ``seq``), or the copy was taken after
+        # ``published`` was read and a few newer generations landed there, the
+        # first generation(s) are not this copy's to use: give them up rather
+        # than reject the copy.
+        oldest = max(1, newest - self._capacity + 1)
+        oldest_ts = None
+        for _ in range(_SNAP_OLDEST_SKIP):
+            if oldest > newest:
+                return None
+            oldest_ts = self._generation_ts(meta, data, oldest)
+            if oldest_ts is not None:
+                break
+            oldest += 1
+        if oldest_ts is None:
+            return None
+        # Never silently clamp an exposure outside retained state history.
+        # A target just newer than ``newest`` can be retried by the caller;
+        # one older than ``oldest`` means the recorder fell irrecoverably
+        # behind and the episode must not be saved as synchronized.
+        if target_ts < oldest_ts or target_ts > newest_ts:
+            return None
+        lo = oldest
+        hi = newest
+        first_at_or_after = newest + 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            ts = self._generation_ts(meta, data, mid)
+            if ts is None:
+                return None
+            if ts >= target_ts:
+                first_at_or_after = mid
+                hi = mid - 1
+            else:
+                lo = mid + 1
+
+        candidates: list[tuple[float, "NDArray[Any]"]] = []
+        if first_at_or_after <= newest:
+            snap = self._generation(meta, data, first_at_or_after)
+            if snap is None:
+                return None
+            candidates.append((abs(float(snap[0]) - target_ts), snap))
+        before = first_at_or_after - 1
+        if before >= oldest:
+            snap = self._generation(meta, data, before)
+            if snap is None:
+                return None
+            candidates.append((abs(float(snap[0]) - target_ts), snap))
+        if not candidates:
+            return None
+        # On an exact tie, prefer the later sample. This avoids pairing an
+        # image with a needlessly older state at a half-tick boundary.
+        _distance, nearest = min(
+            candidates, key=lambda item: (item[0], -float(item[1][0]))
+        )
+        return self._unpack(nearest)
+
+    def _slot_of(self, meta: "NDArray[Any]", generation: int) -> int | None:
+        """Physical slot holding ``generation`` if it is committed there."""
+        slot = (generation - 1) % self._capacity
+        seq = int(meta["seq"][slot])
+        if seq == 0 or seq & 1 or int(meta["generation"][slot]) != generation:
+            return None
+        return slot
+
+    def _generation_ts(
+        self, meta: "NDArray[Any]", data: "NDArray[Any]", generation: int
+    ) -> float | None:
+        slot = self._slot_of(meta, generation)
+        return None if slot is None else float(data[slot, 0])
+
+    def _generation(
+        self, meta: "NDArray[Any]", data: "NDArray[Any]", generation: int
+    ) -> "NDArray[Any] | None":
+        slot = self._slot_of(meta, generation)
+        return None if slot is None else data[slot]
+
+    def _unpack(self, snap: "NDArray[Any]") -> tuple[dict, dict, float, bool]:
         ts = float(snap[0])
         vals = snap[1:]
         no = len(self._obs_keys)
@@ -1036,45 +1352,9 @@ class SnapshotReader:
         intervention = bool(snap[-1] >= 0.5)
         return joint_obs, action, ts, intervention
 
-    def read_latest(self) -> tuple[dict, dict, float, bool] | None:
-        count = int(self._meta["seq"][0])
-        if count == 0:
-            return None
-        snap = self._read_slot((count - 1) % _SNAP_RING_SLOTS)
-        return self._to_dicts(snap) if snap is not None else None
-
-    def read_nearest(self, target_ts: float) -> tuple[dict, dict, float, bool] | None:
-        """Return the buffered snapshot whose timestamp is nearest ``target_ts``.
-
-        Pairs a camera frame's capture time with the pose/action snapshot
-        captured closest to it (both on the system-wide ``perf_counter``
-        timeline) instead of whatever happened to be newest — the residual
-        skew is recorded per row as ``pose_lag``. Falls back over any slot the
-        writer is concurrently updating; returns ``None`` before the first
-        write.
-        """
-        count = int(self._meta["seq"][0])
-        if count == 0:
-            return None
-        best: np.ndarray | None = None
-        best_err = float("inf")
-        for back in range(min(count, _SNAP_RING_SLOTS)):
-            slot = (count - 1 - back) % _SNAP_RING_SLOTS
-            snap = self._read_slot(slot)
-            if snap is None:
-                continue
-            err = abs(float(snap[0]) - target_ts)
-            if err < best_err:
-                best, best_err = snap, err
-            elif best is not None and float(snap[0]) < target_ts:
-                # Timestamps decrease as we walk back; once past the target
-                # and no longer improving, stop.
-                break
-        return self._to_dicts(best) if best is not None else None
-
     def close(self) -> None:
-        self._meta = None  # type: ignore[assignment]
-        self._slot_seq = None  # type: ignore[assignment]
+        self._header = None  # type: ignore[assignment]
+        self._slot_meta = None  # type: ignore[assignment]
         self._data = None  # type: ignore[assignment]
         if self._shm is not None:
             try:

@@ -15,11 +15,11 @@ Values set here sit between the built-in defaults and anything you pass on the c
 | `robot.has_gripper` | `has_gripper` on the robot config | every operation |
 | `robot.gripper_torque_limit` | `<side>.gripper.torque_limit` on both arms | every operation |
 | `robot.gripper_max_speed` | `<side>.gripper.max_speed` on both arms | every operation |
-| `robot.cart_enabled` | `enabled` on the [Jelly config](/operations/teleop-config#jelly) | teleop, data collection, DAgger |
+| `robot.jelly_enabled` | `enabled` on the [Jelly config](/operations/teleop-config#jelly) | teleop, data collection, DAgger |
 | `robot.reset_torque_threshold` | `reset_torque_threshold` | teleop, data collection, DAgger, run policy, replay |
 | `robot.teleop_torque_threshold` | `teleop_torque_threshold` (switch arms it at `16`) | teleop, data collection, DAgger, replay |
 | `robot.policy_torque_threshold` | `policy_torque_threshold` (switch arms it at `16`) | run policy |
-| `robot.gravity_kd` / `robot.gravity_rate_hz` / `robot.gravity_telemetry_hz` | `kd` / `rate_hz` / `telemetry_hz` | gravity comp, waypoints |
+| `robot.gravity_kd` / `robot.gravity_rate_hz` | `kd` / `rate_hz` | gravity comp, waypoints |
 | `teleop.frequency` | `frequency` on the [teleop session](/operations/teleop-config#teleop), and `teleop_hz` on data collection | teleop, data collection, DAgger |
 | `teleop.position_multiplier` / `teleop.rotation_multiplier` | the same keys on the teleop session | teleop, data collection, DAgger |
 | `teleop.hold_to_engage` | `hold_to_engage` on the teleop session | teleop, data collection, DAgger |
@@ -38,4 +38,4 @@ Values set here sit between the built-in defaults and anything you pass on the c
 | `system.hardware_profile` | the `mantis` flag (`axol` or `mantis`) | teleop, data collection |
 | `system.log_level` | `log_level` | every operation |
 
-Everything else is under the **Advanced** tab, stored under keys that mirror the config sections: `axol.*` (robot), `vr_teleop.*` (teleop session), `kinematics.*`, `cart.*` (Jelly), `vr_server.*`, and `lerobot.*` (the `robot_config.*` fields). One stored value applies to every operation that has that subsystem.
+Everything else is under the **Advanced** tab, stored under keys that mirror the config sections: `axol.*` (robot), `vr_teleop.*` (teleop session), `kinematics.*`, `jelly.*`, `vr_server.*`, and `lerobot.*` (the `robot_config.*` fields). One stored value applies to every operation that has that subsystem.

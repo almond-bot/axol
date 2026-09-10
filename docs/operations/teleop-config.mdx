@@ -22,7 +22,7 @@ axol teleop --axol.left_stiffness 0.8 --teleop.position_multiplier 1.5
 |---|---|---|
 | `--sim` | `false` | Drive the browser visualiser instead of the robot. Robot gains and CAN channels are ignored. |
 | `--mantis` | `false` | Drive the Mantis rigs' grippers from their triggers instead of the robot. |
-| `--cart_only` | `false` | Drive only the Jelly; the arms are never touched. |
+| `--jelly_only` | `false` | Drive only Jelly; the arms are never touched. |
 | `--left_channel` | `can_alm_axol_l` | CAN interface for the left arm. `null` disables the arm. |
 | `--right_channel` | `can_alm_axol_r` | CAN interface for the right arm. `null` disables the arm. |
 | `--cameras` | `{}` | Cameras to stream to the headset, as slot → serial: `"{overhead: 41234567, left_arm: 41234568}"`. Empty means no video. |
@@ -59,4 +59,4 @@ The connection the headset streams poses over.
 
 The optional powered cart (x-drive base and telescoping lift), driven from the headset thumbsticks.
 
-<Jelly prefix="cart." />
+<Jelly prefix="jelly." />

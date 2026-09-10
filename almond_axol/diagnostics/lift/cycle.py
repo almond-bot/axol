@@ -15,6 +15,10 @@ position save to finish before issuing the next move. The held arm joints
 remain monitored throughout lift motion, and Ctrl-C stops the lift. The other
 arm joints hold their measured starting positions throughout.
 
+The arms are driven through the Rust realtime core (``RtAxol``), the same
+control path as teleop: it owns the arm CAN buses, renders the S1 ramps at
+240 Hz, and keeps the held joints damped while the lift cycles.
+
 Usage:
     axol diag.lift-cycle                    # prompts for cycle count
     axol diag.lift-cycle --cycles 10
@@ -41,6 +45,7 @@ from ...constants import ARM_JOINTS, CAN_CHEST, CAN_LEFT, CAN_RIGHT, Joint
 from ...robot.axol import Axol
 from ...robot.config import AxolConfig
 from ...robot.lift import Lift, LiftStatus
+from ...rt import RtAxol
 
 _STATUS_PERIOD_MS = 200
 _STATUS_STALE_S = 1.0
@@ -65,6 +70,9 @@ _SHOULDER_TOLERANCE_RAD = math.radians(3)
 _HELD_JOINT_TOLERANCE_RAD = math.radians(5)
 _ARM_CONTROL_HZ = 100.0
 _ARM_SAFETY_CHECK_PERIOD_S = 0.1
+# The core reports every motor's feedback each 240 Hz tick; a joint that has
+# been silent for this long is no longer being held by it.
+_FEEDBACK_FRESH_S = 0.25
 _S1_INDEX = list(Joint).index(Joint.SHOULDER_1)
 
 _LOWER = 0
@@ -515,7 +523,7 @@ def _validated_arm_pose(
 
 
 async def _read_valid_arm_positions(
-    axol: Axol,
+    axol: RtAxol,
     context: str,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     left, right = await axol.get_positions()
@@ -535,8 +543,22 @@ async def _read_valid_arm_positions(
     )
 
 
-async def _verify_arms_holding(axol: Axol, context: str) -> None:
-    """Prove every selected arm joint remains enabled and holding torque."""
+async def _verify_arms_holding(axol: RtAxol, context: str) -> None:
+    """Prove the realtime core still holds every selected arm joint.
+
+    The core owns the CAN buses while the arms are up, so Python cannot ask
+    each motor for its enable state (a request/response would fight the
+    240 Hz loop). The equivalent evidence is the core's own health: a latched
+    fault (a motor stopped answering — the core stops streaming) or a limp
+    (kp = 0 gravity comp) means the arms are no longer holding, and every
+    selected joint's feedback must be fresh, proving each motor is still
+    answering the core's commands.
+    """
+    core_state = axol.fault or axol.limp
+    if core_state is not None:
+        raise DiagnosticFailure(
+            f"{context}: realtime core reported {core_state}; the arms are not holding"
+        )
     motors = [
         (side, joint, arm.motors.get(joint))
         for side, arm in (("left", axol.left), ("right", axol.right))
@@ -550,19 +572,18 @@ async def _verify_arms_holding(axol: Axol, context: str) -> None:
         raise DiagnosticFailure(
             f"{context}: arm motors are missing: {', '.join(missing)}"
         )
-    results = await asyncio.gather(
-        *(motor.is_holding() for _, _, motor in motors if motor is not None),
-        return_exceptions=True,
-    )
+    now = time.time()
     problems: list[str] = []
-    for (side, joint, _), result in zip(motors, results, strict=True):
+    for side, joint, motor in motors:
+        assert motor is not None
         label = f"{side} {joint.value}"
-        if isinstance(result, BaseException):
+        feedback_ts = motor._feedback_ts
+        if feedback_ts is None:
+            problems.append(f"{label} has reported no feedback to the core")
+        elif now - feedback_ts > _FEEDBACK_FRESH_S:
             problems.append(
-                f"{label} holding check failed ({type(result).__name__}: {result})"
+                f"{label} feedback is stale ({(now - feedback_ts) * 1e3:.0f} ms)"
             )
-        elif not result:
-            problems.append(f"{label} is not enabled and holding")
     if problems:
         raise DiagnosticFailure(f"{context}: " + "; ".join(problems))
 
@@ -580,8 +601,16 @@ def _rest_targets(
     return left_target, right_target
 
 
-async def _disable_arms_verified(axol: Axol) -> None:
-    """Disable every selected-arm motor and prove none still reports holding."""
+async def _disable_arms_verified(robot: RtAxol, axol: Axol) -> None:
+    """Disable every selected-arm motor and prove none still reports holding.
+
+    ``RtAxol.disable`` is the deliberate stop: the core disables the motors on
+    disarm and Python repeats the shutdown once the bus is free. Its lifecycle
+    intentionally suppresses individual motor errors (and, after a core fault
+    or limp, deliberately leaves the motors energized). A diagnostic must be
+    stricter: reopen the maintenance proxies afterwards, query every motor,
+    and refuse PASS unless all of them report torque off.
+    """
     missing = [
         f"{side} {joint.value}"
         for side, arm in (("left", axol.left), ("right", axol.right))
@@ -603,41 +632,50 @@ async def _disable_arms_verified(axol: Axol) -> None:
     if not motors:
         raise DiagnosticFailure("arm shutdown: no selected arm motors are available")
 
-    # The generic Axol.disable() lifecycle intentionally suppresses individual
-    # motor errors before closing its buses. A diagnostic must be stricter: send
-    # every shutdown concurrently, then query every motor while the buses remain
-    # open and refuse PASS unless all of them report torque off.
-    disable_results = await asyncio.gather(
-        *(motor.disable() for _, _, motor in motors),
-        return_exceptions=True,
-    )
-    holding_results = await asyncio.gather(
-        *(motor.is_holding() for _, _, motor in motors),
-        return_exceptions=True,
-    )
+    disable_error: BaseException | None = None
+    try:
+        await robot.disable()
+    except Exception as exc:  # noqa: BLE001 - verified below, reported together
+        disable_error = exc
+    core_state = robot.fault or robot.limp
+    if core_state is not None:
+        # The core never torques off after a fault/limp, and may still own
+        # the bus — do not open proxies against it; the arms are energized.
+        raise DiagnosticFailure(
+            f"arm shutdown was not performed: realtime core reported {core_state}; "
+            "the arms remain energized"
+        )
+
+    await axol.connect()
+    try:
+        holding_results = await asyncio.gather(
+            *(motor.is_holding() for _, _, motor in motors),
+            return_exceptions=True,
+        )
+    finally:
+        # A bus that will not close leaves ownership uncertain; that withholds
+        # the PASS even when every motor reported disabled.
+        await _retry_cleanup(axol.disconnect, label="closing arm CAN buses")
 
     problems = []
-    for (side, joint, _), disable_result, holding_result in zip(
-        motors, disable_results, holding_results, strict=True
-    ):
+    for (side, joint, _), holding_result in zip(motors, holding_results, strict=True):
         label = f"{side} {joint.value}"
-        if isinstance(disable_result, BaseException):
-            problems.append(
-                f"{label} disable failed "
-                f"({type(disable_result).__name__}: {disable_result})"
-            )
         if isinstance(holding_result, BaseException):
             detail = f"{type(holding_result).__name__}: {holding_result}"
             problems.append(f"{label} could not be verified ({detail})")
         elif holding_result:
             problems.append(f"{label} still reports enabled and holding")
+    if disable_error is not None:
+        problems.append(
+            f"disable raised {type(disable_error).__name__}: {disable_error}"
+        )
 
     if problems:
         raise DiagnosticFailure("arm shutdown was not verified: " + "; ".join(problems))
 
 
 async def _ramp_arms(
-    axol: Axol,
+    axol: RtAxol,
     start_left: np.ndarray | None,
     start_right: np.ndarray | None,
     target_left: np.ndarray | None,
@@ -711,7 +749,7 @@ async def _ramp_arms(
 
 
 async def _verify_arm_targets(
-    axol: Axol,
+    axol: RtAxol,
     target_left: np.ndarray | None,
     target_right: np.ndarray | None,
     context: str,
@@ -831,7 +869,8 @@ async def _run(args: argparse.Namespace) -> None:
 
     cycles = _resolve_cycles(args.cycles)
     lift: Lift | None = None
-    axol: Axol | None = None
+    inner: Axol | None = None
+    axol: RtAxol | None = None
     arms_enabled = False
     arms_disabled = False
     arms_at_clearance = False
@@ -872,11 +911,14 @@ async def _run(args: argparse.Namespace) -> None:
                 # gripper while exercising the independent lift mechanism.
                 has_gripper=False,
             )
-            axol = Axol(
+            inner = Axol(
                 config=config,
                 left_channel=None if args.no_left else args.left_channel,
                 right_channel=None if args.no_right else args.right_channel,
             )
+            # Production control path: the Rust core owns the arm buses and
+            # holds the clearance pose, damping live, while the lift cycles.
+            axol = RtAxol(inner)
             print("Enabling arms and holding their measured pose ...")
             # enable() can partially attach before surfacing a motor fault;
             # cleanup must treat the arm state as live from this point onward.
@@ -1049,7 +1091,7 @@ async def _run(args: argparse.Namespace) -> None:
             )
             await ensure_lift_upper_stopped()
             print("S1 rest verified; disabling arm motors ...")
-            await _disable_arms_verified(axol)
+            await _disable_arms_verified(axol, inner)
             arms_disabled = True
             completed = True
     except BaseException as exc:
@@ -1071,12 +1113,22 @@ async def _run(args: argparse.Namespace) -> None:
             except BaseException as exc:
                 cleanup_errors.append(exc)
                 print(f"WARNING: {exc}", file=sys.stderr)
-        if axol is not None:
+        if axol is not None and arms_enabled and not arms_disabled:
+            # Release the core without a disarm: the motors keep holding
+            # their last command (a failed/low lift must never cause the
+            # process to torque off arms out of their clearance).
             try:
-                await _retry_cleanup(
-                    axol.disconnect,
-                    label="closing arm CAN buses",
-                )
+                await _retry_cleanup(axol.detach, label="releasing the realtime core")
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                print(f"WARNING: {exc}", file=sys.stderr)
+        if inner is not None:
+            # Every path above already closed the arm buses (detach, or the
+            # verified disable's proxy reopen/close); this proves it. A bus
+            # that cannot be closed leaves ownership uncertain and withholds
+            # the PASS.
+            try:
+                await _retry_cleanup(inner.disconnect, label="closing arm CAN buses")
             except BaseException as exc:
                 cleanup_errors.append(exc)
                 print(f"WARNING: {exc}", file=sys.stderr)

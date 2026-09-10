@@ -2,15 +2,17 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 
 | Flag | Default | Description |
 |---|---|---|
-| <F>--{prefix}left_stiffness</F> | `0.5` | How stiff the left arm is, from `0` (fully compliant) to `1` (rigid). One number applies to every joint; a 7-element list sets each joint in the order `shoulder_1, shoulder_2, shoulder_3, elbow, wrist_1, wrist_2, wrist_3`. Higher tracks targets more tightly but yields less to obstacles. |
-| <F>--{prefix}right_stiffness</F> | `0.5` | Same, for the right arm. |
+| <F>--{prefix}left_stiffness</F> | `1.0` | How stiff the left arm is, from `0` (soft, hand-guidable) to `1` (the tuned gains). Lower values only add compliance — the arm tracks a little less tightly but yields more to obstacles. One number applies to every joint; a 7-element list sets each joint in the order `shoulder_1, shoulder_2, shoulder_3, elbow, wrist_1, wrist_2, wrist_3`. |
+| <F>--{prefix}right_stiffness</F> | `1.0` | Same, for the right arm. |
 | <F>--{prefix}has_gripper</F> | `true` | Set `false` on the gripperless model. The gripper motors are never enabled and datasets record 7 channels per arm instead of 8. |
 | <F>--{prefix}max_step_rad</F> | `0.5` | Largest joint move (rad) allowed between two consecutive commands. Bigger moves are dropped with a warning. `inf` disables. |
 | <F>--{prefix}left.gripper.torque_limit</F> | `0.5` | Grip force — peak gripper torque (Nm). |
 | <F>--{prefix}left.gripper.max_speed</F> | `10.0` | Maximum gripper speed (rad/s). |
-| <F>--{prefix}left.elbow.kp</F> | per joint | Position stiffness of one joint at stiffness `0`, in `[0, 500]`. |
-| <F>--{prefix}left.elbow.kd</F> | per joint | Velocity damping. Capped by the motor firmware (`5` on most motors); use `kd_soft` for more. |
-| <F>--{prefix}left.elbow.kd_soft</F> | per joint | Extra software damping (Nm·s/rad) beyond the motor cap. |
+| <F>--{prefix}left.elbow.kp</F> | per joint | Position stiffness of one joint, in `[0, 500]`. This is the stiffness-`1` value. |
+| <F>--{prefix}left.elbow.kd</F> | per joint | Velocity damping in the motor firmware, in `[0, 5]`. |
+| <F>--{prefix}left.elbow.kd_host</F> | per joint | Extra damping (Nm·s/rad) applied by the host, for the slow shoulder resonance the firmware can't damp. Scaled down automatically in poses where the joint carries less inertia. `0` on joints whose firmware damping is enough. |
+| <F>--{prefix}left.elbow.kd_host_hz</F> | `null` | Centre frequency (Hz) of the band the host damping acts in. `null` tracks the arm's pose automatically. |
+| <F>--{prefix}left.elbow.kd_host_q</F> | `null` | Width of that band (bandwidth = centre ÷ q). `null` uses `0.8`. |
 | <F>--{prefix}left.elbow.j_eff</F> | per joint | Effective inertia (kg·m²) used for acceleration feed-forward. |
 | <F>--{prefix}left.elbow.mass</F> | per joint | Mass (kg) of the link, used for gravity compensation. Tune if an arm sags or pushes back in [gravity comp](/operations/gravity-comp). |
 | <F>--{prefix}left.elbow.com</F> | per joint | Centre of mass `[x, y, z]` (m) of the link. |
@@ -21,30 +23,34 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 
 Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or any joint: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3`.
 
-<Accordion title="Per-joint defaults">
-  Both arms share these. `kp`/`kd` are the stiffness-`0` values; the **stiff** columns are the stiffness-`1` values. At the default stiffness `0.5` the gain is the geometric mean of the two (`shoulder_1` `kp` ≈ 141).
+<Note>
+  A robot calibrated with [`tune.pid --save`](/cli/tune-pid), [`tune.friction --save`](/cli/tune-friction), or [`tune.gravity --save`](/cli/tune-gravity) uses its own measured values (from `~/.almond/calibration.json`) instead of the defaults below. Flags you pass still override both.
+</Note>
 
-  | Joint | `kp` | `kd` | `kd_soft` | `j_eff` | `mass` (kg) | `com` (m, left arm) | stiff `kp` | stiff `kd` |
-  |---|---|---|---|---|---|---|---|---|
-  | `shoulder_1` | 40 | 5 | 5.0 | 1.27 | 1.80 | `[0.0652, 0, 0]` | 500 | 5.0 |
-  | `shoulder_2` | 50 | 5 | 5.0 | 0.91 | 1.00 | `[0, 0.0116, −0.0303]` | 500 | 5.0 |
-  | `shoulder_3` | 45 | 1 | 0 | 0 | 3.75 | `[0, 0.0029, −0.1650]` | 250 | 2.0 |
-  | `elbow` | 40 | 3 | 0 | 0 | 0.25 | `[−0.0256, 0, −0.0720]` | 100 | 2.0 |
-  | `wrist_1` | 30 | 1 | 0 | 0 | 0.25 | `[0, 0, −0.0614]` | 150 | 1.0 |
-  | `wrist_2` | 25 | 1 | 0 | 0 | 0.65 | `[0, 0.0285, −0.0285]` | 150 | 2.5 |
-  | `wrist_3` | 25 | 0.5 | 0 | 0 | 0.75 | `[−0.0285, 0, −0.0895]` | 100 | 0.8 |
+<Accordion title="Per-joint defaults">
+  Both arms share these. `kp`/`kd` are the stiffness-`1` values (the default); the **soft** columns are what stiffness `0` blends toward. `shoulder_1` also sets `kd_host_q` to `3.0`; every other joint leaves it `null`.
+
+  | Joint | `kp` | `kd` | `kd_host` | `j_eff` | `mass` (kg) | soft `kp` | soft `kd` |
+  |---|---|---|---|---|---|---|---|
+  | `shoulder_1` | 250 | 3.5 | 40 | 1.27 | 1.80 | 40 | 1.4 |
+  | `shoulder_2` | 250 | 3.5 | 35 | 1.1 | 1.00 | 50 | 1.57 |
+  | `shoulder_3` | 180 | 5.0 | 0 | 0.25 | 3.75 | 45 | 1.0 |
+  | `elbow` | 130 | 5.0 | 0 | 0.6 | 0.25 | 40 | 2.22 |
+  | `wrist_1` | 180 | 1.7 | 0 | 0 | 0.25 | 30 | 0.69 |
+  | `wrist_2` | 130 | 3.5 | 0 | 0 | 0.65 | 25 | 1.5 |
+  | `wrist_3` | 130 | 2.0 | 0 | 0 | 0.75 | 25 | 0.9 |
 </Accordion>
 
 <Accordion title="Per-motor friction defaults">
-  Factory values of `fc`, `k`, `fv`, `fo` for each motor, measured with [`tune.friction`](/cli/tune-friction).
+  Fallback values of `fc`, `k`, `fv`, `fo` for each motor, measured on the reference robot with [`tune.friction`](/cli/tune-friction).
 
   | Joint | Left arm | Right arm |
   |---|---|---|
-  | `shoulder_1` | `1.0191, 723.53, 3.3848, 0.2853` | `1.0390, 781.53, 3.5425, 0.2861` |
-  | `shoulder_2` | `1.6873, 115.41, 2.7202, −0.1701` | `1.6873, 115.41, 2.7202, 0.1701` |
-  | `shoulder_3` | `0.5979, 106.56, 2.1515, 0.0242` | `0.4773, 91.37, 1.8673, 0.0631` |
-  | `elbow` | `0.6806, 801.34, 0.8665, −0.2496` | `0.5255, 159.25, 0.8480, 0.3607` |
-  | `wrist_1` | `0.5601, 66.02, 1.2435, 0.0504` | `0.4415, 80.96, 1.3184, 0.0497` |
-  | `wrist_2` | `0.2658, 180.00, 0.9962, 0.0691` | `0.1880, 813.44, 1.1331, 0.0252` |
-  | `wrist_3` | `0.1048, 829.09, 0.5857, 0.0638` | `0.1137, 852.61, 0.5843, 0.0345` |
+  | `shoulder_1` | `0.9091, 799.59, 0, 0.37` | `1.2972, 742.11, 0, −0.1557` |
+  | `shoulder_2` | `1.1378, 756.76, 0, −0.3969` | `1.3950, 768.06, 0, 0.2082` |
+  | `shoulder_3` | `0.3599, 835.51, 0, −0.0133` | `0.4377, 107.94, 0.0853, −0.0147` |
+  | `elbow` | `0.6023, 855.95, 0, −0.072` | `0.6066, 784.78, 0, 0.049` |
+  | `wrist_1` | `0.3765, 88.91, 0.0298, −0.0115` | `0.5245, 98.58, 0.3062, −0.0097` |
+  | `wrist_2` | `0.1521, 780.31, 0, −0.0152` | `0.1092, 899.67, 0, 0.0021` |
+  | `wrist_3` | `0.0714, 927.26, 0, 0.0042` | `0.1172, 204.46, 0, 0.0042` |
 </Accordion>

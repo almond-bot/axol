@@ -27,6 +27,8 @@ You can run it from the **web control panel** or the **CLI** (`axol gravity-comp
 
       <Step title="Select Gravity Compensation and Start">
         Pick **Gravity Compensation** from the operation selector and press **Start**. The arms go weightless immediately. Press **Stop** to hold them rigid again.
+
+        To record the hand-guided session, set a **recording name** on the panel before starting — the capture is written when the session stops, and **Build motion** in the diagnostics dashboard turns it into a replayable [reference motion](/cli/motion-build).
       </Step>
     </Steps>
   </Tab>
@@ -39,9 +41,10 @@ You can run it from the **web control panel** or the **CLI** (`axol gravity-comp
     axol gravity-comp --right_channel null            # left arm only
     axol gravity-comp --kd 1.0                        # heavier damping (less floppy)
     axol gravity-comp --free_joints [WRIST_3]         # only WRIST_3 free; the rest held rigid
+    axol gravity-comp --record demo1                  # capture the hand-guided motion
     ```
 
-    Press `Ctrl+C` to stop. Use `--free_joints` to float only the named joints while the rest of the arm holds its pose — handy for isolating one joint at a time. See the [`gravity-comp`](/cli/gravity-comp) reference for every flag.
+    Press `Ctrl+C` to stop. Use `--free_joints` to float only the named joints while the rest of the arm holds its pose — handy for isolating one joint at a time. `--record` captures the hand-guided session so [`motion.build`](/cli/motion-build) can turn it into a replayable reference motion. See the [`gravity-comp`](/cli/gravity-comp) reference for every flag.
   </Tab>
 </Tabs>
 

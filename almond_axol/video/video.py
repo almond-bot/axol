@@ -15,10 +15,10 @@ hardware NVENC via :mod:`almond_axol.video.hw_video` (a ``gst-launch``
 subprocess); pre-encoded sources skip it. Either way aiortc never encodes in
 software — it only packetizes and ships RTP.
 
-On the SDK re-encode path, frames are handed in as the SDK's native **BGRA**
-(4-channel), so the NVENC pipeline feeds the hardware VIC directly (BGRx ->
-NV12) with no CPU colorspace conversion — the same efficiency that keeps the
-120 Hz IK loop healthy while three 1920x1200@60 streams encode.
+On the SDK re-encode path, frames are sampled at a fixed 30 fps and handed in
+as the SDK's native **BGRA** (4-channel), so the NVENC pipeline feeds the
+hardware VIC directly (BGRx -> NV12) with no CPU colorspace conversion. Camera
+capture remains independent and may run faster for recording or policy input.
 
 The existing VR WebSocket (``/ws``) is reused purely for SDP signaling — no
 new ports. aiortc gathers ICE candidates during ``setLocalDescription`` and
@@ -62,13 +62,14 @@ from ..vr.ice import (
     replicate_candidates_across_mlines,
     summarize_candidates,
 )
+from .constants import HEADSET_STREAM_FPS
 from .hw_video import install_hw_encoder
 
 _logger = logging.getLogger(__name__)
 
-# How long the frame-driven path waits for a new frame before emitting a
-# keepalive repeat of the previous one (camera stall, etc.).
-_WAIT_TIMEOUT_MS = 500.0
+# How long a pre-encoded track waits for its next access unit before checking
+# whether the camera pipeline is still alive.
+_AU_WAIT_TIMEOUT_MS = 500.0
 
 _NAL_TYPE_IDR = 5
 _ANNEXB_START = b"\x00\x00\x00\x01"
@@ -85,15 +86,14 @@ def webrtc_available() -> bool:
 
 
 class ZedFrameSource:
-    """Frame-driven relay source adapting a ZED SDK camera (or stereo eye).
+    """Latest-frame relay source adapting a ZED SDK camera (or stereo eye).
 
     Wraps a connected ``ZedCamera`` / stereo eye into the raw-frame ``source``
-    that :class:`CameraVideoTrack` consumes: ``wait_next`` blocks until the
-    camera produces a frame newer than the last one sent, so every relayed
-    frame is encoded the instant it's captured instead of waiting to be sampled
-    by a fixed-rate timer. It returns the SDK's **native BGRA** (4-channel) so
-    the NVENC pipeline can hand it straight to the hardware via ``nvvidconv`` —
-    no CPU colorspace conversion.
+    that :class:`CameraVideoTrack` consumes. At each 30 Hz stream tick it reads
+    the newest frame non-destructively, without clearing the event used by
+    recording/policy waiters. It returns the SDK's **native BGRA** (4-channel)
+    so the NVENC pipeline can hand it straight to the hardware via
+    ``nvvidconv`` — no CPU colorspace conversion.
 
     Used by the SDK-grab fallback path (teleop / collect-data / the relay
     subprocess); the GPU-resident ``gst_zed`` cameras instead expose
@@ -113,27 +113,36 @@ class ZedFrameSource:
 
     @property
     def fps(self) -> int:
-        return int(self._cam.fps or 30)
+        return HEADSET_STREAM_FPS
 
     def wait_next(self, after_ts: float | None, timeout_ms: float) -> Any:
-        target = after_ts + 1e-6 if after_ts is not None else 0.0
         try:
-            frame, cap_ts, _recv_ts = self._cam.read_bgra_at_or_after(
-                target, timeout_ms=timeout_ms
-            )
+            latest = getattr(self._cam, "read_latest_bgra_with_ts", None)
+            if latest is not None:
+                frame, cap_ts, _recv_ts = latest()
+            else:
+                # Compatibility for external camera-like sources implementing
+                # the former relay contract. In-repo ZED cameras always take
+                # the non-consuming path above.
+                target = after_ts + 1e-6 if after_ts is not None else 0.0
+                frame, cap_ts, _recv_ts = self._cam.read_bgra_at_or_after(
+                    target, timeout_ms=timeout_ms
+                )
+            if after_ts is not None and cap_ts <= after_ts:
+                return None
             return frame, cap_ts
-        except Exception:  # noqa: BLE001 - timeout/stall → keepalive in track
+        except Exception:  # noqa: BLE001 - startup/stall → keepalive in track
             return None
 
 
 class CameraVideoTrack(VideoStreamTrack):
     """WebRTC video track backed by a connected ZED camera (BGRA frames).
 
-    Frame-driven: ``recv`` blocks on the source's ``wait_next`` until the
-    camera produces a frame newer than the last one sent and returns it
-    immediately, with the RTP timestamp derived from the frame's *capture*
-    time so glass-to-glass latency stays minimal. Frames are the SDK's native
-    BGRA (4-channel); the hardware encoder consumes them without a CPU convert.
+    Paced at the fixed headset rate independently of camera capture. Each tick
+    samples the newest source frame, repeating the previous frame during a
+    camera stall. A per-peer absolute monotonic deadline prevents a delayed
+    encode from causing catch-up bursts. Frames are the SDK's native BGRA
+    (4-channel); the hardware encoder consumes them without a CPU convert.
     """
 
     kind = "video"
@@ -147,6 +156,20 @@ class CameraVideoTrack(VideoStreamTrack):
         self._last: NDArray[Any] | None = None
         self._last_cap_ts: float | None = None
         self._ts_origin: float | None = None  # perf_counter of pts == 0
+        self._interval = 1.0 / HEADSET_STREAM_FPS
+        self._next_send_at: float | None = None
+
+    async def _pace(self) -> float:
+        """Wait for the next 30 Hz slot, resetting after rather than bursting."""
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if self._next_send_at is None or self._next_send_at < now:
+            self._next_send_at = now
+        delay = self._next_send_at - now
+        if delay > 0.0:
+            await asyncio.sleep(delay)
+        self._next_send_at += self._interval
+        return time.perf_counter()
 
     def _clock_pts(self, perf_ts: float) -> int:
         if self._ts_origin is None:
@@ -157,10 +180,12 @@ class CameraVideoTrack(VideoStreamTrack):
         if self.readyState != "live":
             raise MediaStreamError
 
+        send_ts = await self._pace()
+
         result: tuple[NDArray[Any], float] | None = None
         try:
             result = await asyncio.get_running_loop().run_in_executor(
-                None, self._wait_next, self._last_cap_ts, _WAIT_TIMEOUT_MS
+                None, self._wait_next, self._last_cap_ts, 0.0
             )
         except Exception as exc:  # source is best-effort; never kill the track
             _logger.debug("video source wait_next raised: %s", exc)
@@ -169,7 +194,6 @@ class CameraVideoTrack(VideoStreamTrack):
             arr, cap_ts = result
             self._last = arr
             self._last_cap_ts = cap_ts
-            pts = self._clock_pts(cap_ts)
         else:
             # Camera stalled: repeat the last frame (or black) as a keepalive
             # so the connection and keyframe machinery stay alive.
@@ -178,13 +202,13 @@ class CameraVideoTrack(VideoStreamTrack):
                 if self._last is not None
                 else np.zeros((self._h, self._w, 4), dtype=np.uint8)
             )
-            pts = self._clock_pts(time.perf_counter())
 
         frame = VideoFrame.from_ndarray(
             np.ascontiguousarray(arr, dtype=np.uint8), format="bgra"
         )
-        frame.pts = pts
+        frame.pts = self._clock_pts(send_ts)
         frame.time_base = VIDEO_TIME_BASE
+        frame.duration = round(VIDEO_CLOCK_RATE / HEADSET_STREAM_FPS)
         return frame
 
 
@@ -217,7 +241,7 @@ class PrecodedVideoTrack(MediaStreamTrack):
 
     def _pop(self) -> list[bytes] | None:
         try:
-            return self._queue.get(timeout=_WAIT_TIMEOUT_MS / 1000.0)
+            return self._queue.get(timeout=_AU_WAIT_TIMEOUT_MS / 1000.0)
         except queue.Empty:
             return None
 
@@ -255,9 +279,10 @@ def _track_for_source(source: Any) -> MediaStreamTrack:
     * a pre-encoded source exposing ``subscribe()`` (the GPU-resident
       :mod:`~almond_axol.video.gst_zed` cameras) → :class:`PrecodedVideoTrack`,
       whose H.264 access units go straight to RTP with no Python encode;
-    * a connected ``ZedCamera`` / stereo eye (exposes ``read_bgra_at_or_after``
-      but not ``wait_next``) → wrapped in :class:`ZedFrameSource` so a bare
-      camera "just works";
+    * a connected ``ZedCamera`` / stereo eye (exposes the latest-BGRA API, or
+      the legacy ``read_bgra_at_or_after`` API, but not ``wait_next``) → wrapped
+      in :class:`ZedFrameSource` so a bare camera "just works" at the fixed
+      headset cadence;
     * anything already exposing ``wait_next`` (e.g. a hand-built
       :class:`ZedFrameSource`) → used as-is.
 
@@ -265,7 +290,10 @@ def _track_for_source(source: Any) -> MediaStreamTrack:
     """
     if hasattr(source, "subscribe"):
         return PrecodedVideoTrack(source)
-    if not hasattr(source, "wait_next") and hasattr(source, "read_bgra_at_or_after"):
+    is_zed_like = hasattr(source, "read_latest_bgra_with_ts") or hasattr(
+        source, "read_bgra_at_or_after"
+    )
+    if not hasattr(source, "wait_next") and is_zed_like:
         source = ZedFrameSource(source)
     return CameraVideoTrack(source)
 

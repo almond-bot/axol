@@ -11,7 +11,7 @@ Up to four buses, **each optional and independent**:
 
 - Left arm → `can_alm_axol_l` (Axol Hub channel 0)
 - Right arm → `can_alm_axol_r` (Axol Hub channel 1)
-- Powered cart's wheel bus (if present) → `can_alm_axol_b`
+- Jelly's wheel bus (if present) → `can_alm_axol_b`
 - Chest bus / lift controller (if present) → `can_alm_axol_c`
 
 ```bash
@@ -20,7 +20,7 @@ axol can.setup
 
 The Axol Hub and Mantis Hub are dual-channel USB CAN adapters; the wheel and chest buses use single-channel adapters. `can.setup` identifies all of them by **probing the devices on their CAN lines**: an Axol arm has a shoulder motor at ID `0x001`, a Mantis publishes trigger frames on ID `0x009` (both the 6-byte and current 7-byte firmware frame are accepted), the wheel bus has Damiao motors at IDs `0x01`–`0x04`, and the jelly_legs lift controller answers a status request on the chest bus. The attached devices must be powered for automatic identification. Already configured adapters are probed again when attached, so a live response corrects stale Axol/Mantis or wheel/chest assignments from an earlier setup. If an apparently-up `gs_usb` adapter is not receiving, setup resets the relevant bus and retries before deciding it is silent. A silent or unplugged configured single-channel adapter keeps its previous assignment as an explicitly unverified fallback; a new silent adapter is offered to the operator and can replace that fallback. An unresolved adapter pinned to two roles is rejected before rules are written. For a silent dual-channel hub, the normal `axol can.setup` prompt lets the operator keep the previous role or choose Axol/Mantis; no separate reassignment command is needed. Each identified adapter is pinned by USB serial, and the startup scripts bring every configured interface up while skipping anything unplugged. A Jetson host's built-in system CAN controller is ignored entirely.
 
-Running `axol can.setup` is deliberately a disruptive **link reset** for every attached adapter in its supported scope: the Axol arm pair, powered-cart wheel bus, chest/lift bus, and Mantis pair are taken down, restored to 1 Mbit/s with the expected queue length, and brought back up before they are trusted. Both channels of a dual hub go down before either comes back up; wheel and lift adapters reset independently. This does not reboot/zero/calibrate an actuator, clear a healthy saved assignment, reload a healthy USB driver, or touch the Jetson's built-in `mttcan` interfaces. As a one-time migration on older Jetson installs, setup automatically rebuilds an Almond-managed `gs_usb` override that predates reliable build identity; overrides outside Almond's managed path and signature-enforcing hosts still fail closed. Do not run setup during an active robot operation.
+Running `axol can.setup` is deliberately a disruptive **link reset** for every attached adapter in its supported scope: the Axol arm pair, Jelly wheel bus, chest/lift bus, and Mantis pair are taken down, restored to 1 Mbit/s with the expected queue length, and brought back up before they are trusted. Both channels of a dual hub go down before either comes back up; wheel and lift adapters reset independently. This does not reboot/zero/calibrate an actuator, clear a healthy saved assignment, reload a healthy USB driver, or touch the Jetson's built-in `mttcan` interfaces. As a one-time migration on older Jetson installs, setup automatically rebuilds an Almond-managed `gs_usb` override that predates reliable build identity; overrides outside Almond's managed path and signature-enforcing hosts still fail closed. Do not run setup during an active robot operation.
 
 The Mantis handheld data-collection rig uses the **same dual-channel CAN board as the arm hub**, with one gripper bus per channel — each bus carries that side's Damiao gripper motor (ID `0x008`) and trigger node (ID `0x009`):
 
@@ -34,7 +34,11 @@ The Mantis profile gets its own udev rule file, startup script, and hotplug brin
 </Note>
 
 <Info>
-  After setup, the interfaces come up automatically on every reboot (via a `@reboot` cron hook) **and** whenever the adapter re-enumerates mid-session: a udev rule pulls in the `axol-can-up.service` bring-up whenever the hub (re-)appears, so a replug — or a USB drop caused by motor EMI — heals itself within a second or two without operator action. You don't need `can.setup` just to use the cart — [`axol teleop`](/cli/teleop) brings the cart's own interface up on its own — but pinning it gives the adapter a stable name across reboots.
+  At the end of setup, when an arm hub was identified, `can.setup` also fetches this robot's **factory calibration** (friction + gravity, keyed by the hub serial) from the public calibration bucket into `~/.almond/factory_calibration.json` — see [`tune.factory`](/cli/tune-factory). Keyless and best-effort: an offline setup just keeps whatever cache exists.
+</Info>
+
+<Info>
+  After setup, the interfaces come up automatically on every reboot (via a `@reboot` cron hook) **and** whenever the adapter re-enumerates mid-session: a udev rule pulls in the `axol-can-up.service` bring-up whenever the hub (re-)appears, so a replug — or a USB drop caused by motor EMI — heals itself within a second or two without operator action. You don't need `can.setup` just to use Jelly — [`axol teleop`](/cli/teleop) brings Jelly's own interface up on its own — but pinning it gives the adapter a stable name across reboots.
 </Info>
 
 <Note>

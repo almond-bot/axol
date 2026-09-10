@@ -7,7 +7,6 @@ must do when that happens while an operation owns the CAN buses.
 from __future__ import annotations
 
 import asyncio
-import errno
 import threading
 import time
 import unittest
@@ -20,12 +19,13 @@ import httpx
 
 from almond_axol.motor import CanBus, MotorError, MotorStatus
 from almond_axol.motor.bus import (
-    _flush_lock_for_running_loop,
-    _tx_queue_full,
+    is_stall_report,
+    set_channel_stalled,
     stalled_channels,
 )
 from almond_axol.robot.axol import Axol
 from almond_axol.robot.base import HardwareCleanupError
+from almond_axol.rt.link import RtLink
 from almond_axol.serve import app as app_module
 from almond_axol.serve.manager import Session
 from almond_axol.serve.robot_link import (
@@ -38,15 +38,27 @@ from almond_axol.serve.runner import STALL_STOP_ERROR, OperationRunner
 
 # The serve API doubles (settings store, session manager, updater) already exist
 # for the reservation tests; reuse them rather than growing a second set.
-from .test_serve_session_reservation import _Manager, _Settings, _Updater
+from tests.test_serve_session_reservation import _Manager, _Settings, _Updater
+
+
+# What the Rust transports put on the wire when nothing ACKs for STALL_DETECT
+# (``proxy.rs`` for the maintenance proxy, ``serve.rs`` for the armed core).
+_PROXY_STALL = (
+    "CAN can-left TX queue stalled >1s (e-stop or unpowered motors); commands "
+    "stopped, stale queue purged"
+)
+_CORE_STALL = (
+    "fault: can-left: TX queue stalled >1s — no node ACKing frames (e-stop / "
+    "motors unpowered?); commands stopped, stale queue purged"
+)
 
 
 class _FakeBus:
-    """Stands in for the SocketCAN transport: no socket, just open/closed.
+    """Stands in for the Rust-proxy transport: no process, just open/closed.
 
-    ``stalled`` mirrors :attr:`CanBus.stalled`: the bus has seen its TX queue
-    stop draining because no node ACKs (motor power gone). A bus whose
-    interface merely dropped off USB times out the same way without it.
+    ``stalled`` mirrors :attr:`CanBus.stalled`: the proxy reported its TX
+    queue stopped draining because no node ACKs (motor power gone). A proxy
+    that died for any other reason fails every send the same way without it.
     """
 
     def __init__(self, channel: str) -> None:
@@ -60,24 +72,43 @@ class _FakeBus:
     async def close(self) -> None:
         self.closed = True
 
+    def _add_listener(self, _listener: Any) -> None:
+        pass
+
+    def enable_observer_mode(self) -> None:
+        pass
+
 
 class _FakeDriver:
     """One motor at the CAN protocol boundary, powered or not.
 
     An unpowered motor answers nothing, exactly like a driver whose request
-    frames time out; a powered one answers reads and reports whether it took
-    the disable command.
+    frames time out — or, once the stalled proxy has exited, whose sends the
+    bus refuses outright (``bus_gone``); a powered one answers reads and
+    reports whether it took the disable command.
     """
 
-    def __init__(self, *, powered: bool = True, accepts_disable: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        powered: bool = True,
+        accepts_disable: bool = True,
+        bus_gone: bool = False,
+    ) -> None:
         self.powered = powered
         self.accepts_disable = accepts_disable
+        self.bus_gone = bus_gone
         self.disable_calls = 0
+        # Firmware gain ceilings Axol.__init__ checks the config against.
+        self.kp_max = 500.0
+        self.kd_max = 5.0
 
     def set_feedback_callback(self, _callback: Any) -> None:
         pass
 
     def _answer(self) -> None:
+        if self.bus_gone:
+            raise can.CanOperationError("axol-rt proxy for can-left exited")
         if not self.powered:
             raise MotorError("motor did not answer")
 
@@ -122,6 +153,20 @@ class DisableClassificationTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(all(bus.closed for bus in buses))
 
+    async def test_unpowered_arms_behind_an_exited_proxy_are_unpowered_too(
+        self,
+    ) -> None:
+        # The proxy purges the queue and exits on a stall, so by the time
+        # disable() probes the motors the bus itself refuses every send. That
+        # is still "nothing on the arm answered" — the stall flag is the proof.
+        axol, buses = _axol_with_drivers(lambda _channel: _FakeDriver(bus_gone=True))
+        for bus in buses:
+            bus.stalled = True
+
+        await axol.disable()
+
+        self.assertTrue(all(bus.closed for bus in buses))
+
     async def test_reachable_motor_that_will_not_disable_still_raises(self) -> None:
         drivers = {
             "can-left": lambda: _FakeDriver(powered=False),
@@ -149,95 +194,121 @@ class DisableClassificationTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(bus.closed for bus in buses))
 
 
+def _stalled_bus(channel: str) -> CanBus:
+    """A CanBus flagged stalled the way its proxy's stall report flags it."""
+    bus = object.__new__(CanBus)
+    bus._channel = channel
+    bus._stalled = False
+    bus._mark_stalled(_PROXY_STALL.replace("can-left", channel))
+    return bus
+
+
 class FreshBusStallFlagTest(unittest.TestCase):
     def test_opening_a_bus_clears_a_stale_stall_on_its_channel(self) -> None:
         # A bus abandoned open on a dead loop (a failed teardown that kept its
         # buses) never clears its stall. The next bus on that channel is the
         # one whose state matters, and it has seen no stall yet.
-        stale = object.__new__(CanBus)
-        stale._channel = "can-stale-test"
-        stale._stalled = False
-        stale._lost = False
-        stale._wake = asyncio.Event()
-        stale._mark_stalled(OSError("ENOBUFS"))
-        self.addCleanup(lambda: asyncio.run(_discard_stall(stale)))
+        stale = _stalled_bus("can-stale-test")
+        self.addCleanup(_discard_stall, stale)
+        self.assertTrue(stale.stalled)
         self.assertIn("can-stale-test", stalled_channels())
 
-        with patch("almond_axol.motor.bus.can.Bus"):
-            fresh = CanBus("can-stale-test")
+        fresh = CanBus("can-stale-test")
 
         self.assertNotIn("can-stale-test", stalled_channels())
         self.assertFalse(fresh.stalled)
         self.assertEqual(fresh.channel, "can-stale-test")
 
+    def test_closing_a_stalled_bus_withdraws_its_channel(self) -> None:
+        bus = CanBus("can-close-test")
+        self.addCleanup(_discard_stall, bus)
+        bus._mark_stalled(_PROXY_STALL.replace("can-left", "can-close-test"))
+        self.assertIn("can-close-test", stalled_channels())
 
-class TxQueueFullClassificationTest(unittest.TestCase):
-    """Both shapes python-can gives a full TX queue must be recognised.
+        asyncio.run(bus.close())
 
-    Missing either one re-raises out of ``CanBus._send`` instead of dropping
-    the frame, so the command never times out upstream as a ``MotorError`` and
-    the bus never accumulates the overflow that declares the stall — which
-    takes the watchdog and the unpowered classification down with it.
+        self.assertNotIn("can-close-test", stalled_channels())
+
+
+class StallReportClassificationTest(unittest.IsolatedAsyncioTestCase):
+    """The proxy's stall report is the one signal that the bus is *dead*.
+
+    Every other way the proxy can go away — it crashed, the interface
+    vanished, a protocol error — fails sends the same way while the motors may
+    still be powered and holding torque, so only the stall text may set the
+    flag; missing it takes the watchdog and the unpowered classification down.
     """
 
-    def test_errno_form_is_recognised(self) -> None:
-        exc = can.CanOperationError("send failed", error_code=errno.ENOBUFS)
+    def test_both_transports_stall_texts_are_recognised(self) -> None:
+        self.assertTrue(is_stall_report(_PROXY_STALL))
+        self.assertTrue(is_stall_report(_CORE_STALL))
+        self.assertFalse(is_stall_report("CAN can-left send failed: ENODEV"))
+        self.assertFalse(is_stall_report("fault: arm: bus thread died"))
 
-        self.assertTrue(_tx_queue_full(exc))
+    async def _feed(self, bus: CanBus, *payloads: bytes) -> None:
+        reader = asyncio.StreamReader()
+        for payload in payloads:
+            reader.feed_data(len(payload).to_bytes(4, "little") + payload)
+        reader.feed_eof()
+        bus._reader = reader
+        bus._state = "open"
+        await bus._read_loop()
 
-    def test_message_only_form_is_recognised(self) -> None:
-        # python-can's SocketCAN backend raises exactly this, with no errno,
-        # after retrying a partial write for its send timeout.
-        exc = can.CanOperationError("Transmit buffer full")
+    async def test_proxy_stall_report_marks_the_bus_stalled(self) -> None:
+        bus = CanBus("can-report-test")
+        self.addCleanup(_discard_stall, bus)
 
-        self.assertTrue(_tx_queue_full(exc))
+        await self._feed(bus, b"E" + _PROXY_STALL.encode())
 
-    def test_unrelated_can_errors_are_left_alone(self) -> None:
-        self.assertFalse(_tx_queue_full(can.CanOperationError("Failed to transmit")))
-        self.assertFalse(_tx_queue_full(OSError(errno.ENODEV, "No such device")))
+        self.assertTrue(bus.stalled)
+        self.assertIn("can-report-test", stalled_channels())
+        self.assertIn("stalled", bus._closed_reason or "")
+
+    async def test_other_proxy_errors_leave_the_bus_unstalled(self) -> None:
+        bus = CanBus("can-report-test")
+        self.addCleanup(_discard_stall, bus)
+
+        await self._feed(bus, b"ECAN can-report-test send failed: ENODEV")
+
+        self.assertFalse(bus.stalled)
+        self.assertNotIn("can-report-test", stalled_channels())
+        self.assertIsNotNone(bus._closed_reason)
 
 
-class FlushLockLoopAffinityTest(unittest.TestCase):
-    """The flush lock must not outlive the loop that took it.
+class CoreStallReportTest(unittest.TestCase):
+    """While armed the realtime core owns the sockets, so its ``fault:`` is
+    where the e-stop shows up; the link must publish it for the watchdog."""
 
-    A bus is owned by an operation's loop while it holds the arms and by the
-    idle link's loop afterwards. A single module-level ``asyncio.Lock`` binds
-    to the first of those and then rejects the second, which strands every
-    later reconnect behind "bound to a different event loop".
-    """
+    def _link(self) -> RtLink:
+        link = RtLink(binary="/nonexistent/axol-rt")
+        self.addCleanup(link._stalled_ifaces.clear)
+        self.addCleanup(set_channel_stalled, "can-left", False)
+        return link
 
-    def test_each_loop_gets_its_own_lock(self) -> None:
-        async def take() -> asyncio.Lock:
-            lock = _flush_lock_for_running_loop()
-            async with lock:
-                return lock
+    def test_stall_fault_names_its_interface(self) -> None:
+        link = self._link()
 
-        first = asyncio.run(take())
-        second = asyncio.run(take())
+        link._note_stall(_CORE_STALL)
 
-        self.assertIsNot(first, second)
+        self.assertIn("can-left", stalled_channels())
+        self.assertNotIn("can-right", stalled_channels())
 
-    def test_the_same_loop_reuses_one_lock(self) -> None:
-        async def take_twice() -> tuple[asyncio.Lock, asyncio.Lock]:
-            return _flush_lock_for_running_loop(), _flush_lock_for_running_loop()
+    def test_other_faults_are_not_stalls(self) -> None:
+        link = self._link()
 
-        first, second = asyncio.run(take_twice())
+        link._note_stall("fault: arm: bus thread died")
+        link._note_stall("fault: can-left: motor 0x03 silent for 1.0s")
 
-        self.assertIs(first, second)
+        self.assertNotIn("can-left", stalled_channels())
 
-    def test_a_dead_loop_does_not_strand_the_next_one(self) -> None:
-        # Acquire without releasing, exactly as a loop torn down mid-flush
-        # leaves it, then prove a fresh loop can still flush.
-        async def acquire_and_abandon() -> None:
-            await _flush_lock_for_running_loop().acquire()
+    def test_closing_the_link_withdraws_the_stall(self) -> None:
+        link = self._link()
+        link._note_stall(_CORE_STALL)
+        self.assertIn("can-left", stalled_channels())
 
-        asyncio.run(acquire_and_abandon())
+        asyncio.run(link.close())
 
-        async def flush_again() -> bool:
-            async with _flush_lock_for_running_loop():
-                return True
-
-        self.assertTrue(asyncio.run(flush_again()))
+        self.assertNotIn("can-left", stalled_channels())
 
 
 class _LockedOutLink:
@@ -463,16 +534,6 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
 
 
 class BusStallWatchdogTest(unittest.TestCase):
-    def _stalled_bus(self, channel: str) -> CanBus:
-        """A CanBus flagged stalled the way a dead (unpowered) bus flags itself."""
-        bus = object.__new__(CanBus)
-        bus._channel = channel
-        bus._stalled = False
-        bus._lost = False
-        bus._wake = asyncio.Event()
-        bus._mark_stalled(OSError("ENOBUFS"))
-        return bus
-
     def test_sustained_stall_stops_the_operation(self) -> None:
         runner = OperationRunner()
         session = Session("teleop", {})
@@ -494,8 +555,8 @@ class BusStallWatchdogTest(unittest.TestCase):
             # stall this operation owns.
             watchdog.start()
             time.sleep(0.05)
-            bus = self._stalled_bus("can-stall-test")
-            self.addCleanup(lambda: asyncio.run(_discard_stall(bus)))
+            bus = _stalled_bus("can-stall-test")
+            self.addCleanup(_discard_stall, bus)
             watchdog.join(timeout=5.0)
 
         self.assertFalse(watchdog.is_alive())
@@ -508,8 +569,8 @@ class BusStallWatchdogTest(unittest.TestCase):
         session = Session("teleop", {})
         session.status = "running"
         runner._session = session
-        bus = self._stalled_bus("can-inherited-test")
-        self.addCleanup(lambda: asyncio.run(_discard_stall(bus)))
+        bus = _stalled_bus("can-inherited-test")
+        self.addCleanup(_discard_stall, bus)
         stop_event = threading.Event()
         threading.Timer(0.05, stop_event.set).start()
 
@@ -548,11 +609,9 @@ class BusStallWatchdogTest(unittest.TestCase):
         self.assertIsNone(session.error)
 
 
-async def _discard_stall(bus: CanBus) -> None:
+def _discard_stall(bus: CanBus) -> None:
     """Take the test bus back out of the process-wide stalled set."""
-    bus._bus = None
-    bus._reader_task = None
-    await bus.close()
+    set_channel_stalled(bus.channel, False)
 
 
 class _FakeMotor:
@@ -589,6 +648,7 @@ class StaleTelemetryTest(unittest.TestCase):
     def _connected_link(self) -> RobotLink:
         with (
             patch("almond_axol.serve.robot_link.CanBus", side_effect=_FakeBus),
+            patch("almond_axol.motor.observer.CanBus", side_effect=_FakeBus),
             patch(
                 "almond_axol.serve.robot_link.Motor",
                 side_effect=lambda *_args, **_kwargs: _FakeMotor(),

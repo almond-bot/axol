@@ -28,6 +28,12 @@ interface TelemetryChartProps {
   version: number
   /** Index into the fast sample: 0 = position, 1 = velocity, 2 = torque. */
   metric: number
+  /**
+   * Display multiplier applied to every sample (default 1). The stream
+   * carries radians; the chart shows degrees, so position/velocity pass
+   * 180/π here.
+   */
+  scale?: number
   view: ChartView
   /** Called on wheel-zoom / drag-pan; the parent owns the view. */
   onViewChange?: (view: ChartView) => void
@@ -35,6 +41,11 @@ interface TelemetryChartProps {
   quietReason?: string | null
   /** Plot height in px (fullscreen mode sizes itself). */
   height?: number
+  /**
+   * Longest sample gap (s) still drawn as a connected line. The default suits
+   * the 10 Hz fast stream; the 1 Hz slow (temperature) series needs more.
+   */
+  gapBreakS?: number
   className?: string
 }
 
@@ -63,6 +74,7 @@ function extract(
   frames: TelemetryFrame[],
   series: ChartSeries[],
   metric: number,
+  scale: number,
   view: ChartView
 ): Extracted | null {
   if (frames.length === 0 || series.length === 0) return null
@@ -81,8 +93,9 @@ function extract(
     const frame = visible[i]
     for (let s = 0; s < series.length; s++) {
       const sample = frame.m[series[s].key]
-      const value = sample?.[metric]
-      if (value == null || Number.isNaN(value)) continue
+      const raw = sample?.[metric]
+      if (raw == null || Number.isNaN(raw)) continue
+      const value = raw * scale
       points[s].push([frame.t, value])
       if (value < min) min = value
       if (value > max) max = value
@@ -130,6 +143,7 @@ function fmtClock(t: number): string {
  * legend with live per-series values under the plot.
  */
 export function TelemetryChart({
+  scale = 1,
   title,
   unit,
   series,
@@ -140,6 +154,7 @@ export function TelemetryChart({
   onViewChange,
   quietReason,
   height = 260,
+  gapBreakS = GAP_BREAK_S,
   className,
 }: TelemetryChartProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -171,11 +186,11 @@ export function TelemetryChart({
   }, [expanded])
 
   const data = useMemo(
-    () => extract(frames, series, metric, view),
+    () => extract(frames, series, metric, scale, view),
     // The live buffer is mutated in place (stable identity) — `version` is its
     // change signal; static charts pass a fresh `frames` array instead.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- version is the buffer's change signal
-    [frames, version, series, metric, view]
+    [frames, version, series, metric, scale, view]
   )
 
   const plotW = size.w - PAD.left - PAD.right
@@ -254,12 +269,12 @@ export function TelemetryChart({
     return series.map((s) => {
       for (let i = frames.length - 1; i >= Math.max(0, frames.length - 20); i--) {
         const v = frames[i].m[s.key]?.[metric]
-        if (v != null) return v
+        if (v != null) return v * scale
       }
       return null
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps -- version is the buffer's change signal
-  }, [frames, version, series, metric])
+  }, [frames, version, series, metric, scale])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -333,7 +348,7 @@ export function TelemetryChart({
       ctx.beginPath()
       let prevT = -Infinity
       for (const [t, v] of pts) {
-        if (t - prevT > GAP_BREAK_S) ctx.moveTo(x(t), y(v))
+        if (t - prevT > gapBreakS) ctx.moveTo(x(t), y(v))
         else ctx.lineTo(x(t), y(v))
         prevT = t
       }
@@ -361,7 +376,7 @@ export function TelemetryChart({
         ctx.stroke()
       }
     }
-  }, [data, size, series, hover, quietReason, view, plotW])
+  }, [data, size, series, hover, quietReason, view, plotW, gapBreakS])
 
   const toTime = useCallback(
     (clientX: number) => {

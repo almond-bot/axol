@@ -109,12 +109,10 @@ def _default_robot_config() -> AxolRobotConfig:
 
     Replay neither records nor streams video — it just plays recorded
     actions back onto the arms — so no camera slots are seeded (an empty
-    ``cameras`` dict opens the arms only). ``telemetry_hz=0`` skips the
-    background poll loop: like ``collect-data``, a ``motion_control`` command
-    is issued every step, whose feedback frames keep the position cache fresh,
-    so the redundant telemetry transactions would only contend on the bus.
+    ``cameras`` dict opens the arms only). The Rust core supplies native-rate
+    feedback while replay targets stream.
     """
-    return AxolRobotConfig(telemetry_hz=0.0)
+    return AxolRobotConfig()
 
 
 @dataclass
@@ -140,7 +138,7 @@ class ReplayDatasetConfig:
     # reproducing the original timing; set a positive value to override it.
     fps: int = 0
     # Smooth playback by linearly interpolating between recorded actions and
-    # commanding the arms at ~120 Hz (the teleop control rate) instead of the
+    # commanding the arms at ~120 Hz (the teleop IK rate) instead of the
     # dataset fps. Episode timing is unchanged; only the command granularity
     # increases. Off by default (each recorded action is sent once, as-is).
     interpolate: bool = False
@@ -174,7 +172,7 @@ def main(argv: list[str]) -> None:
     cfg = parse(ReplayDatasetConfig, argv)
     # force=True: importing lerobot (at module load) installs a root handler and
     # leaves the root level at WARNING, which would otherwise make this a no-op
-    # and silently drop every log_say() status line.
+    # and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
     import sys
@@ -298,7 +296,6 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME
-    from lerobot.utils.utils import log_say
 
     from ..lerobot.robot.robot_axol import AxolRobot
     from ..lerobot.rollout import IKResetController
@@ -348,7 +345,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
             f"directory (and --root if it isn't under $HF_LEROBOT_HOME).\n{listing}"
         )
 
-    log_say(f"Loading episode {episode} from {dataset_root}.")
+    _logger.info(f"Loading episode {episode} from {dataset_root}.")
     try:
         dataset = LeRobotDataset(repo_id, root=str(dataset_root), episodes=[episode])
     except Exception as exc:  # noqa: BLE001 - surface a clean message
@@ -379,7 +376,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     if isinstance(cfg.robot_config, AxolRobotConfig):
         cfg.robot_config.observe_cartesian = recorded_cartesian
     if recorded_cartesian:
-        log_say("Cartesian dataset: replaying EE poses via inverse kinematics.")
+        _logger.info("Cartesian dataset: replaying EE poses via inverse kinematics.")
     robot = AxolRobot(cfg.robot_config)
     missing = [k for k in robot.action_features if k not in action_names]
     if missing:
@@ -401,7 +398,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     # connect, exactly as run-policy does before its policy load.
     reset_controller = IKResetController()
     reset_controller.start()
-    log_say("Started IK reset worker (collision-aware return-to-rest).")
+    _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
     # Tracks whether the arm is currently parked at rest, so the teardown only
     # adds a return-to-rest when one is actually needed (and not a redundant one
@@ -422,7 +419,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         # already set, so it passes no stop hook; on contact it aborts
         # immediately instead of holding (nothing could end that hold).
         nonlocal rested
-        log_say(message)
+        _logger.info(message)
         rested = reset_controller.return_to_rest(
             robot,
             torque_threshold=cfg.reset_torque_threshold,
@@ -430,7 +427,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
             stopped=None if final else _stopped,
             on_contact=None
             if final
-            else lambda: log_say(
+            else lambda: _logger.info(
                 "Contact during return to rest — arms are limp. Free them, "
                 "then stop the run."
             ),
@@ -573,14 +570,14 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
 
     session_error: BaseException | None = None
     try:
-        log_say("Connecting robot...")
+        _logger.info("Connecting robot...")
         robot.connect()
 
         # A Cartesian dataset resolves each recorded EE pose to joints via IK in
         # send_action. Build that solver now so its one-time JIT warmup overlaps
         # the return-to-rest below instead of stalling the first replayed frame.
         if recorded_cartesian:
-            log_say("Preparing Cartesian action solver (IK)...")
+            _logger.info("Preparing Cartesian action solver (IK)...")
             robot.prepare_cartesian_actions()
 
         # Start every take from rest, the same place collect-data records from,
@@ -599,12 +596,12 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
             iteration += 1
             rested = False
             if loop:
-                log_say(
+                _logger.info(
                     f"Replaying episode {episode} (loop {iteration}): "
                     f"{num_frames} frames at {fps} fps{interp_note}."
                 )
             else:
-                log_say(
+                _logger.info(
                     f"Replaying episode {episode}: {num_frames} frames at "
                     f"{fps} fps{interp_note}."
                 )
@@ -616,7 +613,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
                 # Replay has no interactive continue channel, so the hold
                 # lasts until the run is stopped (Ctrl+C or the UI's Stop);
                 # the teardown's final return then parks the arm.
-                log_say(
+                _logger.info(
                     "Contact during playback — the arms are limp and free "
                     "to move. Free them, then stop the run."
                 )
@@ -675,7 +672,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
             except Exception:  # noqa: BLE001 - best-effort; still tear down
                 _logger.warning("return-to-rest during teardown failed", exc_info=True)
 
-        log_say("Stopping.")
+        _logger.info("Stopping.")
         disconnect_failure = _cleanup_replay_robot(
             playback_stopped=playback_stopped,
             cleanup=robot.disconnect,

@@ -53,7 +53,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ...constants import Joint
 from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
-from ...robot.cart import Cart
+from ...robot.jelly import Jelly
 from ...teleop.core import TCPPoseSnapshot, VRTeleopCore
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VREpisodeOutcome, VRFrame, VRState
@@ -121,12 +121,14 @@ class AxolVRTeleop(Teleoperator):
             self._broadcast_json,
         )
 
-        # Powered cart (x-drive base + telescoping lift), operator-only
+        # Jelly (x-drive base + telescoping lift), operator-only
         # mobility on robots that have one: the thumbsticks reposition the
-        # base/lift during a session, exactly as in native teleop. Cart state
+        # base/lift during a session, exactly as in native teleop. Jelly state
         # is NOT part of the action/observation space — it is never recorded
         # into the dataset and policies never control it.
-        self._cart: Cart | None = Cart(config.cart) if config.cart.enabled else None
+        self._jelly: Jelly | None = (
+            Jelly(config.jelly) if config.jelly.enabled else None
+        )
 
         # Last smoothed command; protected by _q_lock so concurrent get_action
         # calls serialize (only the control loop calls it, so uncontended).
@@ -182,18 +184,6 @@ class AxolVRTeleop(Teleoperator):
         with self._rate_lock:
             return self._window_hz(self._vr_frame_times)
 
-    def vr_alive(self, within_s: float = 2.0) -> bool:
-        """True while VR frames have arrived within the last ``within_s``.
-
-        The guarded-return contact hold uses this to detect an *orphaned*
-        hold — the headset exited XR or died, so the reset press that would
-        end it can never arrive — and settle instead of waiting forever.
-        Thread-safe.
-        """
-        with self._rate_lock:
-            last = self._vr_frame_times[-1] if self._vr_frame_times else None
-        return last is not None and (time.perf_counter() - last) < within_s
-
     @property
     def is_connected(self) -> bool:
         return self._vr_server is not None or self._cleanup_pending
@@ -203,14 +193,14 @@ class AxolVRTeleop(Teleoperator):
         return True
 
     @property
-    def cart(self) -> Cart | None:
-        """The powered cart when configured (operator-only mobility), else None.
+    def jelly(self) -> Jelly | None:
+        """Jelly when configured (operator-only mobility), else None.
 
         Exposed so the collect-data entry point can wire the video relay's
-        ZED IMU samples into the cart's heading hold. Deliberately absent
-        from ``action_features``: the cart is never part of the dataset.
+        ZED IMU samples into Jelly's heading hold. Deliberately absent
+        from ``action_features``: Jelly is never part of the dataset.
         """
-        return self._cart
+        return self._jelly
 
     @property
     def action_features(self) -> dict:
@@ -336,10 +326,10 @@ class AxolVRTeleop(Teleoperator):
         self._vr_server.set_video_expected(self._video_expected)
         await self._vr_server.enable()
 
-        if self._cart is not None:
-            # Runs on this dedicated event loop, so the cart's command task
+        if self._jelly is not None:
+            # Runs on this dedicated event loop, so Jelly's command task
             # lives here too — off the caller's synchronous control loop.
-            await self._cart.enable()
+            await self._jelly.enable()
 
         ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe()
@@ -515,7 +505,7 @@ class AxolVRTeleop(Teleoperator):
                 )
 
         # The event loop is an independently-owned resource.  Always stop and
-        # join it, even if cart/VR/IK cleanup above raised, so direct SDK
+        # join it, even if Jelly/VR/IK cleanup above raised, so direct SDK
         # connect failures cannot strand a background thread or its port.
         if loop_thread_alive:
             try:
@@ -579,16 +569,16 @@ class AxolVRTeleop(Teleoperator):
         cleanup_failures: list[tuple[str, BaseException]] = []
         hardware_failures: list[tuple[str, BaseException]] = []
 
-        # Stop new dispatches and turn the cart off before waiting on a worker
+        # Stop new dispatches and turn Jelly off before waiting on a worker
         # which may be wedged in a third-party solve or pipe call.
         if self._ik_thread is not None:
             self._ik_stop.set()
-        if self._cart is not None:
+        if self._jelly is not None:
             try:
-                await self._cart.disable()
+                await self._jelly.disable()
             except BaseException as exc:
-                _logger.exception("cart disable failed")
-                hardware_failures.append(("cart", exc))
+                _logger.exception("Jelly disable failed")
+                hardware_failures.append(("jelly", exc))
 
         thread = self._ik_thread
         thread_alive = False
@@ -786,6 +776,11 @@ class AxolVRTeleop(Teleoperator):
     def is_resetting(self) -> bool:
         """True while a reset is pending, being planned, or playing back."""
         return self._core.is_resetting
+
+    @property
+    def is_tracking(self) -> bool:
+        """True while either arm is actively following the operator."""
+        return self._core.teleop_enabled
 
     @property
     def reset_pending(self) -> bool:
@@ -1151,10 +1146,10 @@ class AxolVRTeleop(Teleoperator):
         # Reset rising edge
         self._core.note_frame_reset(frame.reset)
 
-        if self._cart is not None:
-            # Shared stick → cart mapping (see Cart.apply_vr_frame). Resets
+        if self._jelly is not None:
+            # Shared stick → Jelly mapping (see Jelly.apply_vr_frame). Resets
             # force a stop so the base doesn't creep during return-to-rest.
-            self._cart.apply_vr_frame(frame, resetting=self._core.is_resetting)
+            self._jelly.apply_vr_frame(frame, resetting=self._core.is_resetting)
 
         # Episode state transitions. Latch writes take _event_lock so they
         # can't land inside get_teleop_events' read-then-clear and vanish.

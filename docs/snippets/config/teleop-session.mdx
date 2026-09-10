@@ -4,11 +4,13 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 |---|---|---|
 | <F>--{prefix}rest_pose_left</F> | `[−0.157, 0, 0, 0.314, 0, 0, −0.157]` | Left arm rest pose (rad, 7 joints). The arms start here and return here on reset. Edit it visually in the control panel's **Rest pose** tab. |
 | <F>--{prefix}rest_pose_right</F> | `[0.157, 0, 0, −0.314, 0, 0, 0.157]` | Right arm rest pose. |
-| <F>--{prefix}frequency</F> | `120` | Control-loop rate (Hz). Data collection sets this from `teleop_hz`. |
+| <F>--{prefix}frequency</F> | `120` | Motor command rate (Hz). Data collection sets this from `teleop_hz`. |
+| <F>--{prefix}ik_frequency</F> | `120` | How often VR poses are sent to the IK solver (Hz). The control loop interpolates between solutions. |
 | <F>--{prefix}position_multiplier</F> | `1.0` | Scales hand movement. `2` moves the arm twice as far as your hand. Ignored in `absolute_mode`. |
 | <F>--{prefix}rotation_multiplier</F> | `1.0` | Scales hand rotation the same way. Ignored in `absolute_mode`. |
 | <F>--{prefix}hold_to_engage</F> | `false` | `false`: click both grips to engage, then click a grip to freeze or unfreeze that arm. `true`: each arm tracks only while its grip is held. |
 | <F>--{prefix}disengage_timeout</F> | `0.5` | Seconds without a VR frame before tracking disengages and the arms hold position. `0` disables. |
+| <F>--{prefix}record</F> | `null` | Record every stage of the teleop pipeline to `~/.almond/recordings/<name>_*.npz` for [`motion.build`](/cli/motion-build) and [`diag.offline`](/cli/diag-offline). A bare name like `rec1` goes in that folder; a path is used as-is. |
 | <F>--{prefix}reset_speed</F> | `0.628` | Speed (rad/s) of the return-to-rest move. |
 | <F>--{prefix}reset_min_duration</F> | `1.5` | Minimum duration (s) of a return-to-rest move. |
 | <F>--{prefix}reset_rest_weight</F> | `50.0` | IK weight toward the rest pose when planning a return. |
@@ -24,8 +26,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}teleop_max_vel</F> | `6.283` | Maximum joint speed (rad/s) while tracking. |
 | <F>--{prefix}teleop_max_accel</F> | `21.99` | Maximum joint acceleration (rad/s²) while tracking. |
 | <F>--{prefix}ik_alpha</F> | `0.3` | Smoothing on the IK output, `(0, 1]`. `1` is no smoothing; lower is smoother but adds lag. See [Latency tuning](/operations/teleop#latency-tuning). |
-| <F>--{prefix}pose_min_cutoff</F> | `0.8` | Hand-tremor filter (Hz). Lower is smoother at rest but adds lag. Typical range 0.5–3. |
-| <F>--{prefix}pose_beta</F> | `2.0` | Lets fast, intentional moves through the tremor filter. Increase if fast moves feel sticky. |
+| <F>--{prefix}pose_cutoff</F> | `2.5` | Low-pass cutoff (Hz) on raw controller poses before IK. Lower rejects more hand tremor but adds lag. |
 | <F>--{prefix}absolute_mode</F> | `false` | Mantis mapping: track controller poses 1:1 in a fixed world frame instead of relative to where you engaged. Forced `true` by `--mantis`. |
 | <F>--{prefix}base_height</F> | `null` | In `absolute_mode`, fix the robot base this many metres above the VR floor instead of inferring it. Keeps datasets consistent across operators. |
 | <F>--{prefix}tcp_transform_left</F> | `null` | *Mantis data collection.* Tracker → gripper transform `[x, y, z, qx, qy, qz, qw]` for the left rig. Normally read from the saved calibration; set to override. See [`tracker`](/cli/tracker#transform-file). |
@@ -36,5 +37,5 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}urdf_viewer_world_aligned</F> | `null` | *Mantis data collection.* Whether the pose source shares the viewer headset's floor. `null` means `true` for Quest, `false` for Lighthouse/Ultimate. |
 
 <Note>
-  **Mantis mode** (`--mantis`) forces `absolute_mode: true`, `hold_to_engage: false`, `ik_alpha: 1.0`, `pose_min_cutoff: 5.0`, and removes the speed and acceleration limits. Your values for these keys are ignored in Mantis mode.
+  **Mantis mode** (`--mantis`) forces `absolute_mode: true`, `hold_to_engage: false`, `ik_alpha: 1.0`, `pose_cutoff: 5.0`, and removes the speed and acceleration limits. Your values for these keys are ignored in Mantis mode.
 </Note>

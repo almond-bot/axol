@@ -21,15 +21,14 @@ from __future__ import annotations
 
 import grp
 import logging
-import os
 import pwd
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .paths import ALMOND_HOME_ENV, almond_home
 from .ports import CONTROL_PORT, VR_PORT
+from .rtprio import operator_user
 from .sudo import prime_sudo, run_root
 
 _logger = logging.getLogger(__name__)
@@ -92,30 +91,11 @@ def _read_rule() -> str:
 def _operator_user() -> str | None:
     """Best-effort operator login to grant headset (``dialout``) access.
 
-    ``axol serve`` runs as root under systemd with no ``SUDO_USER``, so use the
-    owner of its explicit ``ALMOND_HOME``. Older units without that environment
-    retain the first-``/home/*`` fallback.
+    Delegates to :func:`~almond_axol.utils.rtprio.operator_user`, which also
+    resolves the owner of an explicit ``ALMOND_HOME`` for a root ``axol serve``
+    under systemd (no ``SUDO_USER``).
     """
-    user = os.environ.get("SUDO_USER")
-    if user and user != "root":
-        return user
-    if os.environ.get(ALMOND_HOME_ENV):
-        try:
-            user = almond_home().owner()
-            if user != "root":
-                return user
-        except (KeyError, OSError):
-            pass
-    try:
-        homes = sorted(Path("/home").iterdir())
-    except OSError:
-        return None
-    for home in homes:
-        try:
-            return home.owner()
-        except (KeyError, OSError):
-            continue
-    return None
+    return operator_user()
 
 
 def _in_group(user: str, group: str) -> bool:

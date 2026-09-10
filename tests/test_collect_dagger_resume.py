@@ -278,11 +278,11 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         )
         control_loop.limiter = None
         control_loop.recorder = SimpleNamespace(publish=mock.Mock())
+        control_loop.robot.get_observation_with_capture_timestamp = mock.Mock(
+            return_value=({"joint": 0.0}, 1.0)
+        )
 
-        with mock.patch.object(
-            collect_dagger, "latest_observation", return_value={"joint": 0.0}
-        ):
-            result = control_loop._policy_tick(1.0)  # noqa: SLF001
+        result = control_loop._policy_tick()  # noqa: SLF001
 
         self.assertIsNone(result)
         control_loop.robot.send_action.assert_not_called()
@@ -299,7 +299,9 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             send_action=mock.Mock(return_value=human_joint_action),
             action_to_dataset=mock.Mock(return_value=cartesian_action),
         )
-        recorder = SimpleNamespace(publish=mock.Mock())
+        recorder = SimpleNamespace(
+            publish=mock.Mock(), poll_capture_error=mock.Mock(return_value=None)
+        )
         recorder.publish.side_effect = (
             lambda *_args, **_kwargs: control_loop.shutdown_event.set()
         )
@@ -349,6 +351,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         )
         recorder = SimpleNamespace(
             publish=mock.Mock(),
+            poll_capture_error=mock.Mock(return_value=None),
             frame_count=mock.Mock(return_value=1),
             pause_episode=mock.Mock(),
             resume_episode=mock.Mock(return_value=0),

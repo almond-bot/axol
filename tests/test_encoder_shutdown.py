@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import queue
-import sys
 import tempfile
 import threading
 import time
 import unittest
-from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -37,6 +35,7 @@ class EncoderShutdownTest(unittest.TestCase):
         release = threading.Event()
         pipeline = mock.Mock()
         src = mock.Mock()
+        src.get_property.return_value = 0  # appsrc current-level-bytes
 
         def set_state(state: str) -> None:
             if state == gst.State.NULL:
@@ -142,6 +141,7 @@ class EncoderShutdownTest(unittest.TestCase):
         gst = self._fake_gst()
         pipeline = mock.Mock()
         src = mock.Mock()
+        src.get_property.return_value = 0  # appsrc current-level-bytes
         src.emit.side_effect = SystemExit("native appsrc aborted")
         with (
             tempfile.TemporaryDirectory() as directory,
@@ -395,69 +395,6 @@ class EncoderShutdownTest(unittest.TestCase):
                 self.assertTrue(encoder._episode_active)
                 self.assertEqual(encoder._cams, {"left": camera})
 
-    def test_concat_pads_short_h264_segment_to_its_advertised_count(self) -> None:
-        # A gst-muxed segment intermittently demuxes one sample short of its
-        # stsz count. Rejecting it lost the whole episode *after* its parquet
-        # rows were written; padding keeps frame-count == row-count and the
-        # imperfection stays confined to the trailing frame (the next segment
-        # begins with an IDR).
-        in_stream = SimpleNamespace(type="video", frames=2)
-
-        class _Packet:
-            dts = 0
-            pts = 0
-            duration = 1
-            time_base = Fraction(1, 60)
-            stream = in_stream
-
-            def __bytes__(self) -> bytes:
-                return b"last-picture"
-
-        packet = _Packet()
-        source = SimpleNamespace(
-            streams=[in_stream],
-            demux=lambda _stream: [packet],
-        )
-        out_stream = SimpleNamespace(time_base=None)
-        destination = mock.Mock()
-        destination.add_stream_from_template.return_value = out_stream
-        source_context = mock.MagicMock()
-        source_context.__enter__.return_value = source
-        destination_context = mock.MagicMock()
-        destination_context.__enter__.return_value = destination
-        pad = mock.Mock()
-        fake_av = SimpleNamespace(Packet=mock.Mock(return_value=pad))
-
-        def open_container(_path, *, mode):
-            return destination_context if mode == "w" else source_context
-
-        fake_av.open = mock.Mock(side_effect=open_container)
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            mock.patch.dict(sys.modules, {"av": fake_av}),
-            mock.patch.object(
-                record_proc, "secure_atomic_copy_file", create=True
-            ) as copy_file,
-            mock.patch(
-                "almond_axol.utils.state_files.secure_atomic_copy_file", copy_file
-            ),
-            self.assertLogs(record_proc._logger, level="ERROR") as logs,
-        ):
-            record_proc._concat_constant_fps(
-                [Path(directory) / "short.mp4"],
-                Path(directory) / "output.mp4",
-                Fraction(60, 1),
-            )
-
-        self.assertEqual(
-            [c.args[0] for c in destination.mux.call_args_list], [packet, pad]
-        )
-        fake_av.Packet.assert_called_once_with(b"last-picture")
-        self.assertEqual(pad.pts, 1000)
-        self.assertEqual(pad.dts, 1000)
-        self.assertIn("demuxed 1 of 2 advertised samples", logs.output[0])
-        copy_file.assert_called_once()
-
     def test_encoded_capture_failure_is_discarded_before_save_reply(self) -> None:
         dataset = mock.Mock(num_episodes=0)
         camera = mock.Mock()
@@ -478,6 +415,7 @@ class EncoderShutdownTest(unittest.TestCase):
                     "width": 640,
                     "height": 480,
                     "fps": 60,
+                    "pts_perf_offset_s": 0.0,
                 }
             },
             "snapshot_shm_name": "snapshot-test",
@@ -490,6 +428,8 @@ class EncoderShutdownTest(unittest.TestCase):
         }
 
         def fail_capture(**kwargs) -> None:
+            # The recorder replies "started" only once the readers report armed.
+            kwargs["on_armed"]()
             kwargs["on_error"]("encoded camera stalled")
 
         with (
@@ -524,7 +464,7 @@ class EncoderShutdownTest(unittest.TestCase):
             ),
             mock.patch.object(record_proc, "_cleanup_recorder_session"),
         ):
-            record_proc._recorder_main(conn, object(), config)
+            record_proc._recorder_main(conn, mock.Mock(), object(), config)
 
         self.assertEqual(dataset.clear_episode_buffer.call_count, 2)
         self.assertEqual(
@@ -532,12 +472,9 @@ class EncoderShutdownTest(unittest.TestCase):
             [
                 mock.call(("ready", 0)),
                 mock.call(("started",)),
-                mock.call(
-                    (
-                        "error",
-                        "encoded camera stalled; episode discarded",
-                    )
-                ),
+                # A capture failure gets its own reply kind so the parent
+                # raises RecorderCaptureError rather than a generic error.
+                mock.call(("capture_error", "encoded camera stalled")),
             ],
         )
         dataset.save_episode.assert_not_called()
@@ -570,6 +507,7 @@ class EncoderShutdownTest(unittest.TestCase):
                     "width": 640,
                     "height": 480,
                     "fps": 60,
+                    "pts_perf_offset_s": 0.0,
                 }
             },
             "snapshot_shm_name": "snapshot-test",
@@ -582,6 +520,7 @@ class EncoderShutdownTest(unittest.TestCase):
         }
 
         def idle_capture(**kwargs) -> None:
+            kwargs["on_armed"]()
             kwargs["stop_event"].wait(5.0)
 
         with (
@@ -608,7 +547,7 @@ class EncoderShutdownTest(unittest.TestCase):
             ),
             mock.patch.object(record_proc, "_cleanup_recorder_session"),
         ):
-            record_proc._recorder_main(conn, object(), config)
+            record_proc._recorder_main(conn, mock.Mock(), object(), config)
 
         self.assertEqual(
             conn.send.call_args_list,

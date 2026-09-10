@@ -1638,7 +1638,7 @@ class FindSingleSerialsTest(unittest.TestCase):
             [call("chest", reset=True), call("wheel", reset=True)],
         )
         self.assertIn("Damiao wheel motors answered", output)
-        self.assertIn("cart lift controller answered", output)
+        self.assertIn("Jelly lift controller answered", output)
 
     def test_live_responses_correct_a_wheel_chest_swap(self) -> None:
         result, _, _, _ = self.run_find(

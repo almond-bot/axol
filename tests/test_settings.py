@@ -22,7 +22,7 @@ class DiagnosticSettingsTest(unittest.TestCase):
             {
                 "mantis": "yes",
                 "sim": "OFF",
-                "cart_only": "no",
+                "jelly_only": "no",
                 "axol.has_gripper": "on",
             },
         )
@@ -32,7 +32,7 @@ class DiagnosticSettingsTest(unittest.TestCase):
             {
                 "mantis": True,
                 "sim": False,
-                "cart_only": False,
+                "jelly_only": False,
                 "axol.has_gripper": True,
             },
         )
@@ -43,7 +43,7 @@ class DiagnosticSettingsTest(unittest.TestCase):
                 "true",
                 "--sim",
                 "false",
-                "--cart_only",
+                "--jelly_only",
                 "false",
                 "--axol.has_gripper",
                 "true",
