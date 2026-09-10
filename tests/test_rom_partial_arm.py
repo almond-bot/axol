@@ -416,6 +416,19 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
         # seven-motor arm is not partial.
         arm_only = set(ARM_JOINTS)
         self.assertFalse(rom.is_bench_run({"left": arm_only, "right": None}, arm_only))
+        # A mounted arm whose gripper does not answer (unpowered, missing, or
+        # not fitted on a gripper-configured robot) is still the robot: the
+        # gripper says nothing about the mounting, and soft PD with no
+        # gravity feedforward would let the held shoulders sag.
+        self.assertFalse(
+            rom.is_bench_run({"left": arm_only, "right": None}, candidates)
+        )
+        # Whereas a gripper that answers on a partial arm is still a bench.
+        self.assertTrue(
+            rom.is_bench_run(
+                {"left": {Joint.WRIST_2, Joint.GRIPPER}, "right": None}, candidates
+            )
+        )
 
 
 # --------------------------------------------------------------------------- #

@@ -284,15 +284,22 @@ def bench_config(config: AxolConfig) -> AxolConfig:
 def is_bench_run(
     arm_joints: dict[str, set[Joint] | None], candidates: set[Joint]
 ) -> bool:
-    """Whether any arm in the run is partial — motors missing from its bus.
+    """Whether any arm in the run is partial — *arm joints* missing from its bus.
 
     A partial arm cannot be on the robot, so it gets :func:`bench_config`.
     The rule is the bus probe, not the ``--joints`` selection: a joint
     subset swept on a fully populated arm is still the robot, and its held
     joints need the production gains and gravity feedforward.
+
+    Only the seven arm joints count. The gripper says nothing about the
+    mounting — a mounted arm whose gripper is unpowered, missing, or simply
+    not fitted must keep the production gains: soft PD with no gravity
+    feedforward would let its held shoulders sag.
     """
+    arm_candidates = candidates & set(ARM_JOINTS)
     return any(
-        joints is not None and joints != candidates for joints in arm_joints.values()
+        joints is not None and (joints & set(ARM_JOINTS)) != arm_candidates
+        for joints in arm_joints.values()
     )
 
 
