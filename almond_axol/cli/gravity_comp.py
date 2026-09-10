@@ -76,7 +76,7 @@ def main(argv: list[str]) -> None:
     cfg = parse(GravityCompCmdConfig, argv)
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
-    # and silently drop log_say() / INFO status lines.
+    # and silently drop the INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
     try:
         asyncio.run(_run(cfg))

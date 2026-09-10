@@ -862,7 +862,7 @@ class VRTeleopCore:
             get_positions: Measured ``(left, right)`` arm positions used to
                 re-sync the pipeline after hand-guiding.
             stopped: Flow shutdown flag; checked every cycle.
-            announce: Operator-facing status line (e.g. ``log_say``).
+            announce: Operator-facing status line (e.g. ``logger.info``).
             on_contact: Extra flow hook run once per trip, before the hold
                 (e.g. unblock the headset's reset button).
             hold_tick: Flow hook run every hold cycle (e.g. consume teleop
