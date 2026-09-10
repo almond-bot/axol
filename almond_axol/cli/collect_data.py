@@ -10,7 +10,7 @@ Episode boundaries are driven by VR controller commands:
 
 and/or, when launched from the web control panel (``axol serve``), by episode
 commands pushed through :class:`_QueueCollectControl` (``POST
-/api/op/episode``): ``start`` begins recording after a spoken 3-second
+/api/op/episode``): ``start`` begins recording after a logged 3-second
 countdown, ``s`` terminates + saves, ``r`` discards + re-records, ``q`` quits
 the session. Both sources are live at once — either can start or end an
 episode.
@@ -48,7 +48,7 @@ one of those phases: without it the panel sat on "Saving…" (no buttons) for as
 long as the arms stayed limp, which reads as a stuck save, and a headset-off
 session had no way out of the hold but Stop.
 
-The teleop loop runs at ``--teleop_hz`` and publishes the latest
+The teleop loop runs at ``--teleop_hz`` and publishes a timestamped
 ``(joint_obs, action)`` snapshot every tick. The dataset itself — frame
 capture, row assembly, encoding, ``save_episode`` — is owned by a separate
 recorder (see :mod:`almond_axol.recording.record_proc`): a subprocess when the video
@@ -83,15 +83,27 @@ from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..recording import (
     DatasetRecorderProcess,
     InProcessRecorder,
+    RecorderCaptureError,
+    RecorderDatasetSaveError,
     default_vcodec,
     restore_dataset_ownership,
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
+from ..teleop.recorder import resolve_prefix
+from ..teleop_activity import TeleopActivityMarker
 from ..teleop.core import TCPPoseSnapshot
 from ..utils import affinity
+from ..utils.control_loop import run_blocking_with_control_ticks
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
+from ..utils.stall_diag import (
+    GcHold,
+    StallWatchdog,
+    freeze_startup_heap,
+    install_gc_pause_logger,
+    unfreeze_heap,
+)
 from .config import (
     DatasetResolution,
     LogLevel,
@@ -124,9 +136,10 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
 
     Applied after parsing, so it overrides these specific teleop fields even if
     set on the CLI (a warning is logged); other teleop knobs (One Euro, rest
-    poses, frequency) pass through untouched. Powered-cart control is always
-    disabled: Mantis is a handheld rig, and a persisted robot cart setting
-    must not open or move unrelated base/lift hardware during collection.
+    poses, frequency) pass through untouched. Jelly (powered base) control is
+    always disabled: Mantis is a handheld rig, and a persisted robot Jelly
+    setting must not open or move unrelated base/lift hardware during
+    collection.
     """
     from dataclasses import fields, replace
 
@@ -179,9 +192,9 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
         from ..kinematics.config import apply_mantis_kinematics_profile
         from ..teleop.config import apply_mantis_teleop_profile
 
-        if cfg.teleop_config.cart.enabled:
-            _logger.info("--mantis: disabling powered-cart control.")
-            cfg.teleop_config.cart.enabled = False
+        if cfg.teleop_config.jelly.enabled:
+            _logger.info("--mantis: disabling Jelly (powered base) control.")
+            cfg.teleop_config.jelly.enabled = False
         cfg.teleop_config.has_gripper = True
         tc = cfg.teleop_config.vr_teleop_config
         if not tc.absolute_mode or tc.hold_to_engage or tc.ik_alpha != 1.0:
@@ -387,11 +400,6 @@ def _default_robot_config() -> AxolRobotConfig:
             "left_arm": ZedCameraConfig(serial=0),
             "right_arm": ZedCameraConfig(serial=0),
         },
-        # The control loop runs motion_control every step, whose command replies
-        # keep the joint cache fresh — so the background telemetry poll loop is
-        # redundant CAN/CPU load. Skipping it (telemetry_hz=0) matches `axol
-        # teleop` and keeps the control rate from sagging when teleop engages.
-        telemetry_hz=0.0,
     )
 
 
@@ -404,10 +412,9 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
     WebRTC track per source (see :func:`almond_axol.video.video._track_for_source`):
     a gst camera/eye already produces GPU-encoded H.264 access units (its
     ``subscribe()`` feeds a pre-encoded track — the same grab/encode serves the
-    dataset), while an SDK camera is adapted to a frame-driven source that
-    encodes each frame as soon as it's captured. Reads only consume the latest
-    frame each camera already keeps, so the dataset capture pipeline is never
-    blocked.
+    dataset), while an SDK camera samples its newest frame on the fixed 30 fps
+    headset clock. These reads are non-consuming, so the independently paced
+    dataset capture pipeline is never blocked.
     """
     if not robot.cameras:
         return
@@ -485,10 +492,11 @@ def _start_video_relay(
 
     The relay subprocess opens the ZED cameras on the GPU-resident gst pipeline,
     streams the headset view over WebRTC (aiortc), **and** publishes each
-    camera's raw RGB frames back to this process through shared memory for the
-    dataset (see :mod:`almond_axol.video.shm_frames`). This keeps the control
-    process off the camera grab/encode/RTP path entirely, so the teleop and IK
-    loops stay as fast as ``axol teleop`` — even while recording.
+    camera's dataset feed through shared memory (PTS-preserving encoded H.264 on
+    the primary path, raw RGB on the fallback; see
+    :mod:`almond_axol.video.shm_frames`). This keeps the control process off the
+    camera grab/encode/RTP path entirely, so the teleop and IK loops stay as fast
+    as ``axol teleop`` — even while recording.
 
     ``dataset_resolution`` is the effective downscale target for the dataset (raw)
     branch — the configured value for a fresh dataset, or the existing dataset's
@@ -528,7 +536,12 @@ def _start_video_relay(
         serial = int(camcfg.serial)
         spec: dict[str, Any] = {
             "serial": serial,
+            # Physical capture and dataset output are independent. The camera
+            # may stay at 60 Hz for low-latency policy/raw access while the
+            # encoded recorder branch decimates to cfg.fps. Headset streaming
+            # is fixed separately at 30 fps.
             "fps": camcfg.fps or 60,
+            "dataset_fps": cfg.fps,
             "record": wants_record,
             "stream": wants_stream,
         }
@@ -654,7 +667,7 @@ class CollectDataConfig:
     # re-engage (frame shift), over five percent frozen-TCP frames, or over one
     # percent disengaged
     # frames (see evaluate_episode_qa): the episode is discarded and
-    # re-recorded with a loud spoken/logged explanation. Set false as an
+    # re-recorded with a loud logged explanation. Set false as an
     # escape hatch (debugging the gate, or deliberately recording unusual
     # sessions) — the per-episode QA summary is still logged, the bad episode
     # is just saved anyway. Only Mantis episodes can fail the gate; on-robot
@@ -806,6 +819,15 @@ def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
 # starting, mirroring the in-headset record countdown so the operator has time
 # to pick the controllers back up. A second click cancels.
 _PANEL_START_COUNTDOWN_S = 3.0
+
+# Control-tick heartbeat age that counts as a stall worth a stack trace: six
+# ticks at 120 Hz. The recorder pairs each camera exposure with the state
+# snapshot the control loop published within 50 ms of it and gives up after a
+# 100 ms wait, so a tick gap this long is already enough to make the recorder
+# drop a dataset row ("no retained robot-state snapshot brackets camera
+# exposure") — no longer fatal to the episode (see record_proc.py), but still
+# worth a stack trace so a chronic stall gets tracked down.
+_TICK_STALL_S = 0.05
 
 # Buttons the panel renders per phase (see EpisodeControls in the web app):
 # ``confirm`` asks for a second, confirming click — the panel's stand-in for
@@ -986,7 +1008,7 @@ def main(argv: list[str]) -> None:
             cfg = parse(CollectDataConfig, argv, fallback_overlay=fallback)
     # force=True: importing lerobot (at module load) installs a root handler
     # and leaves the root level at WARNING, which would otherwise make this a
-    # no-op and silently drop every log_say() status line.
+    # no-op and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
     # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled
@@ -1014,6 +1036,18 @@ def main(argv: list[str]) -> None:
             _run(cfg)
     else:
         _run(cfg)
+
+
+def _resolve_control_trace_prefix(record: str | None) -> str | None:
+    """Resolve an explicitly requested flight-recorder prefix.
+
+    ``VRTeleopConfig.record`` is an opt-in diagnostic. In particular, keep its
+    documented ``None`` default disabled during data collection instead of
+    silently turning every production session into a flight recording.
+    """
+    if not record:
+        return None
+    return resolve_prefix(record)
 
 
 def _run(
@@ -1122,7 +1156,6 @@ def _run_session(
     from lerobot.processor import make_default_processors
     from lerobot.teleoperators.utils import TeleopEvents
     from lerobot.utils.constants import HF_LEROBOT_HOME
-    from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun
 
     from ..lerobot.robot.robot_axol import _LEFT_EE_KEYS, _RIGHT_EE_KEYS, AxolRobot
@@ -1182,11 +1215,26 @@ def _run_session(
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
 
+        # Keep the optional teleop flight recorder coherent across Python and
+        # Rust. An explicit name enables every stage; the documented ``None``
+        # default stays off so production collection does not incur diagnostic
+        # snapshot/compression work unless the operator asks for it. When
+        # enabled, the IK/cmd taps gate themselves to actual tracking, while the
+        # Rust/measured trace is enabled below only after PyRoKi startup and
+        # remains active through guarded returns.
+        vrt_cfg = cfg.teleop_config.vr_teleop_config
+        trace_prefix = _resolve_control_trace_prefix(vrt_cfg.record)
+        if trace_prefix is not None:
+            vrt_cfg.record = trace_prefix
+    else:
+        trace_prefix = None
+
     robot = (
         MantisRobot(cfg.robot_config, defer_gripper_enable=True)
         if mantis_mode
         else AxolRobot(cfg.robot_config)
     )
+    robot.configure_control_trace(trace_prefix)
     teleop = AxolVRTeleop(cfg.teleop_config)
 
     # Check resume eligibility before connecting (file check only)
@@ -1300,14 +1348,10 @@ def _run_session(
         relay.shutdown()
         relay = None
 
-    # On the relay's encoded (gstshm-h264) transport the dataset capture loop
-    # is paced by camera frame arrival — exactly one encoded frame per dataset
-    # row — so rows land at the camera rate no matter what fps was requested,
-    # while ``meta/info.json`` is stamped with the requested value. A mismatch
-    # therefore records a dataset whose metadata lies about its timing, and
-    # every consumer (replay-dataset, training) plays it back at the wrong
-    # speed. Fail fast with the rates the relay actually opened the cameras at
-    # (they can fall back, e.g. to 30 fps) instead of recording bad data.
+    # The encoded dataset branch is independently rate-limited to the requested
+    # recording fps. Verify the negotiated metadata anyway: a mismatch would
+    # make the constant-fps MP4 timeline disagree with the dataset metadata and
+    # replay/training would run at the wrong speed.
     if use_relay:
         mismatched = {
             src: int(m["fps"])
@@ -1323,11 +1367,9 @@ def _run_session(
             )
             raise ValueError(
                 f"Recording fps is {fps}, but dataset frames are captured at "
-                f"the camera rate ({rates}) — the episode would actually "
-                f"record at the camera rate while claiming {fps} fps, so "
-                f"replay and training would run at the wrong speed. Set the "
-                f"recording fps to the camera rate, or raise the camera fps "
-                f"to {fps}."
+                f"different negotiated rates ({rates}); replay and training "
+                f"would run at the wrong speed. Ensure each camera can capture "
+                f"at least {fps} fps."
             )
 
     # Connect first — cameras auto-detect resolution and FPS on open, which
@@ -1336,7 +1378,8 @@ def _run_session(
     # If any of this setup fails, tear the relay subprocess down so it doesn't
     # leak a held camera (it is daemonic, but a long-lived parent could outlive
     # the failure).
-    imu_src: Any | None = None  # board-gyro yaw source for the cart, if wired
+    imu_src: Any | None = None  # board-gyro yaw source for Jelly, if wired
+    activity = TeleopActivityMarker()
 
     def _cleanup_failed_setup(
         *,
@@ -1357,6 +1400,7 @@ def _run_session(
             cleanups.append(("Tegra diagnostics", tegra.stop))
         if imu_src is not None:
             cleanups.append(("board gyro", imu_src.close))
+        cleanups.append(("teleop activity marker", activity.stop))
         cleanups.extend(
             (
                 ("teleop", teleop.disconnect),
@@ -1392,7 +1436,7 @@ def _run_session(
             # hard-stop calibration), then drop torque again, so the jaws are
             # already wide when the first take starts instead of finishing
             # their sweep in-shot. See _preopen_mantis_grippers.
-            _preopen_mantis_grippers(robot, stop_event, log_say)
+            _preopen_mantis_grippers(robot, stop_event, _logger.info)
 
         # The dataset lives in the recorder (subprocess or in-process), not here.
         # Its features come from the robot's joint features + the camera image
@@ -1435,6 +1479,15 @@ def _run_session(
 
         pos_l, pos_r = robot.positions
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
+        try:
+            activity.start()
+        except OSError as exc:
+            _logger.warning("could not publish teleop timing boundary: %s", exc)
+        if trace_prefix is not None:
+            _logger.info(
+                "collection control trace armed (tracking/reset only): %s_*",
+                trace_prefix,
+            )
 
         # Stream the overhead + wrist cameras to the headset so the operator can
         # see the scene and grippers. With the relay this is the subprocess's
@@ -1445,19 +1498,19 @@ def _run_session(
         else:
             _register_camera_video(robot, teleop)
 
-        # Cart heading hold: feed the carrier board's BMI088 yaw rate to the
-        # cart, same as native teleop (see almond_axol.robot.gyro — nothing
+        # Jelly heading hold: feed the carrier board's BMI088 yaw rate to the
+        # Jelly, same as native teleop (see almond_axol.robot.gyro — nothing
         # here touches the video path). Best-effort: on failure the hold is
-        # simply inert (no yaw rates arrive), which the cart logs once driving.
-        if teleop.cart is not None and teleop.cart.config.imu:
+        # simply inert (no yaw rates arrive), which Jelly logs once driving.
+        if teleop.jelly is not None and teleop.jelly.config.imu:
             try:
                 from ..robot.gyro import BoardYawRateSource
 
-                imu_src = BoardYawRateSource(teleop.cart.feed_yaw_rate)
+                imu_src = BoardYawRateSource(teleop.jelly.feed_yaw_rate)
                 imu_src.open()
             except Exception as exc:  # noqa: BLE001 - heading hold is best-effort
                 _logger.warning(
-                    "cart.imu: could not start the board gyro (%s); heading "
+                    "Jelly IMU: could not start the board gyro (%s); heading "
                     "hold disabled",
                     exc,
                 )
@@ -1499,7 +1552,7 @@ def _run_session(
             make_default_processors()
         )
         if is_complete:
-            log_say(f"Resuming existing dataset at {dataset_root}.")
+            _logger.info(f"Resuming existing dataset at {dataset_root}.")
         if use_relay:
             recorder: DatasetRecorderProcess | InProcessRecorder = (
                 DatasetRecorderProcess(
@@ -1566,6 +1619,29 @@ def _run_session(
 
     assert diag is not None and tegra is not None
 
+    # Stall attribution for the control tick. The recorder ends an episode when
+    # this loop stops publishing state for ~100 ms, but nothing so far said
+    # *why* the tick stopped: the watchdog logs the tick thread's stack and
+    # kernel scheduling state while it is stuck (armed only while a take is
+    # starting/recording — resets and saves idle the loop on purpose), and the
+    # gc hook names a stop-the-world collection if that is what paused it.
+    # Cyclic GC is the prime suspect: this process (under `axol serve`, the
+    # whole web server too) carries a large permanent heap, so a gen-2 pass
+    # freezes every thread for hundreds of ms — the pause run-policy measured
+    # at ~500 ms and the relay at ~100 ms, both of which disable the collector
+    # for that reason. Here the permanent heap is frozen out of the collector's
+    # reach once, automatic collection is held for each take, and the deferred
+    # garbage is swept between episodes with the arms at rest.
+    tick_watchdog = StallWatchdog("control tick", _TICK_STALL_S, logger=_logger)
+    tick_watchdog.suspend()
+    tick_watchdog.start()
+    uninstall_gc_log = install_gc_pause_logger(_logger)
+    take_gc = GcHold("control take", _logger)
+    _logger.info(
+        "gc: froze %d startup objects out of the collector's reach",
+        freeze_startup_heap(),
+    )
+
     episodes_recorded = 0
     episode_idx = recorder.episode_count()
     teleop_interval = 1.0 / teleop_hz
@@ -1606,6 +1682,7 @@ def _run_session(
 
     def _maybe_log_rate(t0: float) -> None:
         nonlocal last_rate_log, sect
+        tick_watchdog.beat()
         loop_times.append(t0)
         if prev_t0["v"]:
             gap = t0 - prev_t0["v"]
@@ -1617,30 +1694,34 @@ def _run_session(
         span = loop_times[-1] - loop_times[0]
         n = len(loop_times)
         loop_hz = (n - 1) / span if span > 0 else 0.0
+        # maxgap/maxslip ("the thread lost the CPU") ride on the INFO line: an
+        # average rate hides the single 300 ms gap that discards an episode.
+        # Mantis adds the worst pose-stream age in the window.
         if mantis_mode:
             _logger.info(
-                "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz  pose_lag: %.0f ms",
+                "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz  pose_lag: %.0f ms  "
+                "maxgap: %.0fms  maxslip: %.0fms",
                 loop_hz,
                 teleop.vr_hz(),
                 teleop.ik_hz(),
                 1e3 * max_pose_lag["v"],
+                1e3 * max_gap["v"],
+                1e3 * max_slip["v"],
             )
             max_pose_lag["v"] = 0.0
         else:
             _logger.info(
-                "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz",
+                "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz  maxgap: %.0fms  maxslip: %.0fms",
                 loop_hz,
                 teleop.vr_hz(),
                 teleop.ik_hz(),
-            )
-        # Jitter detail (maxgap/maxslip = "the thread lost the CPU") and the
-        # per-section breakdown stay at DEBUG so INFO is just the rate line.
-        if time_sections:
-            _logger.debug(
-                "loop maxgap=%.1fms maxslip=%.1fms  sections (mean ms): "
-                "obs=%.2f act=%.2f proc=%.2f send=%.2f",
                 1e3 * max_gap["v"],
                 1e3 * max_slip["v"],
+            )
+        # The per-section breakdown stays at DEBUG.
+        if time_sections:
+            _logger.debug(
+                "loop sections (mean ms): obs=%.2f act=%.2f proc=%.2f send=%.2f",
                 1e3 * sect["obs"] / n,
                 1e3 * sect["act"] / n,
                 1e3 * sect["proc"] / n,
@@ -1683,9 +1764,15 @@ def _run_session(
     # interleaved with CAN telemetry on one thread, exactly like `axol teleop`.
     # The main thread drives the episode lifecycle (dataset writes, rest-pose
     # moves) and blocks on each coroutine until the episode (or reset) finishes.
-    async def _episode_loop() -> tuple[bool, bool, bool, EpisodeQAStats]:
+    async def _episode_loop() -> tuple[
+        bool, bool, bool, int, str | None, EpisodeQAStats
+    ]:
         recording = False
+        capture_ready = False
         rerecord = False
+        contact = False
+        captured_rows = 0
+        capture_failure: str | None = None
         # Per-episode data-quality counters (Mantis mode; see EpisodeQAStats).
         # Reset when recording actually starts so the pre-record phase never
         # pollutes the verdict.
@@ -1714,18 +1801,204 @@ def _run_session(
             if vrt_cfg.teleop_torque_threshold > 0
             else None
         )
+        last_robot_act: dict[str, Any] | None = None
+        last_dataset_act: dict[str, Any] | None = None
+
+        class _TrackingContact(RuntimeError):
+            pass
+
+        async def _tracking_tick() -> None:
+            """Run one normal teleop tick without consuming boundary events."""
+            nonlocal capture_failure, last_robot_act, last_dataset_act
+            nonlocal last_tcp, was_engaged
+            if _stopped() and last_robot_act is not None:
+                # Ctrl+C/Stop during recorder startup must drain the bounded
+                # worker before teardown, but must not keep following a moving
+                # controller while it does so.
+                await _hold_tick()
+                return
+            t0 = time.perf_counter()
+            _maybe_log_rate(t0)
+            # Keep a recording's trace open after the headset drops tracking:
+            # terminate/SAVING may arrive before the outer loop consumes it.
+            robot.set_control_trace_active(
+                recording or teleop.is_tracking or teleop.is_resetting
+            )
+
+            joint_obs = robot.get_joint_observation()
+            t_obs = time.perf_counter()
+            teleop.send_feedback(joint_obs)
+            act = teleop.get_action()
+            t_act = time.perf_counter()
+            act_processed = teleop_action_proc((act, joint_obs))
+            robot_act = robot_action_proc((act_processed, joint_obs))
+            dataset_act = robot.action_to_dataset(act_processed)
+            t_proc = time.perf_counter()
+            await robot.send_action_async(robot_act)
+            t_send = time.perf_counter()
+            sect["obs"] += t_obs - t0
+            sect["act"] += t_act - t_obs
+            sect["proc"] += t_proc - t_act
+            sect["send"] += t_send - t_proc
+
+            # Record the action in the configured action space: identity for
+            # joint datasets, FK-to-Cartesian when observe_cartesian is set. The
+            # arm is still commanded with the teleop joint targets above, so its
+            # motion is unchanged — only the stored representation differs.
+            #
+            # Row timestamp: on the robot the loop tick is correct (state and
+            # image both describe the physical robot at t0). On the Mantis the
+            # pose stream *is* the plant's ground truth, so the row is stamped
+            # with the pose's capture time — the moment the hand was actually
+            # there — keeping it on the same capture timeline as the camera
+            # exposure timestamps.
+            row_ts = t0
+            pose_ts: float | None = None
+            if mantis_mode:
+                # Pose and host capture time are one immutable sample. Reading
+                # them through separate accessors could straddle an IK publish
+                # and stamp pose N+1 with pose N's timestamp.
+                tcp_snapshot = teleop.tcp_pose_snapshot()
+                if tcp_snapshot is not None:
+                    last_tcp = tcp_snapshot
+                pose_ts = last_tcp.pose_host_ts if last_tcp is not None else None
+                if pose_ts is not None:
+                    row_ts = pose_ts
+                    lag = t0 - pose_ts
+                    if lag > max_pose_lag["v"]:
+                        max_pose_lag["v"] = lag
+                    if recording and lag > stats.max_pose_lag_s:
+                        stats.max_pose_lag_s = lag
+                # Overwrite the EE dims of both the state and the action with
+                # the tracked ground-truth TCP pose: on the rig the tracker
+                # (not IK-solved virtual joints roundtripped through FK) is
+                # where the gripper physically is, and training must not
+                # inherit filter/solver artifacts. Grippers stay as-is —
+                # measured feedback in the state, commanded in the action.
+                if last_tcp is not None:
+                    joint_obs = dict(joint_obs)
+                    dataset_act = dict(dataset_act)
+                    for keys, pose in (
+                        (_LEFT_EE_KEYS, last_tcp.left),
+                        (_RIGHT_EE_KEYS, last_tcp.right),
+                    ):
+                        pose6 = [
+                            *pose[:3],
+                            *quat_xyzw_to_rotvec(np.asarray(pose[3:7])),
+                        ]
+                        joint_obs.update(zip(keys, pose6))
+                        dataset_act.update(zip(keys, pose6))
+
+            last_robot_act = robot_act
+            last_dataset_act = dataset_act
+            recorder.publish(joint_obs, dataset_act, row_ts)
+
+            # Per-episode QA counters (Mantis only — encoder-FK poses can't go
+            # stale). Frozen TCPs and disengaged spans record a motionless
+            # pose under fresh timestamps; a re-engage re-fits the world→base
+            # transform and shifts the frame of every later row.
+            if mantis_mode and recording and capture_ready:
+                stats.total_frames += 1
+                engaged = teleop.is_engaged()
+                if not engaged:
+                    stats.disengaged_frames += 1
+                elif not was_engaged:
+                    stats.reengaged_while_recording = True
+                was_engaged = engaged
+                if not all(teleop.tracking_sides().values()):
+                    stats.untracked_frames += 1
+                if not all(teleop.trigger_sides().values()):
+                    stats.trigger_loss_frames += 1
+                if pose_ts is None or t0 - pose_ts > _QA_STALE_POSE_S:
+                    stats.stale_frames += 1
+
+            # start_episode resets the subprocess's dedicated error pipe on a
+            # worker thread. Do not inspect that pipe from this event-loop
+            # heartbeat until the start transaction has completed.
+            if recording and capture_ready:
+                capture_error = recorder.poll_capture_error()
+                if capture_error is not None:
+                    capture_failure = str(capture_error)
+                    return
+
+            if watchdog is not None:
+                tripped = watchdog.update(robot.torque_residuals())
+                if tripped is not None:
+                    joint, residual = tripped
+                    _logger.warning(
+                        "teleop contact: %s torque residual %.1f exceeds %.1f — going limp",
+                        joint,
+                        residual,
+                        vrt_cfg.teleop_torque_threshold,
+                    )
+                    raise _TrackingContact
+
+        async def _hold_tick() -> None:
+            """Refresh the last command while recorder/gate shutdown blocks."""
+            if last_robot_act is None or last_dataset_act is None:
+                return
+            t0 = time.perf_counter()
+            _maybe_log_rate(t0)
+            robot.set_control_trace_active(True)
+            joint_obs = robot.get_joint_observation()
+            teleop.send_feedback(joint_obs)
+            await robot.send_action_async(last_robot_act)
+            # Capture is already being stopped on the worker thread. Publishing
+            # keeps the nearest-state history fresh for any final in-flight AU.
+            recorder.publish(joint_obs, last_dataset_act, t0)
+
+        async def _idle_tick() -> None:
+            """Mantis boundary tick: publish state, command nothing.
+
+            The handheld grippers are torquing off in parallel with the
+            recorder close, so re-sending the last gripper target here would
+            fight that. Publishing keeps the nearest-state history fresh for
+            any final in-flight AU.
+            """
+            if last_dataset_act is None:
+                return
+            t0 = time.perf_counter()
+            _maybe_log_rate(t0)
+            joint_obs = robot.get_joint_observation()
+            teleop.send_feedback(joint_obs)
+            recorder.publish(joint_obs, last_dataset_act, t0)
+
+        def _start_capture() -> None:
+            recorder.start_episode(task)
+            if relay is not None:
+                relay.set_raw_enabled(True)
+
+        def _finish_capture() -> tuple[int, str | None]:
+            try:
+                try:
+                    # Freeze the buffer; when the take ended on the trigger
+                    # x3 gesture, also drop the rows captured after its first
+                    # click began so the clicks stay out of the dataset.
+                    return recorder.finish_episode(trim_after=stats.end_t_host), None
+                except RecorderCaptureError as exc:
+                    return 0, str(exc)
+            finally:
+                # A relay-close failure is a camera lifecycle failure, not an
+                # episode rejection. Let it override the recoverable capture
+                # result so the session cannot continue with an open branch.
+                if relay is not None:
+                    relay.set_raw_enabled(False)
 
         async def _start_recording() -> bool:
-            """Enable Mantis grippers, then start capture for this take."""
-            nonlocal recording, stats, recording_started_at, capture_checked
-            nonlocal was_engaged
+            """Enable Mantis grippers, then start capture for this take.
+
+            Raises ``_TrackingContact`` when the contact watchdog trips during
+            the recorder start transaction (the caller ends the take).
+            """
+            nonlocal recording, capture_ready, stats, recording_started_at
+            nonlocal capture_checked, was_engaged
             if mantis_mode:
                 tracking = teleop.tracking_sides()
                 if not all(tracking.values()):
                     missing = ", ".join(
                         side for side, live in tracking.items() if not live
                     )
-                    log_say(
+                    _logger.info(
                         "Cannot start recording: live tracking is missing for "
                         f"{missing}. Restore visibility/SLAM tracking and try again."
                     )
@@ -1735,7 +2008,7 @@ def _run_session(
                     missing = ", ".join(
                         side for side, live in triggers.items() if not live
                     )
-                    log_say(
+                    _logger.info(
                         "Cannot start recording: the Mantis trigger heartbeat is "
                         f"missing for {missing}. Restore the CAN connection, "
                         "release both triggers, re-align, and try again."
@@ -1744,13 +2017,13 @@ def _run_session(
                 if not teleop.is_engaged():
                     # Reachable from the control panel's Start button: the
                     # trigger start gesture engages before it opens the take.
-                    log_say(
+                    _logger.info(
                         "Cannot start recording: Mantis is not engaged. Squeeze "
                         "both triggers together, then release both, to engage "
                         "and start recording."
                     )
                     return False
-                log_say("Preparing Mantis grippers.")
+                _logger.info("Preparing Mantis grippers.")
                 enable_task = asyncio.create_task(robot.enable_grippers_async())
                 while not enable_task.done() and not _stopped():
                     await asyncio.sleep(0.05)
@@ -1788,7 +2061,7 @@ def _run_session(
                         failures.append("Mantis disengaged")
                     await robot.disable_grippers_async()
                     _note_ready(episode_idx + 1)
-                    log_say(
+                    _logger.info(
                         "Cannot start recording: "
                         + "; ".join(failures)
                         + " while the grippers were preparing. Restore both "
@@ -1800,23 +2073,34 @@ def _run_session(
                 if mantis_mode:
                     await robot.disable_grippers_async()
                 return False
-            try:
-                if relay is not None:
-                    relay.set_raw_enabled(True)
-                recorder.start_episode(task)
-            except BaseException:
-                if relay is not None:
-                    relay.set_raw_enabled(False)
-                if mantis_mode:
-                    await robot.disable_grippers_async()
-                raise
             recording = True
+            # From here until the take is over every tick must publish
+            # state on time: hold cyclic GC (the previous take's garbage
+            # was swept between episodes, so no up-front sweep) and arm the
+            # tick watchdog so a stall is attributed, not just detected.
+            take_gc.begin(collect=False)
+            tick_watchdog.resume()
+            # Arm recorder cutoffs before opening the shared-timestamp
+            # dataset valves. Both calls can wait for transport boundaries,
+            # so run them off-loop while normal teleop ticks continue
+            # feeding the Rust target watchdog. ``recording`` is already True:
+            # a contact trip in here ends the take through the normal finish
+            # path (which also closes the relay branch and torques the Mantis
+            # grippers off), and any other failure unwinds the session, whose
+            # teardown covers the same.
+            await run_blocking_with_control_ticks(
+                _start_capture,
+                _tracking_tick,
+                teleop_interval,
+                drain_tick=_idle_tick if mantis_mode else _guard_gravity_step,
+            )
+            capture_ready = True
             stats = EpisodeQAStats()
             recording_started_at = time.perf_counter()
             capture_checked = False
             was_engaged = teleop.is_engaged()
             control.note_recording()
-            log_say("Recording started.")
+            _logger.info("Recording started.")
             # Reflect the recording state on the headset HUD (no-op for the
             # VR-initiated start, where the headset already switched itself).
             teleop.send_feedback_state(VRState.RECORDING)
@@ -1837,7 +2121,11 @@ def _run_session(
             # discard flow consumes its reset press, and a headset-exit
             # reset mid-take is deliberately left as-is.)
             if not recording and teleop.is_resetting:
-                await _guarded_return()
+                robot.set_control_trace_active(True)
+                try:
+                    await _guarded_return()
+                finally:
+                    robot.set_control_trace_active(False)
                 # A contact hold during that move left the panel on the
                 # "contact" phase, and nothing else re-announces this phase
                 # until the next episode — the outer loop only runs
@@ -1847,105 +2135,17 @@ def _run_session(
                 prev_t0["v"] = 0.0
                 continue
             deadline += teleop_interval
-            t0 = time.perf_counter()
-            _maybe_log_rate(t0)
-
-            # Camera reads happen on the capture thread; the control loop only
-            # ever touches joint state.
-            joint_obs = robot.get_joint_observation()
-            t_obs = time.perf_counter()
-            teleop.send_feedback(joint_obs)
-            act = teleop.get_action()
-            t_act = time.perf_counter()
-            act_processed = teleop_action_proc((act, joint_obs))
-            robot_act = robot_action_proc((act_processed, joint_obs))
-            t_proc = time.perf_counter()
-            await robot.send_action_async(robot_act)
-            t_send = time.perf_counter()
-            sect["obs"] += t_obs - t0
-            sect["act"] += t_act - t_obs
-            sect["proc"] += t_proc - t_act
-            sect["send"] += t_send - t_proc
-
-            if watchdog is not None:
-                tripped = watchdog.update(robot.torque_residuals())
-                if tripped is not None:
-                    joint, residual = tripped
-                    _logger.warning(
-                        "teleop contact: %s torque residual %.1f exceeds %.1f — going limp",
-                        joint,
-                        residual,
-                        vrt_cfg.teleop_torque_threshold,
-                    )
-                    return recording, rerecord, True, stats
-
-            # Record the action in the configured action space: identity for
-            # joint datasets, FK-to-Cartesian when observe_cartesian is set. The
-            # arm is still commanded with the teleop joint targets above, so its
-            # motion is unchanged — only the stored representation differs.
-            #
-            # Row timestamp: on the robot the loop tick is correct (state and
-            # image both describe the physical robot at t0). On the Mantis the
-            # pose stream *is* the plant's ground truth, so the row is stamped
-            # with the pose's capture time — the moment the hand was actually
-            # there — keeping it on the same capture timeline as the camera
-            # exposure timestamps.
-            row_ts = t0
-            act_ds = robot.action_to_dataset(act_processed)
-            if mantis_mode:
-                # Pose and host capture time are one immutable sample. Reading
-                # them through separate accessors could straddle an IK publish
-                # and stamp pose N+1 with pose N's timestamp.
-                tcp_snapshot = teleop.tcp_pose_snapshot()
-                if tcp_snapshot is not None:
-                    last_tcp = tcp_snapshot
-                pose_ts = last_tcp.pose_host_ts if last_tcp is not None else None
-                if pose_ts is not None:
-                    row_ts = pose_ts
-                    lag = t0 - pose_ts
-                    if lag > max_pose_lag["v"]:
-                        max_pose_lag["v"] = lag
-                    if recording and lag > stats.max_pose_lag_s:
-                        stats.max_pose_lag_s = lag
-                # Overwrite the EE dims of both the state and the action with
-                # the tracked ground-truth TCP pose: on the rig the tracker
-                # (not IK-solved virtual joints roundtripped through FK) is
-                # where the gripper physically is, and training must not
-                # inherit filter/solver artifacts. Grippers stay as-is —
-                # measured feedback in the state, commanded in the action.
-                if last_tcp is not None:
-                    joint_obs = dict(joint_obs)
-                    act_ds = dict(act_ds)
-                    for keys, pose in (
-                        (_LEFT_EE_KEYS, last_tcp.left),
-                        (_RIGHT_EE_KEYS, last_tcp.right),
-                    ):
-                        pose6 = [
-                            *pose[:3],
-                            *quat_xyzw_to_rotvec(np.asarray(pose[3:7])),
-                        ]
-                        joint_obs.update(zip(keys, pose6))
-                        act_ds.update(zip(keys, pose6))
-            recorder.publish(joint_obs, act_ds, row_ts)
-
-            # Per-episode QA counters (Mantis only — encoder-FK poses can't go
-            # stale). Frozen TCPs and disengaged spans record a motionless
-            # pose under fresh timestamps; a re-engage re-fits the world→base
-            # transform and shifts the frame of every later row.
-            if mantis_mode and recording:
-                stats.total_frames += 1
-                engaged = teleop.is_engaged()
-                if not engaged:
-                    stats.disengaged_frames += 1
-                elif not was_engaged:
-                    stats.reengaged_while_recording = True
-                was_engaged = engaged
-                if not all(teleop.tracking_sides().values()):
-                    stats.untracked_frames += 1
-                if not all(teleop.trigger_sides().values()):
-                    stats.trigger_loss_frames += 1
-                if pose_ts is None or t0 - pose_ts > _QA_STALE_POSE_S:
-                    stats.stale_frames += 1
+            try:
+                await _tracking_tick()
+            except _TrackingContact:
+                contact = True
+                break
+            if capture_failure is not None:
+                # The capture thread has already stopped. End the take now
+                # instead of letting the operator finish an episode that is
+                # guaranteed to be discarded.
+                teleop.send_feedback_state(VRState.SAVING)
+                break
 
             # Capture-health ack: recorder.start_episode has no feedback, so
             # ~2 s in, check that rows are actually landing (one cheap
@@ -1955,7 +2155,7 @@ def _run_session(
                 recording
                 and not capture_checked
                 and recording_started_at is not None
-                and t0 - recording_started_at >= 2.0
+                and time.perf_counter() - recording_started_at >= 2.0
             ):
                 capture_checked = True
                 try:
@@ -1964,7 +2164,7 @@ def _run_session(
                     _logger.warning("capture health check failed: %s", exc)
                     rows = -1
                 if rows == 0:
-                    log_say(
+                    _logger.info(
                         "WARNING: recording for 2 seconds but the recorder "
                         "has captured zero rows — check the cameras and the "
                         "recorder log."
@@ -1984,24 +2184,29 @@ def _run_session(
                 if pending_start is None:
                     pending_start = time.perf_counter() + _PANEL_START_COUNTDOWN_S
                     control.note_countdown(pending_start)
-                    log_say(
+                    _logger.info(
                         f"Recording starts in {_PANEL_START_COUNTDOWN_S:.0f} seconds."
                     )
                 else:
                     pending_start = None
                     _note_ready(episode_idx + 1)
-                    log_say("Recording start cancelled.")
+                    _logger.info("Recording start cancelled.")
             start_requested = events.get("start_recording") or (
                 pending_start is not None and time.perf_counter() >= pending_start
             )
 
             if start_requested and not recording:
                 pending_start = None
-                if not await _start_recording():
-                    return recording, rerecord, False, stats
-                # First-use calibration can take seconds. Re-anchor absolute
-                # pacing so the hot loop does not try to "catch up" that gap
-                # with a burst of CAN commands and recorder publications.
+                try:
+                    started = await _start_recording()
+                except _TrackingContact:
+                    contact = True
+                    break
+                if not started:
+                    return recording, rerecord, False, 0, None, stats
+                # Gripper prep / recorder start can take a while. Re-anchor
+                # absolute pacing so the hot loop does not try to "catch up"
+                # that gap with a burst of CAN commands and recorder publications.
                 deadline = time.perf_counter()
                 prev_t0["v"] = 0.0
                 continue
@@ -2021,9 +2226,9 @@ def _run_session(
                 break
             if events[TeleopEvents.TERMINATE_EPISODE]:
                 if events.get(TeleopEvents.FAILURE):
-                    log_say("Episode ended as failure.")
+                    _logger.info("Episode ended as failure.")
                 else:
-                    log_say("Episode ended successfully.")
+                    _logger.info("Episode ended successfully.")
                     # A trigger-gesture end names when the first click began;
                     # the recorder cuts the take there (see stop_capture).
                     stats.end_t_host = events.get("episode_end_t_host")
@@ -2038,7 +2243,45 @@ def _run_session(
             if slip > max_slip["v"]:
                 max_slip["v"] = slip
 
-        return recording, rerecord, False, stats
+        if contact:
+            # The limp hold that follows ticks through the gravity step, which
+            # carries no heartbeat: stop judging the tick now.
+            tick_watchdog.suspend()
+        # The episode is over the moment the loop breaks. On the Mantis start
+        # torque-off immediately, in parallel with freezing the recorder: a
+        # wedged camera read must never keep the grippers powered while the
+        # capture close waits. Nothing commands the grippers meanwhile (the
+        # boundary tick below only publishes state).
+        disable_task = (
+            asyncio.create_task(robot.disable_grippers_async()) if mantis_mode else None
+        )
+        try:
+            if recording:
+                # A contact abort must never resume the last tracked target
+                # while the bounded capture close drains. Keep the arm limp
+                # instead; normal episode ends refresh the frozen command pose.
+                if mantis_mode:
+                    boundary_tick = _idle_tick
+                    drain_tick = _idle_tick
+                else:
+                    boundary_tick = _guard_gravity_step if contact else _hold_tick
+                    drain_tick = _guard_gravity_step
+                (
+                    captured_rows,
+                    finish_capture_failure,
+                ) = await run_blocking_with_control_ticks(
+                    _finish_capture,
+                    boundary_tick,
+                    teleop_interval,
+                    drain_tick=drain_tick,
+                )
+                if finish_capture_failure is not None:
+                    capture_failure = capture_failure or finish_capture_failure
+        finally:
+            if disable_task is not None:
+                await disable_task
+        tick_watchdog.suspend()
+        return recording, rerecord, contact, captured_rows, capture_failure, stats
 
     # Guarded return-to-rest: the sequencing (torque watchdog, gravity-comp
     # fallback, reset-press retry) lives in the shared engine
@@ -2076,7 +2319,7 @@ def _run_session(
             teleop.request_reset()
         elif events.get("start_recording") or panel_cmd == "start":
             teleop.send_feedback_state(VRState.DATA_COLLECTION)
-            log_say("Press reset to return to rest before recording.")
+            _logger.info("Press reset to return to rest before recording.")
         if teleop.reset_pending:
             # Latched, from either input — the hold exits on the next cycle
             # and replans, so stop offering the panel a button for it.
@@ -2091,38 +2334,63 @@ def _run_session(
             reset_command_state=robot.reset_command_state,
             get_positions=lambda: robot.positions,
             stopped=_stopped,
-            announce=log_say,
+            announce=_logger.info,
             on_contact=_guard_on_contact,
             hold_tick=_guard_hold_tick,
-            vr_alive=teleop.vr_alive,
         )
 
     async def _return_home_loop() -> None:
         """Post-episode return: request the reset, then play it guarded."""
-        log_say("Returning to rest pose.")
-        teleop.request_reset()
-        await _guarded_return()
+        _logger.info("Returning to rest pose.")
+        robot.set_control_trace_active(True)
+        try:
+            teleop.request_reset()
+            await _guarded_return()
+        finally:
+            robot.set_control_trace_active(False)
 
     async def _contact_hold_loop() -> None:
         """Tracking contact: hold limp until reset, then return to rest guarded.
 
         The hold leaves the operator's reset press latched, so the guarded
         return that follows plans from wherever the arms were hand-guided; on
-        an orphaned/stopped hold nothing is latched and the return is skipped
-        (the arms hold position where they are).
+        a stopped hold nothing is latched and the return is skipped.
         """
-        await teleop.contact_hold(
-            gravity_step=_guard_gravity_step,
-            reset_command_state=robot.reset_command_state,
-            get_positions=lambda: robot.positions,
-            stopped=_stopped,
-            announce=log_say,
-            on_contact=_guard_on_contact,
-            hold_tick=_guard_hold_tick,
-            vr_alive=teleop.vr_alive,
-        )
-        if teleop.is_resetting:
-            await _guarded_return()
+        robot.set_control_trace_active(True)
+        try:
+            await teleop.contact_hold(
+                gravity_step=_guard_gravity_step,
+                reset_command_state=robot.reset_command_state,
+                get_positions=lambda: robot.positions,
+                stopped=_stopped,
+                announce=_logger.info,
+                on_contact=_guard_on_contact,
+                hold_tick=_guard_hold_tick,
+            )
+            if teleop.is_resetting:
+                await _guarded_return()
+        finally:
+            robot.set_control_trace_active(False)
+
+    def _drain_robot_future(fut: Any) -> None:
+        """Wait through repeated Ctrl+C until an on-robot coroutine is done.
+
+        Recorder boundary helpers deliberately keep their heartbeat alive until
+        their bounded worker finishes. Cancelling after an arbitrary timeout
+        would let that heartbeat race robot.disconnect() during teardown.
+        """
+        while True:
+            try:
+                fut.result()
+                return
+            except KeyboardInterrupt:
+                # A second Ctrl+C still must not make concurrent motor commands
+                # and teardown possible. The hardware e-stop remains immediate.
+                continue
+            except BaseException:
+                # The coroutine is done and its caller's original exception
+                # remains primary; only command quiescence matters here.
+                return
 
     def _run_on_robot_loop(coro: Any) -> Any:
         """Run ``coro`` on the robot's event loop and block until it returns.
@@ -2133,26 +2401,15 @@ def _run_session(
         fut = asyncio.run_coroutine_threadsafe(coro, robot.event_loop)
         try:
             return fut.result()
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as interrupted:
             loop_stop.set()
-            try:
-                fut.result(timeout=5.0)
-            except BaseException:
-                fut.cancel()
-            raise
+            _drain_robot_future(fut)
+            raise interrupted
 
     def _disable_mantis_grippers() -> None:
         """Leave the handheld grippers torque-off between collection takes."""
         if mantis_mode:
             _run_on_robot_loop(robot.disable_grippers_async())
-
-    def _begin_disable_mantis_grippers() -> Any | None:
-        """Start torque-off without waiting on recorder/camera shutdown."""
-        if not mantis_mode:
-            return None
-        return asyncio.run_coroutine_threadsafe(
-            robot.disable_grippers_async(), robot.event_loop
-        )
 
     def _discard_episode() -> None:
         """Drop the buffered take; a failed discard is logged, not fatal.
@@ -2167,17 +2424,41 @@ def _run_session(
         except RuntimeError as exc:
             _logger.error("episode discard failed; continuing: %s", exc)
 
-    def _wrap_up_episode(recording: bool, rerecord: bool) -> None:
+    def _wrap_up_episode(
+        recording: bool,
+        rerecord: bool,
+        captured_rows: int,
+        capture_failure: str | None,
+    ) -> None:
         """Save or discard the just-ended episode and announce the result."""
         nonlocal episodes_recorded
-        if rerecord:
-            log_say("Re-recording episode.")
+        if capture_failure is not None:
+            _logger.info(
+                f"Episode discarded because camera capture failed: {capture_failure}"
+            )
+            # finish_episode already joined capture and cleared the rejected
+            # buffer. cancel_episode is an idempotent lifecycle reset and also
+            # covers a future recorder implementation that reports the live
+            # poll before its finish reply carries the same rejection.
+            _discard_episode()
+        elif rerecord:
+            _logger.info("Re-recording episode.")
             if recording:
                 _discard_episode()
+        elif recording and captured_rows == 0:
+            # An operator can end the take before the encoded readers have
+            # produced row zero.  That is a valid empty take, not a session
+            # failure; LeRobot's save_episode intentionally rejects it.
+            _logger.info("No frames were captured this episode; discarding.")
+            _discard_episode()
         elif recording:
-            log_say("Saving episode…")
+            _logger.info("Saving episode…")
             try:
                 recorder.save_episode()
+            except RecorderDatasetSaveError:
+                # The commit phase began and the writer state is uncertain:
+                # nothing per-episode can recover this, unwind the session.
+                raise
             except RuntimeError as exc:
                 # A per-episode refusal (capture fault, encoder frame drops,
                 # a video segment that would not mux): the recorder has
@@ -2185,33 +2466,51 @@ def _run_session(
                 # up like collect-dagger does instead of tearing everything
                 # down over one lost episode. Durability failures are a
                 # different type (EpisodeDurabilityError) and still unwind.
-                log_say(f"Episode NOT saved: {exc}")
+                _logger.info(f"Episode NOT saved: {exc}")
                 return
-            # Hosted saves remain root-owned inside the immutable service
-            # store; normalize read-only operator-group access after each take.
+            # The serve unit records as root into the operator's home; hand the
+            # tree back after every save so a crash never leaves a root-owned
+            # dataset behind (no-op off the root service).
             restore_dataset_ownership(dataset_root)
             episodes_recorded += 1
             control.note_saved()
-            log_say(
+            _logger.info(
                 f"Saved episode {recorder.episode_count()} "
                 f"({episodes_recorded} this session)."
             )
         else:
-            log_say("Episode ended before recording started, skipping.")
+            _logger.info("Episode ended before recording started, skipping.")
 
     session_error: BaseException | None = None
     try:
+        # Keep the relay's dataset branch closed until an episode records. This
+        # lives inside the cleanup scope because an acknowledged camera-gate
+        # failure is surfaced synchronously.
+        if relay is not None:
+            relay.set_raw_enabled(False)
+
         while not _stopped():
+            # Arms at rest, nothing recording: sweep the garbage the previous
+            # take deferred (a no-op before the first take). This is the one
+            # place a multi-hundred-ms stop-the-world pass costs nothing.
+            take_gc.end()
             episode_idx = recorder.episode_count()
             # Surface the (1-based) episode number in the headset HUD so the
             # operator can see which episode they're about to record. The panel
             # gets the same readout (plus the Start button) through the
             # control's snapshot.
             teleop.send_feedback_episode(episode_idx + 1)
-            log_say(_note_ready(episode_idx + 1))
+            _logger.info(_note_ready(episode_idx + 1))
 
             try:
-                recording, rerecord, contact, qa = _run_on_robot_loop(_episode_loop())
+                (
+                    recording,
+                    rerecord,
+                    contact,
+                    captured_rows,
+                    capture_failure,
+                    qa,
+                ) = _run_on_robot_loop(_episode_loop())
             except BaseException:
                 # A failure after a recording start must not leave the handheld
                 # grippers powered while the rest of collection unwinds.
@@ -2222,31 +2521,6 @@ def _run_session(
                         "failed to disable Mantis grippers after episode error"
                     )
                 raise
-
-            # The episode is over the moment the loop breaks. Start Mantis
-            # torque-off immediately, in parallel with freezing the recorder:
-            # a wedged camera read must never keep the grippers powered while
-            # stop_capture waits. The recorder stop signal is still issued in
-            # this same turn, so at most its already-in-flight row can finish.
-            disable_future = _begin_disable_mantis_grippers()
-            try:
-                if recording:
-                    # Freeze the buffer; when the take ended on the trigger
-                    # x3 gesture, also drop the rows captured after its first
-                    # click began so the clicks stay out of the dataset.
-                    captured_rows, capture_error = recorder.stop_capture(
-                        trim_after=qa.end_t_host
-                    )
-                else:
-                    captured_rows, capture_error = 0, None
-            finally:
-                if disable_future is not None:
-                    disable_future.result()
-
-            # Recording done — close the raw branch so the rest-pose/reset and
-            # next pre-record phase stay light.
-            if relay is not None:
-                relay.set_raw_enabled(False)
 
             if _stopped():
                 if recording:
@@ -2259,7 +2533,7 @@ def _run_session(
                 # then run the limp hold + guarded return on the robot loop.
                 if recording:
                     _discard_episode()
-                    log_say("Episode discarded (contact).")
+                    _logger.info("Episode discarded (contact).")
                 _run_on_robot_loop(_contact_hold_loop())
                 # Drain VR events fired during the hold/return, then unblock
                 # the headset for the next take.
@@ -2273,31 +2547,26 @@ def _run_session(
             # or when capture fails at startup. Treat it as a recoverable bad
             # take: clear the empty buffer and leave the session ready to try
             # the same episode again instead of tearing down robot control.
-            if recording and not rerecord:
-                if capture_error is not None:
-                    log_say(
-                        "Episode capture failed — discarding and re-recording. "
-                        + capture_error
-                    )
-                    rerecord = True
-                elif captured_rows == 0 and qa.end_t_host is not None:
-                    log_say(
+            if recording and not rerecord and capture_failure is None:
+                if captured_rows == 0 and qa.end_t_host is not None:
+                    _logger.info(
                         "Episode has no dataset rows before the end gesture "
                         "began — it was ended as soon as it started. Discarding "
                         "and re-recording."
                     )
                     rerecord = True
                 elif captured_rows == 0:
-                    log_say(
+                    _logger.info(
                         "Episode captured no dataset rows — it ended before the "
                         "first camera frame arrived. Discarding and re-recording."
                     )
                     rerecord = True
 
-            # Episode QA: always log the one-line verdict; a bad episode is
-            # refused at save and downgraded to discard + re-record unless
-            # the gate is disabled (cfg.qa_gate — escape hatch).
-            if recording:
+            # Episode QA (Mantis counters; a robot session's counters stay at
+            # zero and always pass): always log the one-line verdict; a bad
+            # episode is refused at save and downgraded to discard + re-record
+            # unless the gate is disabled (cfg.qa_gate — escape hatch).
+            if recording and mantis_mode:
                 qa_ok, qa_reasons = evaluate_episode_qa(qa)
                 _logger.info(
                     "episode QA: control_frames=%d captured_rows=%d stale=%d "
@@ -2315,16 +2584,16 @@ def _run_session(
                     qa.trigger_loss_frames,
                     qa.reengaged_while_recording,
                     1e3 * qa.max_pose_lag_s,
-                    capture_error or "none",
+                    capture_failure or "none",
                     (
                         "OK"
-                        if qa_ok and captured_rows > 0 and capture_error is None
+                        if qa_ok and captured_rows > 0 and capture_failure is None
                         else "BAD"
                     ),
                 )
-                if not qa_ok and not rerecord:
+                if not qa_ok and not rerecord and capture_failure is None:
                     if cfg.qa_gate:
-                        log_say(
+                        _logger.info(
                             "Episode REJECTED by the quality gate — "
                             "discarding and re-recording. " + " ".join(qa_reasons)
                         )
@@ -2335,7 +2604,7 @@ def _run_session(
                             "; ".join(qa_reasons),
                         )
 
-            if recording and not rerecord:
+            if recording and not rerecord and capture_failure is None:
                 # Mirror the headset's SAVING state in the panel for the whole
                 # rest-pose + save stretch (recording controls are blocked).
                 control.note_saving()
@@ -2353,16 +2622,18 @@ def _run_session(
                 _return_home_loop(), robot.event_loop
             )
             try:
-                _wrap_up_episode(recording, rerecord)
+                _wrap_up_episode(
+                    recording,
+                    rerecord,
+                    captured_rows,
+                    capture_failure,
+                )
                 home_future.result()
             except BaseException:
                 # Ctrl+C or a failed save: unwind the guarded return so it
                 # stops commanding the robot before teardown.
                 loop_stop.set()
-                try:
-                    home_future.result(timeout=5.0)
-                except BaseException:
-                    home_future.cancel()
+                _drain_robot_future(home_future)
                 raise
             # Drain VR events fired during the return, then unblock the
             # headset for the next take.
@@ -2385,7 +2656,7 @@ def _run_session(
             )
         raise
     finally:
-        log_say("Stopping.")
+        _logger.info("Stopping.")
 
         cleanup_failures: list[tuple[str, BaseException]] = []
 
@@ -2398,9 +2669,17 @@ def _run_session(
 
         _cleanup("system diagnostics", diag.stop)
         _cleanup("Tegra diagnostics", tegra.stop)
+        _cleanup("tick watchdog", tick_watchdog.stop)
+        # Under `axol serve` this process outlives the operation: give its
+        # collector back the frozen heap and a working automatic collection.
+        _cleanup("gc hold", take_gc.end)
+        _cleanup("gc heap", unfreeze_heap)
+        _cleanup("gc pause logger", uninstall_gc_log)
 
         if imu_src is not None:
             _cleanup("board gyro", imu_src.close)
+        _cleanup("teleop activity marker", activity.stop)
+        _cleanup("control trace", lambda: robot.set_control_trace_active(False))
         _cleanup("robot disconnect", robot.disconnect)
         _cleanup("teleop disconnect", teleop.disconnect)
         # Close the relay's dataset branch BEFORE the recorder detaches its

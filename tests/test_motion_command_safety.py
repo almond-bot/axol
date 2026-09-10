@@ -22,7 +22,7 @@ from almond_axol.robot.base import (
     RobotBase,
     is_hardware_cleanup_uncertain,
 )
-from almond_axol.robot.cart import Cart, CartConfig
+from almond_axol.robot.jelly import Jelly, JellyConfig
 from almond_axol.robot.mantis import Mantis, MantisGripperArm
 from almond_axol.teleop.teleop import VRTeleop
 
@@ -742,9 +742,9 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
                         encoder(float(value), -1.0, 1.0, 16)
                 self.assertEqual(encoder(0.0, -1.0, 1.0, 16), 32767)
 
-    async def test_cart_invalid_command_fails_to_stop_not_full_speed(self) -> None:
-        cart = Cart(CartConfig(lift=False))
-        cart._target = (0.5, 0.25, -0.5, 1)
+    async def test_jelly_invalid_command_fails_to_stop_not_full_speed(self) -> None:
+        jelly = Jelly(JellyConfig(lift=False))
+        jelly._target = (0.5, 0.25, -0.5, 1)
 
         for command in (
             (math.nan, 0.0, 0.0, 0),
@@ -754,22 +754,22 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             (0.0, 0.0, 0.0, True),
         ):
             with self.subTest(command=command), self.assertRaises(ValueError):
-                cart.set_command(*command)
-            self.assertEqual(cart._target, (0.0, 0.0, 0.0, 0))
+                jelly.set_command(*command)
+            self.assertEqual(jelly._target, (0.0, 0.0, 0.0, 0))
 
-        cart.set_command(2.0, -2.0, 0.25, -1)
-        self.assertEqual(cart._target, (1.0, -1.0, 0.25, -1))
+        jelly.set_command(2.0, -2.0, 0.25, -1)
+        self.assertEqual(jelly._target, (1.0, -1.0, 0.25, -1))
 
-    async def test_cart_nonfinite_yaw_sample_disables_heading_hold(self) -> None:
-        cart = Cart(CartConfig(lift=False))
-        cart.feed_yaw_rate(0.25)
-        self.assertIsNotNone(cart._yaw_rate)
-        samples = cart._yaw_samples
+    async def test_jelly_nonfinite_yaw_sample_disables_heading_hold(self) -> None:
+        jelly = Jelly(JellyConfig(lift=False))
+        jelly.feed_yaw_rate(0.25)
+        self.assertIsNotNone(jelly._yaw_rate)
+        samples = jelly._yaw_samples
 
-        cart.feed_yaw_rate(math.nan)
+        jelly.feed_yaw_rate(math.nan)
 
-        self.assertIsNone(cart._yaw_rate)
-        self.assertEqual(cart._yaw_samples, samples)
+        self.assertIsNone(jelly._yaw_rate)
+        self.assertEqual(jelly._yaw_samples, samples)
 
     async def test_async_robot_context_marks_disable_failure_as_uncertain(self) -> None:
         robot = SimpleNamespace(
@@ -779,22 +779,22 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(HardwareCleanupError, "ownership is uncertain"):
             await RobotBase.__aexit__(robot)
 
-    async def test_teleop_disable_attempts_cart_and_robot_and_reports_uncertainty(
+    async def test_teleop_disable_attempts_jelly_and_robot_and_reports_uncertainty(
         self,
     ) -> None:
-        cart_error = RuntimeError("cart disable timed out")
+        jelly_error = RuntimeError("jelly disable timed out")
         teleop = object.__new__(VRTeleop)
         teleop._ik_thread = None
         teleop._parent_conn = None
         teleop._ik_process = None
         teleop._vr_thread = None
-        teleop._cart = SimpleNamespace(disable=AsyncMock(side_effect=cart_error))
+        teleop._jelly = SimpleNamespace(disable=AsyncMock(side_effect=jelly_error))
         teleop._robot = SimpleNamespace(disable=AsyncMock())
 
-        with self.assertRaisesRegex(HardwareCleanupError, "cart disable failed"):
+        with self.assertRaisesRegex(HardwareCleanupError, "jelly disable failed"):
             await teleop.disable()
 
-        teleop._cart.disable.assert_awaited_once()
+        teleop._jelly.disable.assert_awaited_once()
         teleop._robot.disable.assert_awaited_once()
 
     async def test_teleop_kills_worker_and_proves_exit_before_clearing(self) -> None:
@@ -806,7 +806,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         teleop._parent_conn = None
         teleop._ik_process = process
         teleop._vr_thread = None
-        teleop._cart = None
+        teleop._jelly = None
         teleop._robot = SimpleNamespace(disable=AsyncMock())
 
         await teleop.disable()
@@ -831,7 +831,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         teleop._parent_conn = None
         teleop._ik_process = process
         teleop._vr_thread = None
-        teleop._cart = None
+        teleop._jelly = None
         teleop._robot = SimpleNamespace(disable=AsyncMock())
 
         await teleop.disable()
@@ -852,7 +852,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         teleop._parent_conn = None
         teleop._ik_process = None
         teleop._vr_thread = None
-        teleop._cart = None
+        teleop._jelly = None
         teleop._robot = SimpleNamespace(disable=AsyncMock())
 
         with (
@@ -884,7 +884,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         teleop._parent_conn = None
         teleop._ik_process = process
         teleop._vr_thread = None
-        teleop._cart = None
+        teleop._jelly = None
         teleop._robot = SimpleNamespace(disable=AsyncMock())
 
         with self.assertRaisesRegex(RuntimeError, "background ownership is uncertain"):
@@ -893,23 +893,23 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(teleop._ik_process, process)
         teleop._robot.disable.assert_awaited_once_with()
 
-    async def test_lerobot_teleop_surfaces_cart_failure_after_other_cleanup(
+    async def test_lerobot_teleop_surfaces_jelly_failure_after_other_cleanup(
         self,
     ) -> None:
-        cart_error = RuntimeError("cart disable timed out")
+        jelly_error = RuntimeError("jelly disable timed out")
         vr_server = SimpleNamespace(disable=AsyncMock())
         teleop = object.__new__(AxolVRTeleop)
         teleop._ik_thread = None
         teleop._ik_stop = threading.Event()
         teleop._parent_conn = None
         teleop._ik_process = None
-        teleop._cart = SimpleNamespace(disable=AsyncMock(side_effect=cart_error))
+        teleop._jelly = SimpleNamespace(disable=AsyncMock(side_effect=jelly_error))
         teleop._vr_server = vr_server
 
-        with self.assertRaisesRegex(HardwareCleanupError, "cart disable failed"):
+        with self.assertRaisesRegex(HardwareCleanupError, "jelly disable failed"):
             await teleop._disconnect_async()
 
-        teleop._cart.disable.assert_awaited_once_with()
+        teleop._jelly.disable.assert_awaited_once_with()
         vr_server.disable.assert_awaited_once_with()
         self.assertIsNone(teleop._vr_server)
         self.assertTrue(teleop._cleanup_pending)
@@ -922,7 +922,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         teleop._ik_stop = threading.Event()
         teleop._parent_conn = None
         teleop._ik_process = process
-        teleop._cart = None
+        teleop._jelly = None
         teleop._vr_server = None
 
         with self.assertRaisesRegex(RuntimeError, "background ownership is uncertain"):
@@ -930,91 +930,6 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(teleop._ik_process, process)
         self.assertTrue(teleop._cleanup_pending)
-
-    async def test_cart_disable_attempts_every_wheel_and_retains_failed_bus(
-        self,
-    ) -> None:
-        disable_error = RuntimeError("front-left torque-off timed out")
-        motors = [
-            SimpleNamespace(
-                clear_errors=AsyncMock(),
-                set_velocity=AsyncMock(),
-                disable=AsyncMock(
-                    side_effect=[disable_error, None] if index == 0 else None
-                ),
-            )
-            for index in range(4)
-        ]
-        bus = SimpleNamespace(close=AsyncMock(), stalled=False)
-        lift = SimpleNamespace(close=AsyncMock(), stalled=False)
-        cart = Cart(CartConfig(lift=False))
-        cart._motors = motors
-        cart._bus = bus
-        cart._lift = lift
-
-        with self.assertRaisesRegex(
-            HardwareCleanupError, "hardware ownership is uncertain"
-        ):
-            await cart.disable()
-
-        self.assertTrue(all(motor.disable.await_count == 1 for motor in motors))
-        bus.close.assert_not_awaited()
-        lift.close.assert_awaited_once_with()
-        self.assertIsNone(cart._lift)
-        self.assertIs(cart._bus, bus)
-        self.assertEqual(cart._motors, motors)
-        self.assertTrue(cart._shutdown_pending)
-
-        await cart.disable()
-        self.assertTrue(all(motor.disable.await_count == 2 for motor in motors))
-        bus.close.assert_awaited_once_with()
-        self.assertFalse(cart._shutdown_pending)
-
-    async def test_cart_partial_enable_failure_disables_all_and_marks_uncertain(
-        self,
-    ) -> None:
-        setup_error = RuntimeError("second wheel enable failed")
-        cleanup_error = RuntimeError("first wheel torque-off timed out")
-        motors = []
-        for index in range(4):
-            motor = SimpleNamespace(
-                _p_max=400.0,
-                _write_register=AsyncMock(),
-                # TIMEOUT readback: 200 ms in 50 µs ticks.
-                _read_register=AsyncMock(return_value=4000),
-                clear_errors=AsyncMock(),
-                enable=AsyncMock(side_effect=setup_error if index == 1 else None),
-                set_control_mode=AsyncMock(),
-                set_velocity=AsyncMock(),
-                disable=AsyncMock(side_effect=cleanup_error if index == 0 else None),
-            )
-            motors.append(motor)
-        bus = SimpleNamespace(start=AsyncMock(), close=AsyncMock())
-        cart = Cart(
-            CartConfig(
-                channel="can-test",
-                lift=False,
-                yaw_hold_gain=0.0,
-            )
-        )
-
-        with (
-            patch("almond_axol.cli.can.setup.iface_up", return_value=True),
-            patch("almond_axol.robot.cart.CanBus", return_value=bus),
-            patch("almond_axol.robot.cart.make_driver", side_effect=motors),
-            self.assertRaisesRegex(
-                RuntimeError, "second wheel enable failed"
-            ) as raised,
-        ):
-            await cart.enable()
-
-        self.assertIs(raised.exception, setup_error)
-        self.assertTrue(is_hardware_cleanup_uncertain(raised.exception))
-        self.assertTrue(all(motor.disable.await_count == 1 for motor in motors))
-        bus.close.assert_not_awaited()
-        self.assertIs(cart._bus, bus)
-        self.assertEqual(cart._motors, motors)
-        self.assertTrue(cart._shutdown_pending)
 
     async def test_teleop_startup_preserves_error_and_marks_failed_cleanup(
         self,

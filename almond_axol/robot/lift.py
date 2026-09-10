@@ -1,5 +1,5 @@
 """
-Telescoping lift on the powered Axol Cart — jelly_legs CAN driver.
+Telescoping lift on Jelly — jelly_legs CAN driver.
 
 The lift legs are driven by our own PCB (firmware: ``jelly_legs`` in the
 circuits-py repo, ``designs/jelly_legs/firmware``), which replaced the
@@ -151,7 +151,7 @@ def _decode_status(data: bytes) -> LiftStatus:
 class Lift:
     """Hold-to-move lift commands over the chest CAN bus.
 
-    Typical usage (from :class:`almond_axol.robot.cart.Cart`)::
+    Typical usage (from :class:`almond_axol.robot.jelly.Jelly`)::
 
         lift = Lift()
         await lift.start()
@@ -164,7 +164,7 @@ class Lift:
     while idle) inside the firmware deadman for as long as a command source
     is attached, an immediate stop on release, and the status poll feeding
     :attr:`status` / :attr:`height_percent`. A source that dies calls
-    :meth:`suspend` (or simply stops calling :meth:`command` — the cart does
+    :meth:`suspend` (or simply stops calling :meth:`command` — Jelly does
     the former on its behalf): one STOP goes out and the stream ends, so
     the firmware deadman — not a host keepalive — decides what the legs do.
     """
@@ -278,7 +278,7 @@ class Lift:
     async def start(self, *, request_status: bool = True) -> None:
         """Open the chest bus and start the jog/status task.
 
-        Brings the interface up if it isn't yet (mirroring the cart's wheel
+        Brings the interface up if it isn't yet (mirroring Jelly's wheel
         bus); a missing interface raises ``RuntimeError`` naming it. Set
         ``request_status=False`` only when a configured periodic stream will
         establish readiness without a solicited bootstrap response.
@@ -339,10 +339,12 @@ class Lift:
         task_error: BaseException | None = None
         external_cancel: asyncio.CancelledError | None = None
         if self._task is not None:
-            self._task.cancel()
+            task = self._task
+            self._task = None
+            task.cancel()
             try:
                 (result,) = await asyncio.gather(
-                    self._task,
+                    task,
                     return_exceptions=True,
                 )
             except asyncio.CancelledError as exc:
@@ -350,7 +352,7 @@ class Lift:
                 # this branch means the caller canceled close() itself.
                 external_cancel = exc
                 (result,) = await asyncio.gather(
-                    self._task,
+                    task,
                     return_exceptions=True,
                 )
                 if isinstance(result, BaseException) and not isinstance(
@@ -362,7 +364,6 @@ class Lift:
                     result, asyncio.CancelledError
                 ):
                     task_error = result
-            self._task = None
         if self._bus is not None:
             cleanup_errors: list[BaseException] = []
             try:
@@ -541,7 +542,7 @@ class Lift:
         """Latch the commanded direction. +1 = up, 0 = stop, -1 = down.
 
         Safe to call from any thread at any rate (a latch, like
-        ``Cart.set_command``); the driver task consumes the latest value and
+        ``Jelly.set_command``); the driver task consumes the latest value and
         streams it to the board every tick (JOG while held, STOP while idle)
         until :meth:`suspend`. Should the caller die mid-hold without
         suspending, the firmware's 300 ms jog deadman stops the legs on its
@@ -575,7 +576,7 @@ class Lift:
     def suspend(self) -> None:
         """The command source is gone: stop once, then go silent.
 
-        Called by the cart when its command stream (headset frames, gamepad
+        Called by Jelly when its command stream (headset frames, gamepad
         polls) goes stale. Any held jog or one-shot move gets one canonical
         STOP; after that the task sends no motion frames at all — no idle
         STOP keepalive — until the next :meth:`command` re-attaches a source.

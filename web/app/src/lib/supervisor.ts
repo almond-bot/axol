@@ -53,7 +53,7 @@ export interface CommandSpec {
   episodeControl?: boolean
   /** Arg name that means "no hardware", or null when the robot is required. */
   simFlag?: string | null
-  /** Arg names that skip the arm-robot gates without being sim (cart_only). */
+  /** Arg names that skip the arm-robot gates without being sim (jelly_only). */
   robotFreeFlags?: string[]
   /** Whether this operation can run against the Mantis hardware profile. */
   supportsMantis?: boolean
@@ -61,6 +61,8 @@ export interface CommandSpec {
   hardwareProfiles?: HardwareProfile[]
   /** Driven from the VR headset, so the panel shows the connect hint. */
   usesHeadset?: boolean
+  /** Diagnostics-dashboard grouping: "helper" | "test" | "tuning". */
+  section?: string | null
   /** Honors the camera spec's headset-stream branch during this operation. */
   streamsVideo?: boolean
 }
@@ -280,9 +282,9 @@ export function saveLocalHardwareProfile(profile: HardwareProfile): void {
   }
 }
 
-/** Per-run flags that only make sense on the Axol profile (sim / cart-only
- *  drive the arm simulator or the cart, never the handheld rigs). */
-const AXOL_ONLY_RUN_FLAGS = new Set(["sim", "cart_only"])
+/** Per-run flags that only make sense on the Axol profile (sim / Jelly-only
+ *  drive the arm simulator or Jelly, never the handheld rigs). */
+const AXOL_ONLY_RUN_FLAGS = new Set(["sim", "jelly_only"])
 
 /**
  * Whether a per-run field is shown/sent for the given device. The legacy
@@ -1230,7 +1232,7 @@ export interface OperationMeta {
   simCapable: boolean
   /** Arg that makes a run hardware-free; null when the robot is required. */
   simFlag: string | null
-  /** Args that skip the arm-robot gates without being sim (teleop's cart_only:
+  /** Args that skip the arm-robot gates without being sim (teleop's jelly_only:
    * real hardware, but the arms and their CAN bus are never touched). */
   robotFreeFlags: string[]
   /** Runtime supports the Mantis hardware profile. */
@@ -1368,8 +1370,8 @@ export function isSimRun(meta: OperationMeta, settings: Record<string, FormValue
 
 /**
  * Whether this run leaves the arms (and their CAN bus) untouched — sim, or a
- * robot-free flag like teleop's cart_only. Such a run skips the "Connect
- * Axol" and motor-fault gates; cart_only still drives real cart hardware.
+ * robot-free flag like teleop's jelly_only. Such a run skips the "Connect
+ * Axol" and motor-fault gates; jelly_only still drives real Jelly hardware.
  */
 export function isRobotFreeRun(meta: OperationMeta, settings: Record<string, FormValue>): boolean {
   if (isSimRun(meta, settings)) return true

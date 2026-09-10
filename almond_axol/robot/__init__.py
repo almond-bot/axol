@@ -9,7 +9,6 @@ from .axol import (
     end_stop_offset_from_position,
 )
 from .base import RobotBase
-from .cart import Cart, CartConfig
 from .config import (
     ArmConfig,
     AxolConfig,
@@ -17,6 +16,7 @@ from .config import (
     JointConfig,
     PositionForceConfig,
 )
+from .jelly import Jelly, JellyConfig
 from .mantis import Mantis, MantisGripperArm
 from .sim import Sim
 
@@ -30,8 +30,8 @@ __all__ = [
     "end_stop_offset_from_position",
     "ArmConfig",
     "AxolConfig",
-    "Cart",
-    "CartConfig",
+    "Jelly",
+    "JellyConfig",
     "FrictionParams",
     "JointConfig",
     "PositionForceConfig",

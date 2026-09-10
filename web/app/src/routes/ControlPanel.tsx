@@ -1415,7 +1415,7 @@ export default function ControlPanel() {
         toast.error(`${meta.label} runs on Axol only — select the Axol tile first.`)
         return
       }
-      // Sim / cart-only are Axol run modes; they are hidden (and ignored) on
+      // Sim / Jelly-only are Axol run modes; they are hidden (and ignored) on
       // Mantis, so only an Axol run can be hardware-free here.
       const isSimSelected = !mantisSelected && isSimRun(meta, settings)
       if (meta.requiresCameras && !isSimSelected) {
@@ -1456,7 +1456,7 @@ export default function ControlPanel() {
       // Send only the panel's per-run fields — the shared settings (and any
       // advanced overrides) are folded in server-side, and stale keys from the
       // old per-op localStorage must not shadow them. On Mantis the Axol-only
-      // run modes (sim / cart_only) are not per-run fields and stay out.
+      // run modes (sim / jelly_only) are not per-run fields and stay out.
       const runKeys = new Set(
         spec ? perRunFields(spec, meta, hardwareProfile).map((f) => f.key) : []
       )

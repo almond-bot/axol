@@ -16,7 +16,7 @@ converted to joint frame internally via :func:`closer_end_stop`.
 The motion is a pure joint-space interpolation between the poses — no
 per-waypoint IK — so the playback is smooth and perfectly repeatable. The
 right arm is left untouched throughout; only the left arm actuates. The arm
-runs at ``--stiffness`` (default 0.5).
+runs at ``--stiffness`` (default 1.0, the tuned production gains).
 
 Examples:
     axol tune.repeatability               # bounce A↔B forever
@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -38,6 +39,9 @@ from ...robot import Axol, closer_end_stop
 from ...robot.config import AxolConfig
 from ...teleop.config import VRTeleopConfig
 from ...teleop.trajectory import plan_collision_aware_trajectory
+
+if TYPE_CHECKING:
+    from ...rt import RtAxol
 
 _RATE_HZ = (
     250.0  # waypoint density — high for smooth playback (speed is set by --speed)
@@ -148,7 +152,7 @@ def _make_motion_command(
 
 
 def _snapshot_q(
-    axol: Axol, solver: KinematicsSolver, q_default: np.ndarray
+    axol: RtAxol, solver: KinematicsSolver, q_default: np.ndarray
 ) -> np.ndarray:
     """Read the *cached* arm positions into a full-N solver vector.
 
@@ -167,7 +171,7 @@ def _snapshot_q(
 
 
 async def _execute(
-    axol: Axol,
+    axol: RtAxol,
     solver: KinematicsSolver,
     trajectory: list[np.ndarray],
     rate_hz: float,
@@ -252,10 +256,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--stiffness",
         type=float,
-        default=0.5,
+        default=1.0,
         help=(
             "Arm stiffness scale (0-1). Lower softens the motors and reduces "
-            "tracking jitter. Default 0.5."
+            "tracking jitter. Default 1.0 (the tuned production gains)."
         ),
     )
     p.add_argument(
@@ -330,11 +334,9 @@ async def _run(args: argparse.Namespace) -> None:
         f"rate={args.rate:.0f} Hz. Press Ctrl-C to stop."
     )
 
-    async with Axol(config=axol_config, **axol_kwargs) as axol:
-        await axol.start_telemetry(500)
-        # Settle the telemetry cache before driving (mirrors gravity_comp).
-        await axol.wait_for_telemetry()
+    from ...rt import RtAxol as _RtAxol
 
+    async with _RtAxol(Axol(config=axol_config, **axol_kwargs)) as axol:
         # Always begin from the planned rest pose. If the operator parked the
         # arm anywhere else, sneak there with a one-off collision-aware plan
         # so the first cycle doesn't snap.

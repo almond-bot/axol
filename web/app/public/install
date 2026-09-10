@@ -3,11 +3,11 @@
 #
 #   curl https://axol.almond.bot/install -fsS | bash
 #
-# Installs uv, installs the axol CLI as a uv tool (from GitHub, pinned to the
-# latest release tag, all extras), installs the pyzed bindings when the ZED SDK
-# is present, installs adb for Quest-over-USB teleop, and registers a root
-# systemd service that keeps `axol serve` running at boot and restarts it if it
-# ever goes down. Safe to re-run: re-running upgrades to the latest release.
+# Installs uv, installs the axol CLI from PyPI as a uv tool (pinned to the latest
+# GitHub release tag, all extras), provisions the camera stack, adb, and the
+# required axol-rt control core, and registers a root systemd service that
+# keeps `axol serve` running at boot and restarts it if it ever goes down. Safe
+# to re-run: re-running upgrades to the latest release.
 
 set -euo pipefail
 
@@ -29,12 +29,13 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 # as their own user and expect `axol` to work there too. uv's default tool +
 # managed-Python locations live under /root (mode 0700), which only root can
 # traverse, so the `axol` wrapper on PATH would fail for everyone else. Pin
-# both to shared, world-readable locations instead. The same vars are baked
-# into the systemd unit below so the self-updater's tag-pinned reinstall keeps
-# operating on this one shared install rather than spawning a /root copy.
+# all three to shared, world-readable locations instead. The same vars are
+# baked into the systemd unit below so the self-updater's tag-pinned reinstall
+# keeps operating on this one shared install rather than spawning a /root copy.
 UV_TOOL_DIR="/opt/axol/uv/tools"
 UV_PYTHON_INSTALL_DIR="/opt/axol/uv/python"
-export UV_TOOL_DIR UV_PYTHON_INSTALL_DIR
+UV_TOOL_BIN_DIR="${BIN_DIR}"
+export UV_TOOL_DIR UV_PYTHON_INSTALL_DIR UV_TOOL_BIN_DIR
 
 say() { printf "\033[1;36m[axol]\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31m[axol]\033[0m %s\n" "$*" >&2; exit 1; }
@@ -81,7 +82,7 @@ say "Latest release: ${LATEST_TAG}."
 
 say "Installing axol ${VERSION} from PyPI (extras: ${EXTRAS}) — this can take a few minutes..."
 mkdir -p "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
-UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
+"${UV}" tool install \
     --python "${PYTHON_VERSION}" \
     --force \
     "almond-axol[${EXTRAS}]==${VERSION}"
@@ -94,29 +95,40 @@ chmod -R a+rX "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 command -v axol >/dev/null 2>&1 || die "axol did not end up on PATH (expected ${BIN_DIR}/axol)."
 say "axol installed at $(command -v axol)."
 
-# -- System provisioning (pyzed + GStreamer camera stack + adb) ---------------
+# -- System provisioning (camera stack + adb + realtime core) -----------------
 
 # `uv tool install` handles the Python package + PyPI deps, but a few pieces it
 # can't: the pyzed bindings (not on PyPI), PyGObject (the in-process appsink
 # reader for the GPU-resident zedxonesrc/zedsrc camera path, built against the
 # system gobject-introspection), and our patched zedxonesrc/zedsrc plugins
 # (which stamp each frame at the true sensor-exposure instant so collected
-# images line up with joint samples). `axol provision` installs all of them
-# idempotently -- the same command the `axol serve` self-updater runs after an
-# upgrade, so there is exactly one provisioning path. Each step self-gates
+# images line up with joint samples), plus the required axol-rt control core.
+# `axol provision` installs all of them idempotently -- the same command the
+# `axol serve` self-updater runs after an upgrade, so there is exactly one
+# provisioning path. Each step self-gates
 # (a no-op without the ZED SDK / apt / NVENC).
 # Also installs adb + the Oculus udev rule (Quest-over-USB controller transport)
 # and, on a factory-flashed ZED Box Duo, replaces the known-bad factory GMSL
 # camera driver with the pinned release (`axol zed.driver`); the new driver
 # only loads at boot, so provision prints a REBOOT REQUIRED notice we surface
 # in the summary below rather than rebooting the box mid-install.
-say "Provisioning system dependencies (pyzed + GStreamer camera stack + adb)..."
+say "Provisioning system dependencies (camera stack + adb + axol-rt)..."
 PROVISION_LOG="$(mktemp)"
-axol provision 2>&1 | tee "${PROVISION_LOG}" \
-    || say "WARNING: provisioning failed; cameras may be unavailable or fall back to the slower ZED SDK path. Re-run 'axol provision'."
+# Most provisioning steps remain best-effort because they self-gate on
+# optional hardware. --require-rt makes the one mandatory step fail the
+# command if its build or capability setup failed.
+PROVISION_OK=1
+"${BIN_DIR}/axol" provision --require-rt 2>&1 | tee "${PROVISION_LOG}" \
+    || PROVISION_OK=0
 REBOOT_REQUIRED=0
 if grep -q "REBOOT REQUIRED" "${PROVISION_LOG}"; then REBOOT_REQUIRED=1; fi
 rm -f "${PROVISION_LOG}"
+
+[ "${PROVISION_OK}" -eq 1 ] \
+    || die "axol-rt provisioning failed. Fix the logged error, then re-run the installer."
+[ -x "${BIN_DIR}/axol-rt" ] \
+    || die "axol-rt did not end up on the shared PATH (expected ${BIN_DIR}/axol-rt)."
+say "axol-rt installed at ${BIN_DIR}/axol-rt."
 
 # -- Quest-over-USB operator access -------------------------------------------
 
@@ -192,6 +204,10 @@ ExecStartPre=-${BIN_DIR}/axol jetson.setup
 ExecStart=${BIN_DIR}/axol serve
 Restart=always
 RestartSec=3
+# Permit the Rust CAN children to request their bounded SCHED_FIFO priority.
+# Manual development shells normally have an rtprio hard limit of zero; the
+# production service must not depend on the ambient login configuration.
+LimitRTPRIO=20
 # A stop during a recording session must outlive the serve layer's dataset
 # teardown: its stop watchdog gives the recorder subprocess up to 200s to
 # finalize the dataset (encode the last episode, flush parquet, write meta).

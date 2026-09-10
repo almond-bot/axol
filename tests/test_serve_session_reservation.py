@@ -332,6 +332,9 @@ class _FakeClosingArm:
         if self.failure is not None:
             raise self.failure
 
+    async def close_observer(self) -> None:
+        pass
+
 
 class _CancellationResistantClosingArm:
     def __init__(self) -> None:
@@ -356,6 +359,9 @@ class _CancellationResistantClosingArm:
                     await self.release.wait()
         finally:
             self.active -= 1
+
+    async def close_observer(self) -> None:
+        pass
 
 
 def _test_app(
@@ -1310,7 +1316,7 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_robot_free_string_booleans_skip_axol_survey_consistently(
         self,
     ) -> None:
-        for key, value in (("sim", "yes"), ("cart_only", "on")):
+        for key, value in (("sim", "yes"), ("jelly_only", "on")):
             with self.subTest(key=key, value=value):
                 manager = _Manager()
                 runner = _Runner()
@@ -1637,9 +1643,17 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
             async def fail_sample() -> dict[str, object]:
                 raise RuntimeError("sample failed")
 
+            async def open_observer(joints: list[object]) -> None:
+                pass
+
+            async def sync_observer_ranges() -> None:
+                pass
+
             arm = SimpleNamespace(
                 health={"SHOULDER_1": {"reachable": True}},
                 open=open_arm,
+                open_observer=open_observer,
+                sync_observer_ranges=sync_observer_ranges,
                 ping=fail_ping,
                 sample=fail_sample,
             )
@@ -1653,6 +1667,11 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
             link._arms = [arm]
             link._ping_task = None
             link._sample_task = None
+            # The observer publish loop is exercised elsewhere; a finished
+            # placeholder keeps _open_and_start from spawning it here.
+            link._publish_task = asyncio.get_running_loop().create_future()
+            link._publish_task.set_result(None)
+            link._sync_task = None
             link._last_ping = time.time()
             link._loop = asyncio.get_running_loop()
             link.hub = SimpleNamespace(clear_slow=Mock(), push_slow=Mock())
@@ -1665,12 +1684,13 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
             self.assertEqual(arm.health, {})
             link.hub.clear_slow.assert_called_once_with()
 
-            for task in (link._ping_task, link._sample_task):
+            for task in (link._ping_task, link._sample_task, link._sync_task):
                 assert task is not None
                 task.cancel()
             await asyncio.gather(
                 link._ping_task,
                 link._sample_task,
+                link._sync_task,
                 return_exceptions=True,
             )
 
@@ -1684,6 +1704,8 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
             link._buses_may_be_open = True
             link._ping_task = None
             link._sample_task = None
+            link._sync_task = None
+            link._publish_task = None
             link._lifecycle_lock = asyncio.Lock()
             link._arms = [arm]
 
@@ -1710,6 +1732,8 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         link._buses_may_be_open = True
         link._ping_task = None
         link._sample_task = None
+        link._sync_task = None
+        link._publish_task = None
         link._lifecycle_lock = asyncio.Lock()
         link._arms = [failed, healthy]
 
@@ -2147,9 +2171,9 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         self,
     ) -> None:
         cases = (
-            ("teleop", {}, SimpleNamespace(mantis=True, sim=False, cart_only=False)),
-            ("teleop", {}, SimpleNamespace(mantis=False, sim=True, cart_only=False)),
-            ("teleop", {}, SimpleNamespace(mantis=False, sim=False, cart_only=True)),
+            ("teleop", {}, SimpleNamespace(mantis=True, sim=False, jelly_only=False)),
+            ("teleop", {}, SimpleNamespace(mantis=False, sim=True, jelly_only=False)),
+            ("teleop", {}, SimpleNamespace(mantis=False, sim=False, jelly_only=True)),
         )
         for op_id, args, config in cases:
             with self.subTest(config=config):
@@ -2170,7 +2194,7 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         config = SimpleNamespace(
             mantis=False,
             sim=False,
-            cart_only=False,
+            jelly_only=False,
             axol=SimpleNamespace(has_gripper=True),
         )
         with (

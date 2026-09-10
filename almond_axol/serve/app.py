@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -1474,12 +1475,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def telemetry_history(
         seconds: float = 120.0, max_frames: int = 2000
     ) -> dict[str, Any]:
-        """Buffered telemetry frames for chart backfill on page load."""
-        return {"frames": hub.history(seconds, max_frames)}
+        """Buffered telemetry frames for chart backfill on page load.
+
+        ``slow`` carries the 1 Hz sweep history (temperature/voltage) so the
+        temperature chart backfills too.
+        """
+        return {
+            "frames": hub.history(seconds, max_frames),
+            "slow": hub.slow_history(seconds),
+            "timing": hub.timing_history(seconds, max_frames),
+        }
 
     @app.websocket("/api/telemetry/ws")
     async def telemetry_ws(ws: WebSocket) -> None:
-        """Live telemetry stream: frame / slow / state messages (see telemetry.py)."""
+        """Live motor + control timing stream (see :mod:`.telemetry`)."""
         await ws.accept()
         queue = hub.subscribe()
         try:
@@ -1607,6 +1616,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     for key, value in launch_args.items()
                     if key in valid_scope_keys
                 }
+                if command_id == "diag.rom-enable":
+                    # Its --joints picks which joints are *swept*; the realtime
+                    # core still brings up every motor of each selected arm, so
+                    # a fault anywhere on the arm blocks the run.
+                    fault_scope_args.pop("joints", None)
                 if command_id == "diag.lift-cycle":
                     # Lift cycle never touches grippers. Keep its arm/side
                     # scoping, but do not block it on an unrelated gripper
@@ -1711,6 +1725,158 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         if data is None:
             return JSONResponse({"error": "unknown run"}, status_code=404)
         return JSONResponse(data)
+
+    # -- tuning runs (sine/step probes, motion replays, offline suites) -------
+    #
+    # These are the artifacts the tuning library persists under
+    # ~/.almond/diagnostics/tuning/ (see almond_axol.tuning.runs). Distinct
+    # from the diagnostics run *history* above: a tuning run is a scored
+    # experiment with full time series, made for charting and A/B comparison.
+
+    @app.get("/api/tuning/gains")
+    async def tuning_gains() -> dict[str, Any]:
+        """Effective per-joint control gains for both arms.
+
+        Shipping defaults from ``config.py`` with this robot's calibration
+        file overlaid — exactly what a tuning run uses when a gain field is
+        left empty. The workbench shows these as the slider baselines.
+        ``kd_host_hz`` is resolved to the shared default where a joint
+        doesn't set its own band centre.
+        """
+        import math
+
+        from ..constants import ARM_JOINTS
+        from ..robot.config import AxolConfig
+        from ..robot.control import DAMP_BP_Q, DAMP_BP_W0
+
+        def _load() -> dict[str, Any]:
+            cfg = AxolConfig()
+            out: dict[str, Any] = {}
+            for side in ("left", "right"):
+                arm_cfg = getattr(cfg, side)
+                joints: dict[str, Any] = {}
+                for j in ARM_JOINTS:
+                    jc = getattr(arm_cfg, j.value)
+                    joints[j.value] = {
+                        "kp": jc.kp,
+                        "kd": jc.kd,
+                        "kd_host": jc.kd_host,
+                        "kd_host_hz": (
+                            jc.kd_host_hz
+                            if jc.kd_host_hz is not None
+                            else round(DAMP_BP_W0 / (2 * math.pi), 1)
+                        ),
+                        "kd_host_q": (
+                            jc.kd_host_q if jc.kd_host_q is not None else DAMP_BP_Q
+                        ),
+                        "j_eff": jc.j_eff,
+                    }
+                out[side] = joints
+            return out
+
+        return {"gains": await asyncio.to_thread(_load)}
+
+    @app.get("/api/tuning/runs")
+    async def tuning_runs() -> dict[str, Any]:
+        from ..tuning import list_runs
+
+        return {"runs": await asyncio.to_thread(list_runs)}
+
+    @app.delete("/api/tuning/runs")
+    async def tuning_runs_clear() -> dict[str, Any]:
+        from ..tuning import clear_runs
+
+        return {"removed": await asyncio.to_thread(clear_runs)}
+
+    @app.get("/api/tuning/runs/{run_id}")
+    async def tuning_run_data(run_id: str, max_points: int = 4000) -> JSONResponse:
+        """One run's metadata plus its time series, decimated for charting.
+
+        ``max_points`` caps each series' length (stride decimation — plenty
+        for on-screen charts; the full-resolution NPZ stays on disk for
+        offline analysis). NaN samples become null in the JSON.
+        """
+        from ..tuning import load_run
+
+        loaded = await asyncio.to_thread(load_run, run_id)
+        if loaded is None:
+            return JSONResponse({"error": "unknown run"}, status_code=404)
+        meta, series = loaded
+
+        def _decimate() -> dict[str, list[float | None]]:
+            def to_json(col: np.ndarray, stride: int) -> list[float | None]:
+                return [float(v) if math.isfinite(v) else None for v in col[::stride]]
+
+            out: dict[str, list[float | None]] = {}
+            for key, arr in series.items():
+                a = np.asarray(arr, dtype=float)
+                if a.ndim == 0 or len(a) == 0:
+                    continue
+                stride = max(1, len(a) // max(max_points, 2))
+                if a.ndim == 1:
+                    out[key] = to_json(a, stride)
+                else:
+                    # Multi-column series (e.g. a motion run's N×14 joint
+                    # matrix) become one flat key per column, "<key>/<i>";
+                    # column names live in meta.params (e.g. "columns").
+                    cols = a.reshape(len(a), -1)
+                    for i in range(cols.shape[1]):
+                        out[f"{key}/{i}"] = to_json(cols[:, i], stride)
+            return out
+
+        return JSONResponse(
+            {"meta": meta, "series": await asyncio.to_thread(_decimate)}
+        )
+
+    @app.delete("/api/tuning/runs/{run_id}")
+    async def tuning_run_delete(run_id: str) -> JSONResponse:
+        from ..tuning import delete_run
+
+        if not await asyncio.to_thread(delete_run, run_id):
+            return JSONResponse({"error": "unknown run"}, status_code=404)
+        return JSONResponse({"deleted": run_id})
+
+    @app.get("/api/tuning/motions")
+    async def tuning_motions() -> dict[str, Any]:
+        """The committed reference motions available for tune.motion replays."""
+        from ..tuning.motion import list_motions
+
+        def _list() -> list[dict[str, Any]]:
+            return [
+                {
+                    "name": m.name,
+                    "rate": m.rate,
+                    "samples": len(m.q),
+                    "durationS": len(m.q) / m.rate if m.rate else 0.0,
+                    "meta": m.meta,
+                }
+                for m in list_motions()
+            ]
+
+        return {"motions": await asyncio.to_thread(_list)}
+
+    @app.get("/api/tuning/recordings")
+    async def tuning_recordings() -> dict[str, Any]:
+        """The flight recordings motion.build can consume, newest first.
+
+        From either recorder: a teleop session (``--teleop.record``) or a
+        hand-guided gravity-comp one (``--record``). Feeds the workbench's
+        Build-motion recording picker.
+        """
+        from ..teleop.recorder import list_recordings
+
+        def _list() -> list[dict[str, Any]]:
+            return [
+                {
+                    "name": r["name"],
+                    "kind": r["kind"],
+                    "modifiedAt": r["modified_at"],
+                    "durationS": r["duration_s"],
+                }
+                for r in list_recordings()
+            ]
+
+        return {"recordings": await asyncio.to_thread(_list)}
 
     # -- local ZED cameras ---------------------------------------------------
 
@@ -2307,7 +2473,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # A faulted motor (over-temp, stall, encoder error, unreachable, …)
             # must block every hardware operation — driving through a fault risks
             # the arm. A sim run never touches the motors, and a robot-free run
-            # (teleop's cart_only) never touches the *arms*, so both stay allowed.
+            # (teleop's jelly_only) never touches the *arms*, so both stay allowed.
             cmd = COMMANDS[req.op]
             try:
                 launch_args = normalize_boolean_args(

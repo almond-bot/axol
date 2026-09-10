@@ -87,12 +87,6 @@ def _default_robot_config() -> AxolRobotConfig:
             "right_arm": ZedCameraConfig(serial=0),
         },
         video_backend="sdk",
-        # The control loop runs motion_control every step, whose command
-        # replies keep the joint cache fresh — so the background telemetry
-        # poll loop is redundant CAN/CPU load that contends with the 60 Hz
-        # action stream on the same buses and event loop. Skipping it
-        # (telemetry_hz=0) matches collect-data and `axol teleop`.
-        telemetry_hz=0.0,
     )
 
 
@@ -302,9 +296,7 @@ class _StdinPolicyControl:
     def begin_gate(
         self, message: str, label: str = "Start episode", phase: str = _GATE_READY
     ) -> None:
-        from lerobot.utils.utils import log_say
-
-        log_say(message)
+        _logger.info(message)
 
     def note_gate(
         self, message: str, label: str = "Start episode", phase: str = _GATE_READY
@@ -313,7 +305,7 @@ class _StdinPolicyControl:
         pass
 
     def note_episode(self, episode: int) -> None:
-        # Panel-only readout; the terminal announces episodes via log_say.
+        # Panel-only readout; the terminal announces episodes via the log.
         pass
 
     def poll_gate(self) -> str | None:
@@ -357,7 +349,7 @@ class _StdinPolicyControl:
             self._stop.set()
 
     def note_saved(self) -> None:
-        # Web-control-only bookkeeping; the terminal path shows saves via log_say.
+        # Web-control-only bookkeeping; the terminal path shows saves via the log.
         pass
 
     def close(self) -> None:
@@ -469,9 +461,7 @@ class _QueuePolicyControl:
     def begin_gate(
         self, message: str, label: str = "Start episode", phase: str = _GATE_READY
     ) -> None:
-        from lerobot.utils.utils import log_say
-
-        log_say(message)
+        _logger.info(message)
         with self._state_lock:
             self._phase = phase
             self._gate_message = message
@@ -485,7 +475,7 @@ class _QueuePolicyControl:
         ``begin_gate`` speaks its message, which is right when a gate opens
         and wrong for a transient swap *inside* one — a contact hold that
         interrupts an idle-phase home states its own instruction and then
-        hands the gate back unchanged, and neither hand-off should be spoken
+        hands the gate back unchanged, and neither hand-off should be announced
         again.
         """
         with self._state_lock:
@@ -510,9 +500,7 @@ class _QueuePolicyControl:
         """Open a gate for the panel and block until the operator resolves it."""
         import queue
 
-        from lerobot.utils.utils import log_say
-
-        log_say(message)
+        _logger.info(message)
         with self._state_lock:
             self._phase = phase
             self._gate_message = message
@@ -590,9 +578,7 @@ class _QueuePolicyControl:
     def resolve_timeout(self, episode_time_s: int) -> str:
         import queue
 
-        from lerobot.utils.utils import log_say
-
-        log_say(
+        _logger.info(
             f"Episode time cap ({episode_time_s}s) reached — choose save/rerecord/quit."
         )
         # The cap stopped recording, but the operator still owes a save/rerecord/
@@ -623,7 +609,7 @@ def main(argv: list[str]) -> None:
     cfg = parse(RunPolicyConfig, argv)
     # force=True: importing lerobot (at module load) installs a root handler
     # and leaves the root level at WARNING, which would otherwise make this a
-    # no-op and silently drop every log_say() status line.
+    # no-op and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
     # Translate operator-actionable hardware faults into a clean non-zero
@@ -2109,7 +2095,6 @@ def _run(
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.processor import make_default_processors
     from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME
-    from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun
 
     from ..lerobot.robot.robot_axol import AxolRobot
@@ -2220,7 +2205,7 @@ def _run(
                     "the existing path is not an empty directory. Choose a new "
                     "--root, or inspect and move/delete the existing data yourself."
                 ) from exc
-            log_say(f"Removed empty dataset directory at {dataset_root}.")
+            _logger.info(f"Removed empty dataset directory at {dataset_root}.")
 
         from lerobot.configs.video import RGBEncoderConfig
 
@@ -2239,7 +2224,7 @@ def _run(
             # Avoid mutating/truncating an incompatible dataset while checking
             # its torn episode tail.
             check_resume_consistency(dataset_root)
-            log_say(f"Resuming existing dataset at {dataset_root}.")
+            _logger.info(f"Resuming existing dataset at {dataset_root}.")
             dataset = LeRobotDataset.resume(
                 repo_id=repo_id,
                 root=str(dataset_root),
@@ -2312,17 +2297,19 @@ def _run(
                 daemon=True,
             )
             server_proc.start()
-            log_say(
+            _logger.info(
                 f"Started PolicyServer on 127.0.0.1:{server_port} "
                 f"(pid={server_proc.pid})."
             )
         else:
-            log_say(f"Using remote inference server at {server_host}:{server_port}.")
+            _logger.info(
+                f"Using remote inference server at {server_host}:{server_port}."
+            )
 
         # Spawn the IK worker in parallel so JAX JIT overlaps with policy load.
         reset_controller = IKResetController()
         reset_controller.start()
-        log_say("Started IK reset worker (collision-aware return-to-rest).")
+        _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
         def _return_to_rest_guarded() -> bool:
             """Guarded return to rest; ``False`` when the operator aborted."""
@@ -2341,12 +2328,12 @@ def _run(
         # ``temporal_ensemble`` is handled in our override so pass a
         # placeholder that the dispatcher short-circuits.
         if aggregate_fn == "temporal_ensemble":
-            log_say(
+            _logger.info(
                 f"Aggregation: temporal_ensemble "
                 f"(coeff={temporal_ensemble_coeff:+.3f}, ACT default 0.01)."
             )
         else:
-            log_say(f"Aggregation: {aggregate_fn}.")
+            _logger.info(f"Aggregation: {aggregate_fn}.")
         client_cfg = RobotClientConfig(
             robot=robot_config,
             policy_type=policy_type,
@@ -2376,11 +2363,11 @@ def _run(
             policy_torque_threshold=cfg.policy_torque_threshold,
         )
 
-        log_say("Loading policy on server (one-time)...")
+        _logger.info("Loading policy on server (one-time)...")
         if not client.start():
             raise RuntimeError("Failed to connect to policy server / load policy.")
 
-        log_say("Connecting robot...")
+        _logger.info("Connecting robot...")
         robot.connect()
 
         # A Cartesian-action policy resolves each action to joints via IK in
@@ -2388,10 +2375,10 @@ def _run(
         # one-time JIT warmup overlaps the return-to-rest + scene-reset prompt
         # below instead of stalling the first policy action.
         if getattr(robot.config, "observe_cartesian", False):
-            log_say("Preparing Cartesian action solver (IK)...")
+            _logger.info("Preparing Cartesian action solver (IK)...")
             robot.prepare_cartesian_actions()
 
-        log_say("Returning to rest pose.")
+        _logger.info("Returning to rest pose.")
         if not _return_to_rest_guarded():
             return
         if not control.await_continue("Reset the scene, then start the first episode."):
@@ -2400,7 +2387,7 @@ def _run(
         while True:
             if stop_event.is_set():
                 break
-            log_say(f"Episode {episodes_recorded + 1}: starting in 1s.")
+            _logger.info(f"Episode {episodes_recorded + 1}: starting in 1s.")
             time.sleep(1.0)
 
             if dataset is not None:
@@ -2496,7 +2483,7 @@ def _run(
                         if client.fatal_error is not None:
                             # Hardware fault from the control loop — drop the
                             # episode and exit the run.
-                            log_say(
+                            _logger.info(
                                 f"Fatal error in control loop: "
                                 f"{client.fatal_error!r}. Aborting run without "
                                 "saving the current episode."
@@ -2553,7 +2540,7 @@ def _run(
                         f"{type(episode_error).__name__}: {episode_error}"
                     )
                 if not episode_workers_stopped:
-                    log_say(f"Safety shutdown: {worker_stop_error}")
+                    _logger.info(f"Safety shutdown: {worker_stop_error}")
                     raise worker_stop_error
                 if episode_error is not None:
                     episode_error.add_note(
@@ -2562,7 +2549,7 @@ def _run(
                     )
                     raise episode_error
                 client.fatal_error = worker_stop_error
-                log_say(
+                _logger.info(
                     f"Ending run after worker cleanup escalation: {worker_stop_error}"
                 )
             elif episode_error is not None:
@@ -2588,7 +2575,7 @@ def _run(
                 # to rest" on the panel, Enter on the terminal) then plans
                 # the return from wherever the arms were left.
                 joint, _residual = client.contact_tripped
-                log_say(f"Contact on {joint} — episode aborted; arms are limp.")
+                _logger.info(f"Contact on {joint} — episode aborted; arms are limp.")
                 if dataset is not None:
                     _clear_episode_buffer_after_workers(
                         dataset, workers_stopped=episode_workers_stopped
@@ -2600,7 +2587,7 @@ def _run(
                     stopped=stop_event.is_set,
                 ):
                     break
-                log_say("Returning to rest pose.")
+                _logger.info("Returning to rest pose.")
                 if not _return_to_rest_guarded():
                     break
                 if not control.await_continue(
@@ -2621,7 +2608,7 @@ def _run(
                 break
 
             if choice == "r":
-                log_say("Re-recording episode.")
+                _logger.info("Re-recording episode.")
                 if dataset is not None:
                     _clear_episode_buffer_after_workers(
                         dataset, workers_stopped=episode_workers_stopped
@@ -2632,7 +2619,7 @@ def _run(
                 # of pulling straight back to rest. The gate's "Return to rest"
                 # (Enter on the terminal) then plans the return from wherever
                 # the arms were left.
-                log_say("Arms are limp for cleanup.")
+                _logger.info("Arms are limp for cleanup.")
                 if not reset_controller.hold_limp(
                     robot,
                     gravity_comp_kd=cfg.reset_gravity_comp_kd,
@@ -2640,7 +2627,7 @@ def _run(
                     stopped=stop_event.is_set,
                 ):
                     break
-                log_say("Returning to rest pose.")
+                _logger.info("Returning to rest pose.")
                 if not _return_to_rest_guarded():
                     break
                 if not control.await_continue("Start the episode again when ready."):
@@ -2677,8 +2664,8 @@ def _run(
             else:
                 episodes_recorded += 1
             control.note_saved()
-            log_say(f"Saved episode {episodes_recorded}.")
-            log_say("Returning to rest pose.")
+            _logger.info(f"Saved episode {episodes_recorded}.")
+            _logger.info("Returning to rest pose.")
             if not _return_to_rest_guarded():
                 break
             if not control.await_continue(
@@ -2705,7 +2692,7 @@ def _run(
         except (ValueError, OSError):
             pass
 
-        log_say("Stopping.")
+        _logger.info("Stopping.")
         if client is not None:
             try:
                 client.stop()
@@ -2784,7 +2771,7 @@ def _run(
             else:
                 try:
                     shutil.rmtree(dataset_root)
-                    log_say(
+                    _logger.info(
                         f"No episodes saved — removed empty dataset at {dataset_root}."
                     )
                 except OSError as exc:
