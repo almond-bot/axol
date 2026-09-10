@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import threading
 import unittest
-from unittest.mock import patch
 
 from almond_axol.cli.collect_dagger import (
     _DaggerControlLoop,
@@ -37,8 +36,7 @@ class DaggerControlCleanupTest(unittest.TestCase):
             teleop_hz=120,
         )
 
-        with patch("lerobot.utils.utils.log_say"):
-            control_loop.run()
+        control_loop.run()
 
         self.assertEqual(control_loop.capture_error, "camera alignment failed")
         self.assertIsNone(control_loop.fatal_error)

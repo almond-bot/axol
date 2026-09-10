@@ -19,9 +19,25 @@ heading hold, the watchdog, and park/unpark at ``JellyConfig.frequency``:
   slow), the wheels are parked: switched to MIT/impedance mode and held at
   their current positions by the motor's internal high-bandwidth position
   loop, so the base does not roll under load.
-- If no fresh command arrives within ``command_timeout`` the target is
-  forced to zero (streaming sources that die mid-motion cannot leave the
-  base driving).
+- Every wheel is armed with the Damiao loss-of-comms alarm
+  (``JellyConfig.can_timeout_ms``, RAM only, readback-verified at enable):
+  a wheel that goes that long without a command frame faults ``LOST_COMM``
+  and torques off by itself, whether or not the host is still running. That
+  motor-side timeout — not any host watchdog — is the runaway safety layer,
+  and the Rust core's job is to never feed it with anything but a live
+  motion command.
+- If no fresh command arrives within ``command_timeout`` the command source
+  is treated as dead. Driving wheels get one zero-velocity frame and then
+  **silence** — no keepalive, no re-send of a stale command — so the alarm
+  trips and torques them off; once that has certainly happened and the
+  wheels have stopped rolling they are re-enabled straight into the park
+  hold. Parked wheels keep their hold (an anchor, not a motion). The lift
+  likewise gets one STOP and then nothing on its bus, so the jelly_legs
+  board's own 300 ms jog deadman is the safety layer for the legs.
+- When the source returns, wheels the alarm tripped are cleared and
+  re-enabled (mode switch before enable, so no stale target replays) and the
+  ramp restarts from rest. Other faults (over-current, thermal) are reported
+  but never cleared blindly.
 
 Damiao position commands/feedback are mapped into ±PMAX (12.5 rad from
 factory — about two wheel turns), which drive wheels escape almost
@@ -174,8 +190,24 @@ class JellyConfig:
         hold_kd:         Damping (Nm·s/rad) of the parked MIT hold.
         frequency:       Wheel command task rate in Hz.
         command_timeout: Seconds without a fresh :meth:`Jelly.set_command`
-                         before the target is forced to zero (and the lift
-                         stopped). Protects against a dead command source.
+                         before the command source is considered dead. On
+                         that edge driving wheels get one zero-velocity frame
+                         and then nothing on CAN — no keepalive — so their
+                         ``can_timeout_ms`` alarm torques them off (they are
+                         then re-anchored into the park hold); parked wheels
+                         keep their hold; the lift gets one STOP and then
+                         silence so the legs' 300 ms jog deadman takes over.
+                         Must comfortably exceed the source's frame period (a
+                         headset streams at 72-90 Hz, with occasional 50-100
+                         ms WiFi gaps).
+        can_timeout_ms:  Damiao loss-of-comms alarm written to every wheel at
+                         enable (RAM only, readback-verified; the enable
+                         fails if a wheel does not take it). A wheel that
+                         receives no command frame for this long faults
+                         ``LOST_COMM`` and torques itself off — the runaway
+                         safety layer for a hung or dead host. Cannot be
+                         disabled, and must be at least twice the command
+                         period so a single late tick does not trip it.
         lift:            Whether the telescoping lift is present (the
                          jelly_legs board on the chest CAN bus, see
                          :mod:`almond_axol.robot.lift`). The chest bus being
@@ -202,10 +234,35 @@ class JellyConfig:
     hold_kp: float = 60.0
     hold_kd: float = 1.5
     frequency: float = 50.0
-    command_timeout: float = 0.3
+    command_timeout: float = 0.2
+    can_timeout_ms: float = 200.0
     lift: bool = True
     lift_channel: str = CAN_CHEST
     lift_speed: int = JOG_SPEED
+
+
+def _pack_config(cfg: JellyConfig) -> bytes:
+    """The ``C`` message that configures the Rust core.
+
+    Eleven little-endian f64 values, in the order ``Config`` in
+    ``rust/axol-rt/src/jelly.rs`` reads them; the core rejects any other
+    length, so an older or newer Python side cannot start it with an implicit
+    (disabled) CAN timeout.
+    """
+    return b"C" + struct.pack(
+        "<11d",
+        cfg.max_speed,
+        cfg.turn_scale,
+        cfg.slew,
+        cfg.axis_snap_deg,
+        cfg.yaw_hold_gain,
+        cfg.yaw_hold_max,
+        cfg.hold_kp,
+        cfg.hold_kd,
+        cfg.frequency,
+        cfg.command_timeout,
+        cfg.can_timeout_ms,
+    )
 
 
 class _YawLog:
@@ -338,6 +395,10 @@ class Jelly:
         # atomic under the GIL), consumed by the command task.
         self._target: tuple[float, float, float, int] = (0.0, 0.0, 0.0, STOP)
         self._target_time: float = 0.0
+        # The last VR frame object mapped by apply_vr_frame. A frame that is
+        # handed over twice (a poller re-reading the server's latest frame,
+        # say) must not count as a fresh command.
+        self._last_vr_frame: object | None = None
 
         # Latest external yaw-rate sample (rad/s CCW, monotonic timestamp),
         # written from any thread; None until a sensor feeds one. The counter
@@ -354,6 +415,11 @@ class Jelly:
         self.parked: bool = False
         self.park_failed: bool = False
         self.send_failed: bool = False
+        # Whether the Rust core currently sees a fresh command source, and
+        # whether any wheel is faulted/torqued off (tripped by its CAN timeout
+        # and awaiting re-enable, or a fault the core will not clear).
+        self.linked: bool = False
+        self.wheel_fault: bool = False
 
     @property
     def config(self) -> JellyConfig:
@@ -411,6 +477,27 @@ class Jelly:
         cfg = self._config
         self._ready.clear()
         self.send_failed = False
+        self.linked = False
+        self.wheel_fault = False
+        if cfg.channel is not None:
+            # The motor-side timeout is the safety layer; refuse a config that
+            # disables it or that the command stream cannot reliably feed. The
+            # Rust core checks the same before touching the wheels.
+            period_ms = 1000.0 / cfg.frequency
+            if not math.isfinite(cfg.can_timeout_ms) or cfg.can_timeout_ms <= 0.0:
+                raise ValueError(
+                    "Jelly can_timeout_ms must be a positive number — the wheel "
+                    "loss-of-comms alarm is the runaway safety layer and cannot "
+                    "be disabled"
+                )
+            if cfg.can_timeout_ms < 2.0 * period_ms:
+                raise ValueError(
+                    f"Jelly can_timeout_ms ({cfg.can_timeout_ms:g} ms) must be at "
+                    f"least twice the command period ({period_ms:g} ms at "
+                    f"{cfg.frequency:g} Hz), or a single late cycle trips the wheels"
+                )
+        if not math.isfinite(cfg.command_timeout) or cfg.command_timeout <= 0.0:
+            raise ValueError("Jelly command_timeout must be a positive number")
         if cfg.lift:
             # Publish the lift before its first await so cancellation during a
             # partial start can still find and close its bus.
@@ -464,24 +551,17 @@ class Jelly:
             self._reader_task = asyncio.create_task(
                 self._rust_reader_loop(), name="jelly-rust-reader"
             )
-            values = (
-                cfg.max_speed,
-                cfg.turn_scale,
-                cfg.slew,
-                cfg.axis_snap_deg,
-                cfg.yaw_hold_gain,
-                cfg.yaw_hold_max,
-                cfg.hold_kp,
-                cfg.hold_kd,
-                cfg.frequency,
-                cfg.command_timeout,
-            )
-            self._send_rust(b"C" + struct.pack("<10d", *values))
+            self._send_rust(_pack_config(cfg))
             await self._writer.drain()
             await asyncio.wait_for(self._ready.wait(), 10.0)
             if self.send_failed:
                 raise RuntimeError("axol-rt Jelly core failed during startup")
-            _logger.info("Jelly Rust wheel core enabled on %s", cfg.channel)
+            _logger.info(
+                "Jelly Rust wheel core enabled on %s (loss-of-comms alarm %.0f ms: "
+                "the wheels torque off on their own when the command stream stops)",
+                cfg.channel,
+                cfg.can_timeout_ms,
+            )
 
         if cfg.yaw_hold_gain != 0.0:
             _logger.info(
@@ -573,9 +653,15 @@ class Jelly:
             wz:   Counter-clockwise rotation, [-1, 1].
             lift: +1 raise, 0 stop, -1 lower.
 
-        Safe to call from any thread at any rate. The command task consumes
-        the latest value; if no fresh command arrives within
-        ``JellyConfig.command_timeout`` the target decays to a full stop.
+        Safe to call from any thread at any rate — but it must be called
+        *continuously* while the source is alive, including while it is
+        commanding zero. The command task consumes the latest value; if no
+        fresh command arrives within ``JellyConfig.command_timeout`` the
+        source is treated as dead: driving wheels are stopped once and then
+        left to their CAN timeout, parked wheels keep their hold (see
+        :class:`Jelly`). Re-sending an old command from a source that has
+        actually lost its input is a bug: that is what keeps the wheels'
+        loss-of-comms alarm from tripping.
         """
 
         def clamp(v: float, *, name: str) -> float:
@@ -635,8 +721,16 @@ class Jelly:
                        base doesn't creep during the return to rest.
 
         Thread-safe (only latches the target); staleness is handled by the
-        command task, so a dead frame stream times out to a full stop.
+        command task, so a dead frame stream times out to a full stop. Only a
+        *new* frame counts as a live source: call this from the server's
+        on-frame callback, once per received frame. The same frame object
+        handed over again (a poller re-reading the latest frame after the
+        headset went quiet) is ignored rather than refreshing the deadline —
+        that would be a stale command dressed up as a fresh one.
         """
+        if frame is self._last_vr_frame:
+            return
+        self._last_vr_frame = frame
         if resetting or frame.reset:
             self.set_command(0.0, 0.0, 0.0, STOP)
             return
@@ -712,6 +806,8 @@ class Jelly:
                 self.parked = bool(flags & 1)
                 self.park_failed = bool(flags & 2)
                 self.send_failed = bool(flags & 4)
+                self.linked = bool(flags & 8)
+                self.wheel_fault = bool(flags & 16)
                 if yaw_log is not None:
                     sample = self._yaw_rate
                     rate = sample[0] if sample is not None else None
@@ -743,17 +839,44 @@ class Jelly:
             raise
 
     async def _bridge_loop(self) -> None:
+        """Forward the latched target to the Rust core and drive the lift.
+
+        The live-source requirement applies to *motion*. While the latched
+        command is fresh the lift streams it (JOG while held, STOP while
+        idle). When the command goes stale the lift is suspended — one STOP,
+        then nothing on CAN — so the jelly_legs jog deadman, not a host
+        keepalive, decides what the legs do; the Rust core meanwhile ramps the
+        wheels to a stop and parks them from the target's own age. When a
+        fresh command arrives the lift stream resumes.
+        """
         interval = 1.0 / self._config.frequency
         warned_silent = False
         started = time.monotonic()
+        linked = False  # the source was fresh on the previous cycle
         try:
             while True:
                 now = time.monotonic()
                 vx, vy, wz, lift_dir = self._target
                 age = max(0.0, now - self._target_time)
-                if age > self._config.command_timeout:
+                fresh = age <= self._config.command_timeout
+                if not fresh:
                     lift_dir = STOP
-                if self._lift is not None:
+                    if linked:
+                        # The source died (teleop thread gone, headset stream
+                        # dropped, wedged poller): release the lift once and go
+                        # quiet rather than re-sending a stale STOP forever.
+                        linked = False
+                        _logger.info(
+                            "Jelly: command source silent for %.0f ms — "
+                            "stopping the lift and going quiet on its bus",
+                            self._config.command_timeout * 1e3,
+                        )
+                        if self._lift is not None:
+                            self._lift.suspend()
+                elif not linked:
+                    linked = True
+                    _logger.info("Jelly: command source live — resuming control")
+                if fresh and self._lift is not None:
                     self._lift.command(lift_dir)
                 self.lift_dir = lift_dir if self._lift is not None else STOP
 

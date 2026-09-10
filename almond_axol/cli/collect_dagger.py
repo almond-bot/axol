@@ -250,7 +250,7 @@ def main(argv: list[str]) -> None:
     cfg = parse(DaggerConfig, argv)
     # force=True: importing lerobot (at module load) installs a root handler
     # and leaves the root level at WARNING, which would otherwise make this a
-    # no-op and silently drop every log_say() status line.
+    # no-op and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
     import sys
@@ -592,7 +592,6 @@ class _DaggerControlLoop(threading.Thread):
 
     def run(self) -> None:
         from lerobot.teleoperators.utils import TeleopEvents
-        from lerobot.utils.utils import log_say
 
         policy_period = 1.0 / float(self.fps)
         teleop_period = 1.0 / float(self.teleop_hz)
@@ -614,7 +613,7 @@ class _DaggerControlLoop(threading.Thread):
                 capture_error = self.recorder.poll_capture_error()
                 if capture_error is not None:
                     self.capture_error = str(capture_error)
-                    log_say(
+                    _logger.info(
                         f"Camera capture failed; ending and discarding this "
                         f"episode: {capture_error}"
                     )
@@ -644,7 +643,7 @@ class _DaggerControlLoop(threading.Thread):
                         # correction resumes at.
                         rows = self.recorder.resume_episode()
                         self.open_span_start = rows / float(self.fps)
-                        log_say("Operator took over — recording the correction.")
+                        _logger.info("Operator took over — recording the correction.")
                 else:
                     if self.state == _STATE_TELEOP:
                         self.state = _STATE_POLICY
@@ -667,11 +666,11 @@ class _DaggerControlLoop(threading.Thread):
                         # jump away from where the operator left the arms.
                         if self.limiter is not None:
                             self.limiter.seed(*self.robot.positions)
-                        log_say("Intervention over — policy resumes.")
+                        _logger.info("Intervention over — policy resumes.")
                     elif self.state == _STATE_POLICY and frozen_press:
                         self.state = _STATE_FROZEN
                         self.recorder.pause_episode()
-                        log_say(
+                        _logger.info(
                             "Frozen — recording paused. Squeeze both grips "
                             "to take over."
                         )
@@ -806,7 +805,6 @@ def _idle_teleop_until_record(
     the operator quit instead: the panel's Stop or a quit at the gate. A
     KeyboardInterrupt propagates to the supervisor's handler (quit).
     """
-    from lerobot.utils.utils import log_say
 
     period = 1.0 / float(teleop_hz)
     teleop_used = False
@@ -828,7 +826,7 @@ def _idle_teleop_until_record(
             # as-is, so the pre-episode re-home still covers the arms.
             teleop.set_intervention_allowed(False)
             teleop.force_disengage()
-            log_say("Returning to rest pose.")
+            _logger.info("Returning to rest pose.")
             if return_to_rest():
                 teleop_used = False  # the arms are at rest again
             teleop.set_intervention_allowed(True)
@@ -1024,7 +1022,6 @@ def _run(
     import socket
 
     from lerobot.utils.constants import HF_LEROBOT_HOME
-    from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun
 
     from ..lerobot.robot.robot_axol import AxolRobot
@@ -1081,7 +1078,7 @@ def _run(
                 "existing path is not an empty directory. Choose a new --root, "
                 "or inspect and move/delete the existing data yourself."
             ) from exc
-        log_say(f"Removed empty dataset directory at {dataset_root}.")
+        _logger.info(f"Removed empty dataset directory at {dataset_root}.")
     if is_complete:
         _require_dagger_resume_schema(dataset_root)
 
@@ -1219,7 +1216,7 @@ def _run(
         # JIT. It owns collision-aware homing between episodes.
         reset_controller = IKResetController()
         reset_controller.start()
-        log_say("Started IK reset worker (collision-aware return-to-rest).")
+        _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
         # The out-of-process video relay owns the cameras and streams the
         # headset view. Its raw branch is forced onto pyshm so both this policy
@@ -1363,7 +1360,7 @@ def _run(
         panel names the contact instead of still reading "reset the scene /
         Start episode" while the arms hang limp.
         """
-        log_say(
+        _logger.info(
             "Contact during return to rest. Free the arms, then press the "
             "VR reset button (or continue in the panel) to retry."
         )
@@ -1387,7 +1384,7 @@ def _run(
 
     session_error: BaseException | None = None
     try:
-        log_say("Connecting robot...")
+        _logger.info("Connecting robot...")
         robot.connect()
 
         # Connect the VR teleop stack: the position source lets takeovers
@@ -1395,7 +1392,7 @@ def _run(
         # positions seed the teleop filters (mirrors collect-data).
         teleop.set_position_source(lambda: robot.positions)
         pos_l, pos_r = robot.positions
-        log_say("Connecting VR teleop (IK worker JIT may take ~20s)...")
+        _logger.info("Connecting VR teleop (IK worker JIT may take ~20s)...")
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
 
         # Stream the cameras to the headset via the relay's out-of-process
@@ -1408,7 +1405,7 @@ def _run(
         # on NVENC from its own cores — nothing dataset-related runs in
         # this process. Mirrors collect-data.
         if is_complete:
-            log_say(f"Resuming existing dataset at {dataset_root}.")
+            _logger.info(f"Resuming existing dataset at {dataset_root}.")
         recorder = DatasetRecorderProcess(
             raw_cond=relay.raw_cond,
             raw_meta=relay.raw_meta,
@@ -1432,7 +1429,7 @@ def _run(
         )
         episode_idx = recorder.episode_count()
 
-        log_say("Returning to rest pose.")
+        _logger.info("Returning to rest pose.")
         if not _return_to_rest_guarded(_gate_retry):
             return
 
@@ -1473,7 +1470,7 @@ def _run(
             if idle_teleop_used:
                 # The operator moved the arms during the scene reset; the
                 # policy expects to start from the rest pose.
-                log_say("Returning to rest pose before the policy starts.")
+                _logger.info("Returning to rest pose before the policy starts.")
                 if not _return_to_rest_guarded(_gate_retry):
                     break
 
@@ -1547,7 +1544,7 @@ def _run(
                 """Switch the live policy instruction to subtask ``idx`` (1-based)."""
                 text = subtasks[idx - 1]
                 policy.set_instruction(text)
-                log_say(f"Subtask {idx}: {text}")
+                _logger.info(f"Subtask {idx}: {text}")
 
             print(
                 "  Grips: one=freeze (pause recording), both=take over, "
@@ -1595,7 +1592,7 @@ def _run(
                     if control_thread.capture_error is not None:
                         break
                     if control_thread.fatal_error is not None:
-                        log_say(
+                        _logger.info(
                             f"Fatal error in DAgger control loop: "
                             f"{control_thread.fatal_error!r}. Aborting run "
                             "without saving the current episode."
@@ -1709,17 +1706,17 @@ def _run(
                 # retrying the unchanged dataset episode index.
                 recorder.cancel_episode()
                 teleop.send_feedback_state(VRState.SAVING)
-                log_say(
+                _logger.info(
                     f"Episode discarded because camera capture failed: {capture_error}"
                 )
-                log_say("Returning to rest pose.")
+                _logger.info("Returning to rest pose.")
                 if not _return_to_rest_guarded(_gate_retry):
                     break
                 continue
 
             choice = control.poll_choice() or control_thread.vr_choice
             if timed_out and choice is None:
-                log_say(
+                _logger.info(
                     f"Episode time cap ({episode_time_s}s) reached; saving the episode."
                 )
                 choice = "s"
@@ -1729,7 +1726,7 @@ def _run(
                 break
 
             teleop.send_feedback_state(VRState.SAVING)
-            log_say("Returning to rest pose.")
+            _logger.info("Returning to rest pose.")
             # An aborted home (stop / declined retry) must not discard a
             # fully-recorded episode: fall through to the save/discard
             # decision either way; the session loop then winds down on the
@@ -1737,7 +1734,7 @@ def _run(
             _return_to_rest_guarded(_gate_retry)
 
             if choice == "r":
-                log_say("Re-recording episode.")
+                _logger.info("Re-recording episode.")
                 recorder.cancel_episode()
                 continue
 
@@ -1745,10 +1742,10 @@ def _run(
                 # Nothing reached the dataset (e.g. every observation
                 # failed, or the episode was ended instantly) —
                 # save_episode would raise on the empty buffer.
-                log_say("No frames were captured this episode; discarding.")
+                _logger.info("No frames were captured this episode; discarding.")
                 recorder.cancel_episode()
                 continue
-            log_say("Saving episode…")
+            _logger.info("Saving episode…")
             try:
                 recorder.save_episode()
             except RecorderDatasetSaveError:
@@ -1759,13 +1756,13 @@ def _run(
                 # An encoder/capture integrity rejection is pre-commit and
                 # already cleared its episode buffer. Other recorder RuntimeErrors
                 # are IPC/lifecycle failures and must stop the session.
-                log_say(f"Episode NOT saved: {exc}")
+                _logger.info(f"Episode NOT saved: {exc}")
                 continue
             restore_dataset_ownership(dataset_root)
             episode_idx += 1
             episodes_recorded += 1
             control.note_saved()
-            log_say(
+            _logger.info(
                 f"Saved episode {episodes_recorded} "
                 f"({control_thread.interventions} intervention(s))."
             )
@@ -1786,7 +1783,7 @@ def _run(
         except (ValueError, OSError):
             pass
 
-        log_say("Stopping.")
+        _logger.info("Stopping.")
         cleanup_failures: list[tuple[str, BaseException]] = []
 
         if not control_worker_stopped:

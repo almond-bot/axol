@@ -72,7 +72,7 @@ def main(argv: list[str]) -> None:
         cfg = parse(TeleopCmdConfig, normalized_argv, fallback_overlay=fallback)
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
-    # and silently drop log_say() / INFO status lines.
+    # and silently drop the INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
     # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled

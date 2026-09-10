@@ -39,15 +39,38 @@ Everything here is Linux-oriented but degrades to "no kernel state" elsewhere.
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 import sys
 import threading
 import time
 import traceback
+from collections.abc import Iterator
 from typing import Callable
 
 _logger = logging.getLogger(__name__)
+
+# Depth of deliberate ``gc.collect()`` calls (GcHold, freeze_startup_heap) on
+# the current thread. gc.callbacks run synchronously on the collecting thread,
+# so the pause logger can tell an intended sweep — which already logs its own
+# duration — from an automatic collection that landed on a hot path.
+_deliberate = threading.local()
+
+
+@contextlib.contextmanager
+def _deliberate_sweep() -> Iterator[None]:
+    depth = getattr(_deliberate, "depth", 0)
+    _deliberate.depth = depth + 1
+    try:
+        yield
+    finally:
+        _deliberate.depth = depth
+
+
+def _in_deliberate_sweep() -> bool:
+    return getattr(_deliberate, "depth", 0) > 0
+
 
 # Innermost frames kept when logging a stalled thread's stack.
 _STACK_FRAMES = 14
@@ -320,7 +343,11 @@ def install_gc_pause_logger(
             return
         pause_ms = (time.perf_counter() - t0) * 1e3
         if pause_ms >= min_ms:
-            log.warning(
+            # An intended sweep (GcHold between takes, the startup freeze)
+            # reports its own duration at INFO; only an *automatic* pass is
+            # the stop-the-world nobody asked for, so only that one warns.
+            log.log(
+                logging.DEBUG if _in_deliberate_sweep() else logging.WARNING,
                 "gc: generation-%d collection paused every thread for %.0f ms "
                 "(%d objects collected)",
                 info.get("generation", -1),
@@ -374,7 +401,8 @@ class GcHold:
         self._was_enabled = gc.isenabled()
         t0 = time.perf_counter()
         if collect:
-            gc.collect()
+            with _deliberate_sweep():
+                gc.collect()
         gc.disable()
         self._held = True
         self._logger.debug(
@@ -392,7 +420,8 @@ class GcHold:
             gc.enable()
         t0 = time.perf_counter()
         try:
-            collected = gc.collect()
+            with _deliberate_sweep():
+                collected = gc.collect()
         finally:
             elapsed_ms = (time.perf_counter() - t0) * 1e3
         self._logger.info(
@@ -413,7 +442,8 @@ def freeze_startup_heap() -> int:
     is an operation inside a longer-lived process (``axol serve``) so the host
     process's collector sees its heap again afterwards.
     """
-    gc.collect()
+    with _deliberate_sweep():
+        gc.collect()
     gc.freeze()
     return gc.get_freeze_count()
 

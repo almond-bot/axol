@@ -47,6 +47,7 @@ class _MotorFeedback:
 
 
 _DM_UINT32_REGS = {7, 8, 9, 10, 13, 14, 15, 16, 35, 36}
+_DM_REG_TIMEOUT = 9  # loss-of-comms alarm, 50 µs ticks (uint32); 0 disables
 _DM_REG_CTRL_MODE = 10  # control mode: 1=MIT, 2=POS_VEL, 3=VEL, 4=FORCE_POS
 _DM_REG_PMAX = 21
 _DM_REG_VMAX = 22
@@ -480,6 +481,19 @@ class DamiaoMotor(MotorDriver):
     async def get_error_code(self) -> MotorStatus:
         feedback = await self._request_feedback()
         return _DM_STATUS_MAP.get(feedback.status, MotorStatus.UNKNOWN)
+
+    @property
+    def last_status(self) -> MotorStatus | None:
+        """Status from the most recent feedback frame, without bus traffic.
+
+        Damiao motors echo a feedback frame for every command frame, so a
+        streaming controller sees a fault (e.g. :attr:`MotorStatus.LOST_COMM`
+        after the CAN timeout tripped) here within one command cycle. None
+        until any feedback has been received.
+        """
+        if self._feedback is None:
+            return None
+        return _DM_STATUS_MAP.get(self._feedback.status, MotorStatus.UNKNOWN)
 
     async def set_position_velocity(self, position: float, max_speed: float) -> None:
         await self._send_cmd(
