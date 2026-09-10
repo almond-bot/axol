@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react"
+import { normalizeServerPages, serverPageUrl, type ServerPage } from "./server-pages.ts"
 
 export type FieldType = "boolean" | "number" | "select" | "text" | "vector"
 
@@ -181,10 +182,24 @@ export interface ServerInfo {
   commit?: string | null
   /** Tag-pinned git tool install (true) vs dev checkout (false). */
   releaseInstall?: boolean
+  /**
+   * Pages the backend serves itself and wants linked from the panel's nav
+   * (registered by a package built on almond-axol). Normalized on fetch; see
+   * lib/server-pages.ts for why these need the server base, not a relative link.
+   */
+  pages: ServerPage[]
 }
 
 export async function fetchInfo(): Promise<ServerInfo> {
-  return json(await fetch(apiUrl("/api/info")))
+  const info = await json<Omit<ServerInfo, "pages"> & { pages?: unknown }>(
+    await fetch(apiUrl("/api/info"))
+  )
+  return { ...info, pages: normalizeServerPages(info.pages) }
+}
+
+/** Href for a backend-served page (see lib/server-pages.ts). */
+export function serverPageHref(path: string): string {
+  return serverPageUrl(apiBase, path)
 }
 
 // ---------------------------------------------------------------------------

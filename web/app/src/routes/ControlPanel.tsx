@@ -1595,7 +1595,7 @@ export default function ControlPanel() {
 
   return (
     <div className="min-h-screen">
-      <SiteNav current="control" />
+      <SiteNav current="control" pages={hostInfo?.pages} />
       <main className="safe-x mx-auto flex max-w-5xl flex-col gap-6 py-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:py-8">
         {update?.updateAvailable && (
           <UpdateBanner

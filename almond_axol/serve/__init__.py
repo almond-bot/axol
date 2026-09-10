@@ -26,9 +26,29 @@ built-ins, with no changes needed here or in ``web/``::
 
 See :class:`~almond_axol.serve.commands.CommandDef` for the full set of
 declarations and the entrypoint protocol.
+
+A package can also extend the app itself — extra ``/api/...`` routes or a
+page it serves — with :func:`register_app_extension`, whose callable runs
+inside ``create_app`` ahead of the web bundle's SPA catch-all, and advertise
+such a page to the panel's navigation with :func:`register_page` (reported
+by ``GET /api/info`` as ``pages``; see :mod:`almond_axol.serve.extensions`)::
+
+    from almond_axol.serve import PanelPage, register_app_extension, register_page
+
+    register_app_extension(lambda app: app.include_router(my_router))
+    register_page(PanelPage("My page", "/my-page"))
 """
 
 from .app import create_app
 from .commands import CommandDef, operation_ids, register
+from .extensions import PanelPage, register_app_extension, register_page
 
-__all__ = ["CommandDef", "create_app", "operation_ids", "register"]
+__all__ = [
+    "CommandDef",
+    "PanelPage",
+    "create_app",
+    "operation_ids",
+    "register",
+    "register_app_extension",
+    "register_page",
+]
