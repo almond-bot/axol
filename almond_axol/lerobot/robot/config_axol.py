@@ -34,13 +34,6 @@ class AxolRobotConfig(RobotConfig):
                           ``--robot_config.cameras "{overhead: {serial:
                           41234567}}"``).
         axol_config:      Per-joint gain config forwarded to the Axol hardware driver.
-        telemetry_hz:     Background telemetry polling rate in Hz. Set to ``0``
-                          (or below) to skip the poll loop entirely and rely on
-                          ``motion_control`` command replies to keep the
-                          position/torque cache fresh — matching ``axol teleop``.
-                          Only safe when a ``motion_control`` loop runs every
-                          step (e.g. ``collect-data``); otherwise the cache goes
-                          stale between commands.
         observe_torques:  Include joint torques in observations. Default False.
         observe_cartesian: Use Cartesian space for both observations and
                           actions: each arm's end-effector is a 6-axis pose
@@ -56,7 +49,6 @@ class AxolRobotConfig(RobotConfig):
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     axol_config: AxolConfig = field(default_factory=AxolConfig)
-    telemetry_hz: float = 120.0
     observe_torques: bool = False
     observe_cartesian: bool = False
     left_channel: str = CAN_LEFT

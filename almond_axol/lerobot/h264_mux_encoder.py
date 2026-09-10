@@ -25,42 +25,38 @@ Alignment contract
 LeRobot decodes dataset video **by timestamp** with a razor-thin tolerance
 (``tolerance_s`` defaults to ``1e-4`` s), and ``add_frame`` stamps row *i* at
 ``timestamp = i / fps``. So the mp4 must be perfectly constant-fps: frame *i* at
-exactly ``i / fps``, with at least as many frames as dataset rows. Shared memory
-does not carry buffer PTS across the ``shmsink``/``shmsrc`` boundary, so this
-encoder assigns the PTS itself: the *k*-th access unit fed for a camera is muxed
-at ``pts = k / fps`` (``dts`` and ``duration`` to match). The caller
-(:func:`~almond_axol.recording.record_proc.run_encoded_capture_loop`) guarantees
-exactly one fresh ``feed_frame`` per camera per dataset row and aborts the take
-if any camera stalls, so frame-count == row-count without replaying an H.264
-packet. The mp4 this muxer writes carries small per-frame PTS rounding (its
-timescale cannot represent ``1/fps`` exactly); the concat step re-stamps every
-frame onto an exact constant-fps grid so LeRobot's razor-thin per-row timestamp
-lookup holds (see
+exactly ``i / fps``, with exactly as many frames as dataset rows. GDP preserves
+the physical capture PTS across ``shmsink``/``shmsrc`` for state association;
+this muxer independently assigns the dataset timeline: the *k*-th access unit is
+muxed at ``pts = k / fps`` (``dts`` and ``duration`` match). The caller
+(:func:`~almond_axol.recording.record_proc.run_encoded_capture_loop`) ordinarily
+requires one fresh AU per camera per row. It may explicitly repeat an all-intra
+AU for one bounded one/two-frame source hole, while retaining the future AU, so
+frame-count and subsequent exposure/row alignment remain exact. The concat step
+reasserts that grid across episodes (see
 :func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`).
 
 Because the frames arrive pre-encoded, the first muxed AU of an episode must be
-an IDR or the mp4 is undecodable from frame 0; the relay forces a keyframe when
-it opens the dataset branch (see :meth:`ZedGstCamera.set_raw_enabled`) and the
-:class:`~almond_axol.video.shm_frames.EncodedAuReader` drops any leading
-non-IDR AUs, so the first fed AU is always a keyframe.
+an IDR or the mp4 is undecodable from frame 0. The relay's dataset stream is
+all-intra: every AU is an actual type-5 IDR, which removes hidden Jetson encoder
+GOP phase from episode boundaries and permits timestamp-based row-zero
+alignment. :class:`~almond_axol.video.shm_frames.EncodedAuReader` verifies that
+contract before delivering any AU.
 
 Image stats
 -----------
 LeRobot folds a sampled subset of frames into running image-normalization stats.
-Here the recorder no longer has raw frames, so each camera decodes its **IDR
-access units as they are fed** on a per-camera background thread
-(:class:`_StatsWorker`): an IDR is self-contained (the relay muxes SPS/PPS into
-every keyframe), so a plain software decoder fed only keyframes (~4/s given the
-relay's IDR cadence) yields the same sampled subset the old post-finalize file
-decode produced, but the cost is amortized across the episode instead of being
-paid as a lump inside ``save_episode``. The worker folds decoded frames into the
-same ``RunningQuantileStats`` the raw path uses (batched updates — the per-call
-histogram build dominates otherwise); :meth:`_CameraH264Muxer.finish` just joins
-the worker and reads the result. If the worker produced nothing (deps missing,
-decode errors), finish falls back to decoding the finalized file's keyframes
-(:meth:`_CameraH264Muxer._compute_stats_from_file`); if that fails too the
-encoder still records correctly and returns ``None`` stats (recomputable
-offline).
+Here the recorder no longer has raw frames, so each camera samples its all-intra
+AUs at a fixed low rate and decodes those on a per-camera background thread
+(:class:`_StatsWorker`). Sampling is time-based rather than "every IDR" because
+every dataset frame is now an IDR; this preserves the old ~4 Hz stats workload
+instead of accidentally decoding four 60 Hz feeds in software. The worker folds
+decoded frames into the same ``RunningQuantileStats`` the raw path uses (batched
+updates — the per-call histogram build dominates otherwise);
+:meth:`_CameraH264Muxer.finish` just joins the worker and reads the result. If
+the worker produced nothing (deps missing, decode errors), finish falls back to
+sampling the finalized file; if that fails too the encoder still records
+correctly and returns ``None`` stats (recomputable offline).
 """
 
 from __future__ import annotations
@@ -84,11 +80,30 @@ _logger = logging.getLogger(__name__)
 # before giving up on that camera's mp4.
 _EOS_TIMEOUT_S = 30.0
 
+# Per-camera appsrc bound (bytes): how much encoded video may queue ahead of
+# the mux/filesink thread before push-buffer blocks the capture thread. This
+# is the recorder's entire tolerance for a storage stall. The all-intra
+# dataset branch runs ~21 Mbit/s per camera at SVGA@60 (peak ~31), so the
+# former 8 MiB held only ~2-3 s — the same window as the encoded-AU reader's
+# 120-frame (2 s) backlog limit, which is why a multi-second write stall
+# surfaced as "encoded-AU backlog exceeded" with the control loop healthy.
+# 64 MiB rides out ~20 s of stalled writes (eMMC/SD garbage collection,
+# dirty-page throttling behind a previous episode's writeback) for at most
+# 256 MiB across four cameras; a genuinely wedged pipeline still stops the
+# episode, just later.
+_APPSRC_MAX_BYTES = 64 * 1024 * 1024
+# Queue depth at which feed() starts warning that storage is falling behind
+# (one line per _APPSRC_PRESSURE_LOG_PERIOD_S per camera). In steady state the
+# queue holds at most a frame or two (~50 KB), so this only fires on a stall.
+_APPSRC_PRESSURE_WARN_BYTES = 4 * 1024 * 1024
+_APPSRC_PRESSURE_LOG_PERIOD_S = 2.0
 # ``appsrc`` must block to preserve every dependency-bearing AU, but its action
-# signal therefore cannot run on the capture thread. A bounded feeder absorbs
-# normal mux jitter; persistent downstream backpressure fills it and turns into
-# a capture error instead of wedging robot/dataset shutdown forever.
-_FEED_QUEUE_MAX = 60
+# signal therefore cannot run on the capture thread. A bounded feeder thread
+# absorbs normal mux jitter; once appsrc itself is full (_APPSRC_MAX_BYTES,
+# ~20 s of stalled writes) the feeder blocks and this queue starts filling —
+# another ~5 s at 60 fps — after which the stall turns into a capture error
+# instead of wedging robot/dataset shutdown forever.
+_FEED_QUEUE_MAX = 300
 _FEED_DRAIN_TIMEOUT_S = 10.0
 _FEED_ABORT_TIMEOUT_S = 2.0
 
@@ -120,6 +135,9 @@ _STATS_QUEUE_MAX = 64
 # frames: per-update overhead (histogram build) dominates single-frame updates,
 # while batching everything to the end would move the whole cost into finish().
 _STATS_BATCH_FRAMES = 48
+# Match the former quarter-second GOP's image-stats sampling density without
+# coupling CPU work to keyframe frequency. Dataset AUs are now all keyframes.
+_STATS_SAMPLE_HZ = 4
 
 
 def _au_is_idr(au: bytes) -> bool:
@@ -144,10 +162,10 @@ def _au_is_idr(au: bytes) -> bool:
 class _StatsWorker:
     """Decode a camera's IDR AUs on a background thread and fold image stats.
 
-    ``feed`` is called from the capture path with keyframe AUs only; the actual
+    ``feed`` is called from the capture path with sampled IDR AUs only; the actual
     decode/convert/downsample/update runs on this worker's thread (PyAV and
     numpy release the GIL for the heavy parts), so the per-row cost on the
-    capture loop is one non-blocking queue put every IDR interval. ``result``
+    capture loop is one non-blocking queue put about four times a second. ``result``
     joins the worker and returns the LeRobot-shaped stats dict, or ``None`` if
     nothing was decoded (caller falls back to the post-finalize file decode).
     """
@@ -183,6 +201,12 @@ class _StatsWorker:
                 auto_downsample_height_width,
             )
 
+            # Same reason as _compute_stats_from_file: the yuv420p -> rgb24
+            # conversion has no SIMD path in this ffmpeg build and libswscale
+            # logs a WARNING per scaler context. Left unsilenced here, every
+            # sampled IDR during a take printed one (dozens per second across
+            # four cameras), burying the recorder's own diagnostics.
+            av.logging.set_level(av.logging.ERROR)
             codec = av.CodecContext.create("h264", "r")
             self._stats = RunningQuantileStats()
         except Exception as exc:  # noqa: BLE001 - deps missing -> no live stats
@@ -289,7 +313,10 @@ class _CameraH264Muxer:
         # compounded across the concat, breaks LeRobot's 1e-4 s per-row lookup.
         self._mux_timescale = fps * 1000
         self._count = 0
+        self._stats_stride = max(1, round(fps / _STATS_SAMPLE_HZ))
         self._error: str | None = None
+        self._peak_queued = 0
+        self._last_pressure_log = 0.0
         self._feed_error: str | None = None
         self._feed_error_lock = threading.Lock()
         self._feed_queue: queue.Queue[tuple[int, bytes] | None] = queue.Queue(
@@ -375,22 +402,66 @@ class _CameraH264Muxer:
         )
         try:
             src = pipeline.get_by_name("src")
+            # The framerate is load-bearing: h264parse re-stamps each frame's
+            # duration from the caps framerate (the encoder's SPS carries no
+            # timing, so without it the duration we set on the appsrc buffer is
+            # dropped). mp4mux derives a sample's duration from the *next*
+            # buffer's PTS and, for the final sample at EOS, from the buffer's
+            # duration — so without a framerate the last sample is written with
+            # duration 0, the track/edit list ends one frame early, and ffmpeg
+            # (honouring the edit list) never yields that frame: a file with
+            # ``n`` advertised samples that demuxes to ``n - 1``, which
+            # ``_validate_finalized_file`` rightly rejects.
             src.set_property(
                 "caps",
                 Gst.Caps.from_string(
-                    "video/x-h264,stream-format=byte-stream,alignment=au"
+                    "video/x-h264,stream-format=byte-stream,alignment=au,"
+                    f"framerate={self._fps}/1"
                 ),
             )
-            # Bound appsrc so a wedged pipeline surfaces as backpressure, not
-            # unbounded memory. push-buffer runs only on our bounded feeder
-            # thread; the capture thread never enters this blocking signal.
-            src.set_property("max-bytes", 8 * 1024 * 1024)
+            # Bound appsrc so a wedged pipeline surfaces as back-pressure, not
+            # unbounded memory; block so we never silently drop a
+            # (dependency-bearing) encoded frame. The bound is most of the
+            # recorder's tolerance for a storage stall: filesink writes through
+            # the page cache, and when the device falls behind (eMMC/SD garbage
+            # collection, dirty-page throttling) the streaming thread parks in
+            # write(), this queue fills, and push-buffer blocks — on our bounded
+            # feeder thread, never on the capture thread (see _FEED_QUEUE_MAX).
+            src.set_property("max-bytes", _APPSRC_MAX_BYTES)
             src.set_property("block", True)
             return pipeline, src
         except BaseException:
             with contextlib.suppress(Exception):
                 pipeline.set_state(Gst.State.NULL)
             raise
+
+    def queued_bytes(self) -> int:
+        """Bytes parked in appsrc waiting for the mux/filesink thread."""
+        if self._src is None:
+            return 0
+        return int(self._src.get_property("current-level-bytes"))
+
+    def _note_write_pressure(self) -> None:
+        """Warn (rate-limited) when the mux queue shows the disk falling behind."""
+        level = self.queued_bytes()
+        if level > self._peak_queued:
+            self._peak_queued = level
+        if level < _APPSRC_PRESSURE_WARN_BYTES:
+            return
+        now = time.perf_counter()
+        if now - self._last_pressure_log < _APPSRC_PRESSURE_LOG_PERIOD_S:
+            return
+        self._last_pressure_log = now
+        _logger.warning(
+            "dataset mux %s: %.1f MiB of encoded video queued ahead of filesink "
+            "(%.0f%% of the %d MiB bound) — storage is not keeping up with the "
+            "write; at the bound the feeder blocks and the episode aborts once "
+            "its queue fills",
+            self.video_path.name,
+            level / 2**20,
+            100.0 * level / _APPSRC_MAX_BYTES,
+            _APPSRC_MAX_BYTES // 2**20,
+        )
 
     def feed(self, au: bytes) -> None:
         """Queue one fresh AU without entering blocking GStreamer code."""
@@ -400,8 +471,9 @@ class _CameraH264Muxer:
             raise RuntimeError(
                 f"H264 muxer feeder for {self.video_path.name} is not running"
             )
+        frame_index = self._count
         try:
-            self._feed_queue.put_nowait((self._count, au))
+            self._feed_queue.put_nowait((frame_index, au))
         except queue.Full as exc:
             message = (
                 f"H264 muxer feeder queue filled for {self.video_path.name}; "
@@ -410,7 +482,12 @@ class _CameraH264Muxer:
             self._set_feed_error(message)
             raise RuntimeError(message) from exc
         self._count += 1
-        if self._stats_worker is not None and _au_is_idr(au):
+        self._note_write_pressure()
+        if (
+            self._stats_worker is not None
+            and frame_index % self._stats_stride == 0
+            and _au_is_idr(au)
+        ):
             self._stats_worker.feed(au)
 
     def _set_feed_error(self, message: str) -> None:
@@ -470,10 +547,10 @@ class _CameraH264Muxer:
         """Decode the finalized mp4's keyframes for image-normalization stats.
 
         Runs once per episode after the file is written (recording paused between
-        episodes), so it never competes with the live capture loop. Keyframes
-        only (``skip_frame=NONKEY``): the relay forces an IDR every ~0.25 s, so
-        this still samples ~4 frames/s while the decoder skips every P-frame —
-        the bulk of a full decode's cost. All sampled frames are folded in one
+        episodes), so it never competes with the live capture loop. Every packet
+        is independently decodable, so demux all packets but send only the same
+        ~4 Hz stride used by the live worker into the decoder. All sampled frames
+        are folded in one
         batched ``RunningQuantileStats.update`` (as stock LeRobot's
         ``sample_images`` path does; the per-call histogram build dominates when
         updating frame by frame), using the same downsample + (H*W, C) layout so
@@ -509,13 +586,24 @@ class _CameraH264Muxer:
             with av.open(str(self.video_path)) as container:
                 stream = container.streams.video[0]
                 stream.thread_type = "AUTO"
-                stream.codec_context.skip_frame = "NONKEY"
-                for frame in container.decode(stream):
-                    rgb = frame.to_ndarray(format="rgb24")  # H, W, C
-                    ds = auto_downsample_height_width(
-                        np.ascontiguousarray(rgb).transpose(2, 0, 1)  # -> C, H, W
-                    )
-                    batches.append(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))
+                frame_index = 0
+                for packet in container.demux(stream):
+                    if packet.dts is None:
+                        continue
+                    sample = frame_index % self._stats_stride == 0
+                    frame_index += 1
+                    if not sample:
+                        continue
+                    if not packet.is_keyframe:
+                        raise RuntimeError(
+                            "all-intra dataset contains a predictive packet"
+                        )
+                    for frame in packet.decode():
+                        rgb = frame.to_ndarray(format="rgb24")  # H, W, C
+                        ds = auto_downsample_height_width(
+                            np.ascontiguousarray(rgb).transpose(2, 0, 1)  # -> C, H, W
+                        )
+                        batches.append(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))
         except Exception as exc:  # noqa: BLE001 - never fail the save over stats
             _logger.warning(
                 "post-finalize stats decode failed for %s: %s",
@@ -528,6 +616,37 @@ class _CameraH264Muxer:
         stats = RunningQuantileStats()
         stats.update(np.concatenate(batches, axis=0))
         return stats.get_statistics()
+
+    def _validate_finalized_file(self) -> None:
+        """Require one muxed packet for every AU accepted by ``appsrc``.
+
+        This runs during ``prepare_finish_episode``, before LeRobot commits
+        parquet rows.  EOS alone only proves that mp4mux wrote a footer; a
+        short sample table would still make every later row/video timestamp
+        association dishonest.
+        """
+        import av
+
+        with av.open(str(self.video_path)) as container:
+            streams = [stream for stream in container.streams if stream.type == "video"]
+            if len(streams) != 1:
+                raise RuntimeError(
+                    f"{self.video_path.name} contains {len(streams)} video streams; "
+                    "expected exactly one"
+                )
+            stream = streams[0]
+            advertised = int(stream.frames or 0)
+            packets = sum(
+                1
+                for packet in container.demux(stream)
+                if packet.pts is not None and packet.dts is not None
+            )
+        if packets != self._count or (advertised and advertised != self._count):
+            raise RuntimeError(
+                f"{self.video_path.name} finalized with {packets} packets "
+                f"({advertised} advertised) after accepting {self._count} access "
+                "units; refusing to commit mismatched video/state rows"
+            )
 
     def finish(self) -> tuple[Path, dict | None]:
         """EOS the pipeline (flush the moov), then return the path + stats.
@@ -555,6 +674,12 @@ class _CameraH264Muxer:
                 f"H264 muxer for {self.video_path.name} failed to finalize: "
                 f"{self._error}"
             )
+        try:
+            self._validate_finalized_file()
+        except Exception:
+            if self._stats_worker is not None:
+                self._stats_worker.cancel()
+            raise
         t_eos = time.perf_counter()
         stats = None
         if self._stats_worker is not None:
@@ -563,12 +688,16 @@ class _CameraH264Muxer:
             # Live worker produced nothing (deps/decode failure): fall back to
             # decoding the finalized file's keyframes.
             stats = self._compute_stats_from_file()
+        # peak-queue is the storage-headroom number for the take: bytes that
+        # sat in appsrc waiting on filesink at the worst moment. Tens of KB
+        # is healthy; MBs mean the disk stalled (see _APPSRC_MAX_BYTES).
         _logger.info(
-            "H264 mux finalize %s: eos=%.2fs stats=%.2fs (%d frames)",
+            "H264 mux finalize %s: eos=%.2fs stats=%.2fs (%d frames, peak-queue %.1f MiB)",
             self.video_path.name,
             t_eos - t0,
             time.perf_counter() - t_eos,
             self._count,
+            self._peak_queued / 2**20,
         )
         return self.video_path, stats
 
@@ -732,6 +861,7 @@ class H264MuxStreamingEncoder:
         self.fps = fps
         self._want_stats = want_stats
         self._cams: dict[str, _CameraH264Muxer] = {}
+        self._prepared_results: dict[str, tuple[Path, dict | None]] | None = None
         self._episode_active = False
         self._closed = False
 
@@ -745,7 +875,7 @@ class H264MuxStreamingEncoder:
         # Axol declares no depth features, so it is always empty here.
         if depth_video_keys:
             raise ValueError("H264MuxStreamingEncoder does not support depth features")
-        if self._episode_active:
+        if self._episode_active or self._prepared_results is not None:
             self.cancel_episode()
         temp_dir = Path(temp_dir)
         self._cams = {}
@@ -785,17 +915,8 @@ class H264MuxStreamingEncoder:
             raise RuntimeError("No active episode. Call start_episode() first.")
         self._cams[video_key].feed(au)
 
-    def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
-        """Finalize every camera's mp4; raises if any muxer failed to finalize.
-
-        Cameras finalize in parallel (one thread each): the EOS flush waits on
-        gst's own threads and the stats decode releases the GIL inside
-        PyAV/numpy, so the wall time is one camera's finalize instead of the
-        sum over cameras — this is the bulk of ``save_episode`` latency.
-
-        A raise leaves ``_episode_active`` set; the next ``start_episode``
-        cancels (and cleans up) the half-finished episode first.
-        """
+    def _finalize_active_episode(self) -> dict[str, tuple[Path, dict | None]]:
+        """Finalize active muxers, leaving no fallible video work pending."""
         if not self._episode_active:
             raise RuntimeError("No active episode to finish.")
         with concurrent.futures.ThreadPoolExecutor(
@@ -810,39 +931,70 @@ class H264MuxStreamingEncoder:
         self._episode_active = False
         return results
 
-    def cancel_episode(self) -> None:
-        if not self._episode_active:
+    def prepare_finish_episode(self) -> None:
+        """Finalize video before LeRobot commits this episode's parquet rows.
+
+        LeRobot 0.6 writes row data before calling ``finish_episode``. Caching
+        the finalized mux results at the operator boundary makes its later call
+        infallible with respect to EOS/muxing, avoiding orphan parquet rows when
+        a camera pipeline cannot finalize.
+        """
+        if self._prepared_results is not None or not self._episode_active:
             return
+        self._prepared_results = self._finalize_active_episode()
+
+    def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
+        """Finalize every camera's mp4; raises if any muxer failed to finalize.
+
+        Cameras finalize in parallel (one thread each): the EOS flush waits on
+        gst's own threads and the stats decode releases the GIL inside
+        PyAV/numpy, so the wall time is one camera's finalize instead of the
+        sum over cameras — this is the bulk of ``save_episode`` latency.
+
+        A raise leaves ``_episode_active`` set; the next ``start_episode``
+        cancels (and cleans up) the half-finished episode first.
+        """
+        if self._prepared_results is not None:
+            results, self._prepared_results = self._prepared_results, None
+            return results
+        return self._finalize_active_episode()
+
+    def cancel_episode(self) -> None:
         first_error: BaseException | None = None
+
+        def record(error: BaseException, note: str) -> None:
+            nonlocal first_error
+            if first_error is None:
+                first_error = error
+            else:
+                first_error.add_note(f"{note}: {type(error).__name__}: {error}")
+
         remaining: dict[str, _CameraH264Muxer] = {}
         for video_key, cam in self._cams.items():
             camera_stopped = False
             try:
                 cam.cancel()
             except BaseException as error:
-                if first_error is None:
-                    first_error = error
-                else:
-                    first_error.add_note(
-                        "additional H264 camera cancellation failure: "
-                        f"{type(error).__name__}: {error}"
-                    )
+                record(error, "additional H264 camera cancellation failure")
             else:
                 camera_stopped = True
             if camera_stopped:
                 try:
                     _remove_h264_staging(cam.video_path)
                 except BaseException as error:
-                    if first_error is None:
-                        first_error = error
-                    else:
-                        first_error.add_note(
-                            "additional H264 staging cleanup failure: "
-                            f"{type(error).__name__}: {error}"
-                        )
+                    record(error, "additional H264 staging cleanup failure")
                 else:
                     continue
             remaining[video_key] = cam
+        # Videos already finalized by prepare_finish_episode() but never
+        # committed (LeRobot's parquet write failed) are staging too.
+        if self._prepared_results is not None:
+            for path, _stats in self._prepared_results.values():
+                try:
+                    _remove_h264_staging(path)
+                except BaseException as error:
+                    record(error, "additional H264 prepared-video cleanup failure")
+        self._prepared_results = None
         self._cams = remaining
         self._episode_active = bool(remaining)
         if first_error is not None:
@@ -851,6 +1003,6 @@ class H264MuxStreamingEncoder:
     def close(self) -> None:
         if self._closed:
             return
-        if self._episode_active:
+        if self._episode_active or self._prepared_results is not None:
             self.cancel_episode()
         self._closed = True

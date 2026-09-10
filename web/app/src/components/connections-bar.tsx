@@ -497,7 +497,7 @@ export function ConnectionsBar({
 
 /** Healthy = reachable on CAN and reporting no error status. */
 function motorHealthy(m: MotorHealth): boolean {
-  return m.reachable && (m.status === "OK" || m.status === "DISABLED" || m.status == null)
+  return m.reachable === true && (m.status === "OK" || m.status === "DISABLED" || m.status == null)
 }
 
 const jointName = (m: MotorHealth) => `${m.arm} ${m.joint.replace(/_/g, " ").toLowerCase()}`
@@ -508,8 +508,13 @@ const jointName = (m: MotorHealth) => `${m.arm} ${m.joint.replace(/_/g, " ").toL
  */
 export function MotorGrid({ robot }: { robot: RobotStatus }) {
   if (!robot.motors.length) return null
-  const color = (m: MotorHealth) => (motorHealthy(m) ? "ok" : "err")
+  // Unknown is its own square: while a task owns the bus nothing reads these
+  // motors, and painting the last-known state would keep showing a motor as
+  // healthy long after its power was cut.
+  const color = (m: MotorHealth) =>
+    m.reachable == null ? "unknown" : motorHealthy(m) ? "ok" : "err"
   const tip = (m: MotorHealth) => {
+    if (m.reachable == null) return `${jointName(m)}: unknown (a task owns the bus)`
     if (!m.reachable) return `${jointName(m)}: unreachable`
     const status = (m.status ?? "OK").replace(/_/g, " ").toLowerCase()
     const temp = m.temperature != null ? ` · ${Math.round(m.temperature)}°C` : ""
@@ -519,6 +524,7 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
   const SQUARE = {
     ok: "bg-emerald-400/80",
     err: "bg-red-400/70",
+    unknown: "bg-white/25",
   }
   return (
     <div className="flex items-center gap-2 whitespace-nowrap">

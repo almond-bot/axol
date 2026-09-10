@@ -1,5 +1,5 @@
 """
-Telescoping lift on the powered Axol Cart — jelly_legs CAN driver.
+Telescoping lift on Jelly — jelly_legs CAN driver.
 
 The lift legs are driven by our own PCB (firmware: ``jelly_legs`` in the
 circuits-py repo, ``designs/jelly_legs/firmware``), which replaced the
@@ -16,8 +16,14 @@ README is the spec):
   (~650 = full speed).
 - ``JOG`` (opcode 0x06) is hold-to-move with a **300 ms deadman**: it must
   be re-sent while held, and a dead host stops the legs. This maps exactly
-  onto :meth:`Lift.command`'s +1/0/-1 latch — the driver task re-sends the
-  jog every 100 ms while a direction is held.
+  onto :meth:`Lift.command`'s +1/0/-1 latch. While a command source is
+  attached (from the first :meth:`Lift.command` until :meth:`Lift.suspend`)
+  the driver task streams one motion frame every 50 ms — ``JOG`` while a
+  direction is held, ``STOP`` while idle — so the legs only ever move under
+  a live, continuously refreshed command, and a lost STOP frame is simply
+  re-sent on the next tick. When the source goes away the driver stops once
+  and then goes **silent**: no keepalive, so the firmware deadman is the
+  safety layer rather than a host re-sending a stale command.
 - The board stays silent until it has received at least one frame, and the
   CANable gs_usb adapters starve their own TX path while continuously
   receiving the 50 ms status broadcast. By default the driver therefore turns
@@ -66,8 +72,9 @@ _OP_JOG = 0x06
 # Default jog speed in encoder counts/s (650 ≈ the firmware's full speed).
 JOG_SPEED = 650
 
-# Jog re-send cadence; must stay well inside the firmware's 300 ms deadman.
-_JOG_RESEND_S = 0.1
+# Motion-frame stream cadence while a command source is attached (JOG or
+# STOP every tick); must stay well inside the firmware's 300 ms jog deadman.
+_JOG_RESEND_S = 0.05
 # Status poll cadence (broadcast is off — see the module docstring).
 _STATUS_POLL_S = 0.2
 # Retry receive-only mode after this many missing broadcast intervals.
@@ -144,7 +151,7 @@ def _decode_status(data: bytes) -> LiftStatus:
 class Lift:
     """Hold-to-move lift commands over the chest CAN bus.
 
-    Typical usage (from :class:`almond_axol.robot.cart.Cart`)::
+    Typical usage (from :class:`almond_axol.robot.jelly.Jelly`)::
 
         lift = Lift()
         await lift.start()
@@ -153,9 +160,13 @@ class Lift:
         await lift.close()
 
     :meth:`command` only latches the direction; the internal task owns all
-    bus traffic — jog re-sends inside the firmware deadman while a direction
-    is held, an immediate stop on release, and the status poll feeding
-    :attr:`status` / :attr:`height_percent`.
+    bus traffic — a continuous motion-frame stream (JOG while held, STOP
+    while idle) inside the firmware deadman for as long as a command source
+    is attached, an immediate stop on release, and the status poll feeding
+    :attr:`status` / :attr:`height_percent`. A source that dies calls
+    :meth:`suspend` (or simply stops calling :meth:`command` — Jelly does
+    the former on its behalf): one STOP goes out and the stream ends, so
+    the firmware deadman — not a host keepalive — decides what the legs do.
     """
 
     def __init__(
@@ -187,6 +198,11 @@ class Lift:
         # this flag for the bus-owning task when a held control is released.
         self._stop_requested = False
         self._one_shot_active = False
+        # True from the first command() until suspend(): the task streams a
+        # motion frame (JOG or idle STOP) every tick only while a live command
+        # source is attached. Off by default so a lift with no source yet (or
+        # one driven purely by one-shot HOME/SET_POS) stays quiet on the bus.
+        self._streaming = False
         # Last jog direction actually sent by the task; a release queues the
         # canonical STOP opcode (which cancels jog, HOME, and SET_POS alike).
         self._last_jog_sent = STOP
@@ -262,7 +278,7 @@ class Lift:
     async def start(self, *, request_status: bool = True) -> None:
         """Open the chest bus and start the jog/status task.
 
-        Brings the interface up if it isn't yet (mirroring the cart's wheel
+        Brings the interface up if it isn't yet (mirroring Jelly's wheel
         bus); a missing interface raises ``RuntimeError`` naming it. Set
         ``request_status=False`` only when a configured periodic stream will
         establish readiness without a solicited bootstrap response.
@@ -278,6 +294,7 @@ class Lift:
         self._last_jog_sent = STOP
         self._stop_requested = False
         self._one_shot_active = False
+        self._streaming = False
         if not iface_up(self._channel):
             bring_up_interfaces([self._channel])
         self._bus = CanBus(self._channel)
@@ -322,10 +339,12 @@ class Lift:
         task_error: BaseException | None = None
         external_cancel: asyncio.CancelledError | None = None
         if self._task is not None:
-            self._task.cancel()
+            task = self._task
+            self._task = None
+            task.cancel()
             try:
                 (result,) = await asyncio.gather(
-                    self._task,
+                    task,
                     return_exceptions=True,
                 )
             except asyncio.CancelledError as exc:
@@ -333,7 +352,7 @@ class Lift:
                 # this branch means the caller canceled close() itself.
                 external_cancel = exc
                 (result,) = await asyncio.gather(
-                    self._task,
+                    task,
                     return_exceptions=True,
                 )
                 if isinstance(result, BaseException) and not isinstance(
@@ -345,7 +364,6 @@ class Lift:
                     result, asyncio.CancelledError
                 ):
                     task_error = result
-            self._task = None
         if self._bus is not None:
             cleanup_errors: list[BaseException] = []
             try:
@@ -398,6 +416,7 @@ class Lift:
         self._direction = STOP
         self._stop_requested = False
         self._one_shot_active = False
+        self._streaming = False
         if external_cancel is not None:
             if task_error is not None:
                 external_cancel.add_note(
@@ -523,9 +542,13 @@ class Lift:
         """Latch the commanded direction. +1 = up, 0 = stop, -1 = down.
 
         Safe to call from any thread at any rate (a latch, like
-        ``Cart.set_command``); the driver task consumes the latest value.
-        Should the caller die mid-hold, the firmware's 300 ms jog deadman
-        stops the legs on its own.
+        ``Jelly.set_command``); the driver task consumes the latest value and
+        streams it to the board every tick (JOG while held, STOP while idle)
+        until :meth:`suspend`. Should the caller die mid-hold without
+        suspending, the firmware's 300 ms jog deadman stops the legs on its
+        own — but a caller that *knows* its source is gone should call
+        :meth:`suspend` so the idle STOP stream ends too and nothing on the
+        bus pretends the source is still alive.
         """
         try:
             value = operator.index(direction)
@@ -534,6 +557,7 @@ class Lift:
         if isinstance(direction, bool) or value not in (DOWN, STOP, UP):
             raise ValueError("direction must be one of DOWN, STOP, or UP")
         direction = int(value)
+        self._streaming = True
         if direction == STOP:
             self._stall_dir = STOP  # release re-arms a stalled direction
             self._stall_logged = False
@@ -548,6 +572,33 @@ class Lift:
             # canonical abort first; the jog begins on the following tick.
             self._stop_requested = True
         self._direction = direction
+
+    def suspend(self) -> None:
+        """The command source is gone: stop once, then go silent.
+
+        Called by Jelly when its command stream (headset frames, gamepad
+        polls) goes stale. Any held jog or one-shot move gets one canonical
+        STOP; after that the task sends no motion frames at all — no idle
+        STOP keepalive — until the next :meth:`command` re-attaches a source.
+        Going quiet, rather than re-sending a stale STOP forever, is what
+        lets the firmware's own deadman be the safety layer. Safe to call
+        from any thread, idempotent.
+        """
+        if (
+            self._direction != STOP
+            or self._last_jog_sent != STOP
+            or self._one_shot_active
+        ):
+            self._stop_requested = True
+        self._direction = STOP
+        self._stall_dir = STOP
+        self._stall_logged = False
+        self._streaming = False
+
+    @property
+    def streaming(self) -> bool:
+        """True while a command source is attached and motion frames stream."""
+        return self._streaming
 
     def _on_message(self, msg) -> None:  # noqa: ANN001 - can.Message, typed lazily
         if msg.arbitration_id == _ID_STATUS and len(msg.data) >= 6:
@@ -571,7 +622,13 @@ class Lift:
             )
 
     async def _run(self) -> None:
-        """Re-send jogs, poll in quiet mode, and recover stale broadcasts."""
+        """Stream motion frames, poll in quiet mode, and recover stale broadcasts.
+
+        Every tick sends exactly one motion frame while a source is attached
+        (:attr:`streaming`): the held JOG, or STOP when idle. Detached
+        (never commanded, or :meth:`suspend`ed), only a queued STOP goes out
+        — otherwise the bus stays silent apart from the status poll.
+        """
         next_poll = 0.0
         started = asyncio.get_running_loop().time()
         warned_silent = False
@@ -617,6 +674,11 @@ class Lift:
                 delivered = await self._send(_OP_STOP)
                 if delivered is False:
                     self._stop_requested = True
+            elif self._streaming and not self._one_shot_active:
+                # Idle keepalive: the source is alive and asking for "stopped",
+                # so say so on every tick. Suppressed during HOME/SET_POS (STOP
+                # would cancel them) and once the source is suspended.
+                await self._send(_OP_STOP)
             self._last_jog_sent = direction
 
             broadcast_stale = False

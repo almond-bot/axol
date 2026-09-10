@@ -360,6 +360,41 @@ def _installed_plugins_ready(manifest_path: Path = _MACHINE_MANIFEST) -> bool:
     return False
 
 
+def sensor_timestamp_patch_installed(
+    element: str, plugin_path: str | Path | None = None
+) -> bool:
+    """Whether runtime resolves the exact binary this patched build published.
+
+    The GStreamer registry alone cannot distinguish the stock Stereolabs
+    plugin (host-receive PTS) from Axol's patched build (sensor-exposure PTS).
+    The root manifest records source/patch provenance, the ZED SDK built
+    against, and a SHA-256 of every installed ``.so``; this re-resolves and
+    re-hashes the artifacts the runtime selects so a later stock upgrade, SDK
+    upgrade, or higher-priority ``GST_PLUGIN_PATH`` cannot leave a stale
+    manifest falsely authorizing exact synchronization. ``plugin_path`` is the
+    file the *caller's* GStreamer loaded for ``element`` (``Gst.Plugin``
+    filename); when given it must be the very artifact the manifest blessed.
+    """
+    if element not in _ZED_ELEMENTS or not _installed_plugins_ready():
+        return False
+    if plugin_path is None:
+        return True
+    manifest = _root_controlled_canonical_file(
+        _MACHINE_MANIFEST, allow_canonical_alias=False
+    )
+    if manifest is None:
+        return False
+    try:
+        saved = json.loads(manifest.read_text(encoding="utf-8"))
+        recorded = saved["plugins"][element]
+        loaded = Path(plugin_path).resolve(strict=True)
+        return str(loaded) == recorded["path"] and (
+            _file_sha256(loaded) == recorded["sha256"]
+        )
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
 def _installed_paths_from_build(src: Path) -> set[Path] | None:
     """Canonical paths written by the just-completed CMake install."""
     install_manifest = src / "build" / "install_manifest.txt"

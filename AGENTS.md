@@ -23,7 +23,9 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 
 ### Testing
 
-- No automated test suite exists in this repository. Validate changes by importing the package and exercising the `Sim`-based code paths.
+- Python unit tests live in `tests/` (stdlib `unittest`, no pytest dependency): `uv run python -m unittest discover -s tests`. They run without hardware — hardware-facing modules are exercised through mocks — but several import the `lerobot` extra at module level, so run them from `uv sync --extra sim --extra lerobot` (a bare `--extra sim` sync leaves ~9 modules failing to import). Add a `tests/test_<module>.py` alongside behaviour changes. For anything the suite doesn't cover, validate by importing the package and exercising the `Sim`-based code paths.
+- MuJoCo is pinned to one API line (`mujoco>=3.8.0,<3.10` in `pyproject.toml`): 3.10 changed the `mj_fullM` signature and 3.11 removed `mjData.qM`, both used by `almond_axol/robot/gravity.py`. `uv.lock` alone does not protect `uv tool install` / `pip install` (they re-resolve), so the upper bound is deliberate. To move to a newer MuJoCo, update the call in `gravity.py`, the bound, and `uv lock` together; `tests/test_gravity.py` guards the pin.
+- The Rust realtime core (`rust/axol-rt`, the required hardware control backend) has a `cargo test` suite: golden filter vectors pinned to the Python originals, wire-protocol round trips, and a damping dissipated-power comparison. `uv run python rust/axol-rt/tools/rt_proto_check.py` exercises the built binary's Unix-socket protocol without CAN. `cargo test stall_detection_live -- --ignored` needs the CAN interfaces up with motors unpowered.
 
 ### Dependency extras
 
@@ -32,7 +34,7 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 | `sim` | viser (browser 3D visualizer) — needed for sim mode |
 | `lerobot` | LeRobot data collection/policy — requires hardware + ZED cameras |
 
-For cloud development: `uv sync --extra sim` is sufficient.
+For cloud development: `uv sync --extra sim --extra lerobot` (the `lerobot` extra is import-time required by part of the test suite; `--extra sim` alone is enough to run sim teleop).
 
 **On a real robot (Jetson/tegra host), never run a bare `uv sync --extra sim`.** The robot's venv also carries the `lerobot` extra plus out-of-band installs — `pyzed` (from `~/.almond/wheels/`) and PyGObject (`pygobject>=3.50,<3.52`, built against the system gobject-introspection) — and an exact sync silently removes them, which kills camera streaming (`No module named 'lerobot'`, no `gi` for the gst relay). Restore with `uv sync --extra sim --extra lerobot` then `uv pip install ~/.almond/wheels/pyzed-*.whl "pygobject>=3.50,<3.52"`. Do **not** install the self-built `jaxlib` / `jax_cuda12_*` wheels from `~/.almond/wheels/` — they were compiled against cuDNN 9.8 while JetPack ships 9.3, so the IK worker's first solve crashes (`RET_CHECK failure ... dnn_support != nullptr`); the lock's CPU jaxlib runs IK at full teleop rate.
 

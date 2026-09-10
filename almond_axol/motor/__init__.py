@@ -5,12 +5,13 @@ Async motor interface for the Almond Axol arm.
 
 Public API
 ──────────
-    CanBus       Shared async SocketCAN bus
+    CanBus       Shared async API backed by the Rust CAN proxy
     Motor        Unified motor interface (constructed from a Joint)
     Joint        Enum of all arm joints
     MotorError   Raised when a motor command fails or times out
     MotorStatus  Unified motor status / error code
     MotorGains   PID gains for speed and position control loops
+    BusObserver  Passive (never-transmitting) decoder of one channel's traffic
 
 Usage
 ─────
@@ -26,6 +27,7 @@ from ..constants import Joint
 from .bus import CanBus
 from .errors import MotorError
 from .motor import Motor, make_driver
+from .observer import BusObserver
 from .types import ControlMode, MotorGains, MotorStatus
 
 __all__ = [
@@ -37,4 +39,5 @@ __all__ = [
     "ControlMode",
     "MotorStatus",
     "MotorGains",
+    "BusObserver",
 ]

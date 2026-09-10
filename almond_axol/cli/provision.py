@@ -18,20 +18,34 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
 * ``gst.build-zed`` — the patched zedxonesrc/zedsrc plugins (sensor-accurate
                       PTS so collected images line up with joint samples).
 * ``gyro.install``  — group access to the carrier board's BMI088 sampling
-                      timer, the cart heading hold's yaw reference (see
+                      timer, Jelly heading hold's yaw reference (see
                       :mod:`almond_axol.robot.gyro`).
+* ``rt.install``    — the ``axol-rt`` realtime core binary (Rust toolchain
+                      via rustup if needed; sources fetched at the installed
+                      package's ref for tool installs), required by hardware
+                      control (see :mod:`almond_axol.rt`).
+* rtprio grant      — a ``limits.d`` drop-in letting the operator's login run
+                      the camera relay's capture chain ``SCHED_FIFO`` from a
+                      manual ``axol serve`` (the systemd unit already has
+                      ``LimitRTPRIO``); without it the relay silently runs
+                      CFS and drops exposures under recording load (see
+                      :mod:`almond_axol.utils.rtprio`).
 * ``tracker.install`` — pinned libsurvive + Vive USB permissions for Mantis
                         Lighthouse tracking.
 
 Both the hosted installer (``web/app/public/install``) and the ``axol serve``
 self-updater (:mod:`almond_axol.serve.update`) run *this* command, so the set
-of steps lives in exactly one place and can't drift between them. Every step is
-idempotent and best-effort (each self-gates on the ZED SDK / apt / NVENC and
-no-ops when unavailable), so ``axol provision`` is safe to run on any host and
-re-run anytime.
+of steps lives in exactly one place and can't drift between them. Plain
+``axol provision`` keeps every step idempotent (each self-gates on the ZED SDK /
+apt / NVENC), so it is safe to run on any host; a step that self-gates is not a
+failure, but a step that fails to repair the host is reported and makes the
+command exit non-zero once every other step has had its chance. The hosted
+installer and post-upgrade path pass ``--require-rt`` (accepted for
+compatibility: the required control-core install already fails the command).
 
-It does NOT pin Jetson clocks — that's ``axol jetson.setup``, a per-boot runtime
-tweak owned by the systemd ``ExecStartPre``, not an install step.
+It does NOT pin Jetson clocks or steer the CAN adapters' interrupt — that's
+``axol jetson.setup``, a per-boot runtime tweak owned by the systemd
+``ExecStartPre``, not an install step.
 """
 
 from __future__ import annotations
@@ -46,7 +60,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from ..robot import gyro
-from ..utils import adb
+from ..rt import install as rt_install
+from ..utils import adb, rtprio
 from ..utils.host_update_lock import (
     HOLDER_READY,
     HostUpdateLockError,
@@ -180,13 +195,23 @@ def _neutralize_legacy_can_root_execution() -> bool:
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``provision`` subcommand."""
-    subparsers.add_parser(
+    parser = subparsers.add_parser(
         "provision",
         help=(
             "Install/refresh the non-PyPI + system pieces "
-            "(Lighthouse tracking, pyzed, GStreamer, camera plugins)."
+            "(cameras, adb, Lighthouse tracking, board access, the operator's "
+            "real-time scheduling grant, and the axol-rt control core)."
         ),
-    ).set_defaults(func=run)
+    )
+    parser.add_argument(
+        "--require-rt",
+        action="store_true",
+        help=(
+            "exit non-zero if the required axol-rt core cannot be installed "
+            "(accepted for compatibility; every failed step already does)"
+        ),
+    )
+    parser.set_defaults(func=run)
 
 
 def _step(label: str, fn: Callable[[], object]) -> bool:
@@ -240,6 +265,10 @@ def _sudo_held_update_lock() -> Iterator[None]:
 
 def run(_args: object = None) -> None:
     """Run every provisioning step in order; each self-gates and is idempotent."""
+    # Surface each step's INFO outcome (what was granted/installed, or already
+    # in place) so a run at a customer site is verifiable from its output alone;
+    # force=True in case an imported dependency already installed a handler.
+    logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
     lock = host_update_lock if os.geteuid() == 0 else _sudo_held_update_lock
     try:
         with lock():
@@ -276,8 +305,12 @@ def _run_locked() -> None:
     # so it just prints a notice.
     step("ZED Box camera driver (zed.driver)", zed_driver.ensure_driver)
     # Group access to the board IMU's sampling timer, so teleop can start the
-    # cart's yaw reference without root. Self-gates on the driver's presence.
+    # Jelly's yaw reference without root. Self-gates on the driver's presence.
     step("board IMU (gyro.install)", gyro.install)
+    # Persistent rtprio allowance for the operator's login, so a manual
+    # `axol serve` can run the camera relay's capture chain SCHED_FIFO like
+    # the systemd unit does (LimitRTPRIO). Applies at the next login.
+    step("rtprio grant (utils.rtprio)", rtprio.install)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
         step("pyzed (zed.install)", zed_install.run)
@@ -286,6 +319,12 @@ def _run_locked() -> None:
     step("GStreamer + PyGObject (gst.install)", gst_install.run)
     if have_sdk:
         step("patched zed-gstreamer plugins (gst.build-zed)", gst_build_zed.run)
+    # The required axol-rt hardware control core: rustup toolchain if needed,
+    # then build from the in-repo crate (dev checkout) or from the sources
+    # at the installed package's exact ref (tool installs). Like every other
+    # step it is reported rather than aborting the run, and any failure makes
+    # the command exit non-zero below.
+    step("axol-rt realtime core (rt.install)", rt_install.run)
 
     if failed:
         raise SystemExit(

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -868,13 +869,22 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         )
 
     def _is_idle() -> bool:
-        """Safe to hand host ownership to the updater: no operation running.
+        """Safe to restart or power off the host: no operation running.
 
         A connected robot is fine -- the hosted transaction stops the service
         and the candidate reconnects after verification; only an in-flight
         operation must not be interrupted.
+
+        A hardware-cleanup lockout does not make the host busy either. The
+        lockout reserves the robot's CAN buses for as long as *this process*
+        lives, and ending the process (host restart, shutdown, self-update) is
+        one of the two documented ways out of it. Every caller here -- the
+        updater's ``idle`` flag that the panel's host tile gates on, the update
+        itself, and :func:`_host_power` -- restarts the process rather than
+        starting work behind the lockout, which ``runner.is_running()`` still
+        refuses.
         """
-        if runner.is_running():
+        if runner.is_running(ignore_cleanup_lockout=True):
             return False
         return not _diagnostic_session_active()
 
@@ -1197,6 +1207,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         run would drop the arms. The hosted install runs as root; a dev serve
         escalates via ``sudo -n`` so a headless context fails fast instead of
         blocking on a password prompt.
+
+        A hardware-cleanup lockout does not refuse it (see :func:`_is_idle`):
+        restarting the host is one of the two documented ways out of it (the
+        other is ``/api/op/clear-lockout``).
         """
         async with session_launch_reservation:
             if not _is_idle():
@@ -1461,12 +1475,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def telemetry_history(
         seconds: float = 120.0, max_frames: int = 2000
     ) -> dict[str, Any]:
-        """Buffered telemetry frames for chart backfill on page load."""
-        return {"frames": hub.history(seconds, max_frames)}
+        """Buffered telemetry frames for chart backfill on page load.
+
+        ``slow`` carries the 1 Hz sweep history (temperature/voltage) so the
+        temperature chart backfills too.
+        """
+        return {
+            "frames": hub.history(seconds, max_frames),
+            "slow": hub.slow_history(seconds),
+            "timing": hub.timing_history(seconds, max_frames),
+        }
 
     @app.websocket("/api/telemetry/ws")
     async def telemetry_ws(ws: WebSocket) -> None:
-        """Live telemetry stream: frame / slow / state messages (see telemetry.py)."""
+        """Live motor + control timing stream (see :mod:`.telemetry`)."""
         await ws.accept()
         queue = hub.subscribe()
         try:
@@ -1594,6 +1616,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     for key, value in launch_args.items()
                     if key in valid_scope_keys
                 }
+                if command_id == "diag.rom-enable":
+                    # Its --joints picks which joints are *swept*; the realtime
+                    # core still brings up every motor of each selected arm, so
+                    # a fault anywhere on the arm blocks the run.
+                    fault_scope_args.pop("joints", None)
                 if command_id == "diag.lift-cycle":
                     # Lift cycle never touches grippers. Keep its arm/side
                     # scoping, but do not block it on an unrelated gripper
@@ -1698,6 +1725,158 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         if data is None:
             return JSONResponse({"error": "unknown run"}, status_code=404)
         return JSONResponse(data)
+
+    # -- tuning runs (sine/step probes, motion replays, offline suites) -------
+    #
+    # These are the artifacts the tuning library persists under
+    # ~/.almond/diagnostics/tuning/ (see almond_axol.tuning.runs). Distinct
+    # from the diagnostics run *history* above: a tuning run is a scored
+    # experiment with full time series, made for charting and A/B comparison.
+
+    @app.get("/api/tuning/gains")
+    async def tuning_gains() -> dict[str, Any]:
+        """Effective per-joint control gains for both arms.
+
+        Shipping defaults from ``config.py`` with this robot's calibration
+        file overlaid — exactly what a tuning run uses when a gain field is
+        left empty. The workbench shows these as the slider baselines.
+        ``kd_host_hz`` is resolved to the shared default where a joint
+        doesn't set its own band centre.
+        """
+        import math
+
+        from ..constants import ARM_JOINTS
+        from ..robot.config import AxolConfig
+        from ..robot.control import DAMP_BP_Q, DAMP_BP_W0
+
+        def _load() -> dict[str, Any]:
+            cfg = AxolConfig()
+            out: dict[str, Any] = {}
+            for side in ("left", "right"):
+                arm_cfg = getattr(cfg, side)
+                joints: dict[str, Any] = {}
+                for j in ARM_JOINTS:
+                    jc = getattr(arm_cfg, j.value)
+                    joints[j.value] = {
+                        "kp": jc.kp,
+                        "kd": jc.kd,
+                        "kd_host": jc.kd_host,
+                        "kd_host_hz": (
+                            jc.kd_host_hz
+                            if jc.kd_host_hz is not None
+                            else round(DAMP_BP_W0 / (2 * math.pi), 1)
+                        ),
+                        "kd_host_q": (
+                            jc.kd_host_q if jc.kd_host_q is not None else DAMP_BP_Q
+                        ),
+                        "j_eff": jc.j_eff,
+                    }
+                out[side] = joints
+            return out
+
+        return {"gains": await asyncio.to_thread(_load)}
+
+    @app.get("/api/tuning/runs")
+    async def tuning_runs() -> dict[str, Any]:
+        from ..tuning import list_runs
+
+        return {"runs": await asyncio.to_thread(list_runs)}
+
+    @app.delete("/api/tuning/runs")
+    async def tuning_runs_clear() -> dict[str, Any]:
+        from ..tuning import clear_runs
+
+        return {"removed": await asyncio.to_thread(clear_runs)}
+
+    @app.get("/api/tuning/runs/{run_id}")
+    async def tuning_run_data(run_id: str, max_points: int = 4000) -> JSONResponse:
+        """One run's metadata plus its time series, decimated for charting.
+
+        ``max_points`` caps each series' length (stride decimation — plenty
+        for on-screen charts; the full-resolution NPZ stays on disk for
+        offline analysis). NaN samples become null in the JSON.
+        """
+        from ..tuning import load_run
+
+        loaded = await asyncio.to_thread(load_run, run_id)
+        if loaded is None:
+            return JSONResponse({"error": "unknown run"}, status_code=404)
+        meta, series = loaded
+
+        def _decimate() -> dict[str, list[float | None]]:
+            def to_json(col: np.ndarray, stride: int) -> list[float | None]:
+                return [float(v) if math.isfinite(v) else None for v in col[::stride]]
+
+            out: dict[str, list[float | None]] = {}
+            for key, arr in series.items():
+                a = np.asarray(arr, dtype=float)
+                if a.ndim == 0 or len(a) == 0:
+                    continue
+                stride = max(1, len(a) // max(max_points, 2))
+                if a.ndim == 1:
+                    out[key] = to_json(a, stride)
+                else:
+                    # Multi-column series (e.g. a motion run's N×14 joint
+                    # matrix) become one flat key per column, "<key>/<i>";
+                    # column names live in meta.params (e.g. "columns").
+                    cols = a.reshape(len(a), -1)
+                    for i in range(cols.shape[1]):
+                        out[f"{key}/{i}"] = to_json(cols[:, i], stride)
+            return out
+
+        return JSONResponse(
+            {"meta": meta, "series": await asyncio.to_thread(_decimate)}
+        )
+
+    @app.delete("/api/tuning/runs/{run_id}")
+    async def tuning_run_delete(run_id: str) -> JSONResponse:
+        from ..tuning import delete_run
+
+        if not await asyncio.to_thread(delete_run, run_id):
+            return JSONResponse({"error": "unknown run"}, status_code=404)
+        return JSONResponse({"deleted": run_id})
+
+    @app.get("/api/tuning/motions")
+    async def tuning_motions() -> dict[str, Any]:
+        """The committed reference motions available for tune.motion replays."""
+        from ..tuning.motion import list_motions
+
+        def _list() -> list[dict[str, Any]]:
+            return [
+                {
+                    "name": m.name,
+                    "rate": m.rate,
+                    "samples": len(m.q),
+                    "durationS": len(m.q) / m.rate if m.rate else 0.0,
+                    "meta": m.meta,
+                }
+                for m in list_motions()
+            ]
+
+        return {"motions": await asyncio.to_thread(_list)}
+
+    @app.get("/api/tuning/recordings")
+    async def tuning_recordings() -> dict[str, Any]:
+        """The flight recordings motion.build can consume, newest first.
+
+        From either recorder: a teleop session (``--teleop.record``) or a
+        hand-guided gravity-comp one (``--record``). Feeds the workbench's
+        Build-motion recording picker.
+        """
+        from ..teleop.recorder import list_recordings
+
+        def _list() -> list[dict[str, Any]]:
+            return [
+                {
+                    "name": r["name"],
+                    "kind": r["kind"],
+                    "modifiedAt": r["modified_at"],
+                    "durationS": r["duration_s"],
+                }
+                for r in list_recordings()
+            ]
+
+        return {"recordings": await asyncio.to_thread(_list)}
 
     # -- local ZED cameras ---------------------------------------------------
 
@@ -2203,7 +2382,78 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             "running": runner.is_running(),
             "session": session.to_dict() if session else None,
             "policy": runner.policy_state(),
+            "lockout": runner.hardware_cleanup_lockout(),
         }
+
+    @app.post("/api/op/clear-lockout")
+    async def op_clear_lockout() -> JSONResponse:
+        """Lift the hardware-cleanup lockout once the motors read torque-free.
+
+        The lockout exists because an operation could not confirm it disabled
+        the motors, so nothing may reopen the CAN buses behind it. Cutting
+        motor power is exactly that case with the torque already gone, so this
+        proves it rather than assuming it: reacquire the idle link, ping every
+        motor, and only release the reservation when each one reads disabled or
+        does not answer at all. A motor that answers and is not disabled is
+        still holding torque nobody supervises, and keeps the lockout.
+
+        The probe borrows the buses. While the lockout stands the failed
+        operation may still hold them, and the idle link is not meant to sit
+        on the same channels for longer than it takes to look: if the lockout
+        is refused, a link this call reconnected is handed back (``busy``)
+        exactly as it was before the probe.
+        """
+
+        async def refuse(error: str, *, reacquired: bool) -> JSONResponse:
+            if reacquired:
+                try:
+                    await asyncio.to_thread(robot.release)
+                except RuntimeError as exc:
+                    error = f"{error}; also could not hand the buses back: {exc}"
+            return JSONResponse({"error": error}, status_code=409)
+
+        async with session_launch_reservation:
+            if not runner.hardware_cleanup_lockout():
+                return JSONResponse(
+                    {"error": "no hardware cleanup lockout is active"},
+                    status_code=409,
+                )
+            if runner.is_running(ignore_cleanup_lockout=True):
+                return JSONResponse(
+                    {"error": "an operation is still running — stop it first"},
+                    status_code=409,
+                )
+            reacquired = False
+            try:
+                reacquired = await asyncio.to_thread(robot.reacquire)
+                status = await asyncio.to_thread(robot.probe)
+            except RuntimeError as exc:
+                return await refuse(
+                    "could not reach the motors to prove they are disabled; "
+                    f"the lockout stands: {exc}",
+                    reacquired=reacquired,
+                )
+            # ``reachable is False`` is the proof this needs (the motor is
+            # unpowered); ``None`` means the probe produced no reading for it,
+            # which proves nothing and must keep the lockout.
+            live = [
+                m
+                for m in status["motors"]
+                if m["reachable"] is not False and m["status"] != "DISABLED"
+            ]
+            if live:
+                return await refuse(
+                    "these motors still answer and are not disabled, "
+                    "so the lockout stands: "
+                    + ", ".join(
+                        f"{m['arm']} {m['joint'].lower()}"
+                        f" ({str(m['status']).replace('_', ' ').lower()})"
+                        for m in live
+                    ),
+                    reacquired=reacquired,
+                )
+            runner.clear_hardware_cleanup_lockout()
+            return JSONResponse({"cleared": True})
 
     @app.post("/api/op/start")
     async def op_start(req: OpStartRequest) -> JSONResponse:
@@ -2223,7 +2473,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # A faulted motor (over-temp, stall, encoder error, unreachable, …)
             # must block every hardware operation — driving through a fault risks
             # the arm. A sim run never touches the motors, and a robot-free run
-            # (teleop's cart_only) never touches the *arms*, so both stay allowed.
+            # (teleop's jelly_only) never touches the *arms*, so both stay allowed.
             cmd = COMMANDS[req.op]
             try:
                 launch_args = normalize_boolean_args(

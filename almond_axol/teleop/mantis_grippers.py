@@ -6,6 +6,13 @@ reader and gripper on each Mantis CAN channel, waits for both triggers to be
 fresh and released, then mirrors their analog values onto the physical
 grippers until stopped. It deliberately starts no VR server and needs no
 tracker binding, cameras, headset, or tracker-to-TCP transform.
+
+The grippers are driven through the Rust realtime core
+(:class:`~almond_axol.rt.RtMantis`): this loop only reads the triggers and
+streams normalised targets at ``poll_interval``; ``axol-rt`` owns the gripper
+buses and paces the POSITION_FORCE commands. The trigger reader's own
+receive-only SocketCAN socket coexists with the core (the kernel duplicates
+frames to every open socket; the core skips the trigger node's ID).
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import numpy as np
 from ..constants import ARM_JOINTS
 from ..robot.base import HardwareCleanupError
 from ..robot.mantis import Mantis
+from ..rt import RtMantis
 from ..tracker.trigger import TriggerReader
 
 _logger = logging.getLogger(__name__)
@@ -29,6 +37,11 @@ _STATUS_INTERVAL_S = 0.25
 _TRIGGER_WAIT_TIMEOUT_S = 5.0
 # Match the release threshold used by the managed Mantis engage gesture.
 _RELEASED_GRIP_MIN = 0.8
+
+
+def _rt_mantis(**kwargs: Any) -> RtMantis:
+    """Default robot factory: the Mantis behind the realtime core."""
+    return RtMantis(Mantis(**kwargs))
 
 
 def _read_fresh_grips(readers: dict[str, Any]) -> tuple[dict[str, float], list[str]]:
@@ -82,7 +95,7 @@ async def run_grippers_only(
     right_channel: str,
     *,
     reader_factory: Callable[[str], Any] = TriggerReader,
-    robot_factory: Callable[..., Any] = Mantis,
+    robot_factory: Callable[..., Any] = _rt_mantis,
     wait_timeout: float = _TRIGGER_WAIT_TIMEOUT_S,
     poll_interval: float = _CONTROL_INTERVAL_S,
     status_interval: float = _STATUS_INTERVAL_S,

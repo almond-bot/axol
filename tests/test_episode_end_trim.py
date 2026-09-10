@@ -208,7 +208,7 @@ class TeleopEventCarriesTheCutTest(unittest.TestCase):
         teleop._vr_frame_times = []
         teleop._core = mock.Mock()
         teleop._core.is_resetting = False
-        teleop._cart = None
+        teleop._jelly = None
         teleop._prev_state = VRState.RECORDING
         teleop._event_lock = threading.Lock()
         teleop._rerecord_latch = False
@@ -343,8 +343,9 @@ class InProcessRecorderTrimTest(unittest.TestCase):
         recorder._stop = None
         recorder._frames = {"n": n_rows}
         recorder._row_times = [200.0 + i * 0.1 for i in range(n_rows)]
-        recorder._capture_error = {"v": None}
+        recorder._capture_error = None
         recorder._fatal_error = None
+        recorder._verifier = mock.Mock()
         return recorder
 
     def test_stop_capture_trims_and_reports_the_kept_row_count(self) -> None:
@@ -362,20 +363,35 @@ class InProcessRecorderTrimTest(unittest.TestCase):
 
 class RecorderProcessTrimProtocolTest(unittest.TestCase):
     def test_client_sends_the_cut_with_stop_capture(self) -> None:
+        # ``stop_capture`` is the non-raising view of ``finish_episode``; both
+        # ride the single ``finish_episode`` wire command, which carries the cut.
         recorder = object.__new__(record_proc.DatasetRecorderProcess)
         recorder._lock = threading.Lock()
         recorder._fatal_error = None
         recorder._closed = False
         recorder._conn = mock.Mock()
         recorder._conn.poll.return_value = True
-        recorder._conn.recv.return_value = ("capture_stopped", 42, None)
+        recorder._conn.recv.return_value = ("finished", 42, None)
 
         self.assertEqual(recorder.stop_capture(trim_after=77.5), (42, None))
-        recorder._conn.send.assert_called_once_with(("stop_capture", 77.5))
+        recorder._conn.send.assert_called_once_with(("finish_episode", 77.5))
 
         recorder._conn.send.reset_mock()
         recorder.stop_capture()
-        recorder._conn.send.assert_called_once_with(("stop_capture", None))
+        recorder._conn.send.assert_called_once_with(("finish_episode", None))
+
+    def test_client_reports_a_capture_failure_as_a_value(self) -> None:
+        recorder = object.__new__(record_proc.DatasetRecorderProcess)
+        recorder._lock = threading.Lock()
+        recorder._fatal_error = None
+        recorder._closed = False
+        recorder._conn = mock.Mock()
+        recorder._conn.poll.return_value = True
+        recorder._conn.recv.return_value = ("finished", 0, "camera stalled")
+
+        rows, error = recorder.stop_capture(trim_after=77.5)
+        self.assertEqual(rows, 0)
+        self.assertIn("camera stalled", error or "")
 
 
 if __name__ == "__main__":

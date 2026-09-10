@@ -36,6 +36,7 @@ import { Input } from "@/components/ui/input"
 import { RobotModel } from "@/components/robot-model"
 import { SiteNav } from "@/components/site-nav"
 import { authorizeCert } from "@/lib/cert-accept"
+import { hostCertAuthorizeVisible, usbCertOrigin } from "@/lib/usb-transport"
 import { cn } from "@/lib/utils"
 
 // Pin drei's <Text> (troika) to a locally-bundled font. By default troika
@@ -299,7 +300,7 @@ function PoseVisualizer({ poseMode }: { poseMode: AxolPoseMode }) {
 //     and move your hands apart (bigger) or together (smaller).
 //   - Reset: press B (right controller) to re-anchor every screen to the
 //     current gaze and clear all moves + resizes. (The thumbstick clicks are
-//     reserved for the powered cart's lift.)
+//     reserved for the Jelly's lift.)
 //
 // The screens behave like TVs: they are world-anchored where the operator was
 // looking when the session started, so the head can move freely while the
@@ -530,7 +531,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
 
     // Pressing B on the right controller (buttons[5]) re-anchors the screens
     // to the current gaze and clears every move + resize. The thumbstick
-    // clicks (buttons[3]) are reserved for the powered cart's lift.
+    // clicks (buttons[3]) are reserved for the Jelly's lift.
     const reanchorPressed = right?.gamepad?.buttons?.[5]?.pressed ?? false
     if (reanchorPressed && !reanchorPrevRef.current) {
       anchoredRef.current = false
@@ -1251,11 +1252,11 @@ export default function App() {
     connect()
   }, [bootParams, hostname, status, connect])
   // Controller poses can ride a wired USB `adb reverse` tunnel (localhost) to
-  // avoid WiFi latency; camera video keeps using the LAN host above. The pose
-  // socket comes up once the main connection is open and the operator opts in.
-  const { poseWsRef, status: poseStatus } = useAxolPoseSocket(
-    usbPoses && status === AxolConnectionStatus.Open
-  )
+  // avoid WiFi latency; camera video keeps using the LAN host above. The tunnel
+  // is independent of the WiFi connection, so the socket opens as soon as the
+  // operator opts in — that is what surfaces the certificate prompt before the
+  // first connect, instead of after poses have already fallen back to WiFi.
+  const { poseWsRef, status: poseStatus } = useAxolPoseSocket(usbPoses)
   // Low-latency WebRTC pose data channel — negotiated once the teleop
   // connection is up (independent of cameras / presenting). AxolVRClient prefers
   // it over the main WebSocket, which stays as the fallback.
@@ -1347,38 +1348,6 @@ export default function App() {
                 <Button variant="ghost" className="w-full" onClick={disconnect}>
                   Disconnect
                 </Button>
-                {usbPoses && (
-                  <div className="flex flex-col gap-2">
-                    <p className="text-center text-xs text-white/40">
-                      Quest over USB:{" "}
-                      <span
-                        className={cn(
-                          "font-medium",
-                          poseStatus === AxolConnectionStatus.Open
-                            ? "text-emerald-400"
-                            : "text-amber-400"
-                        )}
-                      >
-                        {poseStatus === AxolConnectionStatus.Open
-                          ? "controller over cable"
-                          : poseStatus === AxolConnectionStatus.Connecting
-                            ? "connecting USB link… (on WiFi)"
-                            : "WiFi fallback — USB link down"}
-                      </span>
-                    </p>
-                    {poseStatus !== AxolConnectionStatus.Open && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="w-full"
-                        onClick={() => authorizeCert(`https://localhost:${VR_WS_PORT}`)}
-                      >
-                        <ShieldCheck />
-                        Authorize USB certificate
-                      </Button>
-                    )}
-                  </div>
-                )}
               </div>
             ) : status === AxolConnectionStatus.Connecting ? (
               <Button variant="secondary" className="w-full" onClick={disconnect}>
@@ -1421,6 +1390,42 @@ export default function App() {
               </form>
             )}
 
+            {/* Shown in every connection state: the cable certificate is
+                approved here, and approving it before connecting is what keeps
+                the first session off the WiFi fallback. */}
+            {usbPoses && (
+              <div className="flex flex-col gap-2">
+                <p className="text-center text-xs text-white/40">
+                  Quest over USB:{" "}
+                  <span
+                    className={cn(
+                      "font-medium",
+                      poseStatus === AxolConnectionStatus.Open
+                        ? "text-emerald-400"
+                        : "text-amber-400"
+                    )}
+                  >
+                    {poseStatus === AxolConnectionStatus.Open
+                      ? "controller over cable"
+                      : poseStatus === AxolConnectionStatus.Connecting
+                        ? "connecting USB link… (on WiFi)"
+                        : "WiFi fallback — USB link down"}
+                  </span>
+                </p>
+                {poseStatus !== AxolConnectionStatus.Open && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="w-full"
+                    onClick={() => authorizeCert(usbCertOrigin(VR_WS_PORT))}
+                  >
+                    <ShieldCheck />
+                    Authorize USB certificate
+                  </Button>
+                )}
+              </div>
+            )}
+
             {status === AxolConnectionStatus.Open && (
               <div className="grid grid-cols-2 gap-3 text-left text-xs">
                 <ControlHints
@@ -1455,10 +1460,12 @@ export default function App() {
               <div className="flex flex-col gap-2">
                 <p className="rounded-lg border border-red-400/25 bg-red-400/10 p-3 text-xs text-red-300">
                   Could not connect to <span className="font-mono">{hostname || "the server"}</span>
-                  . Check that <span className="font-mono">axol teleop</span> is running, then
-                  authorize its self-signed certificate below.
+                  . Check that <span className="font-mono">axol teleop</span> is running
+                  {hostCertAuthorizeVisible(hostname)
+                    ? ", then authorize its self-signed certificate below."
+                    : "."}
                 </p>
-                {hostname.trim() && (
+                {hostCertAuthorizeVisible(hostname) && (
                   <Button
                     variant="outline"
                     className="w-full"

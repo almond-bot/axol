@@ -24,6 +24,7 @@ import webbrowser
 from pathlib import Path
 
 from ..utils.certs import CERTFILE, KEYFILE, PreparedTLSFiles, prepare_tls_files
+from ..utils.ports import CONTROL_PORT
 
 # The VR server and this control-panel API share one self-signed certificate
 # (see ``almond_axol.utils.certs``) so a single browser cert acceptance covers both.
@@ -43,8 +44,8 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.add_argument(
         "--port",
         type=int,
-        default=8001,
-        help="Port to listen on (default: 8001).",
+        default=CONTROL_PORT,
+        help=f"Port to listen on (default: {CONTROL_PORT}).",
     )
     parser.add_argument(
         "--open",

@@ -32,6 +32,13 @@ _logger = logging.getLogger(__name__)
 # ``utils.adb`` import it) so they can't drift and silently break USB teleop.
 VR_PORT = 8000
 
+# The control panel (``axol serve``) binds this one. The Quest-over-USB tunnel
+# forwards it too: the VR port only exists while a teleop/collect operation is
+# running, so the panel is the origin a freshly cabled headset can always reach
+# on ``localhost`` to confirm the cable path works. (The pose origin on
+# ``VR_PORT`` still needs its own certificate approval; overrides are per-port.)
+CONTROL_PORT = 8001
+
 # How hard ``open_listen_socket`` tries before giving up. A couple of plain
 # retries absorb a previous server still releasing the socket; after that we
 # evict whatever is squatting on the port.

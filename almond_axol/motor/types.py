@@ -52,13 +52,15 @@ class MotorGains:
         speed_ki:    Speed loop integral gain.
         position_kp: Position loop proportional gain.
         position_ki: Position loop integral gain.
-        current_kp:  Current loop proportional gain (MyActuator only, uint8).
-        current_ki:  Current loop integral gain (MyActuator only, uint8).
+        position_kd: Position loop derivative gain (MyActuator protocol V4.2+ only).
+        current_kp:  Current loop proportional gain (MyActuator only).
+        current_ki:  Current loop integral gain (MyActuator only).
     """
 
     speed_kp: float = 0.0
     speed_ki: float = 0.0
     position_kp: float = 0.0
     position_ki: float = 0.0
+    position_kd: float | None = field(default=None)  # MyActuator V4.2+ only
     current_kp: float | None = field(default=None)  # MyActuator only
     current_ki: float | None = field(default=None)  # MyActuator only

@@ -43,14 +43,9 @@ import numpy as np
 from ..robot.control import ContactWatchdog
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
+from .recorder import make as _recorder_make
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
-
-# How long a guarded-return contact hold keeps waiting for a reset press
-# after the VR frame stream has gone dead (headset exited XR or died —
-# nobody is left to press reset). Long enough to free a hooked gripper
-# calmly; then the hold settles into a position hold where the arms are.
-_HOLD_ORPHAN_GRACE_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -121,8 +116,12 @@ class VRTeleopCore:
         self._broadcast_json = broadcast_json
 
         dt = 1.0 / config.frequency
-        self.ema_left = AlphaSmoothFilter(config.ik_alpha)
-        self.ema_right = AlphaSmoothFilter(config.ik_alpha)
+        # ik_alpha is specified as a per-tick blend at the historical 120 Hz
+        # control rate; convert it to this rate's per-tick alpha so the EMA's
+        # *time constant* — the thing that was tuned — is rate-invariant.
+        alpha = 1.0 - (1.0 - config.ik_alpha) ** (120.0 * dt)
+        self.ema_left = AlphaSmoothFilter(alpha)
+        self.ema_right = AlphaSmoothFilter(alpha)
         self.smooth_left = TrapezoidalFilter(
             config.teleop_max_vel, config.teleop_max_accel, dt
         )
@@ -252,6 +251,14 @@ class VRTeleopCore:
         # "no new frame from get_frame()" indistinguishable from an operator
         # holding perfectly still, so staleness must be measured at ingest.
         self._last_frame_time: float | None = None
+
+        # Teleop flight recorder (--teleop.record, see .recorder):
+        # taps the smoothing stages this class owns per control tick — the
+        # segment-rendered raw target, the EMA output, and the final guarded
+        # command (7 left + 7 right arm joints each).
+        self._rec = _recorder_make(
+            self.config.record, "cmd", {"tgt": 14, "ema": 14, "out": 14}
+        )
 
     # ------------------------------------------------------------------
     # Seeding (called once at connect, before the IK loop starts)
@@ -689,6 +696,12 @@ class VRTeleopCore:
         rate the setpoint stair-cases and the velocity feedforward turns each
         jump into a torque spike (jerk).
         """
+        # Flight recorder covers engaged segments only: gate before any early
+        # return so the disengage edge writes the _cmd file even while no
+        # target exists yet or a reset trajectory is playing.
+        if self._rec is not None:
+            self._rec.set_engaged(self.teleop_enabled)
+
         # Post-engage velocity ramp: smoothstep the cap from engage_max_vel to
         # teleop_max_vel across engage_duration. The old behaviour held the
         # low cap for the whole window and then stepped to full speed — error
@@ -757,7 +770,14 @@ class VRTeleopCore:
         out[7] = ema_l[7]
         out[8:15] = smoothed_r_arm
         out[15] = ema_r[7]
-        return self._guard_output(out)
+        out = self._guard_output(out)
+        if self._rec is not None:
+            self._rec.record(
+                tgt=np.concatenate([q[self.left_indices], q[self.right_indices]]),
+                ema=np.concatenate([ema_l[:7], ema_r[:7]]),
+                out=np.concatenate([out[:7], out[8:15]]),
+            )
+        return out
 
     def _guard_output(self, out: np.ndarray) -> np.ndarray:
         """Enforce the per-tick command-step contract on the arm joints.
@@ -811,7 +831,6 @@ class VRTeleopCore:
         announce: Callable[[str], None],
         on_contact: Callable[[], None] | None = None,
         hold_tick: Callable[[], None] | None = None,
-        vr_alive: Callable[[], bool] | None = None,
         move_timeout_s: float = 30.0,
     ) -> None:
         """Play the pending return-to-rest guarded by the contact watchdog.
@@ -826,7 +845,9 @@ class VRTeleopCore:
         :class:`~almond_axol.robot.control.ContactWatchdog`) cancels it
         where it is and drops the arms into a limp gravity-comp hold. The
         operator hand-guides them clear and presses reset, which replans
-        from wherever they were left.
+        from wherever they were left. The hold has no timeout: if the
+        headset has left VR (or the link died) the arms simply stay limp
+        until the operator is back in the headset and presses reset.
 
         Args:
             send_step: Advance the flow's control pipeline by one step —
@@ -841,18 +862,11 @@ class VRTeleopCore:
             get_positions: Measured ``(left, right)`` arm positions used to
                 re-sync the pipeline after hand-guiding.
             stopped: Flow shutdown flag; checked every cycle.
-            announce: Operator-facing status line (e.g. ``log_say``).
+            announce: Operator-facing status line (e.g. ``logger.info``).
             on_contact: Extra flow hook run once per trip, before the hold
                 (e.g. unblock the headset's reset button).
             hold_tick: Flow hook run every hold cycle (e.g. consume teleop
                 events so a stray record press is answered).
-            vr_alive: Whether VR frames are still arriving. When given, a
-                contact hold whose frame stream has been dead for a grace
-                period is *orphaned* — the reset press that ends it can
-                never come (a Y-exit return, a headset that died) — so the
-                hold settles into a position hold where the arms are and
-                the guarded return ends; reconnecting and pressing reset
-                resumes the normal path. ``None`` waits indefinitely.
             move_timeout_s: Cap on each individual play attempt.
         """
         interval = 1.0 / self.config.frequency
@@ -893,7 +907,6 @@ class VRTeleopCore:
                 announce=announce,
                 on_contact=on_contact,
                 hold_tick=hold_tick,
-                vr_alive=vr_alive,
             )
             if hold != "reset":
                 return
@@ -909,7 +922,6 @@ class VRTeleopCore:
         announce: Callable[[str], None],
         on_contact: Callable[[], None] | None = None,
         hold_tick: Callable[[], None] | None = None,
-        vr_alive: Callable[[], bool] | None = None,
     ) -> None:
         """Limp gravity-comp hold after a *tracking-time* contact trip.
 
@@ -934,7 +946,6 @@ class VRTeleopCore:
             announce=announce,
             on_contact=on_contact,
             hold_tick=hold_tick,
-            vr_alive=vr_alive,
         )
         if hold == "reset":
             # The reset press that ended the hold is still latched
@@ -951,13 +962,15 @@ class VRTeleopCore:
         announce: Callable[[str], None],
         on_contact: Callable[[], None] | None,
         hold_tick: Callable[[], None] | None,
-        vr_alive: Callable[[], bool] | None,
     ) -> str:
-        """Shared limp-hold engine: ``reset`` | ``orphaned`` | ``stopped``.
+        """Shared limp-hold engine: ``reset`` | ``stopped``.
 
         Freezes the IK pipeline, holds the arms limp until a reset press
-        (or the flow stops / the hold is orphaned), then hands position
-        control back re-synced to wherever the operator left the arms.
+        (or the flow stops), then hands position control back re-synced to
+        wherever the operator left the arms. There is deliberately no
+        timeout: a headset that has left VR (or a dead link) leaves the arms
+        in gravity comp — free to hand-guide, never stiffening on their own
+        — until the operator is back in the headset and presses reset.
         """
         interval = 1.0 / self.config.frequency
         # Freeze the IK pipeline before the arms go limp — a reset
@@ -970,26 +983,11 @@ class VRTeleopCore:
             on_contact()
         announce("Contact. Arms are free — press reset to continue.")
         deadline = time.perf_counter()
-        orphan_since: float | None = None
-        orphaned = False
         while not stopped() and not self.reset_pending:
             deadline += interval
             await gravity_step()
             if hold_tick is not None:
                 hold_tick()
-            # Orphaned hold: the VR frame stream is dead (Y-exit
-            # return, headset died), so the reset press that ends
-            # this hold can never arrive. After the grace period,
-            # stop waiting and settle where the arms are.
-            if vr_alive is not None:
-                now = time.perf_counter()
-                if vr_alive():
-                    orphan_since = None
-                elif orphan_since is None:
-                    orphan_since = now
-                elif now - orphan_since >= _HOLD_ORPHAN_GRACE_S:
-                    orphaned = True
-                    break
             await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
         if stopped():
             return "stopped"
@@ -997,18 +995,11 @@ class VRTeleopCore:
         # the arms: clear the stale command history (max-step safety
         # check) and re-seed the pipeline from the measured
         # positions, so the first commands hold the true pose with
-        # no transient — and, on a reset press, the replan starts
-        # from it.
+        # no transient and the replan starts from it.
         reset_command_state()
         pos_l, pos_r = get_positions()
         self.resync_to_positions(pos_l, pos_r)
         self.resume_ik()
-        if orphaned:
-            announce(
-                "No headset connected — holding position here. "
-                "Reconnect and press reset to return to rest."
-            )
-            return "orphaned"
         return "reset"
 
     # ------------------------------------------------------------------
@@ -1039,7 +1030,7 @@ class VRTeleopCore:
             on_ik_sample: Called with ``time.perf_counter()`` after each solve,
                 for the adapter's IK-rate readout.
         """
-        ik_interval = 1.0 / self.config.frequency
+        ik_interval = 1.0 / self.config.ik_frequency
         last_frame = None
         recv_timeout_count = 0
         last_dead_warn = 0.0

@@ -6,6 +6,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
+import can
+
 from almond_axol.cli.can import setup as can_setup
 from almond_axol.motor import CanBus
 from almond_axol.robot import lift as lift_module
@@ -110,6 +112,46 @@ class FakeCanBus:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _FakeProxyProcess:
+    """A proxy child that has already exited; ``close`` must still reap it."""
+
+    def __init__(self) -> None:
+        self.reaped = False
+
+    def poll(self) -> int:
+        self.reaped = True
+        return 0
+
+
+def _proxy_bus(
+    reader_task: asyncio.Task | None, proc: _FakeProxyProcess | None
+) -> CanBus:
+    """A ``CanBus`` in the open state without a spawned axol-rt proxy."""
+    bus = object.__new__(CanBus)
+    bus._channel = "can-test"
+    bus._stalled = False
+    bus._socket_path = "/tmp/axol-can-test-does-not-exist.sock"
+    bus._proc = proc
+    bus._reader = None
+    bus._writer = None
+    bus._reader_task = reader_task
+    bus._listeners = []
+    bus._ready = asyncio.Event()
+    bus._closed_reason = None
+    bus._timing = None
+    bus._experiment_waiter = None
+    bus._state = "open"
+    return bus
+
+
+_real_asyncio_wait = asyncio.wait
+
+
+async def _immediate_wait(tasks, *, timeout=None):  # noqa: ANN001, ANN201
+    """``asyncio.wait`` with the reader grace period collapsed to one tick."""
+    return await _real_asyncio_wait(tasks, timeout=0)
 
 
 class LiftStatusModeTest(unittest.IsolatedAsyncioTestCase):
@@ -264,19 +306,22 @@ class LiftStatusModeTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
 
         reader_task = asyncio.create_task(reader())
-        socket = SimpleNamespace(shutdown=Mock())
-        bus = object.__new__(CanBus)
-        bus._reader_task = reader_task
-        bus._bus = socket
+        proc = _FakeProxyProcess()
+        bus = _proxy_bus(reader_task, proc)
 
-        close_task = asyncio.create_task(bus.close())
-        await reader_cancelling.wait()
-        close_task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await close_task
+        with patch("almond_axol.motor.bus.asyncio.wait", _immediate_wait):
+            close_task = asyncio.create_task(bus.close())
+            await reader_cancelling.wait()
+            close_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await close_task
 
-        socket.shutdown.assert_called_once_with()
-        self.assertIsNone(bus._bus)
+        # The proxy child is reaped and the bus is closed before the
+        # cancellation propagates.
+        self.assertIsNone(bus._proc)
+        self.assertIsNone(bus._reader_task)
+        self.assertEqual(bus._state, "closed")
+        self.assertTrue(proc.reaped)
 
     async def test_lift_close_finishes_cleanup_then_propagates_cancellation(
         self,
@@ -292,45 +337,47 @@ class LiftStatusModeTest(unittest.IsolatedAsyncioTestCase):
 
         lift = Lift()
         lift._task = asyncio.create_task(command_task())
-        socket = SimpleNamespace(send=Mock(), shutdown=Mock())
-        bus = object.__new__(CanBus)
-        bus._reader_task = asyncio.create_task(asyncio.Event().wait())
-        bus._bus = socket
-        bus._lost = False
-        bus._stalled = False
-        bus._enobufs_since = None
+        proc = _FakeProxyProcess()
+        bus = _proxy_bus(asyncio.create_task(asyncio.Event().wait()), proc)
+        sent = AsyncMock(return_value=True)
+        bus._send = sent  # type: ignore[method-assign]
         lift._bus = bus
 
-        close_task = asyncio.create_task(lift.close())
-        await command_cancelling.wait()
-        close_task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await close_task
+        with patch("almond_axol.motor.bus.asyncio.wait", _immediate_wait):
+            close_task = asyncio.create_task(lift.close())
+            await command_cancelling.wait()
+            close_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await close_task
 
         self.assertIsNone(lift._bus)
-        socket.shutdown.assert_called_once_with()
-        self.assertEqual(socket.send.call_count, 2)
+        self.assertTrue(proc.reaped)
+        self.assertEqual(bus._state, "closed")
+        self.assertEqual(sent.await_count, 2)
 
-    async def test_lost_or_stalled_can_bus_reports_dropped_frames(self) -> None:
-        for lost, stalled, socket_missing in (
-            (True, False, False),
-            (False, True, False),
-            (False, False, True),
+    async def test_unusable_can_bus_never_reports_a_frame_as_delivered(self) -> None:
+        # The Rust-proxy bus fails closed: a frame on a bus that is closed,
+        # never opened, or whose proxy died raises instead of returning a
+        # silent False, so a one-shot STOP is never mistaken for delivered.
+        for state, closed_reason in (
+            ("closed", None),
+            ("unopened", None),
+            ("open", "axol-rt proxy for can-test exited"),
         ):
-            with self.subTest(
-                lost=lost, stalled=stalled, socket_missing=socket_missing
-            ):
-                socket = None if socket_missing else SimpleNamespace(send=Mock())
-                bus = object.__new__(CanBus)
-                bus._lost = lost
-                bus._stalled = stalled
-                bus._bus = socket
+            with self.subTest(state=state, closed_reason=closed_reason):
+                bus = _proxy_bus(None, None)
+                bus._state = state
+                bus._closed_reason = closed_reason
+                bus._writer = (
+                    None
+                    if state != "open"
+                    else SimpleNamespace(is_closing=lambda: False, write=Mock())
+                )
 
-                delivered = await bus._send(0x420, b"\x02")
-
-                self.assertFalse(delivered)
-                if socket is not None:
-                    socket.send.assert_not_called()
+                with self.assertRaises(can.CanOperationError):
+                    await bus._send(0x420, b"\x02")
+                if bus._writer is not None:
+                    bus._writer.write.assert_not_called()
 
     async def test_dropped_stop_is_reported_pending_and_keeps_bus_open(self) -> None:
         bus = SimpleNamespace(
@@ -440,6 +487,109 @@ class LiftStatusModeTest(unittest.IsolatedAsyncioTestCase):
             await lift._run()
 
         lift._send.assert_not_awaited()
+
+    async def _run_ticks(self, lift: Lift, ticks: int) -> None:
+        """Run ``_run`` for ``ticks`` iterations (the sleep ends the loop)."""
+        remaining = [ticks]
+
+        async def sleep(_seconds: float) -> None:
+            remaining[0] -= 1
+            if remaining[0] <= 0:
+                raise asyncio.CancelledError
+
+        with (
+            patch.object(lift_module.asyncio, "sleep", sleep),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await lift._run()
+
+    def _motion_frames(self, send: AsyncMock) -> list:
+        """Sent opcodes with the status poll filtered out."""
+        return [
+            c for c in send.await_args_list if c.args[0] != lift_module._OP_GET_STATUS
+        ]
+
+    async def test_detached_lift_sends_no_motion_frames(self) -> None:
+        """No command source yet → nothing but the status poll on the bus."""
+        lift = Lift()
+        lift._send = AsyncMock()  # type: ignore[method-assign]
+
+        await self._run_ticks(lift, 3)
+
+        self.assertEqual(self._motion_frames(lift._send), [])
+        self.assertFalse(lift.streaming)
+
+    async def test_attached_source_streams_a_motion_frame_every_tick(self) -> None:
+        lift = Lift(jog_speed=500)
+        lift._send = AsyncMock()  # type: ignore[method-assign]
+
+        lift.command(lift_module.UP)
+        await self._run_ticks(lift, 3)
+        jog = call(lift_module._OP_JOG, struct.pack("<h", 500))
+        self.assertEqual(self._motion_frames(lift._send), [jog, jog, jog])
+        self.assertTrue(lift.streaming)
+
+        # Release: the canonical STOP, then an idle STOP keepalive every tick
+        # for as long as the source keeps saying "stopped".
+        lift._send.reset_mock()
+        lift.command(lift_module.STOP)
+        await self._run_ticks(lift, 3)
+        stop = call(lift_module._OP_STOP)
+        self.assertEqual(self._motion_frames(lift._send), [stop, stop, stop])
+
+    async def test_idle_stream_never_cancels_a_one_shot_move(self) -> None:
+        lift = Lift()
+        lift._bus = SimpleNamespace()
+        lift._send = AsyncMock()  # type: ignore[method-assign]
+        lift.command(lift_module.STOP)  # a source is attached and idle
+        await self._run_ticks(lift, 1)
+        lift._send.reset_mock()
+
+        await lift.set_position(500)
+        lift._send.reset_mock()
+        await self._run_ticks(lift, 3)
+
+        self.assertEqual(self._motion_frames(lift._send), [])
+
+    async def test_suspend_stops_once_then_goes_silent(self) -> None:
+        lift = Lift()
+        lift._send = AsyncMock()  # type: ignore[method-assign]
+        lift.command(lift_module.DOWN)
+        await self._run_ticks(lift, 2)
+        lift._send.reset_mock()
+
+        lift.suspend()
+        await self._run_ticks(lift, 4)
+
+        self.assertEqual(self._motion_frames(lift._send), [call(lift_module._OP_STOP)])
+        self.assertFalse(lift.streaming)
+
+        # Suspending an already-idle, already-stopped lift sends nothing.
+        lift._send.reset_mock()
+        lift.suspend()
+        await self._run_ticks(lift, 2)
+        self.assertEqual(self._motion_frames(lift._send), [])
+
+        # A new command re-attaches the source and the stream resumes.
+        lift.command(lift_module.UP)
+        await self._run_ticks(lift, 1)
+        self.assertEqual(
+            self._motion_frames(lift._send),
+            [call(lift_module._OP_JOG, struct.pack("<h", lift_module.JOG_SPEED))],
+        )
+
+    async def test_suspend_aborts_an_active_one_shot(self) -> None:
+        lift = Lift()
+        lift._bus = SimpleNamespace()
+        lift._send = AsyncMock()  # type: ignore[method-assign]
+        await lift.home()
+        lift._send.reset_mock()
+
+        lift.suspend()
+        await self._run_ticks(lift, 2)
+
+        self.assertEqual(self._motion_frames(lift._send), [call(lift_module._OP_STOP)])
+        self.assertFalse(lift._one_shot_active)
 
     async def test_rejects_out_of_range_status_periods(self) -> None:
         with self.assertRaisesRegex(ValueError, "0 and 65535"):

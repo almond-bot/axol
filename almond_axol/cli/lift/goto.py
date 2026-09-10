@@ -3,7 +3,7 @@ axol lift.goto
 
 Move the telescoping lift to a target height, as percent of its homed
 travel. The default target (75%) is the **robot install height** — high
-enough to slide the robot onto its cart mount comfortably.
+enough to slide the robot onto its Jelly mount comfortably.
 
 Requires a homed lift (``axol lift.home``, a one-time calibration persisted
 in the board's flash). The firmware decelerates into the target and keeps

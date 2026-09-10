@@ -39,8 +39,10 @@ import os
 import re
 import sys
 import threading
+import time
 from typing import Any
 
+from ..motor.bus import STALL_DETECT_S, stalled_channels
 from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
 from ..zed import stereo_serials
 from .commands import flag_enabled, normalize_boolean_args
@@ -78,6 +80,15 @@ _FINALIZE_GRACE_S = 200.0
 # listening.
 _BRIDGE_READY_TIMEOUT_S = 35.0
 _BRIDGE_STOP_TIMEOUT_S = 4.0
+
+# Cadence of the bus-stall watchdog while a hardware operation runs. A stall
+# means motor power went away mid-run (the PSU is the operators' e-stop), which
+# the operation itself never notices: its motion commands are fire-and-forget.
+# The bus already needs STALL_DETECT_S of a non-draining TX queue to declare
+# the stall, and the same window is required again here before stopping, so a
+# stall that recovers on its own does not end a healthy run.
+_STALL_POLL_S = 0.25
+STALL_STOP_ERROR = "motor power lost"
 
 # Loggers whose records we never forward to the UI: webserver lifecycle,
 # access logs, low-level asyncio chatter. We still want the underlying ops'
@@ -267,6 +278,18 @@ class _Capture:
     double emission. The redirect is installed before the op spawns its children
     so they inherit the pipe; if it can't be set up we fall back to Python-only
     capture (the prior behaviour).
+
+    ``logging`` records get the same guarantee. A root ``StreamHandler`` that
+    predates the op (a ``basicConfig()`` at import time, as the axol_pi wrapper
+    does) holds the *original* fd-2 stream object — which the redirect has just
+    pointed at the pipe — so every record it wrote reached the session twice:
+    raw via the pipe and formatted via :class:`_SessionLogHandler`. Such
+    handlers are rebound to the saved terminal-only stream for the op's
+    lifetime and restored afterwards. Conversely an op that calls
+    ``basicConfig(force=True)`` (this package's CLIs) replaces the root
+    handlers with one bound to the current ``sys.stderr`` — the tee — which
+    would keep feeding the finished session after the op; ``__exit__`` moves it
+    to the restored real stream.
     """
 
     def __init__(self, session: Session, level: int) -> None:
@@ -282,6 +305,11 @@ class _Capture:
         self._saved_out: Any = None
         self._saved_err: Any = None
         self._reader: threading.Thread | None = None
+        # The tees installed as sys.stdout/sys.stderr for the op's lifetime.
+        self._tee_out: _StreamTee | None = None
+        self._tee_err: _StreamTee | None = None
+        # Root StreamHandlers moved off fd 1/2 for the op, with their streams.
+        self._rebound: list[tuple[logging.StreamHandler, Any]] = []
 
     def __enter__(self) -> _Capture:
         sink = self._session.emit
@@ -301,9 +329,62 @@ class _Capture:
                 "fd-level log capture unavailable; native/child-process output "
                 "won't reach the UI log"
             )
-            sys.stdout = _StreamTee(self._old_stdout, sink)
-            sys.stderr = _StreamTee(self._old_stderr, sink)
+            self._tee_out = _StreamTee(self._old_stdout, sink)
+            self._tee_err = _StreamTee(self._old_stderr, sink)
+            sys.stdout, sys.stderr = self._tee_out, self._tee_err
         return self
+
+    @staticmethod
+    def _stream_fd(stream: Any) -> int | None:
+        try:
+            return int(stream.fileno())
+        except Exception:  # noqa: BLE001 - not a real file (tee, StringIO, closed)
+            return None
+
+    def _rebind_fd_handlers(self) -> None:
+        """Point root StreamHandlers on fd 1/2 at the saved terminal-only streams.
+
+        Their records already reach the session once, formatted, through
+        :class:`_SessionLogHandler`; through the redirected fd they would
+        arrive a second time as raw text.
+        """
+        for handler in list(logging.getLogger().handlers):
+            if not isinstance(handler, logging.StreamHandler):
+                continue
+            stream = getattr(handler, "stream", None)
+            if stream is None or isinstance(stream, _StreamTee):
+                continue
+            fd = self._stream_fd(stream)
+            if stream is self._old_stderr or fd == 2:
+                target = self._saved_err
+            elif stream is self._old_stdout or fd == 1:
+                target = self._saved_out
+            else:
+                continue
+            if target is None:
+                continue
+            self._rebound.append((handler, handler.setStream(target)))
+
+    def _restore_handlers(self) -> None:
+        """Undo :meth:`_rebind_fd_handlers`; move tee-bound handlers to the real streams."""
+        for handler, previous in self._rebound:
+            try:
+                handler.setStream(previous)
+            except Exception:  # noqa: BLE001
+                pass
+        self._rebound = []
+        # An op's basicConfig(force=True) installed a handler on the tee. The
+        # tee's terminal side is about to be closed and its session is over,
+        # so let the handler keep logging to the real terminal/journald.
+        for handler in list(logging.getLogger().handlers):
+            if not isinstance(handler, logging.StreamHandler):
+                continue
+            stream = getattr(handler, "stream", None)
+            if stream is self._tee_err:
+                handler.setStream(sys.stderr)
+            elif stream is self._tee_out:
+                handler.setStream(sys.stdout)
+        self._tee_out = self._tee_err = None
 
     def _install_fd_tee(self, sink: Any) -> None:
         # Save the real fds so we can keep echoing to the terminal/journald and
@@ -331,8 +412,10 @@ class _Capture:
         # print/log line isn't captured twice. closefd=False: we own the fds.
         self._saved_out = os.fdopen(self._saved_out_fd, "w", buffering=1, closefd=False)
         self._saved_err = os.fdopen(self._saved_err_fd, "w", buffering=1, closefd=False)
-        sys.stdout = _StreamTee(self._saved_out, sink)
-        sys.stderr = _StreamTee(self._saved_err, sink)
+        self._tee_out = _StreamTee(self._saved_out, sink)
+        self._tee_err = _StreamTee(self._saved_err, sink)
+        sys.stdout, sys.stderr = self._tee_out, self._tee_err
+        self._rebind_fd_handlers()
 
     @staticmethod
     def _drain_pipe(pipe_r: int, echo_fd: int, sink: Any) -> None:
@@ -371,6 +454,8 @@ class _Capture:
             root.removeHandler(self._handler)
         if self._old_root_level is not None:
             root.setLevel(self._old_root_level)
+        # Before the saved streams close below: handlers must not be left on them.
+        self._restore_handlers()
         self._teardown_fd_tee()
 
     def _teardown_fd_tee(self) -> None:
@@ -397,13 +482,26 @@ class _Capture:
         # child can't wedge shutdown.
         if self._reader is not None:
             self._reader.join(timeout=2.0)
+        # TextIOWrapper.close() must run while its underlying descriptor still
+        # exists. These wrappers use closefd=False, so closing them marks the
+        # Python object closed (and performs its final flush) without taking
+        # ownership of the saved fd. The old order closed the raw fd first;
+        # when GC later finalized the wrapper — often during a heavy Torch
+        # import at collect-data startup — its implicit flush raised an
+        # ignored ``OSError: [Errno 9] Bad file descriptor``.
+        for stream in (self._saved_out, self._saved_err):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._saved_out = self._saved_err = None
         for fd in (self._saved_out_fd, self._saved_err_fd):
             if fd is not None:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
-        self._saved_out = self._saved_err = None
         self._saved_out_fd = self._saved_err_fd = None
         self._reader = None
 
@@ -443,8 +541,11 @@ class OperationRunner:
         self._episode_control: Any = None
         # A command reported that its hardware disconnect/disable did not
         # complete.  The command may still own one or both CAN buses, so no
-        # later operation may start and the idle RobotLink must not reacquire
-        # them.  Only restarting the serve process can re-establish ownership.
+        # later operation may start and the idle RobotLink does not reacquire
+        # them on its own.  Two ways out: restarting the serve process, or
+        # ``/api/op/clear-lockout``, which borrows the buses just long enough
+        # to prove every motor is torque-free (disabled or unpowered) and
+        # hands them back if it cannot (see clear_hardware_cleanup_lockout).
         self._hardware_cleanup_uncertain = False
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
@@ -464,7 +565,7 @@ class OperationRunner:
     def unsubscribe(self, session: Session, q: "asyncio.Queue[str | None]") -> None:
         session.subscribers.discard(q)
 
-    def is_running(self) -> bool:
+    def is_running(self, *, ignore_cleanup_lockout: bool = False) -> bool:
         # "stopping" still counts as running: the op owns the CAN bus until its
         # worker thread unwinds, so a new op must not start until it's gone.
         # An exception records the terminal error before the worker finishes
@@ -482,12 +583,24 @@ class OperationRunner:
         # In particular, Process.start() may fail after partially creating the
         # child, and multiprocessing rejects is_alive() on an unstarted object.
         bridge_owned = self._bridge_process is not None
-        return (
-            active_status
-            or worker_alive
-            or bridge_owned
-            or self._hardware_cleanup_uncertain
-        )
+        # The lockout reserves the robot, not the host: the operations that
+        # exist to end it — host power, and the lockout clear itself — pass
+        # ``ignore_cleanup_lockout`` so they see only live work.
+        locked_out = self._hardware_cleanup_uncertain and not ignore_cleanup_lockout
+        return active_status or worker_alive or bridge_owned or locked_out
+
+    def hardware_cleanup_lockout(self) -> bool:
+        """Whether an unverified hardware teardown is still reserving the robot."""
+        return self._hardware_cleanup_uncertain
+
+    def clear_hardware_cleanup_lockout(self) -> None:
+        """Release the lockout once the motors have been proven torque-free.
+
+        The caller owns that proof (see the ``/api/op/clear-lockout`` probe);
+        this only drops the reservation the failed teardown left behind.
+        """
+        with self._lock:
+            self._hardware_cleanup_uncertain = False
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -635,7 +748,7 @@ class OperationRunner:
                     )
 
             is_sim = cmd.sim_flag is not None and parsed_flags.get(cmd.sim_flag, False)
-            # A robot-free run (sim, or e.g. teleop's cart_only) never touches
+            # A robot-free run (sim, or e.g. teleop's jelly_only) never touches
             # the arms, so the persistent robot link stays connected and its
             # motor telemetry keeps streaming while the op runs.
             robot_free = is_sim or any(
@@ -734,6 +847,61 @@ class OperationRunner:
         )
         self._thread.start()
         return session
+
+    def _start_stall_watchdog(self, session: Session, needs_robot: bool) -> None:
+        """Watch the CAN buses for a power loss while this operation runs."""
+        if not needs_robot:
+            return
+        threading.Thread(
+            target=self._watch_bus_stall,
+            args=(session, self._stop_event),
+            name="axol-op-stall",
+            daemon=True,
+        ).start()
+
+    def _watch_bus_stall(self, session: Session, stop_event: threading.Event) -> None:
+        """Stop the operation when its CAN buses stay stalled: motor power is gone.
+
+        The operation drives the arms with fire-and-forget motion commands, so
+        losing motor power mid-run leaves it happily commanding a dead bus with
+        the panel still showing it as running. The buses themselves already
+        classify that (``stalled_channels``); this turns it into the Stop the
+        operator would otherwise have to ask for, and marks the session with
+        why it ended.
+        """
+        # Only a stall that begins during this run belongs to it. A channel
+        # already stalled at launch was left that way by an earlier owner
+        # (an abandoned worker that never closed its bus), and stopping this
+        # operation would not fix it.
+        inherited = stalled_channels()
+        stalled_since: float | None = None
+        while not stop_event.wait(_STALL_POLL_S):
+            if self._session is not session or session.status not in (
+                "starting",
+                "running",
+            ):
+                return
+            current = stalled_channels()
+            # A channel that recovered stops being inherited, so if it stalls
+            # again that stall did begin during this run.
+            inherited &= current
+            if not current - inherited:
+                stalled_since = None
+                continue
+            now = time.monotonic()
+            if stalled_since is None:
+                stalled_since = now
+            elif now - stalled_since >= STALL_DETECT_S:
+                session.emit(
+                    "[serve] motor power lost — no motor is answering on the CAN "
+                    "bus; stopping the operation"
+                )
+                _logger.warning(
+                    "motor power lost during %s; stopping", session.command_id
+                )
+                self.stop()
+                self._mark_terminal(session, "error", error=STALL_STOP_ERROR)
+                return
 
     def stop(self) -> Session | None:
         """Begin stopping the current op and return immediately.
@@ -1064,14 +1232,11 @@ class OperationRunner:
         resolution — the size the dataset was recorded at and the policy was
         trained on.
 
-        A recording fps above the cameras' default capture rate raises each
-        *recording* camera's capture fps to match: on the encoded relay
-        transport dataset rows are paced by camera frame arrival, so
-        collect-data requires the recording fps to equal the capture rate —
-        without this, setting a higher recording fps in Settings would just
-        fail that validation. (Higher rates may still be rejected by the
-        camera at large capture resolutions; that surfaces as the same clear
-        validation error.)
+        Recording/policy fps is independent of the fixed 30 fps headset stream.
+        Cameras normally stay at their 60 fps capture rate and the dataset or
+        policy selects its configured cadence. A requested rate above the
+        default raises each recording camera's physical capture rate to match;
+        higher rates may still be rejected at large capture resolutions.
         """
         from ..lerobot.camera.configuration_zed import (
             ZED_RESOLUTION_DIMS,
@@ -1127,10 +1292,9 @@ class OperationRunner:
                 dims = ZED_RESOLUTION_DIMS[cap]
                 merged[f"{prefix}.width"] = dims[0]
                 merged[f"{prefix}.height"] = dims[1]
-            # Recording cameras must capture at least at the recording fps
-            # (rows are paced by frame arrival on the relay's encoded
-            # transport); raise their capture fps when the setting asks for
-            # more than the default rate.
+            # Recording cameras must capture at least at the recording/policy
+            # fps. Lower output rates are selected/decimated downstream; raise
+            # physical capture only when the setting exceeds the default.
             if records and recording_fps > default_capture_fps:
                 merged[f"{prefix}.fps"] = recording_fps
 
@@ -1424,6 +1588,7 @@ class OperationRunner:
             await core(cfg)
 
         cleanup_uncertain = False
+        self._start_stall_watchdog(session, needs_robot)
         with _Capture(session, log_level):
             try:
                 if manage_bridge:
@@ -1472,6 +1637,7 @@ class OperationRunner:
 
         cmd = COMMANDS[op_id]
         cleanup_uncertain = False
+        self._start_stall_watchdog(session, needs_robot)
         with _Capture(session, log_level):
             try:
                 if manage_bridge:

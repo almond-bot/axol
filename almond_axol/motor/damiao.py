@@ -47,6 +47,7 @@ class _MotorFeedback:
 
 
 _DM_UINT32_REGS = {7, 8, 9, 10, 13, 14, 15, 16, 35, 36}
+_DM_REG_TIMEOUT = 9  # loss-of-comms alarm, 50 µs ticks (uint32); 0 disables
 _DM_REG_CTRL_MODE = 10  # control mode: 1=MIT, 2=POS_VEL, 3=VEL, 4=FORCE_POS
 _DM_REG_PMAX = 21
 _DM_REG_VMAX = 22
@@ -119,7 +120,7 @@ class DamiaoMotor(MotorDriver):
         self._v_max = 45.0
         self._t_max = 18.0
 
-        self._on_feedback: Callable[[float, float], None] | None = None
+        self._on_feedback: Callable[[float, float, float, float], None] | None = None
 
         bus._add_listener(self._on_message)
 
@@ -170,7 +171,7 @@ class DamiaoMotor(MotorDriver):
         if msg.arbitration_id != self._feedback_id:
             return
         if (data[0] & 0x0F) == (self._motor_id & 0x0F):
-            self._handle_feedback(data)
+            self._handle_feedback(data, msg.timestamp)
 
     def _handle_register_reply(self, data: bytes) -> None:
         rid = data[3]
@@ -185,7 +186,7 @@ class DamiaoMotor(MotorDriver):
         if fut is not None and not fut.done():
             fut.set_result(value)
 
-    def _handle_feedback(self, data: bytes) -> None:
+    def _handle_feedback(self, data: bytes, timestamp: float) -> None:
         status_code = data[0] >> 4
         pos_int = (data[1] << 8) | data[2]
         vel_int = (data[3] << 4) | (data[4] >> 4)
@@ -211,7 +212,12 @@ class DamiaoMotor(MotorDriver):
         self._feedback_waiters.clear()
 
         if self._on_feedback is not None:
-            self._on_feedback(self._feedback.position, self._feedback.torque)
+            self._on_feedback(
+                self._feedback.position,
+                self._feedback.velocity,
+                self._feedback.torque,
+                timestamp,
+            )
 
     def _canid_bytes(self) -> tuple[int, int]:
         return self._motor_id & 0xFF, (self._motor_id >> 8) & 0xFF
@@ -475,6 +481,19 @@ class DamiaoMotor(MotorDriver):
     async def get_error_code(self) -> MotorStatus:
         feedback = await self._request_feedback()
         return _DM_STATUS_MAP.get(feedback.status, MotorStatus.UNKNOWN)
+
+    @property
+    def last_status(self) -> MotorStatus | None:
+        """Status from the most recent feedback frame, without bus traffic.
+
+        Damiao motors echo a feedback frame for every command frame, so a
+        streaming controller sees a fault (e.g. :attr:`MotorStatus.LOST_COMM`
+        after the CAN timeout tripped) here within one command cycle. None
+        until any feedback has been received.
+        """
+        if self._feedback is None:
+            return None
+        return _DM_STATUS_MAP.get(self._feedback.status, MotorStatus.UNKNOWN)
 
     async def set_position_velocity(self, position: float, max_speed: float) -> None:
         await self._send_cmd(
