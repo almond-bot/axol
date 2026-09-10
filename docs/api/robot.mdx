@@ -17,10 +17,14 @@ Axol(
     config: AxolConfig = AxolConfig(),
     left_channel: str | None = "can_alm_axol_l",
     right_channel: str | None = "can_alm_axol_r",
+    left_joints: Iterable[Joint] | None = None,
+    right_joints: Iterable[Joint] | None = None,
 )
 ```
 
 Pass `left_channel=None` or `right_channel=None` to operate a single arm. Both arms are brought up concurrently on `__aenter__`.
+
+`left_joints` / `right_joints` restrict an arm to the motors actually on its bus, for a partial bench arm (e.g. `{Joint.WRIST_2, Joint.WRIST_3, Joint.GRIPPER}` for a wrist assembly). Absent joints are never constructed or enabled; every `(8,)` array keeps its Joint-enum shape, with absent joints reading `0.0` (the rest pose) and their commands ignored.
 
 ```python
 import asyncio

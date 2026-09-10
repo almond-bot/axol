@@ -145,7 +145,10 @@ def _joint_name_for_id(value: Any) -> str | None:
 
 
 def scoped_motor_faults(
-    faults: list[dict[str, Any]], args: dict[str, Any]
+    faults: list[dict[str, Any]],
+    args: dict[str, Any],
+    *,
+    unselected_joints_only_skip_absent: bool = False,
 ) -> list[dict[str, Any]]:
     """Filter faults down to the motors a command launch will actually touch.
 
@@ -155,9 +158,14 @@ def scoped_motor_faults(
     (ignored in guided zeroing, which walks ``joints`` instead). A bench setup
     with only some motors on the bus can then run a scoped test without the
     absent motors' "unreachable" faults blocking the launch — while faults on
-    the motors the run *does* drive still block it. Callers whose ``joints``
-    does not mean bus presence (the ROM soak: the realtime core brings up the
-    whole arm and ``--joints`` only selects what moves) drop that key first.
+    the motors the run *does* drive still block it.
+
+    ``unselected_joints_only_skip_absent`` is for a command whose ``joints``
+    picks what *moves* while every motor that answers on the bus is still
+    brought up and held (the ROM soak): an unreachable unselected joint is
+    one the run treats as absent and never enables, so its fault is dropped,
+    but any other fault on an unselected joint (a reachable motor in an
+    error state) still blocks because the run will energize that motor.
     """
     arm = str(args.get("arm") or "").strip().lower()
     if arm in ("left", "right"):
@@ -176,7 +184,12 @@ def scoped_motor_faults(
         if joint is not None:
             joint_names = {joint}
     if joint_names is not None:
-        faults = [f for f in faults if f["joint"].upper() in joint_names]
+        faults = [
+            f
+            for f in faults
+            if f["joint"].upper() in joint_names
+            or (unselected_joints_only_skip_absent and f["problem"] != "unreachable")
+        ]
     elif flag_enabled(args.get("guided")):
         # Guided zeroing without an explicit subset walks the seven arm
         # joints; the gripper is never touched (it has no zero to set), so

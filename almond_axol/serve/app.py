@@ -1109,6 +1109,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     async def _motor_fault_response(
         scope_args: dict[str, Any] | None = None,
+        *,
+        unselected_joints_only_skip_absent: bool = False,
     ) -> JSONResponse | None:
         """Return the shared motor-fault rejection, or ``None`` when clear.
 
@@ -1116,11 +1118,16 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         to the motors that run will actually touch — an arm/joint-scoped run
         (guided zeroing of a joint subset, a one-arm ROM test, a single-motor
         tool) must not be blocked by faults on motors it never drives, e.g. a
-        bench arm with only some motors on the bus.
+        bench arm with only some motors on the bus. See
+        :func:`scoped_motor_faults` for ``unselected_joints_only_skip_absent``.
         """
         faults = await asyncio.to_thread(robot.motor_faults)
         if scope_args:
-            faults = scoped_motor_faults(faults, scope_args)
+            faults = scoped_motor_faults(
+                faults,
+                scope_args,
+                unselected_joints_only_skip_absent=unselected_joints_only_skip_absent,
+            )
         if not faults:
             return None
         detail = ", ".join(
@@ -1616,11 +1623,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     for key, value in launch_args.items()
                     if key in valid_scope_keys
                 }
-                if command_id == "diag.rom-enable":
-                    # Its --joints picks which joints are *swept*; the realtime
-                    # core still brings up every motor of each selected arm, so
-                    # a fault anywhere on the arm blocks the run.
-                    fault_scope_args.pop("joints", None)
+                # ROM enable: --joints picks what is *swept*. Its bring-up
+                # probes each bus and brings up every motor that answers, so
+                # an unreachable unselected joint is one the run treats as
+                # absent (a bench wrist assembly on a single adapter) and
+                # must not block it — while any fault on a selected joint, or
+                # an error state on a reachable unselected one, still does.
+                rom_enable = command_id == "diag.rom-enable"
                 if command_id == "diag.lift-cycle":
                     # Lift cycle never touches grippers. Keep its arm/side
                     # scoping, but do not block it on an unrelated gripper
@@ -1637,7 +1646,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         joint.name for joint in ARM_JOINTS
                     )
                 fault_response = await _motor_fault_response(
-                    scope_args=fault_scope_args
+                    scope_args=fault_scope_args,
+                    unselected_joints_only_skip_absent=rom_enable,
                 )
                 if fault_response is not None:
                     return fault_response
