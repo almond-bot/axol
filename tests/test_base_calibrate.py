@@ -1,7 +1,7 @@
 """Tests for the ZED-tracked wheel-radius calibration (diag.base-calibrate).
 
 The fit and the frame geometry are pure functions, so they are exercised
-against a synthetic cart with known radii, camera mount and wheelbase; the
+against a synthetic base with known radii, camera mount and wheelbase; the
 camera and CAN paths are not touched here.
 """
 
@@ -29,7 +29,7 @@ from almond_axol.diagnostics.base.calibrate import (
     wheel_scale_arg,
     write_strokes,
 )
-from almond_axol.robot.cart import mix, stroke_rows
+from almond_axol.robot.jelly import mix, stroke_rows
 
 TRUE_RADII = [0.0503, 0.0496, 0.0509, 0.0499]
 TRUE_CAMERA = (0.31, -0.02)
@@ -51,7 +51,7 @@ def synth_strokes(
     noise: float = 0.0,
     rng: np.random.Generator | None = None,
 ) -> list[Stroke]:
-    """What the tool would record on a cart with these true parameters.
+    """What the tool would record on a base with these true parameters.
 
     The wheels turn exactly as commanded (nominal-radius mix); the body moves
     by the least-squares kinematic map of their true surface travel along a
@@ -252,7 +252,7 @@ class ConsistencyTests(unittest.TestCase):
     def test_tracker_losing_the_forward_axis_is_flagged(self) -> None:
         strokes = synth_strokes(make_plan(0.7, math.radians(90), 0.25, 0.2, 2))
         # One forward stroke measured 28° off-axis and short, heading unchanged:
-        # what a down-looking camera did on the real cart.
+        # what a down-looking camera did on the real Jelly.
         fwd = next(s for s in strokes if s.name == "forward")
         fwd.dx_m, fwd.dy_m = 0.645, 0.344
         lines, bad = consistency_report(strokes)

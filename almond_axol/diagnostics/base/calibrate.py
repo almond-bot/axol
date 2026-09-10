@@ -1,27 +1,27 @@
 """
 base.calibrate
 
-Measure the cart's per-wheel effective radii — and from them
-``CartConfig.wheel_scale`` — with no tape measure, using the overhead ZED's
+Measure Jelly's per-wheel effective radii — and from them
+``JellyConfig.wheel_scale`` — with no tape measure, using the overhead ZED's
 positional tracking as the ground truth.
 
 Why. Four omni wheels never wear identically. A few percent of radius spread
 is invisible from the wheels (each tracks its commanded speed perfectly) but
 slides the base sideways by centimetres per metre even with the gyro heading
 hold engaged, because the wheels' surface speeds are mutually inconsistent
-and the free rollers absorb the difference (see the ``cart`` module
+and the free rollers absorb the difference (see the ``jelly`` module
 docstring). Encoder-only self-calibration — spinning a wheel free as an
 odometer — was simulated and rejected: on an uneven floor the rolling
 assumption it rests on is exactly what breaks, so it fits the floor rather
 than the wheels. An external pose reference doesn't have that problem, and
-the cart already carries one: the stereo ZED X on the overhead mount tracks
+Jelly already carries one: the stereo ZED X on the overhead mount tracks
 its own 6-DoF pose at 60 Hz with sub-millimetre stationary noise.
 
-What it does. The cart performs a fixed set of strokes from wherever it is
+What it does. Jelly performs a fixed set of strokes from wherever it is
 standing — spin 90° each way, then drive forward, back, left and right by
 ``--distance`` — with the heading hold *off* so the wheels' raw kinematics
 show. For each stroke it records the wheels' net rotation (motor odometry,
-:meth:`Cart.read_wheels`) and the camera's net displacement and heading
+:meth:`Jelly.read_wheels`) and the camera's net displacement and heading
 change (ZED positional tracking). Inverting the x-drive kinematics, the
 body's displacement is a fixed linear map of each wheel's surface travel
 ``R_i·φ_i``, so the strokes give a linear least-squares problem in the four
@@ -43,8 +43,8 @@ wheel slip during a stroke (an unloaded diagonal on a bad patch of floor)
 shows up there, and the run should be repeated on flatter ground if they
 exceed a few millimetres.
 
-Output is the ``wheel_scale`` tuple to paste into ``--cart.wheel_scale``
-(or the Advanced → Cart panel), the absolute radii as a sanity check, and
+Output is the ``wheel_scale`` tuple to paste into ``--jelly.wheel_scale``
+(or the Advanced → Jelly panel), the absolute radii as a sanity check, and
 optionally (``--save``) the value written straight into the control panel's
 saved settings. ``--out FILE`` dumps the raw strokes so the fit can be
 recomputed offline with :func:`fit_calibration`.
@@ -73,19 +73,19 @@ from typing import Any
 
 import numpy as np
 
-from ...robot.cart import (
-    _SESSION_PMAX,
+from ...robot.jelly import (
     DEFAULT_CHANNEL,
+    SESSION_PMAX,
     WHEELS,
-    Cart,
-    CartConfig,
+    Jelly,
+    JellyConfig,
     stroke_rows,
 )
 
 _logger = logging.getLogger(__name__)
 
-# Rate at which strokes re-latch their command (the cart's own loop runs at
-# CartConfig.frequency; commands older than command_timeout decay to a stop).
+# Rate at which strokes re-latch their command (Jelly's wheel loop runs at
+# JellyConfig.frequency; commands older than command_timeout stop the base).
 _COMMAND_HZ = 50.0
 # Wheel speed below which the base counts as stopped, and how long the camera
 # must see it motionless (< _SETTLE_MOVE_M) before a stroke's end is recorded.
@@ -96,7 +96,7 @@ _SETTLE_TIMEOUT_S = 15.0
 # wheel could wrap mid-stroke and corrupt its odometry (~40 rad is 1.5 m).
 _PMAX_HEADROOM_RAD = 80.0
 # Fit quality above which the result is flagged as suspect. Translation is
-# judged relative to the strokes' length: on the cart a clean 0.7 m stroke
+# judged relative to the strokes' length: on Jelly a clean 0.7 m stroke
 # leaves ~8 mm (1.1%) of micro-slip and tracker noise, and slip scales with
 # distance.
 _WARN_RESIDUAL_FRAC = 0.02
@@ -111,7 +111,7 @@ _OUTLIER_MAX_FRAC = 0.2
 # Tracking-consistency limits (see consistency_report): spread of the
 # camera-motion / wheel-turns ratio within one stroke direction, and how far
 # off its axis a translation stroke may point while the heading barely moved.
-# Meant to catch gross failures (the cart lifting a wheel gave 10–26%); clean
+# Meant to catch gross failures (Jelly lifting a wheel gave 10–26%); clean
 # runs of six strokes sit at 0.5–2.5%, and a single mildly slipping stroke is
 # the outlier rejection's job.
 _WARN_RATIO_SPREAD = 0.05
@@ -133,7 +133,7 @@ TRACKERS: dict[str, tuple[str, bool]] = {
 
 @dataclass
 class Stroke:
-    """One stroke's measurements, all relative to the cart's pose at its start.
+    """One stroke's measurements, all relative to Jelly's pose at its start.
 
     ``turns`` is each wheel's net rotation (rad, :data:`WHEELS` order, motor
     convention). ``dx_m``/``dy_m`` is the *camera's* horizontal displacement in
@@ -185,7 +185,7 @@ class Calibration:
 
 
 def wheel_scale_arg(scale: list[float] | tuple[float, ...]) -> str:
-    """Render a scale tuple the way ``--cart.wheel_scale`` wants it."""
+    """Render a scale tuple the way ``--jelly.wheel_scale`` wants it."""
     return "[" + ",".join(f"{s:.4f}" for s in scale) + "]"
 
 
@@ -219,7 +219,7 @@ def fit_calibration(strokes: list[Stroke], lever_m: float | None = None) -> Cali
     Unknowns are the four effective radii ``R_i``, the camera's offset ``r``
     from the drive centre (body frame), its mounting yaw ``ψ``, and the wheels'
     rotation lever arm ``L`` unless ``lever_m`` gives it. Per stroke, with the
-    kinematic rows ``(kx, ky, kw)`` of :func:`~almond_axol.robot.cart.stroke_rows`
+    kinematic rows ``(kx, ky, kw)`` of :func:`~almond_axol.robot.jelly.stroke_rows`
     and the measured camera motion ``(d, Δθ)`` expressed in the body-start
     frame (``d_B = Rz(ψ)·d_C``):
 
@@ -379,7 +379,7 @@ class ZedTracker:
 
     ``tracker`` picks the SDK's tracking generation: ``gen3`` / ``gen3-2d``
     (visual-inertial SLAM, without or with the 2D ground constraint — which
-    never initialized on the cart, whose base rocks; needs no depth) or
+    never initialized on Jelly, whose base rocks; needs no depth) or
     ``gen2`` / ``gen1`` (the depth-based odometers, deprecated in SDK 5.x). ``depth_mode`` is any ``sl.DEPTH_MODE`` name; the
     neural modes trigger a one-off multi-minute model optimization on a
     Jetson. Stationary noise is tiny in every configuration (tens of microns
@@ -604,7 +604,7 @@ class Odometer:
 
 
 def ramp_stop_time(cmd_norm: float, decel: float, jerk: float) -> float:
-    """Seconds the cart's ramp needs to bring a command of ``cmd_norm`` to zero.
+    """Seconds Jelly's ramp needs to bring a command of ``cmd_norm`` to zero.
 
     The plain trapezoid takes ``cmd/decel``; with a jerk limit the rate has to
     build up and bleed off again, which adds up to ``decel/jerk`` (the exact
@@ -617,17 +617,17 @@ def ramp_stop_time(cmd_norm: float, decel: float, jerk: float) -> float:
     return t
 
 
-def _trace_row(cart: Cart, t0: float) -> list[float]:
+def _trace_row(jelly: Jelly, t0: float) -> list[float]:
     return [
         round(time.monotonic() - t0, 3),
-        round(math.sqrt(sum(c * c for c in cart.body_cmd)), 4),
-        round(cart.traction_scale, 3),
-        *[round(t, 3) for t in cart.wheel_torques],
+        round(math.sqrt(sum(c * c for c in jelly.body_cmd)), 4),
+        round(jelly.traction_scale, 3),
+        *[round(t, 3) for t in jelly.wheel_torques],
     ]
 
 
 async def _settle(
-    cart: Cart,
+    jelly: Jelly,
     tracker: ZedTracker,
     hold_s: float,
     odometer: Odometer | None = None,
@@ -635,7 +635,7 @@ async def _settle(
 ) -> PoseSample:
     """Command a stop and wait until the wheels and the camera are still.
 
-    Keeps re-latching the zero command (so the cart's watchdog never has to)
+    Keeps re-latching the zero command (so Jelly's watchdog never has to)
     until the ramp has run out, every wheel reads slower than
     ``_SETTLE_WHEEL_RAD_S``, and the camera has moved less than
     ``_SETTLE_MOVE_M`` over the last ``hold_s`` seconds. Feeds every pose to
@@ -643,22 +643,22 @@ async def _settle(
     rows to ``trace`` (rows, t0) while the ramp-down runs. Returns the final
     pose.
     """
-    # Slower than the drive loop: the zero command only has to beat the
-    # cart's command_timeout, and the wheel poll is four feedback requests.
+    # Slower than the drive loop: the zero command only has to beat Jelly's
+    # command_timeout, and read_wheels waits for the core's next status packet.
     interval = 0.05
     t0 = time.monotonic()
     anchor: PoseSample | None = None
     while True:
-        cart.set_command(0.0, 0.0, 0.0)
+        jelly.set_command(0.0, 0.0, 0.0)
         sample = tracker.latest()
         if odometer is not None:
             odometer.update(sample)
-        ramp_done = all(abs(c) < 1e-3 for c in cart.body_cmd)
+        ramp_done = all(abs(c) < 1e-3 for c in jelly.body_cmd)
         if trace is not None and not ramp_done:
-            trace[0].append(_trace_row(cart, trace[1]))
+            trace[0].append(_trace_row(jelly, trace[1]))
         wheels_still = False
         if ramp_done:
-            _, velocities = await cart.read_wheels()
+            _, velocities = await jelly.read_wheels()
             wheels_still = all(abs(v) < _SETTLE_WHEEL_RAD_S for v in velocities)
         if not (ramp_done and wheels_still):
             anchor = None
@@ -669,12 +669,12 @@ async def _settle(
         elif sample.time - anchor.time >= hold_s:
             return sample
         if time.monotonic() - t0 > _SETTLE_TIMEOUT_S:
-            raise StrokeError("the cart did not come to rest after the stroke")
+            raise StrokeError("Jelly did not come to rest after the stroke")
         await asyncio.sleep(interval)
 
 
 async def run_stroke(
-    cart: Cart,
+    jelly: Jelly,
     tracker: ZedTracker,
     plan: StrokePlan,
     *,
@@ -682,11 +682,11 @@ async def run_stroke(
     pause_s: float,
 ) -> Stroke:
     """Drive one stroke to its target and return its measurements."""
-    start_pose = await _settle(cart, tracker, pause_s)
+    start_pose = await _settle(jelly, tracker, pause_s)
     if not start_pose.ok:
         raise StrokeError("positional tracking is not OK at the stroke start")
-    turns0, _ = await cart.read_wheels()
-    if any(abs(p) + _PMAX_HEADROOM_RAD > _SESSION_PMAX for p in turns0):
+    turns0, _ = await jelly.read_wheels()
+    if any(abs(p) + _PMAX_HEADROOM_RAD > SESSION_PMAX for p in turns0):
         raise StrokeError(
             "a wheel's position is too close to the ±PMAX mapping limit for a "
             "stroke — power-cycle the base to reset wheel positions"
@@ -694,17 +694,17 @@ async def run_stroke(
 
     odometer = Odometer(start_pose, plan.rotation)
     interval = 1.0 / _COMMAND_HZ
-    jerk = cart.config.jerk
+    jerk = jelly.config.jerk
     t0 = time.monotonic()
     rate = 0.0  # smoothed progress rate (m/s or rad/s)
     last_progress, last_time = 0.0, t0
     trace: list[list[float]] = []
     while True:
-        cart.set_command(*plan.command)
-        trace.append(_trace_row(cart, t0))
+        jelly.set_command(*plan.command)
+        trace.append(_trace_row(jelly, t0))
         sample = tracker.latest()
         if not sample.ok:
-            cart.set_command(0.0, 0.0, 0.0)
+            jelly.set_command(0.0, 0.0, 0.0)
             raise StrokeError(f"positional tracking lost during '{plan.name}'")
         odometer.update(sample)
         progress = odometer.progress
@@ -716,12 +716,12 @@ async def run_stroke(
         # stroke lands near its target instead of overshooting by the whole
         # decel ramp (which at a brisk speed can be most of a metre). The
         # braking rate is whatever the traction guard currently allows.
-        cmd_norm = math.sqrt(sum(c * c for c in cart.body_cmd))
-        coast = 0.5 * rate * ramp_stop_time(cmd_norm, cart.decel_in_force, jerk)
+        cmd_norm = math.sqrt(sum(c * c for c in jelly.body_cmd))
+        coast = 0.5 * rate * ramp_stop_time(cmd_norm, jelly.decel_in_force, jerk)
         if progress + coast >= plan.target:
             break
         if now - t0 > timeout_s:
-            cart.set_command(0.0, 0.0, 0.0)
+            jelly.set_command(0.0, 0.0, 0.0)
             raise StrokeError(
                 f"'{plan.name}' did not reach its target in {timeout_s:.0f} s "
                 f"(got {progress:.3f} of {plan.target:.3f})"
@@ -729,8 +729,8 @@ async def run_stroke(
         await asyncio.sleep(interval)
     duration = time.monotonic() - t0
 
-    end_pose = await _settle(cart, tracker, pause_s, odometer, (trace, t0))
-    turns1, _ = await cart.read_wheels()
+    end_pose = await _settle(jelly, tracker, pause_s, odometer, (trace, t0))
+    turns1, _ = await jelly.read_wheels()
 
     forward, left = camera_heading_axes(start_pose.rotation)
     delta = end_pose.xy - start_pose.xy
@@ -940,8 +940,8 @@ def format_report(strokes: list[Stroke], cal: Calibration, serial: int) -> str:
     lines += [
         "",
         "Apply with:",
-        f"  --cart.wheel_scale {wheel_scale_arg(cal.wheel_scale)}",
-        "  (control panel: Advanced → Cart → wheel_scale; or rerun with --save)",
+        f"  --jelly.wheel_scale {wheel_scale_arg(cal.wheel_scale)}",
+        "  (control panel: Advanced → Jelly → wheel_scale; or rerun with --save)",
     ]
     return "\n".join(lines)
 
@@ -950,7 +950,7 @@ def save_wheel_scale(scale: list[float]) -> Path:
     """Persist the scale into the control panel's saved settings."""
     from ...serve.settings import SETTINGS_PATH, SettingsStore
 
-    SettingsStore().update(advanced={"cart.wheel_scale": wheel_scale_arg(scale)})
+    SettingsStore().update(advanced={"jelly.wheel_scale": wheel_scale_arg(scale)})
     return SETTINGS_PATH
 
 
@@ -989,7 +989,7 @@ async def _run(args: argparse.Namespace) -> int:
     )
     print(
         f"Clearance needed: {args.distance + 0.5:.1f} m ahead, behind, left and "
-        f"right of the cart, and room to spin {args.angle:.0f}° each way.\n"
+        f"right of Jelly, and room to spin {args.angle:.0f}° each way.\n"
         f"Sequence ({len(plan)} strokes): "
         + ", ".join(p.name for p in plan[:6])
         + (f" × {args.repeat}" if args.repeat > 1 else "")
@@ -1006,14 +1006,14 @@ async def _run(args: argparse.Namespace) -> int:
     print(f"Opening ZED {serial} for positional tracking…", flush=True)
     tracker.open()
     strokes: list[Stroke] = []
-    cart: Cart | None = None
+    jelly: Jelly | None = None
     try:
         await tracker.wait_ready()
         # Heading hold off and no IMU: the fit wants the wheels' raw
         # kinematics, and the camera supplies the heading. Parking stays on so
         # the base holds still between strokes.
-        cart = Cart(
-            CartConfig(
+        jelly = Jelly(
+            JellyConfig(
                 channel=args.channel,
                 lift=False,
                 imu=False,
@@ -1025,11 +1025,11 @@ async def _run(args: argparse.Namespace) -> int:
                 traction_log=args.traction_log,
             )
         )
-        await cart.enable()
-        print("Cart enabled; tracking OK. Driving…", flush=True)
+        await jelly.enable()
+        print("Jelly enabled; tracking OK. Driving…", flush=True)
         for i, p in enumerate(plan, 1):
             stroke = await run_stroke(
-                cart, tracker, p, timeout_s=args.stroke_timeout, pause_s=args.pause
+                jelly, tracker, p, timeout_s=args.stroke_timeout, pause_s=args.pause
             )
             strokes.append(stroke)
             print(
@@ -1045,9 +1045,9 @@ async def _run(args: argparse.Namespace) -> int:
             print(f"Partial strokes written to {args.out}")
         return 1
     finally:
-        if cart is not None:
-            cart.set_command(0.0, 0.0, 0.0)
-            await cart.disable()
+        if jelly is not None:
+            jelly.set_command(0.0, 0.0, 0.0)
+            await jelly.disable()
         tracker.close()
 
     if args.out:
@@ -1072,7 +1072,7 @@ def _report_and_save(
         if input("The fit is suspect. Save anyway? [y/N] ").strip().lower() != "y":
             return 1
     path = save_wheel_scale(cal.wheel_scale)
-    print(f"Saved cart.wheel_scale to {path}")
+    print(f"Saved jelly.wheel_scale to {path}")
     return 0
 
 
@@ -1105,7 +1105,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "--speed",
         type=float,
         default=0.25,
-        help="Normalized translation command, 0–1 of CartConfig.max_speed "
+        help="Normalized translation command, 0–1 of JellyConfig.max_speed "
         "(default: 0.25)",
     )
     parser.add_argument(
@@ -1144,19 +1144,19 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--accel",
         type=float,
-        default=CartConfig.accel,
+        default=JellyConfig.accel,
         help="Command ramp rate for both launch and stop, full-stick units per "
-        "second (CartConfig.accel/decel). Lower it to test whether a veer comes "
+        "second (JellyConfig.accel/decel). Lower it to test whether a veer comes "
         "from load transfer under acceleration lifting a wheel "
-        f"(default: {CartConfig.accel})",
+        f"(default: {JellyConfig.accel})",
     )
     parser.add_argument(
         "--traction",
         action=argparse.BooleanOptionalAction,
-        default=CartConfig.traction,
-        help="Cart traction guard (eases the ramp while a wheel has lost the "
+        default=JellyConfig.traction,
+        help="Traction guard (eases the ramp while a wheel has lost the "
         "floor, judged from motor torque). --no-traction drives the strokes "
-        f"with the plain ramp for an A/B (default: {CartConfig.traction})",
+        f"with the plain ramp for an A/B (default: {JellyConfig.traction})",
     )
     parser.add_argument(
         "--traction-log",
@@ -1202,7 +1202,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "--save",
         action="store_true",
         help="Write the result into the control panel's saved settings "
-        "(cart.wheel_scale under Advanced)",
+        "(jelly.wheel_scale under Advanced)",
     )
     parser.add_argument(
         "-y",
@@ -1236,7 +1236,7 @@ def run_cli(args: argparse.Namespace) -> None:
     try:
         code = asyncio.run(_run(args))
     except KeyboardInterrupt:
-        print("\nInterrupted — cart disabled.")
+        print("\nInterrupted — Jelly disabled.")
         code = 130
     if code:
         raise SystemExit(code)
@@ -1246,7 +1246,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     """Register ``diag.base-calibrate`` for dashboard schema introspection."""
     parser = subparsers.add_parser(
         "diag.base-calibrate",
-        help="Calibrate the cart's per-wheel radii with ZED positional tracking.",
+        help="Calibrate Jelly's per-wheel radii with ZED positional tracking.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
@@ -1257,7 +1257,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="axol diag.base-calibrate",
-        description="Calibrate the cart's per-wheel radii with ZED positional tracking.",
+        description="Calibrate Jelly's per-wheel radii with ZED positional tracking.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

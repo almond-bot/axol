@@ -97,6 +97,8 @@ For low-latency encode the NVENC/VIC engine clocks must be pinned to their maxim
 
 Robots fitted with **Jelly** (x-drive omni base + telescoping lift) let the operator drive the whole robot from the headset thumbsticks — left stick translates, right stick rotates, the stick clicks run the lift. Enable it with `--jelly.enabled true` (or the control panel's **Jelly** toggle); its parameters live in the nested `jelly` config (`--jelly.max_speed`, `--jelly.channel`, `--jelly.imu`, …). Jelly motion is **operator mobility only** — it's never recorded into a dataset and a policy never drives it.
 
+Straight-line motion is kept straight three ways, each aimed at a different cause of veer: the gyro heading hold (`--jelly.imu`, on by default) corrects rotation; `--jelly.wheel_scale`, measured by [`axol diag.base-calibrate`](/cli/diag-base-calibrate), compensates the omni wheels' effective-radius differences that otherwise slide the base sideways; and the command ramp (`--jelly.accel` / `decel` / `jerk`, an asymmetric jerk-limited S-curve) plus its torque-fed traction guard (`--jelly.traction`) keep the weight shift of a launch or stop from lifting a wheel and letting the loaded diagonal pull the base off line. All of it runs in the Rust wheel core (`axol-rt jelly`, see `rust/axol-rt/README.md`).
+
 `--jelly_only` runs *just* Jelly: the arms are never constructed and the Axol hub CAN bus is never opened, so you can drive Jelly without the arm hardware connected. Jelly brings its own CAN interface up on start ([`can.setup`](/cli/can-setup) pins it as `can_alm_axol_b`), so no separate [`can.enable`](/cli/can-enable) step is needed. For the full control mapping see the [VR interface guide](/guides/vr-interface#jelly).
 
 <Note>
