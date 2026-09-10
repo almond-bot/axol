@@ -32,6 +32,10 @@ CAN_BASE = "can_alm_axol_b"
 # The chest bus (another single-channel adapter): the jelly_legs lift
 # controller — our own PCB replacing the Jiecang control box, driving the
 # telescoping lift legs (see almond_axol/robot/lift.py for the protocol).
+# Optional: a Jelly may instead wire the lift controller onto the wheel bus
+# (its IDs 0x420-0x422 are clear of every Damiao range), in which case this
+# interface does not exist and the lift driver uses CAN_BASE — see
+# almond_axol.robot.lift.resolve_lift_channel.
 CAN_CHEST = "can_alm_axol_c"
 
 # CAN bring-up script written by `axol can.setup`. Runs at boot and on adapter

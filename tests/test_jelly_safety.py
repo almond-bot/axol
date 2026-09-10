@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from almond_axol.constants import CAN_BASE, CAN_CHEST
 from almond_axol.robot import jelly as jelly_module
+from almond_axol.robot import lift as lift_module
 from almond_axol.robot.jelly import Jelly, JellyConfig, _pack_config
 from almond_axol.robot.lift import STOP, UP
 
@@ -154,6 +158,53 @@ class JellyCanTimeoutConfigTest(unittest.IsolatedAsyncioTestCase):
 
     def test_default_timeout_is_200ms(self) -> None:
         self.assertEqual(JellyConfig().can_timeout_ms, 200.0)
+
+
+class JellyLiftBusTest(unittest.IsolatedAsyncioTestCase):
+    """The lift follows the wiring ``can.setup`` found: its own chest bus, or
+    the wheel bus it shares with the Damiao motors."""
+
+    def test_lift_channel_defaults_to_auto(self) -> None:
+        self.assertIsNone(JellyConfig().lift_channel)
+
+    async def _enable_lift_only(self, present: tuple[str, ...]) -> str:
+        opened: list[str] = []
+
+        class FakeLift:
+            def __init__(self, channel, jog_speed):  # noqa: ANN001
+                self.channel = lift_module.resolve_lift_channel(channel)
+                opened.append(self.channel)
+
+            async def start(self) -> None:
+                pass
+
+            def command(self, direction) -> None:  # noqa: ANN001
+                pass
+
+            async def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            for name in present:
+                (Path(directory) / name).mkdir()
+            with (
+                patch.object(lift_module, "_SYS_NET", Path(directory)),
+                patch.object(jelly_module, "Lift", FakeLift),
+            ):
+                jelly = Jelly(JellyConfig(channel=None, lift=True))
+                await jelly.enable()
+                try:
+                    self.assertTrue(jelly.has_lift)
+                finally:
+                    await jelly.disable()
+        self.assertEqual(len(opened), 1)
+        return opened[0]
+
+    async def test_lift_uses_its_own_chest_bus_when_present(self) -> None:
+        self.assertEqual(await self._enable_lift_only((CAN_CHEST, CAN_BASE)), CAN_CHEST)
+
+    async def test_lift_shares_the_wheel_bus_without_a_chest_bus(self) -> None:
+        self.assertEqual(await self._enable_lift_only((CAN_BASE,)), CAN_BASE)
 
 
 class JellyRustWireTest(unittest.IsolatedAsyncioTestCase):

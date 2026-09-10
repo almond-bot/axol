@@ -8,6 +8,7 @@ import math
 import time
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -15,6 +16,7 @@ import numpy as np
 
 from almond_axol.constants import CAN_CHEST, Joint
 from almond_axol.diagnostics.lift import cycle
+from almond_axol.robot import lift as lift_module
 from almond_axol.robot.lift import LiftStatus
 
 
@@ -284,14 +286,19 @@ class LiftCycleHelpersTest(unittest.TestCase):
         self.assertFalse(cycle._at_endpoint(_status(1000, moving=True), 1000))
         self.assertFalse(cycle._at_endpoint(_status(1000, drift=9), 1000))
 
-    def test_parser_defaults_to_c_without_wheel_bus_fallback(self) -> None:
+    def test_parser_lift_channel_defaults_to_the_pinned_lift_bus(self) -> None:
         parser = argparse.ArgumentParser()
         cycle._add_arguments(parser, cycles_required=False)
 
         args = parser.parse_args(["--cycles", "3"])
 
-        self.assertEqual(args.lift_channel, "can_alm_axol_c")
-        self.assertEqual(args.lift_channel, CAN_CHEST)
+        # None defers to resolve_lift_channel: the chest bus when that
+        # interface exists, otherwise the wheel bus the lift shares.
+        self.assertIsNone(args.lift_channel)
+        with patch.object(lift_module, "_SYS_NET", Path("/nonexistent")):
+            self.assertEqual(cycle.resolve_lift_channel(args.lift_channel), CAN_CHEST)
+        explicit = parser.parse_args(["--cycles", "3", "--lift-channel", "can9"])
+        self.assertEqual(cycle.resolve_lift_channel(explicit.lift_channel), "can9")
 
     def test_parser_has_no_gripper_control_surface(self) -> None:
         parser = argparse.ArgumentParser()

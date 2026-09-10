@@ -41,10 +41,10 @@ from collections.abc import Awaitable, Callable
 import numpy as np
 
 from ...cli.lift import Interrupted, fmt_status, interrupt_event
-from ...constants import ARM_JOINTS, CAN_CHEST, CAN_LEFT, CAN_RIGHT, Joint
+from ...constants import ARM_JOINTS, CAN_BASE, CAN_CHEST, CAN_LEFT, CAN_RIGHT, Joint
 from ...robot.axol import Axol
 from ...robot.config import AxolConfig
-from ...robot.lift import Lift, LiftStatus
+from ...robot.lift import Lift, LiftStatus, resolve_lift_channel
 from ...rt import RtAxol
 
 _STATUS_PERIOD_MS = 200
@@ -868,6 +868,7 @@ async def _run(args: argparse.Namespace) -> None:
         raise SystemExit("ERROR: cannot skip both arms on a mounted-robot lift test.")
 
     cycles = _resolve_cycles(args.cycles)
+    lift_channel = resolve_lift_channel(args.lift_channel)
     lift: Lift | None = None
     inner: Axol | None = None
     axol: RtAxol | None = None
@@ -881,13 +882,13 @@ async def _run(args: argparse.Namespace) -> None:
 
     print("=== MOUNTED LIFT CYCLE TEST ===")
     print(
-        f"Cycles: {cycles}  |  lift: {args.lift_channel}  |  "
+        f"Cycles: {cycles}  |  lift: {lift_channel}  |  "
         "S1 clearance: left +90 deg / right -90 deg"
     )
     print("Clear the full arm and lift travel before continuing. Ctrl-C stops.\n")
 
     try:
-        lift = await _open_lift(args.lift_channel)
+        lift = await _open_lift(lift_channel)
         with interrupt_event() as interrupted:
             initial_status = _require_fresh_status(lift, "preflight")
             if not initial_status.homed:
@@ -1201,9 +1202,11 @@ def _add_arguments(
     )
     parser.add_argument(
         "--lift-channel",
-        default=CAN_CHEST,
+        default=None,
         metavar="IFACE",
-        help="SocketCAN interface carrying Jelly Legs (default: %(default)s).",
+        help="SocketCAN interface carrying Jelly Legs (default: "
+        f"{CAN_CHEST} when that chest bus exists, otherwise the shared wheel "
+        f"bus {CAN_BASE}).",
     )
     parser.add_argument(
         "--speed",
