@@ -166,6 +166,16 @@ class MotorDriver(ABC):
         """Return the current motor status / error code."""
         ...
 
+    @property
+    def last_status(self) -> MotorStatus | None:
+        """Most recently observed status without generating bus traffic.
+
+        Drivers whose motors report status on every reply (Damiao) return the
+        status of the last frame seen; None when nothing has been received yet
+        or the driver does not cache status.
+        """
+        return None
+
     async def get_low_voltage_threshold(self) -> float:
         """Return the undervoltage protection threshold in Volts.
 

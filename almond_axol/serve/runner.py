@@ -39,8 +39,10 @@ import os
 import re
 import sys
 import threading
+import time
 from typing import Any
 
+from ..motor.bus import STALL_DETECT_S, stalled_channels
 from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
 from ..zed import stereo_serials
 from .commands import flag_enabled, normalize_boolean_args
@@ -78,6 +80,15 @@ _FINALIZE_GRACE_S = 200.0
 # listening.
 _BRIDGE_READY_TIMEOUT_S = 35.0
 _BRIDGE_STOP_TIMEOUT_S = 4.0
+
+# Cadence of the bus-stall watchdog while a hardware operation runs. A stall
+# means motor power went away mid-run (the PSU is the operators' e-stop), which
+# the operation itself never notices: its motion commands are fire-and-forget.
+# The bus already needs STALL_DETECT_S of a non-draining TX queue to declare
+# the stall, and the same window is required again here before stopping, so a
+# stall that recovers on its own does not end a healthy run.
+_STALL_POLL_S = 0.25
+STALL_STOP_ERROR = "motor power lost"
 
 # Loggers whose records we never forward to the UI: webserver lifecycle,
 # access logs, low-level asyncio chatter. We still want the underlying ops'
@@ -456,8 +467,11 @@ class OperationRunner:
         self._episode_control: Any = None
         # A command reported that its hardware disconnect/disable did not
         # complete.  The command may still own one or both CAN buses, so no
-        # later operation may start and the idle RobotLink must not reacquire
-        # them.  Only restarting the serve process can re-establish ownership.
+        # later operation may start and the idle RobotLink does not reacquire
+        # them on its own.  Two ways out: restarting the serve process, or
+        # ``/api/op/clear-lockout``, which borrows the buses just long enough
+        # to prove every motor is torque-free (disabled or unpowered) and
+        # hands them back if it cannot (see clear_hardware_cleanup_lockout).
         self._hardware_cleanup_uncertain = False
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
@@ -477,7 +491,7 @@ class OperationRunner:
     def unsubscribe(self, session: Session, q: "asyncio.Queue[str | None]") -> None:
         session.subscribers.discard(q)
 
-    def is_running(self) -> bool:
+    def is_running(self, *, ignore_cleanup_lockout: bool = False) -> bool:
         # "stopping" still counts as running: the op owns the CAN bus until its
         # worker thread unwinds, so a new op must not start until it's gone.
         # An exception records the terminal error before the worker finishes
@@ -495,12 +509,24 @@ class OperationRunner:
         # In particular, Process.start() may fail after partially creating the
         # child, and multiprocessing rejects is_alive() on an unstarted object.
         bridge_owned = self._bridge_process is not None
-        return (
-            active_status
-            or worker_alive
-            or bridge_owned
-            or self._hardware_cleanup_uncertain
-        )
+        # The lockout reserves the robot, not the host: the operations that
+        # exist to end it — host power, and the lockout clear itself — pass
+        # ``ignore_cleanup_lockout`` so they see only live work.
+        locked_out = self._hardware_cleanup_uncertain and not ignore_cleanup_lockout
+        return active_status or worker_alive or bridge_owned or locked_out
+
+    def hardware_cleanup_lockout(self) -> bool:
+        """Whether an unverified hardware teardown is still reserving the robot."""
+        return self._hardware_cleanup_uncertain
+
+    def clear_hardware_cleanup_lockout(self) -> None:
+        """Release the lockout once the motors have been proven torque-free.
+
+        The caller owns that proof (see the ``/api/op/clear-lockout`` probe);
+        this only drops the reservation the failed teardown left behind.
+        """
+        with self._lock:
+            self._hardware_cleanup_uncertain = False
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -747,6 +773,61 @@ class OperationRunner:
         )
         self._thread.start()
         return session
+
+    def _start_stall_watchdog(self, session: Session, needs_robot: bool) -> None:
+        """Watch the CAN buses for a power loss while this operation runs."""
+        if not needs_robot:
+            return
+        threading.Thread(
+            target=self._watch_bus_stall,
+            args=(session, self._stop_event),
+            name="axol-op-stall",
+            daemon=True,
+        ).start()
+
+    def _watch_bus_stall(self, session: Session, stop_event: threading.Event) -> None:
+        """Stop the operation when its CAN buses stay stalled: motor power is gone.
+
+        The operation drives the arms with fire-and-forget motion commands, so
+        losing motor power mid-run leaves it happily commanding a dead bus with
+        the panel still showing it as running. The buses themselves already
+        classify that (``stalled_channels``); this turns it into the Stop the
+        operator would otherwise have to ask for, and marks the session with
+        why it ended.
+        """
+        # Only a stall that begins during this run belongs to it. A channel
+        # already stalled at launch was left that way by an earlier owner
+        # (an abandoned worker that never closed its bus), and stopping this
+        # operation would not fix it.
+        inherited = stalled_channels()
+        stalled_since: float | None = None
+        while not stop_event.wait(_STALL_POLL_S):
+            if self._session is not session or session.status not in (
+                "starting",
+                "running",
+            ):
+                return
+            current = stalled_channels()
+            # A channel that recovered stops being inherited, so if it stalls
+            # again that stall did begin during this run.
+            inherited &= current
+            if not current - inherited:
+                stalled_since = None
+                continue
+            now = time.monotonic()
+            if stalled_since is None:
+                stalled_since = now
+            elif now - stalled_since >= STALL_DETECT_S:
+                session.emit(
+                    "[serve] motor power lost — no motor is answering on the CAN "
+                    "bus; stopping the operation"
+                )
+                _logger.warning(
+                    "motor power lost during %s; stopping", session.command_id
+                )
+                self.stop()
+                self._mark_terminal(session, "error", error=STALL_STOP_ERROR)
+                return
 
     def stop(self) -> Session | None:
         """Begin stopping the current op and return immediately.
@@ -1433,6 +1514,7 @@ class OperationRunner:
             await core(cfg)
 
         cleanup_uncertain = False
+        self._start_stall_watchdog(session, needs_robot)
         with _Capture(session, log_level):
             try:
                 if manage_bridge:
@@ -1481,6 +1563,7 @@ class OperationRunner:
 
         cmd = COMMANDS[op_id]
         cleanup_uncertain = False
+        self._start_stall_watchdog(session, needs_robot)
         with _Capture(session, log_level):
             try:
                 if manage_bridge:

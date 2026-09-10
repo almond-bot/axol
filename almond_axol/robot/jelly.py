@@ -19,9 +19,12 @@ heading hold, the watchdog, and park/unpark at ``JellyConfig.frequency``:
   slow), the wheels are parked: switched to MIT/impedance mode and held at
   their current positions by the motor's internal high-bandwidth position
   loop, so the base does not roll under load.
-- If no fresh command arrives within ``command_timeout`` the target is
-  forced to zero (streaming sources that die mid-motion cannot leave the
-  base driving).
+- If no fresh command arrives within ``command_timeout`` the command source
+  is treated as dead: the wheel target is forced to zero (so a streaming
+  source that dies mid-motion cannot leave the base driving) and the lift
+  gets one STOP and then **silence** — no keepalive, no re-send of a stale
+  command — so the jelly_legs board's own 300 ms jog deadman is the safety
+  layer for the legs rather than a host re-sending a stale command.
 
 Damiao position commands/feedback are mapped into ±PMAX (12.5 rad from
 factory — about two wheel turns), which drive wheels escape almost
@@ -171,8 +174,14 @@ class JellyConfig:
         hold_kd:         Damping (Nm·s/rad) of the parked MIT hold.
         frequency:       Wheel command task rate in Hz.
         command_timeout: Seconds without a fresh :meth:`Jelly.set_command`
-                         before the target is forced to zero (and the lift
-                         stopped). Protects against a dead command source.
+                         before the command source is considered dead. On
+                         that edge the wheel target is forced to zero and the
+                         lift gets one STOP and then nothing on CAN — no
+                         keepalive — so the legs' 300 ms jog deadman takes
+                         over. Protects against a dead command source. Must
+                         comfortably exceed the source's frame period (a
+                         headset streams at 72-90 Hz, with occasional 50-100
+                         ms WiFi gaps).
         lift:            Whether the telescoping lift is present (the
                          jelly_legs board on the chest CAN bus, see
                          :mod:`almond_axol.robot.lift`). The chest bus being
@@ -199,7 +208,7 @@ class JellyConfig:
     hold_kp: float = 60.0
     hold_kd: float = 1.5
     frequency: float = 50.0
-    command_timeout: float = 0.3
+    command_timeout: float = 0.2
     lift: bool = True
     lift_channel: str = CAN_CHEST
     lift_speed: int = JOG_SPEED
@@ -335,6 +344,10 @@ class Jelly:
         # atomic under the GIL), consumed by the command task.
         self._target: tuple[float, float, float, int] = (0.0, 0.0, 0.0, STOP)
         self._target_time: float = 0.0
+        # The last VR frame object mapped by apply_vr_frame. A frame that is
+        # handed over twice (a poller re-reading the server's latest frame,
+        # say) must not count as a fresh command.
+        self._last_vr_frame: object | None = None
 
         # Latest external yaw-rate sample (rad/s CCW, monotonic timestamp),
         # written from any thread; None until a sensor feeds one. The counter
@@ -632,8 +645,16 @@ class Jelly:
                        base doesn't creep during the return to rest.
 
         Thread-safe (only latches the target); staleness is handled by the
-        command task, so a dead frame stream times out to a full stop.
+        command task, so a dead frame stream times out to a full stop. Only a
+        *new* frame counts as a live source: call this from the server's
+        on-frame callback, once per received frame. The same frame object
+        handed over again (a poller re-reading the latest frame after the
+        headset went quiet) is ignored rather than refreshing the deadline —
+        that would be a stale command dressed up as a fresh one.
         """
+        if frame is self._last_vr_frame:
+            return
+        self._last_vr_frame = frame
         if resetting or frame.reset:
             self.set_command(0.0, 0.0, 0.0, STOP)
             return
@@ -740,17 +761,44 @@ class Jelly:
             raise
 
     async def _bridge_loop(self) -> None:
+        """Forward the latched target to the Rust core and drive the lift.
+
+        The live-source requirement applies to *motion*. While the latched
+        command is fresh the lift streams it (JOG while held, STOP while
+        idle). When the command goes stale the lift is suspended — one STOP,
+        then nothing on CAN — so the jelly_legs jog deadman, not a host
+        keepalive, decides what the legs do; the Rust core meanwhile ramps the
+        wheels to a stop and parks them from the target's own age. When a
+        fresh command arrives the lift stream resumes.
+        """
         interval = 1.0 / self._config.frequency
         warned_silent = False
         started = time.monotonic()
+        linked = False  # the source was fresh on the previous cycle
         try:
             while True:
                 now = time.monotonic()
                 vx, vy, wz, lift_dir = self._target
                 age = max(0.0, now - self._target_time)
-                if age > self._config.command_timeout:
+                fresh = age <= self._config.command_timeout
+                if not fresh:
                     lift_dir = STOP
-                if self._lift is not None:
+                    if linked:
+                        # The source died (teleop thread gone, headset stream
+                        # dropped, wedged poller): release the lift once and go
+                        # quiet rather than re-sending a stale STOP forever.
+                        linked = False
+                        _logger.info(
+                            "Jelly: command source silent for %.0f ms — "
+                            "stopping the lift and going quiet on its bus",
+                            self._config.command_timeout * 1e3,
+                        )
+                        if self._lift is not None:
+                            self._lift.suspend()
+                elif not linked:
+                    linked = True
+                    _logger.info("Jelly: command source live — resuming control")
+                if fresh and self._lift is not None:
                     self._lift.command(lift_dir)
                 self.lift_dir = lift_dir if self._lift is not None else STOP
 

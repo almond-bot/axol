@@ -13,6 +13,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 
+import can
 import numpy as np
 
 from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
@@ -64,7 +65,21 @@ GRIPPER_TRAVEL = math.radians(290)
 _GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm
 _GRIPPER_CALIB_STEP = 0.005  # rad per step
 _GRIPPER_CALIB_SETTLE = 0.001  # s per step
-_GRIPPER_CALIB_MAX_STEPS = math.ceil(GRIPPER_TRAVEL / _GRIPPER_CALIB_STEP)
+# Sweep headroom beyond the nominal travel. Torque only builds once the jaw
+# is against the open stop and the impedance target keeps moving past it, so
+# a gripper that starts at the closed stop needs budget *after* covering
+# GRIPPER_TRAVEL or the sweep ends with the jaws open but no stop detected.
+# Also absorbs unit-to-unit travel variation (~0.035 rad measured). Costs
+# ~60 ms in the no-stop failure case and nothing on success (the loop exits
+# at the torque threshold).
+_GRIPPER_CALIB_OVERTRAVEL = 0.3  # rad
+_GRIPPER_CALIB_MAX_STEPS = math.ceil(
+    (GRIPPER_TRAVEL + _GRIPPER_CALIB_OVERTRAVEL) / _GRIPPER_CALIB_STEP
+)
+# A sweep that moved at least this fraction of GRIPPER_TRAVEL without meeting
+# the torque threshold ran out of jaw, not out of budget: the fingers are not
+# coupled to the motor. Anything shorter stalled against something.
+_GRIPPER_CALIB_FULL_TRAVEL_FRACTION = 0.9
 
 # Impedance gains used only during gripper open-stop calibration.
 _GRIPPER_CALIB_KP = 50.0
@@ -95,6 +110,36 @@ async def _await_all_hardware_actions(*actions: Awaitable[object]) -> None:
     for result in results:
         if isinstance(result, BaseException):
             raise result
+
+
+async def _arm_is_unpowered(arm: "AxolArm", bus: CanBus) -> bool:
+    """True when *arm*'s bus is stalled and no motor on it answers a status read.
+
+    Distinguishes the ways a torque-off can fail to confirm: motor power was
+    removed (the e-stop, so every read times out and the torque is gone
+    already), or a powered motor is refusing to disable (which no read can
+    excuse, and which must keep the caller's cleanup uncertain).
+
+    Both signals are required. Failed reads alone are not proof: a lost CAN
+    interface (the hub dropping off USB) or a proxy that died for any other
+    reason makes every read fail in exactly the same way while the motors stay
+    powered and holding torque. Only the bus can tell the two apart — it
+    declares a stall when nothing on the wire ACKs its frames, which needs
+    every node to be dark.
+    """
+    if not bus.stalled:
+        return False
+    results = await asyncio.gather(
+        *(motor.get_error_code() for motor in arm.motors.values()),
+        return_exceptions=True,
+    )
+    # A powered motor answers this read with its status. One that never
+    # replies raises MotorError; once the stalled proxy has exited, the bus
+    # itself refuses the send (CanOperationError). Either way nothing on the
+    # arm answered, so an all-failure sweep is a dead bus.
+    return bool(results) and all(
+        isinstance(result, (MotorError, can.CanOperationError)) for result in results
+    )
 
 
 async def _rollback_newly_enabled_motors(
@@ -198,19 +243,25 @@ async def calibrate_gripper_open_stop(motor: Motor) -> float:
     """Find a gripper's open hard-stop and return its raw motor position (rad).
 
     Steps the motor incrementally toward open until the torque magnitude
-    reaches ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop). Exhausting the
-    full expected travel without observing that stop fails calibration rather
-    than treating an arbitrary final encoder reading as the open position.
-    Shared by :class:`AxolArm` and the Mantis
+    reaches ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop). The sweep
+    budget is the full expected travel plus ``_GRIPPER_CALIB_OVERTRAVEL`` so a
+    gripper starting at the closed stop still has room to press into the open
+    one. Exhausting that budget without observing the stop fails calibration
+    rather than treating an arbitrary final encoder reading as the open
+    position. Shared by :class:`AxolArm` and the Mantis
     (:mod:`almond_axol.robot.mantis`), whose grippers are the same Damiao unit.
 
     Must be called with the motor already enabled and in IMPEDANCE mode.
 
     Raises:
         MotorError: If the full calibration sweep completes without detecting
-            the open hard-stop torque threshold.
+            the open hard-stop torque threshold. The message distinguishes a
+            motor that covered the whole travel range unopposed (fingers not
+            coupled to the shaft) from one that stalled short of it
+            (obstruction or slipping coupling).
     """
-    target = await motor.get_position()
+    start = await motor.get_position()
+    target = start
     stop_found = False
     last_torque = 0.0
     for _ in range(_GRIPPER_CALIB_MAX_STEPS):
@@ -223,16 +274,31 @@ async def calibrate_gripper_open_stop(motor: Motor) -> float:
         if abs(last_torque) >= _GRIPPER_TORQUE_THRESHOLD:
             stop_found = True
             break
+    final = await motor.get_position()
     if not stop_found:
         commanded_travel = _GRIPPER_CALIB_MAX_STEPS * _GRIPPER_CALIB_STEP
+        travelled = start - final
+        if travelled >= _GRIPPER_CALIB_FULL_TRAVEL_FRACTION * GRIPPER_TRAVEL:
+            hint = (
+                "The motor moved through the whole open/close range without "
+                "meeting resistance — check that the fingers are fitted and "
+                "coupled to the motor shaft"
+            )
+        else:
+            hint = (
+                "The motor stopped short of the full range without reaching "
+                "the torque threshold — check for an obstruction between the "
+                "jaws or a slipping coupling"
+            )
         raise MotorError(
             "Gripper open-stop calibration failed: no hard stop was detected "
-            f"during the {commanded_travel:.3f} rad sweep "
-            f"(last torque {last_torque:.3f} Nm, required "
-            f"{_GRIPPER_TORQUE_THRESHOLD:.3f} Nm); the gripper remains "
+            f"during the {commanded_travel:.3f} rad sweep (motor moved "
+            f"{travelled:.3f} rad of the {GRIPPER_TRAVEL:.3f} rad range; last "
+            f"torque {last_torque:.3f} Nm, required "
+            f"{_GRIPPER_TORQUE_THRESHOLD:.3f} Nm). {hint}; the gripper remains "
             "uncalibrated"
         )
-    return await motor.get_position()
+    return final
 
 
 def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
@@ -2115,6 +2181,12 @@ class Axol(RobotBase):
         caller can retry.  Once torque-off has been verified, a close failure
         is likewise retained and retryable without sending motor commands over
         a bus that may already have closed successfully.
+
+        An arm whose motors have all gone silent is the one unconfirmed
+        torque-off that is not uncertain: its power is off (the e-stop), so
+        there is no torque left to own.  That arm is logged as unpowered and
+        the buses close normally; an arm with a motor still answering keeps
+        raising, so a live motor refusing to disable still locks the hardware.
         """
         self._shutdown_pending = True
         telemetry_tasks = []
@@ -2135,15 +2207,28 @@ class Axol(RobotBase):
             # failed enable() whose rollback did not confirm
             # (_startup_rollback_pending): every motor on each arm is
             # commanded, so a verified pass here settles them too.
-            tasks = []
+            arms: list[tuple[str, AxolArm, CanBus]] = []
             if self.left is not None:
-                tasks.append(self.left.disable())
+                arms.append(("left", self.left, self._left_bus))
             if self.right is not None:
-                tasks.append(self.right.disable())
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            motor_failures = [
-                result for result in results if isinstance(result, BaseException)
-            ]
+                arms.append(("right", self.right, self._right_bus))
+            results = await asyncio.gather(
+                *(arm.disable() for _, arm, _ in arms), return_exceptions=True
+            )
+            motor_failures = []
+            for (side, arm, bus), result in zip(arms, results):
+                if not isinstance(result, BaseException):
+                    continue
+                if await _arm_is_unpowered(arm, bus):
+                    _logger.warning(
+                        "%s arm did not confirm torque-off and no motor answers "
+                        "on its bus — the arm is unpowered (e-stop?), so its "
+                        "torque is already gone: %s",
+                        side,
+                        result,
+                    )
+                    continue
+                motor_failures.append(result)
             if not motor_failures:
                 self._motors_disabled = True
                 self._startup_rollback_pending = None

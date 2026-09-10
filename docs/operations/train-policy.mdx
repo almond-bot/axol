@@ -40,6 +40,34 @@ Training writes checkpoints under `outputs/train/.../checkpoints`, and (with `--
   No local GPU? The ACT tutorial links a [Google Colab notebook](https://huggingface.co/docs/lerobot/en/act#train-using-google-colab) you can use to train in the cloud.
 </Note>
 
+## Mantis datasets: use `axol mantis.train`
+
+Episodes recorded with the [Mantis](/mantis/hardware) handheld rigs (`axol collect-data --mantis true`) store **absolute base-frame end-effector poses** in the Cartesian schema. Each take is anchored to wherever the demonstrator engaged, so a policy trained on absolute targets learns positions in that one world frame and does not transfer when the robot starts somewhere else.
+
+`axol mantis.train` fixes that at training time. It wraps `lerobot-train` — same CLI surface (draccus dotted overrides, `--config_path`, wandb, resume), same checkpoint format — and installs a **chunk-relative end-effector** processor in the policy's pipeline: every predicted action chunk is expressed relative to the observation it was predicted from, and the action/state normalisation statistics are recomputed over the relativised values. The relativisation lives in the checkpoint's processor pipeline, so deployment is unchanged: `axol run-policy --policy_path <ckpt> ...` as usual.
+
+```bash
+axol mantis.train \
+  --dataset.repo_id=${HF_USER}/mantis-pick-place \
+  --policy.type=act \
+  --output_dir=outputs/train/act_mantis_pick_place \
+  --job_name=act_mantis_pick_place \
+  --policy.device=cuda \
+  --wandb.enable=true \
+  --policy.repo_id=${HF_USER}/act_mantis_pick_place
+```
+
+<Warning>
+  Plain `lerobot-train` also runs on a Mantis dataset without error, but it produces a **world-anchored** policy with no start-pose invariance. Use `axol mantis.train` for anything recorded with the rigs (or with `--robot_config.observe_cartesian true` on the robot, if you want the same relative-action generalisation).
+</Warning>
+
+Two things to know:
+
+- **Local only.** Remote HF Jobs (`--job.target` other than `local`) are rejected: the remote pod runs stock `lerobot-train` and cannot carry the processor patch. Run the command on the training machine.
+- **Chunk execution.** With relative actions, chunks predicted from different observations are anchored to different reference poses. The default chunk-queue execution in `run-policy` is exact; `--aggregate_fn temporal_ensemble` blends near-identical absolute actions from overlapping chunks and works well in practice, but the blend is an approximation.
+
+The dataset itself stays standard LeRobot format, so rig-collected and on-robot Cartesian episodes mix freely in one dataset.
+
 ## LeRobotTutorials
 
 <CardGroup cols={2}>

@@ -32,10 +32,13 @@ import sys
 import time
 from pathlib import Path
 
+from ..utils.ports import CONTROL_PORT, VR_PORT
 from ..utils.sudo import run_root
 
-_VR_PORT = 8000
-_SERVE_PORT = 8001
+# Same pair ``utils.adb`` forwards for the control panel's Quest-over-USB flow;
+# sourced from ``utils.ports`` so the tunnel targets can't drift from the binds.
+_VR_PORT = VR_PORT
+_SERVE_PORT = CONTROL_PORT
 _BROWSER_URL = f"https://localhost:{_SERVE_PORT}/vr?host=localhost&autoconnect=1"
 _SERVICE_PATH = Path("/etc/systemd/system/axol-mantis.service")
 _MANAGED_SERVE_SERVICE = "axol.service"

@@ -300,7 +300,9 @@ export function runFieldVisible(key: string, profile: HardwareProfile): boolean 
 export interface MotorHealth {
   arm: string
   joint: string
-  reachable: boolean
+  /** null while a task owns the CAN bus: nobody is reading this motor, so its
+   *  reachability is unknown rather than last-known. */
+  reachable: boolean | null
   /** MotorStatus name from the idle ping (e.g. "OK", "OVER_TEMPERATURE"). */
   status: string | null
   temperature: number | null
@@ -561,6 +563,9 @@ export interface OpStatus {
   /** Present only while an op declaring an episode control is running
    *  (collect-data / run-policy / waypoints); null otherwise. */
   policy: PolicyState | null
+  /** An operation could not confirm it disabled the motors, so the server
+   *  keeps the robot reserved (older hosts omit this). */
+  lockout?: boolean
 }
 
 export async function fetchOpStatus(): Promise<OpStatus> {
@@ -583,6 +588,15 @@ export async function startOperation(
 
 export async function stopOperation(): Promise<SessionInfo> {
   return json(await fetch(apiUrl("/api/op/stop"), { method: "POST" }))
+}
+
+/**
+ * Lift the hardware-cleanup lockout. The server pings every motor first and
+ * refuses (409) unless each one reads disabled or does not answer, so this is
+ * a request to re-check the hardware rather than an override.
+ */
+export async function clearOperationLockout(): Promise<{ cleared: boolean }> {
+  return json(await fetch(apiUrl("/api/op/clear-lockout"), { method: "POST" }))
 }
 
 /** run-policy episode control: ``start`` | ``s`` (save) | ``r`` (rerecord) | ``q`` (quit). */

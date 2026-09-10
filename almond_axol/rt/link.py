@@ -17,6 +17,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from ..motor.bus import is_stall_report, set_channel_stalled
+
 _logger = logging.getLogger(__name__)
 
 # One telemetry entry per slot: pos (rad), vel (rad/s), tau (Nm), age_us.
@@ -79,6 +81,10 @@ class RtLink:
         self._states: asyncio.Queue[str] = asyncio.Queue()
         self._fault: str | None = None
         self._limp: str | None = None
+        # Interfaces this core has reported a TX stall on (published through
+        # ``motor.bus.stalled_channels`` for the serve layer's power-loss
+        # watchdog); cleared when the link closes.
+        self._stalled_ifaces: set[str] = set()
         # Called for each telemetry packet: (side, {slot: FeedbackSlot}).
         self.on_feedback: Callable[[int, dict[int, FeedbackSlot]], None] | None = None
 
@@ -185,6 +191,7 @@ class RtLink:
                         # motor owner has stopped.
                         _logger.info("axol-rt: %s", body)
                         self._fault = body
+                        self._note_stall(body)
                     else:
                         _logger.info("axol-rt: %s", body)
                     self._states.put_nowait(body)
@@ -323,8 +330,34 @@ class RtLink:
         else:
             self._send(struct.pack("<cB", b"R", 0))
 
+    def _note_stall(self, fault: str) -> None:
+        """Publish a ``fault: <iface>: TX queue stalled ...`` process-wide.
+
+        The core owns the CAN sockets while armed, so it — not a
+        :class:`~almond_axol.motor.bus.CanBus` — is the one that sees the
+        e-stop cut motor power (nothing ACKs, the TX queue stays full past
+        ``STALL_DETECT``). The bus thread names its interface at the front of
+        the message, which is what the serve layer's watchdog keys on.
+        """
+        if not is_stall_report(fault):
+            return
+        body = fault.removeprefix("fault:").strip()
+        iface, sep, _rest = body.partition(":")
+        iface = iface.strip()
+        if not sep or not iface or any(ch.isspace() for ch in iface):
+            _logger.warning("axol-rt: stall report without an interface: %s", fault)
+            return
+        if iface not in self._stalled_ifaces:
+            self._stalled_ifaces.add(iface)
+            set_channel_stalled(iface, True)
+
     async def close(self) -> None:
         """Tear down the link and the core process."""
+        # A closed core reports nothing: the stall belonged to this session's
+        # bus owner, not to whoever opens the interface next.
+        for iface in self._stalled_ifaces:
+            set_channel_stalled(iface, False)
+        self._stalled_ifaces.clear()
         if self._reader_task is not None:
             reader_task = self._reader_task
             self._reader_task = None
