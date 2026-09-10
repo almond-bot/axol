@@ -19,5 +19,5 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}command_timeout</F> | `0.2` | Seconds without a stick command before Jelly stops. |
 | <F>--{prefix}can_timeout_ms</F> | `200.0` | Motor-side loss-of-comms timeout (ms). Stops the wheels even if the host hangs. |
 | <F>--{prefix}lift</F> | `true` | The lift is present. |
-| <F>--{prefix}lift_channel</F> | `can_alm_axol_c` | CAN interface of the lift controller. |
+| <F>--{prefix}lift_channel</F> | `null` (auto) | CAN interface of the lift controller. `null` picks the chest bus `can_alm_axol_c` when that interface exists, otherwise the wheel bus `can_alm_axol_b` the lift shares with the motors. |
 | <F>--{prefix}lift_speed</F> | `650` | Lift speed (encoder counts/s). |
