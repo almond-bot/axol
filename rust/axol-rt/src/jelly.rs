@@ -1,8 +1,10 @@
 //! Realtime wheel controller for the Jelly mobile base.
 //!
 //! Python owns VR mapping and the optional lift. This service owns the wheel
-//! motor lifecycle, command watchdog, axis snap, vector slew, x-drive mix,
-//! gyro heading hold, park/unpark state machine, and every wheel CAN frame.
+//! motor lifecycle, command watchdog, axis snap, the jerk-limited vector ramp
+//! and its traction guard (`ramp.rs`), x-drive mix with per-wheel radius
+//! compensation, gyro heading hold, park/unpark state machine, and every wheel
+//! CAN frame.
 //!
 //! # The wheel CAN timeout is the runaway safety layer
 //!
@@ -34,6 +36,7 @@
 use crate::bringup;
 use crate::can::CanSock;
 use crate::proto::{self, MitRanges};
+use crate::ramp::{TractionGuard, VectorRamp, TRACTION_MIN_RAMP_FRAC};
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome};
 use crate::txn;
 use std::io::{self, Read, Write};
@@ -79,11 +82,20 @@ extern "C" fn on_signal(_: libc::c_int) {
     SIGNAL_STOP.store(true, Ordering::SeqCst);
 }
 
+/// Number of f64 values in the `C` config message (`_pack_config` in
+/// `almond_axol/robot/jelly.py` writes exactly this many, in this order).
+const CONFIG_VALUES: usize = 21;
+
 #[derive(Clone, Copy, Debug)]
 struct Config {
     max_speed: f64,
     turn_scale: f64,
-    slew: f64,
+    /// Ramp rate of the normalized command away from zero (full-stick/s).
+    accel: f64,
+    /// Ramp rate toward zero — stops, speed reductions, reversals.
+    decel: f64,
+    /// Limit on the ramp rate's own rate of change (full-stick/s²); 0 = trapezoid.
+    jerk: f64,
     axis_snap_deg: f64,
     yaw_gain: f64,
     yaw_max: f64,
@@ -92,6 +104,13 @@ struct Config {
     frequency: f64,
     timeout: f64,
     can_timeout_ms: f64,
+    /// Per-wheel command multipliers (effective-radius compensation), IDS order.
+    wheel_scale: [f64; 4],
+    /// Traction guard on/off and its thresholds (see `ramp::TractionGuard`).
+    traction: bool,
+    traction_light: f64,
+    traction_floor: f64,
+    traction_torque_min: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -147,33 +166,71 @@ fn f64_at(data: &[u8], at: usize) -> io::Result<f64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated Jelly message"))
 }
 fn parse_config(data: &[u8]) -> io::Result<Config> {
-    if data.len() != 88 {
+    if data.len() != 8 * CONFIG_VALUES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Jelly config must contain 11 f64 values",
+            format!("Jelly config must contain {CONFIG_VALUES} f64 values"),
         ));
     }
+    let v = |i: usize| f64_at(data, 8 * i);
     let c = Config {
-        max_speed: f64_at(data, 0)?,
-        turn_scale: f64_at(data, 8)?,
-        slew: f64_at(data, 16)?,
-        axis_snap_deg: f64_at(data, 24)?,
-        yaw_gain: f64_at(data, 32)?,
-        yaw_max: f64_at(data, 40)?,
-        hold_kp: f64_at(data, 48)?,
-        hold_kd: f64_at(data, 56)?,
-        frequency: f64_at(data, 64)?,
-        timeout: f64_at(data, 72)?,
-        can_timeout_ms: f64_at(data, 80)?,
+        max_speed: v(0)?,
+        turn_scale: v(1)?,
+        accel: v(2)?,
+        decel: v(3)?,
+        jerk: v(4)?,
+        axis_snap_deg: v(5)?,
+        yaw_gain: v(6)?,
+        yaw_max: v(7)?,
+        hold_kp: v(8)?,
+        hold_kd: v(9)?,
+        frequency: v(10)?,
+        timeout: v(11)?,
+        can_timeout_ms: v(12)?,
+        wheel_scale: [v(13)?, v(14)?, v(15)?, v(16)?],
+        traction: v(17)? != 0.0,
+        traction_light: v(18)?,
+        traction_floor: v(19)?,
+        traction_torque_min: v(20)?,
     };
     if !(1.0..=500.0).contains(&c.frequency)
         || !(c.timeout.is_finite() && c.timeout > 0.0)
         || c.max_speed < 0.0
-        || c.slew < 0.0
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid Jelly config values",
+        ));
+    }
+    // A non-positive ramp rate is not "no ramp" — it's a command that never
+    // changes, and for decel that is a base that never stops.
+    if !(c.accel.is_finite() && c.accel > 0.0 && c.decel.is_finite() && c.decel > 0.0)
+        || !(c.jerk.is_finite() && c.jerk >= 0.0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Jelly accel and decel must be positive and jerk >= 0",
+        ));
+    }
+    if c.wheel_scale
+        .iter()
+        .any(|s| !(s.is_finite() && (0.5..=2.0).contains(s)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Jelly wheel_scale needs one finite value in [0.5, 2] per wheel",
+        ));
+    }
+    if c.traction
+        && !(c.traction_light > 0.0
+            && c.traction_light < 1.0
+            && c.traction_floor > 0.0
+            && c.traction_floor <= 1.0
+            && c.traction_torque_min >= 0.0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Jelly traction needs 0 < light < 1, 0 < floor <= 1, torque_min >= 0",
         ));
     }
     // The motor-side timeout is the safety layer; refuse a config that
@@ -378,6 +435,7 @@ fn poll_feedback(
     ranges: &[MitRanges; 4],
     positions: &mut [f64; 4],
     velocities: &mut [f64; 4],
+    torques: &mut [f64; 4],
     statuses: &mut [u8; 4],
 ) -> io::Result<[bool; 4]> {
     let mut answered = [false; 4];
@@ -387,6 +445,7 @@ fn poll_feedback(
                 proto::dm_decode_feedback(&data, ranges[i].p_max, ranges[i].v_max, ranges[i].t_max);
             positions[i] = d.position;
             velocities[i] = d.velocity;
+            torques[i] = d.torque;
             statuses[i] = d.status;
             answered[i] = true;
         }
@@ -398,12 +457,21 @@ fn velocity_frame(v: f64) -> [u8; 8] {
     p[..4].copy_from_slice(&(v as f32).to_le_bytes());
     p
 }
+/// Normalized body command → per-wheel rad/s (IDS order).
+///
+/// The raw mix can exceed 1 when translation and rotation combine, so the
+/// whole set is scaled down together to preserve the motion direction while
+/// keeping every wheel within `max_speed`. `wheel_scale` then multiplies each
+/// wheel to compensate its effective radius (a wheel that is 2% smaller must
+/// spin 2% faster to cover the same floor); it is applied after the
+/// normalization on purpose, so a calibrated wheel may exceed `max_speed` by
+/// its scale rather than shifting the whole set.
 fn mix(vx: f64, vy: f64, wz: f64, cfg: Config) -> [f64; 4] {
     let w = wz * cfg.turn_scale;
     let mut raw = [vx - vy - w, -(vx + vy + w), vx + vy - w, -(vx - vy + w)];
     let scale = raw.iter().fold(1.0f64, |a, v| a.max(v.abs()));
-    for v in &mut raw {
-        *v = *v / scale * cfg.max_speed;
+    for (v, ws) in raw.iter_mut().zip(cfg.wheel_scale) {
+        *v = *v / scale * cfg.max_speed * ws;
     }
     raw
 }
@@ -425,6 +493,7 @@ fn collect_feedback(
     ranges: &[MitRanges; 4],
     positions: &mut [f64; 4],
     velocities: &mut [f64; 4],
+    torques: &mut [f64; 4],
     statuses: &mut [u8; 4],
     deadline: Instant,
 ) -> io::Result<usize> {
@@ -449,6 +518,7 @@ fn collect_feedback(
         seen[i] = true;
         positions[i] = d.position;
         velocities[i] = d.velocity;
+        torques[i] = d.torque;
         statuses[i] = d.status;
     }
     Ok(seen.into_iter().filter(|value| *value).count())
@@ -525,6 +595,12 @@ struct Wheels {
     ranges: [MitRanges; 4],
     pos: [f64; 4],
     vel: [f64; 4],
+    /// Torque per wheel (Nm) from the last echo or poll — the traction
+    /// guard's input.
+    tau: [f64; 4],
+    /// Whether the last command echo delivered all four wheels' feedback
+    /// (so `tau` is one coherent reading).
+    echo_complete: bool,
     /// Feedback status nibble per wheel, from the last echo or poll.
     status: [u8; 4],
     /// Which wheels answered the last explicit poll (`poll_feedback`).
@@ -575,6 +651,7 @@ fn park(
             &wheels.ranges,
             &mut wheels.pos,
             &mut wheels.vel,
+            &mut wheels.tau,
             &mut wheels.status,
         )?;
         if wheels.answered.iter().any(|a| !a) {
@@ -619,7 +696,7 @@ fn park(
 ///
 /// Returns `(healthy, touched)`: whether every wheel is now enabled and
 /// fault-free, and whether any wheel was actually re-enabled (the caller only
-/// restarts its slew ramp / park state in that case).
+/// restarts its command ramp / park state in that case).
 fn recover_wheels(
     sock: &CanSock,
     iface: &str,
@@ -631,6 +708,7 @@ fn recover_wheels(
         &wheels.ranges,
         &mut wheels.pos,
         &mut wheels.vel,
+        &mut wheels.tau,
         &mut wheels.status,
     )?;
     let tripped: Vec<u8> = IDS
@@ -655,6 +733,7 @@ fn recover_wheels(
             &wheels.ranges,
             &mut wheels.pos,
             &mut wheels.vel,
+            &mut wheels.tau,
             &mut wheels.status,
         )?;
     }
@@ -708,6 +787,8 @@ fn control_loop(
         }; 4],
         pos: [0.0; 4],
         vel: [0.0; 4],
+        tau: [0.0; 4],
+        echo_complete: false,
         status: [STATUS_DISABLED; 4],
         answered: [false; 4],
     };
@@ -736,6 +817,15 @@ fn control_loop(
     enable_for_velocity(&sock, &IDS)?;
     let period = Duration::from_secs_f64(1.0 / cfg.frequency);
     let mut cmd = [0.0; 3];
+    let mut ramp = VectorRamp::new(cfg.accel, cfg.decel, cfg.jerk, period.as_secs_f64());
+    let mut guard = cfg.traction.then(|| {
+        TractionGuard::new(
+            cfg.traction_light,
+            cfg.traction_floor,
+            cfg.traction_torque_min,
+            period.as_secs_f64(),
+        )
+    });
     let mut hold: Option<[f64; 4]> = None;
     let mut park_failed = false;
     let mut send_failed = false;
@@ -752,6 +842,7 @@ fn control_loop(
         &wheels.ranges,
         &mut wheels.pos,
         &mut wheels.vel,
+        &mut wheels.tau,
         &mut wheels.status,
         Instant::now() + Duration::from_millis(200),
     )?;
@@ -824,6 +915,8 @@ fn control_loop(
 
             let mut speeds = [0.0; 4];
             let mut yaw_corr = 0.0;
+            let mut traction_scale = 1.0;
+            let mut traction_light: f64 = -1.0; // wheel index judged light, or -1
             let mut sent = false;
             let mut poll_failed = false;
             let send_result: io::Result<()> = (|| {
@@ -857,6 +950,7 @@ fn control_loop(
                         }
                     }
                     cmd = [0.0; 3];
+                    ramp.reset();
                     yaw_err = 0.0;
                     if hold.is_some() && wheels.any_tripped() {
                         // The hold lapsed anyway (a stall of this loop past the
@@ -955,22 +1049,37 @@ fn control_loop(
                         // Those wheels stopped and are back in VELOCITY mode:
                         // ramp from rest and let the park re-anchor them all.
                         cmd = [0.0; 3];
+                        ramp.reset();
                         hold = None;
                     }
                 }
 
                 (target.vx, target.vy) = snap(target.vx, target.vy, cfg.axis_snap_deg);
-                let delta = [target.vx - cmd[0], target.vy - cmd[1], target.wz - cmd[2]];
-                let norm = delta.iter().map(|v| v * v).sum::<f64>().sqrt();
-                let max_delta = cfg.slew * period.as_secs_f64();
-                let k = if norm > max_delta && norm > 0.0 {
-                    max_delta / norm
-                } else {
-                    1.0
+                // Traction guard: judge last tick's torque echo (only while the
+                // wheels are in velocity mode — a parked hold's torques say
+                // nothing about the floor) and ease the ramp while a wheel is
+                // light.
+                let (accel_scale, decel_scale) = match guard.as_mut() {
+                    Some(g) => {
+                        let ramping = ramp.limit() > 0.0
+                            && ramp.rate() >= TRACTION_MIN_RAMP_FRAC * ramp.limit();
+                        let torques =
+                            (hold.is_none() && wheels.echo_complete).then_some(&wheels.tau);
+                        let a = g.update(torques, ramping);
+                        traction_light = g.light_wheel().map_or(-1.0, |i| i as f64);
+                        (a, g.decel_scale())
+                    }
+                    None => (1.0, 1.0),
                 };
-                for i in 0..3 {
-                    cmd[i] += delta[i] * k;
-                }
+                traction_scale = accel_scale;
+                // Ramp the (vx, vy, wz) command as a single vector (direction
+                // preserved), accel/decel asymmetric, jerk-limited.
+                ramp.step(
+                    &mut cmd,
+                    [target.vx, target.vy, target.wz],
+                    accel_scale,
+                    decel_scale,
+                );
                 let moving = cmd.iter().any(|v| v.abs() >= 1e-3);
                 let driving = moving
                     || [target.vx, target.vy, target.wz]
@@ -1021,22 +1130,34 @@ fn control_loop(
             if sent {
                 // Every command frame is echoed with a feedback frame; that
                 // echo is also where a mid-stream LOST_COMM shows up.
-                let _ = collect_feedback(
+                let seen = collect_feedback(
                     &sock,
                     &wheels.ranges,
                     &mut wheels.pos,
                     &mut wheels.vel,
+                    &mut wheels.tau,
                     &mut wheels.status,
                     now + period.mul_f64(0.8),
                 )?;
+                wheels.echo_complete = seen == IDS.len();
+            } else {
+                wheels.echo_complete = false;
             }
             if now >= next_status {
                 next_status = now + Duration::from_millis(50);
+                // Layout mirrors `_rust_reader_loop` in almond_axol/robot/jelly.py:
+                // cmd[3], speeds[4], yaw corr/err/bias, wheel pos[4], vel[4],
+                // torque[4], traction scale and light wheel (-1 = none), then
+                // the flag byte.
                 let mut p = vec![b'U'];
                 for v in cmd
                     .into_iter()
                     .chain(speeds)
                     .chain([yaw_corr, yaw_err, yaw_bias])
+                    .chain(wheels.pos)
+                    .chain(wheels.vel)
+                    .chain(wheels.tau)
+                    .chain([traction_scale, traction_light])
                 {
                     p.extend_from_slice(&v.to_le_bytes());
                 }
@@ -1073,57 +1194,83 @@ fn super_sleep_until(deadline: Instant) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn forward_mix_has_calibrated_signs() {
-        let c = Config {
-            max_speed: 20.0,
-            turn_scale: 1.0,
-            slew: 0.5,
-            axis_snap_deg: 15.0,
-            yaw_gain: 2.0,
-            yaw_max: 0.3,
-            hold_kp: 60.0,
-            hold_kd: 1.5,
-            frequency: 50.0,
-            timeout: 0.3,
-            can_timeout_ms: 200.0,
-        };
-        assert_eq!(mix(1.0, 0.0, 0.0, c), [20.0, -20.0, 20.0, -20.0]);
-    }
-
-    /// Mirrors `struct.pack("<11d", ...)` in `almond_axol/robot/jelly.py`.
-    fn wire(values: [f64; 11]) -> Vec<u8> {
+    /// Mirrors `struct.pack("<21d", ...)` in `almond_axol/robot/jelly.py`.
+    fn wire(values: [f64; CONFIG_VALUES]) -> Vec<u8> {
         values.into_iter().flat_map(f64::to_le_bytes).collect()
     }
 
-    const PY_CONFIG: [f64; 11] = [20.0, 1.0, 0.5, 15.0, 2.0, 0.3, 60.0, 1.5, 50.0, 0.2, 200.0];
+    // max_speed, turn_scale, accel, decel, jerk, axis_snap_deg, yaw_gain,
+    // yaw_max, hold_kp, hold_kd, frequency, timeout, can_timeout_ms,
+    // wheel_scale[4], traction, traction_light, traction_floor,
+    // traction_torque_min — the JellyConfig defaults.
+    const PY_CONFIG: [f64; CONFIG_VALUES] = [
+        20.0, 1.0, 0.5, 1.0, 2.0, 15.0, 2.0, 0.3, 60.0, 1.5, 50.0, 0.2, 200.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 0.35, 0.2, 0.3,
+    ];
+    const CAN_TIMEOUT: usize = 12;
+
+    fn config() -> Config {
+        parse_config(&wire(PY_CONFIG)).unwrap()
+    }
+
+    #[test]
+    fn forward_mix_has_calibrated_signs() {
+        assert_eq!(mix(1.0, 0.0, 0.0, config()), [20.0, -20.0, 20.0, -20.0]);
+    }
+
+    #[test]
+    fn wheel_scale_multiplies_after_normalization() {
+        let mut c = config();
+        c.wheel_scale = [1.02, 1.0, 0.98, 1.0];
+        let s = mix(1.0, 0.0, 0.0, c);
+        assert!((s[0] - 20.4).abs() < 1e-9);
+        assert_eq!(s[1], -20.0);
+        assert!((s[2] - 19.6).abs() < 1e-9);
+        // Saturated combined command: the set is normalized first, then scaled.
+        let s = mix(1.0, 1.0, 0.0, c);
+        assert!((s[1] + 20.0).abs() < 1e-9);
+        assert!((s[2] - 19.6).abs() < 1e-9);
+    }
 
     #[test]
     fn python_config_layout_roundtrips() {
-        let cfg = parse_config(&wire(PY_CONFIG)).unwrap();
+        let cfg = config();
         assert_eq!(cfg.frequency, 50.0);
         assert_eq!(cfg.hold_kp, 60.0);
         assert_eq!(cfg.timeout, 0.2);
         assert_eq!(cfg.can_timeout_ms, 200.0);
+        assert_eq!((cfg.accel, cfg.decel, cfg.jerk), (0.5, 1.0, 2.0));
+        assert_eq!(cfg.wheel_scale, [1.0; 4]);
+        assert!(cfg.traction);
+        assert_eq!(
+            (
+                cfg.traction_light,
+                cfg.traction_floor,
+                cfg.traction_torque_min
+            ),
+            (0.35, 0.2, 0.3)
+        );
     }
 
     #[test]
-    fn old_ten_value_config_is_rejected() {
-        // A Python side that predates the CAN-timeout field must not be able
-        // to start the core with an implicit (zero = disabled) alarm.
-        let old: Vec<u8> = PY_CONFIG[..10]
-            .iter()
-            .copied()
-            .flat_map(f64::to_le_bytes)
-            .collect();
-        assert!(parse_config(&old).is_err());
+    fn older_config_layouts_are_rejected() {
+        // A Python side that predates a field must not be able to start the
+        // core with an implicit value (a zero CAN timeout = a disabled alarm).
+        for n in [10, 11, 13, CONFIG_VALUES - 1] {
+            let old: Vec<u8> = PY_CONFIG[..n]
+                .iter()
+                .copied()
+                .flat_map(f64::to_le_bytes)
+                .collect();
+            assert!(parse_config(&old).is_err(), "{n} values accepted");
+        }
     }
 
     #[test]
     fn can_timeout_cannot_be_disabled() {
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let mut values = PY_CONFIG;
-            values[10] = bad;
+            values[CAN_TIMEOUT] = bad;
             let err = parse_config(&wire(values)).unwrap_err();
             assert!(err.to_string().contains("can_timeout_ms"), "{bad}: {err}");
         }
@@ -1133,10 +1280,35 @@ mod tests {
     fn can_timeout_must_be_at_least_two_command_periods() {
         // 50 Hz → 20 ms period; 39 ms would trip on a single late tick.
         let mut values = PY_CONFIG;
-        values[10] = 39.0;
+        values[CAN_TIMEOUT] = 39.0;
         assert!(parse_config(&wire(values)).is_err());
-        values[10] = 40.0;
+        values[CAN_TIMEOUT] = 40.0;
         assert!(parse_config(&wire(values)).is_ok());
+    }
+
+    #[test]
+    fn ramp_and_traction_values_are_validated() {
+        for (i, bad) in [
+            (2, 0.0),
+            (3, -1.0),
+            (4, -0.1),
+            (13, 0.4),
+            (16, 2.5),
+            (18, 1.0),
+            (19, 0.0),
+        ] {
+            let mut values = PY_CONFIG;
+            values[i] = bad;
+            assert!(
+                parse_config(&wire(values)).is_err(),
+                "field {i} = {bad} accepted"
+            );
+        }
+        // Traction off: its thresholds are not consulted.
+        let mut values = PY_CONFIG;
+        values[17] = 0.0;
+        values[18] = 5.0;
+        assert!(!parse_config(&wire(values)).unwrap().traction);
     }
 
     #[test]
@@ -1185,6 +1357,8 @@ mod tests {
             }; 4],
             pos: [0.0; 4],
             vel: [0.0; 4],
+            tau: [0.0; 4],
+            echo_complete: true,
             status: [STATUS_ENABLED, 0xA, STATUS_ENABLED, STATUS_LOST_COMM],
             answered: [true, true, false, true],
         };

@@ -15,7 +15,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from almond_axol.robot import jelly as jelly_module
-from almond_axol.robot.jelly import Jelly, JellyConfig, _pack_config
+from almond_axol.robot.jelly import (
+    _CONFIG_VALUES,
+    _STATUS_FMT,
+    Jelly,
+    JellyConfig,
+    _pack_config,
+)
 from almond_axol.robot.lift import STOP, UP
 
 
@@ -159,14 +165,54 @@ class JellyCanTimeoutConfigTest(unittest.IsolatedAsyncioTestCase):
 class JellyRustWireTest(unittest.IsolatedAsyncioTestCase):
     """The IPC layout shared with ``rust/axol-rt/src/jelly.rs``."""
 
-    def test_config_message_carries_eleven_values_ending_in_can_timeout(self) -> None:
-        cfg = JellyConfig(frequency=50.0, command_timeout=0.2, can_timeout_ms=200.0)
+    def test_config_message_layout_matches_the_rust_core(self) -> None:
+        cfg = JellyConfig(
+            frequency=50.0,
+            command_timeout=0.2,
+            can_timeout_ms=200.0,
+            accel=0.4,
+            decel=0.9,
+            jerk=1.5,
+            wheel_scale=(1.01, 0.99, 1.0, 1.0),
+            traction=False,
+        )
         payload = _pack_config(cfg)
         self.assertEqual(payload[:1], b"C")
-        # 11 f64 = 88 bytes, the length the Rust ``parse_config`` insists on.
-        self.assertEqual(len(payload) - 1, 88)
-        values = struct.unpack("<11d", payload[1:])
-        self.assertEqual(values[8:], (50.0, 0.2, 200.0))
+        # 21 f64 = 168 bytes, the length the Rust ``parse_config`` insists on
+        # (``CONFIG_VALUES`` in jelly.rs).
+        self.assertEqual(_CONFIG_VALUES, 21)
+        self.assertEqual(len(payload) - 1, 8 * _CONFIG_VALUES)
+        values = struct.unpack(f"<{_CONFIG_VALUES}d", payload[1:])
+        self.assertEqual(values[2:5], (0.4, 0.9, 1.5))
+        self.assertEqual(values[10:13], (50.0, 0.2, 200.0))
+        self.assertEqual(values[13:17], (1.01, 0.99, 1.0, 1.0))
+        self.assertEqual(values[17], 0.0)
+        self.assertEqual(values[18:], (0.35, 0.2, 0.3))
+
+    async def test_status_packet_exposes_wheel_feedback_and_traction(self) -> None:
+        jelly = Jelly(JellyConfig(lift=False, channel=None))
+        reader = asyncio.StreamReader()
+        jelly._reader = reader
+        values = [0.0] * 24
+        values[10:14] = [1.0, -2.0, 3.0, -4.0]  # positions
+        values[14:18] = [0.1, -0.1, 0.1, -0.1]  # velocities
+        values[18:22] = [0.9, -0.05, 1.1, -1.0]  # torques
+        values[22] = 0.4  # traction scale
+        values[23] = 1.0  # light wheel: front_right
+        payload = b"U" + _STATUS_FMT.pack(*values, 8)
+        reader.feed_data(struct.pack("<I", len(payload)) + payload)
+        reader.feed_eof()
+        await jelly._rust_reader_loop()
+        self.assertEqual(jelly.wheel_positions, [1.0, -2.0, 3.0, -4.0])
+        self.assertEqual(jelly.wheel_velocities, [0.1, -0.1, 0.1, -0.1])
+        self.assertEqual(jelly.wheel_torques, [0.9, -0.05, 1.1, -1.0])
+        self.assertEqual(jelly.traction_scale, 0.4)
+        self.assertEqual(jelly.traction_light_wheel, 1)
+        # Braking is eased by the same scale but never below half of decel.
+        self.assertAlmostEqual(jelly.decel_in_force, jelly.config.decel * 0.5)
+        self.assertEqual(
+            await jelly.read_wheels(), ([1.0, -2.0, 3.0, -4.0], [0.1, -0.1, 0.1, -0.1])
+        )
 
     async def test_status_packet_exposes_link_and_wheel_fault_flags(self) -> None:
         jelly = Jelly(JellyConfig(lift=False, channel=None))
@@ -174,7 +220,9 @@ class JellyRustWireTest(unittest.IsolatedAsyncioTestCase):
         jelly._reader = reader
 
         def status(flags: int) -> bytes:
-            payload = b"U" + struct.pack("<10dB", *([0.0] * 10), flags)
+            values = [0.0] * 24
+            values[23] = -1.0  # no light wheel
+            payload = b"U" + _STATUS_FMT.pack(*values, flags)
             return struct.pack("<I", len(payload)) + payload
 
         # parked | linked, then wheel_fault alone (source gone, wheel tripped).

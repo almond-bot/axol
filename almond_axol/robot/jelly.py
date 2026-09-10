@@ -11,11 +11,11 @@ fixed by convention:
 
 :class:`Jelly` exposes a latched command interface: any thread calls
 :meth:`Jelly.set_command` with a normalized body velocity + lift direction.
-The Rust ``axol-rt jelly`` service applies slew limiting, x-drive mixing,
+The Rust ``axol-rt jelly`` service applies ramp limiting, x-drive mixing,
 heading hold, the watchdog, and park/unpark at ``JellyConfig.frequency``:
 
 - While the command is non-zero the wheels track it in VELOCITY mode.
-- When the slew-limited command reaches zero (and the wheels are measured
+- When the ramp-limited command reaches zero (and the wheels are measured
   slow), the wheels are parked: switched to MIT/impedance mode and held at
   their current positions by the motor's internal high-bandwidth position
   loop, so the base does not roll under load.
@@ -53,6 +53,33 @@ Body-frame convention: +x forward, +y left, +wz counter-clockwise. The
 mixing assumes each wheel's positive spin has a forward (+x) component;
 if a wheel runs backwards on Jelly, flip its entry in
 :data:`WHEEL_SIGNS`.
+
+Straight-line drift. Three mechanisms make an x-drive veer on a real floor,
+and they need different fixes (an uneven-floor simulation of this exact
+plant — wobbly-table load redistribution, tanh traction, per-wheel stiction
+and radius spread, the real 50 Hz loop — ranked them):
+
+- *Rotation* — corrected by the gyro heading hold (``JellyConfig.imu``,
+  ``yaw_hold_gain``). The single largest factor: without it the heading
+  wanders several degrees per stroke.
+- *Effective-radius mismatch* — four omni wheels never wear identically, and
+  a 3% spread slides the base sideways ~2 cm per 3 m even with the heading
+  held, because the wheels' speeds are mutually inconsistent and the free
+  rollers absorb the difference. Unobservable from the wheels themselves
+  (each tracks its command perfectly); corrected by ``JellyConfig.wheel_scale``,
+  measured by ``axol diag.base-calibrate`` (Jelly drives six short strokes
+  tracked by the overhead ZED) or fitted from tape-measured strokes with
+  :func:`solve_wheel_scale`.
+- *Diagonal unloading* — one diagonal pair goes light (a wobbly floor, or
+  the weight shift of a launch/stop on a tall base whose mass sits off the
+  wheelbase centre — measured on Jelly: 6–28° of veer at the default ramp,
+  under 2° at a third of it), and the loaded pair can only push along its
+  shared 45° axis, so the base slides sideways while it accelerates and
+  straightens once cruising. No wheel command can fix it while the pair is
+  unloaded; the lever is gentler acceleration, applied automatically while a
+  wheel reads light by the Rust core's torque-based traction guard
+  (``JellyConfig.traction``, ``rust/axol-rt/src/ramp.rs``), or standing
+  (``accel``/``jerk``).
 """
 
 from __future__ import annotations
@@ -80,6 +107,11 @@ DEFAULT_CHANNEL = CAN_BASE
 # Per-wheel spin-direction calibration: flip an entry to -1 if that wheel
 # drives the wrong way with everything else correct.
 WHEEL_SIGNS: dict[int, float] = {1: 1.0, 2: -1.0, 3: 1.0, 4: -1.0}
+
+# The widened ±PMAX position mapping (rad) the Rust core writes to every wheel
+# at startup (``PMAX`` in ``rust/axol-rt/src/jelly.rs``): the range within
+# which wheel positions — and so wheel odometry — stay valid for a session.
+SESSION_PMAX = 400.0
 
 # Rate of the per-cycle heading-hold trace line (JellyConfig.yaw_log). The
 # hold's dynamics are ~1 s, so this resolves them without flooding a console
@@ -125,20 +157,118 @@ def deadzone(value: float, threshold: float) -> float:
 
 
 def mix(
-    vx: float, vy: float, wz: float, max_speed: float, turn_scale: float
+    vx: float,
+    vy: float,
+    wz: float,
+    max_speed: float,
+    turn_scale: float,
+    wheel_scale: tuple[float, float, float, float] | None = None,
 ) -> list[float]:
     """Map normalized body command ([-1, 1] each) to per-wheel rad/s.
 
-    The raw mix can exceed 1 when translation and rotation combine, so the
-    whole set is scaled down together to preserve the motion direction while
-    keeping every wheel within ``max_speed``.
+    The reference implementation of the Rust core's ``mix`` (kept for the
+    simulator, the calibration fit, and tests). The raw mix can exceed 1 when
+    translation and rotation combine, so the whole set is scaled down together
+    to preserve the motion direction while keeping every wheel within
+    ``max_speed``. ``wheel_scale`` (in :data:`WHEELS` order) then multiplies
+    each wheel to compensate its effective radius (a wheel that is 2% smaller
+    must spin 2% faster to cover the same floor); it is applied after the
+    normalization on purpose, so a calibrated wheel may exceed ``max_speed``
+    by its scale rather than shifting the whole set.
     """
     wz *= turn_scale
     raw = [
         WHEEL_SIGNS[w.motor_id] * (w.mx * vx + w.my * vy + w.mw * wz) for w in WHEELS
     ]
     scale = max(1.0, max(abs(r) for r in raw))
-    return [r / scale * max_speed for r in raw]
+    if wheel_scale is None:
+        wheel_scale = (1.0,) * len(WHEELS)
+    return [r / scale * max_speed * ws for r, ws in zip(raw, wheel_scale)]
+
+
+def stroke_rows(
+    turns: tuple[float, float, float, float] | list[float],
+) -> tuple[list[float], list[float], list[float]]:
+    """Kinematic rows mapping the wheels' effective radii to a stroke's motion.
+
+    ``turns`` is each wheel's net rotation over the stroke (rad, in
+    :data:`WHEELS` order, motor convention — as reported by the drivers, before
+    ``WHEEL_SIGNS``). Returns three 4-vectors ``(kx, ky, kw)`` such that, with
+    ``R`` the wheels' effective radii, the body moved ``kx·R`` forward and
+    ``ky·R`` left and turned ``kw·R / lever`` CCW (``lever`` the wheel's
+    rotation lever arm, ``(a + b) / √2`` for a wheelbase of ``2a`` × ``2b``).
+
+    Surface travel of wheel *i* along its drive axis is
+    ``u_i = (mx·x + my·y)/√2 + mw·lever·θ`` (the mixing rows are ±1 stand-ins
+    for the true ±1/√2 drive directions). That 4×3 map has orthogonal columns
+    (norms² 2, 2, 4·lever²), so its least-squares inverse is the transpose
+    scaled per column — which is what these rows are, with ``u_i = R_i·φ_i``.
+    """
+    if len(turns) != len(WHEELS):
+        raise ValueError("each stroke needs one wheel rotation per wheel")
+    phi = [WHEEL_SIGNS[w.motor_id] * float(t) for w, t in zip(WHEELS, turns)]
+    kx = [w.mx * p / (2.0 * math.sqrt(2.0)) for w, p in zip(WHEELS, phi)]
+    ky = [w.my * p / (2.0 * math.sqrt(2.0)) for w, p in zip(WHEELS, phi)]
+    kw = [w.mw * p / 4.0 for w, p in zip(WHEELS, phi)]
+    return kx, ky, kw
+
+
+def solve_wheel_scale(
+    strokes: list[tuple[tuple[float, float, float, float], float, float, float]],
+    lever_m: float,
+) -> tuple[float, float, float, float]:
+    """Fit per-wheel speed scales from measured straight strokes.
+
+    Each stroke is ``(wheel_turns, forward_m, left_m, heading_rad)``:
+    the four wheels' net rotation (rad, in :data:`WHEELS` order, motor
+    convention — i.e. as reported by the drivers, before ``WHEEL_SIGNS``),
+    and the body displacement actually measured over the stroke: forward and
+    leftward distance (tape measure against the start marks, body frame at
+    stroke start) and net heading change (gyro, CCW positive). ``lever_m`` is
+    the wheel's rotation lever arm, ``(a + b) / √2`` for a wheelbase of
+    ``2a`` × ``2b``.
+
+    Inverting the x-drive kinematics, the body displacement is a fixed linear
+    map of the wheels' surface travel ``R_i·φ_i`` (``R_i`` the *effective*
+    radius of wheel *i*), so each stroke gives three linear equations in the
+    four ``R_i`` (see :func:`stroke_rows`); two strokes in different directions
+    (forward and left) determine them. The returned scales are ``R̄ / R_i``
+    normalized to a mean of 1 — multiply wheel *i*'s command by its scale and
+    the wheels become mutually consistent, which is what removes the lateral
+    slide (the common-mode radius only rescales ``max_speed``, so it's
+    deliberately not resolved).
+
+    The measurements can come from a tape measure and the gyro, or — without
+    marking the floor — from the overhead ZED's positional tracking via
+    ``axol diag.base-calibrate`` (:mod:`almond_axol.diagnostics.base.calibrate`),
+    which also solves for the camera's mounting offset.
+
+    Raises ``ValueError`` if the strokes don't determine the radii (fewer than
+    two, or all in one direction).
+    """
+    import numpy as np
+
+    if lever_m <= 0.0:
+        raise ValueError("lever_m must be positive")
+    rows: list[list[float]] = []
+    rhs: list[float] = []
+    for turns, fwd, left, heading in strokes:
+        kx, ky, kw = stroke_rows(turns)
+        rows.extend([kx, ky, kw])
+        rhs.extend([fwd, left, heading * lever_m])
+    a = np.array(rows)
+    b = np.array(rhs)
+    if len(strokes) < 2 or np.linalg.matrix_rank(a) < len(WHEELS):
+        raise ValueError(
+            "wheel radii are not determined by these strokes — record at least "
+            "two, in different directions (e.g. forward and left)"
+        )
+    radii, *_ = np.linalg.lstsq(a, b, rcond=None)
+    if not np.all(np.isfinite(radii)) or np.any(radii <= 0.0):
+        raise ValueError("fit produced a non-positive wheel radius — check the signs")
+    scales = radii.mean() / radii
+    scales /= scales.mean()
+    return tuple(float(s) for s in scales)
 
 
 @dataclass
@@ -154,9 +284,53 @@ class JellyConfig:
                          disables the wheels entirely (lift-only Jelly).
         max_speed:       Peak wheel speed (rad/s) at a full-deflection command.
         turn_scale:      Rotation weight relative to translation, in [0, 1].
-        slew:            Max change of the normalized body command per second;
-                         limits accel/decel so command steps ramp the wheels.
-                         The default takes 2s from rest to full deflection.
+        accel:           Ramp rate of the normalized body command while it
+                         grows away from zero, in full-stick units per second.
+                         The default takes 2 s from rest to full deflection.
+                         Gentler launches also slide less sideways on uneven
+                         floors (an unloaded diagonal can't take up lateral
+                         force; see the module docstring).
+        decel:           Ramp rate while the command shrinks toward zero
+                         (stick released, speed reduced, or reversed). Faster
+                         than ``accel`` so stops are brisk: the default halts
+                         from full stick in 1 s (plus the jerk tail). The
+                         command-timeout stop rides on the same rate.
+        jerk:            Limit on how fast the ramp rate itself changes, in
+                         full-stick units per second². Turns the trapezoid
+                         into an S-curve with no acceleration step at either
+                         end of a launch or stop, which is what the operator
+                         feels as "smooth". The default reaches ``accel`` in
+                         0.25 s and adds ~0.3 s to a stop. 0 disables.
+        wheel_scale:     Per-wheel command multipliers, in :data:`WHEELS`
+                         order (front-left, front-right, back-left,
+                         back-right), compensating each wheel's effective
+                         radius. Wheels that aren't mutually consistent slide
+                         the base sideways even with the heading held — a 3%
+                         radius spread is ~2 cm per 3 m. Measured by ``axol
+                         diag.base-calibrate`` or with :func:`solve_wheel_scale`
+                         from two tape-measured strokes; ``(1, 1, 1, 1)`` is
+                         uncalibrated.
+        traction:        Ease the ramp while a wheel has lost the floor, judged
+                         from the motors' torque feedback (the Rust core's
+                         ``TractionGuard``, ``rust/axol-rt/src/ramp.rs``). A
+                         wheel that lifts under the weight shift of a launch or
+                         a stop can't push, and the base veers along the
+                         remaining pair's diagonal; asking for less
+                         acceleration while it's light is the only wheel-level
+                         remedy. On by default; it does nothing on a floor and
+                         load that keep all four wheels down.
+        traction_light:  A wheel whose ``|torque|`` is below this fraction of
+                         the four wheels' mean counts as light. A loaded wheel
+                         carries its share (~1 Nm on a launch); one in the air
+                         shows only its inertia and bearing drag (~0.1 Nm).
+        traction_floor:  The guard never eases ``accel`` below this fraction.
+                         (Braking has its own, fixed floor of 0.5.)
+        traction_torque_min: Mean ``|torque|`` (Nm) below which the wheels say
+                         nothing about load (gentle cruise, standstill) and the
+                         guard stands down.
+        traction_log:    Log the guard: a line whenever it starts easing and a
+                         per-stroke summary (min ratio, which wheel, how far the
+                         ramp was eased). For tuning; off in normal operation.
         axis_snap_deg:   Translation headings within this many degrees of a
                          cardinal axis (forward/back/left/right) are snapped
                          onto that axis, absorbing off-axis thumb error during
@@ -167,6 +341,9 @@ class JellyConfig:
                          for the heading hold (wired by teleop; see
                          ``almond_axol.robot.gyro``). Independent of the
                          cameras — the overhead ZED keeps its gst pipeline.
+                         On by default: without a yaw reference the hold is
+                         inert and the heading wanders several degrees per
+                         stroke. A missing gyro only logs a warning.
         yaw_hold_gain:   Heading-hold feedback gain, normalized wz per rad of
                          heading error. While translating without a commanded
                          rotation, the yaw rate fed via :meth:`Jelly.feed_yaw_rate`
@@ -221,9 +398,17 @@ class JellyConfig:
     channel: str | None = DEFAULT_CHANNEL
     max_speed: float = 20.0
     turn_scale: float = 1.0
-    slew: float = 0.5
+    accel: float = 0.5
+    decel: float = 1.0
+    jerk: float = 2.0
+    wheel_scale: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
+    traction: bool = True
+    traction_light: float = 0.35
+    traction_floor: float = 0.2
+    traction_torque_min: float = 0.3
+    traction_log: bool = False
     axis_snap_deg: float = 15.0
-    imu: bool = False
+    imu: bool = True
     yaw_hold_gain: float = 2.0
     yaw_hold_max: float = 0.3
     yaw_log: bool = False
@@ -237,20 +422,72 @@ class JellyConfig:
     lift_channel: str = CAN_CHEST
     lift_speed: int = JOG_SPEED
 
+    def __post_init__(self) -> None:
+        # The Rust core re-checks all of this before touching the wheels; the
+        # same checks here surface a bad value where it was written (CLI flag,
+        # settings panel, SDK) instead of as a core startup failure.
+        # A non-positive ramp rate is not "no ramp" — it's a command that
+        # never changes, and for decel that is a base that never stops.
+        for name in ("accel", "decel"):
+            value = getattr(self, name)
+            if not (isinstance(value, (int, float)) and math.isfinite(value)):
+                raise ValueError(f"Jelly {name} must be a finite number")
+            if value <= 0.0:
+                raise ValueError(f"Jelly {name} must be positive (got {value})")
+        if not (
+            isinstance(self.jerk, (int, float))
+            and math.isfinite(self.jerk)
+            and self.jerk >= 0.0
+        ):
+            raise ValueError("Jelly jerk must be a finite number >= 0")
+        scale = tuple(self.wheel_scale)
+        if len(scale) != len(WHEELS) or not all(
+            isinstance(s, (int, float)) and math.isfinite(s) and 0.5 <= s <= 2.0
+            for s in scale
+        ):
+            raise ValueError(
+                "Jelly wheel_scale needs one finite value in [0.5, 2] per wheel "
+                f"({len(WHEELS)} wheels)"
+            )
+        self.wheel_scale = tuple(float(s) for s in scale)
+        if self.traction and not (
+            0.0 < self.traction_light < 1.0
+            and 0.0 < self.traction_floor <= 1.0
+            and self.traction_torque_min >= 0.0
+        ):
+            raise ValueError(
+                "Jelly traction needs 0 < traction_light < 1, "
+                "0 < traction_floor <= 1, traction_torque_min >= 0"
+            )
+
+
+# Number of f64 values in the ``C`` config message and in the ``U`` status
+# packet; ``CONFIG_VALUES`` and the status layout in ``rust/axol-rt/src/jelly.rs``
+# must match.
+_CONFIG_VALUES = 21
+_STATUS_VALUES = 24
+_STATUS_FMT = struct.Struct(f"<{_STATUS_VALUES}dB")
+
+# The guard never eases braking below this fraction of ``decel`` (mirrors
+# ``TRACTION_DECEL_FLOOR`` in ``rust/axol-rt/src/ramp.rs``).
+_TRACTION_DECEL_FLOOR = 0.5
+
 
 def _pack_config(cfg: JellyConfig) -> bytes:
     """The ``C`` message that configures the Rust core.
 
-    Eleven little-endian f64 values, in the order ``Config`` in
+    ``_CONFIG_VALUES`` little-endian f64 values, in the order ``Config`` in
     ``rust/axol-rt/src/jelly.rs`` reads them; the core rejects any other
     length, so an older or newer Python side cannot start it with an implicit
     (disabled) CAN timeout.
     """
     return b"C" + struct.pack(
-        "<11d",
+        f"<{_CONFIG_VALUES}d",
         cfg.max_speed,
         cfg.turn_scale,
-        cfg.slew,
+        cfg.accel,
+        cfg.decel,
+        cfg.jerk,
         cfg.axis_snap_deg,
         cfg.yaw_hold_gain,
         cfg.yaw_hold_max,
@@ -259,7 +496,101 @@ def _pack_config(cfg: JellyConfig) -> bytes:
         cfg.frequency,
         cfg.command_timeout,
         cfg.can_timeout_ms,
+        *cfg.wheel_scale,
+        1.0 if cfg.traction else 0.0,
+        cfg.traction_light,
+        cfg.traction_floor,
+        cfg.traction_torque_min,
     )
+
+
+class _TractionLog:
+    """Per-stroke trace of the traction guard (see ``JellyConfig.traction_log``).
+
+    Fed from the Rust core's status packets. Logs once when the guard first
+    eases within a stroke (which wheel, its torque against the mean) and a
+    summary when the stroke ends: peak mean torque, the lightest any wheel
+    got, how far and how long the ramp was eased. Strokes where the guard never
+    had enough torque to judge are summarized too — that's how
+    ``traction_torque_min`` gets tuned.
+    """
+
+    def __init__(self, torque_min: float) -> None:
+        self._torque_min = torque_min
+        self._active = False
+        self._reset()
+
+    def _reset(self) -> None:
+        self._t0 = time.monotonic()
+        self._peak_mean = 0.0
+        self._min_ratio = 1.0
+        self._min_wheel: int | None = None
+        self._min_scale = 1.0
+        self._eased_cycles = 0
+        self._judged_cycles = 0
+        self._announced = False
+
+    def update(
+        self,
+        *,
+        driving: bool,
+        torques: list[float],
+        scale: float,
+        light_wheel: int | None,
+    ) -> None:
+        if driving and not self._active:
+            self._active = True
+            self._reset()
+        elif not driving and self._active:
+            self._active = False
+            self._summarize()
+            return
+        if not self._active:
+            return
+        mags = [abs(t) for t in torques]
+        mean = sum(mags) / len(mags)
+        self._peak_mean = max(self._peak_mean, mean)
+        if mean >= self._torque_min:
+            self._judged_cycles += 1
+        if light_wheel is not None:
+            self._eased_cycles += 1
+            self._min_scale = min(self._min_scale, scale)
+            if not self._announced:
+                self._announced = True
+                _logger.info(
+                    "traction: %s light (%.2f of %.2f Nm mean) — easing the ramp",
+                    WHEELS[light_wheel].name,
+                    mags[light_wheel],
+                    mean,
+                )
+        if mean >= self._torque_min:
+            index = min(range(len(mags)), key=mags.__getitem__)
+            ratio = mags[index] / mean
+            if ratio < self._min_ratio:
+                self._min_ratio = ratio
+                self._min_wheel = index
+
+    def _summarize(self) -> None:
+        dur = time.monotonic() - self._t0
+        if self._judged_cycles == 0:
+            _logger.info(
+                "traction: stroke %.1fs — never judged (peak mean |τ| %.2f Nm < "
+                "torque_min); lower traction_torque_min if wheels lifted",
+                dur,
+                self._peak_mean,
+            )
+            return
+        wheel = WHEELS[self._min_wheel].name if self._min_wheel is not None else "none"
+        _logger.info(
+            "traction: stroke %.1fs — peak mean |τ| %.2f Nm, lightest %s at %.2f of "
+            "mean, eased %d cycles to %.2f× accel",
+            dur,
+            self._peak_mean,
+            wheel,
+            self._min_ratio,
+            self._eased_cycles,
+            self._min_scale,
+        )
 
 
 class _YawLog:
@@ -387,6 +718,8 @@ class Jelly:
         self._writer: asyncio.StreamWriter | None = None
         self._socket_path = f"/tmp/axol-jelly-{os.getpid()}-{id(self):x}.sock"
         self._ready = asyncio.Event()
+        # Set on every status packet from the core (see :meth:`read_wheels`).
+        self._status_event = asyncio.Event()
 
         # Latched target, written from any thread (single-reference swap is
         # atomic under the GIL), consumed by the command task.
@@ -404,10 +737,21 @@ class Jelly:
         self._yaw_rate: tuple[float, float] | None = None
         self._yaw_samples = 0
 
-        # Introspection for status displays (updated by the command task).
+        # Introspection for status displays (updated from the core's status
+        # packets, ~20 Hz).
         self.body_cmd: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.wheel_speeds: list[float] = [0.0] * len(WHEELS)
         self.yaw_correction: float = 0.0
+        # Wheel feedback as the core last saw it: position (rad, motor
+        # convention — before WHEEL_SIGNS — cumulative within the session),
+        # velocity (rad/s) and torque (Nm), in WHEELS order.
+        self.wheel_positions: list[float] = [0.0] * len(WHEELS)
+        self.wheel_velocities: list[float] = [0.0] * len(WHEELS)
+        self.wheel_torques: list[float] = [0.0] * len(WHEELS)
+        # Traction guard: the scale it currently applies to ``accel`` (1 =
+        # not easing) and the wheel it judges light, if any.
+        self.traction_scale: float = 1.0
+        self.traction_light_wheel: int | None = None
         self.lift_dir: int = STOP
         self.parked: bool = False
         self.park_failed: bool = False
@@ -427,6 +771,32 @@ class Jelly:
     def has_wheels(self) -> bool:
         """True when a wheel CAN channel is configured."""
         return self._config.channel is not None
+
+    @property
+    def decel_in_force(self) -> float:
+        """The braking ramp rate currently allowed (full-stick units/s).
+
+        ``decel`` eased by the traction guard's current scale, which is never
+        below half — what a caller predicting a stop distance should use.
+        """
+        return self._config.decel * max(self.traction_scale, _TRACTION_DECEL_FLOOR)
+
+    async def read_wheels(self) -> tuple[list[float], list[float]]:
+        """Wait for the next status packet and return wheel (positions, velocities).
+
+        Positions are the motors' cumulative rotation (rad, motor convention
+        — before ``WHEEL_SIGNS`` — valid across the session thanks to the
+        widened PMAX), velocities in rad/s, both in :data:`WHEELS` order. Used
+        by ``axol diag.base-calibrate`` as the wheel odometer. Without a wheel
+        core (lift-only, or not enabled) the last known values are returned.
+        """
+        if self._reader_task is not None and not self._reader_task.done():
+            self._status_event.clear()
+            try:
+                await asyncio.wait_for(self._status_event.wait(), 0.5)
+            except TimeoutError:
+                pass
+        return list(self.wheel_positions), list(self.wheel_velocities)
 
     @property
     def has_lift(self) -> bool:
@@ -778,6 +1148,11 @@ class Jelly:
     async def _rust_reader_loop(self) -> None:
         assert self._reader is not None
         yaw_log = _YawLog() if self._config.yaw_log else None
+        traction_log = (
+            _TractionLog(self._config.traction_torque_min)
+            if self._config.traction_log and self._config.traction
+            else None
+        )
         try:
             while True:
                 (size,) = struct.unpack("<I", await self._reader.readexactly(4))
@@ -793,18 +1168,33 @@ class Jelly:
                     )
                     self._ready.set()
                     continue
-                if payload[:1] != b"U" or len(payload) != 82:
+                if payload[:1] != b"U" or len(payload) != 1 + _STATUS_FMT.size:
                     _logger.warning("Jelly Rust core sent an invalid status packet")
                     continue
-                *values, flags = struct.unpack("<10dB", payload[1:])
+                *values, flags = _STATUS_FMT.unpack(payload[1:])
                 self.body_cmd = tuple(values[:3])
                 self.wheel_speeds = list(values[3:7])
                 self.yaw_correction = values[7]
+                self.wheel_positions = list(values[10:14])
+                self.wheel_velocities = list(values[14:18])
+                self.wheel_torques = list(values[18:22])
+                self.traction_scale = values[22]
+                self.traction_light_wheel = (
+                    int(values[23]) if 0 <= values[23] < len(WHEELS) else None
+                )
                 self.parked = bool(flags & 1)
                 self.park_failed = bool(flags & 2)
                 self.send_failed = bool(flags & 4)
                 self.linked = bool(flags & 8)
                 self.wheel_fault = bool(flags & 16)
+                self._status_event.set()
+                if traction_log is not None:
+                    traction_log.update(
+                        driving=any(abs(c) >= 1e-3 for c in self.body_cmd),
+                        torques=self.wheel_torques,
+                        scale=self.traction_scale,
+                        light_wheel=self.traction_light_wheel,
+                    )
                 if yaw_log is not None:
                     sample = self._yaw_rate
                     rate = sample[0] if sample is not None else None
