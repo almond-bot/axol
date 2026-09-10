@@ -70,11 +70,17 @@ band-pass centre). The teleop pipeline's target shaping — the pose
 low-pass, the IK-output EMA, and the Python trapezoid with its engage
 velocity ramp and output guard — also stays: those filters condition the
 *target stream* and live with IK. A command sink hands
-per-joint 9-float tuples `(p_des, mode, kp, kd, t_ff, kd_host, damp_w0,
-damp_q, j_eff)` to `almond_axol.rt.RtAxol`, which ships them to this core
-(~120 Hz) instead of sending CAN from Python. `t_ff` is gravity only in
-tracked mode; `mode 0` (gravity comp) is a tracker-bypassing passthrough
-with `v_des = 0`.
+per-joint 10-float tuples `(p_des, mode, kp, kd, t_ff, kd_host, damp_w0,
+damp_q, j_eff, tau_cap)` to `almond_axol.rt.RtAxol`, which ships them to
+this core (~120 Hz) instead of sending CAN from Python. `t_ff` is gravity
+only in tracked mode; `mode 0` (gravity comp) is a tracker-bypassing
+passthrough with `v_des = 0`. `tau_cap` is a per-command spring-torque cap
+(Nm) that tightens the joint's config cap for that command — box mode
+sends it on the squeeze-carrying shoulders while the arms clamp a box; `0`
+(the idle default) leaves the config cap alone. The `C` config carries a
+`proto 2` line naming this layout; a client and core built against
+different layouts are refused at configure time, before any motor is
+touched (rebuild with `axol rt.install`).
 
 The core owns the wire and the **fast physics**, all per tick from its
 own trajectory and feedback states:

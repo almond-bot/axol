@@ -48,12 +48,16 @@
 //! ## Protocol (length-prefixed messages: u32 LE size, then payload)
 //!
 //! Python -> Rust:
-//! - `C` + text        config: `loop_hz`/`watchdog_ms`/`max_step_rad`
+//! - `C` + text        config: a required `proto 2` line (the wire
+//!                     generation this core speaks — a client built against
+//!                     another layout is rejected here, before any motor
+//!                     is touched), `loop_hz`/`watchdog_ms`/`max_step_rad`
 //!                     keys, one `joint <side> <iface> <name>
 //!                     <motor_id> <kp> <kd> <max_vel> <max_accel> <fc> <k>
-//!                     <fv> <fo>` line per arm joint (tracker limits +
-//!                     friction params), and an optional `gripper <side>
-//!                     <iface> <motor_id>` line
+//!                     <fv> <fo> <tau_cap>` line per arm joint (tracker
+//!                     limits, friction params, spring-torque cap in Nm or
+//!                     `inf`), and an optional `gripper <side> <iface>
+//!                     <motor_id>` line
 //! - `P`               prep: MyActuator 0x76 reset + settle, Damiao
 //!                     clear-errors (torque-neutral; run *before* Python
 //!                     resolves joint offsets, so the wrap state it verifies
@@ -61,18 +65,21 @@
 //! - `A`               arm: bring-up, enable, hold current pose (the
 //!                     gripper must already be enabled + calibrated in
 //!                     POSITION_FORCE mode by the Python side)
-//! - `T` + binary      target: side u8, seq u32 LE, 8 x 9 f64 LE — slots
+//! - `T` + binary      target: side u8, seq u32 LE, 8 x 10 f64 LE — slots
 //!                     0-6 are arm-joint tuples (p_des, mode, kp, kd,
-//!                     t_ff, kd_host, damp_w0, damp_q, j_eff) where mode
-//!                     ≥ 0.5 runs the tracker + friction/inertia terms
-//!                     (teleop) and mode 0 is passthrough (gravity comp);
-//!                     t_ff carries the *slow* model feedforward (gravity
-//!                     only in tracked mode — friction/inertia/damping are
-//!                     computed in-core), kd_host/damp_w0/damp_q are the
-//!                     pose-scheduled damping coefficients, and j_eff is
-//!                     the pose-scaled inertia feedforward gain (Nm·s²/rad);
+//!                     t_ff, kd_host, damp_w0, damp_q, j_eff, tau_cap)
+//!                     where mode ≥ 0.5 runs the tracker + friction/inertia
+//!                     terms (teleop) and mode 0 is passthrough (gravity
+//!                     comp); t_ff carries the *slow* model feedforward
+//!                     (gravity only in tracked mode — friction/inertia/
+//!                     damping are computed in-core), kd_host/damp_w0/damp_q
+//!                     are the pose-scheduled damping coefficients, j_eff is
+//!                     the pose-scaled inertia feedforward gain (Nm·s²/rad),
+//!                     and tau_cap a per-command spring-torque cap (Nm) that
+//!                     tightens the joint's config cap for this command
+//!                     (≤ 0 or non-finite: none — the config cap alone);
 //!                     slot 7 is the gripper (p_des motor-frame, max_speed
-//!                     rad/s, max_torque Nm, then six zeros)
+//!                     rad/s, max_torque Nm, then seven zeros)
 //! - `R` + binary      flight-recorder gate: enabled u8 and, on enable, the
 //!                     Python monotonic timestamp f64 LE. A rising edge
 //!                     truncates the previous segment and starts a gated
@@ -134,6 +141,14 @@
 //!   by the Python torque-residual `ContactWatchdog` (limp gravity-comp
 //!   hold, operator resets); a self-disabled motor just stops contributing
 //!   while the rest of the arm keeps working, as in classic mode.
+//! - Joints with a finite `tau_cap` (the wrists by config; any joint while
+//!   a target carries a per-command cap — box mode's squeeze limit on the
+//!   shoulders) never send a position more than `tau_cap / kp` from their
+//!   last measured one (`filter::cap_spring`), bounding the impedance
+//!   spring torque a blocked joint develops. Being blocked is therefore
+//!   *allowed* for them: the commanded position stays within that window
+//!   of the measured one, so a runaway leans on whatever stopped it with at
+//!   most `tau_cap`. The tighter of the config and per-command caps wins.
 //! - Every command batch accepts exactly one fresh reply per motor. A missed
 //!   sample suppresses host damping for that tick; bursty loss (4 of the last
 //!   32 ticks) marks the joint *degraded* — host damping stays off until a
@@ -539,6 +554,27 @@ pub struct JointCmd {
     /// Pose-scaled inertia feedforward gain (Nm·s²/rad), applied to the
     /// low-pass acceleration derivative of tracker position in tracked mode.
     pub j_eff: f64,
+    /// Per-command spring-torque cap (Nm), combined with the joint's config
+    /// cap by `min` (see `effective_tau_cap`). ≤ 0 or non-finite means no
+    /// per-command cap — so the all-zero default and idle slots are inert.
+    pub tau_cap: f64,
+}
+
+/// Number of f64 fields per target slot on the wire (`T` packets).
+pub const TARGET_FIELDS: usize = 10;
+
+/// The wire generation this core speaks; the client must declare the same
+/// value in its `C` config (`proto <n>`) or be rejected before bring-up.
+pub const PROTO_VERSION: u32 = 2;
+
+/// The spring-torque cap in force for one command: the joint's config cap
+/// tightened by the command's own cap when that is a positive finite number.
+pub fn effective_tau_cap(config_cap: f64, cmd_cap: f64) -> f64 {
+    if cmd_cap.is_finite() && cmd_cap > 0.0 {
+        config_cap.min(cmd_cap)
+    } else {
+        config_cap
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -783,6 +819,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
     let mut loop_hz = 240.0;
     let mut watchdog_ms = 150.0;
     let mut max_step_rad = 0.35;
+    let mut proto: Option<u32> = None;
     let mut buses: Vec<(u8, String, Vec<MotorSpec>)> = Vec::new();
 
     let bad = |line: &str| {
@@ -798,6 +835,24 @@ fn parse_config(text: &str) -> io::Result<Config> {
         }
         let f: Vec<&str> = line.split_whitespace().collect();
         match f[0] {
+            "proto" => {
+                let v: u32 = f
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?;
+                if v != PROTO_VERSION {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "config: client speaks wire protocol {v}, this core speaks \
+                             {PROTO_VERSION} — rebuild axol-rt to match the installed \
+                             almond-axol (`axol rt.install`, or `cargo build --release` \
+                             in rust/axol-rt)"
+                        ),
+                    ));
+                }
+                proto = Some(v);
+            }
             "loop_hz" => {
                 loop_hz = f
                     .get(1)
@@ -818,7 +873,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
             }
             "joint" | "gripper" => {
                 // joint <side 0|1> <iface> <name> <motor_id> <kp> <kd>
-                //       <max_vel> <max_accel> <fc> <k> <fv> <fo>
+                //       <max_vel> <max_accel> <fc> <k> <fv> <fo> <tau_cap>
                 // gripper <side 0|1> <iface> <motor_id>
                 let gripper = f[0] == "gripper";
                 let side: u8 = f
@@ -855,6 +910,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         k: 0.0,
                         fv: 0.0,
                         fo: 0.0,
+                        tau_cap: f64::INFINITY,
                     }
                 } else {
                     MotorSpec {
@@ -874,6 +930,13 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         k: num(10)?,
                         fv: num(11)?,
                         fo: num(12)?,
+                        // "inf" parses to +infinity = uncapped. A NaN or
+                        // non-positive cap would clamp every command onto
+                        // the measured position (a joint that cannot move).
+                        tau_cap: match num(13)? {
+                            cap if cap > 0.0 => cap,
+                            _ => return Err(bad(line)),
+                        },
                     }
                 };
                 if spec.slot >= N_SLOTS {
@@ -883,6 +946,19 @@ fn parse_config(text: &str) -> io::Result<Config> {
             }
             _ => return Err(bad(line)),
         }
+    }
+    if proto.is_none() {
+        // A client that never learned to declare its protocol predates the
+        // 10-field target layout: its first `T` would be rejected mid-session
+        // (motors holding). Fail here instead, before bring-up.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "config: missing `proto {PROTO_VERSION}` line — the client is older \
+                 than this core; update almond-axol or rebuild axol-rt from the \
+                 matching checkout"
+            ),
+        ));
     }
     if buses.is_empty() {
         return Err(io::Error::new(
@@ -899,8 +975,8 @@ fn parse_config(text: &str) -> io::Result<Config> {
 }
 
 fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
-    // side u8, seq u32, 8 slots x 9 f64
-    let expected = 1 + 4 + N_SLOTS * 9 * 8;
+    // side u8, seq u32, 8 slots x TARGET_FIELDS f64
+    let expected = 1 + 4 + N_SLOTS * TARGET_FIELDS * 8;
     if payload.len() != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -912,7 +988,7 @@ fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
     let mut cmds = [JointCmd::default(); N_SLOTS];
     let mut off = 5;
     for cmd in &mut cmds {
-        let mut vals = [0.0f64; 9];
+        let mut vals = [0.0f64; TARGET_FIELDS];
         for v in &mut vals {
             *v = f64::from_le_bytes(payload[off..off + 8].try_into().unwrap());
             off += 8;
@@ -927,6 +1003,7 @@ fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
             damp_w0: vals[6],
             damp_q: vals[7],
             j_eff: vals[8],
+            tau_cap: vals[9],
         };
     }
     Ok((
@@ -959,13 +1036,14 @@ mod tests {
     use super::*;
 
     /// Mirrors `RtLink.send_target`'s packing: side u8, seq u32 LE, then
-    /// 8 slots x 9 f64 LE.
+    /// 8 slots x TARGET_FIELDS f64 LE.
     #[test]
     fn parse_target_roundtrip() {
+        assert_eq!(TARGET_FIELDS, 10);
         let mut payload = vec![1u8];
         payload.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
         for slot in 0..N_SLOTS {
-            for field in 0..9 {
+            for field in 0..TARGET_FIELDS {
                 let v = slot as f64 * 10.0 + field as f64;
                 payload.extend_from_slice(&v.to_le_bytes());
             }
@@ -978,9 +1056,45 @@ mod tests {
             (c.p_des, c.mode, c.kp, c.kd, c.t_ff, c.kd_host, c.damp_w0, c.damp_q, c.j_eff),
             (20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0)
         );
-        // Wrong size (the previous 8-field layout) must be rejected, not
+        assert_eq!(c.tau_cap, 29.0);
+        // Wrong size (the previous 9-field layout) must be rejected, not
         // misparsed — a version-skewed client fails loudly.
-        assert!(parse_target(&payload[..1 + 4 + N_SLOTS * 8 * 8]).is_err());
+        assert!(parse_target(&payload[..1 + 4 + N_SLOTS * 9 * 8]).is_err());
+    }
+
+    /// The per-command cap only ever tightens the config cap; zero (idle
+    /// slots, the all-zero default) and non-finite values leave it alone.
+    #[test]
+    fn per_command_cap_tightens_only() {
+        assert_eq!(effective_tau_cap(f64::INFINITY, 4.0), 4.0);
+        assert_eq!(effective_tau_cap(5.0, 4.0), 4.0);
+        assert_eq!(effective_tau_cap(3.0, 4.0), 3.0);
+        assert_eq!(effective_tau_cap(5.0, 0.0), 5.0);
+        assert_eq!(effective_tau_cap(5.0, -1.0), 5.0);
+        assert_eq!(effective_tau_cap(5.0, f64::INFINITY), 5.0);
+        assert_eq!(effective_tau_cap(5.0, f64::NAN), 5.0);
+        assert_eq!(effective_tau_cap(f64::INFINITY, 0.0), f64::INFINITY);
+        // ... and through cap_spring: a 4 Nm command cap on an uncapped
+        // kp=250 joint clamps the wire position to 16 mrad of measured.
+        let p = filter::cap_spring(1.0, Some(0.0), 250.0, effective_tau_cap(f64::INFINITY, 4.0));
+        assert!((p - 0.016).abs() < 1e-12, "{p}");
+        let p = filter::cap_spring(1.0, Some(0.0), 250.0, effective_tau_cap(f64::INFINITY, 0.0));
+        assert_eq!(p, 1.0);
+    }
+
+    /// The config must declare the wire generation; a mismatch or an
+    /// undeclared (older) client is refused before bring-up.
+    #[test]
+    fn config_requires_matching_proto() {
+        let joint = "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 inf\n";
+        assert!(parse_config(&format!("proto {PROTO_VERSION}\n{joint}")).is_ok());
+        let err = parse_config(joint).err().expect("undeclared proto rejected");
+        assert!(err.to_string().contains("missing `proto"), "{err}");
+        let err = parse_config(&format!("proto {}\n{joint}", PROTO_VERSION + 1))
+            .err()
+            .expect("mismatched proto rejected");
+        assert!(err.to_string().contains("rebuild axol-rt"), "{err}");
+        assert!(parse_config(&format!("proto x\n{joint}")).is_err());
     }
 
     #[test]
@@ -1261,11 +1375,12 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "loop_hz 240\n\
-             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
-             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
+            "proto 2\n\
+             loop_hz 240\n\
+             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 inf\n\
+             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 inf\n\
              gripper 0 canL 8\n\
-             joint 0 canL shoulder_3 3 180 2.0 9.4 33.0 0.4 250 0.08 0.0\n",
+             joint 0 canL wrist_2 6 130 3.5 9.4 33.0 0.4 250 0.08 0.0 3.0\n",
         )
         .unwrap();
         let specs = &cfg.buses[0].2;
@@ -1280,9 +1395,27 @@ mod tests {
             (specs[0].fc, specs[0].k, specs[0].fv, specs[0].fo),
             (0.6, 250.0, 0.15, 0.02)
         );
+        // Python formats an unset torque_limit as "inf" — uncapped.
+        assert_eq!(specs[0].tau_cap, f64::INFINITY);
+        assert_eq!(specs[3].tau_cap, 3.0);
+        assert_eq!(specs[2].tau_cap, f64::INFINITY);
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
         assert!(parse_config("joint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        // ... as must the 12-field layout without the torque cap, and a cap
+        // that would pin the joint to its measured position.
+        assert!(
+            parse_config("joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n")
+                .is_err()
+        );
+        assert!(parse_config(
+            "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 nan\n"
+        )
+        .is_err());
     }
 }
 
@@ -1731,6 +1864,7 @@ fn bus_loop(
             damp_w0: 20.0,
             damp_q: 0.8,
             j_eff: 0.0,
+            tau_cap: f64::INFINITY,
         };
     }
     // The in-core target tracker, per slot: chases the latest streamed
@@ -2066,13 +2200,33 @@ fn bus_loop(
                     // as-is, v_des = 0, slow t_ff only; the tracker re-seeds
                     // so a later mode switch starts transient-free.
                     let tracked = c.mode >= 0.5;
-                    let p_cmd = if tracked {
+                    let p_track = if tracked {
                         let (p, _, _) = trk[m.slot].update(c.p_des, cmd_dt);
                         p
                     } else {
                         trk[m.slot].seed(c.p_des);
                         c.p_des
                     };
+                    // Spring-torque cap (wrists by config; any joint the
+                    // command caps — box mode's squeeze limit): keep the wire
+                    // position within tau_cap / kp of the last measured
+                    // position so a joint blocked by an object leans on it
+                    // with at most tau_cap instead of kp times the operator's
+                    // run-ahead. The tracker keeps rendering the real trajectory
+                    // underneath (no re-seed: a transient clip during a fast
+                    // move must not zero its velocity), and everything
+                    // downstream — the derivative chain feeding friction /
+                    // inertia / host damping, the trace — sees the clamped
+                    // command, so those feedforwards fall to zero while the
+                    // joint is held rather than adding to the press. The
+                    // measured position is the previous tick's reply (one
+                    // 240 Hz period old).
+                    let p_cmd = filter::cap_spring(
+                        p_track,
+                        latest[m.slot].map(|(pos, _, _, _)| pos),
+                        c.kp,
+                        effective_tau_cap(m.tau_cap, c.tau_cap),
+                    );
                     let d = &mut damp[m.slot];
                     let (v_wire, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp) =
                         if tracked && overrun {

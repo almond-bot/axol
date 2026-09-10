@@ -33,7 +33,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
+from ..constants import ARM_JOINTS, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, RT_TARGET_FIELDS
 from ..motor import CanBus, ControlMode, Joint, Motor, MotorError
 from .axol import (
     GRIPPER_TRAVEL,
@@ -94,6 +94,17 @@ class MantisGripperArm:
         self._disable_pending = False
         self._calibrated = False
         self._telemetry_active = False
+
+    @property
+    def gripper_travel(self) -> float:
+        """Open-to-close stroke of the gripper (rad, always positive).
+
+        Same shape as :attr:`AxolArm.gripper_travel`, so diagnostics that
+        cycle a gripper (``diagnostics.can.send``) can treat either rig alike.
+        The Mantis only sweeps to its open stop, so this is the nominal
+        ``GRIPPER_TRAVEL`` from there.
+        """
+        return abs(self._open_pos - self._closed_pos)
 
     # -- Lifecycle -----------------------------------------------------------
 
@@ -316,12 +327,15 @@ class MantisGripperArm:
         raw = float(np.clip(raw, self._open_pos, self._closed_pos))
         cmd = (raw, self._gripper_config.max_speed, self._gripper_config.torque_limit)
         if self._command_sink is not None:
-            # Realtime-core mode: the core's target carries one 9-tuple per
-            # slot in Joint order. The seven arm slots are virtual here (the
-            # core has no arm motors configured and ignores them); slot 7 is
-            # the gripper's POSITION_FORCE command.
-            sink_cmds: list[tuple[float, ...]] = [(0.0,) * 9 for _ in range(_N_ARM)]
-            sink_cmds.append(cmd + (0.0,) * 6)
+            # Realtime-core mode: the core's target carries one
+            # RT_TARGET_FIELDS-tuple per slot in Joint order. The seven arm
+            # slots are virtual here (the core has no arm motors configured
+            # and ignores them); slot 7 is the gripper's POSITION_FORCE
+            # command.
+            sink_cmds: list[tuple[float, ...]] = [
+                (0.0,) * RT_TARGET_FIELDS for _ in range(_N_ARM)
+            ]
+            sink_cmds.append(cmd + (0.0,) * (RT_TARGET_FIELDS - len(cmd)))
             self._command_sink(sink_cmds)
             return
         await self._motor.set_position_force(*cmd)

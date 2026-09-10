@@ -925,10 +925,12 @@ def _build_frame(
         r_trigger_live=latest.r_trigger_live,
         # Cart input is control state, not delayed motion. Preserve the newest
         # thumbstick/click values exactly so interpolation cannot neutralize a
-        # drive command or keep a stale lift command alive.
+        # drive command or keep a stale lift command alive (the IK worker also
+        # reads them from this rendered frame for box-mode width / tilt).
         l_stick_x=latest.l_stick_x,
         l_stick_y=latest.l_stick_y,
         r_stick_x=latest.r_stick_x,
+        r_stick_y=latest.r_stick_y,
         l_stick_click=latest.l_stick_click,
         r_stick_click=latest.r_stick_click,
     )
@@ -964,7 +966,21 @@ def _same_motion(a: np.ndarray, b: np.ndarray, eps: float) -> bool:
     return float(np.max(np.abs(a[20:22] - b[20:22]))) < eps
 
 
+# Thumbstick deflection below this is idle for the identity-stable check.
+_STICK_IDLE = 0.05
+
+
 def _same_control(a: VRFrame, b: VRFrame) -> bool:
+    # A deflected stick is never "unchanged": box mode integrates the stick
+    # (grip width / tilt) over time in the IK worker, which only runs on a fresh frame, so a
+    # held stick with a still hand must keep producing new frames.
+    if (
+        abs(b.l_stick_x) > _STICK_IDLE
+        or abs(b.l_stick_y) > _STICK_IDLE
+        or abs(b.r_stick_x) > _STICK_IDLE
+        or abs(b.r_stick_y) > _STICK_IDLE
+    ):
+        return False
     return (
         a.l_lock == b.l_lock
         and a.r_lock == b.r_lock
@@ -986,6 +1002,7 @@ def _same_control(a: VRFrame, b: VRFrame) -> bool:
         and a.l_stick_x == b.l_stick_x
         and a.l_stick_y == b.l_stick_y
         and a.r_stick_x == b.r_stick_x
+        and a.r_stick_y == b.r_stick_y
         and a.l_stick_click == b.l_stick_click
         and a.r_stick_click == b.r_stick_click
     )

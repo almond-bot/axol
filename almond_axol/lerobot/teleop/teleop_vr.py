@@ -55,6 +55,7 @@ from ...constants import Joint
 from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ...robot.jelly import Jelly
 from ...teleop.core import TCPPoseSnapshot, VRTeleopCore
+from ...teleop.live import LiveSettings
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VREpisodeOutcome, VRFrame, VRState
 from ...vr.server import VRServer
@@ -118,8 +119,14 @@ class AxolVRTeleop(Teleoperator):
             config.vr_teleop_config,
             _logger,
             self._broadcast_tracking,
-            self._broadcast_json,
+            broadcast_mode=lambda key, value: self._live.on_changed(key, value),
+            broadcast_json=self._broadcast_json,
         )
+        # Live session settings (box mode, re-engage, reach, speed…) from the
+        # headset HUD / control panel. This teleoperator never holds the robot
+        # (LeRobot owns it), so the robot-side knobs (grip force) stay hidden
+        # here unless the owner hands it over via ``live_settings.set_robot``.
+        self._live = LiveSettings(self._core, None, self._publish_settings)
 
         # Jelly (x-drive base + telescoping lift), operator-only
         # mobility on robots that have one: the thumbsticks reposition the
@@ -201,6 +208,15 @@ class AxolVRTeleop(Teleoperator):
         from ``action_features``: Jelly is never part of the dataset.
         """
         return self._jelly
+
+    @property
+    def live_settings(self) -> LiveSettings:
+        """The session's live settings (see :mod:`almond_axol.teleop.live`).
+
+        The collect-data entry point calls ``live_settings.set_robot(robot)``
+        once it owns the hardware, which exposes the grip-force control.
+        """
+        return self._live
 
     @property
     def action_features(self) -> dict:
@@ -321,6 +337,8 @@ class AxolVRTeleop(Teleoperator):
         self._vr_server.set_pose_mode(
             "absolute" if self.config.vr_teleop_config.absolute_mode else "relative"
         )
+        self._vr_server.set_on_setting(self._live.apply)
+        self._live.announce()
         # Park early headset video requests until set_video_manager /
         # set_video_sources lands (they run after the caller's camera setup).
         self._vr_server.set_video_expected(self._video_expected)
@@ -864,6 +882,25 @@ class AxolVRTeleop(Teleoperator):
         """
         await self._core.contact_hold(**kwargs)
 
+    def spring_caps(self) -> dict[Joint, float] | None:
+        """Per-joint spring-torque caps the arms should run under right now.
+
+        Thin passthrough to :meth:`VRTeleopCore.spring_caps`: box mode's
+        squeeze cap on the shoulders while clamping a box, ``None`` when
+        nothing is capped. ``collect-data`` hands the result to
+        ``Axol.set_spring_caps`` on change, the same as native teleop.
+        """
+        return self._core.spring_caps()
+
+    def squeeze(self) -> tuple[list[np.ndarray], float] | None:
+        """Box mode's squeeze shaping ``(contacts, force cap)`` for the robot.
+
+        Thin passthrough to :meth:`VRTeleopCore.squeeze`; ``collect-data``
+        hands the result to ``Axol.set_squeeze`` on change, the same as
+        native teleop.
+        """
+        return self._core.squeeze()
+
     # ------------------------------------------------------------------
     # Teleoperator interface
     # ------------------------------------------------------------------
@@ -941,6 +978,22 @@ class AxolVRTeleop(Teleoperator):
         try:
             asyncio.run_coroutine_threadsafe(
                 self._vr_server.broadcast_text(json.dumps(obj)), self._loop
+            )
+        except RuntimeError:
+            pass  # event loop already shut down
+
+    def _publish_settings(self, snapshot: dict) -> None:
+        """Push the live-settings snapshot to every client and store it for
+        late joiners (see :class:`LiveSettings`)."""
+        if self._vr_server is None:
+            return
+        self._vr_server.set_announce("settings", snapshot)
+        if self._loop is None:
+            return
+        text = json.dumps({"type": "settings", "value": snapshot})
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._vr_server.broadcast_text(text), self._loop
             )
         except RuntimeError:
             pass  # event loop already shut down
@@ -1148,8 +1201,12 @@ class AxolVRTeleop(Teleoperator):
 
         if self._jelly is not None:
             # Shared stick → Jelly mapping (see Jelly.apply_vr_frame). Resets
-            # force a stop so the base doesn't creep during return-to-rest.
-            self._jelly.apply_vr_frame(frame, resetting=self._core.is_resetting)
+            # force a stop so the base doesn't creep during return-to-rest;
+            # while a box-mode leader owns the sticks (grip width / tilt)
+            # Jelly is held stopped the same way (frozen pair: sticks drive).
+            self._jelly.apply_vr_frame(
+                frame, resetting=self._core.is_resetting or self._core.pair_owns_sticks
+            )
 
         # Episode state transitions. Latch writes take _event_lock so they
         # can't land inside get_teleop_events' read-then-clear and vanish.

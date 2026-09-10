@@ -40,6 +40,11 @@ pub struct MotorSpec {
     pub k: f64,
     pub fv: f64,
     pub fo: f64,
+    /// Cap (Nm) on the impedance spring torque, enforced each tick by
+    /// clamping the wire position to within `tau_cap / kp` of the measured
+    /// position (see the `serve` tick loop). `INFINITY` disables it; the
+    /// gripper (POSITION_FORCE, own torque limit) never uses it.
+    pub tau_cap: f64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -61,13 +66,14 @@ pub struct ReadyMotor {
     pub kd: f64,
     pub gripper: bool,
     pub slot: usize,
-    /// Tracker limits + friction params, carried over from the spec.
+    /// Tracker limits + friction params + torque cap, carried over from the spec.
     pub max_vel: f64,
     pub max_accel: f64,
     pub fc: f64,
     pub k: f64,
     pub fv: f64,
     pub fo: f64,
+    pub tau_cap: f64,
 }
 
 /// Phase 1 of a cold bring-up: MyActuator 0x76 system reset (all motors at
@@ -154,6 +160,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             k: spec.k,
             fv: spec.fv,
             fo: spec.fo,
+            tau_cap: spec.tau_cap,
         });
     }
 
@@ -202,6 +209,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             k: spec.k,
             fv: spec.fv,
             fo: spec.fo,
+            tau_cap: spec.tau_cap,
         });
     }
     Ok(motors)

@@ -191,6 +191,7 @@ class VRServer:
         """
         self._port = config.port
         self._on_frame: Callable[[VRFrame], None] | None = None
+        self._on_setting: Callable[[str, Any], None] | None = None
         self._certfile = config.certfile or CERTFILE
         self._keyfile = config.keyfile or KEYFILE
         self._tls_files: PreparedTLSFiles | None = None
@@ -253,6 +254,11 @@ class VRServer:
         # pose stream so a delayed old-socket popup cannot overwrite the new
         # socket's replay and then be cleared when that old socket disconnects.
         self._hud_pose_seq: int | None = None
+
+        # Extra server-state messages announced to each client on connect
+        # (``{"type": key, "value": value}``), e.g. the live ``settings``; see
+        # :meth:`set_announce`. Live changes are broadcast separately.
+        self._announce: dict[str, Any] = {}
 
         # The source-wide sequence high-water deduplicates one logical Quest
         # producer copied over USB, WebRTC, and network. Per-client high-water
@@ -367,6 +373,36 @@ class VRServer:
         the browser's listener is attached. Safe to call before :meth:`enable`.
         """
         self._mode = mode
+
+    def set_announce(self, msg_type: str, value: Any) -> None:
+        """Record a server-state message re-sent to every client on connect.
+
+        ``{"type": msg_type, "value": value}`` is pushed to each client in
+        the WebSocket accept handler (after ``mode``) and whenever the client
+        asks with ``{"type": "session-config-request"}`` (see
+        :meth:`_send_session_config`), so a headset joining mid-session adopts
+        the current state — e.g. ``settings`` — instead of its own default.
+        Live changes are pushed separately via :meth:`broadcast_text`. Safe
+        from any thread; ``None`` removes it.
+        """
+        if value is None:
+            self._announce.pop(msg_type, None)
+        else:
+            self._announce[msg_type] = value
+
+    def set_on_setting(self, callback: Callable[[str, Any], None] | None) -> None:
+        """Install the handler for ``{"type": "set", "key": k, "value": v}``.
+
+        Any client — the headset HUD, the control panel — may send one to
+        change a live session setting (box mode, re-engage behaviour, gripper
+        force, …; see :class:`~almond_axol.teleop.live.LiveSettings`). The
+        callback runs on the server's event-loop thread and must be quick and
+        thread-safe toward the control loops; it is expected to publish the
+        resulting state back with :meth:`set_announce` + :meth:`broadcast_text`
+        so every client (including the sender) converges on the server's
+        value. Safe to call after construction.
+        """
+        self._on_setting = callback
 
     def set_pose_mode(self, mode: str) -> None:
         """Set the controller-pose convention announced to every headset.
@@ -1091,6 +1127,21 @@ class VRServer:
             await self._broadcast_hud(exclude=websocket)
             return
 
+        # Live session setting from any client (see set_on_setting). The
+        # handler publishes the resulting state itself; a rejected value is
+        # logged and the clients keep the last announced one.
+        if msg_type == "set":
+            key = obj.get("key")
+            if self._on_setting is None or not isinstance(key, str):
+                return
+            try:
+                self._on_setting(key, obj.get("value"))
+            except Exception as exc:  # noqa: BLE001 - one bad request, not the loop
+                _logger.warning(
+                    "Rejected setting %s=%r: %s", key, obj.get("value"), exc
+                )
+            return
+
         if self._webrtc is None:
             if msg_type == "webrtc-request":
                 if self._video_expected:
@@ -1293,6 +1344,10 @@ class VRServer:
         announcements: list[tuple[str, Any]] = []
         if self._mode is not None:
             announcements.append(("mode", self._mode))
+        # Server-state registered with set_announce (the live ``settings``),
+        # right after the mode so a joining HUD / panel adopts the session's
+        # values before it renders its controls.
+        announcements.extend(list(self._announce.items()))
         # The WebXR client uses this to suppress local record controls when a
         # Lighthouse/Ultimate bridge owns poses. Announce null as well so a
         # current client can distinguish unrestricted policy from an older

@@ -73,6 +73,7 @@ from typing import TYPE_CHECKING, Any
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
+from ..constants import Joint
 from ..lerobot.camera.configuration_zed import (
     ZED_RESOLUTION_DIMS,
     ZedCameraConfig,
@@ -1479,6 +1480,9 @@ def _run_session(
 
         pos_l, pos_r = robot.positions
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
+        # The headset's live settings act on the hardware too (grip force):
+        # hand the teleoperator the arms now that the robot is up.
+        teleop.live_settings.set_robot(robot.axol)
         try:
             activity.start()
         except OSError as exc:
@@ -1667,6 +1671,39 @@ def _run_session(
     def _stopped() -> bool:
         return (stop_event is not None and stop_event.is_set()) or loop_stop.is_set()
 
+    # Box mode's squeeze limits (VRTeleopConfig.box_squeeze_torque /
+    # box_squeeze_force): the teleop core says which joints run under a
+    # per-command spring-torque cap right now and where the tool touches the
+    # box with what force, and the robot is told on change only — same as
+    # native teleop. The Mantis rig has no arms and no setters, so this is a
+    # no-op there.
+    caps_applied: dict[Joint, float] | None = None
+    squeeze_applied: tuple | None = None
+
+    def _sync_spring_caps() -> None:
+        nonlocal caps_applied, squeeze_applied
+        axol = getattr(robot, "axol", None)
+        set_caps = getattr(axol, "set_spring_caps", None)
+        if set_caps is not None:
+            caps = teleop.spring_caps()
+            if caps != caps_applied:
+                set_caps(caps)
+                caps_applied = caps
+        set_squeeze = getattr(axol, "set_squeeze", None)
+        if set_squeeze is not None:
+            squeeze = teleop.squeeze()
+            key = (
+                None
+                if squeeze is None
+                else (tuple(tuple(map(float, c)) for c in squeeze[0]), squeeze[1])
+            )
+            if key != squeeze_applied:
+                if squeeze is None:
+                    set_squeeze(None)
+                else:
+                    set_squeeze(squeeze[0], squeeze[1])
+                squeeze_applied = key
+
     # Worst single-iteration stall and scheduler slip within each window. `gap`
     # is the longest time between consecutive loop iterations (a starved control
     # thread shows up as gaps >> the 1/teleop_hz period); `slip` is how late the
@@ -1834,6 +1871,7 @@ def _run_session(
             robot_act = robot_action_proc((act_processed, joint_obs))
             dataset_act = robot.action_to_dataset(act_processed)
             t_proc = time.perf_counter()
+            _sync_spring_caps()
             await robot.send_action_async(robot_act)
             t_send = time.perf_counter()
             sect["obs"] += t_obs - t0
@@ -1942,6 +1980,7 @@ def _run_session(
             robot.set_control_trace_active(True)
             joint_obs = robot.get_joint_observation()
             teleop.send_feedback(joint_obs)
+            _sync_spring_caps()
             await robot.send_action_async(last_robot_act)
             # Capture is already being stopped on the worker thread. Publishing
             # keeps the nearest-state history fresh for any final in-flight AU.
@@ -2292,6 +2331,7 @@ def _run_session(
     async def _guard_send_step() -> None:
         joint_obs = robot.get_joint_observation()
         act = teleop.get_action()
+        _sync_spring_caps()  # lifts the squeeze cap: the core caps nothing mid-reset
         await robot.send_action_async(robot_action_proc((act, joint_obs)))
 
     async def _guard_gravity_step() -> None:

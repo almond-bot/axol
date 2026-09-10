@@ -11,12 +11,12 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 import can
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, RT_TARGET_FIELDS
 from ..motor import (
     CanBus,
     ControlMode,
@@ -39,6 +39,7 @@ from .control import (
     compute_friction,
 )
 from .gravity import GravityCompensator
+from .squeeze import SqueezeSpec, orient_contacts, shape_squeeze
 
 _logger = logging.getLogger(__name__)
 
@@ -55,17 +56,38 @@ LIMITS: dict[Joint, tuple[float, float]] = {
     Joint.WRIST_1: (math.radians(-135), math.radians(135)),
     Joint.WRIST_2: (math.radians(-90), math.radians(90)),
     Joint.WRIST_3: (math.radians(-90), math.radians(90)),
-    # Gripper absent: open position varies per unit, found at runtime by _calibrate_gripper().
+    # Gripper absent: both end stops vary per unit, found at runtime by _calibrate_gripper().
 }
 
-# Fixed open-to-close travel of the gripper (rad).
+# Nominal open-to-close travel of the gripper (rad). For the arms it is only a
+# placeholder: the real stroke is measured between the two hard stops by
+# ``AxolArm._calibrate_gripper()`` at enable time, and it seeds the
+# pre-calibration gripper range and bounds the calibration sweep. The Mantis
+# (:mod:`almond_axol.robot.mantis`) has no closed stop to sweep to and uses it
+# as the stroke from its calibrated open stop.
 GRIPPER_TRAVEL = math.radians(290)
+_GRIPPER_NOMINAL_TRAVEL = GRIPPER_TRAVEL
 
-# Gripper open-position calibration parameters.
-_GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm
+# Gripper end-stop calibration parameters.
+_GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm — pushing this hard into a stop ends a sweep
 _GRIPPER_CALIB_STEP = 0.005  # rad per step
 _GRIPPER_CALIB_SETTLE = 0.001  # s per step
-# Sweep headroom beyond the nominal travel. Torque only builds once the jaw
+# Two-stop sweep (AxolArm._sweep_to_stop): longest sweep tolerated before
+# concluding there is no stop in that direction.
+_GRIPPER_CALIB_MAX_SWEEP = 2.5 * _GRIPPER_NOMINAL_TRAVEL
+_GRIPPER_CALIB_MAX_SWEEP_STEPS = math.ceil(
+    _GRIPPER_CALIB_MAX_SWEEP / _GRIPPER_CALIB_STEP
+)
+# A stop is only recognised from torque pushing *along* the sweep. Torque
+# building up against the sweep means the motor is already stalled on the
+# far stop (its reported torque sign disagrees with the commanded motion) —
+# abort rather than wind the impedance target further into the mechanism.
+_GRIPPER_CALIB_TORQUE_ABORT = 2.0  # Nm
+# Two stops closer together than this are not a gripper stroke (jammed jaw,
+# or a sweep that stalled on an obstruction).
+_GRIPPER_MIN_TRAVEL = math.radians(30)
+# Open-stop-only sweep (calibrate_gripper_open_stop, the Mantis): headroom
+# beyond the nominal travel. Torque only builds once the jaw
 # is against the open stop and the impedance target keeps moving past it, so
 # a gripper that starts at the closed stop needs budget *after* covering
 # GRIPPER_TRAVEL or the sweep ends with the jaws open but no stop detected.
@@ -81,14 +103,14 @@ _GRIPPER_CALIB_MAX_STEPS = math.ceil(
 # coupled to the motor. Anything shorter stalled against something.
 _GRIPPER_CALIB_FULL_TRAVEL_FRACTION = 0.9
 
-# Impedance gains used only during gripper open-stop calibration.
+# Impedance gains used only during gripper end-stop calibration.
 _GRIPPER_CALIB_KP = 50.0
 _GRIPPER_CALIB_KD = 1.0
 
-# The gripper open position varies per unit and is measured at runtime by
-# ``_calibrate_gripper()``. It is persisted here so a reconnecting
-# ``enable()`` can restore it without re-running the sweep (which physically
-# forces the jaw open, dropping anything a holding gripper grips).
+# The gripper end stops vary per unit and are measured at runtime by
+# ``_calibrate_gripper()``. They are persisted here so a reconnecting
+# ``enable()`` can restore them without re-running the sweep (which physically
+# closes then opens the jaw, dropping anything a holding gripper grips).
 _GRIPPER_CALIB_PATH = almond_path("gripper_calibration.json")
 
 # Tolerance (rad) around the calibrated travel range when validating a
@@ -191,8 +213,8 @@ def _validated_motion_target(q: np.ndarray, *, label: str) -> np.ndarray:
     return target
 
 
-def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
-    """Persist one gripper's calibrated open position (raw motor rad).
+def _save_gripper_calibration(is_left: bool, open_pos: float, close_pos: float) -> None:
+    """Persist one gripper's calibrated end stops (raw motor rad).
 
     A write failure only costs the ability to reconnect to a holding gripper
     later, so it is logged rather than failing the enable that produced the
@@ -208,7 +230,7 @@ def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
         # Missing or corrupt file — overwrite it with a fresh calibration
         # rather than losing the one we just measured.
         pass
-    data[side] = {"open_pos": open_pos, "saved_at": time.time()}
+    data[side] = {"open_pos": open_pos, "close_pos": close_pos, "saved_at": time.time()}
     try:
         secure_atomic_write_json(_GRIPPER_CALIB_PATH, data)
     except OSError as exc:
@@ -220,19 +242,21 @@ def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
         )
 
 
-def _load_gripper_calibration(is_left: bool) -> float:
-    """Return the persisted open position (raw motor rad) for one gripper.
+def _load_gripper_calibration(is_left: bool) -> tuple[float, float]:
+    """Return the persisted ``(open_pos, close_pos)`` (raw motor rad) for one gripper.
 
     Raises:
-        MotorError: If no calibration has been persisted for this arm.
+        MotorError: If no calibration has been persisted for this arm, or the
+            file predates the two-stop calibration (open stop only).
     """
     side = "left" if is_left else "right"
     try:
         data = json.loads(secure_read_text(_GRIPPER_CALIB_PATH))
-        return float(data[side]["open_pos"])
+        entry = data[side]
+        return float(entry["open_pos"]), float(entry["close_pos"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise MotorError(
-            f"No persisted gripper calibration for the {side} arm in "
+            f"No persisted two-stop gripper calibration for the {side} arm in "
             f"{_GRIPPER_CALIB_PATH} — a holding gripper cannot be reconnected "
             f"to without it; empty the gripper, then disable() and enable() "
             f"to calibrate"
@@ -518,6 +542,12 @@ class AxolArm:
     ``(8,)`` array) are ignored and gripper reads report ``0.0``.
     """
 
+    # Box mode's squeeze shaping for the next command (see set_squeeze /
+    # _shape_squeeze): None outside box mode. Class defaults so a partially
+    # built instance behaves as "off".
+    _squeeze: SqueezeSpec | None = None
+    _squeeze_force: float = 0.0
+
     def __init__(
         self,
         bus: CanBus,
@@ -684,20 +714,29 @@ class AxolArm:
         # motor radians (``arm_limits`` returns normalised [0, 1] for the
         # gripper, so the gripper bounds are seeded with raw defaults here
         # and ``_calibrate_gripper()`` overwrites them on enable).
-        # Pre-calibration gripper defaults assume zero is closed — do not rely
-        # on for actual motion.
         joints = list(Joint)
         self._gripper_i: int = joints.index(Joint.GRIPPER)
         self._limits_lo = np.array(
-            [
-                -GRIPPER_TRAVEL if j == Joint.GRIPPER else arm_limits(j, is_left)[0]
-                for j in joints
-            ],
+            [0.0 if j == Joint.GRIPPER else arm_limits(j, is_left)[0] for j in joints],
             dtype=float,
         )
         self._limits_hi = np.array(
             [0.0 if j == Joint.GRIPPER else arm_limits(j, is_left)[1] for j in joints],
             dtype=float,
+        )
+        # Raw motor angles of the gripper's two hard stops. The jaw closes in
+        # the configured ``close_direction``, so which of the two is the
+        # numerically larger angle differs between the mirrored left and right
+        # grippers — the [0 = closed, 1 = open] normalisation goes through
+        # ``_gripper_to_raw`` / ``_gripper_from_raw`` and never assumes an
+        # order. Pre-calibration placeholders assume zero is closed and a
+        # nominal stroke — do not rely on for actual motion.
+        self._gripper_open: float = 0.0
+        self._gripper_close: float = 0.0
+        self._set_gripper_range(
+            open_pos=-self._arm_config.gripper.close_direction
+            * _GRIPPER_NOMINAL_TRAVEL,
+            close_pos=0.0,
         )
 
         # Per-joint offset between motor frame and joint frame:
@@ -712,7 +751,7 @@ class AxolArm:
         # >180° from zero at power-up/reset — see
         # fixed_stop_wrap_correction), applied during zero verification.
         # The gripper offset is 0 because the gripper uses its own [0, 1]
-        # normalisation and is calibrated against torque, not an end stop.
+        # normalisation between its two torque-detected hard stops.
         self._joint_offsets = np.array(
             [
                 0.0
@@ -733,12 +772,13 @@ class AxolArm:
         self._unverified_zeros: set[Joint] = set(ARM_JOINTS) - EITHER_STOP_JOINTS
         self._offset_lock = asyncio.Lock()
         # Realtime-core hook: production motion_control and
-        # gravity_compensate hand their per-joint 9-float tuples
-        # (p_des motor-frame, mode, kp, kd, gravity t_ff, the pose-scheduled
-        # damping coefficients kd_host/w0/q, and the pose-scaled j_eff) to
-        # this callable instead of sending on the CAN bus — the Rust core
-        # owns the wire and computes the velocity/friction/inertia/damping
-        # terms itself each tick from its own tracker and feedback states.
+        # gravity_compensate hand their per-joint RT_TARGET_FIELDS-float
+        # tuples (p_des motor-frame, mode, kp, kd, gravity t_ff, the
+        # pose-scheduled damping coefficients kd_host/w0/q, the pose-scaled
+        # j_eff, and the per-command spring cap) to this callable instead of
+        # sending on the CAN bus — the Rust core owns the wire and computes
+        # the velocity/friction/inertia/damping terms itself each tick from
+        # its own tracker and feedback states.
         self._command_sink: (
             Callable[
                 [list[tuple[float, ...]]],
@@ -746,6 +786,16 @@ class AxolArm:
             ]
             | None
         ) = None
+        # Session-scoped spring-torque caps (Nm) per arm joint, on top of the
+        # configured ``JointConfig.torque_limit``: rides every tracked
+        # command as its tau_cap field (see set_spring_caps). Empty = none.
+        self._spring_caps: dict[Joint, float] = {}
+        self._squeeze = None
+        self._squeeze_force = 0.0  # force (N) the last shaped command applies
+        self._kp_vector = np.array(
+            [float(getattr(self._arm_config, j.value).kp) for j in ARM_JOINTS],
+            dtype=np.float64,
+        )
 
     def _pad_gripper(self, values: list) -> list:
         """Insert a ``0.0`` placeholder in the gripper slot when absent.
@@ -983,9 +1033,7 @@ class AxolArm:
         values = self._pad_gripper([self.motors[j].position for j in self.motors])
         gripper_i = self._gripper_i
         if self._has_gripper:
-            values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
-                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-            )
+            values[gripper_i] = self._gripper_from_raw(values[gripper_i])
         arr = np.array(values, dtype=np.float32)
         return arr + self._joint_offsets.astype(np.float32)
 
@@ -1003,21 +1051,143 @@ class AxolArm:
     # Arm-wide commands                                                    #
     # ------------------------------------------------------------------ #
 
-    async def _calibrate_gripper(self) -> None:
-        """Find the gripper open position by stepping in the negative direction.
+    # ------------------------------------------------------------------ #
+    # Gripper range                                                        #
+    # ------------------------------------------------------------------ #
 
-        Updates ``_limits_lo[gripper_idx]`` (open) and ``_limits_hi[gripper_idx]``
-        (close) which are used for normalization and clipping, and persists the
-        open position so a later :meth:`attach` can restore it without moving
-        the gripper. See :func:`calibrate_gripper_open_stop`.
+    @property
+    def gripper_travel(self) -> float:
+        """Calibrated open-to-close stroke of the gripper (rad, always positive).
+
+        The nominal placeholder until :meth:`enable` has measured the stops.
+        """
+        return abs(self._gripper_open - self._gripper_close)
+
+    def _set_gripper_range(self, open_pos: float, close_pos: float) -> None:
+        """Adopt a pair of gripper hard stops (raw motor rad).
+
+        Records them for the [0, 1] normalisation and seeds the raw clipping
+        bounds with the ordered pair — ``np.clip`` needs ``lo <= hi``, which
+        the open/closed pair does not guarantee on a mirrored gripper.
+        """
+        self._gripper_open = float(open_pos)
+        self._gripper_close = float(close_pos)
+        gripper_i = self._gripper_i
+        self._limits_lo[gripper_i] = min(open_pos, close_pos)
+        self._limits_hi[gripper_i] = max(open_pos, close_pos)
+
+    def _gripper_to_raw(self, opening: float) -> float:
+        """Normalised opening (0.0 = closed, 1.0 = open) → raw motor rad."""
+        return self._gripper_close + opening * (
+            self._gripper_open - self._gripper_close
+        )
+
+    def _gripper_from_raw(self, raw: float) -> float:
+        """Raw motor rad → normalised opening (0.0 = closed, 1.0 = open)."""
+        return (raw - self._gripper_close) / (self._gripper_open - self._gripper_close)
+
+    async def _seek_gripper_stop(self, direction: int) -> float:
+        """Step the gripper in ``direction`` (±1) until it stalls on a hard stop.
+
+        Each step nudges the impedance target ``_GRIPPER_CALIB_STEP`` further
+        and reads the motor torque; the stop is reached once the torque
+        pushing *along* the sweep exceeds ``_GRIPPER_TORQUE_THRESHOLD``. The
+        signed test matters for the second sweep of a calibration, which
+        starts pressed against the stop the first one found: that torque
+        points the other way and must not end the sweep early.
+
+        Returns:
+            The measured shaft position at the stop (raw motor rad).
+
+        Raises:
+            MotorError: If torque builds up *against* the sweep (the motor
+                reports pushing opposite to its commanded motion — stalled on
+                the stop it should be leaving, or an inverted torque sign),
+                or no stop is met within ``_GRIPPER_CALIB_MAX_SWEEP``.
+        """
+        motor = self.motors[Joint.GRIPPER]
+        side = "left" if self._is_left else "right"
+        target = await motor.get_position()
+
+        for _ in range(_GRIPPER_CALIB_MAX_SWEEP_STEPS):
+            target += direction * _GRIPPER_CALIB_STEP
+            await motor.set_impedance(
+                target, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
+            )
+            await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
+            torque = await motor.get_torque()
+            along = torque * direction
+            if along >= _GRIPPER_TORQUE_THRESHOLD:
+                return await motor.get_position()
+            if along <= -_GRIPPER_CALIB_TORQUE_ABORT:
+                await self._unload_gripper_target()
+                raise MotorError(
+                    f"{side} gripper calibration: torque {torque:+.2f} Nm builds "
+                    f"up against the sweep (direction {direction:+d}) — the motor "
+                    f"reports pushing opposite to its commanded motion, so it is "
+                    f"stalled on the stop the sweep should be leaving (or its "
+                    f"torque sign is inverted); the jaw must be free to move"
+                )
+
+        await self._unload_gripper_target()
+        raise MotorError(
+            f"{side} gripper calibration: no hard stop met within "
+            f"{math.degrees(_GRIPPER_CALIB_MAX_SWEEP):.0f}° sweeping in direction "
+            f"{direction:+d} — is the gripper attached and the jaw free to move?"
+        )
+
+    async def _unload_gripper_target(self) -> None:
+        """Re-target the calibration impedance hold at the shaft's actual position.
+
+        Called before a failed sweep raises, so the motor is not left leaning
+        on whatever it stalled against with the wound-up target.
+        """
+        motor = self.motors[Joint.GRIPPER]
+        current = await motor.get_position()
+        await motor.set_impedance(
+            current, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
+        )
+
+    async def _calibrate_gripper(self) -> None:
+        """Measure both gripper hard stops and leave the jaw open.
+
+        Sweeps the jaw closed first (in the configured
+        ``ArmConfig.gripper.close_direction``) until it stalls on the closed
+        stop, then back the other way until it stalls on the open stop, so the
+        gripper finishes open. The stroke is whatever the two stops measure —
+        nothing about it is assumed. Adopts the pair for the [0, 1]
+        normalisation and raw clipping (see :meth:`_set_gripper_range`) and
+        persists it so a later reconnecting :meth:`enable` can restore it
+        without moving the gripper.
 
         Must be called with the gripper motor already enabled and in IMPEDANCE mode.
+
+        Raises:
+            MotorError: If a stop is not found (see :meth:`_seek_gripper_stop`)
+                or the two stops are closer together than ``_GRIPPER_MIN_TRAVEL``.
         """
-        gripper_i = self._gripper_i
-        open_pos = await calibrate_gripper_open_stop(self.motors[Joint.GRIPPER])
-        self._limits_lo[gripper_i] = open_pos
-        self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
-        _save_gripper_calibration(self._is_left, open_pos)
+        close_direction = self._arm_config.gripper.close_direction
+        side = "left" if self._is_left else "right"
+
+        close_pos = await self._seek_gripper_stop(close_direction)
+        open_pos = await self._seek_gripper_stop(-close_direction)
+
+        travel = abs(open_pos - close_pos)
+        if travel < _GRIPPER_MIN_TRAVEL:
+            raise MotorError(
+                f"{side} gripper calibration: stops only {math.degrees(travel):.1f}° "
+                f"apart (closed {close_pos:.3f} rad, open {open_pos:.3f} rad) — "
+                f"the jaw is jammed or met an obstruction"
+            )
+        _logger.info(
+            "%s gripper calibrated: closed %.3f rad, open %.3f rad (stroke %.1f°)",
+            side,
+            close_pos,
+            open_pos,
+            math.degrees(travel),
+        )
+        self._set_gripper_range(open_pos, close_pos)
+        _save_gripper_calibration(self._is_left, open_pos, close_pos)
 
     async def enable(self, hold: bool = True) -> None:
         """Enable all arm motors in IMPEDANCE mode and the gripper in POSITION_FORCE mode.
@@ -1027,10 +1197,10 @@ class AxolArm:
         attached to with reads only — never reset, so they keep holding their
         pose — while the rest get the full bring-up (the mode switch reboots
         MyActuator motors, which is why it must never reach a holding joint).
-        A holding gripper keeps its grasp: its open-stop calibration is
+        A holding gripper keeps its grasp: its end-stop calibration is
         restored from the values persisted by the last full bring-up instead
-        of being re-measured (the calibration sweep would force the jaw
-        open). To force a fresh bring-up of a live robot, call
+        of being re-measured (the calibration sweep would close then open
+        the jaw). To force a fresh bring-up of a live robot, call
         :meth:`disable` first.
 
         With ``hold=True`` (the default) the arm finishes actively holding
@@ -1158,32 +1328,36 @@ class AxolArm:
 
         The no-motion alternative to :meth:`_calibrate_gripper`, used when
         the idempotent :meth:`enable` finds the gripper already live and
-        holding: re-measuring the open stop would sweep the jaw open and
-        drop anything held.
+        holding: re-measuring the stops would sweep the jaw closed and open
+        and drop anything held.
 
         Raises:
-            MotorError: If no calibration was persisted, or it no longer
-                matches the encoder (motor re-zeroed or power-cycled).
+            MotorError: If no calibration was persisted, it disagrees with the
+                configured ``close_direction``, or it no longer matches the
+                encoder (motor re-zeroed or power-cycled).
         """
-        open_pos = _load_gripper_calibration(self._is_left)
+        side = "left" if self._is_left else "right"
+        open_pos, close_pos = _load_gripper_calibration(self._is_left)
+        close_direction = self._arm_config.gripper.close_direction
+        if (close_pos - open_pos) * close_direction <= 0:
+            raise MotorError(
+                f"Persisted {side} gripper calibration (open {open_pos:.2f} rad, "
+                f"closed {close_pos:.2f} rad) was measured with the opposite "
+                f"close_direction to the configured {close_direction:+d} — "
+                f"empty the gripper, then disable() and enable() to recalibrate"
+            )
+        lo = min(open_pos, close_pos)
+        hi = max(open_pos, close_pos)
         current = await self.motors[Joint.GRIPPER].get_position()
-        if not (
-            open_pos - _GRIPPER_CALIB_MARGIN
-            <= current
-            <= open_pos + GRIPPER_TRAVEL + _GRIPPER_CALIB_MARGIN
-        ):
-            side = "left" if self._is_left else "right"
+        if not (lo - _GRIPPER_CALIB_MARGIN <= current <= hi + _GRIPPER_CALIB_MARGIN):
             raise MotorError(
                 f"Persisted {side} gripper calibration does not match the "
                 f"motor: current position {current:.2f} rad is outside the "
-                f"calibrated range [{open_pos:.2f}, "
-                f"{open_pos + GRIPPER_TRAVEL:.2f}] rad (motor re-zeroed or "
+                f"calibrated range [{lo:.2f}, {hi:.2f}] rad (motor re-zeroed or "
                 f"power-cycled?) — empty the gripper, then disable() and "
                 f"enable() to recalibrate"
             )
-        gripper_i = self._gripper_i
-        self._limits_lo[gripper_i] = open_pos
-        self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
+        self._set_gripper_range(open_pos, close_pos)
 
     async def disable(self) -> None:
         """Disable all motors and engage brakes."""
@@ -1238,9 +1412,7 @@ class AxolArm:
         )
         gripper_i = self._gripper_i
         if self._has_gripper:
-            values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
-                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-            )
+            values[gripper_i] = self._gripper_from_raw(values[gripper_i])
         arr = np.array(values, dtype=np.float32)
         return arr + self._joint_offsets.astype(np.float32)
 
@@ -1385,9 +1557,7 @@ class AxolArm:
         positions = positions.copy()
         gripper_i = self._gripper_i
         if self._has_gripper:
-            positions[gripper_i] = self._limits_hi[gripper_i] + positions[gripper_i] * (
-                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-            )
+            positions[gripper_i] = self._gripper_to_raw(float(positions[gripper_i]))
         else:
             positions[gripper_i] = 0.0
         clipped = np.clip(positions, self._limits_lo, self._limits_hi)
@@ -1417,6 +1587,166 @@ class AxolArm:
                 if j in self.motors
             ]
         )
+
+    def set_spring_caps(self, caps: Mapping[Joint, float] | None) -> None:
+        """Cap the impedance *spring* torque of chosen arm joints, live.
+
+        ``caps`` maps arm joints to a torque (Nm); joints absent from it (or
+        all of them, with ``None`` / ``{}``) keep only their configured
+        ``JointConfig.torque_limit``. Two layers enforce a cap. Here, each
+        :meth:`motion_control` first backs the whole arm's command off toward
+        the measured pose until every capped joint's spring torque
+        (``kp`` × run-ahead) is within its cap, keeping the arm's shape (see
+        :meth:`_back_off_to_spring_caps`). The cap then also rides the
+        command to the realtime core, which clamps that joint's wire
+        position to within ``cap / kp`` of measured (``filter::cap_spring``)
+        — the hard guarantee, per joint. So a joint blocked by whatever it
+        is pressing on leans with at most ``cap`` — the tighter of this and
+        the configured cap. Gravity feedforward is outside it. Box mode uses
+        this on the shoulder joints that carry the lateral squeeze while the
+        arms clamp a box.
+
+        Applies from the next :meth:`motion_control`; realtime-core mode
+        only (the classic CAN path has no spring cap). Non-positive or
+        non-finite values are treated as "no cap".
+        """
+        clean: dict[Joint, float] = {}
+        for joint, cap in (caps or {}).items():
+            if joint == Joint.GRIPPER:
+                raise ValueError("spring caps apply to arm joints, not the gripper")
+            value = float(cap)
+            if math.isfinite(value) and value > 0.0:
+                clean[joint] = value
+        self._spring_caps = clean
+
+    @property
+    def spring_caps(self) -> dict[Joint, float]:
+        """The live per-joint spring-torque caps (see :meth:`set_spring_caps`)."""
+        return dict(self._spring_caps)
+
+    def set_squeeze(self, spec: SqueezeSpec | None) -> None:
+        """Shape the next commands' squeeze onto the tool's contact points.
+
+        Box mode's clamp: while a :class:`SqueezeSpec` is set, each
+        :meth:`motion_control` re-expresses the part of its run-ahead that
+        presses the gripper into the box (along ``spec.normal``) as the same
+        total force divided evenly over ``spec.contacts`` — so the far tip of
+        the tool and the face by the wrist both carry it instead of the face
+        alone — and holds that force at ``spec.force_cap`` (and within the
+        spring caps' equivalent, see :meth:`set_spring_caps`). See
+        :mod:`almond_axol.robot.squeeze`. The robot-level
+        :meth:`Axol.set_squeeze` derives each arm's spec (the normal from the
+        two measured mount positions) every command; ``None`` turns it off.
+        Realtime-core mode only.
+        """
+        self._squeeze = spec
+        if spec is None:
+            self._squeeze_force = 0.0
+
+    @property
+    def squeeze_force(self) -> float:
+        """Squeeze force (N) the last shaped command applies (0 when not shaping)."""
+        return self._squeeze_force
+
+    def _shape_squeeze(self, q_cmd: np.ndarray) -> np.ndarray:
+        """Apply :func:`shape_squeeze` to a joint-frame command (see :meth:`set_squeeze`).
+
+        The Jacobian and mount rotation are evaluated at the *measured* pose
+        (the wrench acts there); the run-ahead is ``q_cmd`` over measured.
+        Passes ``q_cmd`` through untouched until measured positions are
+        available or if the shaping fails for any reason — a squeeze that
+        is merely unshaped is the behaviour before this existed, and the
+        spring caps still bound it.
+        """
+        spec = self._squeeze
+        if spec is None:
+            return q_cmd
+        try:
+            measured = self.positions
+        except MotorError:
+            return q_cmd
+        n_arm = len(ARM_JOINTS)
+        q_meas = measured[:n_arm].astype(np.float64)
+        run_ahead = q_cmd[:n_arm].astype(np.float64) - q_meas
+        if not np.all(np.isfinite(run_ahead)):
+            return q_cmd
+        try:
+            _pos, rotation, jac = self._gravity_comp.mount_jacobian(
+                q_meas, is_left=self._is_left
+            )
+            contacts = orient_contacts(spec.contacts, rotation, spec.normal)
+            caps = {ARM_JOINTS.index(j): cap for j, cap in self._spring_caps.items()}
+            kp = self._kp_vector
+            result = shape_squeeze(
+                kp * run_ahead,
+                kp,
+                jac,
+                rotation,
+                spec.normal,
+                contacts,
+                caps,
+                spec.force_cap,
+            )
+        except Exception:  # noqa: BLE001 - never let shaping stop the command stream
+            _logger.exception("squeeze shaping failed; sending the command unshaped")
+            self._squeeze = None
+            return q_cmd
+        self._squeeze_force = result.force
+        if not np.all(np.isfinite(result.tau)):
+            return q_cmd
+        out = q_cmd.copy()
+        out[:n_arm] = (q_meas + result.tau / kp).astype(out.dtype)
+        return out
+
+    def _back_off_to_spring_caps(self, q_cmd: np.ndarray) -> np.ndarray:
+        """Pull the *whole arm's* command back toward measured until every
+        capped joint's spring torque is within its cap.
+
+        ``q_cmd`` is the joint-frame target (gripper slot included, and left
+        alone). A capped joint's spring torque is ``kp`` times its run-ahead
+        (command minus measured); where that exceeds the cap, the run-ahead
+        of every arm joint is scaled by the same factor, so the command moves
+        along the joint-space line from the measured pose toward the target
+        and the arm keeps the *shape* the target had. Clamping the capped
+        joints alone — which is all the realtime core can do, per joint —
+        would leave the others driving to a pose the capped ones never
+        reach: with a box held between the grippers, the two shoulders give
+        while the elbow and wrists don't, and the gripper rolls and yaws by
+        the shoulders' deficit (several degrees for a few centimetres of
+        width jogged past contact), so a flat contact face ends up pressing
+        along one edge. Backed off as a whole, the arm presses with the
+        bounded force at the orientation the target asked for, deflected
+        only by its ordinary compliance. The core's per-joint clamp stays
+        underneath as the hard guarantee.
+
+        With nothing pressing back the run-ahead is servo lag, well inside
+        the caps at box-mode speeds; a fast move that does exceed one is
+        slowed uniformly rather than distorted. Measured positions come from
+        the impedance feedback caches; until they are available the command
+        passes through untouched.
+        """
+        try:
+            measured = self.positions
+        except MotorError:
+            return q_cmd
+        n_arm = len(ARM_JOINTS)
+        run_ahead = q_cmd[:n_arm] - measured[:n_arm]
+        if not np.all(np.isfinite(run_ahead)):
+            return q_cmd
+        scale = 1.0
+        for joint, cap in self._spring_caps.items():
+            i = ARM_JOINTS.index(joint)
+            kp = float(getattr(self._arm_config, joint.value).kp)
+            if kp <= 0.0:
+                continue
+            excess = abs(float(run_ahead[i])) * kp
+            if excess > cap:
+                scale = min(scale, cap / excess)
+        if scale >= 1.0:
+            return q_cmd
+        out = q_cmd.copy()
+        out[:n_arm] = measured[:n_arm] + scale * run_ahead
+        return out
 
     async def motion_control(self, q: np.ndarray) -> None:
         """Send control commands to all joints concurrently.
@@ -1469,12 +1799,21 @@ class AxolArm:
 
         gripper_i = self._gripper_i
         if self._has_gripper:
-            q[gripper_i] = self._limits_hi[gripper_i] + q[gripper_i] * (
-                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-            )
+            q[gripper_i] = self._gripper_to_raw(float(q[gripper_i]))
         else:
             q[gripper_i] = 0.0
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
+
+        sink_mode = self._command_sink is not None
+        if sink_mode and self._squeeze is not None:
+            # Box mode: put the clamp force where the tool touches the box
+            # and hold it at the force cap (see set_squeeze), then the
+            # per-joint spring caps as the layer underneath.
+            clipped = np.clip(
+                self._shape_squeeze(clipped), self._limits_lo, self._limits_hi
+            )
+        if sink_mode and self._spring_caps:
+            clipped = self._back_off_to_spring_caps(clipped)
 
         # Velocity feedforward via differentiation of commanded positions (rad/s),
         # and acceleration feedforward via a second pass for inertia FF (rad/s²).
@@ -1486,7 +1825,6 @@ class AxolArm:
         # these same low-pass derivative chains to the executed tracker
         # position (this loop's 120 Hz differentiation of the pre-tracker
         # target would be out of phase with the executed motion).
-        sink_mode = self._command_sink is not None
         if not sink_mode:
             velocities = self._vel_diff.differentiate(list(clipped))
             accelerations = self._accel_diff.differentiate(velocities)
@@ -1582,19 +1920,20 @@ class AxolArm:
         motor_targets = clipped - self._joint_offsets
 
         if sink_mode:
-            # Production realtime-core mode: ship 9-float tuples to
-            # the sink — which streams them to the Rust core that owns the
-            # CAN bus. mode=1 (tracked): the core's own trapezoid tracker
-            # renders the trajectory toward p_des at 240 Hz and computes the
-            # velocity, friction, and inertia terms from its states — t_ff
-            # here carries *gravity only* (the slow, pose-shaped term this
-            # side owns). The damping coefficients and the pose-scaled
-            # inertia gain are the schedule the core applies each tick
-            # against its own fresh feedback (see the sink_mode comment
-            # above). Slot 7 carries the gripper's POSITION_FORCE command
-            # (motor-frame target, speed limit, torque limit); zeros on the
-            # gripperless SKU (the core has no gripper configured and
-            # ignores the slot).
+            # Production realtime-core mode: ship RT_TARGET_FIELDS-float
+            # tuples to the sink — which streams them to the Rust core that
+            # owns the CAN bus. mode=1 (tracked): the core's own trapezoid
+            # tracker renders the trajectory toward p_des at 240 Hz and
+            # computes the velocity, friction, and inertia terms from its
+            # states — t_ff here carries *gravity only* (the slow, pose-shaped
+            # term this side owns). The damping coefficients and the
+            # pose-scaled inertia gain are the schedule the core applies each
+            # tick against its own fresh feedback (see the sink_mode comment
+            # above). The last field is the per-command spring-torque cap
+            # (see set_spring_caps; 0 = only the configured cap). Slot 7
+            # carries the gripper's POSITION_FORCE command (motor-frame
+            # target, speed limit, torque limit); zeros on the gripperless
+            # SKU (the core has no gripper configured and ignores the slot).
             sink_cmds: list[tuple[float, ...]] = []
             for i, j in enumerate(ARM_JOINTS):
                 gains = getattr(self._arm_config, j.value)
@@ -1609,19 +1948,20 @@ class AxolArm:
                         damp_w0[i],
                         self._damp_q[i],
                         gains.j_eff * float(j_scale[i]),
+                        self._spring_caps.get(j, 0.0),
                     )
                 )
             if self._has_gripper:
+                gripper_cmd = (
+                    float(motor_targets[gripper_i]),
+                    self._arm_config.gripper.max_speed,
+                    self._arm_config.gripper.torque_limit,
+                )
                 sink_cmds.append(
-                    (
-                        float(motor_targets[gripper_i]),
-                        self._arm_config.gripper.max_speed,
-                        self._arm_config.gripper.torque_limit,
-                    )
-                    + (0.0,) * 6
+                    gripper_cmd + (0.0,) * (RT_TARGET_FIELDS - len(gripper_cmd))
                 )
             else:
-                sink_cmds.append((0.0,) * 9)
+                sink_cmds.append((0.0,) * RT_TARGET_FIELDS)
             self._command_sink(sink_cmds)
             self._last_q_commanded = clipped
             return
@@ -1747,9 +2087,7 @@ class AxolArm:
             else:
                 gripper_pos = float(np.clip(gripper_target, 0.0, 1.0))
                 torque = self._arm_config.gripper.torque_limit
-            gripper_pos_raw = self._limits_hi[gripper_i] + gripper_pos * (
-                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-            )
+            gripper_pos_raw = self._gripper_to_raw(gripper_pos)
             gripper_cmd = (
                 gripper_pos_raw,
                 self._arm_config.gripper.max_speed,
@@ -1763,10 +2101,14 @@ class AxolArm:
             # goes to the wire as-is with v_des = 0, no tracker and no
             # friction/inertia terms (a hand-guided limp arm wants gravity
             # feedforward only), and no damping coefficients (classic
-            # gravity comp runs firmware gains only).
-            sink_cmds = [t + (0.0,) * 4 for t in arm_tuples]
+            # gravity comp runs firmware gains only), and no per-command
+            # spring cap (the held joints sit on their snapshot at config
+            # gains; the free ones have no spring to cap).
+            sink_cmds = [t + (0.0,) * (RT_TARGET_FIELDS - len(t)) for t in arm_tuples]
             sink_cmds.append(
-                gripper_cmd + (0.0,) * 6 if gripper_cmd is not None else (0.0,) * 9
+                gripper_cmd + (0.0,) * (RT_TARGET_FIELDS - len(gripper_cmd))
+                if gripper_cmd is not None
+                else (0.0,) * RT_TARGET_FIELDS
             )
             self._command_sink(sink_cmds)
             return
@@ -1885,6 +2227,13 @@ class Axol(RobotBase):
         right_channel: SocketCAN interface name for the right arm.
     """
 
+    # Box mode's squeeze shaping (see set_squeeze): the tool's contact
+    # points (mount frame, face = +1) and the force cap; None = off. Class
+    # defaults so a partially built instance behaves as "off".
+    _squeeze_contacts: tuple[np.ndarray, ...] | None = None
+    _squeeze_force_cap: float = float("inf")
+    _squeeze_log_t: float = 0.0
+
     def __init__(
         self,
         config: AxolConfig = AxolConfig(),
@@ -1953,6 +2302,8 @@ class Axol(RobotBase):
         # connect()/enable()/disconnect() refuse until disable() verifies
         # torque-off (arm-wide, which covers these motors) and clears it.
         self._startup_rollback_pending: list[tuple[str, Motor]] | None = None
+        self._squeeze_contacts = None
+        self._squeeze_force_cap = float("inf")
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
@@ -2521,10 +2872,122 @@ class Axol(RobotBase):
             targets.append(
                 (self.right, _validated_motion_target(right, label="right arm"))
             )
+        self.refresh_squeeze()
         if targets:
             await _await_all_hardware_actions(
                 *(arm.motion_control(q) for arm, q in targets)
             )
+
+    def set_squeeze(
+        self,
+        contacts: Sequence[np.ndarray] | None,
+        force_cap: float = float("inf"),
+    ) -> None:
+        """Turn box mode's squeeze shaping on (or off) for both arms.
+
+        ``contacts`` are the fitted tool's contact points on the box, in the
+        gripper mount frame for the tool's ``face = +1`` side (the parcel
+        gripper in the flush grasp: the folded blade's face by the wrist and
+        the fixed blade's tip); ``None`` turns shaping off. ``force_cap`` is
+        the squeeze force limit per arm (N). From then on every
+        :meth:`motion_control` derives each arm's :class:`SqueezeSpec` — the
+        inward normal is the line between the two arms' measured mount
+        positions — and each arm places its clamp force through the
+        contacts' centroid and holds it at the cap (see
+        :meth:`AxolArm.set_squeeze`, :mod:`almond_axol.robot.squeeze`).
+        Needs both arms and their measured positions; with either missing
+        the arms squeeze unshaped, bounded by the spring caps alone.
+        Realtime-core mode only.
+        """
+        if contacts is None:
+            if self._squeeze_contacts is not None:
+                _logger.info("box squeeze shaping off")
+            self._squeeze_contacts = None
+            for arm in (self.left, self.right):
+                if arm is not None:
+                    arm.set_squeeze(None)
+            return
+        pts = tuple(np.asarray(c, dtype=np.float64).reshape(3) for c in contacts)
+        if not pts:
+            raise ValueError("set_squeeze needs at least one contact point")
+        cap = float(force_cap) if force_cap > 0.0 else float("inf")
+        changed = self._squeeze_contacts is None or (
+            cap != self._squeeze_force_cap
+            or len(pts) != len(self._squeeze_contacts)
+            or any(
+                not np.array_equal(a, b) for a, b in zip(pts, self._squeeze_contacts)
+            )
+        )
+        self._squeeze_contacts = pts
+        self._squeeze_force_cap = cap
+        if changed:
+            _logger.info(
+                "box squeeze shaping on: %d contact point(s), force cap %s N",
+                len(pts),
+                f"{cap:.1f}" if math.isfinite(cap) else "none",
+            )
+
+    @property
+    def squeeze_forces(self) -> tuple[float, float]:
+        """``(left, right)`` squeeze force (N) the last shaped commands apply."""
+        return (
+            self.left.squeeze_force if self.left is not None else 0.0,
+            self.right.squeeze_force if self.right is not None else 0.0,
+        )
+
+    def refresh_squeeze(self) -> None:
+        """Hand each arm this command's :class:`SqueezeSpec` (see :meth:`set_squeeze`).
+
+        Called by :meth:`motion_control` — and by anything that commands the
+        arms directly (``RtAxol.motion_control``) — before each command
+        while shaping is on; a no-op otherwise. Also logs the force the arms
+        are applying, about once a second while they press.
+        """
+        if self._squeeze_contacts is None:
+            return
+        self._log_squeeze_force()
+        spec_l: SqueezeSpec | None = None
+        spec_r: SqueezeSpec | None = None
+        if self.left is not None and self.right is not None:
+            try:
+                n_arm = len(ARM_JOINTS)
+                q_l = self.left.positions[:n_arm].astype(np.float64)
+                q_r = self.right.positions[:n_arm].astype(np.float64)
+                p_l = self._gravity_comp.mount_jacobian(q_l, is_left=True)[0]
+                p_r = self._gravity_comp.mount_jacobian(q_r, is_left=False)[0]
+                across = p_r - p_l
+                dist = float(np.linalg.norm(across))
+                if np.isfinite(dist) and dist > 0.02:
+                    normal = across / dist
+                    spec_l = SqueezeSpec(
+                        normal, self._squeeze_contacts, self._squeeze_force_cap
+                    )
+                    spec_r = SqueezeSpec(
+                        -normal, self._squeeze_contacts, self._squeeze_force_cap
+                    )
+            except MotorError:
+                pass
+        if self.left is not None:
+            self.left.set_squeeze(spec_l)
+        if self.right is not None:
+            self.right.set_squeeze(spec_r)
+
+    def _log_squeeze_force(self) -> None:
+        """Log the shaped squeeze force at ~1 Hz while either arm presses (> 0.5 N)."""
+        left, right = self.squeeze_forces
+        now = time.monotonic()
+        pressing = max(left, right) > 0.5
+        if pressing and now - self._squeeze_log_t >= 1.0:
+            self._squeeze_log_t = now
+            cap = self._squeeze_force_cap
+            _logger.info(
+                "box squeeze: left %.1f N, right %.1f N (cap %s)",
+                left,
+                right,
+                f"{cap:.1f} N" if math.isfinite(cap) else "none",
+            )
+        elif not pressing:
+            self._squeeze_log_t = 0.0  # log the first press right away
 
     async def gravity_compensate(
         self,
@@ -2585,6 +3048,32 @@ class Axol(RobotBase):
             self.left.reset_command_state()
         if self.right is not None:
             self.right.reset_command_state()
+
+    def set_spring_caps(self, caps: Mapping[Joint, float] | None) -> None:
+        """Set the live per-joint spring-torque caps on both arms.
+
+        See :meth:`AxolArm.set_spring_caps`; ``None`` clears them.
+        """
+        before = {
+            side: dict(arm.spring_caps)
+            for side, arm in (("left", self.left), ("right", self.right))
+            if arm is not None
+        }
+        for arm in (self.left, self.right):
+            if arm is not None:
+                arm.set_spring_caps(caps)
+        after = {
+            side: dict(arm.spring_caps)
+            for side, arm in (("left", self.left), ("right", self.right))
+            if arm is not None
+        }
+        if after != before:
+            shown = next(iter(after.values()), {})
+            _logger.info(
+                "spring caps: %s",
+                ", ".join(f"{j.name.lower()} {c:g} Nm" for j, c in shown.items())
+                or "none",
+            )
 
     def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Per-arm measured-minus-gravity torques, ``(left, right)``.

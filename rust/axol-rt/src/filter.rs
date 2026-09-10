@@ -108,6 +108,27 @@ pub fn friction(v: f64, fc: f64, k: f64, fv: f64, fo: f64) -> f64 {
     fc * (0.1 * k.min(FRICTION_FF_K_MAX) * v).tanh() + fv * v + fo
 }
 
+/// Bound the impedance spring torque `kp · (p_cmd − p_meas)` at `tau_cap`
+/// by pulling the wire position back to within `tau_cap / kp` of the
+/// measured position. A blocked joint then leans on the obstacle with at
+/// most `tau_cap` however far the target runs ahead, and the moment the
+/// obstacle clears the command is at most that window away — the catch-up
+/// starts at `tau_cap`, not at `kp` times the accumulated error.
+///
+/// Gravity feedforward is deliberately outside the cap (it holds the arm's
+/// own weight, not the obstacle). With no measured position yet, no cap, or
+/// no spring (`kp ≤ 0`), the command passes through unchanged.
+pub fn cap_spring(p_cmd: f64, p_meas: Option<f64>, kp: f64, tau_cap: f64) -> f64 {
+    let Some(p_meas) = p_meas else {
+        return p_cmd;
+    };
+    if !tau_cap.is_finite() || kp <= 0.0 {
+        return p_cmd;
+    }
+    let window = tau_cap / kp;
+    p_meas + (p_cmd - p_meas).clamp(-window, window)
+}
+
 /// Velocity/acceleration-limited target tracker — the per-joint
 /// `TrapezoidalFilter` from `almond_axol.teleop.filter`, ported per-scalar
 /// with a per-step `dt` (the Python original fixes dt at construction).
@@ -410,6 +431,24 @@ mod tests {
                 "friction({v}): got {got:e}, want {want:e}"
             );
         }
+    }
+
+    #[test]
+    fn cap_spring_bounds_torque_and_passes_through_otherwise() {
+        // Wrist: kp 130, 3 Nm cap → a 1.3° window either side of the
+        // measured position. Blocked at 1.0 with the target run 0.5 rad
+        // ahead, the wire carries 3 Nm of spring, not 65.
+        let p = cap_spring(1.5, Some(1.0), 130.0, 3.0);
+        assert!(((p - 1.0) * 130.0 - 3.0).abs() < 1e-12, "{p}");
+        let p = cap_spring(0.5, Some(1.0), 130.0, 3.0);
+        assert!(((p - 1.0) * 130.0 + 3.0).abs() < 1e-12, "{p}");
+        // Inside the window nothing changes.
+        assert_eq!(cap_spring(1.01, Some(1.0), 130.0, 3.0), 1.01);
+        // Uncapped joints, zero-stiffness (gravity comp) commands, and the
+        // first tick before any feedback all pass through untouched.
+        assert_eq!(cap_spring(1.5, Some(1.0), 130.0, f64::INFINITY), 1.5);
+        assert_eq!(cap_spring(1.5, Some(1.0), 0.0, 3.0), 1.5);
+        assert_eq!(cap_spring(1.5, None, 130.0, 3.0), 1.5);
     }
 
     /// The reason host damping moved into the core: dissipated power vs the

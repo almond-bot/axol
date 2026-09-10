@@ -239,6 +239,9 @@ class VRStartupIntegrityTest(unittest.IsolatedAsyncioTestCase):
         teleop._ik_process = None
         teleop._jelly = None
         teleop._robot = SimpleNamespace(enable=AsyncMock(), disable=AsyncMock())
+        # Live session settings are announced right after the VR listener
+        # comes up (see VRTeleop.enable); a stub keeps that step inert here.
+        teleop._live = SimpleNamespace(announce=Mock(), apply=Mock())
         return teleop
 
     async def test_vr_startup_failure_wakes_propagates_and_is_retryable(self) -> None:
@@ -349,6 +352,9 @@ class LeRobotVRStartupIntegrityTest(unittest.TestCase):
         teleop._ik_thread = None
         teleop._ik_stop = threading.Event()
         teleop._jelly = None
+        # Live session settings are wired to the VR server during connect
+        # (set_on_setting + announce); a stub keeps that step inert here.
+        teleop._live = SimpleNamespace(announce=Mock(), apply=Mock())
         return teleop
 
     @staticmethod
@@ -361,6 +367,7 @@ class LeRobotVRStartupIntegrityTest(unittest.TestCase):
             set_on_frame=Mock(),
             set_mode=Mock(),
             set_pose_mode=Mock(),
+            set_on_setting=Mock(),
             set_video_expected=Mock(),
             enable=AsyncMock(side_effect=enable_error),
             disable=AsyncMock(side_effect=disable_error),

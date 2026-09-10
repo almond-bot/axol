@@ -569,6 +569,9 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         arm._has_gripper = True
         arm._gripper_i = list(Joint).index(Joint.GRIPPER)
         arm._unverified_zeros = set()
+        # The two-stop calibration sweeps in the configured close direction.
+        arm._is_left = True
+        arm._arm_config = SimpleNamespace(gripper=SimpleNamespace(close_direction=-1))
 
         with (
             patch("almond_axol.robot.axol._GRIPPER_CALIB_MAX_STEPS", 3),
@@ -582,9 +585,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             cold_gripper.disable.assert_awaited_once_with()
 
             release_cleanup.set()
-            with self.assertRaisesRegex(
-                MotorError, "no hard stop was detected"
-            ) as raised:
+            with self.assertRaisesRegex(MotorError, "no hard stop") as raised:
                 await task
 
         self.assertFalse(is_hardware_cleanup_uncertain(raised.exception))
