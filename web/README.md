@@ -197,11 +197,11 @@ The app is deployed on Vercel. `vercel.json` builds the client package first so 
 {
   "buildCommand": "npm run build --workspace=packages/axol-vr-client && npm run build --workspace=app",
   "outputDirectory": "app/dist",
-  "installCommand": "rm -f package-lock.json && npm install"
+  "installCommand": "npm ci"
 }
 ```
 
-The `installCommand` removes any macOS-generated lock file to avoid missing Linux rollup binaries on the Vercel build machine.
+The `installCommand` installs from the committed `package-lock.json` rather than re-resolving from the version ranges, so a new release outside a peer range (react 19.3.0 vs `@react-three/fiber`'s `<19.3`) can't break the deploy — bump dependencies deliberately and commit the lockfile. The lockfile carries every platform's optional binaries (rollup, tailwind oxide, lightningcss), so one generated on macOS installs fine on the Linux build machine.
 
 ## Python SDK
 

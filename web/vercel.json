@@ -1,7 +1,7 @@
 {
   "buildCommand": "npm run build --workspace=packages/axol-vr-client && npm run build --workspace=app",
   "outputDirectory": "app/dist",
-  "installCommand": "rm -f package-lock.json && npm install",
+  "installCommand": "npm ci",
   "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }],
   "headers": [
     {
