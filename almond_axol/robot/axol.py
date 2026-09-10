@@ -11,7 +11,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 
 import can
 import numpy as np
@@ -516,6 +516,12 @@ class AxolArm:
     On the gripperless SKU (``AxolConfig.has_gripper = False``) no gripper
     motor is constructed: gripper commands (the last element of every
     ``(8,)`` array) are ignored and gripper reads report ``0.0``.
+
+    ``joints`` restricts the arm to a subset of its motors for a bench setup
+    that has only some of them on the bus (a wrist assembly under a ROM
+    test, say). Absent joints are treated like the absent gripper: never
+    constructed or brought up, their commands ignored, their reads ``0.0``
+    (the rest pose). Every public array keeps its ``(8,)`` Joint-enum shape.
     """
 
     def __init__(
@@ -524,6 +530,7 @@ class AxolArm:
         config: AxolConfig,
         gravity_comp: GravityCompensator,
         is_left: bool = True,
+        joints: Iterable[Joint] | None = None,
     ) -> None:
         """Construct an AxolArm.
 
@@ -532,18 +539,25 @@ class AxolArm:
             config:       Full dual-arm gains config; the correct side is selected via ``is_left``.
             gravity_comp: Shared MuJoCo-based gravity compensator (one per Axol).
             is_left:      ``True`` for the left arm, ``False`` for the right.
+            joints:       The joints whose motors are on the bus; ``None``
+                          (the default) is the full arm. The gripper is only
+                          ever constructed when ``config.has_gripper`` is set.
         """
         self._config = config
         self._arm_config = config.left if is_left else config.right
         self._gravity_comp = gravity_comp
         self._is_left = is_left
-        self._has_gripper = config.has_gripper
-        # Gripperless SKU: the gripper motor is simply never constructed, so
-        # every loop over ``self.motors`` skips it automatically.
+        present = set(Joint) if joints is None else set(joints)
+        if not present:
+            raise ValueError("an arm needs at least one joint")
+        if not config.has_gripper:
+            present.discard(Joint.GRIPPER)
+        self._has_gripper = Joint.GRIPPER in present
+        # Gripperless SKU / partial bench arm: an absent motor is simply never
+        # constructed, so every loop over ``self.motors`` skips it
+        # automatically.
         self.motors: dict[Joint, Motor] = {
-            joint: Motor(bus, joint)
-            for joint in Joint
-            if config.has_gripper or joint != Joint.GRIPPER
+            joint: Motor(bus, joint) for joint in Joint if joint in present
         }
         # The impedance-command encodings clamp kd to the firmware range
         # silently, and there is no host-side fallback for the excess — an
@@ -713,10 +727,12 @@ class AxolArm:
         # fixed_stop_wrap_correction), applied during zero verification.
         # The gripper offset is 0 because the gripper uses its own [0, 1]
         # normalisation and is calibrated against torque, not an end stop.
+        # An absent joint has no motor frame to offset: it reads and is
+        # commanded at 0.0 (the rest pose) in both frames.
         self._joint_offsets = np.array(
             [
                 0.0
-                if j == Joint.GRIPPER
+                if j == Joint.GRIPPER or j not in present
                 else math.nan
                 if j in EITHER_STOP_JOINTS
                 else closer_end_stop(j, is_left)[0]
@@ -724,13 +740,13 @@ class AxolArm:
             ],
             dtype=float,
         )
-        self._unresolved_offsets: set[Joint] = set(EITHER_STOP_JOINTS)
+        self._unresolved_offsets: set[Joint] = set(EITHER_STOP_JOINTS) & present
         # Fixed-stop joints whose encoder zero has not been sanity-checked
         # yet.  resolve_joint_offsets() verifies each one's reading is
         # plausible for a zero at its calibration stop (an unset zero would
         # make every joint-frame value garbage), folds any ±360° single-turn
         # boot wrap into the joint's offset, and removes it from the set.
-        self._unverified_zeros: set[Joint] = set(ARM_JOINTS) - EITHER_STOP_JOINTS
+        self._unverified_zeros: set[Joint] = self._fixed_stop_joints()
         self._offset_lock = asyncio.Lock()
         # Realtime-core hook: production motion_control and
         # gravity_compensate hand their per-joint 9-float tuples
@@ -747,16 +763,26 @@ class AxolArm:
             | None
         ) = None
 
-    def _pad_gripper(self, values: list) -> list:
-        """Insert a ``0.0`` placeholder in the gripper slot when absent.
+    @property
+    def present_joints(self) -> frozenset[Joint]:
+        """The joints with a motor on this arm's bus (see ``joints`` in ``__init__``)."""
+        return frozenset(self.motors)
+
+    def _fixed_stop_joints(self) -> set[Joint]:
+        """Present arm joints whose zero is verified against a fixed end stop."""
+        return (set(ARM_JOINTS) - EITHER_STOP_JOINTS) & set(self.motors)
+
+    def _pad_absent(self, values: list) -> list:
+        """Insert a ``0.0`` placeholder for every absent motor.
 
         Per-motor reads iterate ``self.motors`` (7 entries on the gripperless
-        SKU); this restores the public ``(8,)`` Joint-enum-order shape.
+        SKU, fewer on a partial bench arm); this restores the public ``(8,)``
+        Joint-enum-order shape.
         """
-        if not self._has_gripper:
-            values = list(values)
-            values.insert(self._gripper_i, 0.0)
-        return values
+        if len(self.motors) == len(list(Joint)):
+            return values
+        values = iter(values)
+        return [next(values) if j in self.motors else 0.0 for j in Joint]
 
     # ------------------------------------------------------------------ #
     # Joint-offset resolution                                              #
@@ -980,7 +1006,7 @@ class AxolArm:
         SKU the gripper element is 0.0.
         """
         self._require_offsets_resolved()
-        values = self._pad_gripper([self.motors[j].position for j in self.motors])
+        values = self._pad_absent([self.motors[j].position for j in self.motors])
         gripper_i = self._gripper_i
         if self._has_gripper:
             values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
@@ -996,7 +1022,7 @@ class AxolArm:
         Returns shape (8,) array in Joint enum order (gripper element 0.0 on
         the gripperless SKU).
         """
-        values = self._pad_gripper([m.torque for m in self.motors.values()])
+        values = self._pad_absent([m.torque for m in self.motors.values()])
         return np.array(values, dtype=np.float32)
 
     # ------------------------------------------------------------------ #
@@ -1127,7 +1153,7 @@ class AxolArm:
         # fixed-stop joints against the post-reset frame.  (Either-stop
         # joints are Damiao, whose mode switch is a register write — no
         # reboot, no re-detection needed.)
-        recheck = set(cold) & (set(ARM_JOINTS) - EITHER_STOP_JOINTS)
+        recheck = set(cold) & self._fixed_stop_joints()
         if recheck:
             self._unverified_zeros |= recheck
             await self.resolve_joint_offsets(recheck)
@@ -1213,7 +1239,7 @@ class AxolArm:
         # ±360° wrap correction detected earlier may be stale.  Mark the
         # fixed-stop joints (all MyActuator) for re-verification; the next
         # joint-frame entry point resolves them.
-        self._unverified_zeros |= set(ARM_JOINTS) - EITHER_STOP_JOINTS
+        self._unverified_zeros |= self._fixed_stop_joints()
 
     # ------------------------------------------------------------------ #
     # Getters                                                              #
@@ -1229,7 +1255,7 @@ class AxolArm:
         SKU the gripper element is 0.0.
         """
         await self.resolve_joint_offsets()
-        values = self._pad_gripper(
+        values = self._pad_absent(
             list(
                 await asyncio.gather(
                     *[self.motors[j].get_position() for j in self.motors]
@@ -1253,7 +1279,7 @@ class AxolArm:
         values = await asyncio.gather(
             *[self.motors[j].get_velocity() for j in self.motors]
         )
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_torques(self) -> np.ndarray:
         """Return torque estimate for every joint, fetched concurrently.
@@ -1263,7 +1289,7 @@ class AxolArm:
         the gripperless SKU).
         """
         values = await asyncio.gather(*[m.get_torque() for m in self.motors.values()])
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_temperatures(self) -> np.ndarray:
         """Return motor temperature (°C) for every joint, fetched concurrently.
@@ -1274,7 +1300,7 @@ class AxolArm:
         values = await asyncio.gather(
             *[m.get_temperature() for m in self.motors.values()]
         )
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_voltages(self) -> np.ndarray:
         """Return bus voltage (V) for every joint, fetched concurrently.
@@ -1283,7 +1309,7 @@ class AxolArm:
         the gripperless SKU).
         """
         values = await asyncio.gather(*[m.get_voltage() for m in self.motors.values()])
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_error_codes(self) -> list[MotorStatus]:
         """Return MotorStatus for every joint, fetched concurrently.
@@ -1648,7 +1674,9 @@ class AxolArm:
             )
 
         tasks = [
-            self.motors[j].set_impedance(*arm_cmds[i]) for i, j in enumerate(ARM_JOINTS)
+            self.motors[j].set_impedance(*arm_cmds[i])
+            for i, j in enumerate(ARM_JOINTS)
+            if j in self.motors
         ]
         if self._has_gripper:
             tasks.append(
@@ -1774,6 +1802,7 @@ class AxolArm:
         tasks = [
             self.motors[j].set_impedance(*arm_tuples[i])
             for i, j in enumerate(ARM_JOINTS)
+            if j in self.motors
         ]
         if gripper_cmd is not None:
             tasks.append(self.motors[Joint.GRIPPER].set_position_force(*gripper_cmd))
@@ -1883,6 +1912,8 @@ class Axol(RobotBase):
                        mirrored for shoulder_2 and elbow.
         left_channel:  SocketCAN interface name for the left arm.
         right_channel: SocketCAN interface name for the right arm.
+        left_joints:   Joints with a motor on the left bus (default: the full arm).
+        right_joints:  Joints with a motor on the right bus (default: the full arm).
     """
 
     def __init__(
@@ -1890,6 +1921,8 @@ class Axol(RobotBase):
         config: AxolConfig = AxolConfig(),
         left_channel: str | None = CAN_LEFT,
         right_channel: str | None = CAN_RIGHT,
+        left_joints: Iterable[Joint] | None = None,
+        right_joints: Iterable[Joint] | None = None,
     ) -> None:
         """Construct the dual-arm interface.
 
@@ -1900,6 +1933,10 @@ class Axol(RobotBase):
             config:        Per-joint gains, friction parameters, and gripper config.
             left_channel:  SocketCAN interface name for the left arm, or ``None`` to omit it.
             right_channel: SocketCAN interface name for the right arm, or ``None`` to omit it.
+            left_joints:   Restrict the left arm to the joints actually on its
+                           bus (a partial bench arm); ``None`` is the full arm.
+                           See :class:`AxolArm`.
+            right_joints:  Same for the right arm.
         """
         if left_channel is None and right_channel is None:
             raise ValueError(
@@ -1925,7 +1962,11 @@ class Axol(RobotBase):
         if left_channel is not None:
             self._left_bus = CanBus(left_channel)
             self.left = AxolArm(
-                self._left_bus, config, self._gravity_comp, is_left=True
+                self._left_bus,
+                config,
+                self._gravity_comp,
+                is_left=True,
+                joints=left_joints,
             )
         else:
             self.left = None
@@ -1933,7 +1974,11 @@ class Axol(RobotBase):
         if right_channel is not None:
             self._right_bus = CanBus(right_channel)
             self.right = AxolArm(
-                self._right_bus, config, self._gravity_comp, is_left=False
+                self._right_bus,
+                config,
+                self._gravity_comp,
+                is_left=False,
+                joints=right_joints,
             )
         else:
             self.right = None

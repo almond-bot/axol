@@ -52,7 +52,9 @@
 //!                     keys, one `joint <side> <iface> <name>
 //!                     <motor_id> <kp> <kd> <max_vel> <max_accel> <fc> <k>
 //!                     <fv> <fo>` line per arm joint (tracker limits +
-//!                     friction params), and an optional `gripper <side>
+//!                     friction params; the motor id 1..=7 fixes the
+//!                     joint's target slot, so a bus may carry any subset
+//!                     of the arm), and an optional `gripper <side>
 //!                     <iface> <motor_id>` line
 //! - `P`               prep: MyActuator 0x76 reset + settle, Damiao
 //!                     clear-errors (torque-neutral; run *before* Python
@@ -857,17 +859,25 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         fo: 0.0,
                     }
                 } else {
+                    let motor_id: u8 = f
+                        .get(4)
+                        .and_then(|v| v.parse().ok())
+                        .ok_or_else(|| bad(line))?;
+                    // Arm joint motor ids are 1..=7 in Joint enum order, so the
+                    // id fixes the target-tuple slot regardless of which
+                    // joints a bus carries: a bench arm with only its wrist
+                    // motors keeps them in the wrist slots rather than
+                    // sliding down into the shoulders'.
+                    if !(1..=GRIPPER_SLOT as u8).contains(&motor_id) {
+                        return Err(bad(line));
+                    }
                     MotorSpec {
                         joint: f.get(3).ok_or_else(|| bad(line))?.to_string(),
-                        motor_id: f
-                            .get(4)
-                            .and_then(|v| v.parse().ok())
-                            .ok_or_else(|| bad(line))?,
+                        motor_id,
                         kp: num(5)?,
                         kd: num(6)?,
                         gripper: false,
-                        // Arm joints arrive in Joint enum order per bus.
-                        slot: bus.2.iter().filter(|s| !s.gripper).count(),
+                        slot: motor_id as usize - 1,
                         max_vel: num(7)?,
                         max_accel: num(8)?,
                         fc: num(9)?,
@@ -876,7 +886,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         fo: num(12)?,
                     }
                 };
-                if spec.slot >= N_SLOTS {
+                if spec.slot >= N_SLOTS || bus.2.iter().any(|s| s.slot == spec.slot) {
                     return Err(bad(line));
                 }
                 bus.2.push(spec);
@@ -1283,6 +1293,33 @@ mod tests {
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
         assert!(parse_config("joint 0 canL shoulder_1 1 250 3.5\n").is_err());
+    }
+
+    /// A bus carrying only some of the arm joints (a bench wrist assembly)
+    /// keeps each motor in the slot Python's Joint enum assigns it — the
+    /// slot comes from the motor id, not from the order joints are listed.
+    #[test]
+    fn parse_config_subset_keeps_joint_slots() {
+        let cfg = parse_config(
+            "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
+             joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
+             gripper 0 can0 8\n",
+        )
+        .unwrap();
+        let specs = &cfg.buses[0].2;
+        assert_eq!(
+            specs.iter().map(|s| s.slot).collect::<Vec<_>>(),
+            vec![5, 6, GRIPPER_SLOT]
+        );
+        // Arm joint ids outside 1..=7 have no slot; a repeated id would
+        // double-book one.
+        assert!(parse_config("joint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("joint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config(
+            "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n"
+        )
+        .is_err());
     }
 }
 
@@ -1940,11 +1977,15 @@ fn bus_loop(
                         // Limp: p_des carries no torque (kp = 0) and follows
                         // the hand-guided arm, so a large step is normal and
                         // the fresh gravity t_ff it carries must not be lost.
+                        // Only slots with a motor on this bus are gated: an
+                        // absent joint's slot never leaves its default hold,
+                        // so its (meaningless) target would otherwise reject
+                        // every packet.
                         let step_ok = is_limp
-                            || t.cmds[..GRIPPER_SLOT]
-                                .iter()
-                                .zip(play.iter())
-                                .all(|(c, p)| (c.p_des - p.p_des).abs() <= cfg.max_step_rad);
+                            || motors.iter().filter(|m| !m.gripper).all(|m| {
+                                (t.cmds[m.slot].p_des - play[m.slot].p_des).abs()
+                                    <= cfg.max_step_rad
+                            });
                         if step_ok {
                             play = t.cmds;
                             have_target = true;

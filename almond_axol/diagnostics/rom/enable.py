@@ -17,12 +17,23 @@ therefore exercises exactly the controller the robot ships with.
 
 Select a subset of joints and/or a single arm:
   --joints    Comma-separated joints to sweep (e.g. wrist_1,wrist_2,wrist_3).
-              The whole arm is still brought up and held — the realtime core
-              enables every motor on the bus — but only these joints move;
+              Every motor found on the bus is brought up and held — the
+              realtime core enables all of them — but only these joints move;
               every other joint holds home. Default: all.
   --no-left / --no-right
               Skip an arm entirely. Only the remaining arm is opened, enabled,
               and swept. Cannot skip both.
+
+Before bring-up each bus is probed (read-only status reads) for which motors
+answer. Every selected joint must be there; a selected joint that is missing
+fails the run by name. An *unselected* joint that does not answer is treated
+as physically absent — a bench setup with only a wrist assembly on the bus
+can run ``--joints wrist_2,wrist_3,gripper`` — and is left out of bring-up
+(it is never enabled, and it holds nothing). The skipped joints are printed
+at startup; make sure they really are not attached, because a present but
+unpowered motor is indistinguishable from an absent one and would swing free
+while its neighbours sweep. A full-robot run (no ``--joints``) still requires
+every motor.
 
 The grasp-an-item clamp (hold with force, then soak while holding) only runs
 when every joint is selected. Any subset run drops the grasp step and simply
@@ -50,6 +61,7 @@ import asyncio
 import math
 import sys
 import time
+from collections.abc import Iterable
 
 import numpy as np
 
@@ -60,6 +72,7 @@ from ...constants import (
     CAN_RIGHT,
     Joint,
 )
+from ...motor import CanBus, Motor, MotorError
 from ...robot.axol import (
     ELBOW_LEFT_LIMITS,
     ELBOW_RIGHT_LIMITS,
@@ -137,6 +150,71 @@ def parse_joints(spec: str | None) -> set[Joint]:
             raise SystemExit(f"Unknown joint '{name}'. Valid joints: {valid}")
         selected.add(by_value[name])
     return selected or set(Joint)
+
+
+# Per-motor deadline for the pre-flight presence probe. A live motor answers a
+# status read within a few milliseconds; the Damiao driver's own retries span
+# ~1 s, so this bounds an absent motor to about the same.
+PROBE_TIMEOUT = 1.5  # seconds
+
+
+async def probe_bus_joints(channel: str, joints: Iterable[Joint]) -> set[Joint]:
+    """Return the subset of ``joints`` whose motor answers on ``channel``.
+
+    Read-only: one status read per motor (the same request the dashboard's
+    idle survey uses), so it is safe on a robot in any state — including
+    one still holding from a previous session. The bus is opened and
+    closed around the reads so the realtime core can take the interface
+    over afterwards.
+    """
+    bus = CanBus(channel)
+    await bus.start()
+    try:
+        motors = {joint: Motor(bus, joint) for joint in joints}
+
+        async def answers(joint: Joint, motor: Motor) -> Joint | None:
+            try:
+                await asyncio.wait_for(motor.get_error_code(), PROBE_TIMEOUT)
+            except (MotorError, asyncio.TimeoutError, OSError):
+                return None
+            return joint
+
+        found = await asyncio.gather(*(answers(j, m) for j, m in motors.items()))
+    finally:
+        await bus.close()
+    return {joint for joint in found if joint is not None}
+
+
+def resolve_bus_joints(
+    selected: set[Joint],
+    on_bus: set[Joint],
+    candidates: set[Joint],
+    side: str,
+) -> set[Joint]:
+    """Decide which of one arm's motors a run brings up, given the probe.
+
+    ``candidates`` are the joints the arm could carry (all eight, or seven
+    on the gripperless SKU); ``on_bus`` is the subset that answered. Every
+    selected joint must have answered. Unselected joints that did not answer
+    are dropped from the arm (a partial bench arm), and every joint that
+    did answer is kept so an attached-but-unselected joint is still brought
+    up and held at home rather than left unpowered. A full-robot selection
+    therefore requires the whole arm.
+
+    Raises:
+        SystemExit: Naming the selected joints missing from the bus.
+    """
+    missing = [j for j in Joint if j in selected & candidates and j not in on_bus]
+    if missing:
+        names = ", ".join(j.value for j in missing)
+        raise SystemExit(
+            f"Cannot start: the {side} arm's {names} did not answer on the bus. "
+            "Every selected joint must be powered and connected — check power "
+            "and CAN wiring, or deselect the joints that are not attached."
+        )
+    if not on_bus:
+        raise SystemExit(f"Cannot start: no motors answered on the {side} arm's bus.")
+    return set(on_bus)
 
 
 def home_pose() -> np.ndarray:
@@ -601,10 +679,33 @@ async def run_axol(
         )
         robot = RtMantis(axol)
     else:
+        # Bring up exactly the motors that are on each bus (see the module
+        # docstring): every selected joint must answer the probe; an
+        # unselected one that does not is a joint this bench arm simply
+        # does not have.
+        candidates = {j for j in Joint if config.has_gripper or j != Joint.GRIPPER}
+        arm_joints: dict[str, set[Joint] | None] = {"left": None, "right": None}
+        for side, channel, run in (
+            ("left", left_channel, run_left),
+            ("right", right_channel, run_right),
+        ):
+            if not run:
+                continue
+            on_bus = await probe_bus_joints(channel, candidates)
+            arm_joints[side] = resolve_bus_joints(present, on_bus, candidates, side)
+            skipped = [j.value for j in Joint if j in candidates and j not in on_bus]
+            if skipped:
+                print(
+                    f"{side.capitalize()} arm: {', '.join(skipped)} not on the bus — "
+                    "treating as absent (never enabled). Make sure these joints "
+                    "really are not attached."
+                )
         axol = Axol(
             config=config,
             left_channel=None if no_left else left_channel,
             right_channel=None if no_right else right_channel,
+            left_joints=arm_joints["left"],
+            right_joints=arm_joints["right"],
         )
         robot = RtAxol(axol)
     await robot.enable()
@@ -778,7 +879,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "--joints",
         default=None,
         help="Comma-separated joints to sweep (e.g. wrist_1,wrist_2,wrist_3). "
-        "The whole arm is brought up and held; only these move. Default: all. "
+        "Every motor found on the bus is brought up and held; only these "
+        "move. Selected joints must be present; unselected joints that do "
+        "not answer are treated as absent (partial bench arm). Default: all. "
         f"One of: {', '.join(valid_joints)}.",
     )
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")

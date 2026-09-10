@@ -995,7 +995,9 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
                     "SHOULDER_1,SHOULDER_2,SHOULDER_3,ELBOW,WRIST_1,WRIST_2,WRIST_3"
                 ),
             }
-            scoped.assert_called_once_with([], fault_scope)
+            scoped.assert_called_once_with(
+                [], fault_scope, unselected_joints_only_skip_absent=False
+            )
             begin_mock.assert_called_once_with(session.id, "diag.lift-cycle", effective)
 
             # Let the background watcher restore the shared CAN reservation.
@@ -1086,6 +1088,68 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(manager.sessions, [])
                 self.assertEqual(robot.releases, 0)
+
+    async def test_rom_enable_joint_subset_ignores_absent_unselected_motors(
+        self,
+    ) -> None:
+        """A bench wrist assembly on one adapter: only the selected joints
+        need to answer. Unreachable unselected joints are ones the run treats
+        as absent; a fault on a selected joint, or an error state on a
+        reachable unselected motor (which the run still brings up), blocks."""
+
+        def fault(joint: str, problem: str = "unreachable") -> dict[str, Any]:
+            return {
+                "arm": "left",
+                "joint": joint,
+                "problem": problem,
+                "temperature": None,
+            }
+
+        absent_upper_arm = [
+            fault(j)
+            for j in ("SHOULDER_1", "SHOULDER_2", "SHOULDER_3", "ELBOW", "WRIST_1")
+        ]
+        args = {"joints": "wrist_2,wrist_3,gripper", "no_right": True}
+        cases = (
+            (absent_upper_arm, 200, None),
+            (absent_upper_arm + [fault("WRIST_2")], 409, "left wrist_2 (unreachable)"),
+            (
+                absent_upper_arm + [fault("ELBOW", "over temperature")],
+                409,
+                "left elbow (over temperature)",
+            ),
+        )
+        for faults, status, message in cases:
+            with self.subTest(faults=[f["joint"] for f in faults], status=status):
+                manager = _Manager()
+                robot = _Robot(channels=("can-left", None))
+                robot.motor_faults = Mock(return_value=faults)
+                app = _test_app(manager, _Runner(), robot)
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    response = await client.post(
+                        "/api/run",
+                        json={"command": "diag.rom-enable", "args": dict(args)},
+                    )
+
+                self.assertEqual(response.status_code, status, response.json())
+                if message is None:
+                    self.assertEqual(len(manager.sessions), 1)
+                    launched = manager.sessions[0].args
+                    self.assertEqual(launched["joints"], "wrist_2,wrist_3,gripper")
+                    self.assertEqual(launched["left_channel"], "can-left")
+                    self.assertTrue(launched["no_right"])
+                    # Let the background watcher settle before teardown.
+                    manager.sessions[0].status = "exited"
+                    for queue in manager.queues:
+                        queue.put_nowait(None)
+                    await asyncio.sleep(0)
+                else:
+                    self.assertIn(message, response.json()["error"])
+                    self.assertEqual(manager.sessions, [])
+                    self.assertEqual(robot.releases, 0)
 
     async def test_motor_subprocess_rejects_profile_and_channel_overrides(
         self,

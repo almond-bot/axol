@@ -182,7 +182,11 @@ class RtAxol:
             # The bus channel lives on the CanBus (same package internals).
             bus = self._robot._left_bus if side == 0 else self._robot._right_bus
             iface = bus._channel
+            # Only the motors actually on the bus (a partial bench arm lists
+            # fewer than seven); the core slots each by its motor id.
             for j in ARM_JOINTS:
+                if j not in arm.motors:
+                    continue
                 gains = getattr(arm._arm_config, j.value)
                 f = gains.friction
                 motor_id = _JOINT_CONFIG[j].motor_id
@@ -245,7 +249,7 @@ class RtAxol:
             # feedback would use legacy scaling on V4.4 firmware and a fresh
             # motor could retain the factory voltage threshold.
             for j in ARM_JOINTS:
-                if _JOINT_CONFIG[j].motor_id <= 5:
+                if j in arm.motors and _JOINT_CONFIG[j].motor_id <= 5:
                     driver = arm.motors[j]._driver
                     await driver._detect_capabilities()
                     await driver._apply_low_voltage_threshold()
@@ -324,7 +328,11 @@ class RtAxol:
         def ready() -> bool:
             return all(
                 self._fb_packets[side] > 0
-                and all(arm.motors[joint].has_position for joint in ARM_JOINTS)
+                and all(
+                    motor.has_position
+                    for joint, motor in arm.motors.items()
+                    if joint != Joint.GRIPPER
+                )
                 for side, arm in arms
             )
 
@@ -383,11 +391,10 @@ class RtAxol:
                 return
             self._fb_packets[side] += 1
             for i, (pos, vel, tau, ts) in slots.items():
-                if i < _N_ARM:
-                    motor = arm.motors[joints[i]]
-                elif arm._has_gripper:
-                    motor = arm.motors[Joint.GRIPPER]
-                else:
+                # Slot i is joint i (the core slots motors by id); a slot
+                # for a joint this arm does not carry is ignored.
+                motor = arm.motors.get(joints[i] if i < _N_ARM else Joint.GRIPPER)
+                if motor is None:
                     continue
                 motor._position = pos
                 motor._velocity = vel
