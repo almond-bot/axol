@@ -15,7 +15,7 @@ An arm you never touched holds still. Recording captures both arms, and an arm r
 
 Arm stiffness is the robot's own, shared with every other operation — the control panel's setting, or `--axol.left_stiffness` / `--axol.right_stiffness`. A stiffer arm holds a planned path more closely; a softer one sags off it, but rings less when something disturbs it and yields if the path meets an obstacle. Hand-guiding is unaffected either way, since gravity compensation zeroes the position gain on free joints.
 
-This command is configured via draccus — see [Command configuration](/cli/configuration).
+This command is configured via draccus — see [Command configuration](/cli/configuration). Arm gains and stiffness live on the nested `axol` config and IK weights on `kinematics` — the same fields as teleop's [Robot](/operations/teleop-config#robot) and [Kinematics](/operations/teleop-config#kinematics) parameters, with the same `--axol.` / `--kinematics.` prefixes. The command's own flags are listed below.
 
 ## Driving a session
 

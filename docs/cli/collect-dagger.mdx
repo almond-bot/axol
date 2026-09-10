@@ -19,7 +19,7 @@ Episode boundaries work like `collect-data`: press the **record** button to star
   For the end-to-end workflow — from a trained checkpoint to recorded corrections — see the [DAgger Collection guide](/operations/dagger).
 </Tip>
 
-This command is configured via draccus. The policy side mirrors [`run-policy`](/cli/run-policy) (`--policy_path` / `--policy_type` / `--device`, but inference is in-process and synchronous), and the recording side mirrors [`collect-data`](/cli/collect-data) (the nested `robot_config` / `teleop_config` configs — cameras, per-joint gains, IK, VR server). Nest into them with dots or pass a whole-config file. See [Command configuration](/cli/configuration).
+This command is configured via draccus. The policy side mirrors [`run-policy`](/cli/run-policy) (`--policy_path` / `--policy_type` / `--device`, but inference is in-process and synchronous), and the recording side mirrors [`collect-data`](/cli/collect-data) (the nested `robot_config` / `teleop_config` configs — cameras, per-joint gains, IK, VR server). Nest into them with dots or pass a whole-config file. See [Command configuration](/cli/configuration) for the syntax and [DAgger Collection Config Parameters](/operations/dagger-config) for every field and its default.
 
 Policy observations use the same exposure-time synchronization as `run-policy`: the median camera exposure selects the nearest 240 Hz robot-state sample. The inferred action is published to the recorder with that exposure timestamp, so DAgger policy rows do not pair later joint values with earlier images.
 

@@ -1,0 +1,102 @@
+---
+title: "DAgger Collection Config Parameters"
+sidebarTitle: "Config Parameters"
+description: "Every setting for axol collect-dagger — what it does and its default."
+---
+
+import Robot from "/snippets/config/robot.mdx";
+import LeRobotRobot from "/snippets/config/lerobot-robot.mdx";
+import Cameras from "/snippets/config/cameras.mdx";
+import TeleopSession from "/snippets/config/teleop-session.mdx";
+import Kinematics from "/snippets/config/kinematics.mdx";
+import VRServer from "/snippets/config/vr-server.mdx";
+import Jelly from "/snippets/config/jelly.mdx";
+
+Every setting for `axol collect-dagger`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
+
+```bash
+axol collect-dagger --policy_path myorg/pick-act --policy_type act \
+  --repo_id myorg/pick-dagger --task "pick up the cup" \
+  --robot_config.axol_config.left_stiffness 0.8
+```
+
+<Warning>
+  Stiffness, gripper torque, `observe_torques`, `observe_cartesian`, `fps`, and the camera set must be the **same as when the policy's data was collected**. A policy only works with the dynamics it was trained on.
+</Warning>
+
+## Policy
+
+| Flag | Default | Description |
+|---|---|---|
+| `--policy_path` | required | Policy checkpoint — a HuggingFace Hub repo id or local path. |
+| `--policy_type` | required | `act`, `smolvla`, `diffusion`, `tdmpc`, `vqbet`, `pi0`, `pi05`, or `groot`. |
+| `--device` | `cuda` | `cuda`, `cpu`, or `mps`. |
+| `--episode_time_s` | `600` | Maximum episode length (s), including interventions. |
+| `--policy_max_vel` | `6.283` | Speed limit (rad/s) on the policy's actions. `0` disables. |
+| `--policy_max_accel` | `21.99` | Acceleration limit (rad/s²) on the policy's actions. |
+| `--subtasks` | `null` | Ordered sub-instructions, e.g. `["reach","grasp","lift"]`. Typing `1..N` switches the instruction sent to the policy mid-episode. |
+
+## Recording
+
+| Flag | Default | Description |
+|---|---|---|
+| `--repo_id` | required | Dataset id, `<user>/<dataset>`. |
+| `--task` | required | Task description stored with every frame and sent to the policy. |
+| `--fps` | `60` | Recording rate. Camera frames are captured at this rate. |
+| `--teleop_hz` | `120` | Motor command rate (Hz) while you intervene, independent of `fps`. |
+| `--dataset_resolution` | `SVGA` | Resolution the recorded video is downscaled to, and the resolution the policy sees: `SVGA`, `HD1080`, or `HD1200`. |
+| `--vcodec` | per platform | Dataset video codec: `h264` on Jetson, `auto` elsewhere. |
+| `--root` | `null` | Local dataset directory. Default is the LeRobot cache, `~/.cache/huggingface/lerobot`. |
+| `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. |
+| `--rerun_ip` | `null` (off) | Stream live visualisation to a [Rerun](https://rerun.io) viewer at this address. |
+| `--rerun_port` | `9876` | Rerun viewer port. |
+| `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
+| `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
+
+## Robot {#robot-config}
+
+CAN buses, cameras, and what goes into observations.
+
+<LeRobotRobot prefix="robot_config." />
+
+### Cameras {#cameras}
+
+<Cameras prefix="robot_config.cameras." />
+
+### Arm gains {#robot}
+
+Arm stiffness, gripper limits, and per-joint gains.
+
+<Robot prefix="robot_config.axol_config." />
+
+## Teleop session {#teleop}
+
+How VR controller motion becomes arm motion while you intervene.
+
+<TeleopSession prefix="teleop_config.vr_teleop_config." />
+
+## Kinematics {#kinematics}
+
+The IK solver that turns hand targets into joint angles. A higher weight means the solver cares more about that term.
+
+<Kinematics prefix="teleop_config.kinematics_config." />
+
+## VR server {#vr-server}
+
+The connection the headset streams poses over.
+
+<VRServer prefix="teleop_config.vr_server_config." />
+
+## Jelly {#jelly}
+
+The optional powered cart, driven from the headset thumbsticks between takes. Jelly motion is never recorded.
+
+<Jelly prefix="teleop_config.jelly." />
+
+## Teleoperator {#teleop-config}
+
+| Flag | Default | Description |
+|---|---|---|
+| `--teleop_config.has_gripper` | `true` | Set automatically from `--robot_config.axol_config.has_gripper`. |
+| `--teleop_config.id` | `null` | LeRobot bookkeeping, unused by Axol. |
+| `--teleop_config.calibration_dir` | `null` | LeRobot bookkeeping, unused by Axol. |

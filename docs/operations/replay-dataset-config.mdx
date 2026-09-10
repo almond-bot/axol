@@ -1,0 +1,49 @@
+---
+title: "Replay Dataset Config Parameters"
+sidebarTitle: "Config Parameters"
+description: "Every setting for axol replay-dataset — what it does and its default."
+---
+
+import Robot from "/snippets/config/robot.mdx";
+import LeRobotRobot from "/snippets/config/lerobot-robot.mdx";
+
+Every setting for `axol replay-dataset`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
+
+```bash
+axol replay-dataset --repo_id myorg/pick --episode 3 --interpolate true
+```
+
+## Playback
+
+| Flag | Default | Description |
+|---|---|---|
+| `--repo_id` | required | Dataset id (`<user>/<dataset>`) or a path to a dataset directory. |
+| `--episode` | required | Episode index to replay. |
+| `--fps` | `0` | Playback rate. `0` uses the dataset's recorded rate. |
+| `--root` | `null` | Local dataset directory. Default is the LeRobot cache, `~/.cache/huggingface/lerobot`. |
+| `--interpolate` | `false` | Smooth playback by interpolating between recorded actions at ~120 Hz. |
+| `--loop` | `false` | Replay the episode until stopped, returning to rest between takes. |
+| `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
+| `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
+
+## Contact safety
+
+A contact stop trips when a joint's torque is higher than the gravity model expects — the arm hit something. The arms then go limp instead of pushing through.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--reset_torque_threshold` | `4.0` | Contact stop during return-to-rest (Nm). `0` disables. |
+| `--teleop_torque_threshold` | `0` (off) | Contact stop during playback (Nm). A trip stops playback. The control panel arms it at `16`. |
+| `--reset_gravity_comp_kd` | `0.25` | Damping (Nm·s/rad) of the limp hold. |
+
+## Robot {#robot-config}
+
+Replay uses the arms only; camera and observation settings have no effect.
+
+<LeRobotRobot prefix="robot_config." />
+
+### Arm gains {#robot}
+
+Arm stiffness, gripper limits, and per-joint gains.
+
+<Robot prefix="robot_config.axol_config." />

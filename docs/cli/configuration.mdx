@@ -1,20 +1,25 @@
 ---
 title: "Command configuration"
-description: "How the teleop, gravity-comp, waypoints, collect-data, replay-dataset, run-policy, and inference-server commands are configured with draccus."
+description: "How the teleop, gravity-comp, waypoints, collect-data, collect-dagger, replay-dataset, run-policy, and inference-server commands are configured with draccus."
 ---
 
-Seven commands — [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`waypoints`](/cli/waypoints), [`collect-data`](/cli/collect-data), [`replay-dataset`](/cli/replay-dataset), [`run-policy`](/cli/run-policy), and [`inference-server`](/cli/inference-server) — expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus) instead of a fixed set of `argparse` flags. Every field of the underlying config dataclass is reachable from the command line, and the whole config can also be loaded from a file.
+Eight commands — [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`waypoints`](/cli/waypoints), [`collect-data`](/cli/collect-data), [`collect-dagger`](/cli/collect-dagger), [`replay-dataset`](/cli/replay-dataset), [`run-policy`](/cli/run-policy), and [`inference-server`](/cli/inference-server) — expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus) instead of a fixed set of `argparse` flags. Every field of the underlying config dataclass is reachable from the command line, and the whole config can also be loaded from a file.
+
+This page covers the **syntax**. Each operation mode has its own **Config Parameters** page listing every field with its default: [Teleoperation](/operations/teleop-config), [Gravity Compensation](/operations/gravity-comp-config), [Data Collection](/operations/data-collection-config), [Replay Dataset](/operations/replay-dataset-config), [Run Policy](/operations/run-policy-config), and [DAgger Collection](/operations/dagger-config). `waypoints` and `inference-server` list their flags on their own CLI pages.
 
 The remaining commands (`can.*`, `motor.*`, `zed.*`, `gst.*`, `jetson.setup`, `provision`, `tune.*`, and `serve`) still use plain `argparse` flags and are unaffected by anything on this page.
 
-## Two ways to set any field
+## Three ways to set any field
 
-<CardGroup cols={2}>
+<CardGroup cols={3}>
   <Card title="Dotted CLI overrides" icon="terminal">
     Override any nested field with `--dotted.path VALUE`, e.g. `--axol.left.elbow.kp 60`.
   </Card>
   <Card title="Whole-config file" icon="file-code">
     Load a complete JSON/YAML config with `--config_path run.json`, then layer CLI overrides on top.
+  </Card>
+  <Card title="Control panel" icon="sliders" href="/guides/control-panel#settings">
+    Save a value once on the robot host and it's applied to every operation launched from the panel.
   </Card>
 </CardGroup>
 
@@ -40,7 +45,11 @@ axol teleop --config_path my_teleop.json
 axol run-policy --config_path rollout.yaml --device cpu   # file, then override
 ```
 
-Precedence is **defaults → `--config_path` file → CLI flags** (later wins), so flags always override file values, which override the built-in defaults.
+Precedence is **defaults → `--config_path` file → CLI flags** (later wins), so flags always override file values, which override the built-in defaults. Operations launched from the [control panel](/guides/control-panel#settings) slot the host's saved settings in between the defaults and the file.
+
+### Same knob, different path
+
+Each command embeds the shared subsystem configs at its own dotted path — arm stiffness is `axol.left_stiffness` on `teleop` but `robot_config.axol_config.left_stiffness` on `collect-data`. Each mode's Config Parameters page spells its keys with the right prefix for that command.
 
 <Note>
   On a calibrated robot the "defaults" already include that robot's own measurements, layered in this order (later wins): the coded constants ← the factory calibration fetched from the cloud by [`calibration.pull`](/cli/tune-factory#calibration-pull) (`~/.almond/factory_calibration.json`) ← per-joint gains, friction parameters, and link centres of mass saved locally by [`tune.pid --save`](/cli/tune-pid) / [`tune.friction --save`](/cli/tune-friction) / [`tune.gravity --save`](/cli/tune-gravity) to `~/.almond/calibration.json`. All are loaded into `AxolConfig` at construction; config files and CLI flags still override them like any other default.
@@ -65,4 +74,4 @@ Precedence is **defaults → `--config_path` file → CLI flags** (later wins), 
 
 Choice fields (e.g. `--log_level`, `--policy_type`, `--aggregate_fn`) are validated against their allowed values, and missing required fields or type mismatches are reported as a clean usage error rather than a traceback.
 
-`axol <command> --help` lists only the **common** fields (top-level options plus stiffness and gripper limits) to keep the output readable — the deeply-nested per-joint gains are hidden but remain fully overridable with their dotted paths (e.g. `--axol.left.elbow.kp`). This page is the complete reference for the override syntax.
+`axol <command> --help` lists only the **common** fields (top-level options plus stiffness and gripper limits) to keep the output readable — the deeply-nested per-joint gains are hidden but remain fully overridable with their dotted paths (e.g. `--axol.left.elbow.kp`). This page is the complete reference for the override syntax; each mode's Config Parameters page (e.g. [Teleoperation](/operations/teleop-config)) is the complete list of fields.

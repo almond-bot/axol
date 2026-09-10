@@ -9,7 +9,7 @@ Records teleoperation episodes using VR controller inputs and locally attached Z
   For the end-to-end workflow, see the [Data Collection guide](/operations/data-collection).
 </Tip>
 
-This command is configured via draccus. The robot and teleop subsystems are exposed as the nested `robot_config` / `teleop_config` configs (cameras, per-joint gains, IK, VR server) — nest into them with dots or pass a whole-config file. See [Command configuration](/cli/configuration).
+This command is configured via draccus. The robot and teleop subsystems are exposed as the nested `robot_config` / `teleop_config` configs (cameras, per-joint gains, IK, VR server) — nest into them with dots or pass a whole-config file. See [Command configuration](/cli/configuration) for the syntax. The table below covers the commonly used flags; every nested field — `robot_config.axol_config.*` gains, `robot_config.cameras.*`, and the `teleop_config.vr_teleop_config.*` / `kinematics_config.*` / `vr_server_config.*` / `cart.*` subsystems — is listed with its default in [Data Collection Config Parameters](/operations/data-collection-config).
 
 | Flag | Description |
 |---|---|

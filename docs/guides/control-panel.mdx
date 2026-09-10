@@ -116,6 +116,8 @@ Almost nothing you configure is actually per-run — camera assignment, arm stif
 
 Values are stored **on the Axol host** (`~/.almond/settings.json`) — not in your browser — so they're shared by every operation and every operator device, and they're folded into each operation start automatically (a per-run field always wins over a shared one). Edits stage locally until you press **Save** (or **Discard**). Unset fields show the config's own default as a placeholder; edited ones get a reset button. **Export** / **Import** in the card footer move the whole settings file as JSON for backup or copying between robots.
 
+Every setting on these tabs — and every field under **Advanced** — is documented with its default and meaning on each operation's **Config Parameters** page (e.g. [Teleoperation](/operations/teleop-config)). The [Settings File](/guides/control-panel-settings) page maps each panel setting to the config key it drives, which is what you're editing in an exported `settings.json`.
+
 ### Cameras
 
 Data collection and policy inference also need ZED cameras attached to the host. Axol cameras are assigned under **Axol settings → Cameras**; the two Mantis slots live under **Mantis settings → Cameras**.
