@@ -19,12 +19,25 @@ heading hold, the watchdog, and park/unpark at ``JellyConfig.frequency``:
   slow), the wheels are parked: switched to MIT/impedance mode and held at
   their current positions by the motor's internal high-bandwidth position
   loop, so the base does not roll under load.
+- Every wheel is armed with the Damiao loss-of-comms alarm
+  (``JellyConfig.can_timeout_ms``, RAM only, readback-verified at enable):
+  a wheel that goes that long without a command frame faults ``LOST_COMM``
+  and torques off by itself, whether or not the host is still running. That
+  motor-side timeout — not any host watchdog — is the runaway safety layer,
+  and the Rust core's job is to never feed it with anything but a live
+  motion command.
 - If no fresh command arrives within ``command_timeout`` the command source
-  is treated as dead: the wheel target is forced to zero (so a streaming
-  source that dies mid-motion cannot leave the base driving) and the lift
-  gets one STOP and then **silence** — no keepalive, no re-send of a stale
-  command — so the jelly_legs board's own 300 ms jog deadman is the safety
-  layer for the legs rather than a host re-sending a stale command.
+  is treated as dead. Driving wheels get one zero-velocity frame and then
+  **silence** — no keepalive, no re-send of a stale command — so the alarm
+  trips and torques them off; once that has certainly happened and the
+  wheels have stopped rolling they are re-enabled straight into the park
+  hold. Parked wheels keep their hold (an anchor, not a motion). The lift
+  likewise gets one STOP and then nothing on its bus, so the jelly_legs
+  board's own 300 ms jog deadman is the safety layer for the legs.
+- When the source returns, wheels the alarm tripped are cleared and
+  re-enabled (mode switch before enable, so no stale target replays) and the
+  ramp restarts from rest. Other faults (over-current, thermal) are reported
+  but never cleared blindly.
 
 Damiao position commands/feedback are mapped into ±PMAX (12.5 rad from
 factory — about two wheel turns), which drive wheels escape almost
@@ -175,13 +188,23 @@ class JellyConfig:
         frequency:       Wheel command task rate in Hz.
         command_timeout: Seconds without a fresh :meth:`Jelly.set_command`
                          before the command source is considered dead. On
-                         that edge the wheel target is forced to zero and the
-                         lift gets one STOP and then nothing on CAN — no
-                         keepalive — so the legs' 300 ms jog deadman takes
-                         over. Protects against a dead command source. Must
-                         comfortably exceed the source's frame period (a
+                         that edge driving wheels get one zero-velocity frame
+                         and then nothing on CAN — no keepalive — so their
+                         ``can_timeout_ms`` alarm torques them off (they are
+                         then re-anchored into the park hold); parked wheels
+                         keep their hold; the lift gets one STOP and then
+                         silence so the legs' 300 ms jog deadman takes over.
+                         Must comfortably exceed the source's frame period (a
                          headset streams at 72-90 Hz, with occasional 50-100
                          ms WiFi gaps).
+        can_timeout_ms:  Damiao loss-of-comms alarm written to every wheel at
+                         enable (RAM only, readback-verified; the enable
+                         fails if a wheel does not take it). A wheel that
+                         receives no command frame for this long faults
+                         ``LOST_COMM`` and torques itself off — the runaway
+                         safety layer for a hung or dead host. Cannot be
+                         disabled, and must be at least twice the command
+                         period so a single late tick does not trip it.
         lift:            Whether the telescoping lift is present (the
                          jelly_legs board on the chest CAN bus, see
                          :mod:`almond_axol.robot.lift`). The chest bus being
@@ -209,9 +232,34 @@ class JellyConfig:
     hold_kd: float = 1.5
     frequency: float = 50.0
     command_timeout: float = 0.2
+    can_timeout_ms: float = 200.0
     lift: bool = True
     lift_channel: str = CAN_CHEST
     lift_speed: int = JOG_SPEED
+
+
+def _pack_config(cfg: JellyConfig) -> bytes:
+    """The ``C`` message that configures the Rust core.
+
+    Eleven little-endian f64 values, in the order ``Config`` in
+    ``rust/axol-rt/src/jelly.rs`` reads them; the core rejects any other
+    length, so an older or newer Python side cannot start it with an implicit
+    (disabled) CAN timeout.
+    """
+    return b"C" + struct.pack(
+        "<11d",
+        cfg.max_speed,
+        cfg.turn_scale,
+        cfg.slew,
+        cfg.axis_snap_deg,
+        cfg.yaw_hold_gain,
+        cfg.yaw_hold_max,
+        cfg.hold_kp,
+        cfg.hold_kd,
+        cfg.frequency,
+        cfg.command_timeout,
+        cfg.can_timeout_ms,
+    )
 
 
 class _YawLog:
@@ -364,6 +412,11 @@ class Jelly:
         self.parked: bool = False
         self.park_failed: bool = False
         self.send_failed: bool = False
+        # Whether the Rust core currently sees a fresh command source, and
+        # whether any wheel is faulted/torqued off (tripped by its CAN timeout
+        # and awaiting re-enable, or a fault the core will not clear).
+        self.linked: bool = False
+        self.wheel_fault: bool = False
 
     @property
     def config(self) -> JellyConfig:
@@ -421,6 +474,27 @@ class Jelly:
         cfg = self._config
         self._ready.clear()
         self.send_failed = False
+        self.linked = False
+        self.wheel_fault = False
+        if cfg.channel is not None:
+            # The motor-side timeout is the safety layer; refuse a config that
+            # disables it or that the command stream cannot reliably feed. The
+            # Rust core checks the same before touching the wheels.
+            period_ms = 1000.0 / cfg.frequency
+            if not math.isfinite(cfg.can_timeout_ms) or cfg.can_timeout_ms <= 0.0:
+                raise ValueError(
+                    "Jelly can_timeout_ms must be a positive number — the wheel "
+                    "loss-of-comms alarm is the runaway safety layer and cannot "
+                    "be disabled"
+                )
+            if cfg.can_timeout_ms < 2.0 * period_ms:
+                raise ValueError(
+                    f"Jelly can_timeout_ms ({cfg.can_timeout_ms:g} ms) must be at "
+                    f"least twice the command period ({period_ms:g} ms at "
+                    f"{cfg.frequency:g} Hz), or a single late cycle trips the wheels"
+                )
+        if not math.isfinite(cfg.command_timeout) or cfg.command_timeout <= 0.0:
+            raise ValueError("Jelly command_timeout must be a positive number")
         if cfg.lift:
             # Publish the lift before its first await so cancellation during a
             # partial start can still find and close its bus.
@@ -474,24 +548,17 @@ class Jelly:
             self._reader_task = asyncio.create_task(
                 self._rust_reader_loop(), name="jelly-rust-reader"
             )
-            values = (
-                cfg.max_speed,
-                cfg.turn_scale,
-                cfg.slew,
-                cfg.axis_snap_deg,
-                cfg.yaw_hold_gain,
-                cfg.yaw_hold_max,
-                cfg.hold_kp,
-                cfg.hold_kd,
-                cfg.frequency,
-                cfg.command_timeout,
-            )
-            self._send_rust(b"C" + struct.pack("<10d", *values))
+            self._send_rust(_pack_config(cfg))
             await self._writer.drain()
             await asyncio.wait_for(self._ready.wait(), 10.0)
             if self.send_failed:
                 raise RuntimeError("axol-rt Jelly core failed during startup")
-            _logger.info("Jelly Rust wheel core enabled on %s", cfg.channel)
+            _logger.info(
+                "Jelly Rust wheel core enabled on %s (loss-of-comms alarm %.0f ms: "
+                "the wheels torque off on their own when the command stream stops)",
+                cfg.channel,
+                cfg.can_timeout_ms,
+            )
 
         if cfg.yaw_hold_gain != 0.0:
             _logger.info(
@@ -583,9 +650,15 @@ class Jelly:
             wz:   Counter-clockwise rotation, [-1, 1].
             lift: +1 raise, 0 stop, -1 lower.
 
-        Safe to call from any thread at any rate. The command task consumes
-        the latest value; if no fresh command arrives within
-        ``JellyConfig.command_timeout`` the target decays to a full stop.
+        Safe to call from any thread at any rate — but it must be called
+        *continuously* while the source is alive, including while it is
+        commanding zero. The command task consumes the latest value; if no
+        fresh command arrives within ``JellyConfig.command_timeout`` the
+        source is treated as dead: driving wheels are stopped once and then
+        left to their CAN timeout, parked wheels keep their hold (see
+        :class:`Jelly`). Re-sending an old command from a source that has
+        actually lost its input is a bug: that is what keeps the wheels'
+        loss-of-comms alarm from tripping.
         """
 
         def clamp(v: float, *, name: str) -> float:
@@ -730,6 +803,8 @@ class Jelly:
                 self.parked = bool(flags & 1)
                 self.park_failed = bool(flags & 2)
                 self.send_failed = bool(flags & 4)
+                self.linked = bool(flags & 8)
+                self.wheel_fault = bool(flags & 16)
                 if yaw_log is not None:
                     sample = self._yaw_rate
                     rate = sample[0] if sample is not None else None

@@ -99,6 +99,8 @@ def _status_line(jelly: Jelly, engaged: bool) -> str:
         if status.stall_fault:
             height += " STALL"
     warn = "  [CMD ERR]" if jelly.send_failed else ""
+    if jelly.wheel_fault:
+        warn += "  [WHEEL FAULT]"
     return (
         f"\r  {state:<22}  vx={cmd[0]:+.2f} vy={cmd[1]:+.2f} wz={cmd[2]:+.2f}"
         f"  |  {wheels} rad/s  |  lift:{lift}{height}{warn}  \033[K"
