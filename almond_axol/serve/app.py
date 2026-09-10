@@ -8,6 +8,7 @@ is available it is served too, with SPA-style fallback to ``index.html``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
@@ -15,6 +16,7 @@ import secrets
 import socket
 import subprocess
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -634,6 +636,10 @@ _CAN_DISCOVERY_STATUSES = {
     "error",
 }
 _CAN_DISCOVERY_FORCE_RETRY_SECONDS = 2.0
+# Discovery renames interfaces under a udev lock it can lose to a slow or
+# wedged host. Shutdown joins it so the rename is not cut in half, but the
+# join is bounded: systemd kills the service outright if the stop overruns.
+_CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass
@@ -794,6 +800,44 @@ def _usb_status_dict(status: adb.AdbStatus) -> dict[str, Any]:
         "reverseActive": status.reverse_active,
         "ready": status.ready,
     }
+
+
+async def _wait_for_disconnect(ws: WebSocket) -> None:
+    """Return once the client's close frame arrives."""
+    try:
+        while (await ws.receive())["type"] != "websocket.disconnect":
+            pass
+    except (WebSocketDisconnect, RuntimeError):
+        # Starlette reports the close as a disconnect message on a live socket,
+        # but raises once the connection has already gone: WebSocketDisconnect
+        # from its own helpers, RuntimeError from receiving on a socket whose
+        # disconnect it has already delivered. Every case means the same thing.
+        pass
+
+
+async def _stream_until_disconnect(
+    ws: WebSocket, queue: asyncio.Queue[Any]
+) -> AsyncIterator[Any]:
+    """Yield queued messages until the client disconnects.
+
+    The streaming endpoints only send, so nothing else reads the socket. Without
+    this race the close frame -- including the one uvicorn sends while draining
+    on SIGTERM -- is never observed, and an idle stream holds its handler task
+    (and the server shutdown) open indefinitely.
+    """
+    disconnect = asyncio.ensure_future(_wait_for_disconnect(ws))
+    try:
+        while True:
+            pending = asyncio.ensure_future(queue.get())
+            done, _ = await asyncio.wait(
+                (pending, disconnect), return_when=asyncio.FIRST_COMPLETED
+            )
+            if pending not in done:
+                pending.cancel()
+                return
+            yield pending.result()
+    finally:
+        disconnect.cancel()
 
 
 def create_app(static_dir: Path | None = None) -> FastAPI:
@@ -1493,8 +1537,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         queue = hub.subscribe()
         try:
             await ws.send_json({"type": "hello", **hub.snapshot()})
-            while True:
-                await ws.send_json(await queue.get())
+            async with contextlib.aclosing(
+                _stream_until_disconnect(ws, queue)
+            ) as stream:
+                async for message in stream:
+                    await ws.send_json(message)
         except WebSocketDisconnect:
             pass
         finally:
@@ -2695,12 +2742,16 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 await ws.send_json({"type": "log", "line": line})
             await ws.send_json({"type": "status", "session": session.to_dict()})
 
-            while True:
-                line = await queue.get()
-                if line is None:
-                    await ws.send_json({"type": "status", "session": session.to_dict()})
-                    break
-                await ws.send_json({"type": "log", "line": line})
+            async with contextlib.aclosing(
+                _stream_until_disconnect(ws, queue)
+            ) as stream:
+                async for line in stream:
+                    if line is None:
+                        await ws.send_json(
+                            {"type": "status", "session": session.to_dict()}
+                        )
+                        break
+                    await ws.send_json({"type": "log", "line": line})
         except WebSocketDisconnect:
             pass
         finally:
@@ -2709,7 +2760,17 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         if can_discovery_task is not None and not can_discovery_task.done():
-            await asyncio.shield(can_discovery_task)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(can_discovery_task),
+                    _CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                _logger.warning(
+                    "CAN hardware discovery did not finish within %.0fs; "
+                    "shutting down without it",
+                    _CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS,
+                )
         await runner.shutdown()
         await manager.shutdown()
         await asyncio.to_thread(robot.shutdown)
