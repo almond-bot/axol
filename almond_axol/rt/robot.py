@@ -69,7 +69,7 @@ from ..motor import ControlMode, Joint, MotorError
 from ..motor.bus import CanBus
 from ..motor.motor import _JOINT_CONFIG
 from ..robot.axol import Axol, AxolArm
-from .link import FeedbackSlot, RtLink
+from .link import FeedbackSlot, RtLink, config_header
 
 _logger = logging.getLogger(__name__)
 
@@ -170,6 +170,7 @@ class RtAxol:
     def _config_text(self) -> str:
         max_step = self._arms()[0][1]._config.max_step_rad
         lines = [
+            *config_header(),
             f"loop_hz {self._loop_hz}",
             f"watchdog_ms {self._watchdog_ms}",
             # Corruption defense on the core side; the Python max-step gate

@@ -150,7 +150,7 @@ class _FakeDriver:
         self.position_force.append(args)
 
 
-def _partial_axol(joints: set[Joint]) -> Axol:
+def _partial_axol(joints: set[Joint], config: Any = None) -> Axol:
     with (
         patch("almond_axol.robot.axol.CanBus", _FakeBus),
         patch(
@@ -158,7 +158,10 @@ def _partial_axol(joints: set[Joint]) -> Axol:
             side_effect=lambda *_a, **_k: _FakeDriver(),
         ),
     ):
-        return Axol(left_channel="can0", right_channel=None, left_joints=joints)
+        kwargs = {} if config is None else {"config": config}
+        return Axol(
+            left_channel="can0", right_channel=None, left_joints=joints, **kwargs
+        )
 
 
 class PartialAxolArmTest(unittest.IsolatedAsyncioTestCase):
@@ -289,6 +292,10 @@ class PartialRtAxolTest(unittest.IsolatedAsyncioTestCase):
     def test_config_lists_only_present_motors(self) -> None:
         rt = RtAxol(_partial_axol(set(WRIST_KIT)))
         lines = rt._config_text().splitlines()
+        # Slot-by-motor-id is protocol generation 2; a core that predates it
+        # would slot these wrists at 0 and 1 and then reject every target,
+        # so the config declares the generation and such a core refuses it.
+        self.assertEqual(lines[0], "proto 2")
         joint_lines = [line for line in lines if line.startswith("joint ")]
         self.assertEqual(
             [line.split()[3:5] for line in joint_lines],
@@ -314,6 +321,114 @@ class PartialRtAxolTest(unittest.IsolatedAsyncioTestCase):
             await rt.wait_for_telemetry(timeout=0.05)
         feed(0, {6: (0.1, 0.0, 0.0, 1.0)})
         await rt.wait_for_telemetry(timeout=0.05)
+
+
+# --------------------------------------------------------------------------- #
+# Bench gains                                                                 #
+# --------------------------------------------------------------------------- #
+
+
+class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
+    """A partial arm is off the robot; drive it as plain soft PD.
+
+    The production wrist gains (130/3.5 on wrist_2) plus the model
+    feedforwards vibrated heavily on a wrist kit clamped to a bench. The bench
+    config is the soft end of the stiffness slider with every model term off,
+    so what reaches the core is kp/kd and a zero feedforward.
+    """
+
+    def test_bench_config_is_soft_pd_with_no_model_terms(self) -> None:
+        from almond_axol.robot.config import AxolConfig
+
+        cfg = rom.bench_config(AxolConfig(left_stiffness=1.0, right_stiffness=1.0))
+        self.assertEqual(cfg.left_stiffness, rom.BENCH_STIFFNESS)
+        self.assertEqual(cfg.right_stiffness, rom.BENCH_STIFFNESS)
+        resolved = cfg.resolved()
+        for arm in (resolved.left, resolved.right):
+            for joint in ARM_JOINTS:
+                jc = getattr(arm, joint.value)
+                self.assertEqual(jc.kd_host, 0.0, joint)
+                self.assertEqual(jc.j_eff, 0.0, joint)
+                self.assertEqual(jc.mass, 0.0, joint)
+                self.assertEqual(
+                    (jc.friction.fc, jc.friction.k, jc.friction.fv, jc.friction.fo),
+                    (0.0, 0.0, 0.0, 0.0),
+                    joint,
+                )
+        # The soft endpoint of the slider (``_SOFT_GAINS``), not the tuned top.
+        self.assertAlmostEqual(resolved.left.wrist_2.kp, 25.0)
+        self.assertAlmostEqual(resolved.left.wrist_2.kd, 1.5)
+        self.assertAlmostEqual(resolved.left.wrist_3.kp, 25.0)
+        self.assertAlmostEqual(resolved.left.wrist_3.kd, 0.9)
+        # The gripper is position/force controlled and untouched.
+        self.assertEqual(resolved.left.gripper, AxolConfig().left.gripper)
+
+    async def test_bench_arm_streams_soft_pd_and_zero_feedforward(self) -> None:
+        from almond_axol.robot.config import AxolConfig
+
+        axol = _partial_axol(set(WRIST_KIT), rom.bench_config(AxolConfig()))
+        arm = axol.left
+        assert arm is not None
+        arm._unresolved_offsets.clear()
+        arm._joint_offsets[:] = 0.0
+        shipped: list[list[tuple[float, ...]]] = []
+        arm._command_sink = shipped.append
+        # Wrist_2 rotated with wrist_3 held: on the robot's gains this pose
+        # carries a non-zero gravity feedforward for both wrists.
+        q = np.zeros(8, dtype=np.float32)
+        q[5] = 1.2
+        q[7] = 1.0
+        await arm.motion_control(q)
+        (cmds,) = shipped
+        p_des, mode, kp, kd, t_ff, kd_host, _w0, _q, j_eff = cmds[5]
+        self.assertAlmostEqual(p_des, 1.2, places=5)
+        self.assertEqual(mode, 1.0)
+        self.assertAlmostEqual(kp, 25.0)
+        self.assertAlmostEqual(kd, 1.5)
+        self.assertEqual((t_ff, kd_host, j_eff), (0.0, 0.0, 0.0))
+        _p, _m, kp3, kd3, t_ff3, kd_host3, _w03, _q3, j_eff3 = cmds[6]
+        self.assertAlmostEqual(kp3, 25.0)
+        self.assertAlmostEqual(kd3, 0.9)
+        self.assertEqual((t_ff3, kd_host3, j_eff3), (0.0, 0.0, 0.0))
+        # The core's friction model rides the config; the bench config zeroes it.
+        rt = RtAxol(axol)
+        for line in rt._config_text().splitlines():
+            if line.startswith("joint "):
+                self.assertEqual(line.split()[9:], ["0.0", "0.0", "0.0", "0.0"], line)
+
+    def test_only_a_partial_arm_is_a_bench_run(self) -> None:
+        """A full arm on the bus — even with a joint subset selected — is the
+        robot and keeps the production gains; any missing motor means bench."""
+        candidates = set(Joint)
+        self.assertFalse(
+            rom.is_bench_run({"left": candidates, "right": None}, candidates)
+        )
+        self.assertFalse(
+            rom.is_bench_run({"left": candidates, "right": candidates}, candidates)
+        )
+        self.assertTrue(
+            rom.is_bench_run({"left": set(WRIST_KIT), "right": None}, candidates)
+        )
+        self.assertTrue(
+            rom.is_bench_run({"left": candidates, "right": set(WRIST_KIT)}, candidates)
+        )
+        # Gripperless SKU: the candidate set has no gripper, so a full
+        # seven-motor arm is not partial.
+        arm_only = set(ARM_JOINTS)
+        self.assertFalse(rom.is_bench_run({"left": arm_only, "right": None}, arm_only))
+        # A mounted arm whose gripper does not answer (unpowered, missing, or
+        # not fitted on a gripper-configured robot) is still the robot: the
+        # gripper says nothing about the mounting, and soft PD with no
+        # gravity feedforward would let the held shoulders sag.
+        self.assertFalse(
+            rom.is_bench_run({"left": arm_only, "right": None}, candidates)
+        )
+        # Whereas a gripper that answers on a partial arm is still a bench.
+        self.assertTrue(
+            rom.is_bench_run(
+                {"left": {Joint.WRIST_2, Joint.GRIPPER}, "right": None}, candidates
+            )
+        )
 
 
 # --------------------------------------------------------------------------- #

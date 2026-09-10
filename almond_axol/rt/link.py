@@ -35,6 +35,19 @@ _CONNECT_TIMEOUT_S = 5.0
 _PREP_TIMEOUT_S = 15.0
 _ARM_TIMEOUT_S = 15.0
 
+#: Config/target protocol generation this package speaks; every ``C`` config
+#: opens with ``proto <CONFIG_PROTO>`` and the core refuses a mismatch (see
+#: ``CONFIG_PROTO`` in ``rust/axol-rt/src/serve.rs`` for the history). Bump
+#: both together whenever the config or target layout changes meaning — a
+#: package and a binary from different checkouts must fail at configure
+#: time, not arm and then silently reject every target.
+CONFIG_PROTO = 2
+
+
+def config_header() -> list[str]:
+    """The lines every ``C`` config starts with (the protocol declaration)."""
+    return [f"proto {CONFIG_PROTO}"]
+
 
 def find_binary() -> str:
     """Locate ``axol-rt``: env override, this checkout's build, then PATH."""
@@ -272,11 +285,27 @@ class RtLink:
             if remaining <= 0:
                 raise RtLinkError(f"timed out waiting for {expected!r} from axol-rt")
             try:
-                state = await asyncio.wait_for(self._states.get(), remaining)
-            except asyncio.TimeoutError:
-                raise RtLinkError(
-                    f"timed out waiting for {expected!r} from axol-rt"
-                ) from None
+                state = self._states.get_nowait()
+            except asyncio.QueueEmpty:
+                # A core that exits without acking (a config it refused, a
+                # crash) never sends a state; notice the exit instead of
+                # sitting out the whole timeout with the operator none the
+                # wiser. An ack the core sent just before exiting (disarm)
+                # may still be in flight to the reader task, so give it a
+                # moment to land before calling the exit unacked.
+                proc = self._proc
+                exited = proc is not None and proc.poll() is not None
+                wait = min(remaining, 0.5 if exited else 0.1)
+                try:
+                    state = await asyncio.wait_for(self._states.get(), wait)
+                except asyncio.TimeoutError:
+                    if exited:
+                        assert proc is not None
+                        raise RtLinkError(
+                            f"axol-rt exited (code {proc.returncode}) "
+                            f"before acking {expected!r}"
+                        ) from None
+                    continue
             if state == expected:
                 return
             if state.startswith("fault:") and not tolerate_fault:
@@ -284,8 +313,28 @@ class RtLink:
             # Unrelated state (e.g. a stats line routed as state) — keep waiting.
 
     async def configure(self, config_text: str) -> None:
+        """Ship the ``C`` config and wait for ``config-ok``.
+
+        The core refuses a config whose ``proto`` line does not match its
+        own :data:`CONFIG_PROTO` (or that has none) by exiting; its reason
+        goes to the inherited stderr. Here that becomes an error naming the
+        binary and the fix, since the usual cause is a package updated
+        without rebuilding the core (or the reverse).
+        """
         self._send(b"C" + config_text.encode())
-        await self._await_state("config-ok", 5.0)
+        try:
+            await self._await_state("config-ok", 5.0)
+        except RtLinkError as exc:
+            proc = self._proc
+            if proc is None or proc.poll() is None:
+                raise
+            raise RtLinkError(
+                f"axol-rt at {self._binary} refused the configuration and exited "
+                f"(code {proc.returncode}). This package speaks proto "
+                f"{CONFIG_PROTO}; a binary built from another checkout will not. "
+                "Rebuild it with `axol rt.install` (dev checkout: `cargo build "
+                "--release` in rust/axol-rt) so both come from the same commit."
+            ) from exc
 
     async def prep(self) -> None:
         self._send(b"P")

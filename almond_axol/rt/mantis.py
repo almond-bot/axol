@@ -54,7 +54,7 @@ from ..motor import Joint
 from ..motor.motor import _JOINT_CONFIG
 from ..robot.base import mark_hardware_cleanup_uncertain
 from ..robot.mantis import Mantis, MantisGripperArm
-from .link import FeedbackSlot, RtLink
+from .link import FeedbackSlot, RtLink, config_header
 
 _logger = logging.getLogger(__name__)
 
@@ -157,6 +157,7 @@ class RtMantis:
 
     def _config_text(self) -> str:
         lines = [
+            *config_header(),
             f"loop_hz {self._loop_hz}",
             f"watchdog_ms {self._watchdog_ms}",
             f"max_step_rad {_MAX_STEP_RAD}",

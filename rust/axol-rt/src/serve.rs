@@ -48,8 +48,12 @@
 //! ## Protocol (length-prefixed messages: u32 LE size, then payload)
 //!
 //! Python -> Rust:
-//! - `C` + text        config: `loop_hz`/`watchdog_ms`/`max_step_rad`
-//!                     keys, one `joint <side> <iface> <name>
+//! - `C` + text        config: a mandatory `proto <n>` line (must equal
+//!                     `CONFIG_PROTO` — the client and this binary must
+//!                     agree on the slot layout below, and a stale build
+//!                     of either fails here, loudly, instead of silently
+//!                     rejecting every target), `loop_hz`/`watchdog_ms`/
+//!                     `max_step_rad` keys, one `joint <side> <iface> <name>
 //!                     <motor_id> <kp> <kd> <max_vel> <max_accel> <fc> <k>
 //!                     <fv> <fo>` line per arm joint (tracker limits +
 //!                     friction params; the motor id 1..=7 fixes the
@@ -123,11 +127,13 @@
 //!   each motor holding its last MIT command on firmware gains — the same
 //!   outcome as a classic Python session dying mid-command.
 //! - Targets stepping more than `max_step_rad` from the previous target
-//!   are rejected (counted, reported) — corruption defense; the Python
-//!   side has its own max-step gate. The gripper slot is exempt (its
-//!   targets legitimately jump, matching the Python gate). Whatever gets
-//!   through, the tracker's velocity/acceleration limits bound what the
-//!   wire can ever see.
+//!   are rejected (counted, and warned about at most every
+//!   `DEGRADED_LOG_INTERVAL` naming the joint and step, since a rejected
+//!   stream leaves the arm parked while the client believes it is moving)
+//!   — corruption defense; the Python side has its own max-step gate. The
+//!   gripper slot is exempt (its targets legitimately jump, matching the
+//!   Python gate). Whatever gets through, the tracker's
+//!   velocity/acceleration limits bound what the wire can ever see.
 //! - There is deliberately **no position-deviation abort**, matching the
 //!   classic Python controller. Position error on a compliant impedance
 //!   controller is not a safety signal: a hand on the arm and a joint that
@@ -202,6 +208,18 @@ const VEL_CUTOFF: f64 = 80.0;
 /// Target-tuple slots per arm: 7 arm joints + the gripper.
 const N_SLOTS: usize = 8;
 const GRIPPER_SLOT: usize = 7;
+/// Config/target protocol generation the client must declare (`proto <n>`).
+/// Bumped whenever the meaning of the config or target layout changes, so a
+/// Python package and an `axol-rt` binary built from different checkouts
+/// refuse each other at configure time. Silent skew is the failure mode
+/// this guards against: before it existed, a client that slotted joints by
+/// motor id against a core that slotted them by list order armed fine and
+/// then rejected every target on the max-step gate — the arms just held.
+///
+/// - 1 (implicit; never declared): arm joints took slots in list order.
+/// - 2: slots come from the motor id (`slot = motor_id - 1`), so a bus may
+///   carry any subset of the arm.
+const CONFIG_PROTO: u32 = 2;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -786,6 +804,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
     let mut watchdog_ms = 150.0;
     let mut max_step_rad = 0.35;
     let mut buses: Vec<(u8, String, Vec<MotorSpec>)> = Vec::new();
+    let mut proto: Option<u32> = None;
 
     let bad = |line: &str| {
         io::Error::new(
@@ -800,6 +819,24 @@ fn parse_config(text: &str) -> io::Result<Config> {
         }
         let f: Vec<&str> = line.split_whitespace().collect();
         match f[0] {
+            "proto" => {
+                let declared: u32 = f
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?;
+                if declared != CONFIG_PROTO {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "config: client speaks proto {declared}, this axol-rt speaks \
+                             proto {CONFIG_PROTO} — the almond-axol package and the axol-rt \
+                             binary must be built from the same checkout (rebuild with \
+                             `axol rt.install`)"
+                        ),
+                    ));
+                }
+                proto = Some(declared);
+            }
             "loop_hz" => {
                 loop_hz = f
                     .get(1)
@@ -893,6 +930,19 @@ fn parse_config(text: &str) -> io::Result<Config> {
             }
             _ => return Err(bad(line)),
         }
+    }
+    if proto.is_none() {
+        // A client that predates the `proto` line slots arm joints by list
+        // order, which this core no longer does — refuse rather than arm a
+        // layout it would then misinterpret.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "config: no `proto` line — the client predates proto {CONFIG_PROTO}; the \
+                 almond-axol package and the axol-rt binary must be built from the same \
+                 checkout (rebuild with `axol rt.install`)"
+            ),
+        ));
     }
     if buses.is_empty() {
         return Err(io::Error::new(
@@ -1271,7 +1321,8 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "loop_hz 240\n\
+            "proto 2\n\
+             loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
              gripper 0 canL 8\n\
@@ -1292,7 +1343,7 @@ mod tests {
         );
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("joint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 2\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
     }
 
     /// A bus carrying only some of the arm joints (a bench wrist assembly)
@@ -1301,7 +1352,8 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
+            "proto 2\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
              gripper 0 can0 8\n",
         )
@@ -1313,13 +1365,40 @@ mod tests {
         );
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
-        assert!(parse_config("joint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
-        assert!(parse_config("joint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 2\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 2\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
         assert!(parse_config(
-            "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n\
+            "proto 2\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n"
         )
         .is_err());
+    }
+
+    /// A client and a core built from different checkouts must fail at
+    /// configure time. Without the guard, a proto-1 core (list-order slots)
+    /// armed against a proto-2 client's subset config and then rejected every
+    /// target on the max-step gate — the arms enabled and never moved.
+    #[test]
+    fn parse_config_requires_matching_proto() {
+        let joint = "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n";
+        let error_of = |text: &str| match parse_config(text) {
+            Ok(_) => panic!("accepted a skewed config: {text:?}"),
+            Err(err) => err.to_string(),
+        };
+        // No `proto` line: a client that predates the slot-by-id layout.
+        let err = error_of(joint);
+        assert!(err.contains("no `proto` line"), "{err}");
+        assert!(err.contains("axol rt.install"), "{err}");
+        // A future client generation this core does not understand.
+        let err = error_of(&format!("proto 3\n{joint}"));
+        assert!(err.contains("proto 3"), "{err}");
+        assert!(err.contains("proto 2"), "{err}");
+        // Malformed declarations are bad lines, not silently accepted.
+        assert!(parse_config(&format!("proto\n{joint}")).is_err());
+        assert!(parse_config(&format!("proto two\n{joint}")).is_err());
+        // Order does not matter; the line just has to be there.
+        assert!(parse_config(&format!("{joint}proto 2\n")).is_ok());
     }
 }
 
@@ -1822,6 +1901,7 @@ fn bus_loop(
     let period = Duration::from_secs_f64(1.0 / cfg.loop_hz);
     let watchdog = Duration::from_secs_f64(cfg.watchdog_ms / 1e3);
     let mut rejected: u64 = 0;
+    let mut next_reject_log = Instant::now();
     let mut late: u64 = 0;
     let mut missed: u64 = 0;
     let mut trace_dropped: u64 = 0;
@@ -1980,17 +2060,47 @@ fn bus_loop(
                         // Only slots with a motor on this bus are gated: an
                         // absent joint's slot never leaves its default hold,
                         // so its (meaningless) target would otherwise reject
-                        // every packet.
-                        let step_ok = is_limp
-                            || motors.iter().filter(|m| !m.gripper).all(|m| {
-                                (t.cmds[m.slot].p_des - play[m.slot].p_des).abs()
-                                    <= cfg.max_step_rad
-                            });
-                        if step_ok {
-                            play = t.cmds;
-                            have_target = true;
+                        // every packet. A NaN target is a rejected step too.
+                        let worst = if is_limp {
+                            None
                         } else {
-                            rejected += 1;
+                            motors
+                                .iter()
+                                .filter(|m| !m.gripper)
+                                .map(|m| (m, (t.cmds[m.slot].p_des - play[m.slot].p_des).abs()))
+                                .filter(|(_, step)| step.is_nan() || *step > cfg.max_step_rad)
+                                .max_by(|a, b| a.1.total_cmp(&b.1))
+                        };
+                        match worst {
+                            None => {
+                                play = t.cmds;
+                                have_target = true;
+                            }
+                            Some((m, step)) => {
+                                rejected += 1;
+                                // A rejected target is a hold the client did
+                                // not ask for. One corrupt packet is what the
+                                // gate is for, but a *stream* of rejections
+                                // (a client whose slot layout disagrees with
+                                // this core's, a target frame the offsets
+                                // never lined up with) leaves the arm parked
+                                // while the client believes it is sweeping —
+                                // say so, rate-limited like the other
+                                // degradations; the stats line has the count.
+                                if began >= next_reject_log {
+                                    next_reject_log = began + DEGRADED_LOG_INTERVAL;
+                                    send_text(
+                                        out_tx,
+                                        b'W',
+                                        &format!(
+                                            "{iface}: target rejected — {} steps {:.3} rad from the last accepted target (max_step_rad {:.3}); holding the last accepted target ({rejected} rejected so far)",
+                                            m.joint,
+                                            step,
+                                            cfg.max_step_rad,
+                                        ),
+                                    );
+                                }
+                            }
                         }
                         last_seq = Some(t.seq);
                         last_arrival = Some(t.arrival);
