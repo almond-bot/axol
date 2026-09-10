@@ -12,9 +12,10 @@ up when the session ends (see :mod:`almond_axol.serve.telemetry`).
 CSV columns: ``t`` (epoch seconds) then ``<arm>:<JOINT>:pos`` and
 ``<arm>:<JOINT>:tq`` for every joint of every present arm. Positions are raw
 shaft radians (matching the live dashboard sampler); a cell is left empty for
-any motor with no cached reading yet, so a ``--joints`` subset run still
-captures the joints it actually drives. Velocity is not cached by the motor
-layer, so it is not captured here.
+any motor with no cached reading yet — or with no motor at all (gripperless
+SKU, partial bench arm) — so a ``--joints`` subset run still captures the
+joints it actually drives. Velocity is not cached by the motor layer, so it
+is not captured here.
 
 The Mantis rig (:class:`~almond_axol.robot.mantis.Mantis`) has one real motor
 per side — the gripper — behind the same ``left`` / ``right`` surface; its
@@ -126,7 +127,12 @@ class TelemetryCsvLogger:
                     wrote_any = True
                     continue
                 for joint in Joint:
-                    motor = motors[joint]
+                    motor = motors.get(joint)
+                    if motor is None:
+                        # Absent motor (gripperless SKU, partial bench arm):
+                        # the column stays, its cells stay empty.
+                        row.extend(("", ""))
+                        continue
                     if motor.has_position:
                         row.append(round(float(motor.position), 5))
                         wrote_any = True

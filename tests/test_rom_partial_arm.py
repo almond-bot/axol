@@ -252,6 +252,39 @@ class PartialAxolArmTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(arm.motors[Joint.GRIPPER]._driver.position_force), 2)
 
 
+class PartialArmTelemetryCaptureTest(unittest.IsolatedAsyncioTestCase):
+    async def test_capture_leaves_absent_motor_cells_empty(self) -> None:
+        """The ROM capture samples ``arm.motors`` per joint; absent motors
+        must yield empty cells, not a KeyError that would kill the sampler
+        (and, re-raised from ``logger.stop()`` in the run's ``finally``, skip
+        the motor disable)."""
+        import csv
+        import tempfile
+        from pathlib import Path
+
+        from almond_axol.diagnostics.telemetry_log import TelemetryCsvLogger
+
+        axol = _partial_axol(set(WRIST_KIT))
+        arm = axol.left
+        assert arm is not None
+        arm.motors[Joint.WRIST_2]._position = 0.4
+        arm.motors[Joint.WRIST_2]._torque = 0.1
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = TelemetryCsvLogger(axol, "rom", hz=200.0, out_dir=Path(tmp))
+            with patch("builtins.print"):
+                logger.start()
+            await asyncio.sleep(0.05)
+            await logger.stop()  # re-raises any sampler exception
+            with open(logger.path, newline="") as f:
+                rows = list(csv.reader(f))
+        header, first = rows[0], rows[1]
+        self.assertEqual(len(header), 1 + 2 * len(list(Joint)))
+        self.assertEqual(len(first), len(header))
+        self.assertEqual(first[header.index("left:SHOULDER_1:pos")], "")
+        self.assertEqual(first[header.index("left:WRIST_2:pos")], "0.4")
+        self.assertEqual(first[header.index("left:WRIST_3:pos")], "")
+
+
 class PartialRtAxolTest(unittest.IsolatedAsyncioTestCase):
     def test_config_lists_only_present_motors(self) -> None:
         rt = RtAxol(_partial_axol(set(WRIST_KIT)))
