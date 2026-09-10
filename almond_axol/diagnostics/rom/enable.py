@@ -35,6 +35,16 @@ unpowered motor is indistinguishable from an absent one and would swing free
 while its neighbours sweep. A full-robot run (no ``--joints``) still requires
 every motor.
 
+A partial arm is, by construction, not mounted on the robot (a wrist kit
+clamped to a bench), so it is driven as plain PD: the soft hand-guidable
+gains (``stiffness 0``) with every model-based feedforward off — no gravity
+(the model assumes the robot's mounting orientation), no friction, inertia
+or host-damping terms (all tuned against the full arm's dynamics). The
+production gains on a rigidly clamped wrist assembly vibrate heavily; the
+point of a bench sweep is only to prove the joint actuates through its
+range, which the soft PD does without exciting anything. See
+:func:`bench_config`.
+
 The grasp-an-item clamp (hold with force, then soak while holding) only runs
 when every joint is selected. Any subset run drops the grasp step and simply
 loops the range-of-motion sweeps for the selected joints; if the gripper is one
@@ -62,10 +72,12 @@ import math
 import sys
 import time
 from collections.abc import Iterable
+from dataclasses import replace
 
 import numpy as np
 
 from ...constants import (
+    ARM_JOINTS,
     CAN_LEFT,
     CAN_MANTIS_LEFT,
     CAN_MANTIS_RIGHT,
@@ -82,7 +94,7 @@ from ...robot.axol import (
     SHOULDER_2_RIGHT_LIMITS,
     Axol,
 )
-from ...robot.config import AxolConfig
+from ...robot.config import ArmConfig, AxolConfig, FrictionParams
 from ...robot.mantis import Mantis
 from ...rt import RtAxol, RtMantis
 from ..telemetry_log import TelemetryCsvLogger
@@ -215,6 +227,73 @@ def resolve_bus_joints(
     if not on_bus:
         raise SystemExit(f"Cannot start: no motors answered on the {side} arm's bus.")
     return set(on_bus)
+
+
+# Gains for a partial arm off the robot: the soft end of the stiffness
+# slider — the hand-guidable gains (wrist_2 25/1.5, wrist_3 25/0.9, see
+# ``_SOFT_GAINS`` in robot/config.py), damping-ratio-consistent with the tuned
+# set. The production gains (wrist_2 130/3.5) vibrate heavily on a wrist kit
+# clamped to a bench: firmware kd on the Damiao wrists already sits at the
+# edge of a unit-dependent buzz on the robot (kd=5 buzzes at 110 Hz), and a
+# rigid mount with none of the arm's compliance behind the stator moves that
+# edge down. A bench sweep only has to show the joint tracks through its
+# range; the soft gains do that without exciting anything.
+BENCH_STIFFNESS = 0.0
+_NO_FRICTION = FrictionParams(fc=0.0, k=0.0, fv=0.0, fo=0.0)
+
+
+def bench_config(config: AxolConfig) -> AxolConfig:
+    """Plain-PD gains for a partial arm that is not mounted on the robot.
+
+    Every arm joint gets :data:`BENCH_STIFFNESS` (the soft, hand-guidable
+    ``kp`` / ``kd``) and loses every model-based feedforward, all of which
+    assume the full arm on the robot: gravity (``mass = 0`` — the model
+    computes it for the robot's mounting orientation, which a bench kit is
+    not in), friction (zeroed; the tanh compensator was fit on the full
+    joint chain), inertia (``j_eff = 0``) and host damping (``kd_host = 0``,
+    whose pose schedule reads the same inertia model). What remains is the
+    core's trapezoid tracker driving the firmware PD — enough to sweep a
+    joint through its range and see that it actuates. The gripper is
+    unchanged (it is position/force controlled, not impedance).
+    """
+
+    def plain_pd(arm: ArmConfig) -> ArmConfig:
+        return replace(
+            arm,
+            **{
+                j.value: replace(
+                    getattr(arm, j.value),
+                    friction=_NO_FRICTION,
+                    kd_host=0.0,
+                    j_eff=0.0,
+                    mass=0.0,
+                )
+                for j in ARM_JOINTS
+            },
+        )
+
+    return replace(
+        config,
+        left=plain_pd(config.left),
+        right=plain_pd(config.right),
+        left_stiffness=BENCH_STIFFNESS,
+        right_stiffness=BENCH_STIFFNESS,
+    )
+
+
+def is_bench_run(
+    arm_joints: dict[str, set[Joint] | None], candidates: set[Joint]
+) -> bool:
+    """Whether any arm in the run is partial — motors missing from its bus.
+
+    A partial arm cannot be on the robot, so it gets :func:`bench_config`.
+    The rule is the bus probe, not the ``--joints`` selection: a joint
+    subset swept on a fully populated arm is still the robot, and its held
+    joints need the production gains and gravity feedforward.
+    """
+    return any(
+        joints is not None and joints != candidates for joints in arm_joints.values()
+    )
 
 
 def home_pose() -> np.ndarray:
@@ -700,6 +779,15 @@ async def run_axol(
                     "treating as absent (never enabled). Make sure these joints "
                     "really are not attached."
                 )
+        # A partial arm is off the robot (a bench kit): the production gains
+        # and model feedforwards do not apply there — see bench_config.
+        if is_bench_run(arm_joints, candidates):
+            config = bench_config(config)
+            print(
+                "Partial arm — bench gains: soft PD "
+                f"(stiffness {BENCH_STIFFNESS:g}), no gravity/friction/inertia/"
+                "host-damping feedforward."
+            )
         axol = Axol(
             config=config,
             left_channel=None if no_left else left_channel,

@@ -209,8 +209,11 @@ class RtMantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(self.rt.armed)
         (link,) = _FakeLink.instances
+        config_lines = link.config.splitlines()
+        # The protocol declaration leads every config (see RtLink.configure).
+        self.assertEqual(config_lines[0], "proto 2")
         self.assertEqual(
-            link.config.splitlines()[3:],
+            config_lines[4:],
             ["gripper 0 can_mantis_l 8", "gripper 1 can_mantis_r 8"],
         )
         # Python bring-up (enable / POSITION_FORCE / first target / read)

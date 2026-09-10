@@ -292,6 +292,14 @@ Default interfaces are `can_alm_axol_l` and `can_alm_axol_r`; pass others
 as positional args (`scan` / `bench`). The teleop path finds the binary
 via `AXOL_RT_BIN`, `PATH`, or this crate's `target/release/`.
 
+The binary and the Python package must come from the same checkout: every
+config opens with a `proto <n>` line (`CONFIG_PROTO` in `serve.rs`,
+`almond_axol.rt.link.CONFIG_PROTO`) and a core that speaks a different
+generation refuses it and exits, which Python reports as a stale-binary
+error. After pulling changes to this crate in a dev checkout, rebuild
+(`cargo build --release` here, or `axol rt.install`) before running
+anything against hardware.
+
 ## Roadmap
 
 Nothing pending — the split described above is fully built: Rust owns the
