@@ -1,0 +1,102 @@
+---
+title: "Data Collection Config Parameters"
+sidebarTitle: "Config Parameters"
+description: "Every setting for axol collect-data — what it does and its default."
+---
+
+import Robot from "/snippets/config/robot.mdx";
+import LeRobotRobot from "/snippets/config/lerobot-robot.mdx";
+import Cameras from "/snippets/config/cameras.mdx";
+import TeleopSession from "/snippets/config/teleop-session.mdx";
+import Kinematics from "/snippets/config/kinematics.mdx";
+import VRServer from "/snippets/config/vr-server.mdx";
+import Jelly from "/snippets/config/jelly.mdx";
+
+Every setting for `axol collect-data`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
+
+```bash
+axol collect-data --repo_id myorg/pick --task "pick up the cup" \
+  --robot_config.axol_config.left_stiffness 0.8 \
+  --teleop_config.vr_teleop_config.position_multiplier 1.5
+```
+
+<Warning>
+  Stiffness, gripper torque, `observe_torques`, `observe_cartesian`, `fps`, and the camera set must be the **same here and in [Run Policy](/operations/run-policy-config)**. A policy only works with the dynamics it was trained on.
+</Warning>
+
+## Recording
+
+| Flag | Default | Description |
+|---|---|---|
+| `--repo_id` | required | Dataset id, `<user>/<dataset>`. |
+| `--task` | required | Task description stored with every frame. |
+| `--fps` | `60` | Recording rate. Camera frames are captured at this rate. |
+| `--teleop_hz` | `120` | Motor command rate (Hz) while teleoperating, independent of `fps`. |
+| `--dataset_resolution` | `SVGA` | Resolution the recorded video is downscaled to: `SVGA`, `HD1080`, or `HD1200`. The headset stream keeps the capture resolution. |
+| `--vcodec` | per platform | Dataset video codec: `h264` on Jetson, `auto` elsewhere. |
+| `--root` | `null` | Local dataset directory. Default is the LeRobot cache, `~/.cache/huggingface/lerobot`. |
+| `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. |
+| `--qa_gate` | `true` | Refuse to save Mantis episodes the quality check marks corrupt. `false` saves anyway. |
+| `--rerun_ip` | `null` (off) | Stream live visualisation to a [Rerun](https://rerun.io) viewer at this address. |
+| `--rerun_port` | `9876` | Rerun viewer port. |
+| `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
+| `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
+
+## Mantis
+
+Only used with `--mantis`.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--mantis` | `false` | Record with the Mantis handheld rigs instead of the robot: tracked TCP poses plus wrist cameras. |
+| `--mantis_source` | `lighthouse` | Pose source: `quest`, `lighthouse`, or `ultimate`. Defaults to the host's **Mantis settings → Tracking** choice. |
+| `--mantis_allow_uncalibrated` | `false` | Record without a tracker → TCP calibration. Bring-up only; don't train on the result. |
+| `--mantis_smooth_hz` | `10.0` | Low-pass cutoff (Hz) applied to the recorded pose track on save. `0` disables. |
+
+## Robot {#robot-config}
+
+CAN buses, cameras, and what goes into observations.
+
+<LeRobotRobot prefix="robot_config." />
+
+### Cameras {#cameras}
+
+<Cameras prefix="robot_config.cameras." />
+
+### Arm gains {#robot}
+
+Arm stiffness, gripper limits, and per-joint gains.
+
+<Robot prefix="robot_config.axol_config." />
+
+## Teleop session {#teleop}
+
+How VR controller motion becomes arm motion.
+
+<TeleopSession prefix="teleop_config.vr_teleop_config." />
+
+## Kinematics {#kinematics}
+
+The IK solver that turns hand targets into joint angles. A higher weight means the solver cares more about that term.
+
+<Kinematics prefix="teleop_config.kinematics_config." />
+
+## VR server {#vr-server}
+
+The connection the headset streams poses over.
+
+<VRServer prefix="teleop_config.vr_server_config." />
+
+## Jelly {#jelly}
+
+The optional powered cart, driven from the headset thumbsticks between takes. Cart motion is never recorded.
+
+<Jelly prefix="teleop_config.cart." />
+
+## Teleoperator {#teleop-config}
+
+| Flag | Default | Description |
+|---|---|---|
+| `--teleop_config.has_gripper` | `true` | Set automatically from `--robot_config.axol_config.has_gripper`. |
+| `--teleop_config.id` | `null` | LeRobot bookkeeping, unused by Axol. |
+| `--teleop_config.calibration_dir` | `null` | LeRobot bookkeeping, unused by Axol. |

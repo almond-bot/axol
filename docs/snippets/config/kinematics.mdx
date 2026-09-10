@@ -1,0 +1,28 @@
+export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{children}</code>;
+
+| Flag | Default | Description |
+|---|---|---|
+| <F>--{prefix}pos_weight</F> | `50.0` | Weight on end-effector position error. |
+| <F>--{prefix}ori_weight</F> | `10.0` | Weight on end-effector orientation error. |
+| <F>--{prefix}elbow_weight</F> | `0` (off) | Weight on the headset's elbow-position hint. Off by default because the hint is unreliable on hardware. |
+| <F>--{prefix}rest_weight</F> | `7.5` | Damping toward the current pose. Higher is steadier, lower tracks faster. |
+| <F>--{prefix}posture_weight</F> | `5.0` | Pull toward the home posture, preventing slow drift. |
+| <F>--{prefix}manipulability_weight</F> | `0.05` | Keeps the arm away from singular poses. Forced `0` in Mantis mode. |
+| <F>--{prefix}limit_weight</F> | `75.0` | Penalty on joint-limit violations. |
+| <F>--{prefix}self_collision_margin</F> | `0.025` | Distance (m) at which self-collision avoidance starts. Keep below the arm–torso clearance of normal poses. |
+| <F>--{prefix}self_collision_weight</F> | `150.0` | Weight on self-collision avoidance. |
+| <F>--{prefix}max_iterations</F> | `8` | Solver iterations per IK call. |
+| <F>--{prefix}cost_tolerance</F> | `1e-4` | Convergence tolerance. Keep small. |
+| <F>--{prefix}lambda_initial</F> | `1e-2` | Initial Levenberg–Marquardt damping. |
+| <F>--{prefix}lambda_factor</F> | `10.0` | Damping multiplier after a rejected solver step. |
+| <F>--{prefix}max_joint_delta</F> | `0.0346` | Largest joint change (rad) per IK call. Raise for faster tracking, lower for gentler motion. |
+| <F>--{prefix}max_reach</F> | `0.82` | Maximum shoulder-to-target distance (m). Targets beyond it are pulled in. |
+| <F>--{prefix}reach_soft_start</F> | `0.78` | Distance (m) at which the reach limit starts to act. |
+| <F>--{prefix}manip_damping_threshold</F> | `0.015` | Below this manipulability, extra damping kicks in (near full extension). |
+| <F>--{prefix}manip_damping_boost</F> | `60.0` | Extra damping at zero manipulability. `0` disables. |
+| <F>--{prefix}limit_damping_margin</F> | `0.12` | Distance (rad) from a joint limit inside which the joint is damped while moving toward it. |
+| <F>--{prefix}elbow_fade_band</F> | `0.15` | Height (m) above the shoulder over which the elbow hint fades out. |
+
+<Note>
+  **Mantis mode** replaces any of these still at their default with `pos_weight 200`, `ori_weight 120`, `manipulability_weight 0`, `self_collision_margin 0.02`, `max_joint_delta 0.05`, `max_iterations 12`. A value you set explicitly still wins.
+</Note>

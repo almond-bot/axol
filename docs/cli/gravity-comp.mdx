@@ -5,7 +5,7 @@ description: "Hold both arms in gravity-compensation mode so you can move them b
 
 Holds both arms in gravity-compensation mode so you can move them by hand. Each *free* arm joint is sent `set_impedance` with `kp=0`, `kd=KD`, and a feedforward torque equal to the URDF-modelled gravity. Joints not in the free set are held rigidly at their current position with their configured `ArmConfig` `kp`/`kd` (still gravity-compensated). The grippers are softly held at their current positions.
 
-This command is configured via draccus — see [Command configuration](/cli/configuration).
+This command is configured via draccus — see [Command configuration](/cli/configuration). The per-joint gains, masses, and stiffness it holds the arms with live on the nested `axol` config (`--axol.left_stiffness`, `--axol.left.elbow.mass`, …), listed in full in [Gravity Compensation Config Parameters](/operations/gravity-comp-config).
 
 | Flag | Description |
 |---|---|

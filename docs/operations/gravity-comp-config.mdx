@@ -1,0 +1,32 @@
+---
+title: "Gravity Compensation Config Parameters"
+sidebarTitle: "Config Parameters"
+description: "Every setting for axol gravity-comp — what it does and its default."
+---
+
+import Robot from "/snippets/config/robot.mdx";
+
+Every setting for `axol gravity-comp`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
+
+```bash
+axol gravity-comp --kd 0.4 --axol.left.elbow.mass 0.3
+```
+
+## General
+
+| Flag | Default | Description |
+|---|---|---|
+| `--left_channel` | `can_alm_axol_l` | CAN interface for the left arm. `null` disables the arm. |
+| `--right_channel` | `can_alm_axol_r` | CAN interface for the right arm. `null` disables the arm. |
+| `--free_joints` | `null` (all) | Joints to gravity-compensate, e.g. `[WRIST_3]` or `[SHOULDER_1,ELBOW]`. Other joints hold rigidly. `null` frees all seven. |
+| `--kd` | `0.25` | Damping (Nm·s/rad) on freed joints. Higher is less floppy. |
+| `--rate_hz` | `250.0` | Control-loop rate (Hz). |
+| `--telemetry_hz` | `500.0` | Motor telemetry rate (Hz). |
+| `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
+| `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
+
+## Robot {#robot}
+
+Arm stiffness, gripper limits, and per-joint gains. The `mass` and `com` values are what gravity comp uses to hold the arm weightless — tune them if an arm sags or pushes back.
+
+<Robot prefix="axol." />

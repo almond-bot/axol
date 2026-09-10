@@ -1,0 +1,90 @@
+---
+title: "Run Policy Config Parameters"
+sidebarTitle: "Config Parameters"
+description: "Every setting for axol run-policy — what it does and its default."
+---
+
+import Robot from "/snippets/config/robot.mdx";
+import LeRobotRobot from "/snippets/config/lerobot-robot.mdx";
+import Cameras from "/snippets/config/cameras.mdx";
+
+Every setting for `axol run-policy`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
+
+```bash
+axol run-policy --policy_path myorg/pick-act --policy_type act --task "pick up the cup" \
+  --robot_config.axol_config.left_stiffness 0.8
+```
+
+<Warning>
+  Stiffness, gripper torque, `observe_torques`, `observe_cartesian`, `fps`, and the camera set must be the **same as in [Data Collection](/operations/data-collection-config)**. A policy only works with the dynamics it was trained on.
+</Warning>
+
+## Policy
+
+| Flag | Default | Description |
+|---|---|---|
+| `--policy_path` | required | Policy checkpoint — a HuggingFace Hub repo id or local path (reachable from the inference server when remote). |
+| `--policy_type` | required | `act`, `smolvla`, `diffusion`, `tdmpc`, `vqbet`, `pi0`, `pi05`, or `groot`. |
+| `--task` | required | Task description sent to the policy and stored with recorded frames. |
+| `--device` | `cuda` | `cuda`, `cpu`, or `mps`. |
+| `--episode_time_s` | `120` | Maximum episode length (s). |
+| `--fps` | `60` | Control rate. Must match the training fps unless `--allow_fps_mismatch true`. |
+| `--allow_fps_mismatch` | `false` | Start even if `fps` differs from the training fps. Experiments only. |
+| `--server_host` | `null` (local) | Address of a remote [`inference-server`](/cli/inference-server). `null` starts one locally. |
+| `--server_port` | `8765` | Inference server port. |
+
+## Action chunking
+
+How the action chunks returned by the policy are stitched into smooth motion.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--actions_per_chunk` | `50` | Actions requested from the policy per call. |
+| `--chunk_size_threshold` | `0.9` | Request the next chunk when the action queue drops below this fraction. |
+| `--aggregate_fn` | `temporal_ensemble` | How overlapping chunks are combined: `temporal_ensemble`, `weighted_average`, `latest_only`, `average`, or `conservative`. |
+| `--temporal_ensemble_coeff` | `0.01` | Weight decay for `temporal_ensemble`. |
+| `--ensemble_blend_s` | `0.2` | Fade (s) at the end of each chunk so the motion doesn't step when a chunk expires. `0` disables. |
+| `--align_fade_s` | `1.0` | Fade (s) over which each new chunk's offset from the current motion is blended in. Removes inference-latency oscillation. `0` disables. |
+| `--exec_max_vel` | `6.283` | Joint speed limit (rad/s) on commands sent to the arms. `0` disables. |
+| `--exec_max_accel` | `21.99` | Joint acceleration limit (rad/s²). `0` disables. |
+
+## Recording
+
+Optional — the rollout is recorded to a dataset when `--repo_id` is set.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--repo_id` | `null` | Dataset id, `<user>/<dataset>`. Set it to record the rollout. |
+| `--vcodec` | per platform | Dataset video codec: `h264` on Jetson, `auto` elsewhere. |
+| `--root` | `null` | Local dataset directory. Default is the LeRobot cache, `~/.cache/huggingface/lerobot`. |
+| `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. |
+| `--rerun_ip` | `null` (off) | Stream live visualisation to a [Rerun](https://rerun.io) viewer at this address. |
+| `--rerun_port` | `9876` | Rerun viewer port. |
+| `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
+| `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
+
+## Contact safety
+
+A contact stop trips when a joint's torque is higher than the gravity model expects — the arm hit something. The arms then go limp instead of pushing through.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--reset_torque_threshold` | `4.0` | Contact stop during return-to-rest (Nm). `0` disables. |
+| `--policy_torque_threshold` | `0` (off) | Contact stop while the policy drives (Nm). A trip aborts the episode. The control panel arms it at `16`. |
+| `--reset_gravity_comp_kd` | `0.25` | Damping (Nm·s/rad) of the limp hold. |
+
+## Robot {#robot-config}
+
+CAN buses, cameras, and what goes into observations.
+
+<LeRobotRobot prefix="robot_config." />
+
+### Cameras {#cameras}
+
+<Cameras prefix="robot_config.cameras." />
+
+### Arm gains {#robot}
+
+Arm stiffness, gripper limits, and per-joint gains.
+
+<Robot prefix="robot_config.axol_config." />

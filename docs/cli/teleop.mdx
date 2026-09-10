@@ -5,7 +5,7 @@ description: "Launch a VR teleoperation session on the robot or simulator."
 
 Launches a VR teleoperation session. When started, the hostname (`.local`) and local IP address are printed — enter either of these in the VR app at [axol.almond.bot](https://axol.almond.bot) to connect.
 
-Runs on the **real robot by default**; pass `--sim` for the browser visualizer. The full robot config is exposed via draccus, so every gain, stiffness, and gripper limit is reachable from the CLI or a config file — see [Command configuration](/cli/configuration).
+Runs on the **real robot by default**; pass `--sim` for the browser visualizer. The full robot config is exposed via draccus, so every gain, stiffness, and gripper limit is reachable from the CLI or a config file — see [Command configuration](/cli/configuration) for the syntax. The table below covers the commonly used flags; every field of the nested `axol`, `teleop`, `kinematics`, `vr_server`, and `cart` configs is listed with its default in [Teleoperation Config Parameters](/operations/teleop-config).
 
 <Tip>
   For a guided, step-by-step walkthrough including the VR controller layout, see the [Teleoperation guide](/operations/teleop).

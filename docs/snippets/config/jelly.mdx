@@ -1,0 +1,23 @@
+export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{children}</code>;
+
+| Flag | Default | Description |
+|---|---|---|
+| <F>--{prefix}enabled</F> | `false` | This robot is on a Jelly. Thumbsticks drive the base, stick clicks run the lift. |
+| <F>--{prefix}channel</F> | `can_alm_axol_b` | CAN interface of the wheel motors. `null` means lift only. |
+| <F>--{prefix}max_speed</F> | `20.0` | Peak wheel speed (rad/s) at full stick. |
+| <F>--{prefix}turn_scale</F> | `1.0` | Rotation speed relative to driving speed, `[0, 1]`. |
+| <F>--{prefix}slew</F> | `0.5` | Acceleration ramp. The default takes 2 s from rest to full speed. |
+| <F>--{prefix}axis_snap_deg</F> | `15.0` | Stick directions within this many degrees of straight or sideways snap to exact. `0` disables. |
+| <F>--{prefix}deadzone</F> | `0.15` | Thumbstick deadzone, as a fraction of full deflection. |
+| <F>--{prefix}imu</F> | `false` | Use the board IMU to hold a straight heading. |
+| <F>--{prefix}yaw_hold_gain</F> | `2.0` | Heading-hold strength. `0` disables. |
+| <F>--{prefix}yaw_hold_max</F> | `0.3` | Maximum heading-hold correction. |
+| <F>--{prefix}yaw_log</F> | `false` | Log heading-hold data at 10 Hz, for diagnosing drift. |
+| <F>--{prefix}hold_kp</F> | `60.0` | Stiffness (Nm/rad) holding the wheels when parked. `0` leaves them idle. |
+| <F>--{prefix}hold_kd</F> | `1.5` | Damping (Nm·s/rad) of the parked hold. |
+| <F>--{prefix}frequency</F> | `50.0` | Wheel command rate (Hz). |
+| <F>--{prefix}command_timeout</F> | `0.2` | Seconds without a stick command before the cart stops. |
+| <F>--{prefix}can_timeout_ms</F> | `200.0` | Motor-side loss-of-comms timeout (ms). Stops the wheels even if the host hangs. |
+| <F>--{prefix}lift</F> | `true` | The lift is present. |
+| <F>--{prefix}lift_channel</F> | `can_alm_axol_c` | CAN interface of the lift controller. |
+| <F>--{prefix}lift_speed</F> | `650` | Lift speed (encoder counts/s). |

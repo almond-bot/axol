@@ -1,0 +1,41 @@
+---
+title: "Control Panel Settings File"
+sidebarTitle: "Settings File"
+description: "What each setting in the control panel's settings.json controls."
+---
+
+The [control panel](/guides/control-panel#settings) stores its settings in `~/.almond/settings.json` on the robot host and applies them to every operation it launches. This page maps each stored key to the config parameter it sets, so you know what you're editing when you **Export** / **Import** that file.
+
+Values set here sit between the built-in defaults and anything you pass on the command line: **defaults → control panel → `--config_path` file → CLI flags**, later wins.
+
+| Panel setting | Sets | Applies to |
+|---|---|---|
+| `robot.left_stiffness` / `robot.right_stiffness` | `left_stiffness` / `right_stiffness` on the [robot config](/operations/teleop-config#robot) | every operation |
+| `robot.left_channel` / `robot.right_channel` | `left_channel` / `right_channel` | every operation, diagnostics dashboard |
+| `robot.has_gripper` | `has_gripper` on the robot config | every operation |
+| `robot.gripper_torque_limit` | `<side>.gripper.torque_limit` on both arms | every operation |
+| `robot.gripper_max_speed` | `<side>.gripper.max_speed` on both arms | every operation |
+| `robot.cart_enabled` | `enabled` on the [Jelly config](/operations/teleop-config#jelly) | teleop, data collection, DAgger |
+| `robot.reset_torque_threshold` | `reset_torque_threshold` | teleop, data collection, DAgger, run policy, replay |
+| `robot.teleop_torque_threshold` | `teleop_torque_threshold` (switch arms it at `16`) | teleop, data collection, DAgger, replay |
+| `robot.policy_torque_threshold` | `policy_torque_threshold` (switch arms it at `16`) | run policy |
+| `robot.gravity_kd` / `robot.gravity_rate_hz` / `robot.gravity_telemetry_hz` | `kd` / `rate_hz` / `telemetry_hz` | gravity comp, waypoints |
+| `teleop.frequency` | `frequency` on the [teleop session](/operations/teleop-config#teleop), and `teleop_hz` on data collection | teleop, data collection, DAgger |
+| `teleop.position_multiplier` / `teleop.rotation_multiplier` | the same keys on the teleop session | teleop, data collection, DAgger |
+| `teleop.hold_to_engage` | `hold_to_engage` on the teleop session | teleop, data collection, DAgger |
+| `teleop.rest_pose_left` / `teleop.rest_pose_right` | the same keys on the teleop session (the **Rest pose** editor) | teleop, data collection, DAgger |
+| `teleop.mantis_source` | `mantis_source` | data collection |
+| `mantis.quest_tracker_key` | `tracker_key` on the teleop session (Quest only) | data collection |
+| `mantis.left_channel` / `mantis.right_channel` | the Mantis grippers' CAN interfaces (default `can_mantis_l` / `can_mantis_r`) | teleop, data collection (Mantis) |
+| `teleop.id` / `teleop.calibration_dir` | `teleop_config.id` / `teleop_config.calibration_dir` | data collection, DAgger |
+| `kinematics.pos_weight` / `ori_weight` / `elbow_weight` / `rest_weight` / `max_joint_delta` | the same keys on the [kinematics config](/operations/teleop-config#kinematics) | teleop, data collection, DAgger |
+| `recording.fps` | `fps` | data collection, DAgger, run policy |
+| `recording.replay_fps` | `fps` | replay |
+| `recording.observe_torques` / `recording.observe_cartesian` | `robot_config.observe_torques` / `robot_config.observe_cartesian` | data collection, DAgger, run policy |
+| `recording.vcodec` / `recording.root` / `recording.push_to_hub` | `vcodec` / `root` / `push_to_hub` | data collection, DAgger, run policy (`root` also replay) |
+| `recording.rerun_ip` / `recording.rerun_port` | `rerun_ip` / `rerun_port` | data collection, DAgger, run policy |
+| `inference.device` / `server_host` / `server_port` / `episode_time_s` / `actions_per_chunk` / `chunk_size_threshold` / `aggregate_fn` / `temporal_ensemble_coeff` | the same [run policy](/operations/run-policy-config) keys | run policy |
+| `system.hardware_profile` | the `mantis` flag (`axol` or `mantis`) | teleop, data collection |
+| `system.log_level` | `log_level` | every operation |
+
+Everything else is under the **Advanced** tab, stored under keys that mirror the config sections: `axol.*` (robot), `vr_teleop.*` (teleop session), `kinematics.*`, `cart.*` (Jelly), `vr_server.*`, and `lerobot.*` (the `robot_config.*` fields). One stored value applies to every operation that has that subsystem.
