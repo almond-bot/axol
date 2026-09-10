@@ -72,6 +72,10 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
         "almond_axol.diagnostics.zed.cable",
         "Verify a ZED camera cable by validating captured frames.",
     ),
+    "diag.base-calibrate": (
+        "almond_axol.diagnostics.base.calibrate",
+        "Calibrate Jelly's per-wheel radii with ZED positional tracking.",
+    ),
     "diag.teleop-jitter": (
         "almond_axol.diagnostics.teleop_jitter",
         "Attribute teleop jitter to a pipeline stage from a flight-recorder "

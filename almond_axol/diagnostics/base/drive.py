@@ -5,7 +5,7 @@ Drive Jelly (x-drive omni base + telescoping lift) with a
 Logitech gamepad.
 
 This is a thin gamepad frontend over :class:`almond_axol.robot.jelly.Jelly`,
-which owns all the control logic (slew limiting, x-drive mixing, the MIT
+which owns all the control logic (ramp limiting, x-drive mixing, the MIT
 park hold, PMAX widening, lift commands) — the same class VR teleop
 drives, so bench behavior and teleop behavior cannot drift apart. See the
 ``jelly`` module docstring for wheel CAN IDs, body-frame conventions, and
@@ -146,7 +146,12 @@ async def _run(args: argparse.Namespace) -> None:
         channel=None if args.no_can else args.channel,
         max_speed=args.max_speed,
         turn_scale=args.turn_scale,
-        slew=args.slew,
+        accel=args.accel,
+        decel=args.decel,
+        jerk=args.jerk,
+        wheel_scale=tuple(args.wheel_scale),
+        traction=args.traction,
+        traction_log=args.traction_log,
         deadzone=args.deadzone,
         hold_kp=args.hold_kp,
         hold_kd=args.hold_kd,
@@ -214,10 +219,47 @@ def main(argv: list[str] | None = None) -> None:
         help="Stick deadzone as a fraction of full deflection (default: 0.12)",
     )
     parser.add_argument(
-        "--slew",
+        "--accel",
         type=float,
-        default=2.0,
-        help="Max change of the normalized body command per second (default: 2)",
+        default=JellyConfig.accel,
+        help="Ramp rate of the normalized command away from zero, full-stick "
+        f"units per second (default: {JellyConfig.accel})",
+    )
+    parser.add_argument(
+        "--decel",
+        type=float,
+        default=JellyConfig.decel,
+        help="Ramp rate toward zero — stops and speed reductions "
+        f"(default: {JellyConfig.decel})",
+    )
+    parser.add_argument(
+        "--jerk",
+        type=float,
+        default=JellyConfig.jerk,
+        help="Limit on the ramp rate's rate of change (S-curve), full-stick "
+        f"units per second²; 0 for a plain trapezoid (default: {JellyConfig.jerk})",
+    )
+    parser.add_argument(
+        "--traction",
+        action=argparse.BooleanOptionalAction,
+        default=JellyConfig.traction,
+        help="Ease the ramp while a wheel has lost the floor, judged from motor "
+        f"torque (default: {JellyConfig.traction})",
+    )
+    parser.add_argument(
+        "--traction-log",
+        action="store_true",
+        help="Log the traction guard per stroke (which wheel went light, how far "
+        "the ramp was eased)",
+    )
+    parser.add_argument(
+        "--wheel-scale",
+        type=float,
+        nargs=4,
+        metavar=("FL", "FR", "BL", "BR"),
+        default=list(JellyConfig.wheel_scale),
+        help="Per-wheel command multipliers compensating effective-radius "
+        "differences, from `axol diag.base-calibrate` (default: 1 1 1 1)",
     )
     parser.add_argument(
         "--hold-kp",

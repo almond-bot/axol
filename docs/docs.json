@@ -140,7 +140,8 @@
                   "cli/diag-teleop-jitter",
                   "cli/diag-offline",
                   "cli/diag-lift-cycle",
-                  "cli/diag-zed-cable"
+                  "cli/diag-zed-cable",
+                  "cli/diag-base-calibrate"
                 ]
               },
               {

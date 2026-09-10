@@ -130,13 +130,22 @@ Individual arms are accessible via `axol.left` and `axol.right` (`AxolArm`), whi
 ## `Jelly`
 
 `Jelly` controls the Jelly mobile base and telescoping lift. `JellyConfig`
-contains its wheel, lift, heading-hold, and command-safety settings.
+contains its wheel, ramp (`accel` / `decel` / `jerk`), traction-guard,
+`wheel_scale`, lift, heading-hold, and command-safety settings.
 
 ```python
 from almond_axol.robot import Jelly, JellyConfig
 
 jelly = Jelly(JellyConfig(enabled=True))
 ```
+
+Wheel control runs in the Rust core; `Jelly` forwards the latched command and
+mirrors the core's status — `body_cmd`, `wheel_speeds`, `wheel_positions`,
+`wheel_velocities`, `wheel_torques`, `traction_scale`, and `await
+jelly.read_wheels()` for a fresh odometry sample. `almond_axol.robot.jelly`
+also exposes `solve_wheel_scale(strokes, lever_m)`, which fits the per-wheel
+radius corrections from tape-measured strokes (the ZED-tracked version is
+[`axol diag.base-calibrate`](/cli/diag-base-calibrate)).
 
 ## `Sim`
 
