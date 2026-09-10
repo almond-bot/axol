@@ -8,8 +8,10 @@ from almond_axol.utils.stall_diag import (
     GcHold,
     StallWatchdog,
     format_thread_stack,
+    freeze_startup_heap,
     install_gc_pause_logger,
     thread_sched_state,
+    unfreeze_heap,
 )
 
 
@@ -194,6 +196,32 @@ class GcToolsTest(unittest.TestCase):
         # Uninstalled: a further collection logs nothing.
         gc.collect()
         self.assertEqual(cap.messages(), [])
+
+    def test_gc_pause_logger_demotes_deliberate_sweeps(self) -> None:
+        # GcHold and the startup freeze already log their own sweep duration;
+        # a WARNING from the pause hook on top of that is noise every episode.
+        logger, cap = _logger("test.gc.deliberate")
+        logger.setLevel(logging.DEBUG)
+        uninstall = install_gc_pause_logger(logger, min_ms=0.0)
+        try:
+            hold = GcHold("take", logger=logger)
+            hold.begin()
+            hold.end()
+            freeze_startup_heap()
+            unfreeze_heap()
+            deliberate = [
+                r for r in cap.records if "paused every thread" in r.getMessage()
+            ]
+            self.assertEqual(len(deliberate), 3)
+            self.assertTrue(all(r.levelno == logging.DEBUG for r in deliberate))
+            cap.records.clear()
+            gc.collect()  # anyone else's collection still warns
+            (record,) = [
+                r for r in cap.records if "paused every thread" in r.getMessage()
+            ]
+            self.assertEqual(record.levelno, logging.WARNING)
+        finally:
+            uninstall()
 
     def test_gc_hold_disables_and_restores_collection(self) -> None:
         logger, cap = _logger("test.gc.hold")

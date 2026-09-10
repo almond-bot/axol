@@ -3072,7 +3072,6 @@ def _finalize_dataset(
     mid-finalize — the main way datasets got corrupted — so nothing
     session-length-proportional is allowed here.
     """
-    from lerobot.utils.utils import log_say
 
     try:
         _close_dataset_writers(dataset)
@@ -3097,7 +3096,9 @@ def _finalize_dataset(
         else:
             try:
                 shutil.rmtree(dataset_root)
-                log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
+                _logger.info(
+                    f"No episodes saved — removed empty dataset at {dataset_root}."
+                )
             except OSError as exc:
                 _logger.warning(
                     "Failed to remove empty dataset at %s: %s", dataset_root, exc
@@ -3517,7 +3518,12 @@ def _recorder_main(
     # control loop's cores; fall back to a positive nice where affinity isn't
     # available so it still never preempts the control loop / IK.
     from ..utils import affinity
-    from ..utils.stall_diag import GcHold, StallWatchdog, install_gc_pause_logger
+    from ..utils.stall_diag import (
+        GcHold,
+        StallWatchdog,
+        freeze_startup_heap,
+        install_gc_pause_logger,
+    )
 
     if not affinity.pin_background():
         try:
@@ -3531,7 +3537,12 @@ def _recorder_main(
     # the gc hook names a stop-the-world collection if that is what paused it.
     # Cyclic GC is held for the whole take (the per-row dicts/arrays are freed
     # by refcount anyway) and swept between episodes, as the relay and
-    # run-policy already do for the same measured reason.
+    # run-policy already do for the same measured reason. The sweep runs after
+    # the take's reply has gone out (see the command loop), and the permanent
+    # startup heap is frozen out of its reach once the dataset is open — the
+    # same discipline collect-data applies to the control process. Unfrozen,
+    # each sweep here traversed lerobot/torch and took 0.7-1.0 s per episode,
+    # all of it on the operator's record-start / return-to-rest path.
     uninstall_gc_log = install_gc_pause_logger(_logger)
     gc_hold = GcHold("recorder take", _logger)
     watchdog: StallWatchdog | None = None
@@ -3632,6 +3643,10 @@ def _recorder_main(
         dataset = _open_dataset(config)
         verifier = _EpisodeVideoVerifier(config["dataset_root"])
         conn.send(("ready", dataset.num_episodes))
+        _logger.info(
+            "gc: froze %d startup objects out of the collector's reach",
+            freeze_startup_heap(),
+        )
     except BaseException as startup_error:
         _rollback_recorder_startup(
             cameras=cameras,
@@ -3691,14 +3706,21 @@ def _recorder_main(
             _log_capture_quality(
                 capture_quality, frame_counter["n"], cameras, capture_error["v"]
             )
-        # The take is over: sweep the garbage deferred during it now, while
-        # nothing time-critical runs in this process.
-        gc_hold.end()
+        # The take's deferred garbage is swept at the top of the command loop,
+        # once this command's reply has gone out (see there).
         # Nothing records now: let the previous episode's verify continue.
         verifier.resume()
 
     try:
         while True:
+            # A take just ended and its reply (finished / saved / error /
+            # cancelled) is already on the wire: sweep the garbage deferred
+            # during it now, before blocking on the next command. Nothing
+            # time-critical runs in this process here, and the control process
+            # is not waiting on us — it has started the guarded return to
+            # rest, which the save it sends next overlaps anyway.
+            if gc_hold.held and thread is None:
+                gc_hold.end()
             try:
                 msg = conn.recv()
             except (EOFError, KeyboardInterrupt):
@@ -3728,7 +3750,10 @@ def _recorder_main(
 
                 reset_dropped_frames()
                 stop = threading.Event()
-                gc_hold.begin()
+                # No up-front sweep: the previous take's garbage was swept
+                # after its reply, and a full collection here would sit on
+                # the operator's record-start path (0.7 s measured unfrozen).
+                gc_hold.begin(collect=False)
                 watchdog = StallWatchdog(
                     "recorder capture row", _CAPTURE_ROW_STALL_S, logger=_logger
                 )
@@ -3903,9 +3928,11 @@ def _recorder_main(
                         )
                         verifier.submit(episode_row)
                         if capture_repairs:
+                            # 1-based like the operator-facing "Saved episode
+                            # N" line and the headset HUD, so the two agree.
                             _logger.warning(
                                 "saved episode %d with camera-gap repair(s): %s",
-                                dataset.num_episodes - 1,
+                                dataset.num_episodes,
                                 ", ".join(
                                     f"{event['camera']}@row "
                                     f"{event['frame_index']}="

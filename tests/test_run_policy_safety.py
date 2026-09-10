@@ -276,7 +276,9 @@ class RunPolicySafetyTest(unittest.TestCase):
                 restore = stack.enter_context(
                     mock.patch.object(run_policy, "restore_dataset_ownership")
                 )
-                log_say = stack.enter_context(mock.patch("lerobot.utils.utils.log_say"))
+                announced = stack.enter_context(
+                    mock.patch.object(run_policy._logger, "info")  # noqa: SLF001
+                )
                 stack.enter_context(mock.patch("signal.signal"))
                 raised = stack.enter_context(
                     self.assertRaisesRegex(
@@ -301,7 +303,7 @@ class RunPolicySafetyTest(unittest.TestCase):
         self.assertFalse(
             any(
                 args and str(args[0]).startswith("Saved episode")
-                for args, _ in log_say.call_args_list
+                for args, _ in announced.call_args_list
             )
         )
         restore.assert_not_called()

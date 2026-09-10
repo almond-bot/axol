@@ -267,6 +267,18 @@ class _Capture:
     double emission. The redirect is installed before the op spawns its children
     so they inherit the pipe; if it can't be set up we fall back to Python-only
     capture (the prior behaviour).
+
+    ``logging`` records get the same guarantee. A root ``StreamHandler`` that
+    predates the op (a ``basicConfig()`` at import time, as the axol_pi wrapper
+    does) holds the *original* fd-2 stream object — which the redirect has just
+    pointed at the pipe — so every record it wrote reached the session twice:
+    raw via the pipe and formatted via :class:`_SessionLogHandler`. Such
+    handlers are rebound to the saved terminal-only stream for the op's
+    lifetime and restored afterwards. Conversely an op that calls
+    ``basicConfig(force=True)`` (this package's CLIs) replaces the root
+    handlers with one bound to the current ``sys.stderr`` — the tee — which
+    would keep feeding the finished session after the op; ``__exit__`` moves it
+    to the restored real stream.
     """
 
     def __init__(self, session: Session, level: int) -> None:
@@ -282,6 +294,11 @@ class _Capture:
         self._saved_out: Any = None
         self._saved_err: Any = None
         self._reader: threading.Thread | None = None
+        # The tees installed as sys.stdout/sys.stderr for the op's lifetime.
+        self._tee_out: _StreamTee | None = None
+        self._tee_err: _StreamTee | None = None
+        # Root StreamHandlers moved off fd 1/2 for the op, with their streams.
+        self._rebound: list[tuple[logging.StreamHandler, Any]] = []
 
     def __enter__(self) -> _Capture:
         sink = self._session.emit
@@ -301,9 +318,62 @@ class _Capture:
                 "fd-level log capture unavailable; native/child-process output "
                 "won't reach the UI log"
             )
-            sys.stdout = _StreamTee(self._old_stdout, sink)
-            sys.stderr = _StreamTee(self._old_stderr, sink)
+            self._tee_out = _StreamTee(self._old_stdout, sink)
+            self._tee_err = _StreamTee(self._old_stderr, sink)
+            sys.stdout, sys.stderr = self._tee_out, self._tee_err
         return self
+
+    @staticmethod
+    def _stream_fd(stream: Any) -> int | None:
+        try:
+            return int(stream.fileno())
+        except Exception:  # noqa: BLE001 - not a real file (tee, StringIO, closed)
+            return None
+
+    def _rebind_fd_handlers(self) -> None:
+        """Point root StreamHandlers on fd 1/2 at the saved terminal-only streams.
+
+        Their records already reach the session once, formatted, through
+        :class:`_SessionLogHandler`; through the redirected fd they would
+        arrive a second time as raw text.
+        """
+        for handler in list(logging.getLogger().handlers):
+            if not isinstance(handler, logging.StreamHandler):
+                continue
+            stream = getattr(handler, "stream", None)
+            if stream is None or isinstance(stream, _StreamTee):
+                continue
+            fd = self._stream_fd(stream)
+            if stream is self._old_stderr or fd == 2:
+                target = self._saved_err
+            elif stream is self._old_stdout or fd == 1:
+                target = self._saved_out
+            else:
+                continue
+            if target is None:
+                continue
+            self._rebound.append((handler, handler.setStream(target)))
+
+    def _restore_handlers(self) -> None:
+        """Undo :meth:`_rebind_fd_handlers`; move tee-bound handlers to the real streams."""
+        for handler, previous in self._rebound:
+            try:
+                handler.setStream(previous)
+            except Exception:  # noqa: BLE001
+                pass
+        self._rebound = []
+        # An op's basicConfig(force=True) installed a handler on the tee. The
+        # tee's terminal side is about to be closed and its session is over,
+        # so let the handler keep logging to the real terminal/journald.
+        for handler in list(logging.getLogger().handlers):
+            if not isinstance(handler, logging.StreamHandler):
+                continue
+            stream = getattr(handler, "stream", None)
+            if stream is self._tee_err:
+                handler.setStream(sys.stderr)
+            elif stream is self._tee_out:
+                handler.setStream(sys.stdout)
+        self._tee_out = self._tee_err = None
 
     def _install_fd_tee(self, sink: Any) -> None:
         # Save the real fds so we can keep echoing to the terminal/journald and
@@ -331,8 +401,10 @@ class _Capture:
         # print/log line isn't captured twice. closefd=False: we own the fds.
         self._saved_out = os.fdopen(self._saved_out_fd, "w", buffering=1, closefd=False)
         self._saved_err = os.fdopen(self._saved_err_fd, "w", buffering=1, closefd=False)
-        sys.stdout = _StreamTee(self._saved_out, sink)
-        sys.stderr = _StreamTee(self._saved_err, sink)
+        self._tee_out = _StreamTee(self._saved_out, sink)
+        self._tee_err = _StreamTee(self._saved_err, sink)
+        sys.stdout, sys.stderr = self._tee_out, self._tee_err
+        self._rebind_fd_handlers()
 
     @staticmethod
     def _drain_pipe(pipe_r: int, echo_fd: int, sink: Any) -> None:
@@ -371,6 +443,8 @@ class _Capture:
             root.removeHandler(self._handler)
         if self._old_root_level is not None:
             root.setLevel(self._old_root_level)
+        # Before the saved streams close below: handlers must not be left on them.
+        self._restore_handlers()
         self._teardown_fd_tee()
 
     def _teardown_fd_tee(self) -> None:

@@ -10,7 +10,7 @@ Episode boundaries are driven by VR controller commands:
 
 and/or, when launched from the web control panel (``axol serve``), by episode
 commands pushed through :class:`_QueueCollectControl` (``POST
-/api/op/episode``): ``start`` begins recording after a spoken 3-second
+/api/op/episode``): ``start`` begins recording after a logged 3-second
 countdown, ``s`` terminates + saves, ``r`` discards + re-records, ``q`` quits
 the session. Both sources are live at once — either can start or end an
 episode.
@@ -661,7 +661,7 @@ class CollectDataConfig:
     # re-engage (frame shift), over five percent frozen-TCP frames, or over one
     # percent disengaged
     # frames (see evaluate_episode_qa): the episode is discarded and
-    # re-recorded with a loud spoken/logged explanation. Set false as an
+    # re-recorded with a loud logged explanation. Set false as an
     # escape hatch (debugging the gate, or deliberately recording unusual
     # sessions) — the per-episode QA summary is still logged, the bad episode
     # is just saved anyway. Only Mantis episodes can fail the gate; on-robot
@@ -999,7 +999,7 @@ def main(argv: list[str]) -> None:
             cfg = parse(CollectDataConfig, argv, fallback_overlay=fallback)
     # force=True: importing lerobot (at module load) installs a root handler
     # and leaves the root level at WARNING, which would otherwise make this a
-    # no-op and silently drop every log_say() status line.
+    # no-op and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
     # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled
@@ -1147,7 +1147,6 @@ def _run_session(
     from lerobot.processor import make_default_processors
     from lerobot.teleoperators.utils import TeleopEvents
     from lerobot.utils.constants import HF_LEROBOT_HOME
-    from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun
 
     from ..lerobot.robot.robot_axol import _LEFT_EE_KEYS, _RIGHT_EE_KEYS, AxolRobot
@@ -1428,7 +1427,7 @@ def _run_session(
             # hard-stop calibration), then drop torque again, so the jaws are
             # already wide when the first take starts instead of finishing
             # their sweep in-shot. See _preopen_mantis_grippers.
-            _preopen_mantis_grippers(robot, stop_event, log_say)
+            _preopen_mantis_grippers(robot, stop_event, _logger.info)
 
         # The dataset lives in the recorder (subprocess or in-process), not here.
         # Its features come from the robot's joint features + the camera image
@@ -1544,7 +1543,7 @@ def _run_session(
             make_default_processors()
         )
         if is_complete:
-            log_say(f"Resuming existing dataset at {dataset_root}.")
+            _logger.info(f"Resuming existing dataset at {dataset_root}.")
         if use_relay:
             recorder: DatasetRecorderProcess | InProcessRecorder = (
                 DatasetRecorderProcess(
@@ -1990,7 +1989,7 @@ def _run_session(
                     missing = ", ".join(
                         side for side, live in tracking.items() if not live
                     )
-                    log_say(
+                    _logger.info(
                         "Cannot start recording: live tracking is missing for "
                         f"{missing}. Restore visibility/SLAM tracking and try again."
                     )
@@ -2000,7 +1999,7 @@ def _run_session(
                     missing = ", ".join(
                         side for side, live in triggers.items() if not live
                     )
-                    log_say(
+                    _logger.info(
                         "Cannot start recording: the Mantis trigger heartbeat is "
                         f"missing for {missing}. Restore the CAN connection, "
                         "release both triggers, re-align, and try again."
@@ -2009,13 +2008,13 @@ def _run_session(
                 if not teleop.is_engaged():
                     # Reachable from the control panel's Start button: the
                     # trigger start gesture engages before it opens the take.
-                    log_say(
+                    _logger.info(
                         "Cannot start recording: Mantis is not engaged. Squeeze "
                         "both triggers together, then release both, to engage "
                         "and start recording."
                     )
                     return False
-                log_say("Preparing Mantis grippers.")
+                _logger.info("Preparing Mantis grippers.")
                 enable_task = asyncio.create_task(robot.enable_grippers_async())
                 while not enable_task.done() and not _stopped():
                     await asyncio.sleep(0.05)
@@ -2053,7 +2052,7 @@ def _run_session(
                         failures.append("Mantis disengaged")
                     await robot.disable_grippers_async()
                     _note_ready(episode_idx + 1)
-                    log_say(
+                    _logger.info(
                         "Cannot start recording: "
                         + "; ".join(failures)
                         + " while the grippers were preparing. Restore both "
@@ -2092,7 +2091,7 @@ def _run_session(
             capture_checked = False
             was_engaged = teleop.is_engaged()
             control.note_recording()
-            log_say("Recording started.")
+            _logger.info("Recording started.")
             # Reflect the recording state on the headset HUD (no-op for the
             # VR-initiated start, where the headset already switched itself).
             teleop.send_feedback_state(VRState.RECORDING)
@@ -2156,7 +2155,7 @@ def _run_session(
                     _logger.warning("capture health check failed: %s", exc)
                     rows = -1
                 if rows == 0:
-                    log_say(
+                    _logger.info(
                         "WARNING: recording for 2 seconds but the recorder "
                         "has captured zero rows — check the cameras and the "
                         "recorder log."
@@ -2176,13 +2175,13 @@ def _run_session(
                 if pending_start is None:
                     pending_start = time.perf_counter() + _PANEL_START_COUNTDOWN_S
                     control.note_countdown(pending_start)
-                    log_say(
+                    _logger.info(
                         f"Recording starts in {_PANEL_START_COUNTDOWN_S:.0f} seconds."
                     )
                 else:
                     pending_start = None
                     _note_ready(episode_idx + 1)
-                    log_say("Recording start cancelled.")
+                    _logger.info("Recording start cancelled.")
             start_requested = events.get("start_recording") or (
                 pending_start is not None and time.perf_counter() >= pending_start
             )
@@ -2218,9 +2217,9 @@ def _run_session(
                 break
             if events[TeleopEvents.TERMINATE_EPISODE]:
                 if events.get(TeleopEvents.FAILURE):
-                    log_say("Episode ended as failure.")
+                    _logger.info("Episode ended as failure.")
                 else:
-                    log_say("Episode ended successfully.")
+                    _logger.info("Episode ended successfully.")
                     # A trigger-gesture end names when the first click began;
                     # the recorder cuts the take there (see stop_capture).
                     stats.end_t_host = events.get("episode_end_t_host")
@@ -2311,7 +2310,7 @@ def _run_session(
             teleop.request_reset()
         elif events.get("start_recording") or panel_cmd == "start":
             teleop.send_feedback_state(VRState.DATA_COLLECTION)
-            log_say("Press reset to return to rest before recording.")
+            _logger.info("Press reset to return to rest before recording.")
         if teleop.reset_pending:
             # Latched, from either input — the hold exits on the next cycle
             # and replans, so stop offering the panel a button for it.
@@ -2326,14 +2325,14 @@ def _run_session(
             reset_command_state=robot.reset_command_state,
             get_positions=lambda: robot.positions,
             stopped=_stopped,
-            announce=log_say,
+            announce=_logger.info,
             on_contact=_guard_on_contact,
             hold_tick=_guard_hold_tick,
         )
 
     async def _return_home_loop() -> None:
         """Post-episode return: request the reset, then play it guarded."""
-        log_say("Returning to rest pose.")
+        _logger.info("Returning to rest pose.")
         robot.set_control_trace_active(True)
         try:
             teleop.request_reset()
@@ -2355,7 +2354,7 @@ def _run_session(
                 reset_command_state=robot.reset_command_state,
                 get_positions=lambda: robot.positions,
                 stopped=_stopped,
-                announce=log_say,
+                announce=_logger.info,
                 on_contact=_guard_on_contact,
                 hold_tick=_guard_hold_tick,
             )
@@ -2425,7 +2424,7 @@ def _run_session(
         """Save or discard the just-ended episode and announce the result."""
         nonlocal episodes_recorded
         if capture_failure is not None:
-            log_say(
+            _logger.info(
                 f"Episode discarded because camera capture failed: {capture_failure}"
             )
             # finish_episode already joined capture and cleared the rejected
@@ -2434,17 +2433,17 @@ def _run_session(
             # poll before its finish reply carries the same rejection.
             _discard_episode()
         elif rerecord:
-            log_say("Re-recording episode.")
+            _logger.info("Re-recording episode.")
             if recording:
                 _discard_episode()
         elif recording and captured_rows == 0:
             # An operator can end the take before the encoded readers have
             # produced row zero.  That is a valid empty take, not a session
             # failure; LeRobot's save_episode intentionally rejects it.
-            log_say("No frames were captured this episode; discarding.")
+            _logger.info("No frames were captured this episode; discarding.")
             _discard_episode()
         elif recording:
-            log_say("Saving episode…")
+            _logger.info("Saving episode…")
             try:
                 recorder.save_episode()
             except RecorderDatasetSaveError:
@@ -2458,7 +2457,7 @@ def _run_session(
                 # up like collect-dagger does instead of tearing everything
                 # down over one lost episode. Durability failures are a
                 # different type (EpisodeDurabilityError) and still unwind.
-                log_say(f"Episode NOT saved: {exc}")
+                _logger.info(f"Episode NOT saved: {exc}")
                 return
             # The serve unit records as root into the operator's home; hand the
             # tree back after every save so a crash never leaves a root-owned
@@ -2466,12 +2465,12 @@ def _run_session(
             restore_dataset_ownership(dataset_root)
             episodes_recorded += 1
             control.note_saved()
-            log_say(
+            _logger.info(
                 f"Saved episode {recorder.episode_count()} "
                 f"({episodes_recorded} this session)."
             )
         else:
-            log_say("Episode ended before recording started, skipping.")
+            _logger.info("Episode ended before recording started, skipping.")
 
     session_error: BaseException | None = None
     try:
@@ -2492,7 +2491,7 @@ def _run_session(
             # gets the same readout (plus the Start button) through the
             # control's snapshot.
             teleop.send_feedback_episode(episode_idx + 1)
-            log_say(_note_ready(episode_idx + 1))
+            _logger.info(_note_ready(episode_idx + 1))
 
             try:
                 (
@@ -2525,7 +2524,7 @@ def _run_session(
                 # then run the limp hold + guarded return on the robot loop.
                 if recording:
                     _discard_episode()
-                    log_say("Episode discarded (contact).")
+                    _logger.info("Episode discarded (contact).")
                 _run_on_robot_loop(_contact_hold_loop())
                 # Drain VR events fired during the hold/return, then unblock
                 # the headset for the next take.
@@ -2541,14 +2540,14 @@ def _run_session(
             # the same episode again instead of tearing down robot control.
             if recording and not rerecord and capture_failure is None:
                 if captured_rows == 0 and qa.end_t_host is not None:
-                    log_say(
+                    _logger.info(
                         "Episode has no dataset rows before the end gesture "
                         "began — it was ended as soon as it started. Discarding "
                         "and re-recording."
                     )
                     rerecord = True
                 elif captured_rows == 0:
-                    log_say(
+                    _logger.info(
                         "Episode captured no dataset rows — it ended before the "
                         "first camera frame arrived. Discarding and re-recording."
                     )
@@ -2585,7 +2584,7 @@ def _run_session(
                 )
                 if not qa_ok and not rerecord and capture_failure is None:
                     if cfg.qa_gate:
-                        log_say(
+                        _logger.info(
                             "Episode REJECTED by the quality gate — "
                             "discarding and re-recording. " + " ".join(qa_reasons)
                         )
@@ -2648,7 +2647,7 @@ def _run_session(
             )
         raise
     finally:
-        log_say("Stopping.")
+        _logger.info("Stopping.")
 
         cleanup_failures: list[tuple[str, BaseException]] = []
 
