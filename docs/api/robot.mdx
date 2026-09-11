@@ -26,10 +26,15 @@ Pass `left_channel=None` or `right_channel=None` to operate a single arm. Both a
 
 `left_joints` / `right_joints` restrict an arm to the motors actually on its bus, for a partial bench arm (e.g. `{Joint.WRIST_2, Joint.WRIST_3, Joint.GRIPPER}` for a wrist assembly). Absent joints are never constructed or enabled; every `(8,)` array keeps its Joint-enum shape, with absent joints reading `0.0` (the rest pose) and their commands ignored.
 
+<Note>
+The realtime core is the default for the CLI — `axol teleop`, `axol gravity-comp`, `axol waypoints`, and the control panel all construct `RtAxol` for you. When you drive the robot from your own Python, opting in is explicit: wrap the low-level object as `RtAxol(Axol())`. A bare `Axol` still works, but it sends CAN from Python on the caller's schedule — use it for calibration and diagnostics, not for motion.
+</Note>
+
 ```python
 import asyncio
 import numpy as np
 from almond_axol.robot import Axol
+from almond_axol.rt import RtAxol
 
 async def main():
     async with RtAxol(Axol()) as axol:
