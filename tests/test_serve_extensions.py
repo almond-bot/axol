@@ -35,9 +35,9 @@ def _add_page_route(app: FastAPI) -> None:
 
 class PanelPageTest(unittest.TestCase):
     def test_validates_path(self) -> None:
-        PanelPage("Finetuning", "/finetune")
-        PanelPage("Nested", "/tools/finetune?tab=runs")
-        for bad in ("finetune", "//evil.example", "/api/finetune", "http://x/y", ""):
+        PanelPage("Datasets", "/datasets")
+        PanelPage("Nested", "/tools/datasets?tab=recent")
+        for bad in ("datasets", "//evil.example", "/api/datasets", "http://x/y", ""):
             with self.subTest(path=bad):
                 with self.assertRaises(ValueError):
                     PanelPage("x", bad)
@@ -46,12 +46,16 @@ class PanelPageTest(unittest.TestCase):
 
     def test_to_dict_omits_empty_description(self) -> None:
         self.assertEqual(
-            PanelPage("Finetuning", "/finetune").to_dict(),
-            {"label": "Finetuning", "path": "/finetune"},
+            PanelPage("Datasets", "/datasets").to_dict(),
+            {"label": "Datasets", "path": "/datasets"},
         )
         self.assertEqual(
-            PanelPage("Finetuning", "/finetune", "Train on Pi").to_dict(),
-            {"label": "Finetuning", "path": "/finetune", "description": "Train on Pi"},
+            PanelPage("Datasets", "/datasets", "Browse recorded datasets").to_dict(),
+            {
+                "label": "Datasets",
+                "path": "/datasets",
+                "description": "Browse recorded datasets",
+            },
         )
 
 

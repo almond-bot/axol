@@ -13,7 +13,7 @@
 export interface ServerPage {
   /** Navigation text. */
   label: string
-  /** Absolute path on the backend origin, e.g. "/finetune". */
+  /** Absolute path on the backend origin, e.g. "/datasets". */
   path: string
   /** Optional hover text. */
   description?: string

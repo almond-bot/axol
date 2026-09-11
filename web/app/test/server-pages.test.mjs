@@ -4,11 +4,11 @@ import test from "node:test"
 import { isAbsolutePagePath, normalizeServerPages, serverPageUrl } from "../src/lib/server-pages.ts"
 
 test("only absolute, non-API paths count as backend pages", () => {
-  assert.equal(isAbsolutePagePath("/finetune"), true)
+  assert.equal(isAbsolutePagePath("/datasets"), true)
   assert.equal(isAbsolutePagePath("/tools/x?tab=1"), true)
-  assert.equal(isAbsolutePagePath("finetune"), false)
+  assert.equal(isAbsolutePagePath("datasets"), false)
   assert.equal(isAbsolutePagePath("//evil.example/x"), false)
-  assert.equal(isAbsolutePagePath("/api/finetuning"), false)
+  assert.equal(isAbsolutePagePath("/api/datasets"), false)
 })
 
 test("the /api/info pages field is validated and de-duplicated", () => {
@@ -16,8 +16,8 @@ test("the /api/info pages field is validated and de-duplicated", () => {
   assert.deepEqual(normalizeServerPages("nope"), [])
   assert.deepEqual(
     normalizeServerPages([
-      { label: " Finetuning ", path: "/finetune", description: " Train on Pi " },
-      { label: "Dup", path: "/finetune" },
+      { label: " Datasets ", path: "/datasets", description: " Browse recorded datasets " },
+      { label: "Dup", path: "/datasets" },
       { label: "", path: "/blank" },
       { label: "Relative", path: "x" },
       { label: "API", path: "/api/x" },
@@ -25,20 +25,20 @@ test("the /api/info pages field is validated and de-duplicated", () => {
       { label: "Plain", path: "/plain", description: 3 },
     ]),
     [
-      { label: "Finetuning", path: "/finetune", description: "Train on Pi" },
+      { label: "Datasets", path: "/datasets", description: "Browse recorded datasets" },
       { label: "Plain", path: "/plain" },
     ]
   )
 })
 
 test("page hrefs stay relative on the backend's own origin and absolute elsewhere", () => {
-  assert.equal(serverPageUrl("", "/finetune"), "/finetune")
+  assert.equal(serverPageUrl("", "/datasets"), "/datasets")
   assert.equal(
-    serverPageUrl("https://192.168.1.20:8001", "/finetune"),
-    "https://192.168.1.20:8001/finetune"
+    serverPageUrl("https://192.168.1.20:8001", "/datasets"),
+    "https://192.168.1.20:8001/datasets"
   )
   assert.equal(
-    serverPageUrl("https://station.local:8001/", "/finetune"),
-    "https://station.local:8001/finetune"
+    serverPageUrl("https://station.local:8001/", "/datasets"),
+    "https://station.local:8001/datasets"
   )
 })

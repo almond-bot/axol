@@ -38,7 +38,7 @@ _PATH_RE = re.compile(r"^/[A-Za-z0-9._~%!$&'()*+,;=:@/?#-]*$")
 class PanelPage:
     """A backend-served page the web panel links to.
 
-    ``path`` is absolute on the backend origin (``/finetune``); ``label`` is the
+    ``path`` is absolute on the backend origin (``/datasets``); ``label`` is the
     navigation text. ``description`` is optional hover text.
     """
 
@@ -52,7 +52,7 @@ class PanelPage:
         if not _PATH_RE.fullmatch(self.path) or self.path.startswith("//"):
             raise ValueError(
                 f"PanelPage.path must be an absolute path on the backend "
-                f"(e.g. '/finetune'), got {self.path!r}"
+                f"(e.g. '/datasets'), got {self.path!r}"
             )
         if self.path.startswith("/api/"):
             raise ValueError("PanelPage.path must not live under /api/")
