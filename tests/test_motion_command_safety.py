@@ -16,7 +16,7 @@ from almond_axol.lerobot.teleop.teleop_vr import AxolVRTeleop
 from almond_axol.motor import ControlMode, Joint, MotorError
 from almond_axol.motor.damiao import _float_to_uint as damiao_float_to_uint
 from almond_axol.motor.myactuator import _float_to_uint as myactuator_float_to_uint
-from almond_axol.robot.axol import Axol, AxolArm
+from almond_axol.robot.axol import AxolArm, AxolHardware
 from almond_axol.robot.base import (
     HardwareCleanupError,
     RobotBase,
@@ -41,7 +41,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             patch("almond_axol.robot.axol.CanBus") as can_bus,
             self.assertRaisesRegex(ValueError, "different CAN interfaces"),
         ):
-            Axol(left_channel="can-shared", right_channel="can-shared")
+            AxolHardware(left_channel="can-shared", right_channel="can-shared")
 
         can_bus.assert_not_called()
 
@@ -62,7 +62,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             sibling_started.set()
             await release_sibling.wait()
 
-        robot = object.__new__(Axol)
+        robot = object.__new__(AxolHardware)
         robot.connect = AsyncMock()
         robot.left = SimpleNamespace(
             _prepare_enable_state=AsyncMock(return_value=([], [])),
@@ -117,7 +117,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             reset_command_state=Mock(),
             motors={Joint.GRIPPER: right_cold},
         )
-        robot = object.__new__(Axol)
+        robot = object.__new__(AxolHardware)
         robot.connect = AsyncMock()
         robot.left = left
         robot.right = right
@@ -170,7 +170,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             disable=AsyncMock(),
             motors={},
         )
-        robot = object.__new__(Axol)
+        robot = object.__new__(AxolHardware)
         robot.connect = AsyncMock()
         robot.left = left
         robot.right = right
@@ -226,7 +226,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             stop_telemetry=AsyncMock(side_effect=stop_right),
             disable=AsyncMock(),
         )
-        robot = object.__new__(Axol)
+        robot = object.__new__(AxolHardware)
         robot.left = left
         robot.right = right
         robot._left_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
@@ -283,7 +283,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             disable=AsyncMock(),
             motors={},
         )
-        robot = object.__new__(Axol)
+        robot = object.__new__(AxolHardware)
         robot.connect = AsyncMock()
         robot.left = left
         robot.right = right
@@ -335,7 +335,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             disable=AsyncMock(),
             motors={Joint.GRIPPER: cold_motor},
         )
-        robot = object.__new__(Axol)
+        robot = object.__new__(AxolHardware)
         robot.connect = AsyncMock()
         robot.left = left
         robot.right = right
@@ -372,7 +372,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             disable=AsyncMock(side_effect=[disable_error, None]),
         )
         right = SimpleNamespace(stop_telemetry=AsyncMock(), disable=AsyncMock())
-        robot = object.__new__(Axol)
+        robot = object.__new__(AxolHardware)
         robot.left = left
         robot.right = right
         robot._left_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
@@ -414,7 +414,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             sibling_started.set()
             await release_sibling.wait()
 
-        robot = object.__new__(Axol)
+        robot = object.__new__(AxolHardware)
         robot.left = SimpleNamespace(motion_control=fail_motion)
         robot.right = SimpleNamespace(motion_control=blocked_motion)
         target = np.zeros(len(Joint), dtype=np.float32)
@@ -466,7 +466,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
             sibling_started.set()
             await release_sibling.wait()
 
-        robot = object.__new__(Axol)
+        robot = object.__new__(AxolHardware)
         robot._shutdown_pending = False
         robot.left = SimpleNamespace(stop_telemetry=fail_stop)
         robot.right = SimpleNamespace(stop_telemetry=blocked_stop)
@@ -724,7 +724,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         bad = good.copy()
         bad[3] = np.nan
 
-        for robot_type in (Axol, Mantis):
+        for robot_type in (AxolHardware, Mantis):
             with self.subTest(robot=robot_type.__name__):
                 robot = object.__new__(robot_type)
                 robot.left = _RecordingArm()
@@ -958,7 +958,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         # power cut, so disable() must not excuse it as unpowered.
         left_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
         right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
-        robot = object.__new__(Axol)
+        robot = object.__new__(AxolHardware)
         robot.left = left
         robot.right = right
         robot._left_bus = left_bus
@@ -990,7 +990,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         right = SimpleNamespace(stop_telemetry=AsyncMock(), disable=AsyncMock())
         left_bus = SimpleNamespace(close=AsyncMock(side_effect=[close_error, None]))
         right_bus = SimpleNamespace(close=AsyncMock(), stalled=False)
-        robot = object.__new__(Axol)
+        robot = object.__new__(AxolHardware)
         robot.left = left
         robot.right = right
         robot._left_bus = left_bus

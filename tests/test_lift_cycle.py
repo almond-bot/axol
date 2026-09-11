@@ -140,10 +140,15 @@ class FakeAxol:
 
 
 class FakeRtAxol:
-    """Stand-in for the realtime-core wrapper the diagnostic drives."""
+    """Stand-in for the realtime-core ``Axol`` the diagnostic drives.
+
+    Built the way the diagnostic builds the real one — from config and
+    channels — and exposing the low-level object as ``hardware``.
+    """
 
     def __init__(self, inner: FakeAxol) -> None:
         self.inner = inner
+        self.hardware = inner
         self._events = inner._events
         self.left = inner.left
         self.right = inner.right
@@ -718,6 +723,15 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
                 )
             return fake_axol
 
+        def make_robot(*, config, left_channel, right_channel):  # noqa: ANN001, ANN202
+            return FakeRtAxol(
+                make_axol(
+                    config=config,
+                    left_channel=left_channel,
+                    right_channel=right_channel,
+                )
+            )
+
         async def ramp(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
             events.append("arms.ramp")
             assert fake_axol is not None
@@ -744,8 +758,7 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
         output = stdout if stdout is not None else io.StringIO()
         with (
             patch.object(cycle, "_open_lift", AsyncMock(return_value=lift)),
-            patch.object(cycle, "Axol", side_effect=make_axol),
-            patch.object(cycle, "RtAxol", side_effect=FakeRtAxol),
+            patch.object(cycle, "Axol", side_effect=make_robot),
             patch.object(cycle, "interrupt_event", _interrupt_context),
             patch.object(
                 cycle, "_wait_for_position_save", AsyncMock(return_value=initial)
@@ -852,6 +865,15 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
                 events=events,
             )
 
+        def make_robot(*, config, left_channel, right_channel):  # noqa: ANN001, ANN202
+            return FakeRtAxol(
+                make_axol(
+                    config=config,
+                    left_channel=left_channel,
+                    right_channel=right_channel,
+                )
+            )
+
         ramp_calls = 0
 
         async def ramp(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
@@ -866,8 +888,7 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
         stderr = io.StringIO()
         with (
             patch.object(cycle, "_open_lift", AsyncMock(return_value=lift)),
-            patch.object(cycle, "Axol", side_effect=make_axol),
-            patch.object(cycle, "RtAxol", side_effect=FakeRtAxol),
+            patch.object(cycle, "Axol", side_effect=make_robot),
             patch.object(cycle, "interrupt_event", _interrupt_context),
             patch.object(
                 cycle,
@@ -925,10 +946,18 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
                 events=events,
             )
 
+        def make_robot(*, config, left_channel, right_channel):  # noqa: ANN001, ANN202
+            return FakeRtAxol(
+                make_axol(
+                    config=config,
+                    left_channel=left_channel,
+                    right_channel=right_channel,
+                )
+            )
+
         with (
             patch.object(cycle, "_open_lift", AsyncMock(return_value=lift)),
-            patch.object(cycle, "Axol", side_effect=make_axol),
-            patch.object(cycle, "RtAxol", side_effect=FakeRtAxol),
+            patch.object(cycle, "Axol", side_effect=make_robot),
             patch.object(cycle, "interrupt_event", _interrupt_context),
             patch.object(
                 cycle,
@@ -980,13 +1009,21 @@ class LiftCycleSequenceTest(unittest.IsolatedAsyncioTestCase):
                 events=events,
             )
 
+        def make_robot(*, config, left_channel, right_channel):  # noqa: ANN001, ANN202
+            return FakeRtAxol(
+                make_axol(
+                    config=config,
+                    left_channel=left_channel,
+                    right_channel=right_channel,
+                )
+            )
+
         ramp = AsyncMock(side_effect=lambda *args, **kwargs: events.append("arms.ramp"))
         stderr = io.StringIO()
         stdout = io.StringIO()
         with (
             patch.object(cycle, "_open_lift", AsyncMock(return_value=lift)),
-            patch.object(cycle, "Axol", side_effect=make_axol),
-            patch.object(cycle, "RtAxol", side_effect=FakeRtAxol),
+            patch.object(cycle, "Axol", side_effect=make_robot),
             patch.object(cycle, "interrupt_event", _interrupt_context),
             patch.object(
                 cycle,

@@ -3,41 +3,44 @@ title: "almond_axol.robot"
 description: "Hardware controllers for Axol and Jelly, simulation, configuration, and gravity compensation."
 ---
 
-Hardware controller for both arms. `Axol` is the low-level hardware/model object; production motion wraps it in `RtAxol`, which exclusively owns CAN while armed and runs the control loop at 240 Hz. Direct-register calibration and diagnostics use the low-level object outside that production loop. `Sim` is a drop-in replacement that renders the robot in a browser using viser (requires the `sim` extra).
+Hardware controller for both arms. `Axol` is the robot: it brings the motors up, hands both CAN buses to the Rust realtime core (`axol-rt`), which exclusively owns them while armed and runs the control loop at 240 Hz, and streams your `motion_control` targets to it. `AxolHardware` is the low-level hardware/model object underneath — direct-register calibration and diagnostics use it on a quiet bus, outside the production loop. `Sim` is a drop-in replacement for `Axol` that renders the robot in a browser using viser (requires the `sim` extra).
 
 ```python
-from almond_axol.robot import Axol, AxolConfig, Jelly, JellyConfig, Sim
-from almond_axol.rt import RtAxol
+from almond_axol.robot import Axol, AxolConfig, AxolHardware, Jelly, JellyConfig, Sim
 ```
 
 ## `Axol`
 
 ```python
 Axol(
-    config: AxolConfig = AxolConfig(),
+    config: AxolConfig | None = None,
     left_channel: str | None = "can_alm_axol_l",
     right_channel: str | None = "can_alm_axol_r",
     left_joints: Iterable[Joint] | None = None,
     right_joints: Iterable[Joint] | None = None,
+    *,
+    hardware: AxolHardware | None = None,
+    loop_hz: float = 240.0,
+    watchdog_ms: float = 150.0,
+    max_vel: float = 2π,
+    max_accel: float = 7π,
+    record: str | None = None,
 )
 ```
 
-Pass `left_channel=None` or `right_channel=None` to operate a single arm. Both arms are brought up concurrently on `__aenter__`.
+The first five arguments are forwarded to [`AxolHardware`](#axolhardware). Pass `left_channel=None` or `right_channel=None` to operate a single arm. `left_joints` / `right_joints` restrict an arm to the motors actually on its bus, for a partial bench arm (e.g. `{Joint.WRIST_2, Joint.WRIST_3, Joint.GRIPPER}` for a wrist assembly). Absent joints are never constructed or enabled; every `(8,)` array keeps its Joint-enum shape, with absent joints reading `0.0` (the rest pose) and their commands ignored.
 
-`left_joints` / `right_joints` restrict an arm to the motors actually on its bus, for a partial bench arm (e.g. `{Joint.WRIST_2, Joint.WRIST_3, Joint.GRIPPER}` for a wrist assembly). Absent joints are never constructed or enabled; every `(8,)` array keeps its Joint-enum shape, with absent joints reading `0.0` (the rest pose) and their commands ignored.
+`max_vel` / `max_accel` are the teleop joint caps the core's trajectory tracker is sized from (defaults match `VRTeleopConfig`); `record` is a flight-recorder prefix that captures measured position/torque from the core's feedback at `loop_hz`. `hardware=` wraps an `AxolHardware` you already built instead of constructing one.
 
-<Note>
-The realtime core is the default for the CLI — `axol teleop`, `axol gravity-comp`, `axol waypoints`, and the control panel all construct `RtAxol` for you. When you drive the robot from your own Python, opting in is explicit: wrap the low-level object as `RtAxol(Axol())`. A bare `Axol` still works, but it sends CAN from Python on the caller's schedule — use it for calibration and diagnostics, not for motion.
-</Note>
+This is the same object every CLI flow uses — `axol teleop`, `axol gravity-comp`, `axol waypoints`, the control panel — so code written against `Axol` exercises exactly the controller the robot ships with.
 
 ```python
 import asyncio
 import numpy as np
 from almond_axol.robot import Axol
-from almond_axol.rt import RtAxol
 
 async def main():
-    async with RtAxol(Axol()) as axol:
+    async with Axol() as axol:
         # non-blocking cached reads from the core's 240 Hz feedback
         print("left positions (rad):", axol.left.positions)
         print("left torques (Nm):", axol.left.torques)
@@ -49,6 +52,49 @@ async def main():
 
 asyncio.run(main())
 ```
+
+### Lifecycle
+
+| Method / attribute | Description |
+|---|---|
+| `enable()` | Full bring-up: the core resets the motors, Python resolves joint offsets and calibrates the grippers on the quiet bus, then the core takes the buses and arms. Finishes actively holding the measured pose (gravity feedforward and damping included). Joints already holding from a previous session are attached to, never reset |
+| `disable()` | Deliberate stop: the core disables the motors on disarm and Python repeats the disable once the bus is free. After a core `fault` or `limp`, the motors are deliberately **left holding** (or limp) instead — see [Faults and limp](#faults-and-limp) |
+| `detach()` | Release the core with every motor left holding its last command, for handing a still-energized robot to a later process |
+| `motion_control(left, right)` | Primary control: impedance (arm joints) + position-force (gripper). Python runs the model math (limits, gravity, pose-scheduled feedforward coefficients); the core renders the trajectory at 240 Hz |
+| `gravity_compensate(kd, free_joints, gripper_targets)` | One gravity-comp cycle streamed through the core — the arms go limp and hand-guidable, held up by feedforward |
+| `get_positions()` | `(left, right)` measured positions from the telemetry caches; no CAN traffic |
+| `left` / `right` | The `AxolArm` objects (`positions`, `torques`, `velocities` cached from the core's feedback) |
+| `hardware` | The wrapped [`AxolHardware`](#axolhardware) |
+| `start_telemetry(hz)` / `stop_telemetry()` / `wait_for_telemetry()` | Kept for flows written against `AxolHardware`; the core already streams telemetry every tick, so the first two are no-ops |
+| `state_nearest(perf_ts)` | Telemetry snapshot nearest a camera exposure timestamp, from a short 240 Hz history — used by data collection |
+| `torque_residuals()` / `reset_command_state()` / `reset_gravity_hold()` | Pure-Python state helpers behind guarded return and contact detection |
+
+### Faults and limp
+
+| Attribute | Meaning |
+|---|---|
+| `fault` | The core's latched `fault: ...` (dead bus, protocol error), or `None`. The core has stopped streaming and the motors hold their last command; `disable()` leaves them that way |
+| `limp` | Why the core went limp (`limp: ...` — a motor silent for a second, control timing lost), or `None`. Every arm joint is at kp = 0 with gravity feedforward for the rest of the session; `motion_control` streams gravity comp instead of tracking so the operator can hand-guide the arms to rest and stop |
+
+Faults never drop the arms: a disabled arm falls, a holding or limp arm waits for the operator.
+
+<Note>
+`RtAxol(AxolHardware(...))` — the previous spelling — still works and emits a `DeprecationWarning`. Replace it with `Axol(...)`.
+</Note>
+
+## `AxolHardware`
+
+```python
+AxolHardware(
+    config: AxolConfig = AxolConfig(),
+    left_channel: str | None = "can_alm_axol_l",
+    right_channel: str | None = "can_alm_axol_r",
+    left_joints: Iterable[Joint] | None = None,
+    right_joints: Iterable[Joint] | None = None,
+)
+```
+
+The low-level dual-arm object: one `CanBus` and one `AxolArm` (7 arm motors + gripper) per side, plus the gravity/friction/inertia model. It sends CAN from Python on the caller's schedule. Use it for calibration, register-level diagnostics, and inspecting a robot of unknown state — not for production motion; `Axol` wraps it for that, and the two must not touch the bus at the same time (`Axol.enable()` hands the buses to the core, `Axol.disable()` gets them back). Everything below is also reachable as `Axol(...).hardware` while the core is not armed.
 
 ### Lifecycle methods
 
@@ -73,12 +119,14 @@ If a controlling process dies (or disconnects) while the robot is torqued on, th
 - a mixed robot (e.g. the previous session died mid-`enable`) simply gets the cold joints brought up while the holding ones are left alone;
 - with `hold=True` (the default) `enable()` finishes by commanding the measured pose once (configured gains + gravity feedforward — the arm is already there, so nothing moves), so "enabled" always means *actively holding*.
 
+`Axol.enable()` runs the same convergence before arming the core, so a plain `async with Axol()` reconnects to a live robot too. The low-level flow, for a process that wants to inspect first:
+
 ```python
 import asyncio
-from almond_axol.robot import Axol
+from almond_axol.robot import AxolHardware
 
 async def main():
-    axol = Axol()
+    axol = AxolHardware()
     await axol.connect()                   # open buses; nothing actuated
     held_l, held_r = await axol.get_holding()   # optional: inspect first
     await axol.enable()                    # holding joints kept holding
@@ -177,14 +225,13 @@ Each arm joint is configured with a single `JointConfig` carrying its impedance 
 
 ```python
 from almond_axol.robot import Axol, AxolConfig, FrictionParams
-from almond_axol.rt import RtAxol
 
 config = AxolConfig()
 config.left.elbow.kp = 200
 config.left.elbow.mass = 0.6
 config.left.elbow.com = (-0.025, 0.0, -0.07)
 config.left.elbow.friction = FrictionParams(fc=0.4, k=10.0, fv=0.05, fo=0.0)
-async with RtAxol(Axol(config=config)) as axol: ...
+async with Axol(config=config) as axol: ...
 ```
 
 Or build a fully custom arm with `dataclasses.replace` (start from the `AxolConfig` defaults so you keep the per-side friction values that get injected at construction):
@@ -227,7 +274,7 @@ Gravity feedforward is computed centrally from the URDF — see [Gravity compens
 |---|---|---|
 | `has_gripper` | `True` | Whether this robot is the gripper-equipped SKU. Set `False` for the gripperless SKU: the gripper motors are never constructed, enabled, or calibrated; the gripper element of every `(8,)` joint array is ignored on write and reported as `0.0` on read (array shapes are unchanged). LeRobot datasets recorded on a gripperless robot carry 7 channels per arm instead of 8. |
 | `max_step_rad` | `0.5` | Maximum allowed change in any arm joint (rad) between consecutive `motion_control` calls. Commands that exceed this are dropped and a warning is logged. Set to `float("inf")` to disable. At 30 Hz, 0.5 rad/step ≈ 15 rad/s — roughly 2.5× the teleop velocity ceiling. |
-| `left_stiffness` | `1.0` | Compliance blend for the **left** arm. Either a scalar in `[0, 1]` (applied to every joint) or a 7-tuple of per-joint factors (order: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` — gripper excluded). The default `1.0` runs the hardware-tuned per-joint gains (e.g. `shoulder_1` `kp=350`) — the stiffest the hardware was measured to support, so lower values only *add compliance*, down to the hand-guidable `_SOFT_GAINS` at `0` (`shoulder_1` `kp=40`). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness), with a damping-ratio-consistent soft endpoint so every slider position stays as well damped as the tuned gains; `j_eff` is unchanged by the blend; `kd_host` scales with `√(kp(s)/kp)`. The blend is baked into the `left` / `right` gains by `AxolConfig.resolved()`, called once at the robot-construction boundary (`Axol.__init__`); the stiffness fields themselves are left untouched so a serialized config round-trips cleanly. |
+| `left_stiffness` | `1.0` | Compliance blend for the **left** arm. Either a scalar in `[0, 1]` (applied to every joint) or a 7-tuple of per-joint factors (order: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` — gripper excluded). The default `1.0` runs the hardware-tuned per-joint gains (e.g. `shoulder_1` `kp=350`) — the stiffest the hardware was measured to support, so lower values only *add compliance*, down to the hand-guidable `_SOFT_GAINS` at `0` (`shoulder_1` `kp=40`). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness), with a damping-ratio-consistent soft endpoint so every slider position stays as well damped as the tuned gains; `j_eff` is unchanged by the blend; `kd_host` scales with `√(kp(s)/kp)`. The blend is baked into the `left` / `right` gains by `AxolConfig.resolved()`, called once at the robot-construction boundary (`AxolHardware.__init__`); the stiffness fields themselves are left untouched so a serialized config round-trips cleanly. |
 | `right_stiffness` | `1.0` | Same, for the **right** arm. |
 
 ```python
@@ -250,12 +297,11 @@ If the arms sag or push back in gravity-comp mode, tune the relevant joint's `ma
 
 ```python
 from almond_axol.robot import AxolConfig, Axol
-from almond_axol.rt import RtAxol
 
 config = AxolConfig()
 config.left.elbow.mass = 0.6
 config.left.elbow.com = (-0.025, 0.0, -0.07)
-async with RtAxol(Axol(config=config)) as axol: ...
+async with Axol(config=config) as axol: ...
 ```
 
 See the [`gravity-comp`](/cli/gravity-comp) CLI command to hold the arms in gravity-compensation mode interactively.

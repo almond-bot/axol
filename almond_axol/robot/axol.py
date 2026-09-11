@@ -1,7 +1,13 @@
 """Hardware control classes for the Almond Axol dual-arm robot.
 
-Provides :class:`AxolArm` (single-arm CAN bus controller) and :class:`Axol`
-(dual-arm context manager that opens both buses and constructs all 16 motor drivers).
+Provides :class:`AxolArm` (single-arm CAN bus controller) and
+:class:`AxolHardware` (dual-arm context manager that opens both buses and
+constructs all 16 motor drivers).
+
+``AxolHardware`` sends CAN from Python on the caller's schedule. It is the
+right object for direct-register calibration and diagnostics on a quiet bus.
+Production motion goes through :class:`almond_axol.robot.Axol`, which wraps
+it and hands the buses to the Rust realtime core (``axol-rt``) while armed.
 """
 
 from __future__ import annotations
@@ -537,7 +543,7 @@ class AxolArm:
         Args:
             bus:          Shared CAN bus for this arm (one per physical interface).
             config:       Full dual-arm gains config; the correct side is selected via ``is_left``.
-            gravity_comp: Shared MuJoCo-based gravity compensator (one per Axol).
+            gravity_comp: Shared MuJoCo-based gravity compensator (one per AxolHardware).
             is_left:      ``True`` for the left arm, ``False`` for the right.
             joints:       The joints whose motors are on the bus; ``None``
                           (the default) is the full arm. The gripper is only
@@ -1076,9 +1082,9 @@ class AxolArm:
         On the gripperless SKU the gripper calibration and mode switch are
         skipped (there is no gripper motor).
 
-        This is the motor-level half of :meth:`Axol.enable`: it does **not**
+        This is the motor-level half of :meth:`AxolHardware.enable`: it does **not**
         open the CAN bus. Callers driving arms individually must have
-        awaited :meth:`Axol.connect` (or :meth:`Axol.enable`) first;
+        awaited :meth:`AxolHardware.connect` (or :meth:`AxolHardware.enable`) first;
         otherwise the first motor read fails with a ``CanOperationError``
         saying the bus is unopened or still starting.
 
@@ -1326,7 +1332,7 @@ class AxolArm:
         """Return each motor's enabled-and-holding state, fetched concurrently.
 
         Read-only — safe on a robot of unknown state (pairs with
-        :meth:`Axol.connect` for inspecting before acting). See
+        :meth:`AxolHardware.connect` for inspecting before acting). See
         :meth:`Motor.is_holding` for what "holding" means per motor family.
         Returns a list in Joint enum order. On the gripperless SKU the
         gripper entry is omitted (7 entries).
@@ -1864,14 +1870,14 @@ class AxolArm:
         return tau - gravity
 
 
-class Axol(RobotBase):
-    """Dual-arm Axol robot interface.
+class AxolHardware(RobotBase):
+    """Dual-arm Axol hardware interface, driven directly from Python.
 
     Opens one CAN bus per arm and constructs all 16 motor drivers on entry
     (14 on the gripperless SKU, ``config.has_gripper = False``).
     Use as an async context manager to ensure the buses are cleanly shut down.
 
-        async with Axol() as axol:
+        async with AxolHardware() as axol:
             await axol.enable()
             await axol.start_telemetry(500)  # 500 Hz
 
@@ -1888,7 +1894,7 @@ class Axol(RobotBase):
     touching motor state, for inspecting a robot of unknown state first
     (:meth:`get_holding`, :meth:`get_positions`, ...):
 
-        axol = Axol()
+        axol = AxolHardware()
         await axol.connect()      # open buses; inspect freely, nothing actuated
         await axol.enable()       # holding joints kept holding; cold joints brought up
         pos_l, pos_r = await axol.get_positions()
@@ -2066,7 +2072,7 @@ class Axol(RobotBase):
         just means no bus is open. Startup spawns the process and waits for
         its ready handshake, so it takes a moment: motor I/O issued from
         another task before this coroutine has returned fails with a
-        "CAN bus ... is still starting" error. Only the ``Axol``-level
+        "CAN bus ... is still starting" error. Only the ``AxolHardware``-level
         methods open buses; the per-arm :meth:`AxolArm.enable` /
         :meth:`AxolArm.disable` assume the bus is already open, so a
         controller that toggles arms individually must await ``connect()``

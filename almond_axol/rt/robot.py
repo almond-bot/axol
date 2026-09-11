@@ -1,8 +1,11 @@
-"""``RtAxol`` — the Axol robot driven through the Rust realtime core.
+"""``Axol`` — the Axol robot driven through the Rust realtime core.
 
-Presents the same surface :class:`~almond_axol.teleop.VRTeleop` uses
-(``enable`` / ``disable`` / ``get_positions`` / ``motion_control``), but the
-CAN buses are owned by the ``axol-rt`` subprocess:
+This is the production robot object (re-exported as
+:class:`almond_axol.robot.Axol`). It constructs the low-level
+:class:`~almond_axol.robot.axol.AxolHardware` and presents the same surface
+:class:`~almond_axol.teleop.VRTeleop` uses (``enable`` / ``disable`` /
+``get_positions`` / ``motion_control``), but the CAN buses are owned by the
+``axol-rt`` subprocess:
 
 - ``enable()`` runs the split bring-up: the core resets the motors (prep),
   then Python resolves joint offsets and MyActuator decode ranges through a
@@ -60,15 +63,20 @@ import logging
 import math
 import threading
 import time
+import warnings
 from collections import deque
+from collections.abc import Iterable
+from typing import Self
 
 import numpy as np
 
-from ..constants import ARM_JOINTS
+from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from ..motor import ControlMode, Joint, MotorError
 from ..motor.bus import CanBus
 from ..motor.motor import _JOINT_CONFIG
-from ..robot.axol import Axol, AxolArm
+from ..robot.axol import AxolArm, AxolHardware
+from ..robot.base import RobotBase
+from ..robot.config import AxolConfig
 from .link import FeedbackSlot, RtLink, config_header
 
 _logger = logging.getLogger(__name__)
@@ -82,8 +90,23 @@ _N_ARM = len(ARM_JOINTS)
 _LIMP_KD = 0.25
 
 
-class RtAxol:
-    """Axol with the control loop in the Rust realtime core."""
+class Axol(RobotBase):
+    """The dual-arm Axol robot, with the control loop in the Rust realtime core.
+
+    Construct it exactly like the low-level hardware object and use it as an
+    async context manager::
+
+        async with Axol() as axol:
+            pos_l, pos_r = await axol.get_positions()
+            await axol.motion_control(left=pos_l, right=pos_r)
+
+    ``enable()`` brings the motors up and hands both CAN buses to the
+    ``axol-rt`` subprocess, which paces the 240 Hz loop; Python keeps the
+    model math and streams targets. :attr:`hardware` exposes the wrapped
+    :class:`~almond_axol.robot.axol.AxolHardware` for flows that also need
+    direct register access on a quiet bus (before ``enable()`` or after
+    ``disable()``).
+    """
 
     # The core's tracker limits get headroom over the Python shaper's caps:
     # the in-core trapezoid exists to render a smooth 240 Hz trajectory and
@@ -95,16 +118,32 @@ class RtAxol:
 
     def __init__(
         self,
-        robot: Axol,
+        config: AxolConfig | None = None,
+        left_channel: str | None = CAN_LEFT,
+        right_channel: str | None = CAN_RIGHT,
+        left_joints: Iterable[Joint] | None = None,
+        right_joints: Iterable[Joint] | None = None,
+        *,
+        hardware: AxolHardware | None = None,
         loop_hz: float = 240.0,
         watchdog_ms: float = 150.0,
         max_vel: float = 2.0 * math.pi,
         max_accel: float = 7.0 * math.pi,
         record: str | None = None,
     ) -> None:
-        """Wrap ``robot`` for the realtime core.
+        """Construct the robot for the realtime core.
+
+        The first five arguments are forwarded to
+        :class:`~almond_axol.robot.axol.AxolHardware`; see it for their
+        meaning. Nothing is opened or actuated until :meth:`enable`.
 
         Args:
+            hardware: An already-constructed ``AxolHardware`` to wrap
+                instead of building one from the forwarded arguments (which
+                must then be left at their defaults).
+            loop_hz: Realtime core tick rate.
+            watchdog_ms: Core watchdog — how long it holds the last target
+                without a fresh one before treating the host as gone.
             max_vel: Teleop joint-velocity cap (rad/s) — the core's tracker
                 runs at ``_TRACKER_HEADROOM`` times this. Defaults match
                 ``VRTeleopConfig.teleop_max_vel``.
@@ -114,7 +153,26 @@ class RtAxol:
                 position/torque is captured from the core's feedback packets
                 at its native ``loop_hz`` instead of the Python target rate.
         """
-        self._robot = robot
+        if hardware is None:
+            hardware = AxolHardware(
+                config=AxolConfig() if config is None else config,
+                left_channel=left_channel,
+                right_channel=right_channel,
+                left_joints=left_joints,
+                right_joints=right_joints,
+            )
+        elif (
+            config is not None
+            or left_channel != CAN_LEFT
+            or right_channel != CAN_RIGHT
+            or left_joints is not None
+            or right_joints is not None
+        ):
+            raise ValueError(
+                "Axol(hardware=...) takes the wrapped object as-is; do not also "
+                "pass config / channels / joints"
+            )
+        self._robot = hardware
         self._loop_hz = loop_hz
         self._watchdog_ms = watchdog_ms
         self._max_vel = max_vel
@@ -150,6 +208,18 @@ class RtAxol:
         self._state_cond = threading.Condition()
         self._state_sides: set[int] = set()
         self._state_side_ts: dict[int, float] = {}
+
+    @property
+    def hardware(self) -> AxolHardware:
+        """The wrapped low-level object (buses, motors, model math).
+
+        Its ``left`` / ``right`` arms and their ``motors`` are the same
+        objects this class reads and commands through. Direct register
+        access (``connect()``, ``is_holding()``, ...) is only valid while the
+        core does not own the bus — before :meth:`enable` or after
+        :meth:`disable`.
+        """
+        return self._robot
 
     @property
     def left(self) -> AxolArm | None:
@@ -290,13 +360,18 @@ class RtAxol:
             self._loop_hz,
         )
 
-    async def __aenter__(self) -> RtAxol:
+    async def __aenter__(self) -> Self:
         """Enter the async context, arming the core via :meth:`enable`."""
         await self.enable()
         return self
 
     async def __aexit__(self, *_: object) -> None:
-        """Exit the async context, tearing down via :meth:`disable`."""
+        """Exit the async context, tearing down via :meth:`disable`.
+
+        Unlike :meth:`RobotBase.__aexit__`, teardown errors are not wrapped
+        in ``HardwareCleanupError``: :meth:`disable` already decides, per
+        failure, whether the motors were left holding on purpose.
+        """
         await self.disable()
 
     async def start_telemetry(self, hz: float, *, torque: bool = False) -> None:
@@ -304,9 +379,9 @@ class RtAxol:
 
         Positions, velocities, and torques for every slot arrive in the
         per-tick ``F`` packets regardless of ``hz`` / ``torque`` — a poll
-        loop would need the bus, which the core owns. Kept so classic
-        flows (gravity-comp, waypoints, tune.motion, the LeRobot robot)
-        run unchanged against ``RtAxol``.
+        loop would need the bus, which the core owns. Kept so flows written
+        against ``AxolHardware`` (gravity-comp, waypoints, tune.motion, the
+        LeRobot robot) run unchanged.
         """
         _logger.debug(
             "rt: start_telemetry(%s) ignored — core streams at %.0f Hz",
@@ -320,7 +395,7 @@ class RtAxol:
     async def wait_for_telemetry(self, timeout: float = 5.0) -> None:
         """Block until the core's telemetry stream is flowing for every arm.
 
-        Same contract as :meth:`Axol.wait_for_telemetry`; ``enable`` already
+        Same contract as :meth:`AxolHardware.wait_for_telemetry`; ``enable`` already
         waited once, so after a successful bring-up this returns immediately.
         """
         deadline = time.monotonic() + timeout
@@ -638,7 +713,8 @@ class RtAxol:
         Backs the guarded-return contact hold (limp arms, gravity held by
         feedforward). With the sinks installed, ``AxolArm.gravity_compensate``
         ships its tuples to the core instead of the bus — Python never
-        touches the wire. Same signature as :meth:`Axol.gravity_compensate`.
+        touches the wire. Same signature as
+        :meth:`AxolHardware.gravity_compensate`.
         """
         await self._robot.gravity_compensate(kd, free_joints, gripper_targets)
 
@@ -646,7 +722,7 @@ class RtAxol:
         """Per-arm measured-minus-gravity torques from the telemetry caches.
 
         The core's telemetry refreshes measured torque every tick, so this
-        needs no CAN traffic — same contract as ``Axol``.
+        needs no CAN traffic — same contract as ``AxolHardware``.
         """
         return self._robot.torque_residuals()
 
@@ -821,3 +897,24 @@ class RtAxol:
             _logger.warning(
                 "rt: retaining raw control trace because the core is still running"
             )
+
+
+class RtAxol(Axol):
+    """Deprecated spelling of :class:`Axol`.
+
+    ``RtAxol(AxolHardware(...))`` was the previous way to opt into the realtime
+    core. :class:`almond_axol.robot.Axol` now constructs the hardware object
+    itself; this shim keeps the old idiom working (with a
+    ``DeprecationWarning``) for one release.
+    """
+
+    def __init__(self, robot: AxolHardware | Axol, **kwargs: object) -> None:
+        warnings.warn(
+            "RtAxol is deprecated: construct almond_axol.robot.Axol(...) "
+            "directly (it wraps the realtime core by default)",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if isinstance(robot, Axol):
+            robot = robot.hardware
+        super().__init__(hardware=robot, **kwargs)  # type: ignore[arg-type]

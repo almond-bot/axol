@@ -41,10 +41,9 @@ def min_jerk(alpha: float) -> float:
 
 async def main(out: str) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    from almond_axol.rt import RtAxol
 
-    inner = Axol()
-    robot = RtAxol(inner)
+    robot = Axol()
+    inner = robot.hardware
     await robot.enable()
     try:
         pos_l, pos_r = await robot.get_positions()

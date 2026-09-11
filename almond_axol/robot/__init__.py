@@ -1,9 +1,13 @@
 """Public re-exports for almond_axol.robot."""
 
+# The production robot object lives with the realtime core it drives. Imported
+# last: ``almond_axol.rt`` imports this package's submodules, so every name it
+# needs must already be bound above.
+from ..rt.robot import Axol  # noqa: E402
 from .axol import (
     EITHER_STOP_JOINTS,
-    Axol,
     AxolArm,
+    AxolHardware,
     arm_limits,
     closer_end_stop,
     end_stop_offset_from_position,
@@ -24,6 +28,7 @@ __all__ = [
     "RobotBase",
     "Axol",
     "AxolArm",
+    "AxolHardware",
     "arm_limits",
     "closer_end_stop",
     "EITHER_STOP_JOINTS",

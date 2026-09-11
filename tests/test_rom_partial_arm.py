@@ -4,7 +4,7 @@ A single-channel adapter with just a wrist assembly (wrist_2, wrist_3, gripper)
 on the bus must be able to run ``diag.rom-enable --joints wrist_2,wrist_3,gripper``.
 The pieces that make that work: the pre-flight presence probe and its
 decision rule, an ``AxolArm`` restricted to the motors actually present, and
-an ``RtAxol`` that configures/feeds only those motors (the core slots them by
+an ``Axol`` that configures/feeds only those motors (the core slots them by
 motor id).
 """
 
@@ -20,8 +20,8 @@ import numpy as np
 from almond_axol.constants import ARM_JOINTS, Joint
 from almond_axol.diagnostics.rom import enable as rom
 from almond_axol.motor import ControlMode, MotorError
-from almond_axol.robot.axol import Axol
-from almond_axol.rt import RtAxol
+from almond_axol.robot.axol import AxolHardware
+from almond_axol.rt import Axol
 from almond_axol.serve.robot_link import scoped_motor_faults
 
 WRIST_KIT = {Joint.WRIST_2, Joint.WRIST_3, Joint.GRIPPER}
@@ -117,7 +117,7 @@ class ProbeBusJointsTest(unittest.IsolatedAsyncioTestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Partial AxolArm / RtAxol                                                    #
+# Partial AxolArm / Axol                                                      #
 # --------------------------------------------------------------------------- #
 
 
@@ -150,7 +150,7 @@ class _FakeDriver:
         self.position_force.append(args)
 
 
-def _partial_axol(joints: set[Joint], config: Any = None) -> Axol:
+def _partial_axol(joints: set[Joint], config: Any = None) -> AxolHardware:
     with (
         patch("almond_axol.robot.axol.CanBus", _FakeBus),
         patch(
@@ -159,7 +159,7 @@ def _partial_axol(joints: set[Joint], config: Any = None) -> Axol:
         ),
     ):
         kwargs = {} if config is None else {"config": config}
-        return Axol(
+        return AxolHardware(
             left_channel="can0", right_channel=None, left_joints=joints, **kwargs
         )
 
@@ -207,7 +207,7 @@ class PartialAxolArmTest(unittest.IsolatedAsyncioTestCase):
                 side_effect=lambda *_a, **_k: _FakeDriver(),
             ),
         ):
-            axol = Axol(
+            axol = AxolHardware(
                 AxolConfig(has_gripper=False),
                 left_channel="can0",
                 right_channel=None,
@@ -288,9 +288,9 @@ class PartialArmTelemetryCaptureTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first[header.index("left:WRIST_3:pos")], "")
 
 
-class PartialRtAxolTest(unittest.IsolatedAsyncioTestCase):
+class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
     def test_config_lists_only_present_motors(self) -> None:
-        rt = RtAxol(_partial_axol(set(WRIST_KIT)))
+        rt = Axol(hardware=_partial_axol(set(WRIST_KIT)))
         lines = rt._config_text().splitlines()
         # Slot-by-motor-id is protocol generation 2; a core that predates it
         # would slot these wrists at 0 and 1 and then reject every target,
@@ -304,7 +304,7 @@ class PartialRtAxolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gripper 0 can0 8", lines)
 
     async def test_feedback_feed_fills_present_slots_and_ignores_the_rest(self) -> None:
-        rt = RtAxol(_partial_axol(set(WRIST_KIT)))
+        rt = Axol(hardware=_partial_axol(set(WRIST_KIT)))
         arm = rt.left
         assert arm is not None
         feed = rt._make_feedback_feed()
@@ -391,7 +391,7 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(kd3, 0.9)
         self.assertEqual((t_ff3, kd_host3, j_eff3), (0.0, 0.0, 0.0))
         # The core's friction model rides the config; the bench config zeroes it.
-        rt = RtAxol(axol)
+        rt = Axol(hardware=axol)
         for line in rt._config_text().splitlines():
             if line.startswith("joint "):
                 self.assertEqual(line.split()[9:], ["0.0", "0.0", "0.0", "0.0"], line)

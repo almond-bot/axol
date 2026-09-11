@@ -33,7 +33,7 @@ from ...constants import (
     Joint,
 )
 from ...motor import ControlMode
-from ...robot.axol import GRIPPER_TRAVEL, Axol, AxolArm
+from ...robot.axol import GRIPPER_TRAVEL, AxolArm, AxolHardware
 
 # Marker prefix a --web-prompts step prints before blocking on stdin, matching
 # rom.enable; the dashboard turns it into a Continue button.
@@ -87,7 +87,7 @@ async def run(
     right_channel: str = CAN_RIGHT,
 ) -> None:
     """Open each gripper sequentially, then disable every motor."""
-    axol = Axol(
+    axol = AxolHardware(
         left_channel=None if no_left else left_channel,
         right_channel=None if no_right else right_channel,
     )

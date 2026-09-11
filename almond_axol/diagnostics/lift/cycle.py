@@ -15,7 +15,7 @@ position save to finish before issuing the next move. The held arm joints
 remain monitored throughout lift motion, and Ctrl-C stops the lift. The other
 arm joints hold their measured starting positions throughout.
 
-The arms are driven through the Rust realtime core (``RtAxol``), the same
+The arms are driven through the Rust realtime core (``Axol``), the same
 control path as teleop: it owns the arm CAN buses, renders the S1 ramps at
 240 Hz, and keeps the held joints damped while the lift cycles.
 
@@ -42,10 +42,10 @@ import numpy as np
 
 from ...cli.lift import Interrupted, fmt_status, interrupt_event
 from ...constants import ARM_JOINTS, CAN_BASE, CAN_CHEST, CAN_LEFT, CAN_RIGHT, Joint
-from ...robot.axol import Axol
+from ...robot.axol import AxolHardware
 from ...robot.config import AxolConfig
 from ...robot.lift import Lift, LiftStatus, resolve_lift_channel
-from ...rt import RtAxol
+from ...rt import Axol
 
 _STATUS_PERIOD_MS = 200
 _STATUS_STALE_S = 1.0
@@ -523,7 +523,7 @@ def _validated_arm_pose(
 
 
 async def _read_valid_arm_positions(
-    axol: RtAxol,
+    axol: Axol,
     context: str,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     left, right = await axol.get_positions()
@@ -543,7 +543,7 @@ async def _read_valid_arm_positions(
     )
 
 
-async def _verify_arms_holding(axol: RtAxol, context: str) -> None:
+async def _verify_arms_holding(axol: Axol, context: str) -> None:
     """Prove the realtime core still holds every selected arm joint.
 
     The core owns the CAN buses while the arms are up, so Python cannot ask
@@ -601,10 +601,10 @@ def _rest_targets(
     return left_target, right_target
 
 
-async def _disable_arms_verified(robot: RtAxol, axol: Axol) -> None:
+async def _disable_arms_verified(robot: Axol, axol: AxolHardware) -> None:
     """Disable every selected-arm motor and prove none still reports holding.
 
-    ``RtAxol.disable`` is the deliberate stop: the core disables the motors on
+    ``Axol.disable`` is the deliberate stop: the core disables the motors on
     disarm and Python repeats the shutdown once the bus is free. Its lifecycle
     intentionally suppresses individual motor errors (and, after a core fault
     or limp, deliberately leaves the motors energized). A diagnostic must be
@@ -675,7 +675,7 @@ async def _disable_arms_verified(robot: RtAxol, axol: Axol) -> None:
 
 
 async def _ramp_arms(
-    axol: RtAxol,
+    axol: Axol,
     start_left: np.ndarray | None,
     start_right: np.ndarray | None,
     target_left: np.ndarray | None,
@@ -749,7 +749,7 @@ async def _ramp_arms(
 
 
 async def _verify_arm_targets(
-    axol: RtAxol,
+    axol: Axol,
     target_left: np.ndarray | None,
     target_right: np.ndarray | None,
     context: str,
@@ -870,8 +870,8 @@ async def _run(args: argparse.Namespace) -> None:
     cycles = _resolve_cycles(args.cycles)
     lift_channel = resolve_lift_channel(args.lift_channel)
     lift: Lift | None = None
-    inner: Axol | None = None
-    axol: RtAxol | None = None
+    inner: AxolHardware | None = None
+    axol: Axol | None = None
     arms_enabled = False
     arms_disabled = False
     arms_at_clearance = False
@@ -912,14 +912,16 @@ async def _run(args: argparse.Namespace) -> None:
                 # gripper while exercising the independent lift mechanism.
                 has_gripper=False,
             )
-            inner = Axol(
+            # Production control path: the Rust core owns the arm buses and
+            # holds the clearance pose, damping live, while the lift cycles.
+            axol = Axol(
                 config=config,
                 left_channel=None if args.no_left else args.left_channel,
                 right_channel=None if args.no_right else args.right_channel,
             )
-            # Production control path: the Rust core owns the arm buses and
-            # holds the clearance pose, damping live, while the lift cycles.
-            axol = RtAxol(inner)
+            # The low-level object, for the post-disable verification reads
+            # once the core has released the buses.
+            inner = axol.hardware
             print("Enabling arms and holding their measured pose ...")
             # enable() can partially attach before surfacing a motor fault;
             # cleanup must treat the arm state as live from this point onward.

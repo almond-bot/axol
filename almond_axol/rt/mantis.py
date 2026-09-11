@@ -1,7 +1,8 @@
 """Mantis grippers driven through the Rust realtime core.
 
 :class:`RtMantis` wraps :class:`~almond_axol.robot.mantis.Mantis` the way
-:class:`RtAxol` wraps ``Axol``: Python keeps the tracker/IK/collection
+:class:`~almond_axol.robot.Axol` wraps ``AxolHardware``: Python keeps the
+tracker/IK/collection
 logic and the gripper's *maintenance* flows, while every per-tick
 POSITION_FORCE command and every feedback frame goes through ``axol-rt``,
 which solely owns the two gripper buses and paces the loop with hard,
@@ -29,7 +30,7 @@ at its end:
 * :meth:`disable_grippers` — ``disarm`` (the core disables the motors),
   stop the core, reopen the proxies, and repeat the disable from Python so
   torque-off is *verified* — a Mantis gripper is always safe to release,
-  so unlike ``RtAxol`` a core fault never leaves it holding.
+  so unlike ``Axol`` a core fault never leaves it holding.
 * :meth:`disable` — session end: disarm if armed, then close the buses.
 
 Between takes the gripper caches are refreshed by the explicit reads in
@@ -68,7 +69,7 @@ _MAX_STEP_RAD = 10.0
 
 
 class RtMantis:
-    """The Mantis behind the ``RtAxol`` control surface, core-driven per take.
+    """The Mantis behind the ``Axol`` control surface, core-driven per take.
 
     Args:
         robot:       The classic driver; owns the buses, calibration state,
@@ -105,7 +106,7 @@ class RtMantis:
         self._paused_telemetry: tuple[float, bool] | None = None
         self._lifecycle_lock = asyncio.Lock()
         # Timestamped state history for capture-aligned observations, same
-        # shape and clock mapping as RtAxol.state_nearest.
+        # shape and clock mapping as Axol.state_nearest.
         self._state_history: deque[
             tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
         ] = deque(maxlen=512)
@@ -113,7 +114,7 @@ class RtMantis:
         self._state_sides: set[int] = set()
         self._state_side_ts: dict[int, float] = {}
 
-    # -- Surface shared with RtAxol -------------------------------------------
+    # -- Surface shared with Axol ---------------------------------------------
 
     @property
     def left(self) -> MantisGripperArm | None:
@@ -143,7 +144,7 @@ class RtMantis:
         """The armed core's latched ``limp: ...``, or ``None``.
 
         Only arm joints go limp; a gripper-only core never does. Exposed for
-        callers that poll :attr:`RtAxol.limp` generically.
+        callers that poll :attr:`~almond_axol.robot.Axol.limp` generically.
         """
         return self._link.limp if self._link is not None else None
 
@@ -533,7 +534,7 @@ class RtMantis:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float] | None:
         """Return the telemetry snapshot nearest a camera exposure timestamp.
 
-        Same contract as :meth:`RtAxol.state_nearest`; only populated while
+        Same contract as :meth:`~almond_axol.robot.Axol.state_nearest`; only populated while
         the core is armed.
         """
         deadline = time.perf_counter() + timeout

@@ -45,7 +45,6 @@ import asyncio
 import logging
 import math
 import time
-from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -55,9 +54,6 @@ from ...robot.config import AxolConfig
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
-
-if TYPE_CHECKING:
-    from ...rt import RtAxol
 
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — approach/return trajectory speed
 _PLAN_MIN_DURATION = 1.5  # s
@@ -531,9 +527,7 @@ async def _run(args: argparse.Namespace) -> None:
     traj_playback = [to_full(row) for row in sent]
 
     # Production playback always runs through the Rust core, matching teleop.
-    from ...rt import RtAxol as _RtAxol
-
-    robot: RtAxol = _RtAxol(Axol(config=config))
+    robot = Axol(config=config)
 
     async with robot as axol:
         contact: tuple[str, float] | None = None
