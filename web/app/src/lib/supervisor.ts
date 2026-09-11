@@ -197,9 +197,15 @@ export async function fetchInfo(): Promise<ServerInfo> {
   return { ...info, pages: normalizeServerPages(info.pages) }
 }
 
-/** Href for a backend-served page (see lib/server-pages.ts). */
+/**
+ * Href for a backend-served page (see lib/server-pages.ts). An empty server
+ * base means same-origin — except under the Vite dev server, which proxies
+ * only /api: there the page lives on the proxy target, so the link goes
+ * straight at it (relative would fall through to the SPA's own routes).
+ */
 export function serverPageHref(path: string): string {
-  return serverPageUrl(apiBase, path)
+  const base = apiBase || (import.meta.env.DEV ? __AXOL_DEV_SERVE_URL__ : "")
+  return serverPageUrl(base, path)
 }
 
 // ---------------------------------------------------------------------------

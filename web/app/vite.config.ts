@@ -64,6 +64,9 @@ export default defineConfig({
   define: {
     __AXOL_BUILD_COMMIT__: JSON.stringify(buildCommit()),
     __AXOL_BUILD_VERSION__: JSON.stringify(buildVersion()),
+    // Only /api is proxied in dev; a page the backend serves itself (see
+    // lib/server-pages.ts) has to be linked straight at the proxy target.
+    __AXOL_DEV_SERVE_URL__: JSON.stringify(SUPERVISOR),
   },
   resolve: {
     alias: {
