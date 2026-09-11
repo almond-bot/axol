@@ -373,6 +373,11 @@ fn enable_for_velocity(sock: &CanSock, ids: &[u8]) -> io::Result<()> {
 /// Used while the wheels are *not* being streamed — tripped or torqued off —
 /// where the echo-driven `collect_feedback` has nothing to collect. Returns
 /// which wheels answered; a silent wheel keeps its previous values.
+///
+/// Anything already queued is discarded first: a wheel echoes a feedback
+/// frame for every clear-errors / enable / disable command too, and such an
+/// echo (carrying the status from *before* the enable) would otherwise
+/// satisfy the request and be taken for the wheel's current state.
 fn poll_feedback(
     sock: &CanSock,
     ranges: &[MitRanges; 4],
@@ -380,6 +385,7 @@ fn poll_feedback(
     velocities: &mut [f64; 4],
     statuses: &mut [u8; 4],
 ) -> io::Result<[bool; 4]> {
+    sock.drain_nonblocking()?;
     let mut answered = [false; 4];
     for (i, id) in IDS.into_iter().enumerate() {
         if let Some((data, _)) = txn::dm_request_feedback(sock, id as u16, POLL_TIMEOUT)? {
@@ -562,6 +568,11 @@ impl Wheels {
 /// motor's command state, and MIT with zero gains is torque-free — and only
 /// then cleared and re-enabled, so no velocity target can be replayed by the
 /// enable. The hold frames that follow are the only thing they then act on.
+/// The re-enable is then confirmed by a fresh poll: every wheel must report
+/// `ENABLED`, or the attempt is an error (the caller reports it and retries).
+/// That poll also consumes the feedback echoes the clear/enable commands
+/// produced, so the hold-frame echoes collected next are the wheels' current
+/// state rather than a stale pre-enable `DISABLED`.
 fn park(
     sock: &CanSock,
     iface: &str,
@@ -605,6 +616,22 @@ fn park(
             sock.send(id as u16, &proto::DM_ENABLE)?;
         }
         std::thread::sleep(ENABLE_STEP_SETTLE);
+        wheels.answered = poll_feedback(
+            sock,
+            &wheels.ranges,
+            &mut wheels.pos,
+            &mut wheels.vel,
+            &mut wheels.status,
+        )?;
+        let faults = wheels.faults();
+        if !faults.is_empty() {
+            // Left as they are: MIT mode with zero gains is torque-free and
+            // the loss-of-comms alarm torques off whatever did enable.
+            return Err(io::Error::other(format!(
+                "wheels not enabled after re-enable: {}",
+                faults.join(", ")
+            )));
+        }
     }
     Ok(Some(wheels.pos))
 }
@@ -744,6 +771,9 @@ fn control_loop(
     let mut next = Instant::now() + period;
     let mut next_status = Instant::now();
     let mut enobufs = None;
+    // The enable sequence above was echoed with feedback frames; drop them so
+    // the reply count below is for these zero-velocity frames.
+    sock.drain_nonblocking()?;
     for id in IDS {
         sock.send(0x200 + id as u16, &velocity_frame(0.0))?;
     }
@@ -785,8 +815,14 @@ fn control_loop(
     let mut silent_since = t0.checked_sub(trip_settle).unwrap_or(t0);
     let mut next_park = t0;
 
-    // One guarded frame per wheel; a stall is the e-stop path.
+    // One guarded frame per wheel; a stall is the e-stop path. Whatever is
+    // still queued on the socket — a reply that missed the previous tick's
+    // window, or the echoes a clear/enable sequence produced — is discarded
+    // first, so the feedback collected after this batch is the wheels'
+    // answer to *this* batch. (Without that a pre-enable DISABLED echo was
+    // read as the hold's status and dropped the park hold every tick.)
     let send_all = |frames: [(u16, [u8; 8]); 4], enobufs: &mut Option<Instant>| -> io::Result<()> {
+        sock.drain_nonblocking()?;
         for (arb, frame) in frames {
             if let SendOutcome::Stalled = guarded_send(&sock, arb, &frame, enobufs)? {
                 return Err(io::Error::other("Jelly CAN TX stalled"));
@@ -1201,5 +1237,155 @@ mod tests {
         w.answered = [true; 4];
         assert!(w.faults().is_empty());
         assert!(!w.any_tripped());
+    }
+
+    /// Four simulated Damiao wheels on a (virtual) CAN interface. Like the
+    /// real motors they answer *every* frame addressed to them with a
+    /// feedback frame — including clear-errors (whose echo still carries the
+    /// pre-enable status) and enable — and answer 0x7FF register writes and
+    /// feedback requests on their MST_ID.
+    fn fake_wheels(iface: &str, ready: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+        let sock = CanSock::open(iface).unwrap();
+        ready.store(true, Ordering::Release);
+        let mut enabled = [false; 4];
+        let feedback = |i: usize, enabled: bool| -> [u8; 8] {
+            let status = if enabled {
+                STATUS_ENABLED
+            } else {
+                STATUS_LOST_COMM
+            };
+            // Position and velocity at mid-scale (zero), motor id in the low
+            // nibble of byte 0.
+            [
+                (status << 4) | (i as u8 + 1),
+                0x80,
+                0x00,
+                0x80,
+                0x00,
+                0x00,
+                30,
+                30,
+            ]
+        };
+        while !stop.load(Ordering::Relaxed) {
+            let Some(f) = sock.recv_timeout(Duration::from_millis(5)).unwrap() else {
+                continue;
+            };
+            match f.id {
+                1..=4 => {
+                    let i = f.id as usize - 1;
+                    if f.data == proto::DM_CLEAR_ERRORS || f.data == proto::DM_DISABLE {
+                        enabled[i] = false;
+                    } else if f.data == proto::DM_ENABLE {
+                        enabled[i] = true;
+                    }
+                    // Clear-errors is echoed with the status *before* it and
+                    // enable with the status after it, as on the motor.
+                    sock.send(0x10 + f.id as u16, &feedback(i, enabled[i]))
+                        .unwrap();
+                }
+                0x7FF => {
+                    let id = f.data[0] as usize;
+                    if !(1..=4).contains(&id) {
+                        continue;
+                    }
+                    match f.data[2] {
+                        0xCC => sock
+                            .send(0x10 + id as u16, &feedback(id - 1, enabled[id - 1]))
+                            .unwrap(),
+                        0x55 | 0x33 => {
+                            let mut echo = f.data;
+                            echo[1] = 0;
+                            sock.send(0x10 + id as u16, &echo).unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Re-anchoring tripped wheels into the park hold must leave the loop
+    /// looking at the wheels' *post-enable* status. The clear-errors and
+    /// enable commands are each echoed with a feedback frame; before the fix
+    /// the clear-errors echo (still LOST_COMM / DISABLED) sat in the socket
+    /// and was read as the reply to the first hold frame, so the very next
+    /// tick declared the park hold lapsed, went silent, really tripped the
+    /// wheels, and re-anchored — forever, every ~250 ms.
+    ///
+    /// Needs a virtual CAN interface (`modprobe vcan && ip link add vcan0
+    /// type vcan && ip link set up vcan0`); skips when there is none.
+    #[test]
+    fn reanchor_reads_post_enable_status_not_stale_echoes() {
+        let iface = "vcan0";
+        let Ok(sock) = CanSock::open(iface) else {
+            eprintln!("skipping: no {iface} interface");
+            return;
+        };
+        let ready = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let motors = std::thread::spawn({
+            let ready = Arc::clone(&ready);
+            let stop = Arc::clone(&stop);
+            let iface = iface.to_owned();
+            move || fake_wheels(&iface, ready, stop)
+        });
+        // Frames sent before the wheel socket is bound are not delivered.
+        while !ready.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let ranges = MitRanges {
+            p_max: PMAX,
+            v_max: 45.0,
+            kp_max: 500.0,
+            kd_max: 5.0,
+            t_max: 18.0,
+        };
+        let mut wheels = Wheels {
+            ranges: [ranges; 4],
+            pos: [0.0; 4],
+            vel: [0.0; 4],
+            status: [STATUS_LOST_COMM; 4],
+            answered: [false; 4],
+        };
+        let mut park_failed = false;
+
+        let anchor = park(&sock, iface, &mut wheels, &mut park_failed, true)
+            .unwrap()
+            .expect("stationary wheels anchor");
+        assert_eq!(
+            wheels.status, [STATUS_ENABLED; 4],
+            "status right after re-enable"
+        );
+        assert!(!wheels.any_tripped());
+
+        // The first hold tick, as the loop streams it: the echoes collected
+        // must be the hold frames', not leftovers of the enable sequence.
+        for i in 0..4 {
+            let frame = proto::mit_encode(anchor[i], 0.0, 60.0, 1.5, 0.0, &wheels.ranges[i]);
+            sock.send(IDS[i] as u16, &frame).unwrap();
+        }
+        let seen = collect_feedback(
+            &sock,
+            &wheels.ranges,
+            &mut wheels.pos,
+            &mut wheels.vel,
+            &mut wheels.status,
+            Instant::now() + Duration::from_millis(200),
+        )
+        .unwrap();
+        assert_eq!(seen, 4);
+        assert_eq!(
+            wheels.status, [STATUS_ENABLED; 4],
+            "status after the first hold tick"
+        );
+        assert!(
+            !wheels.any_tripped(),
+            "a stale pre-enable echo would drop the hold"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        motors.join().unwrap();
     }
 }
