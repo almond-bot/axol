@@ -123,7 +123,8 @@ export type AxolSettings = {
  * the IK worker: `aligned` when the grippers already form the box-mode pair
  * (fingers forward, a flat face toward each other across a box-mode-sized gap
  * — a good moment to switch to box mode), `width` in metres, `grasp` the
- * grasp in force (`"flush"` / `"straight"`). Null until the worker's first
+ * grasp in force (`"flush"` / `"straight"`) and `elbow` the elbows-out angle
+ * (degrees) the sticks may have jogged. Null until the worker's first
  * report.
  */
 export type AxolJointState = {
@@ -131,5 +132,5 @@ export type AxolJointState = {
   l_grip: number
   r_grip: number
   engaged: boolean
-  pair: { aligned: boolean; width: number; grasp: string } | null
+  pair: { aligned: boolean; width: number; grasp: string; elbow: number | null } | null
 }

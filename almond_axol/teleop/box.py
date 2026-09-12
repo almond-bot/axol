@@ -74,6 +74,10 @@ class ToolGeometry:
         tip_in: That point's offset (m) along the mount's face axis, on the
             ``face = +1`` side (negative = across the mount axis from the
             box).
+        face_height: Height (m) of the contact face at its root — its
+            extent along the mount's ``Y`` axis, the blades' hinge
+            direction (vertical in box mode), centred on the mount. ``0``
+            for a face modelled as a line along the fingers.
 
     The foot is what box mode places at ``±width / 2``: the two contact
     faces are then ``width`` apart whatever tool is fitted, and the tilt
@@ -87,6 +91,7 @@ class ToolGeometry:
     foot_in: float = 0.0
     tip_fwd: float = 0.0
     tip_in: float = 0.0
+    face_height: float = 0.0
 
     def foot(self, face: float) -> np.ndarray:
         """Mount-frame vector from the mount origin to the contact foot.
@@ -102,21 +107,34 @@ class ToolGeometry:
     def contacts(self, grasp: str, face: float = 1.0) -> list[np.ndarray]:
         """Where this tool touches the box side in the given grasp, mount frame.
 
-        ``"flush"``: the contact face's foot and, if the tool has one, the
-        far tip — the two points the parcel gripper presses with. Any other
-        grasp (``"straight"``, fingers straight along the box): the mount
-        axis where it meets the box side and, again, the far end of the
-        fingers — the fixed blade lying along the box. The squeeze shaping
-        shares the clamp force evenly over these.
+        ``"flush"``: the contact face's root (its foot) and, if the tool has
+        one, the far tip — the points the parcel gripper presses with. Any
+        other grasp (``"straight"``, fingers straight along the box): the
+        mount axis where it meets the box side and, again, the far end of
+        the fingers — the fixed blade lying along the box. A face with a
+        :attr:`face_height` is represented at its root by its top and
+        bottom corners rather than its centre line: the parcel blades are
+        tall triangles (60 mm at the root, a point at the tip), and with
+        the root as one point the shaping fixed the force's line along the
+        fingers but left the *roll* about them to the arm's stiffness
+        coupling, so the face pressed along its top edge and its bottom
+        lifted — the thumb and index finger of a hand pinching while the
+        pinky comes off the box. Shared evenly over the corners and the
+        tip, the force passes through the triangle's centroid with no
+        roll, the whole face flat on the box.
         """
-        if grasp == "flush":
-            pts = [self.foot(face)]
-            if self.tip_fwd:
-                pts.append(self.tip(face))
-            return pts
-        pts = [np.zeros(3, dtype=np.float32)]
+        root = self.foot(face) if grasp == "flush" else np.zeros(3, dtype=np.float32)
+        if self.face_height > 0.0:
+            half = np.array((0.0, 0.5 * self.face_height, 0.0), dtype=np.float32)
+            pts = [root + half, root - half]
+        else:
+            pts = [root]
         if self.tip_fwd:
-            pts.append(np.array((0.0, 0.0, -self.tip_fwd), dtype=np.float32))
+            pts.append(
+                self.tip(face)
+                if grasp == "flush"
+                else np.array((0.0, 0.0, -self.tip_fwd), dtype=np.float32)
+            )
         return pts
 
 
@@ -134,6 +152,9 @@ PARCEL_FACE_R_M = 0.029
 # outboard side of the axis).
 PARCEL_TIP_FWD_M = 0.1385
 PARCEL_TIP_IN_M = -0.0335
+# Both blades are plates 60 mm tall at the root (centred on the flange axis)
+# tapering to a point at the tip: the contact face is that triangle.
+PARCEL_FACE_HEIGHT_M = 0.060
 
 
 def parcel_tool(
@@ -175,6 +196,7 @@ def parcel_tool(
         foot_in=c * n_in,
         tip_fwd=PARCEL_TIP_FWD_M,
         tip_in=PARCEL_TIP_IN_M,
+        face_height=PARCEL_FACE_HEIGHT_M,
     )
 
 

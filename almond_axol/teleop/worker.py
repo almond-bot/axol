@@ -126,12 +126,18 @@ def _dz(v: float) -> float:
     return 0.0 if abs(v) < _STICK_DEADZONE else float(v)
 
 
+# Range (degrees from straight down) the sticks jog ``box_elbow_out`` over:
+# elbows hanging under the shoulder-wrist line to held out level.
+_ELBOW_OUT_MIN = 0.0
+_ELBOW_OUT_MAX = 90.0
+
+
 def _dominant_axis(x: float, y: float) -> tuple[float, float]:
     """Keep only the larger of a thumbstick's two axes (deadzoned).
 
-    Only ``x`` (the grip width) is acted on, but a thumb pushed mostly
-    forward with a little sideways in it should not creep the width either,
-    so the smaller axis is zeroed. Ties go to ``x``.
+    ``x`` is the grip width and ``y`` the elbows; a thumb pushed mostly
+    forward with a little sideways in it should not creep the width (or the
+    other way round), so the smaller axis is zeroed. Ties go to ``x``.
     """
     x, y = _dz(x), _dz(y)
     if abs(x) >= abs(y):
@@ -1054,8 +1060,9 @@ class IKWorker:
         mode from here costs (almost) no alignment blend. ``width`` is the
         grip width in metres — the separation the fitted tool's contact
         faces would have with the mounts where they are (the mount
-        separation itself for the URDF gripper) — and ``grasp`` the grasp in
-        force (``"straight"`` / ``"flush"``).
+        separation itself for the URDF gripper) — ``grasp`` the grasp in
+        force (``"straight"`` / ``"flush"``) and ``elbow`` the elbows-out
+        angle (degrees, ``config.box_elbow_out``) the sticks may have jogged.
         """
         left, right = self._solver.fk(q)
         tool = self._box_tool()
@@ -1093,6 +1100,7 @@ class IKWorker:
             "aligned": bool(aligned),
             "width": round(width, 3),
             "grasp": self._box_grasp(),
+            "elbow": round(float(self._config.box_elbow_out), 1),
         }
 
     def _box_grasp(self) -> str:
@@ -1403,20 +1411,27 @@ class IKWorker:
         return False
 
     def _integrate_sticks(self, frame: VRFrame, box: BoxState, now: float) -> None:
-        """Accumulate this frame's thumbstick input into ``box``.
+        """Accumulate this frame's thumbstick input into ``box`` / the config.
 
-        Box mode's sticks do one thing, and both sticks do the same, so it
+        Box mode's sticks do two things, and both sticks do the same, so it
         doesn't matter which hand leads: left/right sets the **width**
         between the grippers (push right = wider, clamped to
-        ``box_width_min``..``box_width_max``). Forward/back does nothing —
-        the grippers' yaw is the grasp's (``straight`` 0°, ``flush`` the
-        tool's flush tilt) plus the fixed ``config.box_grip_tilt`` trim, not
-        a live control. Only a stick's dominant axis counts, so a thumb
-        pushing "left" with a little forward in it still changes the width
-        (see :func:`_dominant_axis`); with both sticks deflected their inputs
-        add, capped at full deflection. Stick clicks are not modifiers (a
-        single click toggles the grasp, :meth:`_stick_click_toggle`); the
-        pair's position is the leader hand's job, not the sticks'.
+        ``box_width_min``..``box_width_max``), and forward/back sets how far
+        out the **elbows** are held (push forward = further apart, back =
+        tucked in): it jogs ``config.box_elbow_out`` at ``box_elbow_speed``
+        within 0..90° from straight down, the angle the IK's elbow hint
+        (:meth:`_box_elbow_hints`) steers each arm's free swivel to. The
+        grippers' yaw is the grasp's (``straight`` 0°, ``flush`` the tool's
+        flush tilt) plus the fixed ``config.box_grip_tilt`` trim, not a
+        live control. Only a stick's dominant axis counts, so a thumb
+        pushing "left" with a little forward in it still changes only the
+        width (see :func:`_dominant_axis`); with both sticks deflected their
+        inputs add, capped at full deflection. Stick clicks are not
+        modifiers (a single click toggles the grasp,
+        :meth:`_stick_click_toggle`); the pair's position is the leader
+        hand's job, not the sticks'. The elbow angle lives in the config so
+        it outlasts the pair (the next engage keeps it) and reaches the
+        core / settings panel through :meth:`pair_status`.
         """
         cfg = self._config
         dt = (
@@ -1428,9 +1443,9 @@ class IKWorker:
         if dt <= 0.0:
             return
 
-        lx, _ly = _dominant_axis(frame.l_stick_x, frame.l_stick_y)
-        rx, _ry = _dominant_axis(frame.r_stick_x, frame.r_stick_y)
-        if not (lx or rx):
+        lx, ly = _dominant_axis(frame.l_stick_x, frame.l_stick_y)
+        rx, ry = _dominant_axis(frame.r_stick_x, frame.r_stick_y)
+        if not (lx or rx or ly or ry):
             return
 
         x = float(np.clip(lx + rx, -1.0, 1.0))
@@ -1439,6 +1454,16 @@ class IKWorker:
             box.width = float(
                 np.clip(
                     box.width + dt * width_rate, cfg.box_width_min, cfg.box_width_max
+                )
+            )
+        # The raw stick axis reads negative pushed forward (WebXR gamepad
+        # convention, as Jelly's drive reads it too): forward = elbows out.
+        y = -float(np.clip(ly + ry, -1.0, 1.0))
+        elbow_rate = y * cfg.box_elbow_speed
+        if elbow_rate:
+            cfg.box_elbow_out = float(
+                np.clip(
+                    cfg.box_elbow_out + dt * elbow_rate, _ELBOW_OUT_MIN, _ELBOW_OUT_MAX
                 )
             )
 

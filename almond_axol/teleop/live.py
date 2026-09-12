@@ -154,6 +154,21 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         ),
     ),
     LiveSettingDef(
+        key="box_elbow_out",
+        label="Elbows out",
+        type="number",
+        min=0.0,
+        max=90.0,
+        step=5.0,
+        unit="°",
+        help=(
+            "Box mode: how far out the elbows are held, in degrees from "
+            "hanging straight down under the shoulder-wrist line (0) to out "
+            "level (90). Also jogged live by pushing either thumbstick "
+            "forward (further apart) or back (tucked in)."
+        ),
+    ),
+    LiveSettingDef(
         key="box_squeeze_force",
         label="Squeeze force",
         type="number",
@@ -164,8 +179,8 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         help=(
             "Box mode: how hard each arm clamps the box once the width is "
             "jogged in past contact, at any pose, and shared evenly over "
-            "the gripper's contact points (the parcel gripper's face by the "
-            "wrist and its tip) instead of the face alone. Raise it if "
+            "the gripper's contact points (the parcel blade's root corners "
+            "and its tip) so the whole face lies flat. Raise it if "
             "boxes slip, lower it to be gentler; 0 turns the shaping off. "
             "Hardware only."
         ),

@@ -1254,7 +1254,12 @@ function HelpPanel({
     ...(viewOnly
       ? []
       : boxMode
-        ? ["[Grip]  Lead / Freeze Pair", "[Stick ←→]  Width", "[Stick Click]  Flush / Straight"]
+        ? [
+            "[Grip]  Lead / Freeze Pair",
+            "[Stick ←→]  Width",
+            "[Stick ↑↓]  Elbows",
+            "[Stick Click]  Flush / Straight",
+          ]
         : ["[Grip]  Engage / Freeze Arm", "[Both Clicks]  Box Mode"]),
   ].join("\n")
   const leftRows = [
@@ -1267,6 +1272,7 @@ function HelpPanel({
             ? [
                 "[Grip]  Lead / Freeze Pair",
                 "[Stick ←→]  Width",
+                "[Stick ↑↓]  Elbows",
                 "[Stick Click]  Flush / Straight",
                 "[Frozen: Sticks]  Drive Jelly",
                 "[Both Clicks]  Box Mode",
@@ -1808,7 +1814,7 @@ export default function App() {
                           ...(boxMode
                             ? ([
                                 ["Grip", "Lead both arms"],
-                                ["Stick", "← → width"],
+                                ["Stick", "← → width, ↑ ↓ elbows"],
                                 ["Stick click", "Flush / straight grasp"],
                               ] as [string, string][])
                             : ([
@@ -1842,7 +1848,7 @@ export default function App() {
                     ...(boxMode
                       ? ([
                           ["Grip", "Lead both arms"],
-                          ["Stick", "← → width"],
+                          ["Stick", "← → width, ↑ ↓ elbows"],
                           ["Stick click", "Flush / straight grasp"],
                         ] as [string, string][])
                       : ([["Grip", "Engage / freeze arm"]] as [string, string][])),

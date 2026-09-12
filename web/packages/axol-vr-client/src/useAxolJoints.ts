@@ -45,6 +45,7 @@ export function useAxolJoints(
                   aligned: !!pair.aligned,
                   width: pair.width,
                   grasp: typeof pair.grasp === "string" ? pair.grasp : "",
+                  elbow: typeof pair.elbow === "number" ? pair.elbow : null,
                 }
               : null,
           receivedAt: performance.now(),

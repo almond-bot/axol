@@ -409,9 +409,9 @@ class TeleopLoopTest(unittest.TestCase):
                 self.assertEqual(
                     robot.caps, [{Joint.SHOULDER_2: 6.0, Joint.SHOULDER_3: 6.0}]
                 )
-                # ... and the squeeze shaping: the parcel gripper's two
+                # ... and the squeeze shaping: the parcel gripper's three
                 # contacts in the default straight grasp, at the force cap.
-                self.assertEqual(robot.squeezes, [(2, 8.0)])
+                self.assertEqual(robot.squeezes, [(3, 8.0)])
                 core.set_live("box_squeeze_torque", 5.0)
                 core._apply_live_requests()
                 n = robot.commands
@@ -440,7 +440,7 @@ class TeleopLoopTest(unittest.TestCase):
                 self.assertEqual(robot.caps[-1], None)
                 self.assertEqual(len(robot.caps), 5)
                 # The shaping followed box mode the same way: on, off, on, cleared.
-                self.assertEqual(robot.squeezes, [(2, 8.0), None, (2, 8.0), None])
+                self.assertEqual(robot.squeezes, [(3, 8.0), None, (3, 8.0), None])
 
         asyncio.run(scenario())
 

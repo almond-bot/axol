@@ -690,6 +690,23 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="teleop.box_elbow_out",
+                label="Box-mode elbows out (°)",
+                type="number",
+                help=(
+                    "How far out box mode holds the elbows, in degrees from "
+                    "hanging straight down under the shoulder-wrist line (0) "
+                    "to out level (90). The startup value; in the headset "
+                    "either thumbstick forward/back jogs it live (forward = "
+                    "further apart), and what the sticks leave it at is "
+                    "written back here."
+                ),
+                targets={
+                    "teleop": ("teleop.box_elbow_out",),
+                    "collect-data": (f"{_VRT}.box_elbow_out",),
+                },
+            ),
+            SettingDef(
                 key="teleop.box_squeeze_torque",
                 label="Box squeeze cap (Nm)",
                 type="number",
@@ -720,9 +737,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "Box mode: how hard each arm clamps the box once the "
                     "width is jogged in past contact — the same at any pose "
                     "— and shared evenly over the gripper's contact points "
-                    "(the parcel gripper's face by the wrist and its tip) "
-                    "instead of the face alone, so the tip stays on the box "
-                    "as you squeeze. Raise it if boxes slip out, lower it to "
+                    "(the parcel blade's root corners and its tip) instead "
+                    "of the face alone, so the whole face stays flat on the "
+                    "box as you squeeze. Raise it if boxes slip out, lower it to "
                     "be gentler; 0 turns the shaping off. Also adjustable "
                     "live from the headset menu (Squeeze force). Hardware "
                     "only."

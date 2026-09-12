@@ -443,6 +443,7 @@ def _stick_worker(leader: str = "left") -> IKWorker:
         box_grip_tilt=0.0,
         box_elbow_out=40.0,
         box_elbow_weight=10.0,
+        box_elbow_speed=30.0,
     )
     worker._box_leader = leader
     return worker
@@ -653,8 +654,8 @@ class SticksDriveJellyTest(unittest.TestCase):
 
 
 class StickControlTest(unittest.TestCase):
-    """Box mode's sticks set the grip width (left/right), on either stick,
-    and nothing else: forward/back is inert (the grasp sets the yaw)."""
+    """Box mode's sticks set the grip width (left/right) and how far out the
+    elbows are held (forward/back), on either stick; the grasp sets the yaw."""
 
     def _sticks(
         self, worker: IKWorker, box: BoxState, frame: VRFrame, dt: float = 0.05
@@ -672,18 +673,28 @@ class StickControlTest(unittest.TestCase):
         self.assertAlmostEqual(box.width, 0.3, places=6)
         self.assertEqual(box.tilt, 0.0)
 
-    def test_forward_back_changes_nothing(self) -> None:
+    def test_forward_brings_the_elbows_out_back_tucks_them_in(self) -> None:
         worker = _stick_worker()
         box = _box_state()
-        for frame in (
-            _stick_frame(r_stick_y=1.0),
-            _stick_frame(l_stick_y=-1.0),
-            _stick_frame(l_stick_y=1.0, r_stick_y=1.0),
-        ):
-            self._sticks(worker, box, frame)
-            self.assertEqual(box.tilt, 0.0)
-            self.assertEqual(box.width, 0.3)
+        # The raw axis reads negative pushed forward (WebXR): 30°/s for 50 ms.
+        self._sticks(worker, box, _stick_frame(r_stick_y=-1.0))
+        self.assertAlmostEqual(worker._config.box_elbow_out, 41.5, places=6)
+        self._sticks(worker, box, _stick_frame(l_stick_y=1.0))
+        self.assertAlmostEqual(worker._config.box_elbow_out, 40.0, places=6)
+        # Neither touches the width or the yaw trim.
+        self.assertEqual(box.width, 0.3)
+        self.assertEqual(box.tilt, 0.0)
         self.assertEqual(worker._config.box_grip_tilt, 0.0)
+        # Both sticks add, capped at full deflection, and the angle is
+        # clamped to 0..90° from straight down.
+        self._sticks(worker, box, _stick_frame(l_stick_y=-1.0, r_stick_y=-1.0))
+        self.assertAlmostEqual(worker._config.box_elbow_out, 41.5, places=6)
+        for _ in range(40):  # 4 s at the 0.1 s dt cap: 120° asked, 90° given
+            self._sticks(worker, box, _stick_frame(l_stick_y=-1.0), dt=0.1)
+        self.assertEqual(worker._config.box_elbow_out, 90.0)
+        for _ in range(40):
+            self._sticks(worker, box, _stick_frame(l_stick_y=1.0), dt=0.1)
+        self.assertEqual(worker._config.box_elbow_out, 0.0)
 
     def test_config_tilt_trim_yaws_the_fingertips(self) -> None:
         # The trim is a fixed calibration: positive turns the left gripper's
@@ -783,6 +794,7 @@ class _FakeCore:
             "box_tool_open_deg": 141.5,
             "box_face_left": "auto",
             "box_face_right": "auto",
+            "box_elbow_out": 30.0,
             "reengage": "clutch",
             "hold_to_engage": False,
             "position_multiplier": 1.0,
@@ -1020,7 +1032,9 @@ class GraspToggleTest(unittest.TestCase):
         self._step(worker)  # re-snap in the straight grasp
         self.assertIsNotNone(worker._box)
         self.assertEqual(worker._box.tool.flush_tilt, 0.0)
-        self.assertEqual(worker.pair_status(np.zeros(14))["grasp"], "straight")
+        status = worker.pair_status(np.zeros(14))
+        self.assertEqual(status["grasp"], "straight")
+        self.assertEqual(status["elbow"], worker._config.box_elbow_out)
         # Solves happened before and after; the toggle and snap frames hold.
         self._step(worker)
         self.assertGreater(len(worker._solver.calls), n_solves)
@@ -1085,6 +1099,36 @@ class GraspToggleTest(unittest.TestCase):
         # ...and once it has landed, the worker's word is final again.
         core._unpack_solution((q, {"aligned": False, "width": 0.3, "grasp": "flush"}))
         self.assertEqual(core.config.box_grasp, "flush")
+
+    def test_core_mirrors_the_workers_elbow_angle(self) -> None:
+        notified: list[tuple[str, object]] = []
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+            broadcast_mode=lambda key, value: notified.append((key, value)),
+        )
+        q = np.zeros(14, np.float32)
+        self.assertEqual(core.config.box_elbow_out, 30.0)  # the default
+        self.assertGreater(core.config.box_elbow_weight, 0.0)  # hint on
+        status = {"aligned": False, "width": 0.3, "grasp": "straight", "elbow": 42.5}
+        core._unpack_solution((q, status))
+        self.assertEqual(core.config.box_elbow_out, 42.5)
+        self.assertEqual(notified[-1], ("box_elbow_out", 42.5))
+        # A panel/HUD change on its way to the worker survives stale reports.
+        core.set_live("box_elbow_out", 10)
+        core._apply_live_requests()
+        self.assertEqual(core.config.box_elbow_out, 10.0)
+        core._unpack_solution((q, dict(status, elbow=42.5)))
+        self.assertEqual(core.config.box_elbow_out, 10.0)
+        core._unpack_solution((q, dict(status, elbow=10.0)))
+        core._unpack_solution((q, dict(status, elbow=15.0)))
+        self.assertEqual(core.config.box_elbow_out, 15.0)
+        # An old worker without the field changes nothing.
+        core._unpack_solution(
+            (q, {"aligned": False, "width": 0.3, "grasp": "straight"})
+        )
+        self.assertEqual(core.config.box_elbow_out, 15.0)
 
 
 class LiveToggleTest(unittest.TestCase):

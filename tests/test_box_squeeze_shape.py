@@ -27,7 +27,7 @@ import logging
 import math
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 
@@ -37,6 +37,7 @@ from almond_axol.robot.config import AxolConfig
 from almond_axol.robot.gravity import GravityCompensator
 from almond_axol.robot.squeeze import SqueezeSpec, orient_contacts, shape_squeeze
 from almond_axol.teleop.box import (
+    PARCEL_FACE_HEIGHT_M,
     PARCEL_TIP_FWD_M,
     PARCEL_TIP_IN_M,
     URDF_TOOL,
@@ -101,12 +102,12 @@ class ShapeMathTest(unittest.TestCase):
         # more than the total and the other is in tension (lifts off) —
         # which one depends on the pose (the face at the arm-down poses the
         # operator squeezes at, the tip here with the elbow well bent).
-        self.assertGreater(abs(before[0] - before[1]), abs(before.sum()))
+        self.assertGreater(np.ptp(before), abs(before.sum()))
         res = shape_squeeze(self.kp * dq, self.kp, self.jac, self.rot, self.n, self.pts)
         after = _contact_split(
             self.jac, self.kp, self.rot, self.n, self.pts, res.tau / self.kp
         )
-        self.assertAlmostEqual(after[0], after[1], places=6)
+        np.testing.assert_allclose(after, np.full(len(after), after.mean()), atol=1e-6)
         self.assertAlmostEqual(after.sum(), before.sum(), places=6)
         self.assertGreater(res.estimate, 0.0)
         self.assertEqual(res.force, res.estimate)  # no cap in the way
@@ -116,7 +117,7 @@ class ShapeMathTest(unittest.TestCase):
         """Servo lag / payload: a run-ahead orthogonal (in the compliance
         metric) to what the contacts can push back with passes through."""
         r = self.pts @ self.rot.T
-        wr = np.hstack((np.tile(self.n, (2, 1)), np.cross(r, self.n)))
+        wr = np.hstack((np.tile(self.n, (len(r), 1)), np.cross(r, self.n)))
         basis = self.jac.T @ wr.T
         rng = np.random.default_rng(3)
         rest = rng.normal(size=7)
@@ -124,12 +125,14 @@ class ShapeMathTest(unittest.TestCase):
         d = 1.0 / self.kp
         coef = np.linalg.solve(basis.T @ (d[:, None] * basis), basis.T @ (d * rest))
         rest -= basis @ coef
-        tau = rest + basis @ np.array([5.0, -1.0])  # 4 N total, unevenly
+        # 6 N total, unevenly: the root's top corner pressing, its bottom
+        # corner in tension (the face rolled) and the tip lightly loaded.
+        tau = rest + basis @ np.array([7.0, -3.0, 2.0])
         res = shape_squeeze(tau, self.kp, self.jac, self.rot, self.n, self.pts)
-        self.assertAlmostEqual(res.estimate, 4.0, places=6)
-        np.testing.assert_allclose(res.contact_forces, [5.0, -1.0], atol=1e-6)
+        self.assertAlmostEqual(res.estimate, 6.0, places=6)
+        np.testing.assert_allclose(res.contact_forces, [7.0, -3.0, 2.0], atol=1e-6)
         np.testing.assert_allclose(
-            res.tau, rest + basis @ np.array([2.0, 2.0]), atol=1e-6
+            res.tau, rest + basis @ np.array([2.0, 2.0, 2.0]), atol=1e-6
         )
 
     def test_force_cap_saturates_and_the_shape_is_kept(self) -> None:
@@ -143,12 +146,12 @@ class ShapeMathTest(unittest.TestCase):
         split = _contact_split(
             self.jac, self.kp, self.rot, self.n, self.pts, res.tau / self.kp
         )
-        np.testing.assert_allclose(split, [4.0, 4.0], atol=1e-6)
+        np.testing.assert_allclose(split, [8.0 / 3.0] * 3, atol=1e-6)
 
     def test_spring_caps_bound_the_force_through_the_even_split(self) -> None:
         dq = self._translation_run_ahead(0.05)
         r = self.pts @ self.rot.T
-        wr = np.hstack((np.tile(self.n, (2, 1)), np.cross(r, self.n)))
+        wr = np.hstack((np.tile(self.n, (len(r), 1)), np.cross(r, self.n)))
         even = (self.jac.T @ wr.T).mean(axis=1)
         caps = {1: 4.0, 2: 4.0}
         expected = min(4.0 / abs(even[1]), 4.0 / abs(even[2]))
@@ -180,10 +183,11 @@ class ShapeMathTest(unittest.TestCase):
         """``shared`` (the pair's common inward force) bounds what is
         reshaped and capped; the arm's own excess — the pair moving — stays."""
         r = self.pts @ self.rot.T
-        wr = np.hstack((np.tile(self.n, (2, 1)), np.cross(r, self.n)))
+        wr = np.hstack((np.tile(self.n, (len(r), 1)), np.cross(r, self.n)))
         basis = self.jac.T @ wr.T
         even = basis.mean(axis=1)
-        tau = basis @ np.array([10.0, 2.0])  # 12 N, all through the fit
+        fit = np.array([6.0, 4.0, 2.0])
+        tau = basis @ fit  # 12 N, all through the fit
         res = shape_squeeze(
             tau, self.kp, self.jac, self.rot, self.n, self.pts, {}, 8.0, shared=3.0
         )
@@ -191,7 +195,7 @@ class ShapeMathTest(unittest.TestCase):
         self.assertEqual(res.force, 3.0)  # the squeeze, under the cap
         # 3 N of the fit reshaped evenly, the other 9 N left as they were.
         np.testing.assert_allclose(
-            res.tau, basis @ np.array([7.5, 1.5]) + 3.0 * even, atol=1e-6
+            res.tau, basis @ (fit * 0.75) + 3.0 * even, atol=1e-6
         )
         # The cap applies to the squeeze, not to the motion.
         res = shape_squeeze(
@@ -199,7 +203,7 @@ class ShapeMathTest(unittest.TestCase):
         )
         self.assertEqual(res.force, 8.0)
         np.testing.assert_allclose(
-            res.tau, basis @ (np.array([10.0, 2.0]) / 12.0) + 8.0 * even, atol=1e-6
+            res.tau, basis @ (fit / 12.0) + 8.0 * even, atol=1e-6
         )
         # Nothing in common (the other arm is unloaded): untouched.
         for shared in (0.0, -2.0):
@@ -354,7 +358,7 @@ class ArmCommandTest(unittest.TestCase):
         # The tip is loaded as much as the face in the arm's stiffness model.
         pts = orient_contacts(spec.contacts, rot, normal)
         split = _contact_split(jac, kp, rot, normal, pts, expected.tau / kp)
-        np.testing.assert_allclose(split, [4.0, 4.0], atol=1e-6)
+        np.testing.assert_allclose(split, [8.0 / 3.0] * 3, atol=1e-6)
         # Off again: the raw target goes out.
         arm.set_squeeze(None)
         asyncio.run(arm.motion_control(target))
@@ -428,7 +432,7 @@ class RobotPairTest(unittest.TestCase):
         self.assertGreater(spec_r.normal[1], 0.9)
         np.testing.assert_allclose(spec_l.normal, -spec_r.normal)
         self.assertEqual(spec_l.force_cap, 8.0)
-        self.assertEqual(len(spec_l.contacts), 2)
+        self.assertEqual(len(spec_l.contacts), 3)
         # Off clears both.
         robot.set_squeeze(None)
         self.assertIsNone(robot.left._squeeze)
@@ -466,6 +470,14 @@ class RobotPairTest(unittest.TestCase):
 
         return robot, sent, jac_l, jac_r, translate
 
+    @staticmethod
+    def _settle(robot) -> None:
+        """Forget the shaping low-pass's history: the next command applies
+        its correction in full, as after a pause (see ``_smoothed_squeeze``)."""
+        for arm in (robot.left, robot.right):
+            arm._squeeze_corr = None
+            arm._squeeze_corr_t = None
+
     def test_a_carry_is_not_a_squeeze(self) -> None:
         """The pair moving sideways loads one arm's normal exactly like a
         clamp and unloads the other's; shaping or capping it would hold the
@@ -491,6 +503,7 @@ class RobotPairTest(unittest.TestCase):
         # Width jogged 2 cm in on each side: both press, both capped.
         left = translate(jac_l, 0.02 * normal_l)
         right = translate(jac_r, -0.02 * normal_l)
+        self._settle(robot)  # (the tests' commands are microseconds apart)
         asyncio.run(robot.motion_control(left, right))
         self.assertEqual(robot.squeeze_forces, (8.0, 8.0))
         run_l = np.array([c[0] for c in sent[True][-1][:7]])
@@ -501,6 +514,7 @@ class RobotPairTest(unittest.TestCase):
         # not held back to the clamp's command: its extra motion goes out.
         left_c = translate(jac_l, 0.03 * normal_l)
         right_c = translate(jac_r, -0.01 * normal_l)
+        self._settle(robot)
         asyncio.run(robot.motion_control(left_c, right_c))
         est_l = robot.left.squeeze_estimate(left_c)
         est_r = robot.right.squeeze_estimate(right_c)
@@ -561,23 +575,128 @@ class RobotPairTest(unittest.TestCase):
         )
 
 
+class SmoothingTest(unittest.TestCase):
+    """The shaped command follows the measured pose along the contact
+    directions — so measured jitter went straight back out and the clamp
+    buzzed. The correction is low-passed (``SQUEEZE_SMOOTH_S``)."""
+
+    def _arm(self):
+        robot = AxolHardware(AxolConfig())
+        arm = robot.left
+        sent: list = []
+        arm._command_sink = sent.append
+        arm.resolve_joint_offsets = AsyncMock()
+        arm._joint_offsets = np.zeros(8, dtype=np.float32)
+        arm._unverified_zeros = set()
+        arm._unresolved_offsets = set()
+        measured = np.array([0.1, -0.3, 0.05, 0.6, 0.0, 0.1, -0.1, 0.0], np.float32)
+        for i, j in enumerate(ARM_JOINTS):
+            arm.motors[j]._position = float(measured[i])
+        arm.motors[Joint.GRIPPER]._position = 0.0
+        normal = np.array([0.0, -1.0, 0.0])
+        arm.set_squeeze(
+            SqueezeSpec(normal, tuple(parcel_tool(141.5).contacts("straight")), 8.0)
+        )
+        jac = arm._gravity_comp.mount_jacobian(
+            measured[:7].astype(np.float64), is_left=True
+        )[2]
+        target = measured.copy()
+        target[:7] += (
+            np.linalg.pinv(jac) @ np.concatenate([0.02 * normal, np.zeros(3)])
+        ).astype(np.float32)
+        return arm, sent, measured, target
+
+    def _send(self, arm, target, sent) -> np.ndarray:
+        arm.set_squeeze_shared(arm.squeeze_estimate(target))
+        asyncio.run(arm.motion_control(target))
+        return np.array([c[0] for c in sent[-1][:7]])
+
+    def test_measured_jitter_is_filtered_out_of_the_command(self) -> None:
+        arm, sent, measured, target = self._arm()
+        first = self._send(arm, target, sent)  # no history: the full correction
+        self.assertGreater(np.abs(first - target[:7]).max(), 1e-4)
+        # The arm twitches by 0.5° on shoulder_2 between two commands 1/120 s
+        # apart: unfiltered, the whole twitch would ride the command out.
+        s2 = ARM_JOINTS.index(Joint.SHOULDER_2)
+        arm.motors[Joint.SHOULDER_2]._position = float(measured[s2] + math.radians(0.5))
+        arm._squeeze_corr_t -= 1.0 / 120.0
+        with patch(
+            "almond_axol.robot.axol.time.monotonic",
+            return_value=arm._squeeze_corr_t + 1.0 / 120.0,
+        ):
+            second = self._send(arm, target, sent)
+        arm.motors[Joint.SHOULDER_2]._position = float(measured[s2])
+        # The correction moved only a fraction (1 - e^(-dt/tau) ≈ 15 %) of
+        # the way toward the twitched one.
+        moved = np.abs(second - first).max()
+        self.assertLess(moved, 0.3 * math.radians(0.5))
+        self.assertGreater(moved, 0.05 * math.radians(0.5))
+
+    def test_a_released_clamp_eases_out(self) -> None:
+        arm, sent, measured, target = self._arm()
+        shaped = self._send(arm, target, sent)
+        # The pair now says there is nothing in common: the correction
+        # decays instead of stepping off.
+        arm.set_squeeze_shared(0.0)
+        asyncio.run(arm.motion_control(target))
+        eased = np.array([c[0] for c in sent[-1][:7]])
+        np.testing.assert_allclose(eased, shaped, atol=1e-3)
+        self.assertEqual(arm.squeeze_force, 0.0)
+        # After a long gap the history is stale and nothing is applied.
+        arm._squeeze_corr_t -= 1.0
+        asyncio.run(arm.motion_control(target))
+        plain = np.array([c[0] for c in sent[-1][:7]])
+        np.testing.assert_allclose(plain, target[:7], atol=1e-6)
+        self.assertIsNone(arm._squeeze_corr)
+
+
 class ToolContactsTest(unittest.TestCase):
-    def test_parcel_flush_is_face_and_tip(self) -> None:
+    def test_parcel_flush_is_face_corners_and_tip(self) -> None:
         tool = parcel_tool(141.5)
         pts = tool.contacts("flush")
-        self.assertEqual(len(pts), 2)
-        np.testing.assert_allclose(pts[0], tool.foot(1.0))
-        np.testing.assert_allclose(pts[1], [PARCEL_TIP_IN_M, 0.0, -PARCEL_TIP_FWD_M])
+        self.assertEqual(len(pts), 3)
+        half = np.array([0.0, PARCEL_FACE_HEIGHT_M / 2, 0.0])
+        np.testing.assert_allclose(pts[0], tool.foot(1.0) + half, atol=1e-7)
+        np.testing.assert_allclose(pts[1], tool.foot(1.0) - half, atol=1e-7)
+        np.testing.assert_allclose(pts[2], [PARCEL_TIP_IN_M, 0.0, -PARCEL_TIP_FWD_M])
         self.assertAlmostEqual(PARCEL_TIP_FWD_M, 0.1385)
+        self.assertAlmostEqual(PARCEL_FACE_HEIGHT_M, 0.060)
         # The mirrored side.
         np.testing.assert_allclose(
-            tool.contacts("flush", -1.0)[1], [-PARCEL_TIP_IN_M, 0.0, -PARCEL_TIP_FWD_M]
+            tool.contacts("flush", -1.0)[2], [-PARCEL_TIP_IN_M, 0.0, -PARCEL_TIP_FWD_M]
         )
 
     def test_parcel_straight_is_the_blade_along_the_box(self) -> None:
         pts = parcel_tool(141.5).contacts("straight")
-        np.testing.assert_allclose(pts[0], [0.0, 0.0, 0.0])
-        np.testing.assert_allclose(pts[1], [0.0, 0.0, -PARCEL_TIP_FWD_M])
+        # The root's top and bottom corners (the blade is 60 mm tall there,
+        # centred on the mount) and the tip.
+        np.testing.assert_allclose(pts[0], [0.0, 0.03, 0.0])
+        np.testing.assert_allclose(pts[1], [0.0, -0.03, 0.0])
+        np.testing.assert_allclose(pts[2], [0.0, 0.0, -PARCEL_TIP_FWD_M])
+
+    def test_the_face_corners_take_the_roll_out_of_the_clamp(self) -> None:
+        """With the root as a single centre-line point the shaping said
+        nothing about the roll about the fingers, and the face pressed along
+        its top edge (thumb and index pinching, the pinky off the box).
+        With the corners it does: the even split has no roll moment, so a
+        rolled run-ahead is straightened."""
+        cfg = AxolConfig()
+        gc = GravityCompensator(cfg)
+        q = np.array([0.4, -0.15, 0.1, 1.2, 0.0, 0.3, 0.0])
+        _p, rot, jac = gc.mount_jacobian(q, is_left=True)
+        kp = np.array([float(getattr(cfg.left, j.value).kp) for j in ARM_JOINTS])
+        n = np.array([0.0, -1.0, 0.0])
+        pts = orient_contacts(parcel_tool(141.5).contacts("straight"), rot, n)
+        # A squeeze plus a roll about the fingers (the mount's Z, in base
+        # frame the third column of the rotation): the top corner digs in.
+        fingers = rot[:, 2]
+        dq = np.linalg.pinv(jac) @ np.concatenate([0.01 * n, 0.05 * fingers])
+        before = _contact_split(jac, kp, rot, n, pts, dq)
+        self.assertGreater(abs(before[0] - before[1]), 0.5 * abs(before.sum()))
+        res = shape_squeeze(kp * dq, kp, jac, rot, n, pts)
+        after = _contact_split(jac, kp, rot, n, pts, res.tau / kp)
+        self.assertAlmostEqual(after[0], after[1], places=6)  # no roll
+        self.assertAlmostEqual(after[1], after[2], places=6)  # no pitch
 
     def test_urdf_tool_touches_at_the_mount(self) -> None:
         for grasp in ("flush", "straight"):
@@ -594,12 +713,12 @@ class CoreDecisionTest(unittest.TestCase):
         core = _core(box_mode=True, box_tool="parcel", box_grasp="flush")
         contacts, force = core.squeeze()
         self.assertEqual(force, 8.0)
-        self.assertEqual(len(contacts), 2)
-        np.testing.assert_allclose(contacts[1], parcel_tool(141.5).tip(1.0))
+        self.assertEqual(len(contacts), 3)
+        np.testing.assert_allclose(contacts[2], parcel_tool(141.5).tip(1.0))
         core.set_live("box_grasp", "straight")
         core._apply_live_requests()
         contacts, _force = core.squeeze()
-        np.testing.assert_allclose(contacts[0], [0.0, 0.0, 0.0])
+        np.testing.assert_allclose(contacts[0], [0.0, 0.03, 0.0])
         core.set_live("box_tool", "urdf")
         core._apply_live_requests()
         contacts, _force = core.squeeze()

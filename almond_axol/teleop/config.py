@@ -129,8 +129,9 @@ class VRTeleopConfig:
             set the grasp instead (freeze the pair — click the leader's grip
             again — and they drive Jelly as usual, so the box can be carried
             across the room). Either stick does the same thing: left/right
-            changes the gripper separation (right = wider; forward/back does
-            nothing), and a single stick click toggles the grasp
+            changes the gripper separation (right = wider), forward/back how
+            far out the elbows are held (``box_elbow_out``; forward =
+            further apart), and a single stick click toggles the grasp
             (``box_grasp``: flush face or fingers straight). The mode is a live setting
             (``VRTeleopCore.set_box_mode``, the headset's **Box** button,
             both thumbstick clicks together, the control panel); this is the
@@ -195,19 +196,27 @@ class VRTeleopConfig:
         box_align_duration: Seconds over which a box-mode engage blends the
             grippers from their current poses into the parallel
             configuration before the leader controller takes over 1:1.
-        box_elbow_out: Optional explicit elbow posture for box mode, in
+        box_elbow_out: How far out the elbows are held in box mode, in
             degrees from straight down toward each arm's outboard side
             (``0`` hangs the elbows under the shoulder-wrist line, ``90``
             holds them out level). The parallel, fingers-forward gripper
-            poses of box mode leave each arm's elbow swivel free; by default
-            it is left alone — rest damping holds it, and the arm/torso
-            collision model (``KinematicsConfig.self_collision``) keeps it
-            off the base — but a nonzero ``box_elbow_weight`` steers it to
-            this angle with an IK elbow hint instead.
+            poses of box mode leave each arm's elbow swivel free; an IK
+            elbow hint steers it to this angle (at ``box_elbow_weight``).
+            The operator sets it live from either thumbstick — forward
+            brings the elbows further apart, back tucks them in, at
+            ``box_elbow_speed`` — and the value the sticks leave it at is
+            mirrored back here, so it outlasts the pair and shows in the
+            settings panel (also adjustable there, and from the headset
+            menu as **Elbows out**).
         box_elbow_weight: IK weight on that elbow hint (compare
-            ``KinematicsConfig.pos_weight`` 50 for the grippers). ``0`` (the
-            default) disables the hint; ``10`` is a sensible value if you want
-            a deliberately flared carry.
+            ``KinematicsConfig.pos_weight`` 50 for the grippers). ``0``
+            disables the hint — the swivel is then left alone: rest damping
+            holds it and the arm/torso collision model
+            (``KinematicsConfig.self_collision``) keeps it off the base —
+            and the sticks' elbow control does nothing. ``10`` (the default)
+            follows the angle without fighting the gripper poses.
+        box_elbow_speed: Rate (degrees/s) the sticks change
+            ``box_elbow_out`` at full forward/back deflection.
         box_squeeze_torque: Cap (Nm) on the impedance spring torque of the
             joints that squeeze the box — ``shoulder_2`` and ``shoulder_3``
             on each arm (see ``BOX_SQUEEZE_JOINTS`` in
@@ -472,7 +481,8 @@ class VRTeleopConfig:
     box_width_max: float = 0.70
     box_align_duration: float = 1.5
     box_elbow_out: float = 30.0
-    box_elbow_weight: float = 0.0
+    box_elbow_weight: float = 10.0
+    box_elbow_speed: float = 30.0
     box_squeeze_torque: float = 0.0
     box_squeeze_force: float = 8.0
     engage_max_vel: float = 0.1 * 2 * math.pi

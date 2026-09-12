@@ -116,6 +116,12 @@ _GRIPPER_CALIB_FULL_TRAVEL_FRACTION = 0.9
 _GRIPPER_CALIB_KP = 50.0
 _GRIPPER_CALIB_KD = 1.0
 
+# Time constant (s) of the low-pass on box mode's squeeze-shaping correction
+# (``AxolArm._smoothed_squeeze``): ~3 Hz corner. Below it the shaping holds
+# the force it computed; above it the arm keeps its ordinary stiffness, so
+# measurement jitter doesn't ride the command back out.
+SQUEEZE_SMOOTH_S = 0.05
+
 # The gripper end stops vary per unit and are measured at runtime by
 # ``_calibrate_gripper()``. They are persisted here so a reconnecting
 # ``enable()`` can restore them without re-running the sweep (which physically
@@ -564,6 +570,8 @@ class AxolArm:
     _squeeze_force: float = 0.0
     _squeeze_shared: float | None = None
     _squeeze_prep: tuple | None = None
+    _squeeze_corr: np.ndarray | None = None
+    _squeeze_corr_t: float | None = None
 
     def __init__(
         self,
@@ -824,6 +832,10 @@ class AxolArm:
         # pair hasn't looked yet, so this command is not shaped.
         self._squeeze_shared = None
         self._squeeze_prep = None  # squeeze_estimate's intermediates, per command
+        # The shaping's correction to the command, low-passed (see
+        # _shape_squeeze): joint-frame (7,) and the wall time it was updated.
+        self._squeeze_corr = None
+        self._squeeze_corr_t = None
         self._kp_vector = np.array(
             [float(getattr(self._arm_config, j.value).kp) for j in ARM_JOINTS],
             dtype=np.float64,
@@ -1686,6 +1698,8 @@ class AxolArm:
         self._squeeze_prep = None
         if spec is None:
             self._squeeze_force = 0.0
+            self._squeeze_corr = None
+            self._squeeze_corr_t = None
 
     @property
     def squeeze_force(self) -> float:
@@ -1758,7 +1772,7 @@ class AxolArm:
         self._squeeze_prep = None
         if prep is None or shared is None:
             self._squeeze_force = 0.0
-            return q_cmd
+            return self._smoothed_squeeze(q_cmd, None)
         q_meas, run_ahead, args = prep
         kp = args[0]
         try:
@@ -1771,8 +1785,45 @@ class AxolArm:
         if not np.all(np.isfinite(result.tau)):
             return q_cmd
         n_arm = len(ARM_JOINTS)
+        correction = (q_meas + result.tau / kp) - q_cmd[:n_arm].astype(np.float64)
+        return self._smoothed_squeeze(q_cmd, correction)
+
+    def _smoothed_squeeze(
+        self, q_cmd: np.ndarray, correction: np.ndarray | None
+    ) -> np.ndarray:
+        """Apply the shaping's correction to ``q_cmd`` through a low-pass.
+
+        The shaped command is ``q_meas + tau_shaped / kp``: along the
+        contact directions it *follows the measured pose* (that is what
+        holding a force rather than a position means), so every jitter of
+        the measured position — encoder noise, the impedance loop's own
+        micro-motion — went straight back out as a command and the clamp
+        buzzed. First-ordering the correction with ``SQUEEZE_SMOOTH_S``
+        leaves the static force exactly as shaped and turns the arm's
+        response along the contact directions above a few hertz back into
+        its ordinary spring (dynamically, the shaping is a damper
+        ``kp × SQUEEZE_SMOOTH_S`` rather than a zero stiffness). ``None``
+        (nothing to shape this command) decays the correction to zero the
+        same way, so a clamp released or a carry begun eases out of the
+        shaping instead of stepping.
+        """
+        n_arm = len(ARM_JOINTS)
+        target = np.zeros(n_arm) if correction is None else correction
+        now = time.monotonic()
+        prev, prev_t = self._squeeze_corr, self._squeeze_corr_t
+        if prev is None or prev_t is None or now - prev_t > 0.5:
+            # (Re)starting: no history to smooth against, and after a gap
+            # the old correction is stale.
+            smoothed = target if correction is not None else np.zeros(n_arm)
+        else:
+            alpha = 1.0 - math.exp(-(now - prev_t) / SQUEEZE_SMOOTH_S)
+            smoothed = prev + alpha * (target - prev)
+        self._squeeze_corr, self._squeeze_corr_t = smoothed, now
+        if correction is None and not np.any(np.abs(smoothed) > 1e-7):
+            self._squeeze_corr = None  # fully decayed: back to pass-through
+            return q_cmd
         out = q_cmd.copy()
-        out[:n_arm] = (q_meas + result.tau / kp).astype(out.dtype)
+        out[:n_arm] = (q_cmd[:n_arm].astype(np.float64) + smoothed).astype(out.dtype)
         return out
 
     def _back_off_to_spring_caps(self, q_cmd: np.ndarray) -> np.ndarray:

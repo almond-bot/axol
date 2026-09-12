@@ -312,12 +312,15 @@ class VRTeleopCore:
 
         # Latest gripper-pair geometry from the worker (see
         # ``IKWorker.pair_status``): ``{"aligned": bool, "width": m,
-        # "grasp": str}``, or None before the first report. Read by the
-        # adapter for the headset; ``grasp`` is mirrored into the config
-        # (see ``_mirror_grasp``), with a request on its way to the worker
-        # remembered here so stale reports can't undo it.
+        # "grasp": str, "elbow": deg}``, or None before the first report.
+        # Read by the adapter for the headset; ``grasp`` and ``elbow`` are
+        # mirrored into the config (see ``_mirror_worker_field``).
         self.pair_status: dict | None = None
-        self._box_grasp_pending: str | None = None
+        # Config fields the worker owns while a pair is live (a stick click
+        # toggles the grasp, the sticks jog the elbows): a change sent *to*
+        # the worker is pending until it reports the value back, see
+        # _mirror_worker_field.
+        self._worker_pending: dict[str, object] = {}
 
         # Reset latch (set from the VR frame callback / programmatically).
         self._prev_reset: bool = False
@@ -491,6 +494,7 @@ class VRTeleopCore:
             "box_grip_tilt",
             "box_elbow_out",
             "box_elbow_weight",
+            "box_elbow_speed",
         }
     )
 
@@ -732,8 +736,8 @@ class VRTeleopCore:
                         self.smooth_right.max_vel = float(coerced)
                     if key in self._LIVE_WORKER_FIELDS:
                         self._worker_updates.append((key, coerced))
-                        if key == "box_grasp":
-                            self._box_grasp_pending = str(coerced)
+                        if key in self._WORKER_OWNED:
+                            self._worker_pending[key] = coerced
                     self._logger.info("Live setting %s = %s", key, coerced)
                 self._notify_mode(key, coerced)
 
@@ -941,33 +945,45 @@ class VRTeleopCore:
         :meth:`IKWorker.pair_status`); a bare array is accepted too. The
         status is published on :attr:`pair_status` for the adapter's
         headset feedback (the "arms aligned" cue). The worker owns the
-        box-mode grasp while a stick click can toggle it, so the ``grasp``
-        it reports is mirrored into :attr:`config` (and announced as a live
-        setting change) when it differs — the settings panel then shows what
-        the arms are doing, and the value survives the next engage.
+        box-mode grasp (a stick click toggles it) and the elbows-out angle
+        (the sticks jog it) while a pair is live, so the ``grasp`` and
+        ``elbow`` it reports are mirrored into :attr:`config` (and announced
+        as live setting changes) when they differ — the settings panel then
+        shows what the arms are doing, and the values survive the next
+        engage.
         """
         if isinstance(result, tuple):
             q, status = result
             if status is not None:
                 self.pair_status = status
-                grasp = status.get("grasp") if isinstance(status, dict) else None
-                if isinstance(grasp, str):
-                    self._mirror_grasp(grasp)
+                if isinstance(status, dict):
+                    grasp = status.get("grasp")
+                    if isinstance(grasp, str):
+                        self._mirror_worker_field("box_grasp", grasp)
+                    elbow = status.get("elbow")
+                    if isinstance(elbow, (int, float)):
+                        self._mirror_worker_field("box_elbow_out", float(elbow))
             return q
         return result
 
-    def _mirror_grasp(self, grasp: str) -> None:
-        # A grasp change sent *to* the worker is in flight until the worker
+    # Config fields the worker changes on its own from stick input and
+    # reports back through pair_status (see _unpack_solution).
+    _WORKER_OWNED = frozenset({"box_grasp", "box_elbow_out"})
+
+    def _mirror_worker_field(self, key: str, value: object) -> None:
+        # A change sent *to* the worker is in flight until the worker
         # reports it back; statuses from before it landed still carry the old
         # value and must not undo the request.
-        if self._box_grasp_pending is not None:
-            if grasp != self._box_grasp_pending:
+        pending = self._worker_pending.get(key)
+        if pending is not None:
+            if value != pending:
                 return
-            self._box_grasp_pending = None
-        if grasp != self.config.box_grasp:
-            self.config.box_grasp = grasp
-            self._logger.info("Box grasp: %s (stick click)", grasp)
-            self._notify_mode("box_grasp", grasp)
+            del self._worker_pending[key]
+        if value != getattr(self.config, key):
+            setattr(self.config, key, value)
+            if key == "box_grasp":
+                self._logger.info("Box grasp: %s (stick click)", value)
+            self._notify_mode(key, value)
 
     def _accept_tracking_frame(self, frame: object) -> bool:
         """Gate absolute-mode frames across an optical tracking dropout.
