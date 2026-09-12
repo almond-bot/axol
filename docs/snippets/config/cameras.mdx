@@ -1,0 +1,17 @@
+export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{children}</code>;
+
+One ZED camera per slot: `overhead`, `left_arm`, `right_arm`. Flags are shown for `overhead`; swap in the other slot names. Stereo ZED X cameras are detected from their serial. The [control panel's Cameras tab](/guides/control-panel#cameras) edits all of this visually.
+
+| Flag | Default | Description |
+|---|---|---|
+| <F>--{prefix}overhead.serial</F> | `0` (unassigned) | Serial number of the ZED camera. `0` leaves the slot unused. |
+| <F>--{prefix}overhead.fps</F> | `60` | Capture rate. Raised automatically if the recording `fps` is higher. |
+| <F>--{prefix}overhead.width</F> | `960` | Capture width. With `height`, must be a ZED resolution: `SVGA` 960×600, `HD1080` 1920×1080, `HD1200` 1920×1200. |
+| <F>--{prefix}overhead.height</F> | `600` | Capture height. |
+| <F>--{prefix}overhead.color_mode</F> | `RGB` | `RGB` or `BGR`. |
+| <F>--{prefix}overhead.warmup_s</F> | `1` | Seconds of frames discarded on connect. |
+| <F>--{prefix}overhead.stereo</F> | `false` (auto) | Force stereo on or off instead of detecting it from the serial. |
+| <F>--{prefix}overhead.eyes</F> | `both` | Which eye(s) to **record**: `both` (`overhead_left` + `overhead_right`), `left`, or `right`. |
+| <F>--{prefix}overhead.stream_eyes</F> | `null` | Which eye(s) to **stream** to the headset. `null` follows `eyes`. Not used by run-policy. |
+| <F>--{prefix}overhead.record</F> | `true` | Write this camera to the dataset. |
+| <F>--{prefix}overhead.stream</F> | `true` | Show this camera in the headset. Not used by run-policy. |

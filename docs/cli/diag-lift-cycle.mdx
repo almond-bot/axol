@@ -12,14 +12,14 @@ axol diag.lift-cycle --cycles 2 --speed 300
 axol diag.lift-cycle --cycles 1 --no-right --left-channel can0
 ```
 
-In a terminal, omit `--cycles` and the command prompts for a positive number of cycles. Pass `--cycles` directly for unattended use; the diagnostics dashboard exposes it as a required field. `--speed` sets the lift controller's maximum speed in encoder counts/s; use `0` for full configured speed or a value from 250 to 65535. Lower caps are rejected to preserve margin across calibrated lift ranges before the firmware's 60-second safety timeout. `--lift-channel` selects the lift controller's SocketCAN interface (default: `can_alm_axol_c`); pass another interface only for a custom mapping. There is no automatic fallback to the wheel bus (`can_alm_axol_b`).
+In a terminal, omit `--cycles` and the command prompts for a positive number of cycles. Pass `--cycles` directly for unattended use; the diagnostics dashboard exposes it as a required field. `--speed` sets the lift controller's maximum speed in encoder counts/s; use `0` for full configured speed or a value from 250 to 65535. Lower caps are rejected to preserve margin across calibrated lift ranges before the firmware's 60-second safety timeout. `--lift-channel` selects the lift controller's SocketCAN interface. By default it follows the wiring [`can.setup`](/cli/can-setup) pinned: the chest bus `can_alm_axol_c` when that interface exists, otherwise the wheel bus `can_alm_axol_b` the lift shares with the Damiao motors. Pass another interface only for a custom mapping.
 
-The wheel motors and `can_alm_axol_b` do not need to be connected. With the defaults, this command opens only the selected arm buses and the lift/base interface `can_alm_axol_c`.
+The wheel motors do not need to be powered. With the defaults, this command opens only the selected arm buses and the lift's interface (`can_alm_axol_c`, or `can_alm_axol_b` on a shared bus); it never commands the wheels.
 
 `--left-channel` and `--right-channel` select the arm buses. Use `--no-left` or `--no-right` when only one arm is installed or connected; at least one arm is required so the mounted robot can be moved to the clearance pose. Grippers are excluded unconditionally, on both gripper-equipped and gripperless robots.
 
 <Note>
-  The lift must already be homed. Run [`axol lift.home`](/cli/lift-home) first; both commands default to the named lift interface `can_alm_axol_c`.
+  The lift must already be homed. Run [`axol lift.home`](/cli/lift-home) first; both commands resolve the lift interface the same way (`can_alm_axol_c` when present, otherwise `can_alm_axol_b`).
 </Note>
 
 <Note>

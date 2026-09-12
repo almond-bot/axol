@@ -1,7 +1,15 @@
 """Hardware control classes for the Almond Axol dual-arm robot.
 
-Provides :class:`AxolArm` (single-arm CAN bus controller) and :class:`Axol`
-(dual-arm context manager that opens both buses and constructs all 16 motor drivers).
+Provides :class:`AxolArm` (single-arm CAN bus controller) and
+:class:`AxolHardware` (dual-arm context manager that opens both buses and
+constructs all 16 motor drivers).
+
+``AxolHardware`` is internal to the package: it sends CAN from Python on the
+caller's schedule, which is what calibration and diagnostics tooling needs
+on a quiet bus. The public robot object is :class:`almond_axol.robot.Axol`
+(``almond_axol.rt.robot``): it presents this same surface, owns an
+``AxolHardware`` underneath, and hands the buses to the Rust realtime core
+(``axol-rt``) while enabled.
 """
 
 from __future__ import annotations
@@ -11,12 +19,12 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 
 import can
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, RT_TARGET_FIELDS
+from ..constants import ARM_JOINTS, RT_TARGET_FIELDS
 from ..motor import (
     CanBus,
     ControlMode,
@@ -26,6 +34,7 @@ from ..motor import (
     MotorGains,
     MotorStatus,
 )
+from ..settings import SHARED
 from ..utils.paths import almond_path
 from ..utils.state_files import secure_atomic_write_json, secure_read_text
 from .base import RobotBase, mark_hardware_cleanup_uncertain
@@ -540,6 +549,12 @@ class AxolArm:
     On the gripperless SKU (``AxolConfig.has_gripper = False``) no gripper
     motor is constructed: gripper commands (the last element of every
     ``(8,)`` array) are ignored and gripper reads report ``0.0``.
+
+    ``joints`` restricts the arm to a subset of its motors for a bench setup
+    that has only some of them on the bus (a wrist assembly under a ROM
+    test, say). Absent joints are treated like the absent gripper: never
+    constructed or brought up, their commands ignored, their reads ``0.0``
+    (the rest pose). Every public array keeps its ``(8,)`` Joint-enum shape.
     """
 
     # Box mode's squeeze shaping for the next command (see set_squeeze /
@@ -554,26 +569,34 @@ class AxolArm:
         config: AxolConfig,
         gravity_comp: GravityCompensator,
         is_left: bool = True,
+        joints: Iterable[Joint] | None = None,
     ) -> None:
         """Construct an AxolArm.
 
         Args:
             bus:          Shared CAN bus for this arm (one per physical interface).
             config:       Full dual-arm gains config; the correct side is selected via ``is_left``.
-            gravity_comp: Shared MuJoCo-based gravity compensator (one per Axol).
+            gravity_comp: Shared MuJoCo-based gravity compensator (one per AxolHardware).
             is_left:      ``True`` for the left arm, ``False`` for the right.
+            joints:       The joints whose motors are on the bus; ``None``
+                          (the default) is the full arm. The gripper is only
+                          ever constructed when ``config.has_gripper`` is set.
         """
         self._config = config
         self._arm_config = config.left if is_left else config.right
         self._gravity_comp = gravity_comp
         self._is_left = is_left
-        self._has_gripper = config.has_gripper
-        # Gripperless SKU: the gripper motor is simply never constructed, so
-        # every loop over ``self.motors`` skips it automatically.
+        present = set(Joint) if joints is None else set(joints)
+        if not present:
+            raise ValueError("an arm needs at least one joint")
+        if not config.has_gripper:
+            present.discard(Joint.GRIPPER)
+        self._has_gripper = Joint.GRIPPER in present
+        # Gripperless SKU / partial bench arm: an absent motor is simply never
+        # constructed, so every loop over ``self.motors`` skips it
+        # automatically.
         self.motors: dict[Joint, Motor] = {
-            joint: Motor(bus, joint)
-            for joint in Joint
-            if config.has_gripper or joint != Joint.GRIPPER
+            joint: Motor(bus, joint) for joint in Joint if joint in present
         }
         # The impedance-command encodings clamp kd to the firmware range
         # silently, and there is no host-side fallback for the excess — an
@@ -752,10 +775,12 @@ class AxolArm:
         # fixed_stop_wrap_correction), applied during zero verification.
         # The gripper offset is 0 because the gripper uses its own [0, 1]
         # normalisation between its two torque-detected hard stops.
+        # An absent joint has no motor frame to offset: it reads and is
+        # commanded at 0.0 (the rest pose) in both frames.
         self._joint_offsets = np.array(
             [
                 0.0
-                if j == Joint.GRIPPER
+                if j == Joint.GRIPPER or j not in present
                 else math.nan
                 if j in EITHER_STOP_JOINTS
                 else closer_end_stop(j, is_left)[0]
@@ -763,13 +788,13 @@ class AxolArm:
             ],
             dtype=float,
         )
-        self._unresolved_offsets: set[Joint] = set(EITHER_STOP_JOINTS)
+        self._unresolved_offsets: set[Joint] = set(EITHER_STOP_JOINTS) & present
         # Fixed-stop joints whose encoder zero has not been sanity-checked
         # yet.  resolve_joint_offsets() verifies each one's reading is
         # plausible for a zero at its calibration stop (an unset zero would
         # make every joint-frame value garbage), folds any ±360° single-turn
         # boot wrap into the joint's offset, and removes it from the set.
-        self._unverified_zeros: set[Joint] = set(ARM_JOINTS) - EITHER_STOP_JOINTS
+        self._unverified_zeros: set[Joint] = self._fixed_stop_joints()
         self._offset_lock = asyncio.Lock()
         # Realtime-core hook: production motion_control and
         # gravity_compensate hand their per-joint RT_TARGET_FIELDS-float
@@ -797,16 +822,26 @@ class AxolArm:
             dtype=np.float64,
         )
 
-    def _pad_gripper(self, values: list) -> list:
-        """Insert a ``0.0`` placeholder in the gripper slot when absent.
+    @property
+    def present_joints(self) -> frozenset[Joint]:
+        """The joints with a motor on this arm's bus (see ``joints`` in ``__init__``)."""
+        return frozenset(self.motors)
+
+    def _fixed_stop_joints(self) -> set[Joint]:
+        """Present arm joints whose zero is verified against a fixed end stop."""
+        return (set(ARM_JOINTS) - EITHER_STOP_JOINTS) & set(self.motors)
+
+    def _pad_absent(self, values: list) -> list:
+        """Insert a ``0.0`` placeholder for every absent motor.
 
         Per-motor reads iterate ``self.motors`` (7 entries on the gripperless
-        SKU); this restores the public ``(8,)`` Joint-enum-order shape.
+        SKU, fewer on a partial bench arm); this restores the public ``(8,)``
+        Joint-enum-order shape.
         """
-        if not self._has_gripper:
-            values = list(values)
-            values.insert(self._gripper_i, 0.0)
-        return values
+        if len(self.motors) == len(list(Joint)):
+            return values
+        values = iter(values)
+        return [next(values) if j in self.motors else 0.0 for j in Joint]
 
     # ------------------------------------------------------------------ #
     # Joint-offset resolution                                              #
@@ -1030,7 +1065,7 @@ class AxolArm:
         SKU the gripper element is 0.0.
         """
         self._require_offsets_resolved()
-        values = self._pad_gripper([self.motors[j].position for j in self.motors])
+        values = self._pad_absent([self.motors[j].position for j in self.motors])
         gripper_i = self._gripper_i
         if self._has_gripper:
             values[gripper_i] = self._gripper_from_raw(values[gripper_i])
@@ -1044,7 +1079,7 @@ class AxolArm:
         Returns shape (8,) array in Joint enum order (gripper element 0.0 on
         the gripperless SKU).
         """
-        values = self._pad_gripper([m.torque for m in self.motors.values()])
+        values = self._pad_absent([m.torque for m in self.motors.values()])
         return np.array(values, dtype=np.float32)
 
     # ------------------------------------------------------------------ #
@@ -1220,9 +1255,9 @@ class AxolArm:
         On the gripperless SKU the gripper calibration and mode switch are
         skipped (there is no gripper motor).
 
-        This is the motor-level half of :meth:`Axol.enable`: it does **not**
+        This is the motor-level half of :meth:`AxolHardware.enable`: it does **not**
         open the CAN bus. Callers driving arms individually must have
-        awaited :meth:`Axol.connect` (or :meth:`Axol.enable`) first;
+        awaited :meth:`AxolHardware.connect` (or :meth:`AxolHardware.enable`) first;
         otherwise the first motor read fails with a ``CanOperationError``
         saying the bus is unopened or still starting.
 
@@ -1297,7 +1332,7 @@ class AxolArm:
         # fixed-stop joints against the post-reset frame.  (Either-stop
         # joints are Damiao, whose mode switch is a register write — no
         # reboot, no re-detection needed.)
-        recheck = set(cold) & (set(ARM_JOINTS) - EITHER_STOP_JOINTS)
+        recheck = set(cold) & self._fixed_stop_joints()
         if recheck:
             self._unverified_zeros |= recheck
             await self.resolve_joint_offsets(recheck)
@@ -1387,7 +1422,7 @@ class AxolArm:
         # ±360° wrap correction detected earlier may be stale.  Mark the
         # fixed-stop joints (all MyActuator) for re-verification; the next
         # joint-frame entry point resolves them.
-        self._unverified_zeros |= set(ARM_JOINTS) - EITHER_STOP_JOINTS
+        self._unverified_zeros |= self._fixed_stop_joints()
 
     # ------------------------------------------------------------------ #
     # Getters                                                              #
@@ -1403,7 +1438,7 @@ class AxolArm:
         SKU the gripper element is 0.0.
         """
         await self.resolve_joint_offsets()
-        values = self._pad_gripper(
+        values = self._pad_absent(
             list(
                 await asyncio.gather(
                     *[self.motors[j].get_position() for j in self.motors]
@@ -1425,7 +1460,7 @@ class AxolArm:
         values = await asyncio.gather(
             *[self.motors[j].get_velocity() for j in self.motors]
         )
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_torques(self) -> np.ndarray:
         """Return torque estimate for every joint, fetched concurrently.
@@ -1435,7 +1470,7 @@ class AxolArm:
         the gripperless SKU).
         """
         values = await asyncio.gather(*[m.get_torque() for m in self.motors.values()])
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_temperatures(self) -> np.ndarray:
         """Return motor temperature (°C) for every joint, fetched concurrently.
@@ -1446,7 +1481,7 @@ class AxolArm:
         values = await asyncio.gather(
             *[m.get_temperature() for m in self.motors.values()]
         )
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_voltages(self) -> np.ndarray:
         """Return bus voltage (V) for every joint, fetched concurrently.
@@ -1455,7 +1490,7 @@ class AxolArm:
         the gripperless SKU).
         """
         values = await asyncio.gather(*[m.get_voltage() for m in self.motors.values()])
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_error_codes(self) -> list[MotorStatus]:
         """Return MotorStatus for every joint, fetched concurrently.
@@ -1472,7 +1507,7 @@ class AxolArm:
         """Return each motor's enabled-and-holding state, fetched concurrently.
 
         Read-only — safe on a robot of unknown state (pairs with
-        :meth:`Axol.connect` for inspecting before acting). See
+        :meth:`AxolHardware.connect` for inspecting before acting). See
         :meth:`Motor.is_holding` for what "holding" means per motor family.
         Returns a list in Joint enum order. On the gripperless SKU the
         gripper entry is omitted (7 entries).
@@ -1988,7 +2023,9 @@ class AxolArm:
             )
 
         tasks = [
-            self.motors[j].set_impedance(*arm_cmds[i]) for i, j in enumerate(ARM_JOINTS)
+            self.motors[j].set_impedance(*arm_cmds[i])
+            for i, j in enumerate(ARM_JOINTS)
+            if j in self.motors
         ]
         if self._has_gripper:
             tasks.append(
@@ -2116,6 +2153,7 @@ class AxolArm:
         tasks = [
             self.motors[j].set_impedance(*arm_tuples[i])
             for i, j in enumerate(ARM_JOINTS)
+            if j in self.motors
         ]
         if gripper_cmd is not None:
             tasks.append(self.motors[Joint.GRIPPER].set_position_force(*gripper_cmd))
@@ -2177,14 +2215,19 @@ class AxolArm:
         return tau - gravity
 
 
-class Axol(RobotBase):
-    """Dual-arm Axol robot interface.
+class AxolHardware(RobotBase):
+    """Dual-arm Axol hardware interface, driven directly from Python.
+
+    Internal — the public robot object is :class:`almond_axol.robot.Axol`,
+    which owns one of these and exposes the same methods. Use this class
+    directly only from package tooling that must send CAN from Python on a
+    quiet bus (calibration, register-level diagnostics).
 
     Opens one CAN bus per arm and constructs all 16 motor drivers on entry
     (14 on the gripperless SKU, ``config.has_gripper = False``).
     Use as an async context manager to ensure the buses are cleanly shut down.
 
-        async with Axol() as axol:
+        async with AxolHardware() as axol:
             await axol.enable()
             await axol.start_telemetry(500)  # 500 Hz
 
@@ -2201,7 +2244,7 @@ class Axol(RobotBase):
     touching motor state, for inspecting a robot of unknown state first
     (:meth:`get_holding`, :meth:`get_positions`, ...):
 
-        axol = Axol()
+        axol = AxolHardware()
         await axol.connect()      # open buses; inspect freely, nothing actuated
         await axol.enable()       # holding joints kept holding; cold joints brought up
         pos_l, pos_r = await axol.get_positions()
@@ -2222,9 +2265,14 @@ class Axol(RobotBase):
     Args:
         config:        Dual-arm gains config. Left and right arm gains are specified
                        independently; the right arm defaults to the left with gravity
-                       mirrored for shoulder_2 and elbow.
+                       mirrored for shoulder_2 and elbow. ``None`` (default)
+                       loads the robot's shared settings — the same
+                       ``~/.almond/settings.json`` the control panel and CLI
+                       use — over the calibrated defaults.
         left_channel:  SocketCAN interface name for the left arm.
         right_channel: SocketCAN interface name for the right arm.
+        left_joints:   Joints with a motor on the left bus (default: the full arm).
+        right_joints:  Joints with a motor on the right bus (default: the full arm).
     """
 
     # Box mode's squeeze shaping (see set_squeeze): the tool's contact
@@ -2236,20 +2284,53 @@ class Axol(RobotBase):
 
     def __init__(
         self,
-        config: AxolConfig = AxolConfig(),
-        left_channel: str | None = CAN_LEFT,
-        right_channel: str | None = CAN_RIGHT,
+        config: AxolConfig | None = None,
+        left_channel: str | None = SHARED,
+        right_channel: str | None = SHARED,
+        left_joints: Iterable[Joint] | None = None,
+        right_joints: Iterable[Joint] | None = None,
     ) -> None:
         """Construct the dual-arm interface.
 
         CAN buses and motors are created but not started; call ``enable()``
         or use the class as an async context manager to bring up hardware.
 
+        With no arguments the robot is configured exactly as the control
+        panel and the ``axol`` CLI would configure it: ``config`` and the
+        channels come from the shared settings file
+        (``~/.almond/settings.json``; see :mod:`almond_axol.settings`), so
+        stiffness, per-joint gains, link masses and CAN adapters saved once
+        apply here too. Pass any argument explicitly to override it.
+
         Args:
-            config:        Per-joint gains, friction parameters, and gripper config.
-            left_channel:  SocketCAN interface name for the left arm, or ``None`` to omit it.
-            right_channel: SocketCAN interface name for the right arm, or ``None`` to omit it.
+            config:        Per-joint gains, friction parameters, and gripper
+                           config. ``None`` loads the shared settings over the
+                           calibrated defaults (:func:`almond_axol.settings.
+                           shared_axol_config`); ``AxolConfig()`` is the bare
+                           calibrated defaults.
+            left_channel:  SocketCAN interface name for the left arm, or ``None``
+                           to omit it. Defaults to the shared
+                           ``robot.left_channel`` setting.
+            right_channel: SocketCAN interface name for the right arm, or ``None``
+                           to omit it. Defaults to the shared
+                           ``robot.right_channel`` setting.
+            left_joints:   Restrict the left arm to the joints actually on its
+                           bus (a partial bench arm); ``None`` is the full arm.
+                           See :class:`AxolArm`.
+            right_joints:  Same for the right arm.
         """
+        if config is None or left_channel is SHARED or right_channel is SHARED:
+            from ..settings import load_store, shared_axol_config
+
+            store = load_store()
+            if config is None:
+                config = shared_axol_config(store)
+            if left_channel is SHARED or right_channel is SHARED:
+                shared_left, shared_right = store.can_channels()
+                if left_channel is SHARED:
+                    left_channel = shared_left
+                if right_channel is SHARED:
+                    right_channel = shared_right
         if left_channel is None and right_channel is None:
             raise ValueError(
                 "At least one of left_channel or right_channel must be specified."
@@ -2274,7 +2355,11 @@ class Axol(RobotBase):
         if left_channel is not None:
             self._left_bus = CanBus(left_channel)
             self.left = AxolArm(
-                self._left_bus, config, self._gravity_comp, is_left=True
+                self._left_bus,
+                config,
+                self._gravity_comp,
+                is_left=True,
+                joints=left_joints,
             )
         else:
             self.left = None
@@ -2282,7 +2367,11 @@ class Axol(RobotBase):
         if right_channel is not None:
             self._right_bus = CanBus(right_channel)
             self.right = AxolArm(
-                self._right_bus, config, self._gravity_comp, is_left=False
+                self._right_bus,
+                config,
+                self._gravity_comp,
+                is_left=False,
+                joints=right_joints,
             )
         else:
             self.right = None
@@ -2372,7 +2461,7 @@ class Axol(RobotBase):
         just means no bus is open. Startup spawns the process and waits for
         its ready handshake, so it takes a moment: motor I/O issued from
         another task before this coroutine has returned fails with a
-        "CAN bus ... is still starting" error. Only the ``Axol``-level
+        "CAN bus ... is still starting" error. Only the ``AxolHardware``-level
         methods open buses; the per-arm :meth:`AxolArm.enable` /
         :meth:`AxolArm.disable` assume the bus is already open, so a
         controller that toggles arms individually must await ``connect()``
@@ -2939,7 +3028,7 @@ class Axol(RobotBase):
         """Hand each arm this command's :class:`SqueezeSpec` (see :meth:`set_squeeze`).
 
         Called by :meth:`motion_control` — and by anything that commands the
-        arms directly (``RtAxol.motion_control``) — before each command
+        arms directly (``almond_axol.rt.robot.Axol.motion_control``) — before each command
         while shaping is on; a no-op otherwise. Also logs the force the arms
         are applying, about once a second while they press.
         """

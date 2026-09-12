@@ -31,7 +31,7 @@ from unittest.mock import AsyncMock
 import numpy as np
 
 from almond_axol.constants import ARM_JOINTS, Joint
-from almond_axol.robot.axol import Axol
+from almond_axol.robot.axol import AxolHardware
 from almond_axol.robot.config import AxolConfig
 from almond_axol.robot.gravity import GravityCompensator
 from almond_axol.robot.squeeze import SqueezeSpec, orient_contacts, shape_squeeze
@@ -242,7 +242,7 @@ class ArmCommandTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.robot = Axol(AxolConfig())
+        cls.robot = AxolHardware(AxolConfig())
 
     def _arm_at(self, arm, measured: np.ndarray):
         sent: list[list[tuple[float, ...]]] = []
@@ -345,7 +345,7 @@ class RobotPairTest(unittest.TestCase):
     """``Axol.set_squeeze`` derives each arm's inward normal from the measured pair."""
 
     def test_normals_point_at_each_other(self) -> None:
-        robot = Axol(AxolConfig())
+        robot = AxolHardware(AxolConfig())
         for arm in (robot.left, robot.right):
             arm._command_sink = lambda cmds: None
             arm.resolve_joint_offsets = AsyncMock()
@@ -374,17 +374,18 @@ class RobotPairTest(unittest.TestCase):
         self.assertEqual(robot.squeeze_forces, (0.0, 0.0))
 
     def test_needs_a_contact(self) -> None:
-        robot = Axol(AxolConfig())
+        robot = AxolHardware(AxolConfig())
         with self.assertRaises(ValueError):
             robot.set_squeeze([], 8.0)
 
     def test_rt_robot_refreshes_the_specs_too(self) -> None:
-        """The hardware path (RtAxol) commands the arms directly, bypassing
-        Axol.motion_control — it must still hand each arm its spec, or the
-        shaping silently never runs on the robot."""
-        from almond_axol.rt.robot import RtAxol
+        """The hardware path (the core-backed ``rt.robot.Axol``) commands the
+        arms directly, bypassing AxolHardware.motion_control — it must still
+        hand each arm its spec, or the shaping silently never runs on the
+        robot."""
+        from almond_axol.rt.robot import Axol as RtAxol
 
-        robot = Axol(AxolConfig())
+        robot = AxolHardware(AxolConfig())
         sent: list[tuple] = []
         for arm in (robot.left, robot.right):
             arm._command_sink = sent.append
@@ -397,6 +398,7 @@ class RobotPairTest(unittest.TestCase):
         rt._robot = robot
         rt._link = SimpleNamespace(limp=None)
         rt._limp_announced = False
+        rt._armed = True  # motion_control() requires the core to be up
         robot.set_squeeze(parcel_tool(141.5).contacts("flush"), 8.0)
         rest = np.zeros(8, np.float32)
         with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:

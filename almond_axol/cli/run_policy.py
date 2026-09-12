@@ -606,7 +606,7 @@ class _QueuePolicyControl:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run the policy, exiting cleanly on hardware faults."""
-    cfg = parse(RunPolicyConfig, argv)
+    cfg = parse(RunPolicyConfig, argv, settings_op="run-policy")
     # force=True: importing lerobot (at module load) installs a root handler
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every _logger.info() status line.

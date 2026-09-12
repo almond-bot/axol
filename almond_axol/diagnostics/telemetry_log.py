@@ -12,11 +12,12 @@ up when the session ends (see :mod:`almond_axol.serve.telemetry`).
 CSV columns: ``t`` (epoch seconds) then ``<arm>:<JOINT>:pos`` and
 ``<arm>:<JOINT>:tq`` for every joint of every present arm. Positions are raw
 shaft radians (matching the live dashboard sampler); a cell is left empty for
-any motor with no cached reading yet, so a ``--joints`` subset run still
-captures the joints it actually drives. Velocity is not cached by the motor
-layer, so it is not captured here.
+any motor with no cached reading yet — or with no motor at all (gripperless
+SKU, partial bench arm) — so a ``--joints`` subset run still captures the
+joints it actually drives. Velocity is not cached by the motor layer, so it
+is not captured here.
 
-The Mantis rig (:class:`~almond_axol.robot.mantis.Mantis`) has one real motor
+The Mantis rig (:class:`~almond_axol.robot.mantis.MantisHardware`) has one real motor
 per side — the gripper — behind the same ``left`` / ``right`` surface; its
 arms carry no ``motors`` table, so they are sampled through their public
 ``positions`` / ``torques`` arrays (virtual arm joints echo their targets).
@@ -39,7 +40,7 @@ from ..utils.paths import almond_path
 from ..utils.state_files import secure_open_new_text
 
 if TYPE_CHECKING:
-    from ..robot.axol import Axol, AxolArm
+    from ..robot.axol import AxolArm, AxolHardware
 
 CAPTURE_DIR = almond_path("diagnostics", "captures")
 
@@ -51,7 +52,7 @@ class TelemetryCsvLogger:
 
     def __init__(
         self,
-        axol: Axol | Any,
+        axol: AxolHardware | Any,
         name: str,
         hz: float = _DEFAULT_HZ,
         out_dir: Path = CAPTURE_DIR,
@@ -126,7 +127,12 @@ class TelemetryCsvLogger:
                     wrote_any = True
                     continue
                 for joint in Joint:
-                    motor = motors[joint]
+                    motor = motors.get(joint)
+                    if motor is None:
+                        # Absent motor (gripperless SKU, partial bench arm):
+                        # the column stays, its cells stay empty.
+                        row.extend(("", ""))
+                        continue
                     if motor.has_position:
                         row.append(round(float(motor.position), 5))
                         wrote_any = True

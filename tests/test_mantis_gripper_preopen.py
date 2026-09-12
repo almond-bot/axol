@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from almond_axol.cli import collect_data
 from almond_axol.motor import ControlMode, MotorError
 from almond_axol.robot.axol import GRIPPER_TRAVEL
-from almond_axol.robot.mantis import Mantis, MantisGripperArm
+from almond_axol.robot.mantis import MantisGripperArm, MantisHardware
 
 
 class _FakeGripperMotor:
@@ -67,8 +67,8 @@ def _arm(motor: _FakeGripperMotor) -> MantisGripperArm:
         )
 
 
-def _mantis(left: MantisGripperArm, right: MantisGripperArm) -> Mantis:
-    robot = object.__new__(Mantis)
+def _mantis(left: MantisGripperArm, right: MantisGripperArm) -> MantisHardware:
+    robot = object.__new__(MantisHardware)
     robot.left = left
     robot.right = right
     robot._left_bus = SimpleNamespace(start=AsyncMock(), close=AsyncMock())

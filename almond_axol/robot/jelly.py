@@ -2,9 +2,10 @@
 
 Jelly has four omni wheels mounted at 45° on the corners (an
 x-drive), each driven by a Damiao motor in VELOCITY mode on a dedicated
-CAN bus, plus a telescoping lift driven by the jelly_legs board on its own
-chest CAN bus (see :mod:`almond_axol.robot.lift`). Wheel CAN IDs are
-fixed by convention:
+CAN bus, plus a telescoping lift driven by the jelly_legs board — either on
+its own chest CAN bus or sharing the wheel bus; ``axol can.setup`` detects
+which, and the lift driver follows (see :mod:`almond_axol.robot.lift`).
+Wheel CAN IDs are fixed by convention:
 
     id 1  front-left      id 2  front-right
     id 3  back-left       id 4  back-right
@@ -66,7 +67,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from ..constants import CAN_BASE, CAN_CHEST
+from ..constants import CAN_BASE
 from ..rt.link import find_binary
 from .lift import DOWN, JOG_SPEED, STOP, UP, Lift, LiftStatus
 
@@ -209,13 +210,17 @@ class JellyConfig:
                          disabled, and must be at least twice the command
                          period so a single late tick does not trip it.
         lift:            Whether the telescoping lift is present (the
-                         jelly_legs board on the chest CAN bus, see
-                         :mod:`almond_axol.robot.lift`). The chest bus being
-                         down at enable time only disables the lift with a
-                         warning — the buses are independent, so Jelly can
-                         still drive without it.
-        lift_channel:    SocketCAN interface of the chest bus carrying the
-                         jelly_legs lift controller.
+                         jelly_legs board, see :mod:`almond_axol.robot.lift`).
+                         The lift bus being down at enable time only disables
+                         the lift with a warning, so Jelly can still drive
+                         without it.
+        lift_channel:    SocketCAN interface carrying the jelly_legs lift
+                         controller. ``None`` (the default) follows the
+                         wiring ``axol can.setup`` found: the chest bus
+                         (``can_alm_axol_c``) when that interface exists,
+                         otherwise the wheel bus (``can_alm_axol_b``) the lift
+                         shares with the motors (see
+                         :func:`almond_axol.robot.lift.resolve_lift_channel`).
         lift_speed:      Lift jog speed in encoder counts/s (the firmware's
                          full speed is ~650).
     """
@@ -237,7 +242,7 @@ class JellyConfig:
     command_timeout: float = 0.2
     can_timeout_ms: float = 200.0
     lift: bool = True
-    lift_channel: str = CAN_CHEST
+    lift_channel: str | None = None
     lift_speed: int = JOG_SPEED
 
 
@@ -368,7 +373,7 @@ class Jelly:
 
     Typical usage::
 
-        jelly = Jelly(JellyConfig())
+        jelly = Jelly()          # config from the robot's shared settings
         await jelly.enable()
         jelly.set_command(vx=0.5, vy=0.0, wz=0.0, lift=0)   # from any thread
         ...
@@ -378,9 +383,18 @@ class Jelly:
     control and CAN; a small Python bridge forwards targets and owns the
     separate lift driver. Values are normalized to [-1, 1] (body frame: +x
     forward, +y left, +wz CCW); ``lift`` is +1 up / 0 stop / -1 down.
+
+    ``config=None`` (default) loads the shared ``jelly.*`` settings
+    (``~/.almond/settings.json``, the file the control panel and ``axol
+    teleop`` use; see :mod:`almond_axol.settings`) over the defaults; pass a
+    :class:`JellyConfig` to override.
     """
 
-    def __init__(self, config: JellyConfig = JellyConfig()) -> None:
+    def __init__(self, config: JellyConfig | None = None) -> None:
+        if config is None:
+            from ..settings import shared_config
+
+            config = shared_config(JellyConfig, "teleop", "jelly")
         self._config = config
         self._lift: Lift | None = None
         self._task: asyncio.Task | None = None
@@ -511,11 +525,16 @@ class Jelly:
                 await lift.close()
                 self._lift = None
                 _logger.warning(
-                    "Jelly lift: could not open the chest bus %s (%s) — "
+                    "Jelly lift: could not open the lift bus %s (%s) — "
                     "the lift is disabled for this session",
-                    cfg.lift_channel,
+                    lift.channel,
                     exc,
                 )
+            else:
+                if cfg.channel is not None and lift.channel == cfg.channel:
+                    _logger.info(
+                        "Jelly lift: jelly_legs shares the wheel bus %s", lift.channel
+                    )
 
         if cfg.channel is not None:
             from ..cli.can.setup import bring_up_interfaces, iface_up

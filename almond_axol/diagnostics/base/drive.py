@@ -19,8 +19,10 @@ Controls (Logitech F310/F710 in XInput mode):
     B             quit (wheels stopped, motors disabled)
 
 The D-pad commands the lift only while the deadman is held; releasing
-either stops it. The lift is the jelly_legs board on the chest CAN bus
-(see :mod:`almond_axol.robot.lift`); the status line shows its height as
+either stops it. The lift is the jelly_legs board on the chest CAN bus, or
+on the wheel bus when it shares that adapter — ``--lift-channel`` defaults
+to whichever ``axol can.setup`` pinned (see :mod:`almond_axol.robot.lift`);
+the status line shows its height as
 percent of homed travel, blank until the board answers (and ``---`` until
 the legs have been homed once). ``--no-lift`` skips the lift entirely.
 
@@ -38,6 +40,7 @@ import asyncio
 import logging
 import os
 
+from ...constants import CAN_BASE, CAN_CHEST
 from ...robot.jelly import DEFAULT_CHANNEL, WHEELS, Jelly, JellyConfig, deadzone
 from ...robot.lift import DOWN, STOP, UP
 
@@ -252,8 +255,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--lift-channel",
         default=JellyConfig.lift_channel,
-        help="SocketCAN interface of the chest bus carrying the jelly_legs "
-        f"lift controller (default: {JellyConfig.lift_channel})",
+        help="SocketCAN interface carrying the jelly_legs lift controller "
+        f"(default: {CAN_CHEST} when that chest bus exists, otherwise the "
+        f"wheel bus {CAN_BASE} the lift shares with the motors)",
     )
     parser.add_argument(
         "--imu",

@@ -30,6 +30,7 @@ axol run-policy --server_host <server-ip> --policy_path myorg/pick-place-policy 
 | `--port INT` | gRPC port (default: 8765). Must match `run-policy`'s `--server_port`. |
 | `--fps INT` | Action chunk rate (default: 60). Must match `run-policy`'s `--fps`. |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+| `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. See [Command configuration](/cli/configuration). |
 
 <Note>
   Requires the `lerobot` extra and, for GPU inference, a CUDA-capable PyTorch install on the server machine. Without `--server_host`, `run-policy` spawns its own local `PolicyServer` child process — this command is only needed when inference runs on a different machine.

@@ -1,4 +1,4 @@
-"""``RtMantis``: the Mantis grippers driven through the Rust realtime core.
+"""``Mantis``: the Mantis grippers driven through the Rust realtime core.
 
 Per take the core is armed on the gripper buses (Python bring-up on the quiet
 bus, hand-over, arm, first target through the core) and disarmed at the end
@@ -16,12 +16,12 @@ from unittest.mock import patch
 
 import numpy as np
 
-from almond_axol.constants import RT_PROTO_VERSION, RT_TARGET_FIELDS
+from almond_axol.constants import RT_TARGET_FIELDS
 from almond_axol.motor import ControlMode
 from almond_axol.robot.axol import GRIPPER_TRAVEL
-from almond_axol.robot.mantis import Mantis, MantisGripperArm
-from almond_axol.rt.link import RtLinkError
-from almond_axol.rt.mantis import RtMantis
+from almond_axol.robot.mantis import MantisGripperArm, MantisHardware
+from almond_axol.rt.link import CONFIG_PROTO, RtLinkError
+from almond_axol.rt.mantis import Mantis
 
 
 class _FakeGripperMotor:
@@ -151,8 +151,8 @@ def _arm(motor: _FakeGripperMotor, channel: str, log: list[str]) -> MantisGrippe
 
 def _mantis(
     left: MantisGripperArm, right: MantisGripperArm, *, defer: bool = True
-) -> Mantis:
-    robot = object.__new__(Mantis)
+) -> MantisHardware:
+    robot = object.__new__(MantisHardware)
     robot.left = left
     robot.right = right
     robot._left_bus = left._bus
@@ -171,7 +171,7 @@ def _calibrated(arm: MantisGripperArm) -> None:
     arm._closed_pos = 1.0 + GRIPPER_TRAVEL
 
 
-class RtMantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
+class MantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         _FakeLink.instances = []
         _FakeLink.fail_on_arm = False
@@ -186,7 +186,7 @@ class RtMantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
         patcher = patch("almond_axol.rt.mantis.RtLink", _FakeLink)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.rt = RtMantis(self.mantis)
+        self.rt = Mantis._wrap(self.mantis)
 
     async def test_connect_opens_buses_and_verifies_torque_off_without_a_core(
         self,
@@ -210,10 +210,11 @@ class RtMantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(self.rt.armed)
         (link,) = _FakeLink.instances
-        lines = link.config.splitlines()
-        self.assertEqual(lines[0], f"proto {RT_PROTO_VERSION}")
+        config_lines = link.config.splitlines()
+        # The protocol declaration leads every config (see RtLink.configure).
+        self.assertEqual(config_lines[0], f"proto {CONFIG_PROTO}")
         self.assertEqual(
-            lines[4:],
+            config_lines[4:],
             ["gripper 0 can_mantis_l 8", "gripper 1 can_mantis_r 8"],
         )
         # Python bring-up (enable / POSITION_FORCE / first target / read)
@@ -355,7 +356,7 @@ class RtMantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.left._bus.open and self.right._bus.open)
 
     async def test_recording_gate_reaches_the_armed_core(self) -> None:
-        rt = RtMantis(self.mantis, record="/tmp/axol-rt-mantis-test/trace")
+        rt = Mantis._wrap(self.mantis, record="/tmp/axol-rt-mantis-test/trace")
         await rt.connect()
         await rt.enable_grippers()
         (link,) = _FakeLink.instances
@@ -369,7 +370,7 @@ class RtMantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_deferred_enable_arms_immediately(self) -> None:
         mantis = _mantis(self.left, self.right, defer=False)
-        rt = RtMantis(mantis)
+        rt = Mantis._wrap(mantis)
 
         await rt.enable()
 
@@ -379,11 +380,11 @@ class RtMantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rt.armed)
 
 
-class RtMantisSurfaceTest(unittest.IsolatedAsyncioTestCase):
+class MantisSurfaceTest(unittest.IsolatedAsyncioTestCase):
     async def test_axol_surface_stubs(self) -> None:
         left = _arm(_FakeGripperMotor(), "can_mantis_l", [])
         right = _arm(_FakeGripperMotor(), "can_mantis_r", [])
-        rt = RtMantis(_mantis(left, right))
+        rt = Mantis._wrap(_mantis(left, right))
 
         self.assertIsNone(rt.fault)
         self.assertIsNone(rt.limp)
@@ -395,7 +396,7 @@ class RtMantisSurfaceTest(unittest.IsolatedAsyncioTestCase):
             await rt.gravity_compensate()
         self.assertIsNone(rt.state_nearest(time.perf_counter(), timeout=0.0))
 
-    def test_robot_mantis_builds_an_rt_mantis(self) -> None:
+    def test_robot_mantis_builds_a_core_mantis(self) -> None:
         from almond_axol.lerobot.robot.config_mantis import MantisRobotConfig
         from almond_axol.lerobot.robot.robot_mantis import MantisRobot
 
@@ -403,9 +404,9 @@ class RtMantisSurfaceTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(MantisRobot, "_build_cameras", return_value=({}, [])):
             robot = MantisRobot(config, defer_gripper_enable=True)
         hardware = robot._build_hardware()
-        self.assertIsInstance(hardware, RtMantis)
-        self.assertIsInstance(hardware.robot, Mantis)
-        self.assertTrue(hardware.robot._defer_gripper_enable)
+        self.assertIsInstance(hardware, Mantis)
+        self.assertIsInstance(hardware._robot, MantisHardware)
+        self.assertTrue(hardware._robot._defer_gripper_enable)
 
 
 if __name__ == "__main__":

@@ -26,13 +26,37 @@
       {
         "group": "Operations",
         "pages": [
-          "operations/teleop",
-          "operations/gravity-comp",
-          "operations/data-collection",
-          "operations/replay-dataset",
+          {
+            "group": "Teleoperation",
+            "root": "operations/teleop",
+            "pages": ["operations/teleop-config"]
+          },
+          {
+            "group": "Gravity Compensation",
+            "root": "operations/gravity-comp",
+            "pages": ["operations/gravity-comp-config"]
+          },
+          {
+            "group": "Data Collection",
+            "root": "operations/data-collection",
+            "pages": ["operations/data-collection-config"]
+          },
+          {
+            "group": "Replay Dataset",
+            "root": "operations/replay-dataset",
+            "pages": ["operations/replay-dataset-config"]
+          },
           "operations/train-policy",
-          "operations/run-policy",
-          "operations/dagger"
+          {
+            "group": "Run Policy",
+            "root": "operations/run-policy",
+            "pages": ["operations/run-policy-config"]
+          },
+          {
+            "group": "DAgger Collection",
+            "root": "operations/dagger",
+            "pages": ["operations/dagger-config"]
+          }
         ]
       },
       {
@@ -51,7 +75,11 @@
       {
         "group": "Web Interfaces",
         "pages": [
-          "guides/control-panel",
+          {
+            "group": "Web Control Panel",
+            "root": "guides/control-panel",
+            "pages": ["guides/control-panel-settings"]
+          },
           "guides/diagnostics-dashboard",
           "guides/vr-interface",
           "guides/quest-over-usb",

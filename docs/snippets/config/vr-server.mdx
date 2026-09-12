@@ -1,0 +1,14 @@
+export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{children}</code>;
+
+| Flag | Default | Description |
+|---|---|---|
+| <F>--{prefix}port</F> | `8000` | Port the headset connects to. [Quest-over-USB](/guides/quest-over-usb) uses the same port. |
+| <F>--{prefix}certfile</F> | `null` | TLS certificate. `null` uses the auto-generated one in `~/.almond/vr/certs/`. |
+| <F>--{prefix}keyfile</F> | `null` | TLS private key. `null` as above. |
+| <F>--{prefix}interp_enabled</F> | `true` | Smooth out jittery or batched pose arrivals. `false` uses the latest raw frame. |
+| <F>--{prefix}interp_min_delay_s</F> | `0` | Minimum playout delay (s). |
+| <F>--{prefix}interp_max_delay_s</F> | `0.15` | Maximum playout delay (s) spent absorbing network jitter. |
+| <F>--{prefix}interp_smooth_window_s</F> | `0.12` | Smoothing window (s). Adds about half of it as latency. `0` disables. See [Latency tuning](/operations/teleop#latency-tuning). |
+| <F>--{prefix}interp_outlier_k</F> | `4.0` | Glitch-rejection threshold. Lower is more aggressive; `≤ 0` disables. |
+| <F>--{prefix}pose_source_kind</F> | `null` | Which pose source may drive: `webxr` (Quest), `tracker` (Lighthouse/Ultimate), or `null` for whichever connects first. Set automatically for Mantis. |
+| <F>--{prefix}expected_pose_source_id</F> | `null` | *Mantis data collection.* Exact pose-source ID accepted. Set automatically. |

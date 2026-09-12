@@ -21,14 +21,22 @@ Up to four Axol buses, every one of them optional and independent:
     lift controller (listens on 0x420, answers on 0x421 — see
     ``almond_axol.robot.lift``), named can_alm_axol_c.
 
+Jelly's lift may also share the wheel bus instead of having its own chest
+adapter: the jelly_legs IDs (0x420-0x422) are clear of every Damiao range,
+so one single-channel adapter then carries both. That topology is detected
+too (wheels *and* lift answer on the same bus) — the adapter is pinned as
+can_alm_axol_b, no chest interface is configured, and the lift driver
+follows (``almond_axol.robot.lift.resolve_lift_channel``).
+
 The hub is told apart from the single-channel adapters by channel count: it
 always enumerates both channels under one serial, the others exactly one.
 The two single-channel adapters are physically identical, so they are told
 apart by *probing*: a bus whose jelly_legs board answers a GET_STATUS is the
-chest, one whose Damiao motors answer a register read is the wheels; a bus
-where nothing answers (devices unpowered) falls back to asking the operator.
-A Jetson host's built-in system CAN controller (mttcan) has no USB serial
-and is never touched.
+chest, one whose Damiao motors answer a register read is the wheels, one
+where both answer is the shared wheel+lift bus; a bus where nothing answers
+(devices unpowered) falls back to asking the operator. A Jetson host's
+built-in system CAN controller (mttcan) has no USB serial and is never
+touched.
 
 On Raspberry Pi 5 hosts the setup additionally raises the RP1 USB
 controllers' EMI tolerance (see :func:`_setup_rp1_usb_quirk`), which targets
@@ -63,7 +71,7 @@ from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from ...constants import (
     CAN_BASE,
@@ -111,6 +119,22 @@ _LOCK_LOCAL = threading.local()
 _USB_SERIAL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}\Z")
 
 DualHubIdentity = Literal["axol", "mantis", "silent", "conflict"]
+# What a single-channel adapter's bus turned out to carry: the Damiao wheel
+# motors, the jelly_legs lift controller, or both on one shared bus.
+SingleBusIdentity = Literal["wheels", "chest", "shared"]
+
+
+class SingleBusRoles(NamedTuple):
+    """Single-channel adapter assignment: ``(wheels serial, chest serial, shared)``.
+
+    ``lift_on_wheel_bus`` is True when the jelly_legs lift controller answered
+    on the wheel bus itself, i.e. the lift shares ``can_alm_axol_b`` and no
+    chest adapter is expected.
+    """
+
+    wheels: str | None
+    chest: str | None
+    lift_on_wheel_bus: bool = False
 
 
 @dataclass(frozen=True)
@@ -1152,9 +1176,11 @@ _JELLY_GET_STATUS = bytes([0x04])
 # the board before expecting its own transmissions to get through.
 _JELLY_SET_RATE_OFF = bytes([0x05, 0x00, 0x00])
 # Damiao register read: 0x7FF [id_lo, id_hi, 0x33, rid, ...]; the motor
-# echoes a 0x33 reply on its feedback ID. Register 60 (VBUS) is read-only.
+# echoes a 0x33 reply on its feedback ID (MST_ID = 0x10 + motor ID). Register
+# 60 (VBUS) is read-only.
 _DAMIAO_CFG_ID = 0x7FF
 _DAMIAO_WHEEL_IDS = (0x01, 0x02, 0x03, 0x04)
+_DAMIAO_FEEDBACK_BASE = 0x10
 _PROBE_ATTEMPTS = 3
 _PROBE_WINDOW_S = 0.4
 
@@ -1258,18 +1284,25 @@ def _probe_chest(iface: str) -> bool:
 
 
 def _probe_wheels(iface: str) -> bool:
-    """True when a Damiao wheel motor (ID 0x01-0x04) answers on ``iface``."""
+    """True when a Damiao wheel motor (ID 0x01-0x04) answers on ``iface``.
+
+    The reply must arrive on the motor's own feedback ID as well as carry the
+    register-read signature: on a bus shared with the jelly_legs board, a
+    status frame (0x421) whose position/velocity bytes happened to spell
+    ``[id, 0x00, 0x33, ...]`` must not pass as a wheel.
+    """
     frames = [
         (_DAMIAO_CFG_ID, bytes([mid, 0x00, 0x33, 60, 0, 0, 0, 0]))
         for mid in _DAMIAO_WHEEL_IDS
     ]
 
-    def is_reply(_can_id: int, data: bytes) -> bool:
+    def is_reply(can_id: int, data: bytes) -> bool:
         return (
             len(data) == 8
             and data[2] == 0x33
             and data[1] == 0x00
             and data[0] in _DAMIAO_WHEEL_IDS
+            and can_id == _DAMIAO_FEEDBACK_BASE + data[0]
         )
 
     return _probe(iface, frames, is_reply)
@@ -1418,8 +1451,12 @@ def _iface_for_serial(serial: str) -> str | None:
 
 def _identify_adapter(
     serial: str, *, reset: bool = False, recover_silence: bool = True
-) -> str | None:
-    """Probe a single-channel adapter's bus: ``"wheels"``, ``"chest"``, or None.
+) -> SingleBusIdentity | None:
+    """Probe a single-channel adapter's bus.
+
+    Returns ``"wheels"`` (Damiao motors answered), ``"chest"`` (the jelly_legs
+    board answered), ``"shared"`` (both did — the lift is wired onto the wheel
+    bus), or None when nothing answered.
 
     Explicit ``can.setup`` passes ``reset=True`` for a previously identified
     wheel/Jelly or chest/lift adapter. Unknown generic gs_usb devices get a
@@ -1440,7 +1477,7 @@ def _identify_adapter(
         # Silence any jelly_legs board before the wheel probe: the board starts
         # its 50 ms broadcast after the first frame it sees (the wheel probe's
         # own Damiao reads would wake it), and that stream starves the CANable's
-        # TX path — on a combined bus the wheel probe would then go deaf and the
+        # TX path — on a shared bus the wheel probe would then go deaf and the
         # bus would be misclassified as chest-only. Harmless where no board is
         # listening; a frame queued on a dead bus is dropped by the reset.
         _send_once(iface, _JELLY_CMD_ID, _JELLY_SET_RATE_OFF)
@@ -1448,14 +1485,8 @@ def _identify_adapter(
         wheels = _probe_wheels(iface)
         chest = _probe_chest(iface)
         if chest and wheels:
-            # The pre-split combined Jelly bus (jelly_legs next to the wheels).
-            print(
-                f"  WARNING: both the wheel motors and the jelly_legs board "
-                f"answer on {iface} — treating it as the wheel bus. Point the "
-                f"lift at it explicitly (jelly.lift_channel={_CAN_B}) or move "
-                f"the lift onto its own chest bus."
-            )
-            return "wheels"
+            # The lift is wired onto the wheel bus: one adapter, both devices.
+            return "shared"
         if chest:
             return "chest"
         if wheels:
@@ -2362,7 +2393,7 @@ def _ensure_setup_locked(
         _wait_for_dual_channel_serial(configured_usb)
     hub_serial = hub_serial or _resolve_hub_serial()
     if wheels_serial is None and chest_serial is None:
-        wheels_serial, chest_serial = _find_single_serials(
+        wheels_serial, chest_serial, _lift_on_wheel_bus = _find_single_serials(
             hub_serial, _configured_serial(_MANTIS_PROFILE), interactive=False
         )
     else:
@@ -2810,7 +2841,7 @@ def _find_single_serials(
     mantis_serial: str | None = None,
     *,
     interactive: bool = True,
-) -> tuple[str | None, str | None]:
+) -> SingleBusRoles:
     """Assign single-channel adapters to the wheel/chest buses.
 
     Every attached candidate is probed. Previously pinned wheel/Jelly and
@@ -2824,7 +2855,13 @@ def _find_single_serials(
     invisible prompt cannot block them. Duplicate unresolved pins are
     rejected. Serials claimed by a dual hub are excluded.
 
-    Returns ``(wheels_serial, chest_serial)``, either of which may be None.
+    A bus on which both the wheel motors and the jelly_legs board answer is
+    the *shared* wheel+lift bus: it takes the wheel role, and — since the
+    lift has provably been found there — a stale chest pin that no live board
+    backs is dropped rather than kept as an unverified fallback.
+
+    Returns :class:`SingleBusRoles` — ``(wheels_serial, chest_serial,
+    lift_on_wheel_bus)``; either serial may be None.
     """
     configured = {
         "wheels": _configured_named_serial(_CAN_B),
@@ -2847,7 +2884,7 @@ def _find_single_serials(
             f"probing{configured_note} (wheel motors / Jelly lift must be "
             "powered)..."
         )
-    detected: dict[str, str | None] = {}
+    detected: dict[str, SingleBusIdentity | None] = {}
     for serial in attached:
         print(f"  {serial}: probing wheel drive / Jelly lift controller...")
         known = serial in configured.values()
@@ -2869,14 +2906,30 @@ def _find_single_serials(
                 "then re-run setup."
             )
 
+    # The shared wheel+lift bus takes the wheel role: the lift driver reaches
+    # the board through can_alm_axol_b when no chest interface exists.
+    role_identities: dict[str, set[SingleBusIdentity]] = {
+        "wheels": {"wheels", "shared"},
+        "chest": {"chest"},
+    }
+
     def detected_for(role: str) -> str | None:
-        matches = sorted(serial for serial, found in detected.items() if found == role)
+        matches = sorted(
+            serial
+            for serial, found in detected.items()
+            if found in role_identities[role]
+        )
         if not matches:
             return None
         configured_serial = configured[role]
         selected = configured_serial if configured_serial in matches else matches[0]
-        label = "Damiao wheel motors" if role == "wheels" else "Jelly lift controller"
-        target = _CAN_B if role == "wheels" else _CAN_C
+        if detected[selected] == "shared":
+            label = "Damiao wheel motors and the Jelly lift controller"
+            target = f"{_CAN_B} (shared wheel + lift bus)"
+        elif role == "wheels":
+            label, target = "Damiao wheel motors", _CAN_B
+        else:
+            label, target = "Jelly lift controller", _CAN_C
         print(f"  {selected}: {label} answered -> {target}")
         for serial in matches:
             if serial != selected:
@@ -2893,6 +2946,14 @@ def _find_single_serials(
     source = {
         role: ("detected" if serial else None) for role, serial in assigned.items()
     }
+    lift_on_wheel_bus = (
+        assigned["wheels"] is not None and detected.get(assigned["wheels"]) == "shared"
+    )
+    if lift_on_wheel_bus and assigned["chest"] is not None:
+        print(
+            f"  WARNING: a second Jelly lift controller answered on {assigned['chest']} "
+            f"as well; the lift driver prefers {_CAN_C} over the shared wheel bus."
+        )
 
     # Keep old pins only when no live response contradicts them. A later
     # operator choice may replace these unverified fallbacks.
@@ -2902,6 +2963,16 @@ def _find_single_serials(
     ):
         old_serial = configured[role]
         if assigned[role] or not old_serial or old_serial == assigned[other_role]:
+            continue
+        if role == "chest" and lift_on_wheel_bus:
+            # The lift was positively found on the wheel bus, so the chest
+            # adapter this pin describes no longer carries it. Keeping the
+            # rule would revive can_alm_axol_c — and steer the lift driver
+            # onto an empty bus — the day that adapter is plugged back in.
+            print(
+                f"  {label}: the lift controller answered on the wheel bus; "
+                f"dropping the configured chest adapter {old_serial}."
+            )
             continue
         # Do not preserve a single-bus pin when that serial is currently
         # attached under a different topology (especially a selected hub).
@@ -2941,8 +3012,9 @@ def _find_single_serials(
             continue
         choice = (
             input(
-                f"    Assign it to the [w]heel/Jelly bus ({_CAN_B}), the "
-                f"[c]hest/lift bus ({_CAN_C}), or leave blank to skip: "
+                f"    Assign it to the [w]heel/Jelly bus ({_CAN_B}; also the lift "
+                f"when it shares that bus), the [c]hest/lift bus ({_CAN_C}), or "
+                "leave blank to skip: "
             )
             .strip()
             .lower()
@@ -2965,7 +3037,7 @@ def _find_single_serials(
     chest = assigned["chest"]
     if wheels and wheels == chest:
         _die(f"Adapter {wheels} cannot be assigned to both wheel and chest buses.")
-    return wheels, chest
+    return SingleBusRoles(wheels, chest, lift_on_wheel_bus)
 
 
 def _pull_factory_calibration(serial: str) -> None:
@@ -3028,7 +3100,7 @@ def _run_locked(args: object = None) -> None:
     configured_chest = _configured_named_serial(_CAN_C)
     interactive = _stdin_is_tty()
     hub_serial, mantis_serial = _find_dual_serials(interactive=interactive)
-    wheels_serial, chest_serial = _find_single_serials(
+    wheels_serial, chest_serial, lift_on_wheel_bus = _find_single_serials(
         hub_serial, mantis_serial, interactive=interactive
     )
     if not (hub_serial or mantis_serial or wheels_serial or chest_serial):
@@ -3094,6 +3166,8 @@ def _run_locked(args: object = None) -> None:
         print(f"  Wheels   : {_CAN_B}")
     if chest_serial:
         print(f"  Chest    : {_CAN_C} (jelly_legs lift)")
+    elif lift_on_wheel_bus:
+        print(f"  Lift     : {_CAN_B} (jelly_legs shares the wheel bus)")
     if hub_serial or wheels_serial or chest_serial:
         print(f"  Startup  : {_CRON_SCRIPT} (runs at @reboot via root crontab)")
         print(

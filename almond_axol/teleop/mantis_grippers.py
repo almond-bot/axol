@@ -8,7 +8,7 @@ grippers until stopped. It deliberately starts no VR server and needs no
 tracker binding, cameras, headset, or tracker-to-TCP transform.
 
 The grippers are driven through the Rust realtime core
-(:class:`~almond_axol.rt.RtMantis`): this loop only reads the triggers and
+(:class:`~almond_axol.robot.Mantis`): this loop only reads the triggers and
 streams normalised targets at ``poll_interval``; ``axol-rt`` owns the gripper
 buses and paces the POSITION_FORCE commands. The trigger reader's own
 receive-only SocketCAN socket coexists with the core (the kernel duplicates
@@ -26,8 +26,7 @@ import numpy as np
 
 from ..constants import ARM_JOINTS
 from ..robot.base import HardwareCleanupError
-from ..robot.mantis import Mantis
-from ..rt import RtMantis
+from ..rt import Mantis
 from ..tracker.trigger import TriggerReader
 
 _logger = logging.getLogger(__name__)
@@ -39,9 +38,9 @@ _TRIGGER_WAIT_TIMEOUT_S = 5.0
 _RELEASED_GRIP_MIN = 0.8
 
 
-def _rt_mantis(**kwargs: Any) -> RtMantis:
+def _rt_mantis(**kwargs: Any) -> Mantis:
     """Default robot factory: the Mantis behind the realtime core."""
-    return RtMantis(Mantis(**kwargs))
+    return Mantis(**kwargs)
 
 
 def _read_fresh_grips(readers: dict[str, Any]) -> tuple[dict[str, float], list[str]]:

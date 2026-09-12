@@ -4,8 +4,9 @@ The control-panel runner owns this lifecycle itself. Direct ``collect-data``
 uses :func:`managed_mantis_bridge` so ``--mantis_source`` has the same meaning
 everywhere: Quest waits for WebXR, while Lighthouse and Ultimate start the
 selected local tracker backend automatically. Teleop never tracks (Mantis
-teleop is grippers-only); it only shares the saved rig channel map through
-:func:`load_direct_mantis_fallback`.
+teleop is grippers-only). Both inherit the saved rig channel map (and, for a
+Quest collection, the saved tracker key) from the robot's shared settings
+through :func:`almond_axol.cli.config.parse`'s ``settings_args`` fold.
 """
 
 from __future__ import annotations
@@ -43,51 +44,6 @@ def set_managed_pose_source_id(cfg: object) -> str:
     pose_source_id = f"mantis-{uuid.uuid4()}"
     server.expected_pose_source_id = pose_source_id
     return pose_source_id
-
-
-def load_direct_mantis_fallback(
-    *, collection: bool
-) -> tuple[dict[str, object], str | None]:
-    """Load UI-saved Mantis defaults below direct config-file/CLI overrides.
-
-    The logical CAN map describes the physical handheld rig, not a browser
-    session. Direct commands therefore inherit the same saved values as the
-    control panel. Teleop (``collection=False``) inherits only the channel
-    map: Mantis teleop is grippers-only, so the saved tracking source and
-    Quest calibration selector apply only to collection runs. For collection
-    the Quest key is returned separately because callers must add it only
-    after the effective source (including a config-file or CLI override)
-    resolves to Quest.
-    """
-    from ..serve.settings import SettingsStore
-
-    settings = SettingsStore()
-    left, right = require_mantis_channels(settings.mantis_can_channels())
-    if not collection:
-        return {"left_channel": left, "right_channel": right}, None
-
-    values = settings.snapshot()["values"]
-    source_value = values.get("teleop.mantis_source")
-    source = str(source_value).strip() if source_value is not None else ""
-    quest_value = values.get("mantis.quest_tracker_key")
-    quest_key = str(quest_value).strip() if quest_value is not None else ""
-
-    fallback: dict[str, object] = {
-        "robot_config": {
-            "left_channel": left,
-            "right_channel": right,
-        }
-    }
-    if source:
-        fallback["mantis_source"] = source
-    return fallback, quest_key or None
-
-
-def add_quest_key_to_direct_fallback(
-    fallback: dict[str, object], quest_key: str
-) -> None:
-    """Add a source-scoped saved Quest datum to a direct-collection overlay."""
-    fallback["teleop_config"] = {"vr_teleop_config": {"tracker_key": quest_key}}
 
 
 def require_mantis_tracker_readiness(source: str) -> None:

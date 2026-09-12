@@ -29,7 +29,6 @@ import argparse
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -39,9 +38,6 @@ from ...robot import Axol, closer_end_stop
 from ...robot.config import AxolConfig
 from ...teleop.config import VRTeleopConfig
 from ...teleop.trajectory import plan_collision_aware_trajectory
-
-if TYPE_CHECKING:
-    from ...rt import RtAxol
 
 _RATE_HZ = (
     250.0  # waypoint density — high for smooth playback (speed is set by --speed)
@@ -152,7 +148,7 @@ def _make_motion_command(
 
 
 def _snapshot_q(
-    axol: RtAxol, solver: KinematicsSolver, q_default: np.ndarray
+    axol: Axol, solver: KinematicsSolver, q_default: np.ndarray
 ) -> np.ndarray:
     """Read the *cached* arm positions into a full-N solver vector.
 
@@ -171,7 +167,7 @@ def _snapshot_q(
 
 
 async def _execute(
-    axol: RtAxol,
+    axol: Axol,
     solver: KinematicsSolver,
     trajectory: list[np.ndarray],
     rate_hz: float,
@@ -334,9 +330,7 @@ async def _run(args: argparse.Namespace) -> None:
         f"rate={args.rate:.0f} Hz. Press Ctrl-C to stop."
     )
 
-    from ...rt import RtAxol as _RtAxol
-
-    async with _RtAxol(Axol(config=axol_config, **axol_kwargs)) as axol:
+    async with Axol(config=axol_config, **axol_kwargs) as axol:
         # Always begin from the planned rest pose. If the operator parked the
         # arm anywhere else, sneak there with a one-off collision-aware plan
         # so the first cycle doesn't snap.

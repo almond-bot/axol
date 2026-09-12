@@ -15,7 +15,7 @@ position save to finish before issuing the next move. The held arm joints
 remain monitored throughout lift motion, and Ctrl-C stops the lift. The other
 arm joints hold their measured starting positions throughout.
 
-The arms are driven through the Rust realtime core (``RtAxol``), the same
+The arms are driven through the Rust realtime core (``Axol``), the same
 control path as teleop: it owns the arm CAN buses, renders the S1 ramps at
 240 Hz, and keeps the held joints damped while the lift cycles.
 
@@ -41,11 +41,10 @@ from collections.abc import Awaitable, Callable
 import numpy as np
 
 from ...cli.lift import Interrupted, fmt_status, interrupt_event
-from ...constants import ARM_JOINTS, CAN_CHEST, CAN_LEFT, CAN_RIGHT, Joint
-from ...robot.axol import Axol
+from ...constants import ARM_JOINTS, CAN_BASE, CAN_CHEST, CAN_LEFT, CAN_RIGHT, Joint
 from ...robot.config import AxolConfig
-from ...robot.lift import Lift, LiftStatus
-from ...rt import RtAxol
+from ...robot.lift import Lift, LiftStatus, resolve_lift_channel
+from ...rt import Axol
 
 _STATUS_PERIOD_MS = 200
 _STATUS_STALE_S = 1.0
@@ -523,7 +522,7 @@ def _validated_arm_pose(
 
 
 async def _read_valid_arm_positions(
-    axol: RtAxol,
+    axol: Axol,
     context: str,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     left, right = await axol.get_positions()
@@ -543,7 +542,7 @@ async def _read_valid_arm_positions(
     )
 
 
-async def _verify_arms_holding(axol: RtAxol, context: str) -> None:
+async def _verify_arms_holding(axol: Axol, context: str) -> None:
     """Prove the realtime core still holds every selected arm joint.
 
     The core owns the CAN buses while the arms are up, so Python cannot ask
@@ -601,10 +600,10 @@ def _rest_targets(
     return left_target, right_target
 
 
-async def _disable_arms_verified(robot: RtAxol, axol: Axol) -> None:
+async def _disable_arms_verified(robot: Axol) -> None:
     """Disable every selected-arm motor and prove none still reports holding.
 
-    ``RtAxol.disable`` is the deliberate stop: the core disables the motors on
+    ``Axol.disable`` is the deliberate stop: the core disables the motors on
     disarm and Python repeats the shutdown once the bus is free. Its lifecycle
     intentionally suppresses individual motor errors (and, after a core fault
     or limp, deliberately leaves the motors energized). A diagnostic must be
@@ -613,7 +612,7 @@ async def _disable_arms_verified(robot: RtAxol, axol: Axol) -> None:
     """
     missing = [
         f"{side} {joint.value}"
-        for side, arm in (("left", axol.left), ("right", axol.right))
+        for side, arm in (("left", robot.left), ("right", robot.right))
         if arm is not None
         for joint in ARM_JOINTS
         if joint not in arm.motors
@@ -624,7 +623,7 @@ async def _disable_arms_verified(robot: RtAxol, axol: Axol) -> None:
         )
     motors = [
         (side, joint, motor)
-        for side, arm in (("left", axol.left), ("right", axol.right))
+        for side, arm in (("left", robot.left), ("right", robot.right))
         if arm is not None
         for joint, motor in arm.motors.items()
         if joint in ARM_JOINTS
@@ -646,7 +645,7 @@ async def _disable_arms_verified(robot: RtAxol, axol: Axol) -> None:
             "the arms remain energized"
         )
 
-    await axol.connect()
+    await robot.connect()
     try:
         holding_results = await asyncio.gather(
             *(motor.is_holding() for _, _, motor in motors),
@@ -655,7 +654,7 @@ async def _disable_arms_verified(robot: RtAxol, axol: Axol) -> None:
     finally:
         # A bus that will not close leaves ownership uncertain; that withholds
         # the PASS even when every motor reported disabled.
-        await _retry_cleanup(axol.disconnect, label="closing arm CAN buses")
+        await _retry_cleanup(robot.disconnect, label="closing arm CAN buses")
 
     problems = []
     for (side, joint, _), holding_result in zip(motors, holding_results, strict=True):
@@ -675,7 +674,7 @@ async def _disable_arms_verified(robot: RtAxol, axol: Axol) -> None:
 
 
 async def _ramp_arms(
-    axol: RtAxol,
+    axol: Axol,
     start_left: np.ndarray | None,
     start_right: np.ndarray | None,
     target_left: np.ndarray | None,
@@ -749,7 +748,7 @@ async def _ramp_arms(
 
 
 async def _verify_arm_targets(
-    axol: RtAxol,
+    axol: Axol,
     target_left: np.ndarray | None,
     target_right: np.ndarray | None,
     context: str,
@@ -868,9 +867,9 @@ async def _run(args: argparse.Namespace) -> None:
         raise SystemExit("ERROR: cannot skip both arms on a mounted-robot lift test.")
 
     cycles = _resolve_cycles(args.cycles)
+    lift_channel = resolve_lift_channel(args.lift_channel)
     lift: Lift | None = None
-    inner: Axol | None = None
-    axol: RtAxol | None = None
+    axol: Axol | None = None
     arms_enabled = False
     arms_disabled = False
     arms_at_clearance = False
@@ -881,13 +880,13 @@ async def _run(args: argparse.Namespace) -> None:
 
     print("=== MOUNTED LIFT CYCLE TEST ===")
     print(
-        f"Cycles: {cycles}  |  lift: {args.lift_channel}  |  "
+        f"Cycles: {cycles}  |  lift: {lift_channel}  |  "
         "S1 clearance: left +90 deg / right -90 deg"
     )
     print("Clear the full arm and lift travel before continuing. Ctrl-C stops.\n")
 
     try:
-        lift = await _open_lift(args.lift_channel)
+        lift = await _open_lift(lift_channel)
         with interrupt_event() as interrupted:
             initial_status = _require_fresh_status(lift, "preflight")
             if not initial_status.homed:
@@ -911,14 +910,13 @@ async def _run(args: argparse.Namespace) -> None:
                 # gripper while exercising the independent lift mechanism.
                 has_gripper=False,
             )
-            inner = Axol(
+            # Production control path: the Rust core owns the arm buses and
+            # holds the clearance pose, damping live, while the lift cycles.
+            axol = Axol(
                 config=config,
                 left_channel=None if args.no_left else args.left_channel,
                 right_channel=None if args.no_right else args.right_channel,
             )
-            # Production control path: the Rust core owns the arm buses and
-            # holds the clearance pose, damping live, while the lift cycles.
-            axol = RtAxol(inner)
             print("Enabling arms and holding their measured pose ...")
             # enable() can partially attach before surfacing a motor fault;
             # cleanup must treat the arm state as live from this point onward.
@@ -1091,7 +1089,7 @@ async def _run(args: argparse.Namespace) -> None:
             )
             await ensure_lift_upper_stopped()
             print("S1 rest verified; disabling arm motors ...")
-            await _disable_arms_verified(axol, inner)
+            await _disable_arms_verified(axol)
             arms_disabled = True
             completed = True
     except BaseException as exc:
@@ -1118,17 +1116,19 @@ async def _run(args: argparse.Namespace) -> None:
             # their last command (a failed/low lift must never cause the
             # process to torque off arms out of their clearance).
             try:
-                await _retry_cleanup(axol.detach, label="releasing the realtime core")
+                await _retry_cleanup(
+                    axol.disconnect, label="releasing the realtime core"
+                )
             except BaseException as exc:
                 cleanup_errors.append(exc)
                 print(f"WARNING: {exc}", file=sys.stderr)
-        if inner is not None:
-            # Every path above already closed the arm buses (detach, or the
-            # verified disable's proxy reopen/close); this proves it. A bus
-            # that cannot be closed leaves ownership uncertain and withholds
-            # the PASS.
+        if axol is not None:
+            # Every path above already closed the arm buses (the core release,
+            # or the verified disable's proxy reopen/close); this proves it. A
+            # bus that cannot be closed leaves ownership uncertain and
+            # withholds the PASS.
             try:
-                await _retry_cleanup(inner.disconnect, label="closing arm CAN buses")
+                await _retry_cleanup(axol.disconnect, label="closing arm CAN buses")
             except BaseException as exc:
                 cleanup_errors.append(exc)
                 print(f"WARNING: {exc}", file=sys.stderr)
@@ -1201,9 +1201,11 @@ def _add_arguments(
     )
     parser.add_argument(
         "--lift-channel",
-        default=CAN_CHEST,
+        default=None,
         metavar="IFACE",
-        help="SocketCAN interface carrying Jelly Legs (default: %(default)s).",
+        help="SocketCAN interface carrying Jelly Legs (default: "
+        f"{CAN_CHEST} when that chest bus exists, otherwise the shared wheel "
+        f"bus {CAN_BASE}).",
     )
     parser.add_argument(
         "--speed",

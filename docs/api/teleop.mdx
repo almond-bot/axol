@@ -12,15 +12,27 @@ from almond_axol.teleop import VRTeleop, VRTeleopConfig
 ```python
 import asyncio
 from almond_axol.robot import Axol
-from almond_axol.rt import RtAxol
 from almond_axol.teleop import VRTeleop
 
 async def main():
-    async with VRTeleop(RtAxol(Axol())) as teleop:
+    async with VRTeleop(Axol()) as teleop:
         await teleop.run()  # blocking; Ctrl+C to exit
 
 asyncio.run(main())
 ```
+
+```python
+VRTeleop(
+    robot: RobotBase,
+    *,
+    config: VRTeleopConfig | None = None,             # None → teleop.* shared settings
+    kinematics_config: KinematicsConfig | None = None, # None → kinematics.* shared settings
+    vr_server_config: VRServerConfig | None = None,    # None → vr_server.* shared settings
+    jelly: Jelly | None = None,
+)
+```
+
+Each config left `None` is built from the robot's shared settings file (`~/.almond/settings.json` — the one the [control panel](/guides/control-panel-settings) edits and `axol teleop` reads) over the built-in defaults, so an SDK session runs the same rest poses, multipliers, IK weights and VR port as the panel. Pass a config explicitly to override it; see [Shared settings](/api/robot#shared-settings).
 
 Use `step()` instead of `run()` to integrate teleoperation into your own control loop:
 

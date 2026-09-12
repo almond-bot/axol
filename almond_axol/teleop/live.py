@@ -292,7 +292,7 @@ class LiveSettings:
 
     def _has_spring_caps(self) -> bool:
         # The squeeze cap rides the realtime core's command tuples; only a
-        # robot that can carry it (Axol / RtAxol, not the sim) shows the knob.
+        # robot that can carry it (the hardware Axol, not the sim) shows the knob.
         return callable(getattr(self._robot, "set_spring_caps", None))
 
     def _hidden(self, d: LiveSettingDef) -> bool:

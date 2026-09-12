@@ -60,7 +60,7 @@ The hosted app is built on Vercel; `vercel.json` builds the client package first
 {
   "buildCommand": "npm run build --workspace=packages/axol-vr-client && npm run build --workspace=app",
   "outputDirectory": "app/dist",
-  "installCommand": "rm -f package-lock.json && npm install"
+  "installCommand": "npm ci"
 }
 ```
 

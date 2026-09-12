@@ -3,14 +3,26 @@ Telescoping lift on Jelly — jelly_legs CAN driver.
 
 The lift legs are driven by our own PCB (firmware: ``jelly_legs`` in the
 circuits-py repo, ``designs/jelly_legs/firmware``), which replaced the
-Jiecang JCB35N2 control box. It sits alone on the chest CAN bus
-(:data:`~almond_axol.constants.CAN_CHEST`, named by ``axol can.setup``).
+Jiecang JCB35N2 control box. Two wirings are supported, and ``axol
+can.setup`` tells them apart by probing:
+
+- **Own chest bus** — the board sits alone on a second single-channel
+  adapter (:data:`~almond_axol.constants.CAN_CHEST`).
+- **Shared wheel bus** — the board hangs off the same bus as the four
+  Damiao wheel motors (:data:`~almond_axol.constants.CAN_BASE`). Its IDs
+  (0x420-0x422) are clear of every Damiao range (commands 0x01-0x04,
+  mode frames 0x101-0x304, feedback 0x11-0x14, register access 0x7FF), and
+  the firmware only queues frames addressed to 0x420, so both protocols
+  coexist on one 1 Mbps bus.
+
+:func:`resolve_lift_channel` picks the interface for the ``None`` default:
+the chest bus when that interface exists, otherwise the wheel bus.
 
 Protocol (classic CAN 2.0, 11-bit IDs, 1 Mbps, little-endian; the firmware
 README is the spec):
 
 - The board listens on **0x420** (byte 0 = opcode) and answers/broadcasts
-  status on **0x421**.
+  status on **0x421** (power telemetry on **0x422**).
 - Positions on the wire are permille of homed travel (0 = fully lowered,
   1000 = fully raised, 0xFFFF = not homed); speeds are encoder counts/s
   (~650 = full speed).
@@ -47,8 +59,9 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 
-from ..constants import CAN_CHEST
+from ..constants import CAN_BASE, CAN_CHEST
 from ..motor import CanBus
 
 _logger = logging.getLogger(__name__)
@@ -57,9 +70,33 @@ UP = 1
 STOP = 0
 DOWN = -1
 
-# Arbitration IDs (clear of the Damiao ranges, though the buses are separate).
+# Arbitration IDs. Clear of the Damiao wheel-motor ranges so the board can
+# share the wheel bus (see the module docstring).
 _ID_CMD = 0x420
 _ID_STATUS = 0x421
+
+_SYS_NET = Path("/sys/class/net")
+
+
+def resolve_lift_channel(channel: str | None = None) -> str:
+    """The SocketCAN interface carrying the jelly_legs board.
+
+    An explicit ``channel`` is returned unchanged. ``None`` selects by
+    topology, as pinned by ``axol can.setup``: the chest bus
+    (:data:`~almond_axol.constants.CAN_CHEST`) when that interface exists on
+    this host, otherwise the wheel bus (:data:`~almond_axol.constants.CAN_BASE`)
+    the lift shares with the Damiao motors. With neither interface present
+    the chest name is returned so the eventual "interface not found" error
+    names the canonical bus.
+    """
+    if channel is not None:
+        return channel
+    if (_SYS_NET / CAN_CHEST).exists():
+        return CAN_CHEST
+    if (_SYS_NET / CAN_BASE).exists():
+        return CAN_BASE
+    return CAN_CHEST
+
 
 # Opcodes (command frame byte 0).
 _OP_SET_POS = 0x01
@@ -149,7 +186,7 @@ def _decode_status(data: bytes) -> LiftStatus:
 
 
 class Lift:
-    """Hold-to-move lift commands over the chest CAN bus.
+    """Hold-to-move lift commands over the lift's CAN bus (chest or shared wheel bus).
 
     Typical usage (from :class:`almond_axol.robot.jelly.Jelly`)::
 
@@ -171,7 +208,7 @@ class Lift:
 
     def __init__(
         self,
-        channel: str = CAN_CHEST,
+        channel: str | None = None,
         jog_speed: int = JOG_SPEED,
         status_period_ms: int = 0,
     ) -> None:
@@ -179,6 +216,9 @@ class Lift:
 
         Args:
             channel: SocketCAN interface carrying the jelly_legs controller.
+                ``None`` resolves it from the host's pinned interfaces (see
+                :func:`resolve_lift_channel`): the chest bus when present,
+                otherwise the wheel bus the lift shares with the motors.
             jog_speed: Held-jog speed in encoder counts/s.
             status_period_ms: Firmware status broadcast period in milliseconds.
                 Zero (the default) disables broadcasts and explicitly polls at
@@ -186,7 +226,7 @@ class Lift:
                 may use 200 ms to receive status without transmitting while
                 the motors are moving.
         """
-        self._channel = channel
+        self._channel = resolve_lift_channel(channel)
         self._jog_speed = self._validate_jog_speed(jog_speed)
         self._status_period_ms = self._validate_status_period(status_period_ms)
         self._bus: CanBus | None = None
@@ -237,6 +277,11 @@ class Lift:
         return period_ms
 
     @property
+    def channel(self) -> str:
+        """The SocketCAN interface this driver talks to (resolved at construction)."""
+        return self._channel
+
+    @property
     def status(self) -> LiftStatus | None:
         """The latest status frame, or None before the board first answers."""
         return self._status
@@ -276,10 +321,13 @@ class Lift:
         return self._status.height_percent if self._status is not None else None
 
     async def start(self, *, request_status: bool = True) -> None:
-        """Open the chest bus and start the jog/status task.
+        """Open the lift's bus and start the jog/status task.
 
         Brings the interface up if it isn't yet (mirroring Jelly's wheel
-        bus); a missing interface raises ``RuntimeError`` naming it. Set
+        bus); a missing interface raises ``RuntimeError`` naming it. On a
+        shared wheel bus this opens a second SocketCAN socket next to the
+        ``axol-rt jelly`` core's — the kernel delivers every frame to both,
+        and :meth:`_on_message` only decodes the board's status ID. Set
         ``request_status=False`` only when a configured periodic stream will
         establish readiness without a solicited bootstrap response.
         """
@@ -711,7 +759,8 @@ class Lift:
                 warned_silent = True
                 _logger.warning(
                     "lift: no status from the jelly_legs board on %s after "
-                    "%.0fs — is the chest powered? (Monitoring continues.)",
+                    "%.0fs — is the lift controller powered and on this bus? "
+                    "(Monitoring continues.)",
                     self._channel,
                     _SILENT_WARN_S,
                 )

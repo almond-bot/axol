@@ -1578,7 +1578,7 @@ export default function ControlPanel() {
   }
 
   const viewerHost = serverHost || hostInfo?.lanIp || ""
-  const mantisSource = String(settingsSnap?.values["teleop.mantis_source"] ?? "lighthouse")
+  const mantisSource = String(settingsSnap?.values["mantis.source"] ?? "lighthouse")
   // Child settings actions can finish after their old-host tree unmounts.
   // Capture the generation represented by these callbacks so an old camera
   // daemon restart or diagnostics launch cannot refresh/repopulate a new host.

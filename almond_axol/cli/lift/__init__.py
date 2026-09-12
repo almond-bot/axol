@@ -1,10 +1,11 @@
 """Shared plumbing for the ``axol lift.*`` commands.
 
 Both commands (``lift.home``, ``lift.goto``) talk to the jelly_legs lift
-controller on the chest CAN bus through the :class:`~almond_axol.robot.lift.
-Lift` driver, watch its status to completion, and stop the motion on
-Ctrl-C / a control-panel Stop (the serve session manager sends SIGINT
-first, so ``KeyboardInterrupt`` covers both).
+controller — on its chest CAN bus or the wheel bus it shares with the
+motors, whichever ``axol can.setup`` pinned — through the
+:class:`~almond_axol.robot.lift.Lift` driver, watch its status to
+completion, and stop the motion on Ctrl-C / a control-panel Stop (the serve
+session manager sends SIGINT first, so ``KeyboardInterrupt`` covers both).
 """
 
 from __future__ import annotations
@@ -15,8 +16,8 @@ import contextlib
 import signal
 import time
 
-from ...constants import CAN_CHEST
-from ...robot.lift import Lift, LiftStatus
+from ...constants import CAN_BASE, CAN_CHEST
+from ...robot.lift import Lift, LiftStatus, resolve_lift_channel
 
 # How long to wait for the board's first status reply before giving up.
 FIRST_STATUS_TIMEOUT_S = 3.0
@@ -30,9 +31,10 @@ STATUS_STALE_S = 1.0
 def add_channel_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--channel",
-        default=CAN_CHEST,
-        help="SocketCAN interface of the chest bus carrying the jelly_legs "
-        f"lift controller (default: {CAN_CHEST})",
+        default=None,
+        help="SocketCAN interface carrying the jelly_legs lift controller "
+        f"(default: {CAN_CHEST} when that chest bus exists, otherwise the "
+        f"wheel bus {CAN_BASE} the lift shares with the motors)",
     )
 
 
@@ -57,12 +59,15 @@ def fmt_status(st: LiftStatus) -> str:
     return f"pos={pos} vel={st.velocity:+5d} [{' '.join(flags) or 'idle'}]"
 
 
-async def open_lift(channel: str) -> Lift:
-    """Open the chest bus and wait for the board's first status reply.
+async def open_lift(channel: str | None) -> Lift:
+    """Open the lift's bus and wait for the board's first status reply.
 
-    Raises ``SystemExit`` with an actionable message when the interface is
-    missing or the board never answers.
+    ``channel`` None resolves to the chest bus or the shared wheel bus (see
+    :func:`almond_axol.robot.lift.resolve_lift_channel`). Raises
+    ``SystemExit`` with an actionable message when the interface is missing
+    or the board never answers.
     """
+    channel = resolve_lift_channel(channel)
     lift = Lift(channel)
     try:
         await lift.start()
@@ -92,7 +97,7 @@ async def open_lift(channel: str) -> Lift:
         )
         raise SystemExit(
             f"ERROR: {exc}\nRun `axol can.setup` once to name and bring up "
-            f"the chest bus, or pass --channel.{cleanup_detail}"
+            f"the lift's bus, or pass --channel.{cleanup_detail}"
         ) from exc
     deadline = time.monotonic() + FIRST_STATUS_TIMEOUT_S
     while lift.status is None and time.monotonic() < deadline:
@@ -101,7 +106,7 @@ async def open_lift(channel: str) -> Lift:
         await lift.close()
         raise SystemExit(
             f"ERROR: no status from the jelly_legs board on {channel} — "
-            f"is the chest powered and wired to this adapter?"
+            f"is the lift controller powered and wired to this adapter?"
         )
     return lift
 

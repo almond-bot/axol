@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,18 +70,179 @@ class DiagnosticSettingsTest(unittest.TestCase):
     def test_boolean_settings_are_canonical_and_strict(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "settings.json")
-            store.update(values={"robot.has_gripper": "yes"})
-            self.assertIs(store.snapshot()["values"]["robot.has_gripper"], True)
+            store.update(values={"axol.has_gripper": "yes"})
+            self.assertIs(store.snapshot()["values"]["axol.has_gripper"], True)
             self.assertTrue(store.has_gripper())
 
-            store.update(values={"robot.has_gripper": "off"})
-            self.assertIs(store.snapshot()["values"]["robot.has_gripper"], False)
+            store.update(values={"axol.has_gripper": "off"})
+            self.assertIs(store.snapshot()["values"]["axol.has_gripper"], False)
             self.assertFalse(store.has_gripper())
 
             with self.assertRaisesRegex(
-                ValueError, "robot.has_gripper must be a boolean"
+                ValueError, "axol.has_gripper must be a boolean"
             ):
-                store.update(values={"robot.has_gripper": 1})
+                store.update(values={"axol.has_gripper": 1})
+
+    def test_file_is_a_nested_tree_of_canonical_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            store = SettingsStore(path)
+            store.update(
+                values={
+                    "axol.left_stiffness": 0.7,
+                    "axol.left.elbow.kp": 60,
+                    "teleop.rest_pose_left": [0, 0.1, 0, 0, 0, 0, 0],
+                    "robot.right_channel": "null",
+                    "recording.root": "/data",
+                },
+                cameras={"serials": {"overhead": "1"}},
+            )
+
+            document = json.loads(path.read_text())
+            self.assertEqual(
+                document,
+                {
+                    "version": 2,
+                    "axol": {
+                        "left": {"elbow": {"kp": 60}},
+                        "left_stiffness": 0.7,
+                    },
+                    "teleop": {"rest_pose_left": [0, 0.1, 0, 0, 0, 0, 0]},
+                    "robot": {"right_channel": "null"},
+                    "recording": {"root": "/data"},
+                    "cameras": {"serials": {"overhead": "1"}},
+                },
+            )
+            # The file leads with the version and follows the section order
+            # the registry declares, so it reads top-down like a config.
+            self.assertEqual(
+                list(document),
+                ["version", "axol", "teleop", "robot", "recording", "cameras"],
+            )
+            self.assertEqual(store.document(), document)
+
+            reloaded = SettingsStore(path)
+            self.assertEqual(reloaded.snapshot(), store.snapshot())
+            self.assertNotIn("advanced", reloaded.snapshot())
+            # The teleop subtree is the same shape as TeleopCmdConfig, so the
+            # merged args are just the flattened file.
+            merged = reloaded.merged_args("teleop", {})
+            self.assertEqual(merged["axol.left.elbow.kp"], 60)
+            self.assertEqual(merged["axol.left_stiffness"], 0.7)
+            self.assertEqual(merged["right_channel"], "null")
+            self.assertNotIn("root", merged)
+
+    def test_version_one_file_migrates_to_canonical_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "values": {
+                            "robot.left_stiffness": 0.7,
+                            "robot.gripper_torque_limit": 0.4,
+                            "robot.has_gripper": False,
+                            "robot.gravity_kd": 0.9,
+                            "teleop.mantis_source": "quest",
+                            "teleop.frequency": 240,
+                            "recording.observe_torques": True,
+                            "teleop.id": "op",
+                        },
+                        "advanced": {
+                            "axol.left.elbow.kp": 60,
+                            "vr_teleop.frequency": 120,
+                            "vr_teleop.hold_to_engage": True,
+                            "lerobot.id": "robot-one",
+                        },
+                        "cameras": None,
+                    }
+                )
+            )
+            store = SettingsStore(path)
+
+            self.assertEqual(
+                store.snapshot()["values"],
+                {
+                    "axol.left_stiffness": 0.7,
+                    "axol.left.gripper.torque_limit": 0.4,
+                    "axol.right.gripper.torque_limit": 0.4,
+                    "axol.has_gripper": False,
+                    "gravity.kd": 0.9,
+                    "mantis.source": "quest",
+                    # The visible curated value wins over the hidden one.
+                    "teleop.frequency": 240,
+                    "lerobot.observe_torques": True,
+                    "lerobot_teleop.id": "op",
+                    "axol.left.elbow.kp": 60,
+                    "teleop.hold_to_engage": True,
+                    "lerobot.id": "robot-one",
+                },
+            )
+            self.assertFalse(store.has_gripper())
+            collect = store.merged_args("collect-data", {"mantis": True})
+            self.assertEqual(collect["mantis_source"], "quest")
+            self.assertEqual(collect["teleop_hz"], 240)
+            self.assertEqual(collect["teleop_config.vr_teleop_config.frequency"], 240)
+            self.assertEqual(collect["robot_config.observe_torques"], True)
+            self.assertEqual(collect["teleop_config.id"], "op")
+            self.assertEqual(
+                collect["robot_config.axol_config.right.gripper.torque_limit"], 0.4
+            )
+            self.assertEqual(store.merged_args("gravity-comp", {})["kd"], 0.9)
+
+            # The next save rewrites the file in the nested layout.
+            store.update(values={"kinematics.pos_weight": 99})
+            document = json.loads(path.read_text())
+            self.assertEqual(document["version"], 2)
+            self.assertNotIn("values", document)
+            self.assertNotIn("advanced", document)
+            self.assertEqual(
+                document["teleop"], {"frequency": 240, "hold_to_engage": True}
+            )
+            self.assertEqual(document["kinematics"], {"pos_weight": 99})
+
+    def test_update_accepts_pre_v2_names_from_cached_panels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.json")
+            store.update(
+                values={
+                    "robot.gripper_max_speed": 3,
+                    "teleop.mantis_source": "ultimate",
+                },
+                advanced={"vr_teleop.position_multiplier": 1.5},
+            )
+            values = store.snapshot()["values"]
+            self.assertEqual(values["axol.left.gripper.max_speed"], 3)
+            self.assertEqual(values["axol.right.gripper.max_speed"], 3)
+            self.assertEqual(values["mantis.source"], "ultimate")
+            self.assertEqual(values["teleop.position_multiplier"], 1.5)
+
+            store.update(values={"robot.gripper_max_speed": None})
+            values = store.snapshot()["values"]
+            self.assertNotIn("axol.left.gripper.max_speed", values)
+            self.assertNotIn("axol.right.gripper.max_speed", values)
+
+    def test_update_rejects_unknown_sections_and_curated_only_leaves(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.json")
+            with self.assertRaisesRegex(KeyError, "nope.x"):
+                store.update(values={"nope.x": 1})
+            # Sections whose leaves carry explicit per-op targets accept only
+            # their curated keys …
+            with self.assertRaisesRegex(KeyError, "recording.bogus"):
+                store.update(values={"recording.bogus": 1})
+            with self.assertRaisesRegex(KeyError, "axol"):
+                store.update(values={"axol": 1})
+            # … while any leaf of a grafted subsystem is fine: the op schemas
+            # decide what it means and build_argv drops what they don't know.
+            store.update(values={"axol.left.wrist.kp": 5, "axol.not_a_field": 1})
+            merged = store.merged_args("run-policy", {})
+            self.assertEqual(merged["robot_config.axol_config.left.wrist.kp"], 5)
+            self.assertNotIn(
+                "--robot_config.axol_config.not_a_field",
+                build_argv("run-policy", merged),
+            )
 
     def test_lift_cycle_does_not_inherit_gripper_setting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -257,10 +419,8 @@ class DiagnosticSettingsTest(unittest.TestCase):
             store = SettingsStore(Path(directory) / "settings.json")
             store.update(
                 values={
-                    "teleop.id": "../../saved-teleop",
-                    "teleop.calibration_dir": "/etc/saved-teleop",
-                },
-                advanced={
+                    "lerobot_teleop.id": "../../saved-teleop",
+                    "lerobot_teleop.calibration_dir": "/etc/saved-teleop",
                     "vr_server.certfile": "/etc/saved-cert",
                     "vr_server.keyfile": "/etc/saved-key",
                     "lerobot.id": "../../saved-robot",

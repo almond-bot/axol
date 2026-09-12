@@ -32,6 +32,10 @@ CAN_BASE = "can_alm_axol_b"
 # The chest bus (another single-channel adapter): the jelly_legs lift
 # controller — our own PCB replacing the Jiecang control box, driving the
 # telescoping lift legs (see almond_axol/robot/lift.py for the protocol).
+# Optional: a Jelly may instead wire the lift controller onto the wheel bus
+# (its IDs 0x420-0x422 are clear of every Damiao range), in which case this
+# interface does not exist and the lift driver uses CAN_BASE — see
+# almond_axol.robot.lift.resolve_lift_channel.
 CAN_CHEST = "can_alm_axol_c"
 
 # CAN bring-up script written by `axol can.setup`. Runs at boot and on adapter
@@ -55,12 +59,9 @@ ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 # damp_w0, damp_q, j_eff, tau_cap)``. The gripper slot repurposes the first
 # three (target, max_speed, max_torque) and zero-pads the rest. Must match
 # ``TARGET_FIELDS`` in ``rust/axol-rt/src/serve.rs``; the core's config
-# handshake (``proto``, see ``RT_PROTO_VERSION``) rejects a mismatch.
+# handshake (``proto``, ``almond_axol.rt.link.CONFIG_PROTO``) rejects a
+# mismatch, so bump that together with any change here.
 RT_TARGET_FIELDS = 10
-# Wire generation declared to the realtime core at configure time (its
-# ``PROTO_VERSION``). Bump together with ``RT_TARGET_FIELDS`` / any change to
-# the ``T`` layout so a stale binary is refused before bring-up.
-RT_PROTO_VERSION = 2
 
 
 URDF_PATH: Path = Path(__file__).resolve().parent / "kinematics" / "urdf" / "axol.urdf"

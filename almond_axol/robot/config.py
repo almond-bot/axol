@@ -15,14 +15,13 @@ via :func:`dataclasses.replace`::
 
     from almond_axol.robot.config import AxolConfig, FrictionParams
     from almond_axol.robot import Axol
-    from almond_axol.rt import RtAxol
 
     config = AxolConfig()
     config.left.elbow.kp = 200
     config.left.elbow.mass = 0.6
     config.left.elbow.com = (-0.025, 0.0, -0.07)
     config.left.elbow.friction = FrictionParams(fc=0.4, k=10.0, fv=0.05, fo=0.0)
-    async with RtAxol(Axol(config=config)) as axol: ...
+    async with Axol(config=config) as axol: ...
 """
 
 from __future__ import annotations

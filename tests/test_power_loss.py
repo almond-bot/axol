@@ -23,7 +23,7 @@ from almond_axol.motor.bus import (
     set_channel_stalled,
     stalled_channels,
 )
-from almond_axol.robot.axol import Axol
+from almond_axol.robot.axol import AxolHardware
 from almond_axol.robot.base import HardwareCleanupError
 from almond_axol.rt.link import RtLink
 from almond_axol.serve import app as app_module
@@ -39,7 +39,6 @@ from almond_axol.serve.runner import STALL_STOP_ERROR, OperationRunner
 # The serve API doubles (settings store, session manager, updater) already exist
 # for the reservation tests; reuse them rather than growing a second set.
 from tests.test_serve_session_reservation import _Manager, _Settings, _Updater
-
 
 # What the Rust transports put on the wire when nothing ACKs for STALL_DETECT
 # (``proxy.rs`` for the maintenance proxy, ``serve.rs`` for the armed core).
@@ -99,7 +98,7 @@ class _FakeDriver:
         self.accepts_disable = accepts_disable
         self.bus_gone = bus_gone
         self.disable_calls = 0
-        # Firmware gain ceilings Axol.__init__ checks the config against.
+        # Firmware gain ceilings AxolHardware.__init__ checks the config against.
         self.kp_max = 500.0
         self.kd_max = 5.0
 
@@ -123,8 +122,8 @@ class _FakeDriver:
         return MotorStatus.OK
 
 
-def _axol_with_drivers(driver_for: Any) -> tuple[Axol, list[_FakeBus]]:
-    """Build an Axol whose motors are ``driver_for(channel)`` fakes."""
+def _axol_with_drivers(driver_for: Any) -> tuple[AxolHardware, list[_FakeBus]]:
+    """Build an AxolHardware whose motors are ``driver_for(channel)`` fakes."""
     buses: list[_FakeBus] = []
 
     def make_bus(channel: str) -> _FakeBus:
@@ -139,7 +138,7 @@ def _axol_with_drivers(driver_for: Any) -> tuple[Axol, list[_FakeBus]]:
             side_effect=lambda bus, *_args, **_kwargs: driver_for(bus.channel),
         ),
     ):
-        axol = Axol(left_channel="can-left", right_channel="can-right")
+        axol = AxolHardware(left_channel="can-left", right_channel="can-right")
     return axol, buses
 
 

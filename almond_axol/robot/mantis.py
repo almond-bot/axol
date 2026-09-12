@@ -5,7 +5,7 @@ to the same Damiao gripper the robot uses — held by a human demonstrator. Each
 gripper sits alone on its own CAN bus (``can_mantis_l`` / ``can_mantis_r``)
 at the production gripper CAN ID (0x08).
 
-:class:`Mantis` mirrors the :class:`~almond_axol.robot.axol.Axol` control surface
+:class:`MantisHardware` mirrors the :class:`~almond_axol.robot.axol.AxolHardware` control surface
 (``enable`` / ``get_positions`` / ``motion_control`` / per-side ``positions`` /
 ``torques``) so the LeRobot wrapper and ``collect-data`` drive it unchanged.
 The seven arm joints per side are **virtual**: there is no arm, so
@@ -19,10 +19,11 @@ with the arm-state channel equal to the commanded IK solution.
 On hardware this class is the *maintenance* half of the driver: bus
 ownership between takes, gripper bring-up and calibration, torque-off
 verification. The per-tick POSITION_FORCE command stream runs through the
-Rust realtime core — :class:`almond_axol.rt.RtMantis` wraps a ``Mantis``,
-arms ``axol-rt`` on the two gripper buses for the duration of a take, and
-installs a command sink on each :class:`MantisGripperArm` so
-``motion_control`` hands its gripper tuple to the core instead of the wire.
+Rust realtime core — :class:`almond_axol.robot.Mantis` wraps a
+``MantisHardware``, arms ``axol-rt`` on the two gripper buses for the
+duration of a take, and installs a command sink on each
+:class:`MantisGripperArm` so ``motion_control`` hands its gripper tuple to
+the core instead of the wire.
 """
 
 from __future__ import annotations
@@ -33,8 +34,9 @@ from collections.abc import Callable
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, RT_TARGET_FIELDS
+from ..constants import ARM_JOINTS, RT_TARGET_FIELDS
 from ..motor import CanBus, ControlMode, Joint, Motor, MotorError
+from ..settings import SHARED
 from .axol import (
     GRIPPER_TRAVEL,
     _await_all_hardware_actions,
@@ -72,7 +74,7 @@ class MantisGripperArm:
         self._bus = bus
         self._motor = Motor(bus, Joint.GRIPPER)
         self._gripper_config = gripper_config
-        # Realtime-core mode (:class:`almond_axol.rt.RtMantis`): while the
+        # Realtime-core mode (:class:`almond_axol.robot.Mantis`): while the
         # core is armed on this bus, ``_send_gripper_target`` hands the
         # gripper's POSITION_FORCE tuple (motor-frame target, speed limit,
         # torque limit) to this callable in the core's 8-slot command shape
@@ -341,24 +343,47 @@ class MantisGripperArm:
         await self._motor.set_position_force(*cmd)
 
 
-class Mantis(RobotBase):
-    """The Mantis rig's dual handheld grippers behind the ``Axol`` control surface.
+class MantisHardware(RobotBase):
+    """The Mantis rig's dual handheld grippers, driven directly from Python.
+
+    Internal — the public rig object is :class:`almond_axol.robot.Mantis`,
+    which owns one of these and exposes the same methods. Mirrors the
+    ``AxolHardware`` control surface.
 
     Args:
         config:        Reused for the per-side gripper POSITION_FORCE tuning
                        (``ArmConfig.gripper``); everything else is ignored.
+                       ``None`` (default) loads the robot's shared settings
+                       (``~/.almond/settings.json``, see
+                       :mod:`almond_axol.settings`) over the defaults.
         left_channel:  SocketCAN interface of the left gripper, or ``None`` to omit.
+                       Defaults to the shared ``mantis.left_channel`` setting
+                       (``can_mantis_l`` when unset).
         right_channel: SocketCAN interface of the right gripper, or ``None`` to omit.
+                       Defaults to the shared ``mantis.right_channel`` setting
+                       (``can_mantis_r`` when unset).
     """
 
     def __init__(
         self,
-        config: AxolConfig = AxolConfig(),
-        left_channel: str | None = CAN_MANTIS_LEFT,
-        right_channel: str | None = CAN_MANTIS_RIGHT,
+        config: AxolConfig | None = None,
+        left_channel: str | None = SHARED,
+        right_channel: str | None = SHARED,
         *,
         defer_gripper_enable: bool = False,
     ) -> None:
+        if config is None or left_channel is SHARED or right_channel is SHARED:
+            from ..settings import load_store, shared_axol_config
+
+            store = load_store()
+            if config is None:
+                config = shared_axol_config(store)
+            if left_channel is SHARED or right_channel is SHARED:
+                shared_left, shared_right = store.mantis_can_channels()
+                if left_channel is SHARED:
+                    left_channel = shared_left
+                if right_channel is SHARED:
+                    right_channel = shared_right
         left_channel = (
             str(left_channel).strip() if left_channel is not None else None
         ) or None

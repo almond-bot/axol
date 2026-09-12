@@ -42,7 +42,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 
@@ -55,9 +55,6 @@ from ..utils.paths import almond_path
 from ..waypoints import Waypoint, WaypointSet
 from .config import LogLevel, normalize_bool_flags, parse
 from .gravity_comp import _resolve_free_joints
-
-if TYPE_CHECKING:
-    from ..rt import RtAxol
 
 _logger = logging.getLogger(__name__)
 
@@ -411,7 +408,7 @@ class _Session:
     def __init__(
         self,
         cfg: WaypointsCmdConfig,
-        robot: RobotBase | RtAxol,
+        robot: RobotBase,
         control: Control,
         stop_event: threading.Event,
     ) -> None:
@@ -883,7 +880,11 @@ class _Session:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a teach-and-repeat session."""
-    cfg = parse(WaypointsCmdConfig, normalize_bool_flags(argv, "sim", "play_only"))
+    cfg = parse(
+        WaypointsCmdConfig,
+        normalize_bool_flags(argv, "sim", "play_only"),
+        settings_op="waypoints",
+    )
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
@@ -934,18 +935,15 @@ async def _session(
     if cfg.sim:
         from ..robot.sim import Sim
 
-        robot: RobotBase | RtAxol = Sim()
+        robot: RobotBase = Sim()
     else:
         from ..robot import Axol
-        from ..rt import RtAxol
 
         # Rust is the sole hardware backend for both teaching and playback.
-        robot = RtAxol(
-            Axol(
-                config=cfg.axol,
-                left_channel=cfg.left_channel,
-                right_channel=cfg.right_channel,
-            )
+        robot = Axol(
+            config=cfg.axol,
+            left_channel=cfg.left_channel,
+            right_channel=cfg.right_channel,
         )
 
     async with robot:

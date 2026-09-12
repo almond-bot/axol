@@ -26,8 +26,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 
-from almond_axol.constants import ARM_JOINTS, RT_PROTO_VERSION, RT_TARGET_FIELDS, Joint
-from almond_axol.robot.axol import Axol
+from almond_axol.constants import ARM_JOINTS, RT_TARGET_FIELDS, Joint
+from almond_axol.robot.axol import AxolHardware
 from almond_axol.robot.config import AxolConfig
 from almond_axol.rt import link as rt_link
 from almond_axol.teleop.config import VRTeleopConfig
@@ -94,7 +94,7 @@ class ArmCommandTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         # Offline: buses and motors are constructed, nothing is opened.
-        cls.robot = Axol(AxolConfig())
+        cls.robot = AxolHardware(AxolConfig())
 
     def _arm_with_sink(self):
         arm = self.robot.left
@@ -244,25 +244,28 @@ class WireTest(unittest.TestCase):
         self.assertEqual(slot2[9], 29.0)  # the tau_cap field
 
     def test_config_declares_the_protocol_first(self) -> None:
-        from almond_axol.rt.mantis import RtMantis
-        from almond_axol.rt.robot import RtAxol
+        from almond_axol.rt.link import CONFIG_PROTO
+        from almond_axol.rt.mantis import Mantis
+        from almond_axol.rt.robot import Axol
 
-        self.assertEqual(RT_PROTO_VERSION, 2)
+        # Proto 3 is the 10-float target slot with the tau_cap field.
+        self.assertEqual(CONFIG_PROTO, 3)
         for cls, robot in (
             (
-                RtAxol,
+                Axol,
                 SimpleNamespace(
                     left=SimpleNamespace(
                         _config=SimpleNamespace(max_step_rad=0.35),
                         _arm_config=AxolConfig().left,
                         _has_gripper=False,
+                        motors={j: object() for j in ARM_JOINTS},
                     ),
                     right=None,
                     _left_bus=SimpleNamespace(_channel="canL"),
                     _right_bus=None,
                 ),
             ),
-            (RtMantis, SimpleNamespace(left=None, right=None)),
+            (Mantis, SimpleNamespace(left=None, right=None)),
         ):
             rt = object.__new__(cls)
             rt._robot = robot
@@ -271,7 +274,7 @@ class WireTest(unittest.TestCase):
             rt._max_vel = 1.0
             rt._max_accel = 1.0
             first = rt._config_text().splitlines()[0]
-            self.assertEqual(first, f"proto {RT_PROTO_VERSION}", cls.__name__)
+            self.assertEqual(first, f"proto {CONFIG_PROTO}", cls.__name__)
 
 
 class LiveSettingTest(unittest.TestCase):

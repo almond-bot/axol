@@ -247,7 +247,7 @@ class DaggerConfig:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run the session, exiting cleanly on hardware faults."""
-    cfg = parse(DaggerConfig, argv)
+    cfg = parse(DaggerConfig, argv, settings_op="collect-dagger")
     # force=True: importing lerobot (at module load) installs a root handler
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every _logger.info() status line.

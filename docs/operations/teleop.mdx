@@ -73,7 +73,7 @@ The easiest way is from the app itself: when you press **Connect** and the certi
       </Step>
 
       <Step title="Start and check the grippers">
-        With Mantis selected only **Teleoperation** and **Collect data** are listed. Pick **Teleoperation** (there is no sim or cart option on Mantis) and press **Start**. Once both triggers read live and released, the grippers open to their hard stops (keep them clear), then each trigger closes its gripper proportionally. Squeeze the physical **left** trigger: if the **right** gripper moves, swap the CAN side mapping. Only a faulted gripper or a stale trigger heartbeat blocks this run; **Stop** disables both grippers.
+        With Mantis selected only **Teleoperation** and **Collect data** are listed. Pick **Teleoperation** (there is no sim or Jelly option on Mantis) and press **Start**. Once both triggers read live and released, the grippers open to their hard stops (keep them clear), then each trigger closes its gripper proportionally. Squeeze the physical **left** trigger: if the **right** gripper moves, swap the CAN side mapping. Only a faulted gripper or a stale trigger heartbeat blocks this run; **Stop** disables both grippers.
       </Step>
     </Steps>
 
@@ -159,6 +159,9 @@ If teleop feels too laggy, adjust in this order — one knob at a time, on the r
 ## Next steps
 
 <CardGroup cols={2}>
+  <Card title="Config Parameters" icon="sliders" href="/operations/teleop-config">
+    Every setting for teleop, with its default.
+  </Card>
   <Card title="Remote Teleop" icon="globe" href="/guides/remote-teleop">
     Drive the robot over the internet from anywhere with Tailscale.
   </Card>
