@@ -74,7 +74,9 @@ _MAX_STEP_RAD = 10.0
 class Mantis(RobotBase):
     """The Mantis rig behind the ``Axol`` control surface, core-driven per take.
 
-    Construct it exactly like the low-level hardware object::
+    Two gripper motors (one per SocketCAN bus) and no arm joints; the
+    ``motion_control`` surface accepts full 8-slot targets and only slot 7
+    (the gripper) reaches the hardware::
 
         async with Mantis() as mantis:
             await mantis.motion_control(left=q, right=q)
@@ -86,10 +88,10 @@ class Mantis(RobotBase):
         right_channel: SocketCAN interface of the right gripper, or ``None``.
         defer_gripper_enable: Leave the motors torque-off and the core
                      unstarted until :meth:`enable_grippers` (data collection).
-        hardware:    An already-constructed
-                     :class:`~almond_axol.robot.mantis.MantisHardware` to wrap
-                     instead of building one (the forwarded arguments must
-                     then be left at their defaults).
+
+    The keyword-only core options rarely need changing:
+
+    Args:
         loop_hz:     Core loop rate (the gripper's POSITION_FORCE command
                      and feedback cadence).
         watchdog_ms: Core watchdog — with no fresh target for this long it
@@ -100,33 +102,56 @@ class Mantis(RobotBase):
 
     def __init__(
         self,
-        config: AxolConfig | None = None,
+        config: AxolConfig = AxolConfig(),
         left_channel: str | None = CAN_MANTIS_LEFT,
         right_channel: str | None = CAN_MANTIS_RIGHT,
         *,
         defer_gripper_enable: bool = False,
-        hardware: MantisHardware | None = None,
         loop_hz: float = 240.0,
         watchdog_ms: float = 150.0,
         record: str | None = None,
     ) -> None:
-        if hardware is None:
-            hardware = MantisHardware(
-                config=AxolConfig() if config is None else config,
+        self._init_core(
+            MantisHardware(
+                config=config,
                 left_channel=left_channel,
                 right_channel=right_channel,
                 defer_gripper_enable=defer_gripper_enable,
-            )
-        elif (
-            config is not None
-            or left_channel != CAN_MANTIS_LEFT
-            or right_channel != CAN_MANTIS_RIGHT
-            or defer_gripper_enable
-        ):
-            raise ValueError(
-                "Mantis(hardware=...) takes the wrapped object as-is; do not also "
-                "pass config / channels / defer_gripper_enable"
-            )
+            ),
+            loop_hz=loop_hz,
+            watchdog_ms=watchdog_ms,
+            record=record,
+        )
+
+    @classmethod
+    def _wrap(
+        cls,
+        hardware: MantisHardware,
+        *,
+        loop_hz: float = 240.0,
+        watchdog_ms: float = 150.0,
+        record: str | None = None,
+    ) -> Self:
+        """Build the rig around an already-constructed low-level object.
+
+        Internal: lets tests substitute a hand-built
+        :class:`~almond_axol.robot.mantis.MantisHardware` (fake buses) for
+        the one :meth:`__init__` would construct.
+        """
+        self = cls.__new__(cls)
+        self._init_core(
+            hardware, loop_hz=loop_hz, watchdog_ms=watchdog_ms, record=record
+        )
+        return self
+
+    def _init_core(
+        self,
+        hardware: MantisHardware,
+        *,
+        loop_hz: float,
+        watchdog_ms: float,
+        record: str | None,
+    ) -> None:
         self._robot = hardware
         self._loop_hz = loop_hz
         self._watchdog_ms = watchdog_ms
@@ -161,16 +186,6 @@ class Mantis(RobotBase):
     @property
     def right(self) -> MantisGripperArm | None:
         return self._robot.right
-
-    @property
-    def hardware(self) -> MantisHardware:
-        """The wrapped low-level object (buses, calibration state, arms)."""
-        return self._robot
-
-    @property
-    def robot(self) -> MantisHardware:
-        """Alias of :attr:`hardware` (the original spelling)."""
-        return self._robot
 
     @property
     def armed(self) -> bool:
@@ -229,13 +244,6 @@ class Mantis(RobotBase):
         """Open the buses (deferred mode also verifies torque-off); no core."""
         async with self._lifecycle_lock:
             await self._robot.connect()
-
-    async def __aenter__(self) -> Self:
-        await self.enable()
-        return self
-
-    async def __aexit__(self, *_: object) -> None:
-        await self.disable()
 
     async def enable_grippers(self) -> None:
         """Bring both grippers up and hand their buses to the realtime core.
@@ -446,11 +454,12 @@ class Mantis(RobotBase):
                 raise
             await self._disarm_unlocked()
 
-    async def detach(self) -> None:
-        """Release the bus without changing torque — not meaningful here.
+    async def disconnect(self) -> None:
+        """Close the buses; on a Mantis this is :meth:`disable`.
 
-        A Mantis gripper is disabled at every take end; there is no holding
-        state worth preserving across processes, so this is :meth:`disable`.
+        ``Axol.disconnect()`` leaves the arms holding for a later process.
+        A Mantis gripper is disabled at every take end and has no holding
+        state worth preserving, so the grippers are torqued off here too.
         """
         await self.disable()
 

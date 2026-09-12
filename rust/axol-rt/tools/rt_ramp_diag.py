@@ -43,7 +43,6 @@ async def main(out: str) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
     robot = Axol()
-    inner = robot.hardware
     await robot.enable()
     try:
         pos_l, pos_r = await robot.get_positions()
@@ -58,7 +57,7 @@ async def main(out: str) -> None:
         meas_log: list[np.ndarray] = []
         ts_log: list[np.ndarray] = []
 
-        left_arm = inner.left
+        left_arm = robot.left
         assert left_arm is not None
         names = ", ".join(
             f"joint[{j}] {math.degrees(a):+.0f}°" for j, a in EXCURSION.items()

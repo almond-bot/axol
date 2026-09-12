@@ -290,7 +290,7 @@ class PartialArmTelemetryCaptureTest(unittest.IsolatedAsyncioTestCase):
 
 class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
     def test_config_lists_only_present_motors(self) -> None:
-        rt = Axol(hardware=_partial_axol(set(WRIST_KIT)))
+        rt = Axol._wrap(_partial_axol(set(WRIST_KIT)))
         lines = rt._config_text().splitlines()
         # Slot-by-motor-id is protocol generation 2; a core that predates it
         # would slot these wrists at 0 and 1 and then reject every target,
@@ -304,7 +304,8 @@ class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gripper 0 can0 8", lines)
 
     async def test_feedback_feed_fills_present_slots_and_ignores_the_rest(self) -> None:
-        rt = Axol(hardware=_partial_axol(set(WRIST_KIT)))
+        rt = Axol._wrap(_partial_axol(set(WRIST_KIT)))
+        rt._armed = True  # the core's feed is what fills the caches
         arm = rt.left
         assert arm is not None
         feed = rt._make_feedback_feed()
@@ -391,7 +392,7 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(kd3, 0.9)
         self.assertEqual((t_ff3, kd_host3, j_eff3), (0.0, 0.0, 0.0))
         # The core's friction model rides the config; the bench config zeroes it.
-        rt = Axol(hardware=axol)
+        rt = Axol._wrap(axol)
         for line in rt._config_text().splitlines():
             if line.startswith("joint "):
                 self.assertEqual(line.split()[9:], ["0.0", "0.0", "0.0", "0.0"], line)

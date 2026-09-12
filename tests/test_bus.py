@@ -132,7 +132,7 @@ class CanBusStateTest(unittest.IsolatedAsyncioTestCase):
         message = str(ctx.exception)
         self.assertIn("has not been opened", message)
         self.assertIn("not a daemon", message)
-        self.assertIn("AxolHardware.connect()", message)
+        self.assertIn("Axol.connect()", message)
         self.assertIn("AxolArm.enable()", message)
 
     async def test_send_while_starting_says_still_starting(self) -> None:
@@ -166,7 +166,7 @@ class CanBusStateTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(can.CanOperationError) as ctx:
             await self.bus._send(0x123, b"\x01")
         self.assertIn("was closed", str(ctx.exception))
-        self.assertIn("AxolHardware.connect()", str(ctx.exception))
+        self.assertIn("Axol.connect()", str(ctx.exception))
 
     async def test_start_is_idempotent_while_open(self) -> None:
         await self.bus.start()

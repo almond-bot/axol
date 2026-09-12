@@ -157,8 +157,8 @@ class VRTeleop:
 
         if isinstance(robot, AxolHardware):
             raise TypeError(
-                "VRTeleop hardware requires almond_axol.robot.Axol (the realtime "
-                "core); direct Python control of AxolHardware has been removed"
+                "VRTeleop requires almond_axol.robot.Axol (or Sim); direct Python "
+                "control of the low-level AxolHardware object is not supported"
             )
         self._robot = robot
         self._jelly = jelly

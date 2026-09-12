@@ -1,14 +1,13 @@
 """Public re-exports for almond_axol.robot."""
 
-# The production robot objects live with the realtime core they drive.
-# Imported last: ``almond_axol.rt`` imports this package's submodules, so every
-# name it needs must already be bound above.
-from ..rt.mantis import Mantis  # noqa: E402
-from ..rt.robot import Axol  # noqa: E402
+# The robot objects live with the realtime core they drive. ``almond_axol.rt``
+# imports this package's *submodules* (never these re-exports), so the cycle
+# resolves whichever package is imported first.
+from ..rt.mantis import Mantis
+from ..rt.robot import Axol
 from .axol import (
     EITHER_STOP_JOINTS,
     AxolArm,
-    AxolHardware,
     arm_limits,
     closer_end_stop,
     end_stop_offset_from_position,
@@ -22,14 +21,13 @@ from .config import (
     PositionForceConfig,
 )
 from .jelly import Jelly, JellyConfig
-from .mantis import MantisGripperArm, MantisHardware
+from .mantis import MantisGripperArm
 from .sim import Sim
 
 __all__ = [
     "RobotBase",
     "Axol",
     "AxolArm",
-    "AxolHardware",
     "arm_limits",
     "closer_end_stop",
     "EITHER_STOP_JOINTS",
@@ -44,5 +42,4 @@ __all__ = [
     "Sim",
     "Mantis",
     "MantisGripperArm",
-    "MantisHardware",
 ]

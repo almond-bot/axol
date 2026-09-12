@@ -1,11 +1,12 @@
-"""``Axol`` — the Axol robot driven through the Rust realtime core.
+"""``Axol`` — the Axol robot, with its control loop in the Rust realtime core.
 
 This is the production robot object (re-exported as
-:class:`almond_axol.robot.Axol`). It constructs the low-level
-:class:`~almond_axol.robot.axol.AxolHardware` and presents the same surface
-:class:`~almond_axol.teleop.VRTeleop` uses (``enable`` / ``disable`` /
-``get_positions`` / ``motion_control``), but the CAN buses are owned by the
-``axol-rt`` subprocess:
+:class:`almond_axol.robot.Axol`). Its public surface is the classic one —
+``connect`` / ``enable`` / ``disable`` / ``disconnect``, the ``get_*`` /
+``set_*`` register calls, telemetry, ``motion_control`` — and it owns the
+low-level :class:`~almond_axol.robot.axol.AxolHardware` (buses, motors,
+model math) as an implementation detail. What changed is behind the scenes:
+while enabled, the CAN buses are owned by the ``axol-rt`` subprocess:
 
 - ``enable()`` runs the split bring-up: the core resets the motors (prep),
   then Python resolves joint offsets and MyActuator decode ranges through a
@@ -64,13 +65,13 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Self
 
 import numpy as np
 
 from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
-from ..motor import ControlMode, Joint, MotorError
+from ..motor import ControlMode, Joint, MotorError, MotorGains, MotorStatus
 from ..motor.bus import CanBus
 from ..motor.motor import _JOINT_CONFIG
 from ..robot.axol import AxolArm, AxolHardware
@@ -90,10 +91,11 @@ _LIMP_KD = 0.25
 
 
 class Axol(RobotBase):
-    """The dual-arm Axol robot, with the control loop in the Rust realtime core.
+    """Dual-arm Axol robot interface.
 
-    Construct it exactly like the low-level hardware object and use it as an
-    async context manager::
+    Opens one CAN bus per arm and constructs all 16 motor drivers on entry
+    (14 on the gripperless SKU, ``config.has_gripper = False``). Use as an
+    async context manager to ensure the buses are cleanly shut down::
 
         async with Axol() as axol:
             pos_l, pos_r = await axol.get_positions()
@@ -101,10 +103,11 @@ class Axol(RobotBase):
 
     ``enable()`` brings the motors up and hands both CAN buses to the
     ``axol-rt`` subprocess, which paces the 240 Hz loop; Python keeps the
-    model math and streams targets. :attr:`hardware` exposes the wrapped
-    :class:`~almond_axol.robot.axol.AxolHardware` for flows that also need
-    direct register access on a quiet bus (before ``enable()`` or after
-    ``disable()``).
+    model math and streams targets. While the core owns the bus, reads of
+    position / velocity / torque come from its per-tick telemetry (no CAN is
+    sent from Python) and the register-level calls (``get_temperatures``,
+    ``set_gains``, ``set_control_mode``, ...) are unavailable — use them on a
+    :meth:`connect`-ed robot before :meth:`enable`, or after :meth:`disable`.
     """
 
     # The core's tracker limits get headroom over the Python shaper's caps:
@@ -117,30 +120,37 @@ class Axol(RobotBase):
 
     def __init__(
         self,
-        config: AxolConfig | None = None,
+        config: AxolConfig = AxolConfig(),
         left_channel: str | None = CAN_LEFT,
         right_channel: str | None = CAN_RIGHT,
         left_joints: Iterable[Joint] | None = None,
         right_joints: Iterable[Joint] | None = None,
         *,
-        hardware: AxolHardware | None = None,
         loop_hz: float = 240.0,
         watchdog_ms: float = 150.0,
         max_vel: float = 2.0 * math.pi,
         max_accel: float = 7.0 * math.pi,
         record: str | None = None,
     ) -> None:
-        """Construct the robot for the realtime core.
+        """Construct the dual-arm interface.
 
-        The first five arguments are forwarded to
-        :class:`~almond_axol.robot.axol.AxolHardware`; see it for their
-        meaning. Nothing is opened or actuated until :meth:`enable`.
+        CAN buses and motors are created but not started; call ``enable()``
+        or use the class as an async context manager to bring up hardware.
 
         Args:
-            hardware: An already-constructed ``AxolHardware`` to wrap
-                instead of building one from the forwarded arguments (which
-                must then be left at their defaults).
-            loop_hz: Realtime core tick rate.
+            config:        Per-joint gains, friction parameters, and gripper config.
+            left_channel:  SocketCAN interface for the left arm, or ``None``
+                           to operate without it.
+            right_channel: SocketCAN interface for the right arm, or ``None``.
+            left_joints:   Joints physically present on the left arm (a
+                           partial bench arm); ``None`` means the full arm.
+            right_joints:  Same for the right arm.
+
+        The keyword-only arguments tune the realtime core and rarely need
+        changing:
+
+        Args:
+            loop_hz: Core tick rate.
             watchdog_ms: Core watchdog — how long it holds the last target
                 without a fresh one before treating the host as gone.
             max_vel: Teleop joint-velocity cap (rad/s) — the core's tracker
@@ -152,26 +162,66 @@ class Axol(RobotBase):
                 position/torque is captured from the core's feedback packets
                 at its native ``loop_hz`` instead of the Python target rate.
         """
-        if hardware is None:
-            hardware = AxolHardware(
-                config=AxolConfig() if config is None else config,
+        self._init_core(
+            AxolHardware(
+                config=config,
                 left_channel=left_channel,
                 right_channel=right_channel,
                 left_joints=left_joints,
                 right_joints=right_joints,
-            )
-        elif (
-            config is not None
-            or left_channel != CAN_LEFT
-            or right_channel != CAN_RIGHT
-            or left_joints is not None
-            or right_joints is not None
-        ):
-            raise ValueError(
-                "Axol(hardware=...) takes the wrapped object as-is; do not also "
-                "pass config / channels / joints"
-            )
+            ),
+            loop_hz=loop_hz,
+            watchdog_ms=watchdog_ms,
+            max_vel=max_vel,
+            max_accel=max_accel,
+            record=record,
+        )
+
+    @classmethod
+    def _wrap(
+        cls,
+        hardware: AxolHardware,
+        *,
+        loop_hz: float = 240.0,
+        watchdog_ms: float = 150.0,
+        max_vel: float = 2.0 * math.pi,
+        max_accel: float = 7.0 * math.pi,
+        record: str | None = None,
+    ) -> Self:
+        """Build the robot around an already-constructed low-level object.
+
+        Internal: lets tests and bench tooling substitute a hand-built
+        :class:`~almond_axol.robot.axol.AxolHardware` (fake buses, partial
+        arms) for the one :meth:`__init__` would construct.
+        """
+        self = cls.__new__(cls)
+        self._init_core(
+            hardware,
+            loop_hz=loop_hz,
+            watchdog_ms=watchdog_ms,
+            max_vel=max_vel,
+            max_accel=max_accel,
+            record=record,
+        )
+        return self
+
+    def _init_core(
+        self,
+        hardware: AxolHardware,
+        *,
+        loop_hz: float,
+        watchdog_ms: float,
+        max_vel: float,
+        max_accel: float,
+        record: str | None,
+    ) -> None:
         self._robot = hardware
+        # ``_core_started``: an ``axol-rt`` process exists for this session
+        # (from ``enable`` until teardown) — teardown must go through the
+        # core. ``_armed``: the core holds the buses (from its ``arm`` ack
+        # until ``disable`` / ``disconnect``) and Python must not send CAN.
+        self._core_started = False
+        self._armed = False
         self._loop_hz = loop_hz
         self._watchdog_ms = watchdog_ms
         self._max_vel = max_vel
@@ -209,24 +259,23 @@ class Axol(RobotBase):
         self._state_side_ts: dict[int, float] = {}
 
     @property
-    def hardware(self) -> AxolHardware:
-        """The wrapped low-level object (buses, motors, model math).
-
-        Its ``left`` / ``right`` arms and their ``motors`` are the same
-        objects this class reads and commands through. Direct register
-        access (``connect()``, ``is_holding()``, ...) is only valid while the
-        core does not own the bus — before :meth:`enable` or after
-        :meth:`disable`.
-        """
-        return self._robot
-
-    @property
     def left(self) -> AxolArm | None:
+        """The left :class:`~almond_axol.robot.axol.AxolArm`, or ``None``."""
         return self._robot.left
 
     @property
     def right(self) -> AxolArm | None:
+        """The right :class:`~almond_axol.robot.axol.AxolArm`, or ``None``."""
         return self._robot.right
+
+    def _require_quiet_bus(self, what: str) -> None:
+        """Refuse register-level CAN traffic while the core owns the bus."""
+        if self._armed:
+            raise MotorError(
+                f"{what} is unavailable while the robot is enabled: the realtime "
+                "core owns the CAN bus. Use it on a connect()-ed robot before "
+                "enable(), or after disable()."
+            )
 
     def _arms(self) -> list[tuple[int, AxolArm]]:
         out = []
@@ -304,6 +353,7 @@ class Axol(RobotBase):
         self._fb_packets = [0, 0]
         self._limp_announced = False
         await self._link.start()
+        self._core_started = True
         await self._link.configure(self._config_text())
         # The core's prep resets the MyActuator motors (multi-turn wrap state
         # changes) — it must complete before Python resolves offsets, and
@@ -343,6 +393,7 @@ class Axol(RobotBase):
         # before the realtime bus threads open their SocketCAN sockets.
         await asyncio.gather(*(bus.close() for bus in self._buses()))
         await self._link.arm()
+        self._armed = True
         await self._wait_for_caches()
         # Prime one full hold target at the measured pose: the core's own
         # bring-up hold has no gravity feedforward (t_ff = 0) and no damping
@@ -359,44 +410,50 @@ class Axol(RobotBase):
             self._loop_hz,
         )
 
-    async def __aenter__(self) -> Self:
-        """Enter the async context, arming the core via :meth:`enable`."""
-        await self.enable()
-        return self
+    async def connect(self) -> None:
+        """Open the CAN buses only — nothing is actuated.
 
-    async def __aexit__(self, *_: object) -> None:
-        """Exit the async context, tearing down via :meth:`disable`.
-
-        Unlike :meth:`RobotBase.__aexit__`, teardown errors are not wrapped
-        in ``HardwareCleanupError``: :meth:`disable` already decides, per
-        failure, whether the motors were left holding on purpose.
+        Every read API (``get_holding()``, ``get_positions()``, ...) becomes
+        usable for inspecting a robot of unknown state; :meth:`enable` opens
+        the buses itself, so this is optional. Not valid while enabled (the
+        core owns the bus).
         """
-        await self.disable()
+        self._require_quiet_bus("connect()")
+        await self._robot.connect()
 
     async def start_telemetry(self, hz: float, *, torque: bool = False) -> None:
-        """No-op: the core already streams full telemetry every tick.
+        """Begin background polling of every motor (classic, on a quiet bus).
 
-        Positions, velocities, and torques for every slot arrive in the
-        per-tick ``F`` packets regardless of ``hz`` / ``torque`` — a poll
-        loop would need the bus, which the core owns. Kept so flows written
-        against ``AxolHardware`` (gravity-comp, waypoints, tune.motion, the
-        LeRobot robot) run unchanged.
+        While enabled this is a no-op: positions, velocities, and torques
+        for every slot already arrive in the core's per-tick ``F`` packets
+        regardless of ``hz`` / ``torque``, and a poll loop would need the
+        bus, which the core owns.
         """
-        _logger.debug(
-            "rt: start_telemetry(%s) ignored — core streams at %.0f Hz",
-            hz,
-            self._loop_hz,
-        )
+        if self._armed:
+            _logger.debug(
+                "rt: start_telemetry(%s) ignored — core streams at %.0f Hz",
+                hz,
+                self._loop_hz,
+            )
+            return
+        await self._robot.start_telemetry(hz, torque=torque)
 
     async def stop_telemetry(self) -> None:
-        """No-op counterpart of :meth:`start_telemetry`."""
+        """Stop background polling (no-op while the core streams)."""
+        if self._armed:
+            return
+        await self._robot.stop_telemetry()
 
     async def wait_for_telemetry(self, timeout: float = 5.0) -> None:
-        """Block until the core's telemetry stream is flowing for every arm.
+        """Block until every motor has reported a position.
 
-        Same contract as :meth:`AxolHardware.wait_for_telemetry`; ``enable`` already
-        waited once, so after a successful bring-up this returns immediately.
+        While enabled this waits on the core's telemetry stream (``enable``
+        already waited once, so it returns immediately after a successful
+        bring-up); otherwise on the classic poll loop.
         """
+        if not self._armed:
+            await self._robot.wait_for_telemetry(timeout)
+            return
         deadline = time.monotonic() + timeout
         arms = self._arms()
 
@@ -679,8 +736,9 @@ class Axol(RobotBase):
         what it needs from Python is gravity evaluated at the *measured*
         (hand-guided) pose, not at a target the arm can no longer follow.
         Every control loop keeps its cadence, the arms stay weightless, and
-        the operator guides them to rest and stops the session.
+        the         operator guides them to rest and stops the session.
         """
+        self._require_enabled("motion_control()")
         limp = self._link.limp
         if limp is not None:
             if not self._limp_announced:
@@ -712,16 +770,23 @@ class Axol(RobotBase):
         Backs the guarded-return contact hold (limp arms, gravity held by
         feedforward). With the sinks installed, ``AxolArm.gravity_compensate``
         ships its tuples to the core instead of the bus — Python never
-        touches the wire. Same signature as
-        :meth:`AxolHardware.gravity_compensate`.
+        touches the wire.
         """
+        self._require_enabled("gravity_compensate()")
         await self._robot.gravity_compensate(kd, free_joints, gripper_targets)
+
+    def _require_enabled(self, what: str) -> None:
+        if not self._armed:
+            raise MotorError(
+                f"{what} requires an enabled robot: call enable() first (the "
+                "realtime core drives the motors)"
+            )
 
     def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Per-arm measured-minus-gravity torques from the telemetry caches.
 
         The core's telemetry refreshes measured torque every tick, so this
-        needs no CAN traffic — same contract as ``AxolHardware``.
+        needs no CAN traffic.
         """
         return self._robot.torque_residuals()
 
@@ -733,39 +798,167 @@ class Axol(RobotBase):
         """Re-snapshot the gravity-comp hold setpoint (pure Python state)."""
         self._robot.reset_gravity_hold()
 
+    # -- State reads ------------------------------------------------------------
+    #
+    # While enabled, position / velocity / torque come from the caches the
+    # core's per-tick telemetry fills (no CAN sent from Python). Everything
+    # else needs the bus and is only available on a quiet one.
+
+    def _cached_pair(
+        self, per_arm: Callable[[AxolArm], np.ndarray]
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        def one(arm: AxolArm | None) -> np.ndarray | None:
+            return per_arm(arm) if arm is not None else None
+
+        return one(self._robot.left), one(self._robot.right)
+
     async def get_positions(
         self,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Measured positions from the telemetry-filled caches (no CAN sent).
+        """Joint positions (rad; gripper ``[0, 1]``) for both arms.
 
-        Every joint — gripper included — refreshes from the core's per-tick
-        telemetry packets once armed (the gripper's POSITION_FORCE replies
-        land in the same slot stream).
+        While enabled, from the telemetry-filled caches — every joint,
+        gripper included, refreshes from the core's per-tick packets.
         """
+        if not self._armed:
+            return await self._robot.get_positions()
+        return self._cached_pair(lambda arm: arm.positions.copy())
 
-        def arm_positions(arm: AxolArm | None) -> np.ndarray | None:
-            return arm.positions.copy() if arm is not None else None
-
-        return (
-            arm_positions(self._robot.left),
-            arm_positions(self._robot.right),
+    async def get_velocities(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Joint velocities (rad/s) for both arms."""
+        if not self._armed:
+            return await self._robot.get_velocities()
+        return self._cached_pair(
+            lambda arm: np.array(
+                arm._pad_absent([m.velocity for m in arm.motors.values()]),
+                dtype=np.float32,
+            )
         )
 
-    async def detach(self) -> None:
-        """Release the bus with every motor left holding its last command.
+    async def get_torques(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Joint torques (Nm on Damiao, A on MyActuator) for both arms."""
+        if not self._armed:
+            return await self._robot.get_torques()
+        return self._cached_pair(lambda arm: arm.torques.copy())
 
-        For flows that hand a still-energized robot to a later process:
-        ``diag.rom-enable`` leaves the grippers clamped on the item for
-        ``diag.rom-disable`` to release, and ``diag.lift-cycle`` must never
-        torque off arms that are out of their clearance pose. No disarm is
+    async def get_temperatures(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Motor temperatures (°C). Quiet bus only."""
+        self._require_quiet_bus("get_temperatures()")
+        return await self._robot.get_temperatures()
+
+    async def get_voltages(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Bus voltages (V). Quiet bus only."""
+        self._require_quiet_bus("get_voltages()")
+        return await self._robot.get_voltages()
+
+    async def get_error_codes(
+        self,
+    ) -> tuple[list[MotorStatus] | None, list[MotorStatus] | None]:
+        """Per-motor status flags. Quiet bus only."""
+        self._require_quiet_bus("get_error_codes()")
+        return await self._robot.get_error_codes()
+
+    async def get_holding(self) -> tuple[list[bool] | None, list[bool] | None]:
+        """Enabled-and-holding per motor (usable right after :meth:`connect`).
+
+        Quiet bus only; while enabled every motor is holding by definition.
+        """
+        self._require_quiet_bus("get_holding()")
+        return await self._robot.get_holding()
+
+    async def get_gains(
+        self,
+    ) -> tuple[list[MotorGains] | None, list[MotorGains] | None]:
+        """Per-motor gains. Quiet bus only."""
+        self._require_quiet_bus("get_gains()")
+        return await self._robot.get_gains()
+
+    # -- State writes (quiet bus only) ------------------------------------------
+
+    async def clear_errors(self) -> None:
+        """Clear latched error flags on all motors."""
+        self._require_quiet_bus("clear_errors()")
+        await self._robot.clear_errors()
+
+    async def set_control_mode(self, mode: ControlMode) -> None:
+        """Set ``ControlMode`` on all motors (MyActuator motors reboot)."""
+        self._require_quiet_bus("set_control_mode()")
+        await self._robot.set_control_mode(mode)
+
+    async def set_gains(
+        self,
+        left: dict[Joint, MotorGains] | None = None,
+        right: dict[Joint, MotorGains] | None = None,
+    ) -> None:
+        """Write motor gains per joint (persisted to non-volatile memory)."""
+        self._require_quiet_bus("set_gains()")
+        await self._robot.set_gains(left or {}, right or {})
+
+    async def set_zero_position(
+        self,
+        left: list[Joint] | None = None,
+        right: list[Joint] | None = None,
+    ) -> None:
+        """Zero the given joints at their current position."""
+        self._require_quiet_bus("set_zero_position()")
+        await self._robot.set_zero_position(left, right)
+
+    async def set_acceleration(
+        self,
+        left: dict[Joint, float] | None = None,
+        right: dict[Joint, float] | None = None,
+    ) -> None:
+        """Set per-joint acceleration ramps (rad/s²)."""
+        self._require_quiet_bus("set_acceleration()")
+        await self._robot.set_acceleration(left or {}, right or {})
+
+    async def set_positions_velocity(
+        self,
+        left: np.ndarray | None = None,
+        right: np.ndarray | None = None,
+        max_speed: float = 0.0,
+    ) -> None:
+        """Position command with a speed limit per arm."""
+        self._require_quiet_bus("set_positions_velocity()")
+        await self._robot.set_positions_velocity(left, right, max_speed)
+
+    async def set_velocity(
+        self,
+        left: np.ndarray | None = None,
+        right: np.ndarray | None = None,
+    ) -> None:
+        """Velocity command per arm."""
+        self._require_quiet_bus("set_velocity()")
+        await self._robot.set_velocity(left, right)
+
+    # -- Teardown ---------------------------------------------------------------
+
+    async def disconnect(self) -> None:
+        """Close the CAN buses leaving motor torque exactly as it is.
+
+        While enabled: release the bus with every motor left holding its
+        last command, for flows that hand a still-energized robot to a later
+        process (``diag.rom-enable`` leaves the grippers clamped on the item
+        for ``diag.rom-disable`` to release; ``diag.lift-cycle`` must never
+        torque off arms that are out of their clearance pose). No disarm is
         sent — the core exits on the closed link and, as on every exit that
         is not an explicit ``D``, leaves each motor holding its last MIT
         command on firmware gains, gravity feedforward included. Host
         damping stops with the core, exactly as when a classic session
-        closed its buses without disabling. A later ``enable()`` (or the
-        maintenance-proxy attach ``rom.disable`` does) picks the robot up
-        from there.
+        closed its buses without disabling. A later ``enable()`` picks the
+        robot up from there.
+
+        After :meth:`connect` only: closes the maintenance proxies.
         """
+        if not self._armed:
+            await self._robot.disconnect()
+            return
         if self._rec is not None:
             self.set_recording_engaged(False)
         for _side, arm in self._arms():
@@ -775,12 +968,14 @@ class Axol(RobotBase):
             await self._link.close()
         except Exception:  # noqa: BLE001 - the motors hold either way
             _logger.exception("rt: core link teardown failed")
+        self._armed = False
+        self._core_started = False
         if self._rec is not None:
             try:
                 self._rec.dump()
             except Exception:  # noqa: BLE001 - continue trace finalization
                 _logger.exception("rt: could not dump the measurement trace")
-        _logger.info("rt: detached — motors left holding their last command")
+        _logger.info("rt: disconnected — motors left holding their last command")
 
     async def disable(self) -> None:
         """Disarm the core and tear the link down.
@@ -796,7 +991,13 @@ class Axol(RobotBase):
         this teardown: a disabled arm falls; a holding or limp arm waits for
         the operator. Matches the classic controller, where a session dying
         mid-command left the motors holding for the next ``enable()``.
+
+        Without a core for this session (after :meth:`connect` only) this is
+        the classic torque-off over the maintenance proxies.
         """
+        if not self._core_started:
+            await self._robot.disable()
+            return
         if self._rec is not None:
             self.set_recording_engaged(False)
         for _side, arm in self._arms():
@@ -835,6 +1036,8 @@ class Axol(RobotBase):
             await self._link.close()
         except Exception:  # noqa: BLE001 - continue with maintenance disable
             _logger.exception("rt: core link teardown failed")
+        self._armed = False
+        self._core_started = False
         # Reopen Rust maintenance proxies only after proving that the core's
         # bus-owning process has exited.
         buses = self._buses()

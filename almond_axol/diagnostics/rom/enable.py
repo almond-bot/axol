@@ -92,10 +92,8 @@ from ...robot.axol import (
     SHOULDER_1_LEFT_LIMITS,
     SHOULDER_2_LEFT_LIMITS,
     SHOULDER_2_RIGHT_LIMITS,
-    AxolHardware,
 )
 from ...robot.config import ArmConfig, AxolConfig, FrictionParams
-from ...robot.mantis import MantisHardware
 from ...rt import Axol, Mantis
 from ..telemetry_log import TelemetryCsvLogger
 
@@ -753,7 +751,6 @@ async def run_axol(
     # Production control path: the Rust core owns the buses and runs the
     # 240 Hz loop; this script only streams targets (see the module docstring).
     robot: Axol | Mantis
-    axol: AxolHardware | MantisHardware
     if target == "mantis":
         # Grippers-only core on the Mantis buses; the seven arm joints per
         # side are virtual (they latch the streamed targets), so the sweep
@@ -763,7 +760,6 @@ async def run_axol(
             left_channel=None if no_left else left_channel,
             right_channel=None if no_right else right_channel,
         )
-        axol = robot.hardware
     else:
         # Bring up exactly the motors that are on each bus (see the module
         # docstring): every selected joint must answer the probe; an
@@ -802,12 +798,11 @@ async def run_axol(
             left_joints=arm_joints["left"],
             right_joints=arm_joints["right"],
         )
-        axol = robot.hardware
     await robot.enable()
     print("Motors enabled (realtime core armed).")
 
     # The logger samples the motor caches, which the core's telemetry fills.
-    logger = TelemetryCsvLogger(axol, "rom") if capture else None
+    logger = TelemetryCsvLogger(robot, "rom") if capture else None
     if logger is not None:
         logger.start()
 
@@ -957,7 +952,7 @@ async def run_axol(
             await robot.disable()
             print("Arms left limp (gravity comp) — hand-guide them to rest.")
         elif keep_enabled:
-            await robot.detach()
+            await robot.disconnect()
             print(
                 "\nMotors left enabled — robot is holding the item.\n"
                 "Run `uv run -m almond_axol.diagnostics.rom.disable` to open the "

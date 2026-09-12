@@ -4,10 +4,12 @@ Provides :class:`AxolArm` (single-arm CAN bus controller) and
 :class:`AxolHardware` (dual-arm context manager that opens both buses and
 constructs all 16 motor drivers).
 
-``AxolHardware`` sends CAN from Python on the caller's schedule. It is the
-right object for direct-register calibration and diagnostics on a quiet bus.
-Production motion goes through :class:`almond_axol.robot.Axol`, which wraps
-it and hands the buses to the Rust realtime core (``axol-rt``) while armed.
+``AxolHardware`` is internal to the package: it sends CAN from Python on the
+caller's schedule, which is what calibration and diagnostics tooling needs
+on a quiet bus. The public robot object is :class:`almond_axol.robot.Axol`
+(``almond_axol.rt.robot``): it presents this same surface, owns an
+``AxolHardware`` underneath, and hands the buses to the Rust realtime core
+(``axol-rt``) while enabled.
 """
 
 from __future__ import annotations
@@ -1872,6 +1874,11 @@ class AxolArm:
 
 class AxolHardware(RobotBase):
     """Dual-arm Axol hardware interface, driven directly from Python.
+
+    Internal — the public robot object is :class:`almond_axol.robot.Axol`,
+    which owns one of these and exposes the same methods. Use this class
+    directly only from package tooling that must send CAN from Python on a
+    quiet bus (calibration, register-level diagnostics).
 
     Opens one CAN bus per arm and constructs all 16 motor drivers on entry
     (14 on the gripperless SKU, ``config.has_gripper = False``).

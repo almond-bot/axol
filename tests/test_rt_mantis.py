@@ -185,7 +185,7 @@ class MantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
         patcher = patch("almond_axol.rt.mantis.RtLink", _FakeLink)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.rt = Mantis(hardware=self.mantis)
+        self.rt = Mantis._wrap(self.mantis)
 
     async def test_connect_opens_buses_and_verifies_torque_off_without_a_core(
         self,
@@ -354,7 +354,7 @@ class MantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.left._bus.open and self.right._bus.open)
 
     async def test_recording_gate_reaches_the_armed_core(self) -> None:
-        rt = Mantis(hardware=self.mantis, record="/tmp/axol-rt-mantis-test/trace")
+        rt = Mantis._wrap(self.mantis, record="/tmp/axol-rt-mantis-test/trace")
         await rt.connect()
         await rt.enable_grippers()
         (link,) = _FakeLink.instances
@@ -368,7 +368,7 @@ class MantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_deferred_enable_arms_immediately(self) -> None:
         mantis = _mantis(self.left, self.right, defer=False)
-        rt = Mantis(hardware=mantis)
+        rt = Mantis._wrap(mantis)
 
         await rt.enable()
 
@@ -382,7 +382,7 @@ class MantisSurfaceTest(unittest.IsolatedAsyncioTestCase):
     async def test_axol_surface_stubs(self) -> None:
         left = _arm(_FakeGripperMotor(), "can_mantis_l", [])
         right = _arm(_FakeGripperMotor(), "can_mantis_r", [])
-        rt = Mantis(hardware=_mantis(left, right))
+        rt = Mantis._wrap(_mantis(left, right))
 
         self.assertIsNone(rt.fault)
         self.assertIsNone(rt.limp)
@@ -403,8 +403,8 @@ class MantisSurfaceTest(unittest.IsolatedAsyncioTestCase):
             robot = MantisRobot(config, defer_gripper_enable=True)
         hardware = robot._build_hardware()
         self.assertIsInstance(hardware, Mantis)
-        self.assertIsInstance(hardware.hardware, MantisHardware)
-        self.assertTrue(hardware.hardware._defer_gripper_enable)
+        self.assertIsInstance(hardware._robot, MantisHardware)
+        self.assertTrue(hardware._robot._defer_gripper_enable)
 
 
 if __name__ == "__main__":

@@ -331,8 +331,9 @@ class MantisGripperArm:
 class MantisHardware(RobotBase):
     """The Mantis rig's dual handheld grippers, driven directly from Python.
 
-    Mirrors the ``AxolHardware`` control surface. Production takes go through
-    :class:`almond_axol.robot.Mantis`, which wraps this object.
+    Internal — the public rig object is :class:`almond_axol.robot.Mantis`,
+    which owns one of these and exposes the same methods. Mirrors the
+    ``AxolHardware`` control surface.
 
     Args:
         config:        Reused for the per-side gripper POSITION_FORCE tuning

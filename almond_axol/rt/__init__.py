@@ -1,12 +1,12 @@
 """Production realtime core: the CAN control loop runs in Rust.
 
-:class:`almond_axol.robot.Axol` (defined here as :class:`Axol`) wraps the
-low-level :class:`~almond_axol.robot.axol.AxolHardware`, and the Mantis rig's
-:class:`almond_axol.robot.Mantis` (:class:`Mantis` here) wraps
-:class:`~almond_axol.robot.mantis.MantisHardware`.
-Python keeps VR, IK, and MuJoCo gravity, while per-joint targets are shipped
-over a Unix socket to ``axol-rt`` (see ``rust/axol-rt``), which solely owns
-the buses and paces the 240 Hz control loop.
+:class:`almond_axol.robot.Axol` and :class:`almond_axol.robot.Mantis` are
+defined here. They present the classic robot API and own the low-level bus /
+motor / model objects (:mod:`almond_axol.robot.axol`,
+:mod:`almond_axol.robot.mantis`) as an implementation detail. Python keeps
+VR, IK, and MuJoCo gravity, while per-joint targets are shipped over a Unix
+socket to ``axol-rt`` (see ``rust/axol-rt``), which solely owns the buses and
+paces the 240 Hz control loop while the robot is enabled.
 """
 
 # ``almond_axol.robot`` re-exports ``Axol`` / ``Mantis`` from this package's
