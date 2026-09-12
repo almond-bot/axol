@@ -52,6 +52,8 @@ axol teleop --settings_path bench.json       # a different robot's settings
 axol teleop --no_settings --axol.left_stiffness 0.8   # built-in defaults only
 ```
 
+A missing `~/.almond/settings.json` is fine (a fresh host runs the built-in defaults), but a file that exists and cannot be read — corrupt JSON, a permission problem, a symlink in its path — is a usage error, not a silent fallback: the command refuses to start rather than run a different robot's numbers. Fix the file, or pass `--no_settings` to run without it. The same applies to the SDK (`Axol()`, `Mantis()`, `Jelly()`, `VRTeleop()` raise). Only `axol serve` tolerates an unreadable file, so the control panel can come up for you to repair it.
+
 ### Dotted overrides
 
 Each command is backed by a config dataclass (for example `TeleopCmdConfig` wraps the full [`AxolConfig`](/api/robot)). Nest into it with dots:

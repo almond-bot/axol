@@ -18,7 +18,7 @@ from almond_axol.serve.runner import (
     _bind_managed_mantis_trigger_channels,
     _managed_mantis_run_channels,
 )
-from almond_axol.serve.settings import SettingsStore
+from almond_axol.serve.settings import SettingsStore, advanced_schema
 from almond_axol.utils.can_channels import require_mantis_channels
 
 
@@ -224,6 +224,46 @@ class MantisChannelFlowTest(unittest.TestCase):
             self.assertEqual(snapshot["values"]["mantis.quest_tracker_key"], key)
             self.assertNotIn("vr_teleop.tracker_key", snapshot["values"])
             self.assertNotIn("teleop.tracker_key", snapshot["values"])
+
+    def test_quest_tracker_key_has_exactly_one_home(self) -> None:
+        # The curated mantis.quest_tracker_key drives the teleop section's
+        # tracker_key on collect-data. That path must not resurface as a
+        # second, unscoped knob: not in the Advanced tree, and not as a
+        # storable key (via update or a hand-edited file).
+        def field_keys(nodes: list[dict]) -> set[str]:
+            keys: set[str] = set()
+            for node in nodes:
+                if node["kind"] == "field":
+                    keys.add(node["key"])
+                else:
+                    keys |= field_keys(node["children"])
+            return keys
+
+        teleop = next(s for s in advanced_schema() if s["key"] == "teleop")
+        self.assertNotIn("teleop.tracker_key", field_keys(teleop["nodes"]))
+
+        key = "quest:meta-quest-touch-plus:grip"
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.json")
+            store.update(values={"teleop.tracker_key": key})
+            values = store.snapshot()["values"]
+            self.assertEqual(values["mantis.quest_tracker_key"], key)
+            self.assertNotIn("teleop.tracker_key", values)
+            # Applied only for Quest Mantis collection, as the curated key is.
+            self.assertNotIn(
+                "teleop.tracker_key",
+                store.merged_args("teleop", {"mantis": True, "mantis_source": "quest"}),
+            )
+            self.assertNotIn(
+                "teleop_config.vr_teleop_config.tracker_key",
+                store.merged_args("collect-data", {"mantis": False}),
+            )
+
+            path = Path(directory) / "edited.json"
+            path.write_text(json.dumps({"version": 2, "teleop": {"tracker_key": key}}))
+            values = SettingsStore(path).snapshot()["values"]
+            self.assertEqual(values["mantis.quest_tracker_key"], key)
+            self.assertNotIn("teleop.tracker_key", values)
 
     def test_mantis_channels_must_be_two_nonempty_distinct_names(self) -> None:
         self.assertEqual(

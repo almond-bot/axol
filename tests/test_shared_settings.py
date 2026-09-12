@@ -27,6 +27,7 @@ from almond_axol.robot import Axol, AxolConfig, Jelly, JellyConfig, Mantis
 from almond_axol.serve.settings import SettingsStore
 from almond_axol.settings import (
     SHARED,
+    load_store,
     shared_axol_config,
     shared_can_channels,
     shared_config,
@@ -191,6 +192,54 @@ class CliSharedSettingsTest(_StoreCase):
                 ["--settings_path", str(self.path.with_name("nope.json"))],
                 settings_op="teleop",
             )
+
+    def test_unreadable_settings_file_fails_closed(self) -> None:
+        # A file that exists but cannot be read must not silently become the
+        # calibrated defaults: that is a different robot. Both the explicit
+        # path and the default one refuse, and the message names the exit.
+        corrupt = self.path.with_name("corrupt.json")
+        corrupt.write_text("{not json")
+        # _StoreCase stubs load_store with this test's store; use the real one.
+        real_loader = patch("almond_axol.settings.load_store", load_store)
+        for argv in (["--settings_path", str(corrupt)], []):
+            with self.subTest(argv=argv):
+                stderr = StringIO()
+                with (
+                    real_loader,
+                    patch("almond_axol.serve.settings.SETTINGS_PATH", corrupt),
+                    redirect_stderr(stderr),
+                    self.assertRaises(SystemExit),
+                ):
+                    parse(TeleopCmdConfig, argv, settings_op="teleop")
+                self.assertIn("could not read the settings file", stderr.getvalue())
+                self.assertIn(str(corrupt), stderr.getvalue())
+                self.assertIn("--no_settings", stderr.getvalue())
+        # The escape hatch works, and a *missing* default file is still fine.
+        with real_loader, patch("almond_axol.serve.settings.SETTINGS_PATH", corrupt):
+            cfg = parse(TeleopCmdConfig, ["--no_settings"], settings_op="teleop")
+        self.assertEqual(cfg.axol.left_stiffness, 1.0)
+        with (
+            real_loader,
+            patch(
+                "almond_axol.serve.settings.SETTINGS_PATH",
+                self.path.with_name("none.json"),
+            ),
+        ):
+            cfg = parse(TeleopCmdConfig, [], settings_op="teleop")
+        self.assertEqual(cfg.axol.left_stiffness, 1.0)
+
+    def test_sdk_store_is_strict_but_tolerates_a_missing_file(self) -> None:
+        corrupt = self.path.with_name("corrupt.json")
+        corrupt.write_text("{not json")
+        with self.assertRaises(ValueError):
+            load_store(corrupt)
+        # Serve-style tolerance is opt-in and loud.
+        with self.assertLogs("almond_axol.serve.settings", "ERROR"):
+            tolerant = load_store(corrupt, strict=False)
+        self.assertEqual(tolerant.snapshot()["values"], {})
+        self.assertEqual(
+            load_store(self.path.with_name("none.json")).snapshot()["values"], {}
+        )
 
     def test_mantis_args_select_the_rig_channel_map(self) -> None:
         cfg = parse(

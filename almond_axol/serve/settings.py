@@ -991,14 +991,42 @@ _LEGACY_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _curated_section_aliases() -> dict[str, str]:
+    """Section paths that a curated key with explicit targets already drives.
+
+    ``mantis.quest_tracker_key`` sets ``teleop_config.vr_teleop_config
+    .tracker_key`` on collect-data, which is the ``teleop`` section's
+    ``teleop.tracker_key``. That path must not be a second, unscoped home
+    for the same knob (the curated one is applied only for Quest Mantis
+    runs), so it is folded back onto the curated key and hidden from the
+    Advanced tree. Computed once from the tables, never spelled twice.
+    """
+    aliases: dict[str, str] = {}
+    for setting in _SETTINGS_BY_KEY.values():
+        if setting.targets is None:
+            continue
+        for op, keys in setting.targets.items():
+            for key in keys:
+                for section in SECTIONS:
+                    prefix = section.targets.get(op)
+                    if prefix and key.startswith(prefix + "."):
+                        path = section.key + key[len(prefix) :]
+                        if path != setting.key:
+                            aliases[path] = setting.key
+    return aliases
+
+
+_SECTION_ALIASES: dict[str, str] = _curated_section_aliases()
+
+
 def canonical_keys(key: str) -> tuple[str, ...]:
-    """Translate a possibly pre-v2 key into its canonical key(s)."""
+    """Translate a possibly pre-v2 (or aliased) key into its canonical key(s)."""
     mapped = _LEGACY_KEYS.get(key)
     if mapped is not None:
         return mapped
     if key.startswith("vr_teleop."):
-        return ("teleop." + key.removeprefix("vr_teleop."),)
-    return (key,)
+        key = "teleop." + key.removeprefix("vr_teleop.")
+    return (_SECTION_ALIASES.get(key, key),)
 
 
 def flatten_tree(tree: dict[str, Any], prefix: str = "") -> dict[str, Any]:
@@ -1073,13 +1101,14 @@ def _rekey_nodes(
 def advanced_schema() -> list[dict[str, Any]]:
     """The unified Advanced tree: one canonical section per shared subsystem.
 
-    Curated keys are pruned so every knob has exactly one home. Best-effort
-    per section: a subsystem whose reference op can't build its schema
-    (missing extras) is simply omitted.
+    Curated keys — and the section paths they drive under another name —
+    are pruned so every knob has exactly one home. Best-effort per section:
+    a subsystem whose reference op can't build its schema (missing extras)
+    is simply omitted.
     """
     from .commands import get_schema
 
-    managed = set(_SETTINGS_BY_KEY)
+    managed = set(_SETTINGS_BY_KEY) | set(_SECTION_ALIASES)
     sections: list[dict[str, Any]] = []
     for section in SECTIONS:
         if section.ref_op is None or section.ref_prefix is None:
@@ -1209,10 +1238,18 @@ class SettingsStore:
     HTTP API exchanges them. Version-1 files (flat ``values`` + ``advanced``
     maps under the old curated names) are migrated on load and rewritten in
     the new layout on the next save.
+
+    A missing file is an empty store. An *unreadable* one (corrupt JSON, a
+    permission error, a symlinked path component) is logged and treated as
+    empty by default — serve must come up so the operator can repair it —
+    but ``strict=True`` re-raises instead: the CLI and SDK use that, since
+    silently running the calibrated defaults in place of the robot's saved
+    gravity model is exactly the failure the shared file exists to prevent.
     """
 
-    def __init__(self, path: Path = SETTINGS_PATH) -> None:
+    def __init__(self, path: Path = SETTINGS_PATH, *, strict: bool = False) -> None:
         self._path = path
+        self._strict = strict
         self._lock = threading.Lock()
         self._data = self._load()
 
@@ -1223,17 +1260,25 @@ class SettingsStore:
                 if "values" in raw or "advanced" in raw:
                     values = self._migrate_v1(raw)
                 else:
-                    values = flatten_tree(
+                    flat = flatten_tree(
                         {
                             key: value
                             for key, value in raw.items()
                             if key not in _RESERVED_KEYS and isinstance(value, dict)
                         }
                     )
+                    # A hand-edited file may spell a knob by its section path
+                    # (``teleop.tracker_key``); fold it onto its one home.
+                    values = {}
+                    for key, value in flat.items():
+                        for canonical in canonical_keys(key):
+                            values[canonical] = value
                 return {"values": values, "cameras": raw.get("cameras")}
         except FileNotFoundError:
             pass
         except Exception:  # noqa: BLE001 - a corrupt file must not kill serve
+            if self._strict:
+                raise
             _logger.exception("failed to load %s; starting empty", self._path)
         return {"values": {}, "cameras": None}
 

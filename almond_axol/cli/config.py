@@ -276,11 +276,23 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
     ) -> dict[str, Any]:
         if self._settings_op is None or disabled:
             return {}
-        from ..settings import load_store, shared_overlay
+        from ..settings import load_store, shared_overlay, store_path
 
         if settings_path is not None and not Path(settings_path).is_file():
             self.parser.error(f"--{SETTINGS_PATH_ARG}: no such file: {settings_path}")
-        store = load_store(settings_path)
+        # Fail closed: a settings file that exists but cannot be read must
+        # not silently turn into the calibrated defaults — that is a
+        # different robot. Name the escape hatch so the operator can still
+        # run while they repair the file.
+        try:
+            store = load_store(settings_path)
+        except Exception as exc:  # noqa: BLE001 - any read/parse failure
+            shown = settings_path if settings_path is not None else str(store_path())
+            self.parser.error(
+                f"could not read the settings file {shown}: "
+                f"{type(exc).__name__}: {exc} "
+                f"(fix it, or pass --{NO_SETTINGS_ARG} to run without it)"
+            )
         return shared_overlay(self._settings_op, self._settings_args, store=store)
 
     def _postprocessing(self, parsed_args: Any) -> Any:

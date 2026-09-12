@@ -45,6 +45,7 @@ __all__ = [
     "shared_config",
     "shared_mantis_can_channels",
     "shared_overlay",
+    "store_path",
 ]
 
 T = TypeVar("T")
@@ -69,16 +70,29 @@ marks "not given" — :class:`~almond_axol.robot.Axol` resolves it to the
 """
 
 
-def load_store(path: str | Path | None = None) -> SettingsStore:
+def store_path() -> Path:
+    """Where the robot's settings live (``$ALMOND_HOME/settings.json``)."""
+    from .serve import settings as serve_settings
+
+    return serve_settings.SETTINGS_PATH
+
+
+def load_store(path: str | Path | None = None, *, strict: bool = True) -> SettingsStore:
     """Open the shared settings (``~/.almond/settings.json`` unless ``path``).
 
     A missing file yields an empty store, so every loader below degrades to
-    the built-in defaults on a fresh host. Imported lazily: the store lives
-    in the serve package, which this module must stay cheap to import from.
+    the built-in defaults on a fresh host. A file that exists but cannot be
+    read (corrupt JSON, permissions, a symlinked path component) raises
+    rather than quietly running the defaults — the caller asked for the
+    robot's settings and must not get a different robot. Pass
+    ``strict=False`` for serve-style tolerance. Imported lazily: the store
+    lives in the serve package, which this module must stay cheap to import
+    from.
     """
-    from .serve.settings import SettingsStore
+    from .serve import settings as serve_settings
 
-    return SettingsStore() if path is None else SettingsStore(Path(path))
+    resolved = serve_settings.SETTINGS_PATH if path is None else Path(path)
+    return serve_settings.SettingsStore(resolved, strict=strict)
 
 
 def shared_overlay(
