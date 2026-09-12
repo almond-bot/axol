@@ -18,10 +18,41 @@ The remaining commands (`can.*`, `motor.*`, `zed.*`, `gst.*`, `jetson.setup`, `p
   <Card title="Whole-config file" icon="file-code">
     Load a complete JSON/YAML config with `--config_path run.json`, then layer CLI overrides on top.
   </Card>
-  <Card title="Control panel" icon="sliders" href="/guides/control-panel#settings">
-    Save a value once on the robot host and it's applied to every operation launched from the panel.
+  <Card title="Shared settings file" icon="sliders" href="/guides/control-panel-settings">
+    Save a value once in the control panel (`~/.almond/settings.json`) and every operation — panel, CLI, or SDK — uses it by default.
   </Card>
 </CardGroup>
+
+### The shared settings file
+
+The robot has **one** settings file, `~/.almond/settings.json` (`$ALMOND_HOME/settings.json`), edited by the [control panel](/guides/control-panel#settings). The same file is read **by default** by every draccus command on this page and by the [SDK constructors](/api/robot#shared-settings), so arm stiffness, per-joint gains and link masses, gripper limits, teleop rates and rest poses, CAN adapters — anything saved once — apply identically whether you drive the robot from the browser, the terminal, or Python.
+
+The file uses the **same vocabulary as a `--config_path` file**: it is a nested tree whose `axol`, `teleop`, `kinematics`, `jelly` and `vr_server` sections are the config dataclasses themselves, plus a few sections for operation-level knobs (`robot` for the CAN channels, `gravity`, `recording`, `inference`, …). For `axol teleop` the file is literally a partial teleop config; the other commands embed the same subsystems at their own paths and the translation is automatic. See the [Settings File](/guides/control-panel-settings) page for the layout.
+
+```json
+{
+  "version": 2,
+  "axol": { "left_stiffness": 0.8, "left": { "elbow": { "kp": 60 } } },
+  "teleop": { "frequency": 240 },
+  "robot": { "left_channel": "can0", "right_channel": "null" }
+}
+```
+
+Two flags control it on every draccus command:
+
+| Flag | Effect |
+|---|---|
+| `--settings_path PATH` | Read another settings file (the same file the control panel's **Export** writes) instead of `~/.almond/settings.json`. |
+| `--no_settings` | Ignore the settings file; run the built-in (calibrated) defaults plus whatever you pass explicitly. |
+
+```bash
+axol teleop                                  # panel settings apply
+axol gravity-comp --kd 1.0                   # panel settings, kd overridden
+axol teleop --settings_path bench.json       # a different robot's settings
+axol teleop --no_settings --axol.left_stiffness 0.8   # built-in defaults only
+```
+
+A missing `~/.almond/settings.json` is fine (a fresh host runs the built-in defaults), but a file that exists and cannot be read — corrupt JSON, a permission problem, a symlink in its path — is a usage error, not a silent fallback: the command refuses to start rather than run a different robot's numbers. Fix the file, or pass `--no_settings` to run without it. The same applies to the SDK (`Axol()`, `Mantis()`, `Jelly()`, `VRTeleop()` raise). Only `axol serve` tolerates an unreadable file, so the control panel can come up for you to repair it.
 
 ### Dotted overrides
 
@@ -45,7 +76,7 @@ axol teleop --config_path my_teleop.json
 axol run-policy --config_path rollout.yaml --device cpu   # file, then override
 ```
 
-Precedence is **defaults → `--config_path` file → CLI flags** (later wins), so flags always override file values, which override the built-in defaults. Operations launched from the [control panel](/guides/control-panel#settings) slot the host's saved settings in between the defaults and the file.
+Precedence is **defaults → shared settings file → `--config_path` file → CLI flags** (later wins), so flags always override file values, which override the robot's saved settings, which override the built-in defaults. Operations launched from the [control panel](/guides/control-panel#settings) resolve in exactly the same order, so a direct CLI run and a panel-launched one agree on every value neither of you overrode.
 
 ### Same knob, different path
 
@@ -65,6 +96,7 @@ Each command embeds the shared subsystem configs at its own dotted path — arm 
 | Lists use bracket syntax | `[a,b,c]` | `--free_joints [SHOULDER_1,WRIST_3]` |
 | Dict fields take **one inline YAML/JSON value** (dotted paths can't reach inside a dict) | `--field "{k: v}"` | `--cameras "{overhead: 41234567}"` (teleop); `--robot_config.cameras "{overhead: {serial: 41234567}}"` (collect-data / run-policy) |
 | Booleans take an explicit value | `--flag true` | `--push_to_hub true` |
+| Shared settings selectors (every draccus command) | `--settings_path PATH`, `--no_settings` | `--no_settings` (built-in defaults only) |
 
 <Note>
   Booleans are value-taking under draccus (`--push_to_hub true`, not a bare `--push_to_hub`). The one exception is `teleop`'s `--sim`, which is normalized so a bare `--sim` works as well as `--sim true`.

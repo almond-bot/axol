@@ -70,13 +70,14 @@ from typing import Self
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..constants import ARM_JOINTS
 from ..motor import ControlMode, Joint, MotorError, MotorGains, MotorStatus
 from ..motor.bus import CanBus
 from ..motor.motor import _JOINT_CONFIG
 from ..robot.axol import AxolArm, AxolHardware
 from ..robot.base import RobotBase
 from ..robot.config import AxolConfig
+from ..settings import SHARED
 from .link import FeedbackSlot, RtLink, config_header
 
 _logger = logging.getLogger(__name__)
@@ -120,9 +121,9 @@ class Axol(RobotBase):
 
     def __init__(
         self,
-        config: AxolConfig = AxolConfig(),
-        left_channel: str | None = CAN_LEFT,
-        right_channel: str | None = CAN_RIGHT,
+        config: AxolConfig | None = None,
+        left_channel: str | None = SHARED,
+        right_channel: str | None = SHARED,
         left_joints: Iterable[Joint] | None = None,
         right_joints: Iterable[Joint] | None = None,
         *,
@@ -137,11 +138,21 @@ class Axol(RobotBase):
         CAN buses and motors are created but not started; call ``enable()``
         or use the class as an async context manager to bring up hardware.
 
+        With no arguments the robot is configured exactly as the control
+        panel and ``axol teleop`` configure it: ``config`` and the CAN
+        channels come from the robot's shared settings file
+        (``~/.almond/settings.json``, see :mod:`almond_axol.settings`).
+        Every argument passed explicitly overrides its setting.
+
         Args:
-            config:        Per-joint gains, friction parameters, and gripper config.
-            left_channel:  SocketCAN interface for the left arm, or ``None``
-                           to operate without it.
-            right_channel: SocketCAN interface for the right arm, or ``None``.
+            config:        Per-joint gains, friction parameters, and gripper
+                           config. ``None`` (default) builds it from the
+                           shared settings over the calibrated defaults;
+                           ``AxolConfig()`` is the bare defaults.
+            left_channel:  SocketCAN interface for the left arm; ``SHARED``
+                           (default) reads the saved channel, ``None``
+                           operates without the arm.
+            right_channel: Same for the right arm.
             left_joints:   Joints physically present on the left arm (a
                            partial bench arm); ``None`` means the full arm.
             right_joints:  Same for the right arm.

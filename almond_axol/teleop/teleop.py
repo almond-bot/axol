@@ -120,15 +120,21 @@ class VRTeleop:
         vr_server_config:  VR WebSocket server parameters (port, TLS certs).
         jelly:              Jelly (x-drive base + lift) for robots that
                            have one; ``None`` for a static base.
+
+    Each config left ``None`` is built from the robot's shared settings
+    (``~/.almond/settings.json`` — the file the control panel and the
+    ``axol`` CLI use; see :mod:`almond_axol.settings`) over the built-in
+    defaults, so an SDK session runs the same teleop parameters as
+    ``axol teleop``. Pass a config explicitly to override it.
     """
 
     def __init__(
         self,
         robot: RobotBase,
         *,
-        config: VRTeleopConfig = VRTeleopConfig(),
-        kinematics_config: KinematicsConfig = KinematicsConfig(),
-        vr_server_config: VRServerConfig = VRServerConfig(),
+        config: VRTeleopConfig | None = None,
+        kinematics_config: KinematicsConfig | None = None,
+        vr_server_config: VRServerConfig | None = None,
         jelly: Jelly | None = None,
     ) -> None:
         """Construct the teleoperation session.
@@ -139,8 +145,11 @@ class VRTeleop:
         Args:
             robot:             Hardware or simulation target implementing :class:`RobotBase`.
             config:            Teleop loop parameters (rest poses, frequency, velocity limits).
+                               ``None`` loads the shared ``teleop.*`` settings.
             kinematics_config: IK solver cost weights forwarded to the IK subprocess.
+                               ``None`` loads the shared ``kinematics.*`` settings.
             vr_server_config:  VR WebSocket server parameters (port, TLS certs).
+                               ``None`` loads the shared ``vr_server.*`` settings.
             jelly:              Jelly (x-drive base + telescoping lift),
                                or ``None`` for a robot on a static base. When
                                present, the headset thumbsticks drive it: left
@@ -160,6 +169,23 @@ class VRTeleop:
                 "VRTeleop requires almond_axol.robot.Axol (or Sim); direct Python "
                 "control of the low-level AxolHardware object is not supported"
             )
+        if config is None or kinematics_config is None or vr_server_config is None:
+            # One read of the shared settings file serves every config that
+            # was left to default (the same ``teleop`` op mapping the panel
+            # and ``axol teleop`` apply).
+            from ..settings import load_store, shared_config
+
+            store = load_store()
+            if config is None:
+                config = shared_config(VRTeleopConfig, "teleop", "teleop", store=store)
+            if kinematics_config is None:
+                kinematics_config = shared_config(
+                    KinematicsConfig, "teleop", "kinematics", store=store
+                )
+            if vr_server_config is None:
+                vr_server_config = shared_config(
+                    VRServerConfig, "teleop", "vr_server", store=store
+                )
         self._robot = robot
         self._jelly = jelly
         self._config = config

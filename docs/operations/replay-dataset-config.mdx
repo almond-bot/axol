@@ -9,6 +9,8 @@ import LeRobotRobot from "/snippets/config/lerobot-robot.mdx";
 
 Every setting for `axol replay-dataset`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
 
+In the [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`, read by default) `robot_config.axol_config.*` is the file's `axol` section, the other `robot_config.*` fields are `lerobot`, the channels live under `robot`, `--root` under `recording.root`, and this command's `--fps` is `recording.replay_fps` (data collection's recording rate is a different knob).
+
 ```bash
 axol replay-dataset --repo_id myorg/pick --episode 3 --interpolate true
 ```
@@ -25,6 +27,7 @@ axol replay-dataset --repo_id myorg/pick --episode 3 --interpolate true
 | `--loop` | `false` | Replay the episode until stopped, returning to rest between takes. |
 | `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 | `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
+| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it. Applies beneath `--config_path` and the flags. |
 
 ## Contact safety
 

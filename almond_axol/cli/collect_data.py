@@ -90,9 +90,9 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
+from ..teleop.core import TCPPoseSnapshot
 from ..teleop.recorder import resolve_prefix
 from ..teleop_activity import TeleopActivityMarker
-from ..teleop.core import TCPPoseSnapshot
 from ..utils import affinity
 from ..utils.control_loop import run_blocking_with_control_ticks
 from ..utils.jetson_diag import TegraStatsDiag
@@ -154,7 +154,7 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
             for f in fields(cfg.robot_config)
             if f.init
         }
-        # ``robot.has_gripper`` is a shared Axol setting and may be false for a
+        # ``axol.has_gripper`` is a shared Axol setting and may be false for a
         # gripperless robot SKU. Mantis hardware always has two real grippers;
         # copy rather than mutate the inherited Axol config object, then force
         # the schema/hardware invariant for this run.
@@ -994,18 +994,20 @@ def main(argv: list[str]) -> None:
     # Accept the bare ``--mantis`` / ``--mantis_allow_uncalibrated`` spelling
     # that ``axol teleop --mantis`` already takes.
     argv = normalize_bool_flags(argv, "mantis", "mantis_allow_uncalibrated")
-    cfg = parse(CollectDataConfig, argv)
+    # The robot's shared settings (~/.almond/settings.json, the control
+    # panel's file) sit beneath config-file/CLI overrides — see parse().
+    cfg = parse(CollectDataConfig, argv, settings_op="collect-data")
     if cfg.mantis:
-        from .mantis_bridge import (
-            add_quest_key_to_direct_fallback,
-            load_direct_mantis_fallback,
+        # A Mantis run inherits the host's saved rig CAN channel map and, for
+        # a Quest source, the saved Quest tracker key — the same conditional
+        # fold the control panel applies. The source is resolved first so a
+        # config-file/CLI override of it decides whether the key applies.
+        cfg = parse(
+            CollectDataConfig,
+            argv,
+            settings_op="collect-data",
+            settings_args={"mantis": True, "mantis_source": cfg.mantis_source},
         )
-
-        fallback, quest_key = load_direct_mantis_fallback(collection=True)
-        cfg = parse(CollectDataConfig, argv, fallback_overlay=fallback)
-        if cfg.mantis_source == "quest" and quest_key is not None:
-            add_quest_key_to_direct_fallback(fallback, quest_key)
-            cfg = parse(CollectDataConfig, argv, fallback_overlay=fallback)
     # force=True: importing lerobot (at module load) installs a root handler
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every _logger.info() status line.

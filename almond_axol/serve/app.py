@@ -127,9 +127,9 @@ class RobotConnectRequest(BaseModel):
 
 
 class SettingsUpdateRequest(BaseModel):
-    """Partial update of the shared operator settings (serve/settings.py).
+    """Partial update of the shared robot settings (serve/settings.py).
 
-    ``values`` and ``advanced`` merge per key (``null`` resets a key to its
+    ``values`` merges per canonical dotted key (``null`` resets a key to its
     default); ``cameras`` replaces the stored camera spec wholesale. Omitted
     sections are left untouched.
     """
@@ -138,6 +138,8 @@ class SettingsUpdateRequest(BaseModel):
     cameras: dict[str, Any] | None = None
     # Distinguish "clear the cameras" (null) from "don't touch them" (omitted).
     camerasSet: bool = False
+    # Pre-v2 panels kept the Advanced tree in its own map; still accepted and
+    # merged into ``values`` under the canonical keys.
     advanced: dict[str, Any] | None = None
 
 
@@ -2116,7 +2118,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
         def inspect() -> dict[str, Any]:
             from ..cli.tracker_install import lighthouse_readiness
-            from ..tracker.lighthouse_survey import load_lighthouse_survey
             from ..cli.tracker_ultimate import (
                 is_ultimate_tracker_key,
                 ultimate_runtime_readiness,
@@ -2133,6 +2134,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 select_quest_transform_key,
             )
             from ..tracker import load_tracker_config
+            from ..tracker.lighthouse_survey import load_lighthouse_survey
             from ..vr.server import get_last_quest_pose_datum
             from .tracker_setup import TrackerSetupError, calibration_snapshot
 

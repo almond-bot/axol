@@ -10,6 +10,8 @@ import Cameras from "/snippets/config/cameras.mdx";
 
 Every setting for `axol run-policy`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
 
+In the [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`, read by default) `robot_config.axol_config.*` is the file's `axol` section, the other `robot_config.*` fields are `lerobot`, `--left_channel` / `--right_channel` live under `robot`, the recording fields under `recording`, and the inference and action-chunking fields (plus `policy_torque_threshold`) under `inference`.
+
 ```bash
 axol run-policy --policy_path myorg/pick-act --policy_type act --task "pick up the cup" \
   --robot_config.axol_config.left_stiffness 0.8
@@ -62,6 +64,7 @@ Optional — the rollout is recorded to a dataset when `--repo_id` is set.
 | `--rerun_port` | `9876` | Rerun viewer port. |
 | `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 | `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
+| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it. Applies beneath `--config_path` and the flags. |
 
 ## Contact safety
 

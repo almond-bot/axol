@@ -52,12 +52,13 @@ from typing import Self
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
+from ..constants import ARM_JOINTS
 from ..motor import Joint
 from ..motor.motor import _JOINT_CONFIG
 from ..robot.base import RobotBase, mark_hardware_cleanup_uncertain
 from ..robot.config import AxolConfig
 from ..robot.mantis import MantisGripperArm, MantisHardware
+from ..settings import SHARED
 from .link import FeedbackSlot, RtLink, config_header
 
 _logger = logging.getLogger(__name__)
@@ -102,9 +103,9 @@ class Mantis(RobotBase):
 
     def __init__(
         self,
-        config: AxolConfig = AxolConfig(),
-        left_channel: str | None = CAN_MANTIS_LEFT,
-        right_channel: str | None = CAN_MANTIS_RIGHT,
+        config: AxolConfig | None = None,
+        left_channel: str | None = SHARED,
+        right_channel: str | None = SHARED,
         *,
         defer_gripper_enable: bool = False,
         loop_hz: float = 240.0,

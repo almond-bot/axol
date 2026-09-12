@@ -14,6 +14,8 @@ import Jelly from "/snippets/config/jelly.mdx";
 
 Every setting for `axol collect-data`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
 
+In the [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`, read by default) the same sections appear without this command's wrapper prefixes: `robot_config.axol_config.*` is the file's `axol`, `teleop_config.vr_teleop_config.*` is `teleop`, `teleop_config.kinematics_config.*` is `kinematics`, `teleop_config.vr_server_config.*` is `vr_server`, `teleop_config.jelly.*` is `jelly`, the other `robot_config.*` fields are `lerobot`, and `fps` / `root` / `vcodec` / `push_to_hub` / `rerun_*` live under `recording`.
+
 ```bash
 axol collect-data --repo_id myorg/pick --task "pick up the cup" \
   --robot_config.axol_config.left_stiffness 0.8 \
@@ -41,6 +43,7 @@ axol collect-data --repo_id myorg/pick --task "pick up the cup" \
 | `--rerun_port` | `9876` | Rerun viewer port. |
 | `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 | `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
+| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it. Applies beneath `--config_path` and the flags. |
 
 ## Mantis
 

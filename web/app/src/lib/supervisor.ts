@@ -85,8 +85,9 @@ export interface SessionInfo {
 }
 
 /** A submitted form value; vector fields carry one entry per component
- * (numbers once parseable, the raw text while mid-edit). */
-export type FormValue = string | boolean | (number | string)[]
+ * (numbers once parseable, the raw text while mid-edit). Numbers appear when
+ * a form is seeded from stored settings (the server keeps them typed). */
+export type FormValue = string | number | boolean | (number | string)[]
 
 const MAX_LINES = 5000
 
@@ -984,11 +985,14 @@ export async function removeTrackerCalibration(
 }
 
 // ---------------------------------------------------------------------------
-// Shared operator settings (serve/settings.py) — persisted on the serve host
-// at ~/.almond/settings.json and folded into every op start server-side.
+// The robot's shared settings (serve/settings.py) — persisted on the serve
+// host at ~/.almond/settings.json, read by the CLI and SDK too, and folded
+// into every op start server-side. On the wire every value is keyed by its
+// canonical dotted path ("axol.left.elbow.kp"); on disk the same keys form a
+// nested tree (see settings-file.ts).
 // ---------------------------------------------------------------------------
 
-export type SettingValue = string | number | boolean | number[]
+export type SettingValue = string | number | boolean | (number | string)[]
 
 /** Optional widget hints for a settings field (slider ranges, pose editor,
  * toggle-number = a switch arming a numeric value where 0 means off). */
@@ -1032,13 +1036,12 @@ export interface AdvancedSection {
 }
 
 export interface SettingsSnapshot {
-  /** Stored shared values keyed by canonical setting key (sparse: only set ones). */
+  /** Every stored value keyed by canonical dotted key (sparse: only set
+   * ones) — curated controls and the Advanced tree share this one map; the
+   * server translates each key to every op's own config path. */
   values: Record<string, SettingValue>
   /** Stored camera spec, or null when never configured on this host. */
   cameras: CameraSpec | null
-  /** Advanced values keyed canonically (e.g. "axol.left.elbow.kp") — one
-   * source of truth, translated to each op's config path server-side. */
-  advanced: Record<string, FormValue>
   schema: SettingsCategory[]
   advancedSchema: AdvancedSection[]
 }
@@ -1049,8 +1052,6 @@ export interface SettingsPatch {
   cameras?: CameraSpec | null
   /** Must accompany `cameras: null` so clearing is distinguishable from omitting. */
   camerasSet?: boolean
-  /** Per-key merge of canonical advanced values; null resets a key. */
-  advanced?: Record<string, FormValue | null>
 }
 
 export async function fetchSettings(): Promise<SettingsSnapshot> {

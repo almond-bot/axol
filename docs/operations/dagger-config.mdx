@@ -14,6 +14,8 @@ import Jelly from "/snippets/config/jelly.mdx";
 
 Every setting for `axol collect-dagger`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
 
+In the [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`, read by default) the same sections appear without this command's wrapper prefixes — `robot_config.axol_config.*` is the file's `axol`, `teleop_config.vr_teleop_config.*` is `teleop`, `teleop_config.kinematics_config.*` is `kinematics`, the other `robot_config.*` fields are `lerobot`, and the recording fields live under `recording` — exactly as for [data collection](/operations/data-collection-config).
+
 ```bash
 axol collect-dagger --policy_path myorg/pick-act --policy_type act \
   --repo_id myorg/pick-dagger --task "pick up the cup" \
@@ -52,6 +54,7 @@ axol collect-dagger --policy_path myorg/pick-act --policy_type act \
 | `--rerun_port` | `9876` | Rerun viewer port. |
 | `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 | `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
+| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it. Applies beneath `--config_path` and the flags. |
 
 ## Robot {#robot-config}
 
