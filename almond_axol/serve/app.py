@@ -48,7 +48,6 @@ from .commands import (
     normalize_boolean_args,
     operation_ids,
 )
-from .extensions import app_extensions, panel_pages
 from .manager import Session, SessionManager
 from .robot_link import STATE_ERROR, RobotLink, scoped_motor_faults
 from .runner import OperationRunner
@@ -1188,10 +1187,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # differs between releases.
             "commit": updater.commit,
             "releaseInstall": updater.release_install,
-            # Backend-served pages a downstream package registered
-            # (``almond_axol.serve.register_page``); the panel links to them
-            # against its server base, since it may run on another origin.
-            "pages": [page.to_dict() for page in panel_pages()],
         }
 
     @app.get("/api/update/status")
@@ -2730,12 +2725,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         await runner.shutdown()
         await manager.shutdown()
         await asyncio.to_thread(robot.shutdown)
-
-    # Downstream route additions go in ahead of the SPA catch-all so a page a
-    # package serves itself (see ``almond_axol.serve.extensions``) resolves
-    # like the built-in routes do instead of falling through to index.html.
-    for extension in app_extensions():
-        extension(app)
 
     if static_dir is not None:
         _mount_spa(app, static_dir)
