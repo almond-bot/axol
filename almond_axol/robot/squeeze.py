@@ -47,10 +47,13 @@ normal exactly as if it were pressing (the servo lag of a move toward the
 other arm), and shaping or capping that would make it trail the move —
 the leading arm slows while the trailing one, whose run-ahead points
 outward, doesn't, and the grippers skew. So each command the pair first
-estimates both arms' inward forces and shapes only their common part
-(``shared`` = the smaller of the two, ≥ 0): a translation has one of them
-negative and shapes nothing; a clamp has both positive and shapes it all;
-a clamp carried along shapes the clamp and lets the motion through.
+estimates both arms' inward forces and splits them into their mean — the
+clamp, which is capped — and their difference — the carry, equal and
+opposite on the two arms, which passes through in full on both. A
+translation has a zero mean and shapes nothing; a clamp has a zero
+difference and is capped; a clamp carried along keeps its cap and its
+motion, the arm moving away from its box side leading by exactly what
+the other pushes.
 """
 
 from __future__ import annotations
@@ -61,6 +64,11 @@ from dataclasses import dataclass
 import numpy as np
 
 __all__ = ["SqueezeSpec", "SqueezeResult", "orient_contacts", "shape_squeeze"]
+
+
+# Pair squeeze (N) over which the shaping fades in from nothing: below it a
+# free carry's estimate noise around zero would toggle the redistribution.
+SQUEEZE_RAMP_N = 2.0
 
 
 @dataclass(frozen=True)
@@ -150,22 +158,34 @@ def shape_squeeze(
             each bounds the force at which that joint's share of the even
             split reaches the cap.
         force_cap: Operator's squeeze force limit (N).
-        shared: The squeeze (N) this arm is actually applying against the
-            other — the part of its estimate to reshape and cap. One arm's
+        shared: The *pair's* squeeze (N): the mean of the two arms'
+            estimates (:meth:`AxolHardware.refresh_squeeze`). One arm's
             run-ahead along its inward normal cannot tell a squeeze from
-            the pair moving that way (servo lag while the operator carries
-            the box left loads the right arm's normal exactly like a
-            clamp); only the *common* inward run-ahead of the two arms is
-            a squeeze. The pair passes ``min`` of the two arms' estimates
-            here (:meth:`AxolHardware.refresh_squeeze`), and whatever this
-            arm estimates beyond it — motion — passes through unshaped and
-            uncapped, so the pair never lags its own move. ``None`` shapes
-            the whole estimate (a single arm pressing on a fixed object).
+            the pair moving that way — servo lag while the operator carries
+            the box left loads the right arm's normal exactly like a clamp
+            and unloads the left's — so the two estimates are split into
+            what they have in common (the clamp, ``shared``) and what they
+            differ by (the carry, ``estimate - shared``, equal and opposite
+            on the two arms). The clamp is capped at the limit; the carry
+            passes through in full, *whatever its sign*, so the arm moving
+            away from its box side leads the move by as much as the other
+            pushes — the pair translates as a rigid body under position
+            control while the clamp between them is force-controlled.
+            (Taking the smaller estimate as the squeeze instead and
+            reshaping only that much of each arm swallowed the leading
+            arm's outward part: held at the cap relative to its measured
+            pose it could only be pushed along by the box, trailed the
+            move and caught up when it stopped.) Both parts go out over
+            the even split, so the face stays flat while carrying too.
+            ``None`` shapes this arm's whole estimate (a single arm
+            pressing on a fixed object).
 
     Returns:
         :class:`SqueezeResult`. With no squeeze to shape (the run-ahead is
         not pressing the contacts into the box, or ``shared`` ≤ 0) ``tau``
-        is returned unchanged.
+        is returned unchanged; a small pair squeeze fades the reshaping in
+        over ``SQUEEZE_RAMP_N`` so a free carry's noise around zero doesn't
+        toggle the wrists' moments.
     """
     tau = np.asarray(tau, dtype=np.float64)
     kp = np.asarray(kp, dtype=np.float64)
@@ -195,12 +215,14 @@ def shape_squeeze(
         if cap > 0.0 and np.isfinite(cap) and lever > 1e-9:
             limit = min(limit, cap / lever)
 
-    squeeze = estimate if shared is None else min(float(shared), estimate)
+    squeeze = estimate if shared is None else float(shared)
     if squeeze <= 0.0:
         return SqueezeResult(tau, 0.0, estimate, limit, forces)
-    # Reshape (and cap) the squeeze's share of the fitted contact forces;
-    # the remainder of the fit — the arm's own motion along the normal —
-    # stays in ``tau`` as it was.
+    # The clamp, capped, plus this arm's share of the carry (the rest of
+    # its estimate, either sign), both over the even split, in place of the
+    # fitted contact part.
     force = min(squeeze, limit)
-    shaped = tau - basis @ (forces * (squeeze / estimate)) + force * even
+    total = force + (estimate - squeeze)
+    weight = 1.0 if shared is None else min(squeeze / SQUEEZE_RAMP_N, 1.0)
+    shaped = tau + weight * (total * even - basis @ forces)
     return SqueezeResult(shaped, force, estimate, limit, forces)

@@ -1751,9 +1751,9 @@ class AxolArm:
         """Tell this arm how much of its estimate is the pair's squeeze (N).
 
         Set by :meth:`AxolHardware.refresh_squeeze` before each command:
-        the smaller of the two arms' :meth:`squeeze_estimate`, floored at 0.
-        Only that much is reshaped and capped; the rest of the arm's inward
-        run-ahead is the pair moving and passes through (see ``shared`` in
+        the mean of the two arms' :meth:`squeeze_estimate`, floored at 0.
+        That much is capped; what this arm's estimate differs from it by
+        is the pair moving and passes through (see ``shared`` in
         :func:`~almond_axol.robot.squeeze.shape_squeeze`). ``None`` sends
         the next command unshaped.
         """
@@ -3129,11 +3129,14 @@ class AxolHardware(RobotBase):
         :class:`SqueezeSpec` (the inward normal from the measured pair, see
         :meth:`set_squeeze`), then asks both for the inward force their
         target would press with and gives them the *common* part — the
-        smaller of the two, floored at 0 — as the squeeze to shape and cap.
-        The pair moving sideways loads one arm's normal and unloads the
-        other's, so it shapes nothing and neither arm is held back; only a
-        clamp, which loads both, is. Also logs the force the arms are
-        applying, about once a second while they press.
+        mean of the two, floored at 0 — as the squeeze to shape and cap;
+        what each arm's estimate differs from it by is the pair's carry and
+        passes through (see ``shared`` in
+        :func:`~almond_axol.robot.squeeze.shape_squeeze`). The pair moving
+        sideways loads one arm's normal and unloads the other's by the same
+        amount, so the mean is unchanged and neither arm is held back; only
+        a clamp, which loads both, is capped. Also logs the force the arms
+        are applying, about once a second while they press.
         """
         if self._squeeze_contacts is None:
             return
@@ -3149,7 +3152,7 @@ class AxolHardware(RobotBase):
             est_l = self.left.squeeze_estimate(left)
             est_r = self.right.squeeze_estimate(right)
             if est_l is not None and est_r is not None:
-                shared = max(min(est_l, est_r), 0.0)
+                shared = max(0.5 * (est_l + est_r), 0.0)
         for arm in (self.left, self.right):
             if arm is not None:
                 arm.set_squeeze_shared(shared)

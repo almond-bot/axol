@@ -271,12 +271,13 @@ class VRTeleopConfig:
             shared evenly over the tool's contact points (the moment that
             puts it through their centroid rides the wrists), and held at
             this cap — the tighter of it and what the spring caps allow
-            under that even split. Only the *pair's* squeeze is shaped:
-            each command both arms' inward forces are estimated and the
-            smaller of the two is the squeeze — a carry loads one arm's
-            normal and unloads the other's and shapes nothing, so neither
-            arm is ever held back from a move. The rest of the command
-            (carrying the box, servo lag) is untouched. ``8`` N a side
+            under that even split. Only the *pair's* squeeze is capped:
+            each command both arms' inward forces are estimated and split
+            into their mean — the clamp — and their difference — the
+            carry, which passes through in full on both arms, so the pair
+            translates as one body and neither arm is ever held back from
+            a move. The rest of the command (servo lag, the box's weight)
+            is untouched. ``8`` N a side
             holds a light parcel with margin; raise it if boxes slip,
             lower it to be gentler. ``0`` disables the shaping (only the
             torque cap, if set, then bounds the squeeze,

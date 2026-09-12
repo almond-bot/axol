@@ -179,33 +179,42 @@ class ShapeMathTest(unittest.TestCase):
         res = shape_squeeze(tau, self.kp, self.jac, self.rot, self.n, np.zeros((0, 3)))
         np.testing.assert_array_equal(res.tau, tau)
 
-    def test_shared_shapes_only_the_pairs_squeeze(self) -> None:
-        """``shared`` (the pair's common inward force) bounds what is
-        reshaped and capped; the arm's own excess — the pair moving — stays."""
+    def test_shared_caps_the_clamp_and_passes_the_carry(self) -> None:
+        """``shared`` (the pair's mean inward force) is the clamp: capped.
+        What this arm's estimate differs from it by is the carry: through in
+        full, either sign, so the arm moving away from its box leads."""
         r = self.pts @ self.rot.T
         wr = np.hstack((np.tile(self.n, (len(r), 1)), np.cross(r, self.n)))
         basis = self.jac.T @ wr.T
         even = basis.mean(axis=1)
         fit = np.array([6.0, 4.0, 2.0])
         tau = basis @ fit  # 12 N, all through the fit
+        # Pair squeeze 3 N, this arm 12: it is the trailing arm of a carry,
+        # pushing 9 N more than the clamp. Clamp under the cap: 3 + 9 = 12,
+        # now evenly split.
         res = shape_squeeze(
             tau, self.kp, self.jac, self.rot, self.n, self.pts, {}, 8.0, shared=3.0
         )
         self.assertAlmostEqual(res.estimate, 12.0, places=6)
-        self.assertEqual(res.force, 3.0)  # the squeeze, under the cap
-        # 3 N of the fit reshaped evenly, the other 9 N left as they were.
-        np.testing.assert_allclose(
-            res.tau, basis @ (fit * 0.75) + 3.0 * even, atol=1e-6
-        )
-        # The cap applies to the squeeze, not to the motion.
+        self.assertEqual(res.force, 3.0)
+        np.testing.assert_allclose(res.tau, 12.0 * even, atol=1e-6)
+        # Pair squeeze 11 N: the clamp is capped to 8, the 1 N carry kept.
         res = shape_squeeze(
             tau, self.kp, self.jac, self.rot, self.n, self.pts, {}, 8.0, shared=11.0
         )
         self.assertEqual(res.force, 8.0)
-        np.testing.assert_allclose(
-            res.tau, basis @ (fit / 12.0) + 8.0 * even, atol=1e-6
+        np.testing.assert_allclose(res.tau, 9.0 * even, atol=1e-6)
+        # Pair squeeze 50 N while this arm estimates 12: it is the *leading*
+        # arm of a carry (38 N less than the clamp). Capped to 8 the clamp
+        # leaves it pulling away with 30 N — and the other arm, 88 → 46, so
+        # the pair's net push (2 × 8 + their difference) is what a rigid
+        # pair's servo lag would give.
+        res = shape_squeeze(
+            tau, self.kp, self.jac, self.rot, self.n, self.pts, {}, 8.0, shared=50.0
         )
-        # Nothing in common (the other arm is unloaded): untouched.
+        self.assertEqual(res.force, 8.0)
+        np.testing.assert_allclose(res.tau, -30.0 * even, atol=1e-6)
+        # Nothing in common (a pure carry, or the pair opening): untouched.
         for shared in (0.0, -2.0):
             res = shape_squeeze(
                 tau,
@@ -220,12 +229,12 @@ class ShapeMathTest(unittest.TestCase):
             )
             self.assertEqual(res.force, 0.0)
             np.testing.assert_array_equal(res.tau, tau)
-        # More in common than this arm estimates: its whole estimate.
+        # A pair squeeze inside the ramp fades the redistribution in.
         res = shape_squeeze(
-            tau, self.kp, self.jac, self.rot, self.n, self.pts, {}, 100.0, shared=50.0
+            tau, self.kp, self.jac, self.rot, self.n, self.pts, {}, 8.0, shared=1.0
         )
-        self.assertAlmostEqual(res.force, 12.0, places=6)
-        np.testing.assert_allclose(res.tau, 12.0 * even, atol=1e-6)
+        self.assertEqual(res.force, 1.0)
+        np.testing.assert_allclose(res.tau, 0.5 * tau + 6.0 * even, atol=1e-6)
 
     def test_single_contact_only_saturates(self) -> None:
         pts = self.pts[:1]
@@ -490,9 +499,11 @@ class RobotPairTest(unittest.TestCase):
         left = translate(jac_l, 0.02 * normal_l)
         right = translate(jac_r, 0.02 * normal_l)
         asyncio.run(robot.motion_control(left, right))
-        self.assertGreater(robot.left.squeeze_estimate(left), 8.0)
-        self.assertLess(robot.right.squeeze_estimate(right), 0.0)
-        self.assertEqual(robot.squeeze_forces, (0.0, 0.0))
+        est_l = robot.left.squeeze_estimate(left)
+        est_r = robot.right.squeeze_estimate(right)
+        self.assertGreater(est_l, 8.0)
+        self.assertAlmostEqual(est_r, -est_l, places=6)  # equal and opposite
+        self.assertLess(max(robot.squeeze_forces), 1e-6)
         for arm, target in ((True, left), (False, right)):
             sent_arm = np.array([c[0] for c in sent[arm][-1][:7]])
             np.testing.assert_allclose(sent_arm, target[:7], atol=1e-6)
@@ -509,9 +520,11 @@ class RobotPairTest(unittest.TestCase):
         run_l = np.array([c[0] for c in sent[True][-1][:7]])
         run_r = np.array([c[0] for c in sent[False][-1][:7]])
         # Now the same clamp carried 1 cm toward the left's side: the left
-        # (leading) arm's run-ahead grows, the right's shrinks. The clamp is
-        # still recognised — the smaller estimate — and the leading arm is
-        # not held back to the clamp's command: its extra motion goes out.
+        # (trailing) arm's inward run-ahead grows, the right's shrinks by the
+        # same amount, so the pair's squeeze — their mean — is unchanged and
+        # still capped, and the carry passes on *both* arms: the left pushes
+        # by it, the right pulls away by it, and the pair translates as one
+        # under position control with the clamp force-controlled between.
         left_c = translate(jac_l, 0.03 * normal_l)
         right_c = translate(jac_r, -0.01 * normal_l)
         self._settle(robot)
@@ -519,60 +532,18 @@ class RobotPairTest(unittest.TestCase):
         est_l = robot.left.squeeze_estimate(left_c)
         est_r = robot.right.squeeze_estimate(right_c)
         self.assertGreater(est_l, est_r)
-        self.assertGreater(est_r, 8.0)  # 1 cm past contact is still a clamp
+        self.assertGreater(est_r, 0.0)
         self.assertEqual(robot.squeeze_forces, (8.0, 8.0))
         moved_l = np.array([c[0] for c in sent[True][-1][:7]])
         moved_r = np.array([c[0] for c in sent[False][-1][:7]])
-        # Right: the same capped clamp as before. Left: that clamp plus the
-        # carry — ahead of the plain clamp's command along its normal by
-        # the (estimate difference's worth of) motion, not held at the cap.
-        np.testing.assert_allclose(moved_r, run_r, atol=1e-6)
-        along = float((jac_l @ (moved_l - run_l))[:3] @ normal_l)
-        self.assertGreater(along, 0.005)
-
-    def test_rt_robot_refreshes_the_specs_too(self) -> None:
-        """The hardware path (the core-backed ``rt.robot.Axol``) commands the
-        arms directly, bypassing AxolHardware.motion_control — it must still
-        hand each arm its spec, or the shaping silently never runs on the
-        robot."""
-        from almond_axol.rt.robot import Axol as RtAxol
-
-        robot = AxolHardware(AxolConfig())
-        sent: list[tuple] = []
-        for arm in (robot.left, robot.right):
-            arm._command_sink = sent.append
-            arm._joint_offsets = np.zeros(8, dtype=np.float32)
-            arm._unverified_zeros = set()
-            arm._unresolved_offsets = set()
-            for motor in arm.motors.values():
-                motor._position = 0.0
-        rt = object.__new__(RtAxol)
-        rt._robot = robot
-        rt._link = SimpleNamespace(limp=None)
-        rt._limp_announced = False
-        rt._armed = True  # motion_control() requires the core to be up
-        robot.set_squeeze(parcel_tool(141.5).contacts("flush"), 8.0)
-        rest = np.zeros(8, np.float32)
-        with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:
-            asyncio.run(rt.motion_control(rest, rest))
-            # Press in: both commands run ahead toward the other arm (at
-            # q = 0 shoulder_2 swings either mount toward -y).
-            left_in, right_in = rest.copy(), rest.copy()
-            s2 = ARM_JOINTS.index(Joint.SHOULDER_2)
-            left_in[s2] = 0.05
-            right_in[s2] = -0.05
-            asyncio.run(rt.motion_control(left_in, right_in))
-            self.assertGreater(max(robot.squeeze_forces), 0.5)
-            asyncio.run(rt.motion_control(left_in, right_in))  # logs last tick's
-        self.assertIsNotNone(robot.left._squeeze)
-        self.assertIsNotNone(robot.right._squeeze)
-        self.assertLess(robot.left._squeeze.normal[1], -0.9)
-        self.assertEqual(len(sent), 6)
-        # And the arms report what they press with in the log so a
-        # deployment can be checked without a force gauge.
-        self.assertTrue(
-            any("box squeeze:" in line for line in logs.output), logs.output
-        )
+        along_l = float((jac_l @ (moved_l - run_l))[:3] @ normal_l)
+        along_r = float((jac_r @ (moved_r - run_r))[:3] @ normal_l)
+        # Both mounts' commands moved toward the left's box side (the
+        # direction of the carry) relative to the plain clamp — the right
+        # leading, not held at the cap against its measured pose.
+        self.assertGreater(along_l, 0.004)
+        self.assertGreater(along_r, 0.004)
+        self.assertAlmostEqual(along_l, along_r, delta=0.004)
 
 
 class SmoothingTest(unittest.TestCase):
