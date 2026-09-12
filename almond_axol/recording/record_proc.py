@@ -194,6 +194,19 @@ _SNAPSHOT_HISTORY_SIZE = 512
 # before they silently contaminate a whole episode.
 _STATE_ALIGNMENT_WARN_S = 0.050
 
+# A Mantis-created dataset declares ``observation.pose_lag`` (see
+# ``recording.datasets.RESUME_FILLABLE_FEATURES``): the signed skew, in
+# seconds, between the row's camera exposure and the state sample written
+# next to it. The recorder owns that column: it is the one place that knows
+# which snapshot it paired with which exposure, so both capture loops stamp
+# it from that pairing whenever the dataset declares it — the publisher never
+# has to (and a value it did publish is replaced). On the rig the snapshot is
+# stamped with the tracker pose's host time, so this is the tracker→image
+# lag; on the arms it is the Rust telemetry sample→image lag. A held state
+# (see ``_RowStatePairer``) shows up as the larger lag it really is.
+_POSE_LAG_FEATURE = "observation.pose_lag"
+_POSE_LAG_KEY = "pose_lag"
+
 # Fail-open recording policy. A take is a scarce, operator-driven artefact; a
 # single imperfect row is not. Both capture loops therefore *mitigate* every
 # per-row defect they can (repeat the prior IDR into a bounded hole, discard a
@@ -1491,6 +1504,12 @@ def run_capture_loop(
     DAgger annotation: a per-frame bool, see ``lerobot.rollout``'s DAgger
     strategy), each row is tagged from the snapshot's intervention flag — the
     publisher (the control loop) marks the ticks where a human was driving.
+
+    When it declares ``observation.pose_lag`` (a Mantis-created dataset, or
+    any flow appending to one), each row's ``pose_lag`` is the signed skew
+    between its camera exposure and the snapshot it was paired with — the
+    recorder fills it, the publisher's snapshot need not carry it (see
+    :data:`_POSE_LAG_FEATURE`). Both loops share this contract.
     """
     try:
         import numpy as np
@@ -1499,6 +1518,7 @@ def run_capture_loop(
         from lerobot.utils.visualization_utils import log_rerun_data
 
         tag_intervention = "intervention" in dataset.features
+        stamp_pose_lag = _POSE_LAG_FEATURE in dataset.features
 
         # Wait for the first snapshot *published after this episode started*.
         # The snapshot history persists across episodes, so its newest record
@@ -1710,7 +1730,7 @@ def run_capture_loop(
             if snap is None:
                 tick += 1
                 continue
-            joint_obs, action, _snap_ts, intervention = snap
+            joint_obs, action, snap_ts, intervention = snap
             snapshot_skew_sum += snapshot_skew
             snapshot_skew_max = max(snapshot_skew_max, snapshot_skew)
 
@@ -1718,6 +1738,8 @@ def run_capture_loop(
             for cam_key, (frame, _cap_ts, _recv_ts) in frames.items():
                 obs[cam_key] = frame
             obs_processed = robot_obs_proc(obs)
+            if stamp_pose_lag:
+                obs_processed[_POSE_LAG_KEY] = row_capture_ts - snap_ts
 
             obs_frame = build_dataset_frame(
                 dataset.features, obs_processed, prefix=OBS_STR
@@ -1822,6 +1844,7 @@ def run_encoded_capture_loop(
         from lerobot.utils.visualization_utils import log_rerun_data
 
         tag_intervention = "intervention" in dataset.features
+        stamp_pose_lag = _POSE_LAG_FEATURE in dataset.features
 
         # Flush before the relay valve opens. Arming the cutoff first guarantees
         # that a newly admitted all-intra AU survives into row zero instead of
@@ -2313,7 +2336,7 @@ def run_encoded_capture_loop(
             )
             if snap is None:
                 continue
-            joint_obs, action, _snap_ts, intervention = snap
+            joint_obs, action, snap_ts, intervention = snap
             snapshot_skew_sum += snapshot_skew
             snapshot_skew_max = max(snapshot_skew_max, snapshot_skew)
 
@@ -2324,6 +2347,8 @@ def run_encoded_capture_loop(
             obs_processed = robot_obs_proc(dict(joint_obs))
             for cam_key, au in aus.items():
                 obs_processed[cam_key] = au
+            if stamp_pose_lag:
+                obs_processed[_POSE_LAG_KEY] = row_capture_ts - snap_ts
 
             obs_frame = build_dataset_frame(
                 dataset.features, obs_processed, prefix=OBS_STR

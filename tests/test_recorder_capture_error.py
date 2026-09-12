@@ -1325,5 +1325,130 @@ class CaptureQualitySummaryTest(unittest.TestCase):
         )
 
 
+class PoseLagStampTest(unittest.TestCase):
+    """A dataset declaring ``observation.pose_lag`` gets it from the recorder.
+
+    The column is declared by every Mantis-created dataset, but no publisher
+    puts a ``pose_lag`` key in its snapshot (the snapshot layout is the joint
+    observation + action keys), so ``build_dataset_frame`` used to KeyError on
+    the first row of every such dataset — fresh or resumed. The recorder is the
+    one place that knows which state sample it paired with which exposure, so
+    it stamps the signed exposure - state skew itself, in both loops.
+    """
+
+    # The real LeRobot feature entry (``RESUME_FILLABLE_FEATURES``), so the
+    # raw-loop test below runs the real ``build_dataset_frame`` — the call
+    # that raised ``KeyError: 'pose_lag'`` before the recorder stamped it.
+    _POSE_LAG_FEATURES = {
+        "observation.state": {"dtype": "float32", "shape": (1,), "names": ["state"]},
+        "observation.pose_lag": {
+            "dtype": "float32",
+            "shape": (1,),
+            "names": ["pose_lag"],
+        },
+    }
+
+    def _snapshot_behind(self, target_ts: float) -> tuple[dict, dict, float, bool]:
+        # The nearest retained state sample is 4 ms older than the exposure.
+        return {"state": 1.0}, {"target": 2}, target_ts - 0.004, False
+
+    def test_raw_loop_stamps_the_exposure_to_state_skew(self) -> None:
+        stop = threading.Event()
+        dataset = _CaptureDataset(stop, stop_after=3)
+        dataset.features = self._POSE_LAG_FEATURES
+        errors: list[str] = []
+
+        with patch("lerobot.utils.visualization_utils.log_rerun_data"):
+            run_capture_loop(
+                cameras={"cam": _RawCamera([])},
+                read_snapshot=lambda: ({}, {}, time.perf_counter(), False),
+                read_snapshot_nearest=self._snapshot_behind,
+                dataset=dataset,
+                # A publisher-supplied value is replaced: the recorder owns it.
+                robot_obs_proc=lambda obs: {**obs, "pose_lag": 99.0},
+                fps=60,
+                task="test",
+                rerun_ip=None,
+                stop_event=stop,
+                on_error=errors.append,
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(dataset.rows), 3)
+        for row in dataset.rows:
+            self.assertEqual(row["observation.state"].tolist(), [1.0])
+            self.assertAlmostEqual(
+                float(row["observation.pose_lag"][0]), 0.004, places=6
+            )
+
+    def test_encoded_loop_stamps_the_exposure_to_state_skew(self) -> None:
+        stop = threading.Event()
+        dataset = _CaptureDataset(stop, stop_after=3)
+        dataset.features = self._POSE_LAG_FEATURES
+        errors: list[str] = []
+        base = time.perf_counter() + 0.1
+        cam = _EncodedCamera(
+            [
+                (b"\x00\x00\x00\x01\x65au", base + i / 60, base + i / 60)
+                for i in range(6)
+            ]
+        )
+
+        with (
+            patch(
+                "lerobot.utils.feature_utils.build_dataset_frame",
+                side_effect=lambda _f, values, prefix: dict(values),
+            ),
+            patch("lerobot.utils.visualization_utils.log_rerun_data"),
+        ):
+            run_encoded_capture_loop(
+                cameras={"cam": cam},
+                read_snapshot=lambda: ({}, {}, time.perf_counter(), False),
+                read_snapshot_nearest=self._snapshot_behind,
+                dataset=dataset,
+                robot_obs_proc=lambda obs: obs,
+                fps=60,
+                task="test",
+                rerun_ip=None,
+                stop_event=stop,
+                on_error=errors.append,
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(dataset.rows), 3)
+        for row in dataset.rows:
+            self.assertAlmostEqual(row["pose_lag"], 0.004, places=6)
+
+    def test_a_dataset_without_the_column_gets_no_key(self) -> None:
+        stop = threading.Event()
+        dataset = _CaptureDataset(stop, stop_after=2)
+        errors: list[str] = []
+
+        with (
+            patch(
+                "lerobot.utils.feature_utils.build_dataset_frame",
+                side_effect=lambda _f, values, prefix: dict(values),
+            ),
+            patch("lerobot.utils.visualization_utils.log_rerun_data"),
+        ):
+            run_capture_loop(
+                cameras={"cam": _RawCamera([])},
+                read_snapshot=lambda: ({}, {}, time.perf_counter(), False),
+                read_snapshot_nearest=self._snapshot_behind,
+                dataset=dataset,
+                robot_obs_proc=lambda obs: obs,
+                fps=60,
+                task="test",
+                rerun_ip=None,
+                stop_event=stop,
+                on_error=errors.append,
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(dataset.rows), 2)
+        for row in dataset.rows:
+            self.assertNotIn("pose_lag", row)
+
+
 if __name__ == "__main__":
     unittest.main()
