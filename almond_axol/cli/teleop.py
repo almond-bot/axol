@@ -413,14 +413,10 @@ async def _run(cfg: TeleopCmdConfig) -> None:
     else:
         # The Rust realtime core is the sole hardware control backend. Python
         # owns VR/IK/model math and streams targets; Rust owns both CAN buses.
-        from ..rt import RtAxol
-
-        robot = RtAxol(
-            Axol(
-                config=cfg.axol,
-                left_channel=cfg.left_channel,
-                right_channel=cfg.right_channel,
-            ),
+        robot = Axol(
+            config=cfg.axol,
+            left_channel=cfg.left_channel,
+            right_channel=cfg.right_channel,
             max_vel=cfg.teleop.teleop_max_vel,
             max_accel=cfg.teleop.teleop_max_accel,
             record=cfg.teleop.record,

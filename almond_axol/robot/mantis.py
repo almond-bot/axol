@@ -5,7 +5,7 @@ to the same Damiao gripper the robot uses — held by a human demonstrator. Each
 gripper sits alone on its own CAN bus (``can_mantis_l`` / ``can_mantis_r``)
 at the production gripper CAN ID (0x08).
 
-:class:`Mantis` mirrors the :class:`~almond_axol.robot.axol.Axol` control surface
+:class:`MantisHardware` mirrors the :class:`~almond_axol.robot.axol.AxolHardware` control surface
 (``enable`` / ``get_positions`` / ``motion_control`` / per-side ``positions`` /
 ``torques``) so the LeRobot wrapper and ``collect-data`` drive it unchanged.
 The seven arm joints per side are **virtual**: there is no arm, so
@@ -19,10 +19,11 @@ with the arm-state channel equal to the commanded IK solution.
 On hardware this class is the *maintenance* half of the driver: bus
 ownership between takes, gripper bring-up and calibration, torque-off
 verification. The per-tick POSITION_FORCE command stream runs through the
-Rust realtime core — :class:`almond_axol.rt.RtMantis` wraps a ``Mantis``,
-arms ``axol-rt`` on the two gripper buses for the duration of a take, and
-installs a command sink on each :class:`MantisGripperArm` so
-``motion_control`` hands its gripper tuple to the core instead of the wire.
+Rust realtime core — :class:`almond_axol.robot.Mantis` wraps a
+``MantisHardware``, arms ``axol-rt`` on the two gripper buses for the
+duration of a take, and installs a command sink on each
+:class:`MantisGripperArm` so ``motion_control`` hands its gripper tuple to
+the core instead of the wire.
 """
 
 from __future__ import annotations
@@ -73,7 +74,7 @@ class MantisGripperArm:
         self._bus = bus
         self._motor = Motor(bus, Joint.GRIPPER)
         self._gripper_config = gripper_config
-        # Realtime-core mode (:class:`almond_axol.rt.RtMantis`): while the
+        # Realtime-core mode (:class:`almond_axol.robot.Mantis`): while the
         # core is armed on this bus, ``_send_gripper_target`` hands the
         # gripper's POSITION_FORCE tuple (motor-frame target, speed limit,
         # torque limit) to this callable in the core's 8-slot command shape
@@ -328,8 +329,12 @@ class MantisGripperArm:
         await self._motor.set_position_force(*cmd)
 
 
-class Mantis(RobotBase):
-    """The Mantis rig's dual handheld grippers behind the ``Axol`` control surface.
+class MantisHardware(RobotBase):
+    """The Mantis rig's dual handheld grippers, driven directly from Python.
+
+    Internal — the public rig object is :class:`almond_axol.robot.Mantis`,
+    which owns one of these and exposes the same methods. Mirrors the
+    ``AxolHardware`` control surface.
 
     Args:
         config:        Reused for the per-side gripper POSITION_FORCE tuning

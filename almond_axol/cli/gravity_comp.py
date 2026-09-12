@@ -34,7 +34,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -43,9 +42,6 @@ from ..robot import Axol
 from ..teleop.recorder import TeleopRecorder
 from ..teleop.recorder import make as _recorder_make
 from .config import GravityCompCmdConfig, parse
-
-if TYPE_CHECKING:
-    from ..rt import RtAxol
 
 
 def _resolve_free_joints(names: list[str] | None) -> set[Joint] | None:
@@ -117,18 +113,14 @@ async def _run(cfg: GravityCompCmdConfig) -> None:
 
     # Rust owns CAN for every production hardware control loop. Python keeps
     # the gravity model and streams passthrough targets to the core.
-    from ..rt import RtAxol as _RtAxol
-
-    robot: RtAxol = _RtAxol(
-        Axol(
-            config=cfg.axol,
-            left_channel=cfg.left_channel,
-            right_channel=cfg.right_channel,
-        )
+    robot = Axol(
+        config=cfg.axol,
+        left_channel=cfg.left_channel,
+        right_channel=cfg.right_channel,
     )
 
     async with robot as axol:
-        # RtAxol.enable() leaves the joints in the required modes and verifies
+        # Axol.enable() leaves the joints in the required modes and verifies
         # the core's native feedback stream before returning.
 
         if rec is not None:
@@ -148,7 +140,7 @@ async def _run(cfg: GravityCompCmdConfig) -> None:
                 rec.set_engaged(False)
 
 
-def _record_measured(rec: TeleopRecorder, axol: RtAxol) -> None:
+def _record_measured(rec: TeleopRecorder, axol: Axol) -> None:
     """Append one measured-side row (arm joints only) to the recorder.
 
     Reads the cached positions/torques the impedance feedback frames refresh

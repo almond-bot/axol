@@ -21,7 +21,7 @@ def _robot_with_cameras(
 ) -> AxolRobot:
     """Bare AxolRobot over fake cameras and a fake Rust-core telemetry history.
 
-    ``state_nearest`` mimics ``RtAxol.state_nearest``: the retained feedback
+    ``state_nearest`` mimics ``Axol.state_nearest``: the retained feedback
     sample closest to the requested exposure time, here ``state_offset_s``
     before it, so the expected pose lag is simply that offset.
     """

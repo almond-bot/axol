@@ -40,7 +40,6 @@ from lerobot.robots.robot import Robot
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...constants import Joint
-from ...robot.axol import Axol
 from ...robot.base import HardwareCleanupError
 from ...teleop.config import VRTeleopConfig
 from ...teleop.filter import TrapezoidalFilter
@@ -50,7 +49,7 @@ if TYPE_CHECKING:
     from ...kinematics.config import KinematicsConfig
     from ...kinematics.fk import AxolForwardKinematics
     from ...kinematics.solver import KinematicsSolver
-    from ...rt import RtAxol, RtMantis
+    from ...rt import Axol, Mantis
 
 _logger = logging.getLogger(__name__)
 
@@ -143,7 +142,7 @@ class AxolRobot(Robot):
         self._left_trq_keys = [f"left_{j.value}.trq" for j in joints]
         self._right_trq_keys = [f"right_{j.value}.trq" for j in joints]
         self._ik_config = ik_config
-        self._axol: RtAxol | RtMantis | None = None
+        self._axol: Axol | Mantis | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._connect_future: Future[None] | None = None
@@ -175,7 +174,7 @@ class AxolRobot(Robot):
         )
         self._cartesian_last_send: float = 0.0
         # Optional flight-recorder prefix configured by collect-data before
-        # connect(). RtAxol owns the 240 Hz measured + motor-facing traces;
+        # connect(). Axol owns the 240 Hz measured + motor-facing traces;
         # keeping this runtime-only avoids exposing a diagnostics plumbing
         # detail as part of LeRobot's persistent robot configuration schema.
         self._control_trace: str | None = None
@@ -410,21 +409,19 @@ class AxolRobot(Robot):
 
         _logger.info("AxolRobot connected.")
 
-    def _build_hardware(self) -> RtAxol | RtMantis:
-        """Construct the realtime-core-backed driver.
+    def _build_hardware(self) -> Axol | Mantis:
+        """Construct the realtime-core-backed robot.
 
         LeRobot uses the same sole production backend as teleop: the Rust
         core owns CAN at 240 Hz while Python streams policy/teleop targets.
         Overridden by the Mantis subclass (grippers-only core).
         """
-        from ...rt import RtAxol as _RtAxol
+        from ...rt import Axol as _Axol
 
-        return _RtAxol(
-            Axol(
-                self.config.axol_config,
-                left_channel=self.config.left_channel,
-                right_channel=self.config.right_channel,
-            ),
+        return _Axol(
+            self.config.axol_config,
+            left_channel=self.config.left_channel,
+            right_channel=self.config.right_channel,
             max_vel=VRTeleopConfig.teleop_max_vel,
             max_accel=VRTeleopConfig.teleop_max_accel,
             record=self._control_trace,
@@ -558,7 +555,7 @@ class AxolRobot(Robot):
     def limp(self) -> str | None:
         """Why the realtime core went limp, or ``None`` while it is healthy.
 
-        Mirrors :attr:`almond_axol.rt.RtAxol.limp`: once set, every arm joint
+        Mirrors :attr:`almond_axol.robot.Axol.limp`: once set, every arm joint
         is at kp = 0 with the streamed gravity feedforward for the rest of
         the session and :meth:`send_action` streams gravity comp instead of
         tracking. Recording flows check this before promising motion (a
@@ -1004,7 +1001,7 @@ class AxolRobot(Robot):
         :meth:`send_action`) and blocks until the cycle is sent. Telemetry must
         be active, so call this only while connected; drive it in a loop at the
         desired rate to keep the arms free to be hand-guided. See
-        :meth:`almond_axol.robot.axol.Axol.gravity_compensate` for the
+        :meth:`almond_axol.robot.axol.AxolHardware.gravity_compensate` for the
         ``kd``/``free_joints`` semantics.
         """
         assert self._axol is not None and self._loop is not None
@@ -1031,7 +1028,7 @@ class AxolRobot(Robot):
         Call after hand-guiding the arms (e.g. under
         :meth:`gravity_compensate`) and before resuming :meth:`send_action`, so
         the return-to-pose command is not rejected by the max-step safety
-        check. See :meth:`almond_axol.robot.axol.Axol.reset_command_state`.
+        check. See :meth:`almond_axol.robot.axol.AxolHardware.reset_command_state`.
 
         Mutates plain Python state on the arm wrappers, so it runs directly
         without the event loop.

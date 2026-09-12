@@ -205,6 +205,14 @@ class CliSharedSettingsTest(_StoreCase):
 
 
 class SdkSharedSettingsTest(_StoreCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # ``Axol()`` is the realtime-core robot; constructing it only needs
+        # the core binary to *resolve*, which these tests never launch.
+        patcher = patch("almond_axol.rt.link.find_binary", return_value="/fake/axol-rt")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_axol_defaults_come_from_the_shared_settings(self) -> None:
         with patch("almond_axol.robot.axol.CanBus") as can_bus:
             axol = Axol()

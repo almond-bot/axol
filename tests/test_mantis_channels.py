@@ -12,7 +12,7 @@ from almond_axol.cli.collect_data import CollectDataConfig
 from almond_axol.cli.config import TeleopCmdConfig, parse
 from almond_axol.cli.mantis_bridge import managed_mantis_bridge
 from almond_axol.constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
-from almond_axol.robot.mantis import Mantis
+from almond_axol.robot.mantis import MantisHardware
 from almond_axol.serve.app import _mantis_channel_mismatch_message
 from almond_axol.serve.runner import (
     _bind_managed_mantis_trigger_channels,
@@ -38,7 +38,7 @@ class MantisChannelFlowTest(unittest.TestCase):
                 patch("almond_axol.robot.mantis.CanBus") as can_bus,
                 self.assertRaisesRegex(ValueError, "different CAN interfaces"),
             ):
-                Mantis(left_channel=left, right_channel=right)
+                MantisHardware(left_channel=left, right_channel=right)
 
             can_bus.assert_not_called()
 
