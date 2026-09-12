@@ -320,8 +320,30 @@ class Axol(RobotBase):
                 )
         return "\n".join(lines) + "\n"
 
-    async def enable(self) -> None:
-        """Full rt bring-up: prep (core resets) -> Python reads -> arm."""
+    async def enable(self, hold: bool = True) -> None:
+        """Bring every motor up.
+
+        Idempotent per motor: joints already holding from a previous session
+        are attached to with reads only (never reset), a holding gripper
+        keeps its grasp, and cold joints get the full bring-up including
+        gripper calibration.
+
+        With ``hold=True`` (the default) the realtime core then takes the
+        buses and the robot finishes actively holding its measured pose —
+        gravity feedforward and damping included — ready for
+        :meth:`motion_control`.
+
+        Pass ``hold=False`` to leave freshly brought-up joints enabled but
+        limp, with Python keeping the bus and no core started: for flows that
+        pick their own ``ControlMode`` and drive the motors' built-in
+        controllers (:meth:`set_control_mode`, :meth:`set_positions_velocity`,
+        :meth:`set_velocity`). :meth:`motion_control` is unavailable in that
+        state; :meth:`disable` is the classic torque-off.
+        """
+        if not hold:
+            self._require_quiet_bus("enable(hold=False)")
+            await self._robot.enable(hold=False)
+            return
         try:
             await self._enable()
         except BaseException:
@@ -352,6 +374,13 @@ class Axol(RobotBase):
         """Bring up the realtime core; :meth:`enable` owns rollback."""
         self._fb_packets = [0, 0]
         self._limp_announced = False
+        # Hand the interfaces to the core quiet: a robot that was
+        # ``connect()``-ed (or enabled with ``hold=False``) still has Python's
+        # maintenance proxies open and possibly a telemetry poll running. The
+        # core's prep must run with no other frames on the wire, and Python
+        # must not cache a pre-reset frame; torque is untouched by this.
+        if any(bus.is_open() for bus in self._buses()):
+            await self._robot.disconnect()
         await self._link.start()
         self._core_started = True
         await self._link.configure(self._config_text())
@@ -778,8 +807,8 @@ class Axol(RobotBase):
     def _require_enabled(self, what: str) -> None:
         if not self._armed:
             raise MotorError(
-                f"{what} requires an enabled robot: call enable() first (the "
-                "realtime core drives the motors)"
+                f"{what} requires the realtime core: call enable() (with the "
+                "default hold=True) first"
             )
 
     def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:

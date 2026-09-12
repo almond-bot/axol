@@ -98,6 +98,8 @@ class AxolApiTest(unittest.TestCase):
             self.assertIs(params[name].kind, inspect.Parameter.KEYWORD_ONLY)
             self.assertIsNot(params[name].default, inspect.Parameter.empty)
         self.assertNotIn("hardware", params)
+        enable = inspect.signature(Axol.enable).parameters
+        self.assertIs(enable["hold"].default, True)
 
     def test_forwards_hardware_arguments(self) -> None:
         config = AxolConfig(has_gripper=False)
@@ -165,6 +167,16 @@ class AxolBusOwnershipTest(unittest.IsolatedAsyncioTestCase):
         # No core was started for this session: a classic torque-off.
         disable.assert_awaited_once()
 
+    async def test_enable_without_hold_is_the_classic_bring_up(self) -> None:
+        # hold=False keeps the bus in Python for custom control modes: no core.
+        with patch.object(self.hardware, "enable", AsyncMock()) as enable:
+            await self.robot.enable(hold=False)
+        enable.assert_awaited_once_with(hold=False)
+        self.assertFalse(self.robot._core_started)
+        self.assertFalse(self.robot._armed)
+        with self.assertRaisesRegex(MotorError, "requires the realtime core"):
+            await self.robot.motion_control(left=np.zeros(8, dtype=np.float32))
+
     async def test_register_calls_are_refused_while_the_core_owns_the_bus(self) -> None:
         self.robot._armed = True
         for call in (
@@ -178,9 +190,9 @@ class AxolBusOwnershipTest(unittest.IsolatedAsyncioTestCase):
                 await call
 
     async def test_motion_requires_enable(self) -> None:
-        with self.assertRaisesRegex(MotorError, "call enable\\(\\) first"):
+        with self.assertRaisesRegex(MotorError, "requires the realtime core"):
             await self.robot.motion_control(left=np.zeros(8, dtype=np.float32))
-        with self.assertRaisesRegex(MotorError, "call enable\\(\\) first"):
+        with self.assertRaisesRegex(MotorError, "requires the realtime core"):
             await self.robot.gravity_compensate()
 
     async def test_cached_reads_while_armed_send_no_can(self) -> None:
