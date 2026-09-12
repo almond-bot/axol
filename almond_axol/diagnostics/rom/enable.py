@@ -10,7 +10,7 @@ the robot returns home but keeps holding the item with the motors left enabled
 — run ``almond_axol.diagnostics.rom.disable`` afterwards to open the grippers
 and retrieve the item.
 
-The arms are driven through the Rust realtime core (``RtAxol``), the same
+The arms are driven through the Rust realtime core (``Axol``), the same
 control path as teleop: the core owns the CAN buses, renders the streamed
 targets at 240 Hz, and runs the host damping against fresh feedback. A soak
 therefore exercises exactly the controller the robot ships with.
@@ -92,11 +92,9 @@ from ...robot.axol import (
     SHOULDER_1_LEFT_LIMITS,
     SHOULDER_2_LEFT_LIMITS,
     SHOULDER_2_RIGHT_LIMITS,
-    Axol,
 )
 from ...robot.config import ArmConfig, AxolConfig, FrictionParams
-from ...robot.mantis import Mantis
-from ...rt import RtAxol, RtMantis
+from ...rt import Axol, Mantis
 from ..telemetry_log import TelemetryCsvLogger
 
 CONTROL_RATE_HZ = 100.0  # Hz
@@ -308,14 +306,14 @@ def home_pose() -> np.ndarray:
 
 
 async def _stream(
-    robot: RtAxol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
 ) -> None:
     """Ship one target pair to the core, refusing to keep "sweeping" limp arms.
 
     Once the core has gone limp (loss-of-trust fault: a silent motor)
-    ``RtAxol.motion_control`` streams gravity comp instead of tracking, so the
+    ``Axol.motion_control`` streams gravity comp instead of tracking, so the
     arms would hang weightless while this script kept announcing sweeps. Stop
     the run instead; the operator hand-guides the arms to rest.
     """
@@ -326,7 +324,7 @@ async def _stream(
 
 
 async def hold_pose(
-    robot: RtAxol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     seconds: float,
@@ -347,7 +345,7 @@ async def hold_pose(
 
 
 async def _stream_hold_forever(
-    robot: RtAxol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
 ) -> None:
@@ -359,7 +357,7 @@ async def _stream_hold_forever(
 
 
 async def move_grippers(
-    robot: RtAxol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_grip: float,  # normalized [0, 1] — 0 closed, 1 open
@@ -397,7 +395,7 @@ async def move_grippers(
 
 
 async def sweep_to_target(
-    robot: RtAxol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_target: np.ndarray,  # rad
@@ -412,7 +410,7 @@ async def sweep_to_target(
 
 
 async def sweep_unchecked(
-    robot: RtAxol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_target: np.ndarray,  # rad
@@ -451,7 +449,7 @@ def with_joint(
 
 
 async def sweep_joint_range(
-    robot: RtAxol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     joint: Joint,
@@ -506,7 +504,7 @@ async def sweep_joint_range(
 
 
 async def run_rom_cycle(
-    robot: RtAxol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     speed: float,  # rad/s
@@ -647,7 +645,7 @@ async def run_rom_cycle(
     return left_q, right_q
 
 
-async def return_home(robot: RtAxol | RtMantis) -> None:
+async def return_home(robot: Axol | Mantis) -> None:
     """Ease the arms back to home from their current pose, keeping the grippers shut.
 
     Used to bring the robot to a safe home position while it stays clamped on
@@ -671,7 +669,7 @@ async def return_home(robot: RtAxol | RtMantis) -> None:
 async def _confirm(
     instruction: str,
     web_prompts: bool,
-    robot: RtAxol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
 ) -> None:
@@ -701,7 +699,7 @@ async def _confirm(
             pass
 
 
-async def _positions(robot: RtAxol | RtMantis) -> tuple[np.ndarray, np.ndarray]:
+async def _positions(robot: Axol | Mantis) -> tuple[np.ndarray, np.ndarray]:
     """Measured positions as (left, right); an absent arm reports home."""
     left, right = await robot.get_positions()
     return (
@@ -752,18 +750,16 @@ async def run_axol(
         config.right.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
     # Production control path: the Rust core owns the buses and runs the
     # 240 Hz loop; this script only streams targets (see the module docstring).
-    robot: RtAxol | RtMantis
-    axol: Axol | Mantis
+    robot: Axol | Mantis
     if target == "mantis":
         # Grippers-only core on the Mantis buses; the seven arm joints per
         # side are virtual (they latch the streamed targets), so the sweep
         # helpers run unchanged and only the gripper physically moves.
-        axol = Mantis(
+        robot = Mantis(
             config=config,
             left_channel=None if no_left else left_channel,
             right_channel=None if no_right else right_channel,
         )
-        robot = RtMantis(axol)
     else:
         # Bring up exactly the motors that are on each bus (see the module
         # docstring): every selected joint must answer the probe; an
@@ -795,23 +791,22 @@ async def run_axol(
                 f"(stiffness {BENCH_STIFFNESS:g}), no gravity/friction/inertia/"
                 "host-damping feedforward."
             )
-        axol = Axol(
+        robot = Axol(
             config=config,
             left_channel=None if no_left else left_channel,
             right_channel=None if no_right else right_channel,
             left_joints=arm_joints["left"],
             right_joints=arm_joints["right"],
         )
-        robot = RtAxol(axol)
     await robot.enable()
     print("Motors enabled (realtime core armed).")
 
     # The logger samples the motor caches, which the core's telemetry fills.
-    logger = TelemetryCsvLogger(axol, "rom") if capture else None
+    logger = TelemetryCsvLogger(robot, "rom") if capture else None
     if logger is not None:
         logger.start()
 
-    # Settle for 2 s at the measured pose (RtAxol.enable already primed the
+    # Settle for 2 s at the measured pose (Axol.enable already primed the
     # core with one gravity-compensated hold there).
     settle_left, settle_right = await _positions(robot)
     await hold_pose(robot, settle_left, settle_right, 2.0)
@@ -957,7 +952,7 @@ async def run_axol(
             await robot.disable()
             print("Arms left limp (gravity comp) — hand-guide them to rest.")
         elif keep_enabled:
-            await robot.detach()
+            await robot.disconnect()
             print(
                 "\nMotors left enabled — robot is holding the item.\n"
                 "Run `uv run -m almond_axol.diagnostics.rom.disable` to open the "

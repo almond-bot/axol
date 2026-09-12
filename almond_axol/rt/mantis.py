@@ -1,7 +1,9 @@
 """Mantis grippers driven through the Rust realtime core.
 
-:class:`RtMantis` wraps :class:`~almond_axol.robot.mantis.Mantis` the way
-:class:`RtAxol` wraps ``Axol``: Python keeps the tracker/IK/collection
+:class:`Mantis` (re-exported as :class:`almond_axol.robot.Mantis`) wraps
+:class:`~almond_axol.robot.mantis.MantisHardware` the way
+:class:`~almond_axol.robot.Axol` wraps ``AxolHardware``: Python keeps the
+tracker/IK/collection
 logic and the gripper's *maintenance* flows, while every per-tick
 POSITION_FORCE command and every feedback frame goes through ``axol-rt``,
 which solely owns the two gripper buses and paces the loop with hard,
@@ -29,11 +31,11 @@ at its end:
 * :meth:`disable_grippers` — ``disarm`` (the core disables the motors),
   stop the core, reopen the proxies, and repeat the disable from Python so
   torque-off is *verified* — a Mantis gripper is always safe to release,
-  so unlike ``RtAxol`` a core fault never leaves it holding.
+  so unlike ``Axol`` a core fault never leaves it holding.
 * :meth:`disable` — session end: disarm if armed, then close the buses.
 
 Between takes the gripper caches are refreshed by the explicit reads in
-:meth:`get_positions` (the classic ``Mantis`` path); while armed, the
+:meth:`get_positions` (the classic ``MantisHardware`` path); while armed, the
 core's ``F`` packets fill them at ``loop_hz`` and reads return the cache.
 """
 
@@ -46,14 +48,16 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from typing import Self
 
 import numpy as np
 
-from ..constants import ARM_JOINTS
+from ..constants import ARM_JOINTS, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
 from ..motor import Joint
 from ..motor.motor import _JOINT_CONFIG
-from ..robot.base import mark_hardware_cleanup_uncertain
-from ..robot.mantis import Mantis, MantisGripperArm
+from ..robot.base import RobotBase, mark_hardware_cleanup_uncertain
+from ..robot.config import AxolConfig
+from ..robot.mantis import MantisGripperArm, MantisHardware
 from .link import FeedbackSlot, RtLink, config_header
 
 _logger = logging.getLogger(__name__)
@@ -67,12 +71,27 @@ _GRIPPER_SLOT = _N_ARM
 _MAX_STEP_RAD = 10.0
 
 
-class RtMantis:
-    """The Mantis behind the ``RtAxol`` control surface, core-driven per take.
+class Mantis(RobotBase):
+    """The Mantis rig behind the ``Axol`` control surface, core-driven per take.
+
+    Two gripper motors (one per SocketCAN bus) and no arm joints; the
+    ``motion_control`` surface accepts full 8-slot targets and only slot 7
+    (the gripper) reaches the hardware::
+
+        async with Mantis() as mantis:
+            await mantis.motion_control(left=q, right=q)
 
     Args:
-        robot:       The classic driver; owns the buses, calibration state,
-                     and the per-side :class:`MantisGripperArm` objects.
+        config:        Per-side gripper POSITION_FORCE tuning
+                       (``ArmConfig.gripper``); everything else is ignored.
+        left_channel:  SocketCAN interface of the left gripper, or ``None``.
+        right_channel: SocketCAN interface of the right gripper, or ``None``.
+        defer_gripper_enable: Leave the motors torque-off and the core
+                     unstarted until :meth:`enable_grippers` (data collection).
+
+    The keyword-only core options rarely need changing:
+
+    Args:
         loop_hz:     Core loop rate (the gripper's POSITION_FORCE command
                      and feedback cadence).
         watchdog_ms: Core watchdog — with no fresh target for this long it
@@ -83,12 +102,57 @@ class RtMantis:
 
     def __init__(
         self,
-        robot: Mantis,
+        config: AxolConfig = AxolConfig(),
+        left_channel: str | None = CAN_MANTIS_LEFT,
+        right_channel: str | None = CAN_MANTIS_RIGHT,
+        *,
+        defer_gripper_enable: bool = False,
         loop_hz: float = 240.0,
         watchdog_ms: float = 150.0,
         record: str | None = None,
     ) -> None:
-        self._robot = robot
+        self._init_core(
+            MantisHardware(
+                config=config,
+                left_channel=left_channel,
+                right_channel=right_channel,
+                defer_gripper_enable=defer_gripper_enable,
+            ),
+            loop_hz=loop_hz,
+            watchdog_ms=watchdog_ms,
+            record=record,
+        )
+
+    @classmethod
+    def _wrap(
+        cls,
+        hardware: MantisHardware,
+        *,
+        loop_hz: float = 240.0,
+        watchdog_ms: float = 150.0,
+        record: str | None = None,
+    ) -> Self:
+        """Build the rig around an already-constructed low-level object.
+
+        Internal: lets tests substitute a hand-built
+        :class:`~almond_axol.robot.mantis.MantisHardware` (fake buses) for
+        the one :meth:`__init__` would construct.
+        """
+        self = cls.__new__(cls)
+        self._init_core(
+            hardware, loop_hz=loop_hz, watchdog_ms=watchdog_ms, record=record
+        )
+        return self
+
+    def _init_core(
+        self,
+        hardware: MantisHardware,
+        *,
+        loop_hz: float,
+        watchdog_ms: float,
+        record: str | None,
+    ) -> None:
+        self._robot = hardware
         self._loop_hz = loop_hz
         self._watchdog_ms = watchdog_ms
         self._link: RtLink | None = None
@@ -105,7 +169,7 @@ class RtMantis:
         self._paused_telemetry: tuple[float, bool] | None = None
         self._lifecycle_lock = asyncio.Lock()
         # Timestamped state history for capture-aligned observations, same
-        # shape and clock mapping as RtAxol.state_nearest.
+        # shape and clock mapping as Axol.state_nearest.
         self._state_history: deque[
             tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
         ] = deque(maxlen=512)
@@ -113,7 +177,7 @@ class RtMantis:
         self._state_sides: set[int] = set()
         self._state_side_ts: dict[int, float] = {}
 
-    # -- Surface shared with RtAxol -------------------------------------------
+    # -- Surface shared with Axol ---------------------------------------------
 
     @property
     def left(self) -> MantisGripperArm | None:
@@ -122,11 +186,6 @@ class RtMantis:
     @property
     def right(self) -> MantisGripperArm | None:
         return self._robot.right
-
-    @property
-    def robot(self) -> Mantis:
-        """The wrapped classic driver (maintenance path)."""
-        return self._robot
 
     @property
     def armed(self) -> bool:
@@ -143,7 +202,7 @@ class RtMantis:
         """The armed core's latched ``limp: ...``, or ``None``.
 
         Only arm joints go limp; a gripper-only core never does. Exposed for
-        callers that poll :attr:`RtAxol.limp` generically.
+        callers that poll :attr:`~almond_axol.robot.Axol.limp` generically.
         """
         return self._link.limp if self._link is not None else None
 
@@ -172,7 +231,7 @@ class RtMantis:
     async def enable(self) -> None:
         """Open the buses; unless deferred, also arm the grippers now.
 
-        Mirrors :meth:`Mantis.enable`: ``defer_gripper_enable=True`` (data
+        Mirrors :meth:`MantisHardware.enable`: ``defer_gripper_enable=True`` (data
         collection) leaves the motors torque-off and the core unstarted
         until :meth:`enable_grippers`.
         """
@@ -185,13 +244,6 @@ class RtMantis:
         """Open the buses (deferred mode also verifies torque-off); no core."""
         async with self._lifecycle_lock:
             await self._robot.connect()
-
-    async def __aenter__(self) -> RtMantis:
-        await self.enable()
-        return self
-
-    async def __aexit__(self, *_: object) -> None:
-        await self.disable()
 
     async def enable_grippers(self) -> None:
         """Bring both grippers up and hand their buses to the realtime core.
@@ -381,7 +433,7 @@ class RtMantis:
     async def open_grippers(self) -> None:
         """Open both grippers fully through the core, then release torque.
 
-        The pre-record move (see :meth:`Mantis.open_grippers`): arm, drive
+        The pre-record move (see :meth:`MantisHardware.open_grippers`): arm, drive
         the jaws to the calibrated open stop, confirm from feedback, disarm.
         A failure — or a cancellation mid-move (a Stop during the pre-record
         prep) — still torques both grippers off before it propagates.
@@ -402,11 +454,12 @@ class RtMantis:
                 raise
             await self._disarm_unlocked()
 
-    async def detach(self) -> None:
-        """Release the bus without changing torque — not meaningful here.
+    async def disconnect(self) -> None:
+        """Close the buses; on a Mantis this is :meth:`disable`.
 
-        A Mantis gripper is disabled at every take end; there is no holding
-        state worth preserving across processes, so this is :meth:`disable`.
+        ``Axol.disconnect()`` leaves the arms holding for a later process.
+        A Mantis gripper is disabled at every take end and has no holding
+        state worth preserving, so the grippers are torqued off here too.
         """
         await self.disable()
 
@@ -533,7 +586,7 @@ class RtMantis:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float] | None:
         """Return the telemetry snapshot nearest a camera exposure timestamp.
 
-        Same contract as :meth:`RtAxol.state_nearest`; only populated while
+        Same contract as :meth:`~almond_axol.robot.Axol.state_nearest`; only populated while
         the core is armed.
         """
         deadline = time.perf_counter() + timeout

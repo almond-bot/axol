@@ -18,7 +18,7 @@ Typical usage::
 Or with custom components::
 
     async with VRTeleop(
-        RtAxol(Axol()),
+        Axol(),
         config=VRTeleopConfig(teleop_max_vel=2.0),
         vr_server_config=VRServerConfig(port=9000),
     ) as teleop:
@@ -47,13 +47,13 @@ from ..robot.base import (
     RobotBase,
     mark_hardware_cleanup_uncertain,
 )
-from ..robot.jelly import Jelly
 from ..robot.control import ContactWatchdog
+from ..robot.jelly import Jelly
+from ..teleop_activity import TeleopActivityMarker
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
-from ..teleop_activity import TeleopActivityMarker
 from .config import VRTeleopConfig
 from .core import VRTeleopCore
 from .recorder import make as _recorder_make
@@ -153,12 +153,12 @@ class VRTeleop:
         # Direct Python control-loop teleop is no longer supported. Keep this guard at
         # the reusable API boundary so custom callers cannot silently bypass
         # the production Rust core; Sim remains a valid alternate target.
-        from ..robot.axol import Axol
+        from ..robot.axol import AxolHardware
 
-        if isinstance(robot, Axol):
+        if isinstance(robot, AxolHardware):
             raise TypeError(
-                "VRTeleop hardware requires RtAxol(Axol()); direct Python "
-                "control has been removed"
+                "VRTeleop requires almond_axol.robot.Axol (or Sim); direct Python "
+                "control of the low-level AxolHardware object is not supported"
             )
         self._robot = robot
         self._jelly = jelly
@@ -214,7 +214,7 @@ class VRTeleop:
         # taps the measured side per control tick — cached joint positions
         # and torques (8 left + 8 right), refreshed by the impedance feedback
         # frames so reading them costs no CAN traffic.
-        # RtAxol receives feedback at the native 240 Hz wire rate and owns the
+        # Axol receives feedback at the native 240 Hz wire rate and owns the
         # same `_meas.npz` stage when recording is on. Sim keeps this
         # once-per-loop recorder.
         self._robot_recorder = (

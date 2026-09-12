@@ -190,7 +190,7 @@ class RtLink:
                         # core is still serving, but every arm joint is at
                         # kp = 0 with the streamed gravity feedforward, and
                         # stays that way for the session. Sends remain open —
-                        # RtAxol turns motion_control into gravity comp so
+                        # Axol turns motion_control into gravity comp so
                         # the t_ff keeps tracking the hand-guided pose.
                         _logger.warning("axol-rt: %s", body)
                         if self._limp is None:
