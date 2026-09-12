@@ -95,8 +95,8 @@ from ...robot.axol import (
     AxolHardware,
 )
 from ...robot.config import ArmConfig, AxolConfig, FrictionParams
-from ...robot.mantis import Mantis
-from ...rt import Axol, RtMantis
+from ...robot.mantis import MantisHardware
+from ...rt import Axol, Mantis
 from ..telemetry_log import TelemetryCsvLogger
 
 CONTROL_RATE_HZ = 100.0  # Hz
@@ -308,7 +308,7 @@ def home_pose() -> np.ndarray:
 
 
 async def _stream(
-    robot: Axol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
 ) -> None:
@@ -326,7 +326,7 @@ async def _stream(
 
 
 async def hold_pose(
-    robot: Axol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     seconds: float,
@@ -347,7 +347,7 @@ async def hold_pose(
 
 
 async def _stream_hold_forever(
-    robot: Axol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
 ) -> None:
@@ -359,7 +359,7 @@ async def _stream_hold_forever(
 
 
 async def move_grippers(
-    robot: Axol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_grip: float,  # normalized [0, 1] — 0 closed, 1 open
@@ -397,7 +397,7 @@ async def move_grippers(
 
 
 async def sweep_to_target(
-    robot: Axol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_target: np.ndarray,  # rad
@@ -412,7 +412,7 @@ async def sweep_to_target(
 
 
 async def sweep_unchecked(
-    robot: Axol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_target: np.ndarray,  # rad
@@ -451,7 +451,7 @@ def with_joint(
 
 
 async def sweep_joint_range(
-    robot: Axol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     joint: Joint,
@@ -506,7 +506,7 @@ async def sweep_joint_range(
 
 
 async def run_rom_cycle(
-    robot: Axol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     speed: float,  # rad/s
@@ -647,7 +647,7 @@ async def run_rom_cycle(
     return left_q, right_q
 
 
-async def return_home(robot: Axol | RtMantis) -> None:
+async def return_home(robot: Axol | Mantis) -> None:
     """Ease the arms back to home from their current pose, keeping the grippers shut.
 
     Used to bring the robot to a safe home position while it stays clamped on
@@ -671,7 +671,7 @@ async def return_home(robot: Axol | RtMantis) -> None:
 async def _confirm(
     instruction: str,
     web_prompts: bool,
-    robot: Axol | RtMantis,
+    robot: Axol | Mantis,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
 ) -> None:
@@ -701,7 +701,7 @@ async def _confirm(
             pass
 
 
-async def _positions(robot: Axol | RtMantis) -> tuple[np.ndarray, np.ndarray]:
+async def _positions(robot: Axol | Mantis) -> tuple[np.ndarray, np.ndarray]:
     """Measured positions as (left, right); an absent arm reports home."""
     left, right = await robot.get_positions()
     return (
@@ -752,18 +752,18 @@ async def run_axol(
         config.right.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
     # Production control path: the Rust core owns the buses and runs the
     # 240 Hz loop; this script only streams targets (see the module docstring).
-    robot: Axol | RtMantis
-    axol: AxolHardware | Mantis
+    robot: Axol | Mantis
+    axol: AxolHardware | MantisHardware
     if target == "mantis":
         # Grippers-only core on the Mantis buses; the seven arm joints per
         # side are virtual (they latch the streamed targets), so the sweep
         # helpers run unchanged and only the gripper physically moves.
-        axol = Mantis(
+        robot = Mantis(
             config=config,
             left_channel=None if no_left else left_channel,
             right_channel=None if no_right else right_channel,
         )
-        robot = RtMantis(axol)
+        axol = robot.hardware
     else:
         # Bring up exactly the motors that are on each bus (see the module
         # docstring): every selected joint must answer the probe; an

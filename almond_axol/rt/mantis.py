@@ -1,6 +1,7 @@
 """Mantis grippers driven through the Rust realtime core.
 
-:class:`RtMantis` wraps :class:`~almond_axol.robot.mantis.Mantis` the way
+:class:`Mantis` (re-exported as :class:`almond_axol.robot.Mantis`) wraps
+:class:`~almond_axol.robot.mantis.MantisHardware` the way
 :class:`~almond_axol.robot.Axol` wraps ``AxolHardware``: Python keeps the
 tracker/IK/collection
 logic and the gripper's *maintenance* flows, while every per-tick
@@ -34,7 +35,7 @@ at its end:
 * :meth:`disable` — session end: disarm if armed, then close the buses.
 
 Between takes the gripper caches are refreshed by the explicit reads in
-:meth:`get_positions` (the classic ``Mantis`` path); while armed, the
+:meth:`get_positions` (the classic ``MantisHardware`` path); while armed, the
 core's ``F`` packets fill them at ``loop_hz`` and reads return the cache.
 """
 
@@ -45,16 +46,19 @@ import bisect
 import logging
 import threading
 import time
+import warnings
 from collections import deque
 from collections.abc import Callable
+from typing import Self
 
 import numpy as np
 
-from ..constants import ARM_JOINTS
+from ..constants import ARM_JOINTS, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
 from ..motor import Joint
 from ..motor.motor import _JOINT_CONFIG
-from ..robot.base import mark_hardware_cleanup_uncertain
-from ..robot.mantis import Mantis, MantisGripperArm
+from ..robot.base import RobotBase, mark_hardware_cleanup_uncertain
+from ..robot.config import AxolConfig
+from ..robot.mantis import MantisGripperArm, MantisHardware
 from .link import FeedbackSlot, RtLink, config_header
 
 _logger = logging.getLogger(__name__)
@@ -68,12 +72,25 @@ _GRIPPER_SLOT = _N_ARM
 _MAX_STEP_RAD = 10.0
 
 
-class RtMantis:
-    """The Mantis behind the ``Axol`` control surface, core-driven per take.
+class Mantis(RobotBase):
+    """The Mantis rig behind the ``Axol`` control surface, core-driven per take.
+
+    Construct it exactly like the low-level hardware object::
+
+        async with Mantis() as mantis:
+            await mantis.motion_control(left=q, right=q)
 
     Args:
-        robot:       The classic driver; owns the buses, calibration state,
-                     and the per-side :class:`MantisGripperArm` objects.
+        config:        Per-side gripper POSITION_FORCE tuning
+                       (``ArmConfig.gripper``); everything else is ignored.
+        left_channel:  SocketCAN interface of the left gripper, or ``None``.
+        right_channel: SocketCAN interface of the right gripper, or ``None``.
+        defer_gripper_enable: Leave the motors torque-off and the core
+                     unstarted until :meth:`enable_grippers` (data collection).
+        hardware:    An already-constructed
+                     :class:`~almond_axol.robot.mantis.MantisHardware` to wrap
+                     instead of building one (the forwarded arguments must
+                     then be left at their defaults).
         loop_hz:     Core loop rate (the gripper's POSITION_FORCE command
                      and feedback cadence).
         watchdog_ms: Core watchdog — with no fresh target for this long it
@@ -84,12 +101,34 @@ class RtMantis:
 
     def __init__(
         self,
-        robot: Mantis,
+        config: AxolConfig | None = None,
+        left_channel: str | None = CAN_MANTIS_LEFT,
+        right_channel: str | None = CAN_MANTIS_RIGHT,
+        *,
+        defer_gripper_enable: bool = False,
+        hardware: MantisHardware | None = None,
         loop_hz: float = 240.0,
         watchdog_ms: float = 150.0,
         record: str | None = None,
     ) -> None:
-        self._robot = robot
+        if hardware is None:
+            hardware = MantisHardware(
+                config=AxolConfig() if config is None else config,
+                left_channel=left_channel,
+                right_channel=right_channel,
+                defer_gripper_enable=defer_gripper_enable,
+            )
+        elif (
+            config is not None
+            or left_channel != CAN_MANTIS_LEFT
+            or right_channel != CAN_MANTIS_RIGHT
+            or defer_gripper_enable
+        ):
+            raise ValueError(
+                "Mantis(hardware=...) takes the wrapped object as-is; do not also "
+                "pass config / channels / defer_gripper_enable"
+            )
+        self._robot = hardware
         self._loop_hz = loop_hz
         self._watchdog_ms = watchdog_ms
         self._link: RtLink | None = None
@@ -125,8 +164,13 @@ class RtMantis:
         return self._robot.right
 
     @property
-    def robot(self) -> Mantis:
-        """The wrapped classic driver (maintenance path)."""
+    def hardware(self) -> MantisHardware:
+        """The wrapped low-level object (buses, calibration state, arms)."""
+        return self._robot
+
+    @property
+    def robot(self) -> MantisHardware:
+        """Alias of :attr:`hardware` (the original spelling)."""
         return self._robot
 
     @property
@@ -173,7 +217,7 @@ class RtMantis:
     async def enable(self) -> None:
         """Open the buses; unless deferred, also arm the grippers now.
 
-        Mirrors :meth:`Mantis.enable`: ``defer_gripper_enable=True`` (data
+        Mirrors :meth:`MantisHardware.enable`: ``defer_gripper_enable=True`` (data
         collection) leaves the motors torque-off and the core unstarted
         until :meth:`enable_grippers`.
         """
@@ -187,7 +231,7 @@ class RtMantis:
         async with self._lifecycle_lock:
             await self._robot.connect()
 
-    async def __aenter__(self) -> RtMantis:
+    async def __aenter__(self) -> Self:
         await self.enable()
         return self
 
@@ -382,7 +426,7 @@ class RtMantis:
     async def open_grippers(self) -> None:
         """Open both grippers fully through the core, then release torque.
 
-        The pre-record move (see :meth:`Mantis.open_grippers`): arm, drive
+        The pre-record move (see :meth:`MantisHardware.open_grippers`): arm, drive
         the jaws to the calibrated open stop, confirm from feedback, disarm.
         A failure — or a cancellation mid-move (a Stop during the pre-record
         prep) — still torques both grippers off before it propagates.
@@ -619,3 +663,24 @@ class RtMantis:
 
     def reset_gravity_hold(self) -> None:
         """No gravity hold on a Mantis."""
+
+
+class RtMantis(Mantis):
+    """Deprecated spelling of :class:`Mantis`.
+
+    ``RtMantis(MantisHardware(...))`` was the previous way to opt into the
+    realtime core. :class:`almond_axol.robot.Mantis` now constructs the
+    hardware object itself; this shim keeps the old idiom working (with a
+    ``DeprecationWarning``) for one release.
+    """
+
+    def __init__(self, robot: MantisHardware | Mantis, **kwargs: object) -> None:
+        warnings.warn(
+            "RtMantis is deprecated: construct almond_axol.robot.Mantis(...) "
+            "directly (it wraps the realtime core by default)",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if isinstance(robot, Mantis):
+            robot = robot.hardware
+        super().__init__(hardware=robot, **kwargs)  # type: ignore[arg-type]

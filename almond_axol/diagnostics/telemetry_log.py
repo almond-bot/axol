@@ -17,7 +17,7 @@ SKU, partial bench arm) — so a ``--joints`` subset run still captures the
 joints it actually drives. Velocity is not cached by the motor layer, so it
 is not captured here.
 
-The Mantis rig (:class:`~almond_axol.robot.mantis.Mantis`) has one real motor
+The Mantis rig (:class:`~almond_axol.robot.mantis.MantisHardware`) has one real motor
 per side — the gripper — behind the same ``left`` / ``right`` surface; its
 arms carry no ``motors`` table, so they are sampled through their public
 ``positions`` / ``torques`` arrays (virtual arm joints echo their targets).
@@ -40,7 +40,7 @@ from ..utils.paths import almond_path
 from ..utils.state_files import secure_open_new_text
 
 if TYPE_CHECKING:
-    from ..robot.axol import Axol, AxolArm
+    from ..robot.axol import AxolArm, AxolHardware
 
 CAPTURE_DIR = almond_path("diagnostics", "captures")
 
@@ -52,7 +52,7 @@ class TelemetryCsvLogger:
 
     def __init__(
         self,
-        axol: Axol | Any,
+        axol: AxolHardware | Any,
         name: str,
         hz: float = _DEFAULT_HZ,
         out_dir: Path = CAPTURE_DIR,

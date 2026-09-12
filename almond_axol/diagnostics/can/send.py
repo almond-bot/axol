@@ -7,7 +7,7 @@ must be on the bus (the core brings the whole arm up); only the chosen joint
 moves.
 
 ``--target mantis`` drives the Mantis rig's handheld grippers instead
-(``RtMantis`` on ``can_mantis_l`` / ``can_mantis_r``): the core owns the
+(``Mantis`` on ``can_mantis_l`` / ``can_mantis_r``): the core owns the
 gripper buses exactly as it does during a take, and only ``--joint gripper``
 is meaningful there.
 
@@ -44,8 +44,7 @@ from ...constants import (
 )
 from ...robot.axol import GRIPPER_TRAVEL, arm_limits
 from ...robot.config import AxolConfig
-from ...robot.mantis import Mantis
-from ...rt import Axol, RtMantis
+from ...rt import Axol, Mantis
 
 _BAR_WIDTH = 24
 _TAU = 2 * math.pi
@@ -285,16 +284,14 @@ async def _run(
     cycle_count = 0
     send_error_count = 0
 
-    robot: Axol | RtMantis
+    robot: Axol | Mantis
     if mantis:
         # Grippers-only core on the Mantis buses; ``enable`` (non-deferred)
         # brings the grippers up and arms it, as a take does.
-        robot = RtMantis(
-            Mantis(
-                config=AxolConfig(),
-                left_channel=left_channel if run_left else None,
-                right_channel=right_channel if run_right else None,
-            )
+        robot = Mantis(
+            config=AxolConfig(),
+            left_channel=left_channel if run_left else None,
+            right_channel=right_channel if run_right else None,
         )
     else:
         # ``resolved()`` applies the default stiffness blend at the hardware

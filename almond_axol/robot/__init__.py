@@ -1,8 +1,9 @@
 """Public re-exports for almond_axol.robot."""
 
-# The production robot object lives with the realtime core it drives. Imported
-# last: ``almond_axol.rt`` imports this package's submodules, so every name it
-# needs must already be bound above.
+# The production robot objects live with the realtime core they drive.
+# Imported last: ``almond_axol.rt`` imports this package's submodules, so every
+# name it needs must already be bound above.
+from ..rt.mantis import Mantis  # noqa: E402
 from ..rt.robot import Axol  # noqa: E402
 from .axol import (
     EITHER_STOP_JOINTS,
@@ -21,7 +22,7 @@ from .config import (
     PositionForceConfig,
 )
 from .jelly import Jelly, JellyConfig
-from .mantis import Mantis, MantisGripperArm
+from .mantis import MantisGripperArm, MantisHardware
 from .sim import Sim
 
 __all__ = [
@@ -43,4 +44,5 @@ __all__ = [
     "Sim",
     "Mantis",
     "MantisGripperArm",
+    "MantisHardware",
 ]

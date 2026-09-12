@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from ...kinematics.config import KinematicsConfig
     from ...kinematics.fk import AxolForwardKinematics
     from ...kinematics.solver import KinematicsSolver
-    from ...rt import Axol, RtMantis
+    from ...rt import Axol, Mantis
 
 _logger = logging.getLogger(__name__)
 
@@ -142,7 +142,7 @@ class AxolRobot(Robot):
         self._left_trq_keys = [f"left_{j.value}.trq" for j in joints]
         self._right_trq_keys = [f"right_{j.value}.trq" for j in joints]
         self._ik_config = ik_config
-        self._axol: Axol | RtMantis | None = None
+        self._axol: Axol | Mantis | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._connect_future: Future[None] | None = None
@@ -409,7 +409,7 @@ class AxolRobot(Robot):
 
         _logger.info("AxolRobot connected.")
 
-    def _build_hardware(self) -> Axol | RtMantis:
+    def _build_hardware(self) -> Axol | Mantis:
         """Construct the realtime-core-backed robot.
 
         LeRobot uses the same sole production backend as teleop: the Rust
