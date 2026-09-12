@@ -147,9 +147,10 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         help=(
             "Box mode: hard cap on the shoulder torque that squeezes the box "
             "(shoulder_2 and shoulder_3, the joints a sideways push at the "
-            "gripper loads) — the per-joint backstop under the squeeze "
+            "gripper loads) — an opt-in per-joint backstop under the squeeze "
             "force. Roughly the cap ÷ the shoulder's lever (0.3–0.65 m) in "
-            "clamp force. 0 turns it off. Hardware only."
+            "clamp force. It also slows any move toward the other arm, so "
+            "0 (off, the default) unless you need it. Hardware only."
         ),
     ),
     LiveSettingDef(

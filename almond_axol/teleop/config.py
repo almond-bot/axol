@@ -91,11 +91,11 @@ class VRTeleopConfig:
         reengage: What happens to an arm's controller↔arm mapping when its
             grip re-engages (after a freeze, a disengage, or a pause in which
             the operator walked away or the arm was moved by hand).
-            ``"clutch"`` (default) re-snaps: the arm stays where it is and
+            ``"clutch"`` re-snaps: the arm stays where it is and
             the controller's *current* pose becomes the new origin — the
             operator brings the controller to (roughly) match the arm before
-            gripping, and nothing moves at the grip. ``"ramp"`` keeps the
-            mapping from the arm's previous engage as a session anchor and
+            gripping, and nothing moves at the grip. ``"ramp"`` (default) keeps
+            the mapping from the arm's previous engage as a session anchor and
             eases the arm out to where that mapping says the controller now
             is — the arm comes to the hand, over ``reengage_ramp_min_s`` or
             longer (paced by ``reengage_ramp_speed``), then tracks 1:1. The
@@ -231,12 +231,18 @@ class VRTeleopConfig:
             raised — so ``6`` Nm is roughly 9–20 N a side; the arms give
             way rather than push harder. Gravity feedforward and the other
             joints' configured caps (the wrists' 5 Nm) are unaffected.
-            ``0`` disables. Live-adjustable (headset menu / control panel);
-            realtime-core hardware only. This is the hard, per-joint
-            backstop; the squeeze *force* the operator feels is set by
-            ``box_squeeze_force`` below, which bounds it consistently
-            across poses (the shoulder's lever to the gripper halves as
-            the box is raised, so a fixed torque alone would let the force
+            ``0`` (the default) disables. Live-adjustable (headset menu /
+            control panel); realtime-core hardware only. This is an
+            opt-in hard, per-joint backstop, off by default because it
+            cannot tell a squeeze from a move: the shoulders' spring
+            torque during an ordinary carry — servo lag under motion, a
+            few degrees at ``kp`` 250 — exceeds any cap tight enough to
+            matter, so with it on the arm moving toward the other trails
+            the move and the pair skews. The squeeze *force* the operator
+            feels is set by ``box_squeeze_force`` below, which shapes only
+            the pair's common squeeze and bounds it consistently across
+            poses (the shoulder's lever to the gripper halves as the box
+            is raised, so a fixed torque alone would let the force
             double).
         box_squeeze_force: The clamp force (N) each arm presses the box
             with once the grip width is jogged in past contact, whatever
@@ -256,12 +262,17 @@ class VRTeleopConfig:
             shared evenly over the tool's contact points (the moment that
             puts it through their centroid rides the wrists), and held at
             this cap — the tighter of it and what the spring caps allow
-            under that even split. The rest of the command (carrying the
-            box, servo lag) is untouched. ``8`` N a side holds a light
-            parcel with margin; raise it if boxes slip, lower it to be
-            gentler. ``0`` disables the shaping (the torque cap alone
-            then bounds the squeeze, pose-dependently). Live-adjustable;
-            realtime-core hardware only.
+            under that even split. Only the *pair's* squeeze is shaped:
+            each command both arms' inward forces are estimated and the
+            smaller of the two is the squeeze — a carry loads one arm's
+            normal and unloads the other's and shapes nothing, so neither
+            arm is ever held back from a move. The rest of the command
+            (carrying the box, servo lag) is untouched. ``8`` N a side
+            holds a light parcel with margin; raise it if boxes slip,
+            lower it to be gentler. ``0`` disables the shaping (only the
+            torque cap, if set, then bounds the squeeze,
+            pose-dependently). Live-adjustable; realtime-core hardware
+            only.
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest
@@ -446,7 +457,7 @@ class VRTeleopConfig:
     teleop_torque_threshold: float = 0.0
     reset_gravity_comp_kd: float = 0.25
     hold_to_engage: bool = False
-    reengage: ReengageMode = "clutch"
+    reengage: ReengageMode = "ramp"
     reengage_ramp_speed: float = 0.15
     reengage_ramp_min_s: float = 0.75
     box_mode: bool = False
@@ -462,7 +473,7 @@ class VRTeleopConfig:
     box_align_duration: float = 1.5
     box_elbow_out: float = 30.0
     box_elbow_weight: float = 0.0
-    box_squeeze_torque: float = 6.0
+    box_squeeze_torque: float = 0.0
     box_squeeze_force: float = 8.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0

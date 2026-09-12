@@ -37,6 +37,9 @@ from almond_axol.teleop.teleop import VRTeleop
 
 
 def _core(**overrides) -> VRTeleopCore:
+    # The per-joint cap is opt-in (off by default, it slows a carry); these
+    # tests exercise it, so turn it on unless a test says otherwise.
+    overrides.setdefault("box_squeeze_torque", 6.0)
     return VRTeleopCore(
         VRTeleopConfig(**overrides),
         logging.getLogger("test"),
@@ -64,8 +67,19 @@ class CoreDecisionTest(unittest.TestCase):
         )
         self.assertFalse(core.teleop_enabled)
 
-    def test_default_is_six_newton_metres(self) -> None:
-        self.assertEqual(VRTeleopConfig().box_squeeze_torque, 6.0)
+    def test_default_is_off(self) -> None:
+        # A torque cap cannot tell a squeeze from a move: the shoulders'
+        # servo lag while the pair carries a box exceeds any useful cap, so
+        # with one on the arm moving toward the other trails the move. The
+        # squeeze force (shaped on the pair's common squeeze only) is the
+        # default limit; the cap is an opt-in backstop.
+        self.assertEqual(VRTeleopConfig().box_squeeze_torque, 0.0)
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+        )
+        self.assertIsNone(core.spring_caps())
 
     def test_zero_disables(self) -> None:
         core = _core(box_mode=True, box_squeeze_torque=0.0)

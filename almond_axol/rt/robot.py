@@ -794,9 +794,10 @@ class Axol(RobotBase):
             await self.gravity_compensate(kd=_LIMP_KD)
             return
         # Box mode's squeeze shaping: this command's per-arm spec (the inward
-        # normal from the measured pair) — the arms are commanded directly
-        # below, not through Axol.motion_control, so refresh it here.
-        self._robot.refresh_squeeze()
+        # normal from the measured pair) and the pair's common squeeze — the
+        # arms are commanded directly below, not through
+        # AxolHardware.motion_control, so refresh it here.
+        self._robot.refresh_squeeze(left, right)
         tasks = []
         if left is not None and self._robot.left is not None:
             tasks.append(self._robot.left.motion_control(left))

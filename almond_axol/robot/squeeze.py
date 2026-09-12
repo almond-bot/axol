@@ -40,6 +40,17 @@ The force cap is the tighter of the operator's force limit
 evenly split load — so the joint caps bound the force consistently across
 poses instead of letting the arm's shape decide, and the per-joint back-off
 and the realtime core's per-joint clamp underneath rarely have to act.
+
+What counts as a squeeze is decided by the *pair*, not by one arm. An arm
+carrying a box sideways runs ahead of its measured pose along its inward
+normal exactly as if it were pressing (the servo lag of a move toward the
+other arm), and shaping or capping that would make it trail the move —
+the leading arm slows while the trailing one, whose run-ahead points
+outward, doesn't, and the grippers skew. So each command the pair first
+estimates both arms' inward forces and shapes only their common part
+(``shared`` = the smaller of the two, ≥ 0): a translation has one of them
+negative and shapes nothing; a clamp has both positive and shapes it all;
+a clamp carried along shapes the clamp and lets the motion through.
 """
 
 from __future__ import annotations
@@ -77,8 +88,9 @@ class SqueezeResult:
     Attributes:
         tau: Shaped run-ahead torque (Nm) per arm joint; ``q_meas + tau /
             kp`` is the command to send.
-        force: Total squeeze force (N) the arm will apply after shaping —
-            the estimate saturated at the limit; 0 while not pressing.
+        force: Squeeze force (N) the arm will apply after shaping — the
+            shaped part (``shared``, or the whole estimate) saturated at the
+            limit; 0 while not pressing.
         estimate: Squeeze force (N) the unshaped run-ahead was asking for
             (negative when the gripper is being pulled off the box).
         limit: Force limit (N) in effect: the tighter of the force cap and
@@ -118,6 +130,7 @@ def shape_squeeze(
     contacts: np.ndarray,
     spring_caps: Mapping[int, float] | None = None,
     force_cap: float = float("inf"),
+    shared: float | None = None,
 ) -> SqueezeResult:
     """Reshape a run-ahead torque so its squeeze is shared over the contacts.
 
@@ -137,11 +150,22 @@ def shape_squeeze(
             each bounds the force at which that joint's share of the even
             split reaches the cap.
         force_cap: Operator's squeeze force limit (N).
+        shared: The squeeze (N) this arm is actually applying against the
+            other — the part of its estimate to reshape and cap. One arm's
+            run-ahead along its inward normal cannot tell a squeeze from
+            the pair moving that way (servo lag while the operator carries
+            the box left loads the right arm's normal exactly like a
+            clamp); only the *common* inward run-ahead of the two arms is
+            a squeeze. The pair passes ``min`` of the two arms' estimates
+            here (:meth:`AxolHardware.refresh_squeeze`), and whatever this
+            arm estimates beyond it — motion — passes through unshaped and
+            uncapped, so the pair never lags its own move. ``None`` shapes
+            the whole estimate (a single arm pressing on a fixed object).
 
     Returns:
-        :class:`SqueezeResult`. With no squeeze estimated (the run-ahead is
-        not pressing the contacts into the box) ``tau`` is returned
-        unchanged.
+        :class:`SqueezeResult`. With no squeeze to shape (the run-ahead is
+        not pressing the contacts into the box, or ``shared`` ≤ 0) ``tau``
+        is returned unchanged.
     """
     tau = np.asarray(tau, dtype=np.float64)
     kp = np.asarray(kp, dtype=np.float64)
@@ -171,8 +195,12 @@ def shape_squeeze(
         if cap > 0.0 and np.isfinite(cap) and lever > 1e-9:
             limit = min(limit, cap / lever)
 
-    if estimate <= 0.0:
+    squeeze = estimate if shared is None else min(float(shared), estimate)
+    if squeeze <= 0.0:
         return SqueezeResult(tau, 0.0, estimate, limit, forces)
-    force = min(estimate, limit)
-    shaped = tau - basis @ forces + force * even
+    # Reshape (and cap) the squeeze's share of the fitted contact forces;
+    # the remainder of the fit — the arm's own motion along the normal —
+    # stays in ``tau`` as it was.
+    force = min(squeeze, limit)
+    shaped = tau - basis @ (forces * (squeeze / estimate)) + force * even
     return SqueezeResult(shaped, force, estimate, limit, forces)

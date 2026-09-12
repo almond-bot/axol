@@ -700,10 +700,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "lift the box are untouched). Jogging the width past "
                     "contact then leans on the box with at most this torque "
                     "instead of pressing harder the further you jog — the "
-                    "per-joint backstop under the squeeze force below. In "
-                    "clamp force that is roughly the cap ÷ the shoulder's "
-                    "0.3–0.65 m lever. 0 disables. Also adjustable live from "
-                    "the headset menu (Squeeze cap). Hardware only."
+                    "opt-in per-joint backstop under the squeeze force below. "
+                    "In clamp force that is roughly the cap ÷ the shoulder's "
+                    "0.3–0.65 m lever. It cannot tell a squeeze from a move, "
+                    "so it also slows the arm moving toward the other: 0 "
+                    "(off, the default) unless you need it. Also adjustable "
+                    "live from the headset menu (Squeeze cap). Hardware only."
                 ),
                 targets={
                     "teleop": ("teleop.box_squeeze_torque",),
