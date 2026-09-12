@@ -686,7 +686,7 @@ class AxolConfig:
                          is unchanged by the blend. The blend is baked
                          into the ``left`` / ``right`` gains by
                          :meth:`resolved`, which is called once at the
-                         robot-construction boundary (``Axol.__init__``).
+                         robot-construction boundary (``AxolHardware.__init__``).
                          The stiffness fields are left untouched on the
                          config itself, so a serialized :class:`AxolConfig`
                          round-trips cleanly (loading a dumped config and
@@ -714,7 +714,7 @@ class AxolConfig:
         gains, where the blend is the identity — so the result is
         **idempotent**: calling :meth:`resolved` again is a no-op. This is
         applied once at the single robot-construction boundary
-        (``Axol.__init__``) so every consumer sees consistent gains while
+        (``AxolHardware.__init__``) so every consumer sees consistent gains while
         the unresolved config stays safe to serialize and reload.
         """
         return replace(

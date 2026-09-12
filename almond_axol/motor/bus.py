@@ -88,8 +88,8 @@ class CanBus:
     the core has disarmed.
 
     The proxy is **not a daemon**: it is a child process of *this* Python
-    process, spawned by :meth:`start` (``Axol.connect()`` / ``Axol.enable()``)
-    and reaped by :meth:`close` (``Axol.disconnect()`` / ``Axol.disable()``).
+    process, spawned by :meth:`start` (``AxolHardware.connect()`` / ``AxolHardware.enable()``)
+    and reaped by :meth:`close` (``AxolHardware.disconnect()`` / ``AxolHardware.disable()``).
     Its lifetime is the bus session, so ``axol-rt`` not appearing in ``ps``
     means this process has no open bus — not that a service needs starting.
     Startup spawns the process and waits for its ready handshake, so it is
@@ -267,14 +267,14 @@ class CanBus:
         """Explain why the bus cannot send right now, by lifecycle state."""
         if self._closed_reason is not None:
             return (
-                f"{self._closed_reason}; call Axol.connect() (CanBus.start()) "
+                f"{self._closed_reason}; call AxolHardware.connect() (CanBus.start()) "
                 "to reopen the bus"
             )
         if self._state == "unopened":
             return (
                 f"CAN bus {self._channel} has not been opened: the axol-rt "
                 "proxy is a child process of this Python process started by "
-                "Axol.connect() / Axol.enable() (CanBus.start()), not a "
+                "AxolHardware.connect() / AxolHardware.enable() (CanBus.start()), not a "
                 "daemon — await connect() before any motor I/O (per-arm "
                 "AxolArm.enable() does not open the bus itself)"
             )
@@ -282,13 +282,13 @@ class CanBus:
             return (
                 f"CAN bus {self._channel} is still starting: the axol-rt proxy "
                 "has been spawned but has not finished its ready handshake — "
-                "await the in-flight Axol.connect() / CanBus.start() before "
+                "await the in-flight AxolHardware.connect() / CanBus.start() before "
                 "issuing motor I/O (calling connect() again is idempotent and "
                 "waits for it)"
             )
         return (
-            f"CAN bus {self._channel} was closed (Axol.disconnect() / "
-            "Axol.disable() / CanBus.close()); call Axol.connect() to reopen it"
+            f"CAN bus {self._channel} was closed (AxolHardware.disconnect() / "
+            "AxolHardware.disable() / CanBus.close()); call AxolHardware.connect() to reopen it"
         )
 
     async def close(self) -> None:

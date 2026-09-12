@@ -16,12 +16,11 @@ from unittest.mock import patch
 
 import can
 
-from almond_axol.motor import bus as bus_module
-from almond_axol.motor.bus import CanBus
-
 # CanBus.start() imports rt.link lazily; import it up front so the heavy
 # package import (which itself uses subprocess) happens before Popen is faked.
 import almond_axol.rt.link  # noqa: E402,F401
+from almond_axol.motor import bus as bus_module
+from almond_axol.motor.bus import CanBus
 
 
 def _frame(payload: bytes) -> bytes:
@@ -133,7 +132,7 @@ class CanBusStateTest(unittest.IsolatedAsyncioTestCase):
         message = str(ctx.exception)
         self.assertIn("has not been opened", message)
         self.assertIn("not a daemon", message)
-        self.assertIn("Axol.connect()", message)
+        self.assertIn("AxolHardware.connect()", message)
         self.assertIn("AxolArm.enable()", message)
 
     async def test_send_while_starting_says_still_starting(self) -> None:
@@ -167,7 +166,7 @@ class CanBusStateTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(can.CanOperationError) as ctx:
             await self.bus._send(0x123, b"\x01")
         self.assertIn("was closed", str(ctx.exception))
-        self.assertIn("Axol.connect()", str(ctx.exception))
+        self.assertIn("AxolHardware.connect()", str(ctx.exception))
 
     async def test_start_is_idempotent_while_open(self) -> None:
         await self.bus.start()
