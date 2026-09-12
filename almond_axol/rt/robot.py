@@ -390,7 +390,7 @@ class Axol(RobotBase):
         # maintenance proxies open and possibly a telemetry poll running. The
         # core's prep must run with no other frames on the wire, and Python
         # must not cache a pre-reset frame; torque is untouched by this.
-        if any(bus.is_open() for bus in self._buses()):
+        if any(bus.is_open for bus in self._buses()):
             await self._robot.disconnect()
         await self._link.start()
         self._core_started = True

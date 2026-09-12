@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import inspect
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 
@@ -214,6 +214,46 @@ class AxolBusOwnershipTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(pos_l, positions)
         self.assertIsNone(pos_r)
         np.testing.assert_array_equal(trq_l, torques)
+
+
+class _LinkStartFailed(Exception):
+    """Sentinel: ``_enable`` got past the bus check and reached the core."""
+
+
+class AxolEnableBusHandoffTest(unittest.IsolatedAsyncioTestCase):
+    """``enable()`` inspects the *real* ``CanBus`` before starting the core.
+
+    Deliberately built on unpatched ``CanBus`` objects: ``CanBus.is_open`` is
+    a property, and a ``MagicMock`` bus hides a ``bus.is_open()`` call (a
+    mock is callable) that raises ``TypeError`` on hardware before any motor
+    is touched — the regression that broke ``async with Axol()``.
+    """
+
+    def setUp(self) -> None:
+        self.enterContext(patch("almond_axol.rt.robot.RtLink"))
+        self.robot = Axol(left_channel="can0", right_channel=None)
+        self.hardware = self.robot._robot
+        self.robot._link.start = AsyncMock(side_effect=_LinkStartFailed())
+        # Rollback tears the hardware down; keep it off the (absent) bus.
+        self.enterContext(patch.object(self.hardware, "disable", AsyncMock()))
+
+    async def test_unopened_bus_is_left_alone(self) -> None:
+        self.assertFalse(self.hardware._left_bus.is_open)
+        with patch.object(self.hardware, "disconnect", AsyncMock()) as disconnect:
+            with self.assertRaises(_LinkStartFailed):
+                await self.robot.enable()
+        disconnect.assert_not_awaited()
+        self.robot._link.start.assert_awaited_once()
+
+    async def test_open_bus_is_handed_over_quiet(self) -> None:
+        bus = self.hardware._left_bus
+        bus._state = "open"
+        bus._writer = MagicMock(is_closing=lambda: False)
+        self.assertTrue(bus.is_open)
+        with patch.object(self.hardware, "disconnect", AsyncMock()) as disconnect:
+            with self.assertRaises(_LinkStartFailed):
+                await self.robot.enable()
+        disconnect.assert_awaited_once()
 
 
 class MantisApiTest(unittest.TestCase):
