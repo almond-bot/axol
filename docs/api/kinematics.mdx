@@ -57,7 +57,7 @@ q = solver.ik(q, left_pose=(l_pos + np.array([0.0, 0.0, 0.05]), l_rot))
 | `left_indices` / `right_indices` | Indices into the full `q` array for each arm — `[0…6]` and `[7…13]`, kept as a readable way to split a full vector |
 | `fk(q)` | Forward kinematics → `((pos_3, rot_3x3), (pos_3, rot_3x3))` — the same format `ik` takes |
 | `elbow_positions(q)` | World-frame elbow positions → `(left_3, right_3)` |
-| `ik(q, left_pose, right_pose, left_elbow_pos, right_elbow_pos)` | IK; `pose` is `(pos_3, rot_3x3)`; elbow hints are optional `(3,)` arrays |
+| `ik(q_current, left_pose, right_pose, left_elbow_pos, right_elbow_pos)` | IK from the current joint vector; `pose` is `(pos_3, rot_3x3)`; elbow hints are optional `(3,)` arrays |
 | `set_posture_pose(q)` / `posture_pose` | Set / read the null-space attractor (home pose for joint drift prevention) |
 | `to_pyroki_order(q)` / `from_pyroki_order(q)` | Convert to/from the internal pyroki joint ordering — only needed when driving `solver.robot` / `solver.robot_coll` directly |
 
