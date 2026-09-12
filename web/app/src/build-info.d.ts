@@ -5,6 +5,3 @@ declare const __AXOL_BUILD_COMMIT__: string | null
 
 /** pyproject.toml version at build time; null when unknown. */
 declare const __AXOL_BUILD_VERSION__: string | null
-
-/** The `axol serve` origin the dev server proxies /api to (AXOL_SERVE_URL). */
-declare const __AXOL_DEV_SERVE_URL__: string
