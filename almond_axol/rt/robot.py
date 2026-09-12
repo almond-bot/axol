@@ -63,7 +63,6 @@ import logging
 import math
 import threading
 import time
-import warnings
 from collections import deque
 from collections.abc import Iterable
 from typing import Self
@@ -897,24 +896,3 @@ class Axol(RobotBase):
             _logger.warning(
                 "rt: retaining raw control trace because the core is still running"
             )
-
-
-class RtAxol(Axol):
-    """Deprecated spelling of :class:`Axol`.
-
-    ``RtAxol(AxolHardware(...))`` was the previous way to opt into the realtime
-    core. :class:`almond_axol.robot.Axol` now constructs the hardware object
-    itself; this shim keeps the old idiom working (with a
-    ``DeprecationWarning``) for one release.
-    """
-
-    def __init__(self, robot: AxolHardware | Axol, **kwargs: object) -> None:
-        warnings.warn(
-            "RtAxol is deprecated: construct almond_axol.robot.Axol(...) "
-            "directly (it wraps the realtime core by default)",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if isinstance(robot, Axol):
-            robot = robot.hardware
-        super().__init__(hardware=robot, **kwargs)  # type: ignore[arg-type]

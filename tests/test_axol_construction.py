@@ -1,16 +1,13 @@
 """``almond_axol.robot.Axol`` / ``Mantis`` are the realtime-core robots.
 
 ``Axol(...)`` takes the same arguments as the low-level ``AxolHardware`` and
-constructs it internally; ``hardware=`` wraps an existing one; the old
-``RtAxol(AxolHardware(...))`` spelling keeps working behind a
-``DeprecationWarning``. ``Mantis`` / ``MantisHardware`` / ``RtMantis`` follow
-the same pattern.
+constructs it internally; ``hardware=`` wraps an existing one. ``Mantis`` /
+``MantisHardware`` follow the same pattern.
 """
 
 from __future__ import annotations
 
 import unittest
-import warnings
 from unittest.mock import patch
 
 from almond_axol.constants import Joint
@@ -27,7 +24,6 @@ from almond_axol.robot import axol as axol_module
 from almond_axol.robot import mantis as mantis_module
 from almond_axol.rt import Axol as RtModuleAxol
 from almond_axol.rt import Mantis as RtModuleMantis
-from almond_axol.rt import RtAxol, RtMantis
 
 
 class AxolConstructionTest(unittest.TestCase):
@@ -76,19 +72,6 @@ class AxolConstructionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different CAN interfaces"):
             Axol(left_channel="can0", right_channel="can0")
 
-    def test_rtaxol_is_a_deprecated_alias(self) -> None:
-        hardware = AxolHardware(left_channel="can0", right_channel=None)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            robot = RtAxol(hardware, max_vel=2.0)
-            # The old idiom written against the new ``Axol`` still resolves.
-            nested = RtAxol(Axol(hardware=hardware))
-        self.assertEqual([w.category for w in caught], [DeprecationWarning] * 2)
-        self.assertIsInstance(robot, Axol)
-        self.assertIs(robot.hardware, hardware)
-        self.assertEqual(robot._max_vel, 2.0)
-        self.assertIs(nested.hardware, hardware)
-
 
 class MantisConstructionTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -122,17 +105,6 @@ class MantisConstructionTest(unittest.TestCase):
             Mantis(hardware=hardware, defer_gripper_enable=True)
         with self.assertRaisesRegex(ValueError, "different CAN interfaces"):
             Mantis(left_channel="can_l", right_channel="can_l")
-
-    def test_rtmantis_is_a_deprecated_alias(self) -> None:
-        hardware = MantisHardware(left_channel="can_l", right_channel=None)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            rig = RtMantis(hardware, record=None)
-            nested = RtMantis(Mantis(hardware=hardware))
-        self.assertEqual([w.category for w in caught], [DeprecationWarning] * 2)
-        self.assertIsInstance(rig, Mantis)
-        self.assertIs(rig.hardware, hardware)
-        self.assertIs(nested.hardware, hardware)
 
 
 if __name__ == "__main__":

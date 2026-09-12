@@ -79,7 +79,7 @@ asyncio.run(main())
 Faults never drop the arms: a disabled arm falls, a holding or limp arm waits for the operator.
 
 <Note>
-`RtAxol(AxolHardware(...))` — the previous spelling — still works and emits a `DeprecationWarning`. Replace it with `Axol(...)`. The Mantis rig follows the same pattern: `almond_axol.robot.Mantis` is the core-backed rig, `MantisHardware` the low-level object, `RtMantis` the deprecated alias.
+The Mantis rig follows the same pattern: `almond_axol.robot.Mantis` is the core-backed rig, `MantisHardware` the low-level object.
 </Note>
 
 ## `AxolHardware`

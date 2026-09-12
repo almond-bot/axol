@@ -46,7 +46,6 @@ import bisect
 import logging
 import threading
 import time
-import warnings
 from collections import deque
 from collections.abc import Callable
 from typing import Self
@@ -663,24 +662,3 @@ class Mantis(RobotBase):
 
     def reset_gravity_hold(self) -> None:
         """No gravity hold on a Mantis."""
-
-
-class RtMantis(Mantis):
-    """Deprecated spelling of :class:`Mantis`.
-
-    ``RtMantis(MantisHardware(...))`` was the previous way to opt into the
-    realtime core. :class:`almond_axol.robot.Mantis` now constructs the
-    hardware object itself; this shim keeps the old idiom working (with a
-    ``DeprecationWarning``) for one release.
-    """
-
-    def __init__(self, robot: MantisHardware | Mantis, **kwargs: object) -> None:
-        warnings.warn(
-            "RtMantis is deprecated: construct almond_axol.robot.Mantis(...) "
-            "directly (it wraps the realtime core by default)",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if isinstance(robot, Mantis):
-            robot = robot.hardware
-        super().__init__(hardware=robot, **kwargs)  # type: ignore[arg-type]

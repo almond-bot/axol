@@ -7,8 +7,6 @@ low-level :class:`~almond_axol.robot.axol.AxolHardware`, and the Mantis rig's
 Python keeps VR, IK, and MuJoCo gravity, while per-joint targets are shipped
 over a Unix socket to ``axol-rt`` (see ``rust/axol-rt``), which solely owns
 the buses and paces the 240 Hz control loop.
-
-``RtAxol`` / ``RtMantis`` are the deprecated previous spellings.
 """
 
 # ``almond_axol.robot`` re-exports ``Axol`` / ``Mantis`` from this package's
@@ -17,7 +15,7 @@ the buses and paces the 240 Hz control loop.
 # ``robot/__init__`` importing ``rt.mantis`` while ``rt.mantis`` is itself
 # mid-import (through ``robot.base``) would otherwise fail.
 from .. import robot as _robot  # noqa: F401
-from .mantis import Mantis, RtMantis
-from .robot import Axol, RtAxol
+from .mantis import Mantis
+from .robot import Axol
 
-__all__ = ["Axol", "Mantis", "RtAxol", "RtMantis"]
+__all__ = ["Axol", "Mantis"]
