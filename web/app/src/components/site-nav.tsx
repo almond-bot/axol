@@ -2,8 +2,6 @@ import { useState, type ReactNode } from "react"
 import { ExternalLink, Menu, Rocket, X } from "lucide-react"
 import { buttonVariants } from "@/components/ui/button"
 import { QuickstartDialog } from "@/components/quickstart-dialog"
-import { type ServerPage } from "@/lib/server-pages"
-import { serverPageHref } from "@/lib/supervisor"
 import { cn } from "@/lib/utils"
 
 /**
@@ -11,11 +9,8 @@ import { cn } from "@/lib/utils"
  * which cross-link is shown (control panel <-> VR app). Uses plain anchors so
  * switching routes does a full navigation (each route lazy-loads its bundle).
  * ``right`` injects route-specific controls (e.g. the connection pill) just
- * before the Docs / cross-link buttons. ``pages`` are the backend-served
- * pages ``/api/info`` advertises (lib/server-pages.ts): they link against the
- * connected server's origin, so when the panel runs on another host they open
- * in a new tab and keep this one connected. On narrow screens the links
- * collapse into a hamburger menu so the bar never overflows the viewport.
+ * before the Docs / cross-link buttons. On narrow screens the links collapse
+ * into a hamburger menu so the bar never overflows the viewport.
  */
 const PAGE_LABEL: Record<string, string> = {
   control: "Control Panel",
@@ -25,35 +20,16 @@ const PAGE_LABEL: Record<string, string> = {
 
 function NavLinks({
   current,
-  pages,
   onQuickstart,
   itemClass,
 }: {
   current: string
-  pages: ServerPage[]
   onQuickstart: () => void
   itemClass?: string
 }) {
   const item = cn(buttonVariants({ variant: "ghost", size: "sm" }), itemClass)
   return (
     <>
-      {pages.map((page) => {
-        const href = serverPageHref(page.path)
-        const external = href !== page.path
-        return (
-          <a
-            key={page.path}
-            href={href}
-            title={page.description}
-            target={external ? "_blank" : undefined}
-            rel={external ? "noreferrer" : undefined}
-            className={item}
-          >
-            {page.label}
-            {external && <ExternalLink />}
-          </a>
-        )
-      })}
       <a href="https://docs.almond.bot" target="_blank" rel="noreferrer" className={item}>
         Docs
         <ExternalLink />
@@ -86,12 +62,9 @@ function NavLinks({
 export function SiteNav({
   current,
   right,
-  pages = [],
 }: {
   current: "control" | "vr" | "diagnostics"
   right?: ReactNode
-  /** Backend-served pages to link (``ServerInfo.pages``); none by default. */
-  pages?: ServerPage[]
 }) {
   const [menuOpen, setMenuOpen] = useState(false)
   // Owned here, not by the menu item: closing the menu unmounts its contents,
@@ -112,11 +85,7 @@ export function SiteNav({
         <div className="flex shrink-0 items-center gap-2">
           {right}
           <nav className="hidden items-center gap-2 md:flex">
-            <NavLinks
-              current={current}
-              pages={pages}
-              onQuickstart={() => setQuickstartOpen(true)}
-            />
+            <NavLinks current={current} onQuickstart={() => setQuickstartOpen(true)} />
           </nav>
           <button
             type="button"
@@ -135,7 +104,6 @@ export function SiteNav({
           >
             <NavLinks
               current={current}
-              pages={pages}
               onQuickstart={() => setQuickstartOpen(true)}
               itemClass="w-full justify-start"
             />
