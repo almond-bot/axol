@@ -8,6 +8,8 @@ import Robot from "/snippets/config/robot.mdx";
 
 Every setting for `axol gravity-comp`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
 
+In the [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`, read by default) the `axol` section is the robot config below, `--left_channel` / `--right_channel` live under `robot`, and `--kd` / `--rate_hz` under `gravity`.
+
 ```bash
 axol gravity-comp --kd 0.8 --axol.left.elbow.mass 0.3
 ```
@@ -24,6 +26,7 @@ axol gravity-comp --kd 0.8 --axol.left.elbow.mass 0.3
 | `--rate_hz` | `250.0` | Control-loop rate (Hz). |
 | `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 | `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
+| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it. Applies beneath `--config_path` and the flags. |
 
 ## Robot {#robot}
 

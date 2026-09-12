@@ -51,6 +51,7 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--rerun_port INT` | Rerun viewer port (default: 9876); only used when `--rerun_ip` is set |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 | `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
+| `--settings_path PATH` / `--no_settings` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it (`~/.almond/settings.json` applies by default, beneath `--config_path` and the flags). |
 
 Every policy observation is assembled around image exposure time: all cameras must provide a fresh timestamped frame, their median exposure selects the nearest sample from the Rust core's 240 Hz telemetry history, and only then are joint/Cartesian features built. A stale camera, missing state bracket, or excessive timestamp skew stops the rollout instead of silently feeding a train/inference-misaligned observation. The default SDK backend derives exposure time from `TIME_REFERENCE.IMAGE`; the optional GStreamer backend is accepted only when the exact timestamp-patched plugin binary installed by `gst.build-zed` is verified.
 

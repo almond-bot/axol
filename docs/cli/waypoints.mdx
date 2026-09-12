@@ -75,6 +75,7 @@ Grip force is the gripper's `torque_limit`, shared with every other operation an
 | `--rate_hz FLOAT` | Control loop and waypoint rate in Hz (default: 250) |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 | `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
+| `--settings_path PATH` / `--no_settings` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it (`~/.almond/settings.json` applies by default, beneath `--config_path` and the flags). |
 
 ```bash
 axol waypoints                                  # teach, then play

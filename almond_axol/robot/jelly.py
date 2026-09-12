@@ -370,7 +370,7 @@ class Jelly:
 
     Typical usage::
 
-        jelly = Jelly(JellyConfig())
+        jelly = Jelly()          # config from the robot's shared settings
         await jelly.enable()
         jelly.set_command(vx=0.5, vy=0.0, wz=0.0, lift=0)   # from any thread
         ...
@@ -380,9 +380,18 @@ class Jelly:
     control and CAN; a small Python bridge forwards targets and owns the
     separate lift driver. Values are normalized to [-1, 1] (body frame: +x
     forward, +y left, +wz CCW); ``lift`` is +1 up / 0 stop / -1 down.
+
+    ``config=None`` (default) loads the shared ``jelly.*`` settings
+    (``~/.almond/settings.json``, the file the control panel and ``axol
+    teleop`` use; see :mod:`almond_axol.settings`) over the defaults; pass a
+    :class:`JellyConfig` to override.
     """
 
-    def __init__(self, config: JellyConfig = JellyConfig()) -> None:
+    def __init__(self, config: JellyConfig | None = None) -> None:
+        if config is None:
+            from ..settings import shared_config
+
+            config = shared_config(JellyConfig, "teleop", "jelly")
         self._config = config
         self._lift: Lift | None = None
         self._task: asyncio.Task | None = None

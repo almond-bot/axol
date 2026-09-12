@@ -883,7 +883,11 @@ class _Session:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a teach-and-repeat session."""
-    cfg = parse(WaypointsCmdConfig, normalize_bool_flags(argv, "sim", "play_only"))
+    cfg = parse(
+        WaypointsCmdConfig,
+        normalize_bool_flags(argv, "sim", "play_only"),
+        settings_op="waypoints",
+    )
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)

@@ -38,6 +38,7 @@ import { useToast } from "@/components/ui/toast"
 import { Card } from "@/components/ui/card"
 import { FieldRow, FlatSchemaForm } from "@/components/config-form"
 import { materializeCameraSpec, type CameraProfileBySlot } from "@/lib/camera-spec"
+import { buildSettingsFile, parseSettingsFile } from "@/lib/settings-file"
 import {
   AXOL_CATEGORY_KEYS,
   SETTINGS_SCOPES,
@@ -53,17 +54,17 @@ import { cn } from "@/lib/utils"
 
 // Mantis-specific keys declared under the Teleop & VR schema category; they
 // render on the Mantis tabs instead.
-const MANTIS_SOURCE_KEYS = ["teleop.mantis_source", "mantis.quest_tracker_key"]
+const MANTIS_SOURCE_KEYS = ["mantis.source", "mantis.quest_tracker_key"]
 const MANTIS_CHANNEL_KEYS = ["mantis.left_channel", "mantis.right_channel"]
 // Keys the card never edits: the device selection has its own switch above.
 const EXTERNALLY_MANAGED_KEYS = new Set([HARDWARE_PROFILE_SETTING])
 
 interface Draft {
+  /** Every staged value by canonical key — curated tabs and Advanced alike. */
   values: Record<string, SettingValue>
   cameras: CameraSpec
   /** Layout whose controls most recently changed each shared logical slot. */
   cameraProfiles: CameraProfileBySlot
-  advanced: Record<string, FormValue>
 }
 
 const CAMERA_SLOTS: CameraSlot[] = ["overhead", "left_arm", "right_arm"]
@@ -171,12 +172,9 @@ export function SettingsSection({
     values: { ...(snapshot?.values ?? {}) },
     cameras,
     cameraProfiles: {},
-    advanced: { ...(snapshot?.advanced ?? {}) },
   })
   const settingsResolved = snapshot !== null || supportError !== null
-  const nextSeedKey = settingsResolved
-    ? JSON.stringify([snapshot?.values, snapshot?.advanced, cameras])
-    : null
+  const nextSeedKey = settingsResolved ? JSON.stringify([snapshot?.values, cameras]) : null
   if (nextSeedKey !== null && nextSeedKey !== seedKey && (draft == null || !dirty)) {
     setSeedKey(nextSeedKey)
     setDraft(seedDraft())
@@ -229,16 +227,13 @@ export function SettingsSection({
     }
   }
 
+  // Export writes the same nested document the host keeps in
+  // ~/.almond/settings.json, so a file from one robot can be dropped onto
+  // another (or read by the CLI / SDK) unchanged.
   function exportFile() {
     if (!draft) return
     const blob = new Blob(
-      [
-        JSON.stringify(
-          { values: draft.values, cameras: draft.cameras, advanced: draft.advanced },
-          null,
-          2
-        ),
-      ],
+      [JSON.stringify(buildSettingsFile(draft.values, draft.cameras), null, 2)],
       { type: "application/json" }
     )
     const url = URL.createObjectURL(blob)
@@ -251,14 +246,13 @@ export function SettingsSection({
 
   function importFile(text: string) {
     try {
-      const data = JSON.parse(text)
-      if (!data || typeof data !== "object") throw new Error("invalid settings file")
+      const parsed = parseSettingsFile(JSON.parse(text))
       setDraft((d) => {
         if (!d) return d
-        const importedCameras = (data.cameras as CameraSpec) ?? d.cameras
+        const importedCameras = (parsed.cameras as CameraSpec | null | undefined) ?? d.cameras
         const profile = scope === "mantis" ? "mantis" : "axol"
         // The device selection is not part of the card; keep the stored one.
-        const values = { ...(data.values ?? {}) }
+        const values: Record<string, SettingValue> = { ...parsed.values }
         for (const key of EXTERNALLY_MANAGED_KEYS) {
           delete values[key]
           if (d.values[key] !== undefined) values[key] = d.values[key]
@@ -272,7 +266,6 @@ export function SettingsSection({
             d.cameraProfiles,
             profile
           ),
-          advanced: { ...(data.advanced ?? {}) },
         }
       })
     } catch (e) {
@@ -320,15 +313,15 @@ export function SettingsSection({
   const poseFields =
     schema.find((c) => c.key === "teleop")?.settings.filter((s) => s.ui.widget === "pose") ?? []
   const teleopCategory = schema.find((c) => c.key === "teleop")
-  const mantisSourceField = teleopCategory?.settings.find((s) => s.key === "teleop.mantis_source")
+  const mantisSourceField = teleopCategory?.settings.find((s) => s.key === "mantis.source")
   const questTrackerKeyField = teleopCategory?.settings.find(
     (s) => s.key === "mantis.quest_tracker_key"
   )
   const mantisChannelFields =
     teleopCategory?.settings.filter((s) => MANTIS_CHANNEL_KEYS.includes(s.key)) ?? []
   const defaultMantisSource = String(mantisSourceField?.default ?? "lighthouse")
-  const draftMantisSource = String(draft?.values["teleop.mantis_source"] ?? defaultMantisSource)
-  const storedMantisSource = String(snapshot?.values["teleop.mantis_source"] ?? defaultMantisSource)
+  const draftMantisSource = String(draft?.values["mantis.source"] ?? defaultMantisSource)
+  const storedMantisSource = String(snapshot?.values["mantis.source"] ?? defaultMantisSource)
   const mantisSourceSaved = draftMantisSource === storedMantisSource
   const draftQuestTrackerKey = String(draft?.values["mantis.quest_tracker_key"] ?? "")
   const storedQuestTrackerKey = String(snapshot?.values["mantis.quest_tracker_key"] ?? "")
@@ -503,18 +496,9 @@ export function SettingsSection({
             ) : tab === "advanced" ? (
               <AdvancedPanel
                 sections={snapshot?.advancedSchema ?? []}
-                overrides={draft.advanced}
-                onChange={(key, value) =>
-                  setDraft((d) => (d ? { ...d, advanced: { ...d.advanced, [key]: value } } : d))
-                }
-                onReset={(key) =>
-                  setDraft((d) => {
-                    if (!d) return d
-                    const advanced = { ...d.advanced }
-                    delete advanced[key]
-                    return { ...d, advanced }
-                  })
-                }
+                overrides={draft.values}
+                onChange={setValue}
+                onReset={(key) => setValue(key, null)}
               />
             ) : activeCategory ? (
               <CategoryPanel
@@ -609,16 +593,6 @@ function computePatch(
       patch.camerasSet = true
     }
   }
-
-  const beforeAdv = snapshot?.advanced ?? {}
-  const advPatch: Record<string, FormValue | null> = {}
-  for (const [k, v] of Object.entries(draft.advanced)) {
-    if (JSON.stringify(beforeAdv[k]) !== JSON.stringify(v)) advPatch[k] = v
-  }
-  for (const k of Object.keys(beforeAdv)) {
-    if (!(k in draft.advanced)) advPatch[k] = null
-  }
-  if (Object.keys(advPatch).length > 0) patch.advanced = advPatch
 
   return patch
 }
@@ -958,11 +932,11 @@ function SettingRow({
 
 /**
  * The unified Advanced tree: every remaining config field, organized by
- * subsystem (Axol, Teleop, Kinematics, VR server, LeRobot robot). One value
- * here is the source of truth for **all** operations — the server translates
- * each canonical key to the right config path per op at start. Curated
- * settings, cameras and per-run fields are pruned server-side so every knob
- * has exactly one home.
+ * subsystem (Axol, Teleop, Kinematics, Jelly, VR server, LeRobot robot). It
+ * edits the same canonical value map as the curated tabs — one value here is
+ * the source of truth for **all** operations; the server translates each key
+ * to the right config path per op at start. Curated settings, cameras and
+ * per-run fields are pruned server-side so every knob has exactly one home.
  */
 function AdvancedPanel({
   sections,

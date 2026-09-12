@@ -16,6 +16,12 @@ Every field is reachable from the CLI (draccus-style) or a JSON/YAML file:
     axol gravity-comp --right_channel null --free_joints [SHOULDER_1,WRIST_3]
     axol gravity-comp --record demo1
     axol gravity-comp --config_path my_gravity.json
+    axol gravity-comp --no_settings                   # ignore ~/.almond/settings.json
+
+The robot's shared settings file (``~/.almond/settings.json``, the one the
+control panel edits) is applied by default beneath the config file and the
+flags — so the gravity model (per-joint masses / CoMs) and ``kd`` match what
+the panel's gravity-comp runs.
 
 ``--record`` captures the hand-guided session (measured arm-joint positions
 and torques, one row per control tick) to ``<prefix>_gc.npz`` with the same
@@ -73,7 +79,7 @@ def _resolve_free_joints(names: list[str] | None) -> set[Joint] | None:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run gravity-compensation mode."""
-    cfg = parse(GravityCompCmdConfig, argv)
+    cfg = parse(GravityCompCmdConfig, argv, settings_op="gravity-comp")
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop the INFO status lines.

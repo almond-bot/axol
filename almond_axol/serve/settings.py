@@ -1,29 +1,48 @@
-"""Shared operator settings for the control panel.
+"""The robot's shared settings: one file, one vocabulary, every surface.
 
-The control panel used to bury every tunable inside each operation's own
-config form, persisted per-browser in localStorage. Almost none of those
-values are actually per-run — camera assignment, arm stiffness, teleop rate,
-recording fps, the inference server address — they are properties of *this
-robot*, shared by every operation and every operator device. This module
-gives them one home on the serve host:
+Almost nothing an operator tunes is per-run — camera assignment, arm
+stiffness, per-joint gains, teleop rate, recording fps, the inference server
+address — they are properties of *this robot*. This module gives them one
+home on the host, ``~/.almond/settings.json``, read by the control panel,
+the ``axol`` CLI and the SDK alike (see :mod:`almond_axol.settings`).
 
-- :data:`SETTINGS` — the curated registry of shared settings, grouped into
-  UI categories. Each setting maps to the dotted config key(s) it drives on
-  each operation (the same ops have the same knob at different paths, e.g.
-  stiffness is ``axol.left_stiffness`` on teleop but
-  ``robot_config.axol_config.left_stiffness`` on collect-data).
-- :data:`ADVANCED_SECTIONS` — the unified Advanced tree: every remaining
-  config field under a *canonical* subsystem key (``axol.*``,
-  ``vr_teleop.*``, ``kinematics.*``, …). One stored value is translated to
-  each op's own dotted path at start, so there is a single source of truth
-  applying to all tasks — never per-task copies of the same knob.
-- :class:`SettingsStore` — JSON persistence at ``~/.almond/settings.json``
-  (the camera spec, the curated values, and the canonical advanced values),
-  plus the merge that folds them into an op start's args. The request's own
-  args always win, so a per-run value can still override a shared one.
+The file is a nested tree keyed by **canonical sections**
+(:data:`SECTIONS`)::
 
-Precedence at op start (later wins): dataclass defaults → curated settings →
-advanced values → the request's args → the camera spec fold-in.
+    {
+      "version": 2,
+      "axol":       {"left_stiffness": 0.8, "left": {"elbow": {"kp": 60}}},
+      "teleop":     {"frequency": 240, "rest_pose_left": [...]},
+      "kinematics": {"pos_weight": 100},
+      "robot":      {"left_channel": "can0", "right_channel": "null"},
+      "gravity":    {"kd": 0.5},
+      "recording":  {"fps": 30, "root": "/data"},
+      "cameras":    {...camera spec...}
+    }
+
+Each subsystem section (``axol``, ``teleop``, ``kinematics``, ``jelly``,
+``vr_server``) is the *same shape as its config dataclass*, so for ``axol
+teleop`` the file is literally a partial ``--config_path`` file. The same ops
+embed those subsystems at different dotted paths (stiffness is
+``axol.left_stiffness`` on teleop but
+``robot_config.axol_config.left_stiffness`` on collect-data); a section
+declares the prefix it is grafted onto per op, and every value under it is
+translated at start. A handful of op-level knobs whose leaf names differ
+between ops (``recording.fps`` is ``fps`` on collect-data but
+``recording.replay_fps`` is ``fps`` on replay) carry explicit per-op targets
+on their :class:`SettingDef` instead.
+
+:data:`SETTINGS` is the curated subset the panel renders as first-class
+controls, grouped into UI categories; every other leaf of a section is
+reachable through the panel's Advanced tree. Curated vs advanced is purely a
+presentation split — the file and the stored keys do not distinguish them.
+
+:class:`SettingsStore` persists the file (plus the camera spec) and folds it
+into an op start's args. The request's own args always win, so a per-run
+value can still override a shared one.
+
+Precedence at op start (later wins): dataclass defaults → shared settings →
+the request's args → the camera spec fold-in.
 """
 
 from __future__ import annotations
@@ -43,11 +62,13 @@ from .commands import flag_enabled, normalize_boolean_args, parse_boolean
 _logger = logging.getLogger(__name__)
 
 SETTINGS_PATH = almond_path("settings.json")
+SETTINGS_VERSION = 2
 
 # The built-in operations, whose dotted config paths the tables below spell
 # out. A registered operation joins the same tables through its
 # ``settings_like`` alias rather than re-declaring them (see _settings_op).
 _OPS = ("teleop", "gravity-comp", "collect-data", "run-policy", "replay-dataset")
+_LEROBOT_OPS = ("collect-data", "run-policy", "replay-dataset")
 
 # Dotted paths into the lerobot-based ops' shared robot config.
 _ROBOT = "robot_config"
@@ -56,25 +77,147 @@ _TELEOP_CFG = "teleop_config"
 _VRT = f"{_TELEOP_CFG}.vr_teleop_config"
 _KIN = f"{_TELEOP_CFG}.kinematics_config"
 
+# Top-level keys of the settings file that are not sections.
+_RESERVED_KEYS = frozenset({"version", "cameras"})
+
+
+@dataclass(frozen=True)
+class Section:
+    """One canonical top-level key of the settings file.
+
+    ``targets`` maps an operation id to the dotted prefix the section's
+    subtree is grafted onto for that op (``""`` = the op's top level). A
+    section without targets holds only curated leaves whose per-op paths are
+    spelled out on their :class:`SettingDef` (their leaf names differ between
+    ops, so no single prefix works).
+
+    ``ref_op`` / ``ref_prefix`` name the op config subtree the panel's
+    Advanced form for this section is built from; ``None`` keeps the section
+    out of the Advanced tree (its leaves are all curated, or its op-level
+    neighbours are per-run fields that must not become shared).
+    ``drop_children`` removes subtrees owned elsewhere (cameras by the
+    Cameras tab; axol_config by the ``axol`` section).
+    """
+
+    key: str
+    label: str
+    targets: dict[str, str] = field(default_factory=dict)
+    ref_op: str | None = None
+    ref_prefix: str | None = None
+    drop_children: tuple[str, ...] = ()
+
+    def graft(self, op: str, subpath: str) -> tuple[str, ...]:
+        """The op config key(s) a ``<section>.<subpath>`` value drives."""
+        prefix = self.targets.get(op)
+        if prefix is None:
+            return ()
+        return (f"{prefix}.{subpath}" if prefix else subpath,)
+
+
+SECTIONS: tuple[Section, ...] = (
+    # -- shared subsystem configs: the subtree *is* the dataclass -----------
+    Section(
+        key="axol",
+        label="Axol",
+        targets={
+            "teleop": "axol",
+            "gravity-comp": "axol",
+            **{op: _AXOL for op in _LEROBOT_OPS},
+        },
+        ref_op="teleop",
+        ref_prefix="axol",
+    ),
+    Section(
+        key="teleop",
+        label="Teleop",
+        targets={"teleop": "teleop", "collect-data": _VRT},
+        ref_op="teleop",
+        ref_prefix="teleop",
+    ),
+    Section(
+        key="kinematics",
+        label="Kinematics",
+        targets={"teleop": "kinematics", "collect-data": _KIN},
+        ref_op="teleop",
+        ref_prefix="kinematics",
+    ),
+    Section(
+        key="jelly",
+        label="Jelly",
+        targets={"teleop": "jelly", "collect-data": f"{_TELEOP_CFG}.jelly"},
+        ref_op="teleop",
+        ref_prefix="jelly",
+    ),
+    Section(
+        key="vr_server",
+        label="VR server",
+        targets={
+            "teleop": "vr_server",
+            "collect-data": f"{_TELEOP_CFG}.vr_server_config",
+        },
+        ref_op="teleop",
+        ref_prefix="vr_server",
+    ),
+    # -- LeRobot wrappers around the shared configs --------------------------
+    Section(
+        key="lerobot",
+        label="LeRobot robot",
+        targets={op: _ROBOT for op in _LEROBOT_OPS},
+        # Replay exposes the same robot subtree without importing the optional
+        # ZED stack, so these controls remain available on camera-less hosts.
+        ref_op="replay-dataset",
+        ref_prefix=_ROBOT,
+        drop_children=("cameras", "axol config"),
+    ),
+    Section(
+        key="lerobot_teleop",
+        label="LeRobot teleoperator",
+        targets={"collect-data": _TELEOP_CFG},
+    ),
+    # -- op-level knobs grafted onto each op's top level ----------------------
+    Section(
+        key="robot",
+        label="Robot",
+        targets={
+            "teleop": "",
+            "gravity-comp": "",
+            "diag.lift-cycle": "",
+            **{op: _ROBOT for op in _LEROBOT_OPS},
+        },
+    ),
+    Section(key="gravity", label="Gravity comp", targets={"gravity-comp": ""}),
+    Section(key="inference", label="Inference", targets={"run-policy": ""}),
+    # -- op-level knobs whose leaf names differ per op: explicit targets ----
+    Section(key="mantis", label="Mantis"),
+    Section(key="recording", label="Recording"),
+    Section(key="system", label="System"),
+)
+
+_SECTIONS_BY_KEY: dict[str, Section] = {s.key: s for s in SECTIONS}
+
 
 @dataclass(frozen=True)
 class SettingDef:
-    """One shared setting: how it renders and which op config keys it drives.
+    """One curated setting: how it renders and (if irregular) what it drives.
 
-    ``targets`` maps an operation id to the dotted config key(s) this setting
-    sets on that op (build_argv turns them into CLI-style overrides). ``ui``
-    carries optional widget hints for the front-end (slider ranges, the pose
-    editor). ``options`` makes it a dropdown. ``effective_default`` describes
-    what actually happens when the config default is ``None`` (e.g. "the
-    LeRobot cache dir", "inference runs locally") — shown as the placeholder
-    instead of an unhelpful "unset"; a callable is resolved on the serve host.
+    ``key`` is the canonical ``<section>.<subpath>`` the value is stored
+    under. Its op config keys normally follow from the section's prefix map
+    (:meth:`Section.graft`); ``targets`` overrides that for the irregular
+    ones — a leaf whose name differs per op, or one that fans out to several
+    paths (``teleop.frequency`` also sets collect-data's ``teleop_hz``).
+    ``ui`` carries optional widget hints for the front-end (slider ranges,
+    the pose editor). ``options`` makes it a dropdown. ``effective_default``
+    describes what actually happens when the config default is ``None``
+    (e.g. "the LeRobot cache dir", "inference runs locally") — shown as the
+    placeholder instead of an unhelpful "unset"; a callable is resolved on
+    the serve host.
     """
 
     key: str
     label: str
     type: str  # "number" | "boolean" | "text" | "select"
     help: str
-    targets: dict[str, tuple[str, ...]]
+    targets: dict[str, tuple[str, ...]] | None = None
     options: tuple[str, ...] | None = None
     ui: dict[str, Any] = field(default_factory=dict)
     effective_default: "str | Callable[[], str] | None" = None
@@ -214,7 +357,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
         description="Arm behaviour shared by every operation on this robot.",
         settings=(
             SettingDef(
-                key="robot.left_stiffness",
+                key="axol.left_stiffness",
                 label="Left arm stiffness",
                 type="number",
                 help=(
@@ -224,16 +367,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "policy."
                 ),
                 ui={"widget": "slider", "min": 0, "max": 1, "step": 0.05},
-                targets={
-                    "teleop": ("axol.left_stiffness",),
-                    "gravity-comp": ("axol.left_stiffness",),
-                    "collect-data": (f"{_AXOL}.left_stiffness",),
-                    "run-policy": (f"{_AXOL}.left_stiffness",),
-                    "replay-dataset": (f"{_AXOL}.left_stiffness",),
-                },
             ),
             SettingDef(
-                key="robot.right_stiffness",
+                key="axol.right_stiffness",
                 label="Right arm stiffness",
                 type="number",
                 help=(
@@ -241,13 +377,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "runs the tuned gains, lower only adds compliance."
                 ),
                 ui={"widget": "slider", "min": 0, "max": 1, "step": 0.05},
-                targets={
-                    "teleop": ("axol.right_stiffness",),
-                    "gravity-comp": ("axol.right_stiffness",),
-                    "collect-data": (f"{_AXOL}.right_stiffness",),
-                    "run-policy": (f"{_AXOL}.right_stiffness",),
-                    "replay-dataset": (f"{_AXOL}.right_stiffness",),
-                },
             ),
             SettingDef(
                 key="robot.left_channel",
@@ -258,14 +387,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "or can0 for a non-Axol-hub adapter). 'null' disables the "
                     "arm. Also used by the diagnostics dashboard's robot link."
                 ),
-                targets={
-                    "teleop": ("left_channel",),
-                    "gravity-comp": ("left_channel",),
-                    "collect-data": (f"{_ROBOT}.left_channel",),
-                    "run-policy": (f"{_ROBOT}.left_channel",),
-                    "replay-dataset": (f"{_ROBOT}.left_channel",),
-                    "diag.lift-cycle": ("left_channel",),
-                },
             ),
             SettingDef(
                 key="robot.right_channel",
@@ -276,17 +397,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "or can1 for a non-Axol-hub adapter). 'null' disables the "
                     "arm. Also used by the diagnostics dashboard's robot link."
                 ),
-                targets={
-                    "teleop": ("right_channel",),
-                    "gravity-comp": ("right_channel",),
-                    "collect-data": (f"{_ROBOT}.right_channel",),
-                    "run-policy": (f"{_ROBOT}.right_channel",),
-                    "replay-dataset": (f"{_ROBOT}.right_channel",),
-                    "diag.lift-cycle": ("right_channel",),
-                },
             ),
             SettingDef(
-                key="robot.has_gripper",
+                key="axol.has_gripper",
                 label="Grippers fitted",
                 type="boolean",
                 help=(
@@ -296,72 +409,33 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "channels are dropped from recorded datasets. The gripper "
                     "torque/speed settings below then have no effect."
                 ),
-                targets={
-                    "teleop": ("axol.has_gripper",),
-                    "gravity-comp": ("axol.has_gripper",),
-                    "collect-data": (f"{_AXOL}.has_gripper",),
-                    "run-policy": (f"{_AXOL}.has_gripper",),
-                    "replay-dataset": (f"{_AXOL}.has_gripper",),
-                },
             ),
             SettingDef(
-                key="robot.gripper_torque_limit",
-                label="Gripper torque limit (Nm)",
+                key="axol.left.gripper.torque_limit",
+                label="Left gripper torque limit (Nm)",
                 type="number",
-                help="Peak gripper output torque, applied to both grippers.",
-                targets={
-                    "teleop": (
-                        "axol.left.gripper.torque_limit",
-                        "axol.right.gripper.torque_limit",
-                    ),
-                    "gravity-comp": (
-                        "axol.left.gripper.torque_limit",
-                        "axol.right.gripper.torque_limit",
-                    ),
-                    "collect-data": (
-                        f"{_AXOL}.left.gripper.torque_limit",
-                        f"{_AXOL}.right.gripper.torque_limit",
-                    ),
-                    "run-policy": (
-                        f"{_AXOL}.left.gripper.torque_limit",
-                        f"{_AXOL}.right.gripper.torque_limit",
-                    ),
-                    "replay-dataset": (
-                        f"{_AXOL}.left.gripper.torque_limit",
-                        f"{_AXOL}.right.gripper.torque_limit",
-                    ),
-                },
+                help="Peak output torque of the left gripper.",
             ),
             SettingDef(
-                key="robot.gripper_max_speed",
-                label="Gripper max speed (rad/s)",
+                key="axol.right.gripper.torque_limit",
+                label="Right gripper torque limit (Nm)",
                 type="number",
-                help="Maximum gripper joint speed, applied to both grippers.",
-                targets={
-                    "teleop": (
-                        "axol.left.gripper.max_speed",
-                        "axol.right.gripper.max_speed",
-                    ),
-                    "gravity-comp": (
-                        "axol.left.gripper.max_speed",
-                        "axol.right.gripper.max_speed",
-                    ),
-                    "collect-data": (
-                        f"{_AXOL}.left.gripper.max_speed",
-                        f"{_AXOL}.right.gripper.max_speed",
-                    ),
-                    "run-policy": (
-                        f"{_AXOL}.left.gripper.max_speed",
-                        f"{_AXOL}.right.gripper.max_speed",
-                    ),
-                    "replay-dataset": (
-                        f"{_AXOL}.left.gripper.max_speed",
-                        f"{_AXOL}.right.gripper.max_speed",
-                    ),
-                },
+                help="Peak output torque of the right gripper.",
             ),
             SettingDef(
-                key="robot.jelly_enabled",
+                key="axol.left.gripper.max_speed",
+                label="Left gripper max speed (rad/s)",
+                type="number",
+                help="Maximum joint speed of the left gripper.",
+            ),
+            SettingDef(
+                key="axol.right.gripper.max_speed",
+                label="Right gripper max speed (rad/s)",
+                type="number",
+                help="Maximum joint speed of the right gripper.",
+            ),
+            SettingDef(
+                key="jelly.enabled",
                 label="Jelly",
                 type="boolean",
                 help=(
@@ -373,13 +447,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "into datasets and policies never control it. Jelly "
                     "parameters live under Advanced → Jelly."
                 ),
-                targets={
-                    "teleop": ("jelly.enabled",),
-                    "collect-data": (f"{_TELEOP_CFG}.jelly.enabled",),
-                },
             ),
             SettingDef(
-                key="robot.reset_torque_threshold",
+                key="teleop.reset_torque_threshold",
                 label="Reset contact threshold (Nm)",
                 type="number",
                 help=(
@@ -391,6 +461,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "where they are. Raise if normal returns false-trip; 0 "
                     "disables the watchdog."
                 ),
+                # Also a top-level field of the ops without a teleop subtree.
                 targets={
                     "teleop": ("teleop.reset_torque_threshold",),
                     "collect-data": (f"{_VRT}.reset_torque_threshold",),
@@ -399,7 +470,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
-                key="robot.teleop_torque_threshold",
+                key="teleop.teleop_torque_threshold",
                 label="Teleop contact stop (Nm)",
                 type="number",
                 help=(
@@ -425,7 +496,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
-                key="robot.policy_torque_threshold",
+                key="inference.policy_torque_threshold",
                 label="Policy contact stop (Nm)",
                 type="number",
                 help=(
@@ -439,23 +510,18 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "tripping it."
                 ),
                 ui={"widget": "toggle-number", "onValue": 16},
-                targets={
-                    "run-policy": ("policy_torque_threshold",),
-                },
             ),
             SettingDef(
-                key="robot.gravity_kd",
+                key="gravity.kd",
                 label="Gravity comp damping (kd)",
                 type="number",
                 help="Velocity damping applied to freed joints in gravity comp.",
-                targets={"gravity-comp": ("kd",)},
             ),
             SettingDef(
-                key="robot.gravity_rate_hz",
+                key="gravity.rate_hz",
                 label="Gravity comp rate (Hz)",
                 type="number",
                 help="Gravity compensation control-loop rate.",
-                targets={"gravity-comp": ("rate_hz",)},
             ),
         ),
     ),
@@ -465,7 +531,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
         description="How VR controller motion drives the arms (teleop and data collection).",
         settings=(
             SettingDef(
-                key="teleop.mantis_source",
+                key="mantis.source",
                 label="Mantis tracking",
                 type="select",
                 options=("lighthouse", "ultimate", "quest"),
@@ -525,6 +591,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Teleop rate (Hz)",
                 type="number",
                 help="Control-loop rate for VR teleoperation (whole Hz).",
+                # Fans out: collect-data also paces its loop from ``teleop_hz``.
                 targets={
                     "teleop": ("teleop.frequency",),
                     "collect-data": ("teleop_hz", f"{_VRT}.frequency"),
@@ -539,10 +606,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "(1 = 1:1; larger covers more workspace with less hand travel)."
                 ),
                 ui={"widget": "slider", "min": 0.5, "max": 3, "step": 0.1},
-                targets={
-                    "teleop": ("teleop.position_multiplier",),
-                    "collect-data": (f"{_VRT}.position_multiplier",),
-                },
             ),
             SettingDef(
                 key="teleop.rotation_multiplier",
@@ -553,10 +616,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "(1 = 1:1; larger rotates further with less wrist twist)."
                 ),
                 ui={"widget": "slider", "min": 0.5, "max": 3, "step": 0.1},
-                targets={
-                    "teleop": ("teleop.rotation_multiplier",),
-                    "collect-data": (f"{_VRT}.rotation_multiplier",),
-                },
             ),
             SettingDef(
                 key="teleop.hold_to_engage",
@@ -570,10 +629,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "engage from rest, then a click on either grip toggles "
                     "that arm between tracking and frozen."
                 ),
-                targets={
-                    "teleop": ("teleop.hold_to_engage",),
-                    "collect-data": (f"{_VRT}.hold_to_engage",),
-                },
             ),
             SettingDef(
                 key="teleop.rest_pose_left",
@@ -584,10 +639,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "ARM_JOINTS order. Edited with the pose editor."
                 ),
                 ui={"widget": "pose"},
-                targets={
-                    "teleop": ("teleop.rest_pose_left",),
-                    "collect-data": (f"{_VRT}.rest_pose_left",),
-                },
             ),
             SettingDef(
                 key="teleop.rest_pose_right",
@@ -598,24 +649,18 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "ARM_JOINTS order. Edited with the pose editor."
                 ),
                 ui={"widget": "pose"},
-                targets={
-                    "teleop": ("teleop.rest_pose_right",),
-                    "collect-data": (f"{_VRT}.rest_pose_right",),
-                },
             ),
             SettingDef(
-                key="teleop.id",
+                key="lerobot_teleop.id",
                 label="Teleoperator ID",
                 type="text",
                 help="LeRobot identifier used for this teleoperator instance.",
-                targets={"collect-data": ("teleop_config.id",)},
             ),
             SettingDef(
-                key="teleop.calibration_dir",
+                key="lerobot_teleop.calibration_dir",
                 label="Teleoperator calibration directory",
                 type="text",
                 help="Directory containing LeRobot teleoperator calibration files.",
-                targets={"collect-data": ("teleop_config.calibration_dir",)},
             ),
         ),
     ),
@@ -632,20 +677,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Position weight",
                 type="number",
                 help="Weight on end-effector position error.",
-                targets={
-                    "teleop": ("kinematics.pos_weight",),
-                    "collect-data": (f"{_KIN}.pos_weight",),
-                },
             ),
             SettingDef(
                 key="kinematics.ori_weight",
                 label="Orientation weight",
                 type="number",
                 help="Weight on end-effector orientation error.",
-                targets={
-                    "teleop": ("kinematics.ori_weight",),
-                    "collect-data": (f"{_KIN}.ori_weight",),
-                },
             ),
             SettingDef(
                 key="kinematics.elbow_weight",
@@ -657,10 +694,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "elbow tracking; the arm's swivel then follows the posture "
                     "attractor instead of the headset's inferred elbow."
                 ),
-                targets={
-                    "teleop": ("kinematics.elbow_weight",),
-                    "collect-data": (f"{_KIN}.elbow_weight",),
-                },
             ),
             SettingDef(
                 key="kinematics.rest_weight",
@@ -670,20 +703,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "Weight pulling joints toward the current configuration — "
                     "higher damps drift, lower tracks more aggressively."
                 ),
-                targets={
-                    "teleop": ("kinematics.rest_weight",),
-                    "collect-data": (f"{_KIN}.rest_weight",),
-                },
             ),
             SettingDef(
                 key="kinematics.max_joint_delta",
                 label="Max joint delta (rad)",
                 type="number",
                 help="Maximum change of any joint between consecutive IK solutions.",
-                targets={
-                    "teleop": ("kinematics.max_joint_delta",),
-                    "collect-data": (f"{_KIN}.max_joint_delta",),
-                },
             ),
         ),
     ),
@@ -716,7 +741,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 targets={"replay-dataset": ("fps",)},
             ),
             SettingDef(
-                key="recording.observe_torques",
+                key="lerobot.observe_torques",
                 label="Observe torques",
                 type="boolean",
                 help=(
@@ -724,13 +749,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "policy must run with the same observation shape it was "
                     "trained on."
                 ),
-                targets={
-                    "collect-data": (f"{_ROBOT}.observe_torques",),
-                    "run-policy": (f"{_ROBOT}.observe_torques",),
-                },
             ),
             SettingDef(
-                key="recording.observe_cartesian",
+                key="lerobot.observe_cartesian",
                 label="Observe Cartesian",
                 type="boolean",
                 help=(
@@ -739,10 +760,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "of the 7 joint angles. Must match between data collection "
                     "and running the policy."
                 ),
-                targets={
-                    "collect-data": (f"{_ROBOT}.observe_cartesian",),
-                    "run-policy": (f"{_ROBOT}.observe_cartesian",),
-                },
             ),
             SettingDef(
                 key="recording.vcodec",
@@ -817,7 +834,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="select",
                 options=("cuda", "cpu", "mps"),
                 help="Device the policy runs on.",
-                targets={"run-policy": ("device",)},
             ),
             SettingDef(
                 key="inference.server_host",
@@ -828,35 +844,30 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "to run inference locally."
                 ),
                 effective_default="local — inference runs on this machine",
-                targets={"run-policy": ("server_host",)},
             ),
             SettingDef(
                 key="inference.server_port",
                 label="Inference server port",
                 type="number",
                 help="Port of the inference server (local or remote).",
-                targets={"run-policy": ("server_port",)},
             ),
             SettingDef(
                 key="inference.episode_time_s",
                 label="Episode length (s)",
                 type="number",
                 help="Maximum length of one policy episode.",
-                targets={"run-policy": ("episode_time_s",)},
             ),
             SettingDef(
                 key="inference.actions_per_chunk",
                 label="Actions per chunk",
                 type="number",
                 help="Actions requested from the policy per inference call.",
-                targets={"run-policy": ("actions_per_chunk",)},
             ),
             SettingDef(
                 key="inference.chunk_size_threshold",
                 label="Chunk size threshold",
                 type="number",
                 help="Queue fraction below which the next chunk is requested.",
-                targets={"run-policy": ("chunk_size_threshold",)},
             ),
             SettingDef(
                 key="inference.aggregate_fn",
@@ -870,14 +881,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "conservative",
                 ),
                 help="How overlapping action chunks are combined.",
-                targets={"run-policy": ("aggregate_fn",)},
             ),
             SettingDef(
                 key="inference.temporal_ensemble_coeff",
                 label="Temporal ensemble coeff",
                 type="number",
                 help="Exponential weight for the temporal_ensemble aggregation.",
-                targets={"run-policy": ("temporal_ensemble_coeff",)},
             ),
         ),
     ),
@@ -919,114 +928,116 @@ _SETTINGS_BY_KEY: dict[str, SettingDef] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Advanced settings: ONE tree shared by every operation.
-#
-# The same subsystem config lives at a different dotted path on each op
-# (``axol.left.elbow.kp`` on teleop, ``robot_config.axol_config.left.elbow.kp``
-# on collect-data). Advanced values are therefore stored under a *canonical*
-# key — ``<section>.<subpath>`` — and translated to each op's own path at
-# start, so one stored value applies to every task that has that subsystem.
-# ---------------------------------------------------------------------------
+def targets_for(key: str, op: str) -> tuple[str, ...]:
+    """The op config key(s) a stored canonical ``key`` drives on ``op``.
 
-
-@dataclass(frozen=True)
-class AdvancedSection:
-    """One canonical subsystem in the unified Advanced tree.
-
-    ``ref_op``/``ref_prefix`` name the op schema subtree the UI form is built
-    from; ``targets`` maps each op to the dotted prefix the canonical subpath
-    is grafted onto at start. ``drop_children`` removes subtrees owned
-    elsewhere (cameras by the Cameras tab; axol_config by the axol section).
+    A curated setting with explicit ``targets`` wins; every other key is
+    grafted through its section's per-op prefix. Unknown sections (or a bare
+    section name) drive nothing.
     """
-
-    key: str
-    label: str
-    ref_op: str
-    ref_prefix: str
-    targets: dict[str, str]
-    drop_children: tuple[str, ...] = ()
-
-
-ADVANCED_SECTIONS: tuple[AdvancedSection, ...] = (
-    AdvancedSection(
-        key="axol",
-        label="Axol",
-        ref_op="teleop",
-        ref_prefix="axol",
-        targets={
-            "teleop": "axol",
-            "gravity-comp": "axol",
-            "collect-data": _AXOL,
-            "run-policy": _AXOL,
-            "replay-dataset": _AXOL,
-        },
-    ),
-    AdvancedSection(
-        key="vr_teleop",
-        label="Teleop",
-        ref_op="teleop",
-        ref_prefix="teleop",
-        targets={"teleop": "teleop", "collect-data": _VRT},
-    ),
-    AdvancedSection(
-        key="kinematics",
-        label="Kinematics",
-        ref_op="teleop",
-        ref_prefix="kinematics",
-        targets={"teleop": "kinematics", "collect-data": _KIN},
-    ),
-    AdvancedSection(
-        key="jelly",
-        label="Jelly",
-        ref_op="teleop",
-        ref_prefix="jelly",
-        targets={"teleop": "jelly", "collect-data": f"{_TELEOP_CFG}.jelly"},
-    ),
-    AdvancedSection(
-        key="vr_server",
-        label="VR server",
-        ref_op="teleop",
-        ref_prefix="vr_server",
-        targets={
-            "teleop": "vr_server",
-            "collect-data": "teleop_config.vr_server_config",
-        },
-    ),
-    AdvancedSection(
-        key="lerobot",
-        label="LeRobot robot",
-        # Replay exposes the same robot subtree without importing the optional
-        # ZED stack, so these controls remain available on camera-less hosts.
-        ref_op="replay-dataset",
-        ref_prefix=_ROBOT,
-        targets={
-            "collect-data": _ROBOT,
-            "run-policy": _ROBOT,
-            "replay-dataset": _ROBOT,
-        },
-        drop_children=("cameras", "axol config"),
-    ),
-)
-
-_ADVANCED_BY_KEY = {s.key: s for s in ADVANCED_SECTIONS}
+    setting = _SETTINGS_BY_KEY.get(key)
+    if setting is not None and setting.targets is not None:
+        return setting.targets.get(op, ())
+    section_key, _, subpath = key.partition(".")
+    section = _SECTIONS_BY_KEY.get(section_key)
+    if section is None or not subpath:
+        return ()
+    return section.graft(op, subpath)
 
 
-def _managed_canonical_keys() -> set[str]:
-    """Canonical advanced keys already owned by a curated setting.
+def is_known_key(key: str) -> bool:
+    """Whether a canonical key may be stored.
 
-    Every curated target that falls inside a section's subtree (on any op) is
-    hidden from the Advanced tree, so each knob has exactly one home.
+    Any leaf under a grafted section is fine (the op schemas decide what it
+    means; ``build_argv`` drops what they don't know). Sections that only
+    carry explicit-target leaves accept just their curated keys.
     """
-    managed: set[str] = set()
-    for setting in _SETTINGS_BY_KEY.values():
-        for op, keys in setting.targets.items():
-            for key in keys:
-                for section in ADVANCED_SECTIONS:
-                    prefix = section.targets.get(op)
-                    if prefix and key.startswith(prefix + "."):
-                        managed.add(section.key + key[len(prefix) :])
-    return managed
+    if key in _SETTINGS_BY_KEY:
+        return True
+    section_key, _, subpath = key.partition(".")
+    section = _SECTIONS_BY_KEY.get(section_key)
+    return section is not None and bool(subpath) and bool(section.targets)
+
+
+# Curated keys of the previous flat file layout (``values``) and their
+# canonical homes. One old key may fan out to several leaves (the gripper
+# limits used to set both sides at once).
+_LEGACY_KEYS: dict[str, tuple[str, ...]] = {
+    "robot.left_stiffness": ("axol.left_stiffness",),
+    "robot.right_stiffness": ("axol.right_stiffness",),
+    "robot.has_gripper": ("axol.has_gripper",),
+    "robot.gripper_torque_limit": (
+        "axol.left.gripper.torque_limit",
+        "axol.right.gripper.torque_limit",
+    ),
+    "robot.gripper_max_speed": (
+        "axol.left.gripper.max_speed",
+        "axol.right.gripper.max_speed",
+    ),
+    "robot.jelly_enabled": ("jelly.enabled",),
+    "robot.reset_torque_threshold": ("teleop.reset_torque_threshold",),
+    "robot.teleop_torque_threshold": ("teleop.teleop_torque_threshold",),
+    "robot.policy_torque_threshold": ("inference.policy_torque_threshold",),
+    "robot.gravity_kd": ("gravity.kd",),
+    "robot.gravity_rate_hz": ("gravity.rate_hz",),
+    "teleop.mantis_source": ("mantis.source",),
+    "teleop.id": ("lerobot_teleop.id",),
+    "teleop.calibration_dir": ("lerobot_teleop.calibration_dir",),
+    "recording.observe_torques": ("lerobot.observe_torques",),
+    "recording.observe_cartesian": ("lerobot.observe_cartesian",),
+    # The Advanced tree's old name for the teleop subsystem, and the Quest
+    # datum that used to be buried in it.
+    "vr_teleop.tracker_key": ("mantis.quest_tracker_key",),
+}
+
+
+def canonical_keys(key: str) -> tuple[str, ...]:
+    """Translate a possibly pre-v2 key into its canonical key(s)."""
+    mapped = _LEGACY_KEYS.get(key)
+    if mapped is not None:
+        return mapped
+    if key.startswith("vr_teleop."):
+        return ("teleop." + key.removeprefix("vr_teleop."),)
+    return (key,)
+
+
+def flatten_tree(tree: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """``{"axol": {"left": {"kp": 1}}}`` → ``{"axol.left.kp": 1}``.
+
+    Only dicts nest; lists (poses, per-joint stiffness) are leaves.
+    """
+    flat: dict[str, Any] = {}
+    for name, value in tree.items():
+        key = f"{prefix}{name}"
+        if isinstance(value, dict):
+            flat.update(flatten_tree(value, key + "."))
+        else:
+            flat[key] = value
+    return flat
+
+
+def nest_tree(flat: dict[str, Any]) -> dict[str, Any]:
+    """Inverse of :func:`flatten_tree`; sections in registry order, leaves sorted."""
+    order = {section.key: i for i, section in enumerate(SECTIONS)}
+    tree: dict[str, Any] = {}
+    for key in sorted(
+        flat, key=lambda k: (order.get(k.partition(".")[0], len(order)), k)
+    ):
+        node = tree
+        *parents, leaf = key.split(".")
+        for part in parents:
+            child = node.get(part)
+            if not isinstance(child, dict):
+                child = node[part] = {}
+            node = child
+        node[leaf] = flat[key]
+    return tree
+
+
+# ---------------------------------------------------------------------------
+# The Advanced tree: every non-curated leaf of the grafted sections, built
+# from a reference op's schema and re-rooted under the canonical section key.
+# ---------------------------------------------------------------------------
 
 
 def _rekey_nodes(
@@ -1062,14 +1073,17 @@ def _rekey_nodes(
 def advanced_schema() -> list[dict[str, Any]]:
     """The unified Advanced tree: one canonical section per shared subsystem.
 
-    Best-effort per section: a subsystem whose reference op can't build its
-    schema (missing extras) is simply omitted.
+    Curated keys are pruned so every knob has exactly one home. Best-effort
+    per section: a subsystem whose reference op can't build its schema
+    (missing extras) is simply omitted.
     """
     from .commands import get_schema
 
-    managed = _managed_canonical_keys()
+    managed = set(_SETTINGS_BY_KEY)
     sections: list[dict[str, Any]] = []
-    for section in ADVANCED_SECTIONS:
+    for section in SECTIONS:
+        if section.ref_op is None or section.ref_prefix is None:
+            continue
         try:
             schema = get_schema(section.ref_op)
         except Exception:  # noqa: BLE001 - optional extras may be missing
@@ -1138,8 +1152,13 @@ def settings_schema() -> list[dict[str, Any]]:
     for cat in SETTINGS:
         fields: list[dict[str, Any]] = []
         for s in cat.settings:
+            targets = {
+                op: keys
+                for op in (*_OPS, "diag.lift-cycle")
+                if (keys := targets_for(s.key, op))
+            }
             default: Any = None
-            for op, keys in s.targets.items():
+            for op, keys in targets.items():
                 leaf = defaults.get(op, {}).get(keys[0])
                 if leaf is not None:
                     default = leaf
@@ -1166,7 +1185,7 @@ def settings_schema() -> list[dict[str, Any]]:
                     "default": default,
                     "defaultText": default_text,
                     "ui": s.ui,
-                    "targets": {op: list(keys) for op, keys in s.targets.items()},
+                    "targets": {op: list(keys) for op, keys in targets.items()},
                 }
             )
         categories.append(
@@ -1181,16 +1200,15 @@ def settings_schema() -> list[dict[str, Any]]:
 
 
 class SettingsStore:
-    """Thread-safe JSON persistence for the shared operator settings.
+    """Thread-safe JSON persistence for the robot's shared settings.
 
-    File shape (all sections optional)::
-
-        {
-          "version": 1,
-          "values": {"robot.left_stiffness": 0.8, ...},
-          "cameras": {...camera spec, see app.OpStartRequest...},
-          "advanced": {"axol.left.elbow.kp": 60, ...}   # canonical keys
-        }
+    On disk the file is the nested tree described in the module docstring
+    (``version`` 2): one object per canonical section plus the panel's
+    ``cameras`` spec. In memory the same values are kept flat under their
+    dotted canonical keys (``"axol.left.elbow.kp"``), which is also how the
+    HTTP API exchanges them. Version-1 files (flat ``values`` + ``advanced``
+    maps under the old curated names) are migrated on load and rewritten in
+    the new layout on the next save.
     """
 
     def __init__(self, path: Path = SETTINGS_PATH) -> None:
@@ -1202,38 +1220,65 @@ class SettingsStore:
         try:
             raw = json.loads(secure_read_text(self._path))
             if isinstance(raw, dict):
-                values = dict(raw.get("values") or {})
-                advanced = dict(raw.get("advanced") or {})
-                # tracker_key used to be buried in Advanced. Adopt it into
-                # the source-specific Mantis control so there is one visible
-                # value and readiness evaluates exactly what a run will use.
-                legacy_key = advanced.pop("vr_teleop.tracker_key", None)
-                if legacy_key is not None:
-                    values.setdefault("mantis.quest_tracker_key", legacy_key)
-                return {
-                    "values": values,
-                    "cameras": raw.get("cameras"),
-                    "advanced": advanced,
-                }
+                if "values" in raw or "advanced" in raw:
+                    values = self._migrate_v1(raw)
+                else:
+                    values = flatten_tree(
+                        {
+                            key: value
+                            for key, value in raw.items()
+                            if key not in _RESERVED_KEYS and isinstance(value, dict)
+                        }
+                    )
+                return {"values": values, "cameras": raw.get("cameras")}
         except FileNotFoundError:
             pass
         except Exception:  # noqa: BLE001 - a corrupt file must not kill serve
             _logger.exception("failed to load %s; starting empty", self._path)
-        return {"values": {}, "cameras": None, "advanced": {}}
+        return {"values": {}, "cameras": None}
+
+    @staticmethod
+    def _migrate_v1(raw: dict[str, Any]) -> dict[str, Any]:
+        """Flat curated ``values`` + canonical ``advanced`` → canonical keys.
+
+        Curated values win over an advanced entry for the same leaf: they
+        were the visible control, the advanced one was hidden as "managed".
+        """
+        values: dict[str, Any] = {}
+        for key, value in dict(raw.get("advanced") or {}).items():
+            for canonical in canonical_keys(key):
+                values[canonical] = value
+        for key, value in dict(raw.get("values") or {}).items():
+            for canonical in canonical_keys(key):
+                values[canonical] = value
+        return values
 
     def _save_locked(self) -> None:
-        payload = {"version": 1, **self._data}
-        secure_atomic_write_json(self._path, payload)
+        # nest_tree already orders sections by registry and leaves by name;
+        # keep that so the file reads top-down like the config it mirrors.
+        secure_atomic_write_json(self._path, self._document_locked(), sort_keys=False)
+
+    def _document_locked(self) -> dict[str, Any]:
+        return {
+            "version": SETTINGS_VERSION,
+            **nest_tree(self._data["values"]),
+            "cameras": self._data["cameras"],
+        }
 
     # -- API surface ---------------------------------------------------------
 
     def snapshot(self) -> dict[str, Any]:
+        """Stored values (flat canonical keys) and the camera spec."""
         with self._lock:
             return {
                 "values": dict(self._data["values"]),
                 "cameras": self._data["cameras"],
-                "advanced": dict(self._data["advanced"]),
             }
+
+    def document(self) -> dict[str, Any]:
+        """The settings file as written to disk (nested, versioned)."""
+        with self._lock:
+            return self._document_locked()
 
     def update(
         self,
@@ -1243,31 +1288,29 @@ class SettingsStore:
     ) -> dict[str, Any]:
         """Apply a partial update and persist. Returns the new snapshot.
 
-        ``values`` and ``advanced`` merge per key; a ``None`` value removes the
-        key (reset to default). ``cameras`` replaces the whole camera spec
+        ``values`` merges per canonical key; a ``None`` value removes the key
+        (reset to default). Pre-v2 key names (and the old ``advanced`` map)
+        are still accepted from cached panels and imported files and land
+        on their canonical keys. ``cameras`` replaces the whole camera spec
         (``None`` clears it).
         """
-        if advanced is not None and "vr_teleop.tracker_key" in advanced:
-            # Accept an imported pre-migration settings file, but immediately
-            # move its hidden Advanced value into the visible Quest control.
-            legacy_key = advanced.get("vr_teleop.tracker_key")
-            advanced = dict(advanced)
-            advanced.pop("vr_teleop.tracker_key", None)
-            values = dict(values or {})
-            values.setdefault("mantis.quest_tracker_key", legacy_key)
-        if values is not None:
-            values = dict(values)
-            unknown = [k for k in values if k not in _SETTINGS_BY_KEY]
+        if values is not None or advanced is not None:
+            incoming: dict[str, Any] = {}
+            for key, value in {**(advanced or {}), **(values or {})}.items():
+                for canonical in canonical_keys(key):
+                    incoming[canonical] = value
+            unknown = [k for k in incoming if not is_known_key(k)]
             if unknown:
                 raise KeyError(f"unknown settings: {', '.join(sorted(unknown))}")
-            for key, value in values.items():
-                setting = _SETTINGS_BY_KEY[key]
-                if setting.type == "boolean" and value is not None:
-                    values[key] = parse_boolean(value, key=key)
-        if advanced is not None:
-            bad = [k for k in advanced if k.partition(".")[0] not in _ADVANCED_BY_KEY]
-            if bad:
-                raise KeyError(f"unknown advanced settings: {', '.join(sorted(bad))}")
+            for key, value in incoming.items():
+                setting = _SETTINGS_BY_KEY.get(key)
+                if (
+                    setting is not None
+                    and setting.type == "boolean"
+                    and value is not None
+                ):
+                    incoming[key] = parse_boolean(value, key=key)
+            values = incoming
         with self._lock:
             if (
                 values is not None
@@ -1322,12 +1365,6 @@ class SettingsStore:
                         self._data["values"][k] = v
             if cameras is not ...:
                 self._data["cameras"] = cameras
-            if advanced is not None:
-                for k, v in advanced.items():
-                    if v is None:
-                        self._data["advanced"].pop(k, None)
-                    else:
-                        self._data["advanced"][k] = v
             self._save_locked()
         return self.snapshot()
 
@@ -1428,45 +1465,35 @@ class SettingsStore:
     def has_gripper(self) -> bool:
         """Whether this robot is the gripper-equipped SKU (default ``True``).
 
-        Read from the curated ``robot.has_gripper`` setting; the robot link
-        uses it to skip the gripper motors' pings, and the UI reads the
-        mirrored ``hasGripper`` field of ``/api/robot/status``.
+        Read from ``axol.has_gripper``; the robot link uses it to skip the
+        gripper motors' pings, and the UI reads the mirrored ``hasGripper``
+        field of ``/api/robot/status``.
         """
         with self._lock:
-            value = self._data["values"].get("robot.has_gripper")
+            value = self._data["values"].get("axol.has_gripper")
         if value is None:
             return True
-        return parse_boolean(value, key="robot.has_gripper")
+        return parse_boolean(value, key="axol.has_gripper")
 
     def merged_args(self, op_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Fold the shared settings into one op start's args.
 
-        Later wins: curated setting values → advanced values (canonical keys
-        translated to this op's dotted paths) → the request's own args. Keys
-        the op's schema doesn't know are dropped later by ``build_argv``, so a
+        Every stored canonical key is translated to this op's dotted paths
+        (:func:`targets_for`); the request's own args then win. Keys the
+        op's schema doesn't know are dropped later by ``build_argv``, so a
         stale entry can never inject anything — which is also what makes an
-        inherited target table safe when an aliased op only shares part of the
-        original's config.
+        inherited target table safe when an aliased op only shares part of
+        the original's config.
         """
         target_op = _settings_op(op_id)
         merged: dict[str, Any] = {}
         with self._lock:
             values = dict(self._data["values"])
-            advanced = dict(self._data["advanced"])
         for key, value in values.items():
-            setting = _SETTINGS_BY_KEY.get(key)
-            if setting is None or value is None:
+            if value is None:
                 continue
-            for target in setting.targets.get(target_op, ()):
+            for target in targets_for(key, target_op):
                 merged[target] = value
-        for key, value in advanced.items():
-            section_key, _, subpath = key.partition(".")
-            section = _ADVANCED_BY_KEY.get(section_key)
-            if section is None or not subpath or value is None:
-                continue
-            prefix = section.targets.get(target_op)
-            if prefix:
-                merged[f"{prefix}.{subpath}"] = value
 
         # The Mantis and Axol channel maps are deliberately independent. The
         # curated target table cannot express a conditional target, so fold

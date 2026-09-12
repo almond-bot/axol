@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,11 +10,7 @@ from unittest.mock import patch
 
 from almond_axol.cli.collect_data import CollectDataConfig
 from almond_axol.cli.config import TeleopCmdConfig, parse
-from almond_axol.cli.mantis_bridge import (
-    add_quest_key_to_direct_fallback,
-    load_direct_mantis_fallback,
-    managed_mantis_bridge,
-)
+from almond_axol.cli.mantis_bridge import managed_mantis_bridge
 from almond_axol.constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
 from almond_axol.robot.mantis import Mantis
 from almond_axol.serve.app import _mantis_channel_mismatch_message
@@ -23,6 +20,11 @@ from almond_axol.serve.runner import (
 )
 from almond_axol.serve.settings import SettingsStore
 from almond_axol.utils.can_channels import require_mantis_channels
+
+
+def _real_tmp() -> str:
+    """A temp root with no symlinked components (secure state I/O refuses them)."""
+    return os.path.realpath(tempfile.gettempdir())
 
 
 class MantisChannelFlowTest(unittest.TestCase):
@@ -40,11 +42,12 @@ class MantisChannelFlowTest(unittest.TestCase):
 
             can_bus.assert_not_called()
 
-    def test_direct_fallback_matches_saved_rig_source_channels_and_quest_key(
+    def test_direct_mantis_runs_inherit_saved_rig_channels_and_quest_key(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = SettingsStore(Path(directory) / "settings.json")
+        with tempfile.TemporaryDirectory(dir=_real_tmp()) as directory:
+            path = Path(directory) / "settings.json"
+            store = SettingsStore(path)
             store.update(
                 values={
                     "teleop.mantis_source": "quest",
@@ -53,27 +56,54 @@ class MantisChannelFlowTest(unittest.TestCase):
                     "mantis.quest_tracker_key": "quest:oculus-touch-v3:grip",
                 }
             )
-            with patch("almond_axol.serve.settings.SettingsStore", return_value=store):
-                teleop_fallback, quest_key = load_direct_mantis_fallback(
-                    collection=False
-                )
-                collect_fallback, collect_key = load_direct_mantis_fallback(
-                    collection=True
-                )
+            settings = ["--settings_path", str(path)]
+
+            # The direct CLI's two-pass fold: the first parse sees the run's
+            # ``mantis`` flag, the second applies the rig-specific fold.
+            teleop = parse(
+                TeleopCmdConfig,
+                [*settings, "--mantis", "true"],
+                settings_op="teleop",
+                settings_args={"mantis": True},
+            )
+            collect_argv = [*settings, "--repo_id", "t/r", "--task", "t"]
+            first = parse(
+                CollectDataConfig,
+                [*collect_argv, "--mantis", "true"],
+                settings_op="collect-data",
+            )
+            collect = parse(
+                CollectDataConfig,
+                [*collect_argv, "--mantis", "true"],
+                settings_op="collect-data",
+                settings_args={"mantis": True, "mantis_source": first.mantis_source},
+            )
+            lighthouse = parse(
+                CollectDataConfig,
+                [*collect_argv, "--mantis", "true", "--mantis_source", "lighthouse"],
+                settings_op="collect-data",
+                settings_args={"mantis": True, "mantis_source": "lighthouse"},
+            )
 
         # Mantis teleop is grippers-only: it inherits only the channel map,
         # never the tracking source or Quest datum.
         self.assertEqual(
-            teleop_fallback,
-            {"left_channel": "can_mantis_r", "right_channel": "can_mantis_l"},
+            (teleop.left_channel, teleop.right_channel),
+            ("can_mantis_r", "can_mantis_l"),
         )
-        self.assertIsNone(quest_key)
-        self.assertEqual(collect_fallback["mantis_source"], "quest")
+        self.assertIsNone(teleop.teleop.tracker_key)
+        self.assertEqual(first.mantis_source, "quest")
         self.assertEqual(
-            collect_fallback["robot_config"],
-            {"left_channel": "can_mantis_r", "right_channel": "can_mantis_l"},
+            (collect.robot_config.left_channel, collect.robot_config.right_channel),
+            ("can_mantis_r", "can_mantis_l"),
         )
-        self.assertEqual(collect_key, "quest:oculus-touch-v3:grip")
+        self.assertEqual(
+            collect.teleop_config.vr_teleop_config.tracker_key,
+            "quest:oculus-touch-v3:grip",
+        )
+        # A CLI override of the source decides whether the Quest key applies.
+        self.assertEqual(lighthouse.mantis_source, "lighthouse")
+        self.assertIsNone(lighthouse.teleop_config.vr_teleop_config.tracker_key)
 
     def test_direct_fallback_is_below_config_file_and_cli(self) -> None:
         fallback: dict[str, object] = {
@@ -122,8 +152,10 @@ class MantisChannelFlowTest(unittest.TestCase):
                 "left_channel": "saved-left",
                 "right_channel": "saved-right",
             },
+            "teleop_config": {
+                "vr_teleop_config": {"tracker_key": "quest:saved-profile:grip"}
+            },
         }
-        add_quest_key_to_direct_fallback(fallback, "quest:saved-profile:grip")
         cfg = parse(
             CollectDataConfig,
             [
@@ -190,7 +222,8 @@ class MantisChannelFlowTest(unittest.TestCase):
             )
             snapshot = SettingsStore(path).snapshot()
             self.assertEqual(snapshot["values"]["mantis.quest_tracker_key"], key)
-            self.assertNotIn("vr_teleop.tracker_key", snapshot["advanced"])
+            self.assertNotIn("vr_teleop.tracker_key", snapshot["values"])
+            self.assertNotIn("teleop.tracker_key", snapshot["values"])
 
     def test_mantis_channels_must_be_two_nonempty_distinct_names(self) -> None:
         self.assertEqual(

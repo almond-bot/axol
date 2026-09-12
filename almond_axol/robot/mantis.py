@@ -33,8 +33,9 @@ from collections.abc import Callable
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
+from ..constants import ARM_JOINTS
 from ..motor import CanBus, ControlMode, Joint, Motor, MotorError
+from ..settings import SHARED
 from .axol import (
     GRIPPER_TRAVEL,
     _await_all_hardware_actions,
@@ -333,18 +334,37 @@ class Mantis(RobotBase):
     Args:
         config:        Reused for the per-side gripper POSITION_FORCE tuning
                        (``ArmConfig.gripper``); everything else is ignored.
+                       ``None`` (default) loads the robot's shared settings
+                       (``~/.almond/settings.json``, see
+                       :mod:`almond_axol.settings`) over the defaults.
         left_channel:  SocketCAN interface of the left gripper, or ``None`` to omit.
+                       Defaults to the shared ``mantis.left_channel`` setting
+                       (``can_mantis_l`` when unset).
         right_channel: SocketCAN interface of the right gripper, or ``None`` to omit.
+                       Defaults to the shared ``mantis.right_channel`` setting
+                       (``can_mantis_r`` when unset).
     """
 
     def __init__(
         self,
-        config: AxolConfig = AxolConfig(),
-        left_channel: str | None = CAN_MANTIS_LEFT,
-        right_channel: str | None = CAN_MANTIS_RIGHT,
+        config: AxolConfig | None = None,
+        left_channel: str | None = SHARED,
+        right_channel: str | None = SHARED,
         *,
         defer_gripper_enable: bool = False,
     ) -> None:
+        if config is None or left_channel is SHARED or right_channel is SHARED:
+            from ..settings import load_store, shared_axol_config
+
+            store = load_store()
+            if config is None:
+                config = shared_axol_config(store)
+            if left_channel is SHARED or right_channel is SHARED:
+                shared_left, shared_right = store.mantis_can_channels()
+                if left_channel is SHARED:
+                    left_channel = shared_left
+                if right_channel is SHARED:
+                    right_channel = shared_right
         left_channel = (
             str(left_channel).strip() if left_channel is not None else None
         ) or None

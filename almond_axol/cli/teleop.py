@@ -15,6 +15,11 @@ field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
     axol teleop --jelly.enabled true                   # Jelly (base + lift)
     axol teleop --jelly_only                           # drive just Jelly, arms untouched
     axol teleop --config_path my_teleop.json          # whole-config file
+    axol teleop --no_settings                          # ignore ~/.almond/settings.json
+
+The robot's shared settings file (``~/.almond/settings.json``, the one the
+control panel edits) is applied by default beneath the config file and the
+flags, so a direct run uses the same values as a panel-launched one.
 """
 
 import asyncio
@@ -62,14 +67,19 @@ def mantis_rig_channels(cfg: TeleopCmdConfig) -> tuple[str | None, str | None]:
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a VR teleop session."""
     normalized_argv = normalize_bool_flags(argv, "sim", "mantis", "jelly_only")
-    cfg = parse(TeleopCmdConfig, normalized_argv)
+    # The robot's shared settings (~/.almond/settings.json, the control
+    # panel's file) sit beneath config-file/CLI overrides — see parse().
+    cfg = parse(TeleopCmdConfig, normalized_argv, settings_op="teleop")
     if cfg.mantis:
-        # Inherit the host's saved rig CAN channel map (Settings → Mantis),
-        # below config-file/CLI overrides — same map the control panel uses.
-        from .mantis_bridge import load_direct_mantis_fallback
-
-        fallback, _ = load_direct_mantis_fallback(collection=False)
-        cfg = parse(TeleopCmdConfig, normalized_argv, fallback_overlay=fallback)
+        # A Mantis run inherits the host's saved rig CAN channel map
+        # (Settings → Mantis) instead of the Axol arm map — the same
+        # conditional fold the control panel applies.
+        cfg = parse(
+            TeleopCmdConfig,
+            normalized_argv,
+            settings_op="teleop",
+            settings_args={"mantis": True},
+        )
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop the INFO status lines.

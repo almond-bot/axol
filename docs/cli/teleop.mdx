@@ -58,6 +58,7 @@ Runs on the **real robot by default**; pass `--sim` for the browser visualizer. 
 | `--vr_server.port INT` | Port for the VR teleop WebSocket server (default: 8000). The TLS cert/key paths live here too (`--vr_server.certfile`, `--vr_server.keyfile`); `null` (the default) uses the auto-generated cert. |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 | `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. See [Command configuration](/cli/configuration). |
+| `--settings_path PATH` / `--no_settings` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it (`~/.almond/settings.json` applies by default, beneath `--config_path` and the flags). |
 
 To verify the effective loop rather than trusting its console log, leave the [Diagnostics dashboard](/guides/diagnostics-dashboard#control-loop-and-can-timing) open while teleop runs. Its passive CAN timing graph measures command/feedback rate, jitter, response latency, and missed 240 Hz deadlines with kernel timestamps.
 
@@ -76,6 +77,7 @@ axol teleop --jelly_only                            # drive only Jelly (no arms,
 axol teleop --cameras "{overhead: 41234567, left_arm: 41234568, right_arm: 41234569}"
 axol teleop --cameras "{overhead: 41234567}"      # stereo overhead auto-detected, per-lens
 axol teleop --config_path my_teleop.json          # whole-config file
+axol teleop --no_settings                          # ignore ~/.almond/settings.json (panel settings)
 ```
 
 ## Camera streaming to the headset

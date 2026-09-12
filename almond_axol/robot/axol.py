@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable, Iterable
 import can
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..constants import ARM_JOINTS
 from ..motor import (
     CanBus,
     ControlMode,
@@ -26,6 +26,7 @@ from ..motor import (
     MotorGains,
     MotorStatus,
 )
+from ..settings import SHARED
 from ..utils.paths import almond_path
 from ..utils.state_files import secure_atomic_write_json, secure_read_text
 from .base import RobotBase, mark_hardware_cleanup_uncertain
@@ -1909,7 +1910,10 @@ class Axol(RobotBase):
     Args:
         config:        Dual-arm gains config. Left and right arm gains are specified
                        independently; the right arm defaults to the left with gravity
-                       mirrored for shoulder_2 and elbow.
+                       mirrored for shoulder_2 and elbow. ``None`` (default)
+                       loads the robot's shared settings — the same
+                       ``~/.almond/settings.json`` the control panel and CLI
+                       use — over the calibrated defaults.
         left_channel:  SocketCAN interface name for the left arm.
         right_channel: SocketCAN interface name for the right arm.
         left_joints:   Joints with a motor on the left bus (default: the full arm).
@@ -1918,9 +1922,9 @@ class Axol(RobotBase):
 
     def __init__(
         self,
-        config: AxolConfig = AxolConfig(),
-        left_channel: str | None = CAN_LEFT,
-        right_channel: str | None = CAN_RIGHT,
+        config: AxolConfig | None = None,
+        left_channel: str | None = SHARED,
+        right_channel: str | None = SHARED,
         left_joints: Iterable[Joint] | None = None,
         right_joints: Iterable[Joint] | None = None,
     ) -> None:
@@ -1929,15 +1933,42 @@ class Axol(RobotBase):
         CAN buses and motors are created but not started; call ``enable()``
         or use the class as an async context manager to bring up hardware.
 
+        With no arguments the robot is configured exactly as the control
+        panel and the ``axol`` CLI would configure it: ``config`` and the
+        channels come from the shared settings file
+        (``~/.almond/settings.json``; see :mod:`almond_axol.settings`), so
+        stiffness, per-joint gains, link masses and CAN adapters saved once
+        apply here too. Pass any argument explicitly to override it.
+
         Args:
-            config:        Per-joint gains, friction parameters, and gripper config.
-            left_channel:  SocketCAN interface name for the left arm, or ``None`` to omit it.
-            right_channel: SocketCAN interface name for the right arm, or ``None`` to omit it.
+            config:        Per-joint gains, friction parameters, and gripper
+                           config. ``None`` loads the shared settings over the
+                           calibrated defaults (:func:`almond_axol.settings.
+                           shared_axol_config`); ``AxolConfig()`` is the bare
+                           calibrated defaults.
+            left_channel:  SocketCAN interface name for the left arm, or ``None``
+                           to omit it. Defaults to the shared
+                           ``robot.left_channel`` setting.
+            right_channel: SocketCAN interface name for the right arm, or ``None``
+                           to omit it. Defaults to the shared
+                           ``robot.right_channel`` setting.
             left_joints:   Restrict the left arm to the joints actually on its
                            bus (a partial bench arm); ``None`` is the full arm.
                            See :class:`AxolArm`.
             right_joints:  Same for the right arm.
         """
+        if config is None or left_channel is SHARED or right_channel is SHARED:
+            from ..settings import load_store, shared_axol_config
+
+            store = load_store()
+            if config is None:
+                config = shared_axol_config(store)
+            if left_channel is SHARED or right_channel is SHARED:
+                shared_left, shared_right = store.can_channels()
+                if left_channel is SHARED:
+                    left_channel = shared_left
+                if right_channel is SHARED:
+                    right_channel = shared_right
         if left_channel is None and right_channel is None:
             raise ValueError(
                 "At least one of left_channel or right_channel must be specified."

@@ -9,6 +9,11 @@ so every (possibly nested) field is reachable two ways:
   ``--robot_config.cameras "{overhead: {serial: 41234567}}"``.
 - A whole-config file: ``--config_path run.json`` (JSON or YAML), with
   CLI overrides layered on top.
+- The robot's shared settings file (``~/.almond/settings.json``, the one
+  the control panel edits) — read by default and layered beneath the
+  config file and the flags, so a value saved once in the panel applies
+  to direct CLI runs too. ``--no_settings`` skips it; ``--settings_path``
+  reads another file. See :mod:`almond_axol.settings`.
 
 This module provides the pieces shared by all five commands:
 
@@ -20,7 +25,8 @@ This module provides the pieces shared by all five commands:
   defaults (see :class:`AxolConfig`'s seven differently-defaulted
   ``JointConfig`` fields). Seeding the encoded default config as the base
   of draccus's ``mergedeep`` step restores correct partial-override
-  semantics (defaults -> ``--config_path`` file -> CLI flags).
+  semantics (defaults -> shared settings -> ``--config_path`` file -> CLI
+  flags).
 - :func:`register_literal` plus the :data:`LogLevel` / :data:`PolicyType` /
   :data:`AggregateFn` aliases it registers with draccus so it validates
   choices the way ``argparse``'s ``choices=`` used to. ``lerobot`` config
@@ -44,6 +50,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import MISSING, dataclass, field
+from pathlib import Path
 from typing import Any, Literal, TypeVar, get_args
 
 import draccus
@@ -212,6 +219,10 @@ def _default_overlay(config_class: type) -> dict[str, Any]:
     return overlay
 
 
+SETTINGS_PATH_ARG = "settings_path"
+NO_SETTINGS_ARG = "no_settings"
+
+
 class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore[misc]
     """``draccus.ArgumentParser`` that seeds the full default config.
 
@@ -221,11 +232,56 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
     ``--axol.left.elbow.kp 200`` keeps the elbow's other per-joint
     defaults instead of demanding the whole ``JointConfig``. Kept faithful
     to draccus 0.11.6's own ``_postprocessing`` (pinned in pyproject).
+
+    With ``settings_op`` set, the robot's shared settings file is folded in
+    directly above the defaults (see :mod:`almond_axol.settings`), and two
+    extra options control it: ``--settings_path PATH`` reads a different
+    settings file and ``--no_settings`` skips it. Both are consumed here and
+    never reach the config dataclass.
     """
 
-    def __init__(self, *args: Any, overlay: dict[str, Any], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        overlay: dict[str, Any],
+        fallback: dict[str, Any] | None = None,
+        settings_op: str | None = None,
+        settings_args: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         self._overlay = overlay
+        self._fallback = fallback or {}
+        self._settings_op = settings_op
+        self._settings_args = settings_args
         super().__init__(*args, **kwargs)
+        if settings_op is not None:
+            self.parser.add_argument(
+                f"--{SETTINGS_PATH_ARG}",
+                type=str,
+                metavar="PATH",
+                help=(
+                    "Shared robot settings file to apply beneath --config_path "
+                    "and the flags (default: ~/.almond/settings.json, the file "
+                    "the control panel edits)."
+                ),
+            )
+            self.parser.add_argument(
+                f"--{NO_SETTINGS_ARG}",
+                action="store_true",
+                help="Ignore the shared robot settings file; use built-in defaults.",
+            )
+
+    def _shared_settings_overlay(
+        self, settings_path: str | None, disabled: bool
+    ) -> dict[str, Any]:
+        if self._settings_op is None or disabled:
+            return {}
+        from ..settings import load_store, shared_overlay
+
+        if settings_path is not None and not Path(settings_path).is_file():
+            self.parser.error(f"--{SETTINGS_PATH_ARG}: no such file: {settings_path}")
+        store = load_store(settings_path)
+        return shared_overlay(self._settings_op, self._settings_args, store=store)
 
     def _postprocessing(self, parsed_args: Any) -> Any:
         import warnings
@@ -234,6 +290,11 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
         from draccus.parsers import decoding
 
         parsed_arg_values = vars(parsed_args)
+        # The settings selectors are ours, not the config's: pull them out
+        # before draccus deflattens the namespace into the dataclass.
+        settings_path = parsed_arg_values.pop(SETTINGS_PATH_ARG, None)
+        no_settings = bool(parsed_arg_values.pop(NO_SETTINGS_ARG, False))
+        shared = self._shared_settings_overlay(settings_path, no_settings)
         for key in parsed_arg_values:
             parsed_value = cfgparsing.parse_string(parsed_arg_values[key])
             if isinstance(parsed_value, str) and parsed_value.startswith("include"):
@@ -262,8 +323,11 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
             file_args = {}
 
         deflat_d = utils.deflatten(parsed_arg_values, sep=".")
-        # Precedence (later wins): defaults/host fallback -> config file -> CLI.
-        deflat_d = mergedeep.merge({}, self._overlay, file_args, deflat_d)
+        # Precedence (later wins): defaults -> shared settings file -> caller
+        # fallback -> config file -> CLI.
+        deflat_d = mergedeep.merge(
+            {}, self._overlay, shared, self._fallback, file_args, deflat_d
+        )
         return decoding.decode(self.config_class, deflat_d)
 
 
@@ -369,7 +433,9 @@ def _condense_help(ap: argparse.ArgumentParser) -> None:
         "still overridable from the CLI — e.g. per-joint gains like "
         "--axol.left.elbow.kp 60 (or --robot_config.axol_config.* for "
         "collect-data / run-policy) — or load a whole-config file with "
-        "--config_path. Full reference: "
+        "--config_path. The robot's shared settings file "
+        "(~/.almond/settings.json, edited by the control panel) is applied "
+        "beneath both by default; --no_settings skips it. Full reference: "
         "https://docs.almond.bot/cli/configuration"
     )
 
@@ -427,23 +493,41 @@ def parse(
     argv: list[str],
     *,
     fallback_overlay: dict[str, Any] | None = None,
+    settings_op: str | None = None,
+    settings_args: dict[str, Any] | None = None,
 ) -> T:
     """Parse ``argv`` into ``config_class`` with full-default overlay.
 
     draccus auto-adds ``--config_path PATH`` for a whole-config JSON/YAML
     file; every nested field is also overridable via ``--dotted.path
     VALUE``. Unspecified fields fall back to the dataclass defaults.
-    ``fallback_overlay`` adds host-persisted defaults above the dataclass but
-    below both config files and explicit flags.
+
+    ``settings_op`` names the operation (a :data:`~almond_axol.serve.commands.
+    COMMANDS` id such as ``"teleop"``) whose shared-settings mapping applies:
+    the robot's ``~/.almond/settings.json`` — the file the control panel
+    edits — is then folded in directly above the dataclass defaults, so a
+    direct CLI run uses the same values as a panel-launched one. It also adds
+    ``--settings_path PATH`` (read another settings file) and
+    ``--no_settings`` (built-in defaults only). ``settings_args`` are the
+    request-style args that steer the fold (``mantis`` / ``mantis_source``;
+    see :func:`almond_axol.settings.shared_overlay`). ``fallback_overlay``
+    adds caller-supplied defaults above the shared settings but below both
+    config files and explicit flags.
+
+    Precedence (later wins): defaults → shared settings → ``fallback_overlay``
+    → ``--config_path`` file → CLI flags.
 
     Deeply-nested per-joint gains and draccus's per-dataclass config-file
     includes are hidden from ``--help`` (but remain fully overridable) so
     the listing stays scannable; an epilog points at the full reference.
     """
-    overlay = mergedeep.merge(
-        {}, _default_overlay(config_class), fallback_overlay or {}
+    parser = _OverlayArgumentParser(
+        config_class=config_class,
+        overlay=_default_overlay(config_class),
+        fallback=fallback_overlay,
+        settings_op=settings_op,
+        settings_args=settings_args,
     )
-    parser = _OverlayArgumentParser(config_class=config_class, overlay=overlay)
     _condense_help(parser.parser)
     try:
         return parser.parse_args(argv)

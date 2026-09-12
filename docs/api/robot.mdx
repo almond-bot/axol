@@ -14,15 +14,34 @@ from almond_axol.rt import RtAxol
 
 ```python
 Axol(
-    config: AxolConfig = AxolConfig(),
-    left_channel: str | None = "can_alm_axol_l",
-    right_channel: str | None = "can_alm_axol_r",
+    config: AxolConfig | None = None,        # None → the robot's shared settings
+    left_channel: str | None = SHARED,       # SHARED → the robot.left_channel setting
+    right_channel: str | None = SHARED,      # SHARED → the robot.right_channel setting
     left_joints: Iterable[Joint] | None = None,
     right_joints: Iterable[Joint] | None = None,
 )
 ```
 
 Pass `left_channel=None` or `right_channel=None` to operate a single arm. Both arms are brought up concurrently on `__aenter__`.
+
+### Shared settings
+
+`Axol()` with no arguments is configured exactly as the [control panel](/guides/control-panel#settings) and `axol teleop` configure the robot: `config` is built from the robot's shared settings file — `~/.almond/settings.json`, the file the panel edits — over the calibrated defaults, and the CAN channels come from its `robot.left_channel` / `robot.right_channel` values. Stiffness, per-joint gains, link masses and centres of mass, gripper limits and `has_gripper` saved once therefore drive an SDK session too (so, for example, SDK gravity compensation runs the same gravity model as the panel's). The file's `axol` section *is* an `AxolConfig` (same field names, nested the same way), so what you read in `settings.json` is what `Axol().config` holds; see the [Settings File](/guides/control-panel-settings) page for the layout.
+
+Every argument overrides its setting: `Axol(config=AxolConfig())` runs the bare calibrated defaults, `Axol(right_channel=None)` disables the right arm regardless of the file. The same rule applies to `Mantis` (its channels come from `mantis.left_channel` / `mantis.right_channel`), [`Jelly`](#jelly) (`jelly.*`), and [`VRTeleop`](/api/teleop) (`teleop.*`, `kinematics.*`, `vr_server.*`).
+
+The helpers behind this live in `almond_axol.settings` if you need them directly:
+
+```python
+from almond_axol.settings import load_store, shared_axol_config, shared_config, shared_overlay
+from almond_axol.robot import AxolConfig
+from almond_axol.teleop.config import VRTeleopConfig
+
+store = load_store()                          # ~/.almond/settings.json (or load_store(path))
+config = shared_axol_config(store)            # AxolConfig as the panel would run it
+teleop = shared_config(VRTeleopConfig, "teleop", "teleop", store=store)
+overlay = shared_overlay("gravity-comp", store=store)   # nested dict of every value that applies to an op
+```
 
 `left_joints` / `right_joints` restrict an arm to the motors actually on its bus, for a partial bench arm (e.g. `{Joint.WRIST_2, Joint.WRIST_3, Joint.GRIPPER}` for a wrist assembly). Absent joints are never constructed or enabled; every `(8,)` array keeps its Joint-enum shape, with absent joints reading `0.0` (the rest pose) and their commands ignored.
 
@@ -139,7 +158,8 @@ contains its wheel, lift, heading-hold, and command-safety settings.
 ```python
 from almond_axol.robot import Jelly, JellyConfig
 
-jelly = Jelly(JellyConfig(enabled=True))
+jelly = Jelly()                            # jelly.* from the shared settings file
+jelly = Jelly(JellyConfig(enabled=True))   # explicit config overrides it
 ```
 
 ## `Sim`
