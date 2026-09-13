@@ -145,6 +145,11 @@ class AxolBusOwnershipTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_quiet_bus_calls_go_to_the_hardware(self) -> None:
         pair = (np.zeros(8, dtype=np.float32), None)
+        # A MagicMock bus reports every attribute truthy; after connect() a
+        # real bus is no longer ``never_opened``, so say so — the torque-off
+        # below must reach the hardware. (AxolEnableRollbackBeforeCoreTest
+        # covers the never-opened case on real CanBus objects.)
+        self.hardware._left_bus.never_opened = False
         with (
             patch.object(self.hardware, "connect", AsyncMock()) as connect,
             patch.object(self.hardware, "get_positions", AsyncMock(return_value=pair)),
@@ -254,6 +259,46 @@ class AxolEnableBusHandoffTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(_LinkStartFailed):
                 await self.robot.enable()
         disconnect.assert_awaited_once()
+
+
+class AxolEnableRollbackBeforeCoreTest(unittest.IsolatedAsyncioTestCase):
+    """``enable()`` failing before its core starts must not touch the motors.
+
+    On real, never-opened ``CanBus`` objects and with the hardware's
+    ``disable`` *unpatched*: the rollback, and the ``disable()`` a context
+    manager or teleop teardown issues afterwards, used to run the classic
+    torque-off over the unopened bus. That raised ``CanOperationError`` from
+    cleanup, which teleop escalated to ``HardwareCleanupError`` and ``axol
+    serve`` to a safety lockout — for a robot nobody had sent a frame to.
+    """
+
+    def setUp(self) -> None:
+        self.enterContext(patch("almond_axol.rt.robot.RtLink"))
+        self.robot = Axol(left_channel="can0", right_channel=None)
+        self.hardware = self.robot._robot
+        self.robot._link.start = AsyncMock(side_effect=_LinkStartFailed())
+
+    async def test_rollback_and_teardown_send_nothing_on_an_unopened_bus(
+        self,
+    ) -> None:
+        self.assertTrue(self.hardware._left_bus.never_opened)
+        with self.assertNoLogs("almond_axol.rt.robot", level="ERROR"):
+            with self.assertRaises(_LinkStartFailed):
+                await self.robot.enable()
+            # The follow-up teardown (``async with`` / Teleop.disable) must
+            # be a clean no-op too, not a second failure.
+            await self.robot.disable()
+        self.assertTrue(self.hardware._left_bus.never_opened)
+
+    async def test_bus_that_was_opened_still_gets_the_classic_torque_off(
+        self,
+    ) -> None:
+        bus = self.hardware._left_bus
+        bus._state = "closed"  # used earlier in this process, then closed
+        self.assertFalse(bus.never_opened)
+        with patch.object(self.hardware, "disable", AsyncMock()) as disable:
+            await self.robot.disable()
+        disable.assert_awaited_once()
 
 
 class MantisApiTest(unittest.TestCase):

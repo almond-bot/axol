@@ -71,7 +71,8 @@ class ProvisionSafetyTest(unittest.TestCase):
             self.assertIn((["rm", "-f", str(unsafe_unit)], {"check": True}), calls)
             self.assertNotIn((["rm", "-f", str(safe_unit)], {"check": True}), calls)
             self.assertEqual(safe_unit.read_text(), safe_content)
-            self.assertIn("Run `sudo axol can.setup`", output.getvalue())
+            self.assertIn("Run `axol can.setup`", output.getvalue())
+            self.assertNotIn("sudo axol", output.getvalue())
 
     def test_safe_cron_and_unit_are_left_untouched_without_warning(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
