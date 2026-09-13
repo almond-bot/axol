@@ -186,7 +186,7 @@ def _neutralize_legacy_can_root_execution() -> bool:
     if scrubbed:
         print(
             "WARNING: Removed legacy root cron/systemd references to "
-            "operator-writable CAN scripts. Run `sudo axol can.setup` with "
+            "operator-writable CAN scripts. Run `axol can.setup` with "
             "the adapters attached to restore boot/hotplug CAN bring-up from "
             "root-owned /etc/almond-axol/can scripts."
         )
