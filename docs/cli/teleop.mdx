@@ -28,12 +28,12 @@ Runs on the **real robot by default**; pass `--sim` for the browser visualizer. 
 |---|---|
 | `--sim` | Use the software visualizer instead of the real robot. Bare `--sim` works (or `--sim true`). Omit to run on real hardware (the default). |
 | `--mantis` | Mantis teleop — **grippers only, by design**: the rig triggers drive the two handheld grippers over CAN on the separately persisted Mantis channel mapping (default `can_mantis_l/r`, inherited from **Mantis settings**), and nothing else starts — no tracking, VR server, tracker bridge, cameras, or transforms. Both triggers must read live and released before the grippers enable (each opens fully to find its hard stop); a stale trigger stream stops the run. Tracked Mantis runs belong to [`collect-data --mantis`](/cli/collect-data), which owns the pose source and bridge. Mutually exclusive with `--sim`. |
-| `--jelly_only` | Drive **only** [Jelly](#jelly) — the arms are never constructed and the Axol hub CAN channels are never opened, so no arm hardware need be connected. Jelly is implied (`--jelly.enabled` isn't consulted). Mutually exclusive with `--sim`. |
+| `--arms BOOL` | Drive the Axol arms (default: `true`; the control panel's **Axol arms** switch, Robot tab). `false` drives **only** [Jelly](#jelly) — the arms are never constructed and the Axol hub CAN channels are never opened, so no arm hardware need be connected. The arms are also skipped automatically when their CAN interfaces are absent while Jelly's are present. Sim needs the arms on. |
 | `--left_channel <ch\|null>` | CAN channel for the left arm; `null` disables it. Default: `CAN_LEFT`. |
 | `--right_channel <ch\|null>` | CAN channel for the right arm; `null` disables it. Default: `CAN_RIGHT`. |
-| `--jelly.enabled BOOL` | This robot has [Jelly](#jelly) (x-drive base + telescoping lift). When set, the headset thumbsticks drive the base/lift (operator mobility only — never recorded, never policy-controlled). Default: `false`. |
+| `--jelly.wheels BOOL` | Drive [Jelly](#jelly)'s wheels when their CAN interface (`--jelly.channel`) is attached (the control panel's **Jelly wheels** switch). `false` leaves attached wheels cold. Default: `true`. |
 | `--jelly.channel <ch\|null>` | SocketCAN interface for Jelly's wheel motors; `null` disables the wheels (lift-only). Default: `can_alm_axol_b`, pinned by [`can.setup`](/cli/can-setup). |
-| `--jelly.lift BOOL` | The telescoping lift is present (the jelly_legs controller, on its own chest bus or sharing the wheel bus). The lift bus being down only disables the lift with a warning — Jelly still drives. Default: `true`. |
+| `--jelly.lift BOOL` | Run the telescoping lift (the jelly_legs controller, on its own chest bus or sharing the wheel bus) when its bus is attached (the control panel's **Jelly lift** switch). `false` leaves an attached lift cold; a lift bus that is down at start only disables the lift with a warning — Jelly still drives. Default: `true`. |
 | `--jelly.lift_channel <ch\|null>` | SocketCAN interface carrying the lift controller. Default `null` follows the wiring [`can.setup`](/cli/can-setup) found: `can_alm_axol_c` when that chest bus exists, otherwise the wheel bus `can_alm_axol_b` the lift shares with the motors. |
 | `--jelly.imu BOOL` | Feed the carrier board's IMU into Jelly's straight-line heading hold as its yaw reference (independent of the cameras). Default: `false`. |
 | `--jelly.<field> VALUE` | Any other Jelly tunable — peak wheel speed (`--jelly.max_speed`), turn rate, command slew, stick deadzone, park-hold stiffness, … The full set is the `JellyConfig` dataclass, and each field also appears under **Advanced → Jelly** in the [control panel](/guides/control-panel#settings). |
@@ -72,8 +72,8 @@ axol teleop --teleop.rotation_multiplier 2.0      # scale hand rotation 2x
 axol teleop --sim --teleop.absolute_mode true     # generic absolute-mapping demo only
 axol teleop --mantis                              # Mantis rigs: triggers → grippers, no tracking
 axol teleop --left_channel null                   # disable the left arm
-axol teleop --jelly.enabled true                   # drive Jelly from the thumbsticks
-axol teleop --jelly_only                            # drive only Jelly (no arms, no hub)
+axol teleop --arms false                           # drive only Jelly (no arms, no hub)
+axol teleop --jelly.wheels false                   # leave attached wheels cold (lift still runs)
 axol teleop --cameras "{overhead: 41234567, left_arm: 41234568, right_arm: 41234569}"
 axol teleop --cameras "{overhead: 41234567}"      # stereo overhead auto-detected, per-lens
 axol teleop --config_path my_teleop.json          # whole-config file
@@ -94,9 +94,9 @@ For low-latency encode the NVENC/VIC engine clocks must be pinned to their maxim
 
 ## Jelly
 
-Robots fitted with **Jelly** (x-drive omni base + telescoping lift) let the operator drive the whole robot from the headset thumbsticks — left stick translates, right stick rotates, the stick clicks run the lift. Enable it with `--jelly.enabled true` (or the control panel's **Jelly** toggle); its parameters live in the nested `jelly` config (`--jelly.max_speed`, `--jelly.channel`, `--jelly.imu`, …). Jelly motion is **operator mobility only** — it's never recorded into a dataset and a policy never drives it.
+Robots fitted with **Jelly** (x-drive omni base + telescoping lift) let the operator drive the whole robot from the headset thumbsticks — left stick translates, right stick rotates, the stick clicks run the lift. Nothing needs enabling: Jelly is **inferred from the CAN devices attached** — the wheels are driven when their interface (`can_alm_axol_b`) exists, the lift when its bus does (`can_alm_axol_c`, or the shared wheel bus). [`can.setup`](/cli/can-setup) and the control panel's automatic CAN discovery pin those names. `--jelly.wheels false` / `--jelly.lift false` (the control panel's **Jelly wheels** / **Jelly lift** switches) keep attached hardware cold; the other parameters live in the nested `jelly` config (`--jelly.max_speed`, `--jelly.channel`, `--jelly.imu`, …). Jelly motion is **operator mobility only** — it's never recorded into a dataset and a policy never drives it.
 
-`--jelly_only` runs *just* Jelly: the arms are never constructed and the Axol hub CAN bus is never opened, so you can drive Jelly without the arm hardware connected. Jelly brings its own CAN interface up on start ([`can.setup`](/cli/can-setup) pins it as `can_alm_axol_b`), so no separate [`can.enable`](/cli/can-enable) step is needed. For the full control mapping see the [VR interface guide](/guides/vr-interface#jelly).
+`--arms false` runs *just* Jelly: the arms are never constructed and the Axol hub CAN bus is never opened, so you can drive Jelly without the arm hardware connected. The same happens on its own when the arm hub's interfaces are absent but Jelly's are present (a warning says so). Jelly brings its own CAN interface up on start, so no separate [`can.enable`](/cli/can-enable) step is needed. For the full control mapping see the [VR interface guide](/guides/vr-interface#jelly).
 
 <Note>
   This command takes its config via draccus, not fixed `argparse` flags. Field names use underscores, nested fields are dot-separated, `None` is `null`, and lists use `[a,b,c]` — see [Command configuration](/cli/configuration) for the full model.

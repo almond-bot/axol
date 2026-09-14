@@ -12,10 +12,16 @@ field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
     axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
     axol teleop --teleop.position_multiplier 2.0      # scale hand motion 2x
     axol teleop --left_channel null                   # disable the left arm
-    axol teleop --jelly.enabled true                   # Jelly (base + lift)
-    axol teleop --jelly_only                           # drive just Jelly, arms untouched
+    axol teleop --arms false                           # drive just Jelly, arms untouched
+    axol teleop --jelly.wheels false                   # leave attached wheels cold
     axol teleop --config_path my_teleop.json          # whole-config file
     axol teleop --no_settings                          # ignore ~/.almond/settings.json
+
+Jelly (x-drive base + telescoping lift) needs no enabling: the wheels are
+driven when their CAN interface (``can_alm_axol_b``) is present and the lift
+when its bus is, unless switched off with ``--jelly.wheels`` / ``--jelly.lift``
+(the control panel's Robot tab). Likewise the arms are skipped when their CAN
+interfaces are absent but Jelly's are present.
 
 The robot's shared settings file (``~/.almond/settings.json``, the one the
 control panel edits) is applied by default beneath the config file and the
@@ -31,6 +37,7 @@ from ..utils.network import local_ip
 from .config import TeleopCmdConfig, normalize_bool_flags, parse
 
 if TYPE_CHECKING:
+    from ..robot.jelly import JellyConfig
     from ..teleop import VRTeleop
 
 _logger = logging.getLogger(__name__)
@@ -45,10 +52,6 @@ def _prepare_mantis_teleop(cfg: TeleopCmdConfig) -> None:
     """
     if cfg.sim:
         raise ValueError("--mantis and --sim are mutually exclusive")
-    if cfg.jelly_only:
-        raise ValueError(
-            "--mantis drives the handheld rig and --jelly_only drives Jelly — pick one"
-        )
 
 
 def mantis_rig_channels(cfg: TeleopCmdConfig) -> tuple[str | None, str | None]:
@@ -66,7 +69,7 @@ def mantis_rig_channels(cfg: TeleopCmdConfig) -> tuple[str | None, str | None]:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a VR teleop session."""
-    normalized_argv = normalize_bool_flags(argv, "sim", "mantis", "jelly_only")
+    normalized_argv = normalize_bool_flags(argv, "sim", "mantis")
     # The robot's shared settings (~/.almond/settings.json, the control
     # panel's file) sit beneath config-file/CLI overrides — see parse().
     cfg = parse(TeleopCmdConfig, normalized_argv, settings_op="teleop")
@@ -347,20 +350,80 @@ def _wire_jelly_imu(cfg: TeleopCmdConfig, jelly: Any) -> Any | None:
         return None
 
 
-async def _run_jelly_only(cfg: TeleopCmdConfig) -> None:
+def _arm_channels_present(cfg: TeleopCmdConfig) -> bool:
+    """Whether any configured arm CAN interface exists on this host.
+
+    The Axol hub's channels are pinned to ``can_alm_axol_l`` / ``_r`` by
+    ``axol can.setup`` (or the control panel's CAN discovery), so an interface
+    existing under ``/sys/class/net`` is the hub being plugged in. A ``null``
+    channel is an arm deliberately disabled and never counts.
+    """
+    from ..robot.jelly import _iface_exists
+
+    return any(
+        channel is not None and _iface_exists(channel)
+        for channel in (cfg.left_channel, cfg.right_channel)
+    )
+
+
+def select_hardware(cfg: TeleopCmdConfig) -> tuple[bool, "JellyConfig | None"]:
+    """Decide what a session drives: ``(arms, jelly)``.
+
+    The hardware is inferred from the CAN interfaces present, gated by the
+    operator's switches (``arms``, ``jelly.wheels``, ``jelly.lift`` — the
+    control panel's Robot tab). ``jelly`` is the narrowed Jelly config
+    (:func:`~almond_axol.robot.jelly.detect_jelly`) or ``None`` when no
+    Jelly bus is attached. Sim always models the arms and never Jelly.
+
+    The arms are skipped (with a warning) when their interfaces are absent
+    but Jelly's are present — a Jelly-only robot, or a hub left unplugged.
+    With no Jelly attached the arms stay requested so the normal "CAN
+    interface not found" error from the Axol connection names the problem.
+    """
+    if cfg.sim:
+        if not cfg.arms:
+            raise ValueError(
+                "sim models the arms, so it needs --arms on (there is no Jelly "
+                "hardware model in the visualizer) — drop --sim or --arms false"
+            )
+        return True, None
+
+    from ..robot.jelly import detect_jelly
+
+    jelly = detect_jelly(cfg.jelly)
+    arms = cfg.arms
+    if arms and jelly is not None and not _arm_channels_present(cfg):
+        _logger.warning(
+            "teleop: no Axol arm CAN interface found (%s) — driving Jelly only",
+            ", ".join(c for c in (cfg.left_channel, cfg.right_channel) if c),
+        )
+        arms = False
+    if not arms and jelly is None:
+        raise ValueError(
+            "nothing to drive: the arms are switched off (--arms false) and no "
+            "Jelly CAN interface is attached (wheels: "
+            f"{cfg.jelly.channel or 'off'}, lift: "
+            f"{'on' if cfg.jelly.lift else 'off'}). Plug Jelly in (the control "
+            "panel pins its adapters; or run `axol can.setup`) or turn the arms "
+            "back on."
+        )
+    return arms, jelly
+
+
+async def _run_jelly_only(cfg: TeleopCmdConfig, jelly_cfg: "JellyConfig") -> None:
     """Drive only Jelly from the headset — the arms stay cold.
 
     No Axol construction, no IK, no arm CAN: just the VR server for the
     thumbstick stream and the :class:`~almond_axol.robot.jelly.Jelly`. The
     Jelly's control mapping applies unchanged (stick deadman, reset stop,
-    staleness timeout — see ``Jelly.apply_vr_frame``). Having Jelly is
-    implied, so ``--jelly.enabled`` is not consulted; the rest of the
-    ``jelly.*`` parameters (channel, speeds, imu, ...) apply as usual.
+    staleness timeout — see ``Jelly.apply_vr_frame``). ``jelly_cfg`` is the
+    config narrowed to the attached hardware (see :func:`select_hardware`);
+    the rest of the ``jelly.*`` parameters (speeds, imu, ...) apply as usual.
     """
     from ..robot.jelly import Jelly
     from ..vr import VRServer
 
-    jelly = Jelly(cfg.jelly)
+    jelly = Jelly(jelly_cfg)
     server = VRServer(cfg.vr_server)
     server.set_mode("teleop")
     # apply_vr_frame is thread-safe and stops on frame.reset itself; with no
@@ -399,13 +462,12 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         await run_grippers_only(left, right)
         return
 
-    if cfg.jelly_only:
-        if cfg.sim:
-            raise ValueError(
-                "Jelly-only teleop has no sim mode (there is no Jelly hardware "
-                "model in the visualizer) — drop --sim or --jelly_only"
-            )
-        await _run_jelly_only(cfg)
+    # What this session drives follows the CAN interfaces attached (and the
+    # operator's arms / wheels / lift switches) — nothing is enabled by hand.
+    arms, jelly_cfg = select_hardware(cfg)
+    if not arms:
+        assert jelly_cfg is not None  # select_hardware refuses "nothing"
+        await _run_jelly_only(cfg, jelly_cfg)
         return
 
     if cfg.sim:
@@ -421,14 +483,14 @@ async def _run(cfg: TeleopCmdConfig) -> None:
             max_accel=cfg.teleop.teleop_max_accel,
             record=cfg.teleop.record,
         )
-    # Jelly robots (--jelly.enabled true) get the base + lift driven by
-    # the headset thumbsticks; VRTeleop owns Jelly's lifecycle. Skipped in
-    # sim — there is no Jelly hardware model in the visualizer.
+    # A robot with Jelly attached gets the base + lift driven by the headset
+    # thumbsticks; VRTeleop owns Jelly's lifecycle. Never in sim — there is
+    # no Jelly hardware model in the visualizer.
     jelly = None
-    if cfg.jelly.enabled and not cfg.sim:
+    if jelly_cfg is not None:
         from ..robot.jelly import Jelly
 
-        jelly = Jelly(cfg.jelly)
+        jelly = Jelly(jelly_cfg)
     teleop = VRTeleop(
         robot,
         config=cfg.teleop,

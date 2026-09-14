@@ -76,7 +76,7 @@ class Schema:
 
 # Field keys whose label benefits from capitalization or units.
 _PRODUCT_LABELS = {
-    "jelly_only": "Jelly only",
+    "arms": "Axol arms",
     "mantis": "Mantis",
     "mantis_source": "Mantis tracking",
     "mantis_smooth_hz": "Mantis smoothing Hz",

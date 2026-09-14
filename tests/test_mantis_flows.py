@@ -163,14 +163,18 @@ class MantisFlowTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             teleop._prepare_mantis_teleop(TeleopCmdConfig(mantis=True, sim=True))
-        with self.assertRaisesRegex(ValueError, "pick one"):
-            teleop._prepare_mantis_teleop(TeleopCmdConfig(mantis=True, jelly_only=True))
+        # The arms switch is an Axol concern; Mantis drives its own rig buses
+        # regardless of it.
+        teleop._prepare_mantis_teleop(TeleopCmdConfig(mantis=True, arms=False))
 
     def test_mantis_collection_disables_inherited_powered_jelly(self) -> None:
         cfg = collect_data.CollectDataConfig(repo_id="test/repo", task="test")
         self.assertIsInstance(cfg.teleop_config, AxolVRTeleopConfig)
         assert isinstance(cfg.teleop_config, AxolVRTeleopConfig)
-        cfg.teleop_config.jelly.enabled = True
+        # Jelly is inferred from attached CAN devices; the wheels / lift
+        # switches default on, so a Mantis collection must force both off.
+        self.assertTrue(cfg.teleop_config.jelly.wheels)
+        self.assertTrue(cfg.teleop_config.jelly.lift)
         with (
             mock.patch(
                 "almond_axol.teleop.config.apply_mantis_teleop_profile"
@@ -181,7 +185,8 @@ class MantisFlowTest(unittest.TestCase):
         ):
             collect_data._apply_mantis_profile(cfg)
 
-        self.assertFalse(cfg.teleop_config.jelly.enabled)
+        self.assertFalse(cfg.teleop_config.jelly.wheels)
+        self.assertFalse(cfg.teleop_config.jelly.lift)
         apply_teleop.assert_called_once()
         apply_kinematics.assert_called_once()
 
