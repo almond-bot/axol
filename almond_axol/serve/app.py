@@ -45,10 +45,14 @@ from ..utils.sudo import prime_sudo
 from .commands import (
     COMMANDS,
     command_specs,
+    flag_default,
     flag_enabled,
+    flag_value,
     get_schema,
+    is_robot_free,
     normalize_boolean_args,
     operation_ids,
+    safety_flags,
 )
 from .manager import Session, SessionManager
 from .robot_link import STATE_ERROR, RobotLink, scoped_motor_faults
@@ -2536,7 +2540,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # A faulted motor (over-temp, stall, encoder error, unreachable, …)
             # must block every hardware operation — driving through a fault risks
             # the arm. A sim run never touches the motors, and a robot-free run
-            # (teleop's jelly_only) never touches the *arms*, so both stay allowed.
+            # (teleop with the arms switched off) never touches the *arms*, so
+            # both stay allowed.
             cmd = COMMANDS[req.op]
             try:
                 launch_args = normalize_boolean_args(
@@ -2555,12 +2560,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     status_code=400,
                 )
             mantis_mode = cmd.supports_mantis and requested_mantis
-            is_sim = cmd.sim_flag is not None and flag_enabled(
-                launch_args.get(cmd.sim_flag)
-            )
-            robot_free = is_sim or any(
-                flag_enabled(launch_args.get(flag)) for flag in cmd.robot_free_flags
-            )
+            launch_flags = {
+                flag: flag_value(launch_args.get(flag), flag_default(cmd, flag))
+                for flag in safety_flags(cmd)
+            }
+            robot_free = is_robot_free(cmd, launch_flags)
             hardware_profile = "mantis" if mantis_mode else "axol"
             needs_motor_survey = cmd.uses_can_bus and (
                 not robot_free or hardware_profile == "mantis"

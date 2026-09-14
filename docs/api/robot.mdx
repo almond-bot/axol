@@ -168,12 +168,20 @@ The Mantis rig (`almond_axol.robot.Mantis`) has the same shape: `Mantis(config, 
 
 `Jelly` controls the Jelly mobile base and telescoping lift. `JellyConfig`
 contains its wheel, lift, heading-hold, and command-safety settings.
+`detect_jelly` narrows a config to the Jelly hardware actually attached (the
+wheel bus `can_alm_axol_b`, the lift bus) and returns `None` when there is
+none — the same inference `axol teleop` and data collection use, so nothing
+is ever enabled by hand.
 
 ```python
-from almond_axol.robot import Jelly, JellyConfig
+from almond_axol.robot import Jelly, JellyConfig, detect_jelly
 
-jelly = Jelly()                            # jelly.* from the shared settings file
-jelly = Jelly(JellyConfig(enabled=True))   # explicit config overrides it
+jelly = Jelly()                              # jelly.* from the shared settings file
+jelly = Jelly(JellyConfig(max_speed=5.0))    # explicit config overrides it
+
+cfg = detect_jelly(JellyConfig())            # only the attached wheels / lift
+if cfg is not None:
+    jelly = Jelly(cfg)
 ```
 
 ## `Sim`

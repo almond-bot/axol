@@ -19,7 +19,7 @@ from unittest.mock import Mock, patch
 from almond_axol.constants import CAN_BASE, CAN_CHEST
 from almond_axol.robot import jelly as jelly_module
 from almond_axol.robot import lift as lift_module
-from almond_axol.robot.jelly import Jelly, JellyConfig, _pack_config
+from almond_axol.robot.jelly import Jelly, JellyConfig, _pack_config, detect_jelly
 from almond_axol.robot.lift import STOP, UP
 
 
@@ -205,6 +205,95 @@ class JellyLiftBusTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_lift_shares_the_wheel_bus_without_a_chest_bus(self) -> None:
         self.assertEqual(await self._enable_lift_only((CAN_BASE,)), CAN_BASE)
+
+
+class DetectJellyTest(unittest.TestCase):
+    """Jelly is inferred from the CAN interfaces attached, not enabled by hand.
+
+    ``detect_jelly`` narrows the config to the wheel / lift buses that exist
+    under ``/sys/class/net``; the ``wheels`` / ``lift`` switches (the control
+    panel's Robot tab) are the opt-out for attached hardware.
+    """
+
+    def _detect(
+        self, present: tuple[str, ...], cfg: JellyConfig | None = None
+    ) -> JellyConfig | None:
+        with tempfile.TemporaryDirectory() as directory:
+            for name in present:
+                (Path(directory) / name).mkdir()
+            with (
+                patch.object(lift_module, "_SYS_NET", Path(directory)),
+                patch.object(jelly_module, "_SYS_NET", Path(directory)),
+            ):
+                return detect_jelly(cfg or JellyConfig())
+
+    def test_defaults_use_attached_hardware(self) -> None:
+        self.assertTrue(JellyConfig().wheels)
+        self.assertTrue(JellyConfig().lift)
+        self.assertFalse(hasattr(JellyConfig(), "enabled"))
+
+    def test_no_jelly_bus_means_no_jelly(self) -> None:
+        self.assertIsNone(self._detect(()))
+        # Arm-hub interfaces alone are not Jelly.
+        self.assertIsNone(self._detect(("can_alm_axol_l", "can_alm_axol_r")))
+
+    def test_wheel_bus_alone_drives_wheels_and_the_shared_bus_lift(self) -> None:
+        cfg = self._detect((CAN_BASE,))
+        assert cfg is not None
+        self.assertEqual(cfg.channel, CAN_BASE)
+        # The lift may share the wheel bus, so it resolves there and stays on;
+        # a missing board only disables the lift with a warning at enable.
+        self.assertTrue(cfg.lift)
+
+    def test_chest_bus_alone_is_a_lift_only_jelly(self) -> None:
+        cfg = self._detect((CAN_CHEST,))
+        assert cfg is not None
+        self.assertIsNone(cfg.channel)
+        self.assertTrue(cfg.lift)
+
+    def test_both_buses_keep_both(self) -> None:
+        cfg = self._detect((CAN_BASE, CAN_CHEST))
+        assert cfg is not None
+        self.assertEqual(cfg.channel, CAN_BASE)
+        self.assertTrue(cfg.lift)
+
+    def test_wheels_switch_off_keeps_attached_wheels_cold(self) -> None:
+        cfg = self._detect((CAN_BASE, CAN_CHEST), JellyConfig(wheels=False))
+        assert cfg is not None
+        self.assertIsNone(cfg.channel)
+        self.assertTrue(cfg.lift)
+
+    def test_lift_switch_off_keeps_attached_lift_cold(self) -> None:
+        cfg = self._detect((CAN_BASE, CAN_CHEST), JellyConfig(lift=False))
+        assert cfg is not None
+        self.assertEqual(cfg.channel, CAN_BASE)
+        self.assertFalse(cfg.lift)
+
+    def test_both_switches_off_is_no_jelly_even_when_attached(self) -> None:
+        self.assertIsNone(
+            self._detect((CAN_BASE, CAN_CHEST), JellyConfig(wheels=False, lift=False))
+        )
+
+    def test_explicit_channels_are_checked_as_given(self) -> None:
+        cfg = self._detect(("can7",), JellyConfig(channel="can7", lift_channel="can8"))
+        assert cfg is not None
+        self.assertEqual(cfg.channel, "can7")
+        self.assertFalse(cfg.lift)
+        # The pinned wheel bus is not the configured one, so no wheels; with
+        # the lift's auto channel resolving to that bus it is a lift-only Jelly.
+        cfg = self._detect((CAN_BASE,), JellyConfig(channel="can7"))
+        assert cfg is not None
+        self.assertIsNone(cfg.channel)
+        self.assertTrue(cfg.lift)
+        self.assertIsNone(
+            self._detect((CAN_BASE,), JellyConfig(channel="can7", lift=False))
+        )
+
+    def test_narrowing_preserves_the_other_parameters(self) -> None:
+        cfg = self._detect((CAN_BASE,), JellyConfig(max_speed=3.5, imu=True))
+        assert cfg is not None
+        self.assertEqual(cfg.max_speed, 3.5)
+        self.assertTrue(cfg.imu)
 
 
 class JellyRustWireTest(unittest.IsolatedAsyncioTestCase):

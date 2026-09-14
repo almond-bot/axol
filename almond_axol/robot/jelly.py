@@ -65,11 +65,20 @@ import os
 import struct
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 from ..constants import CAN_BASE
 from ..rt.link import find_binary
-from .lift import DOWN, JOG_SPEED, STOP, UP, Lift, LiftStatus
+from .lift import (
+    DOWN,
+    JOG_SPEED,
+    STOP,
+    UP,
+    Lift,
+    LiftStatus,
+    resolve_lift_channel,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -77,6 +86,10 @@ _logger = logging.getLogger(__name__)
 # ``axol can.setup`` names Jelly's adapter to this and includes it in the
 # @reboot bring-up alongside the arm channels.
 DEFAULT_CHANNEL = CAN_BASE
+
+# Where SocketCAN interfaces appear; a pinned Jelly bus existing here is how
+# detect_jelly() tells that the hardware is plugged in.
+_SYS_NET = Path("/sys/class/net")
 
 # Per-wheel spin-direction calibration: flip an entry to -1 if that wheel
 # drives the wrong way with everything else correct.
@@ -147,10 +160,16 @@ class JellyConfig:
     """Configuration for Jelly.
 
     Attributes:
-        enabled:         Whether this robot has Jelly. Only
-                         consulted by entry points that support both variants
-                         (``axol teleop``); code constructing a :class:`Jelly`
-                         directly ignores it.
+        wheels:          Use the wheels when their bus is attached. Whether a
+                         robot *has* Jelly is not configured anywhere: entry
+                         points (``axol teleop``, data collection) call
+                         :func:`detect_jelly`, which uses the wheels when this
+                         is on and ``channel`` exists as a SocketCAN interface,
+                         and the lift when ``lift`` is on and its bus exists.
+                         Turning this off keeps the wheels cold even with the
+                         bus attached. Code constructing a :class:`Jelly`
+                         directly ignores it (``channel=None`` is the
+                         wheel-less form there).
         channel:         SocketCAN interface for the wheel motors. ``None``
                          disables the wheels entirely (lift-only Jelly).
         max_speed:       Peak wheel speed (rad/s) at a full-deflection command.
@@ -206,11 +225,11 @@ class JellyConfig:
                          safety layer for a hung or dead host. Cannot be
                          disabled, and must be at least twice the command
                          period so a single late tick does not trip it.
-        lift:            Whether the telescoping lift is present (the
-                         jelly_legs board, see :mod:`almond_axol.robot.lift`).
-                         The lift bus being down at enable time only disables
-                         the lift with a warning, so Jelly can still drive
-                         without it.
+        lift:            Use the telescoping lift (the jelly_legs board, see
+                         :mod:`almond_axol.robot.lift`) when its bus is
+                         attached; off keeps it cold. The lift bus being down
+                         at enable time only disables the lift with a warning,
+                         so Jelly can still drive without it.
         lift_channel:    SocketCAN interface carrying the jelly_legs lift
                          controller. ``None`` (the default) follows the
                          wiring ``axol can.setup`` found: the chest bus
@@ -222,7 +241,7 @@ class JellyConfig:
                          full speed is ~650).
     """
 
-    enabled: bool = False
+    wheels: bool = True
     channel: str | None = DEFAULT_CHANNEL
     max_speed: float = 20.0
     turn_scale: float = 1.0
@@ -241,6 +260,34 @@ class JellyConfig:
     lift: bool = True
     lift_channel: str | None = None
     lift_speed: int = JOG_SPEED
+
+
+def detect_jelly(cfg: JellyConfig) -> JellyConfig | None:
+    """Narrow ``cfg`` to the Jelly hardware attached to this host.
+
+    Jelly is inferred from the CAN interfaces present rather than configured:
+    ``axol can.setup`` (and the control panel's automatic CAN discovery) pin
+    the wheel bus to ``can_alm_axol_b`` and the lift's own bus to
+    ``can_alm_axol_c``, so an interface existing under ``/sys/class/net`` is
+    the device being plugged in. The wheels are used when ``cfg.wheels`` is on
+    and ``cfg.channel`` exists; the lift when ``cfg.lift`` is on and its
+    resolved bus (:func:`~almond_axol.robot.lift.resolve_lift_channel`)
+    exists. The ``wheels`` / ``lift`` switches are the operator's opt-out for
+    attached hardware.
+
+    Returns a copy of ``cfg`` with the absent parts switched off
+    (``channel=None`` / ``lift=False``), or ``None`` when neither the wheels
+    nor the lift are available — this robot has no Jelly to drive.
+    """
+    wheels = cfg.wheels and cfg.channel is not None and _iface_exists(cfg.channel)
+    lift = cfg.lift and _iface_exists(resolve_lift_channel(cfg.lift_channel))
+    if not wheels and not lift:
+        return None
+    return replace(cfg, channel=cfg.channel if wheels else None, lift=lift)
+
+
+def _iface_exists(channel: str) -> bool:
+    return (_SYS_NET / channel).exists()
 
 
 def _pack_config(cfg: JellyConfig) -> bytes:

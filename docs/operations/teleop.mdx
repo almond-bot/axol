@@ -119,7 +119,7 @@ The bindings below are for Axol. (Mantis teleop uses no headset — the rig trig
 </Note>
 
 <Note>
-  On a robot with **Jelly**, the headset thumbsticks drive Jelly's base and lift during teleop — see [Jelly](/guides/vr-interface#jelly). Enable it with the control panel's **Jelly** toggle or [`axol teleop --jelly.enabled true`](/cli/teleop), or drive just Jelly with the arms left untouched using **Jelly only** / [`axol teleop --jelly_only`](/cli/teleop).
+  On a robot with **Jelly**, the headset thumbsticks drive Jelly's base and lift during teleop — see [Jelly](/guides/vr-interface#jelly). Nothing to enable: Jelly is inferred from the CAN devices attached, and the Robot tab's **Jelly wheels** / **Jelly lift** switches (or [`--jelly.wheels false` / `--jelly.lift false`](/cli/teleop)) opt attached hardware out. Drive just Jelly with the arms left untouched by switching **Axol arms** off (or [`axol teleop --arms false`](/cli/teleop)).
 </Note>
 
 ## Network tip
