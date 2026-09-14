@@ -57,22 +57,33 @@ _REQUEST_CANCEL_POLL_S = 0.05
 def _open_sdk_camera(name: str, spec: dict) -> object | None:
     """Open one ZED camera with the Python SDK, preferring 60 fps capture.
 
-    Returns the connected ``ZedCamera`` / ``ZedStereoCamera`` (or ``None`` if
-    the camera is absent). 60 fps halves frame staleness vs the GMSL 30 fps
-    default; cameras that reject it fall back to their default rate.
+    Returns the connected ``ZedSdkCamera`` / ``ZedSdkStereoCamera`` (or ``None``
+    if the camera is absent or the SDK isn't installed). 60 fps halves frame
+    staleness vs the GMSL 30 fps default; cameras that reject it fall back to
+    their default rate.
     """
-    from ..lerobot.camera.camera_zed import ZedCamera, ZedStereoCamera
-    from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS, ZedCameraConfig
+    from . import zed_sdk
+
+    sdk_error = zed_sdk.sdk_import_error()
+    if sdk_error is not None:
+        _logger.error(
+            "video relay: %s cannot be opened — the gst pipeline is unavailable "
+            "and the ZED SDK fallback is missing (%s). Run `axol zed.install` "
+            "(and `axol gst.install`) on the robot.",
+            name,
+            sdk_error,
+        )
+        return None
 
     serial = spec["serial"]
     resolution = spec.get("resolution") or "HD1200"
     stereo = bool(spec.get("stereo"))
-    dims = ZED_RESOLUTION_DIMS.get(resolution)
+    dims = zed_sdk.ZED_RESOLUTION_DIMS.get(resolution)
     width, height = dims if dims is not None else (None, None)
-    cls = ZedStereoCamera if stereo else ZedCamera
+    cls = zed_sdk.ZedSdkStereoCamera if stereo else zed_sdk.ZedSdkCamera
     for fps in (spec.get("fps", 60), None):
         cam = cls(
-            ZedCameraConfig(
+            zed_sdk.ZedSdkCameraConfig(
                 serial=serial,
                 fps=fps,
                 width=width,
@@ -609,7 +620,7 @@ def _relay_main(
     # Keep the camera objects alive for the relay's lifetime; ``sources`` maps
     # the per-track names the headset sees to a video source per camera/eye.
     # Prefer the GPU-resident gst pipeline; fall back to the SDK grab — a bare
-    # ZedCamera/eye, which WebRTCManager samples on its fixed-rate NVENC track.
+    # ZedSdkCamera/eye, which WebRTCManager samples on its fixed-rate NVENC track.
     owned: list[object] = []
     sources: dict[str, object] = {}
     writers: list[object] = []
@@ -872,6 +883,14 @@ class VideoRelayProcess:
                 Successfully exported sources appear in :attr:`raw_cameras` as
                 lightweight camera proxies.
         """
+        # Calibration files cached by another account (typically the root
+        # service) make every camera open in the child fail with CALIBRATION
+        # FILE NOT AVAILABLE; reconcile the cache here in the parent, where an
+        # interactive `axol teleop` can still escalate via sudo if needed.
+        from ..zed import ensure_calibration_readable
+
+        ensure_calibration_readable()
+
         ctx = multiprocessing.get_context("spawn")
         self._conn, child_conn = ctx.Pipe()
         # One Condition guards every source's shared-memory metadata; it must be

@@ -712,7 +712,9 @@ def attached_hub_state() -> AttachedHubState:
     """Atomic read-only USB snapshot for hosted discovery and inventory.
 
     Candidates are physical devices not covered by one exact, non-conflicting
-    generated profile claim. Their identities remain process-local and are
+    generated claim: an unclaimed dual-channel hub (Axol or Mantis) and an
+    unclaimed single-channel adapter (Jelly's wheel bus or the chest/lift bus)
+    both start hosted discovery. Their identities remain process-local and are
     used only to advance the API's opaque generation counter.
     """
     devices = _attached_supported_usb_devices()
@@ -800,9 +802,14 @@ def attached_hub_state() -> AttachedHubState:
             and _adapter_belongs_to_physical_device(adapter, physical_by_serial[serial])
         ):
             # More than two channels, duplicated IDs, or channels from another
-            # same-serial USB parent remain visibly unresolved. An exact raw
-            # single channel is a legitimate wheel/chest-class adapter and is
-            # intentionally not treated as a hub candidate.
+            # same-serial USB parent remain visibly unresolved.
+            candidates.append(identity)
+        elif serial not in single_claims or claim_counts[serial] != 1:
+            # An exact raw single channel is a wheel/chest-class adapter whose
+            # bus has not been identified yet (or whose serial is pinned to
+            # both roles): hosted discovery probes it for the Damiao wheel
+            # motors / jelly_legs lift controller. A cleanly pinned single
+            # adapter is settled hardware even while its Jelly is unpowered.
             candidates.append(identity)
 
     claim_signature = tuple(
@@ -947,10 +954,11 @@ def _stdin_is_tty() -> bool:
 def _configured_named_serial(name: str) -> str | None:
     """A single-channel adapter's serial as pinned by a previous setup.
 
-    Never auto-detected outside the interactive ``axol can.setup`` flow: a
-    single-channel candlelight adapter is indistinguishable from unrelated
-    hardware without probing, so only a serial the operator has already
-    confirmed — a live named interface or a written udev rule — counts here.
+    Never inferred from a bare scan: a single-channel candlelight adapter is
+    indistinguishable from unrelated hardware without probing its bus, so only
+    a serial an earlier setup (interactive ``axol can.setup`` or the hosted
+    discovery pass) has already pinned — a live named interface or a written
+    udev rule — counts here.
     """
     # Persisted rule authority wins over a transient live occupant. During a
     # stale hub rename, a dual-channel interface can temporarily own a
@@ -2564,15 +2572,95 @@ def _resolve_headless_hub_roles(
     return selected["axol"], selected["mantis"]
 
 
-def setup_detected_hubs() -> HeadlessHubSetupResult:
-    """Identify and persist attached Axol/Mantis hubs without prompting.
+# Which probe results claim each single-channel bus role. The shared
+# wheel+lift bus takes the wheel role: the lift driver reaches the jelly_legs
+# board through can_alm_axol_b when no chest interface exists.
+_SINGLE_ROLE_IDENTITIES: dict[str, frozenset[SingleBusIdentity]] = {
+    "wheels": frozenset({"wheels", "shared"}),
+    "chest": frozenset({"chest"}),
+}
 
-    Only positive CAN signatures may create or change a role. The complete USB
-    and two-channel netdev topology is snapshotted after driver enumeration and
-    checked again after every probe, before the first root-owned rule is
-    published. Duplicate physical devices reporting one serial, incomplete
-    pairs, silence, conflicting signatures, and duplicate fresh roles stay
-    unassigned for the interactive setup flow.
+
+def _resolve_headless_single_roles(
+    observed: dict[str, SingleBusIdentity | None],
+    *,
+    attached_serials: set[str],
+    configured_wheels: str | None,
+    configured_chest: str | None,
+) -> SingleBusRoles:
+    """Conservatively assign the wheel and chest/lift buses without prompts.
+
+    The single-channel counterpart of :func:`_resolve_headless_hub_roles`,
+    with the same rules the interactive :func:`_find_single_serials` applies
+    minus its operator prompts: a positive response wins over a stale pin; an
+    attached pin that stays silent keeps its role and is not replaced by a
+    second same-role responder; an unplugged pin is preserved; several fresh
+    adapters reporting one role stay unassigned. When the adapter *assigned*
+    the wheel role is one on which both the Damiao wheel motors and the
+    jelly_legs board answered, that is the shared wheel+lift bus, and a chest
+    pin no live board backs is dropped rather than steering the lift driver
+    onto an empty ``can_alm_axol_c`` later. A shared responder that does not
+    win the wheel role (a silent attached wheel pin keeps it) proves nothing
+    about the chest bus and leaves it alone, exactly as the interactive flow
+    does.
+    """
+    configured = {"wheels": configured_wheels, "chest": configured_chest}
+    selected: dict[str, str | None] = {"wheels": None, "chest": None}
+    lift_on_wheel_bus = False
+    # Wheels first: whether the lift rides the wheel bus is a property of the
+    # adapter that actually ends up as the wheel bus.
+    for role in ("wheels", "chest"):
+        if role == "chest":
+            wheels_serial = selected["wheels"]
+            lift_on_wheel_bus = (
+                wheels_serial is not None and observed.get(wheels_serial) == "shared"
+            )
+        wanted = _SINGLE_ROLE_IDENTITIES[role]
+        opposite = _SINGLE_ROLE_IDENTITIES["chest" if role == "wheels" else "wheels"]
+        matches = sorted(
+            serial for serial, found in observed.items() if found in wanted
+        )
+        previous = configured[role]
+        previous_observed = observed.get(previous) if previous is not None else None
+
+        if previous in matches:
+            selected[role] = previous
+        elif role == "chest" and lift_on_wheel_bus:
+            # The lift has provably moved onto the wheel bus; only a board
+            # that positively answered on its own adapter keeps a chest pin.
+            selected[role] = matches[0] if len(matches) == 1 else None
+        elif (
+            previous is not None
+            and previous in attached_serials
+            and previous_observed not in opposite
+        ):
+            selected[role] = previous
+        elif len(matches) == 1:
+            selected[role] = matches[0]
+        elif previous is not None and previous not in attached_serials:
+            selected[role] = previous
+
+    wheels, chest = selected["wheels"], selected["chest"]
+    if wheels is not None and wheels == chest:
+        raise RuntimeError(
+            f"Adapter {wheels} is pinned as both the wheel and chest buses and "
+            "no device answered to resolve it; power the Jelly hardware and "
+            "retry, or run `axol can.setup` to reassign it"
+        )
+    return SingleBusRoles(wheels, chest, lift_on_wheel_bus)
+
+
+def setup_detected_hubs() -> HeadlessHubSetupResult:
+    """Identify and persist attached CAN adapters without prompting.
+
+    Covers every role ``axol can.setup`` manages: the dual-channel Axol and
+    Mantis hubs, and the single-channel adapters carrying Jelly's wheel bus
+    (the base) and the jelly_legs chest/lift bus. Only positive CAN signatures
+    may create or change a role. The complete USB and netdev topology is
+    snapshotted after driver enumeration and checked again after every probe,
+    before the first root-owned rule is published. Duplicate physical devices
+    reporting one serial, incomplete pairs, silence, conflicting signatures,
+    and duplicate fresh roles stay unassigned for the interactive setup flow.
     """
     with _global_setup_lock():
         return _setup_detected_hubs_locked()
@@ -2639,6 +2727,10 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
     persisted_dual = {
         serial for serial in (configured_axol, configured_mantis) if serial is not None
     }
+    # Exact single-channel adapters (serial -> live netdev name): wheel-bus /
+    # chest-bus candidates, probed for the Damiao motors and the jelly_legs
+    # board below.
+    eligible_single: dict[str, str] = {}
     for identity, serial in usb_devices:
         records = topology_by_serial.get(serial, ())
         expected_identity = identity.partition("@dev")[0]
@@ -2647,7 +2739,10 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
             and records[0][1] == 0
             and records[0][2] == expected_identity
         )
-        if serial in eligible or (exact_single and serial not in persisted_dual):
+        if serial in eligible:
+            continue
+        if exact_single and serial not in persisted_dual:
+            eligible_single[serial] = records[0][0]
             continue
         raise RuntimeError(
             "An attached CAN adapter has an incomplete or ambiguous channel "
@@ -2693,6 +2788,20 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
         raise RuntimeError(
             "A configured CAN profile's live interface names do not match its "
             "persisted hardware identity; no roles were written"
+        )
+
+    # Single-channel adapters: a pinned wheel/chest adapter is re-probed so a
+    # live response corrects a stale or swapped pin (and detects the lift
+    # moving onto the wheel bus); an unknown adapter gets one non-disruptive
+    # pass, so unrelated hardware is never flapped merely for being attached.
+    observed_single: dict[str, SingleBusIdentity | None] = {}
+    for serial in sorted(eligible_single):
+        print(f"  {serial}: probing wheel drive / Jelly lift controller...")
+        known = serial in {configured_wheels, configured_chest}
+        observed_single[serial] = (
+            _identify_adapter(serial)
+            if known
+            else _identify_adapter(serial, recover_silence=False)
         )
 
     # USB replacement, duplicate insertion, channel loss, or a rename racing
@@ -2743,6 +2852,29 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
         if configured_chest in positively_identified_hubs:
             configured_chest = None
 
+    # Wheel (base) and chest (lift) buses resolve after the hub roles so a
+    # serial a live hub just reclaimed is no longer treated as a single pin.
+    desired_wheels, desired_chest, _lift_on_wheel_bus = _resolve_headless_single_roles(
+        observed_single,
+        attached_serials=attached_serials,
+        configured_wheels=configured_wheels,
+        configured_chest=configured_chest,
+    )
+    single_roles_changed = (desired_wheels, desired_chest) != (
+        configured_wheels,
+        configured_chest,
+    )
+    wheels_changed = desired_wheels is not None and desired_wheels != configured_wheels
+    chest_changed = desired_chest is not None and desired_chest != configured_chest
+    # A positive single-bus identity on a raw (not yet renamed) adapter must
+    # also be repaired in place, exactly like a raw-named hub above.
+    repair_single_names = any(
+        serial is not None
+        and observed_single.get(serial) is not None
+        and eligible_single.get(serial) != name
+        for serial, name in ((desired_wheels, _CAN_B), (desired_chest, _CAN_C))
+    )
+
     stale_axol_claim = (
         configured_axol is not None and observed.get(configured_axol) == "mantis"
     )
@@ -2760,9 +2892,11 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
         or clear_axol_aux
         or reapply_axol
         or repair_axol_names
+        or single_roles_changed
+        or repair_single_names
     ):
-        if desired_axol or configured_wheels or configured_chest:
-            _apply_setup(desired_axol, configured_wheels, configured_chest)
+        if desired_axol or desired_wheels or desired_chest:
+            _apply_setup(desired_axol, desired_wheels, desired_chest)
         else:
             _write_udev_rules(None, None, None)
             _reload_udev()
@@ -2777,9 +2911,17 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
         _reload_udev()
         _rename_interfaces(None, profile=_MANTIS_PROFILE)
 
-    configured_count = int(axol_changed) + int(mantis_changed)
+    configured_count = (
+        int(axol_changed)
+        + int(mantis_changed)
+        + int(wheels_changed)
+        + int(chest_changed)
+    )
     final_state = attached_hub_state()
     remaining = final_state.candidate_count
+    # A silent pinned wheel/chest adapter is deliberately not an incumbent
+    # here: an unpowered Jelly is an everyday state on a bench and must never
+    # hold up the arms' automatic connection.
     silent_incumbents = [
         role
         for role, serial in (
@@ -2806,9 +2948,9 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
             status="partial",
             configured_count=configured_count,
             message=(
-                "Known Axol or Mantis hardware is ready, but another attached "
-                "CAN adapter remains unassigned. Power its Axol motors or "
-                "Mantis triggers and retry discovery, or run `axol can.setup`."
+                "Known CAN hardware is ready, but another attached CAN adapter "
+                "remains unassigned. Power its Axol motors, Mantis triggers, or "
+                "Jelly base/lift and retry discovery, or run `axol can.setup`."
             ),
             validation_identity=final_state.validation_identity,
         )
@@ -2823,9 +2965,10 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
             status="unidentified",
             configured_count=0,
             message=(
-                "No unique Axol or Mantis identity was detected. Ensure the Axol "
-                "motors or Mantis triggers are powered, then retry identification "
-                "or run `axol can.setup`."
+                "No unique Axol, Mantis, or Jelly base/lift identity was detected. "
+                "Ensure the Axol motors, Mantis triggers, or Jelly wheel motors "
+                "and lift controller are powered, then retry identification or "
+                "run `axol can.setup`."
             ),
             validation_identity=final_state.validation_identity,
         )
