@@ -59,13 +59,15 @@ policy.
 
 Camera and recording plumbing follows ``collect-data``'s proven
 out-of-process split, with one twist this flow needs: the video relay owns
-the ZED cameras and streams the headset view, but its raw branch is forced
-onto the **pyshm transport** (``raw_transport: "pyshm"``) so the shared-memory
-frames are readable by *this* process — the policy builds its observations
-from them — as well as by the ``DatasetRecorderProcess`` subprocess that owns
-the dataset (NVENC-encoding on its own cores). The frozen gap uses the
-recorder's ``pause_episode``/``resume_episode`` gate (the capture clock
-re-anchors on resume, so episodes play straight through the gap). Nothing
+the ZED cameras and streams the headset view, and beside its relay-encoded
+dataset branch (which the ``DatasetRecorderProcess`` subprocess muxes, as in
+``collect-data``) it publishes the same exposures into a shared-memory ring
+readable by *this* process — the policy builds its observations from it
+(``raw_transport: "gstshm+pyshm"``; without gst's shm plugin both fall back
+to one pyshm ring, and the recorder re-encodes). The frozen gap uses the
+recorder's ``pause_episode``/``resume_episode`` gate (the encoded loop
+discards the gap's AUs and re-aligns row zero on resume; the raw loop
+re-anchors its clock — either way episodes play straight through). Nothing
 camera- or encode-related runs in the control process, which is what keeps
 the policy at fps and teleop at ``--teleop_hz``. The relay is required —
 there is no in-process fallback (per-frame camera Python in the control
@@ -1219,15 +1221,19 @@ def _run(
         _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
         # The out-of-process video relay owns the cameras and streams the
-        # headset view. Its raw branch is forced onto pyshm so both this policy
-        # process and the recorder can read frames.
-        relay = _start_video_relay(cfg, dataset_resolution, raw_transport="pyshm")
+        # headset view. Its dataset branch stays relay-encoded for the recorder
+        # (mux only) and a second ring branch gives this policy process
+        # readable frames; without gst's shm plugin both fall back to pyshm.
+        relay = _start_video_relay(
+            cfg, dataset_resolution, raw_transport="gstshm+pyshm"
+        )
         expected = set(cfg.robot_config.observation_cameras().keys())
-        if relay is None or not expected <= set(relay.raw_cameras):
+        readable = set(relay.readable_raw_cameras) if relay is not None else set()
+        if relay is None or not expected <= readable:
             raise RuntimeError(
                 "collect-dagger requires the gst video relay with readable raw "
                 f"frames for {sorted(expected)} (got "
-                f"{sorted(relay.raw_cameras) if relay else 'no relay'}). Install "
+                f"{sorted(readable) if relay else 'no relay'}). Install "
                 "the GStreamer stack (`axol gst.install` + `axol gst.build-zed`) "
                 "and check the camera serials."
             )
@@ -1478,9 +1484,9 @@ def _run(
             # history / hidden state from the previous episode).
             policy.reset()
             policy.set_instruction(task)
-            # Arm the recorder before opening the relay branch. Today DAgger
-            # forces raw pyshm, but this ordering also preserves row-zero IDR
-            # semantics if it later adopts the encoded transport. Both calls
+            # Arm the recorder before opening the relay branch: on the encoded
+            # transport that is what makes row zero an IDR admitted at the
+            # shared exposure boundary (the raw fallback is indifferent). Both calls
             # are bounded IPC transactions, but together they can exceed the
             # Rust target watchdog; hold the just-measured post-rest pose while
             # they run off-thread. Policy inference deliberately has not

@@ -16,7 +16,9 @@ buffer to two consumers:
   carrying H.264 AUs *and their original PTS* (``_dataset_enc_shmsink``): the
   recorder just muxes them, so no raw copy or re-encode crosses the boundary.
   For in-process consumers (inference, or the pyshm fallback) it is instead
-  ``nvvidconv`` -> RGBA ``appsink`` -> numpy. Each RGBA frame carries a
+  ``nvvidconv`` -> RGBA ``appsink`` -> numpy; a camera given both a socket
+  and a raw sink builds both, gated together, so a policy reads the very
+  exposures the recorder muxes. Each RGBA frame carries a
   ``capture_perf_ts`` derived from the buffer PTS. We run a
   patched ``zedxonesrc``/``zedsrc`` (``do-timestamp=false``) that stamps the
   PTS at the true sensor-exposure instant (``TIME_REFERENCE::IMAGE``) instead
@@ -1503,6 +1505,10 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         # frame is stored locally — the consumer reads from the sink / shm instead.
         # ``raw_socket_path`` routes the raw branch through gst's native shmsink so
         # the relay does no Python per raw frame (the fix for the recording feed).
+        # Both together build two dataset-gated branches off the same exposures:
+        # the encoded one for the recorder and an RGBA appsink feeding the sink
+        # for an in-process consumer (a policy's observations) — see
+        # _pipeline_str.
         want_raw = want_raw or raw_sink is not None or raw_socket_path is not None
         if not (want_encoded or want_raw):
             raise ValueError("ZedGstCamera needs at least one of encoded/raw")
@@ -1561,9 +1567,14 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         # RawFrameWriter fallback) still take RGBA off an appsink and default
         # open so SDK-less consumers are unchanged; `collect-data` closes that
         # path explicitly until an episode records.
+        # With both a socket and a sink the two branches coexist behind their
+        # own valves (``rawvalve`` / ``polvalve``), opened together on one
+        # exposure boundary (_raw_gates): the recorder muxes the encoded AUs
+        # while the in-process consumer reads the same exposures as RGB.
+        branches: list[str] = []
         if self._raw_socket_path:
             dataset_rate = _dataset_rate_limit(self.fps, self.dataset_fps)
-            raw = (
+            branches.append(
                 f"{_dataset_source_queue('dsenc')} ! {dataset_rate}"
                 "valve name=rawvalve drop=false ! "
                 + _dataset_enc_shmsink(
@@ -1574,22 +1585,34 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
                     "dsenc",
                 )
             )
-        else:
-            raw = (
-                f"{_QUEUE} ! valve name=rawvalve drop=false "
+        if self._raw_appsink_wanted():
+            valve = "polvalve" if self._raw_socket_path else "rawvalve"
+            branches.append(
+                f"{_QUEUE} ! valve name={valve} drop=false "
                 f"! nvvidconv ! video/x-raw,format=RGBA,"
                 f"width={self.raw_width},height={self.raw_height} ! {_raw_appsink('raw')}"
             )
-        if self._want_encoded and self._want_raw:
-            return f"{src} ! tee name=t  t. ! {enc}  t. ! {raw}"
         if self._want_encoded:
-            return f"{src} ! {enc}"
-        return f"{src} ! {raw}"
+            branches.insert(0, enc)
+        if len(branches) == 1:
+            return f"{src} ! {branches[0]}"
+        return f"{src} ! tee name=t  " + "  ".join(f"t. ! {b}" for b in branches)
+
+    def _raw_appsink_wanted(self) -> bool:
+        """Whether this camera pulls RGBA frames in Python (sink or _RawBuffer)."""
+        return self._want_raw and (
+            self._raw_sink_override is not None or self._raw_socket_path is None
+        )
 
     def _raw_gates(self) -> tuple[tuple[str, str | None], ...]:
         if not self._want_raw:
             return ()
-        return (("rawvalve", "dsenc" if self._raw_socket_path else None),)
+        if not self._raw_socket_path:
+            return (("rawvalve", None),)
+        gates: list[tuple[str, str | None]] = [("rawvalve", "dsenc")]
+        if self._raw_appsink_wanted():
+            gates.append(("polvalve", None))
+        return tuple(gates)
 
     def begin_raw_disable(self) -> None:
         """Close this camera's all-intra dataset input."""
@@ -1653,7 +1676,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         # On the shmsink path the frame copy happens in gst's C threads (no
         # Python pull loop here), so the relay's interpreter stays free for the
         # WebRTC send. Only the appsink path needs a Python pull thread.
-        if self._want_raw and self._raw_socket_path is None:
+        if self._raw_appsink_wanted():
             sink = self._raw_sink_override or self._buffer_sink(self._raw)
             self._start_pull(
                 f"zedgst-{self.serial}-raw",
@@ -1914,18 +1937,17 @@ class ZedGstStereoCamera(_GstPipelineBase):
             "max-size-buffers=2 ! "
             f"nvvidconv left={left} right={right} top=0 bottom={eye_h} ! {caps}"
         )
-        sock = (
-            self._left_raw_socket_path
-            if sink_suffix == "l"
-            else self._right_raw_socket_path
-        )
-        # This eye's dataset branch: encode->shmsink (recorder) when it has a
-        # socket, else RGBA appsink (in-process writer / inference). Both sit
-        # behind a per-eye valve so set_raw_enabled can gate them while not
-        # recording. See the mono _pipeline_str note.
-        if sock:
+        side = "left" if sink_suffix == "l" else "right"
+        sock = self._eye_socket_path(side)
+        # This eye's dataset branch(es): encode->shmsink (recorder) when it has
+        # a socket, RGBA appsink (in-process writer / inference) when it has a
+        # sink or neither — both when it has both, each behind its own per-eye
+        # valve so set_raw_enabled can gate them together while not recording.
+        # See the mono _pipeline_str note.
+        branches: list[str] = []
+        if want_raw and sock:
             dataset_rate = _dataset_rate_limit(self.fps, self.dataset_fps)
-            raw = (
+            branches.append(
                 f"{_dataset_source_queue('dsenc_' + sink_suffix)} ! {dataset_rate}"
                 f"valve name=rawvalve_{sink_suffix} drop=false ! "
                 + _dataset_enc_shmsink(
@@ -1936,27 +1958,42 @@ class ZedGstStereoCamera(_GstPipelineBase):
                     "dsenc_" + sink_suffix,
                 )
             )
-        else:
-            raw = (
-                f"{_QUEUE} ! valve name=rawvalve_{sink_suffix} drop=false "
+        if want_raw and self._eye_appsink_wanted(side):
+            valve = f"polvalve_{sink_suffix}" if sock else f"rawvalve_{sink_suffix}"
+            branches.append(
+                f"{_QUEUE} ! valve name={valve} drop=false "
                 f"! nvvidconv ! video/x-raw,format=RGBA,"
                 f"width={self.raw_width},height={self.raw_height} ! "
                 f"{_raw_appsink('raw_' + sink_suffix)}"
             )
-        if want_encoded and want_raw:
-            enc = (
-                f"{_QUEUE} ! {rate}"
-                f"{_enc_branch(bitrate, self.stream_fps, 'venc_' + sink_suffix)} ! "
-                f"{_enc_appsink('enc_' + sink_suffix)}"
-            )
-            return f"{crop} ! tee name=t{sink_suffix}  t{sink_suffix}. ! {enc}  t{sink_suffix}. ! {raw}"
+        enc = (
+            f"{rate}"
+            f"{_enc_branch(bitrate, self.stream_fps, 'venc_' + sink_suffix)} ! "
+            f"{_enc_appsink('enc_' + sink_suffix)}"
+        )
+        if want_encoded and not branches:
+            return f"{crop} ! {enc}"
         if want_encoded:
-            return (
-                f"{crop} ! {rate}"
-                f"{_enc_branch(bitrate, self.stream_fps, 'venc_' + sink_suffix)} ! "
-                f"{_enc_appsink('enc_' + sink_suffix)}"
-            )
-        return f"{crop} ! {raw}"
+            branches.insert(0, f"{_QUEUE} ! {enc}")
+        if len(branches) == 1:
+            return f"{crop} ! {branches[0]}"
+        return f"{crop} ! tee name=t{sink_suffix}  " + "  ".join(
+            f"t{sink_suffix}. ! {b}" for b in branches
+        )
+
+    def _eye_socket_path(self, side: str) -> str | None:
+        return (
+            self._left_raw_socket_path
+            if side == "left"
+            else self._right_raw_socket_path
+        )
+
+    def _eye_appsink_wanted(self, side: str) -> bool:
+        """Whether this eye pulls RGBA frames in Python (sink or _RawBuffer)."""
+        if side not in self._raw_sides:
+            return False
+        sink = self._left_raw_sink if side == "left" else self._right_raw_sink
+        return sink is not None or self._eye_socket_path(side) is None
 
     def _sbs_branch(self) -> str:
         """Encode the uncropped double-width stereo frame as one packed stream.
@@ -1978,14 +2015,12 @@ class ZedGstStereoCamera(_GstPipelineBase):
         gates: list[tuple[str, str | None]] = []
         for side in self._raw_sides:
             suffix = side[0]
-            socket_path = (
-                self._left_raw_socket_path
-                if side == "left"
-                else self._right_raw_socket_path
-            )
+            socket_path = self._eye_socket_path(side)
             gates.append(
                 (f"rawvalve_{suffix}", f"dsenc_{suffix}" if socket_path else None)
             )
+            if socket_path and self._eye_appsink_wanted(side):
+                gates.append((f"polvalve_{suffix}", None))
         return tuple(gates)
 
     def begin_raw_disable(self) -> None:
@@ -2078,7 +2113,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 )
             # shmsink writes the frame in C; only the appsink path needs a Python
             # pull thread (which would contend with the relay's send — the bug).
-            if side in self._raw_sides and sock is None:
+            if self._eye_appsink_wanted(side):
                 sink = raw_sink or self._buffer_sink(raw)
                 self._start_pull(
                     f"zedgst-{self.serial}-raw{suffix}",
