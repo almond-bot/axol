@@ -21,16 +21,16 @@
     "@react-three/fiber": "^9.0.0",
     "@react-three/xr": "^6.0.0",
     "react": "^19.0.0",
-    "three": "^0.182.0"
+    "three": "^0.186.0"
   },
   "devDependencies": {
-    "@react-three/fiber": "^9.5.0",
-    "@react-three/xr": "^6.6.29",
-    "@types/react": "^19.2.7",
+    "@react-three/fiber": "^9.7.0",
+    "@react-three/xr": "^6.6.30",
+    "@types/react": "^19.3.0",
     "@types/three": "^0.182.0",
-    "react": "^19.2.0",
-    "three": "^0.182.0",
+    "react": "^19.3.0",
+    "three": "^0.186.0",
     "tsup": "^8.0.0",
-    "typescript": "~5.9.3"
+    "typescript": "~7.0.2"
   }
 }
