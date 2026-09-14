@@ -83,8 +83,8 @@ def test_command_catalog_and_argv_contracts() -> None:
     assert by_id["teleop"]["simCapable"] is True
     assert by_id["teleop"]["isOperation"] is True
 
-    argv = build_argv("teleop", {"sim": True, "jelly_only": False})
-    assert argv == ["--sim", "true", "--jelly_only", "false"]
+    argv = build_argv("teleop", {"sim": True, "arms": False})
+    assert argv == ["--sim", "true", "--arms", "false"]
     # Keys the schema does not know are dropped, never forwarded.
     assert build_argv("teleop", {"not_a_field": "x"}) == []
     assert _format_value([1, 2]) == "[1, 2]"

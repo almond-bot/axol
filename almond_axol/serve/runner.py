@@ -45,7 +45,14 @@ from typing import Any
 from ..motor.bus import STALL_DETECT_S, stalled_channels
 from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
 from ..zed import stereo_serials
-from .commands import flag_enabled, normalize_boolean_args
+from .commands import (
+    flag_default,
+    flag_enabled,
+    flag_value,
+    is_robot_free,
+    normalize_boolean_args,
+    safety_flags,
+)
 from .manager import Session
 
 _logger = logging.getLogger(__name__)
@@ -676,17 +683,11 @@ class OperationRunner:
             # config to describe exactly the same hardware/no-hardware mode.
             # Otherwise (for example) ``mantis: true`` in config_path could
             # borrow an Axol survey and then open the Mantis buses.
-            safety_flags = tuple(
-                dict.fromkeys(
-                    flag
-                    for flag in (cmd.sim_flag, *cmd.robot_free_flags)
-                    if flag is not None
-                )
-            )
             parsed_flags: dict[str, bool] = {}
-            for flag in safety_flags:
-                requested = flag_enabled(args.get(flag))
-                parsed = flag_enabled(getattr(cfg, flag, False))
+            for flag in safety_flags(cmd):
+                default = flag_default(cmd, flag)
+                requested = flag_value(args.get(flag), default)
+                parsed = flag_value(getattr(cfg, flag, default), default)
                 if parsed != requested:
                     raise ValueError(
                         f"{op_id}'s parsed {flag}={parsed} does not match the "
@@ -747,13 +748,11 @@ class OperationRunner:
                         "control panel's Mantis tile"
                     )
 
-            is_sim = cmd.sim_flag is not None and parsed_flags.get(cmd.sim_flag, False)
-            # A robot-free run (sim, or e.g. teleop's jelly_only) never touches
-            # the arms, so the persistent robot link stays connected and its
-            # motor telemetry keeps streaming while the op runs.
-            robot_free = is_sim or any(
-                parsed_flags.get(flag, False) for flag in cmd.robot_free_flags
-            )
+            # A robot-free run (sim, Mantis, or teleop with the arms switched
+            # off) never touches the arms, so the persistent robot link stays
+            # connected and its motor telemetry keeps streaming while the op
+            # runs.
+            robot_free = is_robot_free(cmd, parsed_flags)
             hardware_profile = "mantis" if mantis_mode else "axol"
             link_matches_run = (
                 self._robot_link is not None

@@ -20,7 +20,7 @@ from .config import (
     JointConfig,
     PositionForceConfig,
 )
-from .jelly import Jelly, JellyConfig
+from .jelly import Jelly, JellyConfig, detect_jelly
 from .mantis import MantisGripperArm
 from .sim import Sim
 
@@ -36,6 +36,7 @@ __all__ = [
     "AxolConfig",
     "Jelly",
     "JellyConfig",
+    "detect_jelly",
     "FrictionParams",
     "JointConfig",
     "PositionForceConfig",

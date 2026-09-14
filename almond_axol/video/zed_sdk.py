@@ -42,6 +42,8 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from ..zed.calibration import calibration_hint
+
 try:
     # pyzed ships with the ZED SDK (``axol zed.install``), not from PyPI, so it
     # is only present on provisioned robot machines. Keep this module — and the
@@ -302,6 +304,7 @@ class ZedSdkCamera:
             raise ConnectionError(
                 f"{self} failed to open camera: {err}. Is the camera connected "
                 "(a camera plugged in after boot needs a zed_x_daemon restart)?"
+                + calibration_hint(self.config.serial)
             )
 
         info = zed.get_camera_information()
@@ -832,6 +835,7 @@ class ZedSdkStereoCamera:
             raise ConnectionError(
                 f"{self} failed to open camera: {err}. Is the camera connected "
                 "(a camera plugged in after boot needs a zed_x_daemon restart)?"
+                + calibration_hint(self.config.serial)
             )
 
         info = zed.get_camera_information()
