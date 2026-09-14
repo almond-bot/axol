@@ -438,8 +438,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 help="Maximum joint speed of the right gripper.",
             ),
             # What a session drives is inferred from the CAN interfaces
-            # attached (arm hub, Jelly wheel bus, lift bus) — these three are
-            # the operator's opt-out for hardware that is plugged in.
+            # attached (arm hub, Jelly wheel bus, lift bus) — this and the
+            # two Jelly switches (in the Jelly category) are the operator's
+            # opt-out for hardware that is plugged in.
             SettingDef(
                 key="robot.arms",
                 label="Axol arms",
@@ -451,31 +452,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "Data collection and policies always use the arms."
                 ),
                 targets={"teleop": ("arms",)},
-            ),
-            SettingDef(
-                key="jelly.wheels",
-                label="Jelly wheels",
-                type="boolean",
-                help=(
-                    "Drive Jelly's x-drive omni base when its CAN adapter is "
-                    "attached (the panel pins it to can_alm_axol_b): left "
-                    "stick translates, right stick x rotates. Off leaves the "
-                    "wheels cold even with the bus present. Operator mobility "
-                    "only — Jelly motion is never recorded into datasets and "
-                    "policies never control it. Jelly parameters live under "
-                    "Advanced → Jelly."
-                ),
-            ),
-            SettingDef(
-                key="jelly.lift",
-                label="Jelly lift",
-                type="boolean",
-                help=(
-                    "Run Jelly's telescoping lift from the stick clicks (left "
-                    "down, right up) when its controller is attached — on its "
-                    "own chest bus (can_alm_axol_c) or sharing the wheel bus. "
-                    "Off leaves the lift cold even with the bus present."
-                ),
             ),
             SettingDef(
                 key="teleop.reset_torque_threshold",
@@ -551,6 +527,46 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Gravity comp rate (Hz)",
                 type="number",
                 help="Gravity compensation control-loop rate.",
+            ),
+        ),
+    ),
+    # Jelly (the powered omni base and telescoping lift the Axol rides on)
+    # has its own settings scope in the panel, opened from its connection
+    # tile: the two hardware switches here, and the drive parameters from
+    # the Jelly config tree as its Parameters tab.
+    SettingCategory(
+        key="jelly",
+        label="Jelly",
+        description=(
+            "Which of Jelly's attached hardware a teleop session drives. "
+            "Whether Jelly is present is inferred from the CAN adapters "
+            "plugged in; these switches only turn attached hardware off."
+        ),
+        settings=(
+            SettingDef(
+                key="jelly.wheels",
+                label="Jelly wheels",
+                type="boolean",
+                help=(
+                    "Drive Jelly's x-drive omni base when its CAN adapter is "
+                    "attached (the panel pins it to can_alm_axol_b): left "
+                    "stick translates, right stick x rotates. Off leaves the "
+                    "wheels cold even with the bus present. Operator mobility "
+                    "only — Jelly motion is never recorded into datasets and "
+                    "policies never control it. Speeds, slew, and the heading "
+                    "hold live under Jelly → Parameters."
+                ),
+            ),
+            SettingDef(
+                key="jelly.lift",
+                label="Jelly lift",
+                type="boolean",
+                help=(
+                    "Run Jelly's telescoping lift from the stick clicks (left "
+                    "down, right up) when its controller is attached — on its "
+                    "own chest bus (can_alm_axol_c) or sharing the wheel bus. "
+                    "Off leaves the lift cold even with the bus present."
+                ),
             ),
         ),
     ),

@@ -429,12 +429,27 @@ export interface CanDiscoveryState {
   message?: string
 }
 
+/** Presence of one Jelly device's pinned CAN interface in the host's inventory. */
+export interface CanDevicePresence {
+  /** The interface the device rides on (the lift shares the wheel bus when it
+   *  has no chest adapter of its own). */
+  channel: string
+  present: boolean
+  up: boolean
+  /** This device was manually disconnected on the serve host. */
+  automaticConnectSuppressed?: boolean
+}
+
+export type CanDeviceInventory = Record<JellyDevice, CanDevicePresence>
+
 export interface CanInterfaceInventory {
   /** Opaque app-lifetime identity; omitted by older serve releases. */
   serverInstanceId?: string
   interfaces: CanInterface[]
   /** Omitted by serve releases that predate hardware-aware auto-connect. */
   profiles?: CanProfileInventory
+  /** Jelly wheel/lift bus presence; omitted by serve releases without Jelly links. */
+  devices?: CanDeviceInventory
   /** Omitted by serve releases that predate safe, non-interactive discovery. */
   discovery?: CanDiscoveryState
 }
@@ -447,6 +462,112 @@ export async function fetchCanInterfaces(): Promise<CanInterfaceInventory> {
 export async function discoverCanHardware(force = false): Promise<CanInterfaceInventory> {
   const path = force ? "/api/can/discover?force=true" : "/api/can/discover"
   return json(await fetch(apiUrl(path), { method: "POST" }))
+}
+
+// ---------------------------------------------------------------------------
+// Jelly wheels + lift (detached CAN + 1 Hz status poll)
+// ---------------------------------------------------------------------------
+
+/** Jelly's two auxiliary devices, each on its own idle link. */
+export type JellyDevice = "wheels" | "lift"
+export const JELLY_DEVICES: readonly JellyDevice[] = ["wheels", "lift"]
+export const JELLY_DEVICE_LABELS: Record<JellyDevice, string> = {
+  wheels: "Jelly Wheels",
+  lift: "Jelly Lift",
+}
+
+/** One wheel motor from the idle ping (IDs 1–4, Damiao). */
+export interface WheelMotorHealth {
+  /** "front_left" | "front_right" | "back_left" | "back_right" */
+  name: string
+  id: number
+  /** null while a task owns the bus or the link is down. */
+  reachable: boolean | null
+  status: string | null
+  temperature: number | null
+  voltage: number | null
+}
+
+/** The jelly_legs board's latest status frame. */
+export interface LiftBoardStatus {
+  homed: boolean
+  /** Percent of homed travel (0 = lowered); null until homed. */
+  heightPercent: number | null
+  moving: boolean
+  homing: boolean
+  stallFault: boolean
+  atLower: boolean
+  atUpper: boolean
+  /** Firmware v0.4+ driver health; null on legacy frames. */
+  driversEnabled: boolean | null
+  vmPresent: boolean | null
+  driverFaultMask: number | null
+}
+
+interface JellyLinkStatusBase {
+  state: RobotState
+  connected: boolean
+  error: string | null
+  lastPing: number | null
+  channel: string
+}
+
+export interface JellyWheelsStatus extends JellyLinkStatusBase {
+  motors: WheelMotorHealth[]
+  motorCount: number
+  reachableCount: number
+}
+
+export interface JellyLiftStatus extends JellyLinkStatusBase {
+  /** Whether the board answered recently; null while nobody polls it. */
+  reachable: boolean | null
+  status: LiftBoardStatus | null
+}
+
+export interface JellyStatus {
+  wheels: JellyWheelsStatus
+  lift: JellyLiftStatus
+}
+
+export async function fetchJellyStatus(): Promise<JellyStatus> {
+  return json(await fetch(apiUrl("/api/jelly/status")))
+}
+
+export async function jellyConnect(device: JellyDevice, automatic = false): Promise<JellyStatus> {
+  return json(
+    await fetch(apiUrl(`/api/jelly/${device}/connect`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ automatic }),
+    })
+  )
+}
+
+export async function jellyDisconnect(device: JellyDevice): Promise<JellyStatus> {
+  return json(await fetch(apiUrl(`/api/jelly/${device}/disconnect`), { method: "POST" }))
+}
+
+/** Healthy = reachable on CAN and reporting no error status. */
+export function wheelMotorHealthy(m: WheelMotorHealth): boolean {
+  return m.reachable === true && (m.status === "OK" || m.status === "DISABLED" || m.status == null)
+}
+
+/** Faulted wheels while connected: unreachable or in an error state. */
+export function wheelFaults(status: JellyWheelsStatus | null | undefined): WheelMotorHealth[] {
+  if (!status || !status.connected) return []
+  return status.motors.filter((m) => m.reachable != null && !wheelMotorHealthy(m))
+}
+
+/** Lift board problems worth a red dot: silent board, stall, or driver fault. */
+export function liftFaultLabel(status: JellyLiftStatus | null | undefined): string | null {
+  if (!status || status.state !== "connected") return null
+  if (status.reachable === false) return "Lift board not answering"
+  const board = status.status
+  if (!board) return null
+  if (board.stallFault) return "Leg stall fault"
+  if (board.driverFaultMask) return "Lift driver fault"
+  if (board.vmPresent === false) return "Lift motor power absent"
+  return null
 }
 
 /** A busy race, transport interruption, or server fault may retry on the next inventory poll. */

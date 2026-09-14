@@ -41,6 +41,9 @@ import { materializeCameraSpec, type CameraProfileBySlot } from "@/lib/camera-sp
 import { buildSettingsFile, parseSettingsFile } from "@/lib/settings-file"
 import {
   AXOL_CATEGORY_KEYS,
+  JELLY_ADVANCED_SECTION,
+  JELLY_CATEGORY_KEYS,
+  JELLY_PARAMETERS_TAB,
   SETTINGS_SCOPES,
   defaultSettingsTab,
   settingsScopeForTab,
@@ -280,8 +283,9 @@ export function SettingsSection({
 
   // Tabs within the active scope. Axol: hardware first (cameras), then arm
   // behaviour categories with the pose editor after Teleop & VR. Mantis: the
-  // tracking flow, wrist cameras, CAN. General: Quest, the
-  // remaining categories, and Advanced.
+  // tracking flow, wrist cameras, CAN. Jelly: the wheels / lift switches and
+  // the drive parameters. General: Quest, the remaining categories, and
+  // Advanced.
   const tabs: { key: SettingsTab; label: string }[] = []
   if (scope === "axol") {
     tabs.push({ key: "cameras", label: "Cameras" })
@@ -296,13 +300,23 @@ export function SettingsSection({
       { key: "mantis-cameras", label: "Cameras" },
       { key: "mantis-can", label: "CAN" }
     )
+  } else if (scope === "jelly") {
+    tabs.push(
+      { key: "jelly", label: "Wheels & lift" },
+      { key: JELLY_PARAMETERS_TAB, label: "Parameters" }
+    )
   } else {
     tabs.push({ key: "usb", label: "Quest" })
     for (const cat of schema) {
-      if (!AXOL_CATEGORY_KEYS.has(cat.key)) tabs.push({ key: cat.key, label: cat.label })
+      if (!AXOL_CATEGORY_KEYS.has(cat.key) && !JELLY_CATEGORY_KEYS.has(cat.key))
+        tabs.push({ key: cat.key, label: cat.label })
     }
     tabs.push({ key: "advanced", label: "Advanced" })
   }
+  // The Jelly config tree has its own tab; everything else stays in Advanced.
+  const advancedSections = snapshot?.advancedSchema ?? []
+  const jellyParameters = advancedSections.find((s) => s.key === JELLY_ADVANCED_SECTION) ?? null
+  const generalAdvancedSections = advancedSections.filter((s) => s.key !== JELLY_ADVANCED_SECTION)
 
   function selectScope(next: SettingsScope) {
     onOpenChange(true)
@@ -495,11 +509,37 @@ export function SettingsSection({
               <PosePanel fields={poseFields} values={draft.values} onChange={setValue} />
             ) : tab === "advanced" ? (
               <AdvancedPanel
-                sections={snapshot?.advancedSchema ?? []}
+                sections={generalAdvancedSections}
                 overrides={draft.values}
                 onChange={setValue}
                 onReset={(key) => setValue(key, null)}
               />
+            ) : tab === JELLY_PARAMETERS_TAB ? (
+              jellyParameters ? (
+                <div className="flex flex-col gap-4">
+                  <p className="text-xs text-white/45">
+                    How the wheels and lift respond to the sticks: peak speed, rotation weight,
+                    slew, axis snap, the heading hold, and the parked hold. One value here applies
+                    to <span className="text-white/65">every operation</span> that drives Jelly.
+                  </p>
+                  <FlatSchemaForm
+                    nodes={jellyParameters.nodes}
+                    overrides={draft.values}
+                    disabled={false}
+                    onChange={setValue}
+                    onReset={(key) => setValue(key, null)}
+                  />
+                </div>
+              ) : (
+                <p className="text-sm text-white/40">
+                  This host does not expose Jelly&apos;s parameters; update it to edit them here.
+                </p>
+              )
+            ) : tab === "jelly" && !activeCategory ? (
+              <p className="text-sm text-white/40">
+                This host does not expose the Jelly wheels / lift switches; update it to edit them
+                here.
+              </p>
             ) : activeCategory ? (
               <CategoryPanel
                 category={activeCategory}
@@ -932,7 +972,8 @@ function SettingRow({
 
 /**
  * The unified Advanced tree: every remaining config field, organized by
- * subsystem (Axol, Teleop, Kinematics, Jelly, VR server, LeRobot robot). It
+ * subsystem (Axol, Teleop, Kinematics, VR server, LeRobot robot; the Jelly
+ * tree has its own Parameters tab under the Jelly scope). It
  * edits the same canonical value map as the curated tabs — one value here is
  * the source of truth for **all** operations; the server translates each key
  * to the right config path per op at start. Curated settings, cameras and
