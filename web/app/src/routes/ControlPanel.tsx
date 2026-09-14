@@ -1025,9 +1025,9 @@ export default function ControlPanel() {
     }
   }, [canDiscoveryRetryBusy, installCanInventory, toast])
 
-  // A fresh Axol/Mantis hub or Jelly base/lift adapter initially appears only
-  // as anonymous canX devices. Ask the server to probe and persist its role
-  // before the ordinary profile chooser runs. The server is the cross-tab single-flight authority; this
+  // A fresh Axol/Mantis hub initially appears only as anonymous canX devices.
+  // Ask the server to probe and persist its role before the ordinary profile
+  // chooser runs. The server is the cross-tab single-flight authority; this
   // latch merely keeps one tab's 2s poll from duplicating the request.
   useEffect(() => {
     if (conn.state !== "ok" || !canDiscovery) return
@@ -1415,8 +1415,8 @@ export default function ControlPanel() {
         toast.error(`${meta.label} runs on Axol only — select the Axol tile first.`)
         return
       }
-      // Sim is an Axol run mode; it is hidden (and ignored) on Mantis, so only
-      // an Axol run can be hardware-free here.
+      // Sim / Jelly-only are Axol run modes; they are hidden (and ignored) on
+      // Mantis, so only an Axol run can be hardware-free here.
       const isSimSelected = !mantisSelected && isSimRun(meta, settings)
       if (meta.requiresCameras && !isSimSelected) {
         // Reuse the detection we already ran (on connect / when the Cameras
@@ -1456,7 +1456,7 @@ export default function ControlPanel() {
       // Send only the panel's per-run fields — the shared settings (and any
       // advanced overrides) are folded in server-side, and stale keys from the
       // old per-op localStorage must not shadow them. On Mantis the Axol-only
-      // sim mode is not a per-run field and stays out.
+      // run modes (sim / jelly_only) are not per-run fields and stay out.
       const runKeys = new Set(
         spec ? perRunFields(spec, meta, hardwareProfile).map((f) => f.key) : []
       )
@@ -1637,7 +1637,7 @@ export default function ControlPanel() {
           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
             <p className="min-w-0 flex-1 text-xs text-amber-100/80">
               {canDiscovery?.message ??
-                "CAN hardware is attached but its Axol, Mantis, or Jelly base/lift role is not yet proven."}{" "}
+                "CAN hardware is attached but its Axol or Mantis role is not yet proven."}{" "}
               Power the hardware, then retry identification. An idle robot link may disconnect
               briefly while it is probed.
             </p>
@@ -1729,7 +1729,6 @@ export default function ControlPanel() {
           settings={settings}
           hardwareProfile={hardwareProfile}
           mantisSource={mantisSource}
-          sharedValues={settingsSnap?.values ?? null}
           onChange={setSetting}
           onReset={resetSetting}
           onResetAll={resetAll}

@@ -8,7 +8,6 @@ is available it is served too, with SPA-style fallback to ``index.html``.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import math
 import os
@@ -16,7 +15,6 @@ import secrets
 import socket
 import subprocess
 import time
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -44,15 +42,13 @@ from ..utils.state_files import mark_privileged_service
 from ..utils.sudo import prime_sudo
 from .commands import (
     COMMANDS,
+    NoSuggestionProvider,
     command_specs,
-    flag_default,
+    field_suggestions,
     flag_enabled,
-    flag_value,
     get_schema,
-    is_robot_free,
     normalize_boolean_args,
     operation_ids,
-    safety_flags,
 )
 from .manager import Session, SessionManager
 from .robot_link import STATE_ERROR, RobotLink, scoped_motor_faults
@@ -642,10 +638,6 @@ _CAN_DISCOVERY_STATUSES = {
     "error",
 }
 _CAN_DISCOVERY_FORCE_RETRY_SECONDS = 2.0
-# Discovery renames interfaces under a udev lock it can lose to a slow or
-# wedged host. Shutdown joins it so the rename is not cut in half, but the
-# join is bounded: systemd kills the service outright if the stop overruns.
-_CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass
@@ -806,48 +798,6 @@ def _usb_status_dict(status: adb.AdbStatus) -> dict[str, Any]:
         "reverseActive": status.reverse_active,
         "ready": status.ready,
     }
-
-
-async def _wait_for_disconnect(ws: WebSocket) -> None:
-    """Return once the client's close frame arrives."""
-    try:
-        while (await ws.receive())["type"] != "websocket.disconnect":
-            pass
-    except (WebSocketDisconnect, RuntimeError):
-        # Starlette reports the close as a disconnect message on a live socket,
-        # but raises once the connection has already gone: WebSocketDisconnect
-        # from its own helpers, RuntimeError from receiving on a socket whose
-        # disconnect it has already delivered. Every case means the same thing.
-        pass
-
-
-async def _stream_until_disconnect(
-    ws: WebSocket, queue: asyncio.Queue[Any]
-) -> AsyncIterator[Any]:
-    """Yield queued messages until the client disconnects.
-
-    The streaming endpoints only send, so nothing else reads the socket. Without
-    this race the close frame -- including the one uvicorn sends while draining
-    on SIGTERM -- is never observed, and an idle stream holds its handler task
-    (and the server shutdown) open indefinitely.
-    """
-    disconnect = asyncio.ensure_future(_wait_for_disconnect(ws))
-    try:
-        while True:
-            pending = asyncio.ensure_future(queue.get())
-            done, _ = await asyncio.wait(
-                (pending, disconnect), return_when=asyncio.FIRST_COMPLETED
-            )
-            # Check the disconnect first: both can finish in the same wait, and
-            # once ``receive()`` has consumed the close frame uvicorn rejects any
-            # further send with a RuntimeError (not a WebSocketDisconnect), so a
-            # message that raced the close is dropped rather than yielded.
-            if disconnect in done:
-                pending.cancel()
-                return
-            yield pending.result()
-    finally:
-        disconnect.cancel()
 
 
 def create_app(static_dir: Path | None = None) -> FastAPI:
@@ -1554,11 +1504,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         queue = hub.subscribe()
         try:
             await ws.send_json({"type": "hello", **hub.snapshot()})
-            async with contextlib.aclosing(
-                _stream_until_disconnect(ws, queue)
-            ) as stream:
-                async for message in stream:
-                    await ws.send_json(message)
+            while True:
+                await ws.send_json(await queue.get())
         except WebSocketDisconnect:
             pass
         finally:
@@ -2540,8 +2487,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # A faulted motor (over-temp, stall, encoder error, unreachable, …)
             # must block every hardware operation — driving through a fault risks
             # the arm. A sim run never touches the motors, and a robot-free run
-            # (teleop with the arms switched off) never touches the *arms*, so
-            # both stay allowed.
+            # (teleop's jelly_only) never touches the *arms*, so both stay allowed.
             cmd = COMMANDS[req.op]
             try:
                 launch_args = normalize_boolean_args(
@@ -2560,11 +2506,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     status_code=400,
                 )
             mantis_mode = cmd.supports_mantis and requested_mantis
-            launch_flags = {
-                flag: flag_value(launch_args.get(flag), flag_default(cmd, flag))
-                for flag in safety_flags(cmd)
-            }
-            robot_free = is_robot_free(cmd, launch_flags)
+            is_sim = cmd.sim_flag is not None and flag_enabled(
+                launch_args.get(cmd.sim_flag)
+            )
+            robot_free = is_sim or any(
+                flag_enabled(launch_args.get(flag)) for flag in cmd.robot_free_flags
+            )
             hardware_profile = "mantis" if mantis_mode else "axol"
             needs_motor_survey = cmd.uses_can_bus and (
                 not robot_free or hardware_profile == "mantis"
@@ -2680,6 +2627,35 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def get_commands() -> list[dict[str, Any]]:
         return command_specs()
 
+    @app.get("/api/commands/{command_id}/suggestions/{field}")
+    async def get_field_suggestions(command_id: str, field: str) -> JSONResponse:
+        """The pick list a command declares for one of its per-run fields.
+
+        Runs the ``CommandDef.field_suggestions`` provider on a worker thread
+        (it may list a remote registry). A provider failure is a 200 with an
+        empty list and the error text, so the panel keeps its plain input and
+        can say why the list is missing; only an undeclared field is a 404.
+        """
+        try:
+            rows = await asyncio.to_thread(field_suggestions, command_id, field)
+        except NoSuggestionProvider:
+            return JSONResponse(
+                {"error": f"no suggestions declared for {command_id}.{field}"},
+                status_code=404,
+            )
+        except Exception as exc:  # noqa: BLE001 - a provider must not break the form
+            _logger.warning(
+                "suggestions for %s.%s failed: %s: %s",
+                command_id,
+                field,
+                type(exc).__name__,
+                exc,
+            )
+            return JSONResponse(
+                {"suggestions": [], "error": f"{type(exc).__name__}: {exc}"}
+            )
+        return JSONResponse({"suggestions": rows, "error": None})
+
     @app.get("/api/sessions")
     async def get_sessions() -> list[dict[str, Any]]:
         sessions = manager.list()
@@ -2762,16 +2738,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 await ws.send_json({"type": "log", "line": line})
             await ws.send_json({"type": "status", "session": session.to_dict()})
 
-            async with contextlib.aclosing(
-                _stream_until_disconnect(ws, queue)
-            ) as stream:
-                async for line in stream:
-                    if line is None:
-                        await ws.send_json(
-                            {"type": "status", "session": session.to_dict()}
-                        )
-                        break
-                    await ws.send_json({"type": "log", "line": line})
+            while True:
+                line = await queue.get()
+                if line is None:
+                    await ws.send_json({"type": "status", "session": session.to_dict()})
+                    break
+                await ws.send_json({"type": "log", "line": line})
         except WebSocketDisconnect:
             pass
         finally:
@@ -2780,17 +2752,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         if can_discovery_task is not None and not can_discovery_task.done():
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(can_discovery_task),
-                    _CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                _logger.warning(
-                    "CAN hardware discovery did not finish within %.0fs; "
-                    "shutting down without it",
-                    _CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS,
-                )
+            await asyncio.shield(can_discovery_task)
         await runner.shutdown()
         await manager.shutdown()
         await asyncio.to_thread(robot.shutdown)

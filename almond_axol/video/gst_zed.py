@@ -51,7 +51,6 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from ..zed.calibration import calibration_hint
 from .constants import HEADSET_STREAM_FPS
 from .hw_video import _bitrate_for, dataset_intra_vbr_bitrate, hw_h264_available
 
@@ -1662,7 +1661,6 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
             raise RuntimeError(
                 f"ZedGstCamera(serial={self.serial}) did not start streaming "
                 f"within {_READY_TIMEOUT_S:.0f}s (camera absent or in use?)."
-                + calibration_hint(self.serial)
             )
         if self._want_raw and self._pts_perf_offset_s is None:
             self.disconnect()
@@ -2095,7 +2093,6 @@ class ZedGstStereoCamera(_GstPipelineBase):
             raise RuntimeError(
                 f"ZedGstStereoCamera(serial={self.serial}) did not start "
                 f"streaming within {_READY_TIMEOUT_S:.0f}s."
-                + calibration_hint(self.serial)
             )
         if self._want_raw and self._pts_perf_offset_s is None:
             self.disconnect()

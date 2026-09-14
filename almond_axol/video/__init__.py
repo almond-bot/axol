@@ -8,7 +8,6 @@ data collection — extracted from :mod:`almond_axol.vr` because the recorder
 Modules
 ───────
     gst_zed      GPU-resident zed-gstreamer capture (grab + NVENC encode)
-    zed_sdk      ZED Python SDK grab-thread cameras (the gst fallback; no lerobot)
     hw_video     Jetson NVENC hardware H.264 encoder for aiortc
     video        aiortc WebRTC relay (``WebRTCManager``) streaming to the headset
     video_proc   Out-of-process video relay subprocess (``VideoRelayProcess``)

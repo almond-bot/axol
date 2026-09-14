@@ -1,11 +1,4 @@
-"""Configuration dataclass for the local ZED camera (LeRobot ``CameraConfig``).
-
-The resolution table and the SDK-facing config live in
-:mod:`almond_axol.video.zed_sdk` (``lerobot``-free); this module wraps them in
-LeRobot's ``CameraConfig`` registry so ``--robot_config.cameras.<slot>`` parses
-on the collect-data / run-policy CLIs and ``make_cameras_from_configs`` can
-build a :class:`~almond_axol.lerobot.camera.ZedCamera` from it.
-"""
+"""Configuration dataclass for the local ZED camera."""
 
 from dataclasses import dataclass
 from typing import Literal
@@ -13,18 +6,33 @@ from typing import Literal
 from lerobot.cameras.configs import CameraConfig, ColorMode
 
 from ...cli.config import register_literal
-from ...video.zed_sdk import ZED_RESOLUTION_DIMS, resolution_for_dims
-
-__all__ = [
-    "ZED_RESOLUTION_DIMS",
-    "StereoEyes",
-    "ZedCameraConfig",
-    "resolution_for_dims",
-]
 
 # Which eye(s) of a stereo ZED X to expose as observations. Registered with
 # draccus so it decodes/validates on the CLI (see register_literal).
 StereoEyes = register_literal(Literal["both", "left", "right"])
+
+# Frame dimensions (width, height) for each ZED capture resolution name.
+# For a stereo ZED X these are per eye.
+ZED_RESOLUTION_DIMS: dict[str, tuple[int, int]] = {
+    "SVGA": (960, 600),
+    "HD1080": (1920, 1080),
+    "HD1200": (1920, 1200),
+}
+
+
+def resolution_for_dims(width: int, height: int) -> str:
+    """Resolution name for ``(width, height)`` frame dimensions.
+
+    Raises:
+        ValueError: If the dimensions match no supported ZED resolution.
+    """
+    for name, dims in ZED_RESOLUTION_DIMS.items():
+        if dims == (width, height):
+            return name
+    raise ValueError(
+        f"{width}x{height} matches no supported ZED resolution "
+        f"({', '.join(f'{n} {w}x{h}' for n, (w, h) in ZED_RESOLUTION_DIMS.items())})"
+    )
 
 
 @CameraConfig.register_subclass("zed")
@@ -34,11 +42,7 @@ class ZedCameraConfig(CameraConfig):
 
     Opens the GMSL-attached camera by serial number via the ZED SDK. One
     instance per camera (overhead, left_arm, right_arm each get their own
-    config). Shares its capture fields (``serial`` … ``stereo``) with
-    :class:`~almond_axol.video.zed_sdk.ZedSdkCameraConfig`, so an instance can
-    be handed straight to the SDK cameras; the remaining fields (``eyes``,
-    ``stream_eyes``, ``record``, ``stream``) describe how the robot / relay
-    use the camera and are not read by the camera itself.
+    config).
 
     Args:
         serial:     Serial number of the camera to open. Defaults to ``0``, an

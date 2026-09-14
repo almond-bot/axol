@@ -89,16 +89,6 @@ def run(args: argparse.Namespace) -> None:
 
     mark_privileged_service()
 
-    # The ZED SDK caches calibration files as whoever opens a camera first. A
-    # root service and an operator's dev `axol serve` share one box, so make
-    # the cache group-shared up front (root: always; operator: only when a
-    # root-written file is already unreadable, which may prompt for sudo on a
-    # tty). Otherwise the first camera open fails with CALIBRATION FILE NOT
-    # AVAILABLE and looks like a cable/camera fault.
-    from ..zed import ensure_calibration_readable
-
-    ensure_calibration_readable()
-
     import uvicorn
 
     from ..serve import create_app
@@ -150,14 +140,7 @@ def run(args: argparse.Namespace) -> None:
                 "ssl_keyfile": tls_files.keyfile,
             }
         config = uvicorn.Config(
-            app,
-            host=args.host,
-            port=args.port,
-            log_level="info",
-            # Without a bound uvicorn waits forever for open streaming
-            # WebSockets, so `systemctl stop axol` sat until its 240s kill.
-            timeout_graceful_shutdown=5,
-            **ssl_kwargs,
+            app, host=args.host, port=args.port, log_level="info", **ssl_kwargs
         )
         server = uvicorn.Server(config)
         server.run(sockets=[sock])

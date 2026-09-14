@@ -354,10 +354,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
     SettingCategory(
         key="robot",
         label="Robot",
-        description=(
-            "Which attached hardware a session drives, and arm behaviour "
-            "shared by every operation on this robot."
-        ),
+        description="Arm behaviour shared by every operation on this robot.",
         settings=(
             SettingDef(
                 key="axol.left_stiffness",
@@ -437,44 +434,18 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="number",
                 help="Maximum joint speed of the right gripper.",
             ),
-            # What a session drives is inferred from the CAN interfaces
-            # attached (arm hub, Jelly wheel bus, lift bus) — these three are
-            # the operator's opt-out for hardware that is plugged in.
             SettingDef(
-                key="robot.arms",
-                label="Axol arms",
+                key="jelly.enabled",
+                label="Jelly",
                 type="boolean",
                 help=(
-                    "Drive the Axol arms in teleop. Off leaves the arms and "
-                    "their CAN channels untouched — no Axol connection or "
-                    "motor check needed — and the headset drives only Jelly. "
-                    "Data collection and policies always use the arms."
-                ),
-                targets={"teleop": ("arms",)},
-            ),
-            SettingDef(
-                key="jelly.wheels",
-                label="Jelly wheels",
-                type="boolean",
-                help=(
-                    "Drive Jelly's x-drive omni base when its CAN adapter is "
-                    "attached (the panel pins it to can_alm_axol_b): left "
-                    "stick translates, right stick x rotates. Off leaves the "
-                    "wheels cold even with the bus present. Operator mobility "
-                    "only — Jelly motion is never recorded into datasets and "
-                    "policies never control it. Jelly parameters live under "
-                    "Advanced → Jelly."
-                ),
-            ),
-            SettingDef(
-                key="jelly.lift",
-                label="Jelly lift",
-                type="boolean",
-                help=(
-                    "Run Jelly's telescoping lift from the stick clicks (left "
-                    "down, right up) when its controller is attached — on its "
-                    "own chest bus (can_alm_axol_c) or sharing the wheel bus. "
-                    "Off leaves the lift cold even with the bus present."
+                    "This robot has Jelly (x-drive omni base + "
+                    "telescoping lift). The headset thumbsticks then drive it "
+                    "during teleop and data collection: left stick translates, "
+                    "right stick x rotates, stick clicks run the lift. "
+                    "Operator mobility only — Jelly motion is never recorded "
+                    "into datasets and policies never control it. Jelly "
+                    "parameters live under Advanced → Jelly."
                 ),
             ),
             SettingDef(
@@ -1003,11 +974,7 @@ _LEGACY_KEYS: dict[str, tuple[str, ...]] = {
         "axol.left.gripper.max_speed",
         "axol.right.gripper.max_speed",
     ),
-    # Jelly used to be opted into by hand; it is now inferred from the CAN
-    # interfaces attached (with jelly.wheels / jelly.lift as the opt-out), so
-    # the old switch has no home and is dropped on load.
-    "robot.jelly_enabled": (),
-    "jelly.enabled": (),
+    "robot.jelly_enabled": ("jelly.enabled",),
     "robot.reset_torque_threshold": ("teleop.reset_torque_threshold",),
     "robot.teleop_torque_threshold": ("teleop.teleop_torque_threshold",),
     "robot.policy_torque_threshold": ("inference.policy_torque_threshold",),
