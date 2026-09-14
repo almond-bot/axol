@@ -49,6 +49,9 @@ from almond_axol.teleop.live import LiveSettings
 
 
 def _core(**overrides) -> VRTeleopCore:
+    # The shaping is opt-in (off by default while box mode's alignment is
+    # settled on hardware); these tests exercise it.
+    overrides.setdefault("box_squeeze_force", 8.0)
     return VRTeleopCore(
         VRTeleopConfig(**overrides),
         logging.getLogger("test"),
@@ -677,8 +680,18 @@ class ToolContactsTest(unittest.TestCase):
 
 
 class CoreDecisionTest(unittest.TestCase):
-    def test_default_force_is_eight_newtons(self) -> None:
-        self.assertEqual(VRTeleopConfig().box_squeeze_force, 8.0)
+    def test_default_is_off(self) -> None:
+        # Off until the pair's alignment and a flat grasp are settled on
+        # hardware without it: box mode then sends the IK's commands as
+        # they are, and the arms press with their plain springs.
+        self.assertEqual(VRTeleopConfig().box_squeeze_force, 0.0)
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+        )
+        self.assertIsNone(core.squeeze())
+        self.assertIsNone(core.spring_caps())
 
     def test_shaping_follows_box_mode_grasp_and_tool(self) -> None:
         core = _core(box_mode=True, box_tool="parcel", box_grasp="flush")

@@ -40,6 +40,7 @@ def _core(**overrides) -> VRTeleopCore:
     # The per-joint cap is opt-in (off by default, it slows a carry); these
     # tests exercise it, so turn it on unless a test says otherwise.
     overrides.setdefault("box_squeeze_torque", 6.0)
+    overrides.setdefault("box_squeeze_force", 8.0)
     return VRTeleopCore(
         VRTeleopConfig(**overrides),
         logging.getLogger("test"),

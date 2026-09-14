@@ -1110,7 +1110,7 @@ class GraspToggleTest(unittest.TestCase):
         )
         q = np.zeros(14, np.float32)
         self.assertEqual(core.config.box_elbow_out, 30.0)  # the default
-        self.assertGreater(core.config.box_elbow_weight, 0.0)  # hint on
+        self.assertEqual(core.config.box_elbow_weight, 0.0)  # hint opt-in
         status = {"aligned": False, "width": 0.3, "grasp": "straight", "elbow": 42.5}
         core._unpack_solution((q, status))
         self.assertEqual(core.config.box_elbow_out, 42.5)

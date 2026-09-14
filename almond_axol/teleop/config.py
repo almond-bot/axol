@@ -210,11 +210,13 @@ class VRTeleopConfig:
             menu as **Elbows out**).
         box_elbow_weight: IK weight on that elbow hint (compare
             ``KinematicsConfig.pos_weight`` 50 for the grippers). ``0``
-            disables the hint — the swivel is then left alone: rest damping
-            holds it and the arm/torso collision model
+            (the default) disables the hint — the swivel is then left
+            alone: rest damping holds it and the arm/torso collision model
             (``KinematicsConfig.self_collision``) keeps it off the base —
-            and the sticks' elbow control does nothing. ``10`` (the default)
-            follows the angle without fighting the gripper poses.
+            and the sticks' elbow control does nothing. ``10`` follows the
+            angle; it is a second cost pulling on each arm during a move,
+            so it stays off until the pair's alignment is settled without
+            it. Live-adjustable (control panel).
         box_elbow_speed: Rate (degrees/s) the sticks change
             ``box_elbow_out`` at full forward/back deflection.
         box_squeeze_torque: Cap (Nm) on the impedance spring torque of the
@@ -277,12 +279,17 @@ class VRTeleopConfig:
             carry, which passes through in full on both arms, so the pair
             translates as one body and neither arm is ever held back from
             a move. The rest of the command (servo lag, the box's weight)
-            is untouched. ``8`` N a side
-            holds a light parcel with margin; raise it if boxes slip,
-            lower it to be gentler. ``0`` disables the shaping (only the
-            torque cap, if set, then bounds the squeeze,
-            pose-dependently). Live-adjustable; realtime-core hardware
-            only.
+            is untouched. ``0`` (the default) disables the shaping: the
+            arms then press with their plain impedance springs — as much as
+            the width is jogged past contact — and commands go to the core
+            exactly as the IK produced them. **Off by default while box
+            mode's basics (the pair's alignment, a flat grasp) are being
+            settled on hardware**: the shaping rewrites each arm's command
+            from its *measured* pose every tick, and every version of it so
+            far has been seen to cost alignment on the robot. ``8`` N a side
+            held a light parcel with margin when it was on; raise it if
+            boxes slip, lower it to be gentler. Live-adjustable;
+            realtime-core hardware only.
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest
@@ -482,10 +489,10 @@ class VRTeleopConfig:
     box_width_max: float = 0.70
     box_align_duration: float = 1.5
     box_elbow_out: float = 30.0
-    box_elbow_weight: float = 10.0
+    box_elbow_weight: float = 0.0
     box_elbow_speed: float = 30.0
     box_squeeze_torque: float = 0.0
-    box_squeeze_force: float = 8.0
+    box_squeeze_force: float = 0.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi

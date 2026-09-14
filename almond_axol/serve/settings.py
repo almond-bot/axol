@@ -752,6 +752,24 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="teleop.box_elbow_weight",
+                label="Box-mode elbow hint weight",
+                type="number",
+                help=(
+                    "IK weight steering box mode's elbows to the angle above "
+                    "(the grippers' own weight is 50). 0 (off, the default) "
+                    "leaves the elbows where they fall — the arm/torso "
+                    "collision model keeps them off the base — and the "
+                    "thumbsticks' elbow control does nothing; 10 turns the "
+                    "hint on. Off while the pair's alignment is settled: it "
+                    "is a second cost pulling on each arm during a move."
+                ),
+                targets={
+                    "teleop": ("teleop.box_elbow_weight",),
+                    "collect-data": (f"{_VRT}.box_elbow_weight",),
+                },
+            ),
+            SettingDef(
                 key="teleop.box_squeeze_torque",
                 label="Box squeeze cap (Nm)",
                 type="number",
@@ -784,8 +802,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "— and shared evenly over the gripper's contact points "
                     "(the parcel blade's root corners and its tip) instead "
                     "of the face alone, so the whole face stays flat on the "
-                    "box as you squeeze. Raise it if boxes slip out, lower it to "
-                    "be gentler; 0 turns the shaping off. Also adjustable "
+                    "box as you squeeze. 0 (off, the default) sends the "
+                    "IK's commands as they are — the arms press with their "
+                    "plain springs; 8 N is a working value. Also adjustable "
                     "live from the headset menu (Squeeze force). Hardware "
                     "only."
                 ),

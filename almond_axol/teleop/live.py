@@ -180,9 +180,8 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
             "Box mode: how hard each arm clamps the box once the width is "
             "jogged in past contact, at any pose, and shared evenly over "
             "the gripper's contact points (the parcel blade's root corners "
-            "and its tip) so the whole face lies flat. Raise it if "
-            "boxes slip, lower it to be gentler; 0 turns the shaping off. "
-            "Hardware only."
+            "and its tip) so the whole face lies flat. 0 (off, the default) "
+            "sends the IK's commands as they are; try 8 N. Hardware only."
         ),
     ),
     LiveSettingDef(
