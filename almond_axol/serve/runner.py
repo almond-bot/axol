@@ -1170,7 +1170,7 @@ class OperationRunner:
         recording). ``legacy`` reads the old single ``resolution`` key as the
         streaming resolution for back-compat.
         """
-        from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS
+        from ..video.zed_sdk import ZED_RESOLUTION_DIMS
 
         val = (cameras or {}).get(key)
         if val is None and legacy:
@@ -1238,10 +1238,7 @@ class OperationRunner:
         default raises each recording camera's physical capture rate to match;
         higher rates may still be rejected at large capture resolutions.
         """
-        from ..lerobot.camera.configuration_zed import (
-            ZED_RESOLUTION_DIMS,
-            ZedCameraConfig,
-        )
+        from ..video.zed_sdk import ZED_RESOLUTION_DIMS, ZedSdkCameraConfig
 
         merged = dict(args)
         serials = self._camera_serials(cameras)
@@ -1260,7 +1257,8 @@ class OperationRunner:
             recording_fps = int(float(str(args.get("fps") or 0)))
         except (TypeError, ValueError):
             recording_fps = 0
-        default_capture_fps = ZedCameraConfig.fps or 0
+        # Same default as the LeRobot ZedCameraConfig the op parses this into.
+        default_capture_fps = ZedSdkCameraConfig.fps or 0
 
         for slot, serial in serials.items():
             streams, s_eyes = self._branch(
