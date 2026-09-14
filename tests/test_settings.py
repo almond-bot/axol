@@ -23,7 +23,7 @@ class DiagnosticSettingsTest(unittest.TestCase):
             {
                 "mantis": "yes",
                 "sim": "OFF",
-                "jelly_only": "no",
+                "arms": "no",
                 "axol.has_gripper": "on",
             },
         )
@@ -33,7 +33,7 @@ class DiagnosticSettingsTest(unittest.TestCase):
             {
                 "mantis": True,
                 "sim": False,
-                "jelly_only": False,
+                "arms": False,
                 "axol.has_gripper": True,
             },
         )
@@ -44,7 +44,7 @@ class DiagnosticSettingsTest(unittest.TestCase):
                 "true",
                 "--sim",
                 "false",
-                "--jelly_only",
+                "--arms",
                 "false",
                 "--axol.has_gripper",
                 "true",
@@ -201,6 +201,94 @@ class DiagnosticSettingsTest(unittest.TestCase):
                 document["teleop"], {"frequency": 240, "hold_to_engage": True}
             )
             self.assertEqual(document["kinematics"], {"pos_weight": 99})
+
+    def test_retired_jelly_switch_is_dropped_and_hardware_toggles_fold(self) -> None:
+        # Jelly used to be opted into by hand (``jelly.enabled``, earlier
+        # ``robot.jelly_enabled``); it is now inferred from the attached CAN
+        # devices, so a saved switch is dropped on load, whatever its value,
+        # and a cached panel sending it is not an error.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "jelly": {"enabled": True, "max_speed": 4.0},
+                        "robot": {"jelly_enabled": False},
+                    }
+                )
+            )
+            store = SettingsStore(path)
+            self.assertEqual(store.snapshot()["values"], {"jelly.max_speed": 4.0})
+            store.update(values={"jelly.enabled": False, "robot.jelly_enabled": True})
+            self.assertEqual(store.snapshot()["values"], {"jelly.max_speed": 4.0})
+            self.assertNotIn("enabled", json.loads(path.read_text())["jelly"])
+
+            # The Robot tab's three switches: arms is teleop's top-level
+            # ``arms`` (and nothing else's), wheels / lift ride the jelly
+            # subtree into teleop and data collection.
+            store.update(
+                values={"robot.arms": "off", "jelly.wheels": False, "jelly.lift": "no"}
+            )
+            teleop = store.merged_args("teleop", {})
+            self.assertIs(teleop["arms"], False)
+            self.assertIs(teleop["jelly.wheels"], False)
+            self.assertIs(teleop["jelly.lift"], False)
+            collect = store.merged_args("collect-data", {})
+            self.assertNotIn("arms", collect)
+            self.assertNotIn("robot_config.arms", collect)
+            self.assertIs(collect["teleop_config.jelly.wheels"], False)
+            self.assertIs(collect["teleop_config.jelly.lift"], False)
+            self.assertNotIn("arms", store.merged_args("gravity-comp", {}))
+            argv = build_argv("teleop", teleop)
+            pairs = {argv[i]: argv[i + 1] for i in range(0, len(argv), 2)}
+            self.assertEqual(pairs["--arms"], "false")
+            self.assertEqual(pairs["--jelly.wheels"], "false")
+            self.assertEqual(pairs["--jelly.lift"], "false")
+            self.assertEqual(pairs["--jelly.max_speed"], "4.0")
+
+    def test_robot_tab_offers_arms_wheels_and_lift_and_no_jelly_only_run_field(
+        self,
+    ) -> None:
+        from almond_axol.serve.settings import advanced_schema, settings_schema
+
+        schema = settings_schema()
+        robot = next(c for c in schema if c["key"] == "robot")
+        robot_keys = [s["key"] for s in robot["settings"]]
+        self.assertIn("robot.arms", robot_keys)
+        # The Jelly switches have their own category (the panel's Jelly
+        # scope), not the Axol robot tab.
+        self.assertNotIn("jelly.wheels", robot_keys)
+        self.assertNotIn("jelly.lift", robot_keys)
+        jelly_category = next(c for c in schema if c["key"] == "jelly")
+        jelly_keys = [s["key"] for s in jelly_category["settings"]]
+        self.assertEqual(jelly_keys, ["jelly.wheels", "jelly.lift"])
+        self.assertNotIn("jelly.enabled", robot_keys + jelly_keys)
+        for setting in (*robot["settings"], *jelly_category["settings"]):
+            if setting["key"] in ("robot.arms", "jelly.wheels", "jelly.lift"):
+                self.assertEqual(setting["type"], "boolean")
+                self.assertIs(setting["default"], True)
+        # Curated keys have one home: the Advanced → Jelly tree no longer
+        # lists the lift switch (nor the retired enable).
+        jelly = next(s for s in advanced_schema() if s["key"] == "jelly")
+
+        def leaves(nodes):  # noqa: ANN001, ANN202
+            for node in nodes:
+                if node["kind"] == "field":
+                    yield node["key"]
+                else:
+                    yield from leaves(node["children"])
+
+        advanced = set(leaves(jelly["nodes"]))
+        self.assertNotIn("jelly.lift", advanced)
+        self.assertNotIn("jelly.wheels", advanced)
+        self.assertNotIn("jelly.enabled", advanced)
+        self.assertIn("jelly.max_speed", advanced)
+
+        teleop = COMMANDS["teleop"]
+        self.assertEqual(teleop.per_run_fields, ("sim",))
+        self.assertEqual(teleop.arms_flag, "arms")
+        self.assertNotIn("jelly_only", teleop.robot_free_flags)
 
     def test_update_accepts_pre_v2_names_from_cached_panels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

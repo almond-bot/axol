@@ -49,12 +49,17 @@ export interface CommandSpec {
   requiresCameras?: boolean
   /** Config keys the panel asks for per run; the rest come from Settings. */
   perRunFields?: string[]
+  /** Per-run fields with a server-side pick list (/api/commands/{id}/suggestions/{field}). */
+  suggestedFields?: string[]
   /** Drives episodes the panel can start / save / discard. */
   episodeControl?: boolean
   /** Arg name that means "no hardware", or null when the robot is required. */
   simFlag?: string | null
-  /** Arg names that skip the arm-robot gates without being sim (jelly_only). */
+  /** Arg names that skip the arm-robot gates without being sim (mantis). */
   robotFreeFlags?: string[]
+  /** Default-on boolean arg that *off* makes the run arm-free (teleop's `arms`,
+   * the Robot tab's "Axol arms" switch); null when the op always uses the arms. */
+  armsFlag?: string | null
   /** Whether this operation can run against the Mantis hardware profile. */
   supportsMantis?: boolean
   /** Connected hardware profiles on which this command may be launched. */
@@ -283,8 +288,11 @@ export function saveLocalHardwareProfile(profile: HardwareProfile): void {
   }
 }
 
-/** Per-run flags that only make sense on the Axol profile (sim / Jelly-only
- *  drive the arm simulator or Jelly, never the handheld rigs). */
+/** Per-run flags that only make sense on the Axol profile (sim drives the arm
+ *  simulator, never the handheld rigs). `jelly_only` is the retired per-run
+ *  Jelly-only toggle older hosts still list — Jelly is now inferred from the
+ *  attached CAN devices, with the Robot tab's "Axol arms" switch for
+ *  arm-free runs. */
 const AXOL_ONLY_RUN_FLAGS = new Set(["sim", "jelly_only"])
 
 /**
@@ -421,12 +429,27 @@ export interface CanDiscoveryState {
   message?: string
 }
 
+/** Presence of one Jelly device's pinned CAN interface in the host's inventory. */
+export interface CanDevicePresence {
+  /** The interface the device rides on (the lift shares the wheel bus when it
+   *  has no chest adapter of its own). */
+  channel: string
+  present: boolean
+  up: boolean
+  /** This device was manually disconnected on the serve host. */
+  automaticConnectSuppressed?: boolean
+}
+
+export type CanDeviceInventory = Record<JellyDevice, CanDevicePresence>
+
 export interface CanInterfaceInventory {
   /** Opaque app-lifetime identity; omitted by older serve releases. */
   serverInstanceId?: string
   interfaces: CanInterface[]
   /** Omitted by serve releases that predate hardware-aware auto-connect. */
   profiles?: CanProfileInventory
+  /** Jelly wheel/lift bus presence; omitted by serve releases without Jelly links. */
+  devices?: CanDeviceInventory
   /** Omitted by serve releases that predate safe, non-interactive discovery. */
   discovery?: CanDiscoveryState
 }
@@ -439,6 +462,112 @@ export async function fetchCanInterfaces(): Promise<CanInterfaceInventory> {
 export async function discoverCanHardware(force = false): Promise<CanInterfaceInventory> {
   const path = force ? "/api/can/discover?force=true" : "/api/can/discover"
   return json(await fetch(apiUrl(path), { method: "POST" }))
+}
+
+// ---------------------------------------------------------------------------
+// Jelly wheels + lift (detached CAN + 1 Hz status poll)
+// ---------------------------------------------------------------------------
+
+/** Jelly's two auxiliary devices, each on its own idle link. */
+export type JellyDevice = "wheels" | "lift"
+export const JELLY_DEVICES: readonly JellyDevice[] = ["wheels", "lift"]
+export const JELLY_DEVICE_LABELS: Record<JellyDevice, string> = {
+  wheels: "Jelly Wheels",
+  lift: "Jelly Lift",
+}
+
+/** One wheel motor from the idle ping (IDs 1–4, Damiao). */
+export interface WheelMotorHealth {
+  /** "front_left" | "front_right" | "back_left" | "back_right" */
+  name: string
+  id: number
+  /** null while a task owns the bus or the link is down. */
+  reachable: boolean | null
+  status: string | null
+  temperature: number | null
+  voltage: number | null
+}
+
+/** The jelly_legs board's latest status frame. */
+export interface LiftBoardStatus {
+  homed: boolean
+  /** Percent of homed travel (0 = lowered); null until homed. */
+  heightPercent: number | null
+  moving: boolean
+  homing: boolean
+  stallFault: boolean
+  atLower: boolean
+  atUpper: boolean
+  /** Firmware v0.4+ driver health; null on legacy frames. */
+  driversEnabled: boolean | null
+  vmPresent: boolean | null
+  driverFaultMask: number | null
+}
+
+interface JellyLinkStatusBase {
+  state: RobotState
+  connected: boolean
+  error: string | null
+  lastPing: number | null
+  channel: string
+}
+
+export interface JellyWheelsStatus extends JellyLinkStatusBase {
+  motors: WheelMotorHealth[]
+  motorCount: number
+  reachableCount: number
+}
+
+export interface JellyLiftStatus extends JellyLinkStatusBase {
+  /** Whether the board answered recently; null while nobody polls it. */
+  reachable: boolean | null
+  status: LiftBoardStatus | null
+}
+
+export interface JellyStatus {
+  wheels: JellyWheelsStatus
+  lift: JellyLiftStatus
+}
+
+export async function fetchJellyStatus(): Promise<JellyStatus> {
+  return json(await fetch(apiUrl("/api/jelly/status")))
+}
+
+export async function jellyConnect(device: JellyDevice, automatic = false): Promise<JellyStatus> {
+  return json(
+    await fetch(apiUrl(`/api/jelly/${device}/connect`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ automatic }),
+    })
+  )
+}
+
+export async function jellyDisconnect(device: JellyDevice): Promise<JellyStatus> {
+  return json(await fetch(apiUrl(`/api/jelly/${device}/disconnect`), { method: "POST" }))
+}
+
+/** Healthy = reachable on CAN and reporting no error status. */
+export function wheelMotorHealthy(m: WheelMotorHealth): boolean {
+  return m.reachable === true && (m.status === "OK" || m.status === "DISABLED" || m.status == null)
+}
+
+/** Faulted wheels while connected: unreachable or in an error state. */
+export function wheelFaults(status: JellyWheelsStatus | null | undefined): WheelMotorHealth[] {
+  if (!status || !status.connected) return []
+  return status.motors.filter((m) => m.reachable != null && !wheelMotorHealthy(m))
+}
+
+/** Lift board problems worth a red dot: silent board, stall, or driver fault. */
+export function liftFaultLabel(status: JellyLiftStatus | null | undefined): string | null {
+  if (!status || status.state !== "connected") return null
+  if (status.reachable === false) return "Lift board not answering"
+  const board = status.status
+  if (!board) return null
+  if (board.stallFault) return "Leg stall fault"
+  if (board.driverFaultMask) return "Lift driver fault"
+  if (board.vmPresent === false) return "Lift motor power absent"
+  return null
 }
 
 /** A busy race, transport interruption, or server fault may retry on the next inventory poll. */
@@ -629,6 +758,33 @@ export interface DatasetInfo {
 export async function fetchDatasets(): Promise<DatasetInfo[]> {
   const res: { datasets?: DatasetInfo[] } = await json(await fetch(apiUrl("/api/datasets")))
   return res.datasets ?? []
+}
+
+/** One row of a per-run field's server-side pick list. */
+export interface FieldSuggestionRow {
+  value: string
+  /** Secondary text shown next to the value (e.g. the run it came from). */
+  label: string | null
+}
+
+/**
+ * The pick list a command declares for one per-run field (CommandDef
+ * ``field_suggestions``). A provider failure comes back as an empty list plus
+ * the reason, so the caller can keep the plain input and say why; an
+ * undeclared field (or an older host) is a 404 and throws.
+ */
+export async function fetchFieldSuggestions(
+  command: string,
+  field: string
+): Promise<{ suggestions: FieldSuggestionRow[]; error: string | null }> {
+  const res: { suggestions?: FieldSuggestionRow[]; error?: string | null } = await json(
+    await fetch(
+      apiUrl(
+        `/api/commands/${encodeURIComponent(command)}/suggestions/${encodeURIComponent(field)}`
+      )
+    )
+  )
+  return { suggestions: res.suggestions ?? [], error: res.error ?? null }
 }
 
 /** Which eye(s) of a stereo ZED X to use, per branch. */
@@ -1225,6 +1381,8 @@ export interface OperationMeta {
   description: string
   /** Per-run config keys surfaced in the panel (required + run identity). */
   fields: string[]
+  /** Per-run fields whose values the host suggests (typing stays free-form). */
+  suggestedFields: string[]
   /** Needs the persistent robot connection (CAN) to run. */
   requiresRobot: boolean
   /** Needs at least one camera serial configured (collect-data / run-policy). */
@@ -1233,9 +1391,13 @@ export interface OperationMeta {
   simCapable: boolean
   /** Arg that makes a run hardware-free; null when the robot is required. */
   simFlag: string | null
-  /** Args that skip the arm-robot gates without being sim (teleop's jelly_only:
+  /** Args that skip the arm-robot gates without being sim (teleop's mantis:
    * real hardware, but the arms and their CAN bus are never touched). */
   robotFreeFlags: string[]
+  /** Default-on boolean arg that *off* makes the run arm-free (teleop's `arms`,
+   * folded in from the Robot tab's "Axol arms" setting: the headset then drives
+   * only Jelly). Null when the op always uses the arms. */
+  armsFlag: string | null
   /** Runtime supports the Mantis hardware profile. */
   supportsMantis: boolean
   /** Shows the episode start / save / discard controls while running. */
@@ -1257,11 +1419,13 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Teleoperation",
     description: "Drive Axol from VR; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
     fields: ["sim"],
+    suggestedFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: true,
     simFlag: "sim",
     robotFreeFlags: ["mantis"],
+    armsFlag: null,
     supportsMantis: true,
     episodeControl: false,
     usesHeadset: true,
@@ -1272,11 +1436,13 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Gravity compensation",
     description: "Hold the arms weightless so they can be moved by hand.",
     fields: ["free_joints"],
+    suggestedFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    armsFlag: null,
     supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
@@ -1288,11 +1454,13 @@ export const OPERATIONS: OperationMeta[] = [
     description:
       "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
     fields: ["repo_id", "task"],
+    suggestedFields: [],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: ["mantis"],
+    armsFlag: null,
     supportsMantis: true,
     // Panel-driven episodes are newer than the registry, so a host old enough
     // to need this table can't serve them — the controls would sit on
@@ -1307,11 +1475,13 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Replay dataset",
     description: "Replay a recorded episode of a LeRobot dataset on Axol, then return to rest.",
     fields: ["repo_id", "episode", "loop", "interpolate"],
+    suggestedFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    armsFlag: null,
     supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
@@ -1323,11 +1493,13 @@ export const OPERATIONS: OperationMeta[] = [
     description:
       "Run a trained policy on Axol via LeRobot async inference, locally or on a remote inference server.",
     fields: ["policy_path", "policy_type", "task", "repo_id"],
+    suggestedFields: [],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    armsFlag: null,
     supportsMantis: false,
     episodeControl: true,
     usesHeadset: false,
@@ -1350,6 +1522,7 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     label: s.label,
     description: s.description,
     fields: s.perRunFields ?? [],
+    suggestedFields: s.suggestedFields ?? [],
     // Every in-process operation drives the arms; only a sim run doesn't, and
     // that's decided per run from simFlag.
     requiresRobot: true,
@@ -1357,6 +1530,7 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     simCapable: s.simCapable,
     simFlag: s.simFlag ?? null,
     robotFreeFlags: s.robotFreeFlags ?? [],
+    armsFlag: s.armsFlag ?? null,
     supportsMantis: s.supportsMantis ?? Boolean(s.perRunFields?.includes("mantis")),
     episodeControl: Boolean(s.episodeControl),
     usesHeadset: Boolean(s.usesHeadset),
@@ -1369,14 +1543,41 @@ export function isSimRun(meta: OperationMeta, settings: Record<string, FormValue
   return meta.simFlag != null && Boolean(settings[meta.simFlag])
 }
 
+/** The shared setting behind teleop's `arms` flag (Robot tab → "Axol arms"). */
+export const ARMS_SETTING = "robot.arms"
+
 /**
- * Whether this run leaves the arms (and their CAN bus) untouched — sim, or a
- * robot-free flag like teleop's jelly_only. Such a run skips the "Connect
- * Axol" and motor-fault gates; jelly_only still drives real Jelly hardware.
+ * Whether the run's arms flag is off. An explicit value in `args` wins;
+ * otherwise the shared settings snapshot decides, with the flag defaulting
+ * to on. For a *live* session pass `sharedValues: null`: its merged args are
+ * the whole truth (a default-on flag is simply omitted from them), and the
+ * operator flipping the saved switch mid-run must not relabel the run.
  */
-export function isRobotFreeRun(meta: OperationMeta, settings: Record<string, FormValue>): boolean {
+export function isArmsOffRun(
+  meta: OperationMeta,
+  args: Record<string, FormValue>,
+  sharedValues: Record<string, unknown> | null | undefined
+): boolean {
+  if (meta.armsFlag == null) return false
+  const runValue = args[meta.armsFlag]
+  if (runValue !== undefined && runValue !== null) return runValue === false
+  return sharedValues?.[ARMS_SETTING] === false
+}
+
+/**
+ * Whether this run leaves the arms (and their CAN bus) untouched — sim, a
+ * robot-free flag, or (given the shared settings) the arms switched off. Such
+ * a run skips the "Connect Axol" and motor-fault gates; an arms-off teleop
+ * still drives real Jelly hardware.
+ */
+export function isRobotFreeRun(
+  meta: OperationMeta,
+  settings: Record<string, FormValue>,
+  sharedValues?: Record<string, unknown> | null
+): boolean {
   if (isSimRun(meta, settings)) return true
-  return meta.robotFreeFlags.some((flag) => Boolean(settings[flag]))
+  if (meta.robotFreeFlags.some((flag) => Boolean(settings[flag]))) return true
+  return isArmsOffRun(meta, settings, sharedValues)
 }
 
 /** Curated fields for an op, resolved from the introspected command schema. */

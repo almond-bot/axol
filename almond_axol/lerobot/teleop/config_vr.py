@@ -21,8 +21,10 @@ class AxolVRTeleopConfig(TeleoperatorConfig):
         vr_teleop_config:      VR teleop session parameters (rest poses, frequency, smoothing).
         kinematics_config:  IK solver parameters forwarded to the subprocess.
         vr_server_config:   VR WebSocket server parameters (port, TLS certs).
-        jelly:               Jelly (x-drive base + telescoping lift) for
-                            robots that have one; ``jelly.enabled`` gates it.
+        jelly:               Jelly (x-drive base + telescoping lift), used
+                            when its CAN interfaces are attached (see
+                            :func:`~almond_axol.robot.jelly.detect_jelly`);
+                            ``jelly.wheels`` / ``jelly.lift`` switch it off.
                             Operator-only mobility: the thumbsticks reposition
                             the base/lift during a session, but Jelly state is
                             never recorded into the dataset and policies never

@@ -126,21 +126,12 @@ def _dispatch_draccus(command: str, argv: list[str]) -> None:
         raise
 
 
-def main() -> None:
-    """Dispatch ``axol <command>`` to the matching CLI handler."""
-    # Load .env / .env.local (TURN credentials, etc.) before any command runs so
-    # the values are in os.environ for in-process ops and child subprocesses.
-    load_local_env()
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argparse tree for every non-draccus ``axol`` subcommand.
 
-    argv = sys.argv[1:]
-    if argv and argv[0] in _DRACCUS_COMMANDS:
-        _dispatch_draccus(argv[0], argv[1:])
-        return
-    if argv and argv[0] in _DIAG_COMMANDS:
-        module_name, _ = _DIAG_COMMANDS[argv[0]]
-        importlib.import_module(module_name).main(argv[1:])
-        return
-
+    Kept separate from :func:`main` so the parser can be constructed (and
+    documentation examples parsed against it) without dispatching anything.
+    """
     parser = argparse.ArgumentParser(prog="axol")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -190,6 +181,23 @@ def main() -> None:
     # own parser).
     for name, (_, help_text) in (*_DRACCUS_COMMANDS.items(), *_DIAG_COMMANDS.items()):
         subparsers.add_parser(name, help=help_text, add_help=False)
+    return parser
 
-    args = parser.parse_args()
+
+def main() -> None:
+    """Dispatch ``axol <command>`` to the matching CLI handler."""
+    # Load .env / .env.local (TURN credentials, etc.) before any command runs so
+    # the values are in os.environ for in-process ops and child subprocesses.
+    load_local_env()
+
+    argv = sys.argv[1:]
+    if argv and argv[0] in _DRACCUS_COMMANDS:
+        _dispatch_draccus(argv[0], argv[1:])
+        return
+    if argv and argv[0] in _DIAG_COMMANDS:
+        module_name, _ = _DIAG_COMMANDS[argv[0]]
+        importlib.import_module(module_name).main(argv[1:])
+        return
+
+    args = build_parser().parse_args()
     args.func(args)

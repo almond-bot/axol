@@ -1,0 +1,6 @@
+app/dist/
+app/public/webxr-profiles/
+coverage/
+node_modules/
+package-lock.json
+packages/*/dist/

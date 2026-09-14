@@ -194,6 +194,85 @@ class _Robot:
         pass
 
 
+class _Jelly:
+    """Stand-in for serve.jelly_link.JellyLink: two independent device links."""
+
+    def __init__(
+        self,
+        states: dict[str, str] | None = None,
+        channels: dict[str, str] | None = None,
+    ) -> None:
+        self.states = dict(states or {"wheels": "disconnected", "lift": "disconnected"})
+        self.channels = dict(
+            channels or {"wheels": "can_alm_axol_b", "lift": "can_alm_axol_b"}
+        )
+        self.errors: dict[str, str | None] = {"wheels": None, "lift": None}
+        self.releases = 0
+        self.reacquires = 0
+        self.connects: list[str] = []
+        self.disconnects: list[str] = []
+        self.release_error: Exception | None = None
+        self.connect_error: str | None = None
+
+    def status(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for device in ("wheels", "lift"):
+            state = self.states[device]
+            out[device] = {
+                "state": state,
+                "connected": state in ("connected", "busy"),
+                "error": self.errors[device],
+                "lastPing": None,
+                "channel": self.channels[device],
+            }
+        return out
+
+    def connect(self, device: str) -> dict[str, Any]:
+        self.connects.append(device)
+        if self.connect_error is not None:
+            self.states[device] = "error"
+            self.errors[device] = self.connect_error
+        else:
+            self.states[device] = "connected"
+            self.errors[device] = None
+        return self.status()
+
+    def disconnect(self, device: str) -> dict[str, Any]:
+        if self.states[device] == "busy":
+            raise RuntimeError(
+                f"cannot disconnect the Jelly {device} while a task owns its bus"
+            )
+        self.disconnects.append(device)
+        self.states[device] = "disconnected"
+        return self.status()
+
+    def release(self) -> None:
+        self.releases += 1
+        if self.release_error is not None:
+            raise self.release_error
+        for device, state in self.states.items():
+            if state == "connected":
+                self.states[device] = "busy"
+
+    def reacquire(self) -> bool:
+        self.reacquires += 1
+        reconnected = False
+        for device, state in self.states.items():
+            if state == "busy":
+                self.states[device] = "connected"
+                reconnected = True
+        return reconnected
+
+    def disconnect_all(self) -> dict[str, Any]:
+        for device, state in list(self.states.items()):
+            if state != "busy":
+                self.disconnect(device)
+        return self.status()
+
+    def shutdown(self) -> None:
+        pass
+
+
 class _Manager:
     def __init__(self, sessions: list[Session] | None = None) -> None:
         self.sessions = sessions or []
@@ -370,10 +449,12 @@ def _test_app(
     robot: _Robot | None = None,
     settings: _Settings | None = None,
     updater: _Updater | None = None,
+    jelly: _Jelly | None = None,
 ) -> Any:
     robot = robot or _Robot()
     settings = settings or _Settings()
     updater = updater or _Updater(lambda: True)
+    jelly = jelly or _Jelly()
 
     def make_updater(is_idle: Any) -> _Updater:
         updater._is_idle = is_idle
@@ -384,6 +465,7 @@ def _test_app(
         patch.object(app_module, "OperationRunner", return_value=runner),
         patch.object(app_module, "SettingsStore", return_value=settings),
         patch.object(app_module, "RobotLink", return_value=robot),
+        patch.object(app_module, "JellyLink", return_value=jelly),
         patch.object(
             app_module,
             "SelfUpdater",
@@ -1380,7 +1462,7 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_robot_free_string_booleans_skip_axol_survey_consistently(
         self,
     ) -> None:
-        for key, value in (("sim", "yes"), ("jelly_only", "on")):
+        for key, value in (("sim", "yes"), ("arms", "off")):
             with self.subTest(key=key, value=value):
                 manager = _Manager()
                 runner = _Runner()
@@ -1394,7 +1476,7 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(runner.starts, 1)
                 assert runner.session is not None
-                self.assertIs(runner.session.args[key], True)
+                self.assertIs(runner.session.args[key], key == "sim")
 
     async def test_motor_operation_binds_launch_to_surveyed_channels(self) -> None:
         manager = _Manager()
@@ -2235,9 +2317,9 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         self,
     ) -> None:
         cases = (
-            ("teleop", {}, SimpleNamespace(mantis=True, sim=False, jelly_only=False)),
-            ("teleop", {}, SimpleNamespace(mantis=False, sim=True, jelly_only=False)),
-            ("teleop", {}, SimpleNamespace(mantis=False, sim=False, jelly_only=True)),
+            ("teleop", {}, SimpleNamespace(mantis=True, sim=False, arms=True)),
+            ("teleop", {}, SimpleNamespace(mantis=False, sim=True, arms=True)),
+            ("teleop", {}, SimpleNamespace(mantis=False, sim=False, arms=False)),
         )
         for op_id, args, config in cases:
             with self.subTest(config=config):
@@ -2258,7 +2340,7 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         config = SimpleNamespace(
             mantis=False,
             sim=False,
-            jelly_only=False,
+            arms=True,
             axol=SimpleNamespace(has_gripper=True),
         )
         with (
@@ -2297,6 +2379,52 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         run_args = thread.call_args.kwargs["args"]
         self.assertFalse(run_args[-1])
         worker.start.assert_called_once_with()
+
+    def test_arms_off_teleop_is_robot_free_and_keeps_the_axol_link(self) -> None:
+        # The Robot tab's "Axol arms" switch off (settings ``robot.arms`` →
+        # teleop ``arms``) drives just Jelly: the run never touches the arms,
+        # so the idle Axol link stays connected and its telemetry streaming.
+        robot = _Robot(profile="axol")
+        runner = OperationRunner(robot_link=robot)
+        config = SimpleNamespace(
+            mantis=False,
+            sim=False,
+            arms=False,
+            axol=SimpleNamespace(has_gripper=True),
+        )
+        worker = Mock()
+        with (
+            patch.object(runner, "_build_config", return_value=config),
+            patch.object(runner, "_attach_cameras_to_teleop"),
+            patch("almond_axol.serve.runner.threading.Thread", return_value=worker),
+        ):
+            session = runner.start("teleop", {"arms": False})
+
+        self.assertEqual(session.status, "running")
+        self.assertEqual(robot.releases, 0)
+        worker.start.assert_called_once_with()
+
+    def test_arms_default_on_requires_the_axol_link(self) -> None:
+        # With ``arms`` omitted the config default (on) applies: a gripperless
+        # survey then trips the gripper check, proving the run was classified
+        # as an arm run rather than robot-free.
+        robot = _Robot(profile="axol", has_gripper=False)
+        runner = OperationRunner(robot_link=robot)
+        config = SimpleNamespace(
+            mantis=False,
+            sim=False,
+            arms=True,
+            axol=SimpleNamespace(has_gripper=True),
+        )
+        with (
+            patch.object(runner, "_build_config", return_value=config),
+            patch.object(runner, "_attach_cameras_to_teleop"),
+        ):
+            session = runner.start("teleop", {})
+
+        self.assertEqual(session.status, "error")
+        self.assertIn("connected Axol survey is gripperless", session.error or "")
+        self.assertEqual(robot.releases, 0)
 
 
 if __name__ == "__main__":

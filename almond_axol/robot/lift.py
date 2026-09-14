@@ -154,7 +154,8 @@ class LiftStatus:
         return self.position_permille / 10.0
 
 
-def _decode_status(data: bytes) -> LiftStatus:
+def decode_status(data: bytes) -> LiftStatus:
+    """Decode one jelly_legs status frame (``0x421`` payload, 6 or 8 bytes)."""
     pos, vel, flags, drift = struct.unpack("<HhBb", data[:6])
     # Treat driver health as one versioned extension: a short/legacy frame must
     # not look like a healthy controller merely because its missing bits would
@@ -183,6 +184,10 @@ def _decode_status(data: bytes) -> LiftStatus:
         ),
         save_pending=(bool(driver_state & 0x08) if driver_state is not None else None),
     )
+
+
+# Historical private name, kept for callers and tests that still use it.
+_decode_status = decode_status
 
 
 class Lift:
@@ -650,7 +655,7 @@ class Lift:
 
     def _on_message(self, msg) -> None:  # noqa: ANN001 - can.Message, typed lazily
         if msg.arbitration_id == _ID_STATUS and len(msg.data) >= 6:
-            self._status = _decode_status(bytes(msg.data))
+            self._status = decode_status(bytes(msg.data))
             received_at = time.monotonic()
             self._last_status_monotonic = received_at
             self._status_timestamps.append(received_at)

@@ -143,12 +143,7 @@ export function ConnectionPill({
   onClick: () => void
 }) {
   const dot = state === "ok" ? "bg-emerald-400" : state === "err" ? "bg-red-400" : "bg-amber-400"
-  const label =
-    state === "ok"
-      ? host || "Connected"
-      : state === "err"
-        ? "Offline"
-        : "Connecting…"
+  const label = state === "ok" ? host || "Connected" : state === "err" ? "Offline" : "Connecting…"
   return (
     <button
       type="button"

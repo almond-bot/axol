@@ -53,7 +53,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ...constants import Joint
 from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
-from ...robot.jelly import Jelly
+from ...robot.jelly import Jelly, detect_jelly
 from ...teleop.core import TCPPoseSnapshot, VRTeleopCore
 from ...teleop.live import LiveSettings
 from ...teleop.worker import run_ik_worker
@@ -130,12 +130,13 @@ class AxolVRTeleop(Teleoperator):
 
         # Jelly (x-drive base + telescoping lift), operator-only
         # mobility on robots that have one: the thumbsticks reposition the
-        # base/lift during a session, exactly as in native teleop. Jelly state
-        # is NOT part of the action/observation space — it is never recorded
-        # into the dataset and policies never control it.
-        self._jelly: Jelly | None = (
-            Jelly(config.jelly) if config.jelly.enabled else None
-        )
+        # base/lift during a session, exactly as in native teleop. Whether the
+        # robot has Jelly is inferred from the CAN interfaces attached (see
+        # detect_jelly), gated by the jelly.wheels / jelly.lift switches. Jelly
+        # state is NOT part of the action/observation space — it is never
+        # recorded into the dataset and policies never control it.
+        jelly_cfg = detect_jelly(config.jelly)
+        self._jelly: Jelly | None = Jelly(jelly_cfg) if jelly_cfg is not None else None
 
         # Last smoothed command; protected by _q_lock so concurrent get_action
         # calls serialize (only the control loop calls it, so uncontended).

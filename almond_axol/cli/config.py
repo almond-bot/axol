@@ -625,17 +625,21 @@ class TeleopCmdConfig:
     The VR WebSocket server (port, TLS certs) lives on the nested
     ``vr_server`` config — e.g. ``--vr_server.port 9000``.
 
-    Robots on Jelly (x-drive base + telescoping lift) enable it
-    with ``--jelly.enabled true``; the thumbsticks then drive the base (left
-    stick translates, right stick x rotates) and the stick clicks run the
-    lift (left click down, right click up), independent of the arm engage
-    toggle. Jelly parameters live on the nested ``jelly`` config — e.g.
-    ``--jelly.max_speed 5`` or ``--jelly.channel can0``.
+    The hardware a session drives is inferred from the CAN interfaces present
+    on the host: the Axol arms when their channels exist, Jelly's wheels when
+    ``can_alm_axol_b`` does, and its lift when the lift bus does (see
+    :func:`almond_axol.robot.jelly.detect_jelly`). The thumbsticks then drive
+    Jelly (left stick translates, right stick x rotates) and the stick clicks
+    run the lift (left click down, right click up), independent of the arm
+    engage toggle. ``--arms false``, ``--jelly.wheels false`` and
+    ``--jelly.lift false`` switch attached hardware off. Jelly parameters live
+    on the nested ``jelly`` config — e.g. ``--jelly.max_speed 5`` or
+    ``--jelly.channel can0``.
 
-    ``--jelly_only`` drives *just* Jelly: the arms are never constructed
+    With the arms off (or their CAN interfaces absent while Jelly's are
+    present) the session drives *just* Jelly: the arms are never constructed
     and the Axol hub CAN channels are never touched — only the VR server
-    (thumbstick stream) and the Jelly run. Having Jelly is implied, so
-    ``--jelly.enabled`` is not consulted.
+    (thumbstick stream) and the Jelly run.
     """
 
     sim: bool = False
@@ -645,10 +649,10 @@ class TeleopCmdConfig:
     # data collection's job (`axol collect-data --mantis`). Mutually exclusive
     # with --sim.
     mantis: bool = False
-    jelly_only: bool = False
-    """Drive only Jelly from the headset thumbsticks. The arms and their CAN
-    channels are left untouched (no Axol hub needed); Jelly is
-    implied. Mutually exclusive with sim."""
+    arms: bool = True
+    """Drive the Axol arms. Off leaves the arms and their CAN channels
+    untouched (no Axol hub needed) and drives only Jelly from the headset
+    thumbsticks. Sim always models the arms, so it needs this on."""
     axol: AxolConfig = field(default_factory=AxolConfig)
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)

@@ -11,7 +11,9 @@ import {
 import {
   HARDWARE_PROFILE_ARG,
   fetchDatasets,
+  fetchFieldSuggestions,
   fetchTrackerBindings,
+  isArmsOffRun,
   isRobotFreeRun,
   isSimRun,
   motorFaultLabel,
@@ -38,7 +40,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
-import { cn } from "@/lib/utils"
+import { cn, sentenceCase } from "@/lib/utils"
 
 const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse", "ultimate"])
 
@@ -59,6 +61,7 @@ export function OperationPanel({
   settings,
   hardwareProfile,
   mantisSource: configuredMantisSource,
+  sharedValues,
   onChange,
   onReset,
   onResetAll,
@@ -87,6 +90,8 @@ export function OperationPanel({
   hardwareProfile: HardwareProfile
   /** Shared Mantis tracking source used when this is a Mantis run. */
   mantisSource: string
+  /** The shared settings values (Robot tab switches such as "Axol arms"). */
+  sharedValues: Record<string, unknown> | null
   onChange: (key: string, value: FormValue) => void
   onReset: (key: string) => void
   onResetAll: () => void
@@ -115,8 +120,8 @@ export function OperationPanel({
 }) {
   // Per-run inputs: every required field plus the op's curated run-identity
   // fields (repo id, task, policy path, episode, …) — required ones first.
-  // The device flag is never one of them, and Axol-only run modes (sim /
-  // Jelly-only) disappear while Mantis is selected.
+  // The device flag is never one of them, and the Axol-only sim mode
+  // disappears while Mantis is selected.
   const runFields = useMemo(
     () => (spec ? perRunFields(spec, meta, hardwareProfile) : []),
     [spec, meta, hardwareProfile]
@@ -198,34 +203,103 @@ export function OperationPanel({
       window.clearInterval(timer)
     }
   }, [connected, mantisMode, mantisSource, trackerSource, live])
+  // Host-declared pick lists for the other per-run fields (CommandDef
+  // field_suggestions — run-policy's model ids from a model registry, say):
+  // fetched like the datasets whenever the form is editable, keyed by field.
+  // A provider failure keeps the plain input and surfaces the reason under
+  // the form; an older host without the endpoint leaves the fields alone.
+  const suggestedKeys = useMemo(
+    () => runFields.map((f) => f.key).filter((k) => meta.suggestedFields.includes(k)),
+    [runFields, meta.suggestedFields]
+  )
+  // The fetched lists are tagged with the operation they were fetched for:
+  // a reply landing after the operator switched panels must not attach to
+  // the next op's field of the same name, and a stale entry from a previous
+  // op is ignored rather than cleared in an effect.
+  const [hostSuggestions, setHostSuggestions] = useState<{
+    op: string
+    rows: Record<string, FieldSuggestion[]>
+    errors: Record<string, string>
+  }>({ op: "", rows: {}, errors: {} })
+  useEffect(() => {
+    if (!connected || suggestedKeys.length === 0 || live) return
+    let cancelled = false
+    for (const key of suggestedKeys) {
+      fetchFieldSuggestions(meta.id, key)
+        .then(({ suggestions: rows, error }) => {
+          if (cancelled) return
+          setHostSuggestions((prev) => {
+            const same = prev.op === meta.id
+            const errors = { ...(same ? prev.errors : {}) }
+            if (error) errors[key] = error
+            else delete errors[key]
+            return {
+              op: meta.id,
+              rows: {
+                ...(same ? prev.rows : {}),
+                [key]: rows.map((r) => ({ value: r.value, label: r.label ?? undefined })),
+              },
+              errors,
+            }
+          })
+        })
+        .catch(() => {})
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [connected, live, meta.id, suggestedKeys])
   const suggestions = useMemo<Record<string, FieldSuggestion[]> | undefined>(() => {
-    if (!wantsDatasets || datasets.length === 0) return undefined
-    return {
-      repo_id: datasets.map((d) => ({
+    const merged: Record<string, FieldSuggestion[]> = {}
+    if (hostSuggestions.op === meta.id) {
+      for (const key of suggestedKeys) {
+        const rows = hostSuggestions.rows[key]
+        if (rows && rows.length > 0) merged[key] = rows
+      }
+    }
+    if (wantsDatasets && datasets.length > 0) {
+      merged.repo_id = datasets.map((d) => ({
         value: d.repoId,
         label:
           d.episodes != null ? `${d.episodes} episode${d.episodes === 1 ? "" : "s"}` : undefined,
-      })),
+      }))
     }
-  }, [wantsDatasets, datasets])
+    return Object.keys(merged).length > 0 ? merged : undefined
+  }, [wantsDatasets, datasets, hostSuggestions, meta.id, suggestedKeys])
+  const suggestionNotes = useMemo(() => {
+    if (hostSuggestions.op !== meta.id) return []
+    return suggestedKeys
+      .filter((key) => hostSuggestions.errors[key])
+      .map((key) => ({
+        key,
+        label: runFields.find((f) => f.key === key)?.label ?? key,
+        error: hostSuggestions.errors[key],
+      }))
+  }, [suggestedKeys, hostSuggestions, meta.id, runFields])
 
-  // Sim and Jelly-only are Axol run modes: hidden and ignored on Mantis.
+  // Sim is an Axol run mode: hidden and ignored on Mantis.
   const isSim = !mantisMode && isSimRun(meta, effectiveSettings)
-  // Sim, Jelly-only, and Mantis runs do not touch the Axol arm motors. Mantis
+  // Teleop with the Robot tab's "Axol arms" switch off drives only Jelly: the
+  // arms and their CAN bus are never touched. A live run is described by its
+  // merged args alone (a default-on flag is omitted from them, so the saved
+  // switch must not be consulted — flipping it mid-run cannot relabel the
+  // run); otherwise the saved setting decides the next start.
+  const savedValues = liveArgs ? null : sharedValues
+  const armsOff = !mantisMode && isArmsOffRun(meta, effectiveSettings, savedValues)
+  // Sim, arms-off, and Mantis runs do not touch the Axol arm motors. Mantis
   // still needs its own live CAN link, however, so `robotFree` only controls
   // the Axol connection/fault gates below; it is not a general hardware-free
   // signal.
-  const robotFree = mantisMode || isRobotFreeRun(meta, effectiveSettings)
+  const robotFree = mantisMode || armsOff || isRobotFreeRun(meta, effectiveSettings, savedValues)
   const robotOk = robot?.state === "connected"
   const axolOk = robotOk && (robot?.profile ?? "axol") === "axol"
   const mantisOk = robotOk && robot?.profile === "mantis"
-  const jellyOnly =
-    !mantisMode && meta.fields.includes("jelly_only") && Boolean(effectiveSettings.jelly_only)
   // `usesHeadset` also identifies operations that run the camera relay. The
   // relay is useful in the panel for every real teleop/collection run,
   // including headset-free Lighthouse/Ultimate Mantis collection. Mantis
-  // teleop is grippers-only: no VR server or cameras run, so no feeds.
-  const showFeeds = meta.usesHeadset && !isSim && !jellyOnly && !(mantisMode && meta.id === "teleop")
+  // teleop is grippers-only: no VR server or cameras run, so no feeds; an
+  // arms-off (Jelly-only) teleop relays no headset video either.
+  const showFeeds = meta.usesHeadset && !isSim && !armsOff && !(mantisMode && meta.id === "teleop")
   const camCount = recordingCameraCount(cameras, mantisMode)
   const currentTrackerReadinessState =
     trackerReadinessSource === mantisSource ? trackerReadinessState : "loading"
@@ -333,13 +407,10 @@ export function OperationPanel({
       if (v === undefined || String(v).trim() === "") blockers.push(`Set ${f.label}`)
     }
   }
-  // Teleop's Axol run modes are mutually exclusive (the server refuses the
-  // start too); catch the combination before the Start button instead of after.
-  const modeFlags = ["sim", "jelly_only"].filter(
-    (f) => runFields.some((field) => field.key === f) && Boolean(settings[f])
-  )
-  if (modeFlags.length > 1) {
-    blockers.push("Sim and Jelly only are mutually exclusive — enable only one")
+  // Sim models the arms, so it cannot run with them switched off (the server
+  // refuses the start too); say so before the Start button instead of after.
+  if (isSim && armsOff) {
+    blockers.push("Sim needs the arms — turn on Axol arms in Robot settings or disable sim")
   }
 
   const editedCount = Object.keys(settings).length
@@ -427,6 +498,13 @@ export function OperationPanel({
                       onReset={onReset}
                     />
                   )}
+                  {!live &&
+                    suggestionNotes.map((note) => (
+                      <p key={note.key} className="text-xs leading-relaxed text-white/45">
+                        {sentenceCase(note.label)} suggestions unavailable — type the value.{" "}
+                        <span className="break-words text-white/35">{note.error}</span>
+                      </p>
+                    ))}
                   {jointField && (
                     <ArmJointPicker
                       value={settings[jointField.key]}
@@ -464,7 +542,7 @@ export function OperationPanel({
                   status/controls, the mirrored headset popups, and the live
                   camera feeds — grouped so it can expand to a fullscreen
                   operator view (the headset-off replacement for the HUD). */}
-              {/* Sim has the browser viewer, Jelly-only has no video relay, and
+              {/* Sim has the browser viewer, an arms-off run has no video relay, and
                   Mantis teleop is grippers-only (no cameras). Mantis collection
                   still relays its configured wrist-camera feeds even when
                   Lighthouse/Ultimate make the headset unnecessary. */}

@@ -528,14 +528,7 @@ const KIND_TABS: Record<string, string> = {
 /* ------------------------------------------------------------------ */
 
 // Matches tune.motion's --gain fields (see _GAIN_FIELDS there).
-const OVERRIDE_FIELDS = [
-  "kp",
-  "kd",
-  "kd_host",
-  "kd_host_hz",
-  "kd_host_q",
-  "j_eff",
-]
+const OVERRIDE_FIELDS = ["kp", "kd", "kd_host", "kd_host_hz", "kd_host_q", "j_eff"]
 
 /** Format a config gain for seeding/comparison (trims float32 noise). */
 function fmtGain(v: unknown): string {
@@ -638,10 +631,7 @@ function GainOverrideEditor({
           <tr>
             <th />
             {OVERRIDE_FIELDS.map((f) => (
-              <th
-                key={f}
-                className="px-1 pb-1 text-left text-[0.65rem] font-normal text-white/40"
-              >
+              <th key={f} className="px-1 pb-1 text-left text-[0.65rem] font-normal text-white/40">
                 {f}
               </th>
             ))}
@@ -771,13 +761,11 @@ function PoseEditor({
             className="h-8 w-28 rounded-md border border-white/10 bg-[#1c1c1c] px-1.5 text-xs text-white/85 outline-none focus:border-[#eff483]/40"
           >
             <option value="">joint…</option>
-            {ARM_JOINT_OPTIONS.filter((o) => o !== excludeJoint || o === row.joint).map(
-              (o) => (
-                <option key={o} value={o}>
-                  {o}
-                </option>
-              )
-            )}
+            {ARM_JOINT_OPTIONS.filter((o) => o !== excludeJoint || o === row.joint).map((o) => (
+              <option key={o} value={o}>
+                {o}
+              </option>
+            ))}
           </select>
           <input
             type="text"
@@ -2116,7 +2104,8 @@ export function TuningWorkbench({
   const scores = meta ? scoreRows(meta, armed ? arm : null) : null
   const legend = meta ? SCORE_LEGEND[meta.kind] : null
   const perJoint = (meta?.metrics as Record<string, unknown> | undefined)?.per_joint as
-    Record<string, Record<string, unknown>> | undefined
+    | Record<string, Record<string, unknown>>
+    | undefined
 
   /* --- compare mode ------------------------------------------------ */
   const comparing = compareIds.length === 2

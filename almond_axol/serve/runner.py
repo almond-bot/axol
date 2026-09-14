@@ -45,7 +45,14 @@ from typing import Any
 from ..motor.bus import STALL_DETECT_S, stalled_channels
 from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
 from ..zed import stereo_serials
-from .commands import flag_enabled, normalize_boolean_args
+from .commands import (
+    flag_default,
+    flag_enabled,
+    flag_value,
+    is_robot_free,
+    normalize_boolean_args,
+    safety_flags,
+)
 from .manager import Session
 
 _logger = logging.getLogger(__name__)
@@ -509,8 +516,16 @@ class _Capture:
 class OperationRunner:
     """Runs one core operation in-process at a time, with log capture."""
 
-    def __init__(self, robot_link: Any = None, settings: Any = None) -> None:
+    def __init__(
+        self, robot_link: Any = None, settings: Any = None, jelly_link: Any = None
+    ) -> None:
         self._robot_link = robot_link
+        # Idle links to Jelly's wheel bus and lift controller
+        # (serve.jelly_link.JellyLink). Released for every hardware run that
+        # could drive Jelly (teleop drives it whenever it is attached) and
+        # reacquired when the run ends. True while this runner holds them.
+        self._jelly_link = jelly_link
+        self._jelly_released = False
         # Shared operator settings (serve.settings.SettingsStore). Folded into
         # every op start beneath the request's own args, so per-run values win.
         self._settings = settings
@@ -676,17 +691,11 @@ class OperationRunner:
             # config to describe exactly the same hardware/no-hardware mode.
             # Otherwise (for example) ``mantis: true`` in config_path could
             # borrow an Axol survey and then open the Mantis buses.
-            safety_flags = tuple(
-                dict.fromkeys(
-                    flag
-                    for flag in (cmd.sim_flag, *cmd.robot_free_flags)
-                    if flag is not None
-                )
-            )
             parsed_flags: dict[str, bool] = {}
-            for flag in safety_flags:
-                requested = flag_enabled(args.get(flag))
-                parsed = flag_enabled(getattr(cfg, flag, False))
+            for flag in safety_flags(cmd):
+                default = flag_default(cmd, flag)
+                requested = flag_value(args.get(flag), default)
+                parsed = flag_value(getattr(cfg, flag, default), default)
                 if parsed != requested:
                     raise ValueError(
                         f"{op_id}'s parsed {flag}={parsed} does not match the "
@@ -747,13 +756,11 @@ class OperationRunner:
                         "control panel's Mantis tile"
                     )
 
-            is_sim = cmd.sim_flag is not None and parsed_flags.get(cmd.sim_flag, False)
-            # A robot-free run (sim, or e.g. teleop's jelly_only) never touches
-            # the arms, so the persistent robot link stays connected and its
-            # motor telemetry keeps streaming while the op runs.
-            robot_free = is_sim or any(
-                parsed_flags.get(flag, False) for flag in cmd.robot_free_flags
-            )
+            # A robot-free run (sim, Mantis, or teleop with the arms switched
+            # off) never touches the arms, so the persistent robot link stays
+            # connected and its motor telemetry keeps streaming while the op
+            # runs.
+            robot_free = is_robot_free(cmd, parsed_flags)
             hardware_profile = "mantis" if mantis_mode else "axol"
             link_matches_run = (
                 self._robot_link is not None
@@ -765,6 +772,18 @@ class OperationRunner:
                 cmd.uses_can_bus
                 and link_matches_run
                 and (not robot_free or hardware_profile == "mantis")
+            )
+            # Jelly is inferred from the attached CAN interfaces at run time,
+            # so any real-hardware Axol run on the CAN bus may open the wheel
+            # and lift buses (teleop drives Jelly whenever it is attached; an
+            # arm-free teleop is Jelly-only). Sim never touches Jelly and a
+            # Mantis run owns only the rig's hub.
+            sim_run = cmd.sim_flag is not None and parsed_flags.get(cmd.sim_flag, False)
+            needs_jelly = (
+                cmd.uses_can_bus
+                and not sim_run
+                and not mantis_mode
+                and self._jelly_link is not None
             )
             if (
                 needs_robot
@@ -831,6 +850,28 @@ class OperationRunner:
                     "[serve] error: robot link could not be released; "
                     "operation was not started"
                 )
+                session.close_stream()
+                return session
+        self._jelly_released = False
+        if needs_jelly:
+            try:
+                self._jelly_link.release()
+                self._jelly_released = True
+            except Exception as exc:  # noqa: BLE001
+                session.status = "error"
+                session.error = f"{type(exc).__name__}: {exc}"
+                session.emit(
+                    "[serve] error: Jelly link could not be released; "
+                    "operation was not started"
+                )
+                if needs_robot and self._robot_link is not None:
+                    try:
+                        self._robot_link.reacquire()
+                    except Exception as reacquire_exc:  # noqa: BLE001
+                        session.emit(
+                            f"[serve] error: robot link reacquire failed: "
+                            f"{reacquire_exc}"
+                        )
                 session.close_stream()
                 return session
 
@@ -1170,7 +1211,7 @@ class OperationRunner:
         recording). ``legacy`` reads the old single ``resolution`` key as the
         streaming resolution for back-compat.
         """
-        from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS
+        from ..video.zed_sdk import ZED_RESOLUTION_DIMS
 
         val = (cameras or {}).get(key)
         if val is None and legacy:
@@ -1238,10 +1279,7 @@ class OperationRunner:
         default raises each recording camera's physical capture rate to match;
         higher rates may still be rejected at large capture resolutions.
         """
-        from ..lerobot.camera.configuration_zed import (
-            ZED_RESOLUTION_DIMS,
-            ZedCameraConfig,
-        )
+        from ..video.zed_sdk import ZED_RESOLUTION_DIMS, ZedSdkCameraConfig
 
         merged = dict(args)
         serials = self._camera_serials(cameras)
@@ -1260,7 +1298,8 @@ class OperationRunner:
             recording_fps = int(float(str(args.get("fps") or 0)))
         except (TypeError, ValueError):
             recording_fps = 0
-        default_capture_fps = ZedCameraConfig.fps or 0
+        # Same default as the LeRobot ZedCameraConfig the op parses this into.
+        default_capture_fps = ZedSdkCameraConfig.fps or 0
 
         for slot, serial in serials.items():
             streams, s_eyes = self._branch(
@@ -1718,4 +1757,12 @@ class OperationRunner:
                 self._mark_terminal(session, "error", error=message)
                 session.emit(f"[serve] error: {message}")
                 _logger.warning("robot reacquire failed: %s", exc)
+        if self._jelly_released and not cleanup_uncertain:
+            self._jelly_released = False
+            try:
+                if self._jelly_link.reacquire():
+                    session.emit("[serve] Jelly link reacquired")
+            except Exception as exc:  # noqa: BLE001 - devices left in error state
+                session.emit(f"[serve] warning: Jelly link reacquire failed: {exc}")
+                _logger.warning("Jelly reacquire failed: %s", exc)
         session.close_stream()

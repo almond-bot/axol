@@ -135,10 +135,7 @@ export function MotorGrid({
                 )}
               />
               <Stat label="Bus" value={fmt(reading?.voltage, 1, "V")} />
-              <Stat
-                label="Pos"
-                value={fmt(pos == null ? null : (pos * 180) / Math.PI, 1, "°")}
-              />
+              <Stat label="Pos" value={fmt(pos == null ? null : (pos * 180) / Math.PI, 1, "°")} />
             </div>
           </button>
         )
@@ -185,8 +182,7 @@ function MotorDetailsDialog({
     }
   }, [arm, joint])
 
-  const deg = (v: number | null) =>
-    v == null ? "–" : `${((v * 180) / Math.PI).toFixed(1)}°`
+  const deg = (v: number | null) => (v == null ? "–" : `${((v * 180) / Math.PI).toFixed(1)}°`)
 
   return (
     <div
@@ -228,9 +224,7 @@ function MotorDetailsDialog({
             <DetailRow
               label="Velocity"
               value={fmt(
-                details.velocity == null
-                  ? null
-                  : (details.velocity * 180) / Math.PI,
+                details.velocity == null ? null : (details.velocity * 180) / Math.PI,
                 1,
                 " °/s"
               )}

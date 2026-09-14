@@ -40,7 +40,7 @@ The Mantis profile gets its own udev rule file, startup script, and hotplug brin
 </Info>
 
 <Info>
-  After setup, the interfaces come up automatically on every reboot (via a `@reboot` cron hook) **and** whenever the adapter re-enumerates mid-session: a udev rule pulls in the `axol-can-up.service` bring-up whenever the hub (re-)appears, so a replug — or a USB drop caused by motor EMI — heals itself within a second or two without operator action. You don't need `can.setup` just to use Jelly — [`axol teleop`](/cli/teleop) brings Jelly's own interface up on its own — but pinning it gives the adapter a stable name across reboots.
+  After setup, the interfaces come up automatically on every reboot (via a `@reboot` cron hook) **and** whenever the adapter re-enumerates mid-session: a udev rule pulls in the `axol-can-up.service` bring-up whenever the hub (re-)appears, so a replug — or a USB drop caused by motor EMI — heals itself within a second or two without operator action. You don't need `can.setup` just to use Jelly — [`axol teleop`](/cli/teleop) brings Jelly's own interface up on its own — but pinning it gives the adapter a stable name across reboots. The [control panel](/guides/control-panel#axol-and-mantis) pins a powered Jelly's wheel and chest/lift adapters automatically when it identifies attached CAN hardware.
 </Info>
 
 <Note>

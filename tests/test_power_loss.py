@@ -38,7 +38,7 @@ from almond_axol.serve.runner import STALL_STOP_ERROR, OperationRunner
 
 # The serve API doubles (settings store, session manager, updater) already exist
 # for the reservation tests; reuse them rather than growing a second set.
-from tests.test_serve_session_reservation import _Manager, _Settings, _Updater
+from tests.test_serve_session_reservation import _Jelly, _Manager, _Settings, _Updater
 
 # What the Rust transports put on the wire when nothing ACKs for STALL_DETECT
 # (``proxy.rs`` for the maintenance proxy, ``serve.rs`` for the armed core).
@@ -406,13 +406,19 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
         return runner
 
     async def _client(
-        self, runner: OperationRunner, robot: _LockedOutLink
+        self,
+        runner: OperationRunner,
+        robot: _LockedOutLink,
+        jelly: _Jelly | None = None,
     ) -> httpx.AsyncClient:
-        client, _updater = await self._client_and_updater(runner, robot)
+        client, _updater = await self._client_and_updater(runner, robot, jelly)
         return client
 
     async def _client_and_updater(
-        self, runner: OperationRunner, robot: _LockedOutLink
+        self,
+        runner: OperationRunner,
+        robot: _LockedOutLink,
+        jelly: _Jelly | None = None,
     ) -> tuple[httpx.AsyncClient, _Updater]:
         """The API client plus the updater double built with the app's real
         ``_is_idle``, which is what the panel's host tile gates on."""
@@ -428,6 +434,7 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
             patch.object(app_module, "OperationRunner", return_value=runner),
             patch.object(app_module, "SettingsStore", return_value=_Settings()),
             patch.object(app_module, "RobotLink", return_value=robot),
+            patch.object(app_module, "JellyLink", return_value=jelly or _Jelly()),
             patch.object(app_module, "SelfUpdater", side_effect=make_updater),
         ):
             app = app_module.create_app()
@@ -518,6 +525,33 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(robot.reacquires, 1)
         self.assertFalse(runner.hardware_cleanup_lockout())
         self.assertFalse(runner.is_running())
+
+    async def test_clear_lockout_hands_the_jelly_buses_back(self) -> None:
+        # The failed run borrowed the Jelly buses too, and the lockout kept
+        # them ``busy``. Lifting it must give them back — otherwise the wheels
+        # and lift tiles read "in use" with no task to end it.
+        robot = _LockedOutLink([_motor("SHOULDER_1", reachable=False, status=None)])
+        runner = self._locked_out_runner(robot)
+        jelly = _Jelly(states={"wheels": "busy", "lift": "busy"})
+
+        async with await self._client(runner, robot, jelly) as client:
+            response = await client.post("/api/op/clear-lockout")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(jelly.reacquires, 1)
+        self.assertEqual(jelly.states, {"wheels": "connected", "lift": "connected"})
+
+    async def test_clear_lockout_refusal_leaves_the_jelly_buses_reserved(self) -> None:
+        robot = _LockedOutLink([_motor("WRIST_2", reachable=True, status="OK")])
+        runner = self._locked_out_runner(robot)
+        jelly = _Jelly(states={"wheels": "busy", "lift": "busy"})
+
+        async with await self._client(runner, robot, jelly) as client:
+            response = await client.post("/api/op/clear-lockout")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(jelly.reacquires, 0)
+        self.assertEqual(jelly.states, {"wheels": "busy", "lift": "busy"})
 
     async def test_clear_lockout_keeps_the_lockout_when_nothing_was_read(self) -> None:
         robot = _LockedOutLink([_motor("SHOULDER_1", reachable=None, status=None)])

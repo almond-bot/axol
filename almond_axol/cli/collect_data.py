@@ -137,10 +137,9 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
 
     Applied after parsing, so it overrides these specific teleop fields even if
     set on the CLI (a warning is logged); other teleop knobs (One Euro, rest
-    poses, frequency) pass through untouched. Jelly (powered base) control is
-    always disabled: Mantis is a handheld rig, and a persisted robot Jelly
-    setting must not open or move unrelated base/lift hardware during
-    collection.
+    poses, frequency) pass through untouched. Jelly (powered base + lift)
+    control is always disabled: Mantis is a handheld rig, and a Jelly bus
+    attached to the same host must not be opened or moved during collection.
     """
     from dataclasses import fields, replace
 
@@ -193,9 +192,10 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
         from ..kinematics.config import apply_mantis_kinematics_profile
         from ..teleop.config import apply_mantis_teleop_profile
 
-        if cfg.teleop_config.jelly.enabled:
-            _logger.info("--mantis: disabling Jelly (powered base) control.")
-            cfg.teleop_config.jelly.enabled = False
+        if cfg.teleop_config.jelly.wheels or cfg.teleop_config.jelly.lift:
+            _logger.info("--mantis: disabling Jelly (powered base + lift) control.")
+            cfg.teleop_config.jelly.wheels = False
+            cfg.teleop_config.jelly.lift = False
         cfg.teleop_config.has_gripper = True
         tc = cfg.teleop_config.vr_teleop_config
         if not tc.absolute_mode or tc.hold_to_engage or tc.ik_alpha != 1.0:

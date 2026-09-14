@@ -71,7 +71,8 @@ class ProvisionSafetyTest(unittest.TestCase):
             self.assertIn((["rm", "-f", str(unsafe_unit)], {"check": True}), calls)
             self.assertNotIn((["rm", "-f", str(safe_unit)], {"check": True}), calls)
             self.assertEqual(safe_unit.read_text(), safe_content)
-            self.assertIn("Run `sudo axol can.setup`", output.getvalue())
+            self.assertIn("Run `axol can.setup`", output.getvalue())
+            self.assertNotIn("sudo axol", output.getvalue())
 
     def test_safe_cron_and_unit_are_left_untouched_without_warning(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -221,6 +222,11 @@ class ProvisionSafetyTest(unittest.TestCase):
                 side_effect=lambda: fail("pyzed"),
             ),
             patch.object(
+                provision.zed_calibration,
+                "share_calibration_files",
+                side_effect=lambda: succeed("calibration"),
+            ),
+            patch.object(
                 provision.gst_install,
                 "run",
                 side_effect=lambda: succeed("gst"),
@@ -236,7 +242,16 @@ class ProvisionSafetyTest(unittest.TestCase):
 
         self.assertEqual(
             attempted,
-            ["adb", "tracker", "driver", "gyro", "pyzed", "gst", "gst-build"],
+            [
+                "adb",
+                "tracker",
+                "driver",
+                "gyro",
+                "pyzed",
+                "calibration",
+                "gst",
+                "gst-build",
+            ],
         )
         message = str(raised.exception)
         self.assertIn("Lighthouse tracking (tracker.install)", message)
