@@ -672,6 +672,10 @@ export default function ControlPanel() {
     manualRobotOverrideRef.current = false
     automaticCanDiscoveryAttemptsRef.current.clear()
     canDiscoveryNoticesRef.current.clear()
+    // The Jelly links restart disconnected with their manual-disconnect pause
+    // forgotten too, so this tab's latches must not outlive the process.
+    autoJellyAttemptsRef.current.clear()
+    manualJellyOverrideRef.current.clear()
   }, [canServerInstanceId, resetAutoRobotRetry])
 
   // Auto-establish the Quest-over-USB tunnel as soon as an authorized headset

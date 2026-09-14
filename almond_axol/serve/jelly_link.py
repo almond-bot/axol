@@ -387,7 +387,9 @@ class JellyLink:
         Each connected device becomes ``busy`` so :meth:`reacquire` knows
         which to reopen. A device that fails to close is left in ``error``
         and the failure is raised — an operation must never open a bus this
-        link may still hold.
+        link may still hold. Nothing then borrows the buses, so any sibling
+        that did close is reopened first: a device is ``busy`` only while a
+        task actually owns it, never stranded there by an aborted hand-over.
         """
         failures: list[str] = []
         for link in self._devices.values():
@@ -402,6 +404,7 @@ class JellyLink:
                 _logger.warning("Jelly %s release failed: %s", link.name, exc)
                 failures.append(f"{link.name}: {exc}")
         if failures:
+            self.reacquire()
             raise RuntimeError(
                 "could not release the Jelly link (" + "; ".join(failures) + ")"
             )

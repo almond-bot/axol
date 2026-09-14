@@ -251,6 +251,7 @@ class JellyLinkStateMachineTest(unittest.TestCase):
     def test_release_failure_leaves_device_in_error_and_raises(self) -> None:
         self.link.connect("wheels")
         self.link.connect("lift")
+        self.mocked.opened.clear()
         self.mocked.close_error["wheels"] = RuntimeError("CAN close timed out")
         with self.assertRaises(RuntimeError) as ctx:
             self.link.release()
@@ -258,8 +259,11 @@ class JellyLinkStateMachineTest(unittest.TestCase):
         status = self.link.status()
         self.assertEqual(status["wheels"]["state"], STATE_ERROR)
         self.assertIn("CAN close timed out", status["wheels"]["error"])
-        # The device that did close is still handed over cleanly.
-        self.assertEqual(status["lift"]["state"], STATE_BUSY)
+        # The hand-over was aborted, so no task will ever give the lift back:
+        # the device that did close is reopened rather than stranded ``busy``
+        # (where connect is a no-op and disconnect is refused).
+        self.assertEqual(status["lift"]["state"], STATE_CONNECTED)
+        self.assertEqual(self.mocked.opened, ["lift"])
 
     def test_reacquire_failure_leaves_device_in_error(self) -> None:
         self.link.connect("wheels")

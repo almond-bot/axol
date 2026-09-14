@@ -2646,6 +2646,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     reacquired=reacquired,
                 )
             runner.clear_hardware_cleanup_lockout()
+            # The failed run borrowed the Jelly buses too and the lockout kept
+            # them ``busy``; with it lifted, hand them back to the idle links.
+            # A device that fails to reopen shows as ``error`` on its tile,
+            # where Connect can retry — the lockout itself is already proven.
+            try:
+                await asyncio.to_thread(jelly.reacquire)
+            except Exception as exc:  # noqa: BLE001 - devices left in error state
+                _logger.warning("Jelly reacquire after lockout clear failed: %s", exc)
             return JSONResponse({"cleared": True})
 
     @app.post("/api/op/start")
