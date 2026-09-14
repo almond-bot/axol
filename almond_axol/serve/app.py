@@ -831,7 +831,11 @@ async def _stream_until_disconnect(
             done, _ = await asyncio.wait(
                 (pending, disconnect), return_when=asyncio.FIRST_COMPLETED
             )
-            if pending not in done:
+            # Check the disconnect first: both can finish in the same wait, and
+            # once ``receive()`` has consumed the close frame uvicorn rejects any
+            # further send with a RuntimeError (not a WebSocketDisconnect), so a
+            # message that raced the close is dropped rather than yielded.
+            if disconnect in done:
                 pending.cancel()
                 return
             yield pending.result()

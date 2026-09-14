@@ -12,6 +12,7 @@ import asyncio
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -34,22 +35,40 @@ _TIMEOUT_S = 5.0
 _TEST_DISCOVERY_BOUND_S = 0.1
 
 
-async def _drive_websocket(app: Any, path: str) -> list[dict[str, Any]]:
-    """Open ``path``, disconnect with nothing published, return the sent frames.
+async def _drive_websocket(
+    app: Any, path: str, *, before_disconnect: Callable[[], None] | None = None
+) -> list[dict[str, Any]]:
+    """Open ``path``, disconnect, and return the frames the handler sent.
 
     Drives the ASGI protocol directly: a websocket client is the only way to
     observe that the handler task ends, and every timeout here is what would
-    otherwise hang a stop.
+    otherwise hang a stop. ``before_disconnect`` runs synchronously right before
+    the close frame is queued, so anything it publishes lands in the same event
+    loop iteration as the disconnect.
+
+    Mirrors uvicorn's post-close behaviour: once ``receive()`` has handed the
+    disconnect to the app, any further send is a protocol violation and raises
+    ``RuntimeError`` (not an ``OSError``, so Starlette does not turn it into a
+    ``WebSocketDisconnect``).
     """
     incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     incoming.put_nowait({"type": "websocket.connect"})
     sent: list[dict[str, Any]] = []
     accepted = asyncio.Event()
+    disconnect_delivered = False
 
     async def receive() -> dict[str, Any]:
-        return await incoming.get()
+        nonlocal disconnect_delivered
+        message = await incoming.get()
+        if message["type"] == "websocket.disconnect":
+            disconnect_delivered = True
+        return message
 
     async def send(message: dict[str, Any]) -> None:
+        if disconnect_delivered:
+            raise RuntimeError(
+                f"Unexpected ASGI message {message['type']!r} after disconnect"
+            )
         sent.append(message)
         if message["type"] in ("websocket.accept", "websocket.close"):
             accepted.set()
@@ -70,6 +89,8 @@ async def _drive_websocket(app: Any, path: str) -> list[dict[str, Any]]:
     }
     handler = asyncio.create_task(app(scope, receive, send))
     await asyncio.wait_for(accepted.wait(), _TIMEOUT_S)
+    if before_disconnect is not None:
+        before_disconnect()
     incoming.put_nowait({"type": "websocket.disconnect", "code": 1000})
     await asyncio.wait_for(handler, _TIMEOUT_S)
     return sent
@@ -105,6 +126,31 @@ class WebSocketDisconnectTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sent[0]["type"], "websocket.accept")
         self.assertIn("status", sent[1]["text"])
+
+    async def test_message_racing_the_disconnect_is_dropped_not_sent(self) -> None:
+        # A publish and the close frame can land in the same event loop
+        # iteration, so both sides of the race finish in one ``asyncio.wait``.
+        # The handler must not send the message: uvicorn rejects a send after
+        # it has delivered the disconnect, and that RuntimeError would escape
+        # the handler as an "Exception in ASGI application" on every panel
+        # close while telemetry is flowing.
+        session = Session("tracker.identify", {})
+        session.status = "running"
+        manager = _Manager([session])
+        app = _test_app(manager, _Runner())
+
+        def publish_line() -> None:
+            (queue,) = manager.queues
+            queue.put_nowait("raced the close frame")
+
+        sent = await _drive_websocket(
+            app, f"/api/sessions/{session.id}/logs", before_disconnect=publish_line
+        )
+
+        self.assertEqual(
+            [m["type"] for m in sent], ["websocket.accept", "websocket.send"]
+        )
+        self.assertNotIn("raced the close frame", sent[1]["text"])
 
 
 class CanDiscoveryShutdownBoundTest(unittest.IsolatedAsyncioTestCase):
