@@ -1792,6 +1792,7 @@ def run_encoded_capture_loop(
     heartbeat: Callable[[], None] | None = None,
     row_times: "list[float] | None" = None,
     quality: "dict[str, int] | None" = None,
+    record_event: "threading.Event | None" = None,
 ) -> None:
     """Frame-driven capture for the relay-encoded (gstshm-h264) transport.
 
@@ -1801,9 +1802,17 @@ def run_encoded_capture_loop(
 
     ``frame_counter`` and ``row_times`` mirror :func:`run_capture_loop`'s (a
     mutable ``{"n": int}`` incremented per appended row, and one capture-time
-    append per row). There is no ``record_event``
-    on this path: capture rows remain continuous within an episode even though
-    each all-intra AU is independently decodable.
+    append per row).
+
+    ``record_event`` (optional) gates mid-episode capture like
+    :func:`run_capture_loop`'s: while cleared, every arriving AU is discarded
+    (the readers stay drained, nothing is muxed) and the dataset's
+    constant-fps timeline simply does not advance. On resume the loop forgets
+    its cross-row continuity — the unrecorded gap must not read as a
+    concealable hole or a cadence drift — and re-runs the row-zero alignment
+    on the next exposures, so the rows after the gap are as synchronized as
+    an episode's first. Every AU is an IDR, so the mp4 stays decodable across
+    the splice. This is what lets a DAgger freeze pause a relay-encoded take.
 
     Unlike :func:`run_capture_loop` (real-time paced, *selecting* the camera
     frame nearest each tick), this loop is driven by the **arrival** of access
@@ -1972,10 +1981,53 @@ def run_encoded_capture_loop(
             label="camera exposure", can_drop=row_drop_is_safe, quality=quality
         )
         last_log = time.perf_counter()
+        paused = False
+
+        def discard_queued_aus() -> int:
+            """Drop every AU already delivered; returns how many were dropped."""
+            dropped = 0
+            for cam in cameras.values():
+                while True:
+                    try:
+                        cam.read_next_au(timeout_ms=0)
+                    except TimeoutError:
+                        break
+                    dropped += 1
+            return dropped
 
         while not stop_event.is_set():
             if heartbeat is not None:
                 heartbeat()
+            if record_event is not None and not record_event.is_set():
+                if not paused:
+                    paused = True
+                    _logger.info(
+                        "encoded capture paused at dataset row %d; discarding "
+                        "exposures until resume",
+                        total_rows,
+                    )
+                # Keep the readers drained: the relay keeps encoding through
+                # the pause and a reader whose bounded queue overflows reports
+                # a transport failure, which would end the take.
+                discard_queued_aus()
+                if stop_event.wait(timeout=0.02):
+                    return
+                continue
+            if paused:
+                paused = False
+                # The AUs exposed during the gap were never rows; the next
+                # exposure is this segment's row zero. Forget the continuity
+                # the gap would otherwise trip (a >1 s "hole", a cadence
+                # re-anchor, a held future AU) and let the row-zero alignment
+                # pick one synchronized cluster again.
+                discard_queued_aus()
+                held_packets.clear()
+                previous_packets.clear()
+                previous_capture_ts.clear()
+                first_capture_ts.clear()
+                capture_intervals.clear()
+                primed = False
+                _logger.info("encoded capture resumed at dataset row %d", total_rows)
             budget = _ENCODED_START_TIMEOUT_S if not primed else _ENCODED_ROW_TIMEOUT_S
             # One shared deadline for the whole row: with per-camera budgets the
             # serial reads compound (a stalled first camera would hand every
@@ -2018,6 +2070,10 @@ def run_encoded_capture_loop(
 
             if stop_event.is_set():
                 return
+            if record_event is not None and not record_event.is_set():
+                # Paused while this row's AUs were being read (a read blocks
+                # up to the row budget): they belong to the gap, not the take.
+                continue
 
             # Trust but verify the raw-valve barrier using the timestamps that
             # actually reached the recorder. A bounded leaky input queue or a
@@ -3798,8 +3854,7 @@ def _recorder_main(
                     quality=capture_quality,
                 )
                 loop_kwargs["frame_counter"] = frame_counter
-                if not encoded_mode:
-                    loop_kwargs["record_event"] = record_event
+                loop_kwargs["record_event"] = record_event
                 armed = threading.Event()
                 if encoded_mode:
                     loop_kwargs["on_armed"] = armed.set
@@ -3852,31 +3907,11 @@ def _recorder_main(
                     # reply even though the capture thread has already exited.
                     conn.send(("finished", frame_counter["n"], finished_capture_error))
             elif kind == "pause_episode":
-                if encoded_mode:
-                    conn.send(
-                        (
-                            "error",
-                            "pause_episode requires a raw transport; the "
-                            "encoded (gstshm-h264) transport can't gate "
-                            "mid-episode.",
-                        )
-                    )
-                else:
-                    record_event.clear()
-                    conn.send(("paused", frame_counter["n"]))
+                record_event.clear()
+                conn.send(("paused", frame_counter["n"]))
             elif kind == "resume_episode":
-                if encoded_mode:
-                    conn.send(
-                        (
-                            "error",
-                            "resume_episode requires a raw transport; the "
-                            "encoded (gstshm-h264) transport can't gate "
-                            "mid-episode.",
-                        )
-                    )
-                else:
-                    record_event.set()
-                    conn.send(("resumed", frame_counter["n"]))
+                record_event.set()
+                conn.send(("resumed", frame_counter["n"]))
             elif kind == "frame_count":
                 conn.send(("frame_count", frame_counter["n"]))
             elif kind == "save_episode":
@@ -4283,10 +4318,10 @@ class DatasetRecorderProcess:
     def pause_episode(self) -> int:
         """Stop capturing mid-episode (rows + clock gate); returns rows so far.
 
-        Raw transports only — the encoded (gstshm-h264) transport can't gate
-        mid-episode (raises). On resume the capture clock re-anchors, so the
-        episode's index-based timestamps stay contiguous across the gap.
-        Idempotent.
+        On the raw transports the capture clock re-anchors on resume; on the
+        encoded (gstshm-h264) transport the arriving AUs are discarded and the
+        row-zero alignment re-runs on resume. Either way the episode's
+        index-based timestamps stay contiguous across the gap. Idempotent.
         """
         return self._episode_gate("pause_episode", "paused")
 

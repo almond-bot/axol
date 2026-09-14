@@ -504,9 +504,11 @@ def _start_video_relay(
 
     ``raw_transport`` optionally forces the relay's raw-branch transport for
     every camera (see :class:`~almond_axol.video.video_proc.VideoRelayProcess`):
-    ``collect-dagger`` passes ``"pyshm"`` so the raw frames are readable by the
-    control process (policy observations) as well as the recorder subprocess.
-    ``None`` keeps the relay's default (gst shm where available).
+    ``collect-dagger`` passes ``"gstshm+pyshm"`` so the raw frames are readable
+    by the control process (policy observations) from a ring beside the
+    relay-encoded dataset branch the recorder subprocess muxes; ``"pyshm"``
+    puts the recorder on the ring too (it re-encodes). ``None`` keeps the
+    relay's default (gst shm where available).
 
     Returns the :class:`VideoRelayProcess`, or ``None`` when it can't be used
     (no cameras or aiortc unavailable), in which case the caller uses the
