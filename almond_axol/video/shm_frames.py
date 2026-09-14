@@ -60,6 +60,15 @@ _logger = logging.getLogger(__name__)
 # 960x540) is a few tens of MB of shared memory for the whole camera set.
 _RAW_RING_SLOTS = 8
 
+# ``read_nearest`` prefers the earlier of two retained frames about equally far
+# from the target: the policy anchors on an exposure every camera has already
+# reached, so a frame at or before it exists for every camera, while the one
+# after it may not yet. Without the bias, a camera that skipped the anchor
+# exposure picked either neighbour (a numeric tie at exactly one period each
+# way), and two such cameras landing on opposite neighbours put the frame set
+# 33 ms apart — 2-5 % of ticks on the bench, each a skipped policy tick.
+_NEAREST_LATER_BIAS_S = 0.002
+
 # Meta header: a single structured record at the front of each block. Padded to
 # a multiple of 64 bytes so the frame buffers start cache-line aligned.
 _META_DTYPE = np.dtype(
@@ -205,6 +214,24 @@ def _block_size(width: int, height: int) -> int:
     return _HEADER_BYTES + _RAW_RING_SLOTS * width * height * _CHANNELS
 
 
+def rgba_to_rgb(rgba: "NDArray[Any]", out: "NDArray[Any]") -> None:
+    """Drop the alpha channel of an ``(H, W, 4)`` frame into ``out`` ``(H, W, 3)``.
+
+    numpy's strided ``out[...] = rgba[:, :, :3]`` takes ~4.3 ms per 960x600
+    frame on the Jetson Orin (a generic 3-of-4-byte gather); at four sources
+    x 60 fps that is more than one core of the relay's Python, under the GIL
+    — the relay fell behind and dropped ~15 % of exposures on 2026-09-14.
+    OpenCV's SIMD ``cvtColor`` does the same copy in ~0.4 ms, so use it when
+    it is importable and fall back to numpy otherwise.
+    """
+    try:
+        import cv2
+
+        cv2.cvtColor(rgba, cv2.COLOR_RGBA2RGB, dst=out)
+    except Exception:  # noqa: BLE001 - cv2 missing or refusing this layout
+        np.copyto(out, rgba[:, :, :_CHANNELS])
+
+
 class RawFrameWriter:
     """Relay-subprocess side: publish raw RGB frames into shared memory.
 
@@ -239,7 +266,8 @@ class RawFrameWriter:
         """Copy one frame's RGB into the oldest ring slot and commit it.
 
         ``rgba`` is an ``(H, W, 4)`` view over the GStreamer buffer (valid only
-        for this call); the ``[:, :, :3]`` copy into shared memory drops alpha.
+        for this call); the copy into shared memory drops alpha
+        (:func:`rgba_to_rgb`).
         """
         slot = self._next_slot
         # Mark this physical slot busy before touching its pixels. Readers copy
@@ -250,7 +278,7 @@ class RawFrameWriter:
             if slot_seq & 1:
                 slot_seq += 1
             self._meta["slot_seq"][0, slot] = slot_seq + 1
-        np.copyto(self._bufs[slot], rgba[:, :, :_CHANNELS])
+        rgba_to_rgb(rgba, self._bufs[slot])
         with self._cond:
             self._meta["slot_cap_ts"][0, slot] = cap_ts
             self._meta["slot_recv_ts"][0, slot] = recv_ts
@@ -371,10 +399,12 @@ class RawFrameReader:
         """Copy the retained frame exposed nearest ``target``.
 
         Never waits: the ring holds the last ``_RAW_RING_SLOTS`` exposures and
-        the nearest one is returned as-is. Raises :class:`LookupError` when no
-        retained frame lies within ``tolerance_s`` of ``target`` (the history
-        does not reach back that far, or the camera skipped that exposure) and
-        :class:`RuntimeError` when nothing has been published yet.
+        the nearest one is returned as-is (a frame after ``target`` has to be
+        ``_NEAREST_LATER_BIAS_S`` closer than one before it to win). Raises
+        :class:`LookupError` when no retained frame lies within ``tolerance_s``
+        of ``target`` (the history does not reach back that far, or the camera
+        skipped that exposure) and :class:`RuntimeError` when nothing has been
+        published yet.
         """
         while True:
             with self._cond:
@@ -391,8 +421,13 @@ class RawFrameReader:
                 # reusing its slot right now; it publishes within a frame copy.
                 time.sleep(0.0005)
                 continue
-            distance = np.where(readable, np.abs(caps - target), np.inf)
-            slot = int(np.argmin(distance))
+            distance = np.abs(caps - target)
+            ranked = np.where(
+                readable,
+                distance + np.where(caps > target, _NEAREST_LATER_BIAS_S, 0.0),
+                np.inf,
+            )
+            slot = int(np.argmin(ranked))
             if distance[slot] > tolerance_s:
                 raise LookupError(
                     f"no retained shared-memory frame within "

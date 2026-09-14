@@ -336,7 +336,11 @@ class _RawBuffer:
     def _rgb(self, rgba: NDArray[Any]) -> NDArray[Any]:
         import numpy as np
 
-        return np.ascontiguousarray(rgba[:, :, :3])
+        from .shm_frames import rgba_to_rgb
+
+        rgb = np.empty(rgba.shape[:2] + (3,), dtype=np.uint8)
+        rgba_to_rgb(rgba, rgb)
+        return rgb
 
     def read_at_or_after(
         self, target: float, timeout_ms: float = 500
