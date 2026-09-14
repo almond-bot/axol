@@ -56,7 +56,7 @@ from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
 from .config import VRTeleopConfig
-from .core import VRTeleopCore
+from .core import VRTeleopCore, measured_arms
 from .live import LiveSettings
 from .recorder import make as _recorder_make
 from .worker import run_ik_worker
@@ -815,39 +815,22 @@ class VRTeleop:
             )
         )
 
-        # Box mode's squeeze limits (VRTeleopConfig.box_squeeze_torque /
-        # box_squeeze_force): the core says which joints to cap and by how
-        # much, and where the tool touches the box and with what force, for
-        # the current state (box mode on, not resetting); the robot carries
-        # the caps to the realtime core on every command and shapes each
-        # command's squeeze onto the contacts. Written only on change, and
+        # Box mode's squeeze torque cap (VRTeleopConfig.box_squeeze_torque):
+        # the core says which joints to cap and by how much for the current
+        # state (box mode on, not resetting); the robot carries the caps to
+        # the realtime core on every command. Written only on change, and
         # cleared when the loop ends so a robot object outliving this
-        # session is not left capped. Sim / classic targets have neither.
+        # session is not left capped. Sim / classic targets have no caps.
         set_caps = getattr(self._robot, "set_spring_caps", None)
-        set_squeeze = getattr(self._robot, "set_squeeze", None)
         caps_applied: dict | None = None
-        squeeze_applied: tuple | None = None
 
         def _sync_squeeze() -> None:
-            nonlocal caps_applied, squeeze_applied
+            nonlocal caps_applied
             if set_caps is not None:
                 want = self._core.spring_caps()
                 if want != caps_applied:
                     set_caps(want)
                     caps_applied = want
-            if set_squeeze is not None:
-                squeeze = self._core.squeeze()
-                key = (
-                    None
-                    if squeeze is None
-                    else (tuple(tuple(map(float, c)) for c in squeeze[0]), squeeze[1])
-                )
-                if key != squeeze_applied:
-                    if squeeze is None:
-                        set_squeeze(None)
-                    else:
-                        set_squeeze(squeeze[0], squeeze[1])
-                    squeeze_applied = key
 
         async def _guard_send_step() -> None:
             left, right = self.step()
@@ -1054,8 +1037,6 @@ class VRTeleop:
                 self._robot_recorder(False)
             if set_caps is not None and caps_applied:
                 set_caps(None)
-            if set_squeeze is not None and squeeze_applied is not None:
-                set_squeeze(None)
             activity.stop()
             diag.stop()
             tegra.stop()
@@ -1162,4 +1143,5 @@ class VRTeleop:
             self._ik_stop,
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,
+            get_measured=lambda: measured_arms(self._robot),
         )

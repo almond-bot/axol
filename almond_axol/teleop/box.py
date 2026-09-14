@@ -82,8 +82,8 @@ class ToolGeometry:
     The foot is what box mode places at ``±width / 2``: the two contact
     faces are then ``width`` apart whatever tool is fitted, and the tilt
     trim rotates the gripper about its foot so the face stays put. The
-    :meth:`contacts` are what the squeeze shaping shares the clamp force
-    over (:mod:`almond_axol.robot.squeeze`).
+    :meth:`contacts` are what the squeeze lean puts the clamp force
+    through (:func:`squeeze_lean`).
     """
 
     flush_tilt: float = 0.0
@@ -115,13 +115,13 @@ class ToolGeometry:
         :attr:`face_height` is represented at its root by its top and
         bottom corners rather than its centre line: the parcel blades are
         tall triangles (60 mm at the root, a point at the tip), and with
-        the root as one point the shaping fixed the force's line along the
+        the root as one point the lean fixed the force's line along the
         fingers but left the *roll* about them to the arm's stiffness
         coupling, so the face pressed along its top edge and its bottom
         lifted — the thumb and index finger of a hand pinching while the
-        pinky comes off the box. Shared evenly over the corners and the
-        tip, the force passes through the triangle's centroid with no
-        roll, the whole face flat on the box.
+        pinky comes off the box. Put through the centroid of the corners
+        and the tip (:func:`squeeze_lean`), the force has no roll and the
+        whole face lies flat on the box.
         """
         root = self.foot(face) if grasp == "flush" else np.zeros(3, dtype=np.float32)
         if self.face_height > 0.0:
@@ -598,6 +598,125 @@ def box_targets(
         )
         out[side] = blend_pose(start, ideal[side], alpha)
     return out
+
+
+@dataclass(frozen=True)
+class SqueezeLean:
+    """One gripper's target offset that puts its clamp force through the contacts.
+
+    Attributes:
+        translation: Extra mount translation (m, world frame) on top of the
+            run-ahead along the normal — the lean's own, perpendicular to
+            the squeeze (the pullback is separate).
+        rotation: Rotation vector (rad, world frame) to apply to the mount.
+        force: Clamp force (N) the arm presses with at this depth.
+        depth: Run-ahead (m) into the box along the inward normal the arm
+            is commanded to — the operator's, or less once capped.
+        pullback: How far (m, ≤ 0) the target is moved back out along the
+            normal to hold the force at the cap; ``0`` under the cap.
+        stiffness: Clamp force per metre of depth (N/m) along the lean.
+    """
+
+    translation: np.ndarray
+    rotation: np.ndarray
+    force: float
+    depth: float
+    pullback: float
+    stiffness: float
+
+
+_NO_LEAN = SqueezeLean(np.zeros(3), np.zeros(3), 0.0, 0.0, 0.0, 0.0)
+
+
+def squeeze_lean(
+    jac: np.ndarray,
+    kp: np.ndarray,
+    rotation: np.ndarray,
+    normal: np.ndarray,
+    contacts: np.ndarray,
+    depth: float,
+    force_cap: float = 0.0,
+) -> SqueezeLean:
+    """How to lean a gripper so its squeeze presses evenly on the tool's contacts.
+
+    An impedance-controlled arm pressing on a box exerts, at the gripper
+    mount, the wrench its joint springs produce from the run-ahead of the
+    command over the pose the box holds it at: ``w = K δ`` with ``K`` the
+    arm's Cartesian stiffness at the mount (``(J diag(1/kp) J^T)^-1``).
+    Jogging the width in past the box is a run-ahead ``δ = depth * n`` —
+    a pure lateral translation of the whole gripper — and the wrench it
+    produces is a lateral force *plus the moment it takes to hold the
+    mount's orientation fixed* against the arm's stiffness coupling: with
+    the left arm's real Jacobian at a box-carrying pose, some 1.5 Nm per
+    centimetre. But the tool does not touch the box at the mount: the
+    parcel gripper's folded blade presses beside the wrist and its fixed
+    blade's tip 13 cm further along the box side. That moment can only be
+    carried by the contacts loading unevenly — the face digging in while
+    the tip lifts (or the other way about), the pinch the operator sees —
+    and it makes the plain jog feel three times stiffer than the clamp
+    itself.
+
+    The clamp the operator wants is the wrench ``w* = F [n; r_c × n]``: a
+    force ``F`` along the inward normal through the *centroid* ``r_c`` of
+    the contact points, which the contacts share evenly (for three points
+    that is the triangle's centroid) with no moment left to unbalance
+    them. The run-ahead that produces it is ``δ* = C w*`` (``C`` the
+    compliance ``J diag(1/kp) J^T``), and its component along ``n`` is the
+    depth the operator jogged, which fixes ``F``. What this returns is the
+    rest of ``δ*`` — the lean: the small yaw that brings the tip in as the
+    face presses (about 1.3° per centimetre of depth at that pose), a
+    touch of roll so the tall face stays flat, and the millimetre of
+    translation that goes with them. Added to the gripper *target*, so the
+    arm's springs render the clamp with no change to the command path:
+    nothing is measured but the depth, and nothing is held back.
+
+    Args:
+        jac: ``(6, 7)`` geometric Jacobian at the mount origin, world
+            frame, linear rows first, at the commanded pose.
+        kp: Joint stiffness (Nm/rad, ``(7,)``).
+        rotation: ``(3, 3)`` mount rotation at the commanded pose.
+        normal: Unit vector, world frame, from this gripper into the box.
+        contacts: ``(k, 3)`` contact points, mount frame, on the box side
+            (:meth:`ToolGeometry.contacts` for the gripper's ``face``).
+        depth: Run-ahead (m) into the box the operator has jogged — how
+            far the raw target sits past where the box holds the gripper.
+        force_cap: Clamp force limit (N); ``0`` or less for none. Past it
+            the depth is pulled back to the cap's (``pullback``), so the
+            gripper presses with the cap however far the width is jogged.
+
+    Returns:
+        :class:`SqueezeLean`. Nothing (all zeros) for a depth ≤ 0 — the
+        gripper is not pressing — or a degenerate model.
+    """
+    if depth <= 0.0:
+        return _NO_LEAN
+    jac = np.asarray(jac, dtype=np.float64)
+    kp = np.asarray(kp, dtype=np.float64)
+    n = np.asarray(normal, dtype=np.float64)
+    pts = np.asarray(contacts, dtype=np.float64).reshape(-1, 3)
+    if pts.shape[0] == 0 or not np.all(kp > 0.0) or not np.all(np.isfinite(jac)):
+        return _NO_LEAN
+    compliance = (jac / kp) @ jac.T  # J diag(1/kp) J^T
+    r_c = pts.mean(axis=0) @ np.asarray(rotation, dtype=np.float64).T
+    unit_wrench = np.concatenate([n, np.cross(r_c, n)])
+    per_newton = compliance @ unit_wrench  # run-ahead per newton of clamp
+    along = float(n @ per_newton[:3])
+    if not (along > 1e-9) or not np.all(np.isfinite(per_newton)):
+        return _NO_LEAN
+    stiffness = 1.0 / along
+    force = stiffness * depth
+    if force_cap > 0.0 and force > force_cap:
+        force = force_cap
+    capped = force / stiffness
+    delta = force * per_newton
+    return SqueezeLean(
+        translation=delta[:3] - capped * n,
+        rotation=delta[3:],
+        force=force,
+        depth=capped,
+        pullback=capped - depth,
+        stiffness=stiffness,
+    )
 
 
 def elbow_swivel_hint(

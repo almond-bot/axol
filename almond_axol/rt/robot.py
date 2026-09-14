@@ -65,7 +65,7 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping
 from typing import Self
 
 import numpy as np
@@ -793,11 +793,6 @@ class Axol(RobotBase):
                 )
             await self.gravity_compensate(kd=_LIMP_KD)
             return
-        # Box mode's squeeze shaping: this command's per-arm spec (the inward
-        # normal from the measured pair) and the pair's common squeeze — the
-        # arms are commanded directly below, not through
-        # AxolHardware.motion_control, so refresh it here.
-        self._robot.refresh_squeeze(left, right)
         tasks = []
         if left is not None and self._robot.left is not None:
             tasks.append(self._robot.left.motion_control(left))
@@ -850,22 +845,6 @@ class Axol(RobotBase):
         from the next :meth:`motion_control`.
         """
         self._robot.set_spring_caps(caps)
-
-    def set_squeeze(
-        self, contacts: Sequence[np.ndarray] | None, force_cap: float = float("inf")
-    ) -> None:
-        """Box mode's squeeze shaping on both arms (see ``Axol.set_squeeze``).
-
-        The shaping is pure command math on the Python side — the wire
-        carries the shaped positions like any other — so it needs nothing
-        from the core beyond the measured positions it already streams.
-        """
-        self._robot.set_squeeze(contacts, force_cap)
-
-    @property
-    def squeeze_forces(self) -> tuple[float, float]:
-        """``(left, right)`` squeeze force (N) the last shaped commands apply."""
-        return self._robot.squeeze_forces
 
     def reset_gravity_hold(self) -> None:
         """Re-snapshot the gravity-comp hold setpoint (pure Python state)."""

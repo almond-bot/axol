@@ -250,46 +250,54 @@ class VRTeleopConfig:
             few degrees at ``kp`` 250 — exceeds any cap tight enough to
             matter, so with it on the arm moving toward the other trails
             the move and the pair skews. The squeeze *force* the operator
-            feels is set by ``box_squeeze_force`` below, which shapes only
-            the pair's common squeeze and bounds it consistently across
-            poses (the shoulder's lever to the gripper halves as the box
-            is raised, so a fixed torque alone would let the force
-            double).
-        box_squeeze_force: The clamp force (N) each arm presses the box
-            with once the grip width is jogged in past contact, whatever
-            the pose — and *where* it presses. The arm's springs exert their
-            force at the gripper mount, but the tool touches the box
-            elsewhere: the parcel gripper with its folded blade's face
-            beside the wrist and the fixed blade's tip 13 cm further along
-            the side. A plain squeeze (a lateral run-ahead of the whole
-            gripper) is a force through the mount and so through the face
-            alone; the tip carries only what the arm's stiffness coupling
-            adds — a fraction of a newton — and lifts off as the squeeze
-            grows, the pinch the operator sees. Box mode therefore
-            *shapes* every command in realtime-core mode
-            (``Axol.set_squeeze``, :mod:`almond_axol.robot.squeeze`): the
-            part of the run-ahead that presses into the box is estimated
-            through the arm's Jacobian, replaced by the same total force
-            shared evenly over the tool's contact points (the moment that
-            puts it through their centroid rides the wrists), and held at
-            this cap — the tighter of it and what the spring caps allow
-            under that even split. Only the *pair's* squeeze is capped:
-            each command both arms' inward forces are estimated and split
-            into their mean — the clamp — and their difference — the
-            carry, which passes through in full on both arms, so the pair
-            translates as one body and neither arm is ever held back from
-            a move. The rest of the command (servo lag, the box's weight)
-            is untouched. ``0`` (the default) disables the shaping: the
-            arms then press with their plain impedance springs — as much as
-            the width is jogged past contact — and commands go to the core
-            exactly as the IK produced them. **Off by default while box
-            mode's basics (the pair's alignment, a flat grasp) are being
-            settled on hardware**: the shaping rewrites each arm's command
-            from its *measured* pose every tick, and every version of it so
-            far has been seen to cost alignment on the robot. ``8`` N a side
-            held a light parcel with margin when it was on; raise it if
-            boxes slip, lower it to be gentler. Live-adjustable;
-            realtime-core hardware only.
+            feels is bounded by ``box_squeeze_force`` below instead, which
+            caps the clamp consistently across poses (the shoulder's lever
+            to the gripper halves as the box is raised, so a fixed torque
+            alone would let the force double) by holding the targets'
+            depth, not by rewriting commands.
+        box_squeeze_lean: Scale on box mode's **squeeze lean** (``1`` = the
+            arm model's value, ``0`` = off). Jogging the width in past the
+            box runs the IK targets ahead of where the box holds the
+            grippers, and the arms' impedance springs turn that run-ahead
+            into the clamp — ``kp`` times it, ~6 N per centimetre. A plain
+            lateral run-ahead, though, is a force at the gripper *mount*
+            plus the moment it takes to hold the mount's orientation fixed
+            against the arm's stiffness coupling (~1.5 Nm per centimetre at
+            a box-carrying pose). The tool doesn't touch the box at the
+            mount: the parcel gripper presses with its blade's root beside
+            the wrist and the fixed blade's tip 13 cm further along the box
+            side, and that moment can only be carried by those contacts
+            loading unevenly — the face digs in as the tip lifts, the pinch
+            the operator sees. The lean turns the run-ahead into a pure
+            force through the contacts' centroid, which they then share
+            evenly: from each arm's Jacobian at the commanded pose and its
+            joint stiffness (:func:`almond_axol.teleop.box.squeeze_lean`),
+            the gripper target is yawed inward about 1.3° per centimetre of
+            clamp depth, rolled a fraction so the tall face stays flat, and
+            shifted a millimetre to match, all in proportion to the depth —
+            how far the targets sit past the measured mounts along the
+            pair's inward normals, averaged over both arms so a carry's
+            servo lag adds nothing, low-passed 0.2 s. It is an offset to
+            the *target*: the arms stay position controlled, the command
+            path is untouched, and neither arm is held back from a move
+            (the measured-pose command shaping this replaces did exactly
+            that and cost the pair its alignment). Tune by eye: raise it if
+            the tip still lifts as you squeeze, lower it if the face by the
+            wrist lifts instead. Live-adjustable; realtime-core hardware
+            only (the sim has no compliance and reports no measurement).
+        box_squeeze_force: Clamp force cap (N) per arm in box mode; ``0``
+            (the default) for none. The squeeze lean above knows the clamp
+            force the depth produces (the arm model's stiffness along the
+            lean, ~6 N per centimetre); past the cap the targets are pulled
+            back out along the pair's inward normals to the cap's depth, by
+            the same amount on both arms, so the pair presses with the cap
+            however far the width is jogged in — at any pose, unlike a
+            joint torque cap. It follows the measured width, low-passed,
+            and only ever moves the two targets toward each other's
+            gripper by equal amounts, so the pair stays a pair. ``8`` N a
+            side holds a light parcel with margin; raise it if boxes slip,
+            lower it to be gentler. Live-adjustable; realtime-core hardware
+            only.
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest
@@ -492,6 +500,7 @@ class VRTeleopConfig:
     box_elbow_weight: float = 0.0
     box_elbow_speed: float = 30.0
     box_squeeze_torque: float = 0.0
+    box_squeeze_lean: float = 1.0
     box_squeeze_force: float = 0.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0

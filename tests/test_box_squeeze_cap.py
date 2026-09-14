@@ -40,7 +40,6 @@ def _core(**overrides) -> VRTeleopCore:
     # The per-joint cap is opt-in (off by default, it slows a carry); these
     # tests exercise it, so turn it on unless a test says otherwise.
     overrides.setdefault("box_squeeze_torque", 6.0)
-    overrides.setdefault("box_squeeze_force", 8.0)
     return VRTeleopCore(
         VRTeleopConfig(**overrides),
         logging.getLogger("test"),
@@ -72,8 +71,8 @@ class CoreDecisionTest(unittest.TestCase):
         # A torque cap cannot tell a squeeze from a move: the shoulders'
         # servo lag while the pair carries a box exceeds any useful cap, so
         # with one on the arm moving toward the other trails the move. The
-        # squeeze force (shaped on the pair's common squeeze only) is the
-        # default limit; the cap is an opt-in backstop.
+        # squeeze force cap (box_squeeze_force, a depth held at the target)
+        # is the pose-consistent limit; the cap is an opt-in backstop.
         self.assertEqual(VRTeleopConfig().box_squeeze_torque, 0.0)
         core = VRTeleopCore(
             VRTeleopConfig(box_mode=True),
@@ -338,16 +337,12 @@ class _FakeRobot:
 
     def __init__(self) -> None:
         self.caps: list[dict | None] = []
-        self.squeezes: list[tuple | None] = []
         self.commands = 0
         self.left = None
         self.right = None
 
     def set_spring_caps(self, caps):
         self.caps.append(caps)
-
-    def set_squeeze(self, contacts, force_cap=float("inf")):
-        self.squeezes.append(None if contacts is None else (len(contacts), force_cap))
 
     async def motion_control(self, left=None, right=None):
         self.commands += 1
@@ -401,7 +396,6 @@ class TeleopLoopTest(unittest.TestCase):
                     await asyncio.sleep(0.005)
                 # Plain teleop: nothing has been sent to the robot's caps.
                 self.assertEqual(robot.caps, [])
-                self.assertEqual(robot.squeezes, [])
                 core.set_live("box_mode", True)
                 core._apply_live_requests()
                 n = robot.commands
@@ -410,9 +404,6 @@ class TeleopLoopTest(unittest.TestCase):
                 self.assertEqual(
                     robot.caps, [{Joint.SHOULDER_2: 6.0, Joint.SHOULDER_3: 6.0}]
                 )
-                # ... and the squeeze shaping: the parcel gripper's three
-                # contacts in the default straight grasp, at the force cap.
-                self.assertEqual(robot.squeezes, [(3, 8.0)])
                 core.set_live("box_squeeze_torque", 5.0)
                 core._apply_live_requests()
                 n = robot.commands
@@ -440,8 +431,6 @@ class TeleopLoopTest(unittest.TestCase):
                 await task
                 self.assertEqual(robot.caps[-1], None)
                 self.assertEqual(len(robot.caps), 5)
-                # The shaping followed box mode the same way: on, off, on, cleared.
-                self.assertEqual(robot.squeezes, [(3, 8.0), None, (3, 8.0), None])
 
         asyncio.run(scenario())
 

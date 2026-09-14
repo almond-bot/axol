@@ -169,6 +169,23 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         ),
     ),
     LiveSettingDef(
+        key="box_squeeze_lean",
+        label="Squeeze lean",
+        type="number",
+        min=0.0,
+        max=3.0,
+        step=0.1,
+        unit="×",
+        help=(
+            "Box mode: leans each gripper's target into the box as the "
+            "squeeze builds (about 1.3° per cm jogged past contact at 1×, "
+            "from the arm model) so the clamp presses evenly on the blade's "
+            "root and its tip instead of the face digging in while the tip "
+            "lifts. Raise it if the tip still lifts as you squeeze, lower it "
+            "if the face by the wrist lifts instead; 0 = off. Hardware only."
+        ),
+    ),
+    LiveSettingDef(
         key="box_squeeze_force",
         label="Squeeze force",
         type="number",
@@ -177,11 +194,11 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         step=1.0,
         unit="N",
         help=(
-            "Box mode: how hard each arm clamps the box once the width is "
-            "jogged in past contact, at any pose, and shared evenly over "
-            "the gripper's contact points (the parcel blade's root corners "
-            "and its tip) so the whole face lies flat. 0 (off, the default) "
-            "sends the IK's commands as they are; try 8 N. Hardware only."
+            "Box mode: cap on how hard each arm clamps the box (about 6 N "
+            "per cm jogged past contact without one). Past it the targets "
+            "are held at the cap's depth, both arms alike, at any pose. "
+            "0 (off, the default) leaves the squeeze to the width you jog; "
+            "try 8 N. Hardware only."
         ),
     ),
     LiveSettingDef(
@@ -315,8 +332,10 @@ class LiveSettings:
             return not self._has_gripper_torque()
         if d.key == "box_squeeze_torque":
             return not self._has_spring_caps()
-        if d.key == "box_squeeze_force":
-            return not callable(getattr(self._robot, "set_squeeze", None))
+        if d.key in ("box_squeeze_lean", "box_squeeze_force"):
+            # The lean reads the arms' measured joints and stiffness; only
+            # a robot with AxolArm sides (the hardware Axol) has them.
+            return getattr(getattr(self._robot, "left", None), "kp", None) is None
         return False
 
     # -- Public API ----------------------------------------------------------

@@ -54,7 +54,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from ...constants import Joint
 from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ...robot.jelly import Jelly, detect_jelly
-from ...teleop.core import TCPPoseSnapshot, VRTeleopCore
+from ...teleop.core import TCPPoseSnapshot, VRTeleopCore, measured_arms
 from ...teleop.live import LiveSettings
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VREpisodeOutcome, VRFrame, VRState
@@ -127,6 +127,10 @@ class AxolVRTeleop(Teleoperator):
         # (LeRobot owns it), so the robot-side knobs (grip force) stay hidden
         # here unless the owner hands it over via ``live_settings.set_robot``.
         self._live = LiveSettings(self._core, None, self._publish_settings)
+        # The robot whose measured joints feed box mode's squeeze lean (see
+        # VRTeleopCore.run_ik_loop / measured_arms); collect-data sets it
+        # once it owns the hardware. None (the default) adds no lean.
+        self.measured_robot: object | None = None
 
         # Jelly (x-drive base + telescoping lift), operator-only
         # mobility on robots that have one: the thumbsticks reposition the
@@ -893,15 +897,6 @@ class AxolVRTeleop(Teleoperator):
         """
         return self._core.spring_caps()
 
-    def squeeze(self) -> tuple[list[np.ndarray], float] | None:
-        """Box mode's squeeze shaping ``(contacts, force cap)`` for the robot.
-
-        Thin passthrough to :meth:`VRTeleopCore.squeeze`; ``collect-data``
-        hands the result to ``Axol.set_squeeze`` on change, the same as
-        native teleop.
-        """
-        return self._core.squeeze()
-
     # ------------------------------------------------------------------
     # Teleoperator interface
     # ------------------------------------------------------------------
@@ -1268,4 +1263,6 @@ class AxolVRTeleop(Teleoperator):
             self._ik_stop,
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,
+            # Read live: collect-data hands the robot over after connect().
+            get_measured=lambda: measured_arms(self.measured_robot),
         )

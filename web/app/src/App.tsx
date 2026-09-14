@@ -991,23 +991,28 @@ function HudButton({
 }
 
 // Mirrors the worker's pair geometry (from the ~20 Hz joints push) into React
-// state — the "grippers aligned" flag and the grasp ("flush" / "straight")
-// — changing only on edges so the HUD doesn't re-render per frame. Aligned
-// is false and the grasp "" until the server reports the pair geometry.
+// state — the "grippers aligned" flag, the grasp ("flush" / "straight") and
+// the clamp force (whole newtons) — changing only on edges so the HUD
+// doesn't re-render per frame. Aligned is false, the grasp "" and the
+// squeeze 0 until the server reports the pair geometry.
 function usePairStatus(jointsRef: RefObject<AxolJointSample | null>): {
   aligned: boolean
   grasp: string
+  squeeze: number
 } {
   const [aligned, setAligned] = useState(false)
   const [grasp, setGrasp] = useState("")
+  const [squeeze, setSqueeze] = useState(0)
   useFrame(() => {
     const pair = jointsRef.current?.pair
     const nextAligned = pair?.aligned ?? false
     if (nextAligned !== aligned) setAligned(nextAligned)
     const nextGrasp = pair?.grasp ?? ""
     if (nextGrasp !== grasp) setGrasp(nextGrasp)
+    const nextSqueeze = Math.round(pair?.squeeze ?? 0)
+    if (nextSqueeze !== squeeze) setSqueeze(nextSqueeze)
   })
-  return { aligned, grasp }
+  return { aligned, grasp, squeeze }
 }
 
 // Tools row (second HUD line, under Exit / ? / status): the two most-used
@@ -1020,6 +1025,7 @@ function ToolsRow({
   onSet,
   aligned,
   grasp,
+  squeeze,
   ghost,
   onToggleGhost,
   onOpenSettings,
@@ -1030,14 +1036,18 @@ function ToolsRow({
   // Pair grasp ("flush" / "straight"); shown on the Box button while box
   // mode is on so the stick-click toggle has a readout.
   grasp: string
+  // Clamp force (N per arm) the pair is pressing with; shown next to the
+  // grasp while pressing so the width jog has a force readout.
+  squeeze: number
   ghost: boolean
   onToggleGhost: () => void
   onOpenSettings: () => void
 }) {
   const boxMode = settings ? settings.values.box_mode === true : null
   const reengage = settings ? String(settings.values.reengage ?? "") : null
+  const boxDetail = [grasp, squeeze > 0 ? `${squeeze} N` : ""].filter(Boolean).join(", ")
   const boxLabel = boxMode
-    ? `Box: ON${grasp ? ` (${grasp})` : ""}`
+    ? `Box: ON${boxDetail ? ` (${boxDetail})` : ""}`
     : aligned
       ? "Box: OFF (aligned)"
       : "Box: OFF"
@@ -1211,7 +1221,7 @@ function HudTools({
   onCloseSettings: () => void
   onStep: (def: AxolSettingDef, direction: 1 | -1) => void
 }) {
-  const { aligned, grasp } = usePairStatus(jointsRef)
+  const { aligned, grasp, squeeze } = usePairStatus(jointsRef)
   return (
     <>
       <ToolsRow
@@ -1219,6 +1229,7 @@ function HudTools({
         onSet={onSet}
         aligned={aligned}
         grasp={grasp}
+        squeeze={squeeze}
         ghost={ghost}
         onToggleGhost={onToggleGhost}
         onOpenSettings={onOpenSettings}

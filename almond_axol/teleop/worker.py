@@ -40,6 +40,7 @@ from .box import (
     side_clamp_rotation,
     smoothstep,
     snap_box,
+    squeeze_lean,
     twist_about,
 )
 from .config import VRTeleopConfig
@@ -94,6 +95,13 @@ _SNAP_STABLE_RATIO = 0.5  # offset growth/size below this = shift, else motion
 # authorise a large jump.
 _STICK_DEADZONE = 0.15
 _STICK_MAX_DT_S = 0.1
+# Squeeze lean (see IKWorker._squeeze_lean): low-pass time constant on the
+# measured clamp depth. The depth is a difference of two positions, so it
+# carries the encoders' noise and the servo lag of a move; a fifth of a
+# second takes the flicker out and still follows a width jog as it lands.
+_LEAN_TAU_S = 0.2
+# A gap between depth samples longer than this restarts the filter.
+_LEAN_RESET_S = 0.5
 # The robot's up (FLU +z), for box-frame rotations.
 _UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
 # The room's up in the frame the controller rotations are held in. Those
@@ -354,6 +362,28 @@ class IKWorker:
         # snap and which controller leads it. None while not in box tracking.
         self._box: BoxState | None = None
         self._box_leader: str | None = None
+        # Squeeze lean (see _squeeze_lean): the arms' measured joint positions
+        # and joint stiffness as last reported by the core (``("meas", ...)``,
+        # hardware only — the sim reports none), the low-passed clamp depth
+        # (m) with the time of its last sample, and the clamp force (N) the
+        # last solve leaned for (0 while not pressing), for pair_status.
+        self._measured: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = (
+            None
+        )
+        self._measured_t = 0.0  # perf_counter of the last report
+        self._lean_depth = 0.0
+        self._lean_t: float | None = None
+        self._lean_force = 0.0
+        # The arm model the lean reads its Jacobians from (the MuJoCo model
+        # gravity compensation runs on); built up front so the first clamp
+        # doesn't stall a solve. None if it can't be built (no lean then).
+        self._lean_model = None
+        try:
+            from ..robot.gravity import GravityCompensator
+
+            self._lean_model = GravityCompensator()
+        except Exception:  # noqa: BLE001 - the lean is optional
+            _logger.exception("arm model unavailable; box mode's squeeze lean is off")
 
         # Absolute (Mantis) mode state: the world-anchored base transform solved
         # at engage — ``(R_wb, t_wb)`` maps base-frame FLU coordinates into the
@@ -1063,6 +1093,8 @@ class IKWorker:
         separation itself for the URDF gripper) — ``grasp`` the grasp in
         force (``"straight"`` / ``"flush"``) and ``elbow`` the elbows-out
         angle (degrees, ``config.box_elbow_out``) the sticks may have jogged.
+        ``squeeze`` is the clamp force (N, per arm) the last box-mode solve
+        leaned for (:meth:`_squeeze_lean`; 0 while not pressing).
         """
         left, right = self._solver.fk(q)
         tool = self._box_tool()
@@ -1101,6 +1133,7 @@ class IKWorker:
             "width": round(width, 3),
             "grasp": self._box_grasp(),
             "elbow": round(float(self._config.box_elbow_out), 1),
+            "squeeze": round(self._lean_force, 1),
         }
 
     def _box_grasp(self) -> str:
@@ -1120,13 +1153,186 @@ class IKWorker:
         if self._box_grasp() == "straight":
             return URDF_TOOL
         kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
-        if kind == "parcel":
-            return parcel_tool(float(getattr(cfg, "box_tool_open_deg", 141.5)))
-        if kind != "urdf":
+        if kind not in ("parcel", "urdf"):
             _logger.warning(
                 "Unknown box_tool %r; using the URDF gripper geometry", cfg.box_tool
             )
+        return self._fitted_tool()
+
+    def _fitted_tool(self) -> ToolGeometry:
+        """The contact geometry of the tool actually fitted (``config.box_tool``).
+
+        Unlike :meth:`_box_tool` this does not fall back to the flat-hands
+        geometry in the ``"straight"`` grasp: the squeeze lean wants where
+        the fitted tool touches the box in *either* grasp
+        (:meth:`ToolGeometry.contacts`).
+        """
+        cfg = self._config
+        kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
+        if kind == "parcel":
+            return parcel_tool(float(getattr(cfg, "box_tool_open_deg", 141.5)))
         return URDF_TOOL
+
+    def note_measured(
+        self,
+        pos_left: np.ndarray,
+        pos_right: np.ndarray,
+        kp_left: np.ndarray,
+        kp_right: np.ndarray,
+    ) -> None:
+        """Record the arms' measured joint positions and joint stiffness.
+
+        Sent by the core before each frame in box mode on hardware
+        (``("meas", left, right, kp_left, kp_right)``, see
+        ``VRTeleopCore.run_ik_loop``): the joint positions (rad, each
+        ``(8,)`` in :data:`ARM_JOINTS` order plus the gripper) and each
+        arm's impedance stiffness ``kp`` per arm joint (Nm/rad, ``(7,)``).
+        Read by :meth:`_squeeze_lean`.
+        """
+        self._measured = (
+            np.asarray(pos_left, dtype=np.float32),
+            np.asarray(pos_right, dtype=np.float32),
+            np.asarray(kp_left, dtype=np.float64),
+            np.asarray(kp_right, dtype=np.float64),
+        )
+        self._measured_t = time.perf_counter()
+
+    @property
+    def squeeze_force(self) -> float:
+        """Clamp force (N) per arm the last box-mode solve leaned for (0 when not pressing)."""
+        return self._lean_force
+
+    def _squeeze_lean(
+        self,
+        box: BoxState,
+        targets: dict[str, Pose],
+        q_current: np.ndarray,
+        now: float,
+    ) -> dict[str, Pose]:
+        """Lean the gripper targets so the clamp presses evenly on the contacts.
+
+        Jogging the width in past the box runs the targets ahead of where
+        the box holds the grippers, and the arms' springs turn that
+        run-ahead into the clamp. A plain lateral run-ahead, though, is a
+        force at the gripper *mount* plus the moment it takes to hold the
+        mount's orientation against the arm's stiffness coupling — and the
+        parcel gripper touches the box at its blade's root beside the wrist
+        and at the fixed blade's tip 13 cm further on, so that moment can
+        only be carried by the contacts loading unevenly: the face digs in
+        as the tip lifts, the pinch. :func:`squeeze_lean` gives, from the
+        arm's Jacobian at the commanded pose and its joint stiffness, the
+        target offset (a yaw of about a degree per centimetre of depth, a
+        touch of roll for the tall face, a millimetre of translation) that
+        turns the run-ahead into a pure force through the contacts'
+        centroid, which they then share evenly; it is scaled by
+        ``config.box_squeeze_lean`` (1 = the model) and applied to each
+        gripper's target here.
+
+        The one measurement is the clamp *depth*: how far the raw targets
+        sit past the measured mounts along the pair's inward normals
+        (:meth:`note_measured`, FK of the measured joints), averaged over
+        the two arms — the servo lag of a move loads one arm's normal and
+        unloads the other's by the same amount, so the mean is the clamp
+        and a carry adds nothing — and low-passed (``_LEAN_TAU_S``). The
+        lean is proportional to it, so nothing is added before contact,
+        and it is an offset to the *target*: the arms are position
+        controlled as ever, the command path is untouched, and neither arm
+        is ever held back from a move (the measured-pose command shaping
+        this replaces did exactly that and cost the pair its alignment).
+        With ``config.box_squeeze_force`` > 0 the depth is capped at that
+        force's, the targets pulled back out along the normals to hold it
+        — the same on both arms, so the pair stays a pair.
+
+        Off (targets returned as they are) without a measurement (the
+        sim, or none reported for ``_LEAN_RESET_S``), the arm model, or a
+        pair still blending into alignment; and with both the lean scale
+        and the force cap at 0.
+        """
+        cfg = self._config
+        scale = float(getattr(cfg, "box_squeeze_lean", 0.0))
+        cap = float(getattr(cfg, "box_squeeze_force", 0.0))
+        meas = self._measured
+        if meas is not None and now - self._measured_t > _LEAN_RESET_S:
+            meas = None  # the core stopped reporting (no reading): stale
+        if (
+            meas is None
+            or self._lean_model is None
+            or not box.aligned
+            or (scale <= 0.0 and cap <= 0.0)
+        ):
+            self._lean_depth, self._lean_t, self._lean_force = 0.0, None, 0.0
+            return targets
+        pos_l, pos_r, kp_l, kp_r = meas
+        q_meas = np.asarray(q_current, dtype=np.float32).copy()
+        for i, gi in enumerate(self.left_indices):
+            q_meas[gi] = pos_l[i]
+        for i, gi in enumerate(self.right_indices):
+            q_meas[gi] = pos_r[i]
+        if not np.all(np.isfinite(q_meas)):
+            return targets
+        measured = dict(zip(("left", "right"), self._solver.fk(q_meas)))
+        lateral = np.asarray(box.rot[:, 1], dtype=np.float64)
+        normals = {"left": -lateral, "right": lateral}
+        raw_depth = 0.5 * sum(
+            float(
+                (
+                    np.asarray(targets[side][0], dtype=np.float64)
+                    - np.asarray(measured[side][0], dtype=np.float64)
+                )
+                @ normals[side]
+            )
+            for side in ("left", "right")
+        )
+        if self._lean_t is None or now - self._lean_t > _LEAN_RESET_S:
+            self._lean_depth = raw_depth
+        else:
+            alpha = 1.0 - math.exp(-(now - self._lean_t) / _LEAN_TAU_S)
+            self._lean_depth += alpha * (raw_depth - self._lean_depth)
+        self._lean_t = now
+        depth = max(self._lean_depth, 0.0)
+        if depth <= 0.0:
+            self._lean_force = 0.0
+            return targets
+
+        grasp = self._box_grasp()
+        tool = self._fitted_tool()
+        kp = {"left": kp_l, "right": kp_r}
+        out: dict[str, Pose] = {}
+        forces: list[float] = []
+        for side, indices in (
+            ("left", self.left_indices),
+            ("right", self.right_indices),
+        ):
+            pos, rot = targets[side]
+            arm_q = np.asarray(q_current, dtype=np.float64)[indices]
+            try:
+                _p, rot_cmd, jac = self._lean_model.mount_jacobian(
+                    arm_q, is_left=(side == "left")
+                )
+            except Exception:  # noqa: BLE001 - never let the lean stop the solve
+                _logger.exception("squeeze lean failed; targets unchanged")
+                self._lean_model = None
+                return targets
+            lean = squeeze_lean(
+                jac,
+                kp[side],
+                rot_cmd,
+                normals[side],
+                np.asarray(tool.contacts(grasp, box.face[side])),
+                depth,
+                cap,
+            )
+            forces.append(lean.force)
+            shift = scale * lean.translation + lean.pullback * normals[side]
+            new_pos = (np.asarray(pos, dtype=np.float64) + shift).astype(np.float32)
+            angle = float(np.linalg.norm(lean.rotation)) * scale
+            new_rot = rot
+            if angle > 1e-9:
+                axis = lean.rotation / np.linalg.norm(lean.rotation)
+                new_rot = (rodrigues(axis, angle) @ rot).astype(np.float32)
+            out[side] = (new_pos, new_rot)
+        self._lean_force = 0.5 * sum(forces)
+        return out
 
     def _box_faces(self) -> Faces:
         """Pinned clamping faces from ``config.box_face_left/right`` (0 = auto)."""
@@ -1295,6 +1501,7 @@ class IKWorker:
         rot = (rodrigues(_UP, yaw) @ box.rot).astype(np.float32) if yaw else box.rot
         self._integrate_sticks(frame, box, now)
         targets = box_targets(box, center, rot, now)
+        targets = self._squeeze_lean(box, targets, q_current, now)
         elbows = self._box_elbow_hints(q_current, targets)
         # The posture attractor follows q for the whole of box mode. Pinned at
         # the engage pose (normal teleop's behaviour) it balances the pose
@@ -1948,6 +2155,7 @@ def run_ik_worker(
       :class:`VRTeleopConfig` field on this process's copy of the config
       (``VRTeleopCore.set_live``).
     - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
+    - ``("meas", left, right, kp_l, kp_r)`` → (no reply; see IKWorker.note_measured)
     - ``("sync", pos_left, pos_right)`` → ``("synced", q)`` — seat the worker's
       joint vector at the robot's measured arm positions (7 arm joints per
       side; any gripper element past index 6 is ignored) and clear the engage
@@ -2034,6 +2242,8 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "set":
                 worker.set_config(str(msg[1]), msg[2])
+            elif isinstance(msg, tuple) and msg[0] == "meas":
+                worker.note_measured(msg[1], msg[2], msg[3], msg[4])
             elif isinstance(msg, tuple) and msg[0] == "reset":
                 q_current = np.asarray(msg[1], dtype=np.float32)
                 traj = worker.compute_reset_trajectory(q_current, q_rest)

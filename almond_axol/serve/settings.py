@@ -793,20 +793,38 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="teleop.box_squeeze_lean",
+                label="Box squeeze lean (×)",
+                type="number",
+                help=(
+                    "Box mode: leans each gripper's target into the box as "
+                    "the squeeze builds — about 1.3° of inward yaw per cm "
+                    "jogged past contact at 1×, from the arm's stiffness "
+                    "model — so the clamp presses evenly on the parcel "
+                    "blade's root and its tip instead of the face digging in "
+                    "while the tip lifts. Raise it if the tip still lifts as "
+                    "you squeeze, lower it if the face by the wrist lifts "
+                    "instead; 0 turns it off. Also adjustable live from the "
+                    "headset menu (Squeeze lean). Hardware only."
+                ),
+                targets={
+                    "teleop": ("teleop.box_squeeze_lean",),
+                    "collect-data": (f"{_VRT}.box_squeeze_lean",),
+                },
+            ),
+            SettingDef(
                 key="teleop.box_squeeze_force",
                 label="Box squeeze force (N)",
                 type="number",
                 help=(
-                    "Box mode: how hard each arm clamps the box once the "
-                    "width is jogged in past contact — the same at any pose "
-                    "— and shared evenly over the gripper's contact points "
-                    "(the parcel blade's root corners and its tip) instead "
-                    "of the face alone, so the whole face stays flat on the "
-                    "box as you squeeze. 0 (off, the default) sends the "
-                    "IK's commands as they are — the arms press with their "
-                    "plain springs; 8 N is a working value. Also adjustable "
-                    "live from the headset menu (Squeeze force). Hardware "
-                    "only."
+                    "Box mode: cap on how hard each arm clamps the box "
+                    "(without one, about 6 N per cm the width is jogged past "
+                    "contact). Past the cap the gripper targets are held at "
+                    "the cap's depth into the box, both arms alike, the same "
+                    "at any pose. 0 (off, the default) leaves the squeeze to "
+                    "the width you jog; 8 N is a working value. Also "
+                    "adjustable live from the headset menu (Squeeze force). "
+                    "Hardware only."
                 ),
                 targets={
                     "teleop": ("teleop.box_squeeze_force",),

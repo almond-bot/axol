@@ -40,9 +40,8 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from ..constants import Joint
+from ..constants import ARM_JOINTS, Joint
 from ..robot.control import ContactWatchdog
-from .box import URDF_TOOL, parcel_tool
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 from .recorder import make as _recorder_make
@@ -59,6 +58,39 @@ _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 # the joints that lift the box; the elbow, which shares both loads, is left
 # uncapped, and the wrists keep their configured 5 Nm.
 BOX_SQUEEZE_JOINTS: tuple[Joint, ...] = (Joint.SHOULDER_2, Joint.SHOULDER_3)
+
+# ``(left positions, right positions, left kp, right kp)``: each arm's
+# measured joint positions (rad, ``(8,)``, ARM_JOINTS order + gripper) and
+# impedance stiffness per arm joint (Nm/rad, ``(7,)``). See measured_arms.
+MeasuredArms = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+
+
+def measured_arms(robot: object) -> MeasuredArms | None:
+    """The arms' measured joint positions and stiffness, for the squeeze lean.
+
+    Reads ``robot.left`` / ``robot.right`` (``AxolArm``: cached feedback
+    ``positions`` — no bus traffic — and ``kp``). ``None`` when the robot
+    has no such arms (the sim), either is absent (a bench arm), or a
+    reading isn't available yet; the worker then adds no lean. Pass as
+    ``get_measured`` to :meth:`VRTeleopCore.run_ik_loop`.
+    """
+    out: list[np.ndarray] = []
+    kps: list[np.ndarray] = []
+    for side in ("left", "right"):
+        arm = getattr(robot, side, None)
+        kp = getattr(arm, "kp", None)
+        if arm is None or kp is None:
+            return None
+        try:
+            pos = np.asarray(arm.positions, dtype=np.float32)
+        except Exception:  # noqa: BLE001 - MotorError etc: no reading yet
+            return None
+        if pos.shape[0] < len(ARM_JOINTS) or not np.all(np.isfinite(pos)):
+            return None
+        out.append(pos)
+        kps.append(np.asarray(kp, dtype=np.float64))
+    return out[0], out[1], kps[0], kps[1]
+
 
 # Thumbstick deflection below which a stick counts as released — the same
 # deadzone box mode and Jelly apply, so "neutral" here means neither would act.
@@ -312,7 +344,8 @@ class VRTeleopCore:
 
         # Latest gripper-pair geometry from the worker (see
         # ``IKWorker.pair_status``): ``{"aligned": bool, "width": m,
-        # "grasp": str, "elbow": deg}``, or None before the first report.
+        # "grasp": str, "elbow": deg, "squeeze": N}``, or None before the
+        # first report.
         # Read by the adapter for the headset; ``grasp`` and ``elbow`` are
         # mirrored into the config (see ``_mirror_worker_field``).
         self.pair_status: dict | None = None
@@ -476,7 +509,7 @@ class VRTeleopCore:
     # read live by this class; ``worker`` fields are also forwarded to the IK
     # subprocess (whose config is a pickled copy) as ``("set", key, value)``.
     _LIVE_CORE_FIELDS = frozenset(
-        {"hold_to_engage", "teleop_max_vel", "box_squeeze_torque", "box_squeeze_force"}
+        {"hold_to_engage", "teleop_max_vel", "box_squeeze_torque"}
     )
     _LIVE_WORKER_FIELDS = frozenset(
         {
@@ -495,6 +528,8 @@ class VRTeleopCore:
             "box_elbow_out",
             "box_elbow_weight",
             "box_elbow_speed",
+            "box_squeeze_lean",
+            "box_squeeze_force",
         }
     )
 
@@ -629,32 +664,6 @@ class VRTeleopCore:
         if not self.box_mode or self.is_resetting or not (cap > 0.0):
             return None
         return {joint: cap for joint in BOX_SQUEEZE_JOINTS}
-
-    def squeeze(self) -> tuple[list[np.ndarray], float] | None:
-        """Box mode's squeeze shaping for the robot: ``(contacts, force cap)``.
-
-        The fitted tool's contact points on the box side (gripper mount
-        frame, ``face = +1``; see :meth:`ToolGeometry.contacts`) for the
-        current grasp, and ``config.box_squeeze_force`` (N). The adapter
-        hands these to the robot (``set_squeeze``), which places each arm's
-        clamp force through the contacts' centroid and holds it at the cap
-        (:mod:`almond_axol.robot.squeeze`). ``None`` outside box mode,
-        during a return-to-rest, and with the force cap set to 0 — shaping
-        off. Cheap and pure — safe to call every cycle; the adapter applies
-        it on change.
-        """
-        force = float(self.config.box_squeeze_force)
-        if not self.box_mode or self.is_resetting or not (force > 0.0):
-            return None
-        cfg = self.config
-        grasp = str(getattr(cfg, "box_grasp", "straight")).strip().lower()
-        kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
-        tool = (
-            parcel_tool(float(getattr(cfg, "box_tool_open_deg", 141.5)))
-            if kind == "parcel"
-            else URDF_TOOL
-        )
-        return tool.contacts(grasp), force
 
     def _disengage_all(self, log_message: str | None = None) -> None:
         """Disengage both arms and clear the edge/ramp state (IK thread).
@@ -1443,6 +1452,7 @@ class VRTeleopCore:
         stop_event: threading.Event,
         process_alive: Callable[[], bool],
         on_ik_sample: Callable[[float], None],
+        get_measured: Callable[[], MeasuredArms | None] | None = None,
     ) -> None:
         """Dispatch VR frames to the IK subprocess and publish raw targets.
 
@@ -1459,6 +1469,12 @@ class VRTeleopCore:
             process_alive: Returns ``False`` if the IK subprocess has died.
             on_ik_sample: Called with ``time.perf_counter()`` after each solve,
                 for the adapter's IK-rate readout.
+            get_measured: Optional; returns the arms' measured joint
+                positions and joint stiffness (see :func:`measured_arms`),
+                or ``None``. Read before every frame while box mode is
+                engaged and forwarded to the worker as ``("meas", left,
+                right, kp_left, kp_right)`` for the squeeze lean
+                (``IKWorker.note_measured``). Hardware flows only.
         """
         ik_interval = 1.0 / self.config.ik_frequency
         last_frame = None
@@ -1630,6 +1646,14 @@ class VRTeleopCore:
                     for key, value in self._worker_updates:
                         conn.send(("set", key, value))
                     self._worker_updates = []
+                if get_measured is not None and self.box_mode and self.teleop_enabled:
+                    try:
+                        measured = get_measured()
+                    except Exception:  # noqa: BLE001 - never stall the solve
+                        self._logger.exception("measured-arm readout failed")
+                        measured = None
+                    if measured is not None:
+                        conn.send(("meas", *measured))
                 conn.send(frame_to_send)
                 result = recv_with_timeout(conn, _IK_RECV_TIMEOUT, stop_event)
                 if result is not None:

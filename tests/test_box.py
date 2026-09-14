@@ -866,6 +866,10 @@ def _box_worker(leader: str = "left") -> IKWorker:
     worker._snap_ctrl = {}
     worker._snap_fk = {}
     worker._last_solve_t = None
+    # No measured arms (the sim): the squeeze lean stays out of the way.
+    worker._measured, worker._measured_t = None, 0.0
+    worker._lean_model = None
+    worker._lean_depth, worker._lean_t, worker._lean_force = 0.0, None, 0.0
     # Engage snap with the leader controller at the origin, unrotated.
     frame = _stick_frame()
     frame.box_leader = leader

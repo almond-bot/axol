@@ -192,8 +192,9 @@ class GravityCompensator:
 
         ``J.T @ wrench`` is the joint torque a wrench (force, moment about
         the mount origin) applied at the mount costs each joint; box mode's
-        squeeze shaping (:mod:`almond_axol.robot.squeeze`) uses it to place
-        the arm's contact force where the tool actually touches the box.
+        squeeze lean (:func:`almond_axol.teleop.box.squeeze_lean`) uses it
+        to place the arm's contact force where the tool actually touches the
+        box.
         Pure kinematics (``mj_kinematics``), so only this arm's joints are
         touched and the call is cheap enough for the control loop.
         """
