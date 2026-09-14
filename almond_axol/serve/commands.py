@@ -87,6 +87,7 @@ class CommandDef:
         streams_video: bool = False,
         sim_flag: str | None = None,
         robot_free_flags: tuple[str, ...] = (),
+        arms_flag: str | None = None,
         supports_mantis: bool = False,
         hardware_profiles: tuple[str, ...] = ("axol", "mantis"),
         uses_headset: bool = False,
@@ -144,9 +145,14 @@ class CommandDef:
         # robot.
         self.sim_flag = sim_flag
         # Arg names that mean "doesn't touch the arms" without being sim
-        # (teleop's jelly_only): the run skips the robot link and the
-        # motor-fault gate but still drives real, non-arm hardware.
+        # (teleop's mantis): the run skips the robot link and the motor-fault
+        # gate but still drives real, non-arm hardware.
         self.robot_free_flags = robot_free_flags
+        # Boolean arg (default true) that *off* makes the run arm-free — the
+        # inverse of a robot-free flag. Teleop's ``arms``: the Robot tab's
+        # "Axol arms" switch, folded in from the shared settings, so a robot
+        # without arms (Jelly only) starts without an Axol connection.
+        self.arms_flag = arms_flag
         # Mantis is a runtime hardware mode only for plain teleop and data
         # collection. Policy/DAgger may consume datasets produced by Mantis,
         # but they always drive Axol hardware.
@@ -345,9 +351,10 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "teleop",
         "Teleoperation",
-        "Drive the Axol from a VR headset. Enable simulation to preview in the "
-        "browser without hardware, or Jelly-only to drive just Jelly. Mantis "
-        "drives the rig grippers from their triggers (no tracking).",
+        "Drive the Axol — and Jelly's wheels and lift when attached — from a "
+        "VR headset. Enable simulation to preview in the browser without "
+        "hardware. Mantis drives the rig grippers from their triggers (no "
+        "tracking).",
         "Operate",
         "draccus",
         _teleop,
@@ -358,13 +365,16 @@ COMMANDS: dict[str, CommandDef] = {
         streams_video=True,
         sim_flag="sim",
         # mantis drives the handheld rig's own CAN buses (can_mantis_l/r), so
-        # like jelly_only it never touches the arms or their motor faults. It is
-        # not a per-run field: the panel derives it from the system-wide
-        # device selection (settings ``system.hardware_profile``).
-        robot_free_flags=("jelly_only", "mantis"),
+        # it never touches the arms or their motor faults. It is not a per-run
+        # field: the panel derives it from the system-wide device selection
+        # (settings ``system.hardware_profile``).
+        robot_free_flags=("mantis",),
+        # The Robot tab's "Axol arms" switch (settings ``robot.arms``): off
+        # drives just Jelly with the arms untouched.
+        arms_flag="arms",
         supports_mantis=True,
         uses_headset=True,
-        per_run_fields=("sim", "jelly_only"),
+        per_run_fields=("sim",),
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",
@@ -955,6 +965,7 @@ def command_specs() -> list[dict[str, Any]]:
             "episodeControl": cmd.has_episode_control,
             "simFlag": cmd.sim_flag,
             "robotFreeFlags": list(cmd.robot_free_flags),
+            "armsFlag": cmd.arms_flag,
             "supportsMantis": cmd.supports_mantis,
             "hardwareProfiles": list(cmd.hardware_profiles),
             "usesHeadset": cmd.uses_headset,
@@ -1007,6 +1018,52 @@ def flag_enabled(value: Any) -> bool:
     if value is None or (isinstance(value, str) and not value.strip()):
         return False
     return parse_boolean(value)
+
+
+def flag_value(value: Any, default: bool) -> bool:
+    """Like :func:`flag_enabled`, but an omitted value keeps ``default``.
+
+    For switches whose config default is *on* (teleop's ``arms``): absent
+    from the launch args means the default applies, not "off".
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    return parse_boolean(value)
+
+
+def safety_flags(cmd: "CommandDef") -> tuple[str, ...]:
+    """The launch args that decide whether a run touches the arms.
+
+    The sim flag, the robot-free flags and the arms flag, deduplicated. The
+    serve layer classifies a launch from these before touching hardware and
+    requires the parsed config to agree with the submitted args.
+    """
+    return tuple(
+        dict.fromkeys(
+            flag
+            for flag in (cmd.sim_flag, *cmd.robot_free_flags, cmd.arms_flag)
+            if flag is not None
+        )
+    )
+
+
+def flag_default(cmd: "CommandDef", flag: str) -> bool:
+    """The value a safety flag has when the launch omits it."""
+    return flag == cmd.arms_flag
+
+
+def is_robot_free(cmd: "CommandDef", flags: dict[str, bool]) -> bool:
+    """Whether a run with these (resolved) safety flags leaves the arms alone.
+
+    ``flags`` maps every :func:`safety_flags` name to its resolved boolean.
+    A sim run, a robot-free flag that is on, or an arms flag that is off all
+    mean the run skips the robot link and the motor-fault gate.
+    """
+    if cmd.sim_flag is not None and flags.get(cmd.sim_flag, False):
+        return True
+    if any(flags.get(flag, False) for flag in cmd.robot_free_flags):
+        return True
+    return cmd.arms_flag is not None and not flags.get(cmd.arms_flag, True)
 
 
 def normalize_boolean_args(command_id: str, args: dict[str, Any]) -> dict[str, Any]:

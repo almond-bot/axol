@@ -1380,7 +1380,7 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_robot_free_string_booleans_skip_axol_survey_consistently(
         self,
     ) -> None:
-        for key, value in (("sim", "yes"), ("jelly_only", "on")):
+        for key, value in (("sim", "yes"), ("arms", "off")):
             with self.subTest(key=key, value=value):
                 manager = _Manager()
                 runner = _Runner()
@@ -1394,7 +1394,7 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(runner.starts, 1)
                 assert runner.session is not None
-                self.assertIs(runner.session.args[key], True)
+                self.assertIs(runner.session.args[key], key == "sim")
 
     async def test_motor_operation_binds_launch_to_surveyed_channels(self) -> None:
         manager = _Manager()
@@ -2235,9 +2235,9 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         self,
     ) -> None:
         cases = (
-            ("teleop", {}, SimpleNamespace(mantis=True, sim=False, jelly_only=False)),
-            ("teleop", {}, SimpleNamespace(mantis=False, sim=True, jelly_only=False)),
-            ("teleop", {}, SimpleNamespace(mantis=False, sim=False, jelly_only=True)),
+            ("teleop", {}, SimpleNamespace(mantis=True, sim=False, arms=True)),
+            ("teleop", {}, SimpleNamespace(mantis=False, sim=True, arms=True)),
+            ("teleop", {}, SimpleNamespace(mantis=False, sim=False, arms=False)),
         )
         for op_id, args, config in cases:
             with self.subTest(config=config):
@@ -2258,7 +2258,7 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         config = SimpleNamespace(
             mantis=False,
             sim=False,
-            jelly_only=False,
+            arms=True,
             axol=SimpleNamespace(has_gripper=True),
         )
         with (
@@ -2297,6 +2297,52 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         run_args = thread.call_args.kwargs["args"]
         self.assertFalse(run_args[-1])
         worker.start.assert_called_once_with()
+
+    def test_arms_off_teleop_is_robot_free_and_keeps_the_axol_link(self) -> None:
+        # The Robot tab's "Axol arms" switch off (settings ``robot.arms`` →
+        # teleop ``arms``) drives just Jelly: the run never touches the arms,
+        # so the idle Axol link stays connected and its telemetry streaming.
+        robot = _Robot(profile="axol")
+        runner = OperationRunner(robot_link=robot)
+        config = SimpleNamespace(
+            mantis=False,
+            sim=False,
+            arms=False,
+            axol=SimpleNamespace(has_gripper=True),
+        )
+        worker = Mock()
+        with (
+            patch.object(runner, "_build_config", return_value=config),
+            patch.object(runner, "_attach_cameras_to_teleop"),
+            patch("almond_axol.serve.runner.threading.Thread", return_value=worker),
+        ):
+            session = runner.start("teleop", {"arms": False})
+
+        self.assertEqual(session.status, "running")
+        self.assertEqual(robot.releases, 0)
+        worker.start.assert_called_once_with()
+
+    def test_arms_default_on_requires_the_axol_link(self) -> None:
+        # With ``arms`` omitted the config default (on) applies: a gripperless
+        # survey then trips the gripper check, proving the run was classified
+        # as an arm run rather than robot-free.
+        robot = _Robot(profile="axol", has_gripper=False)
+        runner = OperationRunner(robot_link=robot)
+        config = SimpleNamespace(
+            mantis=False,
+            sim=False,
+            arms=True,
+            axol=SimpleNamespace(has_gripper=True),
+        )
+        with (
+            patch.object(runner, "_build_config", return_value=config),
+            patch.object(runner, "_attach_cameras_to_teleop"),
+        ):
+            session = runner.start("teleop", {})
+
+        self.assertEqual(session.status, "error")
+        self.assertIn("connected Axol survey is gripperless", session.error or "")
+        self.assertEqual(robot.releases, 0)
 
 
 if __name__ == "__main__":
