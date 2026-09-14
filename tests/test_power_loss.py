@@ -319,6 +319,8 @@ class _LockedOutLink:
         self.reacquires = 0
         self.releases = 0
         self.probes = 0
+        # Raised by the next probe only, then cleared.
+        self.probe_error: Exception | None = None
 
     def profile(self) -> str:
         return "axol"
@@ -346,6 +348,9 @@ class _LockedOutLink:
 
     def probe(self) -> dict[str, Any]:
         self.probes += 1
+        if self.probe_error is not None:
+            error, self.probe_error = self.probe_error, None
+            raise error
         if self.state != STATE_CONNECTED:
             raise RuntimeError(f"robot link is {self.state}")
         return self.status()
@@ -374,13 +379,22 @@ def _motor(joint: str, *, reachable: bool | None, status: str | None) -> dict[st
 
 class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
     def _locked_out_runner(self, robot: _LockedOutLink) -> OperationRunner:
-        """A runner whose last operation failed to confirm its torque-off."""
+        """A runner whose last operation failed to confirm its torque-off.
+
+        The runner probes the motors itself as that operation ends and only
+        locks out when the probe cannot prove them safe; here that first
+        probe fails to read (the failed op still had the bus), so the
+        lockout stands and *robot*'s motors describe what the operator's
+        later Re-check sees. The probe's own reacquire/release round trip is
+        zeroed so each test counts only the Re-check it issues.
+        """
         from almond_axol.serve.commands import COMMANDS
 
         def fail(_cfg: Any, *, stop_event: threading.Event) -> None:
             del stop_event
             raise HardwareCleanupError("robot disable failed")
 
+        robot.probe_error = RuntimeError("bus still owned by the failed run")
         runner = OperationRunner(robot_link=robot)
         session = Session("cleanup-test", {})
         session.status = "running"
@@ -403,7 +417,56 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
                 manage_bridge=False,
             )
         self.assertTrue(runner.hardware_cleanup_lockout())
+        self.assertIsNone(robot.probe_error)
+        robot.reacquires = robot.releases = robot.probes = 0
         return runner
+
+    def test_the_runner_clears_its_own_lockout_when_the_motors_read_safe(
+        self,
+    ) -> None:
+        # No probe failure staged: the operation's cleanup failed, but the
+        # runner's own probe finds every motor disabled or unpowered, so the
+        # operator is never asked to do anything.
+        from almond_axol.serve.commands import COMMANDS
+
+        def fail(_cfg: Any, *, stop_event: threading.Event) -> None:
+            del stop_event
+            raise HardwareCleanupError("robot disable failed")
+
+        robot = _LockedOutLink(
+            [
+                _motor("SHOULDER_1", reachable=False, status=None),
+                _motor("WRIST_2", reachable=True, status="DISABLED"),
+            ]
+        )
+        runner = OperationRunner(robot_link=robot)
+        session = Session("cleanup-test", {})
+        session.status = "running"
+        runner._session = session
+        command = SimpleNamespace(
+            load_entrypoint=lambda: fail,
+            load_episode_control=lambda: None,
+        )
+        with (
+            patch.dict(COMMANDS, {"cleanup-test": command}),
+            patch("almond_axol.serve.runner._Capture") as capture,
+        ):
+            capture.return_value.__enter__.return_value = None
+            runner._run_thread(
+                session,
+                "cleanup-test",
+                SimpleNamespace(),
+                20,
+                needs_robot=True,
+                manage_bridge=False,
+            )
+
+        self.assertFalse(runner.hardware_cleanup_lockout())
+        self.assertFalse(runner.is_running())
+        self.assertEqual(session.status, "error")
+        self.assertIn("robot disable failed", session.error or "")
+        self.assertEqual(robot.probes, 1)
+        self.assertEqual(robot.state, STATE_CONNECTED)
 
     async def _client(
         self,
