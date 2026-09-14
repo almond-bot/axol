@@ -36,7 +36,7 @@ The subsystem sections have **exactly the shape of the matching config dataclass
 | `axol` | the robot config: `left_stiffness` / `right_stiffness`, `has_gripper`, per-joint gains, masses and gripper limits (`left.gripper.torque_limit`, `right.gripper.max_speed`, …) | every operation |
 | `teleop` | the teleop session: `frequency` (also sets `teleop_hz` on data collection), `position_multiplier`, `rotation_multiplier`, `hold_to_engage`, `rest_pose_left` / `rest_pose_right` (the **Rest pose** editor), `reset_torque_threshold` (also run policy and replay), `teleop_torque_threshold` (also replay), … | teleop, data collection, DAgger |
 | `kinematics` | the IK config: `pos_weight`, `ori_weight`, `elbow_weight`, `rest_weight`, `max_joint_delta`, … | teleop, data collection, DAgger |
-| `jelly` | the Jelly config: `wheels`, `lift` (the Robot tab's **Jelly wheels** / **Jelly lift** switches), `max_speed`, … | teleop, data collection, DAgger |
+| `jelly` | the Jelly config: `enabled`, `max_speed`, … | teleop, data collection, DAgger |
 | `vr_server` | the VR WebSocket server: `port`, … | teleop, data collection, DAgger |
 | `lerobot` | the LeRobot `robot_config.*` fields: `observe_torques`, `observe_cartesian`, `id`, `calibration_dir`, … | data collection, DAgger, run policy, replay |
 | `lerobot_teleop` | the LeRobot `teleop_config.id` / `teleop_config.calibration_dir` | data collection, DAgger |

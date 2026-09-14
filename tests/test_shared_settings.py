@@ -61,8 +61,7 @@ class _StoreCase(unittest.TestCase):
                 "axol.left.elbow.mass": 9.9,
                 "robot.right_channel": "null",
                 "gravity.kd": 0.9,
-                "robot.arms": False,
-                "jelly.wheels": False,
+                "jelly.enabled": True,
                 "jelly.max_speed": 0.25,
                 "teleop.rest_pose_left": _REST_LEFT,
                 "teleop.position_multiplier": 1.5,
@@ -88,9 +87,7 @@ class SharedOverlayTest(_StoreCase):
         self.assertIsNone(overlay["right_channel"])
         self.assertEqual(overlay["teleop"]["rest_pose_left"], _REST_LEFT)
         self.assertEqual(overlay["vr_server"]["port"], 8123)
-        self.assertEqual(overlay["jelly"]["wheels"], False)
-        # The Robot tab's "Axol arms" switch is teleop's top-level ``arms``.
-        self.assertEqual(overlay["arms"], False)
+        self.assertEqual(overlay["jelly"]["enabled"], True)
 
         gravity = shared_overlay("gravity-comp", store=self.store)
         self.assertEqual(gravity["kd"], 0.9)
@@ -125,8 +122,7 @@ class CliSharedSettingsTest(_StoreCase):
         self.assertEqual(cfg.axol.left.elbow.mass, 9.9)
         self.assertIsNone(cfg.right_channel)
         self.assertEqual(cfg.vr_server.port, 8123)
-        self.assertFalse(cfg.jelly.wheels)
-        self.assertFalse(cfg.arms)
+        self.assertTrue(cfg.jelly.enabled)
         np.testing.assert_allclose(cfg.teleop.rest_pose_left, _REST_LEFT, rtol=1e-6)
 
         gravity = parse(
@@ -314,9 +310,9 @@ class SdkSharedSettingsTest(_StoreCase):
 
     def test_jelly_and_vr_teleop_defaults_come_from_the_shared_settings(self) -> None:
         jelly = Jelly()
-        self.assertFalse(jelly._config.wheels)
+        self.assertTrue(jelly._config.enabled)
         self.assertEqual(jelly._config.max_speed, 0.25)
-        self.assertTrue(Jelly(JellyConfig())._config.wheels)
+        self.assertFalse(Jelly(JellyConfig())._config.enabled)
 
         with patch("almond_axol.teleop.teleop.VRServer") as server:
             teleop = VRTeleop(MagicMock())

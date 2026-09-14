@@ -49,15 +49,14 @@ export interface CommandSpec {
   requiresCameras?: boolean
   /** Config keys the panel asks for per run; the rest come from Settings. */
   perRunFields?: string[]
+  /** Per-run fields with a server-side pick list (/api/commands/{id}/suggestions/{field}). */
+  suggestedFields?: string[]
   /** Drives episodes the panel can start / save / discard. */
   episodeControl?: boolean
   /** Arg name that means "no hardware", or null when the robot is required. */
   simFlag?: string | null
-  /** Arg names that skip the arm-robot gates without being sim (mantis). */
+  /** Arg names that skip the arm-robot gates without being sim (jelly_only). */
   robotFreeFlags?: string[]
-  /** Default-on boolean arg that *off* makes the run arm-free (teleop's `arms`,
-   * the Robot tab's "Axol arms" switch); null when the op always uses the arms. */
-  armsFlag?: string | null
   /** Whether this operation can run against the Mantis hardware profile. */
   supportsMantis?: boolean
   /** Connected hardware profiles on which this command may be launched. */
@@ -286,11 +285,8 @@ export function saveLocalHardwareProfile(profile: HardwareProfile): void {
   }
 }
 
-/** Per-run flags that only make sense on the Axol profile (sim drives the arm
- *  simulator, never the handheld rigs). `jelly_only` is the retired per-run
- *  Jelly-only toggle older hosts still list — Jelly is now inferred from the
- *  attached CAN devices, with the Robot tab's "Axol arms" switch for
- *  arm-free runs. */
+/** Per-run flags that only make sense on the Axol profile (sim / Jelly-only
+ *  drive the arm simulator or Jelly, never the handheld rigs). */
 const AXOL_ONLY_RUN_FLAGS = new Set(["sim", "jelly_only"])
 
 /**
@@ -635,6 +631,33 @@ export interface DatasetInfo {
 export async function fetchDatasets(): Promise<DatasetInfo[]> {
   const res: { datasets?: DatasetInfo[] } = await json(await fetch(apiUrl("/api/datasets")))
   return res.datasets ?? []
+}
+
+/** One row of a per-run field's server-side pick list. */
+export interface FieldSuggestionRow {
+  value: string
+  /** Secondary text shown next to the value (e.g. the run it came from). */
+  label: string | null
+}
+
+/**
+ * The pick list a command declares for one per-run field (CommandDef
+ * ``field_suggestions``). A provider failure comes back as an empty list plus
+ * the reason, so the caller can keep the plain input and say why; an
+ * undeclared field (or an older host) is a 404 and throws.
+ */
+export async function fetchFieldSuggestions(
+  command: string,
+  field: string
+): Promise<{ suggestions: FieldSuggestionRow[]; error: string | null }> {
+  const res: { suggestions?: FieldSuggestionRow[]; error?: string | null } = await json(
+    await fetch(
+      apiUrl(
+        `/api/commands/${encodeURIComponent(command)}/suggestions/${encodeURIComponent(field)}`
+      )
+    )
+  )
+  return { suggestions: res.suggestions ?? [], error: res.error ?? null }
 }
 
 /** Which eye(s) of a stereo ZED X to use, per branch. */
@@ -1231,6 +1254,8 @@ export interface OperationMeta {
   description: string
   /** Per-run config keys surfaced in the panel (required + run identity). */
   fields: string[]
+  /** Per-run fields whose values the host suggests (typing stays free-form). */
+  suggestedFields: string[]
   /** Needs the persistent robot connection (CAN) to run. */
   requiresRobot: boolean
   /** Needs at least one camera serial configured (collect-data / run-policy). */
@@ -1239,13 +1264,9 @@ export interface OperationMeta {
   simCapable: boolean
   /** Arg that makes a run hardware-free; null when the robot is required. */
   simFlag: string | null
-  /** Args that skip the arm-robot gates without being sim (teleop's mantis:
+  /** Args that skip the arm-robot gates without being sim (teleop's jelly_only:
    * real hardware, but the arms and their CAN bus are never touched). */
   robotFreeFlags: string[]
-  /** Default-on boolean arg that *off* makes the run arm-free (teleop's `arms`,
-   * folded in from the Robot tab's "Axol arms" setting: the headset then drives
-   * only Jelly). Null when the op always uses the arms. */
-  armsFlag: string | null
   /** Runtime supports the Mantis hardware profile. */
   supportsMantis: boolean
   /** Shows the episode start / save / discard controls while running. */
@@ -1267,12 +1288,12 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Teleoperation",
     description: "Drive Axol from VR; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
     fields: ["sim"],
+    suggestedFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: true,
     simFlag: "sim",
     robotFreeFlags: ["mantis"],
-    armsFlag: null,
     supportsMantis: true,
     episodeControl: false,
     usesHeadset: true,
@@ -1283,12 +1304,12 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Gravity compensation",
     description: "Hold the arms weightless so they can be moved by hand.",
     fields: ["free_joints"],
+    suggestedFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
-    armsFlag: null,
     supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
@@ -1300,12 +1321,12 @@ export const OPERATIONS: OperationMeta[] = [
     description:
       "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
     fields: ["repo_id", "task"],
+    suggestedFields: [],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: ["mantis"],
-    armsFlag: null,
     supportsMantis: true,
     // Panel-driven episodes are newer than the registry, so a host old enough
     // to need this table can't serve them — the controls would sit on
@@ -1320,12 +1341,12 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Replay dataset",
     description: "Replay a recorded episode of a LeRobot dataset on Axol, then return to rest.",
     fields: ["repo_id", "episode", "loop", "interpolate"],
+    suggestedFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
-    armsFlag: null,
     supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
@@ -1337,12 +1358,12 @@ export const OPERATIONS: OperationMeta[] = [
     description:
       "Run a trained policy on Axol via LeRobot async inference, locally or on a remote inference server.",
     fields: ["policy_path", "policy_type", "task", "repo_id"],
+    suggestedFields: [],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
-    armsFlag: null,
     supportsMantis: false,
     episodeControl: true,
     usesHeadset: false,
@@ -1365,6 +1386,7 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     label: s.label,
     description: s.description,
     fields: s.perRunFields ?? [],
+    suggestedFields: s.suggestedFields ?? [],
     // Every in-process operation drives the arms; only a sim run doesn't, and
     // that's decided per run from simFlag.
     requiresRobot: true,
@@ -1372,7 +1394,6 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     simCapable: s.simCapable,
     simFlag: s.simFlag ?? null,
     robotFreeFlags: s.robotFreeFlags ?? [],
-    armsFlag: s.armsFlag ?? null,
     supportsMantis: s.supportsMantis ?? Boolean(s.perRunFields?.includes("mantis")),
     episodeControl: Boolean(s.episodeControl),
     usesHeadset: Boolean(s.usesHeadset),
@@ -1385,41 +1406,14 @@ export function isSimRun(meta: OperationMeta, settings: Record<string, FormValue
   return meta.simFlag != null && Boolean(settings[meta.simFlag])
 }
 
-/** The shared setting behind teleop's `arms` flag (Robot tab → "Axol arms"). */
-export const ARMS_SETTING = "robot.arms"
-
 /**
- * Whether the run's arms flag is off. An explicit value in `args` wins;
- * otherwise the shared settings snapshot decides, with the flag defaulting
- * to on. For a *live* session pass `sharedValues: null`: its merged args are
- * the whole truth (a default-on flag is simply omitted from them), and the
- * operator flipping the saved switch mid-run must not relabel the run.
+ * Whether this run leaves the arms (and their CAN bus) untouched — sim, or a
+ * robot-free flag like teleop's jelly_only. Such a run skips the "Connect
+ * Axol" and motor-fault gates; jelly_only still drives real Jelly hardware.
  */
-export function isArmsOffRun(
-  meta: OperationMeta,
-  args: Record<string, FormValue>,
-  sharedValues: Record<string, unknown> | null | undefined
-): boolean {
-  if (meta.armsFlag == null) return false
-  const runValue = args[meta.armsFlag]
-  if (runValue !== undefined && runValue !== null) return runValue === false
-  return sharedValues?.[ARMS_SETTING] === false
-}
-
-/**
- * Whether this run leaves the arms (and their CAN bus) untouched — sim, a
- * robot-free flag, or (given the shared settings) the arms switched off. Such
- * a run skips the "Connect Axol" and motor-fault gates; an arms-off teleop
- * still drives real Jelly hardware.
- */
-export function isRobotFreeRun(
-  meta: OperationMeta,
-  settings: Record<string, FormValue>,
-  sharedValues?: Record<string, unknown> | null
-): boolean {
+export function isRobotFreeRun(meta: OperationMeta, settings: Record<string, FormValue>): boolean {
   if (isSimRun(meta, settings)) return true
-  if (meta.robotFreeFlags.some((flag) => Boolean(settings[flag]))) return true
-  return isArmsOffRun(meta, settings, sharedValues)
+  return meta.robotFreeFlags.some((flag) => Boolean(settings[flag]))
 }
 
 /** Curated fields for an op, resolved from the introspected command schema. */

@@ -32,11 +32,11 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 | Extra | Purpose |
 |-------|---------|
 | `sim` | viser (browser 3D visualizer) — needed for sim mode |
-| `lerobot` | LeRobot data collection/policy — requires hardware + ZED cameras. Not needed for teleop camera streaming: the ZED SDK cameras live in `almond_axol/video/zed_sdk.py` and `almond_axol/lerobot/camera` only wraps them in LeRobot's `Camera`/`CameraConfig` |
+| `lerobot` | LeRobot data collection/policy — requires hardware + ZED cameras |
 
 For cloud development: `uv sync --extra sim --extra lerobot` (the `lerobot` extra is import-time required by part of the test suite; `--extra sim` alone is enough to run sim teleop).
 
-**On a real robot (Jetson/tegra host), never run a bare `uv sync --extra sim`.** The robot's venv also carries the `lerobot` extra plus out-of-band installs — `pyzed` (from `~/.almond/wheels/`) and PyGObject (`pygobject>=3.50,<3.52`, built against the system gobject-introspection) — and an exact sync silently removes them, which kills camera streaming (no `pyzed` for the SDK fallback — teleop logs a `zed.install` hint — and no `gi` for the gst relay) and data collection (`No module named 'lerobot'`). Restore with `uv sync --extra sim --extra lerobot` then `uv pip install ~/.almond/wheels/pyzed-*.whl "pygobject>=3.50,<3.52"`. Do **not** install the self-built `jaxlib` / `jax_cuda12_*` wheels from `~/.almond/wheels/` — they were compiled against cuDNN 9.8 while JetPack ships 9.3, so the IK worker's first solve crashes (`RET_CHECK failure ... dnn_support != nullptr`); the lock's CPU jaxlib runs IK at full teleop rate.
+**On a real robot (Jetson/tegra host), never run a bare `uv sync --extra sim`.** The robot's venv also carries the `lerobot` extra plus out-of-band installs — `pyzed` (from `~/.almond/wheels/`) and PyGObject (`pygobject>=3.50,<3.52`, built against the system gobject-introspection) — and an exact sync silently removes them, which kills camera streaming (`No module named 'lerobot'`, no `gi` for the gst relay). Restore with `uv sync --extra sim --extra lerobot` then `uv pip install ~/.almond/wheels/pyzed-*.whl "pygobject>=3.50,<3.52"`. Do **not** install the self-built `jaxlib` / `jax_cuda12_*` wheels from `~/.almond/wheels/` — they were compiled against cuDNN 9.8 while JetPack ships 9.3, so the IK worker's first solve crashes (`RET_CHECK failure ... dnn_support != nullptr`); the lock's CPU jaxlib runs IK at full teleop rate.
 
 ### Gotchas
 

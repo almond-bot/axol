@@ -1050,7 +1050,7 @@ export default function Diagnostics() {
           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
             <p className="min-w-0 flex-1 text-xs text-amber-100/80">
               {canDiscovery?.message ??
-                "CAN hardware is attached but its Axol, Mantis, or Jelly base/lift role is not yet proven."}{" "}
+                "CAN hardware is attached but its Axol or Mantis role is not yet proven."}{" "}
               Power the hardware, then retry identification. The idle robot link may disconnect
               briefly while it is probed.
             </p>
