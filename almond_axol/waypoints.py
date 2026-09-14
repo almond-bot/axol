@@ -29,6 +29,13 @@ from pathlib import Path
 import numpy as np
 
 from .constants import ARM_JOINTS
+from .utils.paths import almond_home
+from .utils.state_files import (
+    privileged_service_active,
+    require_path_beneath,
+    secure_atomic_write_json,
+    secure_read_text,
+)
 
 # 7 arm joints + gripper, matching motion_control's argument shape.
 JOINT_VECTOR_LEN = len(ARM_JOINTS) + 1
@@ -123,10 +130,12 @@ class WaypointSet:
     def load(cls, path: str | Path) -> WaypointSet:
         """Read a waypoint file, returning an empty set if it does not exist."""
         p = Path(path).expanduser()
+        if privileged_service_active():
+            p = require_path_beneath(p, almond_home(), label="waypoint file")
         if not p.exists():
             return cls()
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(secure_read_text(p))
         except json.JSONDecodeError as exc:
             raise ValueError(f"{p} is not valid JSON: {exc}") from exc
         version = data.get("version", FORMAT_VERSION)
@@ -144,7 +153,8 @@ class WaypointSet:
         truncate a path that took real time to teach.
         """
         p = Path(path).expanduser()
-        p.parent.mkdir(parents=True, exist_ok=True)
+        if privileged_service_active():
+            p = require_path_beneath(p, almond_home(), label="waypoint file")
         payload = {
             "version": FORMAT_VERSION,
             "waypoints": [
@@ -152,6 +162,4 @@ class WaypointSet:
                 for i, wp in enumerate(self.waypoints)
             ],
         }
-        tmp = p.with_suffix(p.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n")
-        tmp.replace(p)
+        secure_atomic_write_json(p, payload, sort_keys=False)

@@ -9,6 +9,7 @@
     "dev": "vite",
     "prebuild": "node scripts/sync-webxr-profiles.mjs",
     "build": "tsc -b && vite build",
+    "test": "node --experimental-strip-types --test test/*.test.mjs",
     "lint": "eslint .",
     "preview": "vite preview"
   },
@@ -26,7 +27,7 @@
     "lucide-react": "^1.17.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "react-router-dom": "^7.17.0",
+    "react-router-dom": "^7.18.3",
     "tailwind-merge": "^3.6.0",
     "three": "^0.182.0",
     "troika-three-text": "^0.52.4",

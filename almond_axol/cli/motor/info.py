@@ -102,7 +102,11 @@ async def _print_motor(
 
 async def _run(args: argparse.Namespace) -> None:
     channel = resolve_channel(args)
-    motor_ids = [args.id] if args.id is not None else list(range(1, 9))
+    motor_ids = (
+        [args.id]
+        if args.id is not None
+        else ([8] if args.target == "mantis" else list(range(1, 9)))
+    )
     async with CanBus(channel) as bus:
         for motor_id in motor_ids:
             await _print_motor(bus, motor_id, channel, args.type)

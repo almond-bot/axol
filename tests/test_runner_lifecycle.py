@@ -45,6 +45,12 @@ class _RobotLink:
     def reacquire(self) -> None:
         self.reacquired += 1
 
+    def profile(self) -> str:
+        return "axol"
+
+    def status(self) -> dict[str, object]:
+        return {"state": "connected", "hasGripper": True}
+
 
 def test_output_forwarding_stream_and_logging_filters() -> None:
     lines: list[str] = []
@@ -81,7 +87,11 @@ def test_operation_start_config_error_and_single_operation_guard(monkeypatch) ->
     monkeypatch.setattr(runner.threading, "Thread", make_thread)
     monkeypatch.setattr(runner.multiprocessing, "active_children", lambda: [])
     operation = runner.OperationRunner()
-    monkeypatch.setattr(operation, "_build_config", lambda op, args: SimpleNamespace())
+    # The runner cross-checks the parsed safety flags against the submitted
+    # ones, so the fake config must echo the requested sim mode.
+    monkeypatch.setattr(
+        operation, "_build_config", lambda op, args: SimpleNamespace(sim=True)
+    )
     session = operation.start("teleop", {"sim": True})
     assert session.status == "running"
     assert operation.current() is session
@@ -105,6 +115,16 @@ def test_operation_start_config_error_and_single_operation_guard(monkeypatch) ->
     assert "bad option" in (failed.error or "")
     assert not broken.is_running()
 
+    # A config whose parsed safety flag disagrees with the submitted one is
+    # refused before any hardware is touched.
+    mismatched = runner.OperationRunner()
+    monkeypatch.setattr(
+        mismatched, "_build_config", lambda op, args: SimpleNamespace(sim=False)
+    )
+    refused = mismatched.start("teleop", {"sim": True})
+    assert refused.status == "error"
+    assert "does not match" in (refused.error or "")
+
 
 def test_operation_releases_and_reacquires_robot(monkeypatch) -> None:
     monkeypatch.setattr(runner.threading, "Thread", _Thread)
@@ -123,8 +143,13 @@ def test_operation_releases_and_reacquires_robot(monkeypatch) -> None:
     warning_link = _RobotLink(release_error=True)
     warning_op = runner.OperationRunner(warning_link)
     monkeypatch.setattr(warning_op, "_build_config", lambda op, args: SimpleNamespace())
-    warning = warning_op.start("teleop", {})
-    assert any("release warning" in line for line in warning.log)
+    # A link that cannot be released refuses to start the op: running arms
+    # over a bus that is still owned by the serve link is never attempted.
+    refused = warning_op.start("teleop", {})
+    assert refused.status == "error"
+    assert "link failed" in (refused.error or "")
+    assert any("could not be released" in line for line in refused.log)
+    assert not warning_op.is_running()
 
 
 def test_operation_stop_and_episode_control(monkeypatch) -> None:
@@ -153,13 +178,15 @@ def test_operation_stop_and_episode_control(monkeypatch) -> None:
     assert operation.stop() is session
 
     pushed: list[str] = []
-    operation._policy_control = SimpleNamespace(
+    operation._episode_control = SimpleNamespace(
         push=pushed.append, snapshot=lambda: {"phase": "waiting"}
     )
     assert operation.episode_command("save")
     assert pushed == ["save"]
+    # The retired disengage toggle is refused even while an op is live.
+    assert not operation.episode_command("bridge-toggle")
     assert operation.policy_state() == {"phase": "waiting"}
-    operation._policy_control = None
+    operation._episode_control = None
     assert not operation.episode_command("save")
     assert operation.policy_state() is None
 
@@ -239,7 +266,7 @@ def test_settings_reset_normalization_and_merged_args(tmp_path: Path) -> None:
     path.parent.mkdir()
     path.write_text("corrupt")
     store = SettingsStore(path)
-    assert store.snapshot() == {"values": {}, "cameras": None, "advanced": {}}
+    assert store.snapshot() == {"values": {}, "cameras": None}
     assert store.can_channels() == ("can_alm_axol_l", "can_alm_axol_r")
     assert store.has_gripper()
 
@@ -266,8 +293,8 @@ def test_settings_reset_normalization_and_merged_args(tmp_path: Path) -> None:
         advanced={"axol.left.elbow.kp": None},
     )
     assert store.cameras() is None
-    assert "robot.left_stiffness" not in store.snapshot()["values"]
-    with pytest.raises(KeyError, match="unknown advanced"):
+    assert "axol.left_stiffness" not in store.snapshot()["values"]
+    with pytest.raises(KeyError, match="unknown settings"):
         store.update(advanced={"unknown.value": 1})
 
 

@@ -26,13 +26,44 @@
       {
         "group": "Operations",
         "pages": [
-          "operations/teleop",
-          "operations/gravity-comp",
-          "operations/data-collection",
-          "operations/replay-dataset",
+          {
+            "group": "Teleoperation",
+            "root": "operations/teleop",
+            "pages": ["operations/teleop-config"]
+          },
+          {
+            "group": "Gravity Compensation",
+            "root": "operations/gravity-comp",
+            "pages": ["operations/gravity-comp-config"]
+          },
+          {
+            "group": "Data Collection",
+            "root": "operations/data-collection",
+            "pages": ["operations/data-collection-config"]
+          },
+          {
+            "group": "Replay Dataset",
+            "root": "operations/replay-dataset",
+            "pages": ["operations/replay-dataset-config"]
+          },
           "operations/train-policy",
-          "operations/run-policy",
-          "operations/dagger"
+          {
+            "group": "Run Policy",
+            "root": "operations/run-policy",
+            "pages": ["operations/run-policy-config"]
+          },
+          {
+            "group": "DAgger Collection",
+            "root": "operations/dagger",
+            "pages": ["operations/dagger-config"]
+          }
+        ]
+      },
+      {
+        "group": "Mantis",
+        "pages": [
+          "mantis/hardware",
+          "mantis/tracking"
         ]
       },
       {
@@ -44,7 +75,11 @@
       {
         "group": "Web Interfaces",
         "pages": [
-          "guides/control-panel",
+          {
+            "group": "Web Control Panel",
+            "root": "guides/control-panel",
+            "pages": ["guides/control-panel-settings"]
+          },
           "guides/diagnostics-dashboard",
           "guides/vr-interface",
           "guides/quest-over-usb",
@@ -59,41 +94,96 @@
             "group": "CLI Reference",
             "pages": [
               "cli/configuration",
-              "cli/serve",
-              "cli/can-setup",
-              "cli/can-enable",
-              "cli/can-driver",
-              "cli/lift-home",
-              "cli/lift-goto",
-              "cli/motor-info",
-              "cli/motor-health",
-              "cli/diag-rom-enable",
-              "cli/diag-rom-disable",
-              "cli/diag-zed-cable",
-              "cli/motor-set-can-id",
-              "cli/motor-set-zero-pos",
-              "cli/motor-dump-config",
-              "cli/motor-set-config",
-              "cli/motor-restore-config",
-              "cli/motor-flash",
-              "cli/teleop",
-              "cli/collect-data",
-              "cli/collect-dagger",
-              "cli/migrate-dataset",
-              "cli/replay-dataset",
-              "cli/run-policy",
-              "cli/inference-server",
-              "cli/provision",
-              "cli/zed-driver",
-              "cli/zed-install",
-              "cli/gst-install",
-              "cli/gst-build-zed",
-              "cli/jetson-setup",
-              "cli/tune-pid",
-              "cli/tune-friction",
-              "cli/tune-repeatability",
-              "cli/gravity-comp",
-              "cli/waypoints"
+              {
+                "group": "Operations",
+                "pages": [
+                  "cli/teleop",
+                  "cli/gravity-comp",
+                  "cli/waypoints",
+                  "cli/collect-data",
+                  "cli/collect-dagger",
+                  "cli/replay-dataset",
+                  "cli/run-policy",
+                  "cli/inference-server",
+                  "cli/migrate-dataset"
+                ]
+              },
+              {
+                "group": "Host",
+                "pages": [
+                  "cli/serve",
+                  "cli/provision",
+                  "cli/rt-install",
+                  "cli/jetson-setup"
+                ]
+              },
+              {
+                "group": "CAN",
+                "pages": [
+                  "cli/can-setup",
+                  "cli/can-enable",
+                  "cli/can-driver"
+                ]
+              },
+              {
+                "group": "Motors",
+                "pages": [
+                  "cli/motor-info",
+                  "cli/motor-health",
+                  "cli/motor-set-can-id",
+                  "cli/motor-set-zero-pos",
+                  "cli/motor-dump-config",
+                  "cli/motor-set-config",
+                  "cli/motor-restore-config",
+                  "cli/motor-flash"
+                ]
+              },
+              {
+                "group": "Lift",
+                "pages": [
+                  "cli/lift-home",
+                  "cli/lift-goto"
+                ]
+              },
+              {
+                "group": "Cameras",
+                "pages": [
+                  "cli/zed-install",
+                  "cli/zed-driver",
+                  "cli/gst-install",
+                  "cli/gst-build-zed"
+                ]
+              },
+              {
+                "group": "Mantis tracking",
+                "pages": [
+                  "cli/tracker"
+                ]
+              },
+              {
+                "group": "Diagnostics",
+                "pages": [
+                  "cli/diag-rom-enable",
+                  "cli/diag-rom-disable",
+                  "cli/diag-teleop-jitter",
+                  "cli/diag-offline",
+                  "cli/diag-lift-cycle",
+                  "cli/diag-zed-cable"
+                ]
+              },
+              {
+                "group": "Tuning",
+                "pages": [
+                  "cli/tune-pid",
+                  "cli/tune-friction",
+                  "cli/tune-gravity",
+                  "cli/tune-factory",
+                  "cli/tune-motion",
+                  "cli/tune-filter",
+                  "cli/motion-build",
+                  "cli/tune-repeatability"
+                ]
+              }
             ]
           },
           {

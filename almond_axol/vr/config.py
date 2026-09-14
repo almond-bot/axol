@@ -33,6 +33,15 @@ class VRServerConfig:
         interp_outlier_k: Hampel outlier threshold in robust standard
             deviations for the glitch rejection inside the smoothing window.
             Lower is more aggressive. ``<= 0`` disables rejection.
+        pose_source_kind: Exclusive pose producer for this server. ``"webxr"``
+            accepts Quest (plus legacy clients); ``"tracker"`` accepts only a
+            Lighthouse/Ultimate bridge while other sockets remain view-only.
+            ``None`` lets the first logical source claim the session.
+        expected_pose_source_id: Exact logical producer ID accepted for pose
+            control. Managed Lighthouse/Ultimate runs set a fresh unguessable
+            value on both their server and bridge so an unrelated standalone
+            bridge cannot claim the session. ``None`` accepts any ID allowed
+            by ``pose_source_kind``.
     """
 
     port: int = VR_PORT
@@ -43,3 +52,5 @@ class VRServerConfig:
     interp_max_delay_s: float = 0.15
     interp_smooth_window_s: float = 0.12
     interp_outlier_k: float = 4.0
+    pose_source_kind: str | None = None
+    expected_pose_source_id: str | None = None

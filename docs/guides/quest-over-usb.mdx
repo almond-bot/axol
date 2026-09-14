@@ -9,7 +9,7 @@ By default the Quest streams controller pose to the robot over Wi-Fi. On some ne
   USB carries **controller poses only**. Camera video still streams over the LAN — WebRTC can't cross the `adb` TCP forward — so you connect to the robot's address as usual and the cameras keep working over Wi-Fi/Ethernet. USB just takes over the pose link.
 </Note>
 
-When USB is selected, the headset sends every pose frame over **both** the cable and Wi-Fi. The robot prefers the wired stream and uses the Wi-Fi frames only while the cable goes quiet, so a mid-session USB drop (or a yanked cable) **fails over to Wi-Fi instantly** with no reconnect, and the cable reclaims the link the moment it comes back. You get the wired link's low latency whenever it's up, without teleop stalling when it isn't.
+When USB is selected, the headset sends every pose frame over **both** the cable and Wi-Fi with one logical producer id and sequence. The robot accepts whichever copy arrives first and discards the duplicate globally. USB normally wins because it is lower-latency; if the cable drops, the next Wi-Fi copy is accepted immediately with no reconnect, and a restored cable naturally wins again when its copies arrive first. Delayed copies can never rewind controls or enter the jitter buffer.
 
 ## One-time setup
 
@@ -23,7 +23,7 @@ When USB is selected, the headset sends every pose frame over **both** the cable
   </Step>
 
   <Step title="Confirm adb is installed on the robot machine">
-    Nothing to do on the **Perception Kit ZED Box** or any [one-command install](/installation) — [`axol provision`](/cli/provision) sets up `adb` and the Quest udev rule for you. On a development install, run `axol provision` once.
+    Nothing to do after a [one-command install](/installation) — [`axol provision`](/cli/provision) sets up `adb` and the Quest udev rule for you. On a development install, run `axol provision` once.
   </Step>
 </Steps>
 
@@ -35,15 +35,27 @@ When USB is selected, the headset sends every pose frame over **both** the cable
   </Step>
 
   <Step title="Authorize and connect from the control panel">
-    In the [control panel](/guides/control-panel#quest-usb), the **Quest USB** settings tab shows the headset state. The first time, accept the **Allow USB debugging?** prompt in the headset (check **Always allow from this computer**). Once authorized, the tunnel comes up **automatically** and the status turns green (*Controller over USB*); the tab's **Connect** button is a manual fallback / reconnect.
+    In the [control panel](/guides/control-panel#quest-usb), the **Quest** tab under **General settings** shows the headset state. The first time, accept the **Allow USB debugging?** prompt in the headset (check **Always allow from this computer**). Once authorized, the tunnels come up **automatically** and the status turns green (*Controller over USB*); the tab's **Connect** button is a manual fallback / reconnect.
+  </Step>
+
+  <Step title="Confirm the tunnel on localhost">
+    In the headset browser, open `https://localhost:8001` — the control panel, reached over the cable — and proceed past the certificate warning. If the panel loads, the tunnel is up. This works while nothing else is running, and it also lets you drive the panel from the headset.
+
+    <Note>
+      Do this before anything else. The browser's override is per-origin (scheme + host + port), so accepting `:8001` does not cover `:8000` — the USB pose link gets its own approval in a later step. Reaching the panel on `localhost` is what proves the cable path works, and it is the origin that is always available.
+    </Note>
   </Step>
 
   <Step title="Enable USB in the VR app">
-    Open the VR app at [axol.almond.bot](https://axol.almond.bot), enter the robot's address as usual, and tick **Quest over USB** before connecting.
+    Open the VR app at [axol.almond.bot](https://axol.almond.bot), enter the robot's address as usual, and tick **Quest over USB**. The USB panel and its **Authorize USB certificate** button appear immediately, before you connect.
   </Step>
 
   <Step title="Authorize the USB certificate">
-    The USB link uses `wss://localhost:8000`, whose self-signed certificate is a **separate origin** from the host cert you already approved. Until it's approved the app runs on Wi-Fi and shows *WiFi fallback — USB link down* with an **Authorize USB certificate** button — tap it and proceed past the warning (equivalently, open `https://localhost:8000` in the headset browser and proceed). The status then flips to *controller over cable*.
+    The USB link uses `wss://localhost:8000`. It serves the same certificate you just saw on `:8001`, but the browser's approval is **per-origin**, so this port needs its own. Until it's approved the app runs on Wi-Fi and shows *WiFi fallback — USB link down*. Tap **Authorize USB certificate** and proceed past the warning (equivalently, open `https://localhost:8000` in the headset browser). The status then flips to *controller over cable*.
+
+    <Warning>
+      Port 8000 only exists while a teleop or data-collection operation is running — the VR server is started and stopped with the operation, not by `axol serve`. Start the operation from the control panel first, otherwise the certificate page cannot load and the poses stay on Wi-Fi.
+    </Warning>
   </Step>
 
   <Step title="Enter VR">
@@ -52,14 +64,14 @@ When USB is selected, the headset sends every pose frame over **both** the cable
 </Steps>
 
 <Warning>
-  If the **Quest USB** settings tab shows `unauthorized`, re-accept the prompt in the headset. If it shows no device, replug the cable and confirm Developer Mode is on. A flaky cable is the most common cause of a link that won't come up.
+  If the **Quest** settings tab shows `unauthorized`, re-accept the prompt in the headset. If it shows no device, replug the cable and confirm Developer Mode is on. A flaky cable is the most common cause of a link that won't come up.
 </Warning>
 
 ## Next steps
 
 <CardGroup cols={2}>
   <Card title="Web Control Panel" icon="sliders" href="/guides/control-panel">
-    Where the Quest USB settings tab lives and how connections work.
+    Where the Quest settings tab lives and how connections work.
   </Card>
   <Card title="VR Interface" icon="vr-cardboard" href="/guides/vr-interface">
     The WebXR app, camera views, and connection details.

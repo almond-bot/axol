@@ -19,13 +19,18 @@ Examples:
 
 import argparse
 import asyncio
-import json
 from pathlib import Path
 from typing import Any
 
 from ...motor.bus import CanBus
 from ...motor.config import Access
 from ...motor.motor import make_driver
+from ...utils.paths import almond_home
+from ...utils.state_files import (
+    privileged_service_active,
+    require_path_beneath,
+    secure_atomic_write_json,
+)
 from . import add_side_and_channel_arguments, resolve_channel
 
 
@@ -124,12 +129,50 @@ async def _dump_motor(
         )
         params[index.name] = value
 
-    return {"motor_id": motor_id, "type": kind, "raw": raw, "params": params}
+    record: dict[str, Any] = {
+        "motor_id": motor_id,
+        "type": kind,
+        "raw": raw,
+        "params": params,
+    }
+
+    # Internal loop gains live behind a separate command (MyActuator 0x30 /
+    # Damiao registers), not the parameter table above. The current loop tracks
+    # the torque setpoint that MIT-mode impedance produces, so its gains scale
+    # the effectiveness of every kp/kd we command — worth comparing per motor.
+    try:
+        gains = await motor.get_gains()
+    except Exception as e:
+        print(f"\n  loop gains: could not read — {e}")
+        return record
+
+    print("\n  loop gains:")
+    loop_gains: dict[str, float] = {}
+    for name in (
+        "current_kp",
+        "current_ki",
+        "speed_kp",
+        "speed_ki",
+        "position_kp",
+        "position_ki",
+        "position_kd",
+    ):
+        value = getattr(gains, name)
+        if value is None:
+            continue
+        print(f"  {name:<30} {value:>14.4f}")
+        loop_gains[name] = value
+    record["loop_gains"] = loop_gains
+    return record
 
 
 async def _run(args: argparse.Namespace) -> None:
     channel = resolve_channel(args)
-    motor_ids = [args.id] if args.id is not None else list(range(1, 9))
+    motor_ids = (
+        [args.id]
+        if args.id is not None
+        else ([8] if args.target == "mantis" else list(range(1, 9)))
+    )
 
     motors: list[dict[str, Any]] = []
     async with CanBus(channel) as bus:
@@ -144,7 +187,16 @@ async def _run(args: argparse.Namespace) -> None:
         print("\nnothing to save — no motor answered")
         return
 
-    args.out.write_text(
-        json.dumps({"channel": channel, "motors": motors}, indent=2) + "\n"
+    output = args.out
+    if privileged_service_active():
+        output = require_path_beneath(
+            output,
+            almond_home(),
+            label="motor configuration output",
+        )
+    secure_atomic_write_json(
+        output,
+        {"channel": channel, "motors": motors},
+        sort_keys=False,
     )
-    print(f"\nsaved {len(motors)} motor(s) to {args.out}")
+    print(f"\nsaved {len(motors)} motor(s) to {output}")

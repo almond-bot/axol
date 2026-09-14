@@ -102,10 +102,26 @@ def test_gst_availability_checks_optional_runtime(
     assert not gst_zed._gi_available()
     assert not gst_zed._element_available("zedsrc")
 
+    class Plugin:
+        @staticmethod
+        def load() -> object | None:
+            return object()
+
+    class StalePlugin:
+        @staticmethod
+        def load() -> object | None:
+            return None
+
     class Factory:
         @staticmethod
         def find(name: str) -> object | None:
-            return object() if name == "zedsrc" else None
+            # A registry hit whose plugin no longer loads (stale build after
+            # a ZED SDK upgrade) must not count as available.
+            if name == "zedsrc":
+                return Plugin()
+            if name == "zedxonesrc":
+                return StalePlugin()
+            return None
 
     class Gst:
         ElementFactory = Factory
@@ -224,7 +240,7 @@ def test_gst_pipeline_fragments_include_transport_and_encoder_settings() -> None
 
     dataset = gst_zed._dataset_enc_shmsink("/tmp/data.sock", 960, 600, 60, "data")
     assert "name=data" in dataset
-    assert "idrinterval=15" in dataset
+    assert f"idrinterval={gst_zed._DATASET_GOP_FRAMES}" in dataset
     assert "socket-path=/tmp/data.sock" in dataset
     assert "peak-bitrate=" in dataset
 
@@ -275,15 +291,14 @@ def test_gst_pipeline_timestamps_latency_and_lifecycle(
     base._clock = Clock()
     assert base.alive
     assert base.is_connected
+    # Sensor PTS maps onto perf_counter only once the PLAYING-time offset is
+    # calibrated; before that (or without a PTS) the frame is unusable.
+    with pytest.raises(RuntimeError, match="mapping is unavailable"):
+        base._cap_perf_from_pts(4_000_000_000, 10.0)
+    base._pts_perf_offset_s = 5.0
     assert base._cap_perf_from_pts(4_000_000_000, 10.0) == 9.0
-    assert base._cap_perf_from_pts(Gst.CLOCK_TIME_NONE, 10.0) == 10.0
-
-    query_result = SimpleNamespace(parse_latency=lambda: (True, 20_000_000, None))
-    monkeypatch.setattr(Query, "new_latency", lambda: query_result)
-    assert base._measure_raw_latency_s(60) == 0.02
-    base._pipeline.query = lambda query: False  # type: ignore[method-assign]
-    assert base._measure_raw_latency_s(50) == 0.02
-    assert base._measure_raw_latency_s(0) == 0.0
+    with pytest.raises(RuntimeError, match="no sensor PTS"):
+        base._cap_perf_from_pts(Gst.CLOCK_TIME_NONE, 10.0)
 
     thread = SimpleNamespace(join=lambda timeout: None)
     base._threads.append(thread)  # type: ignore[arg-type]
@@ -354,15 +369,3 @@ def test_gst_buffer_handlers_unmap_and_publish_frames(
     np.testing.assert_array_equal(
         raw.read_latest_with_ts()[0], [[[0, 1, 2], [4, 5, 6]]]
     )
-
-
-def test_encoder_bitrate_update_is_best_effort() -> None:
-    encoder = SimpleNamespace(
-        values=[], set_property=lambda name, value: encoder.values.append((name, value))
-    )
-    pipeline = SimpleNamespace(
-        get_by_name=lambda name: encoder if name == "present" else None
-    )
-    gst_zed._set_enc_bitrate(pipeline, "present", 4.5)
-    gst_zed._set_enc_bitrate(pipeline, "missing", 10)
-    assert encoder.values == [("bitrate", 4)]

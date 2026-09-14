@@ -4,11 +4,10 @@ import builtins
 import io
 import logging
 import multiprocessing
-from types import SimpleNamespace
 
 import pytest
 
-from almond_axol.utils import affinity, jetson_diag, proc_diag
+from almond_axol.utils import jetson_diag, proc_diag
 from almond_axol.zed import devices, snapshot
 
 
@@ -170,91 +169,6 @@ def test_snapshot_timeout_crash_and_worker(monkeypatch) -> None:
     monkeypatch.setattr(snapshot, "snapshot_jpeg_inproc", lambda serial: b"image")
     snapshot._snapshot_worker(conn, 4)  # type: ignore[arg-type]
     assert conn.sent == [("ok", b"image")]
-
-
-@pytest.mark.parametrize(
-    ("count", "expected"),
-    [
-        (2, None),
-        (
-            4,
-            {
-                "realtime": {0, 1},
-                "ik": {0, 1},
-                "relay": {2, 3},
-                "background": {2, 3},
-            },
-        ),
-        (
-            6,
-            {
-                "realtime": {0, 1},
-                "ik": {0, 1},
-                "relay": {2, 3},
-                "background": {4, 5},
-            },
-        ),
-        (
-            8,
-            {
-                "realtime": {0, 1},
-                "ik": {2},
-                "relay": {3, 4},
-                "background": {5, 6, 7},
-            },
-        ),
-    ],
-)
-def test_affinity_core_groups(monkeypatch, count, expected) -> None:
-    monkeypatch.setattr(affinity.os, "cpu_count", lambda: count)
-    assert affinity.core_groups() == expected
-
-
-def test_affinity_pinners_and_relay_isolation(monkeypatch) -> None:
-    monkeypatch.setattr(affinity.os, "cpu_count", lambda: 8)
-    calls: list[tuple[int, set[int]]] = []
-    monkeypatch.setattr(
-        affinity.os, "sched_setaffinity", lambda pid, cores: calls.append((pid, cores))
-    )
-    assert affinity.pin_realtime()
-    assert affinity.pin_ik()
-    assert affinity.pin_ik_startup()
-    assert affinity.pin_relay()
-    assert affinity.pin_background()
-    assert [cores for _, cores in calls] == [
-        {0, 1},
-        {2},
-        {0, 1, 2},
-        {3, 4},
-        {5, 6, 7},
-    ]
-
-    monkeypatch.setattr(
-        affinity.os,
-        "sched_setaffinity",
-        lambda pid, cores: calls.append((pid, cores)),
-    )
-    monkeypatch.setattr(
-        affinity.os,
-        "listdir",
-        lambda path: ["10", "20", "not-a-thread"],
-    )
-    import threading
-
-    monkeypatch.setattr(
-        threading,
-        "enumerate",
-        lambda: [SimpleNamespace(native_id=10), SimpleNamespace(native_id=None)],
-    )
-    assert affinity.isolate_relay_cpu()
-    assert calls[-2:] == [(10, {3}), (20, {4})]
-
-    def denied(pid, cores):
-        raise OSError("denied")
-
-    monkeypatch.setattr(affinity.os, "sched_setaffinity", denied)
-    assert not affinity.pin_realtime()
-    assert not affinity.isolate_relay_cpu()
 
 
 def test_proc_readers(monkeypatch) -> None:

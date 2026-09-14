@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 
 import numpy as np
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -17,8 +20,18 @@ class VRTeleopConfig:
             ARM_JOINTS order (no gripper). Used as the reset target.
         rest_pose_right: Right arm rest configuration in radians, shape (7,) in
             ARM_JOINTS order (no gripper). Used as the reset target.
-        frequency: Control loop rate in Hz used by :meth:`VRTeleop.run` and
-            as waypoint density for reset trajectories.
+        frequency: Control (CAN command) loop rate in Hz used by
+            :meth:`VRTeleop.run` and as waypoint density for reset
+            trajectories. Each cycle sends 8 impedance/position commands per
+            arm bus whose replies carry all feedback — ~16 frames ≈ 2.1 ms
+            of bus time — so 120 Hz runs each 1 Mbps arm bus at ~25%
+            utilisation. A higher rate mainly buys the host damping loop
+            phase margin (its transport delay is one cycle).
+        ik_frequency: IK dispatch rate in Hz — how often VR frames are sent
+            to the IK subprocess. Decoupled from ``frequency``: solves cost
+            5-10 ms, so the solver can't follow the CAN rate; the control
+            loop interpolates between solutions (segment playback + the
+            trapezoidal output filter).
         reset_speed: Average joint velocity (rad/s) of the worst-case joint
             during a return-to-rest move. The smoothstep profile gives a
             peak joint velocity of ``1.5 * reset_speed``. Determines the
@@ -87,30 +100,32 @@ class VRTeleopConfig:
             any single joint can move toward a new IK target.  Defaults to
             1.0 rev/s (~360 °/s).
         teleop_max_accel: Maximum joint acceleration (rad/s²) enforced by the
-            trapezoidal filter.  Controls how quickly the commanded velocity
-            ramps up or down.  Defaults to 3.5 rev/s² (~1260 °/s²), giving a
-            ~0.3 s ramp from rest to full speed.
+            trapezoidal filter.  Defaults to 3.5 rev/s² (~1260 °/s²).  Since
+            the filter became a critically damped linear tracker, smoothness
+            comes from the tracker itself, not this clamp: replaying recorded
+            teleop showed resonance-band excitation identical at 2.0 and
+            3.5 rev/s², while the lower cap saturated ~4% of moving time —
+            felt as lag-then-surge "jumpiness" on fast moves (vibration
+            windows correlated 5.5× with saturation). Keep it high enough
+            that genuine motion never saturates; it is a safety ceiling.
         ik_alpha: Blend factor for the exponential moving average applied to
             the IK output before the trapezoidal filter.  Range ``(0, 1]``
             where ``1.0`` disables smoothing.  Lower values kill more
             high-frequency jitter at the cost of a small fixed lag
             (``~(1-alpha)/alpha`` frames).  Defaults to ``0.3`` (~20 ms lag
             at 120 Hz), favouring smoothness over minimum latency.
-        pose_min_cutoff: Minimum cutoff frequency (Hz) for the One Euro Filter
+        pose_cutoff: Pole frequency (Hz) of the lag-compensated low-pass
             applied to raw VR controller positions, quaternions, and elbow
-            positions **before** they enter the IK solver.  This is the
-            primary tremor / tracking-noise kill knob.  Lower values give
-            heavier smoothing at rest (more tremor rejection) at the cost of
-            slightly more lag when still.  Typical range: 0.5–3 Hz.  Defaults
-            to ``0.8`` Hz, favouring smoothness over minimum latency (the
-            fixed-lag smoother in the VR server's pose interpolator does the
-            heavy lifting upstream).
-        pose_beta: Speed coefficient for the One Euro Filter.  Raises the
-            filter cutoff proportionally to the signal's instantaneous speed,
-            keeping the filter transparent during fast intentional moves.
-            Increase if fast moves feel sticky.  Defaults to ``2.0`` so the
-            filter stays partially engaged during motion instead of opening
-            fully and passing noise through.
+            positions **before** they enter the IK solver (see
+            :class:`~almond_axol.teleop.filter.LagCompensatedLowPass` for why
+            this replaced the One Euro filter, and for the real-session
+            replay that set this value and the filter's lag-compensation
+            fraction).  Lower values reject more tremor but the trade is
+            steep — the raw stream's 3-12 Hz noise grows with hand speed
+            and sits barely 1.5 octaves above intentional motion — so this
+            stage only trims the band (~81% pass at 2.5 Hz); the resonance
+            itself is handled by pose-tracked host damping on the robot
+            side.
         position_multiplier: Scale factor applied to the controller's
             **position** displacement (not orientation) when mapping hand
             motion to the end-effector target.  ``1.0`` is 1:1 motion;
@@ -137,6 +152,79 @@ class VRTeleopConfig:
             reset.  The headset streams poses at 72+ Hz while presenting,
             so anything beyond a few hundred ms is a real gap, not jitter.
             ``0`` disables the timeout.  Defaults to ``0.5`` s.
+        record: File prefix for the teleop flight recorder (see
+            :mod:`almond_axol.teleop.recorder`).  A bare name (``rec1``)
+            records into ``~/.almond/recordings/``, where ``axol
+            motion.build`` finds it; a path prefix (``/tmp/jit``) is used
+            verbatim.  When set, every stage of the teleop pipeline — raw
+            VR pose, filtered pose, IK output, smoothed command, measured
+            joints, and the Rust core's motor-facing command/torque internals
+            — is captured to ``<prefix>_{ik,cmd,meas,rt}.npz``. The measured
+            and Rust stages run at the native 240 Hz core rate. The capture
+            covers the **latest engage→disengage segment** (last ~5 minutes
+            of it): recording starts at engagement, Python stages write on
+            disengage, the compact Rust stage finalizes when the core disarms,
+            and re-engaging starts the segment over. The same prefix overwrites
+            on the next run. For ``axol
+            motion.build`` or ``axol diag.offline``.  ``None`` (the
+            default) disables recording entirely.
+        absolute_mode: Mantis mapping. Instead of re-applying
+            controller *deltas* onto the robot's engage-time FK pose (normal
+            teleop), the engage rising edge solves a world-anchored robot
+            **base transform** — gravity-aligned, positioned/oriented so the
+            rest-pose FK gripper poses coincide with the two controllers'
+            current poses — and every subsequent frame maps the controller
+            pose 1:1 into that fixed base frame as an absolute IK target.
+            Engaging is therefore the alignment act: the operator holds both
+            grippers at the agreed start pose (matching the robot's rest
+            pose relative to the task scene) and squeezes both grips. The
+            offset between each controller and its gripper TCP is applied from
+            ``tcp_transform_left/right`` when known. Without that transform,
+            the engage snapshot aligns the starting pose only; later poses are
+            mount-dependent and unsuitable for production collection. Elbow
+            hints are ignored in this mode — human
+            elbow positions say nothing about the robot's preferred null-space
+            posture. ``position_multiplier`` / ``rotation_multiplier`` do not
+            apply (the mapping is 1:1 by construction). Defaults to ``False``.
+        base_height: Optional fixed height (metres) of the robot base origin
+            above the VR floor (the WebXR ``local-floor`` reference space) in
+            ``absolute_mode``. When set, the engage-time base fit pins the
+            base's vertical position to it — matching the robot's real
+            mounting height so datasets stay consistent across operators of
+            different heights. ``None`` (default) lets the fit take the
+            vertical position from the held grippers.
+        tcp_transform_left: Tracker→gripper SE(3) transform for the left rig
+            as ``[x, y, z, qx, qy, qz, qw]`` (gripper frame expressed in the
+            tracker's local frame) — the rig's factory design constant, or a
+            per-unit override from ``~/.almond/mantis/tcp_transform.json``.
+            When set, ``absolute_mode`` maps each tracked pose through it —
+            recorded TCP poses become mount-independent and wrist rotations
+            stop smearing into position error. ``None`` falls back to a
+            start-pose-only engage alignment, which is useful for bring-up but
+            not production Cartesian data.
+        tcp_transform_right: Same for the right rig.
+        tracker_key: Quest controller datum key (for example
+            ``"quest:meta-quest-touch-plus:grip"``). Hardware sources always
+            resolve their distinct left/right ``survive:<id>`` or
+            ``ultimate:<mac>`` bindings from tracker config; one singular key
+            cannot safely identify both devices. ``None`` (default) selects a
+            sole saved Quest profile when unambiguous.
+        quest_controller_profile: Expected WebXR controller profile for a
+            calibrated Quest rig (for example ``"oculus-touch-v3"``). A
+            profile-scoped transform key of the form
+            ``quest:<profile>:<space>`` fills this automatically. Absolute
+            tracking fails closed when a connected controller reports a
+            different profile or omits profile metadata.
+        quest_pose_space: Expected WebXR controller pose datum: ``"grip"``
+            for production Mantis capture, or ``"target-ray"`` only for
+            uncalibrated compatibility bring-up. Filled from a profile-scoped
+            Quest transform key alongside ``quest_controller_profile``.
+        urdf_viewer_world_aligned: Whether the active pose producer's world is
+            registered to the viewer headset's local-floor world. ``None``
+            chooses True for Quest and False for Lighthouse/Ultimate. External
+            tracker sessions keep the Quest video/HUD viewer useful but hide
+            the spatial URDF overlay unless an operator explicitly asserts an
+            out-of-band world registration.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -168,6 +256,7 @@ class VRTeleopConfig:
         )
     )
     frequency: float = 120.0
+    ik_frequency: float = 120.0
     reset_speed: float = 0.1 * 2 * math.pi
     reset_min_duration: float = 1.5
     reset_rest_weight: float = 50.0
@@ -184,8 +273,256 @@ class VRTeleopConfig:
     teleop_max_vel: float = 1.0 * 2 * math.pi
     teleop_max_accel: float = 3.5 * 2 * math.pi
     ik_alpha: float = 0.3
-    pose_min_cutoff: float = 0.8
-    pose_beta: float = 2.0
+    pose_cutoff: float = 2.5
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
     disengage_timeout: float = 0.5
+    record: str | None = None
+    absolute_mode: bool = False
+    base_height: float | None = None
+    tcp_transform_left: list[float] | None = None
+    tcp_transform_right: list[float] | None = None
+    tracker_key: str | None = None
+    quest_controller_profile: str | None = None
+    quest_pose_space: str | None = None
+    urdf_viewer_world_aligned: bool | None = None
+
+
+def apply_mantis_teleop_profile(
+    config: VRTeleopConfig, *, tracker_source: str | None = None
+) -> None:
+    """Force the Mantis mapping/faithfulness profile in place.
+
+    Shared by ``collect-data --mantis`` and ``teleop --mantis`` so the two flows
+    behave identically: ``absolute_mode`` (the engage squeeze is the start-pose
+    alignment act), toggle-style lock semantics, and transparent smoothing —
+    the EMA and trapezoid filters exist to protect a physical arm and only add
+    lag between the solution and where the hand actually was, so with no arm to
+    protect the joints should follow the raw IK output. Managed bridges use an
+    acknowledged low→high edge when automatically freezing or re-engaging, so
+    ``hold_to_engage`` must be disabled; otherwise that required low release
+    would act as a dead-man disengage. The pose low-pass cutoff is raised for
+    the same reason: its rest-tremor smoothing costs lag at slow speeds, which
+    on the rig is pure pose↔image misalignment (and visible slack in the
+    headset's URDF overlay); a higher cutoff keeps the solution pinned to the
+    hand at the price of passing through a little tremor.
+
+    Also resolves the tracker→gripper transform per side into
+    ``tcp_transform_left`` / ``tcp_transform_right``, first match wins:
+    explicitly set config values; the override-file entry for the active
+    tracker (the Quest ``config.tracker_key`` or the hardware source's distinct
+    per-side binding — see
+    :func:`almond_axol.mantis.calibration.tracker_key_for_side`); the rig's
+    factory design transform for the tracker family
+    (:data:`~almond_axol.mantis.calibration.DESIGN_TCP_TRANSFORMS` — a design
+    constant, so it applies out of the box). A legacy unkeyed override is
+    considered only when no active source is declared; a Mantis run never
+    applies a transform measured with an unknown tracker. A tracker with none
+    of these is warned about loudly: the session
+    would otherwise silently record uncalibrated (engage-snapshot) TCP poses.
+    """
+    config.absolute_mode = True
+    config.hold_to_engage = False
+    config.ik_alpha = 1.0
+    config.teleop_max_vel = 1e6
+    config.teleop_max_accel = 1e6
+    config.engage_max_vel = 1e6
+    config.pose_cutoff = 5.0
+    if config.urdf_viewer_world_aligned is None:
+        config.urdf_viewer_world_aligned = tracker_source not in (
+            "lighthouse",
+            "ultimate",
+        )
+
+    if tracker_source == "quest" and config.tracker_key is not None:
+        from ..mantis.calibration import parse_quest_tracker_key
+
+        quest_datum = parse_quest_tracker_key(config.tracker_key)
+        if quest_datum is not None:
+            profile, pose_space = quest_datum
+            if config.quest_controller_profile not in (None, profile):
+                raise ValueError(
+                    "Quest tracker_key profile conflicts with "
+                    f"quest_controller_profile: {profile!r} != "
+                    f"{config.quest_controller_profile!r}"
+                )
+            if config.quest_pose_space not in (None, pose_space):
+                raise ValueError(
+                    "Quest tracker_key pose space conflicts with "
+                    f"quest_pose_space: {pose_space!r} != "
+                    f"{config.quest_pose_space!r}"
+                )
+            config.quest_controller_profile = profile
+            config.quest_pose_space = pose_space
+
+    if config.tcp_transform_left is None or config.tcp_transform_right is None:
+        from ..mantis.calibration import (
+            INVALID_TRANSFORM_ENTRY,
+            LEGACY_TRACKER_KEY,
+            MANTIS_TCP_TRANSFORM_FILE,
+            STALE_TRANSFORM_ENTRY,
+            design_transform_for,
+            has_conflicting_transform_override,
+            load_tcp_transforms,
+            parse_quest_tracker_key,
+            select_quest_transform_key,
+            tracker_key_for_side,
+        )
+
+        entry_statuses: dict[tuple[str, str], str] = {}
+        document_errors: list[str] = []
+        saved = load_tcp_transforms(
+            entry_statuses=entry_statuses,
+            document_errors=document_errors,
+        )
+        if tracker_source == "quest" and config.tracker_key is None:
+            config.tracker_key = select_quest_transform_key(saved)
+            if config.tracker_key is not None:
+                _logger.info(
+                    "Mantis Quest: selected the sole profile-scoped transform %r.",
+                    config.tracker_key,
+                )
+        if tracker_source == "quest" and config.tracker_key is not None:
+            quest_datum = parse_quest_tracker_key(config.tracker_key)
+            if quest_datum is not None:
+                profile, pose_space = quest_datum
+                if config.quest_controller_profile not in (None, profile):
+                    raise ValueError(
+                        "Quest transform profile conflicts with "
+                        f"quest_controller_profile: {profile!r} != "
+                        f"{config.quest_controller_profile!r}"
+                    )
+                if config.quest_pose_space not in (None, pose_space):
+                    raise ValueError(
+                        "Quest transform pose space conflicts with "
+                        f"quest_pose_space: {pose_space!r} != "
+                        f"{config.quest_pose_space!r}"
+                    )
+                config.quest_controller_profile = profile
+                config.quest_pose_space = pose_space
+        # Quest has one profile/pose-space datum shared by handedness. Hardware
+        # sources bind two distinct device IDs, so a singular override must not
+        # make the left device's calibration authorize the right rig.
+        tracker_override = (
+            config.tracker_key
+            if tracker_source == "quest"
+            or (
+                tracker_source is None
+                and config.tracker_key is not None
+                and config.tracker_key.split(":", 1)[0] == "quest"
+            )
+            else None
+        )
+        for side in ("left", "right"):
+            attr = f"tcp_transform_{side}"
+            if getattr(config, attr) is not None:
+                continue
+            key, reason = tracker_key_for_side(
+                side,
+                override=tracker_override,
+                source=tracker_source,
+            )
+            entries = saved.get(side, {})
+            design = design_transform_for(side, key)
+            scoped_quest_key = parse_quest_tracker_key(key)
+            blocked_override = (
+                bool(document_errors)
+                or entry_statuses.get((side, key))
+                in {
+                    STALE_TRANSFORM_ENTRY,
+                    INVALID_TRANSFORM_ENTRY,
+                }
+                or has_conflicting_transform_override(
+                    side,
+                    key,
+                    saved,
+                    entry_statuses,
+                )
+            )
+            if key in entries and not (
+                tracker_source == "quest" and scoped_quest_key is None
+            ):
+                setattr(config, attr, entries[key])
+                _logger.info(
+                    "Mantis %s: loaded tracker→gripper calibration for tracker %r (%s).",
+                    side,
+                    key,
+                    reason,
+                )
+            elif tracker_source is None and LEGACY_TRACKER_KEY in entries:
+                setattr(config, attr, entries[LEGACY_TRACKER_KEY])
+                _logger.warning(
+                    "Mantis %s: no transform for the active tracker %r (%s) — "
+                    "falling back to a LEGACY entry measured with an unknown "
+                    "tracker. If the tracker changed since, this transform "
+                    "is wrong; re-key or delete the entry in %s.",
+                    side,
+                    key,
+                    reason,
+                    MANTIS_TCP_TRANSFORM_FILE,
+                )
+            elif blocked_override:
+                _logger.warning(
+                    "Mantis %s: calibration state for tracker %r is unreadable, "
+                    "stale, invalid, or scoped to another device of this family. "
+                    "Refusing to hide it with the standard factory transform; "
+                    "fix, re-key, or remove the conflicting state in %s.",
+                    side,
+                    key,
+                    MANTIS_TCP_TRANSFORM_FILE,
+                )
+            elif design is not None:
+                setattr(config, attr, design)
+                _logger.info(
+                    "Mantis %s: using the rig's factory tracker→gripper transform "
+                    "for tracker %r (%s) — a design constant of the standard "
+                    "mount. A per-unit entry in %s overrides it.",
+                    side,
+                    key,
+                    reason,
+                    MANTIS_TCP_TRANSFORM_FILE,
+                )
+            else:
+                from ..mantis.calibration import candidate_transform_for
+
+                candidate_note = (
+                    " A CAD candidate exists, but it is intentionally not "
+                    "applied until the live tracker datum and orientation are "
+                    "bench-verified."
+                    if candidate_transform_for(side, key) is not None
+                    else ""
+                )
+                _logger.warning(
+                    "Mantis %s: NO tracker→gripper transform for the active "
+                    "tracker %r (%s) — no factory design constant covers this "
+                    "tracker family and %s has no entry for it. Absolute mode "
+                    "will absorb the whole controller→gripper offset into the "
+                    "engage snapshot, so recorded TCP poses will be "
+                    "mount-dependent and wrist rotations will smear into "
+                    "position error. Add a measured transform to the file "
+                    "before collecting data.%s",
+                    side,
+                    key,
+                    reason,
+                    MANTIS_TCP_TRANSFORM_FILE,
+                    candidate_note,
+                )
+
+    # Saved transforms were validated while loading, but explicit dotted CLI
+    # / control-panel Advanced values bypass the file loader. Validate the
+    # final value from every source before the IK worker can slice it into a
+    # position and quaternion. Normalizing here also gives explicit values
+    # the same behavior as saved calibration entries.
+    from ..mantis.calibration import validate_tcp_transform
+
+    for side in ("left", "right"):
+        attr = f"tcp_transform_{side}"
+        transform = getattr(config, attr)
+        if transform is None:
+            continue
+        try:
+            setattr(config, attr, validate_tcp_transform(transform))
+        except ValueError as exc:
+            raise ValueError(
+                f"Mantis {side} tracker→gripper TCP transform is invalid: {exc}"
+            ) from exc

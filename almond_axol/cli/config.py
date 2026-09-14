@@ -9,6 +9,11 @@ so every (possibly nested) field is reachable two ways:
   ``--robot_config.cameras "{overhead: {serial: 41234567}}"``.
 - A whole-config file: ``--config_path run.json`` (JSON or YAML), with
   CLI overrides layered on top.
+- The robot's shared settings file (``~/.almond/settings.json``, the one
+  the control panel edits) — read by default and layered beneath the
+  config file and the flags, so a value saved once in the panel applies
+  to direct CLI runs too. ``--no_settings`` skips it; ``--settings_path``
+  reads another file. See :mod:`almond_axol.settings`.
 
 This module provides the pieces shared by all five commands:
 
@@ -20,7 +25,8 @@ This module provides the pieces shared by all five commands:
   defaults (see :class:`AxolConfig`'s seven differently-defaulted
   ``JointConfig`` fields). Seeding the encoded default config as the base
   of draccus's ``mergedeep`` step restores correct partial-override
-  semantics (defaults -> ``--config_path`` file -> CLI flags).
+  semantics (defaults -> shared settings -> ``--config_path`` file -> CLI
+  flags).
 - :func:`register_literal` plus the :data:`LogLevel` / :data:`PolicyType` /
   :data:`AggregateFn` aliases it registers with draccus so it validates
   choices the way ``argparse``'s ``choices=`` used to. ``lerobot`` config
@@ -44,6 +50,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import MISSING, dataclass, field
+from pathlib import Path
 from typing import Any, Literal, TypeVar, get_args
 
 import draccus
@@ -52,8 +59,8 @@ import numpy as np
 
 from ..constants import CAN_LEFT, CAN_RIGHT
 from ..kinematics.config import KinematicsConfig
-from ..robot.cart import CartConfig
 from ..robot.config import AxolConfig
+from ..robot.jelly import JellyConfig
 from ..teleop.config import VRTeleopConfig
 from ..vr.config import VRServerConfig
 
@@ -148,6 +155,7 @@ AggregateFn = register_literal(
         "conservative",
     ]
 )
+MantisSource = register_literal(Literal["quest", "lighthouse", "ultimate"])
 
 
 # ----------------------------------------------------------------------
@@ -211,6 +219,10 @@ def _default_overlay(config_class: type) -> dict[str, Any]:
     return overlay
 
 
+SETTINGS_PATH_ARG = "settings_path"
+NO_SETTINGS_ARG = "no_settings"
+
+
 class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore[misc]
     """``draccus.ArgumentParser`` that seeds the full default config.
 
@@ -220,11 +232,68 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
     ``--axol.left.elbow.kp 200`` keeps the elbow's other per-joint
     defaults instead of demanding the whole ``JointConfig``. Kept faithful
     to draccus 0.11.6's own ``_postprocessing`` (pinned in pyproject).
+
+    With ``settings_op`` set, the robot's shared settings file is folded in
+    directly above the defaults (see :mod:`almond_axol.settings`), and two
+    extra options control it: ``--settings_path PATH`` reads a different
+    settings file and ``--no_settings`` skips it. Both are consumed here and
+    never reach the config dataclass.
     """
 
-    def __init__(self, *args: Any, overlay: dict[str, Any], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        overlay: dict[str, Any],
+        fallback: dict[str, Any] | None = None,
+        settings_op: str | None = None,
+        settings_args: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         self._overlay = overlay
+        self._fallback = fallback or {}
+        self._settings_op = settings_op
+        self._settings_args = settings_args
         super().__init__(*args, **kwargs)
+        if settings_op is not None:
+            self.parser.add_argument(
+                f"--{SETTINGS_PATH_ARG}",
+                type=str,
+                metavar="PATH",
+                help=(
+                    "Shared robot settings file to apply beneath --config_path "
+                    "and the flags (default: ~/.almond/settings.json, the file "
+                    "the control panel edits)."
+                ),
+            )
+            self.parser.add_argument(
+                f"--{NO_SETTINGS_ARG}",
+                action="store_true",
+                help="Ignore the shared robot settings file; use built-in defaults.",
+            )
+
+    def _shared_settings_overlay(
+        self, settings_path: str | None, disabled: bool
+    ) -> dict[str, Any]:
+        if self._settings_op is None or disabled:
+            return {}
+        from ..settings import load_store, shared_overlay, store_path
+
+        if settings_path is not None and not Path(settings_path).is_file():
+            self.parser.error(f"--{SETTINGS_PATH_ARG}: no such file: {settings_path}")
+        # Fail closed: a settings file that exists but cannot be read must
+        # not silently turn into the calibrated defaults — that is a
+        # different robot. Name the escape hatch so the operator can still
+        # run while they repair the file.
+        try:
+            store = load_store(settings_path)
+        except Exception as exc:  # noqa: BLE001 - any read/parse failure
+            shown = settings_path if settings_path is not None else str(store_path())
+            self.parser.error(
+                f"could not read the settings file {shown}: "
+                f"{type(exc).__name__}: {exc} "
+                f"(fix it, or pass --{NO_SETTINGS_ARG} to run without it)"
+            )
+        return shared_overlay(self._settings_op, self._settings_args, store=store)
 
     def _postprocessing(self, parsed_args: Any) -> Any:
         import warnings
@@ -233,6 +302,11 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
         from draccus.parsers import decoding
 
         parsed_arg_values = vars(parsed_args)
+        # The settings selectors are ours, not the config's: pull them out
+        # before draccus deflattens the namespace into the dataclass.
+        settings_path = parsed_arg_values.pop(SETTINGS_PATH_ARG, None)
+        no_settings = bool(parsed_arg_values.pop(NO_SETTINGS_ARG, False))
+        shared = self._shared_settings_overlay(settings_path, no_settings)
         for key in parsed_arg_values:
             parsed_value = cfgparsing.parse_string(parsed_arg_values[key])
             if isinstance(parsed_value, str) and parsed_value.startswith("include"):
@@ -261,13 +335,16 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
             file_args = {}
 
         deflat_d = utils.deflatten(parsed_arg_values, sep=".")
-        # Precedence (later wins): defaults -> --config_path file -> CLI.
-        deflat_d = mergedeep.merge({}, self._overlay, file_args, deflat_d)
+        # Precedence (later wins): defaults -> shared settings file -> caller
+        # fallback -> config file -> CLI.
+        deflat_d = mergedeep.merge(
+            {}, self._overlay, shared, self._fallback, file_args, deflat_d
+        )
         return decoding.decode(self.config_class, deflat_d)
 
 
 # Per-joint arm fields (``kp`` / ``kd`` / ``friction.*`` / ``mass`` / ``com``
-# / ``j_eff`` / ``kd_soft`` for the seven arm joints). For a config that
+# / ``j_eff`` / ``kd_host`` for the seven arm joints). For a config that
 # embeds ``AxolConfig`` these are ~140 of the ~165 generated options and
 # flood ``--help`` into illegibility. Matched anywhere in a dotted option
 # string so it works for both ``--axol.left.elbow.kp`` (teleop) and
@@ -292,12 +369,14 @@ _INCLUDE_HELP_PREFIX = "Config file for "
 # so we override them outright.
 _FIELD_HELP: dict[str, str] = {
     "left_stiffness": (
-        "Compliance<->stiffness blend in [0, 1]: a scalar (all arm joints) "
-        "or a 7-element list, one per joint."
+        "Compliance blend in [0, 1]: 1 (default) runs the tuned gains, lower "
+        "only adds compliance. A scalar (all arm joints) or a 7-element "
+        "list, one per joint."
     ),
     "right_stiffness": (
-        "Compliance<->stiffness blend in [0, 1]: a scalar (all arm joints) "
-        "or a 7-element list, one per joint."
+        "Compliance blend in [0, 1]: 1 (default) runs the tuned gains, lower "
+        "only adds compliance. A scalar (all arm joints) or a 7-element "
+        "list, one per joint."
     ),
     "max_step_rad": "Max change (rad) in any arm joint between consecutive commands.",
     "has_gripper": (
@@ -366,7 +445,9 @@ def _condense_help(ap: argparse.ArgumentParser) -> None:
         "still overridable from the CLI — e.g. per-joint gains like "
         "--axol.left.elbow.kp 60 (or --robot_config.axol_config.* for "
         "collect-data / run-policy) — or load a whole-config file with "
-        "--config_path. Full reference: "
+        "--config_path. The robot's shared settings file "
+        "(~/.almond/settings.json, edited by the control panel) is applied "
+        "beneath both by default; --no_settings skips it. Full reference: "
         "https://docs.almond.bot/cli/configuration"
     )
 
@@ -419,19 +500,46 @@ def _condense_help(ap: argparse.ArgumentParser) -> None:
         )
 
 
-def parse(config_class: type[T], argv: list[str]) -> T:
+def parse(
+    config_class: type[T],
+    argv: list[str],
+    *,
+    fallback_overlay: dict[str, Any] | None = None,
+    settings_op: str | None = None,
+    settings_args: dict[str, Any] | None = None,
+) -> T:
     """Parse ``argv`` into ``config_class`` with full-default overlay.
 
     draccus auto-adds ``--config_path PATH`` for a whole-config JSON/YAML
     file; every nested field is also overridable via ``--dotted.path
     VALUE``. Unspecified fields fall back to the dataclass defaults.
 
+    ``settings_op`` names the operation (a :data:`~almond_axol.serve.commands.
+    COMMANDS` id such as ``"teleop"``) whose shared-settings mapping applies:
+    the robot's ``~/.almond/settings.json`` — the file the control panel
+    edits — is then folded in directly above the dataclass defaults, so a
+    direct CLI run uses the same values as a panel-launched one. It also adds
+    ``--settings_path PATH`` (read another settings file) and
+    ``--no_settings`` (built-in defaults only). ``settings_args`` are the
+    request-style args that steer the fold (``mantis`` / ``mantis_source``;
+    see :func:`almond_axol.settings.shared_overlay`). ``fallback_overlay``
+    adds caller-supplied defaults above the shared settings but below both
+    config files and explicit flags.
+
+    Precedence (later wins): defaults → shared settings → ``fallback_overlay``
+    → ``--config_path`` file → CLI flags.
+
     Deeply-nested per-joint gains and draccus's per-dataclass config-file
     includes are hidden from ``--help`` (but remain fully overridable) so
     the listing stays scannable; an epilog points at the full reference.
     """
-    overlay = _default_overlay(config_class)
-    parser = _OverlayArgumentParser(config_class=config_class, overlay=overlay)
+    parser = _OverlayArgumentParser(
+        config_class=config_class,
+        overlay=_default_overlay(config_class),
+        fallback=fallback_overlay,
+        settings_op=settings_op,
+        settings_args=settings_args,
+    )
     _condense_help(parser.parser)
     try:
         return parser.parse_args(argv)
@@ -502,7 +610,8 @@ class TeleopCmdConfig:
     track (one decoder session on the headset) and rendered per-lens for
     true stereo. ``--resolution`` picks the capture resolution for all
     cameras (``SVGA`` / ``HD1080`` / ``HD1200``); ``null`` (the default)
-    keeps each camera's SDK default.
+    keeps each camera's SDK default. Headset streaming is fixed at 30 fps,
+    independently of the capture rate used by recording or policy cameras.
 
     ``--camera_eyes`` overrides which eye(s) of a stereo slot are streamed to
     the headset, keyed by slot (``both`` / ``left`` / ``right``) — e.g.
@@ -513,29 +622,35 @@ class TeleopCmdConfig:
     The VR WebSocket server (port, TLS certs) lives on the nested
     ``vr_server`` config — e.g. ``--vr_server.port 9000``.
 
-    Robots on the powered cart (x-drive base + telescoping lift) enable it
-    with ``--cart.enabled true``; the thumbsticks then drive the base (left
+    Robots on Jelly (x-drive base + telescoping lift) enable it
+    with ``--jelly.enabled true``; the thumbsticks then drive the base (left
     stick translates, right stick x rotates) and the stick clicks run the
     lift (left click down, right click up), independent of the arm engage
-    toggle. Cart parameters live on the nested ``cart`` config — e.g.
-    ``--cart.max_speed 5`` or ``--cart.channel can0``.
+    toggle. Jelly parameters live on the nested ``jelly`` config — e.g.
+    ``--jelly.max_speed 5`` or ``--jelly.channel can0``.
 
-    ``--cart_only`` drives *just* the cart: the arms are never constructed
+    ``--jelly_only`` drives *just* Jelly: the arms are never constructed
     and the Axol hub CAN channels are never touched — only the VR server
-    (thumbstick stream) and the cart run. Having a cart is implied, so
-    ``--cart.enabled`` is not consulted.
+    (thumbstick stream) and the Jelly run. Having Jelly is implied, so
+    ``--jelly.enabled`` is not consulted.
     """
 
     sim: bool = False
-    cart_only: bool = False
-    """Drive only the powered cart from the headset thumbsticks. The arms and
-    their CAN channels are left untouched (no Axol hub needed); the cart is
+    # Mantis teleop is grippers-only by design: the rig triggers drive the two
+    # handheld grippers on can_mantis_l/r over CAN, and nothing else starts —
+    # no tracking, VR server, cameras, or recording. Tracked Mantis runs are
+    # data collection's job (`axol collect-data --mantis`). Mutually exclusive
+    # with --sim.
+    mantis: bool = False
+    jelly_only: bool = False
+    """Drive only Jelly from the headset thumbsticks. The arms and their CAN
+    channels are left untouched (no Axol hub needed); Jelly is
     implied. Mutually exclusive with sim."""
     axol: AxolConfig = field(default_factory=AxolConfig)
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)
     vr_server: VRServerConfig = field(default_factory=VRServerConfig)
-    cart: CartConfig = field(default_factory=CartConfig)
+    jelly: JellyConfig = field(default_factory=JellyConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     cameras: dict[str, int] = field(default_factory=dict)
@@ -557,13 +672,29 @@ class GravityCompCmdConfig:
     the impedance gains used to hold non-free joints both come from the
     nested ``axol`` config — override them via e.g.
     ``--axol.left.elbow.kp 60`` or ``--axol.left_stiffness 0.8``.
+
+    ``record`` captures the hand-guided session with the same flight
+    recorder teleop uses (see :mod:`almond_axol.teleop.recorder`): the
+    measured arm-joint positions and torques are written to
+    ``<prefix>_gc.npz`` when the session ends. A bare name records into
+    ``~/.almond/recordings/``, where ``axol motion.build`` finds it — so a
+    reference motion can be built from a hand-guided demonstration instead
+    of a teleoperated one. The capture keeps the last ~5 minutes; the
+    still lead-in/lead-out is trimmed at build time.
     """
 
     axol: AxolConfig = field(default_factory=AxolConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     free_joints: list[str] | None = None
-    kd: float = 0.25
+    record: str | None = None
+    """Recording name for the hand-guided session — the measured joints are
+    captured so axol motion.build can turn them into a reference motion. A
+    bare name lands in ~/.almond/recordings/; empty disables recording."""
+    # 0.5 (was 0.25): residual gravity-model error away from the calibration
+    # pose shows as slow creep on low-friction joints (wrist_2) once kp=0 —
+    # creep speed is roughly error/kd, so doubling kd halves it without
+    # making hand-guiding feel heavy.
+    kd: float = 0.5
     rate_hz: float = 250.0
-    telemetry_hz: float = 500.0
     log_level: LogLevel = "INFO"

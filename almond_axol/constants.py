@@ -24,7 +24,7 @@ class Joint(Enum):
 
 CAN_LEFT = "can_alm_axol_l"
 CAN_RIGHT = "can_alm_axol_r"
-# The powered cart's wheel bus (its own single-channel adapter, separate from
+# The Jelly's wheel bus (its own single-channel adapter, separate from
 # the arm hub), carrying the four Damiao wheel motors at IDs 0x01-0x04.
 # NB: kernel interface names are capped at 15 chars (IFNAMSIZ), so this can't
 # be the more readable "can_alm_axol_base".
@@ -32,14 +32,24 @@ CAN_BASE = "can_alm_axol_b"
 # The chest bus (another single-channel adapter): the jelly_legs lift
 # controller — our own PCB replacing the Jiecang control box, driving the
 # telescoping lift legs (see almond_axol/robot/lift.py for the protocol).
+# Optional: a Jelly may instead wire the lift controller onto the wheel bus
+# (its IDs 0x420-0x422 are clear of every Damiao range), in which case this
+# interface does not exist and the lift driver uses CAN_BASE — see
+# almond_axol.robot.lift.resolve_lift_channel.
 CAN_CHEST = "can_alm_axol_c"
 
 # CAN bring-up script written by `axol can.setup`. Runs at boot and on adapter
 # hotplug, and is also the sanctioned way to reset the interfaces at runtime:
 # it flaps both arm-hub channels *together* (flapping one at a time can wedge
 # the adapter's RX path). The CAN bus layer reuses it to purge stale TX frames
-# after an e-stop (see almond_axol/motor/bus.py).
-CAN_BRINGUP_SCRIPT: Path = Path.home() / ".almond" / "can" / "startup.sh"
+# after an e-stop (see almond_axol/motor/bus.py). It is executed as root by
+# cron/systemd, so it must live outside the operator-writable state tree.
+CAN_BRINGUP_SCRIPT: Path = Path("/etc/almond-axol/can/startup.sh")
+
+# Mantis handheld data-collection rig: one dual-channel adapter, each channel
+# wired to a single Damiao gripper (CAN ID 0x08, same as Joint.GRIPPER).
+CAN_MANTIS_LEFT = "can_mantis_l"
+CAN_MANTIS_RIGHT = "can_mantis_r"
 
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 

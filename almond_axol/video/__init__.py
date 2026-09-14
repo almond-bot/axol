@@ -8,10 +8,11 @@ data collection — extracted from :mod:`almond_axol.vr` because the recorder
 Modules
 ───────
     gst_zed      GPU-resident zed-gstreamer capture (grab + NVENC encode)
+    zed_sdk      ZED Python SDK grab-thread cameras (the gst fallback; no lerobot)
     hw_video     Jetson NVENC hardware H.264 encoder for aiortc
     video        aiortc WebRTC relay (``WebRTCManager``) streaming to the headset
     video_proc   Out-of-process video relay subprocess (``VideoRelayProcess``)
-    shm_frames   Shared-memory transport of raw frames to the recorder subprocess
+    shm_frames   PTS-preserving camera/state transport to the recorder subprocess
 
 These pull in heavy optional deps (aiortc, numpy, GStreamer), so import the
 submodule you need lazily rather than re-exporting here.

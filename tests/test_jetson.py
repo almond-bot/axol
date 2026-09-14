@@ -1,207 +1,669 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
+import unittest
 from pathlib import Path
-from types import SimpleNamespace
-
-import pytest
+from unittest import TestCase
+from unittest.mock import Mock, call, patch
 
 from almond_axol.utils import jetson
 
 
-class _Writer:
-    def __init__(self, results: list[tuple[bool, str]] | None = None) -> None:
-        self.results = list(results or [])
-        self.writes: list[tuple[Path, str]] = []
+class JetsonPowerModeTest(unittest.TestCase):
+    def _preferred_mode(self, config: str) -> tuple[str, str]:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "nvpmodel.conf"
+            config_path.write_text(config)
+            with patch.object(jetson, "_NVPMODEL_CONFIG", config_path):
+                return jetson._preferred_max_power_mode()  # noqa: SLF001
 
-    def write(self, path: Path, value: str) -> tuple[bool, str]:
-        self.writes.append((path, value))
-        return self.results.pop(0) if self.results else (True, "")
+    def test_prefers_maxn_super_using_its_configured_id(self) -> None:
+        self.assertEqual(
+            self._preferred_mode(
+                """
+                < POWER_MODEL ID=0 NAME=15W >
+                < POWER_MODEL ID=1 NAME=25W >
+                < POWER_MODEL ID=2 NAME=MAXN_SUPER >
+                """
+            ),
+            ("2", "MAXN SUPER"),
+        )
+
+    def test_uses_configured_maxn_when_super_is_unavailable(self) -> None:
+        self.assertEqual(
+            self._preferred_mode(
+                """
+                < POWER_MODEL ID=0 NAME=MODE_15W >
+                < POWER_MODEL NAME=MAXN ID=3 >
+                """
+            ),
+            ("3", "MAXN"),
+        )
+
+    def test_falls_back_to_mode_zero_when_names_are_unavailable(self) -> None:
+        self.assertEqual(
+            self._preferred_mode("< POWER_MODEL ID=1 NAME=MODE_15W >"),
+            ("0", "MAXN"),
+        )
+
+    def test_sets_maxn_super_instead_of_mode_zero(self) -> None:
+        escalator = Mock()
+        escalator.run.return_value = (True, "")
+        with (
+            patch.object(jetson, "_is_jetson", return_value=True),
+            patch.object(jetson.shutil, "which", return_value="/usr/sbin/nvpmodel"),
+            patch.object(
+                jetson,
+                "_preferred_max_power_mode",
+                return_value=("2", "MAXN SUPER"),
+            ),
+            patch.object(jetson, "_query_power_mode", side_effect=["1", "2"]),
+        ):
+            jetson._set_max_power_mode(escalator)  # noqa: SLF001
+
+        escalator.run.assert_called_once_with(
+            ["/usr/sbin/nvpmodel", "-m", "2"], input_text="n\n"
+        )
+        escalator.write.assert_not_called()
+
+    def test_persists_selected_super_mode_when_switch_needs_reboot(self) -> None:
+        escalator = Mock()
+        escalator.run.return_value = (
+            False,
+            "NVPM WARN: Reboot required for changing to this power mode: 2",
+        )
+        escalator.write.return_value = (True, "")
+        with (
+            patch.object(jetson, "_is_jetson", return_value=True),
+            patch.object(jetson.shutil, "which", return_value="/usr/sbin/nvpmodel"),
+            patch.object(
+                jetson,
+                "_preferred_max_power_mode",
+                return_value=("2", "MAXN SUPER"),
+            ),
+            patch.object(jetson, "_query_power_mode", side_effect=["1", "1"]),
+        ):
+            jetson._set_max_power_mode(escalator)  # noqa: SLF001
+
+        self.assertEqual(
+            escalator.method_calls,
+            [
+                call.run(["/usr/sbin/nvpmodel", "-m", "2"], input_text="n\n"),
+                call.write(jetson._NVPMODEL_STATUS, "pmode:0002"),  # noqa: SLF001
+            ],
+        )
+
+    def test_failed_deferred_status_write_is_reported(self) -> None:
+        escalator = Mock()
+        escalator.run.return_value = (False, "reboot required")
+        escalator.write.return_value = (False, "read-only filesystem")
+        with (
+            patch.object(jetson, "_is_jetson", return_value=True),
+            patch.object(jetson.shutil, "which", return_value="/usr/sbin/nvpmodel"),
+            patch.object(
+                jetson,
+                "_preferred_max_power_mode",
+                return_value=("2", "MAXN SUPER"),
+            ),
+            patch.object(jetson, "_query_power_mode", side_effect=["1", "1"]),
+            self.assertLogs("almond_axol.utils.jetson", level="WARNING") as logs,
+        ):
+            jetson._set_max_power_mode(escalator)  # noqa: SLF001
+
+        self.assertIn("recording it for the next boot failed", "\n".join(logs.output))
+        self.assertIn("read-only filesystem", "\n".join(logs.output))
+
+    def test_root_command_failure_is_not_retried_through_sudo(self) -> None:
+        failure = subprocess.CompletedProcess(
+            ["/usr/sbin/nvpmodel", "-m", "2"],
+            234,
+            stdout="",
+            stderr="NVPM WARN: Reboot required",
+        )
+        escalator = jetson._RootEscalator(interactive=False)  # noqa: SLF001
+        with (
+            patch.object(jetson.os, "geteuid", return_value=0),
+            patch.object(jetson.subprocess, "run", return_value=failure) as run,
+        ):
+            ok, detail = escalator.run(
+                ["/usr/sbin/nvpmodel", "-m", "2"], input_text="n\n"
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("Reboot required", detail)
+        run.assert_called_once_with(
+            ["/usr/sbin/nvpmodel", "-m", "2"],
+            input="n\n",
+            capture_output=True,
+            text=True,
+        )
+
+    def test_missing_sudo_is_a_reported_non_root_failure(self) -> None:
+        failure = subprocess.CompletedProcess(
+            ["/usr/sbin/nvpmodel", "-m", "2"],
+            1,
+            stdout="",
+            stderr="permission denied",
+        )
+        escalator = jetson._RootEscalator(interactive=True)  # noqa: SLF001
+        with (
+            patch.object(jetson.os, "geteuid", return_value=1000),
+            patch.object(jetson.subprocess, "run", return_value=failure) as run,
+            patch.object(
+                jetson,
+                "prime_sudo",
+                side_effect=FileNotFoundError("sudo is unavailable"),
+            ),
+        ):
+            ok, detail = escalator.run(["/usr/sbin/nvpmodel", "-m", "2"])
+
+        self.assertFalse(ok)
+        self.assertIn("sudo is unavailable", detail)
+        self.assertEqual(run.call_count, 1)
+
+    def test_non_root_command_failure_retries_once_through_sudo(self) -> None:
+        direct_failure = subprocess.CompletedProcess(
+            ["/usr/sbin/nvpmodel", "-m", "2"],
+            1,
+            stdout="",
+            stderr="permission denied",
+        )
+        sudo_success = subprocess.CompletedProcess(
+            ["sudo", "-n", "/usr/sbin/nvpmodel", "-m", "2"],
+            0,
+            stdout="",
+            stderr="",
+        )
+        escalator = jetson._RootEscalator(interactive=True)  # noqa: SLF001
+        with (
+            patch.object(jetson.os, "geteuid", return_value=1000),
+            patch.object(
+                jetson.subprocess,
+                "run",
+                side_effect=[direct_failure, sudo_success],
+            ) as run,
+            patch.object(jetson, "prime_sudo", return_value=True) as prime,
+        ):
+            ok, detail = escalator.run(
+                ["/usr/sbin/nvpmodel", "-m", "2"], input_text="n\n"
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        prime.assert_called_once_with()
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            run.call_args_list[1],
+            call(
+                ["sudo", "-n", "/usr/sbin/nvpmodel", "-m", "2"],
+                input="n\n",
+                capture_output=True,
+                text=True,
+            ),
+        )
+
+    def test_root_write_failure_is_not_retried_through_sudo(self) -> None:
+        escalator = jetson._RootEscalator(interactive=False)  # noqa: SLF001
+        with (
+            patch.object(jetson.os, "geteuid", return_value=0),
+            patch.object(Path, "write_text", side_effect=OSError("read-only")),
+            patch.object(jetson.subprocess, "run") as run,
+        ):
+            ok, detail = escalator.write(Path("/var/lib/nvpmodel/status"), "mode")
+
+        self.assertFalse(ok)
+        self.assertIn("read-only", detail)
+        run.assert_not_called()
+
+    def test_non_root_write_failure_retries_once_through_sudo(self) -> None:
+        success = subprocess.CompletedProcess(
+            ["sudo", "-n", "tee", "/var/lib/nvpmodel/status"],
+            0,
+            stdout="pmode:0002",
+            stderr="",
+        )
+        escalator = jetson._RootEscalator(interactive=True)  # noqa: SLF001
+        status = Path("/var/lib/nvpmodel/status")
+        with (
+            patch.object(jetson.os, "geteuid", return_value=1000),
+            patch.object(Path, "write_text", side_effect=PermissionError("denied")),
+            patch.object(jetson.subprocess, "run", return_value=success) as run,
+            patch.object(jetson, "prime_sudo", return_value=True) as prime,
+        ):
+            ok, detail = escalator.write(status, "pmode:0002")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        prime.assert_called_once_with()
+        run.assert_called_once_with(
+            ["sudo", "-n", "tee", str(status)],
+            input="pmode:0002",
+            capture_output=True,
+            text=True,
+        )
+
+    def test_declined_sudo_prompt_is_attempted_only_once(self) -> None:
+        escalator = jetson._RootEscalator(interactive=True)  # noqa: SLF001
+        with (
+            patch.object(jetson.os, "geteuid", return_value=1000),
+            patch.object(Path, "write_text", side_effect=PermissionError("denied")),
+            patch.object(
+                jetson.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    ["sudo", "-n", "tee"],
+                    1,
+                    stdout="",
+                    stderr="sudo unavailable",
+                ),
+            ),
+            patch.object(jetson, "prime_sudo", return_value=False) as prime,
+        ):
+            self.assertFalse(escalator.write(Path("/sys/mock/one"), "1")[0])
+            self.assertFalse(escalator.write(Path("/sys/mock/two"), "2")[0])
+
+        prime.assert_called_once_with()
 
 
-def _proc(
-    returncode: int, stdout: str = "", stderr: str = ""
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+if __name__ == "__main__":
+    unittest.main()
 
 
-def test_root_escalator_prefers_direct_operations(tmp_path: Path) -> None:
-    escalator = jetson._RootEscalator(interactive=False)
-    target = tmp_path / "setting"
-    assert escalator.write(target, "value") == (True, "")
-    assert target.read_text() == "value"
-    assert escalator.run(["true"]) == (True, "")
+def _stat_line(tid: int, comm: str, rt_priority: int, policy: int) -> str:
+    """A proc(5) ``stat`` line with the given rt_priority (40) / policy (41)."""
+    fields = ["S", "1"] + ["0"] * 35  # state .. field 39
+    fields += [str(rt_priority), str(policy), "0", "0"]
+    return f"{tid} ({comm}) " + " ".join(fields) + "\n"
 
 
-def test_root_escalator_primes_once_and_falls_back_to_sudo(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    primes: list[bool] = []
-    monkeypatch.setattr(jetson, "prime_sudo", lambda: primes.append(True) or True)
+class ThreadsAtFifoTest(TestCase):
+    def _proc(self, tasks: dict[int, tuple[int, int]]) -> Path:
+        root = Path(tempfile.mkdtemp())
+        for tid, (rt_priority, policy) in tasks.items():
+            task = root / "4242" / "task" / str(tid)
+            task.mkdir(parents=True)
+            # A comm with a space and a ")" is legal and must not shift fields.
+            (task / "stat").write_text(
+                _stat_line(tid, "nvargus (x) d", rt_priority, policy)
+            )
+        return root
 
-    class Unwritable:
-        def write_text(self, value: str) -> None:
-            raise PermissionError("direct denied")
+    def test_all_threads_fifo_at_priority(self) -> None:
+        root = self._proc({4242: (6, 1), 4300: (6, 1)})
+        self.assertTrue(jetson._threads_at_fifo(4242, 6, proc_root=root))
 
-        def __str__(self) -> str:
-            return "/sys/setting"
+    def test_any_cfs_thread_is_false(self) -> None:
+        root = self._proc({4242: (6, 1), 4300: (0, 0)})
+        self.assertFalse(jetson._threads_at_fifo(4242, 6, proc_root=root))
 
-    calls: list[list[str]] = []
+    def test_wrong_priority_is_false(self) -> None:
+        root = self._proc({4242: (5, 1)})
+        self.assertFalse(jetson._threads_at_fifo(4242, 6, proc_root=root))
 
-    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        return _proc(0)
-
-    monkeypatch.setattr(jetson.subprocess, "run", run)
-    escalator = jetson._RootEscalator(interactive=True)
-    assert escalator.write(Unwritable(), "42") == (True, "")  # type: ignore[arg-type]
-    assert escalator.write(Unwritable(), "43") == (True, "")  # type: ignore[arg-type]
-    assert primes == [True]
-    assert calls[0] == ["sudo", "-n", "tee", "/sys/setting"]
-
-
-def test_root_escalator_reports_best_command_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    outcomes = [
-        _proc(2, stdout="direct output"),
-        _proc(1, stderr="sudo output"),
-    ]
-    monkeypatch.setattr(
-        jetson.subprocess, "run", lambda *args, **kwargs: outcomes.pop(0)
-    )
-    escalator = jetson._RootEscalator(interactive=False)
-    assert escalator.run(["command"], input_text="n\n") == (False, "sudo output")
-
-    def missing(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        if args[0][0] != "sudo":
-            raise FileNotFoundError("missing executable")
-        return _proc(1)
-
-    monkeypatch.setattr(jetson.subprocess, "run", missing)
-    assert escalator.run(["missing"]) == (False, "missing executable")
+    def test_missing_process_is_none(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        self.assertIsNone(jetson._threads_at_fifo(4242, 6, proc_root=root))
 
 
-def test_power_mode_query_handles_output_and_missing_binary(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        jetson.subprocess,
-        "run",
-        lambda *args, **kwargs: _proc(0, stdout="NV Power Mode: MAXN\n0\n"),
-    )
-    assert jetson._query_power_mode("nvpmodel") == "0"
-    monkeypatch.setattr(
-        jetson.subprocess,
-        "run",
-        lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError()),
-    )
-    assert jetson._query_power_mode("nvpmodel") is None
+class _Escalator:
+    """Records root operations; ``write`` really writes so re-runs can compare."""
+
+    def __init__(self) -> None:
+        self.runs: list[list[str]] = []
+        self.writes: list[Path] = []
+
+    def run(self, argv, *, input_text=None):
+        self.runs.append(argv)
+        if argv[0] == "mkdir":
+            Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+        return True, ""
+
+    def write(self, path, value):
+        self.writes.append(path)
+        path.write_text(value)
+        return True, ""
 
 
-def test_max_power_mode_is_gated_and_skips_when_already_active(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    escalator = SimpleNamespace(
-        run=lambda *args, **kwargs: pytest.fail("unexpected run")
-    )
-    monkeypatch.setattr(jetson, "_is_jetson", lambda: False)
-    jetson._set_max_power_mode(escalator)
+class ThreadsOnCpusTest(TestCase):
+    def _proc(self, tasks: dict[int, str]) -> Path:
+        root = Path(tempfile.mkdtemp())
+        for tid, allowed in tasks.items():
+            task = root / "4242" / "task" / str(tid)
+            task.mkdir(parents=True)
+            (task / "status").write_text(
+                f"Name:\tnvargus-daemon\nCpus_allowed_list:\t{allowed}\nMems_allowed_list:\t0\n"
+            )
+        return root
 
-    monkeypatch.setattr(jetson, "_is_jetson", lambda: True)
-    monkeypatch.setattr(jetson.shutil, "which", lambda name: None)
-    jetson._set_max_power_mode(escalator)
+    def test_parse_cpu_list_handles_ranges(self) -> None:
+        self.assertEqual(jetson._parse_cpu_list("0-2,5"), {0, 1, 2, 5})
+        self.assertEqual(jetson._parse_cpu_list(" 7 "), {7})
+        self.assertEqual(jetson._cpu_list({5, 1}), "1,5")
 
-    monkeypatch.setattr(jetson.shutil, "which", lambda name: "/usr/bin/nvpmodel")
-    monkeypatch.setattr(jetson, "_query_power_mode", lambda binary: jetson._MAXN_MODE)
-    jetson._set_max_power_mode(escalator)
+    def test_all_threads_confined(self) -> None:
+        root = self._proc({4242: "1,5", 4300: "1,5"})
+        self.assertTrue(jetson._threads_on_cpus(4242, {1, 5}, proc_root=root))
 
+    def test_roaming_thread_is_false(self) -> None:
+        root = self._proc({4242: "1,5", 4300: "0-7"})
+        self.assertFalse(jetson._threads_on_cpus(4242, {1, 5}, proc_root=root))
 
-def test_max_power_mode_switches_or_persists_for_next_boot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(jetson, "_is_jetson", lambda: True)
-    monkeypatch.setattr(jetson.shutil, "which", lambda name: "/usr/bin/nvpmodel")
-    modes = iter(["2", "0"])
-    monkeypatch.setattr(jetson, "_query_power_mode", lambda binary: next(modes))
-    calls: list[tuple[list[str], str | None]] = []
-    escalator = SimpleNamespace(
-        run=lambda argv, input_text=None: calls.append((argv, input_text))
-        or (True, ""),
-        write=lambda *args: pytest.fail("unexpected write"),
-    )
-    jetson._set_max_power_mode(escalator)
-    assert calls == [(["/usr/bin/nvpmodel", "-m", "0"], "n\n")]
-
-    monkeypatch.setattr(jetson, "_query_power_mode", lambda binary: "2")
-    writer = _Writer()
-    escalator = SimpleNamespace(
-        run=lambda *args, **kwargs: (True, "reboot required"), write=writer.write
-    )
-    jetson._set_max_power_mode(escalator)
-    assert writer.writes == [(jetson._NVPMODEL_STATUS, "pmode:0000")]
+    def test_missing_process_is_none(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        self.assertIsNone(jetson._threads_on_cpus(4242, {1, 5}, proc_root=root))
 
 
-def test_engine_and_cpu_pinning_cover_changed_equal_and_unreadable_nodes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    engine = tmp_path / "engine.nvenc"
-    engine.mkdir()
-    (engine / "max_freq").write_text("100\n")
-    (engine / "min_freq").write_text("20\n")
-    already = tmp_path / "engine.vic"
-    already.mkdir()
-    (already / "max_freq").write_text("80\n")
-    (already / "min_freq").write_text("80\n")
-    unreadable = tmp_path / "missing.vic"
-
-    cpu0 = tmp_path / "cpu0"
-    cpu1 = tmp_path / "cpu1"
-    cpu2 = tmp_path / "cpu2"
-    for cpu, governor in ((cpu0, "schedutil"), (cpu1, "performance")):
-        (cpu / "cpufreq").mkdir(parents=True)
-        (cpu / "cpufreq" / "scaling_governor").write_text(governor)
-
-    original_glob = Path.glob
-
-    def glob(path: Path, pattern: str):
-        if str(path) == "/sys/class/devfreq":
-            if pattern == "*.nvenc":
-                return iter([engine])
-            return iter([already, unreadable])
-        if str(path) == "/sys/devices/system/cpu":
-            return iter([cpu2, cpu1, cpu0])
-        return original_glob(path, pattern)
-
-    monkeypatch.setattr(Path, "glob", glob)
-    writer = _Writer(results=[(True, ""), (False, "read only")])
-    jetson._pin_engines(writer)
-    assert writer.writes == [(engine / "min_freq", "100")]
-
-    monkeypatch.setattr(jetson, "_is_jetson", lambda: True)
-    jetson._pin_cpu(writer)
-    assert writer.writes[-1] == (cpu0 / "cpufreq" / "scaling_governor", "performance")
-
-    monkeypatch.setattr(jetson, "_is_jetson", lambda: False)
-    before = list(writer.writes)
-    jetson._pin_cpu(writer)
-    assert writer.writes == before
+_INTERRUPTS = """\
+           CPU0       CPU1       CPU2       CPU3
+ 11:    5000000    4999000    5001000    5000500     GICv3  27 Level     arch_timer
+123:    7900000          0          0          0     GICv3 251 Level     xhci-hcd:usb1
+124:          0          0          0          0     GICv3 252 Level     xhci-hcd:usb2
+200:          0        120          0          0     GICv3 300 Level     tegra-can-ish
+ERR:          0
+"""
 
 
-def test_public_clock_helpers_share_escalator(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    seen: list[tuple[str, object]] = []
-    monkeypatch.setattr(
-        jetson, "_pin_engines", lambda esc: seen.append(("engine", esc))
-    )
-    monkeypatch.setattr(jetson, "_pin_cpu", lambda esc: seen.append(("cpu", esc)))
-    monkeypatch.setattr(
-        jetson, "_set_max_power_mode", lambda esc: seen.append(("mode", esc))
-    )
+def _fake_proc(
+    interrupts: str | None,
+    affinity: dict[int, str] = {},
+    effective: dict[int, str] = {},
+) -> Path:
+    """A ``/proc`` stand-in: an interrupts table plus per-irq affinity files.
 
-    jetson.pin_engine_clocks(interactive=True)
-    jetson.pin_realtime_clocks(interactive=True)
-    assert [name for name, _ in seen] == ["engine", "mode", "engine", "cpu"]
-    assert seen[1][1] is seen[2][1] is seen[3][1]
+    ``effective`` adds ``effective_affinity_list`` nodes (the CPU the GIC
+    actually picked out of the nominal mask) for the given irqs.
+    """
+    root = Path(tempfile.mkdtemp())
+    if interrupts is not None:
+        (root / "interrupts").write_text(interrupts)
+    for irq, cpus in affinity.items():
+        (root / "irq" / str(irq)).mkdir(parents=True, exist_ok=True)
+        (root / "irq" / str(irq) / "smp_affinity_list").write_text(cpus + "\n")
+    for irq, cpus in effective.items():
+        (root / "irq" / str(irq)).mkdir(parents=True, exist_ok=True)
+        (root / "irq" / str(irq) / "effective_affinity_list").write_text(cpus + "\n")
+    return root
+
+
+def _fake_sys(devices: dict[str, str]) -> Path:
+    """A ``/sys`` stand-in where each CAN interface's ``device`` link resolves
+    to a USB function directory named like the kernel does (``1-2.2:1.0``)."""
+    root = Path(tempfile.mkdtemp())
+    for iface, function in devices.items():
+        target = root / "bus/usb/devices" / function
+        target.mkdir(parents=True)
+        net = root / "class/net" / iface
+        net.mkdir(parents=True)
+        (net / "device").symlink_to(target)
+    return root
+
+
+class CanUsbIrqsTest(TestCase):
+    def test_resolves_the_bus_from_the_interfaces_usb_function(self) -> None:
+        sys_root = _fake_sys(
+            {jetson.CAN_LEFT: "1-2.2:1.0", jetson.CAN_RIGHT: "1-2.2:1.1"}
+        )
+        self.assertEqual(jetson._can_usb_buses(sys_root=sys_root), {"1"})
+
+    def test_only_the_controller_the_adapters_hang_off(self) -> None:
+        # usb2 is a different controller: it must not be steered.
+        sys_root = _fake_sys({jetson.CAN_LEFT: "1-2.2:1.0"})
+        root = _fake_proc(_INTERRUPTS)
+        self.assertEqual(
+            jetson._can_usb_irqs(proc_root=root, sys_root=sys_root),
+            {123: "xhci-hcd:usb1"},
+        )
+
+    def test_every_xhci_row_when_no_interface_resolves(self) -> None:
+        root = _fake_proc(_INTERRUPTS)
+        self.assertEqual(
+            jetson._can_usb_irqs(proc_root=root, sys_root=Path(tempfile.mkdtemp())),
+            {123: "xhci-hcd:usb1", 124: "xhci-hcd:usb2"},
+        )
+
+    def test_unreadable_table_is_empty(self) -> None:
+        root = _fake_proc(None)
+        self.assertEqual(
+            jetson._can_usb_irqs(proc_root=root, sys_root=Path(tempfile.mkdtemp())),
+            {},
+        )
+
+    def test_irq_affinity_parses_and_tolerates_absence(self) -> None:
+        root = _fake_proc(None, {123: "0-7"})
+        self.assertEqual(jetson._irq_affinity(123, proc_root=root), set(range(8)))
+        self.assertIsNone(jetson._irq_affinity(9, proc_root=root))
+
+    def test_effective_affinity_prefers_the_gic_choice(self) -> None:
+        # Nominal mask says "anywhere"; the GIC actually delivers to CPU0.
+        root = _fake_proc(None, {123: "0-7"}, {123: "0"})
+        self.assertEqual(jetson._irq_effective_affinity(123, proc_root=root), {0})
+        # No effective node (or an empty one): fall back to the nominal mask.
+        root = _fake_proc(None, {124: "0-7"}, {124: ""})
+        self.assertEqual(
+            jetson._irq_effective_affinity(124, proc_root=root), set(range(8))
+        )
+        self.assertIsNone(jetson._irq_effective_affinity(9, proc_root=root))
+
+
+class CanIrqCpusTest(TestCase):
+    """Live placement of the CAN adapters' interrupt, as the camera pool sees it."""
+
+    def setUp(self) -> None:
+        self.sys_root = _fake_sys({jetson.CAN_LEFT: "1-2.2:1.0"})
+
+    def test_unsteered_interrupt_reports_cpu0(self) -> None:
+        root = _fake_proc(_INTERRUPTS, {123: "0-7", 124: "0-7"}, {123: "0"})
+        self.assertEqual(
+            jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root), {0}
+        )
+
+    def test_nominal_mask_when_the_kernel_tracks_no_effective_one(self) -> None:
+        root = _fake_proc(_INTERRUPTS, {123: "0-7", 124: "0-7"})
+        self.assertEqual(
+            jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root),
+            set(range(8)),
+        )
+
+    def test_steered_interrupt_reports_the_can_core_only(self) -> None:
+        # The other controller (usb2) stays on CPU0 but is not the CAN one.
+        root = _fake_proc(_INTERRUPTS, {123: "7", 124: "0-7"}, {123: "7", 124: "0"})
+        self.assertEqual(
+            jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root), {7}
+        )
+
+    def test_every_xhci_row_counts_when_no_interface_resolves(self) -> None:
+        root = _fake_proc(_INTERRUPTS, {123: "7", 124: "0-7"}, {123: "7", 124: "0"})
+        self.assertEqual(
+            jetson.can_irq_cpus(proc_root=root, sys_root=Path(tempfile.mkdtemp())),
+            {0, 7},
+        )
+
+    def test_unknown_when_no_row_or_no_affinity(self) -> None:
+        root = _fake_proc("           CPU0\n 11:   1   GICv3  arch_timer\n")
+        self.assertIsNone(jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root))
+        root = _fake_proc(_INTERRUPTS)  # row present, affinity files missing
+        self.assertIsNone(jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root))
+        root = _fake_proc(None)
+        self.assertIsNone(jetson.can_irq_cpus(proc_root=root, sys_root=self.sys_root))
+
+
+class SteerCanIrqTest(TestCase):
+    def setUp(self) -> None:
+        self.sys_root = _fake_sys({jetson.CAN_LEFT: "1-2.2:1.0"})
+        patches = [
+            patch.object(jetson, "_is_jetson", return_value=True),
+            patch.object(jetson, "can_irq_cpu", return_value=7),
+            patch.object(jetson, "_irqbalance_active", return_value=False),
+            patch.object(jetson, "_SYS_ROOT", self.sys_root),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_steers_the_can_controller_irq_onto_the_can_core(self) -> None:
+        root = _fake_proc(_INTERRUPTS, {123: "0-7", 124: "0-7"})
+        esc = _Escalator()
+        with patch.object(jetson, "_PROC_ROOT", root):
+            jetson._steer_can_irq(esc)
+        self.assertEqual(esc.writes, [root / "irq/123/smp_affinity_list"])
+        self.assertEqual(jetson._irq_affinity(123, proc_root=root), {7})
+        # The other controller was left alone.
+        self.assertEqual(jetson._irq_affinity(124, proc_root=root), set(range(8)))
+
+    def test_rerun_is_a_no_op_once_applied(self) -> None:
+        root = _fake_proc(_INTERRUPTS, {123: "7"})
+        esc = _Escalator()
+        with patch.object(jetson, "_PROC_ROOT", root):
+            jetson._steer_can_irq(esc)
+        self.assertEqual(esc.writes, [])
+
+    def test_missing_controller_only_warns(self) -> None:
+        root = _fake_proc("           CPU0\n 11:   1   GICv3  arch_timer\n")
+        esc = _Escalator()
+        with (
+            patch.object(jetson, "_PROC_ROOT", root),
+            self.assertLogs(jetson._logger, level="WARNING"),
+        ):
+            jetson._steer_can_irq(esc)
+        self.assertEqual(esc.writes, [])
+
+    def test_failed_write_warns_with_the_manual_command(self) -> None:
+        root = _fake_proc(_INTERRUPTS, {123: "0-7"})
+
+        class _Denied(_Escalator):
+            def write(self, path, value):
+                return False, "sudo unavailable"
+
+        with (
+            patch.object(jetson, "_PROC_ROOT", root),
+            self.assertLogs(jetson._logger, level="WARNING") as logs,
+        ):
+            jetson._steer_can_irq(_Denied())
+        self.assertIn("echo 7 | sudo tee", "\n".join(logs.output))
+
+    def test_irqbalance_is_called_out(self) -> None:
+        root = _fake_proc(_INTERRUPTS, {123: "7"})
+        with (
+            patch.object(jetson, "_PROC_ROOT", root),
+            patch.object(jetson, "_irqbalance_active", return_value=True),
+            self.assertLogs(jetson._logger, level="WARNING") as logs,
+        ):
+            jetson._steer_can_irq(_Escalator())
+        self.assertIn("irqbalance", "\n".join(logs.output))
+
+    def test_no_can_partition_is_a_no_op(self) -> None:
+        root = _fake_proc(_INTERRUPTS, {123: "0-7"})
+        esc = _Escalator()
+        with (
+            patch.object(jetson, "_PROC_ROOT", root),
+            patch.object(jetson, "can_irq_cpu", return_value=None),
+        ):
+            jetson._steer_can_irq(esc)
+        self.assertEqual(esc.writes, [])
+
+
+class PrioritizeCaptureDaemonsTest(TestCase):
+    def setUp(self) -> None:
+        self.unit_dir = Path(tempfile.mkdtemp())
+        patches = [
+            patch.object(jetson, "_is_jetson", return_value=True),
+            patch.object(jetson, "_SYSTEMD_UNIT_DIR", self.unit_dir),
+            patch.object(jetson, "_CAPTURE_DAEMON_UNITS", ("nvargus-daemon.service",)),
+            patch.object(jetson, "realtime_camera_cores", return_value={1, 5}),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.dropin = (
+            self.unit_dir / "nvargus-daemon.service.d" / jetson._CAPTURE_DAEMON_DROPIN
+        )
+
+    def test_installs_dropin_and_reschedules_live_daemon(self) -> None:
+        esc = _Escalator()
+        with (
+            patch.object(jetson, "_service_main_pid", return_value=777),
+            patch.object(jetson, "_threads_at_fifo", return_value=False),
+            patch.object(jetson, "_threads_on_cpus", return_value=False),
+        ):
+            jetson._prioritize_capture_daemons(esc)
+
+        text = self.dropin.read_text()
+        self.assertIn("CPUSchedulingPolicy=fifo", text)
+        self.assertIn(
+            f"CPUSchedulingPriority={jetson._CAPTURE_DAEMON_FIFO_PRIORITY}", text
+        )
+        self.assertIn("CPUAffinity=1 5", text)
+        self.assertIn(["systemctl", "daemon-reload"], esc.runs)
+        self.assertIn(
+            [
+                "chrt",
+                "-f",
+                "-a",
+                "-p",
+                str(jetson._CAPTURE_DAEMON_FIFO_PRIORITY),
+                "777",
+            ],
+            esc.runs,
+        )
+        self.assertIn(["taskset", "-a", "-c", "-p", "1,5", "777"], esc.runs)
+
+    def test_rerun_is_a_no_op_once_applied(self) -> None:
+        esc = _Escalator()
+        with (
+            patch.object(jetson, "_service_main_pid", return_value=777),
+            patch.object(jetson, "_threads_at_fifo", return_value=False),
+            patch.object(jetson, "_threads_on_cpus", return_value=False),
+        ):
+            jetson._prioritize_capture_daemons(esc)
+        again = _Escalator()
+        with (
+            patch.object(jetson, "_service_main_pid", return_value=777),
+            patch.object(jetson, "_threads_at_fifo", return_value=True),
+            patch.object(jetson, "_threads_on_cpus", return_value=True),
+        ):
+            jetson._prioritize_capture_daemons(again)
+        self.assertEqual(again.runs, [])
+        self.assertEqual(again.writes, [])
+
+    def test_affinity_alone_is_reapplied_when_daemon_roams(self) -> None:
+        esc = _Escalator()
+        with (
+            patch.object(jetson, "_service_main_pid", return_value=777),
+            patch.object(jetson, "_threads_at_fifo", return_value=True),
+            patch.object(jetson, "_threads_on_cpus", return_value=False),
+        ):
+            jetson._prioritize_capture_daemons(esc)
+        self.assertNotIn("chrt", [argv[0] for argv in esc.runs])
+        self.assertIn(["taskset", "-a", "-c", "-p", "1,5", "777"], esc.runs)
+
+    def test_dropin_omits_affinity_without_a_partition(self) -> None:
+        esc = _Escalator()
+        with (
+            patch.object(jetson, "realtime_camera_cores", return_value=None),
+            patch.object(jetson, "_service_main_pid", return_value=0),
+        ):
+            self.dropin.parent.mkdir(parents=True)
+            self.dropin.write_text("stale\n")
+            jetson._prioritize_capture_daemons(esc)
+        self.assertNotIn("CPUAffinity", self.dropin.read_text())
+
+    def test_absent_daemon_is_skipped_entirely(self) -> None:
+        esc = _Escalator()
+        with patch.object(jetson, "_service_main_pid", return_value=0):
+            jetson._prioritize_capture_daemons(esc)
+        self.assertFalse(self.dropin.exists())
+        self.assertEqual(esc.runs, [])
+
+    def test_stopped_daemon_with_dropin_only_refreshes_dropin(self) -> None:
+        self.dropin.parent.mkdir(parents=True)
+        self.dropin.write_text("stale\n")
+        esc = _Escalator()
+        with patch.object(jetson, "_service_main_pid", return_value=0):
+            jetson._prioritize_capture_daemons(esc)
+        self.assertIn("CPUSchedulingPolicy=fifo", self.dropin.read_text())
+        self.assertNotIn("chrt", [argv[0] for argv in esc.runs])
+
+    def test_gpu_is_pinned_but_not_a_jetson_marker(self) -> None:
+        self.assertIn("*.gpu", jetson._ENGINE_CLOCK_GLOBS)
+        self.assertNotIn("*.gpu", jetson._JETSON_ENGINE_GLOBS)

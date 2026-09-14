@@ -194,7 +194,7 @@ def test_telemetry_hub_snapshot_history_and_subscription(monkeypatch) -> None:
 def test_diagnostics_store_round_trip_csv_and_clear(
     tmp_path: Path, monkeypatch
 ) -> None:
-    now = iter([10.0, 20.0])
+    now = iter([10.0, 20.0, 40.0, 50.0])
     monkeypatch.setattr(telemetry.time, "time", lambda: next(now))
     hub = telemetry.TelemetryHub()
     hub._frames.extend(
@@ -203,7 +203,11 @@ def test_diagnostics_store_round_trip_csv_and_clear(
     store = telemetry.DiagnosticsRunStore(hub, tmp_path / "runs")
     meta = store.begin("session", "rom-test", {"arm": "left"})
 
-    capture = tmp_path / "capture.csv"
+    # Captures are only honoured from the diagnostics capture directory.
+    captures = tmp_path / "captures"
+    captures.mkdir()
+    monkeypatch.setattr(telemetry, "CAPTURES_DIR", captures)
+    capture = captures / "capture.csv"
     capture.write_text(
         "t,left:J1:pos,left:J1:vel,left:J1:tq,ignored\n1.0,1,2,3,x\n2.0,4,,6,x\n"
     )
@@ -216,9 +220,19 @@ def test_diagnostics_store_round_trip_csv_and_clear(
     assert loaded["frames"] == [{"t": 1.0, "m": {"left:J1": [1.0, 2.0, 3.0]}}]
     assert loaded["log"][-1] == "ok"
     assert store.load("missing") is None
+    assert store.load("0123456789ab") is None
 
-    assert store.clear() == 1
+    # A capture path outside the capture directory is ignored, never read.
+    stray = tmp_path / "stray.csv"
+    stray.write_text("t,left:J1:pos\n1.0,1\n")
+    other = store.begin("session", "rom-test", {})
+    store.finalize(other, "exited", 0, [f"[telemetry] csv={stray}"])
+    assert other["telemetryCsv"] == str(stray)
+    assert store.load(other["id"])["frames"] == []
+
+    assert store.clear() == 2
     assert not capture.exists()
+    assert stray.exists()
     assert store.list() == []
     assert store.clear() == 0
 
@@ -226,16 +240,20 @@ def test_diagnostics_store_round_trip_csv_and_clear(
 def test_diagnostics_store_tolerates_corrupt_files(tmp_path: Path) -> None:
     runs = tmp_path / "runs"
     runs.mkdir()
-    (runs / "bad.meta.json").write_text("not json")
-    (runs / "ok.meta.json").write_text(json.dumps({"id": "ok", "startedAt": 1}))
-    (runs / "ok.data.json").write_text("bad")
+    ok = "0123456789ab"
+    (runs / "bad000000000.meta.json").write_text("not json")
+    (runs / f"{ok}.meta.json").write_text(json.dumps({"id": ok, "startedAt": 1}))
+    (runs / f"{ok}.data.json").write_text("bad")
+    # Names outside the run-file shape are never opened, even as meta.
+    (runs / "not-a-run.meta.json").write_text(json.dumps({"id": "x"}))
     store = telemetry.DiagnosticsRunStore(telemetry.TelemetryHub(), runs)
-    assert store.list() == [{"id": "ok", "startedAt": 1}]
-    assert store.load("ok") == {
-        "meta": {"id": "ok", "startedAt": 1},
+    assert store.list() == [{"id": ok, "startedAt": 1}]
+    assert store.load(ok) == {
+        "meta": {"id": ok, "startedAt": 1},
         "frames": [],
         "log": [],
     }
+    assert store.load("not-a-run") is None
 
     malformed = tmp_path / "bad.csv"
     malformed.write_text("wrong,header\n1,2\n")

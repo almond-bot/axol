@@ -48,11 +48,13 @@ import av
 from aiortc.codecs.h264 import H264Encoder
 from aiortc.mediastreams import VIDEO_TIME_BASE, convert_timebase
 
+from .constants import HEADSET_STREAM_FPS
+
 _logger = logging.getLogger(__name__)
 
-# The relay tracks pace at the camera rate; declare a nominal fps for the
-# pipeline caps / IDR interval (frames are pushed as they arrive).
-_FPS = 30
+# SDK-backed WebRTC tracks are paced at this fixed rate before reaching the
+# encoder. Camera capture itself may run faster for recording or policy input.
+_FPS = HEADSET_STREAM_FPS
 
 # Once the encoder's stdout has been quiet this long, the buffered tail is
 # the final NAL of the current access unit (the encoder writes a whole AU
@@ -94,6 +96,25 @@ def dataset_vbr_bitrate(width: int, height: int, fps: int) -> tuple[int, int]:
     """(target, peak) VBR bitrate (bits/s) for the recorded dataset encode."""
     target = max(3_000_000, min(16_000_000, int(width * height * fps * _DATASET_BPP)))
     return target, int(target * _DATASET_PEAK_MULT)
+
+
+# All-intra budget for the relay's encoded dataset branch (``gst_zed``), where
+# every frame is an IDR. Intra frames cannot borrow from their neighbours, so at
+# the predictive budget above each 960x600 frame gets ~12 KB and lands around
+# 31 dB PSNR-Y — visibly blocky on the edge detail the policies rely on — versus
+# ~45 dB for the same bits spread over a 15-frame GOP (measured on the Jetson
+# encoder against a recorded arm camera). ~0.6 bpp (≈21 Mbps at SVGA @ 60)
+# recovers ~41 dB; the cost is about 3.5x the on-disk/upload size per camera.
+_DATASET_INTRA_BPP = 0.6
+_DATASET_INTRA_PEAK_MULT = 1.5
+
+
+def dataset_intra_vbr_bitrate(width: int, height: int, fps: int) -> tuple[int, int]:
+    """(target, peak) VBR bitrate (bits/s) for an all-intra dataset encode."""
+    target = max(
+        8_000_000, min(50_000_000, int(width * height * fps * _DATASET_INTRA_BPP))
+    )
+    return target, int(target * _DATASET_INTRA_PEAK_MULT)
 
 
 def _gst_argv(width: int, height: int, fps: int, bitrate: int) -> list[str]:

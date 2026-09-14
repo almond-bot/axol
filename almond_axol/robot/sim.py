@@ -185,8 +185,8 @@ class Sim(RobotBase):
                 self._joint_names or urdf_arm_joint_names(is_left=True)
             ) + urdf_arm_joint_names(is_left=False)
 
-            # Map each viser joint to its index in robot_order (-1 for joints not
-            # in robot_order, e.g. finger joints, which stay at 0).
+            # Map each viser joint to its index in robot_order (-1 for any
+            # unexpected movable joint outside the arm contract, which stays 0).
             viser_order = viser_urdf.get_actuated_joint_names()
             viser_to_robot: list[int] = []
             for name in viser_order:

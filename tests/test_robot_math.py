@@ -5,7 +5,7 @@ import struct
 import numpy as np
 import pytest
 
-from almond_axol.robot.cart import deadzone, mix
+from almond_axol.robot.jelly import deadzone, mix
 from almond_axol.robot.config import AxolConfig
 from almond_axol.robot.lift import _decode_status
 from almond_axol.teleop.worker import (
@@ -15,7 +15,7 @@ from almond_axol.teleop.worker import (
 )
 
 
-def test_cart_deadzone_rescales_and_clamps() -> None:
+def test_jelly_deadzone_rescales_and_clamps() -> None:
     assert deadzone(0.1, 0.15) == 0.0
     assert deadzone(0.15, 0.15) == 0.0
     assert deadzone(1.0, 0.15) == 1.0
@@ -23,7 +23,7 @@ def test_cart_deadzone_rescales_and_clamps() -> None:
     assert deadzone(0.575, 0.15) == pytest.approx(0.5)
 
 
-def test_cart_mix_preserves_limits_and_symmetry() -> None:
+def test_jelly_mix_preserves_limits_and_symmetry() -> None:
     wheels = mix(vx=1.0, vy=1.0, wz=1.0, max_speed=20.0, turn_scale=1.0)
     assert len(wheels) == 4
     assert max(abs(v) for v in wheels) == pytest.approx(20.0)

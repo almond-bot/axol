@@ -17,6 +17,19 @@ export enum AxolState {
 export type AxolMode = "teleop" | "data_collection"
 
 /**
+ * Controller-pose convention selected by the host independently of the HUD
+ * operating mode. Relative is the legacy Axol target-ray/body-elbow mapping;
+ * absolute is the calibrated grip-space mapping used by Mantis.
+ */
+export type AxolPoseMode = "relative" | "absolute"
+
+/**
+ * Pose producer selected by the host. A tracker-owned session keeps connected
+ * Quest clients view-only; null preserves the unrestricted legacy policy.
+ */
+export type AxolPoseSourceKind = "webxr" | "tracker" | null
+
+/**
  * Which episode action a HUD confirmation popup is gating while recording:
  * stopping to save the episode ("save", armed by A) or discarding it to
  * re-record ("discard", armed by X). Null when no confirmation is pending.
@@ -42,15 +55,15 @@ export type AxolPoseData = {
   r_grip: number
   reset: boolean
   state: AxolState
-  /** Monotonic per-connection frame counter. */
+  /** Monotonic per logical pose source, including page reloads. */
   seq?: number
   /** Capture timestamp (ms, `performance.now()`) for server-side interpolation. */
   t?: number
-  /** Left thumbstick x, [-1, 1], right = +1 — powered-cart strafe. */
+  /** Left thumbstick x, [-1, 1], right = +1 — Jelly strafe. */
   l_stick_x?: number
-  /** Left thumbstick y, [-1, 1], pushed forward = -1 — powered-cart drive. */
+  /** Left thumbstick y, [-1, 1], pushed forward = -1 — Jelly drive. */
   l_stick_y?: number
-  /** Right thumbstick x, [-1, 1], right = +1 — powered-cart rotation. */
+  /** Right thumbstick x, [-1, 1], right = +1 — Jelly rotation. */
   r_stick_x?: number
   /** Left thumbstick pressed in — lift down while held. */
   l_stick_click?: boolean

@@ -31,6 +31,14 @@ class KinematicsConfig:
             targets (see ``elbow_fade_band``).
         rest_weight: Weight penalising deviation from the current joint configuration.
             Acts as a per-step damping term; uses q_current as the target.
+            This is what keeps millimetre-scale target noise from churning
+            the arm's null space: recorded teleop showed 1.5 mm of hand
+            tremor coming out of the solver as up to 1° of anti-correlated
+            joint ripple (elbow vs shoulder_1 at r=-0.96) that cancelled at
+            the hand — internal motion the task cost is blind to. Replaying
+            those bursts through the solver: 15 cut the churn 20-35% with no
+            measurable end-effector tracking cost; 30 cut it 2-5x but added
+            ~30% EE lag during fast reaches, so 15 is the sweet spot.
         posture_weight: Weight penalising deviation from the global preferred posture.
             Acts as a persistent attractor toward the home/rest configuration,
             preventing slow null-space drift (e.g. unnecessary shoulder twist).
@@ -50,17 +58,26 @@ class KinematicsConfig:
             active during ordinary tracking, which makes the trust-region
             solver reject steps — the arm freezes while small target errors
             accumulate, then lurches once the error is large enough to punch
-            through             (the teleop "stuck, then jumps" failure). 0.025 matches
+            through (the teleop "stuck, then jumps" failure). 0.025 matches
             ``VRTeleopConfig.reset_collision_margin``. This value is the
             *ceiling*: each pair's actual activation distance is derived from
-            its home-pose clearance (clamped between the solver's 8 mm floor
-            and this value), so pairs that normally operate near their shell —
-            the wrists and grippers passing 10-17 mm from the base during
-            close-over-table work, the elbow capsules grazing at rest — stay
-            silent in their ordinary envelope instead of holding the cost
-            hinge active there (measured at up to 59% of frames in recorded
-            deburring sessions, which pulsed weight-150 gradients into the arm
-            as path-specific jitter).
+            its home-pose clearance (``min(home_clearance - 2 mm, this
+            value)``, possibly *negative* — see
+            :func:`almond_axol.kinematics.model.collision_cost_params`), so
+            pairs that normally operate near their shell — the wrists and
+            grippers passing 10-17 mm from the base during close-over-table
+            work, the elbow capsules whose conservative fits interpenetrate
+            by 1.4 mm at rest — stay silent in their ordinary envelope
+            instead of holding the cost hinge active there (measured at up
+            to 59% of frames in recorded deburring sessions, which pulsed
+            weight-150 gradients into the arm as path-specific jitter; the
+            formerly floor-clamped elbow pair tripled per-tick solver output
+            acceleration during front-of-torso reaches and kicked the elbow
+            at every shell crossing). Distal arm/base pairs remain active even
+            when their conservative capsules overlap at the physically safe
+            home pose. The upper-arm/base contact pair additionally has an
+            independent final-step guard calibrated from that safe reference,
+            so the pose task cannot push either arm through the base.
         self_collision_weight: Weight on the self-collision penalty. 150 was
             set by replaying recorded close-to-body teleop episodes through
             the solver offline: at 75 the task cost dragged the elbow up to
@@ -139,7 +156,7 @@ class KinematicsConfig:
     pos_weight: float = 50.0
     ori_weight: float = 10.0
     elbow_weight: float = 0.0
-    rest_weight: float = 7.5
+    rest_weight: float = 15.0
     posture_weight: float = 5.0
     manipulability_weight: float = 0.05
     limit_weight: float = 75.0
@@ -156,3 +173,54 @@ class KinematicsConfig:
     manip_damping_boost: float = 60.0
     limit_damping_margin: float = 0.12
     elbow_fade_band: float = 0.15
+
+
+# Solver values the Mantis profile forces (see
+# :func:`apply_mantis_kinematics_profile`). Tuned with ``scripts/mantis_ik_bench.py``
+# against a convergence floor that preserves the same collision and joint-limit
+# objective: the shipping step/iteration bounds stay within 6 mm p95 jaw-tip
+# error of that floor, with no null-space drift while the hand is still and a
+# per-tick solve that fits a 30 Hz collection tick on the Jetson.
+#
+# Rationale per field:
+#   pos/ori weight   Raised ~4x/12x over the arm defaults so the pose target
+#                    dominates the (default-strength) rest/posture
+#                    regularizers — raising the ratio shrinks tracking error;
+#                    weakening the regularizers instead unanchors the elbow
+#                    null space and destabilises the solve.
+#   manipulability   Off: it biases q away from the exact pose solution at
+#                    every tick (~7 mm at rest). Protecting a physical arm
+#                    from singular configs doesn't apply to a virtual one.
+#   collision margin The classic URDF's conservative PCA capsules are already
+#                    near or slightly overlapping at known-safe folded poses.
+#                    Reducing the default 2.5 cm activation distance to 2 cm
+#                    trims that artificial standoff while retaining the full
+#                    collision penalty. Recorded joints replay on the real
+#                    robot, so the collision weight is deliberately unchanged.
+#   max_joint_delta  ~1.4x the fastest bench hand motion so tracking never
+#                    saturates the per-tick clamp; still bounded so a bad
+#                    frame can't teleport the solution.
+#   max_iterations   12 (from 8): recovers convergence headroom the higher
+#                    weights consume, within the 30 Hz solve budget.
+MANTIS_KINEMATICS_OVERRIDES: dict[str, float | int] = {
+    "pos_weight": 200.0,
+    "ori_weight": 120.0,
+    "manipulability_weight": 0.0,
+    "self_collision_margin": 0.02,
+    "max_joint_delta": 0.05,
+    "max_iterations": 12,
+}
+
+
+def apply_mantis_kinematics_profile(config: KinematicsConfig) -> None:
+    """Apply the Mantis solver profile in place.
+
+    Shared by ``teleop --mantis`` and ``collect-data --mantis`` (the same way
+    :func:`almond_axol.teleop.config.apply_mantis_teleop_profile` is). Each
+    override is applied only when the field still holds its dataclass
+    default, so explicit ``--kinematics.<field>`` flags win over the profile.
+    """
+    defaults = KinematicsConfig()
+    for name, value in MANTIS_KINEMATICS_OVERRIDES.items():
+        if getattr(config, name) == getattr(defaults, name):
+            setattr(config, name, value)

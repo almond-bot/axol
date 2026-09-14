@@ -7,13 +7,19 @@ field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
 
     axol teleop                                       # real robot
     axol teleop --sim                                 # browser visualizer
+    axol teleop --mantis                              # Mantis rigs: triggers drive the grippers
     axol teleop --axol.left_stiffness 0.8
     axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
     axol teleop --teleop.position_multiplier 2.0      # scale hand motion 2x
     axol teleop --left_channel null                   # disable the left arm
-    axol teleop --cart.enabled true                   # powered cart (base+lift)
-    axol teleop --cart_only                           # drive just the cart, arms untouched
+    axol teleop --jelly.enabled true                   # Jelly (base + lift)
+    axol teleop --jelly_only                           # drive just Jelly, arms untouched
     axol teleop --config_path my_teleop.json          # whole-config file
+    axol teleop --no_settings                          # ignore ~/.almond/settings.json
+
+The robot's shared settings file (``~/.almond/settings.json``, the one the
+control panel edits) is applied by default beneath the config file and the
+flags, so a direct run uses the same values as a panel-launched one.
 """
 
 import asyncio
@@ -21,6 +27,7 @@ import logging
 import socket
 from typing import TYPE_CHECKING, Any
 
+from ..utils.network import local_ip
 from .config import TeleopCmdConfig, normalize_bool_flags, parse
 
 if TYPE_CHECKING:
@@ -29,29 +36,70 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
-def _get_local_ip() -> str:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+def _prepare_mantis_teleop(cfg: TeleopCmdConfig) -> None:
+    """Validate the Mantis teleop flags before touching live hardware.
+
+    Mantis teleop is grippers-only by design: the rig triggers drive the two
+    grippers over CAN and nothing else starts (no tracking, VR server,
+    cameras, or transforms). Tracked Mantis runs belong to data collection.
+    """
+    if cfg.sim:
+        raise ValueError("--mantis and --sim are mutually exclusive")
+    if cfg.jelly_only:
+        raise ValueError(
+            "--mantis drives the handheld rig and --jelly_only drives Jelly — pick one"
+        )
+
+
+def mantis_rig_channels(cfg: TeleopCmdConfig) -> tuple[str | None, str | None]:
+    """The two rig channels a Mantis run opens (Axol defaults map to the rig's)."""
+    from ..constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
+
+    left = cfg.left_channel
+    right = cfg.right_channel
+    if left == CAN_LEFT:
+        left = CAN_MANTIS_LEFT
+    if right == CAN_RIGHT:
+        right = CAN_MANTIS_RIGHT
+    return left, right
 
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a VR teleop session."""
-    cfg = parse(TeleopCmdConfig, normalize_bool_flags(argv, "sim", "cart_only"))
+    normalized_argv = normalize_bool_flags(argv, "sim", "mantis", "jelly_only")
+    # The robot's shared settings (~/.almond/settings.json, the control
+    # panel's file) sit beneath config-file/CLI overrides — see parse().
+    cfg = parse(TeleopCmdConfig, normalized_argv, settings_op="teleop")
+    if cfg.mantis:
+        # A Mantis run inherits the host's saved rig CAN channel map
+        # (Settings → Mantis) instead of the Axol arm map — the same
+        # conditional fold the control panel applies.
+        cfg = parse(
+            TeleopCmdConfig,
+            normalized_argv,
+            settings_op="teleop",
+            settings_args={"mantis": True},
+        )
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
-    # and silently drop log_say() / INFO status lines.
+    # and silently drop the INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
     # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled
     # by the host installer + its boot service, not here — see
     # `axol jetson.setup` / `axol gst.install`. This entry point just runs.
 
+    if cfg.mantis:
+        # Grippers-only: nothing to connect to (no VR server or tracking).
+        _prepare_mantis_teleop(cfg)
+        asyncio.run(_run(cfg))
+        return
+
     hostname = socket.gethostname()
-    local_ip = _get_local_ip()
+    host_ip = local_ip()
     print("Connect the VR app (https://axol.almond.bot) to this machine:")
     print(f"  Hostname : {hostname}.local")
-    print(f"  IP       : {local_ip}")
+    print(f"  IP       : {host_ip}")
 
     asyncio.run(_run(cfg))
 
@@ -131,7 +179,14 @@ def _start_video_relay(cfg: TeleopCmdConfig, stereo_set: set[int]) -> Any | None
     resolution = cfg.resolution or "HD1200"
     specs: dict[str, dict[str, Any]] = {}
     for name, serial in cfg.cameras.items():
-        spec: dict[str, Any] = {"serial": serial, "resolution": resolution, "fps": 60}
+        spec: dict[str, Any] = {
+            "serial": serial,
+            "resolution": resolution,
+            # Keep capture at the broadly-supported hardware rate. The encoded
+            # WebRTC branch is independently capped at 30 fps; stereo HD1200
+            # cameras may reject a native 30 fps capture mode.
+            "fps": 60,
+        }
         if int(serial) in stereo_set:
             spec["stereo"] = True
             spec["eyes"], spec["eye_suffix"] = _stream_eyes_for(cfg, name)
@@ -154,60 +209,55 @@ def _connect_zed_cameras(
 ) -> list[tuple[str, Any]]:
     """Open the local ZED cameras selected by ``cfg`` → ``(slot, camera)`` pairs.
 
-    Opens each camera through the ZED Python SDK (:class:`ZedCamera`, or
-    :class:`ZedStereoCamera` for any camera whose serial is a stereo ZED X).
-    Used for the in-process fallback when the relay subprocess can't run; the
-    frames are encoded + sent by an in-process aiortc :class:`WebRTCManager`.
-    Slots whose camera is absent are skipped (best-effort preview). Returns an
-    empty list when no cameras are configured or no backend is available. Runs
+    Opens each camera through the ZED Python SDK
+    (:class:`~almond_axol.video.zed_sdk.ZedSdkCamera`, or
+    :class:`~almond_axol.video.zed_sdk.ZedSdkStereoCamera` for any camera whose
+    serial is a stereo ZED X) — no ``lerobot`` involved. Used for the
+    in-process fallback when the relay subprocess can't run; the frames are
+    encoded + sent by an in-process aiortc :class:`WebRTCManager`. Slots whose
+    camera is absent are skipped (best-effort preview). Returns an empty list
+    when no cameras are configured or no backend is available. Runs
     synchronously (blocks on camera startup), so call it off the event loop.
     """
     if not cfg.cameras:
         return []
 
-    # Resolution validation happens against the SDK's name table when the
-    # SDK is importable; the gst path validates names itself.
-    sdk_exc: Exception | None = None
-    try:
-        from ..lerobot.camera.camera_zed import ZedCamera, ZedStereoCamera
-        from ..lerobot.camera.configuration_zed import (
-            ZED_RESOLUTION_DIMS,
-            ZedCameraConfig,
-        )
-    except Exception as exc:  # noqa: BLE001 - missing pyzed/SDK → gst only
-        sdk_exc = exc
+    from ..video import zed_sdk
+
+    # pyzed ships with the ZED SDK (``axol zed.install``), never from PyPI.
+    sdk_exc = zed_sdk.sdk_import_error()
 
     # Capture at the requested resolution; without one, width/height of None
     # adopt each camera's SDK default (HD1200 on GMSL) on connect.
     width: int | None = None
     height: int | None = None
-    if cfg.resolution and sdk_exc is None:
-        dims = ZED_RESOLUTION_DIMS.get(cfg.resolution)
+    if cfg.resolution:
+        dims = zed_sdk.ZED_RESOLUTION_DIMS.get(cfg.resolution)
         if dims is None:
             _logger.warning(
                 "unknown ZED resolution %r (expected one of %s); "
                 "using the camera default",
                 cfg.resolution,
-                ", ".join(ZED_RESOLUTION_DIMS),
+                ", ".join(zed_sdk.ZED_RESOLUTION_DIMS),
             )
         else:
             width, height = dims
 
     def _connect(name: str, serial: int, **kwargs: Any) -> Any | None:
-        """Open one camera via the SDK, preferring 60 fps capture.
+        """Open one camera through the SDK at its full capture rate.
 
-        At the SDK's default the GMSL cameras capture HD1200 at 30 fps,
-        which adds up to a full 33 ms frame interval of staleness to the
-        headset feed; 60 fps halves that. Cameras that don't support 60 at
-        the requested resolution fall back to their default rate.
+        The WebRTC adapter independently caps delivery at 30 fps, so recording
+        and policy capture rates do not become streaming settings.
         """
         if sdk_exc is not None:
             _logger.warning("teleop: %s camera unavailable (%s)", name, sdk_exc)
             return None
-        cls = ZedStereoCamera if kwargs.get("stereo") else ZedCamera
+        cls = (
+            zed_sdk.ZedSdkStereoCamera if kwargs.get("stereo") else zed_sdk.ZedSdkCamera
+        )
         for fps in (60, None):
             cam = cls(
-                ZedCameraConfig(
+                zed_sdk.ZedSdkCameraConfig(
                     serial=serial, fps=fps, width=width, height=height, **kwargs
                 )
             )
@@ -215,7 +265,7 @@ def _connect_zed_cameras(
                 cam.connect(warmup=False)
                 return cam
             except RuntimeError as exc:
-                # Live-parameter mismatch (e.g. 60 fps unsupported) → retry
+                # Live-parameter mismatch (unsupported fps/resolution) → retry
                 # at the camera default.
                 _logger.info("teleop: %s camera rejected %s fps (%s)", name, fps, exc)
             except Exception as exc:  # noqa: BLE001 - camera absent → skip it
@@ -244,16 +294,21 @@ def _connect_zed_cameras(
             continue
         cameras.append((name, cam))
     if not cameras and sdk_exc is not None:
-        _logger.warning("ZED camera preview unavailable: %s", sdk_exc)
+        _logger.error(
+            "ZED camera preview unavailable: neither the gst pipeline nor the ZED "
+            "SDK fallback could open a camera (%s). Run `axol zed.install` (and "
+            "`axol gst.install`) on the robot.",
+            sdk_exc,
+        )
     return cameras
 
 
 def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> None:
     """Register connected ZED cameras as WebRTC sources for the headset.
 
-    The bare ``ZedCamera`` / stereo eyes are registered directly; the in-process
-    aiortc relay adapts each one to a frame-driven source (NVENC encode + aiortc
-    RTP send) — see :func:`almond_axol.video.video._track_for_source`.
+    The bare ``ZedSdkCamera`` / stereo eyes are registered directly; the in-process
+    aiortc relay samples each one on the fixed 30 fps headset clock (NVENC encode
+    + aiortc RTP send) — see :func:`almond_axol.video.video._track_for_source`.
     """
     if not cameras:
         return
@@ -266,8 +321,8 @@ def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> N
         _logger.warning("failed to enable camera video: %s", exc)
 
 
-def _wire_cart_imu(cfg: TeleopCmdConfig, cart: Any) -> Any | None:
-    """Feed the cart's heading hold from the board BMI088 (``--cart.imu``).
+def _wire_jelly_imu(cfg: TeleopCmdConfig, jelly: Any) -> Any | None:
+    """Feed Jelly's heading hold from the board BMI088 (``--jelly.imu``).
 
     The yaw reference is the carrier board's own IMU rather than a camera, so
     nothing here touches the video path — the overhead ZED keeps the relay's
@@ -275,49 +330,49 @@ def _wire_cart_imu(cfg: TeleopCmdConfig, cart: Any) -> Any | None:
 
     Returns a :class:`~almond_axol.robot.gyro.BoardYawRateSource` the caller
     must close on exit, or ``None``. Best-effort: any failure logs and leaves
-    the cart without a heading hold (which is inert when no yaw rates arrive,
-    and says so once the cart starts driving).
+    Jelly without a heading hold (which is inert when no yaw rates arrive,
+    and says so once Jelly starts driving).
     """
-    if cart is None or not cfg.cart.imu:
+    if jelly is None or not cfg.jelly.imu:
         return None
     try:
         from ..robot.gyro import BoardYawRateSource
 
-        src = BoardYawRateSource(cart.feed_yaw_rate)
+        src = BoardYawRateSource(jelly.feed_yaw_rate)
         src.open()
         return src
     except Exception as exc:  # noqa: BLE001 - heading hold is best-effort
         _logger.warning(
-            "cart.imu: could not start the board gyro (%s); heading hold disabled",
+            "Jelly IMU: could not start the board gyro (%s); heading hold disabled",
             exc,
         )
         return None
 
 
-async def _run_cart_only(cfg: TeleopCmdConfig) -> None:
-    """Drive only the powered cart from the headset — the arms stay cold.
+async def _run_jelly_only(cfg: TeleopCmdConfig) -> None:
+    """Drive only Jelly from the headset — the arms stay cold.
 
     No Axol construction, no IK, no arm CAN: just the VR server for the
-    thumbstick stream and the :class:`~almond_axol.robot.cart.Cart`. The
-    cart's own control mapping applies unchanged (stick deadman, reset stop,
-    staleness timeout — see ``Cart.apply_vr_frame``). Having a cart is
-    implied, so ``--cart.enabled`` is not consulted; the rest of the
-    ``cart.*`` parameters (channel, speeds, imu, ...) apply as usual.
+    thumbstick stream and the :class:`~almond_axol.robot.jelly.Jelly`. The
+    Jelly's control mapping applies unchanged (stick deadman, reset stop,
+    staleness timeout — see ``Jelly.apply_vr_frame``). Having Jelly is
+    implied, so ``--jelly.enabled`` is not consulted; the rest of the
+    ``jelly.*`` parameters (channel, speeds, imu, ...) apply as usual.
     """
-    from ..robot.cart import Cart
+    from ..robot.jelly import Jelly
     from ..vr import VRServer
 
-    cart = Cart(cfg.cart)
+    jelly = Jelly(cfg.jelly)
     server = VRServer(cfg.vr_server)
     server.set_mode("teleop")
     # apply_vr_frame is thread-safe and stops on frame.reset itself; with no
     # arms there is no reset trajectory to wait out (resetting stays False).
-    server.set_on_frame(cart.apply_vr_frame)
+    server.set_on_frame(jelly.apply_vr_frame)
 
-    await cart.enable()
-    imu_src = _wire_cart_imu(cfg, cart)
+    await jelly.enable()
+    imu_src = _wire_jelly_imu(cfg, jelly)
     _logger.info(
-        "cart-only teleop: thumbsticks drive the cart (deadman — release "
+        "Jelly-only teleop: thumbsticks drive Jelly (deadman — release "
         "to stop); the arms are untouched"
     )
     try:
@@ -326,44 +381,62 @@ async def _run_cart_only(cfg: TeleopCmdConfig) -> None:
     finally:
         if imu_src is not None:
             await asyncio.to_thread(imu_src.close)
-        await cart.disable()
+        await jelly.disable()
 
 
 async def _run(cfg: TeleopCmdConfig) -> None:
     from ..robot import Axol, Sim
     from ..teleop import VRTeleop
 
-    if cfg.cart_only:
+    if cfg.mantis:
+        # Grippers-only Mantis teleop: no VR server, tracker bridge, or
+        # cameras — the rig triggers drive the grippers over CAN until Stop.
+        # Tracked Mantis runs belong to data collection.
+        _prepare_mantis_teleop(cfg)
+        from ..teleop.mantis_grippers import run_grippers_only
+        from ..utils.can_channels import require_mantis_channels
+
+        left, right = require_mantis_channels(mantis_rig_channels(cfg))
+        print(f"Mantis grippers only (no tracking): left={left} right={right}")
+        await run_grippers_only(left, right)
+        return
+
+    if cfg.jelly_only:
         if cfg.sim:
             raise ValueError(
-                "cart-only teleop has no sim mode (there is no cart hardware "
-                "model in the visualizer) — drop --sim or --cart_only"
+                "Jelly-only teleop has no sim mode (there is no Jelly hardware "
+                "model in the visualizer) — drop --sim or --jelly_only"
             )
-        await _run_cart_only(cfg)
+        await _run_jelly_only(cfg)
         return
 
     if cfg.sim:
         robot = Sim()
     else:
+        # The Rust realtime core is the sole hardware control backend. Python
+        # owns VR/IK/model math and streams targets; Rust owns both CAN buses.
         robot = Axol(
             config=cfg.axol,
             left_channel=cfg.left_channel,
             right_channel=cfg.right_channel,
+            max_vel=cfg.teleop.teleop_max_vel,
+            max_accel=cfg.teleop.teleop_max_accel,
+            record=cfg.teleop.record,
         )
-    # Powered-cart robots (--cart.enabled true) get the base + lift driven by
-    # the headset thumbsticks; VRTeleop owns the cart's lifecycle. Skipped in
-    # sim — there's no cart hardware model in the visualizer.
-    cart = None
-    if cfg.cart.enabled and not cfg.sim:
-        from ..robot.cart import Cart
+    # Jelly robots (--jelly.enabled true) get the base + lift driven by
+    # the headset thumbsticks; VRTeleop owns Jelly's lifecycle. Skipped in
+    # sim — there is no Jelly hardware model in the visualizer.
+    jelly = None
+    if cfg.jelly.enabled and not cfg.sim:
+        from ..robot.jelly import Jelly
 
-        cart = Cart(cfg.cart)
+        jelly = Jelly(cfg.jelly)
     teleop = VRTeleop(
         robot,
         config=cfg.teleop,
         kinematics_config=cfg.kinematics,
         vr_server_config=cfg.vr_server,
-        cart=cart,
+        jelly=jelly,
     )
     if cfg.cameras:
         # The VR server accepts headsets long before the cameras finish
@@ -393,7 +466,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
                 # headsets parked on webrtc-pending with an honest
                 # unavailable instead of leaving them connecting forever.
                 teleop.set_video_sources(None)
-        imu_src = _wire_cart_imu(cfg, cart)
+        imu_src = _wire_jelly_imu(cfg, jelly)
         try:
             await teleop.run()
         finally:

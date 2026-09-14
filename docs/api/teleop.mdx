@@ -3,7 +3,7 @@ title: "almond_axol.teleop"
 description: "Connect a VR headset to the robot (or simulator) for teleoperation."
 ---
 
-Connects a VR headset to the robot (or simulator) for teleoperation. IK runs in a dedicated subprocess to keep JAX off the asyncio event loop. The pipeline is: VR frames → One Euro filtering → IK solve → EMA smoothing → trapezoidal velocity profiling → `motion_control()`.
+Connects a VR headset to the robot (or simulator) for teleoperation. IK runs in a dedicated subprocess to keep JAX off the asyncio event loop. The pipeline is: VR frames → lag-compensated low-pass filtering → IK solve → EMA smoothing → trapezoidal velocity profiling → `motion_control()`.
 
 ```python
 from almond_axol.teleop import VRTeleop, VRTeleopConfig
@@ -20,6 +20,19 @@ async def main():
 
 asyncio.run(main())
 ```
+
+```python
+VRTeleop(
+    robot: RobotBase,
+    *,
+    config: VRTeleopConfig | None = None,             # None → teleop.* shared settings
+    kinematics_config: KinematicsConfig | None = None, # None → kinematics.* shared settings
+    vr_server_config: VRServerConfig | None = None,    # None → vr_server.* shared settings
+    jelly: Jelly | None = None,
+)
+```
+
+Each config left `None` is built from the robot's shared settings file (`~/.almond/settings.json` — the one the [control panel](/guides/control-panel-settings) edits and `axol teleop` reads) over the built-in defaults, so an SDK session runs the same rest poses, multipliers, IK weights and VR port as the panel. Pass a config explicitly to override it; see [Shared settings](/api/robot#shared-settings).
 
 Use `step()` instead of `run()` to integrate teleoperation into your own control loop:
 
@@ -49,19 +62,26 @@ See the [`teleop`](/cli/teleop) CLI command for the equivalent command-line entr
 
 | Field | Default | Description |
 |---|---|---|
-| `frequency` | `120` Hz | Control loop rate used by `run()` and reset trajectory density |
+| `frequency` | `240` Hz | Control loop rate used by `run()` and reset trajectory density |
+| `ik_frequency` | `120` Hz | VR-frame ingest / IK dispatch cadence (decoupled from the faster control loop) |
 | `teleop_max_vel` | `1.0 rev/s` | Trapezoidal filter velocity cap during normal teleoperation |
 | `teleop_max_accel` | `3.5 rev/s²` | Trapezoidal filter acceleration cap |
 | `engage_max_vel` | `0.1 rev/s` | Starting velocity cap when teleop is first engaged after a reset; smoothsteps up to `teleop_max_vel` over `engage_duration` |
 | `engage_duration` | `1.0` s | Seconds over which the velocity cap ramps (smoothstep) from `engage_max_vel` up to `teleop_max_vel` after engaging |
 | `ik_alpha` | `0.3` | EMA blend factor on IK output; `1.0` disables smoothing |
-| `pose_min_cutoff` | `0.8` Hz | One Euro Filter tremor cutoff for raw VR poses |
-| `pose_beta` | `2.0` | One Euro Filter speed coefficient (raises cutoff during fast moves) |
+| `pose_cutoff` | `2.5` Hz | Pole of the lag-compensated low-pass on raw VR poses (tremor rejection before IK) |
+| `record` | `None` | File prefix for the teleop flight recorder; captures every pipeline stage to `<prefix>_{ik,cmd,meas,rt}.npz` for `axol diag.teleop-jitter`. The compact `rt` stage contains the Rust core's actual 240 Hz motor command, derivative/feedforward/damping terms, timing, and feedback. All stages retain the latest engage→disengage segment; Python stages write at disengage and the Rust stage finalizes when the core disarms. |
 | `position_multiplier` | `1.0` | Scale on hand **position** (not orientation): the EE target moves this many times as far as the hand. `>1` extends reach when the arm is longer than the operator's |
 | `rotation_multiplier` | `1.0` | Scale on hand **orientation** (not position): the EE target rotates this many times as far as the hand. `>1` rotates the arm further than the wrist |
 | `reset_speed` | `0.1 rev/s` | Average joint velocity of the worst-case joint during return-to-rest (peak is `1.5×` this) |
 | `reset_min_duration` | `1.5` s | Floor on return-to-rest duration so near-rest starts don't snap home |
 | `rest_pose_left` / `rest_pose_right` | near-zero | Reset target for each arm, shape `(7,)` in `ARM_JOINTS` order |
+| `absolute_mode` | `False` | Mantis mapping: fit one gravity-aligned world→robot-base transform at the deliberate two-control engage gesture, then map live poses 1:1 in that fixed frame |
+| `base_height` | `None` | Optional robot-base height in the pose producer's world; `None` derives it from the two held start poses |
+| `tcp_transform_left` / `tcp_transform_right` | `None` | Tracker→gripper TCP transform `[x, y, z, qx, qy, qz, qw]`. Explicit and file-loaded values must contain seven finite numbers, a translation no farther than 1 metre (values are metres, not millimetres), and a nonzero quaternion. Explicit values are useful for bring-up captures; production Mantis collection also requires each final value to match the active device/profile-keyed entry in `~/.almond/mantis/tcp_transform.json` (or a verified factory constant), so a stale value cannot survive a tracker-source swap |
+| `tracker_key` | `None` | Quest's exact `quest:<WebXR-profile>:grip` transform identity. Lighthouse and Ultimate ignore this singular field and resolve their distinct left/right `survive:<id>` / `ultimate:<mac>` bindings from tracker config. Saved Ultimate entries also carry the quaternion-order/up-axis pose convention and become non-authoritative if it changes |
+| `quest_controller_profile` / `quest_pose_space` | `None` | Expected live Quest controller datum, normally derived from `tracker_key`; a mismatch makes that side untracked and forces recovery instead of applying the wrong mount transform |
+| `urdf_viewer_world_aligned` | `None` | Spatial-overlay policy. Mantis setup resolves `None` to true for Quest and false for Lighthouse/Ultimate, whose world is unrelated to a view-only Quest. Set true for an external source only after an out-of-band origin/yaw co-registration |
 
 <Note>
   **Engage behaviour.** From rest, both grip buttons together engage both arms. Once engaged, each grip acts **per arm** — a click toggles that arm between tracking and frozen (a frozen arm holds its pose and grasp while the other keeps tracking). Set `hold_to_engage` for a dead-man scheme instead: hold both grips to start, release one to freeze that arm, hold on to keep it going. A rising edge on the reset button triggers a collision-aware trajectory back to the rest pose.

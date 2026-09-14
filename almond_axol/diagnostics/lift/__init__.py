@@ -1,0 +1,1 @@
+"""Telescoping-lift diagnostics."""

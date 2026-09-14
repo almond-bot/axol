@@ -6,11 +6,12 @@ description: "Read and print a full status snapshot from one motor or every moto
 Reads and prints a full status snapshot from one motor (or all motors on the bus when `--id` is omitted): model and firmware version (MyActuator only), status/error code, control mode (Damiao only), position, velocity, torque, temperature, and voltage.
 
 <Note>
-  All motor commands accept a mutually exclusive `--l` / `--r` flag to select the left or right arm, and `--id` for the motor's CAN address (hex or decimal). `--channel` overrides the SocketCAN interface derived from the arm, for setups without the Axol hub CAN adapter (e.g. `--channel can0`). For `motor.info`, `--id` is optional — omit it to query **every** motor on the bus (IDs 1–8). `--type` can be `myactuator` or `damiao` and is inferred from the ID if omitted.
+  `--l` / `--r` selects a side. Add `--target mantis` to use that side's Mantis gripper bus instead of its Axol arm bus; `--channel` overrides either derived interface (for example, `can0`). For `motor.info`, omitting `--id` queries IDs 1–8 on Axol and only the Mantis gripper at ID 8. `--type` can be `myactuator` or `damiao` and is inferred from the ID if omitted.
 </Note>
 
 ```bash
 axol motor.info --l                   # scan all 8 motors on the left bus
 axol motor.info --l --id 0x01
 axol motor.info --r --id 6 --type damiao
+axol motor.info --target mantis --l   # left Mantis gripper (ID 8)
 ```

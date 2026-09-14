@@ -16,8 +16,12 @@ concurrency:
 jobs:
   python:
     name: Python
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # aarch64, like the Jetson hosts the package ships to. The test suite needs
+    # the `lerobot` extra (several modules import it at module level), and the
+    # x86_64 torch wheel drags in ~3.5 GB of CUDA libraries the tests never use;
+    # the aarch64 wheel from the same lock is a 150 MB CPU build.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -27,7 +31,7 @@ jobs:
       - name: Install Python 3.13 and locked dependencies
         run: |
           uv python install 3.13
-          uv sync --locked --extra sim --dev
+          uv sync --locked --extra sim --extra lerobot --dev
       - name: Lint and format check
         run: |
           uvx --from ruff==0.9.7 ruff check .

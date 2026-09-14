@@ -201,7 +201,9 @@ def test_successful_update_and_provision(monkeypatch) -> None:
         monkeypatch.setattr(update.os, "_exit", exits.append)
         await updater._run_update()
         assert commands[0][-1] == "almond-axol[lerobot,sim]==2.0.0"
-        assert commands[1] == ("/bin/axol", "provision")
+        # The post-reinstall provision is strict: the realtime core must be
+        # current before the service restarts onto the new code.
+        assert commands[1] == ("/bin/axol", "provision", "--require-rt")
         assert updater._phase == "restarting"
         assert updater._restart_pending
         assert exits == [0]
@@ -241,7 +243,7 @@ def test_provision_once_and_failure_paths(monkeypatch) -> None:
         updater = _updater(monkeypatch)
         tasks: list[object] = []
 
-        def capture(coro):
+        def capture(coro, **kwargs):
             tasks.append(coro)
             coro.close()
             return SimpleNamespace()
@@ -252,7 +254,7 @@ def test_provision_once_and_failure_paths(monkeypatch) -> None:
         assert len(tasks) == 1
 
         monkeypatch.setattr(update.shutil, "which", lambda name: None)
-        await updater._provision()
+        assert not await updater._provision()
 
         monkeypatch.setattr(update.shutil, "which", lambda name: "/bin/axol")
 
@@ -260,12 +262,26 @@ def test_provision_once_and_failure_paths(monkeypatch) -> None:
             return _AsyncProc(b"bad provision", returncode=1)
 
         monkeypatch.setattr(update.asyncio, "create_subprocess_exec", failed)
-        await updater._provision()
+        assert not await updater._provision()
 
         async def missing(*args, **kwargs):
             raise OSError("gone")
 
         monkeypatch.setattr(update.asyncio, "create_subprocess_exec", missing)
-        await updater._provision()
+        assert not await updater._provision()
+
+        commands: list[tuple[str, ...]] = []
+
+        async def ok(*args, **kwargs):
+            commands.append(args)
+            return _AsyncProc(b"done")
+
+        monkeypatch.setattr(update.asyncio, "create_subprocess_exec", ok)
+        assert await updater._provision()
+        assert await updater._provision(require_rt=True)
+        assert commands == [
+            ("/bin/axol", "provision"),
+            ("/bin/axol", "provision", "--require-rt"),
+        ]
 
     asyncio.run(exercise())

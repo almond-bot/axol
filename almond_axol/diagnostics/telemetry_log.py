@@ -1,37 +1,48 @@
 """Per-run telemetry capture for diagnostics scripts that own the CAN bus.
 
-While a diagnostic script runs, ``axol serve``'s own telemetry sampler is
-paused (single-owner CAN bus), so the diagnostics dashboard can't observe the
-run. Scripts fill that gap themselves: :class:`TelemetryCsvLogger` samples the
-robot's *cached* motor state (populated by the script's own command/telemetry
-traffic — no extra CAN frames) into a wide-format CSV, and announces the file
+While a diagnostic script runs, ``axol serve``'s live stream falls back to
+its passive bus observers (decoding the script's own traffic at the dashboard
+sample rate). A script can still contribute a richer capture than that tap:
+:class:`TelemetryCsvLogger` samples the robot's *cached* motor state
+(populated by the script's own command/telemetry traffic — no extra CAN
+frames) into a wide-format CSV at its own cadence, and announces the file
 with a ``[telemetry] csv=<path>`` log line that the serve-side run store picks
 up when the session ends (see :mod:`almond_axol.serve.telemetry`).
 
 CSV columns: ``t`` (epoch seconds) then ``<arm>:<JOINT>:pos`` and
 ``<arm>:<JOINT>:tq`` for every joint of every present arm. Positions are raw
 shaft radians (matching the live dashboard sampler); a cell is left empty for
-any motor with no cached reading yet, so a ``--joints`` subset run still
-captures the joints it actually drives. Velocity is not cached by the motor
-layer, so it is not captured here.
+any motor with no cached reading yet — or with no motor at all (gripperless
+SKU, partial bench arm) — so a ``--joints`` subset run still captures the
+joints it actually drives. Velocity is not cached by the motor layer, so it
+is not captured here.
+
+The Mantis rig (:class:`~almond_axol.robot.mantis.MantisHardware`) has one real motor
+per side — the gripper — behind the same ``left`` / ``right`` surface; its
+arms carry no ``motors`` table, so they are sampled through their public
+``positions`` / ``torques`` arrays (virtual arm joints echo their targets).
 """
 
 from __future__ import annotations
 
 import asyncio
 import csv
+import os
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 from ..constants import Joint
 from ..motor import MotorError
+from ..utils.paths import almond_path
+from ..utils.state_files import secure_open_new_text
 
 if TYPE_CHECKING:
-    from ..robot.axol import Axol, AxolArm
+    from ..robot.axol import AxolArm, AxolHardware
 
-CAPTURE_DIR = Path.home() / ".almond" / "diagnostics" / "captures"
+CAPTURE_DIR = almond_path("diagnostics", "captures")
 
 _DEFAULT_HZ = 5.0
 
@@ -41,7 +52,7 @@ class TelemetryCsvLogger:
 
     def __init__(
         self,
-        axol: Axol,
+        axol: AxolHardware | Any,
         name: str,
         hz: float = _DEFAULT_HZ,
         out_dir: Path = CAPTURE_DIR,
@@ -49,7 +60,7 @@ class TelemetryCsvLogger:
         self._axol = axol
         self._hz = hz
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._path = out_dir / f"{name}_{stamp}.csv"
+        self._path = out_dir / f"{name}_{stamp}_{uuid.uuid4().hex[:8]}.csv"
         self._task: asyncio.Task[None] | None = None
         self._file: TextIO | None = None
 
@@ -59,8 +70,7 @@ class TelemetryCsvLogger:
 
     def start(self) -> None:
         """Open the CSV, announce it in the log, and start sampling."""
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self._path.open("w", newline="")
+        self._file = secure_open_new_text(self._path, newline="")
         writer = csv.writer(self._file)
         header = ["t"]
         for side, arm in self._arms():
@@ -81,10 +91,12 @@ class TelemetryCsvLogger:
                 pass
             self._task = None
         if self._file is not None:
+            self._file.flush()
+            os.fsync(self._file.fileno())
             self._file.close()
             self._file = None
 
-    def _arms(self) -> list[tuple[str, AxolArm]]:
+    def _arms(self) -> list[tuple[str, AxolArm | Any]]:
         pairs = []
         if self._axol.left is not None:
             pairs.append(("left", self._axol.left))
@@ -103,8 +115,24 @@ class TelemetryCsvLogger:
             # AxolArm.positions/torques, which raise if *any* joint on the arm
             # is uncached — that would drop every row of a --joints subset run.
             for _side, arm in self._arms():
+                motors = getattr(arm, "motors", None)
+                if motors is None:
+                    # Mantis gripper arm: virtual joints plus one real
+                    # gripper, exposed only as whole-arm arrays.
+                    positions = arm.positions
+                    torques = arm.torques
+                    for i, _joint in enumerate(Joint):
+                        row.append(round(float(positions[i]), 5))
+                        row.append(round(float(torques[i]), 4))
+                    wrote_any = True
+                    continue
                 for joint in Joint:
-                    motor = arm.motors[joint]
+                    motor = motors.get(joint)
+                    if motor is None:
+                        # Absent motor (gripperless SKU, partial bench arm):
+                        # the column stays, its cells stay empty.
+                        row.extend(("", ""))
+                        continue
                     if motor.has_position:
                         row.append(round(float(motor.position), 5))
                         wrote_any = True

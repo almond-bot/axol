@@ -42,7 +42,6 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -52,6 +51,7 @@ from ..kinematics.config import KinematicsConfig
 from ..robot.base import RobotBase
 from ..robot.config import AxolConfig
 from ..teleop.config import VRTeleopConfig
+from ..utils.paths import almond_path
 from ..waypoints import Waypoint, WaypointSet
 from .config import LogLevel, normalize_bool_flags, parse
 from .gravity_comp import _resolve_free_joints
@@ -73,7 +73,7 @@ Leg = tuple[list[np.ndarray], Grip, Grip]
 
 
 def _default_file() -> str:
-    return str(Path.home() / ".almond" / "waypoints.json")
+    return str(almond_path("waypoints.json"))
 
 
 @dataclass
@@ -148,7 +148,6 @@ class WaypointsCmdConfig:
     """Arm joints to gravity-compensate while teaching; null frees all seven."""
     kd: float = 0.25
     rate_hz: float = 250.0
-    telemetry_hz: float = 500.0
     play_only: bool = False
     """Skip teaching and replay ``file`` straight away. Implied by ``sim``."""
     sim: bool = False
@@ -881,7 +880,11 @@ class _Session:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a teach-and-repeat session."""
-    cfg = parse(WaypointsCmdConfig, normalize_bool_flags(argv, "sim", "play_only"))
+    cfg = parse(
+        WaypointsCmdConfig,
+        normalize_bool_flags(argv, "sim", "play_only"),
+        settings_op="waypoints",
+    )
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
@@ -936,6 +939,7 @@ async def _session(
     else:
         from ..robot import Axol
 
+        # Rust is the sole hardware backend for both teaching and playback.
         robot = Axol(
             config=cfg.axol,
             left_channel=cfg.left_channel,
@@ -943,12 +947,6 @@ async def _session(
         )
 
     async with robot:
-        if not cfg.sim:
-            await robot.start_telemetry(cfg.telemetry_hz)
-            # Motors may still be rebooting from set_control_mode(); block
-            # until every one has answered a poll before driving them.
-            await robot.wait_for_telemetry()
-
         session = _Session(cfg, robot, control, stop_event)
         try:
             await session.run()

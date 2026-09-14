@@ -15,6 +15,8 @@ import * as THREE from "three"
 import {
   AxolConnectionStatus,
   type AxolMode,
+  type AxolPoseMode,
+  type AxolPoseSourceKind,
   AxolVRClient,
   AxolState,
   type ConfirmAction,
@@ -31,8 +33,10 @@ import interFontUrl from "@fontsource/inter/files/inter-latin-700-normal.woff"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
+import { RobotModel } from "@/components/robot-model"
 import { SiteNav } from "@/components/site-nav"
 import { authorizeCert } from "@/lib/cert-accept"
+import { hostCertAuthorizeVisible, usbCertOrigin } from "@/lib/usb-transport"
 import { cn } from "@/lib/utils"
 
 // Pin drei's <Text> (troika) to a locally-bundled font. By default troika
@@ -179,7 +183,7 @@ function AxesMarker({ groupRef }: { groupRef: React.RefObject<THREE.Group | null
   )
 }
 
-function PoseVisualizer() {
+function PoseVisualizer({ poseMode }: { poseMode: AxolPoseMode }) {
   const { gl } = useThree()
   const leftRef = useRef<THREE.Group>(null)
   const rightRef = useRef<THREE.Group>(null)
@@ -233,8 +237,19 @@ function PoseVisualizer() {
       (s: XRInputSource) => s.handedness === "right"
     )
 
-    applyPose(leftRef.current, leftSource?.targetRaySpace ?? null)
-    applyPose(rightRef.current, rightSource?.targetRaySpace ?? null)
+    // Match the spaces actually sent by AxolVRClient: legacy relative Axol
+    // uses target rays, while absolute/Mantis uses the calibrated grip datum
+    // (with target-ray fallback for runtimes that omit gripSpace).
+    const leftSpace =
+      poseMode === "absolute"
+        ? (leftSource?.gripSpace ?? leftSource?.targetRaySpace)
+        : leftSource?.targetRaySpace
+    const rightSpace =
+      poseMode === "absolute"
+        ? (rightSource?.gripSpace ?? rightSource?.targetRaySpace)
+        : rightSource?.targetRaySpace
+    applyPose(leftRef.current, leftSpace ?? null)
+    applyPose(rightRef.current, rightSpace ?? null)
 
     const body = (frame as XRFrame & { body?: XRBody }).body
     applyPosition(lElbowRef.current, body?.get(L_ELBOW_JOINT))
@@ -285,7 +300,7 @@ function PoseVisualizer() {
 //     and move your hands apart (bigger) or together (smaller).
 //   - Reset: press B (right controller) to re-anchor every screen to the
 //     current gaze and clear all moves + resizes. (The thumbstick clicks are
-//     reserved for the powered cart's lift.)
+//     reserved for the Jelly's lift.)
 //
 // The screens behave like TVs: they are world-anchored where the operator was
 // looking when the session started, so the head can move freely while the
@@ -516,7 +531,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
 
     // Pressing B on the right controller (buttons[5]) re-anchors the screens
     // to the current gaze and clears every move + resize. The thumbstick
-    // clicks (buttons[3]) are reserved for the powered cart's lift.
+    // clicks (buttons[3]) are reserved for the Jelly's lift.
     const reanchorPressed = right?.gamepad?.buttons?.[5]?.pressed ?? false
     if (reanchorPressed && !reanchorPrevRef.current) {
       anchoredRef.current = false
@@ -869,12 +884,18 @@ const STATUS_DISPLAY: Partial<Record<AxolState | "pending", { color: string; lab
 function StateDisplay({
   state,
   isRecordingPending,
+  viewOnly,
 }: {
   state: AxolState
   isRecordingPending: boolean
+  viewOnly: boolean
 }) {
   const displayState: AxolState | "pending" = isRecordingPending ? "pending" : state
-  const { color, label } = STATUS_DISPLAY[displayState] ?? { color: "white", label: "• Teleop" }
+  const { color, label: stateLabel } = STATUS_DISPLAY[displayState] ?? {
+    color: "white",
+    label: "• Teleop",
+  }
+  const label = viewOnly ? `${stateLabel} • Quest view only` : stateLabel
 
   return (
     <HudText
@@ -916,15 +937,27 @@ function EpisodeDisplay({ episode }: { episode: number | null }) {
   )
 }
 
-function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode | null }) {
+function HelpPanel({
+  onDismiss,
+  mode,
+  poseSourceKind,
+}: {
+  onDismiss: () => void
+  mode: AxolMode | null
+  poseSourceKind: AxolPoseSourceKind
+}) {
   const W = 0.44
   const H = 0.133
   const col = 0.11
+  const viewOnly = poseSourceKind === "tracker"
   // Recording only exists in data collection; teleop drops the [A] hint.
   const rightRows =
-    mode === "teleop"
+    mode === "teleop" || viewOnly
       ? "[Trigger]  Move Screen\n[2× Trigger]  Resize\n[B]  Reset Screens"
       : "[A]  Start / Stop Rec\n[Trigger]  Move Screen\n[2× Trigger]  Resize\n[B]  Reset Screens"
+  const leftRows = viewOnly
+    ? "[Y]  Exit VR\n[Tracker]  Robot Control"
+    : "[Y]  Exit VR\n[X]  Reset Pose"
 
   return (
     <group position={[0, -0.038, 0]}>
@@ -986,7 +1019,7 @@ function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode 
         material-depthTest={false}
         lineHeight={1.6}
       >
-        {`[Y]  Exit VR\n[X]  Reset Pose`}
+        {leftRows}
       </HudText>
       {/* Right buttons */}
       <HudText
@@ -1005,7 +1038,13 @@ function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode 
   )
 }
 
-function HelpIcon({ mode }: { mode: AxolMode | null }) {
+function HelpIcon({
+  mode,
+  poseSourceKind,
+}: {
+  mode: AxolMode | null
+  poseSourceKind: AxolPoseSourceKind
+}) {
   const [open, setOpen] = useState(false)
 
   return (
@@ -1023,7 +1062,9 @@ function HelpIcon({ mode }: { mode: AxolMode | null }) {
       >
         ?
       </HudText>
-      {open && <HelpPanel onDismiss={() => setOpen(false)} mode={mode} />}
+      {open && (
+        <HelpPanel onDismiss={() => setOpen(false)} mode={mode} poseSourceKind={poseSourceKind} />
+      )}
     </group>
   )
 }
@@ -1171,7 +1212,17 @@ function ConnectionStatus({ status }: { status: AxolConnectionStatus }) {
 }
 
 export default function App() {
-  const [hostname, setHostname] = useState(() => localStorage.getItem("wsHostname") ?? "")
+  // Zero-touch bootstrap (axol mantis.session): ?host= pre-fills the server and
+  // ?autoconnect=1 connects without a click — the headset browser is launched
+  // at this URL over adb, so the only remaining human steps are wearing the
+  // headset and the browser-mandated trigger pull to enter AR.
+  const bootParams = useMemo(
+    () => (typeof window === "undefined" ? null : new URLSearchParams(window.location.search)),
+    []
+  )
+  const [hostname, setHostname] = useState(
+    () => bootParams?.get("host") ?? localStorage.getItem("wsHostname") ?? ""
+  )
   const [usbPoses, setUsbPoses] = useState(() => localStorage.getItem("usbPoses") === "1")
   const [vrState, setVrState] = useState<AxolState>(AxolState.Teleop)
   const [recordingPendingAt, setRecordingPendingAt] = useState<number | null>(null)
@@ -1181,16 +1232,31 @@ export default function App() {
   // Operating mode the server locked us to (null until it announces one on
   // connect). Drives which HUD/hint controls are shown.
   const [vrMode, setVrMode] = useState<AxolMode | null>(null)
+  // Controller space is independent of the HUD mode. It defaults to the
+  // legacy-safe relative mapping until the host's replayable announcement.
+  const [poseMode, setPoseMode] = useState<AxolPoseMode>("relative")
+  const [poseSourceKind, setPoseSourceKind] = useState<AxolPoseSourceKind>(null)
   // Current 1-based episode number during data collection (null until the
   // server announces one; stays null in plain teleop).
   const [episode, setEpisode] = useState<number | null>(null)
+  const [xrError, setXrError] = useState<string | null>(null)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
+
+  // Fire the autoconnect once the client is idle with a host set.
+  const autoConnectedRef = useRef(false)
+  useEffect(() => {
+    if (!bootParams?.get("autoconnect")) return
+    if (autoConnectedRef.current || !hostname) return
+    if (status !== AxolConnectionStatus.Idle) return
+    autoConnectedRef.current = true
+    connect()
+  }, [bootParams, hostname, status, connect])
   // Controller poses can ride a wired USB `adb reverse` tunnel (localhost) to
-  // avoid WiFi latency; camera video keeps using the LAN host above. The pose
-  // socket comes up once the main connection is open and the operator opts in.
-  const { poseWsRef, status: poseStatus } = useAxolPoseSocket(
-    usbPoses && status === AxolConnectionStatus.Open
-  )
+  // avoid WiFi latency; camera video keeps using the LAN host above. The tunnel
+  // is independent of the WiFi connection, so the socket opens as soon as the
+  // operator opts in — that is what surfaces the certificate prompt before the
+  // first connect, instead of after poses have already fallen back to WiFi.
+  const { poseWsRef, status: poseStatus } = useAxolPoseSocket(usbPoses)
   // Low-latency WebRTC pose data channel — negotiated once the teleop
   // connection is up (independent of cameras / presenting). AxolVRClient prefers
   // it over the main WebSocket, which stays as the fallback.
@@ -1228,8 +1294,21 @@ export default function App() {
   }, [status, wsRef])
 
   const handleConnect = () => {
+    setXrError(null)
     localStorage.setItem("wsHostname", hostname)
     connect()
+  }
+
+  const handleEnterVr = async () => {
+    setXrError(null)
+    try {
+      await store.enterAR()
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      setXrError(
+        detail || "The browser refused to enter WebXR. Check headset permissions and try again."
+      )
+    }
   }
 
   const handleUsbToggle = (next: boolean) => {
@@ -1257,45 +1336,18 @@ export default function App() {
 
             {status === AxolConnectionStatus.Open ? (
               <div className="flex flex-col gap-2">
-                <Button size="lg" className="w-full" onClick={() => store.enterAR()}>
+                <Button size="lg" className="w-full" onClick={handleEnterVr}>
                   <Headset />
                   Enter VR
                 </Button>
+                {xrError && (
+                  <p className="rounded-md border border-red-400/20 bg-red-400/[0.06] p-2 text-xs leading-relaxed text-red-200/80">
+                    Could not enter VR: {xrError}
+                  </p>
+                )}
                 <Button variant="ghost" className="w-full" onClick={disconnect}>
                   Disconnect
                 </Button>
-                {usbPoses && (
-                  <div className="flex flex-col gap-2">
-                    <p className="text-center text-xs text-white/40">
-                      Quest over USB:{" "}
-                      <span
-                        className={cn(
-                          "font-medium",
-                          poseStatus === AxolConnectionStatus.Open
-                            ? "text-emerald-400"
-                            : "text-amber-400"
-                        )}
-                      >
-                        {poseStatus === AxolConnectionStatus.Open
-                          ? "controller over cable"
-                          : poseStatus === AxolConnectionStatus.Connecting
-                            ? "connecting USB link… (on WiFi)"
-                            : "WiFi fallback — USB link down"}
-                      </span>
-                    </p>
-                    {poseStatus !== AxolConnectionStatus.Open && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="w-full"
-                        onClick={() => authorizeCert(`https://localhost:${VR_WS_PORT}`)}
-                      >
-                        <ShieldCheck />
-                        Authorize USB certificate
-                      </Button>
-                    )}
-                  </div>
-                )}
               </div>
             ) : status === AxolConnectionStatus.Connecting ? (
               <Button variant="secondary" className="w-full" onClick={disconnect}>
@@ -1338,19 +1390,62 @@ export default function App() {
               </form>
             )}
 
+            {/* Shown in every connection state: the cable certificate is
+                approved here, and approving it before connecting is what keeps
+                the first session off the WiFi fallback. */}
+            {usbPoses && (
+              <div className="flex flex-col gap-2">
+                <p className="text-center text-xs text-white/40">
+                  Quest over USB:{" "}
+                  <span
+                    className={cn(
+                      "font-medium",
+                      poseStatus === AxolConnectionStatus.Open
+                        ? "text-emerald-400"
+                        : "text-amber-400"
+                    )}
+                  >
+                    {poseStatus === AxolConnectionStatus.Open
+                      ? "controller over cable"
+                      : poseStatus === AxolConnectionStatus.Connecting
+                        ? "connecting USB link… (on WiFi)"
+                        : "WiFi fallback — USB link down"}
+                  </span>
+                </p>
+                {poseStatus !== AxolConnectionStatus.Open && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="w-full"
+                    onClick={() => authorizeCert(usbCertOrigin(VR_WS_PORT))}
+                  >
+                    <ShieldCheck />
+                    Authorize USB certificate
+                  </Button>
+                )}
+              </div>
+            )}
+
             {status === AxolConnectionStatus.Open && (
               <div className="grid grid-cols-2 gap-3 text-left text-xs">
                 <ControlHints
                   title="Left"
-                  rows={[
-                    ["Y", "Exit VR"],
-                    ["X", "Reset pose"],
-                  ]}
+                  rows={
+                    poseSourceKind === "tracker"
+                      ? [
+                          ["Y", "Exit VR"],
+                          ["View only", "Tracker controls robot"],
+                        ]
+                      : [
+                          ["Y", "Exit VR"],
+                          ["X", "Reset pose"],
+                        ]
+                  }
                 />
                 <ControlHints
                   title="Right"
                   rows={[
-                    ...(vrMode === "teleop"
+                    ...(vrMode === "teleop" || poseSourceKind === "tracker"
                       ? []
                       : ([["A", "Start / stop rec"]] as [string, string][])),
                     ["Trigger", "Move screen"],
@@ -1365,10 +1460,12 @@ export default function App() {
               <div className="flex flex-col gap-2">
                 <p className="rounded-lg border border-red-400/25 bg-red-400/10 p-3 text-xs text-red-300">
                   Could not connect to <span className="font-mono">{hostname || "the server"}</span>
-                  . Check that <span className="font-mono">axol teleop</span> is running, then
-                  authorize its self-signed certificate below.
+                  . Check that <span className="font-mono">axol teleop</span> is running
+                  {hostCertAuthorizeVisible(hostname)
+                    ? ", then authorize its self-signed certificate below."
+                    : "."}
                 </p>
-                {hostname.trim() && (
+                {hostCertAuthorizeVisible(hostname) && (
                   <Button
                     variant="outline"
                     className="w-full"
@@ -1402,19 +1499,28 @@ export default function App() {
               onPendingRecording={setRecordingPendingAt}
               onPendingConfirm={setPendingConfirm}
               onMode={setVrMode}
+              onPoseMode={setPoseMode}
+              onPoseSourceKind={setPoseSourceKind}
               onEpisode={setEpisode}
               onExit={() => store.getState().session?.end()}
             />
             <ImmersiveCameraFeed wsRef={wsRef} />
             <XRHud>
               <ExitButton />
-              <HelpIcon mode={vrMode} />
-              <StateDisplay state={vrState} isRecordingPending={recordingPendingAt !== null} />
+              <HelpIcon mode={vrMode} poseSourceKind={poseSourceKind} />
+              <StateDisplay
+                state={vrState}
+                isRecordingPending={recordingPendingAt !== null}
+                viewOnly={poseSourceKind === "tracker"}
+              />
               <EpisodeDisplay episode={episode} />
               <CountdownDisplay recordingPendingAt={recordingPendingAt} />
               <ConfirmDisplay action={pendingConfirm} />
             </XRHud>
-            <PoseVisualizer />
+            <PoseVisualizer poseMode={poseMode} />
+            {/* Remount on host changes so any in-flight URDF/STL requests and
+                cached overlay resources are cancelled and disposed. */}
+            <RobotModel key={hostname} hostname={hostname} wsRef={wsRef} />
           </XR>
         </Suspense>
       </Canvas>

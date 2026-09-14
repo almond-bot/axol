@@ -1,19 +1,30 @@
 import { beforeEach, describe, expect, it } from "vitest"
 
 import {
+  HARDWARE_PROFILE_ARG,
   cameraCount,
   computeArgs,
-  configuredSerials,
+  curatedFields,
+  defaultString,
   filterSchema,
   flattenFields,
   isModified,
   isRobotFreeRun,
+  loadLocalHardwareProfile,
+  loadOpSettings,
   missingCameraSerials,
   missingRequired,
   operationsFromCommands,
+  parseHardwareProfile,
+  participatingCameraSerials,
+  perRunFields,
+  runFieldVisible,
+  saveLocalHardwareProfile,
+  saveOpSettings,
   serverHttpBase,
   type CameraSpec,
   type CommandSpec,
+  type OperationId,
   type SchemaField,
   type SchemaNode,
 } from "./supervisor"
@@ -58,10 +69,24 @@ describe("supervisor pure helpers", () => {
       record_resolution: "SVGA",
     }
     expect(cameraCount(cameras)).toBe(2)
-    expect(configuredSerials(cameras)).toEqual(["1", "2"])
+    expect(participatingCameraSerials(cameras)).toEqual(["1", "2"])
     expect(missingCameraSerials(cameras, [{ serial: 2, model: "one", kind: "mono" }])).toEqual([
       "1",
     ])
+    // Mantis reuses the Axol wrist serials unless it has its own.
+    expect(cameraCount(cameras, true)).toBe(1)
+    // A camera disabled on the stream branch still participates via recording.
+    expect(participatingCameraSerials({ ...cameras, stream: { left_arm: false } })).toEqual([
+      "1",
+      "2",
+    ])
+    expect(
+      participatingCameraSerials({
+        ...cameras,
+        stream: { left_arm: false },
+        record: { left_arm: false },
+      })
+    ).toEqual(["1"])
   })
 
   it("flattens and filters nested schemas", () => {
@@ -107,5 +132,65 @@ describe("supervisor pure helpers", () => {
     expect(isRobotFreeRun(meta, { simulate: true })).toBe(true)
     expect(isRobotFreeRun(meta, { cart_only: true })).toBe(true)
     expect(isRobotFreeRun(meta, {})).toBe(false)
+  })
+
+  it("persists the system-wide hardware profile locally", () => {
+    expect(parseHardwareProfile("axol")).toBe("axol")
+    expect(parseHardwareProfile("mantis")).toBe("mantis")
+    expect(parseHardwareProfile("other")).toBeNull()
+    expect(loadLocalHardwareProfile()).toBe("axol")
+    saveLocalHardwareProfile("mantis")
+    expect(loadLocalHardwareProfile()).toBe("mantis")
+  })
+
+  it("hides the device flag and Axol-only run modes per profile", () => {
+    expect(runFieldVisible(HARDWARE_PROFILE_ARG, "axol")).toBe(false)
+    expect(runFieldVisible("sim", "axol")).toBe(true)
+    expect(runFieldVisible("sim", "mantis")).toBe(false)
+    expect(runFieldVisible("jelly_only", "mantis")).toBe(false)
+    expect(runFieldVisible("repo_id", "mantis")).toBe(true)
+  })
+
+  it("resolves curated and per-run fields with required ones first", () => {
+    const mantisFlag: SchemaField = {
+      kind: "field",
+      key: HARDWARE_PROFILE_ARG,
+      label: "Mantis",
+      type: "boolean",
+      default: false,
+      required: false,
+    }
+    const command = {
+      id: "custom",
+      label: "Custom",
+      description: "Custom operation",
+      simCapable: true,
+      requiresHardware: false,
+      available: true,
+      error: null,
+      schema: [...schema, mantisFlag],
+      required: [],
+      cli: "custom",
+      category: "Operate",
+      isOperation: true,
+      simFlag: "sim",
+      robotFreeFlags: [],
+      perRunFields: ["sim", HARDWARE_PROFILE_ARG, "unknown"],
+    } satisfies CommandSpec
+    const [meta] = operationsFromCommands([command])
+    expect(curatedFields(command, meta)).toEqual([optional, mantisFlag])
+    expect(perRunFields(command, meta)).toEqual([required, optional])
+    expect(perRunFields(command, meta, "mantis")).toEqual([required])
+    expect(defaultString(required)).toBe("")
+    expect(defaultString(optional)).toBe("false")
+  })
+
+  it("round-trips per-operation settings and drops the stale device flag", () => {
+    const op = "teleop" as OperationId
+    expect(loadOpSettings(op)).toEqual({})
+    saveOpSettings(op, { sim: true, [HARDWARE_PROFILE_ARG]: true })
+    expect(loadOpSettings(op)).toEqual({ sim: true })
+    localStorage.setItem("axolOp:teleop", "{not json")
+    expect(loadOpSettings(op)).toEqual({})
   })
 })

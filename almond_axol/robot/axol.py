@@ -1,7 +1,15 @@
 """Hardware control classes for the Almond Axol dual-arm robot.
 
-Provides :class:`AxolArm` (single-arm CAN bus controller) and :class:`Axol`
-(dual-arm context manager that opens both buses and constructs all 16 motor drivers).
+Provides :class:`AxolArm` (single-arm CAN bus controller) and
+:class:`AxolHardware` (dual-arm context manager that opens both buses and
+constructs all 16 motor drivers).
+
+``AxolHardware`` is internal to the package: it sends CAN from Python on the
+caller's schedule, which is what calibration and diagnostics tooling needs
+on a quiet bus. The public robot object is :class:`almond_axol.robot.Axol`
+(``almond_axol.rt.robot``): it presents this same surface, owns an
+``AxolHardware`` underneath, and hands the buses to the Rust realtime core
+(``axol-rt``) while enabled.
 """
 
 from __future__ import annotations
@@ -11,11 +19,12 @@ import json
 import logging
 import math
 import time
-from pathlib import Path
+from collections.abc import Awaitable, Callable, Iterable
 
+import can
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..constants import ARM_JOINTS
 from ..motor import (
     CanBus,
     ControlMode,
@@ -25,9 +34,19 @@ from ..motor import (
     MotorGains,
     MotorStatus,
 )
-from .base import RobotBase
+from ..settings import SHARED
+from ..utils.paths import almond_path
+from ..utils.state_files import secure_atomic_write_json, secure_read_text
+from .base import RobotBase, mark_hardware_cleanup_uncertain
 from .config import AxolConfig
-from .control import Differentiator, compute_friction
+from .control import (
+    DAMP_BP_Q,
+    DAMP_BP_W0,
+    VEL_CUTOFF_FREQ,
+    BandPass,
+    Differentiator,
+    compute_friction,
+)
 from .gravity import GravityCompensator
 
 _logger = logging.getLogger(__name__)
@@ -55,7 +74,21 @@ GRIPPER_TRAVEL = math.radians(290)
 _GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm
 _GRIPPER_CALIB_STEP = 0.005  # rad per step
 _GRIPPER_CALIB_SETTLE = 0.001  # s per step
-_GRIPPER_CALIB_MAX_STEPS = math.ceil(GRIPPER_TRAVEL / _GRIPPER_CALIB_STEP)
+# Sweep headroom beyond the nominal travel. Torque only builds once the jaw
+# is against the open stop and the impedance target keeps moving past it, so
+# a gripper that starts at the closed stop needs budget *after* covering
+# GRIPPER_TRAVEL or the sweep ends with the jaws open but no stop detected.
+# Also absorbs unit-to-unit travel variation (~0.035 rad measured). Costs
+# ~60 ms in the no-stop failure case and nothing on success (the loop exits
+# at the torque threshold).
+_GRIPPER_CALIB_OVERTRAVEL = 0.3  # rad
+_GRIPPER_CALIB_MAX_STEPS = math.ceil(
+    (GRIPPER_TRAVEL + _GRIPPER_CALIB_OVERTRAVEL) / _GRIPPER_CALIB_STEP
+)
+# A sweep that moved at least this fraction of GRIPPER_TRAVEL without meeting
+# the torque threshold ran out of jaw, not out of budget: the fingers are not
+# coupled to the motor. Anything shorter stalled against something.
+_GRIPPER_CALIB_FULL_TRAVEL_FRACTION = 0.9
 
 # Impedance gains used only during gripper open-stop calibration.
 _GRIPPER_CALIB_KP = 50.0
@@ -65,13 +98,106 @@ _GRIPPER_CALIB_KD = 1.0
 # ``_calibrate_gripper()``. It is persisted here so a reconnecting
 # ``enable()`` can restore it without re-running the sweep (which physically
 # forces the jaw open, dropping anything a holding gripper grips).
-_GRIPPER_CALIB_PATH = Path.home() / ".almond" / "gripper_calibration.json"
+_GRIPPER_CALIB_PATH = almond_path("gripper_calibration.json")
 
 # Tolerance (rad) around the calibrated travel range when validating a
 # persisted calibration against the gripper's current position on restore.
 # A shaft position outside the range means the calibration no longer matches
 # the encoder (motor re-zeroed or power-cycled) and must not be trusted.
 _GRIPPER_CALIB_MARGIN = 0.35
+
+
+async def _await_all_hardware_actions(*actions: Awaitable[object]) -> None:
+    """Wait for every issued hardware action before surfacing a failure.
+
+    ``asyncio.gather`` normally raises as soon as one child fails while its
+    siblings keep running.  That is unsafe during bus/motor bring-up: cleanup
+    can otherwise close a transport underneath a still-running enable or mode
+    change.  Collect every result first, then raise the first failure.
+    """
+    results = await asyncio.gather(*actions, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+
+
+async def _arm_is_unpowered(arm: "AxolArm", bus: CanBus) -> bool:
+    """True when *arm*'s bus is stalled and no motor on it answers a status read.
+
+    Distinguishes the ways a torque-off can fail to confirm: motor power was
+    removed (the e-stop, so every read times out and the torque is gone
+    already), or a powered motor is refusing to disable (which no read can
+    excuse, and which must keep the caller's cleanup uncertain).
+
+    Both signals are required. Failed reads alone are not proof: a lost CAN
+    interface (the hub dropping off USB) or a proxy that died for any other
+    reason makes every read fail in exactly the same way while the motors stay
+    powered and holding torque. Only the bus can tell the two apart — it
+    declares a stall when nothing on the wire ACKs its frames, which needs
+    every node to be dark.
+    """
+    if not bus.stalled:
+        return False
+    results = await asyncio.gather(
+        *(motor.get_error_code() for motor in arm.motors.values()),
+        return_exceptions=True,
+    )
+    # A powered motor answers this read with its status. One that never
+    # replies raises MotorError; once the stalled proxy has exited, the bus
+    # itself refuses the send (CanOperationError). Either way nothing on the
+    # arm answered, so an all-failure sweep is a dead bus.
+    return bool(results) and all(
+        isinstance(result, (MotorError, can.CanOperationError)) for result in results
+    )
+
+
+async def _rollback_newly_enabled_motors(
+    motors: list[tuple[str, Motor]], setup_error: BaseException
+) -> list[tuple[str, Motor, BaseException]]:
+    """Disable every motor in one failed startup transaction.
+
+    Returns the motors that failed to confirm torque-off. The original startup
+    error is retained and marked as uncertain so ownership-aware callers do
+    not release or reacquire the hardware behind it.
+    """
+    cleanup_results = await asyncio.gather(
+        *(motor.disable() for _, motor in motors),
+        return_exceptions=True,
+    )
+    cleanup_failures = [
+        (label, motor, result)
+        for (label, motor), result in zip(motors, cleanup_results)
+        if isinstance(result, BaseException)
+    ]
+    if not cleanup_failures:
+        return []
+
+    first_label, _, first_failure = cleanup_failures[0]
+    setup_error.add_note(
+        f"Newly enabled motor {first_label} did not confirm torque-off "
+        "during startup rollback"
+    )
+    mark_hardware_cleanup_uncertain(setup_error, first_failure)
+    for label, _, failure in cleanup_failures[1:]:
+        setup_error.add_note(
+            "Additional startup rollback failure for newly enabled motor "
+            f"{label}: {type(failure).__name__}: {failure}"
+        )
+    return cleanup_failures
+
+
+def _validated_motion_target(q: np.ndarray, *, label: str) -> np.ndarray:
+    """Return one finite, exact-shape joint target before hardware is touched."""
+    try:
+        target = np.asarray(q, dtype=float)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} target must be numeric") from exc
+    expected = len(Joint)
+    if target.shape != (expected,):
+        raise ValueError(f"{label} target must have shape ({expected},)")
+    if not np.all(np.isfinite(target)):
+        raise ValueError(f"{label} target contains a non-finite position")
+    return target
 
 
 def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
@@ -84,7 +210,7 @@ def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
     side = "left" if is_left else "right"
     data: dict = {}
     try:
-        existing = json.loads(_GRIPPER_CALIB_PATH.read_text())
+        existing = json.loads(secure_read_text(_GRIPPER_CALIB_PATH))
         if isinstance(existing, dict):
             data = existing
     except (OSError, ValueError):
@@ -93,8 +219,7 @@ def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
         pass
     data[side] = {"open_pos": open_pos, "saved_at": time.time()}
     try:
-        _GRIPPER_CALIB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _GRIPPER_CALIB_PATH.write_text(json.dumps(data, indent=2))
+        secure_atomic_write_json(_GRIPPER_CALIB_PATH, data)
     except OSError as exc:
         _logger.warning(
             "Could not persist %s gripper calibration to %s: %s",
@@ -112,7 +237,7 @@ def _load_gripper_calibration(is_left: bool) -> float:
     """
     side = "left" if is_left else "right"
     try:
-        data = json.loads(_GRIPPER_CALIB_PATH.read_text())
+        data = json.loads(secure_read_text(_GRIPPER_CALIB_PATH))
         return float(data[side]["open_pos"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise MotorError(
@@ -121,6 +246,68 @@ def _load_gripper_calibration(is_left: bool) -> float:
             f"to without it; empty the gripper, then disable() and enable() "
             f"to calibrate"
         ) from exc
+
+
+async def calibrate_gripper_open_stop(motor: Motor) -> float:
+    """Find a gripper's open hard-stop and return its raw motor position (rad).
+
+    Steps the motor incrementally toward open until the torque magnitude
+    reaches ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop). The sweep
+    budget is the full expected travel plus ``_GRIPPER_CALIB_OVERTRAVEL`` so a
+    gripper starting at the closed stop still has room to press into the open
+    one. Exhausting that budget without observing the stop fails calibration
+    rather than treating an arbitrary final encoder reading as the open
+    position. Shared by :class:`AxolArm` and the Mantis
+    (:mod:`almond_axol.robot.mantis`), whose grippers are the same Damiao unit.
+
+    Must be called with the motor already enabled and in IMPEDANCE mode.
+
+    Raises:
+        MotorError: If the full calibration sweep completes without detecting
+            the open hard-stop torque threshold. The message distinguishes a
+            motor that covered the whole travel range unopposed (fingers not
+            coupled to the shaft) from one that stalled short of it
+            (obstruction or slipping coupling).
+    """
+    start = await motor.get_position()
+    target = start
+    stop_found = False
+    last_torque = 0.0
+    for _ in range(_GRIPPER_CALIB_MAX_STEPS):
+        target -= _GRIPPER_CALIB_STEP
+        await motor.set_impedance(
+            target, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
+        )
+        await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
+        last_torque = await motor.get_torque()
+        if abs(last_torque) >= _GRIPPER_TORQUE_THRESHOLD:
+            stop_found = True
+            break
+    final = await motor.get_position()
+    if not stop_found:
+        commanded_travel = _GRIPPER_CALIB_MAX_STEPS * _GRIPPER_CALIB_STEP
+        travelled = start - final
+        if travelled >= _GRIPPER_CALIB_FULL_TRAVEL_FRACTION * GRIPPER_TRAVEL:
+            hint = (
+                "The motor moved through the whole open/close range without "
+                "meeting resistance — check that the fingers are fitted and "
+                "coupled to the motor shaft"
+            )
+        else:
+            hint = (
+                "The motor stopped short of the full range without reaching "
+                "the torque threshold — check for an obstruction between the "
+                "jaws or a slipping coupling"
+            )
+        raise MotorError(
+            "Gripper open-stop calibration failed: no hard stop was detected "
+            f"during the {commanded_travel:.3f} rad sweep (motor moved "
+            f"{travelled:.3f} rad of the {GRIPPER_TRAVEL:.3f} rad range; last "
+            f"torque {last_torque:.3f} Nm, required "
+            f"{_GRIPPER_TORQUE_THRESHOLD:.3f} Nm). {hint}; the gripper remains "
+            "uncalibrated"
+        )
+    return final
 
 
 def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
@@ -338,6 +525,12 @@ class AxolArm:
     On the gripperless SKU (``AxolConfig.has_gripper = False``) no gripper
     motor is constructed: gripper commands (the last element of every
     ``(8,)`` array) are ignored and gripper reads report ``0.0``.
+
+    ``joints`` restricts the arm to a subset of its motors for a bench setup
+    that has only some of them on the bus (a wrist assembly under a ROM
+    test, say). Absent joints are treated like the absent gripper: never
+    constructed or brought up, their commands ignored, their reads ``0.0``
+    (the rest pose). Every public array keeps its ``(8,)`` Joint-enum shape.
     """
 
     def __init__(
@@ -346,37 +539,168 @@ class AxolArm:
         config: AxolConfig,
         gravity_comp: GravityCompensator,
         is_left: bool = True,
+        joints: Iterable[Joint] | None = None,
     ) -> None:
         """Construct an AxolArm.
 
         Args:
             bus:          Shared CAN bus for this arm (one per physical interface).
             config:       Full dual-arm gains config; the correct side is selected via ``is_left``.
-            gravity_comp: Shared MuJoCo-based gravity compensator (one per Axol).
+            gravity_comp: Shared MuJoCo-based gravity compensator (one per AxolHardware).
             is_left:      ``True`` for the left arm, ``False`` for the right.
+            joints:       The joints whose motors are on the bus; ``None``
+                          (the default) is the full arm. The gripper is only
+                          ever constructed when ``config.has_gripper`` is set.
         """
         self._config = config
         self._arm_config = config.left if is_left else config.right
         self._gravity_comp = gravity_comp
         self._is_left = is_left
-        self._has_gripper = config.has_gripper
-        # Gripperless SKU: the gripper motor is simply never constructed, so
-        # every loop over ``self.motors`` skips it automatically.
+        present = set(Joint) if joints is None else set(joints)
+        if not present:
+            raise ValueError("an arm needs at least one joint")
+        if not config.has_gripper:
+            present.discard(Joint.GRIPPER)
+        self._has_gripper = Joint.GRIPPER in present
+        # Gripperless SKU / partial bench arm: an absent motor is simply never
+        # constructed, so every loop over ``self.motors`` skips it
+        # automatically.
         self.motors: dict[Joint, Motor] = {
-            joint: Motor(bus, joint)
-            for joint in Joint
-            if config.has_gripper or joint != Joint.GRIPPER
+            joint: Motor(bus, joint) for joint in Joint if joint in present
         }
+        # The impedance-command encodings clamp kd to the firmware range
+        # silently, and there is no host-side fallback for the excess — an
+        # oversized kd is a config/calibration error, so shout once here
+        # rather than ship less damping than the tuner thinks they have.
+        for joint, motor in self.motors.items():
+            if joint == Joint.GRIPPER:
+                continue
+            jc = getattr(self._arm_config, joint.value)
+            if jc.kd > motor.kd_max:
+                _logger.warning(
+                    "%s %s: configured kd=%.2f exceeds the firmware max %.1f "
+                    "and will be clamped — lower kd, or add damping via "
+                    "kd_host where it is phase-safe",
+                    "left" if is_left else "right",
+                    joint.value,
+                    jc.kd,
+                    motor.kd_max,
+                )
         # q_des → v_des → a_des (commanded), and q_meas → v_meas. v_des feeds
         # the impedance-control velocity FF and the friction model; a_des
-        # feeds inertia FF (``j_eff``); v_meas feeds software damping
-        # (``kd_soft``) — all in :class:`JointConfig`.
-        self._vel_diff = Differentiator(n=len(list(Joint)))
-        self._accel_diff = Differentiator(n=len(list(Joint)))
-        self._meas_vel_diff = Differentiator(n=len(list(Joint)))
+        # feeds inertia FF (``j_eff``); v_meas feeds host-side damping
+        # (``kd_host``, needed on the shoulders where firmware kd can't damp
+        # the low-frequency resonance) — all in :class:`JointConfig`.
+        #
+        # v_meas differentiates the positions cached from impedance feedback
+        # frames against the frames' own CAN receive timestamps (see
+        # ``Differentiator.differentiate``): wall-clock differentiation turns
+        # scheduling jitter into velocity noise proportional to joint speed,
+        # which kd_host amplifies into torque chatter (measured ±1.3 Nm at
+        # 1 rad/s with kd_host=40). The motor-*reported* velocity is not
+        # used: MyActuator's firmware estimate lags too much to damp the
+        # shoulders' ~2.3 Hz resonance — feeding it to kd_host measured
+        # violently unstable (the same lag is why firmware kd underdelivers).
+        #
+        # Motor-facing paths (v_des impedance target, friction FF, a_des →
+        # j_eff FF) keep the slow pole. The host damping term instead gets
+        # its own chain — fast differentiators on both commanded and measured
+        # positions feeding a band-pass centred on each joint's own
+        # structural mode (``kd_host_hz``: ~3 Hz shoulders, 9.5 Hz elbow) —
+        # so kd_host arrives in phase at the mode it must damp without
+        # passing the delayed, anti-phase gain that excites 25-35 Hz
+        # structural modes (see the BandPass docstring in .control for the
+        # measured trade).
+        n_j = len(list(Joint))
+        self._vel_diff = Differentiator(n=n_j)
+        self._accel_diff = Differentiator(n=n_j)
+        self._vel_fast_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
+        self._meas_vel_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
+        # Host-damping band-pass centres: joints with an explicit kd_host_hz
+        # (structural modes — the elbow) keep it fixed; joints with None get
+        # pose-tracked centres each cycle (see motion_control: the shoulders'
+        # impedance mode ωn = √(kp/J(q)) moves 2.2 → 5.4 Hz between rest and
+        # raised-to-the-side, and a fixed rest centre delivered only ~14% of
+        # the damping in the 4.3-8.6 Hz teleop burst band). Config carries
+        # Hz (the operator-facing unit); the control math wants rad/s, so
+        # convert exactly once here.
+        self._damp_w0 = [
+            2 * math.pi * getattr(self._arm_config, j.value).kd_host_hz
+            if j != Joint.GRIPPER
+            and getattr(self._arm_config, j.value).kd_host_hz is not None
+            else DAMP_BP_W0
+            for j in Joint
+        ]
+        self._damp_w0_tracked = [
+            j != Joint.GRIPPER and getattr(self._arm_config, j.value).kd_host_hz is None
+            for j in Joint
+        ]
+        # Per-joint band-pass Q: the 0.8 default suits pose-tracked centres
+        # (an estimate deserves a wide net); a joint pinned on a measured
+        # ring can run narrower (higher q) so the damping stops reaching
+        # into the <1.5 Hz intentional-motion band and dragging the final
+        # approach.
+        self._damp_q = [
+            getattr(self._arm_config, j.value).kd_host_q
+            if j != Joint.GRIPPER
+            and getattr(self._arm_config, j.value).kd_host_q is not None
+            else DAMP_BP_Q
+            for j in Joint
+        ]
+        self._damp_bp = BandPass(n=n_j, w0=self._damp_w0, q=self._damp_q)
         self._last_q_commanded: np.ndarray | None = None
         self._gc_hold_q: np.ndarray | None = None
         self._gc_hold_free: frozenset[Joint] | None = None
+
+        # Reference reflected inertia normalizing the per-cycle kd_host
+        # schedule in motion_control(): per joint, the *maximum* over a
+        # coarse grid of arm shapes (shoulder/elbow combinations). Host
+        # damping is fully applied only near a joint's max-inertia pose,
+        # where its mode is slowest and the ~100 Hz host loop is safest,
+        # and tapers as J(q) drops and the mode speeds up. For every joint
+        # except shoulder_3 the max is at (or equal to) the rest pose, so
+        # this matches the previous rest-pose anchor exactly; shoulder_3 is
+        # inverted — at rest the forearm lies along its axis (J ≈ 3% of
+        # max, fast mode, host damping unstable) and the arm extended with
+        # the elbow bent is its max — so its schedule must anchor there.
+        j_link_rest = gravity_comp.gravity_and_inertia_arm(
+            np.zeros(len(ARM_JOINTS), dtype=np.float32), is_left=is_left
+        )[1].astype(np.float64)
+        self._inertia_ref = j_link_rest.copy()
+        for s1 in (0.0, 1.57, -1.57):
+            for s2 in (0.0, -1.57):
+                for s3 in (0.0, 1.57, -1.57):
+                    for el in (0.0, 1.2, -1.2):
+                        q = np.array([s1, s2, s3, el, 0.0, 0.0, 0.0], dtype=np.float32)
+                        ine = gravity_comp.gravity_and_inertia_arm(q, is_left=is_left)[
+                            1
+                        ].astype(np.float64)
+                        np.maximum(self._inertia_ref, ine, out=self._inertia_ref)
+
+        # Inertia-FF pose schedule. The tuned ``j_eff`` (fit at the rest
+        # pose) is the sum of two physically different terms: the reflected
+        # rotor inertia (motor rotor × gear², pose-independent — dominant on
+        # shoulder_3 and the elbow, whose tuned values exceed their link
+        # inertia severalfold) and the link-chain inertia J_link(q), which
+        # varies strongly with arm shape (shoulder_1: 1.06 kg·m² at rest →
+        # 0.81 elbow bent → ~0.02 raised to the side). Feeding a constant
+        # j_eff over-torques every acceleration transient away from the rest
+        # pose — measured as whole-arm jitter when shoulder_1 launches or
+        # stops with the arm reaching in front — so motion_control() scales
+        # the FF by (J_rotor + J_link(q)) / (J_rotor + J_link(0)): exactly
+        # the tuned value at the rest pose, tracking the true inertia
+        # elsewhere. The rotor term is anchored to the construction-time
+        # (calibrated, pre-blend) j_eff; runtime stiffness blending still
+        # applies multiplicatively through ``gains.j_eff``.
+        j_eff_cfg = np.array(
+            [getattr(self._arm_config, j.value).j_eff for j in ARM_JOINTS],
+            dtype=np.float64,
+        )
+        self._j_rotor = np.maximum(j_eff_cfg - j_link_rest, 0.0)
+        denom = self._j_rotor + j_link_rest
+        # Joints with no tuned j_eff and negligible link inertia (wrists):
+        # the scale multiplies j_eff = 0 anyway, so just avoid dividing by ~0.
+        self._j_ff_denom = np.where(denom > 1e-9, denom, 1.0)
 
         # Clipping arrays.  Arm joints are in joint frame (0 = rest position,
         # matching the URDF and ``arm_limits``); gripper entries are in raw
@@ -412,10 +736,12 @@ class AxolArm:
         # fixed_stop_wrap_correction), applied during zero verification.
         # The gripper offset is 0 because the gripper uses its own [0, 1]
         # normalisation and is calibrated against torque, not an end stop.
+        # An absent joint has no motor frame to offset: it reads and is
+        # commanded at 0.0 (the rest pose) in both frames.
         self._joint_offsets = np.array(
             [
                 0.0
-                if j == Joint.GRIPPER
+                if j == Joint.GRIPPER or j not in present
                 else math.nan
                 if j in EITHER_STOP_JOINTS
                 else closer_end_stop(j, is_left)[0]
@@ -423,25 +749,49 @@ class AxolArm:
             ],
             dtype=float,
         )
-        self._unresolved_offsets: set[Joint] = set(EITHER_STOP_JOINTS)
+        self._unresolved_offsets: set[Joint] = set(EITHER_STOP_JOINTS) & present
         # Fixed-stop joints whose encoder zero has not been sanity-checked
         # yet.  resolve_joint_offsets() verifies each one's reading is
         # plausible for a zero at its calibration stop (an unset zero would
         # make every joint-frame value garbage), folds any ±360° single-turn
         # boot wrap into the joint's offset, and removes it from the set.
-        self._unverified_zeros: set[Joint] = set(ARM_JOINTS) - EITHER_STOP_JOINTS
+        self._unverified_zeros: set[Joint] = self._fixed_stop_joints()
         self._offset_lock = asyncio.Lock()
+        # Realtime-core hook: production motion_control and
+        # gravity_compensate hand their per-joint 9-float tuples
+        # (p_des motor-frame, mode, kp, kd, gravity t_ff, the pose-scheduled
+        # damping coefficients kd_host/w0/q, and the pose-scaled j_eff) to
+        # this callable instead of sending on the CAN bus — the Rust core
+        # owns the wire and computes the velocity/friction/inertia/damping
+        # terms itself each tick from its own tracker and feedback states.
+        self._command_sink: (
+            Callable[
+                [list[tuple[float, ...]]],
+                None,
+            ]
+            | None
+        ) = None
 
-    def _pad_gripper(self, values: list) -> list:
-        """Insert a ``0.0`` placeholder in the gripper slot when absent.
+    @property
+    def present_joints(self) -> frozenset[Joint]:
+        """The joints with a motor on this arm's bus (see ``joints`` in ``__init__``)."""
+        return frozenset(self.motors)
+
+    def _fixed_stop_joints(self) -> set[Joint]:
+        """Present arm joints whose zero is verified against a fixed end stop."""
+        return (set(ARM_JOINTS) - EITHER_STOP_JOINTS) & set(self.motors)
+
+    def _pad_absent(self, values: list) -> list:
+        """Insert a ``0.0`` placeholder for every absent motor.
 
         Per-motor reads iterate ``self.motors`` (7 entries on the gripperless
-        SKU); this restores the public ``(8,)`` Joint-enum-order shape.
+        SKU, fewer on a partial bench arm); this restores the public ``(8,)``
+        Joint-enum-order shape.
         """
-        if not self._has_gripper:
-            values = list(values)
-            values.insert(self._gripper_i, 0.0)
-        return values
+        if len(self.motors) == len(list(Joint)):
+            return values
+        values = iter(values)
+        return [next(values) if j in self.motors else 0.0 for j in Joint]
 
     # ------------------------------------------------------------------ #
     # Joint-offset resolution                                              #
@@ -620,13 +970,15 @@ class AxolArm:
         # while telemetry runs, and the ``positions`` property needs the
         # offsets as soon as the cache fills.
         await self.resolve_joint_offsets()
-        await asyncio.gather(
+        await _await_all_hardware_actions(
             *[m.start_telemetry(hz, torque=torque) for m in self.motors.values()]
         )
 
     async def stop_telemetry(self) -> None:
         """Stop the background telemetry polling loop on all motors."""
-        await asyncio.gather(*[m.stop_telemetry() for m in self.motors.values()])
+        await _await_all_hardware_actions(
+            *[m.stop_telemetry() for m in self.motors.values()]
+        )
 
     async def wait_for_telemetry(self, timeout: float = 5.0) -> None:
         """Block until every motor has reported at least one position.
@@ -663,7 +1015,7 @@ class AxolArm:
         SKU the gripper element is 0.0.
         """
         self._require_offsets_resolved()
-        values = self._pad_gripper([self.motors[j].position for j in self.motors])
+        values = self._pad_absent([self.motors[j].position for j in self.motors])
         gripper_i = self._gripper_i
         if self._has_gripper:
             values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
@@ -679,7 +1031,7 @@ class AxolArm:
         Returns shape (8,) array in Joint enum order (gripper element 0.0 on
         the gripperless SKU).
         """
-        values = self._pad_gripper([m.torque for m in self.motors.values()])
+        values = self._pad_absent([m.torque for m in self.motors.values()])
         return np.array(values, dtype=np.float32)
 
     # ------------------------------------------------------------------ #
@@ -689,31 +1041,15 @@ class AxolArm:
     async def _calibrate_gripper(self) -> None:
         """Find the gripper open position by stepping in the negative direction.
 
-        Steps the gripper motor incrementally toward open until the torque
-        magnitude drops to ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop).
         Updates ``_limits_lo[gripper_idx]`` (open) and ``_limits_hi[gripper_idx]``
         (close) which are used for normalization and clipping, and persists the
         open position so a later :meth:`attach` can restore it without moving
-        the gripper.
+        the gripper. See :func:`calibrate_gripper_open_stop`.
 
         Must be called with the gripper motor already enabled and in IMPEDANCE mode.
         """
-        motor = self.motors[Joint.GRIPPER]
         gripper_i = self._gripper_i
-
-        target = await motor.get_position()
-
-        for _ in range(_GRIPPER_CALIB_MAX_STEPS):
-            target -= _GRIPPER_CALIB_STEP
-            await motor.set_impedance(
-                target, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
-            )
-            await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
-            torque = await motor.get_torque()
-            if abs(torque) >= _GRIPPER_TORQUE_THRESHOLD:
-                break
-
-        open_pos = await motor.get_position()
+        open_pos = await calibrate_gripper_open_stop(self.motors[Joint.GRIPPER])
         self._limits_lo[gripper_i] = open_pos
         self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
         _save_gripper_calibration(self._is_left, open_pos)
@@ -749,7 +1085,16 @@ class AxolArm:
         On the gripperless SKU the gripper calibration and mode switch are
         skipped (there is no gripper motor).
 
+        This is the motor-level half of :meth:`AxolHardware.enable`: it does **not**
+        open the CAN bus. Callers driving arms individually must have
+        awaited :meth:`AxolHardware.connect` (or :meth:`AxolHardware.enable`) first;
+        otherwise the first motor read fails with a ``CanOperationError``
+        saying the bus is unopened or still starting.
+
         Raises:
+            can.CanOperationError: If the arm's CAN bus is not open — never
+                started, still starting, closed, or its ``axol-rt proxy``
+                child exited. The message names which.
             MotorError: If a holding motor is unreachable or in an unexpected
                 control mode (reconnecting targets the impedance workflow —
                 a session that died in another control mode needs
@@ -762,17 +1107,39 @@ class AxolArm:
                 brought up on garbage joint-frame values; run
                 ``axol motor.set-zero-pos --guided`` first.
         """
+        held, cold = await self._prepare_enable_state()
+
+        try:
+            await self._enable_from_holding_state(held, cold, hold=hold)
+        except BaseException as setup_error:
+            # A failed __aenter__ is not followed by __aexit__. Every motor we
+            # may have enabled during this attempt therefore has to confirm
+            # torque-off here. Motors that were already holding before this
+            # call are deliberately excluded so a failed cold bring-up cannot
+            # drop an existing pose or grasp.
+            await _rollback_newly_enabled_motors(
+                [(joint.value, self.motors[joint]) for joint in cold],
+                setup_error,
+            )
+            raise
+
+    async def _prepare_enable_state(self) -> tuple[list[Joint], list[Joint]]:
+        """Validate encoder zeros and snapshot held versus cold motors."""
         # Gate bring-up on plausible encoder zeros BEFORE anything is
         # actuated (position reads work on disabled motors): detect which
         # end stop the either-stop joints were zeroed at, and refuse to
         # enable a robot whose zeros were never set.
         await self.resolve_joint_offsets()
-
         flags = dict(zip(self.motors.keys(), await self.get_holding()))
-        held = [j for j, holding in flags.items() if holding]
-        cold = [j for j, holding in flags.items() if not holding]
+        held = [joint for joint, holding in flags.items() if holding]
+        cold = [joint for joint, holding in flags.items() if not holding]
+        return held, cold
 
-        await asyncio.gather(
+    async def _enable_from_holding_state(
+        self, held: list[Joint], cold: list[Joint], *, hold: bool
+    ) -> None:
+        """Attach held motors and bring cold motors up after state is sampled."""
+        await _await_all_hardware_actions(
             *[
                 self.motors[j].attach(
                     ControlMode.POSITION_FORCE
@@ -783,7 +1150,7 @@ class AxolArm:
             ],
             *[self.motors[j].enable() for j in cold],
         )
-        await asyncio.gather(
+        await _await_all_hardware_actions(
             *[self.motors[j].set_control_mode(ControlMode.IMPEDANCE) for j in cold]
         )
 
@@ -795,7 +1162,7 @@ class AxolArm:
         # fixed-stop joints against the post-reset frame.  (Either-stop
         # joints are Damiao, whose mode switch is a register write — no
         # reboot, no re-detection needed.)
-        recheck = set(cold) & (set(ARM_JOINTS) - EITHER_STOP_JOINTS)
+        recheck = set(cold) & self._fixed_stop_joints()
         if recheck:
             self._unverified_zeros |= recheck
             await self.resolve_joint_offsets(recheck)
@@ -855,7 +1222,12 @@ class AxolArm:
 
     async def disable(self) -> None:
         """Disable all motors and engage brakes."""
-        await asyncio.gather(*[m.disable() for m in self.motors.values()])
+        results = await asyncio.gather(
+            *(m.disable() for m in self.motors.values()), return_exceptions=True
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise failures[0]
 
     async def clear_errors(self) -> None:
         """Clear latched error flags on all motors."""
@@ -876,7 +1248,7 @@ class AxolArm:
         # ±360° wrap correction detected earlier may be stale.  Mark the
         # fixed-stop joints (all MyActuator) for re-verification; the next
         # joint-frame entry point resolves them.
-        self._unverified_zeros |= set(ARM_JOINTS) - EITHER_STOP_JOINTS
+        self._unverified_zeros |= self._fixed_stop_joints()
 
     # ------------------------------------------------------------------ #
     # Getters                                                              #
@@ -892,7 +1264,7 @@ class AxolArm:
         SKU the gripper element is 0.0.
         """
         await self.resolve_joint_offsets()
-        values = self._pad_gripper(
+        values = self._pad_absent(
             list(
                 await asyncio.gather(
                     *[self.motors[j].get_position() for j in self.motors]
@@ -916,7 +1288,7 @@ class AxolArm:
         values = await asyncio.gather(
             *[self.motors[j].get_velocity() for j in self.motors]
         )
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_torques(self) -> np.ndarray:
         """Return torque estimate for every joint, fetched concurrently.
@@ -926,7 +1298,7 @@ class AxolArm:
         the gripperless SKU).
         """
         values = await asyncio.gather(*[m.get_torque() for m in self.motors.values()])
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_temperatures(self) -> np.ndarray:
         """Return motor temperature (°C) for every joint, fetched concurrently.
@@ -937,7 +1309,7 @@ class AxolArm:
         values = await asyncio.gather(
             *[m.get_temperature() for m in self.motors.values()]
         )
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_voltages(self) -> np.ndarray:
         """Return bus voltage (V) for every joint, fetched concurrently.
@@ -946,7 +1318,7 @@ class AxolArm:
         the gripperless SKU).
         """
         values = await asyncio.gather(*[m.get_voltage() for m in self.motors.values()])
-        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
+        return np.array(self._pad_absent(list(values)), dtype=np.float32)
 
     async def get_error_codes(self) -> list[MotorStatus]:
         """Return MotorStatus for every joint, fetched concurrently.
@@ -963,7 +1335,7 @@ class AxolArm:
         """Return each motor's enabled-and-holding state, fetched concurrently.
 
         Read-only — safe on a robot of unknown state (pairs with
-        :meth:`Axol.connect` for inspecting before acting). See
+        :meth:`AxolHardware.connect` for inspecting before acting). See
         :meth:`Motor.is_holding` for what "holding" means per motor family.
         Returns a list in Joint enum order. On the gripperless SKU the
         gripper entry is omitted (7 entries).
@@ -1100,8 +1472,9 @@ class AxolArm:
                Arm joints are in radians in the joint frame (0 = rest);
                gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open).
         """
+        side = "left" if self._is_left else "right"
+        q = _validated_motion_target(q, label=f"{side} arm").copy()
         await self.resolve_joint_offsets()
-        q = q.copy()
 
         # Safety: reject commands with arm-joint deltas that exceed max_step_rad.
         # Deltas are frame-invariant (constant offset), so compute in joint frame.
@@ -1142,44 +1515,178 @@ class AxolArm:
         # and acceleration feedforward via a second pass for inertia FF (rad/s²).
         # Velocities/accelerations are frame-invariant under a constant offset,
         # so we differentiate the joint-frame ``clipped`` array directly.
-        velocities = self._vel_diff.differentiate(list(clipped))
-        accelerations = self._accel_diff.differentiate(velocities)
-        # v_meas drives software velocity damping. The position cache is
-        # empty until the first set_impedance reply lands; fall back to v_des
-        # so the ``kd_soft`` term collapses to 0 for those first cycles.
-        try:
-            v_meas = self._meas_vel_diff.differentiate(list(self.positions))
-        except MotorError:
-            v_meas = list(velocities)
+        # Classic mode only: in realtime-core mode the trajectory the wire
+        # carries is rendered by the core's own tracker at 240 Hz, and the
+        # velocity/friction/inertia terms are computed there by applying
+        # these same low-pass derivative chains to the executed tracker
+        # position (this loop's 120 Hz differentiation of the pre-tracker
+        # target would be out of phase with the executed motion).
+        sink_mode = self._command_sink is not None
+        if not sink_mode:
+            velocities = self._vel_diff.differentiate(list(clipped))
+            accelerations = self._accel_diff.differentiate(velocities)
 
         # Gravity feedforward (Nm) for the seven arm joints, computed from the
         # full URDF chain so child links contribute to each parent joint's load.
         # ``arm_q`` is in joint frame, which matches the URDF convention.
         arm_q = clipped[: len(ARM_JOINTS)].astype(np.float32)
-        gravity = self._gravity_comp.gravity_arm(arm_q, is_left=self._is_left)
+        gravity, inertia = self._gravity_comp.gravity_and_inertia_arm(
+            arm_q, is_left=self._is_left
+        )
+
+        # kd_host schedule: host-side damping is only stable — and only
+        # needed — where the joint's reflected inertia is high. High inertia
+        # means a slow natural mode (ωn = √(kp/J), ~2.3 Hz for a hanging
+        # shoulder) that the motor's lagged internal velocity estimate can't
+        # damp but a ~100 Hz host loop can. As the pose moves mass onto a
+        # joint's axis, J collapses, ωn rises toward the host loop rate, and
+        # the one-cycle-stale host torque arrives out of phase — measured as
+        # sustained jitter on shoulder_1 with the arm raised to the side
+        # (kd_host=15 rang at 0.57° RMS; kd_host=0 was clean, firmware kd
+        # alone handles the fast mode fine). Scale each joint's kd_host by
+        # J(q)/J_ref (J_ref = per-joint max over arm shapes, see __init__),
+        # capped at 1 so the configured values are never exceeded. Constant
+        # damping *ratio* would only need √(J/J_ref), but the binding
+        # constraint at low J is phase-lag stability, not ζ — the linear
+        # taper reaches ~0 at the measured-unstable raised pose (J ratio
+        # 0.02) where √ would still deliver 14% — and the two rules differ
+        # by <25% at the moderate poses where damping matters.
+        host_scale = np.clip(inertia.astype(np.float64) / self._inertia_ref, 0.0, 1.0)
+
+        # Inertia-FF schedule (see __init__): rotor term constant, link term
+        # tracking J(q), normalized to 1 at the rest pose where j_eff was
+        # tuned. Unclipped above 1 on purpose — shoulder_3's link inertia
+        # peaks with the arm extended (up to ~1.6× its rest anchor), exactly
+        # where its acceleration FF is needed most.
+        j_scale = (self._j_rotor + inertia.astype(np.float64)) / self._j_ff_denom
+
+        # Host-damping band-pass centres for this cycle. Tracked joints (see
+        # __init__) follow their pose-dependent impedance mode by scaling the
+        # hardware-anchored rest centre by √(J_rest/J(q)) — j_scale is exactly
+        # (J_rotor + J(q))/(J_rotor + J_rest). Clamped: below ~12 rad/s the
+        # band starts dragging intentional motion, above 50 rad/s (~8 Hz) the
+        # loop's phase budget is spent and more centre only points the damper
+        # at modes it would excite.
+        damp_w0 = list(self._damp_w0)
+        for i in range(len(ARM_JOINTS)):
+            if self._damp_w0_tracked[i]:
+                damp_w0[i] = float(
+                    np.clip(DAMP_BP_W0 / math.sqrt(max(j_scale[i], 1e-6)), 12.0, 50.0)
+                )
+
+        # Host damping input: fast-differentiated commanded and measured
+        # velocities, band-passed at each joint's resonance (damp_w0 above).
+        # The measured side differentiates the positions cached from
+        # impedance feedback frames against the frames' own CAN receive
+        # timestamps (jitter-free — see ``Differentiator.differentiate``).
+        # Falls back to a zero damping input until every cache is filled by
+        # the first set_impedance replies.
+        #
+        # In realtime-core mode the damping *torque* is not computed here at
+        # all: damping is a phase race, and this loop's ~120 Hz sample plus
+        # the socket transport put the counter-torque ~14 ms behind the
+        # velocity it acts on — enough to push the shoulder burst band past
+        # 90° of loop phase, where the damper pumps the mode instead of
+        # damping it (the rt-teleop shaking of 2026-08-27). The core runs
+        # the identical filter chain (see rust/axol-rt/src/filter.rs,
+        # golden-tested against this module) at 240 Hz on the latest feedback,
+        # applying the result within one core tick; this side only *schedules*
+        # it, shipping the pose-scaled gain and band-pass centre/q per command.
+        if not sink_mode:
+            v_des_fast = self._vel_fast_diff.differentiate(list(clipped))
+            try:
+                pos_list: list[float] = []
+                ts_list: list[float] = []
+                for j in Joint:
+                    motor = self.motors.get(j)
+                    if motor is not None:
+                        pos_list.append(motor.position)
+                        ts_list.append(motor.feedback_ts)
+                    else:
+                        pos_list.append(0.0)
+                        ts_list.append(0.0)
+                v_meas_fast = self._meas_vel_diff.differentiate(pos_list, ts_list)
+            except MotorError:
+                v_meas_fast = list(v_des_fast)
+            v_damp = self._damp_bp.update(
+                [d - m for d, m in zip(v_des_fast, v_meas_fast)], w0=damp_w0
+            )
 
         # Convert arm joints to motor frame for the impedance command.  Gripper
         # offset is 0, so its raw motor value is unchanged.
         motor_targets = clipped - self._joint_offsets
 
-        def _mit_cmd(i: int, j: Joint):
+        if sink_mode:
+            # Production realtime-core mode: ship 9-float tuples to
+            # the sink — which streams them to the Rust core that owns the
+            # CAN bus. mode=1 (tracked): the core's own trapezoid tracker
+            # renders the trajectory toward p_des at 240 Hz and computes the
+            # velocity, friction, and inertia terms from its states — t_ff
+            # here carries *gravity only* (the slow, pose-shaped term this
+            # side owns). The damping coefficients and the pose-scaled
+            # inertia gain are the schedule the core applies each tick
+            # against its own fresh feedback (see the sink_mode comment
+            # above). Slot 7 carries the gripper's POSITION_FORCE command
+            # (motor-frame target, speed limit, torque limit); zeros on the
+            # gripperless SKU (the core has no gripper configured and
+            # ignores the slot).
+            sink_cmds: list[tuple[float, ...]] = []
+            for i, j in enumerate(ARM_JOINTS):
+                gains = getattr(self._arm_config, j.value)
+                sink_cmds.append(
+                    (
+                        float(motor_targets[i]),
+                        1.0,
+                        gains.kp,
+                        gains.kd,
+                        float(gravity[i]),
+                        float(host_scale[i]) * gains.kd_host,
+                        damp_w0[i],
+                        self._damp_q[i],
+                        gains.j_eff * float(j_scale[i]),
+                    )
+                )
+            if self._has_gripper:
+                sink_cmds.append(
+                    (
+                        float(motor_targets[gripper_i]),
+                        self._arm_config.gripper.max_speed,
+                        self._arm_config.gripper.torque_limit,
+                    )
+                    + (0.0,) * 6
+                )
+            else:
+                sink_cmds.append((0.0,) * 9)
+            self._command_sink(sink_cmds)
+            self._last_q_commanded = clipped
+            return
+
+        arm_cmds: list[tuple[float, float, float, float, float]] = []
+        for i, j in enumerate(ARM_JOINTS):
             gains = getattr(self._arm_config, j.value)
             f = gains.friction
+            # Host damping is exactly the configured kd_host, pose-scheduled.
+            # A kd beyond the firmware's range is clamped by the command
+            # encoding (and warned about at construction) — it is *not*
+            # rerouted into host damping: the delayed host torque is only
+            # phase-safe on the slow shoulder modes, so silently converting
+            # excess firmware damping into it could excite the very
+            # oscillation the oversized kd was meant to kill.
             t_ff = (
                 float(gravity[i])
                 + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
-                + gains.j_eff * accelerations[i]
-                + gains.kd_soft * (velocities[i] - v_meas[i])
+                + gains.j_eff * float(j_scale[i]) * accelerations[i]
+                + float(host_scale[i]) * gains.kd_host * v_damp[i]
             )
-            return self.motors[j].set_impedance(
-                float(motor_targets[i]),
-                velocities[i],
-                gains.kp,
-                gains.kd,
-                t_ff,
+            arm_cmds.append(
+                (float(motor_targets[i]), velocities[i], gains.kp, gains.kd, t_ff)
             )
 
-        tasks = [_mit_cmd(i, j) for i, j in enumerate(Joint) if j != Joint.GRIPPER]
+        tasks = [
+            self.motors[j].set_impedance(*arm_cmds[i])
+            for i, j in enumerate(ARM_JOINTS)
+            if j in self.motors
+        ]
         if self._has_gripper:
             tasks.append(
                 self.motors[Joint.GRIPPER].set_position_force(
@@ -1188,7 +1695,7 @@ class AxolArm:
                     self._arm_config.gripper.torque_limit,
                 )
             )
-        await asyncio.gather(*tasks)
+        await _await_all_hardware_actions(*tasks)
         self._last_q_commanded = clipped
 
     async def gravity_compensate(
@@ -1253,7 +1760,7 @@ class AxolArm:
         # frame before sending to the impedance controller.
         arm_offsets = self._joint_offsets[: len(ARM_JOINTS)]
 
-        tasks = []
+        arm_tuples: list[tuple[float, float, float, float, float]] = []
         for i, j in enumerate(ARM_JOINTS):
             if j in free_set:
                 p_des = float(arm_q[i] - arm_offsets[i])
@@ -1264,18 +1771,11 @@ class AxolArm:
                 gains = getattr(self._arm_config, j.value)
                 kp_cmd = gains.kp
                 kd_cmd = gains.kd
-            tasks.append(
-                self.motors[j].set_impedance(
-                    p_des,
-                    0.0,
-                    kp_cmd,
-                    kd_cmd,
-                    float(gravity[i]),
-                )
-            )
+            arm_tuples.append((p_des, 0.0, kp_cmd, kd_cmd, float(gravity[i])))
         # Hold the gripper softly so it does not drift open/closed — or drive
         # it to the requested opening, at the full configured torque so it can
         # actually grasp while the arm stays hand-guidable.
+        gripper_cmd: tuple[float, float, float] | None = None
         if self._has_gripper:
             gripper_i = self._gripper_i
             if gripper_target is None:
@@ -1287,13 +1787,34 @@ class AxolArm:
             gripper_pos_raw = self._limits_hi[gripper_i] + gripper_pos * (
                 self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
             )
-            tasks.append(
-                self.motors[Joint.GRIPPER].set_position_force(
-                    gripper_pos_raw,
-                    self._arm_config.gripper.max_speed,
-                    torque,
-                )
+            gripper_cmd = (
+                gripper_pos_raw,
+                self._arm_config.gripper.max_speed,
+                torque,
             )
+
+        if self._command_sink is not None:
+            # Realtime-core mode: the same tuples stream through the core
+            # (which owns the bus) instead of onto the wire from here. The
+            # arm tuples' second field is 0.0 = passthrough mode — p_des
+            # goes to the wire as-is with v_des = 0, no tracker and no
+            # friction/inertia terms (a hand-guided limp arm wants gravity
+            # feedforward only), and no damping coefficients (classic
+            # gravity comp runs firmware gains only).
+            sink_cmds = [t + (0.0,) * 4 for t in arm_tuples]
+            sink_cmds.append(
+                gripper_cmd + (0.0,) * 6 if gripper_cmd is not None else (0.0,) * 9
+            )
+            self._command_sink(sink_cmds)
+            return
+
+        tasks = [
+            self.motors[j].set_impedance(*arm_tuples[i])
+            for i, j in enumerate(ARM_JOINTS)
+            if j in self.motors
+        ]
+        if gripper_cmd is not None:
+            tasks.append(self.motors[Joint.GRIPPER].set_position_force(*gripper_cmd))
         await asyncio.gather(*tasks)
 
     def reset_gravity_hold(self) -> None:
@@ -1328,7 +1849,9 @@ class AxolArm:
         n = len(list(Joint))
         self._vel_diff = Differentiator(n=n)
         self._accel_diff = Differentiator(n=n)
-        self._meas_vel_diff = Differentiator(n=n)
+        self._vel_fast_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
+        self._meas_vel_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
+        self._damp_bp = BandPass(n=n, w0=self._damp_w0, q=self._damp_q)
 
     def torque_residuals(self) -> np.ndarray:
         """Measured minus model-gravity torque per arm joint, shape (7,).
@@ -1350,14 +1873,19 @@ class AxolArm:
         return tau - gravity
 
 
-class Axol(RobotBase):
-    """Dual-arm Axol robot interface.
+class AxolHardware(RobotBase):
+    """Dual-arm Axol hardware interface, driven directly from Python.
+
+    Internal — the public robot object is :class:`almond_axol.robot.Axol`,
+    which owns one of these and exposes the same methods. Use this class
+    directly only from package tooling that must send CAN from Python on a
+    quiet bus (calibration, register-level diagnostics).
 
     Opens one CAN bus per arm and constructs all 16 motor drivers on entry
     (14 on the gripperless SKU, ``config.has_gripper = False``).
     Use as an async context manager to ensure the buses are cleanly shut down.
 
-        async with Axol() as axol:
+        async with AxolHardware() as axol:
             await axol.enable()
             await axol.start_telemetry(500)  # 500 Hz
 
@@ -1374,7 +1902,7 @@ class Axol(RobotBase):
     touching motor state, for inspecting a robot of unknown state first
     (:meth:`get_holding`, :meth:`get_positions`, ...):
 
-        axol = Axol()
+        axol = AxolHardware()
         await axol.connect()      # open buses; inspect freely, nothing actuated
         await axol.enable()       # holding joints kept holding; cold joints brought up
         pos_l, pos_r = await axol.get_positions()
@@ -1395,30 +1923,77 @@ class Axol(RobotBase):
     Args:
         config:        Dual-arm gains config. Left and right arm gains are specified
                        independently; the right arm defaults to the left with gravity
-                       mirrored for shoulder_2 and elbow.
+                       mirrored for shoulder_2 and elbow. ``None`` (default)
+                       loads the robot's shared settings — the same
+                       ``~/.almond/settings.json`` the control panel and CLI
+                       use — over the calibrated defaults.
         left_channel:  SocketCAN interface name for the left arm.
         right_channel: SocketCAN interface name for the right arm.
+        left_joints:   Joints with a motor on the left bus (default: the full arm).
+        right_joints:  Joints with a motor on the right bus (default: the full arm).
     """
 
     def __init__(
         self,
-        config: AxolConfig = AxolConfig(),
-        left_channel: str | None = CAN_LEFT,
-        right_channel: str | None = CAN_RIGHT,
+        config: AxolConfig | None = None,
+        left_channel: str | None = SHARED,
+        right_channel: str | None = SHARED,
+        left_joints: Iterable[Joint] | None = None,
+        right_joints: Iterable[Joint] | None = None,
     ) -> None:
         """Construct the dual-arm interface.
 
         CAN buses and motors are created but not started; call ``enable()``
         or use the class as an async context manager to bring up hardware.
 
+        With no arguments the robot is configured exactly as the control
+        panel and the ``axol`` CLI would configure it: ``config`` and the
+        channels come from the shared settings file
+        (``~/.almond/settings.json``; see :mod:`almond_axol.settings`), so
+        stiffness, per-joint gains, link masses and CAN adapters saved once
+        apply here too. Pass any argument explicitly to override it.
+
         Args:
-            config:        Per-joint gains, friction parameters, and gripper config.
-            left_channel:  SocketCAN interface name for the left arm, or ``None`` to omit it.
-            right_channel: SocketCAN interface name for the right arm, or ``None`` to omit it.
+            config:        Per-joint gains, friction parameters, and gripper
+                           config. ``None`` loads the shared settings over the
+                           calibrated defaults (:func:`almond_axol.settings.
+                           shared_axol_config`); ``AxolConfig()`` is the bare
+                           calibrated defaults.
+            left_channel:  SocketCAN interface name for the left arm, or ``None``
+                           to omit it. Defaults to the shared
+                           ``robot.left_channel`` setting.
+            right_channel: SocketCAN interface name for the right arm, or ``None``
+                           to omit it. Defaults to the shared
+                           ``robot.right_channel`` setting.
+            left_joints:   Restrict the left arm to the joints actually on its
+                           bus (a partial bench arm); ``None`` is the full arm.
+                           See :class:`AxolArm`.
+            right_joints:  Same for the right arm.
         """
+        if config is None or left_channel is SHARED or right_channel is SHARED:
+            from ..settings import load_store, shared_axol_config
+
+            store = load_store()
+            if config is None:
+                config = shared_axol_config(store)
+            if left_channel is SHARED or right_channel is SHARED:
+                shared_left, shared_right = store.can_channels()
+                if left_channel is SHARED:
+                    left_channel = shared_left
+                if right_channel is SHARED:
+                    right_channel = shared_right
         if left_channel is None and right_channel is None:
             raise ValueError(
                 "At least one of left_channel or right_channel must be specified."
+            )
+        if (
+            left_channel is not None
+            and right_channel is not None
+            and left_channel == right_channel
+        ):
+            raise ValueError(
+                "left_channel and right_channel must name different CAN "
+                "interfaces; both arms reuse the same motor IDs"
             )
 
         # Bake stiffness into the per-joint gains exactly once, here at the
@@ -1431,7 +2006,11 @@ class Axol(RobotBase):
         if left_channel is not None:
             self._left_bus = CanBus(left_channel)
             self.left = AxolArm(
-                self._left_bus, config, self._gravity_comp, is_left=True
+                self._left_bus,
+                config,
+                self._gravity_comp,
+                is_left=True,
+                joints=left_joints,
             )
         else:
             self.left = None
@@ -1439,10 +2018,30 @@ class Axol(RobotBase):
         if right_channel is not None:
             self._right_bus = CanBus(right_channel)
             self.right = AxolArm(
-                self._right_bus, config, self._gravity_comp, is_left=False
+                self._right_bus,
+                config,
+                self._gravity_comp,
+                is_left=False,
+                joints=right_joints,
             )
         else:
             self.right = None
+
+        # A failed torque-off or bus close must remain retryable.  In
+        # particular, never close either bus after an unverified motor disable:
+        # retaining both transports is the only way to retry safely.
+        self._shutdown_pending = False
+        # True only after disable() has verified an arm-wide torque-off. A
+        # failed enable() never sets it: its rollback covers only the motors
+        # that transaction brought up, while disable() is the documented
+        # torque-off for every motor on both arms — including joints left
+        # holding by a previous session that the failed enable() attached to.
+        self._motors_disabled = False
+        # Entry-cold motors of a failed coordinated enable that did not
+        # confirm rollback. While set, the robot is in shutdown-pending state:
+        # connect()/enable()/disconnect() refuse until disable() verifies
+        # torque-off (arm-wide, which covers these motors) and clears it.
+        self._startup_rollback_pending: list[tuple[str, Motor]] | None = None
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
@@ -1504,13 +2103,29 @@ class Axol(RobotBase):
         :meth:`enable` — which is idempotent and never drops joints that are
         already holding. Calling ``connect()`` first is optional:
         :meth:`enable` opens the buses itself.
+
+        Each bus is an ``axol-rt proxy`` child process of *this* Python
+        process — not a system daemon. It is spawned here and reaped by
+        :meth:`disconnect` / :meth:`disable`; ``axol-rt`` absent from ``ps``
+        just means no bus is open. Startup spawns the process and waits for
+        its ready handshake, so it takes a moment: motor I/O issued from
+        another task before this coroutine has returned fails with a
+        "CAN bus ... is still starting" error. Only the ``AxolHardware``-level
+        methods open buses; the per-arm :meth:`AxolArm.enable` /
+        :meth:`AxolArm.disable` assume the bus is already open, so a
+        controller that toggles arms individually must await ``connect()``
+        (idempotent — safe to call again) before its first per-arm call.
         """
+        if self._shutdown_pending:
+            raise MotorError(
+                "robot shutdown is incomplete; retry disable before reconnecting"
+            )
         bus_tasks = []
         if self.left is not None:
             bus_tasks.append(self._left_bus.start())
         if self.right is not None:
             bus_tasks.append(self._right_bus.start())
-        await asyncio.gather(*bus_tasks)
+        await _await_all_hardware_actions(*bus_tasks)
 
     async def enable(self, hold: bool = True) -> None:
         """Start CAN buses and bring every motor up, never dropping held joints.
@@ -1530,13 +2145,76 @@ class Axol(RobotBase):
         details and failure modes.
         """
         await self.connect()
+        # From here on motor state is no longer known to be off: the robot may
+        # already be holding from a previous session and this call may bring
+        # more joints up. Only a verified disable() sets the flag again.
+        self._motors_disabled = False
 
-        motor_tasks = []
-        if self.left is not None:
-            motor_tasks.append(self.left.enable(hold=hold))
-        if self.right is not None:
-            motor_tasks.append(self.right.enable(hold=hold))
-        await asyncio.gather(*motor_tasks)
+        arms = [
+            (side, arm)
+            for side, arm in (("left", self.left), ("right", self.right))
+            if arm is not None
+        ]
+        # Snapshot both arms before either can actuate. These exact snapshots
+        # define the transaction: a peer failure rolls back every motor that
+        # was cold at entry while never dropping a pre-existing hold.
+        prepared_results = await asyncio.gather(
+            *(arm._prepare_enable_state() for _, arm in arms),
+            return_exceptions=True,
+        )
+        prepared: list[tuple[str, AxolArm, list[Joint], list[Joint]]] = []
+        for (side, arm), result in zip(arms, prepared_results):
+            if isinstance(result, BaseException):
+                # No arm has actuated yet, so there is nothing to roll back.
+                # Motor state is left exactly as found: disconnect() keeps any
+                # pre-existing hold, while disable() still torques off every
+                # motor on both arms as documented.
+                raise result
+            held, cold = result
+            prepared.append((side, arm, held, cold))
+
+        try:
+            await _await_all_hardware_actions(
+                *(
+                    arm._enable_from_holding_state(held, cold, hold=hold)
+                    for _, arm, held, cold in prepared
+                )
+            )
+        except BaseException as setup_error:
+            rollback_motors = [
+                (f"{side}.{joint.value}", arm.motors[joint])
+                for side, arm, _, cold in prepared
+                for joint in cold
+            ]
+            cleanup_failures = await _rollback_newly_enabled_motors(
+                rollback_motors, setup_error
+            )
+            for side, arm, _, cold in prepared:
+                if cold:
+                    try:
+                        arm.reset_command_state()
+                    except BaseException as state_error:
+                        setup_error.add_note(
+                            f"Could not reset {side} arm command history after "
+                            "startup rollback: "
+                            f"{type(state_error).__name__}: {state_error}"
+                        )
+            if cleanup_failures:
+                # Retain both buses and block another enable/disconnect until
+                # disable() verifies torque-off for the uncertain motor set.
+                self._startup_rollback_pending = [
+                    (label, motor) for label, motor, _ in cleanup_failures
+                ]
+                self._shutdown_pending = True
+            else:
+                # All entry-cold motors are off; the pre-held motors keep
+                # holding. Nothing is marked disabled: only this transaction's
+                # own motors were rolled back, so a caller's disable() must
+                # still torque off both arms in full rather than merely close
+                # the buses and abandon the held joints.
+                self._startup_rollback_pending = None
+            raise
+        self._startup_rollback_pending = None
 
     async def disconnect(self) -> None:
         """Close the CAN buses, leaving motor torque exactly as it is.
@@ -1546,39 +2224,135 @@ class Axol(RobotBase):
         later process can reconnect and :meth:`enable` again. Telemetry is
         stopped first. Use :meth:`disable` instead to torque off.
         """
+        if self._shutdown_pending:
+            raise MotorError(
+                "robot shutdown is incomplete; retry disable before disconnecting"
+            )
         tasks = []
         if self.left is not None:
             tasks.append(self.left.stop_telemetry())
         if self.right is not None:
             tasks.append(self.right.stop_telemetry())
+        stop_error: BaseException | None = None
         try:
-            await asyncio.gather(*tasks)
-        finally:
-            close_tasks = []
-            if self.left is not None:
-                close_tasks.append(self._left_bus.close())
-            if self.right is not None:
-                close_tasks.append(self._right_bus.close())
-            await asyncio.gather(*close_tasks)
+            await _await_all_hardware_actions(*tasks)
+        except BaseException as exc:
+            stop_error = exc
+
+        close_tasks = []
+        if self.left is not None:
+            close_tasks.append(self._left_bus.close())
+        if self.right is not None:
+            close_tasks.append(self._right_bus.close())
+        try:
+            await _await_all_hardware_actions(*close_tasks)
+        except BaseException as close_error:
+            if stop_error is not None:
+                close_error.add_note(
+                    "telemetry shutdown also failed: "
+                    f"{type(stop_error).__name__}: {stop_error}"
+                )
+            raise
+        if stop_error is not None:
+            raise stop_error
 
     async def disable(self) -> None:
-        """Disable all motors and close CAN buses."""
-        tasks = []
+        """Disable every motor, then close both CAN buses.
+
+        This is the torque-off for every motor on both arms, unconditionally —
+        including joints that were already holding from a previous session
+        and joints whose bring-up failed part-way through :meth:`enable`. A
+        failed ``enable()`` only rolls back the motors it brought up itself,
+        so a caller's cleanup must reach here to leave no arm torqued with
+        nobody supervising it. Use :meth:`disconnect` to keep a hold instead.
+
+        If any arm cannot verify torque-off, both buses remain open so the
+        caller can retry.  Once torque-off has been verified, a close failure
+        is likewise retained and retryable without sending motor commands over
+        a bus that may already have closed successfully.
+
+        An arm whose motors have all gone silent is the one unconfirmed
+        torque-off that is not uncertain: its power is off (the e-stop), so
+        there is no torque left to own.  That arm is logged as unpowered and
+        the buses close normally; an arm with a motor still answering keeps
+        raising, so a live motor refusing to disable still locks the hardware.
+        """
+        self._shutdown_pending = True
+        telemetry_tasks = []
         if self.left is not None:
-            tasks.extend([self.left.stop_telemetry(), self.left.disable()])
+            telemetry_tasks.append(self.left.stop_telemetry())
         if self.right is not None:
-            tasks.extend([self.right.stop_telemetry(), self.right.disable()])
-        try:
-            await asyncio.gather(*tasks)
-        except Exception:
-            pass
-        finally:
-            close_tasks = []
+            telemetry_tasks.append(self.right.stop_telemetry())
+        telemetry_results = await asyncio.gather(
+            *telemetry_tasks, return_exceptions=True
+        )
+        telemetry_failures = [
+            result for result in telemetry_results if isinstance(result, BaseException)
+        ]
+
+        motor_failures: list[BaseException] = []
+        if not self._motors_disabled:
+            # Arm-wide torque-off. This also covers the entry-cold motors of a
+            # failed enable() whose rollback did not confirm
+            # (_startup_rollback_pending): every motor on each arm is
+            # commanded, so a verified pass here settles them too.
+            arms: list[tuple[str, AxolArm, CanBus]] = []
             if self.left is not None:
-                close_tasks.append(self._left_bus.close())
+                arms.append(("left", self.left, self._left_bus))
             if self.right is not None:
-                close_tasks.append(self._right_bus.close())
-            await asyncio.gather(*close_tasks)
+                arms.append(("right", self.right, self._right_bus))
+            results = await asyncio.gather(
+                *(arm.disable() for _, arm, _ in arms), return_exceptions=True
+            )
+            motor_failures = []
+            for (side, arm, bus), result in zip(arms, results):
+                if not isinstance(result, BaseException):
+                    continue
+                if await _arm_is_unpowered(arm, bus):
+                    _logger.warning(
+                        "%s arm did not confirm torque-off and no motor answers "
+                        "on its bus — the arm is unpowered (e-stop?), so its "
+                        "torque is already gone: %s",
+                        side,
+                        result,
+                    )
+                    continue
+                motor_failures.append(result)
+            if not motor_failures:
+                self._motors_disabled = True
+                self._startup_rollback_pending = None
+            else:
+                startup_pending = getattr(self, "_startup_rollback_pending", None)
+                if startup_pending:
+                    labels = ", ".join(label for label, _ in startup_pending)
+                    motor_failures[0].add_note(
+                        f"startup rollback is still unconfirmed for: {labels}"
+                    )
+
+        if motor_failures:
+            if telemetry_failures:
+                motor_failures[0].add_note(
+                    "telemetry shutdown also failed: "
+                    f"{type(telemetry_failures[0]).__name__}: "
+                    f"{telemetry_failures[0]}"
+                )
+            raise motor_failures[0]
+        if telemetry_failures:
+            raise telemetry_failures[0]
+
+        close_tasks = []
+        if self.left is not None:
+            close_tasks.append(self._left_bus.close())
+        if self.right is not None:
+            close_tasks.append(self._right_bus.close())
+        closed = await asyncio.gather(*close_tasks, return_exceptions=True)
+        close_failures = [
+            result for result in closed if isinstance(result, BaseException)
+        ]
+        if close_failures:
+            raise close_failures[0]
+        self._motors_disabled = False
+        self._shutdown_pending = False
 
     async def clear_errors(self) -> None:
         """Clear latched error flags on both arms."""
@@ -1827,13 +2601,19 @@ class Axol(RobotBase):
                    (arm joints in rad, gripper in [0, 1]).  ``None`` skips.
             right: Same for the right arm.
         """
-        tasks = []
+        targets: list[tuple[AxolArm, np.ndarray]] = []
         if left is not None and self.left is not None:
-            tasks.append(self.left.motion_control(left))
+            targets.append(
+                (self.left, _validated_motion_target(left, label="left arm"))
+            )
         if right is not None and self.right is not None:
-            tasks.append(self.right.motion_control(right))
-        if tasks:
-            await asyncio.gather(*tasks)
+            targets.append(
+                (self.right, _validated_motion_target(right, label="right arm"))
+            )
+        if targets:
+            await _await_all_hardware_actions(
+                *(arm.motion_control(q) for arm, q in targets)
+            )
 
     async def gravity_compensate(
         self,
