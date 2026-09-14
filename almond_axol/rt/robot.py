@@ -1034,8 +1034,23 @@ class Axol(RobotBase):
 
         Without a core for this session (after :meth:`connect` only) this is
         the classic torque-off over the maintenance proxies.
+
+        Before any bus has ever been opened there is nothing to torque off:
+        no frame has left this process, so the motors are exactly as they
+        were found. That is the rollback of an :meth:`enable` that failed
+        before its core started (``axol-rt`` missing or stale, config
+        rejected) and the second ``disable()`` a context manager or teleop
+        teardown then issues. The classic torque-off could only raise over
+        the unopened bus there, turning a startup error into a false
+        "hardware ownership uncertain" lockout upstream.
         """
         if not self._core_started:
+            if all(bus.never_opened for bus in self._buses()):
+                _logger.info(
+                    "rt: disable() before any CAN bus was opened — no motor "
+                    "traffic was sent, nothing to torque off"
+                )
+                return
             await self._robot.disable()
             return
         if self._rec is not None:

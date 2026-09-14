@@ -209,41 +209,36 @@ def _connect_zed_cameras(
 ) -> list[tuple[str, Any]]:
     """Open the local ZED cameras selected by ``cfg`` → ``(slot, camera)`` pairs.
 
-    Opens each camera through the ZED Python SDK (:class:`ZedCamera`, or
-    :class:`ZedStereoCamera` for any camera whose serial is a stereo ZED X).
-    Used for the in-process fallback when the relay subprocess can't run; the
-    frames are encoded + sent by an in-process aiortc :class:`WebRTCManager`.
-    Slots whose camera is absent are skipped (best-effort preview). Returns an
-    empty list when no cameras are configured or no backend is available. Runs
+    Opens each camera through the ZED Python SDK
+    (:class:`~almond_axol.video.zed_sdk.ZedSdkCamera`, or
+    :class:`~almond_axol.video.zed_sdk.ZedSdkStereoCamera` for any camera whose
+    serial is a stereo ZED X) — no ``lerobot`` involved. Used for the
+    in-process fallback when the relay subprocess can't run; the frames are
+    encoded + sent by an in-process aiortc :class:`WebRTCManager`. Slots whose
+    camera is absent are skipped (best-effort preview). Returns an empty list
+    when no cameras are configured or no backend is available. Runs
     synchronously (blocks on camera startup), so call it off the event loop.
     """
     if not cfg.cameras:
         return []
 
-    # Resolution validation happens against the SDK's name table when the
-    # SDK is importable; the gst path validates names itself.
-    sdk_exc: Exception | None = None
-    try:
-        from ..lerobot.camera.camera_zed import ZedCamera, ZedStereoCamera
-        from ..lerobot.camera.configuration_zed import (
-            ZED_RESOLUTION_DIMS,
-            ZedCameraConfig,
-        )
-    except Exception as exc:  # noqa: BLE001 - missing pyzed/SDK → gst only
-        sdk_exc = exc
+    from ..video import zed_sdk
+
+    # pyzed ships with the ZED SDK (``axol zed.install``), never from PyPI.
+    sdk_exc = zed_sdk.sdk_import_error()
 
     # Capture at the requested resolution; without one, width/height of None
     # adopt each camera's SDK default (HD1200 on GMSL) on connect.
     width: int | None = None
     height: int | None = None
-    if cfg.resolution and sdk_exc is None:
-        dims = ZED_RESOLUTION_DIMS.get(cfg.resolution)
+    if cfg.resolution:
+        dims = zed_sdk.ZED_RESOLUTION_DIMS.get(cfg.resolution)
         if dims is None:
             _logger.warning(
                 "unknown ZED resolution %r (expected one of %s); "
                 "using the camera default",
                 cfg.resolution,
-                ", ".join(ZED_RESOLUTION_DIMS),
+                ", ".join(zed_sdk.ZED_RESOLUTION_DIMS),
             )
         else:
             width, height = dims
@@ -257,10 +252,12 @@ def _connect_zed_cameras(
         if sdk_exc is not None:
             _logger.warning("teleop: %s camera unavailable (%s)", name, sdk_exc)
             return None
-        cls = ZedStereoCamera if kwargs.get("stereo") else ZedCamera
+        cls = (
+            zed_sdk.ZedSdkStereoCamera if kwargs.get("stereo") else zed_sdk.ZedSdkCamera
+        )
         for fps in (60, None):
             cam = cls(
-                ZedCameraConfig(
+                zed_sdk.ZedSdkCameraConfig(
                     serial=serial, fps=fps, width=width, height=height, **kwargs
                 )
             )
@@ -297,14 +294,19 @@ def _connect_zed_cameras(
             continue
         cameras.append((name, cam))
     if not cameras and sdk_exc is not None:
-        _logger.warning("ZED camera preview unavailable: %s", sdk_exc)
+        _logger.error(
+            "ZED camera preview unavailable: neither the gst pipeline nor the ZED "
+            "SDK fallback could open a camera (%s). Run `axol zed.install` (and "
+            "`axol gst.install`) on the robot.",
+            sdk_exc,
+        )
     return cameras
 
 
 def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> None:
     """Register connected ZED cameras as WebRTC sources for the headset.
 
-    The bare ``ZedCamera`` / stereo eyes are registered directly; the in-process
+    The bare ``ZedSdkCamera`` / stereo eyes are registered directly; the in-process
     aiortc relay samples each one on the fixed 30 fps headset clock (NVENC encode
     + aiortc RTP send) — see :func:`almond_axol.video.video._track_for_source`.
     """
