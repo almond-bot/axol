@@ -12,6 +12,10 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       ZED SDK (takes effect on the next reboot; never reboots
                       itself).
 * ``zed.install``   — the pyzed bindings (not on PyPI; needs the ZED SDK).
+* calibration cache — group-shares ``/usr/local/zed/settings`` so calibration
+                      files cached by the root service stay readable from the
+                      operator's own ``axol serve`` / ``axol teleop`` and vice
+                      versa (see :mod:`almond_axol.zed.calibration`).
 * ``gst.install``   — the GStreamer + PyGObject ``appsink`` stack (PyGObject
                       builds against the system gobject-introspection and is
                       dropped on every ``uv tool upgrade``).
@@ -68,6 +72,7 @@ from ..utils.host_update_lock import (
     host_update_lock,
 )
 from ..utils.sudo import prime_sudo, run_root
+from ..zed import calibration as zed_calibration
 from . import tracker_install
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
@@ -314,6 +319,13 @@ def _run_locked() -> None:
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
         step("pyzed (zed.install)", zed_install.run)
+        # The SDK caches each camera's calibration under /usr/local/zed/settings
+        # as whichever account opens it first. The hosted service is root, so
+        # without this the operator's own `axol serve` / `axol teleop` can't
+        # read (or refresh) those files and every camera open fails with
+        # CALIBRATION FILE NOT AVAILABLE. Group-share the cache and make the
+        # directory setgid so files created later inherit the group too.
+        step("ZED calibration cache sharing", zed_calibration.share_calibration_files)
     else:
         print("No ZED SDK at /usr/local/zed; skipping pyzed + zed-gstreamer build.")
     step("GStreamer + PyGObject (gst.install)", gst_install.run)
