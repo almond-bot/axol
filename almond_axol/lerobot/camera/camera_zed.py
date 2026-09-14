@@ -45,6 +45,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from lerobot.utils.errors import DeviceNotConnectedError
 from numpy.typing import NDArray
 
+from ...zed.calibration import calibration_hint
 from .configuration_zed import ZedCameraConfig
 
 _logger = logging.getLogger(__name__)
@@ -124,6 +125,7 @@ class ZedCamera(Camera):
             raise ConnectionError(
                 f"{self} failed to open camera: {err}. Is the camera connected "
                 "(a camera plugged in after boot needs a zed_x_daemon restart)?"
+                + calibration_hint(self.config.serial)
             )
 
         info = zed.get_camera_information()
@@ -645,6 +647,7 @@ class ZedStereoCamera:
             raise ConnectionError(
                 f"{self} failed to open camera: {err}. Is the camera connected "
                 "(a camera plugged in after boot needs a zed_x_daemon restart)?"
+                + calibration_hint(self.config.serial)
             )
 
         info = zed.get_camera_information()

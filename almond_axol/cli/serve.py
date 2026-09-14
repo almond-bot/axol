@@ -89,6 +89,16 @@ def run(args: argparse.Namespace) -> None:
 
     mark_privileged_service()
 
+    # The ZED SDK caches calibration files as whoever opens a camera first. A
+    # root service and an operator's dev `axol serve` share one box, so make
+    # the cache group-shared up front (root: always; operator: only when a
+    # root-written file is already unreadable, which may prompt for sudo on a
+    # tty). Otherwise the first camera open fails with CALIBRATION FILE NOT
+    # AVAILABLE and looks like a cable/camera fault.
+    from ..zed import ensure_calibration_readable
+
+    ensure_calibration_readable()
+
     import uvicorn
 
     from ..serve import create_app

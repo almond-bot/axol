@@ -221,6 +221,11 @@ class ProvisionSafetyTest(unittest.TestCase):
                 side_effect=lambda: fail("pyzed"),
             ),
             patch.object(
+                provision.zed_calibration,
+                "share_calibration_files",
+                side_effect=lambda: succeed("calibration"),
+            ),
+            patch.object(
                 provision.gst_install,
                 "run",
                 side_effect=lambda: succeed("gst"),
@@ -236,7 +241,16 @@ class ProvisionSafetyTest(unittest.TestCase):
 
         self.assertEqual(
             attempted,
-            ["adb", "tracker", "driver", "gyro", "pyzed", "gst", "gst-build"],
+            [
+                "adb",
+                "tracker",
+                "driver",
+                "gyro",
+                "pyzed",
+                "calibration",
+                "gst",
+                "gst-build",
+            ],
         )
         message = str(raised.exception)
         self.assertIn("Lighthouse tracking (tracker.install)", message)

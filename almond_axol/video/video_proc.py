@@ -872,6 +872,14 @@ class VideoRelayProcess:
                 Successfully exported sources appear in :attr:`raw_cameras` as
                 lightweight camera proxies.
         """
+        # Calibration files cached by another account (typically the root
+        # service) make every camera open in the child fail with CALIBRATION
+        # FILE NOT AVAILABLE; reconcile the cache here in the parent, where an
+        # interactive `axol teleop` can still escalate via sudo if needed.
+        from ..zed import ensure_calibration_readable
+
+        ensure_calibration_readable()
+
         ctx = multiprocessing.get_context("spawn")
         self._conn, child_conn = ctx.Pipe()
         # One Condition guards every source's shared-memory metadata; it must be
