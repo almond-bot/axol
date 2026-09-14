@@ -27,6 +27,7 @@ import {
 } from "@/components/diagnostics/diagnostic-actions"
 import { CanAdapterDialog } from "@/components/diagnostics/can-adapter-dialog"
 import { ControlHealth } from "@/components/diagnostics/control-health"
+import { HardwareOverview } from "@/components/diagnostics/hardware-overview"
 import { TuningWorkbench } from "@/components/diagnostics/tuning-workbench"
 import {
   TelemetryChart,
@@ -54,20 +55,29 @@ import {
   discoverCanHardware,
   fetchCanInterfaces,
   fetchCommands,
+  fetchJellyStatus,
   fetchRobotStatus,
   fetchSessions,
   flattenFields,
+  JELLY_DEVICE_LABELS,
+  JELLY_DEVICES,
+  jellyConnect,
+  jellyDisconnect,
   robotConnect,
+  robotDisconnect,
   sendSessionInput,
   setServerBase,
   stopSession,
   useSessionLogs,
+  type CanDeviceInventory,
   type CanDiscoveryState,
   type CanInterfaceInventory,
   type CanProfileInventory,
   type CommandSpec,
   type FormValue,
   type HardwareProfile,
+  type JellyDevice,
+  type JellyStatus,
   type RobotChannels,
   type RobotState,
   type RobotStatus,
@@ -207,11 +217,21 @@ export default function Diagnostics() {
   // older host. It cannot distinguish attached roles, so only retain the
   // historical profile already reported by that host's robot status.
   const [legacyCanInventory, setLegacyCanInventory] = useState(false)
+  // Jelly's wheels and lift: two idle links beside the Axol / Mantis one,
+  // with their own CAN presence. null until fetched; jellySupported drops to
+  // false on a host that predates the Jelly links (its status endpoint 404s).
+  const [canDevices, setCanDevices] = useState<CanDeviceInventory | null>(null)
+  const [jelly, setJelly] = useState<JellyStatus | null>(null)
+  const [jellySupported, setJellySupported] = useState(true)
+  const [jellyBusy, setJellyBusy] = useState<Partial<Record<JellyDevice, boolean>>>({})
+  const autoJellyAttemptsRef = useRef(new Set<string>())
+  const manualJellyOverrideRef = useRef(new Set<JellyDevice>())
   const installCanInventory = useCallback((inventory: CanInterfaceInventory) => {
     const instanceId = inventory.serverInstanceId ?? null
     canServerInstanceIdRef.current = instanceId
     setCanServerInstanceId(instanceId)
     setCanDiscovery(inventory.discovery ?? null)
+    setCanDevices(inventory.devices ?? null)
     if (inventory.profiles) {
       setCanProfiles(inventory.profiles)
       setLegacyCanInventory(false)
@@ -308,10 +328,23 @@ export default function Diagnostics() {
       robotStatusKnownRef.current = false
       canInventoryKnownRef.current = false
       voidCanInventoryPolls(canInventoryPollRef.current)
+      autoJellyAttemptsRef.current.clear()
+      manualJellyOverrideRef.current.clear()
       return
     }
     let active = true
     const poll = () => {
+      fetchJellyStatus()
+        .then((status) => {
+          if (!active) return
+          setJelly(status)
+          setJellySupported(true)
+        })
+        .catch((error) => {
+          if (!active) return
+          if (String(error).includes("HTTP 404")) setJellySupported(false)
+          setJelly(null)
+        })
       fetchRobotStatus()
         .then((r) => {
           if (!active) return
@@ -347,6 +380,7 @@ export default function Diagnostics() {
             canInventoryKnownRef.current = true
             setCanProfiles(null)
             setCanDiscovery(null)
+            setCanDevices(null)
             canServerInstanceIdRef.current = null
             setCanServerInstanceId(null)
             setLegacyCanInventory(true)
@@ -355,6 +389,7 @@ export default function Diagnostics() {
           canInventoryKnownRef.current = false
           setCanProfiles(null)
           setCanDiscovery(null)
+          setCanDevices(null)
           setLegacyCanInventory(false)
         })
     }
@@ -518,6 +553,8 @@ export default function Diagnostics() {
     manualRobotOverrideRef.current = false
     automaticCanDiscoveryAttemptsRef.current.clear()
     canDiscoveryNoticesRef.current.clear()
+    autoJellyAttemptsRef.current.clear()
+    manualJellyOverrideRef.current.clear()
   }, [canServerInstanceId, resetAutoRobotRetry])
   const connectRobot = useCallback(
     async (profile = activeProfile, automatic = false): Promise<boolean> => {
@@ -568,6 +605,73 @@ export default function Diagnostics() {
       }
     },
     [resetAutoRobotRetry, toast]
+  )
+
+  // Releasing the Axol / Mantis link by hand also stops this page bringing it
+  // back up on its own until the host changes.
+  const disconnectRobot = useCallback(async () => {
+    resetAutoRobotRetry()
+    manualRobotOverrideRef.current = true
+    setRobotBusy(true)
+    try {
+      const status = await robotDisconnect()
+      if (!autoRobotMountedRef.current) return
+      setRobot(status)
+      if (status.state !== "disconnected") {
+        throw new Error(status.error ?? "Could not disconnect the CAN link")
+      }
+    } catch (e) {
+      if (autoRobotMountedRef.current) toast.error(String(e))
+    } finally {
+      if (autoRobotMountedRef.current) setRobotBusy(false)
+    }
+  }, [resetAutoRobotRetry, toast])
+
+  // -- Jelly wheels / lift links --
+  const connectJelly = useCallback(
+    async (device: JellyDevice, automatic = false): Promise<boolean> => {
+      if (!automatic) manualJellyOverrideRef.current.add(device)
+      setJellyBusy((prev) => ({ ...prev, [device]: true }))
+      try {
+        const status = await jellyConnect(device, automatic)
+        if (!autoRobotMountedRef.current) return false
+        setJelly(status)
+        if (!status[device].connected) {
+          throw new Error(
+            status[device].error ?? `Could not connect the ${JELLY_DEVICE_LABELS[device]} link`
+          )
+        }
+        return true
+      } catch (e) {
+        if (!autoRobotMountedRef.current) return false
+        if (!automatic) toast.error(String(e))
+        return false
+      } finally {
+        if (autoRobotMountedRef.current) setJellyBusy((prev) => ({ ...prev, [device]: false }))
+      }
+    },
+    [toast]
+  )
+  const disconnectJelly = useCallback(
+    async (device: JellyDevice) => {
+      manualJellyOverrideRef.current.add(device)
+      setJellyBusy((prev) => ({ ...prev, [device]: true }))
+      try {
+        const status = await jellyDisconnect(device)
+        if (!autoRobotMountedRef.current) return
+        setJelly(status)
+        if (status[device].state !== "disconnected") {
+          throw new Error(
+            status[device].error ?? `Could not disconnect the ${JELLY_DEVICE_LABELS[device]} link`
+          )
+        }
+      } catch (e) {
+        if (autoRobotMountedRef.current) toast.error(String(e))
+      } finally {
+        if (autoRobotMountedRef.current) setJellyBusy((prev) => ({ ...prev, [device]: false }))
+      }
+    },
+    [toast]
   )
 
   const canDiscoveryNeedsRetry =
@@ -774,6 +878,50 @@ export default function Diagnostics() {
     robot,
     robotBusy,
     resetAutoRobotRetry,
+    serverOk,
+    sessionInventoryReady,
+  ])
+
+  // Bring up each detected Jelly device once per (device, interface, server
+  // epoch), like the control panel does: only from an idle page, only after
+  // CAN discovery has settled, and never for a device the operator
+  // disconnected by hand (the server refuses those, and this tab stops
+  // asking). Absence is not latched — a replug gets a fresh attempt.
+  useEffect(() => {
+    if (!serverOk || !jelly || !jellySupported || !canDevices || !sessionInventoryReady) return
+    if (
+      canDiscoveryBlocksAutoConnect(canDiscovery) ||
+      activeRun ||
+      hardwareSessionBusy ||
+      launchBusy ||
+      !autoRobotPollStateKnown()
+    )
+      return
+    const serverEpoch = currentCanServerEpoch()
+    for (const device of JELLY_DEVICES) {
+      const presence = canDevices[device]
+      const status = jelly[device]
+      if (!presence?.present || presence.automaticConnectSuppressed) continue
+      if (status.state !== "disconnected" && status.state !== "error") continue
+      if (jellyBusy[device] || manualJellyOverrideRef.current.has(device)) continue
+      const signature = `${device}:${presence.channel}:host-${serverEpoch}`
+      if (autoJellyAttemptsRef.current.has(signature)) continue
+      autoJellyAttemptsRef.current.add(signature)
+      void connectJelly(device, true)
+    }
+  }, [
+    activeRun,
+    autoRobotPollStateKnown,
+    canDevices,
+    canDiscovery,
+    canServerInstanceId,
+    connectJelly,
+    currentCanServerEpoch,
+    hardwareSessionBusy,
+    jelly,
+    jellyBusy,
+    jellySupported,
+    launchBusy,
     serverOk,
     sessionInventoryReady,
   ])
@@ -1124,10 +1272,39 @@ export default function Diagnostics() {
           </div>
         )}
 
+        {/* Every CAN-attached device: Axol / Mantis (the telemetry link's two
+            profiles) plus Jelly's wheels and lift on their own adapters. */}
+        <section className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <h2 className="font-heading text-base font-semibold">Hardware</h2>
+            <span className="text-xs text-white/40">
+              Axol and Mantis share one telemetry link; the Jelly wheels and lift connect on their
+              own.
+            </span>
+          </div>
+          <HardwareOverview
+            online={serverOk}
+            robot={robot}
+            robotBusy={robotBusy}
+            canProfiles={canProfiles}
+            hardwareBusy={activeRun != null || hardwareSessionBusy || launchBusy}
+            onRobotConnect={(profile) => void connectRobot(profile)}
+            onRobotDisconnect={() => void disconnectRobot()}
+            jelly={jelly}
+            jellySupported={jellySupported}
+            jellyBusy={jellyBusy}
+            canDevices={canDevices}
+            onJellyConnect={(device) => void connectJelly(device)}
+            onJellyDisconnect={(device) => void disconnectJelly(device)}
+          />
+        </section>
+
         {/* Motor status */}
         <section className="flex flex-col gap-4">
           <div className="flex flex-wrap items-center gap-3">
-            <h2 className="font-heading text-base font-semibold">Motors</h2>
+            <h2 className="font-heading text-base font-semibold">
+              {robot?.profile === "mantis" ? "Mantis motors" : "Axol motors"}
+            </h2>
             {robot && (
               <span className="text-xs text-white/40">
                 {robot.reachableCount}/{robot.motorCount} reachable

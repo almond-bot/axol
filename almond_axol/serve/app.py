@@ -54,6 +54,7 @@ from .commands import (
     operation_ids,
     safety_flags,
 )
+from .jelly_link import JELLY_DEVICES, JellyLink, device_presence
 from .manager import Session, SessionManager
 from .robot_link import STATE_ERROR, RobotLink, scoped_motor_faults
 from .runner import OperationRunner
@@ -128,6 +129,17 @@ class RobotConnectRequest(BaseModel):
     # Old clients omit this and therefore remain explicit/manual connects.
     # Browser startup sets it so a successful manual Disconnect can remain
     # authoritative across every tab connected to this serve process.
+    automatic: bool = False
+
+
+class JellyConnectRequest(BaseModel):
+    """Connect one of Jelly's idle links (the wheel bus or the lift controller).
+
+    ``automatic`` marks a browser's startup connect so a manual Disconnect of
+    that device stays authoritative across every tab until the operator
+    connects it again by hand.
+    """
+
     automatic: bool = False
 
 
@@ -878,7 +890,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     robot = RobotLink(
         left_channel, right_channel, hub=hub, has_gripper=settings.has_gripper
     )
-    runner = OperationRunner(robot, settings=settings)
+    # Jelly's wheel bus and lift controller get their own idle links (status
+    # only; never commanded) so the panel shows them next to Axol and Mantis.
+    jelly = JellyLink()
+    runner = OperationRunner(robot, settings=settings, jelly_link=jelly)
     runs = DiagnosticsRunStore(hub)
     # ZED devices are exclusive. Hold this across preview capture and operation
     # startup so both paths make their idle check while owning one reservation.
@@ -902,6 +917,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     manually_disconnected_target: (
         tuple[Literal["axol", "mantis"], str | None, str | None] | None
     ) = None
+    # Same idea for Jelly: a manual Disconnect of the wheels or the lift pauses
+    # that device's automatic connect (keyed by its interface) server-wide.
+    manually_disconnected_jelly: dict[str, str] = {}
     can_discovery = _CanDiscoveryCache()
     can_discovery_launch = asyncio.Lock()
     can_discovery_task: asyncio.Task[None] | None = None
@@ -1000,6 +1018,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             manually_disconnected_target
             == ("mantis", mantis_channels[0], mantis_channels[1])
         )
+        devices: dict[str, Any] = {}
+        for device in JELLY_DEVICES:
+            presence = device_presence(device)
+            presence["automaticConnectSuppressed"] = (
+                manually_disconnected_jelly.get(device) == presence["channel"]
+            )
+            devices[device] = presence
         return {
             "serverInstanceId": server_instance_id,
             "interfaces": interfaces,
@@ -1007,6 +1032,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "axol": axol_presence,
                 "mantis": mantis_presence,
             },
+            # Jelly's wheel bus and lift controller: presence follows their
+            # pinned interfaces (can_alm_axol_b / can_alm_axol_c).
+            "devices": devices,
             "discovery": can_discovery.payload(),
         }
 
@@ -1022,6 +1050,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 or confirmed.get("connected") is not False
             ):
                 raise RuntimeError("robot link did not prove it released CAN")
+            # Discovery probes and may rename the wheel/chest interfaces too,
+            # so the Jelly links must not hold them open either.
+            jelly_state = await asyncio.to_thread(jelly.disconnect_all)
+            if any(
+                entry.get("state") != "disconnected" for entry in jelly_state.values()
+            ):
+                raise RuntimeError("Jelly link did not prove it released CAN")
 
             from ..cli.can.setup import setup_detected_hubs
 
@@ -1486,6 +1521,78 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 manually_disconnected_target = target_key
             return result
 
+    # -- Jelly wheels + lift (detached CAN + 1 Hz status poll) ---------------
+
+    @app.get("/api/jelly/status")
+    async def jelly_status() -> dict[str, Any]:
+        """Idle-link status of Jelly's wheel bus and lift controller."""
+        return jelly.status()
+
+    @app.post("/api/jelly/{device}/connect", response_model=None)
+    async def jelly_connect(
+        device: str, req: JellyConnectRequest | None = None
+    ) -> dict[str, Any] | JSONResponse:
+        if device not in JELLY_DEVICES:
+            return JSONResponse({"error": "unknown Jelly device"}, status_code=404)
+        async with session_launch_reservation:
+            if runner.is_running() or _diagnostic_session_active():
+                return JSONResponse(
+                    {
+                        "error": "cannot connect the Jelly link while an operation "
+                        "or setup/diagnostics session owns hardware"
+                    },
+                    status_code=409,
+                )
+            automatic = req is not None and req.automatic
+            if automatic and can_discovery.status in {
+                "needed",
+                "running",
+                "unidentified",
+                "error",
+            }:
+                return JSONResponse(
+                    {
+                        "error": "automatic connection is waiting for CAN "
+                        "hardware discovery"
+                    },
+                    status_code=409,
+                )
+            channel = device_presence(device)["channel"]
+            if automatic and manually_disconnected_jelly.get(device) == channel:
+                return JSONResponse(
+                    {
+                        "error": "automatic connection paused after manual disconnect",
+                        "automaticConnectSuppressed": True,
+                    },
+                    status_code=409,
+                )
+            result = await asyncio.to_thread(jelly.connect, device)
+            if not automatic:
+                manually_disconnected_jelly.pop(device, None)
+            return result
+
+    @app.post("/api/jelly/{device}/disconnect", response_model=None)
+    async def jelly_disconnect(device: str) -> dict[str, Any] | JSONResponse:
+        if device not in JELLY_DEVICES:
+            return JSONResponse({"error": "unknown Jelly device"}, status_code=404)
+        async with session_launch_reservation:
+            if runner.is_running() or _diagnostic_session_active():
+                return JSONResponse(
+                    {
+                        "error": "cannot disconnect the Jelly link while an operation "
+                        "or setup/diagnostics session owns hardware"
+                    },
+                    status_code=409,
+                )
+            channel = jelly.status()[device]["channel"]
+            try:
+                result = await asyncio.to_thread(jelly.disconnect, device)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
+            if result[device]["state"] == "disconnected":
+                manually_disconnected_jelly[device] = channel
+            return result
+
     @app.get("/api/can/interfaces", response_model=None)
     async def can_interfaces() -> dict[str, Any] | JSONResponse:
         """SocketCAN inventory, trusted profiles, and discovery state."""
@@ -1593,7 +1700,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 async with session_launch_reservation:
                     try:
                         if uses_can_bus:
-                            await asyncio.to_thread(robot.reacquire)
+                            try:
+                                await asyncio.to_thread(robot.reacquire)
+                            finally:
+                                await asyncio.to_thread(jelly.reacquire)
                     finally:
                         if uses_can_bus:
                             diagnostic_cleanup_pending.discard(session.id)
@@ -1725,6 +1835,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         },
                         status_code=409,
                     )
+                # The lift helpers and lift cycle open Jelly's buses, so the
+                # idle Jelly links hand theirs over for the run as well.
+                try:
+                    await asyncio.to_thread(jelly.release)
+                except Exception as exc:  # noqa: BLE001 - preserve safety lockout
+                    await asyncio.to_thread(robot.reacquire)
+                    return JSONResponse(
+                        {
+                            "error": "Could not release the Jelly CAN link; the "
+                            "command was not started. Reconnect the Jelly wheels "
+                            f"/ lift before retrying: {exc}"
+                        },
+                        status_code=409,
+                    )
             try:
                 session = await manager.start(
                     command_id, launch_args, stdin_pipe=stdin_pipe
@@ -1732,11 +1856,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             except Exception:
                 if uses_can_bus:
                     await asyncio.to_thread(robot.reacquire)
+                    await asyncio.to_thread(jelly.reacquire)
                 raise
 
             if uses_can_bus:
                 if session.status == "error":
                     await asyncio.to_thread(robot.reacquire)
+                    await asyncio.to_thread(jelly.reacquire)
                 else:
                     diagnostic_cleanup_pending.add(session.id)
             if uses_cameras and session.status != "error":
@@ -2794,6 +2920,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         await runner.shutdown()
         await manager.shutdown()
         await asyncio.to_thread(robot.shutdown)
+        await asyncio.to_thread(jelly.shutdown)
 
     if static_dir is not None:
         _mount_spa(app, static_dir)

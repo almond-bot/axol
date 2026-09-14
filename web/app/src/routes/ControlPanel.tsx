@@ -4,6 +4,8 @@ import { cn } from "@/lib/utils"
 import {
   HARDWARE_PROFILE_ARG,
   HARDWARE_PROFILE_SETTING,
+  JELLY_DEVICES,
+  JELLY_DEVICE_LABELS,
   OPERATIONS,
   cameraCount,
   canDiscoveryRequestCanRetry,
@@ -13,6 +15,7 @@ import {
   fetchCanInterfaces,
   fetchCommands,
   fetchInfo,
+  fetchJellyStatus,
   fetchOpStatus,
   fetchRobotStatus,
   fetchSessions,
@@ -20,6 +23,8 @@ import {
   fetchUpdateStatus,
   fetchUsbStatus,
   isSimRun,
+  jellyConnect,
+  jellyDisconnect,
   loadLocalHardwareProfile,
   loadOpSettings,
   missingCameraSerials,
@@ -40,12 +45,15 @@ import {
   useSessionLogs,
   type CameraDevice,
   type CameraSpec,
+  type CanDeviceInventory,
   type CanDiscoveryState,
   type CanInterfaceInventory,
   type CanProfileInventory,
   type CommandSpec,
   type FormValue,
   type HardwareProfile,
+  type JellyDevice,
+  type JellyStatus,
   type OperationId,
   type OperationMeta,
   type PolicyState,
@@ -183,6 +191,17 @@ export default function ControlPanel() {
     []
   )
   const [canProfiles, setCanProfiles] = useState<CanProfileInventory | null>(null)
+  const [canDevices, setCanDevices] = useState<CanDeviceInventory | null>(null)
+  // Jelly's wheels and lift: two independent idle links next to the Axol /
+  // Mantis one. null until fetched; jellySupported drops to false on a host
+  // too old to expose them (404), so their tiles say so instead of failing.
+  const [jelly, setJelly] = useState<JellyStatus | null>(null)
+  const [jellySupported, setJellySupported] = useState(true)
+  const [jellyBusy, setJellyBusy] = useState<Partial<Record<JellyDevice, boolean>>>({})
+  // One automatic connect per (device, interface, server epoch); a manual
+  // Connect/Disconnect on a device takes it out of automatic hands for this tab.
+  const autoJellyAttemptsRef = useRef(new Set<string>())
+  const manualJellyOverrideRef = useRef(new Set<JellyDevice>())
   const [canDiscovery, setCanDiscovery] = useState<CanDiscoveryState | null>(null)
   const [canServerInstanceId, setCanServerInstanceId] = useState<string | null>(null)
   const canServerInstanceIdRef = useRef<string | null>(null)
@@ -205,6 +224,7 @@ export default function ControlPanel() {
     canServerInstanceIdRef.current = instanceId
     setCanServerInstanceId(instanceId)
     setCanDiscovery(inventory.discovery ?? null)
+    setCanDevices(inventory.devices ?? null)
     if (inventory.profiles) {
       setCanProfiles(inventory.profiles)
       setLegacyCanInventory(false)
@@ -361,6 +381,12 @@ export default function ControlPanel() {
       setRobot(null)
       setRobotBusy(false)
       setCanProfiles(null)
+      setCanDevices(null)
+      setJelly(null)
+      setJellySupported(true)
+      setJellyBusy({})
+      autoJellyAttemptsRef.current.clear()
+      manualJellyOverrideRef.current.clear()
       setCanDiscovery(null)
       canServerInstanceIdRef.current = null
       previousCanServerInstanceIdRef.current = null
@@ -512,6 +538,19 @@ export default function ControlPanel() {
           if (active) setUsb(u)
         })
         .catch(() => {})
+      fetchJellyStatus()
+        .then((status) => {
+          if (!active) return
+          setJelly(status)
+          setJellySupported(true)
+        })
+        .catch((error) => {
+          if (!active) return
+          // A host that predates the Jelly links answers 404: show the tiles
+          // as unavailable rather than as a disconnected device.
+          if (String(error).includes("HTTP 404")) setJellySupported(false)
+          setJelly(null)
+        })
     }
     poll()
     const t = setInterval(poll, 2000)
@@ -691,6 +730,12 @@ export default function ControlPanel() {
     setHostInfo(null)
     setRobot(null)
     setCanProfiles(null)
+    setCanDevices(null)
+    setJelly(null)
+    setJellySupported(true)
+    setJellyBusy({})
+    autoJellyAttemptsRef.current.clear()
+    manualJellyOverrideRef.current.clear()
     setCanDiscovery(null)
     canServerInstanceIdRef.current = null
     previousCanServerInstanceIdRef.current = null
@@ -944,6 +989,59 @@ export default function ControlPanel() {
     }
   }
 
+  // -- Jelly wheels / lift connections --
+  const jellyConnectClick = useCallback(
+    async (device: JellyDevice, automatic = false): Promise<boolean | null> => {
+      const generation = connectionGenerationRef.current
+      if (!automatic) manualJellyOverrideRef.current.add(device)
+      setJellyBusy((prev) => ({ ...prev, [device]: true }))
+      try {
+        const status = await jellyConnect(device, automatic)
+        if (generation !== connectionGenerationRef.current) return null
+        setJelly(status)
+        if (!status[device].connected) {
+          throw new Error(
+            status[device].error ?? `Could not connect the ${JELLY_DEVICE_LABELS[device]} link`
+          )
+        }
+        return true
+      } catch (e) {
+        if (generation !== connectionGenerationRef.current) return null
+        if (!automatic) toast.error(String(e))
+        return false
+      } finally {
+        if (generation === connectionGenerationRef.current)
+          setJellyBusy((prev) => ({ ...prev, [device]: false }))
+      }
+    },
+    [toast]
+  )
+
+  const jellyDisconnectClick = useCallback(
+    async (device: JellyDevice) => {
+      const generation = connectionGenerationRef.current
+      manualJellyOverrideRef.current.add(device)
+      setJellyBusy((prev) => ({ ...prev, [device]: true }))
+      try {
+        const status = await jellyDisconnect(device)
+        if (generation !== connectionGenerationRef.current) return
+        setJelly(status)
+        if (status[device].state !== "disconnected") {
+          throw new Error(
+            status[device].error ?? `Could not disconnect the ${JELLY_DEVICE_LABELS[device]} link`
+          )
+        }
+      } catch (e) {
+        if (generation !== connectionGenerationRef.current) return
+        toast.error(String(e))
+      } finally {
+        if (generation === connectionGenerationRef.current)
+          setJellyBusy((prev) => ({ ...prev, [device]: false }))
+      }
+    },
+    [toast]
+  )
+
   // -- operation lifecycle --
   // Liveness comes from two sources that can briefly disagree about the same
   // session: `session` (the REST start/stop responses) and `status` (the logs
@@ -996,6 +1094,48 @@ export default function ControlPanel() {
     canDiscovery?.status === "partial" ||
     canDiscovery?.status === "unidentified" ||
     canDiscovery?.status === "error"
+
+  // Bring up each detected Jelly device once per (device, interface, server
+  // epoch), the way the Axol/Mantis link auto-connects: only from an idle
+  // panel, only after CAN discovery has settled, and never for a device the
+  // operator disconnected by hand (the server refuses those, and this tab
+  // stops asking). Absence is not latched — a replug gets a fresh attempt.
+  useEffect(() => {
+    if (conn.state !== "ok" || !jelly || !jellySupported || !canDevices) return
+    if (
+      canDiscoveryBlocksAutoConnect(canDiscovery) ||
+      isLive ||
+      hardwareSessionBusy ||
+      activeCommandSession ||
+      !sessionInventoryReady
+    )
+      return
+    const serverEpoch = currentCanServerEpoch()
+    for (const device of JELLY_DEVICES) {
+      const presence = canDevices[device]
+      const status = jelly[device]
+      if (!presence?.present || presence.automaticConnectSuppressed) continue
+      if (status.state !== "disconnected" && status.state !== "error") continue
+      if (jellyBusy[device] || manualJellyOverrideRef.current.has(device)) continue
+      const signature = `${device}:${presence.channel}:host-${serverEpoch}`
+      if (autoJellyAttemptsRef.current.has(signature)) continue
+      autoJellyAttemptsRef.current.add(signature)
+      void jellyConnectClick(device, true)
+    }
+  }, [
+    activeCommandSession,
+    canDevices,
+    canDiscovery,
+    conn.state,
+    currentCanServerEpoch,
+    hardwareSessionBusy,
+    isLive,
+    jelly,
+    jellyBusy,
+    jellyConnectClick,
+    jellySupported,
+    sessionInventoryReady,
+  ])
 
   const retryCanIdentification = useCallback(async () => {
     if (canDiscoveryRetryBusy) return
@@ -1625,6 +1765,12 @@ export default function ControlPanel() {
           canProfiles={canProfiles}
           onRobotConnect={robotConnectClick}
           onRobotDisconnect={robotDisconnectClick}
+          jelly={jelly}
+          jellySupported={jellySupported}
+          jellyBusy={jellyBusy}
+          canDevices={canDevices}
+          onJellyConnect={(device) => void jellyConnectClick(device)}
+          onJellyDisconnect={(device) => void jellyDisconnectClick(device)}
           selectedProfile={hardwareProfile}
           onSelectProfile={(profile) => void selectHardwareProfile(profile)}
           selectDisabled={isLive || hardwareProfileSaving}

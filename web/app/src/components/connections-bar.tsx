@@ -1,5 +1,7 @@
 import {
+  ArrowUpFromLine,
   Check,
+  CircleDot,
   Cpu,
   Loader2,
   Plug,
@@ -11,12 +13,18 @@ import {
 } from "lucide-react"
 import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
+import { LiftSummary, WheelGrid } from "@/components/jelly-status"
+import { jellyDeviceView, STATUS_DOT_CLASS, type StatusDot } from "@/lib/jelly-view"
 import type { SettingsScope } from "@/lib/settings-scope"
 import {
+  JELLY_DEVICE_LABELS,
   restartHost,
   shutdownHost,
+  type CanDeviceInventory,
   type CanProfileInventory,
   type HardwareProfile,
+  type JellyDevice,
+  type JellyStatus,
   type MotorHealth,
   type RobotStatus,
 } from "@/lib/supervisor"
@@ -25,15 +33,9 @@ import { Card } from "@/components/ui/card"
 import { useToast } from "@/components/ui/toast"
 import { cn } from "@/lib/utils"
 
-type Dot = "ok" | "busy" | "warn" | "err" | "idle"
+type Dot = StatusDot
 
-const DOT_CLASS: Record<Dot, string> = {
-  ok: "bg-emerald-400",
-  busy: "bg-sky-400",
-  warn: "bg-amber-400",
-  err: "bg-red-400",
-  idle: "bg-white/30",
-}
+const DOT_CLASS = STATUS_DOT_CLASS
 
 function Tile({
   icon,
@@ -189,12 +191,15 @@ function DeviceSelect({
 }
 
 /**
- * Connection tiles for the Axol Host and the two hardware profiles. Axol and
- * Mantis share one idle telemetry link, so connecting either hardware tile
- * switches that link to its CAN interfaces and motor set. Clicking a tile's
- * title opens that connection's settings: Axol and Mantis each have their
- * own, and the host tile opens the general (shared) settings. The hardware
- * tiles also carry the system-wide device selection (see DeviceSelect).
+ * Connection tiles for the Axol Host, the two hardware profiles, and Jelly's
+ * two devices. Axol and Mantis share one idle telemetry link, so connecting
+ * either hardware tile switches that link to its CAN interfaces and motor
+ * set. Jelly's wheels and lift ride their own single-channel adapters and
+ * have independent idle links (status only), so their tiles connect and
+ * disconnect on their own. Clicking a tile's title opens that connection's
+ * settings: Axol and Mantis each have their own, and the host and Jelly
+ * tiles open the general (shared) settings. The Axol/Mantis tiles also carry
+ * the system-wide device selection (see DeviceSelect).
  *
  * The host tile also carries the host power controls (restart / shut down,
  * each behind a confirmation) — the Disconnect button only drops this
@@ -213,6 +218,12 @@ export function ConnectionsBar({
   canProfiles,
   onRobotConnect,
   onRobotDisconnect,
+  jelly,
+  jellySupported = true,
+  jellyBusy,
+  canDevices,
+  onJellyConnect,
+  onJellyDisconnect,
   selectedProfile,
   onSelectProfile,
   selectDisabled = false,
@@ -236,6 +247,16 @@ export function ConnectionsBar({
   canProfiles?: CanProfileInventory | null
   onRobotConnect: (profile: HardwareProfile) => void
   onRobotDisconnect: () => void
+  /** Idle-link status of Jelly's wheels and lift (null until fetched). */
+  jelly?: JellyStatus | null
+  /** False on a serve host too old to expose the Jelly links. */
+  jellySupported?: boolean
+  /** A connect/disconnect is in flight for that device. */
+  jellyBusy?: Partial<Record<JellyDevice, boolean>>
+  /** Presence of the wheel/lift CAN interfaces from the host inventory. */
+  canDevices?: CanDeviceInventory | null
+  onJellyConnect?: (device: JellyDevice) => void
+  onJellyDisconnect?: (device: JellyDevice) => void
   /** The system-wide device selection, marked on its tile. */
   selectedProfile?: HardwareProfile
   /** Switches the system-wide device selection (offered on the other tile). */
@@ -382,8 +403,79 @@ export function ConnectionsBar({
     )
   }
 
+  // Jelly's wheels and lift: independent idle links on their own adapters,
+  // so each tile connects on its own and neither takes part in the Axol /
+  // Mantis device selection (Jelly is driven alongside Axol, not instead).
+  const jellyTile = (device: JellyDevice) => {
+    const title = JELLY_DEVICE_LABELS[device]
+    const view = jellyDeviceView(device, jelly, canDevices?.[device], jellySupported)
+    const busy = jellyBusy?.[device] ?? false
+    const live = view.state === "connected" || view.state === "busy"
+    return (
+      <Tile
+        key={device}
+        icon={
+          device === "wheels" ? (
+            <CircleDot className="size-3.5" />
+          ) : (
+            <ArrowUpFromLine className="size-3.5" />
+          )
+        }
+        title={title}
+        dot={view.dot}
+        label={view.label}
+        pulse={view.state === "connecting"}
+        onOpenSettings={online && onOpenSettings ? () => onOpenSettings("general") : undefined}
+        statusContent={
+          jelly && view.state === "connected" && !view.fault ? (
+            device === "wheels" ? (
+              <WheelGrid status={jelly.wheels} />
+            ) : (
+              <LiftSummary status={jelly.lift} />
+            )
+          ) : undefined
+        }
+      >
+        {live ? (
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={() => onJellyDisconnect?.(device)}
+            disabled={busy || opRunning || view.state === "busy" || !onJellyDisconnect}
+            aria-label={`Disconnect ${title}`}
+            title={
+              opRunning || view.state === "busy"
+                ? "Wait for the active operation or setup session to finish."
+                : `Release the ${title} link (CAN). The hardware stays powered.`
+            }
+            className="size-8"
+          >
+            <Unplug />
+          </Button>
+        ) : (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => onJellyConnect?.(device)}
+            disabled={!online || !jellySupported || busy || opRunning || !onJellyConnect}
+            title={
+              !jellySupported
+                ? "Update the serve host to connect Jelly's wheels and lift from the panel."
+                : opRunning
+                  ? "Wait for the active operation or setup session to finish."
+                  : undefined
+            }
+          >
+            {busy ? <Loader2 className="animate-spin" /> : <Plug />}
+            Connect
+          </Button>
+        )}
+      </Tile>
+    )
+  }
+
   return (
-    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2 lg:grid-cols-3">
+    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
       <Tile
         icon={<Server className="size-3.5" />}
         title="Axol Host"
@@ -442,6 +534,8 @@ export function ConnectionsBar({
 
       {hardwareTile("axol", "Axol")}
       {hardwareTile("mantis", "Mantis")}
+      {jellyTile("wheels")}
+      {jellyTile("lift")}
 
       {/* Host power confirmation (shutdown / restart) */}
       {powerOpen && (
