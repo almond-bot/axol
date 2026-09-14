@@ -1,11 +1,5 @@
-import { STATUS_DOT_CLASS, liftSummaryText, wheelName, type StatusDot } from "@/lib/jelly-view"
-import {
-  liftFaultLabel,
-  wheelMotorHealthy,
-  type JellyLiftStatus,
-  type JellyWheelsStatus,
-  type WheelMotorHealth,
-} from "@/lib/supervisor"
+import { wheelName } from "@/lib/jelly-view"
+import { wheelMotorHealthy, type JellyWheelsStatus, type WheelMotorHealth } from "@/lib/supervisor"
 import { cn } from "@/lib/utils"
 
 const WHEEL_SHORT: Record<string, string> = {
@@ -69,27 +63,6 @@ export function WheelGrid({ status }: { status: JellyWheelsStatus }) {
           </div>
         )
       })}
-    </div>
-  )
-}
-
-/** One-line lift summary for the tile. */
-export function LiftSummary({ status }: { status: JellyLiftStatus }) {
-  const fault = liftFaultLabel(status)
-  const text = fault ?? liftSummaryText(status)
-  const dot: StatusDot = fault
-    ? "err"
-    : status.reachable == null
-      ? "busy"
-      : status.reachable && status.status
-        ? "ok"
-        : "warn"
-  return (
-    <div className="flex min-w-0 items-center gap-2 text-sm">
-      <span className={cn("size-2 shrink-0 rounded-full", STATUS_DOT_CLASS[dot])} />
-      <span className="min-w-0 flex-1 truncate text-white/75" title={text}>
-        {text}
-      </span>
     </div>
   )
 }

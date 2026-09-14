@@ -1,5 +1,4 @@
 import {
-  ArrowUpFromLine,
   Check,
   CircleDot,
   Cpu,
@@ -13,11 +12,17 @@ import {
 } from "lucide-react"
 import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import { LiftSummary, WheelGrid } from "@/components/jelly-status"
-import { jellyDeviceView, STATUS_DOT_CLASS, type StatusDot } from "@/lib/jelly-view"
+import { WheelGrid } from "@/components/jelly-status"
+import {
+  jellyDeviceView,
+  liftSummaryText,
+  STATUS_DOT_CLASS,
+  type StatusDot,
+} from "@/lib/jelly-view"
 import type { SettingsScope } from "@/lib/settings-scope"
 import {
   JELLY_DEVICE_LABELS,
+  JELLY_DEVICES,
   restartHost,
   shutdownHost,
   type CanDeviceInventory,
@@ -48,6 +53,7 @@ function Tile({
   statusContent,
   badge,
   onOpenSettings,
+  className,
 }: {
   icon: ReactNode
   title: string
@@ -61,6 +67,8 @@ function Tile({
   badge?: ReactNode
   /** Clicking the tile's title opens this connection's settings. */
   onOpenSettings?: () => void
+  /** Grid placement (e.g. a tile spanning the row). */
+  className?: string
 }) {
   const heading = (
     <>
@@ -72,7 +80,8 @@ function Tile({
     <div
       className={cn(
         "group relative flex h-fit min-w-0 flex-col gap-2 overflow-visible rounded-xl border border-white/10 bg-white/[0.02] p-3.5",
-        onOpenSettings && "transition-colors hover:border-white/20"
+        onOpenSettings && "transition-colors hover:border-white/20",
+        className
       )}
     >
       <div className="flex min-h-8 items-center justify-between gap-2">
@@ -197,8 +206,8 @@ function DeviceSelect({
  * set. Jelly's wheels and lift ride their own single-channel adapters and
  * have independent idle links (status only), so their tiles connect and
  * disconnect on their own. Clicking a tile's title opens that connection's
- * settings: Axol and Mantis each have their own, and the host and Jelly
- * tiles open the general (shared) settings. The Axol/Mantis tiles also carry
+ * settings: Axol, Mantis, and Jelly each have their own, and the host tile
+ * opens the general (shared) settings. The Axol/Mantis tiles also carry
  * the system-wide device selection (see DeviceSelect).
  *
  * The host tile also carries the host power controls (restart / shut down,
@@ -403,39 +412,44 @@ export function ConnectionsBar({
     )
   }
 
-  // Jelly's wheels and lift: independent idle links on their own adapters,
-  // so each tile connects on its own and neither takes part in the Axol /
-  // Mantis device selection (Jelly is driven alongside Axol, not instead).
-  const jellyTile = (device: JellyDevice) => {
+  // Jelly's wheels and lift: two independent idle links on their own
+  // adapters, shown as two rows of one tile (each with its own status and
+  // connect / disconnect). Neither takes part in the Axol / Mantis device
+  // selection — Jelly is driven alongside Axol, not instead of it.
+  const jellyRow = (device: JellyDevice) => {
     const title = JELLY_DEVICE_LABELS[device]
+    const short = device === "wheels" ? "Wheels" : "Lift"
     const view = jellyDeviceView(device, jelly, canDevices?.[device], jellySupported)
     const busy = jellyBusy?.[device] ?? false
     const live = view.state === "connected" || view.state === "busy"
+    const detail =
+      jelly && view.state === "connected" && !view.fault ? (
+        device === "wheels" ? (
+          <WheelGrid status={jelly.wheels} />
+        ) : (
+          <span
+            className="min-w-0 flex-1 truncate text-white/75"
+            title={liftSummaryText(jelly.lift)}
+          >
+            {liftSummaryText(jelly.lift)}
+          </span>
+        )
+      ) : (
+        <span className="min-w-0 flex-1 truncate text-white/75" title={view.label}>
+          {view.label}
+        </span>
+      )
     return (
-      <Tile
-        key={device}
-        icon={
-          device === "wheels" ? (
-            <CircleDot className="size-3.5" />
-          ) : (
-            <ArrowUpFromLine className="size-3.5" />
-          )
-        }
-        title={title}
-        dot={view.dot}
-        label={view.label}
-        pulse={view.state === "connecting"}
-        onOpenSettings={online && onOpenSettings ? () => onOpenSettings("general") : undefined}
-        statusContent={
-          jelly && view.state === "connected" && !view.fault ? (
-            device === "wheels" ? (
-              <WheelGrid status={jelly.wheels} />
-            ) : (
-              <LiftSummary status={jelly.lift} />
-            )
-          ) : undefined
-        }
-      >
+      <div key={device} className="flex min-w-0 items-center gap-2 text-sm">
+        <span
+          className={cn(
+            "size-2 shrink-0 rounded-full",
+            DOT_CLASS[view.dot],
+            view.state === "connecting" && "animate-pulse"
+          )}
+        />
+        <span className="w-14 shrink-0 text-xs tracking-wide text-white/45 uppercase">{short}</span>
+        {detail}
         {live ? (
           <Button
             variant="outline"
@@ -448,34 +462,58 @@ export function ConnectionsBar({
                 ? "Wait for the active operation or setup session to finish."
                 : `Release the ${title} link (CAN). The hardware stays powered.`
             }
-            className="size-8"
+            className="size-7 shrink-0"
           >
-            <Unplug />
+            {busy ? <Loader2 className="animate-spin" /> : <Unplug />}
           </Button>
         ) : (
           <Button
             variant="outline"
-            size="sm"
+            size="icon"
             onClick={() => onJellyConnect?.(device)}
             disabled={!online || !jellySupported || busy || opRunning || !onJellyConnect}
+            aria-label={`Connect ${title}`}
             title={
               !jellySupported
                 ? "Update the serve host to connect Jelly's wheels and lift from the panel."
                 : opRunning
                   ? "Wait for the active operation or setup session to finish."
-                  : undefined
+                  : `Connect ${title}`
             }
+            className="size-7 shrink-0"
           >
             {busy ? <Loader2 className="animate-spin" /> : <Plug />}
-            Connect
           </Button>
         )}
-      </Tile>
+      </div>
     )
   }
+  // The tile's headline dot: the worse of the two devices.
+  const jellyViews = JELLY_DEVICES.map((device) =>
+    jellyDeviceView(device, jelly, canDevices?.[device], jellySupported)
+  )
+  const jellyDot: Dot = jellyViews.some((v) => v.dot === "err")
+    ? "err"
+    : jellyViews.some((v) => v.dot === "warn")
+      ? "warn"
+      : jellyViews.some((v) => v.dot === "busy")
+        ? "busy"
+        : jellyViews.some((v) => v.dot === "ok")
+          ? "ok"
+          : "idle"
+  const jellyLive = jellyViews.filter((v) => v.state === "connected" || v.state === "busy").length
+  const jellyLabel = !jellySupported
+    ? "Not available on this host"
+    : jellyLive === 2
+      ? "Wheels and lift connected"
+      : jellyLive === 1
+        ? "One of two connected"
+        : jellyViews.some((v) => v.label === "CAN detected")
+          ? "CAN detected"
+          : "Disconnected"
 
   return (
-    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2 lg:grid-cols-3">
       <Tile
         icon={<Server className="size-3.5" />}
         title="Axol Host"
@@ -534,8 +572,21 @@ export function ConnectionsBar({
 
       {hardwareTile("axol", "Axol")}
       {hardwareTile("mantis", "Mantis")}
-      {jellyTile("wheels")}
-      {jellyTile("lift")}
+      <Tile
+        icon={<CircleDot className="size-3.5" />}
+        title="Jelly"
+        dot={jellyDot}
+        label={jellyLabel}
+        onOpenSettings={online && onOpenSettings ? () => onOpenSettings("jelly") : undefined}
+        className="sm:col-span-2 lg:col-span-3"
+        statusContent={
+          jellySupported ? (
+            <div className="grid gap-2 sm:grid-cols-2 sm:gap-x-6">
+              {JELLY_DEVICES.map(jellyRow)}
+            </div>
+          ) : undefined
+        }
+      />
 
       {/* Host power confirmation (shutdown / restart) */}
       {powerOpen && (

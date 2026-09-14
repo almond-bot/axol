@@ -7,7 +7,6 @@ import {
   jellyDeviceView,
   liftSummaryText,
   STATUS_DOT_CLASS,
-  wheelName,
   type StatusDot,
 } from "@/lib/jelly-view"
 import {
@@ -15,14 +14,11 @@ import {
   JELLY_DEVICES,
   liftFaultLabel,
   motorFaultLabel,
-  wheelMotorHealthy,
   type CanDeviceInventory,
   type CanProfileInventory,
   type HardwareProfile,
   type JellyDevice,
-  type JellyLiftStatus,
   type JellyStatus,
-  type JellyWheelsStatus,
   type RobotState,
   type RobotStatus,
 } from "@/lib/supervisor"
@@ -42,35 +38,39 @@ const STATE_BADGE: Record<
   error: { variant: "destructive", text: "error" },
 }
 
-function HardwareCard({
+/**
+ * One device row: identity, link state, a one-line status (or the wheel
+ * grid), its CAN interface(s), and the connect / disconnect control. Wraps
+ * to two lines on narrow screens instead of squeezing.
+ */
+function HardwareRow({
   icon,
   title,
   state,
   dot,
-  label,
+  status,
+  channels,
   action,
-  children,
 }: {
   icon: ReactNode
   title: string
   state: RobotState
   dot: StatusDot
-  label: string
+  status: ReactNode
+  channels: ReactNode
   action: ReactNode
-  children?: ReactNode
 }) {
   const badge = STATE_BADGE[state]
   return (
-    <div className="flex min-w-0 flex-col gap-3 rounded-xl border border-white/10 bg-white/[0.02] p-3.5">
-      <div className="flex min-h-8 items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
-          {icon}
-          <span className="truncate font-mono">{title}</span>
-          <Badge variant={badge.variant}>{badge.text}</Badge>
-        </div>
-        <div className="shrink-0">{action}</div>
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-3.5 py-2.5">
+      <div className="flex w-40 shrink-0 items-center gap-2 text-xs tracking-widest text-white/45 uppercase">
+        {icon}
+        <span className="truncate font-mono">{title}</span>
       </div>
-      <div className="flex min-w-0 items-center gap-2 text-sm">
+      <Badge variant={badge.variant} className="shrink-0">
+        {badge.text}
+      </Badge>
+      <div className="flex min-w-48 flex-1 items-center gap-2 text-sm">
         <span
           className={cn(
             "size-2 shrink-0 rounded-full",
@@ -78,102 +78,19 @@ function HardwareCard({
             state === "connecting" && "animate-pulse"
           )}
         />
-        <span className="min-w-0 flex-1 truncate text-white/75" title={label}>
-          {label}
-        </span>
+        {status}
       </div>
+      <div className="hidden shrink-0 font-mono text-xs text-white/40 lg:block">{channels}</div>
+      <div className="shrink-0">{action}</div>
+    </div>
+  )
+}
+
+function Text({ children, title }: { children: ReactNode; title?: string }) {
+  return (
+    <span className="min-w-0 flex-1 truncate text-white/75" title={title}>
       {children}
-    </div>
-  )
-}
-
-function Row({ name, value, warn }: { name: string; value: ReactNode; warn?: boolean }) {
-  return (
-    <div className="flex items-baseline justify-between gap-3 text-xs">
-      <span className="text-white/40">{name}</span>
-      <span className={cn("truncate font-mono", warn ? "text-red-300" : "text-white/70")}>
-        {value}
-      </span>
-    </div>
-  )
-}
-
-/** Per-wheel detail rows under the FL/FR/BL/BR grid. */
-function WheelDetails({ status }: { status: JellyWheelsStatus }) {
-  return (
-    <div className="flex flex-col gap-2">
-      <WheelGrid status={status} />
-      <div className="flex flex-col gap-1">
-        {status.motors.map((m) => {
-          const unknown = m.reachable == null
-          const healthy = wheelMotorHealthy(m)
-          const problem = unknown
-            ? "unknown"
-            : !m.reachable
-              ? "unreachable"
-              : (m.status ?? "OK").replace(/_/g, " ").toLowerCase()
-          const extra = [
-            m.temperature != null ? `${Math.round(m.temperature)}°C` : null,
-            m.voltage != null ? `${m.voltage.toFixed(1)} V` : null,
-          ]
-            .filter(Boolean)
-            .join(" · ")
-          return (
-            <Row
-              key={m.id}
-              name={`${wheelName(m)} (id ${m.id})`}
-              value={extra ? `${problem} · ${extra}` : problem}
-              warn={!unknown && !healthy}
-            />
-          )
-        })}
-      </div>
-    </div>
-  )
-}
-
-/** The jelly_legs board's status frame, field by field. */
-function LiftDetails({ status }: { status: JellyLiftStatus }) {
-  const board = status.status
-  const fault = liftFaultLabel(status)
-  if (!board) {
-    return <p className="text-xs text-white/45">{fault ?? liftSummaryText(status)}</p>
-  }
-  const yesNo = (v: boolean | null) => (v == null ? "—" : v ? "yes" : "no")
-  return (
-    <div className="flex flex-col gap-1">
-      <Row name="Homed" value={board.homing ? "homing…" : yesNo(board.homed)} />
-      <Row
-        name="Height"
-        value={board.heightPercent != null ? `${Math.round(board.heightPercent)}%` : "—"}
-      />
-      <Row
-        name="Motion"
-        value={
-          board.moving
-            ? "moving"
-            : board.atLower
-              ? "at lower stop"
-              : board.atUpper
-                ? "at upper stop"
-                : "still"
-        }
-      />
-      <Row name="Stall fault" value={yesNo(board.stallFault)} warn={board.stallFault} />
-      {board.driversEnabled != null && (
-        <Row name="Drivers enabled" value={yesNo(board.driversEnabled)} />
-      )}
-      {board.vmPresent != null && (
-        <Row name="Motor power" value={yesNo(board.vmPresent)} warn={board.vmPresent === false} />
-      )}
-      {board.driverFaultMask != null && (
-        <Row
-          name="Driver faults"
-          value={board.driverFaultMask ? `0x${board.driverFaultMask.toString(16)}` : "none"}
-          warn={board.driverFaultMask !== 0}
-        />
-      )}
-    </div>
+    </span>
   )
 }
 
@@ -196,10 +113,12 @@ export interface HardwareOverviewProps {
 
 /**
  * Every CAN-attached device the host knows about — Axol, Mantis, Jelly's
- * wheels, and Jelly's lift — with its link state, detection, per-motor /
- * per-board detail, and a Connect / Disconnect for each. Axol and Mantis are
- * the two profiles of the one telemetry link, so only one of them is ever
- * connected; the Jelly devices are independent links on their own adapters.
+ * wheels, and Jelly's lift — one row each, with link state, detection,
+ * status detail, CAN interface, and Connect / Disconnect. Axol and Mantis
+ * are the two profiles of the one telemetry link, so only one of them is
+ * ever connected; the Jelly devices are independent links on their own
+ * adapters. Per-wheel temperatures and voltages are in the wheel grid's
+ * tooltips; the Axol / Mantis motors have the Motors section below.
  */
 export function HardwareOverview({
   online,
@@ -220,7 +139,7 @@ export function HardwareOverview({
   const robotLive = robot?.state === "connected" || robot?.state === "busy"
   const busyTitle = "Wait for the active run or setup session to finish."
 
-  const profileCard = (profile: HardwareProfile) => {
+  const profileRow = (profile: HardwareProfile) => {
     const title = PROFILE_LABELS[profile]
     const active = activeProfile === profile
     const presence = canProfiles?.[profile]
@@ -258,6 +177,11 @@ export function HardwareOverview({
                   ? "Not detected"
                   : "Disconnected"
     const channels = active ? robot?.channels : presence?.channels
+    const channelText = channels
+      ? [channels.left && `L ${channels.left}`, channels.right && `R ${channels.right}`]
+          .filter(Boolean)
+          .join(" · ")
+      : ""
     // The link shows one profile at a time; switching means disconnecting
     // the other first, so the page never silently swaps an open link.
     const otherLive = robotLive && !active
@@ -295,37 +219,39 @@ export function HardwareOverview({
         </Button>
       )
     return (
-      <HardwareCard
+      <HardwareRow
         key={profile}
         icon={<Cpu className="size-3.5" />}
         title={title}
         state={state}
         dot={dot}
-        label={label}
+        status={<Text title={label}>{label}</Text>}
+        channels={channelText || "—"}
         action={action}
-      >
-        {channels && (channels.left || channels.right) && (
-          <div className="flex flex-col gap-1">
-            <Row
-              name={profile === "mantis" ? "Left gripper" : "Left arm"}
-              value={channels.left ?? "—"}
-            />
-            <Row
-              name={profile === "mantis" ? "Right gripper" : "Right arm"}
-              value={channels.right ?? "—"}
-            />
-          </div>
-        )}
-      </HardwareCard>
+      />
     )
   }
 
-  const jellyCard = (device: JellyDevice) => {
+  const jellyRow = (device: JellyDevice) => {
     const title = JELLY_DEVICE_LABELS[device]
     const view = jellyDeviceView(device, jelly, canDevices?.[device], jellySupported)
     const busy = jellyBusy[device] ?? false
     const live = view.state === "connected" || view.state === "busy"
-    const channel = jelly?.[device]?.channel ?? canDevices?.[device]?.channel ?? null
+    const channel = jelly?.[device]?.channel ?? canDevices?.[device]?.channel ?? "—"
+    const status =
+      jelly && view.state === "connected" && !view.fault ? (
+        device === "wheels" ? (
+          <WheelGrid status={jelly.wheels} />
+        ) : (
+          <Text title={liftSummaryText(jelly.lift)}>{liftSummaryText(jelly.lift)}</Text>
+        )
+      ) : jelly && view.state === "connected" && device === "lift" ? (
+        <Text title={liftFaultLabel(jelly.lift) ?? view.label}>
+          {liftFaultLabel(jelly.lift) ?? view.label}
+        </Text>
+      ) : (
+        <Text title={view.label}>{view.label}</Text>
+      )
     const action = live ? (
       <Button
         variant="outline"
@@ -340,7 +266,7 @@ export function HardwareOverview({
             : `Release the ${title} link. The hardware stays powered.`
         }
       >
-        <Unplug />
+        {busy ? <Loader2 className="animate-spin" /> : <Unplug />}
       </Button>
     ) : (
       <Button
@@ -361,7 +287,7 @@ export function HardwareOverview({
       </Button>
     )
     return (
-      <HardwareCard
+      <HardwareRow
         key={device}
         icon={
           device === "wheels" ? (
@@ -373,25 +299,17 @@ export function HardwareOverview({
         title={title}
         state={view.state}
         dot={view.dot}
-        label={view.label}
+        status={status}
+        channels={channel}
         action={action}
-      >
-        {channel && <Row name="CAN interface" value={channel} />}
-        {jelly && live ? (
-          device === "wheels" ? (
-            <WheelDetails status={jelly.wheels} />
-          ) : (
-            <LiftDetails status={jelly.lift} />
-          )
-        ) : null}
-      </HardwareCard>
+      />
     )
   }
 
   return (
-    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2 xl:grid-cols-4">
-      {PROFILES.map(profileCard)}
-      {JELLY_DEVICES.map(jellyCard)}
+    <div className="divide-y divide-white/10 rounded-xl border border-white/10 bg-white/[0.02]">
+      {PROFILES.map(profileRow)}
+      {JELLY_DEVICES.map(jellyRow)}
     </div>
   )
 }

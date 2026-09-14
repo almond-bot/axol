@@ -252,13 +252,19 @@ class DiagnosticSettingsTest(unittest.TestCase):
     ) -> None:
         from almond_axol.serve.settings import advanced_schema, settings_schema
 
-        robot = next(c for c in settings_schema() if c["key"] == "robot")
-        keys = [s["key"] for s in robot["settings"]]
-        self.assertIn("robot.arms", keys)
-        self.assertIn("jelly.wheels", keys)
-        self.assertIn("jelly.lift", keys)
-        self.assertNotIn("jelly.enabled", keys)
-        for setting in robot["settings"]:
+        schema = settings_schema()
+        robot = next(c for c in schema if c["key"] == "robot")
+        robot_keys = [s["key"] for s in robot["settings"]]
+        self.assertIn("robot.arms", robot_keys)
+        # The Jelly switches have their own category (the panel's Jelly
+        # scope), not the Axol robot tab.
+        self.assertNotIn("jelly.wheels", robot_keys)
+        self.assertNotIn("jelly.lift", robot_keys)
+        jelly_category = next(c for c in schema if c["key"] == "jelly")
+        jelly_keys = [s["key"] for s in jelly_category["settings"]]
+        self.assertEqual(jelly_keys, ["jelly.wheels", "jelly.lift"])
+        self.assertNotIn("jelly.enabled", robot_keys + jelly_keys)
+        for setting in (*robot["settings"], *jelly_category["settings"]):
             if setting["key"] in ("robot.arms", "jelly.wheels", "jelly.lift"):
                 self.assertEqual(setting["type"], "boolean")
                 self.assertIs(setting["default"], True)
