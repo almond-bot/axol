@@ -130,7 +130,21 @@ class _Robot:
         self.connects = 0
         self.disconnects = 0
         self.set_channel_calls = 0
+        self.probes = 0
         self.release_error: Exception | None = None
+        # What a post-failure probe (see prove_motors_torque_free) reads. A
+        # live motor by default, so a run whose cleanup could not be verified
+        # locks the runner out unless a test says the motors are safe.
+        self.motors: list[dict[str, Any]] = [
+            {
+                "arm": "left",
+                "joint": "WRIST_2",
+                "reachable": True,
+                "status": "OK",
+                "temperature": None,
+                "voltage": None,
+            }
+        ]
         self.fault_check_entered = threading.Event()
         self.fault_check_gate: threading.Event | None = None
 
@@ -148,6 +162,7 @@ class _Robot:
             "channels": {"left": self._channels[0], "right": self._channels[1]},
             "profile": self._profile,
             "hasGripper": self._has_gripper,
+            "motors": self.motors,
         }
 
     def connect(self) -> dict[str, Any]:
@@ -180,9 +195,20 @@ class _Robot:
             raise self.release_error
         self._state = "busy"
 
-    def reacquire(self) -> None:
+    def reacquire(self) -> bool:
+        # Counted on every call (the runner always asks after a robot op);
+        # like RobotLink, reports whether this call actually reconnected.
         self.reacquires += 1
+        if self._state != "busy":
+            return False
         self._state = "connected"
+        return True
+
+    def probe(self) -> dict[str, Any]:
+        self.probes += 1
+        if self._state != "connected":
+            raise RuntimeError(f"robot link is {self._state}")
+        return self.status()
 
     def motor_faults(self) -> list[dict[str, Any]]:
         self.fault_check_entered.set()
@@ -2156,8 +2182,14 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         runner._thread = type("Worker", (), {"is_alive": lambda self: False})()
         self.assertFalse(runner.is_running())
 
-    def test_uncertain_command_cleanup_skips_reacquire_and_stays_busy(self) -> None:
-        robot = _Robot()
+    def test_uncertain_command_cleanup_locks_out_while_a_motor_holds_torque(
+        self,
+    ) -> None:
+        # The op released the link, then could not confirm its torque-off.
+        # The runner probes on its own; a motor that still answers under
+        # torque is the case that reserves the robot, and the probe hands
+        # the buses back rather than leave the idle link on them.
+        robot = _Robot(state="busy")
         runner = OperationRunner(robot_link=robot)
         session = Session("run-policy", {})
         session.status = "error"
@@ -2166,12 +2198,102 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
 
         runner._finish(session, needs_robot=True, cleanup_uncertain=True)
 
-        self.assertEqual(robot.reacquires, 0)
+        self.assertEqual(robot.reacquires, 1)
+        self.assertEqual(robot.probes, 1)
+        self.assertEqual(robot.releases, 1)
+        self.assertEqual(robot._state, "busy")
         self.assertEqual(session.status, "error")
         self.assertTrue(runner.is_running())
+        self.assertTrue(runner.hardware_cleanup_lockout())
+        lockout = [line for line in session.log if "safety lockout" in line]
+        self.assertEqual(len(lockout), 1, list(session.log))
+        self.assertIn("left wrist_2", lockout[0])
+        self.assertIn("Re-check motors", lockout[0])
+        self.assertNotIn("restarted", lockout[0])
+
+    def test_uncertain_command_cleanup_releases_once_the_motors_read_safe(
+        self,
+    ) -> None:
+        # Every motor reads disabled or unpowered: the failed teardown left
+        # nothing under torque, so the operator has nothing to clear. The
+        # session still reports the op's own error.
+        robot = _Robot(state="busy")
+        robot.motors = [
+            {
+                **robot.motors[0],
+                "joint": "SHOULDER_1",
+                "reachable": False,
+                "status": None,
+            },
+            {**robot.motors[0], "reachable": True, "status": "DISABLED"},
+        ]
+        jelly = _Jelly(states={"wheels": "busy", "lift": "busy"})
+        runner = OperationRunner(robot_link=robot, jelly_link=jelly)
+        runner._jelly_released = True
+        session = Session("run-policy", {})
+        session.status = "error"
+        session.error = "HardwareCleanupError: robot disconnect failed"
+        runner._session = session
+
+        runner._finish(session, needs_robot=True, cleanup_uncertain=True)
+
+        self.assertEqual(robot.probes, 1)
+        self.assertEqual(robot.releases, 0)
+        self.assertEqual(robot._state, "connected")
+        self.assertEqual(session.status, "error")
+        self.assertEqual(session.error, "HardwareCleanupError: robot disconnect failed")
+        self.assertFalse(runner.hardware_cleanup_lockout())
+        self.assertFalse(runner.is_running())
+        self.assertEqual(jelly.reacquires, 1)
+        self.assertFalse(any("safety lockout" in line for line in session.log))
         self.assertTrue(
-            any("safety lockout" in line for line in session.log), list(session.log)
+            any("robot released" in line for line in session.log), list(session.log)
         )
+
+    def test_uncertain_command_cleanup_locks_out_when_no_motor_was_read(
+        self,
+    ) -> None:
+        robot = _Robot(state="busy")
+        robot.motors = [{**robot.motors[0], "reachable": None, "status": None}]
+        runner = OperationRunner(robot_link=robot)
+        session = Session("run-policy", {})
+        session.status = "error"
+        runner._session = session
+
+        runner._finish(session, needs_robot=True, cleanup_uncertain=True)
+
+        self.assertTrue(runner.hardware_cleanup_lockout())
+        self.assertEqual(robot.releases, 1)
+
+    def test_uncertain_command_cleanup_locks_out_when_the_probe_cannot_read(
+        self,
+    ) -> None:
+        # The idle link was never up, so there is nothing to probe with: the
+        # runner cannot prove anything and keeps the reservation.
+        robot = _Robot(state="disconnected")
+        runner = OperationRunner(robot_link=robot)
+        session = Session("run-policy", {})
+        session.status = "error"
+        runner._session = session
+
+        runner._finish(session, needs_robot=True, cleanup_uncertain=True)
+
+        self.assertTrue(runner.hardware_cleanup_lockout())
+        self.assertTrue(runner.is_running())
+        lockout = [line for line in session.log if "safety lockout" in line]
+        self.assertEqual(len(lockout), 1, list(session.log))
+        self.assertIn("could not reach the motors", lockout[0])
+
+    def test_uncertain_command_cleanup_locks_out_without_a_robot_link(self) -> None:
+        runner = OperationRunner()
+        session = Session("run-policy", {})
+        session.status = "error"
+        runner._session = session
+
+        runner._finish(session, needs_robot=True, cleanup_uncertain=True)
+
+        self.assertTrue(runner.hardware_cleanup_lockout())
+        self.assertTrue(runner.is_running())
 
     def test_thread_command_cleanup_error_enters_safety_lockout(self) -> None:
         from almond_axol.serve.commands import COMMANDS
@@ -2184,7 +2306,7 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
             load_entrypoint=lambda: fail,
             load_episode_control=lambda: None,
         )
-        robot = _Robot()
+        robot = _Robot(state="busy")
         runner = OperationRunner(robot_link=robot)
         session = Session("cleanup-test", {})
         session.status = "running"
@@ -2205,8 +2327,12 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
             )
 
         self.assertEqual(session.status, "error")
-        self.assertEqual(robot.reacquires, 0)
+        # The link was only borrowed to probe the (still live) motor.
+        self.assertEqual(robot.reacquires, 1)
+        self.assertEqual(robot.releases, 1)
+        self.assertEqual(robot._state, "busy")
         self.assertTrue(runner.is_running())
+        self.assertTrue(runner.hardware_cleanup_lockout())
 
     def test_reacquire_failure_is_reported_instead_of_success(self) -> None:
         robot = _Robot()
