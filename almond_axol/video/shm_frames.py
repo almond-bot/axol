@@ -12,15 +12,23 @@ without touching the hot control path.
 
 Raw-frame fallback layout (one :class:`SharedMemory` block per camera source):
 
-    [ meta: seq, slot, cap_ts, recv_ts, slot0_seq, slot1_seq ]
-    [ buffer 0 ][ buffer 1 ]
+    [ meta: seq, slot, cap_ts, recv_ts, capacity,
+            slot_seq[N], slot_cap_ts[N], slot_recv_ts[N] ]
+    [ buffer 0 ][ buffer 1 ] ... [ buffer N-1 ]
 
-The two frame buffers are double-buffered: the writer always fills the buffer
-the reader isn't pointed at, then publishes the new ``slot`` + timestamps under
-a shared :class:`multiprocessing.Condition` and notifies. A reader copies out of
-the published slot *outside* the lock. The per-slot odd/even sequence marks reuse
-before the writer touches pixels and is checked again after the copy, so even a
-reader delayed across multiple camera frames detects and retries a torn copy.
+The ``N = _RAW_RING_SLOTS`` frame buffers form a ring of the most recent
+exposures: the writer fills the slot after the one it last published, then
+publishes the new ``slot`` + timestamps under a shared
+:class:`multiprocessing.Condition` and notifies. A reader copies out of a slot
+*outside* the lock. The per-slot odd/even sequence marks reuse before the writer
+touches pixels and is checked again after the copy, so even a reader delayed
+across multiple camera frames detects and retries a torn copy. Keeping a short
+history (rather than the earlier double buffer) is what lets
+:meth:`RawFrameReader.read_nearest` hand a policy the frame of *this* camera
+exposed nearest another camera's newest exposure: the camera pipelines run at
+different latencies, so "the newest frame of each" is not one synchronized set,
+while "the frame nearest the slowest pipeline's newest exposure" is — and it is
+already in the ring, so nobody waits for it.
 
 Timestamps are ``time.perf_counter`` seconds. On Linux that is
 ``CLOCK_MONOTONIC``, which shares an origin across processes, so a ``cap_ts``
@@ -45,19 +53,28 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
+# Frames retained per camera source. At 60 fps this is ~130 ms of history —
+# comfortably more than the spread between the stereo and mono pipelines'
+# latencies that ``read_nearest`` has to reach back over (one to two frames on
+# the Jetson), while an extra 7 RGB frames per source (~1.7 MB each at
+# 960x540) is a few tens of MB of shared memory for the whole camera set.
+_RAW_RING_SLOTS = 8
+
 # Meta header: a single structured record at the front of each block. Padded to
-# 64 bytes so the frame buffers start cache-line aligned.
+# a multiple of 64 bytes so the frame buffers start cache-line aligned.
 _META_DTYPE = np.dtype(
     [
         ("seq", "<i8"),
         ("slot", "<i8"),
         ("cap_ts", "<f8"),
         ("recv_ts", "<f8"),
-        ("slot0_seq", "<u8"),
-        ("slot1_seq", "<u8"),
+        ("capacity", "<i8"),
+        ("slot_seq", "<u8", (_RAW_RING_SLOTS,)),
+        ("slot_cap_ts", "<f8", (_RAW_RING_SLOTS,)),
+        ("slot_recv_ts", "<f8", (_RAW_RING_SLOTS,)),
     ]
 )
-_HEADER_BYTES = 64
+_HEADER_BYTES = -(-_META_DTYPE.itemsize // 64) * 64
 
 # Frames are RGB (3 channels): the VIC delivers RGBA, the writer drops alpha so
 # only what the dataset stores crosses the boundary.
@@ -185,7 +202,7 @@ def _disconnect_gst_pull_reader(reader: Any, *, label: str) -> None:
 
 
 def _block_size(width: int, height: int) -> int:
-    return _HEADER_BYTES + 2 * width * height * _CHANNELS
+    return _HEADER_BYTES + _RAW_RING_SLOTS * width * height * _CHANNELS
 
 
 class RawFrameWriter:
@@ -208,8 +225,10 @@ class RawFrameWriter:
         self._next_slot = 0
         self._meta["seq"][0] = 0
         self._meta["slot"][0] = 0
-        self._meta["slot0_seq"][0] = 0
-        self._meta["slot1_seq"][0] = 0
+        self._meta["capacity"][0] = _RAW_RING_SLOTS
+        self._meta["slot_seq"][0, :] = 0
+        self._meta["slot_cap_ts"][0, :] = 0.0
+        self._meta["slot_recv_ts"][0, :] = 0.0
 
     @classmethod
     def create(cls, width: int, height: int, cond: Any) -> "RawFrameWriter":
@@ -217,30 +236,31 @@ class RawFrameWriter:
         return cls(shm, width, height, cond)
 
     def publish(self, rgba: "NDArray[Any]", cap_ts: float, recv_ts: float) -> None:
-        """Copy one frame's RGB into the idle buffer and commit it.
+        """Copy one frame's RGB into the oldest ring slot and commit it.
 
         ``rgba`` is an ``(H, W, 4)`` view over the GStreamer buffer (valid only
         for this call); the ``[:, :, :3]`` copy into shared memory drops alpha.
         """
         slot = self._next_slot
-        slot_seq_field = "slot0_seq" if slot == 0 else "slot1_seq"
         # Mark this physical slot busy before touching its pixels. Readers copy
         # outside the shared lock; the odd/even slot generation lets them
         # detect reuse that has started but is not published yet.
         with self._cond:
-            slot_seq = int(self._meta[slot_seq_field][0])
+            slot_seq = int(self._meta["slot_seq"][0, slot])
             if slot_seq & 1:
                 slot_seq += 1
-            self._meta[slot_seq_field][0] = slot_seq + 1
+            self._meta["slot_seq"][0, slot] = slot_seq + 1
         np.copyto(self._bufs[slot], rgba[:, :, :_CHANNELS])
         with self._cond:
+            self._meta["slot_cap_ts"][0, slot] = cap_ts
+            self._meta["slot_recv_ts"][0, slot] = recv_ts
+            self._meta["slot_seq"][0, slot] = slot_seq + 2
             self._meta["slot"][0] = slot
             self._meta["cap_ts"][0] = cap_ts
             self._meta["recv_ts"][0] = recv_ts
-            self._meta[slot_seq_field][0] = slot_seq + 2
             self._meta["seq"][0] += 1
             self._cond.notify_all()
-        self._next_slot = 1 - slot
+        self._next_slot = (slot + 1) % _RAW_RING_SLOTS
 
     def close(self) -> None:
         # Drop numpy views into the buffer before releasing it.
@@ -260,7 +280,8 @@ class RawFrameReader:
     thread and ``AxolRobot`` use — ``read_at_or_after`` / ``read_latest`` /
     ``read_latest_with_ts`` plus ``width`` / ``height`` / ``fps`` / ``connect``
     / ``disconnect`` / ``is_connected`` — so it drops straight into
-    ``robot.cameras`` with no other changes.
+    ``robot.cameras`` with no other changes, and adds the history reads the
+    policy observation uses (``latest_capture_ts`` / ``read_nearest``).
     """
 
     def __init__(self, name: str, width: int, height: int, fps: int, cond: Any) -> None:
@@ -294,8 +315,7 @@ class RawFrameReader:
                     cap = float(self._meta["cap_ts"][0])
                     if seq > 0 and cap >= target:
                         slot = int(self._meta["slot"][0])
-                        slot_seq_field = "slot0_seq" if slot == 0 else "slot1_seq"
-                        slot_seq = int(self._meta[slot_seq_field][0])
+                        slot_seq = int(self._meta["slot_seq"][0, slot])
                         if slot_seq & 1:
                             continue
                         recv = float(self._meta["recv_ts"][0])
@@ -312,7 +332,7 @@ class RawFrameReader:
             # Reacquire for a formal ARM memory barrier before checking whether
             # the writer lapped this out-of-lock copy and reused its slot.
             with self._cond:
-                slot_stable = int(self._meta[slot_seq_field][0]) == slot_seq
+                slot_stable = int(self._meta["slot_seq"][0, slot]) == slot_seq
             if slot_stable:
                 return frame, cap, recv
 
@@ -323,17 +343,69 @@ class RawFrameReader:
                 if seq == 0:
                     raise RuntimeError("shared-memory camera has no frames yet.")
                 slot = int(self._meta["slot"][0])
-                slot_seq_field = "slot0_seq" if slot == 0 else "slot1_seq"
-                slot_seq = int(self._meta[slot_seq_field][0])
+                slot_seq = int(self._meta["slot_seq"][0, slot])
                 if slot_seq & 1:
                     continue
                 cap = float(self._meta["cap_ts"][0])
                 recv = float(self._meta["recv_ts"][0])
             frame = self._copy_slot(slot)
             with self._cond:
-                slot_stable = int(self._meta[slot_seq_field][0]) == slot_seq
+                slot_stable = int(self._meta["slot_seq"][0, slot]) == slot_seq
             if slot_stable:
                 return frame, cap, recv
+
+    def latest_capture_ts(self) -> tuple[float, float] | None:
+        """Return ``(cap_ts, recv_ts)`` of the newest published frame, or ``None``.
+
+        Non-blocking and copies no pixels: the policy observation uses it to
+        find the exposure every camera has reached before copying anything.
+        """
+        with self._cond:
+            if int(self._meta["seq"][0]) == 0:
+                return None
+            return float(self._meta["cap_ts"][0]), float(self._meta["recv_ts"][0])
+
+    def read_nearest(
+        self, target: float, tolerance_s: float
+    ) -> tuple["NDArray[Any]", float, float]:
+        """Copy the retained frame exposed nearest ``target``.
+
+        Never waits: the ring holds the last ``_RAW_RING_SLOTS`` exposures and
+        the nearest one is returned as-is. Raises :class:`LookupError` when no
+        retained frame lies within ``tolerance_s`` of ``target`` (the history
+        does not reach back that far, or the camera skipped that exposure) and
+        :class:`RuntimeError` when nothing has been published yet.
+        """
+        while True:
+            with self._cond:
+                if int(self._meta["seq"][0]) == 0:
+                    raise RuntimeError("shared-memory camera has no frames yet.")
+                slot_seq = np.array(self._meta["slot_seq"][0], dtype=np.uint64)
+                caps = np.array(self._meta["slot_cap_ts"][0], dtype=np.float64)
+                recvs = np.array(self._meta["slot_recv_ts"][0], dtype=np.float64)
+            # A slot is readable once it has been published (seq > 0) and is
+            # not currently being overwritten (even seq).
+            readable = (slot_seq > 0) & (slot_seq % 2 == 0)
+            if not readable.any():
+                # Only the single published frame exists and the writer is
+                # reusing its slot right now; it publishes within a frame copy.
+                time.sleep(0.0005)
+                continue
+            distance = np.where(readable, np.abs(caps - target), np.inf)
+            slot = int(np.argmin(distance))
+            if distance[slot] > tolerance_s:
+                raise LookupError(
+                    f"no retained shared-memory frame within "
+                    f"{tolerance_s * 1e3:.1f}ms of capture_perf_ts {target:.6f} "
+                    f"(nearest is {distance[slot] * 1e3:.1f}ms away)"
+                )
+            frame = self._copy_slot(slot)
+            with self._cond:
+                slot_stable = int(self._meta["slot_seq"][0, slot]) == int(
+                    slot_seq[slot]
+                )
+            if slot_stable:
+                return frame, float(caps[slot]), float(recvs[slot])
 
     def read_latest(self, max_age_ms: int = 500) -> "NDArray[Any]":
         frame, _cap, recv = self.read_latest_with_ts()
@@ -1365,10 +1437,10 @@ class SnapshotReader:
 
 
 def _frame_views(buf: Any, width: int, height: int) -> list["NDArray[Any]"]:
-    """Two ``(H, W, 3)`` uint8 views over the double buffer after the header."""
+    """``_RAW_RING_SLOTS`` ``(H, W, 3)`` uint8 views over the ring after the header."""
     frame_bytes = width * height * _CHANNELS
     views = []
-    for i in range(2):
+    for i in range(_RAW_RING_SLOTS):
         offset = _HEADER_BYTES + i * frame_bytes
         views.append(
             np.ndarray(

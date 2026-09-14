@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -46,33 +47,54 @@ def _robot_with_cameras(
     return robot
 
 
+def _camera(
+    fps: int,
+    frame: int,
+    cap_ts: float,
+    recv_ts: float,
+    *,
+    history: bool = False,
+) -> SimpleNamespace:
+    """A policy camera double publishing one frame.
+
+    ``history=True`` gives it the shared-memory reader's history surface
+    (``latest_capture_ts`` / ``read_nearest``); otherwise it is an in-process
+    reader exposing only ``read_latest_with_ts`` / ``read_at_or_after``.
+    """
+    image = np.array([frame], dtype=np.uint8)
+    camera = SimpleNamespace(
+        fps=fps,
+        read_latest_with_ts=mock.Mock(return_value=(image, cap_ts, recv_ts)),
+        read_at_or_after=mock.Mock(
+            side_effect=AssertionError("fresh frames must not wait for the future")
+        ),
+    )
+    if history:
+        camera.latest_capture_ts = mock.Mock(return_value=(cap_ts, recv_ts))
+        camera.read_nearest = mock.Mock(return_value=(image, cap_ts, recv_ts))
+    return camera
+
+
 class AxolObservationPoseLagTest(unittest.TestCase):
     """Policy observations pair exposures with the nearest core feedback sample.
 
     The joint state is never read "now": it is selected from the Rust core's
     retained telemetry nearest the cameras' median exposure, and the returned
-    pose lag is that residual. A camera without a fresh, timestamped frame or
-    an unbracketed exposure aborts the observation instead of falling back.
+    pose lag is that residual. Frames are the ones the cameras have *already*
+    delivered — the observation never waits for an exposure after "now" (that
+    wait, paid per camera, ran the 2026-09-14 DAgger loop at 3-8 Hz). A camera
+    without a fresh, timestamped frame or an unbracketed exposure aborts the
+    observation instead of falling back.
     """
 
     def test_timing_is_returned_out_of_band_using_median_exposure(self) -> None:
-        earlier = SimpleNamespace(
-            fps=50,
-            read_at_or_after=mock.Mock(
-                return_value=(np.array([1], dtype=np.uint8), 100.012, 100.015)
-            ),
-        )
-        later = SimpleNamespace(
-            fps=50,
-            read_at_or_after=mock.Mock(
-                return_value=(np.array([2], dtype=np.uint8), 100.027, 100.030)
-            ),
-        )
+        earlier = _camera(50, 1, 100.012, 100.015)
+        later = _camera(50, 2, 100.027, 100.030)
         robot = _robot_with_cameras({"earlier": earlier, "later": later})
 
         with mock.patch(
             "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
-            return_value=100.0,
+            return_value=100.05,
         ):
             observation, pose_lag = robot.get_observation_with_pose_lag()
 
@@ -81,70 +103,155 @@ class AxolObservationPoseLagTest(unittest.TestCase):
         np.testing.assert_array_equal(observation["earlier"], np.array([1]))
         np.testing.assert_array_equal(observation["later"], np.array([2]))
         self.assertAlmostEqual(pose_lag, 0.004)
-        earlier.read_at_or_after.assert_called_once_with(100.0, timeout_ms=240)
-        later.read_at_or_after.assert_called_once_with(100.0, timeout_ms=240)
+        earlier.read_at_or_after.assert_not_called()
+        later.read_at_or_after.assert_not_called()
         # Median of the two exposures selects the telemetry sample.
         robot._axol.state_nearest.assert_called_once()
         self.assertAlmostEqual(robot._axol.state_nearest.call_args.args[0], 100.0195)
 
     def test_capture_timestamp_api_returns_the_median_exposure(self) -> None:
-        camera = SimpleNamespace(
-            fps=60,
-            read_at_or_after=mock.Mock(
-                return_value=(np.array([3], dtype=np.uint8), 250.010, 250.012)
-            ),
-        )
+        camera = _camera(60, 3, 250.010, 250.012)
         robot = _robot_with_cameras({"wrist": camera})
 
         with mock.patch(
             "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
-            return_value=250.0,
+            return_value=250.02,
         ):
             observation, capture_ts = robot.get_observation_with_capture_timestamp()
 
         np.testing.assert_array_equal(observation["wrist"], np.array([3]))
         self.assertAlmostEqual(capture_ts, 250.010)
 
+    def test_frames_anchor_on_the_slowest_pipeline_without_waiting(self) -> None:
+        # The wrist pipeline is two frames ahead of the stereo overhead's; the
+        # observation anchors on the overhead's newest exposure and takes the
+        # wrist's retained frame nearest it, never waiting on either.
+        overhead = _camera(60, 1, 300.0170, 300.0400, history=True)
+        wrist = _camera(60, 2, 300.0503, 300.0550, history=True)
+        wrist.read_nearest = mock.Mock(
+            return_value=(np.array([4], dtype=np.uint8), 300.0168, 300.0210)
+        )
+        robot = _robot_with_cameras({"overhead": overhead, "wrist": wrist})
+
+        with mock.patch(
+            "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
+            return_value=300.06,
+        ):
+            observation, capture_ts = robot.get_observation_with_capture_timestamp()
+
+        np.testing.assert_array_equal(observation["overhead"], np.array([1]))
+        np.testing.assert_array_equal(observation["wrist"], np.array([4]))
+        self.assertAlmostEqual(capture_ts, 300.0169)
+        for camera in (overhead, wrist):
+            camera.read_nearest.assert_called_once_with(300.0170, tolerance_s=0.025)
+            camera.read_at_or_after.assert_not_called()
+            camera.read_latest_with_ts.assert_not_called()
+
+    def test_the_same_exposure_is_never_served_twice(self) -> None:
+        overhead = _camera(60, 1, 300.0170, 300.0400, history=True)
+        wrist = _camera(60, 2, 300.0503, 300.0550, history=True)
+        wrist.read_nearest = mock.Mock(
+            return_value=(np.array([2], dtype=np.uint8), 300.0168, 300.0210)
+        )
+        robot = _robot_with_cameras({"overhead": overhead, "wrist": wrist})
+        clock = mock.patch(
+            "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
+            return_value=300.06,
+        )
+        with clock:
+            _observation, first_ts = robot.get_observation_with_capture_timestamp()
+        self.assertAlmostEqual(first_ts, 300.0169)
+
+        # The overhead has not delivered its next frame: the second call waits
+        # for it (one frame period, bounded by the camera-loss timeout) rather
+        # than hand the policy the frame set it already acted on. The wrist,
+        # already past that exposure, is not waited on.
+        overhead.read_at_or_after = mock.Mock(
+            return_value=(np.array([5], dtype=np.uint8), 300.0337, 300.0570)
+        )
+        overhead.read_nearest = mock.Mock(
+            return_value=(np.array([5], dtype=np.uint8), 300.0337, 300.0570)
+        )
+        wrist.read_nearest = mock.Mock(
+            return_value=(np.array([6], dtype=np.uint8), 300.0335, 300.0380)
+        )
+        with clock:
+            observation, second_ts = robot.get_observation_with_capture_timestamp()
+
+        overhead.read_at_or_after.assert_called_once()
+        (newer_than,) = overhead.read_at_or_after.call_args.args
+        self.assertAlmostEqual(newer_than, 300.0169 + 0.5 / 60)
+        self.assertEqual(
+            overhead.read_at_or_after.call_args.kwargs, {"timeout_ms": 233}
+        )
+        wrist.read_at_or_after.assert_not_called()
+        self.assertAlmostEqual(second_ts, 300.0336)
+        np.testing.assert_array_equal(observation["overhead"], np.array([5]))
+        np.testing.assert_array_equal(observation["wrist"], np.array([6]))
+
+    def test_history_without_the_anchor_exposure_is_a_sync_failure(self) -> None:
+        overhead = _camera(60, 1, 300.0170, 300.0400, history=True)
+        wrist = _camera(60, 2, 300.2000, 300.2050, history=True)
+        wrist.read_nearest = mock.Mock(
+            side_effect=LookupError("nearest is 150.0ms away")
+        )
+        robot = _robot_with_cameras({"overhead": overhead, "wrist": wrist})
+
+        with (
+            mock.patch(
+                "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
+                return_value=300.21,
+            ),
+            self.assertRaisesRegex(RuntimeError, "not synchronized.*'wrist'"),
+        ):
+            robot.get_observation()
+        robot._axol.state_nearest.assert_not_called()
+
     def test_missing_fresh_frame_is_fatal_instead_of_falling_back(self) -> None:
-        camera = SimpleNamespace(
+        silent = _camera(40, 7, 199.5, 199.6)
+        empty = SimpleNamespace(
             fps=40,
-            read_at_or_after=mock.Mock(side_effect=TimeoutError("late exposure")),
             read_latest_with_ts=mock.Mock(
-                return_value=(np.array([7], dtype=np.uint8), 199.875, 199.900)
+                side_effect=RuntimeError("shared-memory camera has no frames yet.")
             ),
             read_latest=mock.Mock(return_value=np.array([9], dtype=np.uint8)),
         )
-        robot = _robot_with_cameras({"wrist": camera})
-
-        for read in (robot.get_observation_with_pose_lag, robot.get_observation):
-            with (
-                self.subTest(api=read.__name__),
-                mock.patch(
-                    "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
-                    return_value=200.0,
-                ),
-                self.assertRaisesRegex(RuntimeError, "produced no fresh frame"),
-            ):
-                read()
-
-        camera.read_latest_with_ts.assert_not_called()
-        camera.read_latest.assert_not_called()
-        robot._axol.state_nearest.assert_not_called()
+        for label, camera in (("silent", silent), ("empty", empty)):
+            robot = _robot_with_cameras({"wrist": camera})
+            for read in (robot.get_observation_with_pose_lag, robot.get_observation):
+                with (
+                    self.subTest(camera=label, api=read.__name__),
+                    mock.patch(
+                        "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
+                        return_value=200.0,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "produced no fresh frame"),
+                ):
+                    read()
+            robot._axol.state_nearest.assert_not_called()
+        empty.read_latest.assert_not_called()
 
     def test_unbracketed_or_distant_telemetry_is_fatal(self) -> None:
-        camera = SimpleNamespace(
-            fps=30,
-            read_at_or_after=mock.Mock(
-                return_value=(np.array([7], dtype=np.uint8), 499.0, 499.0)
-            ),
-        )
+        camera = _camera(30, 7, 499.0, 499.0)
         robot = _robot_with_cameras({"wrist": camera}, state_nearest=lambda _ts: None)
-        with self.assertRaisesRegex(RuntimeError, "no retained robot telemetry"):
+        with (
+            mock.patch(
+                "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
+                return_value=499.01,
+            ),
+            self.assertRaisesRegex(RuntimeError, "no retained robot telemetry"),
+        ):
             robot.get_observation_with_pose_lag()
 
         far = robot_axol._POLICY_STATE_ALIGNMENT_LIMIT_S * 4
         robot = _robot_with_cameras({"wrist": camera}, state_offset_s=far)
-        with self.assertRaisesRegex(RuntimeError, "too far from policy camera"):
+        with (
+            mock.patch(
+                "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
+                return_value=499.01,
+            ),
+            self.assertRaisesRegex(RuntimeError, "too far from policy camera"),
+        ):
             robot.get_observation_with_pose_lag()
 
     def test_concurrent_calls_keep_their_own_lag(self) -> None:
@@ -155,8 +262,13 @@ class AxolObservationPoseLagTest(unittest.TestCase):
             fps = 60
 
             @staticmethod
-            def read_at_or_after(target: float, timeout_ms: int):
-                del timeout_ms
+            def latest_capture_ts() -> tuple[float, float]:
+                now = time.perf_counter()
+                return now, now
+
+            @staticmethod
+            def read_nearest(target: float, tolerance_s: float):
+                del tolerance_s
                 barrier.wait(timeout=2.0)
                 delta = expected[threading.current_thread().name]
                 return np.array([1], dtype=np.uint8), target + delta, target + delta

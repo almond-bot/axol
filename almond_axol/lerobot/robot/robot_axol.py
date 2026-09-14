@@ -103,6 +103,12 @@ _RIGHT_EE_KEYS = [f"right_ee.{a}" for a in _EE_AXES]
 # broken clock/history instead of silently pairing a stale state.
 _POLICY_STATE_ALIGNMENT_LIMIT_S = 0.020
 
+# A policy camera whose newest frame was received longer ago than this many
+# frame periods (plus a fixed scheduling allowance) is treated as silent: the
+# observation aborts rather than pair the robot's live state with an old image.
+_POLICY_CAMERA_MAX_AGE_PERIODS = 2
+_POLICY_CAMERA_MAX_AGE_SLACK_S = 0.200
+
 
 class AxolRobot(Robot):
     """LeRobot Robot wrapping the Axol dual-arm hardware.
@@ -122,6 +128,11 @@ class AxolRobot(Robot):
 
     config_class = AxolRobotConfig
     name = "axol"
+
+    # Class-level defaults so a robot built without ``__init__`` (test doubles
+    # over ``object.__new__``) still has the policy-observation bookkeeping.
+    _last_policy_exposure_ts: float | None = None
+    _policy_exposure_lock = threading.Lock()
 
     def __init__(
         self,
@@ -150,6 +161,10 @@ class AxolRobot(Robot):
         # not stop its coroutine, so a retry must wait for this exact attempt
         # rather than submit a second, overlapping motor/bus teardown.
         self._disconnect_future: Future[None] | None = None
+        # Median exposure of the last policy observation served; the next one
+        # must be newer (see ``_get_synchronized_observation``).
+        self._last_policy_exposure_ts: float | None = None
+        self._policy_exposure_lock = threading.Lock()
         self.cameras, self._stereo_cameras = self._build_cameras()
         self._observation_features: dict[str, type | tuple] | None = None
         self._action_features: dict[str, type | tuple] | None = None
@@ -680,12 +695,13 @@ class AxolRobot(Robot):
     def get_observation(self) -> RobotObservation:
         """Return camera frames paired to nearest timestamped robot state.
 
-        Cameras are sampled with :meth:`ZedCamera.read_at_or_after` against a
-        shared ``time.perf_counter()`` target. Their median sensor-exposure time
-        selects the nearest entry from the Rust core's 240 Hz feedback history,
-        matching collection's exposure-driven association. A missing/stale
-        camera or unbracketed state aborts the observation; policy inference
-        must never continue on a silently mismatched image/state pair.
+        Cameras are sampled at the newest exposure every camera has already
+        delivered (see :meth:`_get_synchronized_observation`). Their median
+        sensor-exposure time selects the nearest entry from the Rust core's
+        240 Hz feedback history, matching collection's exposure-driven
+        association. A missing/stale camera or unbracketed state aborts the
+        observation; policy inference must never continue on a silently
+        mismatched image/state pair.
         """
         observation, _capture_ts, _state_ts = self._get_synchronized_observation()
         return observation
@@ -723,23 +739,96 @@ class AxolRobot(Robot):
     def _get_synchronized_observation(
         self,
     ) -> tuple[RobotObservation, float, float]:
-        """Build one synchronized observation; return (obs, exposure, state) times."""
-        target_ts = time.perf_counter()
+        """Build one synchronized observation; return (obs, exposure, state) times.
+
+        The frame set is anchored on the **newest exposure every camera has
+        already delivered**, not on "now": each camera pipeline (Argus → VIC →
+        shared memory) adds its own latency, and the earlier
+        ``read_at_or_after(perf_counter())`` per camera waited that latency
+        out for *every* camera in turn — one tick cost the sum of the pipeline
+        delays and the loop ran at 3-8 Hz instead of the policy's 60, while the
+        frames it got were still exposed tens of milliseconds apart (each
+        camera's first frame after a different "now"). The 2026-09-14 DAgger
+        session recorded exactly that, plus the recorder discarding takes
+        because the control loop stopped publishing state for whole seconds.
+
+        Now the tick copies nothing until it knows the anchor: the slowest
+        pipeline's newest exposure. Every other camera has that exposure (or
+        its neighbour) in its shared-memory history already
+        (:meth:`RawFrameReader.read_nearest`), so the set is built without
+        waiting and its spread is the cameras' real exposure offset. The one
+        wait left is for freshness: an observation is never served twice, so a
+        loop faster than the cameras blocks for at most one frame period on
+        the lagging camera's next frame. A camera whose newest frame is older
+        than a couple of periods is silent and fails the observation, as a
+        timed-out ``read_at_or_after`` did before. Cameras without a history
+        (an in-process ZED reader) fall back to their newest frame and rely on
+        the spread check.
+        """
+        now = time.perf_counter()
         if not self.cameras:
-            return self._joint_state(), target_ts, target_ts
+            return self._joint_state(), now, now
+        cameras = self.cameras
+        slowest_fps = min(
+            float(getattr(cam, "fps", None) or 30) for cam in cameras.values()
+        )
+        period_s = 1.0 / slowest_fps
+        camera_limit = max(0.010, 1.5 / slowest_fps)
+        max_age_s = (
+            _POLICY_CAMERA_MAX_AGE_PERIODS * period_s + _POLICY_CAMERA_MAX_AGE_SLACK_S
+        )
+
+        # 1. The newest exposure each camera has delivered, without copying.
+        newest: dict[str, tuple[float, float]] = {}
+        for cam_key, cam in cameras.items():
+            newest[cam_key] = self._newest_policy_exposure(cam_key, cam)
+
+        # 2. Freshness: never hand out the exposure set already served. A
+        #    camera still at (or before) the last served exposure has not
+        #    produced the next frame yet — wait for it, bounded like a
+        #    camera-loss timeout, instead of duplicating the observation.
+        with self._policy_exposure_lock:
+            last_served = self._last_policy_exposure_ts
+        if last_served is not None:
+            newer_than = last_served + 0.5 * period_s
+            timeout_ms = int(max_age_s * 1e3)
+            for cam_key, cam in cameras.items():
+                if newest[cam_key][0] > newer_than:
+                    continue
+                try:
+                    _frame, cap_ts, recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
+                        newer_than, timeout_ms=timeout_ms
+                    )
+                except (TimeoutError, RuntimeError) as exc:
+                    raise RuntimeError(
+                        f"policy camera {cam_key!r} produced no fresh frame: {exc}"
+                    ) from exc
+                newest[cam_key] = (float(cap_ts), float(recv_ts))
+
+        # 3. Silence: a camera whose newest frame is a couple of periods old
+        #    would pair a live robot state with an old image.
+        now = time.perf_counter()
+        for cam_key, (cap_ts, recv_ts) in newest.items():
+            if not np.isfinite(cap_ts):
+                raise RuntimeError(
+                    f"policy camera {cam_key!r} produced an invalid capture timestamp"
+                )
+            age_s = now - recv_ts
+            if age_s > max_age_s:
+                raise RuntimeError(
+                    f"policy camera {cam_key!r} produced no fresh frame: its newest "
+                    f"frame is {age_s * 1e3:.0f}ms old (limit {max_age_s * 1e3:.0f}ms)"
+                )
+
+        # 4. Anchor on the exposure the slowest pipeline has reached and take
+        #    every camera's retained frame nearest it.
+        anchor_ts = min(cap_ts for cap_ts, _recv_ts in newest.values())
         frames: dict[str, np.ndarray] = {}
         capture_ts: list[float] = []
-        for cam_key, cam in self.cameras.items():
-            cam_fps = getattr(cam, "fps", None) or 30
-            timeout_ms = int(2 * 1000.0 / cam_fps + 200)
-            try:
-                frame, cap_ts, _recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
-                    target_ts, timeout_ms=timeout_ms
-                )
-            except (TimeoutError, RuntimeError) as exc:
-                raise RuntimeError(
-                    f"policy camera {cam_key!r} produced no fresh frame: {exc}"
-                ) from exc
+        for cam_key, cam in cameras.items():
+            frame, cap_ts = self._policy_frame_nearest(
+                cam_key, cam, anchor_ts, camera_limit
+            )
             if not np.isfinite(cap_ts):
                 raise RuntimeError(
                     f"policy camera {cam_key!r} produced an invalid capture timestamp"
@@ -749,10 +838,6 @@ class AxolRobot(Robot):
 
         row_capture_ts = float(np.median(capture_ts))
         camera_skew = max(capture_ts) - min(capture_ts)
-        slowest_fps = min(
-            float(getattr(cam, "fps", None) or 30) for cam in self.cameras.values()
-        )
-        camera_limit = max(0.010, 1.5 / slowest_fps)
         if camera_skew > camera_limit:
             raise RuntimeError(
                 "policy camera exposures are not synchronized "
@@ -783,7 +868,59 @@ class AxolRobot(Robot):
         )
         obs.update(frames)
 
+        with self._policy_exposure_lock:
+            if (
+                self._last_policy_exposure_ts is None
+                or row_capture_ts > self._last_policy_exposure_ts
+            ):
+                self._last_policy_exposure_ts = row_capture_ts
+
         return obs, row_capture_ts, float(state_ts)
+
+    @staticmethod
+    def _newest_policy_exposure(cam_key: str, cam: object) -> tuple[float, float]:
+        """``(cap_ts, recv_ts)`` of ``cam``'s newest frame, copying no pixels if possible."""
+        latest_capture_ts = getattr(cam, "latest_capture_ts", None)
+        try:
+            if latest_capture_ts is not None:
+                stamps = latest_capture_ts()
+                if stamps is None:
+                    raise RuntimeError("camera has published no frame yet")
+                cap_ts, recv_ts = stamps
+            else:
+                _frame, cap_ts, recv_ts = cam.read_latest_with_ts()  # type: ignore[attr-defined]
+        except (TimeoutError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"policy camera {cam_key!r} produced no fresh frame: {exc}"
+            ) from exc
+        return float(cap_ts), float(recv_ts)
+
+    @staticmethod
+    def _policy_frame_nearest(
+        cam_key: str, cam: object, anchor_ts: float, tolerance_s: float
+    ) -> tuple[np.ndarray, float]:
+        """``cam``'s frame exposed nearest ``anchor_ts`` (its newest without a history)."""
+        read_nearest = getattr(cam, "read_nearest", None)
+        if read_nearest is None:
+            read = cam.read_latest_with_ts  # type: ignore[attr-defined]
+        else:
+
+            def read() -> tuple[np.ndarray, float, float]:
+                return read_nearest(anchor_ts, tolerance_s=tolerance_s)
+
+        try:
+            frame, cap_ts, _recv_ts = read()
+        except LookupError as exc:
+            raise RuntimeError(
+                "policy camera exposures are not synchronized: camera "
+                f"{cam_key!r} retains no frame within {tolerance_s * 1e3:.1f}ms "
+                f"of the anchor exposure ({exc})"
+            ) from exc
+        except (TimeoutError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"policy camera {cam_key!r} produced no fresh frame: {exc}"
+            ) from exc
+        return frame, float(cap_ts)
 
     def _ensure_ik(self) -> KinematicsSolver:
         """Lazily build the IK solver used to resolve Cartesian action targets.
