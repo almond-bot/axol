@@ -75,6 +75,18 @@ async def _drive_websocket(app: Any, path: str) -> list[dict[str, Any]]:
     return sent
 
 
+async def _run_shutdown_hooks(app: Any) -> None:
+    """Run every ``on_shutdown`` hook in registration order, as the lifespan does.
+
+    Iterating the list rather than indexing it keeps the test independent of
+    how many hooks ``create_app`` registers and in what order.
+    """
+    for hook in app.router.on_shutdown:
+        result = hook()
+        if asyncio.iscoroutine(result):
+            await result
+
+
 class WebSocketDisconnectTest(unittest.IsolatedAsyncioTestCase):
     async def test_telemetry_stream_ends_on_client_disconnect(self) -> None:
         app = _test_app(_Manager(), _Runner())
@@ -132,7 +144,7 @@ class CanDiscoveryShutdownBoundTest(unittest.IsolatedAsyncioTestCase):
                         asyncio.to_thread(entered.wait, _TIMEOUT_S), _TIMEOUT_S
                     )
                     started = time.monotonic()
-                    await asyncio.wait_for(app.router.on_shutdown[-1](), _TIMEOUT_S)
+                    await asyncio.wait_for(_run_shutdown_hooks(app), _TIMEOUT_S)
                     elapsed = time.monotonic() - started
                 finally:
                     release.set()
