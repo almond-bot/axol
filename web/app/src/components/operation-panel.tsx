@@ -215,14 +215,17 @@ export function OperationPanel({
   // Sim is an Axol run mode: hidden and ignored on Mantis.
   const isSim = !mantisMode && isSimRun(meta, effectiveSettings)
   // Teleop with the Robot tab's "Axol arms" switch off drives only Jelly: the
-  // arms and their CAN bus are never touched. A live run carries the folded-in
-  // value in its args; otherwise the saved setting decides.
-  const armsOff = !mantisMode && isArmsOffRun(meta, effectiveSettings, sharedValues)
+  // arms and their CAN bus are never touched. A live run is described by its
+  // merged args alone (a default-on flag is omitted from them, so the saved
+  // switch must not be consulted — flipping it mid-run cannot relabel the
+  // run); otherwise the saved setting decides the next start.
+  const savedValues = liveArgs ? null : sharedValues
+  const armsOff = !mantisMode && isArmsOffRun(meta, effectiveSettings, savedValues)
   // Sim, arms-off, and Mantis runs do not touch the Axol arm motors. Mantis
   // still needs its own live CAN link, however, so `robotFree` only controls
   // the Axol connection/fault gates below; it is not a general hardware-free
   // signal.
-  const robotFree = mantisMode || armsOff || isRobotFreeRun(meta, effectiveSettings, sharedValues)
+  const robotFree = mantisMode || armsOff || isRobotFreeRun(meta, effectiveSettings, savedValues)
   const robotOk = robot?.state === "connected"
   const axolOk = robotOk && (robot?.profile ?? "axol") === "axol"
   const mantisOk = robotOk && robot?.profile === "mantis"

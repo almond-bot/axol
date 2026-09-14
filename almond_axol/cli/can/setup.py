@@ -2595,15 +2595,26 @@ def _resolve_headless_single_roles(
     minus its operator prompts: a positive response wins over a stale pin; an
     attached pin that stays silent keeps its role and is not replaced by a
     second same-role responder; an unplugged pin is preserved; several fresh
-    adapters reporting one role stay unassigned. A bus on which both the
-    Damiao wheel motors and the jelly_legs board answered is the shared
-    wheel+lift bus, and a chest pin no live board backs is dropped rather than
-    steering the lift driver onto an empty ``can_alm_axol_c`` later.
+    adapters reporting one role stay unassigned. When the adapter *assigned*
+    the wheel role is one on which both the Damiao wheel motors and the
+    jelly_legs board answered, that is the shared wheel+lift bus, and a chest
+    pin no live board backs is dropped rather than steering the lift driver
+    onto an empty ``can_alm_axol_c`` later. A shared responder that does not
+    win the wheel role (a silent attached wheel pin keeps it) proves nothing
+    about the chest bus and leaves it alone, exactly as the interactive flow
+    does.
     """
     configured = {"wheels": configured_wheels, "chest": configured_chest}
     selected: dict[str, str | None] = {"wheels": None, "chest": None}
-    lift_on_wheel_bus = any(found == "shared" for found in observed.values())
+    lift_on_wheel_bus = False
+    # Wheels first: whether the lift rides the wheel bus is a property of the
+    # adapter that actually ends up as the wheel bus.
     for role in ("wheels", "chest"):
+        if role == "chest":
+            wheels_serial = selected["wheels"]
+            lift_on_wheel_bus = (
+                wheels_serial is not None and observed.get(wheels_serial) == "shared"
+            )
         wanted = _SINGLE_ROLE_IDENTITIES[role]
         opposite = _SINGLE_ROLE_IDENTITIES["chest" if role == "wheels" else "wheels"]
         matches = sorted(

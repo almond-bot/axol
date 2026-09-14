@@ -1389,9 +1389,11 @@ export function isSimRun(meta: OperationMeta, settings: Record<string, FormValue
 export const ARMS_SETTING = "robot.arms"
 
 /**
- * Whether the run's arms flag is off. `args` are the run's args (a live
- * session's merged args carry the folded-in value); otherwise the shared
- * settings snapshot decides, with the flag defaulting to on.
+ * Whether the run's arms flag is off. An explicit value in `args` wins;
+ * otherwise the shared settings snapshot decides, with the flag defaulting
+ * to on. For a *live* session pass `sharedValues: null`: its merged args are
+ * the whole truth (a default-on flag is simply omitted from them), and the
+ * operator flipping the saved switch mid-run must not relabel the run.
  */
 export function isArmsOffRun(
   meta: OperationMeta,

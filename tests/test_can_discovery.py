@@ -580,6 +580,40 @@ class HeadlessHubResolverTest(unittest.TestCase):
         self.assertEqual(result.status, "partial")
         calls["apply"].assert_not_called()
 
+    def test_unassigned_shared_responder_does_not_drop_a_live_chest_pin(
+        self,
+    ) -> None:
+        # The pinned wheel adapter W is attached but silent, so it keeps its
+        # role and the fresh shared responder S is left unassigned. S proving
+        # "wheels + lift on one bus" says nothing about the *assigned* wheel
+        # bus, so the silent chest pin C must survive — no rewrite at all.
+        result, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            wheels="W",
+            chest="C",
+            single_adapters={"W": None, "C": None, "S": "shared"},
+            candidates_before=("S",),
+            candidates_after=("S",),
+            profiles_after={"axol"},
+        )
+        self.assertEqual(result.status, "partial")
+        calls["apply"].assert_not_called()
+
+    def test_shared_response_on_the_assigned_wheel_bus_drops_a_silent_chest_pin(
+        self,
+    ) -> None:
+        # The pinned wheel adapter itself answers shared: the lift has moved
+        # onto the wheel bus, so a chest pin no board backs is dropped.
+        _, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            wheels="W",
+            chest="C",
+            single_adapters={"W": "shared", "C": None},
+        )
+        calls["apply"].assert_called_once_with("A", "W", None)
+
     def test_positive_response_corrects_swapped_base_and_lift_pins(self) -> None:
         _, calls = self._run(
             {"A": "axol"},
