@@ -303,13 +303,29 @@ def design_transform_for(
     return DESIGN_TCP_TRANSFORMS.get(lookup, {}).get(side)
 
 
-def _same_transform(actual: list[float], reference: list[float]) -> bool:
+def same_tcp_transform(actual: object, reference: object) -> bool:
+    """True when two 7-vector transforms describe the same rigid pose mapping.
+
+    Positions must match to within floating-point noise; the rotations are
+    compared as rotations, so a unit quaternion and its negation (``q`` and
+    ``-q`` encode the same rotation) count as equal. Anything that is not a
+    7-element numeric list is simply "not the same" — callers use this to
+    compare a value read back from ``meta/axol.json`` against a live one.
+    """
+    if not isinstance(actual, list) or not isinstance(reference, list):
+        return False
+    if len(actual) != 7 or len(reference) != 7:
+        return False
+    try:
+        a = [float(v) for v in actual]
+        b = [float(v) for v in reference]
+    except (TypeError, ValueError):
+        return False
     position_matches = all(
-        math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
-        for a, b in zip(actual[:3], reference[:3], strict=True)
+        math.isclose(x, y, rel_tol=1e-9, abs_tol=1e-9)
+        for x, y in zip(a[:3], b[:3], strict=True)
     )
-    # Unit quaternions q and -q encode the same rotation.
-    quat_dot = sum(a * b for a, b in zip(actual[3:], reference[3:], strict=True))
+    quat_dot = sum(x * y for x, y in zip(a[3:], b[3:], strict=True))
     return position_matches and math.isclose(
         abs(quat_dot), 1.0, rel_tol=1e-9, abs_tol=1e-6
     )
@@ -337,7 +353,7 @@ def tcp_transform_provenance(
     else:
         is_design = all(
             any(
-                _same_transform(
+                same_tcp_transform(
                     validate_tcp_transform(transforms[side]),
                     validate_tcp_transform(family[side]),
                 )

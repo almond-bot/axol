@@ -23,6 +23,7 @@ from almond_axol.mantis.calibration import (
     MEASURED_TCP_TRANSFORM_ID,
     UNCALIBRATED_TCP_TRANSFORM_ID,
     VIVE_TCP_ROTATION_QUAT,
+    same_tcp_transform,
     tcp_transform_provenance,
 )
 from almond_axol.mantis.relative import quat_xyzw_to_matrix
@@ -352,6 +353,31 @@ class ResumeGateTest(unittest.TestCase):
             _require_mantis_resume_transform(
                 root, _collection(other, measured, "quest")
             )
+
+    def test_measured_transform_matches_across_quaternion_sign(self) -> None:
+        """q and -q are one rotation: a re-saved override must still resume."""
+        measured = [0.01, 0.02, -0.09, 0.0, 0.7071068, 0.0, 0.7071068]
+        negated = [0.01, 0.02, -0.09, 0.0, -0.7071068, 0.0, -0.7071068]
+        root = self._dataset(
+            {
+                "cartesian_pose_frame": "flu-urdf-root-v0.1.32",
+                MANTIS_TCP_TRANSFORM_KEY: tcp_transform_provenance(
+                    measured, measured, source="quest"
+                ),
+            }
+        )
+        _require_mantis_resume_transform(root, _collection(negated, negated, "quest"))
+        # A genuinely different rotation (not just the sign) is still refused.
+        rotated = [0.01, 0.02, -0.09, 0.7071068, 0.0, 0.0, 0.7071068]
+        with self.assertRaisesRegex(ValueError, "mix two pose conventions"):
+            _require_mantis_resume_transform(
+                root, _collection(rotated, measured, "quest")
+            )
+        # Malformed stored values never match.
+        self.assertFalse(same_tcp_transform(None, measured))
+        self.assertFalse(same_tcp_transform(measured[:6], measured))
+        self.assertFalse(same_tcp_transform(["x", *measured[1:]], measured))
+        self.assertTrue(same_tcp_transform(measured, negated))
 
     def test_no_marker_or_uncalibrated_passes(self) -> None:
         design = DESIGN_TCP_TRANSFORMS["survive"]

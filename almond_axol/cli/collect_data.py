@@ -402,6 +402,7 @@ def _require_mantis_resume_transform(
         DESIGN_TCP_TRANSFORM_ID,
         MEASURED_TCP_TRANSFORM_ID,
         UNCALIBRATED_TCP_TRANSFORM_ID,
+        same_tcp_transform,
     )
     from ..recording.cartesian_frame import (
         MANTIS_TCP_TRANSFORM_KEY,
@@ -447,20 +448,13 @@ def _require_mantis_resume_transform(
     if recorded_id == current_id == DESIGN_TCP_TRANSFORM_ID:
         return
     if MEASURED_TCP_TRANSFORM_ID in (recorded_id, current_id):
-
-        def _same_side(side: str) -> bool:
-            old = recorded.get(side)
-            new = current[side]
-            if not isinstance(old, list) or not isinstance(new, list):
-                return False
-            if len(old) != 7 or len(new) != 7:
-                return False
-            return all(
-                math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-9)
-                for a, b in zip(old, new, strict=True)
-            )
-
-        if _same_side("left") and _same_side("right"):
+        # Compare as rigid transforms (q and -q are the same rotation), the
+        # same equality tcp_transform_provenance uses to classify a transform
+        # as factory vs measured, so a re-saved override cannot fail resume.
+        if all(
+            same_tcp_transform(recorded.get(side), current[side])
+            for side in ("left", "right")
+        ):
             return
     raise ValueError(
         f"Cannot resume the Mantis dataset at {dataset_root}: it was recorded "
