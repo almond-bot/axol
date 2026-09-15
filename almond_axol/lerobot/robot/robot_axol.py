@@ -30,6 +30,7 @@ import asyncio
 import logging
 import threading
 import time
+from collections.abc import Iterable
 from concurrent.futures import Future
 from typing import TYPE_CHECKING
 
@@ -109,6 +110,75 @@ _POLICY_STATE_ALIGNMENT_LIMIT_S = 0.020
 _POLICY_CAMERA_MAX_AGE_PERIODS = 2
 _POLICY_CAMERA_MAX_AGE_SLACK_S = 0.200
 
+# Policy camera frames further apart than this many frame periods are *skewed*:
+# the observation still goes out (each camera contributes its retained frame
+# nearest the shared anchor exposure) but the skew is counted and reported,
+# because a persistent skew means the relay's ring is losing exposures.
+_POLICY_CAMERA_SKEW_PERIODS = 1.5
+_POLICY_SKEW_REPORT_INTERVAL_S = 5.0
+
+
+class _PolicySkewMonitor:
+    """Counts policy observations whose camera frames were not exposure-aligned.
+
+    Why this is a report and not an error: on 2026-09-14 a DAgger session's
+    relay ring dropped roughly every other exposure (the headset and the panel
+    both streaming WebRTC out of the relay's Python), so a strict "frames within
+    1.5 periods or fail" rule failed 50-60 % of policy ticks. A failed tick
+    sends **no** action — the loop sleeps a period and retries — so the arms
+    executed a 60 fps action chunk at ~19 actions/s: slow, stepping motion,
+    while the recorder went a second without robot state and discarded the
+    take. A frame that is 2-3 periods (33-50 ms) off for one camera is
+    harmless to a policy whose inference alone takes ~250 ms; a tick that
+    never happens is not. The pre-Rust observation had the same stance (it
+    fell back to each camera's newest frame rather than skip). Truly silent
+    cameras and missing telemetry stay fatal.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._window_start = time.perf_counter()
+        self._observations = 0
+        self._skewed = 0
+        self._max_skew_s = 0.0
+        self._cameras: dict[str, int] = {}
+
+    def record(self, skew_s: float, limit_s: float, offenders: Iterable[str]) -> None:
+        now = time.perf_counter()
+        report: str | None = None
+        with self._lock:
+            self._observations += 1
+            if skew_s > limit_s:
+                self._skewed += 1
+                self._max_skew_s = max(self._max_skew_s, skew_s)
+                for cam_key in offenders:
+                    self._cameras[cam_key] = self._cameras.get(cam_key, 0) + 1
+            elapsed = now - self._window_start
+            if self._skewed and elapsed >= _POLICY_SKEW_REPORT_INTERVAL_S:
+                worst = sorted(self._cameras.items(), key=lambda kv: -kv[1])
+                cameras = (
+                    "; cameras " + ", ".join(f"{k} x{n}" for k, n in worst)
+                    if worst
+                    else ""
+                )
+                report = (
+                    f"policy camera frames skewed in {self._skewed} of "
+                    f"{self._observations} observations over the last "
+                    f"{elapsed:.0f}s (max {self._max_skew_s * 1e3:.0f}ms apart, "
+                    f"limit {limit_s * 1e3:.0f}ms{cameras}). Inference continues "
+                    "on each camera's nearest retained frame; the relay's ring is "
+                    "losing exposures (check its CPU: WebRTC peers, recorder, gst "
+                    "threads)."
+                )
+            if elapsed >= _POLICY_SKEW_REPORT_INTERVAL_S:
+                self._window_start = now
+                self._observations = 0
+                self._skewed = 0
+                self._max_skew_s = 0.0
+                self._cameras = {}
+        if report is not None:
+            _logger.warning(report)
+
 
 class AxolRobot(Robot):
     """LeRobot Robot wrapping the Axol dual-arm hardware.
@@ -165,6 +235,7 @@ class AxolRobot(Robot):
         # must be newer (see ``_get_synchronized_observation``).
         self._last_policy_exposure_ts: float | None = None
         self._policy_exposure_lock = threading.Lock()
+        self._policy_skew: _PolicySkewMonitor | None = None
         self.cameras, self._stereo_cameras = self._build_cameras()
         self._observation_features: dict[str, type | tuple] | None = None
         self._action_features: dict[str, type | tuple] | None = None
@@ -701,7 +772,9 @@ class AxolRobot(Robot):
         240 Hz feedback history, matching collection's exposure-driven
         association. A missing/stale camera or unbracketed state aborts the
         observation; policy inference must never continue on a silently
-        mismatched image/state pair.
+        mismatched image/state pair. Frames a few periods apart across cameras
+        (a relay ring that dropped an exposure) do not: the nearest retained
+        frames are served and the skew is reported.
         """
         observation, _capture_ts, _state_ts = self._get_synchronized_observation()
         return observation
@@ -762,8 +835,17 @@ class AxolRobot(Robot):
         the lagging camera's next frame. A camera whose newest frame is older
         than a couple of periods is silent and fails the observation, as a
         timed-out ``read_at_or_after`` did before. Cameras without a history
-        (an in-process ZED reader) fall back to their newest frame and rely on
-        the spread check.
+        (an in-process ZED reader) contribute their newest frame.
+
+        Alignment is best effort, not a precondition: when a camera's ring has
+        no frame near the anchor (it dropped that exposure) the observation
+        takes the nearest frame it does retain — its newest, if the history
+        does not reach the anchor at all — and the resulting skew is counted
+        and reported by :class:`_PolicySkewMonitor` rather than failing the
+        tick. A skipped tick sends no action and publishes no state, which is
+        how a lossy relay ring turned into slow, stepping arm motion and
+        discarded takes on 2026-09-14; a couple of frames of skew on one
+        camera costs the policy nothing comparable.
         """
         now = time.perf_counter()
         if not self.cameras:
@@ -773,7 +855,7 @@ class AxolRobot(Robot):
             float(getattr(cam, "fps", None) or 30) for cam in cameras.values()
         )
         period_s = 1.0 / slowest_fps
-        camera_limit = max(0.010, 1.5 / slowest_fps)
+        skew_limit = max(0.010, _POLICY_CAMERA_SKEW_PERIODS * period_s)
         max_age_s = (
             _POLICY_CAMERA_MAX_AGE_PERIODS * period_s + _POLICY_CAMERA_MAX_AGE_SLACK_S
         )
@@ -821,29 +903,35 @@ class AxolRobot(Robot):
                 )
 
         # 4. Anchor on the exposure the slowest pipeline has reached and take
-        #    every camera's retained frame nearest it.
+        #    every camera's retained frame nearest it. The lookup tolerance is
+        #    the silence limit, not the alignment limit: a camera that dropped
+        #    the anchor exposure contributes its neighbour, and one whose
+        #    history no longer reaches the anchor contributes its newest frame.
         anchor_ts = min(cap_ts for cap_ts, _recv_ts in newest.values())
         frames: dict[str, np.ndarray] = {}
-        capture_ts: list[float] = []
+        capture_ts: dict[str, float] = {}
         for cam_key, cam in cameras.items():
             frame, cap_ts = self._policy_frame_nearest(
-                cam_key, cam, anchor_ts, camera_limit
+                cam_key, cam, anchor_ts, max_age_s
             )
             if not np.isfinite(cap_ts):
                 raise RuntimeError(
                     f"policy camera {cam_key!r} produced an invalid capture timestamp"
                 )
             frames[cam_key] = frame
-            capture_ts.append(cap_ts)
+            capture_ts[cam_key] = cap_ts
 
-        row_capture_ts = float(np.median(capture_ts))
-        camera_skew = max(capture_ts) - min(capture_ts)
-        if camera_skew > camera_limit:
-            raise RuntimeError(
-                "policy camera exposures are not synchronized "
-                f"(spread {camera_skew * 1e3:.1f}ms, limit "
-                f"{camera_limit * 1e3:.1f}ms)"
-            )
+        row_capture_ts = float(np.median(list(capture_ts.values())))
+        camera_skew = max(capture_ts.values()) - min(capture_ts.values())
+        self._policy_skew_monitor().record(
+            camera_skew,
+            skew_limit,
+            (
+                cam_key
+                for cam_key, cap_ts in capture_ts.items()
+                if abs(cap_ts - anchor_ts) > skew_limit
+            ),
+        )
 
         assert self._axol is not None
         state = self._axol.state_nearest(row_capture_ts)
@@ -895,27 +983,44 @@ class AxolRobot(Robot):
             ) from exc
         return float(cap_ts), float(recv_ts)
 
+    def _policy_skew_monitor(self) -> _PolicySkewMonitor:
+        monitor = getattr(self, "_policy_skew", None)
+        if monitor is None:
+            monitor = _PolicySkewMonitor()
+            self._policy_skew = monitor
+        return monitor
+
     @staticmethod
     def _policy_frame_nearest(
         cam_key: str, cam: object, anchor_ts: float, tolerance_s: float
     ) -> tuple[np.ndarray, float]:
-        """``cam``'s frame exposed nearest ``anchor_ts`` (its newest without a history)."""
+        """``cam``'s retained frame exposed nearest ``anchor_ts``.
+
+        Without a history (an in-process reader) that is its newest frame. With
+        one, a history that retains nothing within ``tolerance_s`` of the
+        anchor — the camera is more than a ring's worth ahead of the slowest
+        pipeline — also falls back to the newest frame: the caller accounts
+        the skew (:class:`_PolicySkewMonitor`); it is not a reason to skip the
+        tick. Only a camera with no frame at all fails.
+        """
         read_nearest = getattr(cam, "read_nearest", None)
-        if read_nearest is None:
-            read = cam.read_latest_with_ts  # type: ignore[attr-defined]
-        else:
-
-            def read() -> tuple[np.ndarray, float, float]:
-                return read_nearest(anchor_ts, tolerance_s=tolerance_s)
-
         try:
-            frame, cap_ts, _recv_ts = read()
-        except LookupError as exc:
-            raise RuntimeError(
-                "policy camera exposures are not synchronized: camera "
-                f"{cam_key!r} retains no frame within {tolerance_s * 1e3:.1f}ms "
-                f"of the anchor exposure ({exc})"
-            ) from exc
+            if read_nearest is not None:
+                try:
+                    frame, cap_ts, _recv_ts = read_nearest(
+                        anchor_ts, tolerance_s=tolerance_s
+                    )
+                except LookupError as exc:
+                    _logger.debug(
+                        "policy camera %r retains no frame within %.0fms of the "
+                        "anchor exposure (%s); using its newest frame",
+                        cam_key,
+                        tolerance_s * 1e3,
+                        exc,
+                    )
+                    frame, cap_ts, _recv_ts = cam.read_latest_with_ts()  # type: ignore[attr-defined]
+            else:
+                frame, cap_ts, _recv_ts = cam.read_latest_with_ts()  # type: ignore[attr-defined]
         except (TimeoutError, RuntimeError) as exc:
             raise RuntimeError(
                 f"policy camera {cam_key!r} produced no fresh frame: {exc}"

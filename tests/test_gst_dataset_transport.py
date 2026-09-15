@@ -273,6 +273,8 @@ class GstDatasetTransportTest(unittest.TestCase):
             pipeline, "rawvalve", "dsenc", "/tmp/mono-dataset.sock"
         )
         self.assertIn(
+            "queue name=pol_srcq leaky=downstream max-size-buffers=2 "
+            "max-size-bytes=0 max-size-time=0 ! "
             "valve name=polvalve drop=false ! nvvidconv ! video/x-raw,format=RGBA,"
             "width=960,height=600 ! appsink name=raw",
             pipeline,
@@ -313,6 +315,8 @@ class GstDatasetTransportTest(unittest.TestCase):
                 pipeline, f"rawvalve_{suffix}", f"dsenc_{suffix}", sock
             )
             self.assertIn(
+                f"queue name=pol_{suffix}_srcq leaky=downstream max-size-buffers=2 "
+                "max-size-bytes=0 max-size-time=0 ! "
                 f"valve name=polvalve_{suffix} drop=false ! nvvidconv ! "
                 "video/x-raw,format=RGBA,width=960,height=600 ! "
                 f"appsink name=raw_{suffix}",
@@ -617,6 +621,11 @@ class ExposureCriticalThreadsTest(unittest.TestCase):
                 "dsenc_srcq:src",
                 "dsenc_l_srcq:sr",
                 "dsenc_r_srcq:sr",
+                # The policy branch's queue holds the camera surface until the
+                # VIC has converted it, exactly like the dataset source queues.
+                "pol_srcq:src",
+                "pol_l_srcq:src",
+                "pol_r_srcq:src",
             },
         )
         # Post-copy stages keep CFS: they have their own deeper buffering.

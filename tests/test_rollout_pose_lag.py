@@ -84,7 +84,9 @@ class AxolObservationPoseLagTest(unittest.TestCase):
     delivered — the observation never waits for an exposure after "now" (that
     wait, paid per camera, ran the 2026-09-14 DAgger loop at 3-8 Hz). A camera
     without a fresh, timestamped frame or an unbracketed exposure aborts the
-    observation instead of falling back.
+    observation instead of falling back; frames merely skewed across cameras
+    (a ring that dropped an exposure) are served and the skew is reported,
+    never turned into a skipped tick.
     """
 
     def test_timing_is_returned_out_of_band_using_median_exposure(self) -> None:
@@ -143,7 +145,14 @@ class AxolObservationPoseLagTest(unittest.TestCase):
         np.testing.assert_array_equal(observation["wrist"], np.array([4]))
         self.assertAlmostEqual(capture_ts, 300.0169)
         for camera in (overhead, wrist):
-            camera.read_nearest.assert_called_once_with(300.0170, tolerance_s=0.025)
+            # The lookup tolerance is the camera-silence limit (two periods +
+            # 200 ms), not the alignment limit: a dropped exposure yields the
+            # neighbouring frame rather than a failed observation.
+            camera.read_nearest.assert_called_once()
+            self.assertAlmostEqual(camera.read_nearest.call_args.args[0], 300.0170)
+            self.assertAlmostEqual(
+                camera.read_nearest.call_args.kwargs["tolerance_s"], 2 / 60 + 0.2
+            )
             camera.read_at_or_after.assert_not_called()
             camera.read_latest_with_ts.assert_not_called()
 
@@ -189,7 +198,12 @@ class AxolObservationPoseLagTest(unittest.TestCase):
         np.testing.assert_array_equal(observation["overhead"], np.array([5]))
         np.testing.assert_array_equal(observation["wrist"], np.array([6]))
 
-    def test_history_without_the_anchor_exposure_is_a_sync_failure(self) -> None:
+    def test_history_without_the_anchor_exposure_falls_back_to_newest(self) -> None:
+        # The wrist ring no longer reaches the overhead's newest exposure (it
+        # is more than a ring ahead, or it dropped everything near it): the
+        # observation still goes out, with the wrist's newest frame, and the
+        # skew is reported instead of failing the tick — a failed tick sends
+        # no action, which is what made the 2026-09-14 arms step.
         overhead = _camera(60, 1, 300.0170, 300.0400, history=True)
         wrist = _camera(60, 2, 300.2000, 300.2050, history=True)
         wrist.read_nearest = mock.Mock(
@@ -202,10 +216,58 @@ class AxolObservationPoseLagTest(unittest.TestCase):
                 "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
                 return_value=300.21,
             ),
-            self.assertRaisesRegex(RuntimeError, "not synchronized.*'wrist'"),
+            mock.patch.object(robot_axol._logger, "warning") as warning,
         ):
-            robot.get_observation()
-        robot._axol.state_nearest.assert_not_called()
+            observation, capture_ts = robot.get_observation_with_capture_timestamp()
+
+        np.testing.assert_array_equal(observation["overhead"], np.array([1]))
+        np.testing.assert_array_equal(observation["wrist"], np.array([2]))
+        wrist.read_latest_with_ts.assert_called_once()
+        self.assertAlmostEqual(capture_ts, (300.0170 + 300.2000) / 2)
+        robot._axol.state_nearest.assert_called_once()
+        monitor = robot._policy_skew_monitor()
+        self.assertEqual(monitor._skewed, 1)
+        self.assertEqual(monitor._cameras, {"wrist": 1})
+        self.assertAlmostEqual(monitor._max_skew_s, 0.183)
+        # The report is rate limited: nothing on the first observation.
+        warning.assert_not_called()
+
+    def test_skewed_frames_are_served_and_reported_once_per_window(self) -> None:
+        # Two periods of skew (the wrist dropped the anchor exposure and its
+        # neighbour) used to raise "not synchronized"; now the frames are
+        # served and one warning summarises the window.
+        overhead = _camera(60, 1, 300.0170, 300.0400, history=True)
+        wrist = _camera(60, 2, 300.0503, 300.0550, history=True)
+        wrist.read_nearest = mock.Mock(
+            return_value=(np.array([4], dtype=np.uint8), 300.0503, 300.0550)
+        )
+        robot = _robot_with_cameras({"overhead": overhead, "wrist": wrist})
+
+        with (
+            mock.patch(
+                "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
+                return_value=300.06,
+            ),
+            mock.patch.object(robot_axol._logger, "warning") as warning,
+        ):
+            observation, _ts = robot.get_observation_with_capture_timestamp()
+            np.testing.assert_array_equal(observation["wrist"], np.array([4]))
+            warning.assert_not_called()
+            # Past the report interval the next observation emits the summary
+            # (the window is timed on perf_counter, so age the window rather
+            # than the clock — the frames must stay fresh).
+            monitor = robot._policy_skew_monitor()
+            monitor._window_start -= robot_axol._POLICY_SKEW_REPORT_INTERVAL_S
+            robot._last_policy_exposure_ts = None  # fresh frame set again
+            robot.get_observation_with_capture_timestamp()
+
+        warning.assert_called_once()
+        message = warning.call_args.args[0]
+        self.assertIn("skewed in 2 of 2 observations", message)
+        self.assertIn("max 33ms apart", message)
+        self.assertIn("wrist x2", message)
+        # The window resets after a report.
+        self.assertEqual(robot._policy_skew_monitor()._skewed, 0)
 
     def test_missing_fresh_frame_is_fatal_instead_of_falling_back(self) -> None:
         silent = _camera(40, 7, 199.5, 199.6)

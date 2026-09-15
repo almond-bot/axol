@@ -516,13 +516,33 @@ _COMM_MAX = 15
 # VIC copy. Argus owns only a handful of those surfaces, so these queues are
 # two buffers deep and an overrun there is a lost exposure; everything after
 # the VIC copy has its own (deeper) buffering.
+#
+# The policy (RGBA appsink) branch's source queue belongs to the same class:
+# its consumer thread holds the camera surface until the VIC has converted it
+# to system memory. Left as an anonymous CFS ``queueN`` it was the first thing
+# starved once the relay's throughput cores saturated (the policy ops run three
+# VIC branches per camera plus WebRTC on the cores collect-data runs two on;
+# 2026-09-14: cpu5 at 93-97 % with two WebRTC peers), and its two-deep queue
+# then shed 10-50 % of the exposures the control loop reads.
 _EXPOSURE_CRITICAL_QUEUES = (
     "eye_l_cropq",
     "eye_r_cropq",
     "dsenc_srcq",
     "dsenc_l_srcq",
     "dsenc_r_srcq",
+    "pol_srcq",
+    "pol_l_srcq",
+    "pol_r_srcq",
 )
+
+
+def _policy_source_queue(name: str) -> str:
+    """Shallow named queue in front of the policy branch's VIC RGBA convert."""
+    return (
+        f"queue name={name}_srcq leaky=downstream "
+        f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
+        "max-size-bytes=0 max-size-time=0"
+    )
 
 
 def _task_thread_comm(element_name: str) -> str:
@@ -930,11 +950,17 @@ class _GstPipelineBase:
             return
         queue_valves: dict[str, Any] = {}
         for valve_name, encoder_name in gates:
-            if encoder_name is None:
-                continue
             valve = self._pipeline.get_by_name(valve_name)
             if valve is None:
                 _logger.debug("dataset queue diagnostic missing valve %s", valve_name)
+                continue
+            if encoder_name is None:
+                # The policy (RGBA) branch: its only queue is the source queue
+                # in front of the VIC convert; an overrun there is an exposure
+                # the control loop will never see.
+                if valve_name.startswith("polvalve"):
+                    suffix = valve_name[len("polvalve") :]
+                    queue_valves[f"pol{suffix}_srcq"] = valve
                 continue
             for queue_name in (
                 f"{encoder_name}_srcq",
@@ -1588,7 +1614,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         if self._raw_appsink_wanted():
             valve = "polvalve" if self._raw_socket_path else "rawvalve"
             branches.append(
-                f"{_QUEUE} ! valve name={valve} drop=false "
+                f"{_policy_source_queue('pol')} ! valve name={valve} drop=false "
                 f"! nvvidconv ! video/x-raw,format=RGBA,"
                 f"width={self.raw_width},height={self.raw_height} ! {_raw_appsink('raw')}"
             )
@@ -1961,7 +1987,8 @@ class ZedGstStereoCamera(_GstPipelineBase):
         if want_raw and self._eye_appsink_wanted(side):
             valve = f"polvalve_{sink_suffix}" if sock else f"rawvalve_{sink_suffix}"
             branches.append(
-                f"{_QUEUE} ! valve name={valve} drop=false "
+                f"{_policy_source_queue('pol_' + sink_suffix)} ! "
+                f"valve name={valve} drop=false "
                 f"! nvvidconv ! video/x-raw,format=RGBA,"
                 f"width={self.raw_width},height={self.raw_height} ! "
                 f"{_raw_appsink('raw_' + sink_suffix)}"
