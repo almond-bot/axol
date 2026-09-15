@@ -96,16 +96,43 @@ _ULTIMATE_CAD_ORIGIN_DELTA_Z_M = (
     - VIVE_TRACKER_CAD_ORIGINS_MM["survive"][2]
 ) / 1000.0
 # Let G be the shared gripper/CAD frame and T the bridge-reported tracker
-# frame. The stored quaternion is R_TG = Rx(+90 deg), and the translation is
-# the TCP origin expressed in T. Moving the tracker origin by delta_O in G
-# therefore changes that translation by
+# frame. The stored translation is the TCP origin expressed in T. Moving the
+# tracker origin by delta_O in G therefore changes that translation by
 #
-#     delta_p_TG = -R_TG @ delta_O.
+#     delta_p_TG = -R_TG @ delta_O,
 #
-# Rx(+90 deg) maps CAD +z to tracker -y, so negating the +11 mm origin shift
+# where R_TG is the stored tracker→gripper rotation. The translation was
+# derived (and the Ultimate delta applied) under the mount-CAD convention in
+# which CAD +z maps to tracker -y, so negating the +11 mm origin shift
 # produces +11 mm on the Ultimate tracker-y TCP component. This is a mount-
 # frame derivation, not the bridge's z-up-world -> y-up-world basis relabel.
 _ULTIMATE_TRACKER_Y_TCP_DELTA_M = _ULTIMATE_CAD_ORIGIN_DELTA_Z_M
+
+# Tracker→gripper rotation for the flat-back Vive mounts (Tracker 3.0 and
+# Ultimate), as a unit quaternion ``[qx, qy, qz, qw]``: Ry(180°). Field
+# datasets recorded with the previous Rx(+90°) constant (axol <= 0.2.4)
+# replayed on Axol with every gripper pitched ~90° away from where the
+# operator held it; ``axol migrate-dataset --mantis-tcp-rotation`` repairs
+# them (see :data:`LEGACY_VIVE_TCP_ROTATION_QUAT`).
+VIVE_TCP_ROTATION_QUAT: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 0.0)
+# The retired Rx(+90°) rotation, kept only so the dataset migration can undo
+# it.
+LEGACY_VIVE_TCP_ROTATION_QUAT: tuple[float, float, float, float] = (
+    0.7071068,
+    0.0,
+    0.0,
+    0.7071068,
+)
+# Identifier written to a Mantis dataset's ``meta/axol.json`` (as
+# ``mantis_tcp_transform.id``) when it was recorded with the factory
+# constants below. Datasets without that field predate it and were recorded
+# with :data:`LEGACY_VIVE_TCP_ROTATION_QUAT`.
+DESIGN_TCP_TRANSFORM_ID = "vive-flat-back-ry180-v0.2.5"
+# Marker id for a run whose transforms came from a per-unit measurement (the
+# override file or an explicit CLI value) rather than the factory constants.
+MEASURED_TCP_TRANSFORM_ID = "measured"
+# Marker id for a bring-up run without any tracker→gripper transform.
+UNCALIBRATED_TCP_TRANSFORM_ID = "uncalibrated"
 # A tracker mounted to a hand-held gripper cannot plausibly be farther than a
 # metre from its TCP. This catches the dangerous and easy mm-as-m typo (for
 # example entering 47 instead of 0.047) before it can authorize collection.
@@ -118,20 +145,37 @@ MAX_TCP_TRANSLATION_M = 1.0
 # are factory values that apply out of the box; a per-unit measured entry in
 # the override file always wins over them.
 #
-# survive (Vive Tracker 3.0, standard mount): derived from the rig CAD
-# (2026-08-10) — tracker seated flat, stabilizing-pin recess toward the jaws,
-# gripper flange 92 mm forward / 35.5 mm below the tracker's mounting plane,
-# gripper pointing forward, jaw travel lateral. Expressed in the bridge's
-# tracker frame (libsurvive head frame with the z-up→y-up body relabel).
-# The tracker and Mantis CAD frames use the approved standard mounting
-# orientation; no additional axis flip or 180° correction is applied.
+# survive (Vive Tracker 3.0, standard mount): translation derived from the
+# rig CAD (2026-08-10) — tracker seated flat, stabilizing-pin recess toward
+# the jaws, gripper flange 92 mm forward / 35.5 mm below the tracker's
+# mounting plane, gripper pointing forward, jaw travel lateral. Expressed in
+# the bridge's tracker frame (libsurvive head frame with the z-up→y-up body
+# relabel).
+#
+# Rotation: Ry(180°) (:data:`VIVE_TCP_ROTATION_QUAT`). The flat-back mount
+# puts the tracker's +z (its LED face normal, which after the bridge's
+# relabel is the tracker's "up") along the gripper's -z (the finger
+# direction, see ``constants.GRIPPER_TIP_OFFSET``) and the tracker's +x along
+# the gripper's -x, with the shared y axis unchanged. The original CAD
+# derivation shipped Rx(+90°) here (axol <= 0.2.4), which is the mount-CAD
+# frame's convention rather than the bridge's device frame: every recorded
+# gripper orientation was pitched ~90° from where the operator held the rig,
+# so an operator holding the rig exactly like the robot's rest gripper
+# produced a dataset that Axol could not replay (field report, isolate-5,
+# 2026-09). Ry(180°) is the rotation that maps that same engage pose onto the
+# rest FK gripper frame; ``axol migrate-dataset --mantis-tcp-rotation``
+# repairs datasets recorded with the old constant.
 #
 # Each entry is ``[x, y, z, qx, qy, qz, qw]``: the gripper TCP frame
 # expressed in that tracker's device-local frame as the bridge/headset
 # reports it — the TCP origin in metres plus ``R_TG``, whose columns are the
 # gripper axes expressed in tracker coordinates (equivalently, it maps
-# gripper-coordinate vectors into tracker coordinates), straight from the
-# mount CAD.
+# gripper-coordinate vectors into tracker coordinates).
+#
+# TODO(mantis-calibration): bench-verify the translation ``[0, 0.0355,
+# -0.092]`` under the corrected rotation with the URDF overlay (it was
+# derived alongside the retired rotation, so its sign convention has not
+# been confirmed on hardware).
 #
 # TODO(mantis-calibration): Measure the Quest 3 cradle transform empirically.
 # The headset client streams WebXR ``gripSpace`` (with ``targetRaySpace`` only
@@ -147,36 +191,32 @@ MAX_TCP_TRANSLATION_M = 1.0
 # factory transform above. :data:`VIVE_TRACKER_CAD_ORIGINS_MM` records their
 # respective [47, 0, 35] mm and [47, 0, 46] mm reference origins. The common 47/0
 # coordinates cancel and establish delta_O = [0, 0, +11] mm in the shared
-# gripper/CAD frame. With the inherited R_TG = Rx(+90 deg),
-# delta_p_TG = -R_TG @ delta_O = [0, +11, 0] mm. Applying that tracker-y delta
-# to the V3 transform's independently derived 35.5 mm component gives 46.5 mm;
+# gripper/CAD frame. Under the mount-CAD convention the translation was
+# derived in, delta_p_TG = [0, +11, 0] mm. Applying that tracker-y delta to
+# the V3 transform's independently derived 35.5 mm component gives 46.5 mm;
 # the -92 mm forward offset and mount rotation are inherited. The two tracker
 # families use the same local axis directions and the same flat-back mounting
 # orientation, so Ultimate needs no additional rotation.
+_SURVIVE_DESIGN_TCP_TRANSFORM: list[float] = [
+    0.0,
+    0.0355,
+    -0.092,
+    *VIVE_TCP_ROTATION_QUAT,
+]
+_ULTIMATE_DESIGN_TCP_TRANSFORM: list[float] = [
+    0.0,
+    0.0355 + _ULTIMATE_TRACKER_Y_TCP_DELTA_M,
+    -0.092,
+    *VIVE_TCP_ROTATION_QUAT,
+]
 DESIGN_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
     "survive": {
-        "left": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
-        "right": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
+        "left": list(_SURVIVE_DESIGN_TCP_TRANSFORM),
+        "right": list(_SURVIVE_DESIGN_TCP_TRANSFORM),
     },
     "ultimate": {
-        "left": [
-            0.0,
-            0.0355 + _ULTIMATE_TRACKER_Y_TCP_DELTA_M,
-            -0.092,
-            0.7071068,
-            0.0,
-            0.0,
-            0.7071068,
-        ],
-        "right": [
-            0.0,
-            0.0355 + _ULTIMATE_TRACKER_Y_TCP_DELTA_M,
-            -0.092,
-            0.7071068,
-            0.0,
-            0.0,
-            0.7071068,
-        ],
+        "left": list(_ULTIMATE_DESIGN_TCP_TRANSFORM),
+        "right": list(_ULTIMATE_DESIGN_TCP_TRANSFORM),
     },
 }
 
@@ -261,6 +301,75 @@ def design_transform_for(
     ):
         return None
     return DESIGN_TCP_TRANSFORMS.get(lookup, {}).get(side)
+
+
+def same_tcp_transform(actual: object, reference: object) -> bool:
+    """True when two 7-vector transforms describe the same rigid pose mapping.
+
+    Positions must match to within floating-point noise; the rotations are
+    compared as rotations, so a unit quaternion and its negation (``q`` and
+    ``-q`` encode the same rotation) count as equal. Anything that is not a
+    7-element numeric list is simply "not the same" — callers use this to
+    compare a value read back from ``meta/axol.json`` against a live one.
+    """
+    if not isinstance(actual, list) or not isinstance(reference, list):
+        return False
+    if len(actual) != 7 or len(reference) != 7:
+        return False
+    try:
+        a = [float(v) for v in actual]
+        b = [float(v) for v in reference]
+    except (TypeError, ValueError):
+        return False
+    position_matches = all(
+        math.isclose(x, y, rel_tol=1e-9, abs_tol=1e-9)
+        for x, y in zip(a[:3], b[:3], strict=True)
+    )
+    quat_dot = sum(x * y for x, y in zip(a[3:], b[3:], strict=True))
+    return position_matches and math.isclose(
+        abs(quat_dot), 1.0, rel_tol=1e-9, abs_tol=1e-6
+    )
+
+
+def tcp_transform_provenance(
+    left: list[float] | None,
+    right: list[float] | None,
+    *,
+    source: str | None,
+) -> dict[str, object]:
+    """Describe the tracker→gripper transforms a Mantis dataset was recorded with.
+
+    The result is written verbatim into the dataset's ``meta/axol.json`` so a
+    later constant change can be undone by ``migrate-dataset`` without
+    guessing. ``id`` is :data:`DESIGN_TCP_TRANSFORM_ID` when both sides use
+    the current factory constants, :data:`MEASURED_TCP_TRANSFORM_ID` when
+    either side carries a per-unit value, and
+    :data:`UNCALIBRATED_TCP_TRANSFORM_ID` when a side has no transform at all
+    (``--mantis_allow_uncalibrated`` bring-up capture).
+    """
+    transforms = {"left": left, "right": right}
+    if any(value is None for value in transforms.values()):
+        transform_id = UNCALIBRATED_TCP_TRANSFORM_ID
+    else:
+        is_design = all(
+            any(
+                same_tcp_transform(
+                    validate_tcp_transform(transforms[side]),
+                    validate_tcp_transform(family[side]),
+                )
+                for family in DESIGN_TCP_TRANSFORMS.values()
+            )
+            for side in ("left", "right")
+        )
+        transform_id = (
+            DESIGN_TCP_TRANSFORM_ID if is_design else MEASURED_TCP_TRANSFORM_ID
+        )
+    return {
+        "id": transform_id,
+        "source": source,
+        "left": None if left is None else [float(v) for v in left],
+        "right": None if right is None else [float(v) for v in right],
+    }
 
 
 def candidate_transform_for(side: str, tracker_key: str) -> list[float] | None:
