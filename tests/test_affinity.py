@@ -267,18 +267,14 @@ class ApplyPinsEveryThreadTest(TestCase):
             self.assertTrue(pin())
         return calls
 
-    def test_pin_ik_leaves_the_xla_pool_on_the_startup_mask(self) -> None:
+    def test_pin_ik_moves_the_xla_pool_off_the_startup_mask(self) -> None:
         # pin_ik_startup widened the worker to {2, 3} and JAX spawned its
-        # tf_XLAEigen pool there. Narrowing the pool onto the IK core with the
-        # solve loop (axol #301's first cut) serialized the solve onto one
-        # CPU: engaged IK fell from ~100-115 Hz to 62-78 Hz and teleop
-        # juddered (station, 2026-09-15 15:45). Only the loop thread narrows.
+        # tf_XLAEigen pool there; pin_ik must narrow those threads too, or the
+        # solve keeps running on the control core (measured 2026-09-15: ~25 %
+        # of one XLA thread on core 2 during every intervention).
         calls = self._run(affinity.pin_ik)
-        self.assertEqual(calls, [(0, {3})])
-
-    def test_pin_ik_startup_widens_every_thread(self) -> None:
-        calls = self._run(affinity.pin_ik_startup)
-        self.assertEqual(calls, [(0, {2, 3}), (202, {2, 3})])
+        self.assertEqual(calls[0], (0, {3}))  # the caller, via pid 0
+        self.assertCountEqual(calls[1:], [(202, {3})])  # 101 is the caller; 303 exited
 
     def test_recorder_narrowing_moves_its_import_threads(self) -> None:
         with patch.object(affinity.os, "cpu_count", return_value=8):
@@ -304,8 +300,8 @@ class ApplyPinsEveryThreadTest(TestCase):
             patch.object(affinity.os, "listdir", side_effect=OSError("no /proc")),
             patch.object(affinity.os, "sched_setaffinity") as set_affinity,
         ):
-            self.assertTrue(affinity.pin_background())
-        self.assertEqual(set_affinity.call_args_list, [call(0, {0, 1})])
+            self.assertTrue(affinity.pin_ik())
+        self.assertEqual(set_affinity.call_args_list, [call(0, {3})])
 
 
 class CoreGroupsTest(TestCase):
