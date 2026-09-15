@@ -1856,8 +1856,10 @@ export default function ControlPanel() {
         {lockout && (
           <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3 text-xs text-red-200/80 sm:flex-row sm:items-center sm:justify-between">
             <p>
-              The last operation could not confirm it disabled the motors, so the robot stays
-              reserved. If motor power was cut (the PSU e-stop), re-check the motors to release it.
+              The last operation could not confirm it disabled the motors, and a probe afterwards
+              found at least one still answering under torque (or could not read them), so the robot
+              stays reserved. Cut motor power (the PSU e-stop), then re-check the motors to release
+              it.
             </p>
             <Button
               variant="outline"

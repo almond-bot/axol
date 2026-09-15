@@ -693,7 +693,8 @@ export interface OpStatus {
   /** Present only while an op declaring an episode control is running
    *  (collect-data / run-policy / waypoints); null otherwise. */
   policy: PolicyState | null
-  /** An operation could not confirm it disabled the motors, so the server
+  /** An operation could not confirm it disabled the motors and the server's
+   *  own probe afterwards could not prove them torque-free either, so it
    *  keeps the robot reserved (older hosts omit this). */
   lockout?: boolean
 }

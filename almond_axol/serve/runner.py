@@ -212,6 +212,54 @@ def _forward_line(sink: Any, line: str) -> None:
         pass
 
 
+def prove_motors_torque_free(robot: Any) -> str | None:
+    """Prove every motor is torque-free, or say why that could not be shown.
+
+    Used when an operation could not confirm it disabled the motors. Rather
+    than assume, this looks: reacquire the idle link if a task had released
+    it, force one ping sweep, and accept only when each motor reads
+    ``DISABLED`` or does not answer at all (``reachable is False``, i.e. it
+    is unpowered). A motor that answers and is not disabled is holding torque
+    nobody supervises; a motor with no reading (``reachable is None``) proves
+    nothing. Both refuse.
+
+    Returns ``None`` on proof, otherwise the refusal reason. The probe only
+    borrows the buses: the failed operation may still hold them, so on
+    refusal a link this call brought up is handed back (``busy``) exactly as
+    it was before. A link that was already connected is left alone.
+    """
+    reacquired = False
+
+    def refuse(error: str) -> str:
+        if reacquired:
+            try:
+                robot.release()
+            except Exception as exc:  # noqa: BLE001 - report with the refusal
+                error = f"{error}; also could not hand the buses back: {exc}"
+        return error
+
+    try:
+        reacquired = bool(robot.reacquire())
+        status = robot.probe()
+    except Exception as exc:  # noqa: BLE001 - any unread motor keeps the lockout
+        return refuse(f"could not reach the motors to prove they are disabled: {exc}")
+    live = [
+        m
+        for m in status["motors"]
+        if m["reachable"] is not False and m["status"] != "DISABLED"
+    ]
+    if live:
+        return refuse(
+            "these motors still answer and are not disabled: "
+            + ", ".join(
+                f"{m['arm']} {m['joint'].lower()}"
+                f" ({str(m['status']).replace('_', ' ').lower()})"
+                for m in live
+            )
+        )
+    return None
+
+
 class _StreamTee:
     """Mirror a stream to the original fd and emit each completed line."""
 
@@ -555,12 +603,13 @@ class OperationRunner:
         # loop drains.
         self._episode_control: Any = None
         # A command reported that its hardware disconnect/disable did not
-        # complete.  The command may still own one or both CAN buses, so no
-        # later operation may start and the idle RobotLink does not reacquire
-        # them on its own.  Two ways out: restarting the serve process, or
-        # ``/api/op/clear-lockout``, which borrows the buses just long enough
-        # to prove every motor is torque-free (disabled or unpowered) and
-        # hands them back if it cannot (see clear_hardware_cleanup_lockout).
+        # complete, and the probe ``_finish`` ran right after it could not
+        # prove the motors torque-free (see prove_motors_torque_free).  The
+        # command may still own one or both CAN buses, so no later operation
+        # may start and the idle RobotLink does not reacquire them on its own.
+        # Ways out: ``/api/op/clear-lockout`` re-runs the same probe (after
+        # the operator cuts motor power, typically), or the serve process
+        # restarts.
         self._hardware_cleanup_uncertain = False
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
@@ -1738,14 +1787,31 @@ class OperationRunner:
         cleanup_uncertain: bool = False,
     ) -> None:
         if cleanup_uncertain:
-            with self._lock:
-                self._hardware_cleanup_uncertain = True
-            message = (
-                "hardware cleanup could not be verified; robot ownership remains "
-                "reserved until axol serve is restarted"
-            )
-            self._mark_terminal(session, "error", error=session.error or message)
-            session.emit(f"[serve] safety lockout: {message}")
+            # The operation could not confirm it torqued the motors off.  Do
+            # not make the operator prove it by hand: look now, and only
+            # reserve the robot when the motors really cannot be shown safe.
+            if self._robot_link is None:
+                refusal: str | None = "no robot link to probe the motors with"
+            else:
+                session.emit(
+                    "[serve] hardware cleanup could not be verified; probing the motors"
+                )
+                refusal = prove_motors_torque_free(self._robot_link)
+            if refusal is None:
+                cleanup_uncertain = False
+                session.emit(
+                    "[serve] every motor reads disabled or unpowered; robot released"
+                )
+            else:
+                with self._lock:
+                    self._hardware_cleanup_uncertain = True
+                message = (
+                    f"{refusal}; robot ownership remains reserved. Cut motor "
+                    "power, then use Re-check motors in the control panel "
+                    "(POST /api/op/clear-lockout) to release it"
+                )
+                self._mark_terminal(session, "error", error=session.error or message)
+                session.emit(f"[serve] safety lockout: {message}")
         self._mark_terminal(session, "exited")
         session.emit(f"[serve] {session.command_id} finished")
         if needs_robot and self._robot_link is not None and not cleanup_uncertain:

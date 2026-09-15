@@ -282,11 +282,41 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             return_value=({"joint": 0.0}, 1.0)
         )
 
-        result = control_loop._policy_tick()  # noqa: SLF001
+        result = control_loop._policy_tick(1.0)  # noqa: SLF001
 
         self.assertIsNone(result)
         control_loop.robot.send_action.assert_not_called()
         control_loop.recorder.publish.assert_not_called()
+
+    def test_policy_tick_snapshots_the_live_joints_at_the_tick(self) -> None:
+        # The policy's observation is re-served between ring frames (its
+        # exposure timestamp repeats), so the recorder's snapshot — which
+        # must arrive every tick on a monotonic timeline — is the live joint
+        # state dated at the tick, exactly as the teleop and frozen states
+        # publish it.
+        control_loop = object.__new__(collect_dagger._DaggerControlLoop)  # noqa: SLF001
+        control_loop.shutdown_event = threading.Event()
+        performed = {"left.pos": 0.9}
+        live_joints = {"left.pos": 0.85}
+        control_loop.robot = SimpleNamespace(
+            send_action=mock.Mock(return_value=performed),
+            get_joint_observation=mock.Mock(return_value=live_joints),
+            get_observation_with_capture_timestamp=mock.Mock(
+                return_value=({"left.pos": 0.8, "wrist": object()}, 41.95)
+            ),
+        )
+        control_loop.policy = SimpleNamespace(
+            act=mock.Mock(return_value={"left.pos": 1.0})
+        )
+        control_loop.limiter = None
+        control_loop.recorder = SimpleNamespace(publish=mock.Mock())
+
+        result = control_loop._policy_tick(42.0)  # noqa: SLF001
+
+        self.assertEqual(result, {"left.pos": 1.0})
+        control_loop.recorder.publish.assert_called_once_with(
+            live_joints, performed, 42.0
+        )
 
     def test_cartesian_dagger_intervention_records_converted_joint_action(self) -> None:
         control_loop = object.__new__(collect_dagger._DaggerControlLoop)  # noqa: SLF001

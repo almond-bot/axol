@@ -290,7 +290,7 @@ def _raw_plan(name: str, spec: dict) -> list[tuple[str, str]]:
 
 def _open_gst_camera_raw(
     name: str, spec: dict, cond: object, socket_dir: str | None
-) -> tuple[object, dict[str, object], list, dict[str, dict]] | None:
+) -> tuple[object, dict[str, object], list, dict[str, dict], dict[str, dict]] | None:
     """Open one camera via the gst pipeline with both encoded + raw branches.
 
     Like :func:`_open_gst_camera`, but additionally exports each source's
@@ -310,13 +310,32 @@ def _open_gst_camera_raw(
     *control* process (``VideoRelayProcess.raw_cameras`` become real
     :class:`RawFrameReader` proxies instead of dims-only stubs), which callers
     need when something in the control process must consume the raw frames —
-    e.g. a policy building observations while the recorder subprocess records
-    the same frames. The cost is the relay-side per-frame Python copy this
-    path always had; the encoded headset branch is unaffected.
+    e.g. a policy building observations. The cost is the relay-side per-frame
+    Python copy this path always had — and, when the recorder subprocess
+    records the same frames, a recorder that re-encodes four raw streams
+    itself instead of muxing: on the 8-core Orin that recorder and its NVENC
+    feeders share two cores with the relay's camera threads and kept only
+    ~35-40 % of a 60 fps take's rows (2026-09-14), so the saved episode
+    played ~2.7x fast.
 
-    Returns ``(owned_camera, {track: source}, [writers], {source: meta})`` — where
-    ``meta`` is the per-source dict from :func:`_gsth264_meta` / :func:`_pyshm_meta`
-    — or ``None`` when the gst stack/camera is unavailable (the caller then falls
+    ``raw_transport: "gstshm+pyshm"`` is the fix for that case: the dataset
+    branch stays on **gstshm** (the recorder muxes AUs, zero raw work) and a
+    second, RGBA-appsink branch off the same exposures feeds a
+    :class:`RawFrameWriter` ring the control process reads (the policy's
+    observations). Both branches open on one exposure boundary behind their
+    own valves. The recorder's per-source meta is the gsth264 one; the ring's
+    pyshm meta comes back separately (``policy_meta``) for the parent to hand
+    to its :class:`RawFrameReader`\\ s. Without gst's shm plugin it degrades
+    to plain pyshm. ``policy_fps`` in the spec decimates that ring ahead of
+    its VIC convert (the policy reads an observation a few times a second;
+    see ``gst_zed._policy_rate_limit``) — the reader's ``fps`` is the ring's
+    rate, so the control process paces its freshness rules on it.
+
+    Returns ``(owned_camera, {track: source}, [writers], {source: meta},
+    {source: policy_meta})`` — where ``meta`` is the per-source dict from
+    :func:`_gsth264_meta` / :func:`_pyshm_meta` and ``policy_meta`` holds a
+    :func:`_pyshm_meta` per source only on the combined transport — or
+    ``None`` when the gst stack/camera is unavailable (the caller then falls
     back to the in-process camera pipeline).
     """
     from .gst_zed import (
@@ -350,8 +369,17 @@ def _open_gst_camera_raw(
         if dw < width or dh < height:
             raw_w, raw_h = dw, dh
     raw_dims = (raw_w, raw_h)
-    use_shm = socket_dir is not None and spec.get("raw_transport") != "pyshm"
+    transport = spec.get("raw_transport")
+    use_shm = socket_dir is not None and transport != "pyshm"
+    # The combined transport adds the control-process ring beside the encoded
+    # dataset branch; the pyshm meta for that ring is returned as policy_meta.
+    policy_ring = use_shm and transport == "gstshm+pyshm"
     dataset_fps = int(spec.get("dataset_fps", spec.get("fps", 60)))
+    # The control-process ring's rate (``policy_fps``; 0/absent = capture rate).
+    # Only the combined transport has a ring that is the policy's alone; on the
+    # plain pyshm fallback the ring is also the recorder's input and stays at
+    # the dataset rate.
+    policy_fps_wanted = int(spec.get("policy_fps") or 0)
     # A camera can opt out of either branch: stream-only (no raw / dataset) or
     # record-only (no encoded / headset). This path is only entered when the
     # camera records (see _relay_main), so the raw branch is always built; the
@@ -360,6 +388,9 @@ def _open_gst_camera_raw(
 
     for fps in (int(spec.get("fps", 60)), 30):
         writers: list = []
+        policy_fps = (
+            min(policy_fps_wanted, fps) if policy_ring and policy_fps_wanted else fps
+        )
         try:
             if stereo and use_shm:
                 # Encoded eyes feed the headset; raw eyes feed the dataset — they
@@ -381,12 +412,22 @@ def _open_gst_camera_raw(
                     eye_kwargs["left_raw_socket_path"] = socks["left"]
                 if "right" in socks:
                     eye_kwargs["right_raw_socket_path"] = socks["right"]
+                ring_writers: dict[str, RawFrameWriter] = {}
+                if policy_ring:
+                    ring_writers = {
+                        side: RawFrameWriter.create(raw_w, raw_h, cond)
+                        for side, _ in raw_plan
+                    }
+                    writers = list(ring_writers.values())
+                    for side, writer in ring_writers.items():
+                        eye_kwargs[f"{side}_raw_sink"] = writer.publish
                 cam: object = ZedGstStereoCamera(
                     serial,
                     resolution,
                     fps,
                     raw_dims=raw_dims,
                     dataset_fps=dataset_fps,
+                    policy_fps=policy_fps,
                     encoded_eyes=enc_sides,
                     raw_eyes=raw_sides,
                     encoded_sbs=sbs,
@@ -411,7 +452,12 @@ def _open_gst_camera_raw(
                     )
                     for side, src in raw_plan
                 }
-                return cam, sources, [], raw_meta
+                policy_meta = {
+                    src: _pyshm_meta(ring_writers[side].name, raw_w, raw_h, policy_fps)
+                    for side, src in raw_plan
+                    if side in ring_writers
+                }
+                return cam, sources, writers, raw_meta, policy_meta
             if stereo:
                 sbs = wants_stream and _stream_sbs(spec)
                 enc_plan = _eye_plan(name, spec) if wants_stream and not sbs else []
@@ -449,20 +495,26 @@ def _open_gst_camera_raw(
                     src: _pyshm_meta(eye_writers[side].name, raw_w, raw_h, fps)
                     for side, src in raw_plan
                 }
-                return cam, sources, writers, raw_meta
+                return cam, sources, writers, raw_meta, {}
             # Mono: the camera streams only when ``stream`` is set; a record-only
             # mono camera builds the raw branch alone (no encoded source, so it is
             # not exposed to the headset).
             if use_shm:
                 sock = os.path.join(socket_dir, f"{name}.sock")
+                ring: RawFrameWriter | None = None
+                if policy_ring:
+                    ring = RawFrameWriter.create(raw_w, raw_h, cond)
+                    writers = [ring]
                 cam = ZedGstCamera(
                     serial,
                     resolution,
                     fps,
                     want_encoded=wants_stream,
+                    raw_sink=ring.publish if ring is not None else None,
                     raw_socket_path=sock,
                     raw_dims=raw_dims,
                     dataset_fps=dataset_fps,
+                    policy_fps=policy_fps,
                 )
                 cam.connect()
                 meta = {
@@ -475,7 +527,18 @@ def _open_gst_camera_raw(
                         cam.pts_perf_offset_s,
                     )
                 }
-                return cam, ({name: cam} if wants_stream else {}), [], meta
+                policy_meta = (
+                    {name: _pyshm_meta(ring.name, raw_w, raw_h, policy_fps)}
+                    if ring is not None
+                    else {}
+                )
+                return (
+                    cam,
+                    {name: cam} if wants_stream else {},
+                    writers,
+                    meta,
+                    policy_meta,
+                )
             writer = RawFrameWriter.create(raw_w, raw_h, cond)
             writers = [writer]
             cam = ZedGstCamera(
@@ -492,6 +555,7 @@ def _open_gst_camera_raw(
                 {name: cam} if wants_stream else {},
                 writers,
                 {name: _pyshm_meta(writer.name, raw_w, raw_h, fps)},
+                {},
             )
         except Exception as exc:  # noqa: BLE001 - try lower fps, then give up
             for w in writers:
@@ -625,6 +689,7 @@ def _relay_main(
     sources: dict[str, object] = {}
     writers: list[object] = []
     raw_meta: dict[str, dict] = {}
+    policy_meta: dict[str, dict] = {}
     # Prefer the gst-native GDP/shmsink transport for dataset video: it encodes
     # and exports every timestamped AU in C, so the relay does zero Python per
     # dataset frame and the WebRTC send keeps the GIL it needs. Falls back to the
@@ -650,11 +715,12 @@ def _relay_main(
         if wants_record:
             raw = _open_gst_camera_raw(name, spec, raw_cond, socket_dir)
             if raw is not None:
-                cam, gst_sources, cam_writers, cam_meta = raw
+                cam, gst_sources, cam_writers, cam_meta, cam_policy_meta = raw
                 owned.append(cam)
                 sources.update(gst_sources)
                 writers.extend(cam_writers)
                 raw_meta.update(cam_meta)
+                policy_meta.update(cam_policy_meta)
                 continue
             # No gst raw path for this camera. If it also streams, fall through to
             # the encoded-only path below; if it's record-only, there's nothing
@@ -682,7 +748,7 @@ def _relay_main(
             sources[name] = cam
 
     manager = WebRTCManager(sources) if sources else None
-    conn.send(("ready", sorted(sources), raw_meta))
+    conn.send(("ready", sorted(sources), raw_meta, policy_meta))
     if manager is None:
         if raw_meta:
             # Record-only: every camera has streaming disabled, so there's no
@@ -877,7 +943,10 @@ class VideoRelayProcess:
             cameras: Per-source spec: ``{name: {"serial": int,
                 "resolution": str, "fps": int, "stereo": bool}}``. ``fps``
                 is the physical capture/data rate; headset encoding is fixed
-                independently at 30 fps.
+                independently at 30 fps. Optional ``dataset_fps`` decimates
+                the recorder branch and ``policy_fps`` the control-process
+                ring of the ``gstshm+pyshm`` transport (see
+                :func:`_open_gst_camera_raw`).
             want_raw: Also publish each camera's dataset feed to shared memory
                 (encoded GDP/H.264 when available, raw RGB as fallback).
                 Successfully exported sources appear in :attr:`raw_cameras` as
@@ -919,6 +988,11 @@ class VideoRelayProcess:
         # + caps, or pyshm block name) and dims — exposed (with :attr:`raw_cond`)
         # so the recorder subprocess can attach its own consumer per source.
         self.raw_meta: dict[str, dict] = {}
+        # ``{source: pyshm meta}`` of the control-process rings on the combined
+        # ``gstshm+pyshm`` transport (empty otherwise); those sources'
+        # :attr:`raw_cameras` are real :class:`RawFrameReader`\\ s while the
+        # recorder keeps consuming the encoded ``raw_meta`` transport.
+        self.policy_meta: dict[str, dict] = {}
         try:
             # Retain every field shutdown() needs before the fallible spawn. A
             # Process.start() interruption can arrive after the child has already
@@ -938,8 +1012,10 @@ class VideoRelayProcess:
                         )
                     self.sources = list(msg[1])
                     raw_meta = msg[2] if len(msg) > 2 else {}
+                    policy_meta = msg[3] if len(msg) > 3 else {}
                     self.raw_meta = dict(raw_meta)
-                    self._attach_raw_readers(raw_meta)
+                    self.policy_meta = dict(policy_meta)
+                    self._attach_raw_readers(raw_meta, policy_meta)
                     break
                 if not self._proc.is_alive():
                     raise RuntimeError(
@@ -979,21 +1055,36 @@ class VideoRelayProcess:
         """
         return self._raw_cond
 
-    def _attach_raw_readers(self, raw_meta: dict[str, dict]) -> None:
+    def _attach_raw_readers(
+        self, raw_meta: dict[str, dict], policy_meta: dict[str, dict] | None = None
+    ) -> None:
         """Expose each relay raw source to the control process.
 
         On the **gstshm** transport the control process never reads frames (the
         recorder owns the shmsrc consumer), so attach a dims-only
-        :class:`_RawCameraStub`. On the **pyshm** fallback, attach a
-        :class:`RawFrameReader` over the shared-memory block.
+        :class:`_RawCameraStub` — unless the source also has a control-process
+        ring (``policy_meta``, the combined ``gstshm+pyshm`` transport), which
+        gets a :class:`RawFrameReader` over that ring. On the **pyshm**
+        fallback, attach a :class:`RawFrameReader` over the shared-memory
+        block.
         """
         if not raw_meta:
             return
         from .shm_frames import RawFrameReader
 
+        policy_meta = policy_meta or {}
         for source, meta in raw_meta.items():
             try:
-                if str(meta["transport"]).startswith("gstshm"):
+                ring = policy_meta.get(source)
+                if ring is not None and self._raw_cond is not None:
+                    self.raw_cameras[source] = RawFrameReader(
+                        ring["shm_name"],
+                        ring["width"],
+                        ring["height"],
+                        ring["fps"],
+                        self._raw_cond,
+                    )
+                elif str(meta["transport"]).startswith("gstshm"):
                     self.raw_cameras[source] = _RawCameraStub(
                         meta["width"], meta["height"], meta["fps"]
                     )
@@ -1121,6 +1212,21 @@ class VideoRelayProcess:
         await asyncio.get_running_loop().run_in_executor(
             None, self._send, ("close_all",)
         )
+
+    @property
+    def readable_raw_cameras(self) -> dict[str, object]:
+        """The raw sources this process can actually read frames from.
+
+        Every :attr:`raw_cameras` entry minus the dims-only stubs of the
+        gstshm transport — the pyshm blocks, and on ``gstshm+pyshm`` the
+        control-process rings. A policy that builds observations from the
+        relay must find all of its cameras here, not in :attr:`raw_cameras`.
+        """
+        return {
+            name: cam
+            for name, cam in self.raw_cameras.items()
+            if not isinstance(cam, _RawCameraStub)
+        }
 
     def set_raw_enabled(self, enabled: bool) -> None:
         """Open/close the raw dataset branch in the relay (recording only).

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing
 import queue
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -19,8 +20,10 @@ from almond_axol.video.hw_video import (
 from almond_axol.video.shm_frames import (
     RawFrameReader,
     RawFrameWriter,
+    _RAW_RING_SLOTS,
     _au_has_coded_slice,
     _block_size,
+    rgba_to_rgb,
 )
 from almond_axol.video.video_proc import _eye_plan, _plan, _pyshm_meta, _raw_plan
 
@@ -84,10 +87,79 @@ def test_shared_memory_raw_frame_round_trip() -> None:
     try:
         with pytest.raises(RuntimeError, match="no frames"):
             reader.read_latest_with_ts()
+        assert reader.latest_capture_ts() is None
+        with pytest.raises(RuntimeError, match="no frames"):
+            reader.read_nearest(10.0, tolerance_s=1.0)
         writer.publish(rgba, cap_ts=10.0, recv_ts=11.0)
         frame, cap, recv = reader.read_latest_with_ts()
         np.testing.assert_array_equal(frame, rgba[:, :, :3])
         assert (cap, recv) == (10.0, 11.0)
+        assert reader.latest_capture_ts() == (10.0, 11.0)
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_rgba_to_rgb_matches_the_strided_copy_on_both_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(7)
+    rgba = rng.integers(0, 256, size=(5, 6, 4), dtype=np.uint8)
+    expected = np.ascontiguousarray(rgba[:, :, :3])
+
+    out = np.zeros((5, 6, 3), dtype=np.uint8)
+    rgba_to_rgb(rgba, out)
+    np.testing.assert_array_equal(out, expected)
+
+    # Without OpenCV the numpy gather produces the same bytes.
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    out = np.zeros((5, 6, 3), dtype=np.uint8)
+    rgba_to_rgb(rgba, out)
+    np.testing.assert_array_equal(out, expected)
+
+
+def test_shared_memory_ring_serves_the_frame_nearest_an_exposure() -> None:
+    condition = multiprocessing.Condition()
+    writer = RawFrameWriter.create(2, 1, condition)
+    reader = RawFrameReader(writer.name, 2, 1, 60, condition)
+    try:
+        for i in range(1, 4):
+            rgba = np.full((1, 2, 4), i, dtype=np.uint8)
+            writer.publish(rgba, cap_ts=float(i), recv_ts=float(i) + 0.05)
+        # The newest frame is still the one the plain reads see...
+        assert reader.latest_capture_ts() == (3.0, 3.05)
+        assert reader.read_latest_with_ts()[1] == 3.0
+        # ...while the history serves an earlier exposure, without waiting.
+        frame, cap, recv = reader.read_nearest(2.1, tolerance_s=0.5)
+        np.testing.assert_array_equal(frame, np.full((1, 2, 3), 2, dtype=np.uint8))
+        assert (cap, recv) == (2.0, 2.05)
+        # Nothing within tolerance: the history does not reach that far.
+        with pytest.raises(LookupError, match="nearest is"):
+            reader.read_nearest(0.0, tolerance_s=0.5)
+        # Halfway between two exposures the earlier one wins (every camera has
+        # reached the anchor, so the frame before it exists for all of them);
+        # a later frame has to be clearly closer.
+        assert reader.read_nearest(2.5, tolerance_s=1.0)[1] == 2.0
+        assert reader.read_nearest(2.5005, tolerance_s=1.0)[1] == 2.0
+        assert reader.read_nearest(2.503, tolerance_s=1.0)[1] == 3.0
+
+        # The ring evicts the oldest exposures as it wraps; the recent ones
+        # stay addressable and the frame pixels follow their own slot.
+        for i in range(4, 4 + _RAW_RING_SLOTS):
+            rgba = np.full((1, 2, 4), i, dtype=np.uint8)
+            writer.publish(rgba, cap_ts=float(i), recv_ts=float(i) + 0.05)
+        newest = 3 + _RAW_RING_SLOTS
+        with pytest.raises(LookupError):
+            reader.read_nearest(1.0, tolerance_s=0.5)
+        for i in range(newest - _RAW_RING_SLOTS + 1, newest + 1):
+            frame, cap, _recv = reader.read_nearest(float(i) + 0.2, tolerance_s=0.5)
+            assert cap == float(i)
+            np.testing.assert_array_equal(frame, np.full((1, 2, 3), i, dtype=np.uint8))
+        # Frames older than the ring never resurface via a wide tolerance
+        # either: the nearest retained one wins.
+        assert reader.read_nearest(0.0, tolerance_s=100.0)[1] == float(
+            newest - _RAW_RING_SLOTS + 1
+        )
     finally:
         reader.close()
         writer.close()

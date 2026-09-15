@@ -10,7 +10,13 @@ import httpx
 from almond_axol.serve import commands
 from almond_axol.serve.commands import CommandDef, command_specs, field_suggestions
 
-from .test_serve_session_reservation import _Manager, _Runner, _test_app
+try:
+    from .test_serve_session_reservation import _Manager, _Runner, _test_app
+except ImportError:
+    # ``unittest discover -s tests`` imports test modules top-level (no parent
+    # package), so the relative import above fails there; fall back to the
+    # absolute name, which resolves because the start dir is on sys.path.
+    from test_serve_session_reservation import _Manager, _Runner, _test_app
 
 
 def _command(provider: Any = None, **kwargs: Any) -> CommandDef:

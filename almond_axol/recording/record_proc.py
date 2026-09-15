@@ -60,8 +60,13 @@ _ENCODER_THREADS = 2
 # is plenty fine-grained for timestamp-tolerant dataset decode.
 _ENCODER_GOP = 30
 
-# How long the recorder subprocess may take to open cameras' shm + the dataset.
-_READY_TIMEOUT_S = 60.0
+# How long the recorder subprocess may take to import torch/lerobot, open the
+# cameras' shm + the dataset, and answer ``ready``. This guards a wedged child,
+# not a slow one: a normal start is 25-45 s on the Orin and the 2026-09-14
+# DAgger session hit 56 s with the import starved on the relay's cores (see
+# affinity.pin_background_and_ik), which the old 60 s budget turned into a
+# session-ending failure before the operator had started anything.
+_READY_TIMEOUT_S = 180.0
 # How long a save_episode (encoder flush + parquet write + post-episode stats)
 # may take.
 _SAVE_TIMEOUT_S = 180.0
@@ -1792,6 +1797,7 @@ def run_encoded_capture_loop(
     heartbeat: Callable[[], None] | None = None,
     row_times: "list[float] | None" = None,
     quality: "dict[str, int] | None" = None,
+    record_event: "threading.Event | None" = None,
 ) -> None:
     """Frame-driven capture for the relay-encoded (gstshm-h264) transport.
 
@@ -1801,9 +1807,17 @@ def run_encoded_capture_loop(
 
     ``frame_counter`` and ``row_times`` mirror :func:`run_capture_loop`'s (a
     mutable ``{"n": int}`` incremented per appended row, and one capture-time
-    append per row). There is no ``record_event``
-    on this path: capture rows remain continuous within an episode even though
-    each all-intra AU is independently decodable.
+    append per row).
+
+    ``record_event`` (optional) gates mid-episode capture like
+    :func:`run_capture_loop`'s: while cleared, every arriving AU is discarded
+    (the readers stay drained, nothing is muxed) and the dataset's
+    constant-fps timeline simply does not advance. On resume the loop forgets
+    its cross-row continuity — the unrecorded gap must not read as a
+    concealable hole or a cadence drift — and re-runs the row-zero alignment
+    on the next exposures, so the rows after the gap are as synchronized as
+    an episode's first. Every AU is an IDR, so the mp4 stays decodable across
+    the splice. This is what lets a DAgger freeze pause a relay-encoded take.
 
     Unlike :func:`run_capture_loop` (real-time paced, *selecting* the camera
     frame nearest each tick), this loop is driven by the **arrival** of access
@@ -1972,10 +1986,53 @@ def run_encoded_capture_loop(
             label="camera exposure", can_drop=row_drop_is_safe, quality=quality
         )
         last_log = time.perf_counter()
+        paused = False
+
+        def discard_queued_aus() -> int:
+            """Drop every AU already delivered; returns how many were dropped."""
+            dropped = 0
+            for cam in cameras.values():
+                while True:
+                    try:
+                        cam.read_next_au(timeout_ms=0)
+                    except TimeoutError:
+                        break
+                    dropped += 1
+            return dropped
 
         while not stop_event.is_set():
             if heartbeat is not None:
                 heartbeat()
+            if record_event is not None and not record_event.is_set():
+                if not paused:
+                    paused = True
+                    _logger.info(
+                        "encoded capture paused at dataset row %d; discarding "
+                        "exposures until resume",
+                        total_rows,
+                    )
+                # Keep the readers drained: the relay keeps encoding through
+                # the pause and a reader whose bounded queue overflows reports
+                # a transport failure, which would end the take.
+                discard_queued_aus()
+                if stop_event.wait(timeout=0.02):
+                    return
+                continue
+            if paused:
+                paused = False
+                # The AUs exposed during the gap were never rows; the next
+                # exposure is this segment's row zero. Forget the continuity
+                # the gap would otherwise trip (a >1 s "hole", a cadence
+                # re-anchor, a held future AU) and let the row-zero alignment
+                # pick one synchronized cluster again.
+                discard_queued_aus()
+                held_packets.clear()
+                previous_packets.clear()
+                previous_capture_ts.clear()
+                first_capture_ts.clear()
+                capture_intervals.clear()
+                primed = False
+                _logger.info("encoded capture resumed at dataset row %d", total_rows)
             budget = _ENCODED_START_TIMEOUT_S if not primed else _ENCODED_ROW_TIMEOUT_S
             # One shared deadline for the whole row: with per-camera budgets the
             # serial reads compound (a stalled first camera would hand every
@@ -2018,6 +2075,10 @@ def run_encoded_capture_loop(
 
             if stop_event.is_set():
                 return
+            if record_event is not None and not record_event.is_set():
+                # Paused while this row's AUs were being read (a read blocks
+                # up to the row budget): they belong to the gap, not the take.
+                continue
 
             # Trust but verify the raw-valve barrier using the timestamps that
             # actually reached the recorder. A bounded leaky input queue or a
@@ -3541,7 +3602,13 @@ def _recorder_main(
 
     # Keep the recorder (+ its NVENC gst children, which inherit this) off the
     # control loop's cores; fall back to a positive nice where affinity isn't
-    # available so it still never preempts the control loop / IK.
+    # available so it still never preempts the control loop / IK. The torch +
+    # lerobot imports below are the one heavy thing this process ever does
+    # (~25 s of CPU): they run widened onto the idle IK core so the relay's
+    # SCHED_FIFO camera threads on the background cores cannot stretch them
+    # past the ready handshake (see affinity.pin_background_and_ik). Whether
+    # the process then narrows to the background cores before any reader
+    # thread exists is the caller's ``share_ik_core`` (below).
     from ..utils import affinity
     from ..utils.stall_diag import (
         GcHold,
@@ -3550,7 +3617,8 @@ def _recorder_main(
         install_gc_pause_logger,
     )
 
-    if not affinity.pin_background():
+    pinned = affinity.pin_background_and_ik()
+    if not pinned:
         try:
             os.nice(5)
         except (AttributeError, OSError):
@@ -3602,6 +3670,15 @@ def _recorder_main(
     else:
         install_dataset_encoder()
     _, _, robot_obs_proc = make_default_processors()
+
+    # Imports done. Unless the caller shares the IK core with this recorder
+    # (the policy ops, whose relay leaves the background cores ~5 % idle —
+    # see affinity.pin_background_and_ik), narrow to the background cores
+    # before the readers spawn their gst threads (threads inherit the
+    # spawning thread's affinity), so nothing of the steady state lands on
+    # the IK core.
+    if pinned and not config.get("share_ik_core", False):
+        affinity.pin_background()
 
     # Build a per-source frame reader matching the relay's chosen transport.
     # gstshm-h264: an EncodedAuReader (shmsrc → gdpdepay → h264parse → appsink)
@@ -3798,8 +3875,7 @@ def _recorder_main(
                     quality=capture_quality,
                 )
                 loop_kwargs["frame_counter"] = frame_counter
-                if not encoded_mode:
-                    loop_kwargs["record_event"] = record_event
+                loop_kwargs["record_event"] = record_event
                 armed = threading.Event()
                 if encoded_mode:
                     loop_kwargs["on_armed"] = armed.set
@@ -3852,31 +3928,11 @@ def _recorder_main(
                     # reply even though the capture thread has already exited.
                     conn.send(("finished", frame_counter["n"], finished_capture_error))
             elif kind == "pause_episode":
-                if encoded_mode:
-                    conn.send(
-                        (
-                            "error",
-                            "pause_episode requires a raw transport; the "
-                            "encoded (gstshm-h264) transport can't gate "
-                            "mid-episode.",
-                        )
-                    )
-                else:
-                    record_event.clear()
-                    conn.send(("paused", frame_counter["n"]))
+                record_event.clear()
+                conn.send(("paused", frame_counter["n"]))
             elif kind == "resume_episode":
-                if encoded_mode:
-                    conn.send(
-                        (
-                            "error",
-                            "resume_episode requires a raw transport; the "
-                            "encoded (gstshm-h264) transport can't gate "
-                            "mid-episode.",
-                        )
-                    )
-                else:
-                    record_event.set()
-                    conn.send(("resumed", frame_counter["n"]))
+                record_event.set()
+                conn.send(("resumed", frame_counter["n"]))
             elif kind == "frame_count":
                 conn.send(("frame_count", frame_counter["n"]))
             elif kind == "save_episode":
@@ -4037,6 +4093,14 @@ class DatasetRecorderProcess:
     exposes the same interface as :class:`InProcessRecorder`. ``publish`` is the
     only hot-path call (one ~40-float shm write per control tick); the episode
     commands are rare and run on the main thread between episodes.
+
+    ``config["share_ik_core"]`` (default false) keeps the recorder's steady
+    state on the IK core as well as the background cores. Set it from the ops
+    whose relay also runs the policy ring branch (``collect-dagger``, the Pi
+    ``run-policy``): with three VIC branches per camera plus the capture daemon,
+    all real-time, the background cores leave the CFS recorder too little to
+    sustain 60 rows/s and every take ends on ``encoded-AU backlog exceeded``
+    after 25-30 s — see :func:`almond_axol.utils.affinity.pin_background_and_ik`.
     """
 
     def __init__(
@@ -4283,10 +4347,10 @@ class DatasetRecorderProcess:
     def pause_episode(self) -> int:
         """Stop capturing mid-episode (rows + clock gate); returns rows so far.
 
-        Raw transports only — the encoded (gstshm-h264) transport can't gate
-        mid-episode (raises). On resume the capture clock re-anchors, so the
-        episode's index-based timestamps stay contiguous across the gap.
-        Idempotent.
+        On the raw transports the capture clock re-anchors on resume; on the
+        encoded (gstshm-h264) transport the arriving AUs are discarded and the
+        row-zero alignment re-runs on resume. Either way the episode's
+        index-based timestamps stay contiguous across the gap. Idempotent.
         """
         return self._episode_gate("pause_episode", "paused")
 
