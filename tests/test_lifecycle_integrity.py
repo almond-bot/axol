@@ -588,6 +588,9 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
                 "almond_axol.video.shm_frames.EncodedAuReader",
                 side_effect=[first, second],
             ),
+            patch(
+                "almond_axol.utils.affinity.pin_background_startup", return_value=True
+            ),
             patch("almond_axol.utils.affinity.pin_background", return_value=True),
             patch.object(record_proc, "install_encoded_dataset_encoder"),
             patch("almond_axol.video.shm_frames.SnapshotReader") as snapshot,
@@ -624,6 +627,9 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             patch(
                 "almond_axol.video.shm_frames.SnapshotReader",
                 return_value=snap_reader,
+            ),
+            patch(
+                "almond_axol.utils.affinity.pin_background_startup", return_value=True
             ),
             patch("almond_axol.utils.affinity.pin_background", return_value=True),
             patch.object(record_proc, "install_encoded_dataset_encoder"),
@@ -852,6 +858,9 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             patch(
                 "almond_axol.video.shm_frames.SnapshotReader",
                 return_value=snap_reader,
+            ),
+            patch(
+                "almond_axol.utils.affinity.pin_background_startup", return_value=True
             ),
             patch("almond_axol.utils.affinity.pin_background", return_value=True),
             patch.object(record_proc, "install_dataset_encoder"),

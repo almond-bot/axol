@@ -269,6 +269,36 @@ def pin_background() -> bool:
     return _pin("background")
 
 
+def pin_background_startup() -> bool:
+    """Widen the recorder subprocess across ``background`` ∪ ``ik`` for its imports.
+
+    The recorder's first act is a one-shot ~25 s of CPU: importing torch and
+    lerobot. Confined to the two background cores it competes with the relay's
+    GStreamer threads there — and since the exposure-critical queues of every
+    relay branch run ``SCHED_FIFO`` (:func:`prioritize_capture_threads`), it
+    only gets what they leave. On the 2026-09-14 DAgger session, with the
+    headset streaming and three VIC branches per camera, that stretched the
+    import to 56 s and the ``ready`` handshake timed out (the session ended
+    before the operator could start an episode); the ZED SDK's own CFS grab
+    threads shared the same leftovers and dropped ~10 % of exposures for as
+    long as the import ran, which the headset saw as a stuttering feed. The
+    recorder starts before any episode, when the IK core is idle (the IK
+    worker's own compile — :func:`pin_ik_startup` — is over by then, and the
+    solves only run while an operator drives), so let the import spread onto
+    it, then :func:`pin_background` narrows the steady state back before the
+    frame readers are created (threads inherit the affinity of the thread that
+    spawns them, so the readers' gst threads must be created narrowed). Only a
+    dedicated IK core is borrowed: on hosts where ``ik`` collapses onto the
+    control core (<8 cores) the import stays on ``background`` — control never
+    shares a CPU with throughput work.
+    """
+    groups = core_groups()
+    if groups is None:
+        return False
+    spare_ik = groups["ik"] - groups["realtime"]
+    return _apply(groups["background"] | spare_ik, "background-startup")
+
+
 def isolate_relay_cpu() -> bool:
     """Separate relay Python from GStreamer and give gst throughput headroom.
 

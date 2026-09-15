@@ -445,6 +445,9 @@ class EncoderShutdownTest(unittest.TestCase):
                 "almond_axol.video.shm_frames.SnapshotReader",
                 return_value=snapshot_reader,
             ),
+            mock.patch(
+                "almond_axol.utils.affinity.pin_background_startup", return_value=True
+            ),
             mock.patch("almond_axol.utils.affinity.pin_background", return_value=True),
             mock.patch.object(record_proc, "install_encoded_dataset_encoder"),
             mock.patch.object(record_proc, "_open_dataset", return_value=dataset),
@@ -535,6 +538,9 @@ class EncoderShutdownTest(unittest.TestCase):
             mock.patch(
                 "almond_axol.video.shm_frames.SnapshotReader",
                 return_value=mock.Mock(),
+            ),
+            mock.patch(
+                "almond_axol.utils.affinity.pin_background_startup", return_value=True
             ),
             mock.patch("almond_axol.utils.affinity.pin_background", return_value=True),
             mock.patch.object(record_proc, "install_encoded_dataset_encoder"),

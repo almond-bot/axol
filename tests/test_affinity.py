@@ -297,3 +297,44 @@ class IsolateRelayCpuTest(TestCase):
             set_affinity.call_args_list,
             [call(101, {2}), call(201, {3})],
         )
+
+
+class BackgroundStartupTest(TestCase):
+    """The recorder's import phase borrows a dedicated IK core, never control's."""
+
+    def _startup_cores(self, n: int) -> set[int]:
+        applied: list[set[int]] = []
+        with (
+            patch.object(affinity.os, "cpu_count", return_value=n),
+            patch.object(
+                affinity.os, "sched_setaffinity", lambda pid, c: applied.append(set(c))
+            ),
+        ):
+            self.assertTrue(affinity.pin_background_startup())
+        return applied[-1]
+
+    def test_eight_cores_widen_onto_the_idle_ik_core(self) -> None:
+        # 2026-09-14: the torch/lerobot import confined to the two background
+        # cores competed with the relay's SCHED_FIFO camera threads there,
+        # took 56 s, and the recorder's ready handshake timed out before the
+        # operator could start an episode.
+        with patch.object(affinity.os, "cpu_count", return_value=8):
+            groups = affinity.core_groups()
+        assert groups is not None
+        self.assertEqual(self._startup_cores(8), groups["background"] | groups["ik"])
+        self.assertTrue(self._startup_cores(8).isdisjoint(groups["realtime"]))
+
+    def test_smaller_layouts_never_touch_the_control_core(self) -> None:
+        # Below 8 cores ``ik`` collapses onto the control core; the import
+        # must not follow it there.
+        for n in (4, 5, 6):
+            with patch.object(affinity.os, "cpu_count", return_value=n):
+                groups = affinity.core_groups()
+            assert groups is not None
+            cores = self._startup_cores(n)
+            self.assertEqual(cores, groups["background"], n)
+            self.assertTrue(cores.isdisjoint(groups["realtime"]), n)
+
+    def test_noop_without_partitioning(self) -> None:
+        with patch.object(affinity.os, "cpu_count", return_value=2):
+            self.assertFalse(affinity.pin_background_startup())
