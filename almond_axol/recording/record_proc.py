@@ -3675,7 +3675,8 @@ def _recorder_main(
     # (the policy ops, whose relay leaves the background cores ~5 % idle —
     # see affinity.pin_background_and_ik), narrow to the background cores
     # before the readers spawn their gst threads (threads inherit the
-    # spawning thread's affinity), so nothing of the steady state lands on
+    # spawning thread's affinity; the pin also moves the worker pools the
+    # imports already spawned), so nothing of the steady state lands on
     # the IK core.
     if pinned and not config.get("share_ik_core", False):
         affinity.pin_background()
