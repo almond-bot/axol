@@ -12,7 +12,6 @@ from almond_axol.video.gst_zed import (
     _consumer_attribution,
     _GstPipelineBase,
     _task_thread_comm,
-    encode_chain_thread_comms,
     exposure_critical_thread_comms,
 )
 from almond_axol.video.hw_video import dataset_intra_vbr_bitrate, dataset_vbr_bitrate
@@ -707,35 +706,9 @@ class ExposureCriticalThreadsTest(unittest.TestCase):
                 "pol_r_srcq:src",
             },
         )
-        # Post-copy stages are not capture-critical: they have their own
-        # deeper buffering and form the encode tier instead.
+        # Post-copy stages keep CFS: they have their own deeper buffering.
         self.assertNotIn(_task_thread_comm("dsenc_l_inq"), comms)
         self.assertNotIn(_task_thread_comm("dsenc_outq"), comms)
-
-    def test_encode_chain_comms_cover_feed_dequeue_and_drain(self) -> None:
-        comms = encode_chain_thread_comms()
-
-        self.assertTrue(all(len(c) <= 15 for c in comms))
-        self.assertEqual(
-            comms,
-            {
-                # nvv4l2h264enc's capture-plane dequeue thread (plugin-named).
-                "V4L2_EncThread",
-                # Feed queue -> NVENC, the encoder's src task, drain -> shmsink,
-                # per dataset encoder (mono, and one per stereo eye).
-                "dsenc_inq:src",
-                "dsenc:src",
-                "dsenc_outq:src",
-                "dsenc_l_inq:src",
-                "dsenc_l:src",
-                "dsenc_l_outq:sr",
-                "dsenc_r_inq:src",
-                "dsenc_r:src",
-                "dsenc_r_outq:sr",
-            },
-        )
-        # Disjoint from the capture tier, which outranks it.
-        self.assertTrue(comms.isdisjoint(exposure_critical_thread_comms()))
 
     def test_consumer_attribution_reports_wait_between_overruns(self) -> None:
         snapshots = iter([(1_000_000, "R", "0"), (21_000_000, "R", "0")])

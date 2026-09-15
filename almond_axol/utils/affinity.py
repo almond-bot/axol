@@ -31,26 +31,12 @@ inherit the relay/recorder affinity). The CAN set is exported to ``axol-rt``,
 which assigns one bus thread to each core itself. Best-effort and self-gating: a
 no-op on machines with too few cores or without ``sched_setaffinity`` (e.g.
 macOS), so off-Jetson dev is unaffected.
-
-The dedicated-process pins (``ik``, ``relay``, ``background``) move **every
-thread** of the process, not just the caller: ``sched_setaffinity(0, …)`` is
-per-thread, and each of these processes widens for a one-shot startup cost and
-narrows afterwards (:func:`pin_ik_startup` → :func:`pin_ik`,
-:func:`pin_background_and_ik` → :func:`pin_background`), by which time the
-libraries it imported have spawned their worker pools on the wide mask. Measured
-2026-09-15 on a station mid-``collect-dagger``: the IK worker's two
-``tf_XLAEigen`` threads — the JAX solve itself — still carried the startup mask
-``{2, 3}`` and ran ~25 % of one on the control core during every intervention,
-where the 120 Hz teleop loop then made 100-114 Hz. :func:`pin_realtime` keeps
-the per-thread semantics: under ``axol serve`` the control loop is one thread
-of the shared server process, whose web/VR threads must stay off that core.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import threading
 from collections.abc import Iterable
 
 _logger = logging.getLogger(__name__)
@@ -201,51 +187,6 @@ def realtime_camera_cores() -> set[int] | None:
     return cores or None
 
 
-# A camera pool this wide is split between the Argus daemon and the relay's
-# own FIFO chain (see capture_daemon_cores); narrower pools stay shared.
-_CAMERA_POOL_SPLIT_MIN_CORES = 3
-
-
-def capture_daemon_cores() -> set[int] | None:
-    """Cores for the Argus capture daemon (``nvargus-daemon``, SCHED_FIFO 6).
-
-    The highest core of :func:`realtime_camera_cores` when the pool has at
-    least three; the whole pool otherwise (two cores cannot be split without
-    serializing one side onto a single CPU). The relay's FIFO chain takes the
-    rest (:func:`relay_capture_cores`), so no CPU carries both.
-
-    Sharing the pool put ~160 % of a core of SCHED_FIFO work — the daemon's
-    ~72 % (four 60 fps GMSL sensors) plus the relay's capture chain — on three
-    CPUs with nothing keeping any one of them under the kernel's RT throttle
-    (95 % per CPU, ``sched_rt_runtime_us``). Measured 2026-09-15 on a station
-    mid-``collect-dagger``: per-CPU FIFO load peaked at 96-101 % in ordinary
-    seconds, and at 10:48:59 the kernel logged ``sched: RT throttling
-    activated`` — 30 ms later the throttled daemon reported ``All captures are
-    already pending, no idle captures available``, stopped its capture
-    scheduler, and the ZED SDK's recovery restarted it, taking every camera on
-    the box with it (the take was discarded, the session ended). With the
-    daemon alone on one core its 72 % sits under the throttle with margin,
-    and a relay thread spinning on a stalled camera can no longer throttle the
-    daemon's CPU along with its own.
-    """
-    pool = realtime_camera_cores()
-    if pool is None or len(pool) < _CAMERA_POOL_SPLIT_MIN_CORES:
-        return pool
-    return {max(pool)}
-
-
-def relay_capture_cores() -> set[int] | None:
-    """Cores for the relay's SCHED_FIFO threads (:func:`prioritize_capture_threads`).
-
-    :func:`realtime_camera_cores` minus the daemon's core once the pool is wide
-    enough to split (see :func:`capture_daemon_cores`); the whole pool otherwise.
-    """
-    pool = realtime_camera_cores()
-    if pool is None or len(pool) < _CAMERA_POOL_SPLIT_MIN_CORES:
-        return pool
-    return pool - {max(pool)}
-
-
 def _can_irq_may_land_on(cpus: set[int]) -> bool:
     """Whether the CAN adapters' interrupt can still be delivered to ``cpus``.
 
@@ -283,13 +224,8 @@ def can_irq_cpu() -> int | None:
 
 
 def pin_realtime() -> bool:
-    """Pin the calling thread (and the threads it goes on to spawn) to the realtime cores.
-
-    Thread-scoped on purpose: under ``axol serve`` the control loop runs as one
-    thread of the shared server process, whose web / VR / telemetry threads must
-    keep roaming the other cores rather than pile onto the control core.
-    """
-    return _pin("realtime", all_threads=False)
+    """Pin the calling process to the realtime cores (the control loop + threads)."""
+    return _pin("realtime")
 
 
 def pin_ik() -> bool:
@@ -455,24 +391,18 @@ def isolate_relay_cpu() -> bool:
 
 
 # The SCHED_FIFO ladder across the stack, lowest to highest:
-#   ENCODE_FIFO_PRIORITY   (4)  relay dataset encode chain (NVENC feed/dequeue)
 #   CAPTURE_FIFO_PRIORITY  (5)  relay camera capture chain
 #   capture daemon         (6)  nvargus-daemon, see utils.jetson
 #   axol-rt CAN loops     (20)  AXOL_RT_FIFO_PRIORITY, rt.link
 # Camera work sits above every CFS thread so a capture wake-up never queues
-# behind the encode/mux workers; the encode chain sits just under it so it
-# yields to a capture wake-up but not to the recorder; the CAN loops outrank
-# everything and run on disjoint cores anyway. The top rung is also what the
-# persistent rtprio grant (utils.rtprio, LimitRTPRIO in the service unit)
-# allows a non-root launcher.
-ENCODE_FIFO_PRIORITY = 4
+# behind the encode/mux workers; the CAN loops outrank everything and run on
+# disjoint cores anyway. The top rung is also what the persistent rtprio grant
+# (utils.rtprio, LimitRTPRIO in the service unit) allows a non-root launcher.
 CAPTURE_FIFO_PRIORITY = 5
 MAX_FIFO_PRIORITY = 20
 
 
-def prioritize_capture_threads(
-    thread_comms: Iterable[str], encode_thread_comms: Iterable[str] = ()
-) -> int:
+def prioritize_capture_threads(thread_comms: Iterable[str]) -> int:
     """Move the camera *capture* chain to ``SCHED_FIFO`` so it never misses an exposure.
 
     The relay's gst pool is ~80 CFS threads (VIC copies, NVENC dispatch, shm
@@ -502,40 +432,23 @@ def prioritize_capture_threads(
     that still carries the process's own ``comm`` — GStreamer, GLib, NVENC and
     CUDA all rename theirs, so an unrenamed thread in the relay is the SDK's.
 
-    ``encode_thread_comms`` (``gst_zed.encode_chain_thread_comms``) names the
-    dataset encode chain — the queue feeding each NVENC, the encoder's own
-    output task and the NVIDIA plugin's dequeue thread, the queue draining it
-    into ``shmsink`` — which goes to :data:`ENCODE_FIFO_PRIORITY`, one notch
-    *below* the capture chain. Left CFS, those threads shared the camera cores
-    with whatever CFS work spilled there, and the NVENC pipeline is a closed
-    loop: an input surface is released only once its encoded AU has been
-    dequeued and pushed on, so a starved dequeue thread exhausts the
-    encoder's input pool within a few frames and the feed queue in front of
-    it overruns (``dsenc_inq overrun … consumer state=S wchan=futex`` — the
-    feeder asleep in the encoder, waiting for a buffer). That is what every
-    DAgger intervention did (2026-09-15, measured over a day of sessions:
-    1045 concealment lines/min while the operator drove vs 10/min under the
-    policy) once the IK worker took its core back from the recorder and the
-    recorder's threads landed on the camera cores. The chain's CPU cost is
-    ~1 % of a core per encoder, so the tier adds nothing the RT throttle
-    would notice, and its rank keeps a capture wake-up ahead of it.
-
-    Every thread it elevates is also confined to :func:`relay_capture_cores`:
-    the FIFO camera pool minus the Argus daemon's core (see
-    :func:`capture_daemon_cores`). :func:`isolate_relay_cpu` leaves the gst
-    pool free to use the CPU the CAN adapters' interrupt lands on by default,
-    which is fine for CFS work but not for a FIFO thread: one runnable there
-    delays the interrupt's bottom half and with it both arms' CAN feedback
-    (see :func:`core_groups`). Call once after the pipelines are PLAYING (the
-    threads exist by then). Returns the number of threads moved; ``0`` when
-    the platform has no ``sched_setscheduler`` or the process lacks
-    ``CAP_SYS_NICE`` / an rtprio allowance — a manual run from a shell without
-    the ``axol provision`` rtprio grant. That case is logged as a warning (it
-    is the whole story behind an otherwise puzzling run of skipped exposures)
-    and the threads stay CFS, exactly the previous behaviour.
+    Every thread it elevates is also confined to :func:`realtime_camera_cores`.
+    :func:`isolate_relay_cpu` leaves the gst pool free to use the CPU the CAN
+    adapters' interrupt lands on by default, which is fine for CFS work but
+    not for a FIFO thread: one runnable there delays the interrupt's bottom
+    half and with it both arms' CAN feedback (see :func:`core_groups`). Call
+    once after the pipelines are PLAYING (the threads exist by then). Returns
+    the number of threads moved; ``0`` when the platform has no
+    ``sched_setscheduler`` or the process lacks ``CAP_SYS_NICE`` / an rtprio
+    allowance — a manual run from a shell without the ``axol provision``
+    rtprio grant. That case is logged as a warning (it is the whole story
+    behind an otherwise puzzling run of skipped exposures) and the threads
+    stay CFS, exactly the previous behaviour.
     """
     if not hasattr(os, "sched_setscheduler") or not hasattr(os, "SCHED_FIFO"):
         return 0
+    import threading
+
     py_tids = {t.native_id for t in threading.enumerate() if t.native_id is not None}
     try:
         with open("/proc/self/comm") as fh:
@@ -543,17 +456,10 @@ def prioritize_capture_threads(
         tasks = os.listdir("/proc/self/task")
     except OSError:
         return 0
-    # comm -> FIFO priority; the capture tier wins a name listed in both.
-    wanted = {comm: ENCODE_FIFO_PRIORITY for comm in encode_thread_comms}
-    wanted.update(dict.fromkeys(thread_comms, CAPTURE_FIFO_PRIORITY))
-    wanted[process_comm] = CAPTURE_FIFO_PRIORITY
-    params = {
-        prio: os.sched_param(prio)  # type: ignore[attr-defined]
-        for prio in set(wanted.values())
-    }
-    cores = relay_capture_cores() if hasattr(os, "sched_setaffinity") else None
+    wanted = set(thread_comms) | {process_comm}
+    param = os.sched_param(CAPTURE_FIFO_PRIORITY)  # type: ignore[attr-defined]
+    cores = realtime_camera_cores() if hasattr(os, "sched_setaffinity") else None
     moved = 0
-    moved_encode = 0
     denied: OSError | None = None
     for entry in tasks:
         try:
@@ -567,13 +473,11 @@ def prioritize_capture_threads(
                 comm = fh.read().strip()
         except OSError:
             continue  # exited between listdir and here
-        prio = wanted.get(comm)
-        if prio is None:
+        if comm not in wanted:
             continue
         try:
-            os.sched_setscheduler(tid, os.SCHED_FIFO, params[prio])  # type: ignore[attr-defined]
+            os.sched_setscheduler(tid, os.SCHED_FIFO, param)  # type: ignore[attr-defined]
             moved += 1
-            moved_encode += prio == ENCODE_FIFO_PRIORITY
         except PermissionError as exc:
             denied = exc
             break
@@ -595,79 +499,29 @@ def prioritize_capture_threads(
             MAX_FIFO_PRIORITY,
         )
     elif moved:
-        capture_names = sorted(
-            comm
-            for comm, prio in wanted.items()
-            if prio == CAPTURE_FIFO_PRIORITY and comm != process_comm
-        )
-        encode_names = sorted(
-            comm for comm, prio in wanted.items() if prio == ENCODE_FIFO_PRIORITY
-        )
         _logger.info(
             "camera capture threads -> SCHED_FIFO %d on cores %s (%d threads: %s "
-            "+ SDK workers); encode chain -> SCHED_FIFO %d (%d threads: %s)",
+            "+ SDK workers)",
             CAPTURE_FIFO_PRIORITY,
             sorted(cores) if cores is not None else "(unpinned)",
-            moved - moved_encode,
-            ", ".join(capture_names),
-            ENCODE_FIFO_PRIORITY,
-            moved_encode,
-            ", ".join(encode_names) or "-",
+            moved,
+            ", ".join(sorted(wanted - {process_comm})),
         )
     return moved
 
 
-def _pin(group: str, *, all_threads: bool = True) -> bool:
+def _pin(group: str) -> bool:
     groups = core_groups()
     if groups is None:
         return False
-    return _apply(groups[group], group, all_threads=all_threads)
+    return _apply(groups[group], group)
 
 
-def _apply(cores: set[int], label: str, *, all_threads: bool = True) -> bool:
-    """Pin the calling thread — and with ``all_threads`` every other thread of
-    the process — to ``cores``.
-
-    ``sched_setaffinity(0, …)`` binds only the calling thread; threads created
-    afterwards inherit it, threads that already exist keep theirs. The
-    dedicated processes re-pin after a widened startup (see the module
-    docstring), so by default the process's other threads — library worker
-    pools spawned on the wide mask — are moved too. A thread that exits between
-    the ``/proc`` listing and its pin is skipped.
-    """
+def _apply(cores: set[int], label: str) -> bool:
     try:
         os.sched_setaffinity(0, cores)  # type: ignore[attr-defined]
     except (AttributeError, OSError) as exc:  # AttributeError: no sched_* (macOS)
         _logger.debug("could not set CPU affinity to %s: %s", sorted(cores), exc)
         return False
-    others = _pin_other_threads(cores) if all_threads else 0
-    _logger.info(
-        "pinned to %s cores %s%s",
-        label,
-        sorted(cores),
-        f" ({others} other thread(s) moved along)" if others else "",
-    )
+    _logger.info("pinned to %s cores %s", label, sorted(cores))
     return True
-
-
-def _pin_other_threads(cores: set[int]) -> int:
-    """Pin every thread of this process but the caller to ``cores``; count moved."""
-    try:
-        tasks = os.listdir("/proc/self/task")
-    except OSError:
-        return 0
-    me = threading.get_native_id()
-    moved = 0
-    for entry in tasks:
-        try:
-            tid = int(entry)
-        except ValueError:
-            continue
-        if tid == me:
-            continue
-        try:
-            os.sched_setaffinity(tid, cores)  # type: ignore[attr-defined]
-        except OSError:
-            continue  # exited between listdir and here
-        moved += 1
-    return moved

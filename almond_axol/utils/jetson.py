@@ -26,10 +26,8 @@ Tegra defaults trade latency for power/throughput and hurt us:
   own capture threads then report ~0 ms CPU wait: they are waiting on the
   daemon, not on the scheduler). :func:`pin_realtime_clocks` runs it
   ``SCHED_FIFO`` one notch above those relay capture threads, confined to
-  its own camera core (``affinity.capture_daemon_cores``: the pool the
-  relay's FIFO chain lives on minus the core the daemon takes, so no CPU
-  carries both and neither can drive the other into the kernel's RT
-  throttle) and so never a control, IK, CAN, or interrupt core.
+  the same camera cores (``affinity.realtime_camera_cores``) so a
+  real-time daemon never lands on a control, IK, CAN, or interrupt core.
 
 * **CAN interrupt placement** — both USB CAN adapters hang off one xHCI
   controller whose interrupt the GIC delivers to CPU0, a core the camera
@@ -65,7 +63,7 @@ import subprocess
 from pathlib import Path
 
 from ..constants import CAN_LEFT, CAN_RIGHT
-from .affinity import CAPTURE_FIFO_PRIORITY, can_irq_cpu, capture_daemon_cores
+from .affinity import CAPTURE_FIFO_PRIORITY, can_irq_cpu, realtime_camera_cores
 from .sudo import prime_sudo
 
 _logger = logging.getLogger(__name__)
@@ -698,22 +696,19 @@ def _prioritize_capture_daemons(escalator: _RootEscalator) -> None:
     restarting the daemon under running cameras (threads it creates later
     inherit both).
 
-    A real-time daemon must not roam: confined to its camera core
-    (:func:`affinity.capture_daemon_cores` — one core of the FIFO camera pool,
-    the relay's own FIFO chain keeps the rest, so ~72 % of a core of daemon
-    never stacks on the same CPU as the relay's capture threads and neither
-    can throttle the other) it cannot preempt the Python control loop or IK,
-    nor sit on the CPU the CAN adapters' interrupt lands on before
-    :func:`_steer_can_irq` moves it, where a FIFO thread delays the
+    A real-time daemon must not roam: confined to the camera cores
+    (:func:`affinity.realtime_camera_cores`) it cannot preempt the Python
+    control loop or IK, nor sit on the CPU the CAN adapters' interrupt lands
+    on before :func:`_steer_can_irq` moves it, where a FIFO thread delays the
     interrupt's bottom half and with it both arms' feedback. That core set is
     read *after* the steering step, so once the interrupt is on a CAN core the
-    pool widens to three and the split applies; the drop-in is rewritten
-    whenever the set changes.
+    daemon (like the relay's capture threads) may use CPU0 as well; the
+    drop-in is rewritten whenever the set changes.
     """
     if not _is_jetson():
         _logger.debug("not a Jetson; leaving the camera daemons' scheduling alone")
         return
-    cores = capture_daemon_cores()
+    cores = realtime_camera_cores()
     dropin_text = (
         "# Installed by `axol jetson.setup`: every ZED X camera frame passes\n"
         "# through this daemon, so it must not be descheduled behind the\n"
@@ -880,7 +875,7 @@ def pin_realtime_clocks(*, interactive: bool = False) -> None:
     SDK processing), switches the CPUs to the ``performance`` governor (IK
     rate), steers the CAN adapters' USB-controller interrupt onto a CAN core
     (so real-time camera work can never stall motor feedback), and schedules
-    the Argus camera daemon ``SCHED_FIFO`` on its own camera core (all-camera
+    the Argus camera daemon ``SCHED_FIFO`` on the camera cores (all-camera
     frame drops under load). All are Jetson-only: power-mode selection,
     CPU-governor pinning, interrupt steering and daemon scheduling are gated
     on :func:`_is_jetson` so they never alter a non-Tegra host, and engine
