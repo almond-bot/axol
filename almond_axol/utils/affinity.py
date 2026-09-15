@@ -32,18 +32,17 @@ which assigns one bus thread to each core itself. Best-effort and self-gating: a
 no-op on machines with too few cores or without ``sched_setaffinity`` (e.g.
 macOS), so off-Jetson dev is unaffected.
 
-The dedicated-process pins (``ik``, ``relay``, ``background``) move **every
-thread** of the process, not just the caller: ``sched_setaffinity(0, …)`` is
-per-thread, and each of these processes widens for a one-shot startup cost and
-narrows afterwards (:func:`pin_ik_startup` → :func:`pin_ik`,
-:func:`pin_background_and_ik` → :func:`pin_background`), by which time the
-libraries it imported have spawned their worker pools on the wide mask. Measured
-2026-09-15 on a station mid-``collect-dagger``: the IK worker's two
-``tf_XLAEigen`` threads — the JAX solve itself — still carried the startup mask
-``{2, 3}`` and ran ~25 % of one on the control core during every intervention,
-where the 120 Hz teleop loop then made 100-114 Hz. :func:`pin_realtime` keeps
-the per-thread semantics: under ``axol serve`` the control loop is one thread
-of the shared server process, whose web/VR threads must stay off that core.
+The dedicated-process pins (``relay``, ``background``) move **every thread**
+of the process, not just the caller: ``sched_setaffinity(0, …)`` is
+per-thread, and the recorder widens for a one-shot startup cost and narrows
+afterwards (:func:`pin_background_and_ik` → :func:`pin_background`), by which
+time the libraries it imported have spawned their worker pools on the wide
+mask. Two pins stay thread-scoped: :func:`pin_realtime`, because under ``axol
+serve`` the control loop is one thread of the shared server process whose
+web/VR threads must stay off that core, and :func:`pin_ik`, because JAX's XLA
+pool spawned under :func:`pin_ik_startup` needs the second core it was given —
+confined to the IK core with the solve loop it halves the IK rate (see
+:func:`pin_ik`).
 """
 
 from __future__ import annotations
@@ -293,14 +292,30 @@ def pin_realtime() -> bool:
 
 
 def pin_ik() -> bool:
-    """Pin the calling process to the IK core(s).
+    """Pin the IK worker's solve loop (the calling thread) to the IK core(s).
 
     On 8+ cores this is a single core dedicated to the out-of-process JAX solver,
     isolating it from the control process so recording load can't preempt it
     mid-solve. On smaller hosts the ``ik`` group collapses onto the control cores,
     so this is equivalent to :func:`pin_realtime`.
+
+    Thread-scoped, deliberately: JAX's XLA CPU backend runs each solve across
+    its ``tf_XLAEigen`` pool *and* the calling thread, and Eigen's pool
+    spin-waits between ops. The pool was spawned under :func:`pin_ik_startup`
+    and keeps that ``realtime ∪ ik`` mask — on an 8-core host ~25 % of one
+    pool thread runs on the control core while an operator drives. Moving the
+    pool onto the single IK core along with the loop (axol #301's first cut)
+    serialized the solve onto one CPU: engaged IK fell from ~100-115 Hz to
+    62-78 Hz (median 68, station teleop 2026-09-15 15:45) and the 120 Hz
+    teleop loop stalled on it — the arms visibly juddered. The control loop
+    tolerates the pool's share of its core (measured 100-114 Hz under DAgger
+    interventions with it there); it does not tolerate a 65 Hz IK. Confining
+    the pool properly means a one-thread XLA pool (``XLA_FLAGS`` /
+    ``intra_op_parallelism_threads`` before the worker imports JAX), which
+    has not been measured on this solver — until it is, the pool keeps the
+    startup mask.
     """
-    return _pin("ik")
+    return _pin("ik", all_threads=False)
 
 
 def pin_ik_startup() -> bool:
