@@ -487,6 +487,7 @@ def _start_video_relay(
     cfg: "CollectDataConfig",
     dataset_resolution: str,
     raw_transport: str | None = None,
+    policy_fps: int | None = None,
 ) -> Any | None:
     """Start the out-of-process video relay for data collection.
 
@@ -508,7 +509,14 @@ def _start_video_relay(
     by the control process (policy observations) from a ring beside the
     relay-encoded dataset branch the recorder subprocess muxes; ``"pyshm"``
     puts the recorder on the ring too (it re-encodes). ``None`` keeps the
-    relay's default (gst shm where available).
+    relay's default (gst shm where available). ``policy_fps`` decimates that
+    control-process ring (``gstshm+pyshm`` only): the policy reads an
+    observation a few times a second and the control loop re-serves the
+    newest frame set between ring frames, so a capture-rate ring only spent
+    a third VIC pass per camera plus a 60 Hz RGB copy per source on frames
+    nobody looked at — on the Orin, the core the dataset encode branch was
+    short of (see ``gst_zed._policy_rate_limit``). ``None``/``0`` keeps the
+    ring at capture rate.
 
     Returns the :class:`VideoRelayProcess`, or ``None`` when it can't be used
     (no cameras or aiortc unavailable), in which case the caller uses the
@@ -555,6 +563,8 @@ def _start_video_relay(
         spec["dataset_resolution"] = dataset_resolution
         if raw_transport is not None:
             spec["raw_transport"] = raw_transport
+        if policy_fps:
+            spec["policy_fps"] = int(policy_fps)
         # The recorded eyes (``eyes``) must match observation_cameras() so the
         # relay's raw branch exports exactly the keys the recorder expects; the
         # streamed eyes (``stream_eyes``) drive the headset feed independently, so

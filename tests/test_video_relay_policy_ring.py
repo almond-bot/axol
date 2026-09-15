@@ -77,5 +77,94 @@ class PolicyRingAttachTest(unittest.TestCase):
         self.assertEqual(list(relay.readable_raw_cameras), ["cam"])
 
 
+class _FakeGstCamera:
+    """Stands in for ZedGstCamera inside _open_gst_camera_raw."""
+
+    instances: list[_FakeGstCamera] = []
+
+    def __init__(self, serial: int, resolution: str, fps: int, **kwargs: object):
+        self.serial = serial
+        self.fps = fps
+        self.kwargs = kwargs
+        self.pts_perf_offset_s = 0.5
+        _FakeGstCamera.instances.append(self)
+
+    def connect(self) -> None:
+        pass
+
+
+class _FakeWriter:
+    name = "ring-cam"
+
+    @classmethod
+    def create(cls, w: int, h: int, cond: object) -> _FakeWriter:
+        return cls()
+
+    def publish(self, *args: object) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class PolicyRingRateTest(unittest.TestCase):
+    """``policy_fps`` in a spec thins only the control-process ring."""
+
+    def setUp(self) -> None:
+        _FakeGstCamera.instances.clear()
+        for target, value in (
+            ("almond_axol.video.gst_zed.ZedGstCamera", _FakeGstCamera),
+            ("almond_axol.video.gst_zed.zed_gst_available", lambda **kw: True),
+            ("almond_axol.video.shm_frames.RawFrameWriter", _FakeWriter),
+        ):
+            patcher = patch(target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _open(self, spec: dict) -> tuple[dict, dict]:
+        result = video_proc._open_gst_camera_raw(
+            "cam",
+            {"serial": 7, "resolution": "SVGA", "fps": 60, **spec},
+            object(),
+            "/tmp",
+        )
+        assert result is not None
+        _cam, _sources, _writers, raw_meta, policy_meta = result
+        return raw_meta, policy_meta
+
+    def test_combined_transport_thins_the_ring_to_policy_fps(self) -> None:
+        raw_meta, policy_meta = self._open(
+            {"raw_transport": "gstshm+pyshm", "policy_fps": 20}
+        )
+        camera = _FakeGstCamera.instances[-1]
+        self.assertEqual(camera.kwargs["policy_fps"], 20)
+        self.assertEqual(camera.kwargs["dataset_fps"], 60)
+        # The reader paces its freshness rules on the ring's rate; the
+        # recorder's encoded branch stays at the dataset rate.
+        self.assertEqual(policy_meta["cam"]["fps"], 20)
+        self.assertEqual(raw_meta["cam"]["fps"], 60)
+        self.assertEqual(raw_meta["cam"]["transport"], "gstshm-h264")
+
+    def test_policy_fps_is_capped_at_capture_rate(self) -> None:
+        _raw_meta, policy_meta = self._open(
+            {"raw_transport": "gstshm+pyshm", "policy_fps": 90}
+        )
+        self.assertEqual(_FakeGstCamera.instances[-1].kwargs["policy_fps"], 60)
+        self.assertEqual(policy_meta["cam"]["fps"], 60)
+
+    def test_without_policy_fps_the_ring_runs_at_capture_rate(self) -> None:
+        _raw_meta, policy_meta = self._open({"raw_transport": "gstshm+pyshm"})
+        self.assertEqual(_FakeGstCamera.instances[-1].kwargs["policy_fps"], 60)
+        self.assertEqual(policy_meta["cam"]["fps"], 60)
+
+    def test_plain_pyshm_fallback_ignores_policy_fps(self) -> None:
+        # On plain pyshm the ring is the recorder's input too: never thinned.
+        raw_meta, policy_meta = self._open({"raw_transport": "pyshm", "policy_fps": 20})
+        self.assertNotIn("policy_fps", _FakeGstCamera.instances[-1].kwargs)
+        self.assertEqual(raw_meta["cam"]["transport"], "pyshm")
+        self.assertEqual(raw_meta["cam"]["fps"], 60)
+        self.assertEqual(policy_meta, {})
+
+
 if __name__ == "__main__":
     unittest.main()
