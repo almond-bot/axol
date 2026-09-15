@@ -565,34 +565,6 @@ def exposure_critical_thread_comms() -> frozenset[str]:
     )
 
 
-# The dataset encoders (``_dataset_enc_shmsink``): one per mono camera, one per
-# stereo eye. Each has a named feed queue (``<name>_inq``), its own src task
-# and a named drain queue (``<name>_outq``) in front of ``gdppay ! shmsink``.
-_DATASET_ENCODER_NAMES = ("dsenc", "dsenc_l", "dsenc_r")
-# The NVIDIA ``nvv4l2h264enc`` plugin's capture-plane dequeue thread; every
-# encoder in the process (dataset and headset stream alike) names its own so.
-_ENCODER_PLUGIN_THREAD_COMM = "V4L2_EncThread"
-
-
-def encode_chain_thread_comms() -> frozenset[str]:
-    """``comm`` names of the dataset encode chain: NVENC feed, dequeue and drain.
-
-    The consumers of :func:`_dataset_input_queue` (pushing converted surfaces
-    into NVENC), the encoders' own src tasks and the plugin's dequeue threads,
-    and the consumers of the ``<name>_outq`` queues (pushing AUs through
-    ``gdppay`` into ``shmsink``). The relay runs them ``SCHED_FIFO`` one notch
-    under the capture chain (see ``affinity.prioritize_capture_threads``):
-    NVENC releases an input surface only once its AU has been dequeued and
-    pushed on, so any of these starving behind CFS spill stalls the feed queue
-    and costs dataset frames.
-    """
-    comms = {_ENCODER_PLUGIN_THREAD_COMM}
-    for name in _DATASET_ENCODER_NAMES:
-        for suffix in ("_inq", "", "_outq"):
-            comms.add(_task_thread_comm(name + suffix))
-    return frozenset(comms)
-
-
 def _thread_sched_wait_ns() -> int | None:
     """Cumulative time this thread spent runnable-but-waiting (Linux only)."""
     try:
