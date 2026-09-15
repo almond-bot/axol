@@ -3,7 +3,7 @@ title: "almond_axol.kinematics"
 description: "Bimanual inverse kinematics solver using pyroki and JAX/jaxls."
 ---
 
-Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, builds a collision model, and JIT-compiles the solver during `__init__` — the first solver in a process takes a few seconds; subsequent calls (and subsequent solver instances) are fast.
+Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, builds the arm↔torso collision model (`self_collision`, on by default), and JIT-compiles the solver during `__init__` — both graph shapes, with and without elbow hints, so box mode's first frame never waits on a compile; the first solver in a process takes a few seconds (a persistent on-disk cache makes later runs fast); subsequent calls (and subsequent solver instances) are fast.
 
 <Note>
   Solver startup is cached at two levels, both automatic:
@@ -95,13 +95,14 @@ for q in plan_linear_segment(solver, q_a, q_b, speed=0.25, ang_speed=1.2, rate=2
 |---|---|---|
 | `pos_weight` | `50.0` | End-effector position tracking weight |
 | `ori_weight` | `10.0` | End-effector orientation tracking weight |
-| `elbow_weight` | `0.0` | Elbow hint tracking weight. `0` (the default) disables elbow tracking — the headset's inferred elbow proved unreliable on hardware, so the arm's swivel is left to the posture attractor. When enabled, the hint is projected onto the robot's reachable elbow sphere and fades out above shoulder height (see `elbow_fade_band`) |
+| `elbow_weight` | `0.0` | Elbow hint tracking weight for the headset's elbow. `0` (the default) disables it — the headset's inferred elbow proved unreliable on hardware, so in plain teleop the arm's swivel is left to the posture attractor. When enabled, the hint is projected onto the robot's reachable elbow sphere and fades out above shoulder height (see `elbow_fade_band`). Independent of this, box mode can pass its own synthetic "elbows out" hint with a per-call weight (`VRTeleopConfig.box_elbow_out` / `box_elbow_weight`, off by default, via `ik(elbow_weight=...)`, no fade) |
 | `rest_weight` | `7.5` | Per-step damping; penalises deviation from `q_current` |
 | `posture_weight` | `5.0` | Persistent attractor to home pose (prevents null-space drift) |
 | `manipulability_weight` | `0.05` | Reward for configurations with high manipulability |
 | `limit_weight` | `75.0` | Joint limit penalty weight |
-| `self_collision_margin` | `0.025` m | Minimum clearance between collision bodies. Kept below the arm–torso clearance of normal teleop poses so the collision cost isn't active during ordinary tracking |
-| `self_collision_weight` | `150.0` | Self-collision penalty weight |
+| `self_collision` | `True` | Whether the arm↔torso (`base` / `s1`) collision model is part of the solve. On by default: the capsule model is built, the soft self-collision cost is in the IK graph, the hard upper-arm/base guard runs on every final step so a pose target cannot push an arm into the torso, and the return-to-rest planner is collision-aware. Plain teleop rarely exercises it (the operator's own arms keep targets plausible); [box mode](/guides/vr-interface#box-mode) does, since its parallel, closing gripper poses would otherwise fold the elbows into the base. `False` drops all of it and the reset planner interpolates in joint space with joint limits only (limits are clamped every step either way). The two fields below tune the collision-aware solve |
+| `self_collision_margin` | `0.025` m | Minimum clearance between collision bodies (with `self_collision` on). Kept below the arm–torso clearance of normal teleop poses so the collision cost isn't active during ordinary tracking |
+| `self_collision_weight` | `150.0` | Self-collision penalty weight (with `self_collision` on) |
 | `max_iterations` | `8` | Solver iterations per `ik()` call |
 | `cost_tolerance` | `1e-4` | Convergence tolerance; small enough that only genuine convergence ends a solve (not a rejected step) |
 | `lambda_initial` | `1e-2` | Initial Levenberg–Marquardt damping for the per-tick solve |

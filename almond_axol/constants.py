@@ -53,6 +53,16 @@ CAN_MANTIS_RIGHT = "can_mantis_r"
 
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 
+# Fields per joint slot in a realtime-core command tuple — what an
+# ``AxolArm`` command sink hands to ``almond_axol.rt`` and what one ``T``
+# target slot carries on the wire: ``(p_des, mode, kp, kd, t_ff, kd_host,
+# damp_w0, damp_q, j_eff, tau_cap)``. The gripper slot repurposes the first
+# three (target, max_speed, max_torque) and zero-pads the rest. Must match
+# ``TARGET_FIELDS`` in ``rust/axol-rt/src/serve.rs``; the core's config
+# handshake (``proto``, ``almond_axol.rt.link.CONFIG_PROTO``) rejects a
+# mismatch, so bump that together with any change here.
+RT_TARGET_FIELDS = 10
+
 
 URDF_PATH: Path = Path(__file__).resolve().parent / "kinematics" / "urdf" / "axol.urdf"
 

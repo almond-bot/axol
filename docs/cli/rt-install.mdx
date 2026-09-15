@@ -28,6 +28,8 @@ Three concerns, each idempotent and self-gating:
 
 The binary lookup order at runtime is `AXOL_RT_BIN` (env override), then the current checkout's repo build, then `axol-rt` on PATH — so a manual checkout build or an explicit override wins over the provisioned copy.
 
+The package and the binary must speak the same wire protocol. Python declares its generation in the core's config (`proto <n>` — `CONFIG_PROTO` in `almond_axol.rt.link`, currently `3`), and a binary built from a different layout refuses to configure — before any motor is touched — with a message naming the fix (`config: client speaks proto …, this axol-rt speaks proto …`); the session then fails with `axol-rt … refused the configuration and exited`. That is the signal to rebuild: `axol rt.install`, or `cargo build --release` in `rust/axol-rt` for a checkout whose `target/release/` binary has gone stale.
+
 <Note>
   A failed rustup download, source fetch, build, or capability setup is
   warning-only inside plain `axol provision`. Pass `--require-rt` to make that

@@ -676,6 +676,179 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 ),
             ),
             SettingDef(
+                key="teleop.box_mode",
+                label="Box mode at startup",
+                type="boolean",
+                help=(
+                    "Start sessions in box mode: the grippers clamp the box "
+                    "between their sides like two flat hands (level, the "
+                    "tool's contact face along the box side) and one grip "
+                    "drives both arms by position and heading — the pair "
+                    "stays level (the other hand's grip hands over the "
+                    "lead). Thumbsticks set the grip width "
+                    "while a grip leads and drive the base once the pair is "
+                    "frozen. Can also be toggled live from the headset menu "
+                    "or both thumbstick clicks."
+                ),
+                targets={
+                    "teleop": ("teleop.box_mode",),
+                    "collect-data": (f"{_VRT}.box_mode",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_tool",
+                label="Box-mode gripper",
+                type="select",
+                options=("parcel", "urdf"),
+                help=(
+                    "Which gripper is fitted, for box mode's contact "
+                    "geometry. parcel: the hinged-blade parcel gripper — each "
+                    "gripper is yawed so the folded blade's flat face lies "
+                    "along the box side and the grip width is measured "
+                    "between the two faces. urdf: the stock two-finger "
+                    "gripper — mounts are the width apart, fingers straight "
+                    "forward. Also switchable live from the headset menu."
+                ),
+                targets={
+                    "teleop": ("teleop.box_tool",),
+                    "collect-data": (f"{_VRT}.box_tool",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_grasp",
+                label="Box-mode grasp",
+                type="select",
+                options=("straight", "flush"),
+                help=(
+                    "Which grasp a box-mode session starts in. straight (the "
+                    "default): fingers straight forward (0°), width between "
+                    "the mounts. flush: the fitted gripper's contact face "
+                    "along the box side (parcel gripper: the folded blade's "
+                    "face, grippers yawed 38.5° inward, width between the "
+                    "faces). In the headset a click of either thumbstick "
+                    "while leading toggles between the two; the arms blend "
+                    "over."
+                ),
+                targets={
+                    "teleop": ("teleop.box_grasp",),
+                    "collect-data": (f"{_VRT}.box_grasp",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_elbow_out",
+                label="Box-mode elbows out (°)",
+                type="number",
+                help=(
+                    "How far out box mode holds the elbows, in degrees from "
+                    "hanging straight down under the shoulder-wrist line (0) "
+                    "to out level (90). The startup value; in the headset "
+                    "either thumbstick forward/back jogs it live (forward = "
+                    "further apart), and what the sticks leave it at is "
+                    "written back here."
+                ),
+                targets={
+                    "teleop": ("teleop.box_elbow_out",),
+                    "collect-data": (f"{_VRT}.box_elbow_out",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_elbow_weight",
+                label="Box-mode elbow hint weight",
+                type="number",
+                help=(
+                    "IK weight steering box mode's elbows to the angle above "
+                    "(the grippers' own weight is 50; 10 is the default). 0 "
+                    "turns the hint off: the elbows are left where they fall "
+                    "— the arm/torso collision model keeps them off the base "
+                    "— and the thumbsticks' elbow control does nothing."
+                ),
+                targets={
+                    "teleop": ("teleop.box_elbow_weight",),
+                    "collect-data": (f"{_VRT}.box_elbow_weight",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_squeeze_torque",
+                label="Box squeeze cap (Nm)",
+                type="number",
+                help=(
+                    "Box mode: cap on the shoulder torque that squeezes the "
+                    "box (shoulder_2 and shoulder_3 on each arm — the joints "
+                    "a sideways push at the gripper loads; the joints that "
+                    "lift the box are untouched). Jogging the width past "
+                    "contact then leans on the box with at most this torque "
+                    "instead of pressing harder the further you jog — the "
+                    "opt-in per-joint backstop under the squeeze force below. "
+                    "In clamp force that is roughly the cap ÷ the shoulder's "
+                    "0.3–0.65 m lever. It cannot tell a squeeze from a move, "
+                    "so it also slows the arm moving toward the other: 0 "
+                    "(off, the default) unless you need it. Also adjustable "
+                    "live from the headset menu (Squeeze cap). Hardware only."
+                ),
+                targets={
+                    "teleop": ("teleop.box_squeeze_torque",),
+                    "collect-data": (f"{_VRT}.box_squeeze_torque",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_squeeze_lean",
+                label="Box squeeze lean (×)",
+                type="number",
+                help=(
+                    "Box mode: leans each gripper's target into the box as "
+                    "the squeeze builds — about 1.3° of inward yaw per cm "
+                    "jogged past contact at 1×, from the arm's stiffness "
+                    "model — so the clamp presses evenly on the parcel "
+                    "blade's root and its tip instead of the face digging in "
+                    "while the tip lifts. Raise it if the tip still lifts as "
+                    "you squeeze, lower it if the face by the wrist lifts "
+                    "instead; 0 turns it off. Also adjustable live from the "
+                    "headset menu (Squeeze lean). Hardware only."
+                ),
+                targets={
+                    "teleop": ("teleop.box_squeeze_lean",),
+                    "collect-data": (f"{_VRT}.box_squeeze_lean",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_squeeze_force",
+                label="Box squeeze force (N)",
+                type="number",
+                help=(
+                    "Box mode: cap on how hard each arm clamps the box "
+                    "(without one, about 6 N per cm the width is jogged past "
+                    "contact). Past the cap the gripper targets are held at "
+                    "the cap's depth into the box, both arms alike, the same "
+                    "at any pose. 0 (off, the default) leaves the squeeze to "
+                    "the width you jog; 8 N is a working value. Also "
+                    "adjustable live from the headset menu (Squeeze force). "
+                    "Hardware only."
+                ),
+                targets={
+                    "teleop": ("teleop.box_squeeze_force",),
+                    "collect-data": (f"{_VRT}.box_squeeze_force",),
+                },
+            ),
+            SettingDef(
+                key="teleop.reengage",
+                label="Re-engage",
+                type="select",
+                options=("clutch", "ramp"),
+                help=(
+                    "What a grip does when an arm re-engages after a pause "
+                    "(a freeze, a walk-away, or the arm being moved by hand). "
+                    "clutch: the arm stays put and the controller's current "
+                    "pose becomes its new origin — you match the arm. ramp: "
+                    "the arm eases out to where your controller is under the "
+                    "mapping from its previous engage — the arm matches you. "
+                    "Can also be toggled live from the headset menu."
+                ),
+                targets={
+                    "teleop": ("teleop.reengage",),
+                    "collect-data": (f"{_VRT}.reengage",),
+                },
+            ),
+            SettingDef(
                 key="teleop.rest_pose_left",
                 label="Left arm rest pose",
                 type="text",

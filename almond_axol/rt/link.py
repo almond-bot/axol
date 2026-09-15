@@ -17,9 +17,16 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from ..constants import RT_TARGET_FIELDS
 from ..motor.bus import is_stall_report, set_channel_stalled
 
 _logger = logging.getLogger(__name__)
+
+_TARGET_SLOT_FMT = struct.Struct(f"<{RT_TARGET_FIELDS}d")
+# Pseudo-state queued by the reader when the core drops the socket, so a
+# pending state wait fails at once (the core never emits a state with this
+# text — its states are lowercase words / "fault: ..." / "limp: ...").
+_CLOSED_STATE = "<connection closed>"
 
 # One telemetry entry per slot: pos (rad), vel (rad/s), tau (Nm), age_us.
 _FEEDBACK_SLOTS = 8
@@ -41,7 +48,7 @@ _ARM_TIMEOUT_S = 15.0
 #: both together whenever the config or target layout changes meaning — a
 #: package and a binary from different checkouts must fail at configure
 #: time, not arm and then silently reject every target.
-CONFIG_PROTO = 2
+CONFIG_PROTO = 3
 
 
 def config_header() -> list[str]:
@@ -220,6 +227,9 @@ class RtLink:
                     _logger.warning("axol-rt: unknown message tag %r", tag)
         except (asyncio.IncompleteReadError, ConnectionResetError):
             _logger.info("axol-rt: connection closed")
+            # Wake any state wait immediately (a refused config, a crash)
+            # instead of leaving it to run out its timeout.
+            self._states.put_nowait(_CLOSED_STATE)
         except asyncio.CancelledError:
             raise
 
@@ -310,6 +320,10 @@ class RtLink:
                 return
             if state.startswith("fault:") and not tolerate_fault:
                 raise RtLinkError(f"axol-rt: {state}")
+            if state == _CLOSED_STATE:
+                raise RtLinkError(
+                    f"axol-rt closed the connection while {expected!r} was awaited"
+                )
             # Unrelated state (e.g. a stats line routed as state) — keep waiting.
 
     async def configure(self, config_text: str) -> None:
@@ -361,12 +375,15 @@ class RtLink:
         cmds: list[tuple[float, ...]],
     ) -> None:
         """Ship one arm's 8 slot tuples (p_des, mode, kp, kd, gravity t_ff,
-        kd_host, damp_w0, damp_q, j_eff; the gripper slot repurposes the
-        first three as target/speed/torque). mode ≥ 0.5 runs the core's
-        tracker + friction/inertia terms, 0 is passthrough (gravity comp).
+        kd_host, damp_w0, damp_q, j_eff, tau_cap — ``RT_TARGET_FIELDS``
+        each; the gripper slot repurposes the first three as
+        target/speed/torque). mode ≥ 0.5 runs the core's tracker +
+        friction/inertia terms, 0 is passthrough (gravity comp). tau_cap is
+        a per-command spring-torque cap in Nm that tightens the joint's
+        configured cap for this command; 0 leaves the configured cap alone.
         Sync — safe to call from the event loop; the write is buffered."""
         payload = struct.pack("<cBI", b"T", side, seq & 0xFFFFFFFF) + b"".join(
-            struct.pack("<9d", *cmd) for cmd in cmds
+            _TARGET_SLOT_FMT.pack(*cmd) for cmd in cmds
         )
         self._send(payload)
 

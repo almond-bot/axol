@@ -94,6 +94,7 @@ def _step_worker() -> IKWorker:
         ik_frequency=120.0,
         position_multiplier=1.0,
         rotation_multiplier=1.0,
+        reengage="clutch",
         absolute_mode=False,
     )
     worker._solver = _SeedLeftSolver()
@@ -101,6 +102,9 @@ def _step_worker() -> IKWorker:
     worker._active = {"left": True, "right": True}
     worker._hold_fk = {}
     worker._hold_elbow_fk = {}
+    worker._ramp = {}
+    worker._box = None
+    worker._box_leader = None
     worker._freeze_since = {}
     worker._freeze_targets = {}
     worker._snap_ctrl = {
@@ -328,6 +332,7 @@ class FreezeClutchStepTest(unittest.TestCase):
 
     def test_snap_arm_reanchors_elbow_origin_too(self) -> None:
         worker = _freeze_tracker()
+        worker._ramp = {}
         worker._snap_ctrl = {}
         worker._snap_fk = {}
         worker._snap_elbow_ctrl = {}
