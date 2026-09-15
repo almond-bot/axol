@@ -64,7 +64,7 @@ _ENCODER_GOP = 30
 # cameras' shm + the dataset, and answer ``ready``. This guards a wedged child,
 # not a slow one: a normal start is 25-45 s on the Orin and the 2026-09-14
 # DAgger session hit 56 s with the import starved on the relay's cores (see
-# affinity.pin_background_startup), which the old 60 s budget turned into a
+# affinity.pin_background_and_ik), which the old 60 s budget turned into a
 # session-ending failure before the operator had started anything.
 _READY_TIMEOUT_S = 180.0
 # How long a save_episode (encoder flush + parquet write + post-episode stats)
@@ -3606,8 +3606,9 @@ def _recorder_main(
     # lerobot imports below are the one heavy thing this process ever does
     # (~25 s of CPU): they run widened onto the idle IK core so the relay's
     # SCHED_FIFO camera threads on the background cores cannot stretch them
-    # past the ready handshake (see affinity.pin_background_startup), and the
-    # process narrows to the background cores before any reader thread exists.
+    # past the ready handshake (see affinity.pin_background_and_ik). Whether
+    # the process then narrows to the background cores before any reader
+    # thread exists is the caller's ``share_ik_core`` (below).
     from ..utils import affinity
     from ..utils.stall_diag import (
         GcHold,
@@ -3616,7 +3617,7 @@ def _recorder_main(
         install_gc_pause_logger,
     )
 
-    pinned = affinity.pin_background_startup()
+    pinned = affinity.pin_background_and_ik()
     if not pinned:
         try:
             os.nice(5)
@@ -3670,10 +3671,13 @@ def _recorder_main(
         install_dataset_encoder()
     _, _, robot_obs_proc = make_default_processors()
 
-    # Imports done: narrow to the background cores before the readers spawn
-    # their gst threads (threads inherit the spawning thread's affinity), so
-    # nothing of the recorder's steady state lands on the IK core.
-    if pinned:
+    # Imports done. Unless the caller shares the IK core with this recorder
+    # (the policy ops, whose relay leaves the background cores ~5 % idle —
+    # see affinity.pin_background_and_ik), narrow to the background cores
+    # before the readers spawn their gst threads (threads inherit the
+    # spawning thread's affinity), so nothing of the steady state lands on
+    # the IK core.
+    if pinned and not config.get("share_ik_core", False):
         affinity.pin_background()
 
     # Build a per-source frame reader matching the relay's chosen transport.
@@ -4089,6 +4093,14 @@ class DatasetRecorderProcess:
     exposes the same interface as :class:`InProcessRecorder`. ``publish`` is the
     only hot-path call (one ~40-float shm write per control tick); the episode
     commands are rare and run on the main thread between episodes.
+
+    ``config["share_ik_core"]`` (default false) keeps the recorder's steady
+    state on the IK core as well as the background cores. Set it from the ops
+    whose relay also runs the policy ring branch (``collect-dagger``, the Pi
+    ``run-policy``): with three VIC branches per camera plus the capture daemon,
+    all real-time, the background cores leave the CFS recorder too little to
+    sustain 60 rows/s and every take ends on ``encoded-AU backlog exceeded``
+    after 25-30 s — see :func:`almond_axol.utils.affinity.pin_background_and_ik`.
     """
 
     def __init__(

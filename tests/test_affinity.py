@@ -299,8 +299,8 @@ class IsolateRelayCpuTest(TestCase):
         )
 
 
-class BackgroundStartupTest(TestCase):
-    """The recorder's import phase borrows a dedicated IK core, never control's."""
+class BackgroundAndIkTest(TestCase):
+    """The recorder borrows a dedicated IK core (imports; policy-op steady state), never control's."""
 
     def _startup_cores(self, n: int) -> set[int]:
         applied: list[set[int]] = []
@@ -310,7 +310,7 @@ class BackgroundStartupTest(TestCase):
                 affinity.os, "sched_setaffinity", lambda pid, c: applied.append(set(c))
             ),
         ):
-            self.assertTrue(affinity.pin_background_startup())
+            self.assertTrue(affinity.pin_background_and_ik())
         return applied[-1]
 
     def test_eight_cores_widen_onto_the_idle_ik_core(self) -> None:
@@ -337,4 +337,4 @@ class BackgroundStartupTest(TestCase):
 
     def test_noop_without_partitioning(self) -> None:
         with patch.object(affinity.os, "cpu_count", return_value=2):
-            self.assertFalse(affinity.pin_background_startup())
+            self.assertFalse(affinity.pin_background_and_ik())

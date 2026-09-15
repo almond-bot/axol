@@ -446,7 +446,7 @@ class EncoderShutdownTest(unittest.TestCase):
                 return_value=snapshot_reader,
             ),
             mock.patch(
-                "almond_axol.utils.affinity.pin_background_startup", return_value=True
+                "almond_axol.utils.affinity.pin_background_and_ik", return_value=True
             ),
             mock.patch("almond_axol.utils.affinity.pin_background", return_value=True),
             mock.patch.object(record_proc, "install_encoded_dataset_encoder"),
@@ -540,7 +540,7 @@ class EncoderShutdownTest(unittest.TestCase):
                 return_value=mock.Mock(),
             ),
             mock.patch(
-                "almond_axol.utils.affinity.pin_background_startup", return_value=True
+                "almond_axol.utils.affinity.pin_background_and_ik", return_value=True
             ),
             mock.patch("almond_axol.utils.affinity.pin_background", return_value=True),
             mock.patch.object(record_proc, "install_encoded_dataset_encoder"),

@@ -589,7 +589,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
                 side_effect=[first, second],
             ),
             patch(
-                "almond_axol.utils.affinity.pin_background_startup", return_value=True
+                "almond_axol.utils.affinity.pin_background_and_ik", return_value=True
             ),
             patch("almond_axol.utils.affinity.pin_background", return_value=True),
             patch.object(record_proc, "install_encoded_dataset_encoder"),
@@ -629,7 +629,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
                 return_value=snap_reader,
             ),
             patch(
-                "almond_axol.utils.affinity.pin_background_startup", return_value=True
+                "almond_axol.utils.affinity.pin_background_and_ik", return_value=True
             ),
             patch("almond_axol.utils.affinity.pin_background", return_value=True),
             patch.object(record_proc, "install_encoded_dataset_encoder"),
@@ -860,7 +860,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
                 return_value=snap_reader,
             ),
             patch(
-                "almond_axol.utils.affinity.pin_background_startup", return_value=True
+                "almond_axol.utils.affinity.pin_background_and_ik", return_value=True
             ),
             patch("almond_axol.utils.affinity.pin_background", return_value=True),
             patch.object(record_proc, "install_dataset_encoder"),
