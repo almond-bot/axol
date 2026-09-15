@@ -8,9 +8,11 @@ low-level :class:`~almond_axol.robot.axol.AxolHardware` (buses, motors,
 model math) as an implementation detail. What changed is behind the scenes:
 while enabled, the CAN buses are owned by the ``axol-rt`` subprocess:
 
-- ``enable()`` runs the split bring-up: the core resets the motors (prep),
-  then Python resolves joint offsets and MyActuator decode ranges through a
-  Rust maintenance proxy. That proxy exits before the realtime core enables
+- ``enable()`` runs the split bring-up: the core resets the *cold* motors
+  (prep — joints already enabled and holding are left untouched, exactly
+  as the classic idempotent enable attaches to them), then Python resolves
+  joint offsets and MyActuator decode ranges through a Rust maintenance
+  proxy. That proxy exits before the realtime core enables
   and holds, making the core the sole CAN owner while armed. ``Motor`` caches
   fill from the core's per-tick telemetry packets — ~480 packet decodes/s
   replacing ~7,700 Python frame dispatches/s on this CPU-starved Jetson.
@@ -395,9 +397,13 @@ class Axol(RobotBase):
         await self._link.start()
         self._core_started = True
         await self._link.configure(self._config_text())
-        # The core's prep resets the MyActuator motors (multi-turn wrap state
-        # changes) — it must complete before Python resolves offsets, and
-        # before Python's buses open so no pre-reset frame is ever cached.
+        # The core's prep resets the cold MyActuator motors (multi-turn wrap
+        # state changes) — it must complete before Python resolves offsets,
+        # and before Python's buses open so no pre-reset frame is ever
+        # cached. Joints found already enabled and holding are skipped by
+        # the core (the 0x76 reset reboots the motor and drops torque for
+        # ~2 s), so reconnecting to a live robot keeps it holding — the same
+        # per-motor idempotency as the classic AxolHardware.enable().
         await self._link.prep()
 
         await self._robot.connect()

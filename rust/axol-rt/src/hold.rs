@@ -180,7 +180,13 @@ fn bus_hold(
     sock.set_send_timeout(Duration::from_millis(20))?;
     sock.drain()?;
     let specs: Vec<MotorSpec> = joints.iter().map(|p| p.spec.clone()).collect();
-    bringup::prep(&sock, &specs)?;
+    let held = bringup::prep(&sock, &specs)?;
+    if !held.is_empty() {
+        println!(
+            "  {iface}: already holding, attached without reset: {}",
+            held.join(", ")
+        );
+    }
     let ready = bringup::prepare(&sock, iface, &specs)?;
     let mut motors: Vec<HeldMotor> = ready
         .into_iter()
