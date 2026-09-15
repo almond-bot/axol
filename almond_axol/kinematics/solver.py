@@ -784,6 +784,18 @@ class KinematicsSolver:
     # -- Properties ----------------------------------------------------------
 
     @property
+    def shoulder_positions(self) -> dict[str, np.ndarray]:
+        """Base-frame shoulder origins the reach soft-clamp is centred on.
+
+        Fixed by the URDF (the shoulder body does not move with the arm
+        joints); the same centres :meth:`ik` clamps its targets around.
+        """
+        return {
+            "left": np.asarray(self._left_shoulder_pos, dtype=np.float64),
+            "right": np.asarray(self._right_shoulder_pos, dtype=np.float64),
+        }
+
+    @property
     def joint_names(self) -> list[str]:
         """All actuated joint names — left arm then right arm, ARM_JOINTS order."""
         return list(_LEFT_JOINT_NAMES + _RIGHT_JOINT_NAMES)

@@ -367,6 +367,110 @@ def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
         )
 
 
+def _mantis_tcp_transform_provenance(cfg: "CollectDataConfig") -> dict[str, object]:
+    """The ``meta/axol.json`` record of this run's tracker→gripper transforms."""
+    from ..mantis.calibration import tcp_transform_provenance
+
+    vrt = cfg.teleop_config.vr_teleop_config
+    return tcp_transform_provenance(
+        vrt.tcp_transform_left,
+        vrt.tcp_transform_right,
+        source=cfg.mantis_source,
+    )
+
+
+def _reach_soft_start_m(cfg: "CollectDataConfig") -> float:
+    """Shoulder-to-TCP distance past which the IK reach clamp engages."""
+    return float(cfg.teleop_config.kinematics_config.reach_soft_start)
+
+
+def _require_mantis_resume_transform(
+    dataset_root: Path, cfg: "CollectDataConfig"
+) -> None:
+    """Refuse to append to a Mantis dataset recorded with retired constants.
+
+    The recorded EE poses of every row pass through the tracker→gripper
+    transform, so appending episodes mapped through a different rotation
+    would mix two incompatible pose conventions in one dataset — and the
+    row-level data carries nothing that could tell them apart afterwards.
+    Datasets predating the ``mantis_tcp_transform`` marker field were recorded
+    with the Rx(+90°) Vive rotation; ``axol migrate-dataset
+    --mantis-tcp-rotation`` repairs them (and stamps the field), after which
+    they can be resumed.
+    """
+    from ..mantis.calibration import (
+        DESIGN_TCP_TRANSFORM_ID,
+        MEASURED_TCP_TRANSFORM_ID,
+        UNCALIBRATED_TCP_TRANSFORM_ID,
+    )
+    from ..recording.cartesian_frame import (
+        MANTIS_TCP_TRANSFORM_KEY,
+        read_cartesian_frame_marker,
+    )
+
+    marker = read_cartesian_frame_marker(dataset_root)
+    if marker is None:
+        # Pre-v0.1.32 or joint-space; the schema check elsewhere decides.
+        return
+    recorded = marker.get(MANTIS_TCP_TRANSFORM_KEY)
+    current = _mantis_tcp_transform_provenance(cfg)
+    if recorded is None and cfg.mantis_source == "quest":
+        # Quest never had a factory constant, so the old rows used a per-unit
+        # measurement this run cannot check against.
+        _logger.warning(
+            "Resuming a Mantis Quest dataset (%s) recorded before axol stamped "
+            "its tracker→gripper transforms into meta/axol.json; make sure the "
+            "measured Quest transforms are the ones the earlier episodes used.",
+            dataset_root,
+        )
+        return
+    if recorded is None:
+        raise ValueError(
+            f"Cannot resume the Mantis dataset at {dataset_root}: it was recorded "
+            "by axol <= 0.2.4 with the retired Rx(+90°) Vive tracker→gripper "
+            "rotation, and this run would append poses mapped through the "
+            "corrected Ry(180°) constant. Repair it first with "
+            "`axol migrate-dataset --repo_id <id> --mantis-tcp-rotation` "
+            "(add --swap-sides if the left/right trackers were bound to the "
+            "opposite rigs), or record to a new repo_id."
+        )
+    if not isinstance(recorded, dict):
+        raise ValueError(
+            f"Cannot resume the Mantis dataset at {dataset_root}: its "
+            f"meta/axol.json {MANTIS_TCP_TRANSFORM_KEY} field is malformed."
+        )
+    recorded_id = recorded.get("id")
+    current_id = current["id"]
+    if UNCALIBRATED_TCP_TRANSFORM_ID in (recorded_id, current_id):
+        # Bring-up captures are explicitly not training data; nothing to protect.
+        return
+    if recorded_id == current_id == DESIGN_TCP_TRANSFORM_ID:
+        return
+    if MEASURED_TCP_TRANSFORM_ID in (recorded_id, current_id):
+
+        def _same_side(side: str) -> bool:
+            old = recorded.get(side)
+            new = current[side]
+            if not isinstance(old, list) or not isinstance(new, list):
+                return False
+            if len(old) != 7 or len(new) != 7:
+                return False
+            return all(
+                math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-9)
+                for a, b in zip(old, new, strict=True)
+            )
+
+        if _same_side("left") and _same_side("right"):
+            return
+    raise ValueError(
+        f"Cannot resume the Mantis dataset at {dataset_root}: it was recorded "
+        f"with tracker→gripper transforms {recorded_id!r} but this run resolved "
+        f"{current['id']!r} (left={current['left']}, right={current['right']}). "
+        "Appending would mix two pose conventions in one dataset. Use the "
+        "dataset's transforms, migrate it, or record to a new repo_id."
+    )
+
+
 def _prepare_recording_cameras(cfg: "CollectDataConfig") -> None:
     """Prune placeholders and require a real dataset camera, without I/O."""
     if not isinstance(cfg.robot_config, AxolRobotConfig):
@@ -734,6 +838,11 @@ class EpisodeQAStats:
     # Worst pose-stream age (tick time minus pose capture time) seen while
     # recording, in seconds. Reported in the QA summary; not itself a gate.
     max_pose_lag_s: float = 0.0
+    # Ticks where either hand was carried beyond the arm's reach soft-clamp
+    # (``KinematicsConfig.reach_soft_start`` from the shoulder). The rig has
+    # no arm to stop the operator, but the recorded pose is one Axol cannot
+    # follow on replay. Reported and warned about; not a gate.
+    out_of_reach_frames: int = 0
     # Host perf_counter instant the episode's data should end at, when the
     # operator ended it with the trigger x3 gesture: the moment the first
     # click began. Rows captured after it are trimmed before the save so the
@@ -754,6 +863,13 @@ class EpisodeQAStats:
     def untracked_fraction(self) -> float:
         """Invalid-per-side ticks as a fraction of recorded ticks."""
         return self.untracked_frames / self.total_frames if self.total_frames else 0.0
+
+    @property
+    def out_of_reach_fraction(self) -> float:
+        """Beyond-reach ticks as a fraction of recorded ticks (0.0 when empty)."""
+        return (
+            self.out_of_reach_frames / self.total_frames if self.total_frames else 0.0
+        )
 
 
 def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
@@ -1311,6 +1427,10 @@ def _run_session(
             # Mantis dataset.
             allowed_extra_features=frozenset({"intervention", "observation.pose_lag"}),
         )
+        if mantis_mode:
+            # Same pose convention as the existing rows, or refuse: the
+            # tracker→gripper rotation is baked into every recorded pose.
+            _require_mantis_resume_transform(dataset_root, cfg)
         # Only repair a torn episode tail after proving this is the exact
         # dataset schema the current run is authorized to append to.
         check_resume_consistency(dataset_root)
@@ -1550,6 +1670,12 @@ def _run_session(
         # Tracked (VR) poses carry measurement noise the robot's encoder FK
         # doesn't — smooth only Mantis episodes (see record_proc._maybe_smooth_episode).
         "smooth_ee_hz": cfg.mantis_smooth_hz if mantis_mode else 0.0,
+        # Which tracker→gripper transforms the recorded poses were mapped
+        # through (meta/axol.json). A later constant change is migrated from
+        # this record instead of guessed (see migrate-dataset).
+        "mantis_tcp_transform": (
+            _mantis_tcp_transform_provenance(cfg) if mantis_mode else None
+        ),
     }
     try:
         teleop_action_proc, robot_action_proc, robot_obs_proc = (
@@ -1915,6 +2041,16 @@ def _run_session(
                     stats.trigger_loss_frames += 1
                 if pose_ts is None or t0 - pose_ts > _QA_STALE_POSE_S:
                     stats.stale_frames += 1
+                if last_tcp is not None and last_tcp.out_of_reach:
+                    if stats.out_of_reach_frames == 0:
+                        _logger.warning(
+                            "Mantis: %s hand is beyond Axol's reach (> %.2f m "
+                            "from the shoulder) — the robot cannot follow this "
+                            "part of the episode on replay.",
+                            "/".join(last_tcp.out_of_reach),
+                            _reach_soft_start_m(cfg),
+                        )
+                    stats.out_of_reach_frames += 1
 
             # start_episode resets the subprocess's dedicated error pipe on a
             # worker thread. Do not inspect that pipe from this event-loop
@@ -2575,7 +2711,7 @@ def _run_session(
                 _logger.info(
                     "episode QA: control_frames=%d captured_rows=%d stale=%d "
                     "(%.1f%%) disengaged=%d (%.1f%%) untracked=%d (%.1f%%) "
-                    "trigger_loss=%d reengaged=%s "
+                    "trigger_loss=%d reengaged=%s out_of_reach=%d (%.1f%%) "
                     "max_pose_lag=%.0fms capture_error=%s -> %s",
                     qa.total_frames,
                     captured_rows,
@@ -2587,6 +2723,8 @@ def _run_session(
                     100 * qa.untracked_fraction,
                     qa.trigger_loss_frames,
                     qa.reengaged_while_recording,
+                    qa.out_of_reach_frames,
+                    100 * qa.out_of_reach_fraction,
                     1e3 * qa.max_pose_lag_s,
                     capture_failure or "none",
                     (
@@ -2595,6 +2733,16 @@ def _run_session(
                         else "BAD"
                     ),
                 )
+                if qa.out_of_reach_frames:
+                    _logger.warning(
+                        "episode has %d frames (%.1f%%) with a hand beyond "
+                        "Axol's reach; the robot will not reproduce those "
+                        "poses on replay. Keep the grippers within ~%.2f m of "
+                        "the shoulders.",
+                        qa.out_of_reach_frames,
+                        100 * qa.out_of_reach_fraction,
+                        _reach_soft_start_m(cfg),
+                    )
                 if not qa_ok and not rerecord and capture_failure is None:
                     if cfg.qa_gate:
                         _logger.info(
