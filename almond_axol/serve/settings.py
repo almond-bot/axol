@@ -757,12 +757,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="number",
                 help=(
                     "IK weight steering box mode's elbows to the angle above "
-                    "(the grippers' own weight is 50). 0 (off, the default) "
-                    "leaves the elbows where they fall — the arm/torso "
-                    "collision model keeps them off the base — and the "
-                    "thumbsticks' elbow control does nothing; 10 turns the "
-                    "hint on. Off while the pair's alignment is settled: it "
-                    "is a second cost pulling on each arm during a move."
+                    "(the grippers' own weight is 50; 10 is the default). 0 "
+                    "turns the hint off: the elbows are left where they fall "
+                    "— the arm/torso collision model keeps them off the base "
+                    "— and the thumbsticks' elbow control does nothing."
                 ),
                 targets={
                     "teleop": ("teleop.box_elbow_weight",),

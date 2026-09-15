@@ -134,6 +134,9 @@ def _dz(v: float) -> float:
     return 0.0 if abs(v) < _STICK_DEADZONE else float(v)
 
 
+# Clearance (m) kept between the two grippers' bodies when the width is
+# closed with nothing between them (see ToolGeometry.min_width).
+_BODY_CLEARANCE_M = 0.01
 # Range (degrees from straight down) the sticks jog ``box_elbow_out`` over:
 # elbows hanging under the shoulder-wrist line to held out level.
 _ELBOW_OUT_MIN = 0.0
@@ -1121,7 +1124,7 @@ class IKWorker:
             aligned = pair_aligned(
                 left,
                 right,
-                width_min=self._config.box_width_min,
+                width_min=self._box_width_min(),
                 width_max=self._config.box_width_max,
                 tilt=tilt,
                 tol_deg=_ALIGNED_TOL_DEG,
@@ -1158,6 +1161,23 @@ class IKWorker:
                 "Unknown box_tool %r; using the URDF gripper geometry", cfg.box_tool
             )
         return self._fitted_tool()
+
+    def _box_width_min(self) -> float:
+        """The smallest grip width the sticks (and an engage snap) allow now.
+
+        ``config.box_width_min`` — the operator's floor between the contact
+        faces — or, if larger, the width at which the fitted tool's bodies
+        would come within ``_BODY_CLEARANCE_M`` of each other in the
+        current grasp (:meth:`ToolGeometry.min_width`). With the parcel
+        gripper the flush grasp's faces are proud of the wrist, so they
+        may close to the operator's floor; in the straight grasp (the face
+        on the mount axis) the wrists meet first, at ~77 mm.
+        """
+        cfg = self._config
+        return max(
+            float(cfg.box_width_min),
+            self._fitted_tool().min_width(self._box_grasp(), _BODY_CLEARANCE_M),
+        )
 
     def _fitted_tool(self) -> ToolGeometry:
         """The contact geometry of the tool actually fitted (``config.box_tool``).
@@ -1439,7 +1459,7 @@ class IKWorker:
                 r_fk,
                 now,
                 align_duration=cfg.box_align_duration,
-                width_min=cfg.box_width_min,
+                width_min=self._box_width_min(),
                 width_max=cfg.box_width_max,
                 tilt=math.radians(cfg.box_grip_tilt),
                 tool=self._box_tool(),
@@ -1623,7 +1643,9 @@ class IKWorker:
         Box mode's sticks do two things, and both sticks do the same, so it
         doesn't matter which hand leads: left/right sets the **width**
         between the grippers (push right = wider, clamped to
-        ``box_width_min``..``box_width_max``), and forward/back sets how far
+        ``box_width_min``..``box_width_max`` — the floor raised, if need
+        be, to where the grippers' bodies would meet in this grasp,
+        :meth:`_box_width_min`), and forward/back sets how far
         out the **elbows** are held (push forward = further apart, back =
         tucked in): it jogs ``config.box_elbow_out`` at ``box_elbow_speed``
         within 0..90° from straight down, the angle the IK's elbow hint
@@ -1660,7 +1682,9 @@ class IKWorker:
         if width_rate:
             box.width = float(
                 np.clip(
-                    box.width + dt * width_rate, cfg.box_width_min, cfg.box_width_max
+                    box.width + dt * width_rate,
+                    self._box_width_min(),
+                    cfg.box_width_max,
                 )
             )
         # The raw stick axis reads negative pushed forward (WebXR gamepad

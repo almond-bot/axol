@@ -191,7 +191,14 @@ class VRTeleopConfig:
             deflection in box mode.
         box_width_min: Smallest grip width (m, between the two grippers'
             contact faces — for the URDF gripper, between the mount frames)
-            the box-mode sticks allow.
+            the box-mode sticks allow. A floor for thin parcels: the
+            fitted tool raises it, per grasp, to where the two grippers'
+            bodies would meet (``ToolGeometry.min_width`` — with the parcel
+            gripper the flush grasp's faces are proud of the wrists and
+            may close to this value, while the straight grasp stops at
+            ~77 mm, the wrists a centimetre apart). Clamping a box means
+            jogging the width *past* its size, so this sits well under the
+            thinnest parcel.
         box_width_max: Largest grip width (m) the box-mode sticks allow.
         box_align_duration: Seconds over which a box-mode engage blends the
             grippers from their current poses into the parallel
@@ -209,14 +216,12 @@ class VRTeleopConfig:
             settings panel (also adjustable there, and from the headset
             menu as **Elbows out**).
         box_elbow_weight: IK weight on that elbow hint (compare
-            ``KinematicsConfig.pos_weight`` 50 for the grippers). ``0``
-            (the default) disables the hint — the swivel is then left
-            alone: rest damping holds it and the arm/torso collision model
-            (``KinematicsConfig.self_collision``) keeps it off the base —
-            and the sticks' elbow control does nothing. ``10`` follows the
-            angle; it is a second cost pulling on each arm during a move,
-            so it stays off until the pair's alignment is settled without
-            it. Live-adjustable (control panel).
+            ``KinematicsConfig.pos_weight`` 50 for the grippers). ``10``
+            (the default) follows the angle. ``0`` disables the hint — the
+            swivel is then left alone: rest damping holds it and the
+            arm/torso collision model (``KinematicsConfig.self_collision``)
+            keeps it off the base — and the sticks' elbow control does
+            nothing. Live-adjustable (control panel).
         box_elbow_speed: Rate (degrees/s) the sticks change
             ``box_elbow_out`` at full forward/back deflection.
         box_squeeze_torque: Cap (Nm) on the impedance spring torque of the
@@ -493,11 +498,11 @@ class VRTeleopConfig:
     box_face_right: str = "auto"
     box_grip_tilt: float = 0.0
     box_width_speed: float = 0.08
-    box_width_min: float = 0.10
+    box_width_min: float = 0.02
     box_width_max: float = 0.70
     box_align_duration: float = 1.5
     box_elbow_out: float = 30.0
-    box_elbow_weight: float = 0.0
+    box_elbow_weight: float = 10.0
     box_elbow_speed: float = 30.0
     box_squeeze_torque: float = 0.0
     box_squeeze_lean: float = 1.0

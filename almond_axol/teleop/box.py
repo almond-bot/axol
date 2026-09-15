@@ -78,6 +78,12 @@ class ToolGeometry:
             extent along the mount's ``Y`` axis, the blades' hinge
             direction (vertical in box mode), centred on the mount. ``0``
             for a face modelled as a line along the fingers.
+        body_in: How far (m) the gripper's *body* — its housing and the
+            wrist link it hangs off — reaches from the mount axis toward
+            the box, along the face axis. What the two grippers would meet
+            at if the width were closed with no box between them
+            (:meth:`min_width`). The wrist link (``W2``) is 67 mm across
+            that axis on every tool, hence the default.
 
     The foot is what box mode places at ``±width / 2``: the two contact
     faces are then ``width`` apart whatever tool is fitted, and the tilt
@@ -92,6 +98,24 @@ class ToolGeometry:
     tip_fwd: float = 0.0
     tip_in: float = 0.0
     face_height: float = 0.0
+    body_in: float = 0.0335
+
+    def min_width(self, grasp: str, clearance: float = 0.0) -> float:
+        """Smallest grip width (m) that keeps the two grippers' bodies apart.
+
+        The width is between the contact faces; the bodies sit
+        :attr:`body_in` from the mount axes, and where the faces sit
+        relative to those axes depends on the grasp: in ``"flush"`` the
+        parcel gripper's folded blade is ``foot_in`` inboard of the axis —
+        proud of the wrist by a centimetre, so the faces may all but meet
+        — while in ``"straight"`` (and on the stock gripper) the face is
+        modelled on the axis itself and the bodies close in step with the
+        width. Returns the width at which the bodies are ``clearance``
+        apart, never less than ``0``; the operator's ``box_width_min`` is
+        applied on top.
+        """
+        face_in = self.foot_in if grasp == "flush" else 0.0
+        return max(0.0, 2.0 * (self.body_in - face_in) + clearance)
 
     def foot(self, face: float) -> np.ndarray:
         """Mount-frame vector from the mount origin to the contact foot.

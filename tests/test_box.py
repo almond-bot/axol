@@ -324,6 +324,19 @@ class ParcelToolTest(unittest.TestCase):
         self.assertEqual(URDF_TOOL.flush_tilt, 0.0)
         np.testing.assert_array_equal(URDF_TOOL.foot(1.0), np.zeros(3))
 
+    def test_min_width_keeps_the_bodies_apart(self) -> None:
+        tool = parcel_tool(141.5)
+        # Flush: the folded face is 40 mm inboard of the axis, proud of the
+        # 33.5 mm wrist, so the faces may meet — no floor beyond the operator's.
+        self.assertGreater(tool.foot_in, tool.body_in)
+        self.assertEqual(tool.min_width("flush", 0.01), 0.0)
+        # Straight: the face sits on the axis and the wrists close with the
+        # width — they are a centimetre apart at 77 mm.
+        self.assertAlmostEqual(tool.min_width("straight", 0.01), 0.077, places=9)
+        self.assertAlmostEqual(URDF_TOOL.min_width("flush", 0.01), 0.077, places=9)
+        self.assertAlmostEqual(URDF_TOOL.min_width("straight", 0.0), 0.067, places=9)
+        self.assertEqual(ToolGeometry(body_in=0.0).min_width("straight", 0.01), 0.01)
+
     def test_face_plane_is_half_a_width_from_the_centre(self) -> None:
         tool = parcel_tool(141.5)
         for face in (1.0, -1.0):
@@ -765,6 +778,24 @@ class StickControlTest(unittest.TestCase):
             worker._integrate_sticks(frame, box, now=0.1 * i)
         self.assertAlmostEqual(box.width, 0.1, places=6)
 
+    def test_width_floor_follows_the_grasp(self) -> None:
+        # The operator's floor is 2 cm; with the parcel gripper the straight
+        # grasp stops where the wrists would meet, the flush grasp closes
+        # to the floor.
+        worker = _stick_worker()
+        worker._config.box_width_min = 0.02
+        worker._config.box_tool = "parcel"
+        worker._config.box_tool_open_deg = 141.5
+        frame = _stick_frame(r_stick_x=-1.0)
+        for grasp, floor in (("straight", 0.077), ("flush", 0.02)):
+            worker._config.box_grasp = grasp
+            box = _box_state()
+            worker._integrate_sticks(frame, box, now=0.0)
+            for i in range(1, 100):
+                worker._integrate_sticks(frame, box, now=0.1 * i)
+            self.assertAlmostEqual(box.width, floor, places=6, msg=grasp)
+        self.assertEqual(VRTeleopConfig().box_width_min, 0.02)
+
     def test_tilt_seeds_the_next_engage(self) -> None:
         left, right = _pair(0.3)
         state = snap_box(
@@ -1114,7 +1145,7 @@ class GraspToggleTest(unittest.TestCase):
         )
         q = np.zeros(14, np.float32)
         self.assertEqual(core.config.box_elbow_out, 30.0)  # the default
-        self.assertEqual(core.config.box_elbow_weight, 0.0)  # hint opt-in
+        self.assertEqual(core.config.box_elbow_weight, 10.0)  # hint on by default
         status = {"aligned": False, "width": 0.3, "grasp": "straight", "elbow": 42.5}
         core._unpack_solution((q, status))
         self.assertEqual(core.config.box_elbow_out, 42.5)
