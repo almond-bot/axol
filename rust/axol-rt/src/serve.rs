@@ -61,12 +61,18 @@
 //!                     of the arm), and an optional `gripper <side>
 //!                     <iface> <motor_id>` line
 //! - `P`               prep: MyActuator 0x76 reset + settle, Damiao
-//!                     clear-errors (torque-neutral; run *before* Python
-//!                     resolves joint offsets, so the wrap state it verifies
-//!                     is the post-reset one; the gripper is never touched)
-//! - `A`               arm: bring-up, enable, hold current pose (the
-//!                     gripper must already be enabled + calibrated in
-//!                     POSITION_FORCE mode by the Python side)
+//!                     clear-errors on every *cold* arm joint (torque-neutral
+//!                     on a disabled motor; run *before* Python resolves
+//!                     joint offsets, so the wrap state it verifies is the
+//!                     post-reset one). Joints found already enabled and
+//!                     holding are skipped — the reset would reboot them and
+//!                     drop the arm — and named in an `L` line; the gripper
+//!                     is never touched
+//! - `A`               arm: bring-up, enable the cold joints, hold current
+//!                     pose (holding joints are attached to without a brake
+//!                     release / enable frame; the gripper must already be
+//!                     enabled + calibrated in POSITION_FORCE mode by the
+//!                     Python side)
 //! - `T` + binary      target: side u8, seq u32 LE, 8 x 9 f64 LE — slots
 //!                     0-6 are arm-joint tuples (p_des, mode, kp, kd,
 //!                     t_ff, kd_host, damp_w0, damp_q, j_eff) where mode
@@ -1598,10 +1604,21 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                 let mut ok = true;
                 for (_, iface, specs) in &cfg.buses {
                     let step = CanSock::open(iface).and_then(|sock| bringup::prep(&sock, specs));
-                    if let Err(err) = step {
-                        send_text(&out_tx, b'S', &format!("fault: prep {iface}: {err}"));
-                        ok = false;
-                        break;
+                    match step {
+                        Ok(held) if !held.is_empty() => send_text(
+                            &out_tx,
+                            b'L',
+                            &format!(
+                                "{iface}: already holding, attached without reset: {}",
+                                held.join(", ")
+                            ),
+                        ),
+                        Ok(_) => {}
+                        Err(err) => {
+                            send_text(&out_tx, b'S', &format!("fault: prep {iface}: {err}"));
+                            ok = false;
+                            break;
+                        }
                     }
                 }
                 if ok {

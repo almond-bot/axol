@@ -148,6 +148,17 @@ pub fn ma_decode_status1(data: &[u8; 8]) -> (f64, u16) {
     (volts, errors)
 }
 
+/// "Enabled and holding" from a 0x9A reply — the Python driver's
+/// `is_holding`. Byte 3 is labelled the brake-release state by the protocol,
+/// but fleet firmware reads it 1 only while the motor is actively executing
+/// commands (0 when disabled, freshly enabled but never commanded, or just
+/// reset); combined with a clean error mask it is exactly the signal the
+/// idempotent enable needs to leave a live joint alone.
+pub fn ma_is_holding(data: &[u8; 8]) -> bool {
+    let (_, errors) = ma_decode_status1(data);
+    data[3] == 0x01 && errors == 0
+}
+
 // ------------------------------------------------------------------- Damiao
 
 /// Register-read request (`0x33`) for `motor_id`, sent to 0x7FF.
@@ -185,9 +196,8 @@ pub fn dm_pos_force_encode(position: f64, max_speed: f64, current_limit: f64) ->
 }
 
 /// Damiao feedback status nibbles (frame byte 0, high nibble).
-#[allow(dead_code)] // staged for status verification
+#[allow(dead_code)] // only asserted in tests; serve checks for ENABLED
 pub const DM_STATUS_DISABLED: u8 = 0x0;
-#[allow(dead_code)] // staged for status verification
 pub const DM_STATUS_ENABLED: u8 = 0x1;
 
 /// True when `data` is a register-read reply for (`motor_id`, `rid`).
@@ -306,5 +316,36 @@ mod tests {
         assert_eq!(encoded, 36003);
         let decoded = uint_to_float(encoded, -12.5, 12.5, 16);
         assert!((decoded - 1.2345).abs() < 25.0 / 65535.0);
+    }
+
+    /// Mirrors `MyActuatorDriver.is_holding`: status-1 byte 3 (running) set
+    /// and error bits (bytes 6-7) clear. A held joint must be recognised so
+    /// prep never sends it the 0x76 reset.
+    #[test]
+    fn ma_is_holding_matches_python() {
+        // 0x9A reply: [cmd, temp, brake/running..., volts lo, hi, err lo, hi]
+        let holding = [0x9A, 30, 0, 0x01, 0xF0, 0x00, 0x00, 0x00];
+        assert!(ma_is_holding(&holding));
+        let disabled = [0x9A, 30, 0, 0x00, 0xF0, 0x00, 0x00, 0x00];
+        assert!(!ma_is_holding(&disabled));
+        // Running byte set but a latched fault: not a safe attach.
+        let faulted = [0x9A, 30, 0, 0x01, 0xF0, 0x00, 0x02, 0x00];
+        assert!(!ma_is_holding(&faulted));
+    }
+
+    /// Damiao holding is the ENABLED status nibble of any feedback frame.
+    #[test]
+    fn dm_feedback_status_nibble() {
+        let mut frame = [0u8; 8];
+        frame[0] = 0x16; // id 6, status ENABLED
+        assert_eq!(
+            dm_decode_feedback(&frame, 12.5, 30.0, 10.0).status,
+            DM_STATUS_ENABLED
+        );
+        frame[0] = 0x06; // id 6, status DISABLED
+        assert_eq!(
+            dm_decode_feedback(&frame, 12.5, 30.0, 10.0).status,
+            DM_STATUS_DISABLED
+        );
     }
 }
