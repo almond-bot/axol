@@ -860,10 +860,16 @@ def _relay_main(
     # encode pool is not guaranteed once recording starts, so it gets a
     # real-time class of its own — confined to the camera cores, never the
     # CPU that delivers the CAN adapters' replies (see
-    # prioritize_capture_threads / realtime_camera_cores).
-    from .gst_zed import exposure_critical_thread_comms
+    # prioritize_capture_threads / relay_capture_cores). The dataset encode
+    # chain (NVENC feed, dequeue, drain into shmsink) goes one notch under it:
+    # NVENC frees an input surface only once its AU is dequeued and pushed on,
+    # so a dequeue thread starved behind CFS spill on these cores stalls the
+    # feed queue and costs dataset frames (every DAgger intervention did).
+    from .gst_zed import encode_chain_thread_comms, exposure_critical_thread_comms
 
-    affinity.prioritize_capture_threads(exposure_critical_thread_comms())
+    affinity.prioritize_capture_threads(
+        exposure_critical_thread_comms(), encode_chain_thread_comms()
+    )
 
     try:
         asyncio.run(serve())

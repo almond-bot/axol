@@ -570,7 +570,7 @@ class PrioritizeCaptureDaemonsTest(TestCase):
             patch.object(jetson, "_is_jetson", return_value=True),
             patch.object(jetson, "_SYSTEMD_UNIT_DIR", self.unit_dir),
             patch.object(jetson, "_CAPTURE_DAEMON_UNITS", ("nvargus-daemon.service",)),
-            patch.object(jetson, "realtime_camera_cores", return_value={1, 5}),
+            patch.object(jetson, "capture_daemon_cores", return_value={1, 5}),
         ]
         for p in patches:
             p.start()
@@ -640,7 +640,7 @@ class PrioritizeCaptureDaemonsTest(TestCase):
     def test_dropin_omits_affinity_without_a_partition(self) -> None:
         esc = _Escalator()
         with (
-            patch.object(jetson, "realtime_camera_cores", return_value=None),
+            patch.object(jetson, "capture_daemon_cores", return_value=None),
             patch.object(jetson, "_service_main_pid", return_value=0),
         ):
             self.dropin.parent.mkdir(parents=True)
