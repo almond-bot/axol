@@ -225,6 +225,15 @@ class DaggerConfig:
     # are already enveloped by the teleop smoothing stack.
     policy_max_vel: float = 6.2832
     policy_max_accel: float = 21.9911
+    # Rate of the policy's camera ring (frames/s), independent of --fps: the
+    # relay decimates its control-process ring branch to this ahead of the VIC
+    # convert, and the policy loop (still ticking at --fps) re-serves the
+    # newest frame set between ring frames. Inference reads an observation a
+    # few times a second, so a capture-rate ring only spent a third VIC pass
+    # per camera and a 60 Hz RGB copy per source on frames nobody used — on
+    # the Orin, the throughput the dataset encode branch was short of
+    # (concealed frames with the headset streaming). 0 = capture rate.
+    policy_fps: int = 20
     # Control rate while the operator is engaged (the TELEOP state only). The
     # policy state always ticks at --fps (the policy was trained on fps-spaced
     # actions). Teleop ticks faster for smoother commanded motion (the robot's
@@ -549,14 +558,14 @@ class _DaggerControlLoop(threading.Thread):
         self.intervention_spans: list[tuple[float, float]] = []
         self.open_span_start: float | None = None
 
-    def _policy_tick(self) -> dict[str, float] | None:
+    def _policy_tick(self, t0: float) -> dict[str, float] | None:
         """One policy inference tick; returns the sent action or ``None``.
 
         ``None`` means the tick was skipped (observation/camera hiccup, or
         the backend declined the observation) — skip-and-retry.
         """
         try:
-            obs, observation_ts = self.robot.get_observation_with_capture_timestamp()
+            obs, _observation_ts = self.robot.get_observation_with_capture_timestamp()
         except Exception as exc:  # noqa: BLE001
             _logger.warning("Observation failed (%s); skipping tick.", exc)
             return None
@@ -580,15 +589,17 @@ class _DaggerControlLoop(threading.Thread):
         performed = self.robot.send_action(action_dict)
         if self.shutdown_event.is_set():
             return None
-        # obs carries the historical joints selected at observation_ts (camera
-        # arrays are ignored by the snapshot writer's fixed key list). Date the
-        # inferred action at that same sensor-exposure instant: the outer tick's
-        # t0 may precede the frames by a full camera period, while send time also
-        # includes inference latency.
+        # Snapshot the live joint state at this tick, dated at the tick, like
+        # the teleop and frozen states (and collect-data) do: the recorder
+        # pairs every 60 Hz exposure with the nearest snapshot, and those must
+        # arrive at the tick rate on a monotonic timeline. The policy's
+        # observation is not that snapshot any more — its ring runs below
+        # --fps and the frame set (with the joints selected at its exposure)
+        # is re-served between ring frames, so its timestamp repeats.
         self.recorder.publish(
-            obs,
+            self.robot.get_joint_observation(),
             performed if performed is not None else action_dict,
-            observation_ts,
+            t0,
         )
         return action_dict
 
@@ -691,7 +702,7 @@ class _DaggerControlLoop(threading.Thread):
                 if self.shutdown_event.is_set():
                     return
                 if self.state == _STATE_POLICY:
-                    sent = self._policy_tick()
+                    sent = self._policy_tick(t0)
                     if sent is None:
                         time.sleep(period)
                         continue
@@ -1222,10 +1233,14 @@ def _run(
 
         # The out-of-process video relay owns the cameras and streams the
         # headset view. Its dataset branch stays relay-encoded for the recorder
-        # (mux only) and a second ring branch gives this policy process
-        # readable frames; without gst's shm plugin both fall back to pyshm.
+        # (mux only) and a second ring branch, decimated to --policy_fps,
+        # gives this policy process readable frames; without gst's shm plugin
+        # both fall back to pyshm.
         relay = _start_video_relay(
-            cfg, dataset_resolution, raw_transport="gstshm+pyshm"
+            cfg,
+            dataset_resolution,
+            raw_transport="gstshm+pyshm",
+            policy_fps=cfg.policy_fps,
         )
         expected = set(cfg.robot_config.observation_cameras().keys())
         readable = set(relay.readable_raw_cameras) if relay is not None else set()
@@ -1503,6 +1518,16 @@ def _run(
 
             def _hold_start_pose() -> None:
                 robot.send_action(start_hold_action)
+                # The relay branch opens on an exposure boundary inside
+                # _start_capture, before the control loop's first tick
+                # publishes: bracket the take's first exposures with robot
+                # state from here, or the recorder's history starts after
+                # them and those rows are dropped (5 per take, 2026-09-15).
+                recorder.publish(
+                    robot.get_joint_observation(),
+                    start_hold_action,
+                    time.perf_counter(),
+                )
 
             run_blocking_with_sync_control_ticks(
                 _start_capture,

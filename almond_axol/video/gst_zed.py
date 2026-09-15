@@ -18,7 +18,9 @@ buffer to two consumers:
   For in-process consumers (inference, or the pyshm fallback) it is instead
   ``nvvidconv`` -> RGBA ``appsink`` -> numpy; a camera given both a socket
   and a raw sink builds both, gated together, so a policy reads the very
-  exposures the recorder muxes. Each RGBA frame carries a
+  exposures the recorder muxes — the policy branch decimated to
+  ``policy_fps`` ahead of its VIC convert when the caller asks
+  (``_policy_rate_limit``). Each RGBA frame carries a
   ``capture_perf_ts`` derived from the buffer PTS. We run a
   patched ``zedxonesrc``/``zedsrc`` (``do-timestamp=false``) that stamps the
   PTS at the true sensor-exposure instant (``TIME_REFERENCE::IMAGE``) instead
@@ -659,19 +661,51 @@ def _gpu_clock_summary() -> str:
 
 def _dataset_rate_limit(capture_fps: int, dataset_fps: int) -> str:
     """Decimate the encoded dataset branch without synthesizing frames."""
-    if capture_fps <= 0 or dataset_fps <= 0:
-        raise ValueError("camera and dataset fps must be positive")
-    if dataset_fps > capture_fps:
+    return _decimate(capture_fps, dataset_fps, "dataset")
+
+
+def _policy_rate_limit(capture_fps: int, policy_fps: int) -> str:
+    """Decimate the policy (RGBA appsink) branch ahead of its VIC convert.
+
+    The policy ring exists for inference, which reads an observation a few
+    times a second; the control loop re-serves the newest frame set between
+    ring frames (``AxolRobot._get_synchronized_observation``). Running the
+    ring at capture rate meant a third full-rate VIC branch per camera plus a
+    60 Hz Python RGB copy per source in the relay — on the 8-core Orin, with
+    the capture daemon and the exposure-critical gst threads all real-time on
+    the three throughput cores, that was the core the dataset encode branch
+    was missing (2026-09-15: 21-38 % concealed frames per take with one or
+    two WebRTC viewers). Dropping here, before ``nvvidconv``, releases the
+    camera surface immediately and skips both the VIC pass and the copy.
+    """
+    return _decimate(capture_fps, policy_fps, "policy")
+
+
+def _decimate(capture_fps: int, target_fps: int, what: str) -> str:
+    """``videorate`` prefix that drops a capture-rate NVMM stream to ``target_fps``.
+
+    Drop-only, so no frame is synthesized and every buffer that passes keeps
+    its sensor PTS (checked on the box: the output timestamps are a subset of
+    the input's). With the explicit ``framerate`` cap ``videorate`` picks the
+    input frame nearest each output slot, so 60 → 20 is exactly every third
+    exposure even with sensor-timestamp jitter (a bare ``max-rate`` alone
+    alternates 2- and 3-frame steps). The slot grid is phased on the first
+    buffer the element saw, so it must stay *upstream* of any valve: after a
+    gap it passes a burst at capture rate to catch up on that grid.
+    """
+    if capture_fps <= 0 or target_fps <= 0:
+        raise ValueError(f"camera and {what} fps must be positive")
+    if target_fps > capture_fps:
         raise ValueError(
-            f"dataset fps ({dataset_fps}) cannot exceed camera capture fps "
+            f"{what} fps ({target_fps}) cannot exceed camera capture fps "
             f"({capture_fps})"
         )
-    if dataset_fps == capture_fps:
+    if target_fps == capture_fps:
         return ""
     return (
-        f"videorate drop-only=true max-rate={dataset_fps} ! "
+        f"videorate drop-only=true max-rate={target_fps} ! "
         "video/x-raw(memory:NVMM),format=NV12,"
-        f"framerate={dataset_fps}/1 ! "
+        f"framerate={target_fps}/1 ! "
     )
 
 
@@ -1519,6 +1553,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         raw_socket_path: str | None = None,
         raw_dims: tuple[int, int] | None = None,
         dataset_fps: int | None = None,
+        policy_fps: int | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _RESOLUTION_ENUM:
@@ -1546,6 +1581,13 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         if self.dataset_fps <= 0 or self.dataset_fps > self.fps:
             raise ValueError(
                 f"dataset fps must be in [1, {self.fps}], got {self.dataset_fps}"
+            )
+        # Rate of the RGBA appsink (policy ring) branch; capture rate unless the
+        # caller decimates it (see _policy_rate_limit).
+        self.policy_fps = fps if policy_fps is None else int(policy_fps)
+        if self.policy_fps <= 0 or self.policy_fps > self.fps:
+            raise ValueError(
+                f"policy fps must be in [1, {self.fps}], got {self.policy_fps}"
             )
         self.width, self.height = _RESOLUTION_DIMS[resolution]
         # The raw (dataset) branch can be downscaled on the VIC to cut the bytes
@@ -1613,8 +1655,10 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
             )
         if self._raw_appsink_wanted():
             valve = "polvalve" if self._raw_socket_path else "rawvalve"
+            policy_rate = _policy_rate_limit(self.fps, self.policy_fps)
             branches.append(
-                f"{_policy_source_queue('pol')} ! valve name={valve} drop=false "
+                f"{_policy_source_queue('pol')} ! {policy_rate}"
+                f"valve name={valve} drop=false "
                 f"! nvvidconv ! video/x-raw,format=RGBA,"
                 f"width={self.raw_width},height={self.raw_height} ! {_raw_appsink('raw')}"
             )
@@ -1808,6 +1852,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         right_raw_socket_path: str | None = None,
         raw_dims: tuple[int, int] | None = None,
         dataset_fps: int | None = None,
+        policy_fps: int | None = None,
         eyes: str = "both",
         encoded_eyes: "list[str] | tuple[str, ...] | None" = None,
         raw_eyes: "list[str] | tuple[str, ...] | None" = None,
@@ -1881,6 +1926,11 @@ class ZedGstStereoCamera(_GstPipelineBase):
         if self.dataset_fps <= 0 or self.dataset_fps > self.fps:
             raise ValueError(
                 f"dataset fps must be in [1, {self.fps}], got {self.dataset_fps}"
+            )
+        self.policy_fps = fps if policy_fps is None else int(policy_fps)
+        if self.policy_fps <= 0 or self.policy_fps > self.fps:
+            raise ValueError(
+                f"policy fps must be in [1, {self.fps}], got {self.policy_fps}"
             )
         self.width, self.height = _RESOLUTION_DIMS[resolution]
         # Per-eye downscale target for the raw (dataset) branch; encoded eyes keep
@@ -1986,8 +2036,9 @@ class ZedGstStereoCamera(_GstPipelineBase):
             )
         if want_raw and self._eye_appsink_wanted(side):
             valve = f"polvalve_{sink_suffix}" if sock else f"rawvalve_{sink_suffix}"
+            policy_rate = _policy_rate_limit(self.fps, self.policy_fps)
             branches.append(
-                f"{_policy_source_queue('pol_' + sink_suffix)} ! "
+                f"{_policy_source_queue('pol_' + sink_suffix)} ! {policy_rate}"
                 f"valve name={valve} drop=false "
                 f"! nvvidconv ! video/x-raw,format=RGBA,"
                 f"width={self.raw_width},height={self.raw_height} ! "

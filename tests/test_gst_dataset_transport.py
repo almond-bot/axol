@@ -295,6 +295,84 @@ class GstDatasetTransportTest(unittest.TestCase):
         self.assertFalse(camera._raw_appsink_wanted())
         self.assertNotIn("appsink name=raw", camera._pipeline_str())
 
+    def test_policy_fps_decimates_the_ring_branch_ahead_of_the_vic(self) -> None:
+        """policy_fps drops ring frames before nvvidconv, upstream of the valve.
+
+        Drop-only ``videorate`` keeps the sensor PTS of every frame it passes
+        and, with the explicit framerate cap, selects exactly every third
+        exposure at 60 → 20. It must sit upstream of the valve: downstream of
+        a closed valve it passes a capture-rate burst on reopen. The dataset
+        branch stays at the dataset rate — only the policy ring is thinned.
+        """
+        camera = ZedGstCamera(
+            serial=1,
+            resolution="SVGA",
+            fps=60,
+            raw_socket_path="/tmp/mono-dataset.sock",
+            raw_sink=lambda *a: None,
+            policy_fps=20,
+        )
+
+        pipeline = camera._pipeline_str()
+
+        self.assertIn(
+            "queue name=pol_srcq leaky=downstream max-size-buffers=2 "
+            "max-size-bytes=0 max-size-time=0 ! "
+            "videorate drop-only=true max-rate=20 ! "
+            "video/x-raw(memory:NVMM),format=NV12,framerate=20/1 ! "
+            "valve name=polvalve drop=false ! nvvidconv ! video/x-raw,format=RGBA,"
+            "width=960,height=600 ! appsink name=raw",
+            pipeline,
+        )
+        # The dataset encode branch is untouched (capture rate = dataset rate).
+        self.assertIn(
+            "queue name=dsenc_srcq leaky=downstream max-size-buffers=2 "
+            "max-size-bytes=0 max-size-time=0 ! valve name=rawvalve",
+            pipeline,
+        )
+        self.assertEqual(pipeline.count("videorate"), 2)  # headset 30 + ring 20
+
+        stereo = ZedGstStereoCamera(
+            serial=2,
+            resolution="SVGA",
+            fps=60,
+            left_raw_socket_path="/tmp/left-dataset.sock",
+            right_raw_socket_path="/tmp/right-dataset.sock",
+            left_raw_sink=lambda *a: None,
+            right_raw_sink=lambda *a: None,
+            policy_fps=20,
+        )
+        stereo_pipeline = stereo._pipeline_str()
+        for suffix in ("l", "r"):
+            self.assertIn(
+                f"queue name=pol_{suffix}_srcq leaky=downstream max-size-buffers=2 "
+                "max-size-bytes=0 max-size-time=0 ! "
+                "videorate drop-only=true max-rate=20 ! "
+                "video/x-raw(memory:NVMM),format=NV12,framerate=20/1 ! "
+                f"valve name=polvalve_{suffix} drop=false ! nvvidconv",
+                stereo_pipeline,
+            )
+
+    def test_policy_fps_defaults_to_capture_rate_and_is_bounded(self) -> None:
+        camera = ZedGstCamera(
+            serial=1,
+            resolution="SVGA",
+            fps=60,
+            raw_socket_path="/tmp/mono-dataset.sock",
+            raw_sink=lambda *a: None,
+        )
+        self.assertEqual(camera.policy_fps, 60)
+        self.assertNotIn("max-rate=60", camera._pipeline_str())
+        for bad in (0, 61):
+            with self.subTest(policy_fps=bad), self.assertRaises(ValueError):
+                ZedGstCamera(
+                    serial=1,
+                    resolution="SVGA",
+                    fps=60,
+                    raw_sink=lambda *a: None,
+                    policy_fps=bad,
+                )
+
     def test_stereo_socket_plus_sink_gates_each_eye_twice(self) -> None:
         camera = ZedGstStereoCamera(
             serial=2,

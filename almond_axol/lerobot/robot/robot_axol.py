@@ -32,6 +32,7 @@ import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -118,6 +119,25 @@ _POLICY_CAMERA_SKEW_PERIODS = 1.5
 _POLICY_SKEW_REPORT_INTERVAL_S = 5.0
 
 
+@dataclass(frozen=True)
+class _PolicyObservation:
+    """One built policy observation, re-served until the cameras move on.
+
+    ``anchor_ts`` is the exposure the frame set was anchored on (the slowest
+    pipeline's newest at build time); ``capture_ts`` the set's median exposure
+    and ``state_ts`` the telemetry sample paired with it. The relay's policy
+    ring runs below the control rate (``policy_fps``), so most control ticks
+    find no newer exposure and get this same set back — the frames and the
+    joints selected at their exposure stay one consistent pair for the policy,
+    while the recorder's per-tick snapshot is the loop's business.
+    """
+
+    anchor_ts: float
+    observation: RobotObservation
+    capture_ts: float
+    state_ts: float
+
+
 class _PolicySkewMonitor:
     """Counts policy observations whose camera frames were not exposure-aligned.
 
@@ -201,7 +221,7 @@ class AxolRobot(Robot):
 
     # Class-level defaults so a robot built without ``__init__`` (test doubles
     # over ``object.__new__``) still has the policy-observation bookkeeping.
-    _last_policy_exposure_ts: float | None = None
+    _last_policy_observation: _PolicyObservation | None = None
     _policy_exposure_lock = threading.Lock()
 
     def __init__(
@@ -231,9 +251,10 @@ class AxolRobot(Robot):
         # not stop its coroutine, so a retry must wait for this exact attempt
         # rather than submit a second, overlapping motor/bus teardown.
         self._disconnect_future: Future[None] | None = None
-        # Median exposure of the last policy observation served; the next one
-        # must be newer (see ``_get_synchronized_observation``).
-        self._last_policy_exposure_ts: float | None = None
+        # The last policy observation built, keyed on its anchor exposure; it
+        # is served again until the cameras deliver a newer exposure (see
+        # ``_get_synchronized_observation``).
+        self._last_policy_observation: _PolicyObservation | None = None
         self._policy_exposure_lock = threading.Lock()
         self._policy_skew: _PolicySkewMonitor | None = None
         self.cameras, self._stereo_cameras = self._build_cameras()
@@ -767,7 +788,8 @@ class AxolRobot(Robot):
         """Return camera frames paired to nearest timestamped robot state.
 
         Cameras are sampled at the newest exposure every camera has already
-        delivered (see :meth:`_get_synchronized_observation`). Their median
+        delivered, and the same set is returned until a newer exposure
+        arrives (see :meth:`_get_synchronized_observation`). Their median
         sensor-exposure time selects the nearest entry from the Rust core's
         240 Hz feedback history, matching collection's exposure-driven
         association. A missing/stale camera or unbracketed state aborts the
@@ -829,11 +851,18 @@ class AxolRobot(Robot):
         pipeline's newest exposure. Every other camera has that exposure (or
         its neighbour) in its shared-memory history already
         (:meth:`RawFrameReader.read_nearest`), so the set is built without
-        waiting and its spread is the cameras' real exposure offset. The one
-        wait left is for freshness: an observation is never served twice, so a
-        loop faster than the cameras blocks for at most one frame period on
-        the lagging camera's next frame. A camera whose newest frame is older
-        than a couple of periods is silent and fails the observation, as a
+        waiting and its spread is the cameras' real exposure offset. Nothing
+        waits for freshness either: while the anchor has not moved on from
+        the last set built, that set is served again (:class:`_PolicyObservation`
+        — frames plus the joints selected at their exposure, one consistent
+        pair). The relay's policy ring runs below the control rate by design
+        (``policy_fps``: inference reads an observation a few times a second,
+        and a capture-rate ring cost a third VIC pass per camera plus a 60 Hz
+        RGB copy per source in the relay), so at 60 Hz most ticks are
+        re-serves and cost two header reads per camera. The recorder's
+        per-tick snapshot is published by the loop from the live joint state,
+        not from this observation. A camera whose newest frame is older than
+        a couple of ring periods is silent and fails the observation, as a
         timed-out ``read_at_or_after`` did before. Cameras without a history
         (an in-process ZED reader) contribute their newest frame.
 
@@ -865,30 +894,10 @@ class AxolRobot(Robot):
         for cam_key, cam in cameras.items():
             newest[cam_key] = self._newest_policy_exposure(cam_key, cam)
 
-        # 2. Freshness: never hand out the exposure set already served. A
-        #    camera still at (or before) the last served exposure has not
-        #    produced the next frame yet — wait for it, bounded like a
-        #    camera-loss timeout, instead of duplicating the observation.
-        with self._policy_exposure_lock:
-            last_served = self._last_policy_exposure_ts
-        if last_served is not None:
-            newer_than = last_served + 0.5 * period_s
-            timeout_ms = int(max_age_s * 1e3)
-            for cam_key, cam in cameras.items():
-                if newest[cam_key][0] > newer_than:
-                    continue
-                try:
-                    _frame, cap_ts, recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
-                        newer_than, timeout_ms=timeout_ms
-                    )
-                except (TimeoutError, RuntimeError) as exc:
-                    raise RuntimeError(
-                        f"policy camera {cam_key!r} produced no fresh frame: {exc}"
-                    ) from exc
-                newest[cam_key] = (float(cap_ts), float(recv_ts))
-
-        # 3. Silence: a camera whose newest frame is a couple of periods old
-        #    would pair a live robot state with an old image.
+        # 2. Silence: a camera whose newest frame is a couple of periods old
+        #    would pair a live robot state with an old image. Checked before
+        #    a re-serve too — a set built from a camera that has since died
+        #    is not evidence the camera is alive.
         now = time.perf_counter()
         for cam_key, (cap_ts, recv_ts) in newest.items():
             if not np.isfinite(cap_ts):
@@ -902,12 +911,20 @@ class AxolRobot(Robot):
                     f"frame is {age_s * 1e3:.0f}ms old (limit {max_age_s * 1e3:.0f}ms)"
                 )
 
-        # 4. Anchor on the exposure the slowest pipeline has reached and take
-        #    every camera's retained frame nearest it. The lookup tolerance is
-        #    the silence limit, not the alignment limit: a camera that dropped
-        #    the anchor exposure contributes its neighbour, and one whose
-        #    history no longer reaches the anchor contributes its newest frame.
+        # 3. Anchor on the exposure the slowest pipeline has reached. If that
+        #    is still the exposure the last set was built on, serve that set
+        #    again rather than copy the same frames out of the rings.
         anchor_ts = min(cap_ts for cap_ts, _recv_ts in newest.values())
+        with self._policy_exposure_lock:
+            last = self._last_policy_observation
+        if last is not None and anchor_ts <= last.anchor_ts + 0.5 * period_s:
+            return dict(last.observation), last.capture_ts, last.state_ts
+
+        # 4. Take every camera's retained frame nearest the anchor. The lookup
+        #    tolerance is the silence limit, not the alignment limit: a camera
+        #    that dropped the anchor exposure contributes its neighbour, and
+        #    one whose history no longer reaches the anchor contributes its
+        #    newest frame.
         frames: dict[str, np.ndarray] = {}
         capture_ts: dict[str, float] = {}
         for cam_key, cam in cameras.items():
@@ -956,14 +973,13 @@ class AxolRobot(Robot):
         )
         obs.update(frames)
 
+        built = _PolicyObservation(anchor_ts, obs, row_capture_ts, float(state_ts))
         with self._policy_exposure_lock:
-            if (
-                self._last_policy_exposure_ts is None
-                or row_capture_ts > self._last_policy_exposure_ts
-            ):
-                self._last_policy_exposure_ts = row_capture_ts
+            last = self._last_policy_observation
+            if last is None or anchor_ts > last.anchor_ts:
+                self._last_policy_observation = built
 
-        return obs, row_capture_ts, float(state_ts)
+        return dict(obs), row_capture_ts, float(state_ts)
 
     @staticmethod
     def _newest_policy_exposure(cam_key: str, cam: object) -> tuple[float, float]:

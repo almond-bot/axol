@@ -326,7 +326,10 @@ def _open_gst_camera_raw(
     own valves. The recorder's per-source meta is the gsth264 one; the ring's
     pyshm meta comes back separately (``policy_meta``) for the parent to hand
     to its :class:`RawFrameReader`\\ s. Without gst's shm plugin it degrades
-    to plain pyshm.
+    to plain pyshm. ``policy_fps`` in the spec decimates that ring ahead of
+    its VIC convert (the policy reads an observation a few times a second;
+    see ``gst_zed._policy_rate_limit``) — the reader's ``fps`` is the ring's
+    rate, so the control process paces its freshness rules on it.
 
     Returns ``(owned_camera, {track: source}, [writers], {source: meta},
     {source: policy_meta})`` — where ``meta`` is the per-source dict from
@@ -372,6 +375,11 @@ def _open_gst_camera_raw(
     # dataset branch; the pyshm meta for that ring is returned as policy_meta.
     policy_ring = use_shm and transport == "gstshm+pyshm"
     dataset_fps = int(spec.get("dataset_fps", spec.get("fps", 60)))
+    # The control-process ring's rate (``policy_fps``; 0/absent = capture rate).
+    # Only the combined transport has a ring that is the policy's alone; on the
+    # plain pyshm fallback the ring is also the recorder's input and stays at
+    # the dataset rate.
+    policy_fps_wanted = int(spec.get("policy_fps") or 0)
     # A camera can opt out of either branch: stream-only (no raw / dataset) or
     # record-only (no encoded / headset). This path is only entered when the
     # camera records (see _relay_main), so the raw branch is always built; the
@@ -380,6 +388,9 @@ def _open_gst_camera_raw(
 
     for fps in (int(spec.get("fps", 60)), 30):
         writers: list = []
+        policy_fps = (
+            min(policy_fps_wanted, fps) if policy_ring and policy_fps_wanted else fps
+        )
         try:
             if stereo and use_shm:
                 # Encoded eyes feed the headset; raw eyes feed the dataset — they
@@ -416,6 +427,7 @@ def _open_gst_camera_raw(
                     fps,
                     raw_dims=raw_dims,
                     dataset_fps=dataset_fps,
+                    policy_fps=policy_fps,
                     encoded_eyes=enc_sides,
                     raw_eyes=raw_sides,
                     encoded_sbs=sbs,
@@ -441,7 +453,7 @@ def _open_gst_camera_raw(
                     for side, src in raw_plan
                 }
                 policy_meta = {
-                    src: _pyshm_meta(ring_writers[side].name, raw_w, raw_h, fps)
+                    src: _pyshm_meta(ring_writers[side].name, raw_w, raw_h, policy_fps)
                     for side, src in raw_plan
                     if side in ring_writers
                 }
@@ -502,6 +514,7 @@ def _open_gst_camera_raw(
                     raw_socket_path=sock,
                     raw_dims=raw_dims,
                     dataset_fps=dataset_fps,
+                    policy_fps=policy_fps,
                 )
                 cam.connect()
                 meta = {
@@ -515,7 +528,7 @@ def _open_gst_camera_raw(
                     )
                 }
                 policy_meta = (
-                    {name: _pyshm_meta(ring.name, raw_w, raw_h, fps)}
+                    {name: _pyshm_meta(ring.name, raw_w, raw_h, policy_fps)}
                     if ring is not None
                     else {}
                 )
@@ -930,7 +943,10 @@ class VideoRelayProcess:
             cameras: Per-source spec: ``{name: {"serial": int,
                 "resolution": str, "fps": int, "stereo": bool}}``. ``fps``
                 is the physical capture/data rate; headset encoding is fixed
-                independently at 30 fps.
+                independently at 30 fps. Optional ``dataset_fps`` decimates
+                the recorder branch and ``policy_fps`` the control-process
+                ring of the ``gstshm+pyshm`` transport (see
+                :func:`_open_gst_camera_raw`).
             want_raw: Also publish each camera's dataset feed to shared memory
                 (encoded GDP/H.264 when available, raw RGB as fallback).
                 Successfully exported sources appear in :attr:`raw_cameras` as
