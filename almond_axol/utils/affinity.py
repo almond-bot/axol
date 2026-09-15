@@ -269,6 +269,54 @@ def pin_background() -> bool:
     return _pin("background")
 
 
+def pin_background_and_ik() -> bool:
+    """Pin the recorder subprocess across ``background`` ∪ ``ik``.
+
+    Two uses, both about the recorder being the only *CFS* work left on the
+    background cores. Everything else there is real-time: the capture daemon
+    (``nvargus-daemon``, SCHED_FIFO 6, pinned to the camera cores by
+    ``jetson.setup``; ~75 % of a core for four 60 fps GMSL sources) and the
+    relay's exposure-critical GStreamer threads (:func:`prioritize_capture_threads`)
+    — so the recorder gets exactly what they leave, which on the policy ops
+    (three VIC branches per camera: dataset encode, policy ring, headset
+    stream) is ~5 % of each of cores 0/1/5 (measured 2026-09-14 with
+    ``run-policy``'s panel configuration, no headset). Two consequences:
+
+    * **Startup.** The recorder's first act is a one-shot ~25 s of CPU:
+      importing torch and lerobot. On the 2026-09-14 DAgger session that
+      stretched to 56 s and the ``ready`` handshake timed out (the session
+      ended before the operator could start an episode); the ZED SDK's own CFS
+      grab threads shared the same leftovers and dropped ~10 % of exposures for
+      as long as the import ran, which the headset saw as a stuttering feed.
+      Every recorder runs its imports widened: the IK core is idle then (the IK
+      worker's own compile — :func:`pin_ik_startup` — is over, and the solves
+      only run while an operator drives).
+    * **Steady state, policy ops only.** The mux-only recorder needs ~40 % of a
+      core for four 60 fps H.264 streams (`shmsrc` → Python pull → lerobot row
+      → mp4 mux). Narrowed back to the background cores it sustained 55-60
+      rows/s with dips to 35, so its per-source AU queue (120 frames = 2 s)
+      grew from the first second and tripped ``encoded-AU backlog exceeded``
+      25-30 s into every take — the take is discarded and the arms return
+      home: the "reset in the middle of the episode" the 2026-09-14 sessions
+      showed. Kept on the IK core as well (``share_ik_core`` in the recorder
+      config, set by the ops that run the policy ring), CFS wake placement
+      puts its threads on the idle core: 3605/3611 rows in two 60 s takes,
+      backlog 1-2, cores 0/1 down from 95 % to 83 %. ``collect-data`` keeps
+      the narrow steady state (:func:`pin_background`): its relay runs two
+      branches per camera, its recorder was never short, and the IK worker on
+      that core drives the arms at 100 Hz for the whole session.
+
+    Only a dedicated IK core is borrowed: on hosts where ``ik`` collapses onto
+    the control core (<8 cores) the recorder stays on ``background`` — control
+    never shares a CPU with throughput work.
+    """
+    groups = core_groups()
+    if groups is None:
+        return False
+    spare_ik = groups["ik"] - groups["realtime"]
+    return _apply(groups["background"] | spare_ik, "background+ik")
+
+
 def isolate_relay_cpu() -> bool:
     """Separate relay Python from GStreamer and give gst throughput headroom.
 

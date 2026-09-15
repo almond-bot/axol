@@ -63,7 +63,11 @@ def _config() -> dict:
 
 class RecorderGcHoldTest(unittest.TestCase):
     def _run(
-        self, commands: list, *, repairs: list[dict] | None = None
+        self,
+        commands: list,
+        *,
+        repairs: list[dict] | None = None,
+        config_extra: dict | None = None,
     ) -> tuple[_Events, mock.Mock]:
         events = _Events()
         dataset = mock.Mock()
@@ -104,7 +108,14 @@ class RecorderGcHoldTest(unittest.TestCase):
                 "almond_axol.video.shm_frames.SnapshotReader",
                 return_value=mock.Mock(),
             ),
-            mock.patch("almond_axol.utils.affinity.pin_background", return_value=True),
+            mock.patch(
+                "almond_axol.utils.affinity.pin_background_and_ik",
+                side_effect=lambda: events.log.append(("pin", "background+ik")) or True,
+            ),
+            mock.patch(
+                "almond_axol.utils.affinity.pin_background",
+                side_effect=lambda: events.log.append(("pin", "background")) or True,
+            ),
             mock.patch(
                 "almond_axol.utils.stall_diag.GcHold",
                 side_effect=lambda *a, **k: _FakeGcHold(events),
@@ -134,7 +145,9 @@ class RecorderGcHoldTest(unittest.TestCase):
                 "almond_axol.lerobot.nvenc_encoder.dropped_frames", return_value=0
             ),
         ):
-            record_proc._recorder_main(conn, mock.Mock(), object(), _config())
+            record_proc._recorder_main(
+                conn, mock.Mock(), object(), {**_config(), **(config_extra or {})}
+            )
         return events, dataset
 
     def test_repair_audit_line_numbers_the_episode_like_the_operator_sees_it(
@@ -167,7 +180,31 @@ class RecorderGcHoldTest(unittest.TestCase):
 
     def test_startup_heap_is_frozen_once_after_ready(self) -> None:
         events, _ = self._run([None])
-        self.assertEqual(events.log, [("send", "ready"), ("freeze",)])
+        self.assertEqual(
+            [e for e in events.log if e[0] != "pin"],
+            [("send", "ready"), ("freeze",)],
+        )
+
+    def test_imports_run_widened_then_narrow_to_background_by_default(self) -> None:
+        # collect-data's recorder: the IK core only for the torch/lerobot
+        # import, narrowed back before any reader thread exists (they inherit
+        # the affinity) — the IK worker drives the arms from that core.
+        events, _ = self._run([None])
+        pins = [e[1] for e in events.log if e[0] == "pin"]
+        self.assertEqual(pins, ["background+ik", "background"])
+        self.assertLess(
+            events.log.index(("pin", "background")),
+            events.log.index(("send", "ready")),
+        )
+
+    def test_share_ik_core_keeps_the_steady_state_widened(self) -> None:
+        # The policy ops (2026-09-14): narrowed to the background cores the
+        # mux-only recorder sustained <60 rows/s beside the relay's third VIC
+        # branch and the FIFO capture daemon, and every take ended on
+        # "encoded-AU backlog exceeded" 25-30 s in.
+        events, _ = self._run([None], config_extra={"share_ik_core": True})
+        pins = [e[1] for e in events.log if e[0] == "pin"]
+        self.assertEqual(pins, ["background+ik"])
 
     def test_take_holds_without_a_pre_sweep_and_sweeps_after_the_reply(self) -> None:
         events, _ = self._run(
@@ -178,7 +215,7 @@ class RecorderGcHoldTest(unittest.TestCase):
             ]
         )
         self.assertEqual(
-            events.log,
+            [e for e in events.log if e[0] != "pin"],
             [
                 ("send", "ready"),
                 ("freeze",),

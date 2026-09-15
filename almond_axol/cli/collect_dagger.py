@@ -1431,6 +1431,10 @@ def _run(
                 "rerun_port": rerun_port,
                 "push_to_hub": cfg.push_to_hub,
                 "log_level": cfg.log_level,
+                # The relay runs the policy ring beside the dataset branch, so
+                # the mux-only recorder needs the IK core to keep 60 rows/s
+                # (affinity.pin_background_and_ik).
+                "share_ik_core": True,
             },
         )
         episode_idx = recorder.episode_count()
