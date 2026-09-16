@@ -247,8 +247,10 @@ class DaggerTeleopCore(VRTeleopCore):
             # compute_output softens the transition over a few ticks). The
             # operator pre-sets the triggers before engaging — hold the
             # trigger down before a takeover so a held part stays gripped.
-            self.l_grip = frame.l_grip
-            self.r_grip = frame.r_grip
+            # Scaled to the fitted gripper's opening (grip_command), like
+            # the base core's.
+            self.l_grip = self.grip_command(frame.l_grip)
+            self.r_grip = self.grip_command(frame.r_grip)
 
     def _sync_to_robot(self) -> None:
         """Seat the worker's q and this core's state at the robot's pose.

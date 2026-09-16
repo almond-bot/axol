@@ -520,6 +520,7 @@ class VRTeleopCore:
             "box_width_speed",
             "box_align_duration",
             "box_tool",
+            "gripper_stroke_deg",
             "box_tool_open_deg",
             "box_grasp",
             "box_face_left",
@@ -858,9 +859,39 @@ class VRTeleopCore:
         # Only track a gripper while its arm is engaged, so a frozen arm's
         # grasp (and a disengaged session) can't be actuated by the trigger.
         if self.left_enabled:
-            self.l_grip = frame.l_grip
+            self.l_grip = self.grip_command(frame.l_grip)
         if self.right_enabled:
-            self.r_grip = frame.r_grip
+            self.r_grip = self.grip_command(frame.r_grip)
+
+    def grip_command(self, trigger: float) -> float:
+        """The gripper opening to command for a trigger's grip value.
+
+        ``trigger`` is the frame's grip, ``0`` squeezed (closed) to ``1``
+        released; the result is the normalised opening the robot takes,
+        ``1.0`` being the calibrated open stop. The parcel gripper's hinged
+        blade folds ``config.gripper_stroke_deg`` (180°) back at that stop,
+        flat against the fixed blade — the face box mode's parallel
+        (``"straight"``) grasp clamps with, and the one place the gripper
+        is opened that far. Everywhere else — plain teleop and the flush
+        grasp — it opens only to ``config.box_tool_open_deg`` (140°), so a
+        released trigger commands that fold and the trigger's travel is
+        spread over it: the value is scaled by ``open / stroke``. Nothing
+        is scaled for the stock gripper (``box_tool`` ``"urdf"``), or with
+        the open angle at or past the stroke.
+        """
+        grip = float(trigger)
+        cfg = self.config
+        if str(getattr(cfg, "box_tool", "urdf")).strip().lower() != "parcel":
+            return grip
+        stroke = float(getattr(cfg, "gripper_stroke_deg", 180.0))
+        open_deg = float(getattr(cfg, "box_tool_open_deg", stroke))
+        if stroke <= 0.0 or open_deg >= stroke:
+            return grip
+        parallel = (
+            bool(cfg.box_mode)
+            and str(getattr(cfg, "box_grasp", "straight")).strip().lower() != "flush"
+        )
+        return grip if parallel else grip * max(open_deg, 0.0) / stroke
 
     def _update_engage_box(self, frame: object) -> None:
         """Box-mode engage: one grip drives both arms as a level pair.
@@ -872,7 +903,8 @@ class VRTeleopCore:
         (``config.hold_to_engage``): the pair tracks while any grip is held,
         led by the held hand (a hand-over happens when the leader lets go
         while the other still holds). Both grippers follow the leader's
-        trigger.
+        trigger, opened to the grasp's fold (:meth:`grip_command`: the full
+        stroke in the parallel grasp, ``box_tool_open_deg`` in the flush).
 
         The thumbsticks set the grip width while someone leads and
         drive Jelly while nobody does (:attr:`pair_owns_sticks`); the switch
@@ -942,7 +974,9 @@ class VRTeleopCore:
         self._prev_r_lock = r_lock
 
         if enabled:
-            grip = float(frame.r_grip if leader == "right" else frame.l_grip)
+            grip = self.grip_command(
+                frame.r_grip if leader == "right" else frame.l_grip
+            )
             self.l_grip = grip
             self.r_grip = grip
 

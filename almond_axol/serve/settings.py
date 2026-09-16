@@ -722,10 +722,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 help=(
                     "Which grasp a box-mode session starts in. straight (the "
                     "default): fingers straight forward (0°), width between "
-                    "the mounts. flush: the fitted gripper's contact face "
-                    "along the box side (parcel gripper: the folded blade's "
-                    "face, grippers yawed 38.5° inward, width between the "
-                    "faces). In the headset a click of either thumbstick "
+                    "the mounts — the parallel grasp, the one place the "
+                    "parcel gripper's blade opens to its full 180° stroke. "
+                    "flush: the fitted gripper's contact face along the box "
+                    "side (parcel gripper: the blade opened 140°, grippers "
+                    "yawed 40° inward, width between the faces). In the "
+                    "headset a click of either thumbstick "
                     "while leading toggles between the two; the arms blend "
                     "over."
                 ),

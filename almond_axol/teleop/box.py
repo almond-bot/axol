@@ -191,22 +191,24 @@ def parcel_tool(
     The parcel gripper is two flat blades side by side along the fingers
     direction: a fixed one on the mount axis and a hinged one that swings
     toward the box side, about a vertical hinge ``pivot_fwd`` ahead of the
-    flange, until it meets its mechanical stop ``open_deg`` from closed.
-    Folded that far back it lies alongside the wrist, and the box side is
-    clamped by that blade's flat face — a large patch *behind* the hinge,
-    roughly centred on the wrist, so a straight lateral squeeze needs
-    almost no wrist moment to keep it flat. For the face to lie on the box
-    side the fixed blade must point ``180° - open_deg`` inward: that is the
-    flush tilt (38.5° at the CAD's 141.5° stop). The foot is the point of
-    the folded face nearest the mount origin: the face plane is ``face_r``
-    from the hinge, so its distance from the mount origin along its normal
-    is ``pivot_fwd * sin(open) + face_r``.
+    flange, opened ``open_deg`` from closed (its stroke runs to 180°, flat
+    back against the fixed blade — box mode's parallel grasp, where the
+    face is parallel to the box at yaw 0; everywhere else it is opened to
+    ``VRTeleopConfig.box_tool_open_deg``, 140°). Folded that far back it
+    lies alongside the wrist, and the box side is clamped by that blade's
+    flat face — a large patch *behind* the hinge, roughly centred on the
+    wrist, so a straight lateral squeeze needs almost no wrist moment to
+    keep it flat. For the face to lie on the box side the fixed blade must
+    point ``180° - open_deg`` inward: that is the flush tilt (40° at 140°).
+    The foot is the point of the folded face nearest the mount origin: the
+    face plane is ``face_r`` from the hinge, so its distance from the mount
+    origin along its normal is ``pivot_fwd * sin(open) + face_r``.
 
-    The fixed blade's tip is ahead of the hinge and, at the CAD stop, ~9 mm
-    *past* the face plane (it would sit exactly on it at ~146°), so with the
-    face flush it hooks the box's front corner or digs in; the tilt trim
-    backs the face off to touch tip-and-heel instead. Both flush at once
-    needs the stop at ~146° (see the config docs).
+    The fixed blade's tip is ahead of the hinge and, at 140°, ~11 mm *past*
+    the face plane (it would sit exactly on it at ~146°), so with the face
+    flush it hooks the box's front corner or digs in; the tilt trim backs
+    the face off to touch tip-and-heel instead. Both flush at once needs the
+    opening at ~146° (see the config docs).
     """
     phi = math.radians(open_deg)
     # Face normal toward the box, in (forward, inboard) mount coordinates:

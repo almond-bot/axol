@@ -1190,7 +1190,7 @@ class IKWorker:
         cfg = self._config
         kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
         if kind == "parcel":
-            return parcel_tool(float(getattr(cfg, "box_tool_open_deg", 141.5)))
+            return parcel_tool(float(getattr(cfg, "box_tool_open_deg", 140.0)))
         return URDF_TOOL
 
     def note_measured(
