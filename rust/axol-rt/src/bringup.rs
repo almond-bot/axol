@@ -40,7 +40,18 @@ pub struct MotorSpec {
     pub k: f64,
     pub fv: f64,
     pub fo: f64,
+    /// MyActuator MIT `(p_max, t_max)` the client detected for this motor
+    /// (its own 0xB2/0xB5 reads, with retries, before arming). When present
+    /// it is authoritative: the wire is encoded against it whatever this
+    /// side's reads say, so one dropped capability reply here can never
+    /// silently scale every `t_ff` by the legacy/V4.4 ratio (2.5-5.4x on an
+    /// X6/X8). `None` for Damiao motors and the gripper.
+    pub mit_ranges: Option<(f64, f64)>,
 }
+
+/// Attempts at the MyActuator capability reads (0xB2 version, 0xB5 model)
+/// before the bring-up gives up on them.
+const CAPABILITY_READ_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Vendor {
@@ -156,16 +167,22 @@ pub fn prep(sock: &CanSock, specs: &[MotorSpec]) -> io::Result<Vec<String>> {
 
 /// Phase 2: capability detection, fault checks, range reads, and position
 /// reads. Read-only — the motors stay torque-off until [`enable`].
-pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<Vec<ReadyMotor>> {
+///
+/// `notes` collects non-fatal observations for the caller's log (a
+/// capability read that disagreed with the client's, a read that only
+/// succeeded on retry).
+pub fn prepare(
+    sock: &CanSock,
+    iface: &str,
+    specs: &[MotorSpec],
+    notes: &mut Vec<String>,
+) -> io::Result<Vec<ReadyMotor>> {
     let err = |msg: String| io::Error::other(format!("{iface}: {msg}"));
     let mut motors = Vec::new();
 
     for spec in specs.iter().filter(|s| s.motor_id <= 5) {
         let id = spec.motor_id;
-        let version = txn::ma_request(sock, id, proto::ma_cmd(proto::MA_READ_VERSION), TIMEOUT)?
-            .map(|(d, _)| proto::ma_decode_version(&d));
-        let model = read_ma_model(sock, id)?;
-        let (p_max, t_max) = proto::ma_mit_ranges(version, model.as_deref());
+        let (p_max, t_max) = ma_ranges_for(sock, spec, notes).map_err(err)?;
 
         let Some((s1, _)) =
             txn::ma_request(sock, id, proto::ma_cmd(proto::MA_READ_STATUS1), TIMEOUT)?
@@ -263,6 +280,96 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
         });
     }
     Ok(motors)
+}
+
+/// The MIT `(p_max, t_max)` a MyActuator's wire frames are encoded against.
+///
+/// The client's detected ranges (`spec.mit_ranges`) win when present; this
+/// side's own 0xB2/0xB5 reads then only cross-check them, and a
+/// disagreement is reported through `notes` rather than acted on (the
+/// client read with retries on a quiet bus; both cannot be right, and
+/// arming against the client's value keeps Python's feedback decode and the
+/// wire consistent with each other). Without shipped ranges the own reads
+/// are authoritative and are retried; a motor that never answers them is a
+/// bring-up error, exactly like one that never answers the status or
+/// position read — never a silent fall-back to the legacy ranges.
+fn ma_ranges_for(
+    sock: &CanSock,
+    spec: &MotorSpec,
+    notes: &mut Vec<String>,
+) -> Result<(f64, f64), String> {
+    let id = spec.motor_id;
+    let mut version = None;
+    let mut model = None;
+    let mut attempts = 0;
+    while attempts < CAPABILITY_READ_ATTEMPTS && (version.is_none() || model.is_none()) {
+        attempts += 1;
+        if version.is_none() {
+            version = txn::ma_request(sock, id, proto::ma_cmd(proto::MA_READ_VERSION), TIMEOUT)
+                .map_err(|e| e.to_string())?
+                .map(|(d, _)| proto::ma_decode_version(&d));
+        }
+        if model.is_none() {
+            model = read_ma_model(sock, id).map_err(|e| e.to_string())?;
+        }
+    }
+    let own = match (version, model.as_deref()) {
+        (Some(v), Some(m)) => Some(proto::ma_mit_ranges(Some(v), Some(m))),
+        _ => None,
+    };
+    if attempts > 1 && own.is_some() {
+        notes.push(format!(
+            "{} (0x{id:02X}): capability read succeeded on attempt {attempts}",
+            spec.joint
+        ));
+    }
+    let label = format!("{} (0x{id:02X})", spec.joint);
+    let detail = format!(
+        "firmware {}, model {:?}",
+        version.map_or("?".to_string(), |v| v.to_string()),
+        model.as_deref().unwrap_or("?"),
+    );
+    let (ranges, note) = resolve_ma_ranges(&label, spec.mit_ranges, own, &detail)?;
+    notes.extend(note);
+    Ok(ranges)
+}
+
+/// The range decision, separated from the bus reads so it can be tested:
+/// `shipped` is the client's detection, `own` this side's (both `None` when
+/// unavailable). Returns the ranges to arm against plus an optional note.
+fn resolve_ma_ranges(
+    label: &str,
+    shipped: Option<(f64, f64)>,
+    own: Option<(f64, f64)>,
+    detail: &str,
+) -> Result<((f64, f64), Option<String>), String> {
+    match (shipped, own) {
+        (Some(shipped), Some(read)) => {
+            let note = if (shipped.0 - read.0).abs() > 1e-6 || (shipped.1 - read.1).abs() > 1e-6 {
+                Some(format!(
+                    "{label}: MIT ranges disagree — client detected p_max {} / t_max {}, this \
+                     read gives {} / {} ({detail}); arming against the client's",
+                    shipped.0, shipped.1, read.0, read.1,
+                ))
+            } else {
+                None
+            };
+            Ok((shipped, note))
+        }
+        (Some(shipped), None) => Ok((
+            shipped,
+            Some(format!(
+                "{label}: no capability reply in {CAPABILITY_READ_ATTEMPTS} attempts; arming \
+                 against the client's detected ranges (p_max {} / t_max {})",
+                shipped.0, shipped.1
+            )),
+        )),
+        (None, Some(read)) => Ok((read, None)),
+        (None, None) => Err(format!(
+            "{label}: no firmware version / model reply in {CAPABILITY_READ_ATTEMPTS} \
+             attempts — cannot tell which MIT ranges the motor decodes against, not enabling"
+        )),
+    }
 }
 
 pub fn read_ma_model(sock: &CanSock, motor_id: u8) -> io::Result<Option<String>> {
@@ -366,4 +473,40 @@ fn disable_inner(sock: &CanSock, motors: &[ReadyMotor]) -> bool {
         }
     }
     complete
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The failure this guards against: a dropped 0xB2/0xB5 reply used to
+    /// select the legacy (12.5, 24) ranges silently, scaling every t_ff on a
+    /// V4.4 X6/X8 by 2.5x/5.4x for the session.
+    #[test]
+    fn range_resolution_never_falls_back_silently() {
+        let v44_x8 = (proto::MA_P_MAX_V44, 129.0);
+        let legacy = (proto::MA_P_MAX_LEGACY, proto::MA_T_MAX_LEGACY);
+        // Client and core agree: no note.
+        let (r, note) = resolve_ma_ranges("s1", Some(v44_x8), Some(v44_x8), "").unwrap();
+        assert_eq!(r, v44_x8);
+        assert!(note.is_none());
+        // Core's read missing: the client's ranges are used, with a note.
+        let (r, note) = resolve_ma_ranges("s1", Some(v44_x8), None, "").unwrap();
+        assert_eq!(r, v44_x8);
+        assert!(note.unwrap().contains("client's detected ranges"));
+        // Core's read disagrees (it saw legacy): the client's win, loudly.
+        let (r, note) = resolve_ma_ranges("s1", Some(v44_x8), Some(legacy), "fw ?").unwrap();
+        assert_eq!(r, v44_x8);
+        let note = note.unwrap();
+        assert!(note.contains("disagree"), "{note}");
+        assert!(note.contains("129"), "{note}");
+        assert!(note.contains("24"), "{note}");
+        // No client detection (hold tool): the core's own read is used.
+        let (r, note) = resolve_ma_ranges("s1", None, Some(v44_x8), "").unwrap();
+        assert_eq!(r, v44_x8);
+        assert!(note.is_none());
+        // Neither: refuse to arm rather than guess.
+        let err = resolve_ma_ranges("s1", None, None, "").unwrap_err();
+        assert!(err.contains("not enabling"), "{err}");
+    }
 }

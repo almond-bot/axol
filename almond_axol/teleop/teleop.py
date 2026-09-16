@@ -50,8 +50,15 @@ from ..robot.base import (
 from ..robot.control import ContactWatchdog
 from ..robot.jelly import Jelly
 from ..teleop_activity import TeleopActivityMarker
+from ..utils.control_loop import rebase_deadline
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
+from ..utils.stall_diag import (
+    GcHold,
+    freeze_startup_heap,
+    install_gc_pause_logger,
+    unfreeze_heap,
+)
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
 from .config import VRTeleopConfig
@@ -717,6 +724,7 @@ class VRTeleop:
         sect = {"step": 0.0, "send": 0.0}
         max_gap = 0.0  # worst loop-iteration spacing within the window
         max_slip = 0.0  # worst lateness past the absolute deadline
+        stalls = 0  # deadline re-anchors (pacing debt dropped, not replayed)
         prev_iter = 0.0
 
         # Same /proc CPU sampler as collect-data, so the two flows' per-core
@@ -734,6 +742,24 @@ class VRTeleop:
         # closed, so its diag/tegra lines isolate the record-phase delta.
         tegra = TegraStatsDiag(_logger)
         tegra.start()
+
+        # Cyclic GC discipline, the same as collect-data's: a full collection
+        # freezes every thread of this process (control, IK dispatch, VR) for
+        # hundreds of milliseconds on the Jetson — measured ~100 ms in the
+        # relay and ~500 ms in run-policy — which the control loop can only
+        # answer with a held target and then a catch-up. The permanent heap
+        # (JAX, MuJoCo, the robot model, the VR/WebRTC stacks — everything
+        # allocated through enable()) is frozen out of the collector's reach
+        # once, automatic collection is held while tracking is engaged, and
+        # the deferred garbage is swept at each disengage, when the arms are
+        # holding still and the pause costs nothing.
+        uninstall_gc_log = install_gc_pause_logger(_logger)
+        engaged_gc = GcHold("teleop engaged", _logger)
+        gc_engaged = False
+        _logger.info(
+            "gc: froze %d startup objects out of the collector's reach",
+            freeze_startup_heap(),
+        )
 
         # Guarded return-to-rest needs torque feedback and gravity comp —
         # hardware (Axol) only. The Sim target has neither (and nothing
@@ -824,12 +850,30 @@ class VRTeleop:
                     deadline = time.perf_counter()
                     prev_iter = 0.0
                     continue
-                deadline += interval
+                # A stall is dropped, not replayed as a burst (see
+                # control_loop.MAX_PACING_DEBT_INTERVALS); it shows up in
+                # maxslip and the stall count below.
                 t_start = time.perf_counter()
+                rebased = rebase_deadline(deadline, t_start, interval)
+                if rebased != deadline:
+                    stalls += 1
+                    deadline = rebased
+                deadline += interval
                 left, right = self.step()
                 t_step = time.perf_counter()
+                engaged = self._core.teleop_enabled
+                if engaged != gc_engaged:
+                    # Engage: hold collection without an up-front sweep (the
+                    # last disengage already swept, and a sweep here would
+                    # itself be the hitch). Disengage: the arms are holding
+                    # still — sweep now, where the pause is invisible.
+                    gc_engaged = engaged
+                    if engaged:
+                        engaged_gc.begin(collect=False)
+                    else:
+                        engaged_gc.end()
                 if self._robot_recorder is not None:
-                    self._robot_recorder(self._core.teleop_enabled)
+                    self._robot_recorder(engaged)
                 await self._robot.motion_control(left=left, right=right)
 
                 if self._rec is not None:
@@ -924,9 +968,21 @@ class VRTeleop:
                         1e3 * max_gap,
                         1e3 * max_slip,
                     )
+                    if stalls:
+                        # A stall is a motion artefact the operator felt
+                        # (the arm held, then resumed); say so at INFO with
+                        # its size, the way the loop rate is reported.
+                        _logger.info(
+                            "loop: %d stall%s this window (worst gap %.1f ms) — "
+                            "pacing re-anchored instead of catching up",
+                            stalls,
+                            "" if stalls == 1 else "s",
+                            1e3 * max_gap,
+                        )
                     sect = {"step": 0.0, "send": 0.0}
                     max_gap = 0.0
                     max_slip = 0.0
+                    stalls = 0
                     loop_times.clear()
                     last_log = now
 
@@ -950,6 +1006,17 @@ class VRTeleop:
             activity.stop()
             diag.stop()
             tegra.stop()
+            # Under `axol serve` this process outlives the session: give its
+            # collector back the frozen heap and automatic collection.
+            for label, cleanup in (
+                ("gc hold", engaged_gc.end),
+                ("gc heap", unfreeze_heap),
+                ("gc pause logger", uninstall_gc_log),
+            ):
+                try:
+                    cleanup()
+                except Exception:  # noqa: BLE001 - never mask the loop's exit
+                    _logger.exception("teleop: %s cleanup failed", label)
 
     # ------------------------------------------------------------------
     # Step
@@ -1048,4 +1115,5 @@ class VRTeleop:
             self._ik_stop,
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,
+            wait_frame=self._vr_server.wait_render_frame,
         )

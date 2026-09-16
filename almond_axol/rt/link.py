@@ -41,7 +41,7 @@ _ARM_TIMEOUT_S = 15.0
 #: both together whenever the config or target layout changes meaning — a
 #: package and a binary from different checkouts must fail at configure
 #: time, not arm and then silently reject every target.
-CONFIG_PROTO = 2
+CONFIG_PROTO = 3
 
 
 def config_header() -> list[str]:
@@ -340,8 +340,17 @@ class RtLink:
         self._send(b"P")
         await self._await_state("prepped", _PREP_TIMEOUT_S)
 
-    async def arm(self) -> None:
-        self._send(b"A")
+    async def arm(self, ranges_text: str = "") -> None:
+        """Ship the ``A`` arm message and wait for ``armed``.
+
+        ``ranges_text`` carries one ``ranges <side> <motor_id> <p_max>
+        <t_max>`` line per MyActuator arm joint — the MIT ranges this side
+        detected from the motor's firmware version and model. The core
+        encodes the wire against these and only cross-checks its own reads,
+        so a dropped capability reply during its bring-up cannot select the
+        wrong (legacy) ranges for a joint.
+        """
+        self._send(b"A" + ranges_text.encode())
         await self._await_state("armed", _ARM_TIMEOUT_S)
 
     async def disarm(self) -> None:

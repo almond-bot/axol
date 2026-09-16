@@ -295,7 +295,7 @@ class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
         # Slot-by-motor-id is protocol generation 2; a core that predates it
         # would slot these wrists at 0 and 1 and then reject every target,
         # so the config declares the generation and such a core refuses it.
-        self.assertEqual(lines[0], "proto 2")
+        self.assertEqual(lines[0], "proto 3")
         joint_lines = [line for line in lines if line.startswith("joint ")]
         self.assertEqual(
             [line.split()[3:5] for line in joint_lines],

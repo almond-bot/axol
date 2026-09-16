@@ -125,6 +125,7 @@ def _step_worker() -> IKWorker:
     worker._f_r_quat = _IdentityFilter()
     worker._f_l_elbow = _IdentityFilter()
     worker._f_r_elbow = _IdentityFilter()
+    worker._last_raw_quat = {}
     return worker
 
 

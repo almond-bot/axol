@@ -1211,4 +1211,5 @@ class AxolVRTeleop(Teleoperator):
             self._ik_stop,
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,
+            wait_frame=self._vr_server.wait_render_frame,  # type: ignore[union-attr]
         )

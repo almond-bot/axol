@@ -109,6 +109,9 @@ _MA_DEC_VEL_PLAN = 0x03  # velocity planning deceleration
 # ~2.5x on V4.4 firmware (±60 Nm on an X6). The active firmware is detected
 # per-motor in enable() via the 0xB2 version read.
 _MA_FW_V44_VERSION = 2026042402
+# Attempts at the 0xB2/0xB5 capability reads before _detect_capabilities
+# gives up (see its docstring).
+_MA_CAPABILITY_READ_ATTEMPTS = 3
 
 # Unchanged across firmware versions.
 _MA_V_MAX = 45.0  # rad/s
@@ -392,17 +395,39 @@ class MyActuatorMotor(MotorDriver):
     async def _detect_capabilities(self) -> None:
         """Read firmware version + model once and configure MIT-command ranges.
 
-        Cached after the first success; raises MotorError if the motor doesn't
-        answer (callers fall back to the conservative legacy ranges).
+        Cached after the first success. The reads are retried a few times
+        (:data:`_MA_CAPABILITY_READ_ATTEMPTS`) because the first frames on a
+        freshly opened bus are the ones most often dropped, and getting the
+        ranges wrong is not a soft failure: a t_ff encoded for the wrong
+        range is silently scaled 2.5-5.4x on V4.4 firmware. Raises
+        MotorError only when every attempt went unanswered.
         """
         if self._fw_version is not None:
             return
-        version = await self._read_firmware_version()
-        model = await self._read_model()
-        self._fw_version = version
-        self._model = model
-        self._max_torque = _model_max_torque(model)
-        self._p_max, self._t_max = mit_ranges(version, model)
+        last_error: MotorError | None = None
+        for attempt in range(1, _MA_CAPABILITY_READ_ATTEMPTS + 1):
+            try:
+                version = await self._read_firmware_version()
+                model = await self._read_model()
+            except MotorError as exc:
+                last_error = exc
+                continue
+            if attempt > 1:
+                _logger.info(
+                    "MyActuator motor %#04x: capability read succeeded on attempt %d",
+                    self._motor_id,
+                    attempt,
+                )
+            self._fw_version = version
+            self._model = model
+            self._max_torque = _model_max_torque(model)
+            self._p_max, self._t_max = mit_ranges(version, model)
+            return
+        raise MotorError(
+            f"MyActuator motor {self._motor_id:#04x}: no firmware version / model "
+            f"reply in {_MA_CAPABILITY_READ_ATTEMPTS} attempts — cannot determine "
+            "its MIT command ranges"
+        ) from last_error
 
     # ------------------------------------------------------------------ #
     # Public API (implements MotorDriver)                                  #
@@ -420,11 +445,24 @@ class MyActuatorMotor(MotorDriver):
     async def enable(self) -> None:
         # Detect firmware version + model so the MIT command and feedback decode
         # use the ranges this motor's firmware actually implements. If the motor
-        # doesn't answer, keep the conservative legacy ranges set in __init__.
+        # doesn't answer (with retries), keep the legacy ranges set in
+        # __init__ — but say so: on V4.4 firmware those ranges scale every
+        # t_ff 2.5-5.4x, which reads as one joint fighting its own gravity
+        # feedforward, and a silent fallback left nothing in the log to
+        # explain it.
         try:
             await self._detect_capabilities()
-        except MotorError:
-            pass
+        except MotorError as exc:
+            _logger.warning(
+                "MyActuator motor %#04x: %s — commanding it against the legacy "
+                "MIT ranges (p_max %.3f rad, t_max %.0f Nm); if this motor runs "
+                "V4.4 firmware its torque feedforward will be mis-scaled until "
+                "it is re-enabled",
+                self._motor_id,
+                exc,
+                self._p_max,
+                self._t_max,
+            )
         await self._apply_low_voltage_threshold()
         await self._request(self._cmd(_MA_RELEASE_BRAKE))
 

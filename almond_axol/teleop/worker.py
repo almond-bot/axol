@@ -285,6 +285,9 @@ class IKWorker:
         self._f_r_quat = LagCompensatedLowPass(freq, fc)
         self._f_l_elbow = LagCompensatedLowPass(freq, fc)
         self._f_r_elbow = LagCompensatedLowPass(freq, fc)
+        # Last raw controller quaternion per side, for the hemisphere
+        # continuity the linear quaternion filters need (_same_hemisphere).
+        self._last_raw_quat: dict[str, np.ndarray] = {}
 
         # Pre-settle the configured rest pose to the manipulability-balanced
         # IK fixed point. The configured pose has a non-zero manipulability
@@ -404,6 +407,15 @@ class IKWorker:
                 frame.r_ee.quaternion.w,
             ]
         )
+        # q and -q are the same rotation, but the quaternion filters below are
+        # linear in the 4-vector: a representation flip between consecutive
+        # frames would drive their state through the origin over ~10 samples,
+        # and the normalised output would sweep a 180° arc and back — a full
+        # wrist excursion from no hand motion. Keep each stream in the
+        # hemisphere of its previous sample (the TCP-mapping path already does
+        # this for the absolute mode at _apply_tcp_transform).
+        raw_l_quat = self._same_hemisphere("left", raw_l_quat)
+        raw_r_quat = self._same_hemisphere("right", raw_r_quat)
 
         verdict, off_l, off_r = self._frame_snap_verdict(raw_l_pos, raw_r_pos, t_s)
         if verdict == "hold":
@@ -1241,9 +1253,25 @@ class IKWorker:
         self._clear_freeze(side)
         return True
 
+    def _same_hemisphere(self, side: str, quat: np.ndarray) -> np.ndarray:
+        """Return ``quat`` or ``-quat``, whichever continues the stream.
+
+        Chooses the sign with the non-negative dot product against the
+        previous raw quaternion of this controller, so the linear pose
+        filters never see a q → −q representation flip (see ``step``). The
+        first sample of a stream is taken as-is; a filter reset clears the
+        memory (:meth:`_reset_pose_filters`).
+        """
+        prev = self._last_raw_quat.get(side)
+        if prev is not None and float(np.dot(quat, prev)) < 0.0:
+            quat = -quat
+        self._last_raw_quat[side] = quat
+        return quat
+
     def _reset_pose_filters(self) -> None:
         """Clear the pose-filter state for every controller and elbow stream."""
         self._last_mapped_quat = {}
+        self._last_raw_quat = {}
         self._f_l_pos.reset()
         self._f_l_quat.reset()
         self._f_r_pos.reset()
@@ -1399,6 +1427,19 @@ def run_ik_worker(
     # to the dedicated IK core so per-frame solves aren't preempted by recording
     # load (on <8-core hosts this collapses onto the realtime cores).
     affinity.pin_ik()
+    # Everything allocated so far — JAX/XLA, the compiled graphs, the robot
+    # model — is permanent for the session. Freeze it out of the collector's
+    # reach so a gen-2 pass in this process never has to traverse it: that
+    # traversal is what turns a routine collection into a 100+ ms stall, and
+    # an IK stall of that size is a held target followed by a catch-up on the
+    # arm (the control loop's segment player spreads at most 40 ms of it).
+    from ..utils.stall_diag import freeze_startup_heap, install_gc_pause_logger
+
+    install_gc_pause_logger(_logger)
+    _logger.info(
+        "ik worker gc: froze %d startup objects out of the collector's reach",
+        freeze_startup_heap(),
+    )
 
     while True:
         try:

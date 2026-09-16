@@ -1013,6 +1013,7 @@ class VRTeleopCore:
         stop_event: threading.Event,
         process_alive: Callable[[], bool],
         on_ik_sample: Callable[[float], None],
+        wait_frame: Callable[[float], bool] | None = None,
     ) -> None:
         """Dispatch VR frames to the IK subprocess and publish raw targets.
 
@@ -1029,11 +1030,26 @@ class VRTeleopCore:
             process_alive: Returns ``False`` if the IK subprocess has died.
             on_ik_sample: Called with ``time.perf_counter()`` after each solve,
                 for the adapter's IK-rate readout.
+            wait_frame: Blocks until a new VR frame has arrived or the given
+                timeout (s) elapses, returning whether one did. Used to idle
+                while ``get_frame`` keeps returning the same object: without
+                it the loop re-renders the pose every millisecond to find it
+                unchanged — GIL-held numpy work the control loop's precise
+                wake-up then has to win the GIL back from on every tick.
         """
         ik_interval = 1.0 / self.config.ik_frequency
         last_frame = None
         recv_timeout_count = 0
         last_dead_warn = 0.0
+
+        def idle() -> None:
+            # Nothing to dispatch: wait for the next frame (or one interval —
+            # the render is time-based, so buffered motion still needs
+            # re-sampling) rather than spinning at 1 kHz.
+            if wait_frame is not None:
+                wait_frame(ik_interval)
+            else:
+                time.sleep(0.001)
 
         while not stop_event.is_set():
             # Paused (arms moved out-of-band, e.g. gravity comp): idle without
@@ -1102,7 +1118,7 @@ class VRTeleopCore:
             # A reset/startup trajectory is playing back; compute_output advances
             # it at the control rate, so just don't dispatch new IK meanwhile.
             if self.reset_interp.is_active():
-                time.sleep(0.001)
+                time.sleep(ik_interval)
                 continue
 
             # Guard the sampling + engage steps: an exception here previously
@@ -1116,7 +1132,7 @@ class VRTeleopCore:
                 continue
             if frame is None:
                 self._maybe_disengage_stale(conn, last_frame, process_alive)
-                time.sleep(0.001)
+                idle()
                 continue
             if frame is last_frame:
                 # PoseInterpolator deliberately preserves object identity when
@@ -1131,7 +1147,7 @@ class VRTeleopCore:
                     if snapshot is not None:
                         self.last_tcp_snapshot = replace(snapshot, pose_host_ts=pose_ts)
                 self._maybe_disengage_stale(conn, last_frame, process_alive)
-                time.sleep(0.001)
+                idle()
                 continue
             last_frame = frame
             self.last_tracking = self._validated_tracking_flags(frame)

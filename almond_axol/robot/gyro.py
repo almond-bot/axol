@@ -72,9 +72,12 @@ _GRAVITY_BAND = (0.82, 1.18)  # g
 _GRAVITY_ALPHA = 0.01
 
 # Ring drain period. Well under the ~5 s it takes 200 Hz to fill 1024 slots,
-# so the producer never stalls, and short enough that a sample reaches the
-# Jelly's 50 Hz command loop fresh.
-_DRAIN_INTERVAL = 0.002
+# so the producer never stalls, and short enough (half the Jelly command
+# period) that a sample reaches its 50 Hz loop fresh. Not shorter: this is a
+# Python thread taking the GIL in the teleop control process — at the
+# previous 2 ms it woke 500 times a second to feed a 50 Hz consumer, a steady
+# source of preemption for the 120 Hz control loop it shares the GIL with.
+_DRAIN_INTERVAL = 0.01
 
 
 _UDEV_RULE_PATH = "/etc/udev/rules.d/99-bmi-spsc.rules"

@@ -408,13 +408,71 @@ _RIGHT_FRICTION = _ArmFriction(
 )
 
 
-def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
+#: A calibration overlay raising ``kd_host`` above this multiple of the
+#: shipped value is flagged (see :func:`_calibrated_joint`).
+_KD_HOST_OVERLAY_WARN_RATIO = 1.5
+
+
+def _warn_host_damping_overlay(
+    joint: str, jc: JointConfig, overrides: dict[str, Any]
+) -> None:
+    """Flag a calibration overlay that re-arms a host damper the shipped
+    config deliberately restrained.
+
+    The shipped gains encode negative results measured on hardware: host
+    damping *pumps* the 8.7-11.3 Hz mast mode on shoulder_3 and the elbow
+    (so they ship with ``kd_host = 0``), ``kd_host = 60`` re-sustained
+    shoulder_2's ring, and shoulder_1's Q = 3 band exists to stay off the
+    12.5-13.6 Hz structural mode. A ``calibration.json`` written before
+    those findings — or by a tuning session that went the other way — is
+    applied field-by-field with no check, so one robot can ring where its
+    twins do not, with nothing in the log to say why. The saved values stay
+    authoritative (the operator chose them for this machine); this only
+    makes the disagreement visible at startup.
+    """
+    kd_host = overrides.get("kd_host")
+    if kd_host is not None:
+        if jc.kd_host <= 0.0 and kd_host > 0.0:
+            _logger.warning(
+                "calibration: %s kd_host=%.1f enables host damping on a joint "
+                "the shipped config keeps at 0 (host damping measured to pump "
+                "a structural mode there); the saved value is applied — "
+                "re-check with `axol tune.pid` if this joint rings",
+                joint,
+                kd_host,
+            )
+        elif jc.kd_host > 0.0 and kd_host > _KD_HOST_OVERLAY_WARN_RATIO * jc.kd_host:
+            _logger.warning(
+                "calibration: %s kd_host=%.1f is more than %.1fx the shipped "
+                "%.1f; the saved value is applied — re-check with `axol tune.pid` "
+                "if this joint rings",
+                joint,
+                kd_host,
+                _KD_HOST_OVERLAY_WARN_RATIO,
+                jc.kd_host,
+            )
+    q = overrides.get("kd_host_q")
+    if q is not None and jc.kd_host_q is not None and q < jc.kd_host_q:
+        _logger.warning(
+            "calibration: %s kd_host_q=%.2f widens the host-damping band below "
+            "the shipped Q=%.2f (narrowed to stay off a measured structural "
+            "mode); the saved value is applied",
+            joint,
+            q,
+            jc.kd_host_q,
+        )
+
+
+def _calibrated_joint(
+    jc: JointConfig, entry: dict[str, Any], joint: str = ""
+) -> JointConfig:
     """Overlay one joint's calibration-file entry onto its config."""
     overrides: dict[str, Any] = {
         f: entry[f]
         for f in ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
         if f in entry
     }
+    _warn_host_damping_overlay(joint or "joint", jc, overrides)
     friction = entry.get("friction")
     if friction is not None:
         overrides["friction"] = FrictionParams(**friction)
@@ -503,6 +561,7 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
             joint.value: _calibrated_joint(
                 getattr(arm, joint.value),
                 {**factory.get(joint.value, {}), **local.get(joint.value, {})},
+                f"{side} {joint.value}",
             )
             for joint in ARM_JOINTS
             if joint.value in factory or joint.value in local

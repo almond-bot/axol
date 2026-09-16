@@ -139,6 +139,12 @@ class PoseInterpolator:
         self._outlier_floor = float(outlier_floor_m)
 
         self._lock = threading.Lock()
+        # Set by push() for consumers idling in wait_for_frame(): the IK
+        # dispatch loop used to poll sample() every millisecond while the pose
+        # was static — a full render (several dozen GIL-held numpy calls)
+        # per poll to learn nothing had changed, and the control loop's
+        # precise wake-up had to win the GIL back from it every tick.
+        self._pushed = threading.Event()
         # Incremented whenever buffered timing/ownership state is invalidated.
         # sample() performs its numpy work outside the lock; this generation
         # prevents an in-flight render from committing or returning the old
@@ -288,6 +294,25 @@ class PoseInterpolator:
                 del self._caps[:extra]
                 del self._frames[:extra]
                 del self._vecs[:extra]
+        self._pushed.set()
+
+    def wait_for_frame(self, timeout: float) -> bool:
+        """Block until a frame has been pushed since the last call, or ``timeout``.
+
+        For a consumer that has just found :meth:`sample` unchanged: rather
+        than polling the render, sleep until the buffer actually receives
+        something (the headset streams at 72-90 Hz, so this wakes at most
+        that often while idle) or the timeout passes — the render is
+        time-based, so a consumer must still re-sample once per control
+        interval while frames are buffered. Returns True if a push woke it.
+        """
+        fired = self._pushed.wait(timeout)
+        if fired:
+            # Cleared *before* the caller samples: a push landing between
+            # here and that sample sets it again for the next wait, and the
+            # sample itself already sees the frame.
+            self._pushed.clear()
+        return fired
 
     def _update_hold(
         self,

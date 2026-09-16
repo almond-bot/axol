@@ -12,6 +12,33 @@ from typing import TypeVar
 
 T = TypeVar("T")
 
+#: Pacing debt cap for absolute-deadline command loops, in control
+#: intervals. Such a loop tracks an absolute deadline so an ordinary late wake
+#: is corrected on the next cycle, but a *stall* — a GC pass, a long GIL hold,
+#: a scheduler preemption, a slow ``motion_control`` — must not be paid back
+#: the same way: catching up runs every missed tick back-to-back with zero
+#: sleep, each advancing the smoothing filters by a full nominal step, so the
+#: command the realtime core receives jumps by the whole stall's worth of
+#: hand motion within a couple of milliseconds and its tracker renders that
+#: as a surge. Past this much debt the deadline is re-anchored to now instead
+#: (the ticks are simply lost, as they would be under relative pacing) and
+#: the segment interpolator + trapezoid absorb the accumulated *target* error
+#: at the configured velocity/acceleration caps.
+MAX_PACING_DEBT_INTERVALS = 2.0
+
+
+def rebase_deadline(deadline: float, now: float, interval: float) -> float:
+    """The deadline to pace the next cycle from, given the current time.
+
+    Returns ``deadline`` unchanged while the loop is at most
+    :data:`MAX_PACING_DEBT_INTERVALS` behind (late wakes keep being corrected
+    by the absolute schedule), and ``now`` once it has fallen further behind
+    than that, dropping the backlog rather than bursting through it.
+    """
+    if now - deadline > MAX_PACING_DEBT_INTERVALS * interval:
+        return now
+    return deadline
+
 
 async def run_blocking_with_control_ticks(
     operation: Callable[[], T],

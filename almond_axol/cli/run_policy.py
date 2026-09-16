@@ -1885,7 +1885,11 @@ def _build_axol_robot_client(
             # the threshold means the policy is pushing/pulling on something
             # beyond legitimate task contact — abort the episode so the
             # supervisor can hold the arms limp instead of grinding on.
-            if self.contact_tripped is None:
+            # The watchdog is off at the default threshold (0), but its
+            # argument — two MuJoCo forward passes — was evaluated every tick
+            # regardless: ~0.3-0.5 ms of GIL-held work per 60 Hz tick for
+            # nothing. Gate on the threshold before computing residuals.
+            if self.contact_tripped is None and self._contact_watchdog.threshold > 0:
                 tripped = self._contact_watchdog.update(self.robot.torque_residuals())
                 if tripped is not None:
                     joint, residual = tripped

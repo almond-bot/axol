@@ -68,11 +68,19 @@
 //!                     holding are skipped — the reset would reboot them and
 //!                     drop the arm — and named in an `L` line; the gripper
 //!                     is never touched
-//! - `A`               arm: bring-up, enable the cold joints, hold current
+//! - `A` + text        arm: bring-up, enable the cold joints, hold current
 //!                     pose (holding joints are attached to without a brake
 //!                     release / enable frame; the gripper must already be
 //!                     enabled + calibrated in POSITION_FORCE mode by the
-//!                     Python side)
+//!                     Python side). The text body carries one `ranges
+//!                     <side> <motor_id> <p_max> <t_max>` line per
+//!                     MyActuator arm joint: the MIT ranges the client
+//!                     detected from the motor's firmware version and model
+//!                     (with retries, after the `P` resets). The core encodes
+//!                     the wire against these and only cross-checks its own
+//!                     reads, so a single dropped 0xB2/0xB5 reply during arm
+//!                     can never silently select the legacy ranges (a 2.5x /
+//!                     5.4x `t_ff` scale error on a V4.4 X6 / X8)
 //! - `T` + binary      target: side u8, seq u32 LE, 8 x 9 f64 LE — slots
 //!                     0-6 are arm-joint tuples (p_des, mode, kp, kd,
 //!                     t_ff, kd_host, damp_w0, damp_q, j_eff) where mode
@@ -184,6 +192,7 @@
 //! - Client disconnect while armed, SIGINT/SIGTERM, and protocol errors
 //!   stop the stream and exit with the motors holding (not disabled).
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -195,7 +204,7 @@ use std::time::{Duration, Instant};
 
 use crate::bringup::{self, MotorSpec, Vendor};
 use crate::can::CanSock;
-use crate::filter::{self, BandPass, LpDiff, Trapezoid};
+use crate::filter::{self, BandPass, DampGate, LpDiff, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
@@ -225,16 +234,22 @@ const GRIPPER_SLOT: usize = 7;
 /// - 1 (implicit; never declared): arm joints took slots in list order.
 /// - 2: slots come from the motor id (`slot = motor_id - 1`), so a bus may
 ///   carry any subset of the arm.
-const CONFIG_PROTO: u32 = 2;
+/// - 3: the `A` message carries the client-detected MyActuator MIT ranges
+///   (`ranges <side> <motor_id> <p_max> <t_max>` lines), which the core
+///   encodes against instead of its own single-attempt reads. A proto-2
+///   core would arm a proto-3 client fine and silently ignore the body, so
+///   the bump is what makes the skew visible.
+const CONFIG_PROTO: u32 = 3;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
-/// logged. It is not a fault. Host damping is already suppressed on every
-/// tick without a fresh sample, so a missed frame can never feed stale
-/// velocity into the damping term; the arm simply runs on firmware kd for
-/// the lossy stretch. Bursty loss is routine while cameras, IK compilation,
-/// and the dataset writer boot on the same host and USB fabric as the CAN
-/// adapters — disabling both arms for it ended otherwise healthy sessions.
+/// logged. It is not a fault. A tick without a fresh sample never feeds a
+/// stale velocity into the damping term (the `DampGate` holds the last
+/// trusted output through an isolated miss, then fades and ramps back in);
+/// through a degraded stretch the arm simply runs on firmware kd. Bursty
+/// loss is routine while cameras, IK compilation, and the dataset writer
+/// boot on the same host and USB fabric as the CAN adapters — disabling
+/// both arms for it ended otherwise healthy sessions.
 const DEGRADED_RECENT_MISSED_FEEDBACK: u32 = 4;
 /// A motor that has not replied for this long is treated as gone rather than
 /// lossy. Past this point the session goes limp (see the Safety notes)
@@ -256,15 +271,26 @@ const LIMP_KD: f64 = 0.25;
 /// delayed USB-CAN replies despite there still being cycle headroom.
 const REPLY_GUARD: Duration = Duration::from_micros(150);
 /// A tick starting more than this far past its deadline is phase-degraded. Its
-/// host damping is suppressed even when feedback itself is fresh.
+/// host damping is not advanced even when feedback itself is fresh (the
+/// `DampGate` holds the previous output for it), and it reschedules
+/// relative to its own start instead of the grid (`next_bus_deadline`).
 const LATE_TICK: Duration = Duration::from_micros(500);
+/// How much of its pre-gap velocity a joint is assumed to keep across a
+/// whole-cycle overrun: `exp(-lateness / τ)`. During the gap the motor keeps
+/// executing the last MIT command (kp toward the held p_des, kd toward the
+/// held v_des), which decelerates the joint toward that p_des with a time
+/// constant of tens of milliseconds at the tuned shoulder stiffness. The
+/// value only scales the derivative chains' *kept* velocity state
+/// (`LpDiff::rebase`); it never adds velocity.
+const OVERRUN_VELOCITY_TAU: f64 = 0.05;
 /// Clustered lateness that marks a bus's *timing* degraded (host damping off
 /// on every joint of that bus until a clean 32-tick window): three late
 /// ticks in a row, or this many in the window. Not a fault — the same
 /// treatment bursty feedback loss gets. A whole-cycle overrun (a tick that
 /// wakes a full period or more late) degrades on its own: the sample/command
-/// ordering that tick was lost, so its damping and inertia terms are
-/// re-seeded rather than computed over the gap.
+/// ordering that tick was lost, so its inertia term restarts and its
+/// derivative chains are rebased (velocity state kept, see
+/// `OVERRUN_VELOCITY_TAU`) rather than differentiated across the gap.
 const DEGRADED_RECENT_LATE_TICKS: u32 = 8;
 // Bad control timing never takes the session limp — degraded is the whole
 // response, however long it lasts. A late tick invalidates exactly the terms
@@ -375,17 +401,32 @@ fn configure_bus_scheduling(
     Ok(())
 }
 
-/// Schedule the next batch from the instant this batch actually began.
+/// Schedule the next batch: on the absolute grid while this batch woke on
+/// time, from the instant it actually began once it did not.
 ///
-/// A deadline based on the old absolute grid compresses the interval following
-/// any late wake: 1.5 ms late at 240 Hz would make the next command gap only
-/// 2.67 ms. Motors cannot recover elapsed control time, and that shortened
-/// feedback/command phase can turn host damping into excitation. A relative
-/// start-to-start period gives up an unobservable amount of wall-clock phase
-/// instead: lateness can lower the average rate briefly, but can never produce
-/// a catch-up command faster than the configured rate.
-fn next_bus_deadline(began: Instant, period: Duration) -> Instant {
-    began + period
+/// A deadline based purely on the absolute grid compresses the interval
+/// following any late wake: 1.5 ms late at 240 Hz would make the next
+/// command gap only 2.67 ms. Motors cannot recover elapsed control time, and
+/// that shortened feedback/command phase can turn host damping into
+/// excitation. So a tick that woke more than `LATE_TICK` late reschedules
+/// relative to its own start: lateness lowers the average rate briefly but
+/// never produces a catch-up command faster than the configured rate.
+///
+/// A tick that woke *within* `LATE_TICK` of its deadline stays on the grid.
+/// Rescheduling those relatively too let every wake's few-µs latency
+/// accumulate into a random walk of the bus's phase, so the half-period
+/// stagger between the two buses (which keeps the two USB-CAN adapters from
+/// bursting through the same xHCI interrupt at once) drifted into alignment
+/// within minutes — correlated late replies on both arms at once. The cost
+/// of staying on the grid is bounded by `LATE_TICK` (≤ 0.5 ms of a 4.17 ms
+/// period, once), which is exactly the lateness the tick was already
+/// judged on time for.
+fn next_bus_deadline(deadline: Instant, began: Instant, period: Duration) -> Instant {
+    if began.saturating_duration_since(deadline) <= LATE_TICK {
+        deadline + period
+    } else {
+        began + period
+    }
 }
 
 /// Accept at most one reply from each motor commanded in this tick.
@@ -900,6 +941,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         k: 0.0,
                         fv: 0.0,
                         fo: 0.0,
+                        mit_ranges: None,
                     }
                 } else {
                     let motor_id: u8 = f
@@ -927,6 +969,9 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         k: num(10)?,
                         fv: num(11)?,
                         fo: num(12)?,
+                        // Filled from the `A` message: the client detects the
+                        // MyActuator ranges only after the `P` resets.
+                        mit_ranges: None,
                     }
                 };
                 if spec.slot >= N_SLOTS || bus.2.iter().any(|s| s.slot == spec.slot) {
@@ -962,6 +1007,35 @@ fn parse_config(text: &str) -> io::Result<Config> {
         max_step_rad,
         buses,
     })
+}
+
+/// Parse the `A` body: `ranges <side> <motor_id> <p_max> <t_max>` lines
+/// (blank lines and `#` comments ignored). Returns `(side, motor_id) ->
+/// (p_max, t_max)`. An empty body is valid (a client with no MyActuator
+/// joints, or a bench flow that leaves detection to the core).
+fn parse_arm_ranges(text: &str) -> io::Result<HashMap<(u8, u8), (f64, f64)>> {
+    let bad =
+        |line: &str| io::Error::new(io::ErrorKind::InvalidData, format!("arm: bad line: {line}"));
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f[0] != "ranges" || f.len() != 5 {
+            return Err(bad(line));
+        }
+        let side: u8 = f[1].parse().map_err(|_| bad(line))?;
+        let motor_id: u8 = f[2].parse().map_err(|_| bad(line))?;
+        let p_max: f64 = f[3].parse().map_err(|_| bad(line))?;
+        let t_max: f64 = f[4].parse().map_err(|_| bad(line))?;
+        if side > 1 || !(p_max.is_finite() && p_max > 0.0 && t_max.is_finite() && t_max > 0.0) {
+            return Err(bad(line));
+        }
+        out.insert((side, motor_id), (p_max, t_max));
+    }
+    Ok(out)
 }
 
 fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
@@ -1064,10 +1138,37 @@ mod tests {
     fn bus_deadline_never_catches_up_after_overrun() {
         let base = Instant::now();
         let period = Duration::from_millis(4);
+        // Woke 2 ms late: reschedule from the actual start, never compress.
         assert_eq!(
-            next_bus_deadline(base + Duration::from_millis(2), period),
+            next_bus_deadline(base, base + Duration::from_millis(2), period),
             base + Duration::from_millis(6)
         );
+        // Woke a whole period late: same rule.
+        assert_eq!(
+            next_bus_deadline(base, base + Duration::from_millis(4), period),
+            base + Duration::from_millis(8)
+        );
+    }
+
+    /// An on-time wake stays on the absolute grid, so the per-wake latency
+    /// does not random-walk the bus phase (and the left/right stagger).
+    #[test]
+    fn bus_deadline_holds_the_grid_when_on_time() {
+        let base = Instant::now();
+        let period = Duration::from_millis(4);
+        let jitter = Duration::from_micros(120);
+        assert_eq!(
+            next_bus_deadline(base, base + jitter, period),
+            base + period
+        );
+        assert_eq!(next_bus_deadline(base, base, period), base + period);
+        // Exactly at the late threshold is still on time; past it is not.
+        assert_eq!(
+            next_bus_deadline(base, base + LATE_TICK, period),
+            base + period
+        );
+        let past = base + LATE_TICK + Duration::from_micros(1);
+        assert_eq!(next_bus_deadline(base, past, period), past + period);
     }
 
     #[test]
@@ -1327,7 +1428,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 2\n\
+            "proto 3\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
@@ -1349,7 +1450,7 @@ mod tests {
         );
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 2\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 3\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
     }
 
     /// A bus carrying only some of the arm joints (a bench wrist assembly)
@@ -1358,7 +1459,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 2\n\
+            "proto 3\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
              gripper 0 can0 8\n",
@@ -1371,10 +1472,10 @@ mod tests {
         );
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
-        assert!(parse_config("proto 2\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
-        assert!(parse_config("proto 2\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 3\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 3\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
         assert!(parse_config(
-            "proto 2\n\
+            "proto 3\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n"
         )
@@ -1396,15 +1497,49 @@ mod tests {
         let err = error_of(joint);
         assert!(err.contains("no `proto` line"), "{err}");
         assert!(err.contains("axol rt.install"), "{err}");
-        // A future client generation this core does not understand.
-        let err = error_of(&format!("proto 3\n{joint}"));
-        assert!(err.contains("proto 3"), "{err}");
+        // A previous client generation (no ranges on the arm message) and
+        // a future one this core does not understand.
+        let err = error_of(&format!("proto 2\n{joint}"));
         assert!(err.contains("proto 2"), "{err}");
+        assert!(err.contains("proto 3"), "{err}");
+        let err = error_of(&format!("proto 4\n{joint}"));
+        assert!(err.contains("proto 4"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 2\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 3\n")).is_ok());
+    }
+
+    /// The arm message carries the client's detected MIT ranges per
+    /// MyActuator joint. Empty is fine (no MyActuator joints); anything
+    /// malformed or non-physical is refused before a motor is touched.
+    #[test]
+    fn parse_arm_ranges_roundtrip_and_validation() {
+        let ranges = parse_arm_ranges(
+            "# left arm\n\
+             ranges 0 1 12.566 60\n\
+             ranges 0 2 12.566 129.0\n\
+             ranges 1 1 12.5 24\n",
+        )
+        .unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[&(0, 1)], (12.566, 60.0));
+        assert_eq!(ranges[&(0, 2)], (12.566, 129.0));
+        assert_eq!(ranges[&(1, 1)], (12.5, 24.0));
+        assert!(parse_arm_ranges("").unwrap().is_empty());
+        assert!(parse_arm_ranges("\n  \n").unwrap().is_empty());
+        for bad in [
+            "ranges 0 1 12.566",      // missing t_max
+            "ranges 2 1 12.566 60",   // no such side
+            "ranges 0 1 0 60",        // zero p_max
+            "ranges 0 1 12.566 -60",  // negative t_max
+            "ranges 0 1 12.566 nan",  // non-finite
+            "range 0 1 12.566 60",    // unknown key
+            "ranges 0 one 12.566 60", // non-numeric id
+        ] {
+            assert!(parse_arm_ranges(bad).is_err(), "accepted {bad:?}");
+        }
     }
 }
 
@@ -1630,6 +1765,18 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                     send_text(&out_tx, b'S', "fault: arm before config");
                     continue;
                 };
+                // The client's detected MyActuator MIT ranges ride on the
+                // arm message (detection happens after the `P` resets, so
+                // they cannot be in the config). Stamped onto the specs the
+                // bus threads bring up; a malformed body is a client bug and
+                // fails the arm before any motor is touched.
+                let ranges = match parse_arm_ranges(&String::from_utf8_lossy(body)) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        send_text(&out_tx, b'S', &format!("fault: arm: {err}"));
+                        continue;
+                    }
+                };
                 stop.store(false, Ordering::SeqCst);
                 fault.store(0, Ordering::SeqCst);
                 disarm.store(false, Ordering::SeqCst);
@@ -1640,7 +1787,12 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                 // separation, preventing both USB-CAN adapters from bursting
                 // commands and replies through the same xHCI interrupt at once.
                 let start_gate = Arc::new((Mutex::new(None), Condvar::new()));
-                for (side, iface, specs) in cfg.buses.clone() {
+                for (side, iface, mut specs) in cfg.buses.clone() {
+                    for spec in specs.iter_mut() {
+                        if !spec.gripper && spec.motor_id <= 5 {
+                            spec.mit_ranges = ranges.get(&(side, spec.motor_id)).copied();
+                        }
+                    }
                     let cfg = Arc::clone(cfg);
                     let targets = Arc::clone(&targets);
                     let stop = Arc::clone(&stop);
@@ -1831,13 +1983,41 @@ fn bus_loop(
         }
     };
     let _ = sock.drain();
-    let motors = match bringup::prepare(&sock, iface, specs) {
+    let mut prepare_notes = Vec::new();
+    let motors = match bringup::prepare(&sock, iface, specs, &mut prepare_notes) {
         Ok(m) => m,
         Err(err) => {
             let _ = ready_tx.send(Err(err));
             return Ok(());
         }
     };
+    for note in &prepare_notes {
+        send_text(out_tx, b'W', &format!("{iface}: {note}"));
+    }
+    for m in motors
+        .iter()
+        .filter(|m| m.vendor == bringup::Vendor::MyActuator)
+    {
+        send_text(
+            out_tx,
+            b'L',
+            &format!(
+                "{iface}: {} (0x{:02X}) MIT ranges p_max {} t_max {}{}",
+                m.joint,
+                m.id,
+                m.ranges.p_max,
+                m.ranges.t_max,
+                if specs
+                    .iter()
+                    .any(|s| s.motor_id == m.id && s.mit_ranges.is_some())
+                {
+                    " (client-detected)"
+                } else {
+                    " (core-detected)"
+                }
+            ),
+        );
+    }
     if let Err(err) = bringup::enable(&sock, iface, &motors) {
         let _ = ready_tx.send(Err(err));
         return Ok(());
@@ -1888,6 +2068,9 @@ fn bus_loop(
         v_cmd_fast: LpDiff,
         v_meas: LpDiff,
         bp: BandPass,
+        /// Hold / ramp continuity for the band-pass output across ticks
+        /// whose sample cannot be trusted — see `filter::DampGate`.
+        gate: DampGate,
         vel_meas: f64,
         last_fb: Option<Instant>,
     }
@@ -1898,6 +2081,7 @@ fn bus_loop(
             v_cmd_fast: LpDiff::new(VEL_CUTOFF),
             v_meas: LpDiff::new(VEL_CUTOFF),
             bp: BandPass::new(),
+            gate: DampGate::new(),
             vel_meas: 0.0,
             last_fb: None,
         })
@@ -1908,8 +2092,10 @@ fn bus_loop(
     // Motor caches from these instead of passively reading the bus.
     let mut latest: [SlotFeedback; N_SLOTS] = [None; N_SLOTS];
     // Whether the immediately preceding tick produced a fresh sample for
-    // each slot. Host damping is suppressed for one tick after a miss; the
-    // firmware's local kd remains active without relying on stale host state.
+    // each slot. A tick after a miss never differentiates a stale sample
+    // into the damper; its `DampGate` holds the last trusted output through
+    // an isolated miss instead of chopping it to zero (see filter.rs). The
+    // firmware's local kd remains active throughout.
     let mut feedback_fresh = [false; N_SLOTS];
     let mut have_target = false;
     let mut last_seq: Option<u32> = None;
@@ -2064,8 +2250,20 @@ fn bus_loop(
             // Adopt a newly arrived target: latest-wins — the tracker
             // renders the trajectory toward it at loop rate, so no
             // interpolation segment is needed.
-            {
-                let slot = targets[side as usize].lock().unwrap();
+            //
+            // `try_lock`, never `lock`: the slot is written by the socket
+            // reader, a SCHED_OTHER thread on whatever CPU Python left it,
+            // and `std::sync::Mutex` has no priority inheritance. If the
+            // reader is preempted inside its ~100 ns critical section, a
+            // blocking lock here would park this SCHED_FIFO loop until the
+            // reader is rescheduled — a late tick, and with it a damping
+            // dropout on every joint of the bus. Contended means a target is
+            // being written right now; it is adopted on the next tick, 4 ms
+            // later, which the tracker absorbs without a trace. A poisoned
+            // mutex (the reader panicked) is treated the same way rather
+            // than crashing the bus thread: the watchdog then reports the
+            // stalled stream and holds, as it does when the client dies.
+            if let Ok(slot) = targets[side as usize].try_lock() {
                 if let Some(t) = slot.target {
                     if last_seq != Some(t.seq) {
                         // Corruption defense on the raw target step; the
@@ -2245,16 +2443,29 @@ fn bus_loop(
                     let (v_wire, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp) =
                         if tracked && overrun {
                             // The gap since the last command is not a trajectory
-                            // segment the motor followed — it held. Re-prime the
-                            // derivative chains at rest here so the first tick
-                            // back carries no fictitious velocity, acceleration
-                            // (inertia torque), or band-pass energy; they ramp
-                            // in again from the next tick as tracking resumes.
-                            d.v_cmd.seed(p_cmd);
-                            d.a_cmd.seed(0.0);
-                            d.v_cmd_fast.seed(p_cmd);
-                            d.bp.reset();
-                            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                            // segment the derivative chains may integrate across
+                            // — but the joint did not stop for it either: the
+                            // motor kept executing the last command, velocity
+                            // feedforward included, and decelerated toward its
+                            // held p_des with a time constant of tens of ms.
+                            // So *rebase* the chains at the new position keeping
+                            // their velocity state (scaled by how much of it a
+                            // gap this long plausibly preserved) rather than
+                            // re-seeding them at rest: seeding zeroed the wire
+                            // v_des and friction feedforward for a moving joint
+                            // — a kd·v brake pulse plus a ±Fc step — and then
+                            // re-ramped them over the 20 rad/s time constant.
+                            // The inertia term restarts from zero (no
+                            // acceleration is known across the gap), and the
+                            // damping input is treated as an untrusted tick.
+                            let keep = (-lateness.as_secs_f64() / OVERRUN_VELOCITY_TAU).exp();
+                            d.v_cmd.rebase(p_cmd, keep);
+                            d.v_cmd_fast.rebase(p_cmd, keep);
+                            let v_cmd = d.v_cmd.value();
+                            d.a_cmd.seed(v_cmd);
+                            let friction_ff = filter::friction(v_cmd, m.fc, m.k, m.fv, m.fo);
+                            let v_damp = d.gate.bad(&mut d.bp, tick_dt);
+                            (v_cmd, 0.0, d.v_cmd_fast.value(), friction_ff, 0.0, v_damp)
                         } else if tracked {
                             // Match classic AxolArm.motion_control: friction uses
                             // the 20 rad/s low-pass position derivative, inertia
@@ -2271,24 +2482,29 @@ fn bus_loop(
                                 && timing_on_time
                                 && !timing_health.degraded
                                 && !feedback_health[m.slot].degraded;
+                            // A tick without a trusted sample (missed reply,
+                            // late wake, degraded stretch) never feeds a stale
+                            // velocity into the damper — but it no longer chops
+                            // the damping to zero either: the gate holds the
+                            // last trusted output through an isolated gap and
+                            // ramps back in after a long one (see DampGate).
                             let v_damp = if damp_ok {
-                                d.bp.update(v_cmd_fast - d.vel_meas, c.damp_w0, c.damp_q, tick_dt)
+                                d.gate.good(
+                                    &mut d.bp,
+                                    v_cmd_fast - d.vel_meas,
+                                    c.damp_w0,
+                                    c.damp_q,
+                                    tick_dt,
+                                )
                             } else {
-                                // A missing frame makes measured velocity stale.
-                                // Reset rather than carrying band-pass energy into
-                                // the first tick after feedback recovers. While the
-                                // joint is degraded, damping stays off for the whole
-                                // stretch: re-engaging a freshly reset band-pass
-                                // every few ticks is a torque transient, not damping.
-                                d.bp.reset();
-                                0.0
+                                d.gate.bad(&mut d.bp, tick_dt)
                             };
                             (v_cmd, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp)
                         } else {
                             d.v_cmd.seed(p_cmd);
                             d.a_cmd.seed(0.0);
                             d.v_cmd_fast.seed(p_cmd);
-                            d.bp.reset();
+                            d.gate.reset(&mut d.bp);
                             (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                         };
                     let damping_ff = c.kd_host * v_damp;
@@ -2545,17 +2761,19 @@ fn bus_loop(
 
             if began >= next_stats {
                 next_stats = began + Duration::from_secs(5);
+                let damp_holds: u64 = damp.iter().map(|d| d.gate.holds).sum();
+                let damp_releases: u64 = damp.iter().map(|d| d.gate.releases).sum();
                 send_text(
                     out_tx,
                     b'L',
                     &format!(
-                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {overruns} overruns, {timing_degraded_ticks} timing-degraded ticks in {timing_degraded_episodes} episodes, {missed} missed replies, {degraded_ticks} feedback-degraded ticks in {degraded_episodes} episodes, {rejected} rejected targets, {trace_dropped} trace drops, seq {:?}",
+                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {overruns} overruns, {timing_degraded_ticks} timing-degraded ticks in {timing_degraded_episodes} episodes, {missed} missed replies, {degraded_ticks} feedback-degraded ticks in {degraded_episodes} episodes, damping held {damp_holds} joint-ticks / released {damp_releases}x, {rejected} rejected targets, {trace_dropped} trace drops, seq {:?}",
                         late as f64 / ticks as f64 * 100.0,
                         last_seq,
                     ),
                 );
             }
-            deadline = next_bus_deadline(began, period);
+            deadline = next_bus_deadline(deadline, began, period);
         }
     })();
 

@@ -58,7 +58,7 @@ async def session(name, actions):
 
 
 joint_line = b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
-cfg = b"C" + b"proto 2\n" + b"loop_hz 240\n" + joint_line
+cfg = b"C" + b"proto 3\n" + b"loop_hz 240\n" + joint_line
 
 
 async def clean(send, recv, w):

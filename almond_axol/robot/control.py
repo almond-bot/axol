@@ -200,6 +200,33 @@ class BandPass:
         self._lp = [0.0] * n
         self._bp = [0.0] * n
         self._last_time: float | None = None
+        # Running estimate of the caller's sample interval, for the stall
+        # detection in :meth:`update`.
+        self._ts_nominal: float | None = None
+
+    # A sample interval this many times the running nominal interval is a
+    # stall of the calling loop (a GC pass, a blocked thread), not a sample:
+    # the state is dropped and the filter restarts, as the realtime core's
+    # copy does on an overrun. Integrating across the gap instead — even with
+    # a stable coefficient — would apply the stale pre-stall damping torque
+    # (sign and all) to a joint that has since moved on.
+    STALL_FACTOR = 3.0
+
+    @staticmethod
+    def _max_coefficient(q: float) -> float:
+        """Largest SVF coefficient that keeps the one-step update stable.
+
+        The Chamberlin state update is ``[lp, bp] ← [[1, f], [−f, 1 − f² −
+        f/q]]·[lp, bp]``; its eigenvalues stay inside the unit circle only
+        for ``f < −1/q + √(1/q² + 4)`` — 1.108 at the default q = 0.8, 1.694
+        at q = 3. The old fixed clamp ``2·sin(0.7) = 1.288`` was *past* that
+        limit for any q below ~1.1: one loop stall longer than ~1.17/w0
+        (59 ms at the 20 rad/s rest centre, 23 ms at the 50 rad/s raised-arm
+        centre) multiplied the stored state by −1.64 instead of damping it.
+        A 10 % margin keeps the eigenvalues comfortably inside.
+        """
+        limit = -1.0 / q + math.sqrt(1.0 / (q * q) + 4.0)
+        return min(2.0 * math.sin(0.7), 0.9 * limit)
 
     def update(self, x: list[float], w0: Sequence[float] | None = None) -> list[float]:
         """Advance one step; returns the band-passed values (zeros on first call).
@@ -223,12 +250,23 @@ class BandPass:
         self._last_time = now
         if ts <= 0:
             return [b / q for b, q in zip(self._bp, self._q)]
+        if self._ts_nominal is not None and ts > self.STALL_FACTOR * self._ts_nominal:
+            # See STALL_FACTOR: restart rather than integrate across the gap.
+            self._lp = [0.0] * self._n
+            self._bp = [0.0] * self._n
+            return [0.0] * self._n
+        self._ts_nominal = (
+            ts if self._ts_nominal is None else 0.9 * self._ts_nominal + 0.1 * ts
+        )
         out: list[float] = []
         for i in range(self._n):
             # Chamberlin SVF coefficient; the sin() form keeps the centre
-            # accurate at low fs, and clamping keeps the filter stable
-            # across loop stalls.
-            f = 2.0 * math.sin(min(0.5 * self._w0[i] * ts, 0.7))
+            # accurate at low fs, and the clamp keeps the one-step update
+            # stable for this channel's q (see _max_coefficient).
+            f = min(
+                2.0 * math.sin(min(0.5 * self._w0[i] * ts, 0.7)),
+                self._max_coefficient(self._q[i]),
+            )
             self._lp[i] += f * self._bp[i]
             hp = x[i] - self._lp[i] - self._bp[i] / self._q[i]
             self._bp[i] += f * hp

@@ -94,7 +94,7 @@ from ..teleop.core import TCPPoseSnapshot
 from ..teleop.recorder import resolve_prefix
 from ..teleop_activity import TeleopActivityMarker
 from ..utils import affinity
-from ..utils.control_loop import run_blocking_with_control_ticks
+from ..utils.control_loop import rebase_deadline, run_blocking_with_control_ticks
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..utils.stall_diag import (
@@ -2124,8 +2124,11 @@ def _run_session(
         # corrected on the next cycle instead of stretching the command interval.
         # Regular command timing matters because motion_control derives its
         # velocity feedforward by differentiating commanded positions, so a
-        # jittery interval shows up as jerk.
+        # jittery interval shows up as jerk. A *stall* is the exception: past
+        # a couple of intervals of debt the deadline is re-anchored rather
+        # than replayed as a burst of ticks (see control_loop.rebase_deadline).
         deadline = time.perf_counter()
+        stalls = 0
         while not _stopped():
             # A reset playing outside a recording — the startup move at
             # session start, or a reset press during the pre-record phase —
@@ -2148,6 +2151,17 @@ def _run_session(
                 deadline = time.perf_counter()
                 prev_t0["v"] = 0.0
                 continue
+            rebased = rebase_deadline(deadline, time.perf_counter(), teleop_interval)
+            if rebased != deadline:
+                stalls += 1
+                if stalls <= 3 or stalls % 50 == 0:
+                    _logger.info(
+                        "loop: stall #%d — pacing re-anchored instead of "
+                        "replaying %.0f ms of missed ticks as a burst",
+                        stalls,
+                        1e3 * (rebased - deadline),
+                    )
+                deadline = rebased
             deadline += teleop_interval
             try:
                 await _tracking_tick()

@@ -354,6 +354,15 @@ class VRServer:
         """
         return self._interp.sample()
 
+    def wait_render_frame(self, timeout: float) -> bool:
+        """Sleep until a new pose frame arrives or ``timeout`` elapses.
+
+        The idle companion of :meth:`get_render_frame`: a consumer that found
+        the render unchanged waits here instead of re-rendering every
+        millisecond. Returns True if a frame arrived.
+        """
+        return self._interp.wait_for_frame(timeout)
+
     def set_on_frame(self, callback: Callable[[VRFrame], None] | None) -> None:
         """Replace the on_frame callback. Safe to call after construction."""
         self._on_frame = callback

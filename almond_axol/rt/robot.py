@@ -338,6 +338,26 @@ class Axol(RobotBase):
                 )
         return "\n".join(lines) + "\n"
 
+    def _ranges_text(self) -> str:
+        """The ``A`` message body: this side's detected MyActuator MIT ranges.
+
+        One ``ranges <side> <motor_id> <p_max> <t_max>`` line per MyActuator
+        arm joint, from the driver's ``_detect_capabilities`` (run with
+        retries earlier in ``_enable``). The core arms against these instead
+        of its own single reads — see ``RtLink.arm``.
+        """
+        lines = []
+        for side, arm in self._arms():
+            for j in ARM_JOINTS:
+                motor_id = _JOINT_CONFIG[j].motor_id
+                if j not in arm.motors or motor_id > 5:
+                    continue
+                driver = arm.motors[j]._driver
+                lines.append(
+                    f"ranges {side} {motor_id} {driver._p_max!r} {driver._t_max!r}"
+                )
+        return "\n".join(lines) + ("\n" if lines else "")
+
     async def enable(self, hold: bool = True) -> None:
         """Bring every motor up.
 
@@ -463,7 +483,7 @@ class Axol(RobotBase):
         # Hand the interfaces over completely: the maintenance proxy exits
         # before the realtime bus threads open their SocketCAN sockets.
         await asyncio.gather(*(bus.close() for bus in self._buses()))
-        await self._link.arm()
+        await self._link.arm(self._ranges_text())
         self._armed = True
         await self._wait_for_caches()
         # Prime one full hold target at the measured pose: the core's own
@@ -474,6 +494,13 @@ class Axol(RobotBase):
         # One motion_control at the measured pose ships gravity plus the
         # pose-scheduled fast-term coefficients; the watchdog then holds it,
         # damping included.
+        # The arms' command history predates this bring-up (a previous
+        # session in the same process under `axol serve`, a hand-guided
+        # hold): a stale _last_q_commanded more than max_step_rad from the
+        # measured pose would have the prime below rejected, leaving the core
+        # holding with no gravity feedforward until the first real command.
+        for _side, arm in self._arms():
+            arm.reset_command_state()
         pos_l, pos_r = await self.get_positions()
         await self.motion_control(left=pos_l, right=pos_r)
         _logger.info(

@@ -119,6 +119,29 @@ own trajectory and feedback states:
   intended ~3.2 Hz mode while rejecting the measured 12.5-13.6 Hz
   mast/forearm structural mode. Every production flow consumes the same
   value, and explicit calibration or CLI Q values remain authoritative.
+- **Damping never steps on a single bad tick.** A tick whose sample cannot
+  be trusted — one missed reply, one wake more than 0.5 ms late — does not
+  switch the damping torque to zero and empty the band-pass (which was a
+  1-7 Nm torque step into the very mode being damped, repeated silently on
+  every isolated miss below the degraded threshold). `filter::DampGate`
+  holds the last trusted output through up to three consecutive bad ticks
+  (fading 1.0, 0.5, 0.125), keeps the band-pass state and folds the
+  skipped time into the next update; a longer gap — a degraded stretch —
+  lets go, and when samples return the torque ramps back in over 50 ms
+  instead of stepping. A stale sample is never differentiated into the
+  damper. The stats line counts held joint-ticks and releases.
+- **The wire is encoded against the client's detected MIT ranges.** A
+  MyActuator on V4.4 firmware decodes `t_ff` against ±60 Nm (X6) or
+  ±129 Nm (X8) instead of the legacy ±24 Nm. The Python side reads each
+  motor's firmware version and model (0xB2/0xB5, with retries) before
+  arming and ships the resulting `(p_max, t_max)` per joint on the `A`
+  message; the core arms against those and only cross-checks its own
+  reads, logging a disagreement. Before this the core's own single-attempt
+  reads decided, and one dropped reply during arm silently selected the
+  legacy ranges — every `t_ff` on that joint scaled 2.5x/5.4x for the
+  session. Without shipped ranges (the `hold` tool) the core's reads are
+  retried and a motor that never answers them fails the bring-up like one
+  that never answers its status read.
 - **Faults never disable the motors.** Dropping the arms is worse than
   anything the checks detect. Torque comes off only on an explicit `D`
   disarm of a healthy session (the operator's deliberate stop) or an
@@ -137,12 +160,18 @@ own trajectory and feedback states:
   degraded tier and nothing above it. A whole-cycle overrun (a tick that
   wakes a full period or more late), three late ticks (> 0.5 ms) in a
   row, or 8 of the last 32 late marks that *bus* timing-degraded: host
-  damping off on every joint of the bus until a clean 32-tick window, and
-  the overrun tick's tracker advances one nominal period with its
-  derivative chains re-seeded at rest — the motors held the previous
-  command across the gap, so there is no trajectory to differentiate and
-  no inertia or damping torque to compute from it. Firmware kp/kd and the
-  streamed gravity `t_ff` are untouched: the arm keeps holding. The
+  damping off on every joint of the bus until a clean 32-tick window
+  (fading out and ramping back in through the `DampGate`), and the
+  overrun tick's tracker advances one nominal period with its derivative
+  chains *rebased* rather than re-seeded: the reference position moves to
+  the new tick but the velocity state is kept (scaled by
+  `exp(-lateness / 50 ms)`, the rate at which the held command
+  decelerates a joint toward its held `p_des`), so a joint that was moving
+  into the gap keeps its wire velocity and friction feedforward instead of
+  having them zeroed and re-ramped — a `kd·v` brake pulse plus a ±Fc step
+  at every overrun in motion. Only the inertia term restarts (no
+  acceleration is known across the gap). Firmware kp/kd and the streamed
+  gravity `t_ff` are untouched: the arm keeps holding. The
   transition is a `W` warning line carrying the thread's own counters
   across that wake (`src/stall.rs`: `/proc/thread-self/schedstat`
   runnable-wait, `getrusage(RUSAGE_THREAD)` page faults and involuntary

@@ -1139,6 +1139,14 @@ class AxolArm:
         self, held: list[Joint], cold: list[Joint], *, hold: bool
     ) -> None:
         """Attach held motors and bring cold motors up after state is sampled."""
+        # Whatever command history this object carries predates this
+        # bring-up (a previous session in the same process, a hand-guided
+        # hold) and describes a pose the arm is no longer at. Differentiating
+        # or band-passing across it would put a phantom velocity — and, with
+        # kd_host, a torque kick — into the first command; a stale
+        # _last_q_commanded could reject that command outright. Start clean;
+        # the held/hold seeding below re-anchors the max-step check.
+        self.reset_command_state()
         await _await_all_hardware_actions(
             *[
                 self.motors[j].attach(

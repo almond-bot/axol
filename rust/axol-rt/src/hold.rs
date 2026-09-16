@@ -73,6 +73,9 @@ pub fn parse_params(path: &str) -> io::Result<Vec<JointParams>> {
                     k: 0.0,
                     fv: 0.0,
                     fo: 0.0,
+                    // hold reads the ranges itself (with retries) — there is
+                    // no client to have detected them first.
+                    mit_ranges: None,
                 },
                 t_ff: fields.get(5)?.parse().ok()?,
             })
@@ -187,7 +190,11 @@ fn bus_hold(
             held.join(", ")
         );
     }
-    let ready = bringup::prepare(&sock, iface, &specs)?;
+    let mut notes = Vec::new();
+    let ready = bringup::prepare(&sock, iface, &specs, &mut notes)?;
+    for note in &notes {
+        println!("  {iface}: {note}");
+    }
     let mut motors: Vec<HeldMotor> = ready
         .into_iter()
         .map(|ready| {
