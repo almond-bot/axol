@@ -199,6 +199,73 @@ impl Trapezoid {
     }
 }
 
+/// Running estimate of a target stream's spacing, learned from arrivals.
+///
+/// Python streams at ~120 Hz in teleop; run-policy / collect-dagger's policy
+/// state at the dataset rate (30-60 Hz), and dagger switches between the
+/// two mid-session. Learned rather than configured so no client, old or
+/// new, has to declare its rate. Gaps shorter than the estimate are always
+/// taken (a faster stream is followed at once). A single long gap is a late
+/// arrival — exactly what `Holdover` bridges — and must not stretch the
+/// estimate, or a stalling host would teach the core that stalls are
+/// normal; but `RELEARN` long gaps *in a row* are a slower stream, and the
+/// estimate re-seeds from their mean (Bugbot on #306: the first version
+/// only ever rejected long gaps, so after a dagger intervention every
+/// on-time 33 ms policy frame counted as late).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cadence {
+    value: Option<f64>,
+    slow_run: u32,
+    slow_sum: f64,
+}
+
+impl Cadence {
+    /// Clamp on any single gap sample (seconds).
+    pub const MIN: f64 = 0.002;
+    pub const MAX: f64 = 0.100;
+    /// Weight of each in-cadence gap in the running estimate.
+    const SMOOTHING: f64 = 0.1;
+    /// A gap longer than this many cadences is an outlier (late arrival).
+    pub const OUTLIER: f64 = 1.75;
+    /// This many consecutive outlier gaps are a slower stream, not lateness:
+    /// at 30 Hz that is 200 ms of the new rate before the estimate follows.
+    pub const RELEARN: u32 = 6;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Current estimate (seconds), once two targets have arrived.
+    pub fn get(&self) -> Option<f64> {
+        self.value
+    }
+
+    /// Record the gap (seconds) between two consecutive adopted targets.
+    pub fn observe(&mut self, gap: f64) {
+        if !gap.is_finite() || gap <= 0.0 {
+            return;
+        }
+        let sample = gap.clamp(Self::MIN, Self::MAX);
+        match self.value {
+            None => self.value = Some(sample),
+            Some(c) if gap > Self::OUTLIER * c => {
+                self.slow_run += 1;
+                self.slow_sum += sample;
+                if self.slow_run >= Self::RELEARN {
+                    self.value = Some(self.slow_sum / self.slow_run as f64);
+                    self.slow_run = 0;
+                    self.slow_sum = 0.0;
+                }
+            }
+            Some(c) => {
+                self.slow_run = 0;
+                self.slow_sum = 0.0;
+                self.value = Some(c + Self::SMOOTHING * (sample - c));
+            }
+        }
+    }
+}
+
 /// Carries a *late* streamed target forward along the stream's own velocity.
 ///
 /// The core tracks the latest target Python streamed. When Python's tick is
@@ -614,6 +681,75 @@ mod tests {
             hold.observe(p, Some(CADENCE), Some(CADENCE));
         }
         p
+    }
+
+    #[test]
+    fn cadence_learns_the_stream_and_ignores_a_single_late_gap() {
+        let mut c = Cadence::new();
+        assert_eq!(c.get(), None);
+        for _ in 0..50 {
+            c.observe(CADENCE);
+        }
+        let learned = c.get().unwrap();
+        assert!((learned - CADENCE).abs() < 1e-9);
+        // One 40 ms stall (a late arrival) leaves the estimate alone.
+        c.observe(0.040);
+        assert_eq!(c.get().unwrap(), learned);
+        // As do a few scattered ones with on-time gaps between.
+        for _ in 0..3 {
+            c.observe(0.030);
+            c.observe(CADENCE);
+        }
+        assert!((c.get().unwrap() - CADENCE).abs() < 1e-3);
+        // A resume after a long hold (watchdog territory) is not a cadence.
+        c.observe(0.5);
+        assert!((c.get().unwrap() - CADENCE).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cadence_relearns_a_slower_stream_after_a_run_of_long_gaps() {
+        // Dagger: 120 Hz teleop intervention, then the policy state at 30 Hz.
+        let mut c = Cadence::new();
+        for _ in 0..50 {
+            c.observe(CADENCE);
+        }
+        let slow = 1.0 / 30.0;
+        for k in 1..Cadence::RELEARN {
+            c.observe(slow);
+            assert!(
+                (c.get().unwrap() - CADENCE).abs() < 1e-9,
+                "gap {k}: still the old cadence while the run is short"
+            );
+        }
+        c.observe(slow);
+        assert!(
+            (c.get().unwrap() - slow).abs() < 1e-9,
+            "re-seeded from the run: {:?}",
+            c.get()
+        );
+        // Now an on-time 30 Hz frame is not late for the holdover.
+        let hold = Holdover::new(0.08, 0.35);
+        let p = 1.0;
+        assert_eq!(hold.target(p, slow, c.get()), p);
+        // And a faster stream is followed at once (short gaps always count).
+        for _ in 0..40 {
+            c.observe(CADENCE);
+        }
+        assert!((c.get().unwrap() - CADENCE).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cadence_clamps_and_ignores_garbage() {
+        let mut c = Cadence::new();
+        c.observe(0.0);
+        c.observe(-1.0);
+        c.observe(f64::NAN);
+        assert_eq!(c.get(), None);
+        c.observe(10.0);
+        assert_eq!(c.get(), Some(Cadence::MAX));
+        let mut fast = Cadence::new();
+        fast.observe(1e-6);
+        assert_eq!(fast.get(), Some(Cadence::MIN));
     }
 
     #[test]

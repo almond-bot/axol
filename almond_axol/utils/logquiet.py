@@ -44,14 +44,20 @@ NOISY_LOGGER_LEVEL = logging.INFO
 
 
 def quiet_noisy_loggers(level: int = NOISY_LOGGER_LEVEL) -> None:
-    """Pin every logger in :data:`NOISY_LOGGERS` at ``level`` (default INFO).
+    """Cap every logger in :data:`NOISY_LOGGERS` at ``level`` (default INFO).
+
+    A *cap*, never a floor: the level set is ``max(level, root level)``, so
+    under ``--log_level WARNING`` these packages stay at WARNING (an explicit
+    INFO on the package logger would otherwise pass INFO records *through* a
+    stricter root — a logger's own level overrides the inherited one). The
+    serve panel changes the root level per op and calls this each time, so
+    the cap follows the root in both directions.
 
     Idempotent and cheap; call it right after the ``basicConfig`` that sets
     the root level. Child loggers (``aiortc.rtcrtpsender``) inherit the cap
     through their parent's effective level, so only the package roots are
-    listed. A logger already stricter than ``level`` is left alone.
+    listed.
     """
+    cap = max(level, logging.getLogger().getEffectiveLevel())
     for name in NOISY_LOGGERS:
-        logger = logging.getLogger(name)
-        if logger.level == logging.NOTSET or logger.level < level:
-            logger.setLevel(level)
+        logging.getLogger(name).setLevel(cap)
