@@ -30,7 +30,7 @@ axol run-policy --policy_path myorg/pick-act --policy_type act --task "pick up t
 | `--task` | required | Task description sent to the policy and stored with recorded frames. |
 | `--device` | `cuda` | `cuda`, `cpu`, or `mps`. |
 | `--episode_time_s` | `120` | Maximum episode length (s). |
-| `--fps` | `60` | Control rate. Must match the training fps unless `--allow_fps_mismatch true`. |
+| `--fps` | `30` | Control rate. Must match the training fps unless `--allow_fps_mismatch true` (a checkpoint trained on 60 fps data needs `--fps 60`). |
 | `--allow_fps_mismatch` | `false` | Start even if `fps` differs from the training fps. Experiments only. |
 | `--server_host` | `null` (local) | Address of a remote [`inference-server`](/cli/inference-server). `null` starts one locally. |
 | `--server_port` | `8765` | Inference server port. |

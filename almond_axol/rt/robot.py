@@ -27,7 +27,10 @@ while enabled, the CAN buses are owned by the ``axol-rt`` subprocess:
   POSITION_FORCE command (motor-frame target, speed limit, torque limit).
 - The *fast* physics all run in the core, per 240 Hz tick, from its own
   trajectory and feedback states: a golden-ported trapezoid tracker chases
-  the latest target (replacing linear interpolation), the classic 20 rad/s
+  the latest target (replacing linear interpolation) — carried forward along
+  the stream's own velocity for up to 80 ms when this side's tick is late,
+  so a Python stall renders as smooth motion rather than a stop-then-lunge
+  (``filter::Holdover``) —, the classic 20 rad/s
   command-derivative chain computes smooth friction/inertia feedforwards
   from that executed trajectory (friction params ride the config; the
   pose-scaled ``j_eff`` rides each target), and band-passed velocity damping
