@@ -199,6 +199,113 @@ impl Trapezoid {
     }
 }
 
+/// Carries a *late* streamed target forward along the stream's own velocity.
+///
+/// The core tracks the latest target Python streamed. When Python's tick is
+/// late — the control thread lost the CPU to a camera relay, a desktop, a
+/// stats daemon, whatever else the host runs — the tracker's target stops
+/// dead for the gap and then jumps by everything the hand moved meanwhile:
+/// at 120 Hz a 40 ms stall is a five-target notch, and the 5 Hz tracker
+/// renders that as a visible decelerate-then-lunge hitch (2026-09-15, every
+/// stalled tick in the flight recorder lined up with an arm "jump").
+///
+/// Instead of holding, the target the tracker is given keeps moving at the
+/// velocity the stream itself had — estimated from consecutive adopted
+/// targets, smoothed — starting once the newest target is older than the
+/// stream's cadence plus slack, with the velocity ramping linearly to zero
+/// over `max_hold`. The reach is clamped to `max_reach`, and the tracker's
+/// own vel/accel limits still bound the wire. An on-time stream is
+/// untouched (`target` returns `p` unchanged), a stalled one (operator
+/// stopped, watchdog) glides to rest within `max_hold`, and when the late
+/// target finally lands the step the tracker sees is the extrapolation
+/// error, not the whole gap. This is what makes smoothness independent of
+/// host scheduling rather than a property of a particular box's load.
+#[derive(Clone, Copy, Debug)]
+pub struct Holdover {
+    /// Seconds a late target is carried forward before the extrapolation
+    /// has glided to rest and the tracker simply holds.
+    pub max_hold: f64,
+    /// Furthest (rad) the carried target may travel from the last real one.
+    pub max_reach: f64,
+    vel: f64,
+    last: Option<f64>,
+}
+
+impl Holdover {
+    /// Weight of each fresh velocity sample in the running estimate. The
+    /// stream is Python's own trapezoid output, so consecutive samples are
+    /// already smooth; the light filter only takes socket jitter out of the
+    /// finite difference.
+    const SMOOTHING: f64 = 0.5;
+    /// A target is *late* once its age exceeds this many cadences; inside
+    /// that window it is the stream's normal spacing plus transport jitter.
+    pub const SLACK: f64 = 1.25;
+    /// Inter-arrival gaps beyond this many cadences (stream resumed after a
+    /// hold) carry no velocity information: the estimate restarts from rest.
+    const RESUME: f64 = 4.0;
+
+    pub fn new(max_hold: f64, max_reach: f64) -> Self {
+        Self {
+            max_hold,
+            max_reach,
+            vel: 0.0,
+            last: None,
+        }
+    }
+
+    /// Forget the stream: the next target starts a fresh estimate from rest.
+    /// Called for passthrough (gravity comp / limp) targets and on rejects.
+    pub fn reset(&mut self) {
+        self.vel = 0.0;
+        self.last = None;
+    }
+
+    /// Current velocity estimate, rad/s.
+    #[cfg(test)]
+    pub fn vel(&self) -> f64 {
+        self.vel
+    }
+
+    /// Record a freshly adopted tracked target `p`, `dt` seconds after the
+    /// previous adopted one (`None` when there is no usable previous
+    /// arrival), for a stream whose nominal spacing is `cadence` seconds.
+    pub fn observe(&mut self, p: f64, dt: Option<f64>, cadence: Option<f64>) {
+        match (self.last, dt, cadence) {
+            (Some(prev), Some(dt), Some(cadence))
+                if dt > 0.0 && dt.is_finite() && dt <= Self::RESUME * cadence =>
+            {
+                let raw = (p - prev) / dt;
+                if raw.is_finite() {
+                    self.vel += Self::SMOOTHING * (raw - self.vel);
+                } else {
+                    self.vel = 0.0;
+                }
+            }
+            _ => self.vel = 0.0,
+        }
+        self.last = Some(p);
+    }
+
+    /// The target to track `age` seconds after `p` (the last real target)
+    /// arrived. Identity while the stream is on time or its cadence is not
+    /// yet known.
+    pub fn target(&self, p: f64, age: f64, cadence: Option<f64>) -> f64 {
+        let Some(cadence) = cadence else {
+            return p;
+        };
+        let late = age - Self::SLACK * cadence;
+        if late <= 0.0 || self.vel == 0.0 || self.max_hold <= 0.0 {
+            return p;
+        }
+        // Velocity ramps linearly from `vel` to zero over `max_hold`, so the
+        // carried target decelerates to rest instead of stopping short:
+        // reach(t) = ∫₀ᵗ vel·(1 − τ/T) dτ = vel·(t − t²/2T), t ≤ T.
+        let t = late.min(self.max_hold);
+        let reach = self.vel * (t - t * t / (2.0 * self.max_hold));
+        p + reach.clamp(-self.max_reach, self.max_reach)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +599,193 @@ mod tests {
             power_core < 1.5 * power_classic,
             "in-core damping should dissipate at least 1.5x the delayed \
              chain's power (core {power_core:e} W vs classic {power_classic:e} W)"
+        );
+    }
+
+    /// The Python target stream: 120 Hz, constant velocity.
+    const CADENCE: f64 = 1.0 / 120.0;
+    const STREAM_VEL: f64 = 1.2; // rad/s
+
+    fn streamed(hold: &mut Holdover, n: usize) -> f64 {
+        let mut p = 0.0;
+        hold.observe(p, None, Some(CADENCE));
+        for _ in 0..n {
+            p += STREAM_VEL * CADENCE;
+            hold.observe(p, Some(CADENCE), Some(CADENCE));
+        }
+        p
+    }
+
+    #[test]
+    fn holdover_is_identity_for_an_on_time_stream() {
+        let mut hold = Holdover::new(0.08, 0.35);
+        let p = streamed(&mut hold, 60);
+        assert!((hold.vel() - STREAM_VEL).abs() < 1e-9);
+        // Inside cadence + slack nothing is carried, whatever the velocity.
+        for age in [0.0, 0.5 * CADENCE, CADENCE, 1.2 * CADENCE] {
+            assert_eq!(hold.target(p, age, Some(CADENCE)), p, "age {age}");
+        }
+        // Unknown cadence (first target of a session) is identity too.
+        assert_eq!(hold.target(p, 0.05, None), p);
+    }
+
+    #[test]
+    fn holdover_carries_a_late_target_along_the_stream_velocity() {
+        let mut hold = Holdover::new(0.08, 0.35);
+        let p = streamed(&mut hold, 20);
+        // 40 ms after the last target the hand has moved STREAM_VEL·40 ms.
+        // The carried target covers most of that (minus the slack window
+        // and the deceleration ramp), and the step the tracker sees when
+        // the late target lands shrinks from the whole gap to the residual.
+        let age = 0.040;
+        let truth = p + STREAM_VEL * age;
+        let carried = hold.target(p, age, Some(CADENCE));
+        let gap = truth - p;
+        let residual = truth - carried;
+        assert!(carried > p, "must move in the stream's direction");
+        assert!(
+            residual < 0.5 * gap,
+            "residual {residual:.4} should be well under the raw gap {gap:.4}"
+        );
+        // Monotone in age and never past the true line.
+        let mut prev = p;
+        for k in 1..=20 {
+            let a = k as f64 * 0.004;
+            let c = hold.target(p, a, Some(CADENCE));
+            assert!(c >= prev, "carried target must not retreat (age {a})");
+            assert!(
+                c <= p + STREAM_VEL * a + 1e-12,
+                "must not lead the stream (age {a})"
+            );
+            prev = c;
+        }
+    }
+
+    #[test]
+    fn holdover_glides_to_rest_within_max_hold() {
+        let max_hold = 0.08;
+        let mut hold = Holdover::new(max_hold, 0.35);
+        let p = streamed(&mut hold, 60);
+        let late_start = Holdover::SLACK * CADENCE;
+        let at_rest = hold.target(p, late_start + max_hold, Some(CADENCE));
+        // Ramp integral: vel·T/2.
+        let want = p + STREAM_VEL * max_hold / 2.0;
+        assert!((at_rest - want).abs() < 1e-9, "got {at_rest}, want {want}");
+        // Past max_hold nothing more is added: the tracker just holds there.
+        assert_eq!(
+            hold.target(p, late_start + 2.0 * max_hold, Some(CADENCE)),
+            at_rest
+        );
+        assert_eq!(hold.target(p, 10.0, Some(CADENCE)), at_rest);
+        // The velocity at the end of the ramp is zero: reach is flat there.
+        let just_before = hold.target(p, late_start + max_hold - 1e-4, Some(CADENCE));
+        assert!((at_rest - just_before).abs() < STREAM_VEL * 1e-4 * 0.01);
+    }
+
+    #[test]
+    fn holdover_reach_is_clamped() {
+        let mut hold = Holdover::new(1.0, 0.02);
+        let p = streamed(&mut hold, 20);
+        let far = hold.target(p, 1.0, Some(CADENCE));
+        assert!((far - (p + 0.02)).abs() < 1e-12);
+        // Negative direction clamps symmetrically.
+        let mut back = Holdover::new(1.0, 0.02);
+        back.observe(1.0, None, Some(CADENCE));
+        back.observe(1.0 - STREAM_VEL * CADENCE, Some(CADENCE), Some(CADENCE));
+        let far_back = back.target(1.0 - STREAM_VEL * CADENCE, 1.0, Some(CADENCE));
+        assert!((far_back - (1.0 - STREAM_VEL * CADENCE - 0.02)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn holdover_restarts_from_rest_after_a_resume_or_reset() {
+        let mut hold = Holdover::new(0.08, 0.35);
+        let p = streamed(&mut hold, 20);
+        assert!(hold.vel() > 0.0);
+        // A target landing after a long silence (stream resumed) carries no
+        // velocity information: the arm was held, not moving.
+        hold.observe(p + 0.3, Some(0.5), Some(CADENCE));
+        assert_eq!(hold.vel(), 0.0);
+        assert_eq!(hold.target(p + 0.3, 0.05, Some(CADENCE)), p + 0.3);
+        // Two more on-time targets and the estimate is live again.
+        hold.observe(p + 0.3 + STREAM_VEL * CADENCE, Some(CADENCE), Some(CADENCE));
+        assert!(hold.vel() > 0.0);
+        // Explicit reset (passthrough target / reject) drops it as well, and
+        // the first target after a reset has no previous to difference.
+        hold.reset();
+        assert_eq!(hold.vel(), 0.0);
+        hold.observe(0.0, Some(CADENCE), Some(CADENCE));
+        assert_eq!(hold.vel(), 0.0);
+        // A missing cadence never produces a velocity.
+        hold.observe(0.01, Some(CADENCE), None);
+        assert_eq!(hold.vel(), 0.0);
+    }
+
+    #[test]
+    fn holdover_shrinks_the_tracker_hitch_across_a_stalled_tick() {
+        // The whole point: run the 240 Hz trapezoid against a 120 Hz
+        // constant-velocity stream with one 40 ms stall in it, with and
+        // without holdover, and compare the worst deviation of the rendered
+        // trajectory from the ideal constant-velocity line.
+        fn worst_deviation(with_holdover: bool) -> f64 {
+            let dt = 1.0 / 240.0;
+            let mut trk = Trapezoid::new(6.0, 40.0);
+            trk.seed(0.0);
+            let mut hold = Holdover::new(0.08, 0.35);
+            let stall_start = 0.5;
+            let stall_len = 0.040;
+            let mut next_target_t = 0.0;
+            let mut last_p = 0.0;
+            let mut last_arrival = 0.0;
+            let mut have_prev = false;
+            let mut worst = 0.0;
+            let n = (1.5 / dt) as usize;
+            for k in 0..n {
+                let t = k as f64 * dt;
+                // Python's tick: on time, except it sleeps through the stall.
+                while next_target_t <= t {
+                    let arrives = next_target_t;
+                    let in_stall = arrives > stall_start && arrives < stall_start + stall_len;
+                    if !in_stall {
+                        let p = STREAM_VEL * arrives;
+                        let gap = if have_prev {
+                            Some(arrives - last_arrival)
+                        } else {
+                            None
+                        };
+                        hold.observe(p, gap, Some(CADENCE));
+                        last_p = p;
+                        last_arrival = arrives;
+                        have_prev = true;
+                    }
+                    next_target_t += CADENCE;
+                }
+                let target = if with_holdover {
+                    hold.target(last_p, t - last_arrival, Some(CADENCE))
+                } else {
+                    last_p
+                };
+                let (pos, _, _) = trk.update(target, dt);
+                // Only judge the stall and its recovery (steady tracking lag
+                // is identical in both runs); subtract that lag out.
+                if t > stall_start && t < stall_start + 0.4 {
+                    let ideal = STREAM_VEL * t - STREAM_VEL / Trapezoid::POS_TRACK_GAIN;
+                    worst = f64::max(worst, (pos - ideal).abs());
+                }
+            }
+            worst
+        }
+        let plain = worst_deviation(false);
+        let held = worst_deviation(true);
+        assert!(
+            plain > 0.01,
+            "the stall must produce a visible hitch to fix ({plain:.4})"
+        );
+        eprintln!(
+            "worst deviation across a 40 ms stall: plain {plain:.4} rad, holdover {held:.4} rad"
+        );
+        assert!(
+            held < 0.5 * plain,
+            "holdover should at least halve the hitch (plain {plain:.4}, held {held:.4})"
         );
     }
 }
