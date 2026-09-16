@@ -426,6 +426,30 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 help="Peak output torque of the right gripper.",
             ),
             SettingDef(
+                key="axol.left.gripper.open_limit_deg",
+                label="Left gripper opening (°)",
+                type="number",
+                help=(
+                    "How far a fully open command opens the left gripper, in "
+                    "degrees of motor rotation from the closed stop (140 for "
+                    "the parcel gripper's blade). Box mode's angled grasp "
+                    "opens it to the stop instead. 0 = the stop always (the "
+                    "stock gripper)."
+                ),
+            ),
+            SettingDef(
+                key="axol.right.gripper.open_limit_deg",
+                label="Right gripper opening (°)",
+                type="number",
+                help=(
+                    "How far a fully open command opens the right gripper, in "
+                    "degrees of motor rotation from the closed stop (140 for "
+                    "the parcel gripper's blade). Box mode's angled grasp "
+                    "opens it to the stop instead. 0 = the stop always (the "
+                    "stock gripper)."
+                ),
+            ),
+            SettingDef(
                 key="axol.left.gripper.max_speed",
                 label="Left gripper max speed (rad/s)",
                 type="number",
@@ -722,12 +746,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 help=(
                     "Which grasp a box-mode session starts in. straight (the "
                     "default): fingers straight forward (0°), width between "
-                    "the mounts — the parallel grasp, the one place the "
-                    "parcel gripper's blade opens to its full 180° stroke. "
-                    "flush: the fitted gripper's contact face along the box "
-                    "side (parcel gripper: the blade opened 140°, grippers "
-                    "yawed 40° inward, width between the faces). In the "
-                    "headset a click of either thumbstick "
+                    "the mounts. flush: the fitted gripper's contact face "
+                    "along the box side (parcel gripper: the blade folded to "
+                    "its open stop — the one place the gripper opens past "
+                    "its working 140° — grippers yawed 180° minus the blade "
+                    "stop inward, width between the faces). In the headset a "
+                    "click of either thumbstick "
                     "while leading toggles between the two; the arms blend "
                     "over."
                 ),

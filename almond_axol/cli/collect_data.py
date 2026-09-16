@@ -89,6 +89,7 @@ from ..recording import (
     default_vcodec,
     restore_dataset_ownership,
 )
+from ..robot.axol import AxolArm
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
 from ..teleop.core import TCPPoseSnapshot
@@ -1493,6 +1494,16 @@ def _run_session(
             teleop.set_video_expected(True)
 
         pos_l, pos_r = robot.positions
+        # The gripper readings are normalised over the stroke; the teleop
+        # seeds its grip commands from slot 7, which run over the working
+        # opening (AxolArm.gripper_command converts; see open_limit_deg).
+        axol = robot.axol
+        for pos, arm in (
+            (pos_l, getattr(axol, "left", None)),
+            (pos_r, getattr(axol, "right", None)),
+        ):
+            if isinstance(arm, AxolArm) and pos is not None and len(pos) > 7:
+                pos[7] = arm.gripper_command(float(pos[7]))
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
         # The headset's live settings act on the hardware too (grip force):
         # hand the teleoperator the arms now that the robot is up.
@@ -1692,9 +1703,12 @@ def _run_session(
     # teleop. The Mantis rig has no arms and no setter, so this is a no-op
     # there.
     caps_applied: dict[Joint, float] | None = None
+    # And the grippers' working opening: the angled box grasp folds the
+    # parcel gripper's blade to its stop, all else works it at open_limit_deg.
+    full_stroke_applied: bool | None = None
 
     def _sync_spring_caps() -> None:
-        nonlocal caps_applied
+        nonlocal caps_applied, full_stroke_applied
         axol = getattr(robot, "axol", None)
         set_caps = getattr(axol, "set_spring_caps", None)
         if set_caps is not None:
@@ -1702,6 +1716,12 @@ def _run_session(
             if caps != caps_applied:
                 set_caps(caps)
                 caps_applied = caps
+        set_full = getattr(axol, "set_gripper_full_stroke", None)
+        if set_full is not None:
+            full = teleop.gripper_full_stroke()
+            if full != full_stroke_applied:
+                set_full(full)
+                full_stroke_applied = full
 
     # Worst single-iteration stall and scheduler slip within each window. `gap`
     # is the longest time between consecutive loop iterations (a starved control

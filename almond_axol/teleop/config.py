@@ -148,33 +148,25 @@ class VRTeleopConfig:
             the URDF carries — the mounts themselves are ``width`` apart
             and the flat side of the closed fingers faces the box at tilt 0.
             Live-adjustable.
-        gripper_stroke_deg: Parcel gripper only: the hinged blade's full
-            fold (degrees from closed) at its mechanical open stop — where
-            the gripper calibration finds the open position, grip ``1.0``.
-            At ``180`` the blade lies flat back against the fixed one, its
-            face parallel to the box side at yaw 0: that is box mode's
-            parallel (``"straight"``) grasp, the one place the gripper is
-            opened this far.
         box_tool_open_deg: Parcel gripper only: how far (degrees from
-            closed) the hinged blade is opened everywhere *but* the parallel
-            grasp — plain teleop and box mode's ``"flush"`` grasp. A
-            released trigger commands this fold, ``box_tool_open_deg /
-            gripper_stroke_deg`` of the calibrated stroke (140° of 180°:
-            ``0.78``), and the trigger's travel is spread over it
-            (``VRTeleopCore.grip_command``). The flush yaw is ``180°`` minus
-            this — 40° — so the folded blade's face lies along the box side.
-            If that face won't sit flat, read the tilt trim at which it
-            does (HUD) and *subtract* it from this value. Live-adjustable.
+            closed) the hinged blade is folded at its open stop. The
+            angled (``"flush"``) grasp opens the gripper all the way to
+            that stop (``VRTeleopCore.gripper_full_stroke`` →
+            ``AxolArm.set_gripper_full_stroke``; every other mode works the
+            blade at the robot's ``open_limit_deg``, 140°) and yaws each
+            gripper ``180°`` minus this inward so the folded face lies along
+            the box side. The stop's angle is not known to the robot — this
+            is the geometry's estimate of it, a calibration constant: if
+            the face won't sit flat, read the tilt trim at which it does
+            (HUD) and *subtract* it from this value. Live-adjustable.
         box_grasp: Which of box mode's two grasps a session starts in.
             ``"straight"`` (the default): fingers straight forward (yaw 0),
-            width between the mount frames — the parallel grasp: with the
-            parcel gripper the blade is opened to its full
-            ``gripper_stroke_deg`` here (and only here), flat back against
-            the fixed blade so its face lies parallel to the box side.
-            ``"flush"``: the fitted tool's contact face along the box side
-            — for the parcel gripper the blade opened to
-            ``box_tool_open_deg``, with the grippers yawed ``180° -
-            box_tool_open_deg`` inward and the width measured between the
+            width between the mount frames — the plain flat-hands grasp,
+            the blade at its working 140° like everywhere else. ``"flush"``:
+            the fitted tool's contact face along the box side — for the
+            parcel gripper the blade folded to its open stop (the one place
+            the gripper is opened that far), with the grippers yawed ``180°
+            - box_tool_open_deg`` inward and the width measured between the
             faces. Toggled live while a grip is leading by clicking (and
             releasing) either thumbstick — a click that turns into the
             both-sticks box-mode gesture doesn't count — or from the
@@ -504,7 +496,6 @@ class VRTeleopConfig:
     reengage_ramp_min_s: float = 0.75
     box_mode: bool = False
     box_tool: str = "parcel"
-    gripper_stroke_deg: float = 180.0
     box_tool_open_deg: float = 140.0
     box_grasp: str = "straight"
     box_face_left: str = "auto"

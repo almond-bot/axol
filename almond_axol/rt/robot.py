@@ -836,6 +836,14 @@ class Axol(RobotBase):
         """Clear command history on both arms (pure Python state)."""
         self._robot.reset_command_state()
 
+    def set_gripper_full_stroke(self, full: bool) -> None:
+        """Open the grippers to their stops or their working opening (see ``AxolArm.set_gripper_full_stroke``).
+
+        Pure Python state on the arm objects: the next :meth:`motion_control`
+        maps the gripper command over the new span.
+        """
+        self._robot.set_gripper_full_stroke(full)
+
     def set_spring_caps(self, caps: Mapping[Joint, float] | None) -> None:
         """Live per-joint spring-torque caps on both arms (see ``AxolArm.set_spring_caps``).
 

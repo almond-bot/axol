@@ -191,15 +191,15 @@ def parcel_tool(
     The parcel gripper is two flat blades side by side along the fingers
     direction: a fixed one on the mount axis and a hinged one that swings
     toward the box side, about a vertical hinge ``pivot_fwd`` ahead of the
-    flange, opened ``open_deg`` from closed (its stroke runs to 180°, flat
-    back against the fixed blade — box mode's parallel grasp, where the
-    face is parallel to the box at yaw 0; everywhere else it is opened to
-    ``VRTeleopConfig.box_tool_open_deg``, 140°). Folded that far back it
-    lies alongside the wrist, and the box side is clamped by that blade's
-    flat face — a large patch *behind* the hinge, roughly centred on the
-    wrist, so a straight lateral squeeze needs almost no wrist moment to
-    keep it flat. For the face to lie on the box side the fixed blade must
-    point ``180° - open_deg`` inward: that is the flush tilt (40° at 140°).
+    flange, until it meets its mechanical stop ``open_deg`` from closed
+    (the angled grasp opens the gripper to that stop; every other mode
+    works the blade at the robot's 140° ``open_limit_deg``). Folded that
+    far back it lies alongside the wrist, and the box side is clamped by
+    that blade's flat face — a large patch *behind* the hinge, roughly
+    centred on the wrist, so a straight lateral squeeze needs almost no
+    wrist moment to keep it flat. For the face to lie on the box side the
+    fixed blade must point ``180° - open_deg`` inward: that is the flush
+    tilt (40° with the stop at 140°).
     The foot is the point of the folded face nearest the mount origin: the
     face plane is ``face_r`` from the hinge, so its distance from the mount
     origin along its normal is ``pivot_fwd * sin(open) + face_r``.
@@ -208,7 +208,7 @@ def parcel_tool(
     the face plane (it would sit exactly on it at ~146°), so with the face
     flush it hooks the box's front corner or digs in; the tilt trim backs
     the face off to touch tip-and-heel instead. Both flush at once needs the
-    opening at ~146° (see the config docs).
+    stop at ~146° (see the config docs).
     """
     phi = math.radians(open_deg)
     # Face normal toward the box, in (forward, inboard) mount coordinates:

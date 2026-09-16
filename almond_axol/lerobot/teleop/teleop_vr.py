@@ -897,6 +897,17 @@ class AxolVRTeleop(Teleoperator):
         """
         return self._core.spring_caps()
 
+    def gripper_full_stroke(self) -> bool:
+        """Whether the grippers should open to their stops right now.
+
+        Passthrough to :meth:`VRTeleopCore.gripper_full_stroke`: box mode's
+        angled grasp folds the parcel gripper's blade to its stop; every
+        other mode works it at the robot's ``open_limit_deg``.
+        ``collect-data`` hands the result to ``Axol.set_gripper_full_stroke``
+        on change, the same as native teleop.
+        """
+        return self._core.gripper_full_stroke()
+
     # ------------------------------------------------------------------
     # Teleoperator interface
     # ------------------------------------------------------------------

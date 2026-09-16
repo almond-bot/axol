@@ -217,11 +217,21 @@ class PositionForceConfig:
                          stop, then back to the open stop — so a wrong sign
                          swaps open/closed and leaves the jaw closed after
                          bring-up.
+        open_limit_deg:  How far a fully open command (``1.0``) opens the
+                         jaw, in degrees of motor rotation from the closed
+                         stop (closed = 0°). The parcel gripper's hinged
+                         blade is worked at 140° everywhere but box mode's
+                         angled grasp, where it goes to its open stop
+                         however far that is (``AxolArm.set_gripper_full_stroke``);
+                         the stop's angle is never assumed. A limit at or
+                         past the calibrated stroke, or ``0``, means the
+                         stop is the open position (the stock gripper).
     """
 
     torque_limit: float
     max_speed: float
     close_direction: int = -1
+    open_limit_deg: float = 140.0
 
     def __post_init__(self) -> None:
         if self.close_direction not in (1, -1):
