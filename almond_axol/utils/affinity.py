@@ -7,7 +7,9 @@ During ``collect-data`` the box runs five kinds of work that contend for cores:
   process pins the bus threads individually and runs them ``SCHED_FIFO``.
 * **realtime** — the Python 120 Hz target loop plus its web/VR/teleop and
   IK-dispatch threads. It has a separate core from CAN, so Python or camera
-  activity cannot delay a motor tick.
+  activity cannot delay a motor tick. Every control-loop command pins it
+  (``teleop`` too, since 2026-09-15 — unpinned, its loop floated onto the
+  FIFO CAN cores / the IK core and ran one tick in twelve 15–65 ms late).
 * **ik** — the out-of-process JAX IK solver (a ~1-core solve). On 8+ cores it
   gets a dedicated core so recording load can't preempt it mid-solve (which drops
   its rate ~115 -> ~80 Hz); on smaller hosts it shares the realtime cores.
@@ -393,13 +395,104 @@ def isolate_relay_cpu() -> bool:
 # The SCHED_FIFO ladder across the stack, lowest to highest:
 #   CAPTURE_FIFO_PRIORITY  (5)  relay camera capture chain
 #   capture daemon         (6)  nvargus-daemon, see utils.jetson
+#   CONTROL_FIFO_PRIORITY (10)  the Python 120 Hz control thread
 #   axol-rt CAN loops     (20)  AXOL_RT_FIFO_PRIORITY, rt.link
 # Camera work sits above every CFS thread so a capture wake-up never queues
-# behind the encode/mux workers; the CAN loops outrank everything and run on
-# disjoint cores anyway. The top rung is also what the persistent rtprio grant
-# (utils.rtprio, LimitRTPRIO in the service unit) allows a non-root launcher.
+# behind the encode/mux workers; the control thread sits above camera work in
+# case a small layout ever puts them on one core (it feeds motor targets); the
+# CAN loops outrank everything and run on disjoint cores anyway. The top rung
+# is also what the persistent rtprio grant (utils.rtprio, LimitRTPRIO in the
+# service unit) allows a non-root launcher.
 CAPTURE_FIFO_PRIORITY = 5
+CONTROL_FIFO_PRIORITY = 10
 MAX_FIFO_PRIORITY = 20
+
+
+def prioritize_control_thread() -> bool:
+    """Run the calling thread ``SCHED_FIFO`` so it outranks its core-mates.
+
+    The realtime core is one CPU on every layout, and the control loop shares
+    it with everything :func:`pin_realtime` drags along: the VR pose thread
+    (pose ingest + SSL websocket), the IK dispatch thread, the diagnostics
+    scanners and whatever spills over from the IK worker's XLA pool. All of
+    them are CFS ``nice 0`` and CFS shares the core evenly, so the biggest
+    consumer — the 120 Hz tick itself at ~35 % of the core — waits as long as
+    it runs. Measured on the ZED box on 2026-09-15 with the headset streaming
+    (``/proc/<tid>/schedstat``): control thread 320-370 ms/s on CPU and
+    300-340 ms/s runnable-but-waiting, the vr-server 140 ms/s, ik-loop 115,
+    diag 30, XLA spill 60; the flight recorder saw one command tick in fifty
+    15-53 ms late, felt as the arms hitching. A FIFO thread preempts its CFS
+    core-mates the moment it wakes, exactly the treatment ``axol-rt`` gives
+    the CAN loops and the relay gives camera capture. It still blocks like
+    any other thread (select, the GIL, socket writes), so the others run in
+    the ~65 % of the core it leaves free.
+
+    Thread-scoped: ``sched_setscheduler(0, ...)`` on Linux acts on the calling
+    thread. ``SCHED_RESET_ON_FORK`` is set so threads and processes this one
+    spawns afterwards (IK dispatch, flight-recorder dumps, asyncio executors,
+    the relay and IK worker processes) start ``SCHED_OTHER``/``nice 0`` — the
+    kernel applies the reset on every clone, threads included (verified on
+    5.15). Best-effort like :func:`prioritize_capture_threads`: without
+    ``sched_setscheduler``/the reset flag it is a no-op, and without the
+    rtprio allowance the thread stays CFS with one warning. Pair with
+    :func:`release_control_thread` when the loop ends so a long-lived serve
+    worker thread is not left FIFO.
+    """
+    if not hasattr(os, "sched_setscheduler") or not hasattr(os, "SCHED_FIFO"):
+        return False
+    reset_on_fork = getattr(os, "SCHED_RESET_ON_FORK", None)
+    if reset_on_fork is None:
+        # Without the reset flag every thread spawned from here would inherit
+        # FIFO — the 1 kHz IK-dispatch poll above the control loop itself.
+        return False
+    param = os.sched_param(CONTROL_FIFO_PRIORITY)  # type: ignore[attr-defined]
+    try:
+        os.sched_setscheduler(0, os.SCHED_FIFO | reset_on_fork, param)  # type: ignore[attr-defined]
+    except PermissionError as exc:
+        _logger.warning(
+            "control thread stays SCHED_OTHER (no CAP_SYS_NICE: %s); expect "
+            "late control ticks while the VR/IK threads share its core. Run "
+            "`axol provision` and log in again (or `sudo prlimit --pid $$ "
+            "--rtprio=%d:%d` in this shell) so it may use SCHED_FIFO",
+            exc,
+            MAX_FIFO_PRIORITY,
+            MAX_FIFO_PRIORITY,
+        )
+        return False
+    except OSError as exc:
+        _logger.debug("could not make the control thread SCHED_FIFO: %s", exc)
+        return False
+    _logger.info("control thread -> SCHED_FIFO %d", CONTROL_FIFO_PRIORITY)
+    return True
+
+
+def enter_control_thread() -> bool:
+    """Make the calling thread *the* control thread: realtime core + ``SCHED_FIFO``.
+
+    For loops that live on a thread of their own rather than the command's
+    calling thread — ``AxolRobot``'s ``axol-event-loop``, which runs
+    ``motion_control`` for ``collect-data`` / ``collect-dagger`` (their hot
+    loop is scheduled onto it) and ``run-policy`` (whose 60 Hz thread hands
+    each action to it). Call it first thing on that thread: the pin is
+    thread-scoped (a no-op re-pin when the process already sits on the
+    realtime cores, the one thread moved there when it does not — run-policy
+    leaves its observation/inference threads free to float), and the FIFO
+    policy is thread-scoped with the reset-on-fork flag as in
+    :func:`prioritize_control_thread`. Returns True when either took effect.
+    """
+    pinned = pin_realtime()
+    fifo = prioritize_control_thread()
+    return pinned or fifo
+
+
+def release_control_thread() -> None:
+    """Undo :func:`prioritize_control_thread` for the calling thread."""
+    if not hasattr(os, "sched_setscheduler") or not hasattr(os, "SCHED_OTHER"):
+        return
+    try:
+        os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))  # type: ignore[attr-defined]
+    except OSError:
+        pass
 
 
 def prioritize_capture_threads(thread_comms: Iterable[str]) -> int:

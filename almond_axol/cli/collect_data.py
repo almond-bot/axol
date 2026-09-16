@@ -1078,6 +1078,10 @@ def _run(
         original_affinity = None
 
     if original_affinity is not None:
+        # Process-wide pin; the hot loop itself runs on AxolRobot's
+        # `axol-event-loop` thread, which additionally goes SCHED_FIFO on
+        # that core (affinity.enter_control_thread) so the VR/IK/diag threads
+        # sharing the core cannot delay a tick.
         affinity.pin_realtime()
 
     session_error: BaseException | None = None

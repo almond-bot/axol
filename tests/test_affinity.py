@@ -338,3 +338,81 @@ class BackgroundAndIkTest(TestCase):
     def test_noop_without_partitioning(self) -> None:
         with patch.object(affinity.os, "cpu_count", return_value=2):
             self.assertFalse(affinity.pin_background_and_ik())
+
+
+class ControlThreadFifoTest(TestCase):
+    """The control thread goes SCHED_FIFO, thread-scoped, children reset to CFS."""
+
+    def test_sets_fifo_with_reset_on_fork_on_the_calling_thread(self) -> None:
+        with (
+            patch.object(affinity.os, "sched_setscheduler", create=True) as setsched,
+            patch.object(
+                affinity.os, "sched_param", create=True, side_effect=lambda p: p
+            ),
+            patch.object(affinity.os, "SCHED_FIFO", 1, create=True),
+            patch.object(affinity.os, "SCHED_RESET_ON_FORK", 0x40000000, create=True),
+        ):
+            self.assertTrue(affinity.prioritize_control_thread())
+        setsched.assert_called_once_with(
+            0, 1 | 0x40000000, affinity.CONTROL_FIFO_PRIORITY
+        )
+
+    def test_without_the_reset_flag_it_declines(self) -> None:
+        # Otherwise every thread spawned from the control thread (the 1 kHz
+        # IK-dispatch poll included) would inherit FIFO.
+        with (
+            patch.object(affinity.os, "sched_setscheduler", create=True) as setsched,
+            patch.object(affinity.os, "SCHED_FIFO", 1, create=True),
+        ):
+            if hasattr(affinity.os, "SCHED_RESET_ON_FORK"):
+                with patch.object(affinity.os, "SCHED_RESET_ON_FORK", None):
+                    self.assertFalse(affinity.prioritize_control_thread())
+            else:
+                self.assertFalse(affinity.prioritize_control_thread())
+        setsched.assert_not_called()
+
+    def test_permission_denied_stays_cfs_with_a_warning(self) -> None:
+        with (
+            patch.object(
+                affinity.os,
+                "sched_setscheduler",
+                create=True,
+                side_effect=PermissionError(1, "Operation not permitted"),
+            ),
+            patch.object(
+                affinity.os, "sched_param", create=True, side_effect=lambda p: p
+            ),
+            patch.object(affinity.os, "SCHED_FIFO", 1, create=True),
+            patch.object(affinity.os, "SCHED_RESET_ON_FORK", 0x40000000, create=True),
+            self.assertLogs(affinity._logger, level="WARNING") as logs,
+        ):
+            self.assertFalse(affinity.prioritize_control_thread())
+        self.assertIn("SCHED_OTHER", logs.output[0])
+
+    def test_release_puts_the_thread_back_on_cfs(self) -> None:
+        with (
+            patch.object(affinity.os, "sched_setscheduler", create=True) as setsched,
+            patch.object(
+                affinity.os, "sched_param", create=True, side_effect=lambda p: p
+            ),
+            patch.object(affinity.os, "SCHED_OTHER", 0, create=True),
+        ):
+            affinity.release_control_thread()
+        setsched.assert_called_once_with(0, 0, 0)
+
+    def test_control_sits_between_capture_and_can_on_the_ladder(self) -> None:
+        self.assertGreater(
+            affinity.CONTROL_FIFO_PRIORITY, affinity.CAPTURE_FIFO_PRIORITY
+        )
+        self.assertLess(affinity.CONTROL_FIFO_PRIORITY, affinity.MAX_FIFO_PRIORITY)
+
+    def test_enter_control_thread_pins_then_goes_fifo(self) -> None:
+        with (
+            patch.object(affinity, "pin_realtime", return_value=False) as pin,
+            patch.object(
+                affinity, "prioritize_control_thread", return_value=True
+            ) as fifo,
+        ):
+            self.assertTrue(affinity.enter_control_thread())
+        pin.assert_called_once_with()
+        fifo.assert_called_once_with()
