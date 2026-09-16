@@ -105,6 +105,7 @@ def _step_worker() -> IKWorker:
     worker._ramp = {}
     worker._box = None
     worker._box_leader = None
+    worker._box_snap = None
     worker._freeze_since = {}
     worker._freeze_targets = {}
     worker._snap_ctrl = {

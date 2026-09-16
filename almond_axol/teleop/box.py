@@ -744,6 +744,46 @@ def squeeze_lean(
     )
 
 
+def tip_inward_sign(rot: np.ndarray, normal: np.ndarray, up: np.ndarray) -> float:
+    """``+1`` if a positive yaw about ``up`` swings this gripper's tip toward the box.
+
+    The tip is where the fingers point (:func:`approach_axis`); a yaw
+    about ``up`` moves that direction along ``up × fingers``. ``normal`` is
+    the inward normal from the gripper into the box.
+    """
+    fingers = approach_axis(rot).astype(np.float64)
+    swing = np.cross(np.asarray(up, dtype=np.float64), fingers)
+    return 1.0 if float(swing @ np.asarray(normal, dtype=np.float64)) >= 0.0 else -1.0
+
+
+def toe_out(
+    ideal: dict[str, Pose],
+    measured: dict[str, Pose],
+    normals: dict[str, np.ndarray],
+    up: np.ndarray,
+) -> float:
+    """How far the grippers' tips have swung off the box (rad), from FK of the measured joints.
+
+    Each gripper's measured mount rotation is compared with its ideal
+    (parallel-slot) rotation and the yaw about ``up`` between them taken,
+    signed so that a tip *away* from the box is positive; the two sides are
+    averaged. Under a clamp with the face pressing and the tip lifted —
+    the pinch — both tips are off the box and the mean is the toe-out
+    angle. A turn of the whole pair lags on both arms with the *same*
+    sense about ``up``, which is opposite senses tip-in/tip-out, so the
+    servo lag of a carry cancels and only the pinch is left. Rigid
+    gripper, flat box side: zero means both the face and the tip are on
+    the box.
+    """
+    total = 0.0
+    for side in _SIDE_SIGN:
+        r_ideal = np.asarray(ideal[side][1], dtype=np.float64)
+        r_meas = np.asarray(measured[side][1], dtype=np.float64)
+        yaw = twist_about(r_meas @ r_ideal.T, up)
+        total -= tip_inward_sign(r_ideal, normals[side], up) * yaw
+    return 0.5 * total
+
+
 def elbow_swivel_hint(
     shoulder: np.ndarray,
     elbow: np.ndarray,

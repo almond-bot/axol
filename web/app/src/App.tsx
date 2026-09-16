@@ -992,17 +992,20 @@ function HudButton({
 
 // Mirrors the worker's pair geometry (from the ~20 Hz joints push) into React
 // state — the "grippers aligned" flag, the grasp ("flush" / "straight") and
-// the clamp force (whole newtons) — changing only on edges so the HUD
-// doesn't re-render per frame. Aligned is false, the grasp "" and the
-// squeeze 0 until the server reports the pair geometry.
+// the clamp force (whole newtons) and the squeeze trim (whole degrees) —
+// changing only on edges so the HUD doesn't re-render per frame. Aligned is
+// false, the grasp "" and the squeeze and trim 0 until the server reports
+// the pair geometry.
 function usePairStatus(jointsRef: RefObject<AxolJointSample | null>): {
   aligned: boolean
   grasp: string
   squeeze: number
+  trim: number
 } {
   const [aligned, setAligned] = useState(false)
   const [grasp, setGrasp] = useState("")
   const [squeeze, setSqueeze] = useState(0)
+  const [trim, setTrim] = useState(0)
   useFrame(() => {
     const pair = jointsRef.current?.pair
     const nextAligned = pair?.aligned ?? false
@@ -1011,8 +1014,10 @@ function usePairStatus(jointsRef: RefObject<AxolJointSample | null>): {
     if (nextGrasp !== grasp) setGrasp(nextGrasp)
     const nextSqueeze = Math.round(pair?.squeeze ?? 0)
     if (nextSqueeze !== squeeze) setSqueeze(nextSqueeze)
+    const nextTrim = Math.round(pair?.trim ?? 0)
+    if (nextTrim !== trim) setTrim(nextTrim)
   })
-  return { aligned, grasp, squeeze }
+  return { aligned, grasp, squeeze, trim }
 }
 
 // Tools row (second HUD line, under Exit / ? / status): the two most-used
@@ -1026,6 +1031,7 @@ function ToolsRow({
   aligned,
   grasp,
   squeeze,
+  trim,
   ghost,
   onToggleGhost,
   onOpenSettings,
@@ -1039,13 +1045,18 @@ function ToolsRow({
   // Clamp force (N per arm) the pair is pressing with; shown next to the
   // grasp while pressing so the width jog has a force readout.
   squeeze: number
+  // Extra inward yaw (whole degrees) the squeeze trim has added so the blade
+  // tips press as hard as the roots; shown with the force while nonzero.
+  trim: number
   ghost: boolean
   onToggleGhost: () => void
   onOpenSettings: () => void
 }) {
   const boxMode = settings ? settings.values.box_mode === true : null
   const reengage = settings ? String(settings.values.reengage ?? "") : null
-  const boxDetail = [grasp, squeeze > 0 ? `${squeeze} N` : ""].filter(Boolean).join(", ")
+  const boxDetail = [grasp, squeeze > 0 ? `${squeeze} N` : "", trim !== 0 ? `${trim}° in` : ""]
+    .filter(Boolean)
+    .join(", ")
   const boxLabel = boxMode
     ? `Box: ON${boxDetail ? ` (${boxDetail})` : ""}`
     : aligned
@@ -1221,7 +1232,7 @@ function HudTools({
   onCloseSettings: () => void
   onStep: (def: AxolSettingDef, direction: 1 | -1) => void
 }) {
-  const { aligned, grasp, squeeze } = usePairStatus(jointsRef)
+  const { aligned, grasp, squeeze, trim } = usePairStatus(jointsRef)
   return (
     <>
       <ToolsRow
@@ -1230,6 +1241,7 @@ function HudTools({
         aligned={aligned}
         grasp={grasp}
         squeeze={squeeze}
+        trim={trim}
         ghost={ghost}
         onToggleGhost={onToggleGhost}
         onOpenSettings={onOpenSettings}

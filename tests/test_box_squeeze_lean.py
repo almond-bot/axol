@@ -40,8 +40,12 @@ from almond_axol.teleop.box import (
     PARCEL_TIP_IN_M,
     URDF_TOOL,
     BoxState,
+    ideal_gripper_poses,
     parcel_tool,
+    rodrigues,
+    side_clamp_rotation,
     squeeze_lean,
+    toe_out,
 )
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore, measured_arms
@@ -686,6 +690,176 @@ class ForwardingTest(unittest.TestCase):
         sent = self._run(core, lambda: _frame(True, True), measured, 4)
         self.assertTrue(sent)
         self.assertFalse(_meas_messages(sent))
+
+
+class _YawedSolver:
+    """Solver stub: FK is a level pair whose grippers sit yawed about up.
+
+    ``yaw`` is per side (rad, right-handed about +z); the mounts are at the
+    pair's slots so a target pushed inward reads as depth.
+    """
+
+    left_indices = list(range(0, 7))
+    right_indices = list(range(8, 15))
+
+    def __init__(self, yaw: dict[str, float]) -> None:
+        self.yaw = yaw
+
+    @staticmethod
+    def ideal() -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        rot = np.eye(3, dtype=np.float32)
+        return ideal_gripper_poses(
+            np.array((0.4, 0.0, 0.3), np.float32),
+            rot,
+            0.3,
+            {
+                "left": side_clamp_rotation(1.0, 1.0, 0.0),
+                "right": side_clamp_rotation(-1.0, 1.0, 0.0),
+            },
+        )
+
+    def fk(self, q):
+        del q
+        up = np.array((0.0, 0.0, 1.0))
+        out = {}
+        for side, (pos, rot) in self.ideal().items():
+            out[side] = (pos, (rodrigues(up, self.yaw[side]) @ rot).astype(np.float32))
+        return out["left"], out["right"]
+
+
+class WorkerTrimTest(unittest.TestCase):
+    """The squeeze trim: measured toe-out integrated into inward yaw."""
+
+    def _worker(self, solver, **cfg) -> IKWorker:
+        w = object.__new__(IKWorker)
+        w._config = types.SimpleNamespace(
+            **{
+                "box_tool": "urdf",
+                "box_grasp": "straight",
+                "box_squeeze_lean": 0.0,
+                "box_squeeze_trim": 5.0,
+                "box_squeeze_force": 0.0,
+                **cfg,
+            }
+        )
+        w._solver = solver
+        w._lean_model = None
+        w._measured, w._measured_t = None, 0.0
+        w._lean_depth, w._lean_t, w._lean_force = 0.0, None, 0.0
+        w._lean_trim = 0.0
+        q = np.zeros(16, np.float32)
+        w.note_measured(q[0:8], q[8:16], _KP_L, _KP_R)
+        return w
+
+    def _box(self) -> BoxState:
+        return BoxState(
+            center=np.zeros(3, np.float32),
+            rot=np.eye(3, dtype=np.float32),
+            width=0.3,
+            face={"left": 1.0, "right": 1.0},
+            tilt=0.0,
+            align_start={},
+            align_t0=0.0,
+            align_duration=0.0,
+            tool=URDF_TOOL,
+        )
+
+    @staticmethod
+    def _targets(depth: float):
+        """The ideal slots pushed ``depth`` into the box (the left is at +y)."""
+        ideal = _YawedSolver.ideal()
+        return {
+            "left": (
+                ideal["left"][0] + np.array([0, -depth, 0], np.float32),
+                ideal["left"][1],
+            ),
+            "right": (
+                ideal["right"][0] + np.array([0, depth, 0], np.float32),
+                ideal["right"][1],
+            ),
+        }
+
+    def _run(self, w, targets, seconds: float, t0: float = 100.0):
+        out = targets
+        n = int(seconds * 120)
+        for i in range(n):
+            t = t0 + i / 120.0
+            w._measured_t = t
+            out = w._squeeze_lean(self._box(), targets, np.zeros(16, np.float32), t)
+        return out, t0 + n / 120.0
+
+    def test_toe_out_integrates_into_inward_yaw_and_is_bounded(self) -> None:
+        # Tips 2° off the box on both sides (left tip swings away with +yaw).
+        w = self._worker(
+            _YawedSolver({"left": math.radians(2.0), "right": -math.radians(2.0)})
+        )
+        targets = self._targets(0.01)
+        out, t = self._run(w, targets, 1.0)
+        # 1°/s per degree of error, so ~2° after a second (less a frame).
+        self.assertGreater(w.squeeze_trim_deg, 1.5)
+        self.assertLess(w.squeeze_trim_deg, 2.5)
+        # The targets are yawed tip-inward by the trim: relative to the
+        # ideal they read as *negative* toe-out of that size.
+        normals = {
+            "left": -np.array([0.0, 1.0, 0.0]),
+            "right": np.array([0.0, 1.0, 0.0]),
+        }
+        up = np.array([0.0, 0.0, 1.0])
+        self.assertAlmostEqual(
+            math.degrees(toe_out(targets, out, normals, up)),
+            -w.squeeze_trim_deg,
+            places=4,
+        )
+        # Positions untouched; the trim is a yaw.
+        for side in ("left", "right"):
+            np.testing.assert_array_equal(out[side][0], targets[side][0])
+        # Kept on: bounded by box_squeeze_trim.
+        out, t = self._run(w, targets, 6.0, t0=t)
+        self.assertAlmostEqual(w.squeeze_trim_deg, 5.0, places=6)
+
+    def test_the_trim_bleeds_away_once_the_grippers_stop_pressing(self) -> None:
+        w = self._worker(
+            _YawedSolver({"left": math.radians(2.0), "right": -math.radians(2.0)})
+        )
+        _out, t = self._run(w, self._targets(0.01), 3.0)
+        self.assertGreater(w.squeeze_trim_deg, 2.5)
+        # Width jogged back out: the targets sit at (in fact behind) the
+        # measured mounts, no depth, and the trim decays (1 s).
+        out, t = self._run(w, self._targets(-0.01), 3.0, t0=t)
+        self.assertLess(w.squeeze_trim_deg, 0.3)
+        self.assertEqual(w.squeeze_force, 0.0)
+
+    def test_a_turn_of_the_pair_adds_no_trim(self) -> None:
+        # Both grippers lag the same way about up: a carry, not a pinch.
+        w = self._worker(
+            _YawedSolver({"left": math.radians(3.0), "right": math.radians(3.0)})
+        )
+        self._run(w, self._targets(0.01), 2.0)
+        self.assertAlmostEqual(w.squeeze_trim_deg, 0.0, places=9)
+
+    def test_off_at_zero(self) -> None:
+        w = self._worker(
+            _YawedSolver({"left": math.radians(2.0), "right": -math.radians(2.0)}),
+            box_squeeze_trim=0.0,
+        )
+        targets = self._targets(0.01)
+        out, _t = self._run(w, targets, 1.0)
+        self.assertIs(out, targets)
+        self.assertEqual(w.squeeze_trim_deg, 0.0)
+
+    def test_a_pair_still_blending_resets_the_trim(self) -> None:
+        w = self._worker(
+            _YawedSolver({"left": math.radians(2.0), "right": -math.radians(2.0)})
+        )
+        self._run(w, self._targets(0.01), 1.0)
+        self.assertGreater(w.squeeze_trim_deg, 1.0)
+        box = self._box()
+        box.align_duration = 1.0
+        targets = self._targets(0.01)
+        self.assertIs(
+            w._squeeze_lean(box, targets, np.zeros(16, np.float32), 200.0), targets
+        )
+        self.assertEqual(w.squeeze_trim_deg, 0.0)
 
 
 if __name__ == "__main__":

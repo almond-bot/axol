@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 import types
 import unittest
 
@@ -26,6 +27,8 @@ from almond_axol.teleop.box import (
     rotation_angle,
     side_clamp_rotation,
     snap_box,
+    tip_inward_sign,
+    toe_out,
     twist_about,
 )
 from almond_axol.teleop.config import VRTeleopConfig
@@ -742,12 +745,14 @@ class BoxExitTest(unittest.TestCase):
         self.assertNotIn(("box_mode", False), modes)
         # The blade limit lifts with the grasp (the blade heads for the stop).
         self.assertIsNone(core.gripper_open_limit())
-        # Once the blend has had its time, the mode switch lands.
+        # Once the blend has had its time, the mode switch lands — and the
+        # next frame engages both arms in plain teleop straight away.
         core._box_exit_deadline = 0.0
         core.update_engage(_stick_frame(l_lock=False, r_lock=True))
         self.assertFalse(core.box_mode)
-        self.assertFalse(core.teleop_enabled)
         self.assertIn(("box_mode", False), modes)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.left_enabled and core.right_enabled)
 
     def test_letting_go_finishes_the_exit_early(self) -> None:
         core, modes = self._core(box_grasp="flush", box_align_duration=10.0)
@@ -790,6 +795,94 @@ class BoxExitTest(unittest.TestCase):
         core.update_engage(_stick_frame(l_lock=False, r_lock=False))
         self.assertFalse(core.box_mode)
         self.assertEqual(core.config.box_grasp, "flush")
+
+
+class ModeSwitchEngagesTest(unittest.TestCase):
+    """A box-mode switch engages the arms at once: into box mode led by
+    ``box_lead_hand``, out of it with both arms — no grip needed."""
+
+    def _core(self, **cfg) -> VRTeleopCore:
+        return VRTeleopCore(
+            VRTeleopConfig(**cfg),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+        )
+
+    def test_switching_on_leads_with_the_right_hand(self) -> None:
+        core = self._core()
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertFalse(core.teleop_enabled)
+        core.set_box_mode(True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertTrue(core.box_mode)
+        self.assertTrue(core.teleop_enabled)
+        self.assertEqual(core._box_leader, "right")
+        self.assertTrue(core.pair_owns_sticks)
+
+    def test_the_lead_hand_is_a_setting(self) -> None:
+        core = self._core(box_lead_hand="left")
+        core.set_box_mode(True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertEqual(core._box_leader, "left")
+        # Live too.
+        core.set_live("box_lead_hand", "right")
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.set_box_mode(True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertEqual(core._box_leader, "right")
+
+    def test_a_grip_held_at_the_switch_is_not_an_edge(self) -> None:
+        core = self._core()
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        core.set_box_mode(True)
+        # Still holding the right grip through the switch: the pair is led
+        # by the right hand and the held grip doesn't freeze it.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertEqual(core._box_leader, "right")
+        # Releasing and clicking again does freeze it, as usual.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertIsNone(core._box_leader)
+
+    def test_switching_off_engages_both_arms(self) -> None:
+        core = self._core(box_mode=True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.teleop_enabled)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.box_mode)
+        self.assertTrue(core.left_enabled)
+        self.assertTrue(core.right_enabled)
+        self.assertFalse(core.pair_owns_sticks)
+
+    def test_a_late_first_frame_does_not_engage(self) -> None:
+        # Switched from the panel with nobody in the headset: the first
+        # frame, long after, engages nothing — the grips do, as usual.
+        core = self._core()
+        core.set_box_mode(True)
+        core._apply_live_requests()
+        core._auto_engage_until = time.perf_counter() - 1.0
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertTrue(core.box_mode)
+        self.assertFalse(core.teleop_enabled)
+        self.assertIsNone(core._auto_engage_until)
+
+    def test_a_reset_that_leaves_box_mode_does_not_engage(self) -> None:
+        core = self._core(box_mode=True)
+        core._set_box_mode(False, engage=False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertFalse(core.box_mode)
+        self.assertFalse(core.teleop_enabled)
+
+    def test_dead_man_sessions_keep_the_grip_rule(self) -> None:
+        core = self._core(hold_to_engage=True)
+        core.set_box_mode(True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertTrue(core.box_mode)
+        self.assertFalse(core.teleop_enabled)
 
 
 class StickControlTest(unittest.TestCase):
@@ -946,6 +1039,7 @@ class _FakeCore:
     def __init__(self) -> None:
         self.values = {
             "box_mode": True,
+            "box_lead_hand": "right",
             "box_grasp": "flush",
             "box_tool": "parcel",
             "box_tool_open_deg": 141.5,
@@ -1018,6 +1112,7 @@ def _box_worker(leader: str = "left") -> IKWorker:
     worker._ramp = {}
     worker._box = None
     worker._box_leader = None
+    worker._box_snap = None
     worker._freeze_since = {}
     worker._freeze_targets = {}
     worker._snap_ctrl = {}
@@ -1316,6 +1411,139 @@ class LiveToggleTest(unittest.TestCase):
             live.apply("reengage", "toggle")
         with self.assertRaises(ValueError):
             live.apply("position_multiplier", "toggle")
+
+
+class BoxExitRampTest(unittest.TestCase):
+    """Box mode keeps its leader anchor apart from the per-arm session snaps,
+    so leaving it in "ramp" re-engage blends *both* arms back out to the
+    controller↔arm mapping the operator had before the box."""
+
+    def _worker(self) -> IKWorker:
+        from tests.test_ik_freeze_clutch import _step_worker
+
+        worker = _step_worker()
+        cfg = worker._config
+        cfg.reengage = "ramp"
+        cfg.reengage_ramp_speed = 0.15
+        cfg.reengage_ramp_min_s = 0.75
+        cfg.box_align_duration = 0.0
+        cfg.box_width_min = 0.02
+        cfg.box_width_max = 0.7
+        cfg.box_tool = "urdf"
+        cfg.box_face_left = "auto"
+        cfg.box_face_right = "auto"
+        cfg.box_grip_tilt = 0.0
+        cfg.box_width_speed = 0.1
+        cfg.box_elbow_out = 30.0
+        cfg.box_elbow_weight = 0.0
+        cfg.box_elbow_speed = 30.0
+        cfg.box_squeeze_lean = 0.0
+        cfg.box_squeeze_trim = 0.0
+        cfg.box_squeeze_force = 0.0
+        worker._measured, worker._measured_t = None, 0.0
+        worker._lean_model = None
+        worker._lean_depth, worker._lean_t, worker._lean_force = 0.0, None, 0.0
+        worker._lean_trim = 0.0
+        return worker
+
+    def test_leaving_box_mode_ramps_both_arms_to_the_session_mapping(self) -> None:
+        from tests.test_ik_freeze_clutch import _frame
+
+        worker = self._worker()
+        session = {
+            side: tuple(v.copy() for v in worker._snap_ctrl[side])
+            for side in ("left", "right")
+        }
+        q = np.zeros(14, np.float32)
+        # Plain teleop, both arms engaged on the session snaps.
+        worker.step(_frame(left_forward=0.0, t_ms=0.0), q)
+        # Into box mode, right hand leading: the pair snaps its own anchor.
+        boxed = _frame(left_forward=0.0, t_ms=10.0)
+        boxed.box_leader = "right"
+        worker.step(boxed, q)
+        self.assertIsNotNone(worker._box_snap)
+        self.assertEqual(set(worker._snap_ctrl), {"left", "right"})
+        boxed = _frame(left_forward=0.0, t_ms=20.0)
+        boxed.box_leader = "right"
+        worker.step(boxed, q)
+        # Out again with both grips engaged (the core engages both arms on
+        # the switch): each arm ramps against its *session* snap.
+        worker.step(_frame(left_forward=0.05, t_ms=30.0), q)
+        self.assertIsNone(worker._box)
+        self.assertIsNone(worker._box_snap)
+        self.assertEqual(set(worker._ramp), {"left", "right"})
+        for side in ("left", "right"):
+            np.testing.assert_array_equal(worker._snap_ctrl[side][0], session[side][0])
+            np.testing.assert_array_equal(worker._snap_ctrl[side][1], session[side][1])
+
+
+class ToeOutTest(unittest.TestCase):
+    """The squeeze trim's error: how far the tips have swung off the box."""
+
+    def _pair(self):
+        rot = np.eye(3, dtype=np.float32)
+        ideal = ideal_gripper_poses(
+            np.array((0.4, 0.0, 0.3), np.float32),
+            rot,
+            0.3,
+            BoxState(
+                center=np.zeros(3, np.float32),
+                rot=rot,
+                width=0.3,
+                face={"left": 1.0, "right": 1.0},
+                tilt=0.0,
+                align_start={},
+                align_t0=0.0,
+                align_duration=0.0,
+                tool=URDF_TOOL,
+            ).grip_rel(),
+        )
+        normals = {"left": -rot[:, 1], "right": rot[:, 1]}
+        return ideal, normals, rot[:, 2]
+
+    def _yawed(self, ideal, yaw: dict[str, float]):
+        return {
+            side: (pos, (rodrigues(_UP, yaw[side]) @ rot).astype(np.float32))
+            for side, (pos, rot) in ideal.items()
+        }
+
+    def test_parallel_is_zero(self) -> None:
+        ideal, normals, up = self._pair()
+        self.assertAlmostEqual(toe_out(ideal, ideal, normals, up), 0.0, places=9)
+
+    def test_tips_off_the_box_is_positive_on_both_sides(self) -> None:
+        ideal, normals, up = self._pair()
+        # Fingers forward (+x); the left gripper sits at +y and its box is
+        # at -y. Its tip swings *away* (to +y) with a positive yaw about
+        # up; the right gripper's with a negative one.
+        left_out = self._yawed(ideal, {"left": math.radians(2.0), "right": 0.0})
+        self.assertAlmostEqual(
+            math.degrees(toe_out(ideal, left_out, normals, up)), 1.0, places=6
+        )
+        both_out = self._yawed(
+            ideal, {"left": math.radians(2.0), "right": -math.radians(2.0)}
+        )
+        self.assertAlmostEqual(
+            math.degrees(toe_out(ideal, both_out, normals, up)), 2.0, places=6
+        )
+        tips_in = self._yawed(
+            ideal, {"left": -math.radians(2.0), "right": math.radians(2.0)}
+        )
+        self.assertAlmostEqual(
+            math.degrees(toe_out(ideal, tips_in, normals, up)), -2.0, places=6
+        )
+
+    def test_a_turn_of_the_pair_cancels(self) -> None:
+        ideal, normals, up = self._pair()
+        lag = self._yawed(
+            ideal, {"left": math.radians(3.0), "right": math.radians(3.0)}
+        )
+        self.assertAlmostEqual(toe_out(ideal, lag, normals, up), 0.0, places=9)
+
+    def test_tip_inward_sign_matches_the_side(self) -> None:
+        ideal, normals, up = self._pair()
+        self.assertEqual(tip_inward_sign(ideal["left"][1], normals["left"], up), -1.0)
+        self.assertEqual(tip_inward_sign(ideal["right"][1], normals["right"], up), 1.0)
 
 
 if __name__ == "__main__":

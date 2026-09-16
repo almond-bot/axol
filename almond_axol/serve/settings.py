@@ -688,11 +688,27 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "lead). Thumbsticks set the grip width "
                     "while a grip leads and drive the base once the pair is "
                     "frozen. Can also be toggled live from the headset menu "
-                    "or both thumbstick clicks."
+                    "or both thumbstick clicks; switching engages at once."
                 ),
                 targets={
                     "teleop": ("teleop.box_mode",),
                     "collect-data": (f"{_VRT}.box_mode",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_lead_hand",
+                label="Box-mode lead hand",
+                type="select",
+                options=("right", "left"),
+                help=(
+                    "Which controller leads the pair when box mode is "
+                    "switched on (the pair engages straight away, led by "
+                    "this hand). The other grip can still take the lead "
+                    "over. Also switchable live from the headset menu."
+                ),
+                targets={
+                    "teleop": ("teleop.box_lead_hand",),
+                    "collect-data": (f"{_VRT}.box_lead_hand",),
                 },
             ),
             SettingDef(
@@ -809,6 +825,25 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 targets={
                     "teleop": ("teleop.box_squeeze_lean",),
                     "collect-data": (f"{_VRT}.box_squeeze_lean",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_squeeze_trim",
+                label="Box squeeze trim (°)",
+                type="number",
+                help=(
+                    "Box mode: on top of the lean, yaws the grippers further "
+                    "into the box while they press until their measured "
+                    "faces sit parallel to it — closes what gear backlash "
+                    "and wrist give the lean's stiffness model misses, so "
+                    "the blade tips clamp as hard as the roots on heavy "
+                    "boxes. The most inward yaw it may add; 0 turns it off. "
+                    "Also adjustable live from the headset menu (Squeeze "
+                    "trim). Hardware only."
+                ),
+                targets={
+                    "teleop": ("teleop.box_squeeze_trim",),
+                    "collect-data": (f"{_VRT}.box_squeeze_trim",),
                 },
             ),
             SettingDef(

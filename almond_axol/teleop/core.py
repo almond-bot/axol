@@ -98,6 +98,11 @@ _STICK_NEUTRAL = 0.15
 # Grace after ``box_align_duration`` for a deferred box-mode exit: the
 # worker's re-blend to the straight grasp starts a frame after the request.
 _BOX_EXIT_MARGIN_S = 0.25
+# How long after a box-mode switch the next VR frame may arrive and still
+# engage the arms at once (see VRTeleopCore._maybe_auto_engage). Longer than
+# a frame gap under load; far shorter than the walk from the panel to the
+# headset.
+_AUTO_ENGAGE_WINDOW_S = 1.0
 
 
 def _sticks_neutral(frame: object) -> bool:
@@ -362,6 +367,12 @@ class VRTeleopCore:
         # waits (until this deadline, or the grip lets go) for the pair to
         # blend the yaw back out, see ``_begin_box_exit``.
         self._box_exit_deadline: float | None = None
+        # A mode switch engages at once (into box mode led by
+        # ``config.box_lead_hand``, out of it with both arms): the deadline
+        # by which the next frame must arrive for that to happen, else the
+        # switch was made with nobody in the headset and the usual grip
+        # engage applies. See ``_maybe_auto_engage``.
+        self._auto_engage_until: float | None = None
 
         # Reset latch (set from the VR frame callback / programmatically).
         self._prev_reset: bool = False
@@ -519,7 +530,7 @@ class VRTeleopCore:
     # read live by this class; ``worker`` fields are also forwarded to the IK
     # subprocess (whose config is a pickled copy) as ``("set", key, value)``.
     _LIVE_CORE_FIELDS = frozenset(
-        {"hold_to_engage", "teleop_max_vel", "box_squeeze_torque"}
+        {"hold_to_engage", "teleop_max_vel", "box_squeeze_torque", "box_lead_hand"}
     )
     _LIVE_WORKER_FIELDS = frozenset(
         {
@@ -539,6 +550,7 @@ class VRTeleopCore:
             "box_elbow_weight",
             "box_elbow_speed",
             "box_squeeze_lean",
+            "box_squeeze_trim",
             "box_squeeze_force",
         }
     )
@@ -785,9 +797,15 @@ class VRTeleopCore:
                     self._logger.info("Live setting %s = %s", key, coerced)
                 self._notify_mode(key, coerced)
 
-    def _set_box_mode(self, want: bool) -> None:
-        """Apply a box-mode switch now (IK thread): disengage, flip, log."""
+    def _set_box_mode(self, want: bool, engage: bool = True) -> None:
+        """Apply a box-mode switch now (IK thread): disengage, flip, log.
+
+        With ``engage`` (the default for an operator's switch; a
+        return-to-rest passes ``False``) the next frame engages the new
+        mode's arms at once, see :meth:`_maybe_auto_engage`.
+        """
         self._box_exit_deadline = None
+        self._auto_engage_until = None
         if want == self.box_mode:
             return
         if self.teleop_enabled:
@@ -796,6 +814,67 @@ class VRTeleopCore:
         self._logger.info(
             "Box mode %s", "on: one grip engages both arms" if want else "off"
         )
+        if engage:
+            self._auto_engage_until = time.perf_counter() + _AUTO_ENGAGE_WINDOW_S
+
+    def _lead_hand(self) -> str:
+        """``config.box_lead_hand`` normalised to ``"left"`` / ``"right"``."""
+        hand = str(getattr(self.config, "box_lead_hand", "right")).strip().lower()
+        return "left" if hand == "left" else "right"
+
+    def _maybe_auto_engage(self, frame: object) -> None:
+        """Engage the arms on the first frame after a mode switch (IK thread).
+
+        Into box mode the pair engages led by ``config.box_lead_hand`` —
+        the grippers blend into the pair from where they are first, as on
+        any box engage — and out of it both arms engage together, so with
+        ``"ramp"`` re-engage they blend back out to where the controllers
+        are. No grip needed either way. Skipped if the frame comes later
+        than :data:`_AUTO_ENGAGE_WINDOW_S` after the switch (nobody in the
+        headset: the usual grip engage applies), while a return-to-rest is
+        under way, in dead-man (``hold_to_engage``) sessions, or if the
+        arms are somehow engaged already.
+        """
+        until = self._auto_engage_until
+        if until is None:
+            return
+        self._auto_engage_until = None
+        if (
+            time.perf_counter() > until
+            or self.teleop_enabled
+            or self.is_resetting
+            or self.config.hold_to_engage
+        ):
+            return
+        l_lock = bool(frame.l_lock)
+        r_lock = bool(frame.r_lock)
+        if self.box_mode:
+            leader = self._lead_hand()
+            self._box_leader = leader
+            self._box_sticks_held = False
+            self._logger.info(
+                "Teleop enabled (box mode, %s hand leads — switched on)", leader
+            )
+        else:
+            self._logger.info("Teleop enabled (both arms — box mode switched off)")
+        self.left_enabled = True
+        self.right_enabled = True
+        self._require_both_engage = False
+        self._broadcast(True)
+        self._start_engage_ramp()
+        # A grip already held at the switch is not an edge on this frame.
+        self._prev_both = l_lock and r_lock
+        self._prev_l_lock = l_lock
+        self._prev_r_lock = r_lock
+
+    def _start_engage_ramp(self) -> None:
+        """Begin the out-of-rest velocity ramp (``engage_max_vel`` →
+        ``teleop_max_vel`` over ``engage_duration``) if the arms were at rest."""
+        if self._at_rest:
+            self.smooth_left.max_vel = self.config.engage_max_vel
+            self.smooth_right.max_vel = self.config.engage_max_vel
+            self._engage_time = time.perf_counter()
+            self._at_rest = False
 
     def _begin_box_exit(self) -> bool:
         """Start leaving box mode from the angled grasp; ``True`` if deferred.
@@ -873,6 +952,7 @@ class VRTeleopCore:
         ``engage_duration`` (advanced in :meth:`compute_output`).
         """
         self._apply_live_requests()
+        self._maybe_auto_engage(frame)
         if self.box_mode:
             self._update_engage_box(frame)
             # A grip that just froze the pair ends a deferred exit now.
@@ -916,11 +996,7 @@ class VRTeleopCore:
         if now_enabled and not was_enabled:
             self._logger.info("Teleop enabled")
             self._broadcast(True)
-            if self._at_rest:
-                self.smooth_left.max_vel = self.config.engage_max_vel
-                self.smooth_right.max_vel = self.config.engage_max_vel
-                self._engage_time = time.perf_counter()
-                self._at_rest = False
+            self._start_engage_ramp()
         elif was_enabled and not now_enabled:
             self._logger.info("Teleop disabled")
             self._broadcast(False)
@@ -1024,11 +1100,7 @@ class VRTeleopCore:
         if enabled and not was_enabled:
             self._logger.info("Teleop enabled (box mode, %s hand leads)", leader)
             self._broadcast(True)
-            if self._at_rest:
-                self.smooth_left.max_vel = self.config.engage_max_vel
-                self.smooth_right.max_vel = self.config.engage_max_vel
-                self._engage_time = time.perf_counter()
-                self._at_rest = False
+            self._start_engage_ramp()
         elif was_enabled and not enabled:
             self._logger.info("Teleop disabled (box pair frozen)")
             self._broadcast(False)
@@ -1601,7 +1673,7 @@ class VRTeleopCore:
                 if self.box_mode:
                     # Going home leaves box mode: the arms come back as two
                     # arms, and the next engage is a deliberate one.
-                    self._set_box_mode(False)
+                    self._set_box_mode(False, engage=False)
                     self._notify_mode("box_mode", False)
                 # Keep is_resetting true across the (possibly seconds-long)
                 # planning round trip so callers waiting on it don't observe a

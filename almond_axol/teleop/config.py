@@ -135,7 +135,17 @@ class VRTeleopConfig:
             (``box_grasp``: flush face or fingers straight). The mode is a live setting
             (``VRTeleopCore.set_box_mode``, the headset's **Box** button,
             both thumbstick clicks together, the control panel); this is the
-            default it starts in.
+            default it starts in. Switching engages at once, no grip
+            needed: into box mode the pair is led by ``box_lead_hand``
+            straight away (the grippers blend into the pair first, as on
+            any box engage), and out of it both arms engage together, so
+            in ``"ramp"`` re-engage they blend back out to the controllers.
+            A return-to-rest that leaves box mode does not engage.
+        box_lead_hand: Which controller leads the pair when box mode is
+            switched on, ``"right"`` (the default) or ``"left"``. The lead
+            can still be handed over with the other grip, and a session
+            that engages from a frozen pair is led by the grip that does.
+            Live-adjustable.
         box_tool: Which gripper is fitted, for box mode's contact geometry
             (:class:`~almond_axol.teleop.box.ToolGeometry`). ``"parcel"``
             (the default): the parcel gripper — a fixed blade on the mount
@@ -295,6 +305,24 @@ class VRTeleopConfig:
             the tip still lifts as you squeeze, lower it if the face by the
             wrist lifts instead. Live-adjustable; realtime-core hardware
             only (the sim has no compliance and reports no measurement).
+        box_squeeze_trim: Bound (degrees) on box mode's **squeeze trim**;
+            ``0`` turns it off. The lean above is open loop, and the arm is
+            not quite its model: gear backlash, the wrist's own give and
+            the gripper flexing under load all let the tip swing off the
+            box further than the joint springs say, so a heavy box — more
+            depth, for the friction to carry it — still shows the pinch.
+            The trim closes that gap from what the encoders do see: the
+            yaw between each gripper's measured mount rotation and its
+            parallel slot, signed tip-out and averaged over the two arms
+            (a turn of the pair lags both arms the same way about up,
+            opposite ways tip-in/tip-out, so a carry cancels out). While
+            the grippers press it is integrated — 1° of toe-out adds 1°/s —
+            into an extra inward yaw of both targets, never more than this
+            many degrees, and it bleeds away (1 s) once they don't. It
+            settles where the measured face is parallel to the box, tip
+            and root both on it, whatever the unmodelled give was, about a
+            second after the clamp. Shown as ``trim`` in the pair status.
+            Live-adjustable; realtime-core hardware only.
         box_squeeze_force: Clamp force cap (N) per arm in box mode; ``0``
             (the default) for none. The squeeze lean above knows the clamp
             force the depth produces (the arm model's stiffness along the
@@ -496,6 +524,7 @@ class VRTeleopConfig:
     reengage_ramp_speed: float = 0.15
     reengage_ramp_min_s: float = 0.75
     box_mode: bool = False
+    box_lead_hand: str = "right"
     box_tool: str = "parcel"
     box_tool_open_deg: float = 140.0
     box_grasp: str = "straight"
@@ -511,6 +540,7 @@ class VRTeleopConfig:
     box_elbow_speed: float = 30.0
     box_squeeze_torque: float = 0.0
     box_squeeze_lean: float = 1.0
+    box_squeeze_trim: float = 5.0
     box_squeeze_force: float = 0.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0

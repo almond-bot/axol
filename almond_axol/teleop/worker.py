@@ -41,6 +41,8 @@ from .box import (
     smoothstep,
     snap_box,
     squeeze_lean,
+    tip_inward_sign,
+    toe_out,
     twist_about,
 )
 from .config import VRTeleopConfig
@@ -102,6 +104,12 @@ _STICK_MAX_DT_S = 0.1
 _LEAN_TAU_S = 0.2
 # A gap between depth samples longer than this restarts the filter.
 _LEAN_RESET_S = 0.5
+# Squeeze trim (see _squeeze_lean): integral gain (1/s) from the measured
+# toe-out of the tips to the extra inward yaw of the targets — an error of
+# 1° adds 1°/s — and the time constant (s) the trim bleeds away with once
+# the grippers stop pressing.
+_TRIM_GAIN = 1.0
+_TRIM_DECAY_S = 1.0
 # The robot's up (FLU +z), for box-frame rotations.
 _UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
 # The room's up in the frame the controller rotations are held in. Those
@@ -365,6 +373,14 @@ class IKWorker:
         # snap and which controller leads it. None while not in box tracking.
         self._box: BoxState | None = None
         self._box_leader: str | None = None
+        # The leader's anchor for the pair — its controller pose and its
+        # gripper's FK at the box engage — kept apart from the per-arm snaps
+        # above, which stay the session's controller↔arm mapping: leaving
+        # box mode in "ramp" re-engage blends *both* arms back out to that
+        # mapping, the one the operator engaged with before box mode.
+        self._box_snap: (
+            tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None
+        ) = None
         # Squeeze lean (see _squeeze_lean): the arms' measured joint positions
         # and joint stiffness as last reported by the core (``("meas", ...)``,
         # hardware only — the sim reports none), the low-passed clamp depth
@@ -377,6 +393,9 @@ class IKWorker:
         self._lean_depth = 0.0
         self._lean_t: float | None = None
         self._lean_force = 0.0
+        # Squeeze trim: the extra inward yaw (rad) of each gripper target the
+        # measured toe-out of the tips has integrated to, see _squeeze_lean.
+        self._lean_trim = 0.0
         # The arm model the lean reads its Jacobians from (the MuJoCo model
         # gravity compensation runs on); built up front so the first clamp
         # doesn't stall a solve. None if it can't be built (no lean then).
@@ -593,6 +612,9 @@ class IKWorker:
                 if side in self._snap_ctrl:
                     pos, rot = self._snap_ctrl[side]
                     self._snap_ctrl[side] = (pos + delta, rot)
+                if self._box_snap is not None and side == self._box_leader:
+                    (pos, rot), fk = self._box_snap
+                    self._box_snap = ((pos + delta, rot), fk)
                 if self._snap_elbow_ctrl.get(side) is not None:
                     self._snap_elbow_ctrl[side] = self._snap_elbow_ctrl[side] + delta
 
@@ -630,6 +652,7 @@ class IKWorker:
             self._clear_freeze()
             self._box = None
             self._box_leader = None
+            self._box_snap = None
             return q_current
 
         if frame.box_leader is not None:
@@ -642,9 +665,13 @@ class IKWorker:
             )
         if self._box is not None:
             # Box tracking ended without a lock-less frame in between (mode
-            # switched while engaged): the per-arm path below re-snaps.
+            # switched while engaged): the per-arm path below re-engages each
+            # arm — in "ramp" mode against the session snaps box mode left
+            # untouched, so both arms blend back out to the mapping the
+            # operator had before the box; otherwise with a fresh snap.
             self._box = None
             self._box_leader = None
+            self._box_snap = None
             self._active = {"left": False, "right": False}
             self._hold_fk = {}
             self._hold_elbow_fk = {}
@@ -1097,7 +1124,9 @@ class IKWorker:
         force (``"straight"`` / ``"flush"``) and ``elbow`` the elbows-out
         angle (degrees, ``config.box_elbow_out``) the sticks may have jogged.
         ``squeeze`` is the clamp force (N, per arm) the last box-mode solve
-        leaned for (:meth:`_squeeze_lean`; 0 while not pressing).
+        leaned for (:meth:`_squeeze_lean`; 0 while not pressing) and
+        ``trim`` the extra inward yaw (degrees) the squeeze trim has added
+        to the gripper targets on top of the lean.
         """
         left, right = self._solver.fk(q)
         tool = self._box_tool()
@@ -1137,6 +1166,7 @@ class IKWorker:
             "grasp": self._box_grasp(),
             "elbow": round(float(self._config.box_elbow_out), 1),
             "squeeze": round(self._lean_force, 1),
+            "trim": round(math.degrees(self._lean_trim), 1),
         }
 
     def _box_grasp(self) -> str:
@@ -1263,24 +1293,38 @@ class IKWorker:
         force's, the targets pulled back out along the normals to hold it
         — the same on both arms, so the pair stays a pair.
 
+        The model's lean is open loop, and the arm is not quite the model:
+        gear backlash, the wrist's own compliance, and the gripper flexing
+        under load all let the tip swing off the box further than the joint
+        springs say, so a heavy box — more depth for the friction to carry
+        it — still shows the pinch. The **squeeze trim** closes that gap
+        from the one thing the encoders do see: the yaw between each
+        gripper's measured mount rotation and its parallel slot, signed
+        tip-out and averaged over the two arms (:func:`toe_out`; a turn of
+        the pair lags both arms the same way about up, which is opposite
+        ways tip-in/tip-out, so a carry cancels out of it). While the
+        grippers press, that toe-out is integrated (``_TRIM_GAIN``) into an
+        extra inward yaw of both targets, bounded by
+        ``config.box_squeeze_trim`` degrees (0 turns it off), and it bleeds
+        away (``_TRIM_DECAY_S``) once they don't. It settles where the
+        measured face is parallel to the box — tip and root both on it —
+        whatever the unmodelled give was, a second or so after the clamp.
+
         Off (targets returned as they are) without a measurement (the
-        sim, or none reported for ``_LEAN_RESET_S``), the arm model, or a
-        pair still blending into alignment; and with both the lean scale
-        and the force cap at 0.
+        sim, or none reported for ``_LEAN_RESET_S``) or a pair still
+        blending into alignment; the model's lean also needs the arm model
+        and a nonzero lean scale or force cap.
         """
         cfg = self._config
         scale = float(getattr(cfg, "box_squeeze_lean", 0.0))
         cap = float(getattr(cfg, "box_squeeze_force", 0.0))
+        trim_max = math.radians(max(float(getattr(cfg, "box_squeeze_trim", 0.0)), 0.0))
         meas = self._measured
         if meas is not None and now - self._measured_t > _LEAN_RESET_S:
             meas = None  # the core stopped reporting (no reading): stale
-        if (
-            meas is None
-            or self._lean_model is None
-            or not box.aligned
-            or (scale <= 0.0 and cap <= 0.0)
-        ):
+        if meas is None or not box.aligned:
             self._lean_depth, self._lean_t, self._lean_force = 0.0, None, 0.0
+            self._lean_trim = 0.0
             return targets
         pos_l, pos_r, kp_l, kp_r = meas
         q_meas = np.asarray(q_current, dtype=np.float32).copy()
@@ -1293,6 +1337,7 @@ class IKWorker:
         measured = dict(zip(("left", "right"), self._solver.fk(q_meas)))
         lateral = np.asarray(box.rot[:, 1], dtype=np.float64)
         normals = {"left": -lateral, "right": lateral}
+        up = np.asarray(box.rot[:, 2], dtype=np.float64)
         raw_depth = 0.5 * sum(
             float(
                 (
@@ -1303,17 +1348,36 @@ class IKWorker:
             )
             for side in ("left", "right")
         )
+        dt = 0.0
         if self._lean_t is None or now - self._lean_t > _LEAN_RESET_S:
             self._lean_depth = raw_depth
         else:
-            alpha = 1.0 - math.exp(-(now - self._lean_t) / _LEAN_TAU_S)
+            dt = now - self._lean_t
+            alpha = 1.0 - math.exp(-dt / _LEAN_TAU_S)
             self._lean_depth += alpha * (raw_depth - self._lean_depth)
         self._lean_t = now
         depth = max(self._lean_depth, 0.0)
+
+        # The trim: integrate the measured toe-out while pressing, bleed it
+        # off while not; bounded either way.
+        if trim_max <= 0.0:
+            self._lean_trim = 0.0
+        elif depth > 0.0:
+            self._lean_trim += _TRIM_GAIN * toe_out(targets, measured, normals, up) * dt
+            self._lean_trim = float(np.clip(self._lean_trim, -trim_max, trim_max))
+        elif dt > 0.0:
+            self._lean_trim *= math.exp(-dt / _TRIM_DECAY_S)
+
         if depth <= 0.0:
             self._lean_force = 0.0
-            return targets
+            return self._apply_trim(targets, normals, up)
 
+        model = self._lean_model if (scale > 0.0 or cap > 0.0) else None
+        if model is None:
+            # No arm model, or the model's lean and cap both off: the trim
+            # alone.
+            self._lean_force = 0.0
+            return self._apply_trim(targets, normals, up)
         grasp = self._box_grasp()
         tool = self._fitted_tool()
         kp = {"left": kp_l, "right": kp_r}
@@ -1326,13 +1390,11 @@ class IKWorker:
             pos, rot = targets[side]
             arm_q = np.asarray(q_current, dtype=np.float64)[indices]
             try:
-                _p, rot_cmd, jac = self._lean_model.mount_jacobian(
-                    arm_q, is_left=(side == "left")
-                )
+                _p, rot_cmd, jac = model.mount_jacobian(arm_q, is_left=(side == "left"))
             except Exception:  # noqa: BLE001 - never let the lean stop the solve
                 _logger.exception("squeeze lean failed; targets unchanged")
                 self._lean_model = None
-                return targets
+                return self._apply_trim(targets, normals, up)
             lean = squeeze_lean(
                 jac,
                 kp[side],
@@ -1352,7 +1414,25 @@ class IKWorker:
                 new_rot = (rodrigues(axis, angle) @ rot).astype(np.float32)
             out[side] = (new_pos, new_rot)
         self._lean_force = 0.5 * sum(forces)
+        return self._apply_trim(out, normals, up)
+
+    def _apply_trim(
+        self, targets: dict[str, Pose], normals: dict[str, np.ndarray], up: np.ndarray
+    ) -> dict[str, Pose]:
+        """Yaw each gripper target ``_lean_trim`` further into the box about ``up``."""
+        trim = self._lean_trim
+        if abs(trim) <= 1e-9:
+            return targets
+        out: dict[str, Pose] = {}
+        for side, (pos, rot) in targets.items():
+            sign = tip_inward_sign(rot, normals[side], up)
+            out[side] = (pos, (rodrigues(up, sign * trim) @ rot).astype(np.float32))
         return out
+
+    @property
+    def squeeze_trim_deg(self) -> float:
+        """Extra inward yaw (degrees) of each gripper target the squeeze trim has added."""
+        return math.degrees(self._lean_trim)
 
     def _box_faces(self) -> Faces:
         """Pinned clamping faces from ``config.box_face_left/right`` (0 = auto)."""
@@ -1377,6 +1457,7 @@ class IKWorker:
         self._clear_freeze()
         self._box = None
         self._box_leader = None
+        self._box_snap = None
         self._snap_ctrl = {}
         self._snap_fk = {}
         self._snap_elbow_ctrl = {}
@@ -1466,8 +1547,7 @@ class IKWorker:
                 faces=self._box_faces(),
             )
             self._box_leader = leader
-            self._snap_ctrl = {leader: ctrl[leader]}
-            self._snap_fk = {leader: l_fk if leader == "left" else r_fk}
+            self._box_snap = (ctrl[leader], l_fk if leader == "left" else r_fk)
             self._ramp = {}
             self._active = {"left": True, "right": True}
             self._hold_fk = {}
@@ -1491,13 +1571,14 @@ class IKWorker:
             self._box = None
             return q_current
         ctrl_pos, ctrl_rot = ctrl[leader]
-        snap_ctrl_pos, snap_ctrl_rot = self._snap_ctrl[leader]
+        assert self._box_snap is not None
+        (snap_ctrl_pos, snap_ctrl_rot), snap_fk = self._box_snap
         lead_pos, _lead_rot = _relative_target_np(
             ctrl_pos,
             ctrl_rot,
             snap_ctrl_pos,
             snap_ctrl_rot,
-            *self._snap_fk[leader],
+            *snap_fk,
             position_multiplier=cfg.position_multiplier,
         )
         # Position and heading only: the box centre is carried along with
@@ -1513,7 +1594,7 @@ class IKWorker:
         # box frame about the robot's +z unchanged. The hand's pitch and roll
         # never reach the grippers, so the pair stays level with the fingers
         # straight out.
-        snap_pos, _snap_rot = self._snap_fk[leader]
+        snap_pos = snap_fk[0]
         center = (lead_pos + (box.center - snap_pos)).astype(np.float32)
         yaw = (
             twist_about(ctrl_rot @ snap_ctrl_rot.T, _CTRL_UP) * cfg.rotation_multiplier

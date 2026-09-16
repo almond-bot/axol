@@ -124,8 +124,10 @@ export type AxolSettings = {
  * (fingers forward, a flat face toward each other across a box-mode-sized gap
  * — a good moment to switch to box mode), `width` in metres, `grasp` the
  * grasp in force (`"flush"` / `"straight"`), `elbow` the elbows-out angle
- * (degrees) the sticks may have jogged and `squeeze` the clamp force (N per
+ * (degrees) the sticks may have jogged, `squeeze` the clamp force (N per
  * arm) the pair is pressing a box with (0 when not pressing; null from an
+ * older server) and `trim` the extra inward yaw (degrees) the squeeze trim
+ * has added so the blade tips press as hard as the roots (null from an
  * older server). Null until the worker's first report.
  */
 export type AxolJointState = {
@@ -139,5 +141,6 @@ export type AxolJointState = {
     grasp: string
     elbow: number | null
     squeeze: number | null
+    trim: number | null
   } | null
 }

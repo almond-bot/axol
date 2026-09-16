@@ -74,7 +74,18 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
             "by position and heading (it stays level); the "
             "thumbsticks set the grip width while a grip "
             "leads and drive Jelly once it's frozen. Also toggled by clicking both "
-            "thumbsticks together. Switching disengages the arms first."
+            "thumbsticks together. Switching engages at once: into box mode "
+            "led by the lead hand, out of it with both arms."
+        ),
+    ),
+    LiveSettingDef(
+        key="box_lead_hand",
+        label="Box lead hand",
+        type="select",
+        options=("right", "left"),
+        help=(
+            "Which controller leads the pair when box mode is switched on. "
+            "The other grip can still take the lead over."
         ),
     ),
     LiveSettingDef(
@@ -185,6 +196,22 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
             "root and its tip instead of the face digging in while the tip "
             "lifts. Raise it if the tip still lifts as you squeeze, lower it "
             "if the face by the wrist lifts instead; 0 = off. Hardware only."
+        ),
+    ),
+    LiveSettingDef(
+        key="box_squeeze_trim",
+        label="Squeeze trim",
+        type="number",
+        min=0.0,
+        max=15.0,
+        step=1.0,
+        unit="°",
+        help=(
+            "Box mode: on top of the lean, yaws the grippers further into the "
+            "box while they press until the measured faces sit parallel to "
+            "it — closes what backlash and wrist give the lean's model "
+            "misses, so the tips clamp as hard as the roots on heavy boxes. "
+            "This is the most it may add; 0 = off. Hardware only."
         ),
     ),
     LiveSettingDef(
@@ -334,7 +361,7 @@ class LiveSettings:
             return not self._has_gripper_torque()
         if d.key == "box_squeeze_torque":
             return not self._has_spring_caps()
-        if d.key in ("box_squeeze_lean", "box_squeeze_force"):
+        if d.key in ("box_squeeze_lean", "box_squeeze_trim", "box_squeeze_force"):
             # The lean reads the arms' measured joints and stiffness; only
             # a robot with AxolArm sides (the hardware Axol) has them.
             return getattr(getattr(self._robot, "left", None), "kp", None) is None
