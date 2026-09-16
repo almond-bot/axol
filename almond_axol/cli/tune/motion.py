@@ -54,6 +54,7 @@ from ...robot.config import AxolConfig
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
+from ...utils.logquiet import quiet_noisy_loggers
 
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — approach/return trajectory speed
 _PLAN_MIN_DURATION = 1.5  # s
@@ -210,6 +211,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 def run(args: argparse.Namespace) -> None:
     """Replay the selected reference motion and score tracking per joint."""
     logging.basicConfig(level=getattr(logging, args.log_level))
+    quiet_noisy_loggers()
     try:
         asyncio.run(_run(args))
     except KeyboardInterrupt:

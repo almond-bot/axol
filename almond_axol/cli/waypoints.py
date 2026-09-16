@@ -53,6 +53,7 @@ from ..robot.config import AxolConfig
 from ..teleop.config import VRTeleopConfig
 from ..utils.paths import almond_path
 from ..waypoints import Waypoint, WaypointSet
+from ..utils.logquiet import quiet_noisy_loggers
 from .config import LogLevel, normalize_bool_flags, parse
 from .gravity_comp import _resolve_free_joints
 
@@ -888,6 +889,7 @@ def main(argv: list[str]) -> None:
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
     try:
         _run(cfg)
     except ValueError as exc:

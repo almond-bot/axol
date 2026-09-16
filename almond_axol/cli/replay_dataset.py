@@ -40,6 +40,7 @@ from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..mantis.relative import quat_xyzw_to_rotvec
 from ..mantis.smoothing import rotvec_to_quat_xyzw
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
+from ..utils.logquiet import quiet_noisy_loggers
 from .config import LogLevel, parse
 
 _logger = logging.getLogger(__name__)
@@ -174,6 +175,7 @@ def main(argv: list[str]) -> None:
     # leaves the root level at WARNING, which would otherwise make this a no-op
     # and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
 
     import sys
 
