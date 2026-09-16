@@ -79,6 +79,17 @@ _GRIPPER_NOMINAL_TRAVEL = GRIPPER_TRAVEL
 # Gripper end-stop calibration parameters.
 _GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm — pushing this hard into a stop ends a sweep
 _GRIPPER_CALIB_STEP = 0.005  # rad per step
+# Blade hold (AxolArm._blade_hold): a full open command is "at the limit"
+# from this normalised opening; the integral gain (1/s: a degree of
+# shortfall adds a degree per second); the shortfall window (rad) outside
+# which the blade is taken to be still travelling and nothing integrates
+# (a limit change moves it up to 40° at max_speed); and the time constant
+# (s) the hold bleeds away with once the command leaves the limit.
+_BLADE_HOLD_OPENING = 0.98
+_BLADE_HOLD_GAIN = 1.0
+_BLADE_HOLD_WINDOW = math.radians(8.0)
+_BLADE_HOLD_DECAY_S = 1.0
+_BLADE_HOLD_LOG_S = 1.0  # rate limit (s) of the blade-hold diagnostic line
 _GRIPPER_CALIB_SETTLE = 0.001  # s per step
 # Two-stop sweep (AxolArm._sweep_to_stop): longest sweep tolerated before
 # concluding there is no stop in that direction.
@@ -753,6 +764,12 @@ class AxolArm:
         # full open command stops at; None (the default) = the open stop.
         # See set_gripper_open_limit.
         self._gripper_open_limit: float | None = None
+        # Blade hold (see _blade_hold): the signed raw-rad shift the
+        # command at an opening limit has integrated to, and when it was
+        # last stepped.
+        self._blade_hold_rad: float = 0.0
+        self._blade_hold_t: float | None = None
+        self._blade_hold_log_t: float = -math.inf
         self._set_gripper_range(
             open_pos=-self._arm_config.gripper.close_direction
             * _GRIPPER_NOMINAL_TRAVEL,
@@ -1188,6 +1205,73 @@ class AxolArm:
         if span == 0.0:
             return float(np.clip(reading, 0.0, 1.0))
         return float(np.clip(reading * full / span, 0.0, 1.0))
+
+    def _blade_hold(self, opening: float, now: float | None = None) -> float:
+        """Raw-rad shift that keeps the blade *at* an opening limit under load.
+
+        A blade held at an opening limit (:meth:`set_gripper_open_limit`;
+        box mode's angled grasp) sits short of its stop on the gripper
+        motor's position loop alone, and a box clamped against its face
+        folds it back by that loop's steady-state error under the load —
+        the face tips off the box, invisibly to the arm. While the command
+        is a full open at a limit (``opening`` ≥ ``_BLADE_HOLD_OPENING``)
+        and the measured blade is within ``_BLADE_HOLD_WINDOW`` of it (not
+        still travelling there), the shortfall ``commanded - measured`` is
+        integrated at ``_BLADE_HOLD_GAIN`` into the shift returned, bounded
+        by ``ArmConfig.gripper.hold_trim_deg`` (``0`` = off); off the
+        limit it decays over ``_BLADE_HOLD_DECAY_S``. Sign-agnostic: it
+        pushes the command whichever way the blade is falling short. The
+        joint-limit clip downstream still stops it at the stop.
+        """
+        bound = math.radians(max(float(self._arm_config.gripper.hold_trim_deg), 0.0))
+        if bound <= 0.0:
+            self._blade_hold_rad = 0.0
+            self._blade_hold_t = None
+            return 0.0
+        if now is None:
+            now = time.monotonic()
+        dt = 0.0 if self._blade_hold_t is None else min(now - self._blade_hold_t, 0.1)
+        self._blade_hold_t = now
+        limit = self._gripper_open_limit
+        at_limit = (
+            limit is not None
+            and limit > 0.0
+            and limit < abs(self._gripper_open - self._gripper_close)
+            and opening >= _BLADE_HOLD_OPENING
+        )
+        motor = self.motors.get(Joint.GRIPPER)
+        if not at_limit or motor is None or not motor.has_position:
+            if dt > 0.0:
+                self._blade_hold_rad *= math.exp(-dt / _BLADE_HOLD_DECAY_S)
+            if abs(self._blade_hold_rad) < 1e-6:
+                self._blade_hold_rad = 0.0
+            return self._blade_hold_rad
+        shortfall = self._gripper_to_raw(opening) - float(motor.position)
+        if abs(shortfall) <= _BLADE_HOLD_WINDOW and dt > 0.0:
+            self._blade_hold_rad = float(
+                np.clip(
+                    self._blade_hold_rad + _BLADE_HOLD_GAIN * shortfall * dt,
+                    -bound,
+                    bound,
+                )
+            )
+        if now - self._blade_hold_log_t >= _BLADE_HOLD_LOG_S and (
+            abs(shortfall) > math.radians(0.5) or abs(self._blade_hold_rad) > 1e-6
+        ):
+            self._blade_hold_log_t = now
+            _logger.info(
+                "%s blade hold: blade %+.1f° short of its %.0f° limit, command shifted %+.1f°",
+                "left" if self._is_left else "right",
+                math.degrees(shortfall),
+                math.degrees(limit),
+                math.degrees(self._blade_hold_rad),
+            )
+        return self._blade_hold_rad
+
+    @property
+    def blade_hold_deg(self) -> float:
+        """How far (degrees, signed) the blade hold is currently shifting the gripper command."""
+        return math.degrees(self._blade_hold_rad)
 
     async def _seek_gripper_stop(self, direction: int) -> float:
         """Step the gripper in ``direction`` (±1) until it stalls on a hard stop.
@@ -1828,7 +1912,8 @@ class AxolArm:
 
         gripper_i = self._gripper_i
         if self._has_gripper:
-            q[gripper_i] = self._gripper_to_raw(float(q[gripper_i]))
+            opening = float(q[gripper_i])
+            q[gripper_i] = self._gripper_to_raw(opening) + self._blade_hold(opening)
         else:
             q[gripper_i] = 0.0
         clipped = np.clip(q, self._limits_lo, self._limits_hi)

@@ -217,11 +217,26 @@ class PositionForceConfig:
                          stop, then back to the open stop — so a wrong sign
                          swaps open/closed and leaves the jaw closed after
                          bring-up.
+        hold_trim_deg:   Bound (degrees of motor rotation) on the **blade
+                         hold**; ``0`` turns it off. While an opening limit
+                         is set (:meth:`AxolArm.set_gripper_open_limit` —
+                         box mode's angled grasp holds the parcel blade at
+                         140°, short of its stop) the blade is held by the
+                         motor's position loop alone, and a box clamped
+                         against its face folds it back by the loop's
+                         steady-state error under that load, tipping the
+                         face off the box in a way the arm can't see. The
+                         hold integrates the blade's measured shortfall
+                         from the limit into the command (1°/s per degree,
+                         within ±this), so under load the blade sits where
+                         it was told to; it bleeds away once the command
+                         leaves the limit.
     """
 
     torque_limit: float
     max_speed: float
     close_direction: int = -1
+    hold_trim_deg: float = 10.0
 
     def __post_init__(self) -> None:
         if self.close_direction not in (1, -1):

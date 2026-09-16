@@ -271,6 +271,10 @@ class WorkerLeanTest(unittest.TestCase):
         w._lean_model = _GC
         w._measured, w._measured_t = None, 0.0
         w._lean_depth, w._lean_t, w._lean_force = 0.0, None, 0.0
+        w._lean_trim = {"left": 0.0, "right": 0.0}
+        w._trim_prev = None
+        w._trim_moving_t = -math.inf
+        w._clamp_log_t = -math.inf
         return w
 
     def _box(self) -> BoxState:
@@ -746,7 +750,10 @@ class WorkerTrimTest(unittest.TestCase):
         w._lean_model = None
         w._measured, w._measured_t = None, 0.0
         w._lean_depth, w._lean_t, w._lean_force = 0.0, None, 0.0
-        w._lean_trim = 0.0
+        w._lean_trim = {"left": 0.0, "right": 0.0}
+        w._trim_prev = None
+        w._trim_moving_t = -math.inf
+        w._clamp_log_t = -math.inf
         q = np.zeros(16, np.float32)
         w.note_measured(q[0:8], q[8:16], _KP_L, _KP_R)
         return w
@@ -795,9 +802,10 @@ class WorkerTrimTest(unittest.TestCase):
         )
         targets = self._targets(0.01)
         out, t = self._run(w, targets, 1.0)
-        # 1°/s per degree of error, so ~2° after a second (less a frame).
-        self.assertGreater(w.squeeze_trim_deg, 1.5)
-        self.assertLess(w.squeeze_trim_deg, 2.5)
+        # 1°/s per degree of error once the pair has been still 0.3 s, so
+        # ~1.4° after a second.
+        self.assertGreater(w.squeeze_trim_deg, 1.2)
+        self.assertLess(w.squeeze_trim_deg, 2.0)
         # The targets are yawed tip-inward by the trim: relative to the
         # ideal they read as *negative* toe-out of that size.
         normals = {
@@ -829,13 +837,49 @@ class WorkerTrimTest(unittest.TestCase):
         self.assertLess(w.squeeze_trim_deg, 0.3)
         self.assertEqual(w.squeeze_force, 0.0)
 
-    def test_a_turn_of_the_pair_adds_no_trim(self) -> None:
-        # Both grippers lag the same way about up: a carry, not a pinch.
+    def test_the_trims_are_per_arm(self) -> None:
+        # Only the right tip is off the box (its blade gives more): only
+        # the right target is trimmed.
+        w = self._worker(_YawedSolver({"left": 0.0, "right": -math.radians(2.0)}))
+        targets = self._targets(0.01)
+        out, _t = self._run(w, targets, 1.0)
+        trims = w.squeeze_trims_deg
+        self.assertAlmostEqual(trims["left"], 0.0, places=9)
+        self.assertGreater(trims["right"], 1.2)
+        np.testing.assert_array_equal(out["left"][1], targets["left"][1])
+        self.assertAlmostEqual(w.squeeze_trim_deg, 0.5 * trims["right"], places=9)
+
+    def test_a_moving_pair_holds_the_trims(self) -> None:
+        # A turn of the pair lags both arms the same way about up — toe-out
+        # on one side, toe-in on the other. Per-arm trims can't average
+        # that away, so they only integrate once the pair has been still.
         w = self._worker(
             _YawedSolver({"left": math.radians(3.0), "right": math.radians(3.0)})
         )
-        self._run(w, self._targets(0.01), 2.0)
-        self.assertAlmostEqual(w.squeeze_trim_deg, 0.0, places=9)
+        still = self._targets(0.01)
+        up = np.array([0.0, 0.0, 1.0])
+        n = int(2.0 * 120)
+        for i in range(n):
+            t = 100.0 + i / 120.0
+            w._measured_t = t
+            # The commanded pair turns 20°/s: nothing integrates.
+            turning = {
+                side: (
+                    pos,
+                    (rodrigues(up, math.radians(20.0) * (i / 120.0)) @ rot).astype(
+                        np.float32
+                    ),
+                )
+                for side, (pos, rot) in still.items()
+            }
+            w._squeeze_lean(self._box(), turning, np.zeros(16, np.float32), t)
+        self.assertEqual(w.squeeze_trims_deg, {"left": 0.0, "right": 0.0})
+        # Still again: the first 0.3 s are the lag settling, then the trims
+        # follow whatever toe-out is left (here the stub's, per side).
+        _out, _t = self._run(w, still, 1.3, t0=100.0 + n / 120.0)
+        trims = w.squeeze_trims_deg
+        self.assertGreater(trims["left"], 0.5)  # a +yaw swings the left tip out
+        self.assertLess(trims["right"], -0.5)  # and the right tip in
 
     def test_off_at_zero(self) -> None:
         w = self._worker(

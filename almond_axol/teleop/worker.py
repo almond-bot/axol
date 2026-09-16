@@ -42,7 +42,7 @@ from .box import (
     snap_box,
     squeeze_lean,
     tip_inward_sign,
-    toe_out,
+    toe_out_sides,
     twist_about,
 )
 from .config import VRTeleopConfig
@@ -110,6 +110,15 @@ _LEAN_RESET_S = 0.5
 # the grippers stop pressing.
 _TRIM_GAIN = 1.0
 _TRIM_DECAY_S = 1.0
+# The trims are per arm, so a turn's servo lag would read as toe-out on
+# one side and toe-in on the other: they only integrate while the pair's
+# commanded motion has been under these rates (rad/s about up, m/s at the
+# centre) for _TRIM_STILL_S. Between turns the lag has settled by then.
+_TRIM_STILL_YAW_RATE = math.radians(3.0)
+_TRIM_STILL_SPEED = 0.03
+_TRIM_STILL_S = 0.3
+# While the grippers press, a line of clamp diagnostics this often (s).
+_CLAMP_LOG_PERIOD_S = 1.0
 # The robot's up (FLU +z), for box-frame rotations.
 _UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
 # The room's up in the frame the controller rotations are held in. Those
@@ -393,9 +402,15 @@ class IKWorker:
         self._lean_depth = 0.0
         self._lean_t: float | None = None
         self._lean_force = 0.0
-        # Squeeze trim: the extra inward yaw (rad) of each gripper target the
-        # measured toe-out of the tips has integrated to, see _squeeze_lean.
-        self._lean_trim = 0.0
+        # Squeeze trim: per arm, the extra inward yaw (rad) of its gripper
+        # target the measured toe-out of its tip has integrated to, see
+        # _squeeze_lean; the previous frame's targets (for the pair's
+        # commanded motion) and when the pair last moved; when the clamp
+        # diagnostics were last logged.
+        self._lean_trim: dict[str, float] = {"left": 0.0, "right": 0.0}
+        self._trim_prev: tuple[float, dict[str, Pose]] | None = None
+        self._trim_moving_t: float = -math.inf
+        self._clamp_log_t: float = -math.inf
         # The arm model the lean reads its Jacobians from (the MuJoCo model
         # gravity compensation runs on); built up front so the first clamp
         # doesn't stall a solve. None if it can't be built (no lean then).
@@ -1125,8 +1140,9 @@ class IKWorker:
         angle (degrees, ``config.box_elbow_out``) the sticks may have jogged.
         ``squeeze`` is the clamp force (N, per arm) the last box-mode solve
         leaned for (:meth:`_squeeze_lean`; 0 while not pressing) and
-        ``trim`` the extra inward yaw (degrees) the squeeze trim has added
-        to the gripper targets on top of the lean.
+        ``trim`` the mean extra inward yaw (degrees) the squeeze trims have
+        added to the gripper targets on top of the lean, ``trims`` the two
+        arms' own (``[left, right]``).
         """
         left, right = self._solver.fk(q)
         tool = self._box_tool()
@@ -1166,7 +1182,8 @@ class IKWorker:
             "grasp": self._box_grasp(),
             "elbow": round(float(self._config.box_elbow_out), 1),
             "squeeze": round(self._lean_force, 1),
-            "trim": round(math.degrees(self._lean_trim), 1),
+            "trim": round(self.squeeze_trim_deg, 1),
+            "trims": [round(v, 1) for v in self.squeeze_trims_deg.values()],
         }
 
     def _box_grasp(self) -> str:
@@ -1300,15 +1317,22 @@ class IKWorker:
         it — still shows the pinch. The **squeeze trim** closes that gap
         from the one thing the encoders do see: the yaw between each
         gripper's measured mount rotation and its parallel slot, signed
-        tip-out and averaged over the two arms (:func:`toe_out`; a turn of
-        the pair lags both arms the same way about up, which is opposite
-        ways tip-in/tip-out, so a carry cancels out of it). While the
-        grippers press, that toe-out is integrated (``_TRIM_GAIN``) into an
-        extra inward yaw of both targets, bounded by
-        ``config.box_squeeze_trim`` degrees (0 turns it off), and it bleeds
-        away (``_TRIM_DECAY_S``) once they don't. It settles where the
-        measured face is parallel to the box — tip and root both on it —
-        whatever the unmodelled give was, a second or so after the clamp.
+        tip-out (:func:`toe_out_sides`). While the grippers press, each
+        arm's toe-out is integrated (``_TRIM_GAIN``) into an extra inward
+        yaw of *its* target — the two arms' give differs (the grippers are
+        identical parts, not mirrored, so a clamp loads their hinges
+        opposite ways), so one trim for both left the worse side short —
+        bounded by ``config.box_squeeze_trim`` degrees (0 turns it off),
+        and it bleeds away (``_TRIM_DECAY_S``) once they don't. A turn of
+        the pair lags both arms the same way about up, which reads as
+        toe-out on one side and toe-in on the other, so the trims only
+        integrate once the pair's commanded motion has been still
+        (``_TRIM_STILL_*``) long enough for the lag to settle. They settle
+        where each measured face is parallel to the box — tip and root
+        both on it — whatever the unmodelled give was, a second or so
+        after the clamp. While pressing, a line of diagnostics — per arm
+        depth, force, toe-out and trim — is logged every
+        ``_CLAMP_LOG_PERIOD_S``.
 
         Off (targets returned as they are) without a measurement (the
         sim, or none reported for ``_LEAN_RESET_S``) or a pair still
@@ -1324,7 +1348,8 @@ class IKWorker:
             meas = None  # the core stopped reporting (no reading): stale
         if meas is None or not box.aligned:
             self._lean_depth, self._lean_t, self._lean_force = 0.0, None, 0.0
-            self._lean_trim = 0.0
+            self._lean_trim = {"left": 0.0, "right": 0.0}
+            self._trim_prev = None
             return targets
         pos_l, pos_r, kp_l, kp_r = meas
         q_meas = np.asarray(q_current, dtype=np.float32).copy()
@@ -1338,8 +1363,8 @@ class IKWorker:
         lateral = np.asarray(box.rot[:, 1], dtype=np.float64)
         normals = {"left": -lateral, "right": lateral}
         up = np.asarray(box.rot[:, 2], dtype=np.float64)
-        raw_depth = 0.5 * sum(
-            float(
+        depths = {
+            side: float(
                 (
                     np.asarray(targets[side][0], dtype=np.float64)
                     - np.asarray(measured[side][0], dtype=np.float64)
@@ -1347,7 +1372,8 @@ class IKWorker:
                 @ normals[side]
             )
             for side in ("left", "right")
-        )
+        }
+        raw_depth = 0.5 * (depths["left"] + depths["right"])
         dt = 0.0
         if self._lean_t is None or now - self._lean_t > _LEAN_RESET_S:
             self._lean_depth = raw_depth
@@ -1358,15 +1384,27 @@ class IKWorker:
         self._lean_t = now
         depth = max(self._lean_depth, 0.0)
 
-        # The trim: integrate the measured toe-out while pressing, bleed it
-        # off while not; bounded either way.
+        # The trims: integrate each arm's measured toe-out while pressing
+        # and the pair is still, bleed them off while not pressing; bounded
+        # either way.
+        toe = toe_out_sides(targets, measured, normals, up)
+        still = self._pair_still(targets, now)
         if trim_max <= 0.0:
-            self._lean_trim = 0.0
+            self._lean_trim = {"left": 0.0, "right": 0.0}
         elif depth > 0.0:
-            self._lean_trim += _TRIM_GAIN * toe_out(targets, measured, normals, up) * dt
-            self._lean_trim = float(np.clip(self._lean_trim, -trim_max, trim_max))
+            if still:
+                for side in ("left", "right"):
+                    self._lean_trim[side] = float(
+                        np.clip(
+                            self._lean_trim[side] + _TRIM_GAIN * toe[side] * dt,
+                            -trim_max,
+                            trim_max,
+                        )
+                    )
         elif dt > 0.0:
-            self._lean_trim *= math.exp(-dt / _TRIM_DECAY_S)
+            decay = math.exp(-dt / _TRIM_DECAY_S)
+            for side in ("left", "right"):
+                self._lean_trim[side] *= decay
 
         if depth <= 0.0:
             self._lean_force = 0.0
@@ -1377,12 +1415,14 @@ class IKWorker:
             # No arm model, or the model's lean and cap both off: the trim
             # alone.
             self._lean_force = 0.0
+            self._log_clamp(now, depths, {}, toe, still)
             return self._apply_trim(targets, normals, up)
         grasp = self._box_grasp()
         tool = self._fitted_tool()
         kp = {"left": kp_l, "right": kp_r}
         out: dict[str, Pose] = {}
         forces: list[float] = []
+        per_side_force: dict[str, float] = {}
         for side, indices in (
             ("left", self.left_indices),
             ("right", self.right_indices),
@@ -1405,6 +1445,7 @@ class IKWorker:
                 cap,
             )
             forces.append(lean.force)
+            per_side_force[side] = lean.force
             shift = scale * lean.translation + lean.pullback * normals[side]
             new_pos = (np.asarray(pos, dtype=np.float64) + shift).astype(np.float32)
             angle = float(np.linalg.norm(lean.rotation)) * scale
@@ -1414,25 +1455,83 @@ class IKWorker:
                 new_rot = (rodrigues(axis, angle) @ rot).astype(np.float32)
             out[side] = (new_pos, new_rot)
         self._lean_force = 0.5 * sum(forces)
+        self._log_clamp(now, depths, per_side_force, toe, still)
         return self._apply_trim(out, normals, up)
+
+    def _pair_still(self, targets: dict[str, Pose], now: float) -> bool:
+        """True once the pair's commanded motion has been slow for ``_TRIM_STILL_S``."""
+        prev = self._trim_prev
+        self._trim_prev = (now, targets)
+        if prev is None:
+            self._trim_moving_t = now
+            return False
+        t_prev, prev_targets = prev
+        dt = now - t_prev
+        if dt <= 0.0:
+            return now - self._trim_moving_t >= _TRIM_STILL_S
+        moving = False
+        for side in ("left", "right"):
+            (p0, r0), (p1, r1) = prev_targets[side], targets[side]
+            speed = float(np.linalg.norm(np.asarray(p1, float) - np.asarray(p0, float)))
+            speed /= dt
+            yaw_rate = rotation_angle(r0, r1) / dt
+            if speed > _TRIM_STILL_SPEED or yaw_rate > _TRIM_STILL_YAW_RATE:
+                moving = True
+        if moving:
+            self._trim_moving_t = now
+        return now - self._trim_moving_t >= _TRIM_STILL_S
+
+    def _log_clamp(
+        self,
+        now: float,
+        depths: dict[str, float],
+        forces: dict[str, float],
+        toe: dict[str, float],
+        still: bool,
+    ) -> None:
+        """Rate-limited clamp diagnostics while the grippers press."""
+        if now - self._clamp_log_t < _CLAMP_LOG_PERIOD_S:
+            return
+        self._clamp_log_t = now
+        _logger.info(
+            "box clamp: depth L %.1f / R %.1f mm, force L %.1f / R %.1f N, "
+            "toe-out L %+.2f / R %+.2f°, trim L %+.2f / R %+.2f°%s",
+            depths["left"] * 1e3,
+            depths["right"] * 1e3,
+            forces.get("left", 0.0),
+            forces.get("right", 0.0),
+            math.degrees(toe["left"]),
+            math.degrees(toe["right"]),
+            math.degrees(self._lean_trim["left"]),
+            math.degrees(self._lean_trim["right"]),
+            "" if still else " (pair moving: trims held)",
+        )
 
     def _apply_trim(
         self, targets: dict[str, Pose], normals: dict[str, np.ndarray], up: np.ndarray
     ) -> dict[str, Pose]:
-        """Yaw each gripper target ``_lean_trim`` further into the box about ``up``."""
-        trim = self._lean_trim
-        if abs(trim) <= 1e-9:
+        """Yaw each gripper target its ``_lean_trim`` further into the box about ``up``."""
+        if all(abs(t) <= 1e-9 for t in self._lean_trim.values()):
             return targets
         out: dict[str, Pose] = {}
         for side, (pos, rot) in targets.items():
+            trim = self._lean_trim[side]
+            if abs(trim) <= 1e-9:
+                out[side] = (pos, rot)
+                continue
             sign = tip_inward_sign(rot, normals[side], up)
             out[side] = (pos, (rodrigues(up, sign * trim) @ rot).astype(np.float32))
         return out
 
     @property
     def squeeze_trim_deg(self) -> float:
-        """Extra inward yaw (degrees) of each gripper target the squeeze trim has added."""
-        return math.degrees(self._lean_trim)
+        """Mean extra inward yaw (degrees) of the gripper targets the squeeze trims have added."""
+        return math.degrees(0.5 * sum(self._lean_trim.values()))
+
+    @property
+    def squeeze_trims_deg(self) -> dict[str, float]:
+        """Per arm, the extra inward yaw (degrees) its squeeze trim has added."""
+        return {side: math.degrees(t) for side, t in self._lean_trim.items()}
 
     def _box_faces(self) -> Faces:
         """Pinned clamping faces from ``config.box_face_left/right`` (0 = auto)."""

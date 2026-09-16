@@ -17,6 +17,7 @@ import unittest
 
 import numpy as np
 
+from almond_axol.motor import Joint
 from almond_axol.robot.axol import AxolArm, AxolHardware
 from almond_axol.robot.config import AxolConfig, PositionForceConfig
 from almond_axol.teleop.config import VRTeleopConfig
@@ -118,6 +119,83 @@ class SpanTest(unittest.TestCase):
         self.assertNotIn("gripper_stroke_deg", VRTeleopConfig.__dataclass_fields__)
         self.assertNotIn("open_limit_deg", PositionForceConfig.__dataclass_fields__)
         self.assertEqual(VRTeleopConfig().box_tool_open_deg, 140.0)
+
+
+class BladeHoldTest(unittest.TestCase):
+    """The blade hold keeps a blade *at* its opening limit under a clamp."""
+
+    def _arm(self, hold_deg: float = 10.0) -> AxolArm:
+        arm = _arm(stroke_deg=180.0)
+        arm._arm_config.gripper.hold_trim_deg = hold_deg
+        arm.set_gripper_open_limit(140.0)
+        return arm
+
+    def _measure(self, arm: AxolArm, blade_deg: float) -> None:
+        arm.motors[Joint.GRIPPER]._position = math.radians(blade_deg)
+
+    def _run(self, arm: AxolArm, opening: float, seconds: float, t0: float) -> float:
+        n = int(seconds * 120)
+        hold = 0.0
+        for i in range(n + 1):
+            hold = arm._blade_hold(opening, now=t0 + i / 120.0)
+        return hold
+
+    def test_a_blade_falling_short_is_pushed_on(self) -> None:
+        arm = self._arm()
+        # Commanded to the 140° limit, the clamp folds the blade to 137°.
+        self._measure(arm, 137.0)
+        hold = self._run(arm, 1.0, 1.0, t0=10.0)
+        # 3° short at 1°/s per degree: ~3° after a second, the right way.
+        self.assertGreater(math.degrees(hold), 2.5)
+        self.assertLess(math.degrees(hold), 3.5)
+        self.assertAlmostEqual(arm.blade_hold_deg, math.degrees(hold))
+        # The other way too (sign-agnostic).
+        arm = self._arm()
+        self._measure(arm, 143.0)
+        hold = self._run(arm, 1.0, 1.0, t0=10.0)
+        self.assertLess(math.degrees(hold), -2.5)
+
+    def test_bounded_by_the_config(self) -> None:
+        arm = self._arm(hold_deg=4.0)
+        self._measure(arm, 134.0)
+        hold = self._run(arm, 1.0, 10.0, t0=10.0)
+        self.assertAlmostEqual(math.degrees(hold), 4.0, places=6)
+
+    def test_a_travelling_blade_does_not_wind_up(self) -> None:
+        # The limit just switched: the blade is still 30° away, moving.
+        arm = self._arm()
+        self._measure(arm, 110.0)
+        hold = self._run(arm, 1.0, 2.0, t0=10.0)
+        self.assertEqual(hold, 0.0)
+
+    def test_off_the_limit_it_bleeds_away(self) -> None:
+        arm = self._arm()
+        self._measure(arm, 137.0)
+        self._run(arm, 1.0, 2.0, t0=10.0)
+        self.assertGreater(arm.blade_hold_deg, 1.5)
+        # Trigger squeezed: the command is no longer the full open.
+        hold = self._run(arm, 0.5, 5.0, t0=13.0)
+        self.assertLess(abs(math.degrees(hold)), 0.2)
+        # Or the limit lifted (the blade goes to the stop).
+        arm = self._arm()
+        self._measure(arm, 137.0)
+        self._run(arm, 1.0, 2.0, t0=10.0)
+        arm.set_gripper_open_limit(None)
+        hold = self._run(arm, 1.0, 5.0, t0=13.0)
+        self.assertLess(abs(math.degrees(hold)), 0.2)
+
+    def test_off_at_zero_and_without_a_reading(self) -> None:
+        arm = self._arm(hold_deg=0.0)
+        self._measure(arm, 137.0)
+        self.assertEqual(self._run(arm, 1.0, 1.0, t0=10.0), 0.0)
+        arm = self._arm()
+        arm.motors[Joint.GRIPPER]._position = None
+        self.assertEqual(self._run(arm, 1.0, 1.0, t0=10.0), 0.0)
+
+    def test_default_bound(self) -> None:
+        self.assertEqual(
+            PositionForceConfig(torque_limit=0.5, max_speed=10.0).hold_trim_deg, 10.0
+        )
 
 
 def _core(**cfg) -> VRTeleopCore:

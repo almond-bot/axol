@@ -437,6 +437,29 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="number",
                 help="Maximum joint speed of the right gripper.",
             ),
+            SettingDef(
+                key="axol.left.gripper.hold_trim_deg",
+                label="Left gripper blade hold (°)",
+                type="number",
+                help=(
+                    "Box mode's angled grasp holds the blade at 140°, short "
+                    "of its stop, on the motor's position loop alone, and a "
+                    "clamped box folds it back by that loop's error under "
+                    "load. The hold integrates the blade's measured "
+                    "shortfall into the command so it stays where it was "
+                    "told; this is the most it may shift it. 0 turns it off."
+                ),
+            ),
+            SettingDef(
+                key="axol.right.gripper.hold_trim_deg",
+                label="Right gripper blade hold (°)",
+                type="number",
+                help=(
+                    "As for the left gripper: the most the blade hold may "
+                    "shift the right gripper's command to keep its blade at "
+                    "the 140° limit under a clamp. 0 turns it off."
+                ),
+            ),
             # What a session drives is inferred from the CAN interfaces
             # attached (arm hub, Jelly wheel bus, lift bus) — this and the
             # two Jelly switches (in the Jelly category) are the operator's

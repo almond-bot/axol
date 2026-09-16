@@ -313,15 +313,23 @@ class VRTeleopConfig:
             depth, for the friction to carry it — still shows the pinch.
             The trim closes that gap from what the encoders do see: the
             yaw between each gripper's measured mount rotation and its
-            parallel slot, signed tip-out and averaged over the two arms
-            (a turn of the pair lags both arms the same way about up,
-            opposite ways tip-in/tip-out, so a carry cancels out). While
-            the grippers press it is integrated — 1° of toe-out adds 1°/s —
-            into an extra inward yaw of both targets, never more than this
-            many degrees, and it bleeds away (1 s) once they don't. It
-            settles where the measured face is parallel to the box, tip
-            and root both on it, whatever the unmodelled give was, about a
-            second after the clamp. Shown as ``trim`` in the pair status.
+            parallel slot, signed tip-out — per arm, since the two give
+            differently (the grippers are identical parts, not mirrored,
+            so a clamp loads their hinges opposite ways). While the
+            grippers press, each arm's toe-out is integrated — 1° adds
+            1°/s — into an extra inward yaw of its own target, never more
+            than this many degrees, and it bleeds away (1 s) once they
+            don't. A turn of the pair lags both arms the same way about up
+            (toe-out on one side, toe-in on the other), so the trims only
+            integrate once the pair's commanded motion has been still for
+            0.3 s. They settle where each measured face is parallel to the
+            box, tip and root both on it, whatever the unmodelled give
+            was, about a second after the clamp. Shown as ``trim`` (mean)
+            and ``trims`` (``[left, right]``) in the pair status, and
+            logged once a second while pressing with each arm's depth,
+            force and toe-out. The blade's own give under the clamp —
+            held at 140° by its motor, short of the stop — is handled on
+            the robot (``PositionForceConfig.hold_trim_deg``).
             Live-adjustable; realtime-core hardware only.
         box_squeeze_force: Clamp force cap (N) per arm in box mode; ``0``
             (the default) for none. The squeeze lean above knows the clamp
