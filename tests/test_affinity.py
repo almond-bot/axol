@@ -405,3 +405,14 @@ class ControlThreadFifoTest(TestCase):
             affinity.CONTROL_FIFO_PRIORITY, affinity.CAPTURE_FIFO_PRIORITY
         )
         self.assertLess(affinity.CONTROL_FIFO_PRIORITY, affinity.MAX_FIFO_PRIORITY)
+
+    def test_enter_control_thread_pins_then_goes_fifo(self) -> None:
+        with (
+            patch.object(affinity, "pin_realtime", return_value=False) as pin,
+            patch.object(
+                affinity, "prioritize_control_thread", return_value=True
+            ) as fifo,
+        ):
+            self.assertTrue(affinity.enter_control_thread())
+        pin.assert_called_once_with()
+        fifo.assert_called_once_with()

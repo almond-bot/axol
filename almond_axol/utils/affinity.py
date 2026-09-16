@@ -466,6 +466,25 @@ def prioritize_control_thread() -> bool:
     return True
 
 
+def enter_control_thread() -> bool:
+    """Make the calling thread *the* control thread: realtime core + ``SCHED_FIFO``.
+
+    For loops that live on a thread of their own rather than the command's
+    calling thread — ``AxolRobot``'s ``axol-event-loop``, which runs
+    ``motion_control`` for ``collect-data`` / ``collect-dagger`` (their hot
+    loop is scheduled onto it) and ``run-policy`` (whose 60 Hz thread hands
+    each action to it). Call it first thing on that thread: the pin is
+    thread-scoped (a no-op re-pin when the process already sits on the
+    realtime cores, the one thread moved there when it does not — run-policy
+    leaves its observation/inference threads free to float), and the FIFO
+    policy is thread-scoped with the reset-on-fork flag as in
+    :func:`prioritize_control_thread`. Returns True when either took effect.
+    """
+    pinned = pin_realtime()
+    fifo = prioritize_control_thread()
+    return pinned or fifo
+
+
 def release_control_thread() -> None:
     """Undo :func:`prioritize_control_thread` for the calling thread."""
     if not hasattr(os, "sched_setscheduler") or not hasattr(os, "SCHED_OTHER"):
