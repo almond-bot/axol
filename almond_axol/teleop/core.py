@@ -95,6 +95,9 @@ def measured_arms(robot: object) -> MeasuredArms | None:
 # Thumbstick deflection below which a stick counts as released — the same
 # deadzone box mode and Jelly apply, so "neutral" here means neither would act.
 _STICK_NEUTRAL = 0.15
+# Grace after ``box_align_duration`` for a deferred box-mode exit: the
+# worker's re-blend to the straight grasp starts a frame after the request.
+_BOX_EXIT_MARGIN_S = 0.25
 
 
 def _sticks_neutral(frame: object) -> bool:
@@ -354,6 +357,11 @@ class VRTeleopCore:
         # the worker is pending until it reports the value back, see
         # _mirror_worker_field.
         self._worker_pending: dict[str, object] = {}
+        # A box-mode-off request taken while the led pair held the angled
+        # grasp: the grasp is switched back to straight first and the exit
+        # waits (until this deadline, or the grip lets go) for the pair to
+        # blend the yaw back out, see ``_begin_box_exit``.
+        self._box_exit_deadline: float | None = None
 
         # Reset latch (set from the VR frame callback / programmatically).
         self._prev_reset: bool = False
@@ -492,7 +500,9 @@ class VRTeleopCore:
 
         Takes effect on the IK thread at the next frame: switching while
         engaged disengages first, so the new mode's engage rule applies from
-        a deliberate engage.
+        a deliberate engage. Switching off while a led pair holds the angled
+        grasp levels it first (``_begin_box_exit``); a return-to-rest
+        (:meth:`request_reset`, the headset's X) switches box mode off itself.
         """
         self.set_live("box_mode", bool(enabled))
 
@@ -726,23 +736,24 @@ class VRTeleopCore:
         copy — flushed by ``run_ik_loop`` right before the next dispatch).
         """
         with self._live_lock:
-            if not self._live_requests:
-                return
             requests = self._live_requests
             self._live_requests = {}
+        if self._box_exit_deadline is not None and "box_mode" not in requests:
+            self._finish_box_exit()
         # A no-op request (value already current) still notifies, so every
         # ``set`` a client sends is answered with the server's state.
         for key, value in requests.items():
             if key == "box_mode":
                 want = bool(value)
+                if want:
+                    # Switching (back) on cancels a deferred exit.
+                    self._box_exit_deadline = None
                 if want != self.box_mode:
-                    if self.teleop_enabled:
-                        self._disengage_all("Teleop disabled (mode switch)")
-                    self.box_mode = want
-                    self._logger.info(
-                        "Box mode %s",
-                        "on: one grip engages both arms" if want else "off",
-                    )
+                    if not want and self._begin_box_exit():
+                        # Answered (with the mode actually applied) once
+                        # the pair has left the angled grasp.
+                        continue
+                    self._set_box_mode(want)
                 self._notify_mode("box_mode", want)
             elif key == "reengage":
                 mode = str(value)
@@ -774,6 +785,67 @@ class VRTeleopCore:
                     self._logger.info("Live setting %s = %s", key, coerced)
                 self._notify_mode(key, coerced)
 
+    def _set_box_mode(self, want: bool) -> None:
+        """Apply a box-mode switch now (IK thread): disengage, flip, log."""
+        self._box_exit_deadline = None
+        if want == self.box_mode:
+            return
+        if self.teleop_enabled:
+            self._disengage_all("Teleop disabled (mode switch)")
+        self.box_mode = want
+        self._logger.info(
+            "Box mode %s", "on: one grip engages both arms" if want else "off"
+        )
+
+    def _begin_box_exit(self) -> bool:
+        """Start leaving box mode from the angled grasp; ``True`` if deferred.
+
+        Leaving box mode while the led pair holds the angled (``"flush"``)
+        grasp would hand plain teleop two wrists yawed into the box, and the
+        re-engage ramp then blends each arm out from there. So the grasp is
+        switched back to ``"straight"`` first — the worker re-blends the pair
+        level over ``box_align_duration`` while the grip keeps leading — and
+        the mode switch itself waits for that (:meth:`_finish_box_exit`).
+        Nothing to undo (straight grasp, or no grip leading so the pair
+        can't move anyway): returns ``False`` and the caller exits at once.
+        """
+        if self._box_exit_deadline is not None:
+            # Asked again while waiting: exit now.
+            return False
+        cfg = self.config
+        grasp = str(getattr(cfg, "box_grasp", "straight")).strip().lower()
+        if grasp != "flush" or not self.teleop_enabled:
+            return False
+        self._box_exit_deadline = (
+            time.perf_counter()
+            + float(getattr(cfg, "box_align_duration", 0.0))
+            + _BOX_EXIT_MARGIN_S
+        )
+        self._set_worker_field("box_grasp", "straight")
+        self._logger.info("Box mode off: leaving the angled grasp first")
+        return True
+
+    def _finish_box_exit(self) -> None:
+        """Complete a deferred box-mode exit once the pair is level (or let go)."""
+        deadline = self._box_exit_deadline
+        if deadline is None:
+            return
+        if time.perf_counter() < deadline and self.teleop_enabled:
+            return
+        self._set_box_mode(False)
+        self._notify_mode("box_mode", False)
+
+    def _set_worker_field(self, key: str, value: object) -> None:
+        """Change a worker-mirrored config field from the core (IK thread)."""
+        if value == getattr(self.config, key):
+            return
+        setattr(self.config, key, value)
+        if key in self._LIVE_WORKER_FIELDS:
+            self._worker_updates.append((key, value))
+            if key in self._WORKER_OWNED:
+                self._worker_pending[key] = value
+        self._notify_mode(key, value)
+
     def _notify_mode(self, key: str, value: object) -> None:
         if self._broadcast_mode is not None:
             self._broadcast_mode(key, value)
@@ -803,6 +875,8 @@ class VRTeleopCore:
         self._apply_live_requests()
         if self.box_mode:
             self._update_engage_box(frame)
+            # A grip that just froze the pair ends a deferred exit now.
+            self._finish_box_exit()
             return
 
         l_lock = bool(frame.l_lock)
@@ -1524,6 +1598,11 @@ class VRTeleopCore:
             ):
                 self._reset_latched = False
                 self._reset_cancel = False
+                if self.box_mode:
+                    # Going home leaves box mode: the arms come back as two
+                    # arms, and the next engage is a deliberate one.
+                    self._set_box_mode(False)
+                    self._notify_mode("box_mode", False)
                 # Keep is_resetting true across the (possibly seconds-long)
                 # planning round trip so callers waiting on it don't observe a
                 # false gap between the latch and the trajectory playback.

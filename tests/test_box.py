@@ -666,6 +666,132 @@ class SticksDriveJellyTest(unittest.TestCase):
         self.assertFalse(core.pair_owns_sticks)
 
 
+class BoxExitTest(unittest.TestCase):
+    """Leaving box mode: going home turns it off, and from the angled grasp
+    the pair is levelled first so plain teleop's ramp starts from two
+    straight wrists."""
+
+    def _core(self, **cfg) -> tuple[VRTeleopCore, list[tuple[str, object]]]:
+        modes: list[tuple[str, object]] = []
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True, box_tool="parcel", **cfg),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+            broadcast_mode=lambda key, value: modes.append((key, value)),
+        )
+        return core, modes
+
+    def _lead(self, core: VRTeleopCore) -> None:
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.teleop_enabled)
+
+    def test_going_home_turns_box_mode_off(self) -> None:
+        # Drive the IK loop's reset branch (the X button's latch) through a
+        # fake worker connection that answers the plan with no trajectory.
+        import threading
+
+        core, modes = self._core(box_grasp="flush")
+        self._lead(core)
+        core.q = np.zeros(14, dtype=np.float32)
+        core.request_reset()
+
+        class _Conn:
+            sent: tuple = ()
+
+            def send(self, msg):
+                self.sent = msg
+
+            def recv(self):
+                return ("reset_traj", np.zeros(14), [])
+
+        stop = threading.Event()
+        conn = _Conn()
+        # One loop pass: the reset latch dispatches, then stop.
+        core._pace = lambda _t0, _interval: stop.set()
+        core.run_ik_loop(conn, lambda: None, stop, lambda: True, lambda _t: None)
+        self.assertEqual(conn.sent[0], "reset")
+        self.assertFalse(core.box_mode)
+        self.assertFalse(core.teleop_enabled)
+        self.assertIn(("box_mode", False), modes)
+        # Straight to home: no angled-grasp undo is started for a reset.
+        self.assertIsNone(core._box_exit_deadline)
+        self.assertEqual(core.config.box_grasp, "flush")
+
+    def test_straight_grasp_exits_at_once(self) -> None:
+        core, modes = self._core(box_grasp="straight")
+        self._lead(core)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.box_mode)
+        self.assertIsNone(core._box_exit_deadline)
+        self.assertIn(("box_mode", False), modes)
+
+    def test_angled_grasp_is_undone_before_the_exit(self) -> None:
+        core, modes = self._core(box_grasp="flush", box_align_duration=0.05)
+        self._lead(core)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        # Still in box mode, still led; the grasp went straight to the worker.
+        self.assertTrue(core.box_mode)
+        self.assertTrue(core.teleop_enabled)
+        self.assertEqual(core.config.box_grasp, "straight")
+        self.assertIn(("box_grasp", "straight"), core._worker_updates)
+        self.assertEqual(core._worker_pending.get("box_grasp"), "straight")
+        self.assertIn(("box_grasp", "straight"), modes)
+        self.assertNotIn(("box_mode", False), modes)
+        # The blade limit lifts with the grasp (the blade heads for the stop).
+        self.assertIsNone(core.gripper_open_limit())
+        # Once the blend has had its time, the mode switch lands.
+        core._box_exit_deadline = 0.0
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.box_mode)
+        self.assertFalse(core.teleop_enabled)
+        self.assertIn(("box_mode", False), modes)
+
+    def test_letting_go_finishes_the_exit_early(self) -> None:
+        core, modes = self._core(box_grasp="flush", box_align_duration=10.0)
+        self._lead(core)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.box_mode)
+        # Leader clicks again: the pair freezes; nothing more can level it.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.box_mode)
+        self.assertIn(("box_mode", False), modes)
+
+    def test_asking_again_exits_now(self) -> None:
+        core, modes = self._core(box_grasp="flush", box_align_duration=10.0)
+        self._lead(core)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.box_mode)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.box_mode)
+
+    def test_switching_back_on_cancels_the_exit(self) -> None:
+        core, modes = self._core(box_grasp="flush", box_align_duration=10.0)
+        self._lead(core)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        core.set_box_mode(True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.box_mode)
+        self.assertIsNone(core._box_exit_deadline)
+        self.assertNotIn(("box_mode", False), modes)
+
+    def test_unled_pair_exits_at_once(self) -> None:
+        # Nobody leading: the pair can't move, so there is nothing to wait for.
+        core, modes = self._core(box_grasp="flush")
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertFalse(core.box_mode)
+        self.assertEqual(core.config.box_grasp, "flush")
+
+
 class StickControlTest(unittest.TestCase):
     """Box mode's sticks set the grip width (left/right) and how far out the
     elbows are held (forward/back), on either stick; the grasp sets the yaw."""
