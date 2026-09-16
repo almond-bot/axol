@@ -218,7 +218,10 @@ class DaggerConfig:
     # Safety cap per episode; hitting it saves the episode. DAgger episodes
     # include interventions, so the default is generous.
     episode_time_s: int = 600
-    fps: int = 60
+    # Dataset rate and the policy state's control rate — must equal the fps
+    # the policy was trained at (collect-data's default, 30; see its note on
+    # why 30 rather than 60). Teleop ticks at ``teleop_hz`` regardless.
+    fps: int = 30
     # Velocity/acceleration envelope over the policy's arm actions (rad/s,
     # rad/s²) — see PolicyActionLimiter. Transparent for normal trained
     # motion; only engages on discontinuities (policy outliers, re-plans from

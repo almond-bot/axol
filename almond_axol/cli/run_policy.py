@@ -127,7 +127,11 @@ class RunPolicyConfig:
     task: str
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
     episode_time_s: int = 120
-    fps: int = 60
+    # Control/recording rate — must equal the fps the policy was trained at
+    # (collect-data's default, 30). A 60 fps checkpoint needs --fps 60; the
+    # sanity check below refuses a mismatch rather than replaying actions at
+    # the wrong speed.
+    fps: int = 30
     # Escape hatch for the training-fps sanity check: when the checkpoint
     # records the fps its dataset was collected at (see _training_fps) and it
     # differs from --fps, run-policy refuses to start — actions would replay
