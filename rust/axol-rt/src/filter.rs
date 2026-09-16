@@ -321,7 +321,10 @@ impl Holdover {
     }
 
     /// Forget the stream: the next target starts a fresh estimate from rest.
-    /// Called for passthrough (gravity comp / limp) targets and on rejects.
+    /// Called for passthrough (gravity comp / limp) and gripper targets. A
+    /// *rejected* target does not reset: the carry keeps gliding to rest
+    /// from the last accepted target, and only accepted targets are ever
+    /// observed.
     pub fn reset(&mut self) {
         self.vel = 0.0;
         self.last = None;
@@ -845,7 +848,7 @@ mod tests {
         // Two more on-time targets and the estimate is live again.
         hold.observe(p + 0.3 + STREAM_VEL * CADENCE, Some(CADENCE), Some(CADENCE));
         assert!(hold.vel() > 0.0);
-        // Explicit reset (passthrough target / reject) drops it as well, and
+        // Explicit reset (passthrough target) drops it as well, and
         // the first target after a reset has no previous to difference.
         hold.reset();
         assert_eq!(hold.vel(), 0.0);
