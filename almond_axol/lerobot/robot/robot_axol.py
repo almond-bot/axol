@@ -45,6 +45,7 @@ from ...constants import Joint
 from ...robot.base import HardwareCleanupError
 from ...teleop.config import VRTeleopConfig
 from ...teleop.filter import TrapezoidalFilter
+from ...utils import affinity
 from .config_axol import AxolRobotConfig
 
 if TYPE_CHECKING:
@@ -487,8 +488,20 @@ class AxolRobot(Robot):
             )
         loop = asyncio.new_event_loop()
         self._loop = loop
+
+        def run_control_loop() -> None:
+            # This thread *is* the control loop: collect-data / collect-dagger
+            # schedule their hot loop onto it and run-policy hands it every
+            # action, so it gets the realtime core and SCHED_FIFO the same way
+            # `axol teleop` treats its own loop thread (2026-09-15: as an
+            # ordinary CFS peer of the VR/IK/diag threads on that core it
+            # waited ~300 ms of every second for the CPU — one tick in fifty
+            # 15-50 ms late, arms hitching). Threads it spawns start CFS.
+            affinity.enter_control_thread()
+            loop.run_forever()
+
         self._loop_thread = threading.Thread(
-            target=loop.run_forever, name="axol-event-loop", daemon=True
+            target=run_control_loop, name="axol-event-loop", daemon=True
         )
         self._loop_thread.start()
 

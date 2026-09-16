@@ -102,6 +102,7 @@ from ..recording import (
     restore_dataset_ownership,
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
+from ..utils import affinity
 from ..utils.control_loop import run_blocking_with_sync_control_ticks
 from ..utils.network import local_ip
 from .collect_data import (
@@ -608,6 +609,12 @@ class _DaggerControlLoop(threading.Thread):
     def run(self) -> None:
         from lerobot.teleoperators.utils import TeleopEvents
 
+        # This thread paces every command (`send_action` posts motion_control
+        # onto the robot's FIFO event-loop thread and waits for it), so it is
+        # the other half of the control path: same realtime core, SCHED_FIFO,
+        # anything it spawns reset to CFS — see affinity.enter_control_thread.
+        affinity.enter_control_thread()
+
         policy_period = 1.0 / float(self.fps)
         teleop_period = 1.0 / float(self.teleop_hz)
         last_action: dict[str, float] | None = None
@@ -1041,7 +1048,6 @@ def _run(
 
     from ..lerobot.robot.robot_axol import AxolRobot
     from ..lerobot.teleop.teleop_vr_dagger import DaggerVRTeleop
-    from ..utils import affinity
     from ..vr.models import VRState
 
     # Defaults keep the CLI path unchanged: a stop event nothing ever sets, and

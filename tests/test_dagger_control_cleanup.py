@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import threading
 import unittest
+from unittest.mock import patch
 
+from almond_axol.cli import collect_dagger
 from almond_axol.cli.collect_dagger import (
     _DaggerControlLoop,
     _stop_dagger_control_worker,
@@ -36,8 +38,12 @@ class DaggerControlCleanupTest(unittest.TestCase):
             teleop_hz=120,
         )
 
-        control_loop.run()
+        with patch.object(collect_dagger.affinity, "enter_control_thread") as enter:
+            control_loop.run()
 
+        # The pacing thread is half of the control path: realtime core + FIFO,
+        # claimed by the thread itself the moment it starts running.
+        enter.assert_called_once_with()
         self.assertEqual(control_loop.capture_error, "camera alignment failed")
         self.assertIsNone(control_loop.fatal_error)
 
