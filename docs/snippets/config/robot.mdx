@@ -23,6 +23,26 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 
 Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or any joint: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3`.
 
+<Accordion title="Tracking experiments (opt-in)">
+  Candidates for stiffening the arm and removing its slow-motion stick-slip stairs, each behind a flag so they can be A/B'd on hardware one at a time. With every flag at its default the controller is exactly the production one. They run in the realtime core (which logs a warning naming the active set), and the control trace gains `stiction_ff` / `integral_ff` columns to read them by. Measure with [`tune.pid`](/cli/tune-pid) step/sine RMS and a trace capture, and check the 3 / 8–13 / 27–35 Hz modes stay quiet. Requires a core rebuilt from the same checkout (`axol rt.install`).
+
+  | Flag | Default | Description |
+  |---|---|---|
+  | <F>--{prefix}experiments.friction_k_max</F> | `100.0` | Steepness cap on the Coulomb friction feed-forward. At the default the feed-forward delivers only ~20 % of `fc` at 0.02 rad/s (~46 % at 0.05), which is what makes slow extended-reach moves creep in stairs; at 400 those become ~66 % / ~96 %. Pair with `friction_slew`. |
+  | <F>--{prefix}experiments.friction_slew</F> | `0.0` | Rate limit (Nm/s) on the Coulomb term, `0` off. Keeps the ±`fc` reversal step off the shoulders' 2–3 Hz mode once the cap is raised; try 20–40. |
+  | <F>--{prefix}experiments.friction_load_gain</F> | `0.0` | Load-dependent friction: `fc + gain × |gravity torque|`. Gear friction rises with load and the fits were taken at moderate poses; try 0.03–0.1. |
+  | <F>--{prefix}experiments.stiction_gain</F> | `0.0` | Error-sign Coulomb compensation as a fraction of `fc`, pushing toward the target while the joint is stuck and the velocity feed-forward is off. `0` off, 0.6 suggested; keep under 1 (hunting), and prefer a robot with its own [`tune.friction`](/cli/tune-friction) fit. |
+  | <F>--{prefix}experiments.stiction_err_deg</F> | `0.1` | Position error (degrees) at which that term saturates. |
+  | <F>--{prefix}experiments.integrator_hz</F> | `0.0` | Crossover (Hz) of a slow, clamped position-error integrator on the feed-forward torque; `0` off, 0.3 suggested. Closes the static error the PD loop parks with; if the stairs grow it is too fast. |
+  | <F>--{prefix}experiments.integrator_clamp_fc</F> | `2.0` | Anti-windup bound on the integral torque, as a multiple of the joint's `fc`. |
+  | <F>--{prefix}experiments.integrator_clamp_min_nm</F> | `0.3` | Floor (Nm) on that bound, for the low-friction wrists. |
+  | <F>--{prefix}experiments.integrator_freeze_deg</F> | `2.0` | Position error (degrees) above which the integrator holds instead of winding up. |
+  | <F>--{prefix}experiments.tracker_wire_vel</F> | `false` | Send the core tracker's own velocity as the wire velocity instead of a lagged derivative, so firmware `kd` stops braking during acceleration. |
+  | <F>--{prefix}experiments.tracker_vel_pole</F> | `60.0` | Low-pass pole (rad/s) on that velocity. |
+  | <F>--{prefix}experiments.tracker_accel_ff</F> | `false` | Drive the `j_eff` inertia feed-forward from the tracker's own acceleration instead of a double-lagged derivative. Re-fit `j_eff` with [`tune.pid`](/cli/tune-pid) when on. |
+  | <F>--{prefix}experiments.tracker_accel_pole</F> | `60.0` | Low-pass pole (rad/s) on that acceleration; lower it if `inertia_ff` in the trace shows a 120 Hz comb. |
+</Accordion>
+
 <Note>
   A robot calibrated with [`tune.pid --save`](/cli/tune-pid), [`tune.friction --save`](/cli/tune-friction), or [`tune.gravity --save`](/cli/tune-gravity) uses its own measured values (from `~/.almond/calibration.json`) instead of the defaults below. Flags you pass still override both.
 </Note>

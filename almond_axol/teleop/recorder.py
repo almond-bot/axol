@@ -82,6 +82,8 @@ _RT_TRACE_COLUMNS = (
     "friction_ff",
     "inertia_ff",
     "damping_ff",
+    "stiction_ff",
+    "integral_ff",
     "total_ff",
     "kd_host",
     "damp_w0",

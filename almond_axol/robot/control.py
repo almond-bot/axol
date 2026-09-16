@@ -139,17 +139,141 @@ class ContactWatchdog:
 FRICTION_FF_K_MAX = 100.0
 
 
+def coulomb_unit(velocity: float, k: float, k_max: float = FRICTION_FF_K_MAX) -> float:
+    """Saturation fraction of the Coulomb feedforward: ``tanh(0.1·min(k, k_max)·v)``.
+
+    In ``(−1, 1)``; ``±1`` means the velocity FF is delivering the full
+    ``±fc``. Shared by :func:`compute_friction` and the error-sign stiction
+    term (:func:`stiction_compensation`), which fades out exactly as this
+    saturates so the two never stack past ``fc``.
+    """
+    return math.tanh(0.1 * min(k, k_max) * velocity)
+
+
 def compute_friction(
-    velocity: float, Fc: float, k: float, Fv: float, Fo: float
+    velocity: float,
+    Fc: float,
+    k: float,
+    Fv: float,
+    Fo: float,
+    k_max: float = FRICTION_FF_K_MAX,
 ) -> float:
     """Tanh friction model: τ = Fc * tanh(0.1 * k * v) + Fv * v + Fo
 
-    ``k`` is capped at :data:`FRICTION_FF_K_MAX` (see above) so the Coulomb
-    term ramps smoothly through zero crossings instead of stepping.
+    ``k`` is capped at ``k_max`` (:data:`FRICTION_FF_K_MAX` by default, see
+    above) so the Coulomb term ramps smoothly through zero crossings instead
+    of stepping. ``ControlExperiments.friction_k_max`` raises the cap for
+    the slow-motion stick-slip experiment (pair it with
+    ``friction_slew`` — see :class:`SlewLimiter` — to keep the reversal
+    step from ringing the shoulders).
     """
-    return (
-        Fc * math.tanh(0.1 * min(k, FRICTION_FF_K_MAX) * velocity) + Fv * velocity + Fo
-    )
+    return Fc * coulomb_unit(velocity, k, k_max) + Fv * velocity + Fo
+
+
+class SlewLimiter:
+    """N-channel rate limiter: ``|y[k] − y[k−1]| ≤ rate·dt``.
+
+    Used on the Coulomb friction term when its tanh is steepened past the
+    :data:`FRICTION_FF_K_MAX` cap: the cap exists to keep the ``±fc`` step at
+    every arrival and reversal from ringing the shoulders' 2–3 Hz mode, and a
+    rate limit removes that step just as well while letting the FF reach its
+    full value at a few hundredths of a rad/s instead of tenths. ``rate <= 0``
+    passes the input through unchanged. The first update adopts the input.
+    """
+
+    def __init__(self, n: int) -> None:
+        self._y: list[float | None] = [None] * n
+
+    def update(self, x: Sequence[float], rate: float, dt: float) -> list[float]:
+        out: list[float] = []
+        for i, xi in enumerate(x):
+            prev = self._y[i]
+            if prev is None or rate <= 0.0 or dt <= 0.0:
+                y = float(xi)
+            else:
+                step = rate * dt
+                y = prev + max(-step, min(step, float(xi) - prev))
+            self._y[i] = y
+            out.append(y)
+        return out
+
+    def reset(self) -> None:
+        """Forget the held output; the next update adopts its input."""
+        self._y = [None] * len(self._y)
+
+
+def stiction_compensation(
+    err: float, sat: float, fc: float, gain: float, err_scale: float
+) -> float:
+    """Error-sign Coulomb compensation, ``gain·fc·tanh(err/err_scale)·(1 − |sat|)``.
+
+    The velocity-driven friction FF switches itself off as the commanded
+    trajectory slows into its target, while the joint's real breakaway
+    torque does not — so the joint parks wherever ``kp·e`` drops below
+    ``fc`` (a deadband of ``fc/kp`` per joint) and creeps in stick-slip
+    stairs at slow speed. This term pushes the fitted Coulomb torque in the
+    direction the joint *should* move (``err = q_des − q_meas``) instead of
+    the direction it is *commanded* to move, saturating within
+    ``err_scale`` rad, and is faded by ``1 − |sat|`` (``sat`` from
+    :func:`coulomb_unit`) so it hands over to the velocity FF once that is
+    delivering ``fc`` itself — the two never sum past ``gain·fc`` + ``fc``.
+
+    Hunting is the failure mode: a ``gain`` above the true breakaway/fitted
+    ratio, or encoder noise flipping the sign inside ``err_scale``, limit-
+    cycles the joint. Keep ``gain`` well under 1 (0.6 is the suggested
+    start) so this alone can never overpower friction.
+    """
+    if gain == 0.0 or fc == 0.0:
+        return 0.0
+    scale = max(err_scale, 1e-9)
+    return gain * fc * math.tanh(err / scale) * (1.0 - abs(sat))
+
+
+class ErrorIntegrator:
+    """N-channel clamped, freeze-gated position-error integrator → torque.
+
+    Closes the static error the pure-PD + feedforward loop cannot: whatever
+    constant residual sits at a pose (the friction deadband, a gravity-model
+    or ``fo`` error, a payload) is integrated into ``t_ff`` until the joint
+    lands on target. Sized to act far below the structural modes the
+    damping design fights — see ``ControlExperiments.integrator_hz`` for
+    the crossover and how ``ki`` follows from it.
+
+    Args:
+        n: Number of channels.
+
+    :meth:`update` takes per-channel ``ki`` (Nm/(rad·s)) and ``clamp`` (Nm,
+    anti-windup bound on the *output*) plus a shared ``freeze`` (rad): a
+    channel whose ``|err|`` exceeds it holds its state instead of winding
+    up — a large error is a move in progress or a contact, not a residual.
+    ``dt <= 0`` also holds (used to freeze a channel without fresh
+    feedback). The sign convention is ``err = q_des − q_meas``, so the
+    output torque points toward the target.
+    """
+
+    def __init__(self, n: int) -> None:
+        self._i = [0.0] * n
+
+    def update(
+        self,
+        err: Sequence[float],
+        ki: Sequence[float],
+        clamp: Sequence[float],
+        freeze: float,
+        dt: float,
+    ) -> list[float]:
+        out: list[float] = []
+        for c, (e, k, lim) in enumerate(zip(err, ki, clamp)):
+            if k <= 0.0 or lim <= 0.0:
+                self._i[c] = 0.0
+            elif dt > 0.0 and abs(e) <= freeze:
+                self._i[c] = max(-lim, min(lim, self._i[c] + k * e * dt))
+            out.append(self._i[c])
+        return out
+
+    def reset(self) -> None:
+        """Zero every channel (engage, disengage, limp, gravity comp)."""
+        self._i = [0.0] * len(self._i)
 
 
 class BandPass:

@@ -58,8 +58,12 @@
 //!                     <fv> <fo>` line per arm joint (tracker limits +
 //!                     friction params; the motor id 1..=7 fixes the
 //!                     joint's target slot, so a bus may carry any subset
-//!                     of the arm), and an optional `gripper <side>
-//!                     <iface> <motor_id>` line
+//!                     of the arm), an optional `gripper <side>
+//!                     <iface> <motor_id>` line, and one `exp <name>
+//!                     <value>` line per `ControlExperiments` field (the
+//!                     opt-in tracking experiments — `Experiments` below;
+//!                     every name must be known, so a skewed build fails
+//!                     here)
 //! - `P`               prep: MyActuator 0x76 reset + settle, Damiao
 //!                     clear-errors on every *cold* arm joint (torque-neutral
 //!                     on a disabled motor; run *before* Python resolves
@@ -195,7 +199,7 @@ use std::time::{Duration, Instant};
 
 use crate::bringup::{self, MotorSpec, Vendor};
 use crate::can::CanSock;
-use crate::filter::{self, BandPass, LpDiff, Trapezoid};
+use crate::filter::{self, BandPass, Integrator, LowPass, LpDiff, SlewLimiter, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
@@ -225,7 +229,10 @@ const GRIPPER_SLOT: usize = 7;
 /// - 1 (implicit; never declared): arm joints took slots in list order.
 /// - 2: slots come from the motor id (`slot = motor_id - 1`), so a bus may
 ///   carry any subset of the arm.
-const CONFIG_PROTO: u32 = 2;
+/// - 3: the config carries `exp <name> <value>` lines (the opt-in tracking
+///   experiments, `Experiments`), and the trace gained `stiction_ff` /
+///   `integral_ff` columns.
+const CONFIG_PROTO: u32 = 3;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -567,6 +574,22 @@ pub struct JointCmd {
     pub j_eff: f64,
 }
 
+/// The per-tick fast terms of one tracked joint (all zero in passthrough).
+#[derive(Clone, Copy, Debug, Default)]
+struct Terms {
+    /// MIT wire velocity (rad/s).
+    v_wire: f64,
+    /// Acceleration feeding the inertia feedforward (rad/s²).
+    a_cmd: f64,
+    v_cmd_fast: f64,
+    friction_ff: f64,
+    inertia_ff: f64,
+    /// Band-passed velocity error (before `kd_host`).
+    v_damp: f64,
+    stiction_ff: f64,
+    integral_ff: f64,
+}
+
 #[derive(Clone, Copy)]
 struct Target {
     cmds: [JointCmd; N_SLOTS],
@@ -606,6 +629,8 @@ struct TraceRow {
     friction_ff: f64,
     inertia_ff: f64,
     damping_ff: f64,
+    stiction_ff: f64,
+    integral_ff: f64,
     total_ff: f64,
     kd_host: f64,
     damp_w0: f64,
@@ -627,7 +652,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
     let mut out = io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         out,
-        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt"
+        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,integral_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt"
     )?;
     Ok(out)
 }
@@ -635,7 +660,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
 fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::Result<()> {
     writeln!(
         out,
-        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9}",
+        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9}",
         r.tick,
         r.time_s,
         r.seq,
@@ -655,6 +680,8 @@ fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::R
         r.friction_ff,
         r.inertia_ff,
         r.damping_ff,
+        r.stiction_ff,
+        r.integral_ff,
         r.total_ff,
         r.kd_host,
         r.damp_w0,
@@ -803,6 +830,92 @@ struct Config {
     max_step_rad: f64,
     /// (side, iface, specs) — side 0 = left, 1 = right.
     buses: Vec<(u8, String, Vec<MotorSpec>)>,
+    exp: Experiments,
+}
+
+/// The opt-in tracking-accuracy experiments — `ControlExperiments` in
+/// `almond_axol.robot.config`, one `exp <name> <value>` config line per
+/// field. Defaults reproduce the production control law exactly; each
+/// field's meaning and suggested range is documented on the Python class.
+/// Angles arrive in degrees (the operator-facing unit) and are stored in
+/// radians here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Experiments {
+    /// Cap on the Coulomb tanh steepness (`filter::coulomb_unit`).
+    friction_k_max: f64,
+    /// Rate limit (Nm/s) on the Coulomb term; 0 = off.
+    friction_slew: f64,
+    /// `fc_eff = fc + gain·|τ_gravity|`.
+    friction_load_gain: f64,
+    /// Error-sign Coulomb compensation as a fraction of `fc`; 0 = off.
+    stiction_gain: f64,
+    /// Saturation scale of that term (rad).
+    stiction_err: f64,
+    /// Integrator crossover (Hz): `ki = kp·2π·f`; 0 = off.
+    integrator_hz: f64,
+    /// Anti-windup bound: `max(clamp_fc·fc, clamp_min)` Nm.
+    integrator_clamp_fc: f64,
+    integrator_clamp_min: f64,
+    /// Hold the integrator when `|err|` exceeds this (rad).
+    integrator_freeze: f64,
+    /// MIT wire velocity from the tracker's velocity state (low-passed at
+    /// `tracker_vel_pole` rad/s) instead of the 20 rad/s position derivative.
+    tracker_wire_vel: bool,
+    tracker_vel_pole: f64,
+    /// Inertia feedforward from the tracker's acceleration (low-passed at
+    /// `tracker_accel_pole`) instead of the double 20 rad/s derivative.
+    tracker_accel_ff: bool,
+    tracker_accel_pole: f64,
+}
+
+impl Default for Experiments {
+    fn default() -> Self {
+        Self {
+            friction_k_max: filter::FRICTION_FF_K_MAX,
+            friction_slew: 0.0,
+            friction_load_gain: 0.0,
+            stiction_gain: 0.0,
+            stiction_err: 0.1_f64.to_radians(),
+            integrator_hz: 0.0,
+            integrator_clamp_fc: 2.0,
+            integrator_clamp_min: 0.3,
+            integrator_freeze: 2.0_f64.to_radians(),
+            tracker_wire_vel: false,
+            tracker_vel_pole: 60.0,
+            tracker_accel_ff: false,
+            tracker_accel_pole: 60.0,
+        }
+    }
+}
+
+impl Experiments {
+    /// Apply one `exp <name> <value>` line. Unknown names are an error: the
+    /// client emits every field, so a name this core does not know means
+    /// the two were built from different checkouts.
+    fn set(&mut self, name: &str, value: f64) -> Result<(), ()> {
+        match name {
+            "friction_k_max" => self.friction_k_max = value,
+            "friction_slew" => self.friction_slew = value,
+            "friction_load_gain" => self.friction_load_gain = value,
+            "stiction_gain" => self.stiction_gain = value,
+            "stiction_err_deg" => self.stiction_err = value.to_radians(),
+            "integrator_hz" => self.integrator_hz = value,
+            "integrator_clamp_fc" => self.integrator_clamp_fc = value,
+            "integrator_clamp_min_nm" => self.integrator_clamp_min = value,
+            "integrator_freeze_deg" => self.integrator_freeze = value.to_radians(),
+            "tracker_wire_vel" => self.tracker_wire_vel = value >= 0.5,
+            "tracker_vel_pole" => self.tracker_vel_pole = value,
+            "tracker_accel_ff" => self.tracker_accel_ff = value >= 0.5,
+            "tracker_accel_pole" => self.tracker_accel_pole = value,
+            _ => return Err(()),
+        }
+        Ok(())
+    }
+
+    /// `true` when every experiment is off — the production control law.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 fn parse_config(text: &str) -> io::Result<Config> {
@@ -811,6 +924,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
     let mut max_step_rad = 0.35;
     let mut buses: Vec<(u8, String, Vec<MotorSpec>)> = Vec::new();
     let mut proto: Option<u32> = None;
+    let mut exp = Experiments::default();
 
     let bad = |line: &str| {
         io::Error::new(
@@ -860,6 +974,27 @@ fn parse_config(text: &str) -> io::Result<Config> {
                     .get(1)
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(|| bad(line))?
+            }
+            "exp" => {
+                // exp <name> <value> — see `Experiments`.
+                let name = f.get(1).ok_or_else(|| bad(line))?;
+                let value: f64 = f
+                    .get(2)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?;
+                if !value.is_finite() {
+                    return Err(bad(line));
+                }
+                exp.set(name, value).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "config: unknown experiment `{name}` — the almond-axol package \
+                             and the axol-rt binary must be built from the same checkout \
+                             (rebuild with `axol rt.install`)"
+                        ),
+                    )
+                })?;
             }
             "joint" | "gripper" => {
                 // joint <side 0|1> <iface> <name> <motor_id> <kp> <kd>
@@ -961,6 +1096,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
         watchdog_ms,
         max_step_rad,
         buses,
+        exp,
     })
 }
 
@@ -1327,7 +1463,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 2\n\
+            "proto 3\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
@@ -1349,7 +1485,7 @@ mod tests {
         );
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 2\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 3\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
     }
 
     /// A bus carrying only some of the arm joints (a bench wrist assembly)
@@ -1358,7 +1494,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 2\n\
+            "proto 3\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
              gripper 0 can0 8\n",
@@ -1371,10 +1507,10 @@ mod tests {
         );
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
-        assert!(parse_config("proto 2\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
-        assert!(parse_config("proto 2\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 3\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 3\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
         assert!(parse_config(
-            "proto 2\n\
+            "proto 3\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n"
         )
@@ -1397,14 +1533,56 @@ mod tests {
         assert!(err.contains("no `proto` line"), "{err}");
         assert!(err.contains("axol rt.install"), "{err}");
         // A future client generation this core does not understand.
-        let err = error_of(&format!("proto 3\n{joint}"));
+        let err = error_of(&format!("proto 4\n{joint}"));
+        assert!(err.contains("proto 4"), "{err}");
         assert!(err.contains("proto 3"), "{err}");
-        assert!(err.contains("proto 2"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 2\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 3\n")).is_ok());
+    }
+
+    /// `exp` lines set the tracking experiments; a config without any runs
+    /// the production law (`Experiments::default`), degrees arrive as
+    /// degrees, booleans as 0/1, and an unknown name is a skewed build.
+    #[test]
+    fn parse_config_reads_experiments() {
+        let joint = "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n";
+        let cfg = parse_config(&format!("proto 3\n{joint}")).unwrap();
+        assert!(cfg.exp.is_default());
+        assert_eq!(cfg.exp.friction_k_max, filter::FRICTION_FF_K_MAX);
+
+        let cfg = parse_config(&format!(
+            "proto 3\n{joint}\
+             exp friction_k_max 400\n\
+             exp friction_slew 30\n\
+             exp stiction_gain 0.6\n\
+             exp stiction_err_deg 0.1\n\
+             exp integrator_hz 0.3\n\
+             exp integrator_freeze_deg 2\n\
+             exp tracker_wire_vel 1\n\
+             exp tracker_accel_ff 0\n"
+        ))
+        .unwrap();
+        assert!(!cfg.exp.is_default());
+        assert_eq!(cfg.exp.friction_k_max, 400.0);
+        assert_eq!(cfg.exp.friction_slew, 30.0);
+        assert_eq!(cfg.exp.stiction_gain, 0.6);
+        assert!((cfg.exp.stiction_err - 0.1_f64.to_radians()).abs() < 1e-15);
+        assert_eq!(cfg.exp.integrator_hz, 0.3);
+        assert!((cfg.exp.integrator_freeze - 2.0_f64.to_radians()).abs() < 1e-15);
+        assert!(cfg.exp.tracker_wire_vel);
+        assert!(!cfg.exp.tracker_accel_ff);
+
+        let err = match parse_config(&format!("proto 3\n{joint}exp bogus 1\n")) {
+            Ok(_) => panic!("accepted an unknown experiment"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("unknown experiment `bogus`"), "{err}");
+        assert!(err.contains("axol rt.install"), "{err}");
+        assert!(parse_config(&format!("proto 3\n{joint}exp friction_slew\n")).is_err());
+        assert!(parse_config(&format!("proto 3\n{joint}exp friction_slew nan\n")).is_err());
     }
 }
 
@@ -1882,6 +2060,9 @@ fn bus_loop(
     // Python before it drives friction/inertia feedforward.  Host damping
     // gets separate fast desired/measured velocity derivatives followed by
     // the resonance band-pass.
+    // The experiment states (all inert at the default `Experiments`): the
+    // Coulomb-term slew, the position-error integrator, and the low-passes
+    // on the tracker's own velocity/acceleration states.
     struct Damp {
         v_cmd: LpDiff,
         a_cmd: LpDiff,
@@ -1890,6 +2071,10 @@ fn bus_loop(
         bp: BandPass,
         vel_meas: f64,
         last_fb: Option<Instant>,
+        fric_slew: SlewLimiter,
+        integ: Integrator,
+        v_trk: LowPass,
+        a_trk: LowPass,
     }
     let mut damp: Vec<Damp> = (0..N_SLOTS)
         .map(|_| Damp {
@@ -1900,8 +2085,20 @@ fn bus_loop(
             bp: BandPass::new(),
             vel_meas: 0.0,
             last_fb: None,
+            fric_slew: SlewLimiter::new(),
+            integ: Integrator::new(),
+            v_trk: LowPass::new(),
+            a_trk: LowPass::new(),
         })
         .collect();
+    let exp = &cfg.exp;
+    if !exp.is_default() {
+        send_text(
+            out_tx,
+            b'W',
+            &format!("{iface}: tracking experiments active: {exp:?}"),
+        );
+    }
     let mut prev_tick: Option<Instant> = None;
     // Latest decoded feedback per slot, shipped to Python once per tick as
     // an `F` packet — the core is the only CAN consumer; Python fills its
@@ -2234,65 +2431,134 @@ fn bus_loop(
                     // as-is, v_des = 0, slow t_ff only; the tracker re-seeds
                     // so a later mode switch starts transient-free.
                     let tracked = c.mode >= 0.5;
-                    let p_cmd = if tracked {
-                        let (p, _, _) = trk[m.slot].update(c.p_des, cmd_dt);
-                        p
+                    let (p_cmd, v_trk, a_trk) = if tracked {
+                        trk[m.slot].update(c.p_des, cmd_dt)
                     } else {
                         trk[m.slot].seed(c.p_des);
-                        c.p_des
+                        (c.p_des, 0.0, 0.0)
                     };
                     let d = &mut damp[m.slot];
-                    let (v_wire, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp) =
-                        if tracked && overrun {
-                            // The gap since the last command is not a trajectory
-                            // segment the motor followed — it held. Re-prime the
-                            // derivative chains at rest here so the first tick
-                            // back carries no fictitious velocity, acceleration
-                            // (inertia torque), or band-pass energy; they ramp
-                            // in again from the next tick as tracking resumes.
-                            d.v_cmd.seed(p_cmd);
-                            d.a_cmd.seed(0.0);
-                            d.v_cmd_fast.seed(p_cmd);
-                            d.bp.reset();
-                            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-                        } else if tracked {
-                            // Match classic AxolArm.motion_control: friction uses
-                            // the 20 rad/s low-pass position derivative, inertia
-                            // uses a second identical derivative, and damping
-                            // uses its independent 80 rad/s desired-velocity
-                            // derivative.  Only the source position/rate differ:
-                            // the core can use the trajectory it really sends.
-                            let v_cmd = d.v_cmd.update(p_cmd, tick_dt);
-                            let a_cmd = d.a_cmd.update(v_cmd, tick_dt);
-                            let v_cmd_fast = d.v_cmd_fast.update(p_cmd, tick_dt);
-                            let friction_ff = filter::friction(v_cmd, m.fc, m.k, m.fv, m.fo);
-                            let inertia_ff = c.j_eff * a_cmd;
-                            let damp_ok = feedback_fresh[m.slot]
-                                && timing_on_time
-                                && !timing_health.degraded
-                                && !feedback_health[m.slot].degraded;
-                            let v_damp = if damp_ok {
-                                d.bp.update(v_cmd_fast - d.vel_meas, c.damp_w0, c.damp_q, tick_dt)
-                            } else {
-                                // A missing frame makes measured velocity stale.
-                                // Reset rather than carrying band-pass energy into
-                                // the first tick after feedback recovers. While the
-                                // joint is degraded, damping stays off for the whole
-                                // stretch: re-engaging a freshly reset band-pass
-                                // every few ticks is a torque transient, not damping.
-                                d.bp.reset();
-                                0.0
-                            };
-                            (v_cmd, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp)
+                    // Re-prime every command-side state at rest: the
+                    // derivative chains, the band-pass, and the experiment
+                    // states (a passthrough hold or an overrun gap is not a
+                    // residual to integrate or a friction level to hold).
+                    let reseed = |d: &mut Damp| {
+                        d.v_cmd.seed(p_cmd);
+                        d.a_cmd.seed(0.0);
+                        d.v_cmd_fast.seed(p_cmd);
+                        d.bp.reset();
+                        d.fric_slew.reset();
+                        d.integ.reset();
+                        d.v_trk.seed(0.0);
+                        d.a_trk.seed(0.0);
+                    };
+                    let Terms {
+                        v_wire,
+                        a_cmd,
+                        v_cmd_fast,
+                        friction_ff,
+                        inertia_ff,
+                        v_damp,
+                        stiction_ff,
+                        integral_ff,
+                    } = if tracked && overrun {
+                        // The gap since the last command is not a trajectory
+                        // segment the motor followed — it held. Re-prime the
+                        // derivative chains at rest here so the first tick
+                        // back carries no fictitious velocity, acceleration
+                        // (inertia torque), or band-pass energy; they ramp
+                        // in again from the next tick as tracking resumes.
+                        reseed(d);
+                        Terms::default()
+                    } else if tracked {
+                        // Match classic AxolArm.motion_control: friction uses
+                        // the 20 rad/s low-pass position derivative, inertia
+                        // uses a second identical derivative, and damping
+                        // uses its independent 80 rad/s desired-velocity
+                        // derivative.  Only the source position/rate differ:
+                        // the core can use the trajectory it really sends.
+                        let v_cmd = d.v_cmd.update(p_cmd, tick_dt);
+                        let a_cmd = d.a_cmd.update(v_cmd, tick_dt);
+                        let v_cmd_fast = d.v_cmd_fast.update(p_cmd, tick_dt);
+                        // Experiments (see `Experiments`; all inert by
+                        // default). The wire velocity / inertia FF may come
+                        // from the tracker's own states instead of the
+                        // position-derivative chains; the Coulomb term may
+                        // be steepened + slew-limited and grow with the
+                        // gravity load; and two position-error terms —
+                        // error-sign stiction compensation and a slow
+                        // clamped integrator — act on `p_cmd − p_meas`
+                        // against the latest feedback.
+                        let v_wire = if exp.tracker_wire_vel {
+                            d.v_trk.update(v_trk, exp.tracker_vel_pole, tick_dt)
                         } else {
-                            d.v_cmd.seed(p_cmd);
-                            d.a_cmd.seed(0.0);
-                            d.v_cmd_fast.seed(p_cmd);
-                            d.bp.reset();
-                            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                            v_cmd
                         };
+                        let a_ff = if exp.tracker_accel_ff {
+                            d.a_trk.update(a_trk, exp.tracker_accel_pole, tick_dt)
+                        } else {
+                            a_cmd
+                        };
+                        let fc_eff = m.fc + exp.friction_load_gain * c.t_ff.abs();
+                        let sat = filter::coulomb_unit(v_cmd, m.k, exp.friction_k_max);
+                        let coulomb = d.fric_slew.update(fc_eff * sat, exp.friction_slew, tick_dt);
+                        let friction_ff = coulomb + m.fv * v_cmd + m.fo;
+                        let inertia_ff = c.j_eff * a_ff;
+                        let (stiction_ff, integral_ff) = match latest[m.slot] {
+                            Some((p_meas, _, _, _)) => {
+                                let err = p_cmd - p_meas;
+                                let stiction_ff = filter::stiction(
+                                    err,
+                                    sat,
+                                    fc_eff,
+                                    exp.stiction_gain,
+                                    exp.stiction_err,
+                                );
+                                // Integrate only against a fresh sample: a
+                                // stale error is not new information.
+                                let dt_i = if feedback_fresh[m.slot] { tick_dt } else { 0.0 };
+                                let ki = c.kp * 2.0 * std::f64::consts::PI * exp.integrator_hz;
+                                let clamp =
+                                    (exp.integrator_clamp_fc * m.fc).max(exp.integrator_clamp_min);
+                                let integral_ff =
+                                    d.integ.update(err, ki, clamp, exp.integrator_freeze, dt_i);
+                                (stiction_ff, integral_ff)
+                            }
+                            None => (0.0, d.integ.update(0.0, 0.0, 0.0, 0.0, 0.0)),
+                        };
+                        let damp_ok = feedback_fresh[m.slot]
+                            && timing_on_time
+                            && !timing_health.degraded
+                            && !feedback_health[m.slot].degraded;
+                        let v_damp = if damp_ok {
+                            d.bp.update(v_cmd_fast - d.vel_meas, c.damp_w0, c.damp_q, tick_dt)
+                        } else {
+                            // A missing frame makes measured velocity stale.
+                            // Reset rather than carrying band-pass energy into
+                            // the first tick after feedback recovers. While the
+                            // joint is degraded, damping stays off for the whole
+                            // stretch: re-engaging a freshly reset band-pass
+                            // every few ticks is a torque transient, not damping.
+                            d.bp.reset();
+                            0.0
+                        };
+                        Terms {
+                            v_wire,
+                            a_cmd: a_ff,
+                            v_cmd_fast,
+                            friction_ff,
+                            inertia_ff,
+                            v_damp,
+                            stiction_ff,
+                            integral_ff,
+                        }
+                    } else {
+                        reseed(d);
+                        Terms::default()
+                    };
                     let damping_ff = c.kd_host * v_damp;
-                    let t_ff = c.t_ff + friction_ff + inertia_ff + damping_ff;
+                    let t_ff =
+                        c.t_ff + friction_ff + inertia_ff + damping_ff + stiction_ff + integral_ff;
                     if trace_this_tick && trace_tx.is_some() {
                         trace_pending[m.slot] = Some(TraceRow {
                             tick: ticks,
@@ -2315,6 +2581,8 @@ fn bus_loop(
                             friction_ff,
                             inertia_ff,
                             damping_ff,
+                            stiction_ff,
+                            integral_ff,
                             total_ff: t_ff,
                             kd_host: c.kd_host,
                             damp_w0: c.damp_w0,

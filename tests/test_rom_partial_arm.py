@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from dataclasses import fields
 from typing import Any
 from unittest.mock import patch
 
@@ -21,6 +22,7 @@ from almond_axol.constants import ARM_JOINTS, Joint
 from almond_axol.diagnostics.rom import enable as rom
 from almond_axol.motor import ControlMode, MotorError
 from almond_axol.robot.axol import AxolHardware
+from almond_axol.robot.config import ControlExperiments
 from almond_axol.rt import Axol
 from almond_axol.serve.robot_link import scoped_motor_faults
 
@@ -292,10 +294,18 @@ class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
     def test_config_lists_only_present_motors(self) -> None:
         rt = Axol._wrap(_partial_axol(set(WRIST_KIT)))
         lines = rt._config_text().splitlines()
-        # Slot-by-motor-id is protocol generation 2; a core that predates it
-        # would slot these wrists at 0 and 1 and then reject every target,
-        # so the config declares the generation and such a core refuses it.
-        self.assertEqual(lines[0], "proto 2")
+        # Slot-by-motor-id arrived with protocol generation 2; a core that
+        # predates it would slot these wrists at 0 and 1 and then reject
+        # every target, so the config declares the generation and such a
+        # core refuses it. Generation 3 added the ``exp`` experiment lines.
+        self.assertEqual(lines[0], "proto 3")
+        # Every experiment field is declared (all at their production
+        # defaults here), so a core from another checkout fails loudly.
+        exp_lines = [line for line in lines if line.startswith("exp ")]
+        self.assertEqual(len(exp_lines), len(fields(ControlExperiments)))
+        self.assertIn("exp friction_k_max 100.0", exp_lines)
+        self.assertIn("exp integrator_hz 0.0", exp_lines)
+        self.assertIn("exp tracker_wire_vel 0", exp_lines)
         joint_lines = [line for line in lines if line.startswith("joint ")]
         self.assertEqual(
             [line.split()[3:5] for line in joint_lines],

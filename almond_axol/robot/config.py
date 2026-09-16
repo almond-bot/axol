@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 from ..constants import ARM_JOINTS
@@ -648,6 +648,123 @@ def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
 
 
 @dataclass
+class ControlExperiments:
+    """Opt-in tracking-accuracy experiments, every one off by default.
+
+    Each field is a flag (``--axol.experiments.<name>``) so the candidates
+    for stiffening the arm / removing its slow-motion stick-slip stairs can
+    be A/B'd on hardware one at a time against the shipped controller. With
+    every field at its default the control law is bit-for-bit the
+    production one. The math lives in :mod:`almond_axol.robot.control`
+    (classic path, golden reference) and ``rust/axol-rt/src/filter.rs``
+    (the realtime core, which is what production runs); the values ride
+    the core's config as ``exp <name> <value>`` lines.
+
+    Measure each with ``tune.pid`` step/sine RMS plus an ``AXOL_RT_TRACE``
+    capture (the trace carries ``stiction_ff`` / ``integral_ff`` columns
+    next to the existing feedforwards) and check the 3 / 8–13 / 27–35 Hz
+    modes stay quiet.
+
+    Attributes:
+        friction_k_max: Steepness cap on the Coulomb friction feedforward's
+            tanh (:data:`~almond_axol.robot.control.FRICTION_FF_K_MAX`,
+            100). The cap makes the FF deliver only ~20 % of ``fc`` at
+            0.02 rad/s and ~46 % at 0.05 — slow extended-reach moves creep
+            in stick-slip stairs of ``(fc_break − fc_kinetic)/kp``. At 400
+            those become ~66 % and ~96 % (the FF saturates by ~0.05 rad/s
+            instead of ~0.2); pair with ``friction_slew`` so the ``±fc``
+            reversal step stays off the shoulders' 2–3 Hz mode (the reason
+            the cap exists).
+        friction_slew: Rate limit (Nm/s) on the Coulomb friction term;
+            ``0`` is off. 20–40 turns a reversal into a ~60–130 ms ramp on
+            the shoulders while leaving steady low-speed compensation intact.
+        friction_load_gain: Load-dependent Coulomb friction,
+            ``fc_eff = fc + gain·|τ_gravity|`` (dimensionless, ~0.03–0.1).
+            Gear friction rises with load torque, and the friction fits
+            were taken at moderate poses — at extended reach the shoulders
+            and elbow are under-compensated exactly where the stairs show.
+        stiction_gain: Error-sign Coulomb compensation as a fraction of
+            ``fc`` (:func:`~almond_axol.robot.control.stiction_compensation`);
+            ``0`` is off, 0.6 the suggested start. Acts while the joint is
+            stuck and the commanded velocity is ~0 — the textbook stick-slip
+            and deadband fix. Keep it under 1 so it can never overpower
+            friction alone (hunting); drop to 0.4 or off on a joint that
+            limit-cycles at rest. Wants a per-robot ``tune.friction`` fit.
+        stiction_err_deg: Position error (degrees) at which the stiction
+            term saturates (``tanh(err/scale)``).
+        integrator_hz: Crossover frequency (Hz) of a slow, clamped integral
+            of position error added to ``t_ff``
+            (:class:`~almond_axol.robot.control.ErrorIntegrator`); ``0`` is
+            off, 0.3 the suggested start (well below the 2–13 Hz modes the
+            damping design fights). ``ki = kp·2π·f`` per joint, i.e. the
+            integral equals the proportional term at ``f``. Collapses the
+            friction/gravity-model/payload residual after arrival; too fast
+            and it winds up during the stick phase and fires bigger slips —
+            if the stairs grow, lower it.
+        integrator_clamp_fc: Anti-windup bound on the integral torque as a
+            multiple of the joint's ``fc`` (so it can eat friction plus a
+            small model error, never a contact). Sized for uncalibrated
+            robots at 2×.
+        integrator_clamp_min_nm: Floor (Nm) on that bound, for the low-fc
+            wrists.
+        integrator_freeze_deg: Position error (degrees) above which the
+            integrator holds instead of winding up — a large error is a
+            move in progress or a contact, not a residual.
+        tracker_wire_vel: Realtime core only. Send the in-core tracker's own
+            velocity state (through ``tracker_vel_pole``) as the MIT wire
+            velocity instead of the 20 rad/s low-pass derivative of tracker
+            position. The derivative lags ~50 ms, and firmware ``kd·(v_des −
+            v)`` brakes by ``kd × lag`` during every acceleration (~0.75 Nm
+            on the kd=5 joints); the tracker velocity is
+            acceleration-bounded by construction.
+        tracker_vel_pole: First-order pole (rad/s) on that tracker velocity.
+        tracker_accel_ff: Realtime core only. Drive the ``j_eff`` inertia
+            feedforward from the tracker's own acceleration (through
+            ``tracker_accel_pole``) instead of two 20 rad/s poles on
+            position, which arrive ~−90° late at the shoulder mode. The
+            fitted ``j_eff`` values absorb the old lag, so re-fit them with
+            ``tune.pid`` when this is on.
+        tracker_accel_pole: First-order pole (rad/s) on that acceleration.
+            One mild pole (~60) keeps the 120 Hz target staircase's
+            adoption/repeat-tick ripple (see the core README) out of the
+            torque; lower it if ``inertia_ff`` in the trace shows a 120 Hz
+            comb.
+    """
+
+    friction_k_max: float = 100.0
+    friction_slew: float = 0.0
+    friction_load_gain: float = 0.0
+    stiction_gain: float = 0.0
+    stiction_err_deg: float = 0.1
+    integrator_hz: float = 0.0
+    integrator_clamp_fc: float = 2.0
+    integrator_clamp_min_nm: float = 0.3
+    integrator_freeze_deg: float = 2.0
+    tracker_wire_vel: bool = False
+    tracker_vel_pole: float = 60.0
+    tracker_accel_ff: bool = False
+    tracker_accel_pole: float = 60.0
+
+    def is_default(self) -> bool:
+        """``True`` when every experiment is off (the production control law)."""
+        return self == ControlExperiments()
+
+    def config_lines(self) -> list[str]:
+        """The ``exp <name> <value>`` lines the realtime core parses.
+
+        Every field is emitted (booleans as ``0``/``1``) so a core built from
+        another checkout, which would not know a name, fails at configure
+        time instead of silently running a different control law.
+        """
+        out: list[str] = []
+        for f in fields(self):
+            v = getattr(self, f.name)
+            text = str(int(v)) if isinstance(v, bool) else repr(float(v))
+            out.append(f"exp {f.name} {text}")
+        return out
+
+
+@dataclass
 class AxolConfig:
     """Top-level configuration for both arms and grippers.
 
@@ -692,6 +809,9 @@ class AxolConfig:
                          round-trips cleanly (loading a dumped config and
                          resolving it again is idempotent).
         right_stiffness: Same, for the **right** arm.
+        experiments:     Opt-in tracking-accuracy experiments
+                         (:class:`ControlExperiments`), all off by default.
+                         Flags: ``--axol.experiments.<name>``.
     """
 
     left: ArmConfig = field(
@@ -704,6 +824,7 @@ class AxolConfig:
     max_step_rad: float = 0.5
     left_stiffness: float | list[float] = 1.0
     right_stiffness: float | list[float] = 1.0
+    experiments: ControlExperiments = field(default_factory=ControlExperiments)
 
     def resolved(self) -> "AxolConfig":
         """Return a copy with stiffness baked into the ``left``/``right`` gains.

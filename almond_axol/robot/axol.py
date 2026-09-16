@@ -45,7 +45,10 @@ from .control import (
     VEL_CUTOFF_FREQ,
     BandPass,
     Differentiator,
-    compute_friction,
+    ErrorIntegrator,
+    SlewLimiter,
+    coulomb_unit,
+    stiction_compensation,
 )
 from .gravity import GravityCompensator
 
@@ -648,6 +651,13 @@ class AxolArm:
             for j in Joint
         ]
         self._damp_bp = BandPass(n=n_j, w0=self._damp_w0, q=self._damp_q)
+        # Classic-path state for the opt-in tracking experiments
+        # (``AxolConfig.experiments``): the Coulomb-term slew limiter and the
+        # position-error integrator, plus the wall-clock spacing they step
+        # by. In realtime-core mode the core holds the equivalent state.
+        self._fric_slew = SlewLimiter(n_j)
+        self._integ = ErrorIntegrator(n_j)
+        self._exp_last_time: float | None = None
         self._last_q_commanded: np.ndarray | None = None
         self._gc_hold_q: np.ndarray | None = None
         self._gc_hold_free: frozenset[Joint] | None = None
@@ -1594,6 +1604,7 @@ class AxolArm:
         # it, shipping the pose-scaled gain and band-pass centre/q per command.
         if not sink_mode:
             v_des_fast = self._vel_fast_diff.differentiate(list(clipped))
+            meas_pos: list[float] | None = None
             try:
                 pos_list: list[float] = []
                 ts_list: list[float] = []
@@ -1606,6 +1617,7 @@ class AxolArm:
                         pos_list.append(0.0)
                         ts_list.append(0.0)
                 v_meas_fast = self._meas_vel_diff.differentiate(pos_list, ts_list)
+                meas_pos = pos_list
             except MotorError:
                 v_meas_fast = list(v_des_fast)
             v_damp = self._damp_bp.update(
@@ -1661,6 +1673,61 @@ class AxolArm:
             self._last_q_commanded = clipped
             return
 
+        # Classic-path evaluation of the opt-in tracking experiments
+        # (``AxolConfig.experiments``; the core runs the same math at 240 Hz
+        # in production — see rust/axol-rt/src/serve.rs). The tracker-state
+        # experiments (``tracker_wire_vel`` / ``tracker_accel_ff``) have no
+        # tracker here and are core-only.
+        exp = self._config.experiments
+        now = time.perf_counter()
+        exp_dt = 0.0 if self._exp_last_time is None else now - self._exp_last_time
+        self._exp_last_time = now
+        n_arm = len(ARM_JOINTS)
+        fc_eff = [
+            getattr(self._arm_config, j.value).friction.fc
+            + exp.friction_load_gain * abs(float(gravity[i]))
+            for i, j in enumerate(ARM_JOINTS)
+        ]
+        sat = [
+            coulomb_unit(
+                velocities[i],
+                getattr(self._arm_config, j.value).friction.k,
+                exp.friction_k_max,
+            )
+            for i, j in enumerate(ARM_JOINTS)
+        ]
+        coulomb = self._fric_slew.update(
+            [fc_eff[i] * sat[i] for i in range(n_arm)] + [0.0],
+            exp.friction_slew,
+            exp_dt,
+        )
+        # Position-error terms need measured positions (motor frame, like
+        # ``motor_targets``); without a full feedback cache they stay off.
+        if meas_pos is not None:
+            err = [float(motor_targets[i]) - meas_pos[i] for i in range(n_arm)]
+        else:
+            err = [0.0] * n_arm
+        ki = [
+            getattr(self._arm_config, j.value).kp * 2.0 * math.pi * exp.integrator_hz
+            for j in ARM_JOINTS
+        ]
+        clamp = [
+            max(
+                exp.integrator_clamp_fc
+                * getattr(self._arm_config, j.value).friction.fc,
+                exp.integrator_clamp_min_nm,
+            )
+            for j in ARM_JOINTS
+        ]
+        integral = self._integ.update(
+            err + [0.0],
+            ki + [0.0],
+            clamp + [0.0],
+            math.radians(exp.integrator_freeze_deg),
+            exp_dt if meas_pos is not None else 0.0,
+        )
+        stiction_scale = math.radians(exp.stiction_err_deg)
+
         arm_cmds: list[tuple[float, float, float, float, float]] = []
         for i, j in enumerate(ARM_JOINTS):
             gains = getattr(self._arm_config, j.value)
@@ -1674,9 +1741,15 @@ class AxolArm:
             # oscillation the oversized kd was meant to kill.
             t_ff = (
                 float(gravity[i])
-                + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
+                + coulomb[i]
+                + f.fv * velocities[i]
+                + f.fo
                 + gains.j_eff * float(j_scale[i]) * accelerations[i]
                 + float(host_scale[i]) * gains.kd_host * v_damp[i]
+                + stiction_compensation(
+                    err[i], sat[i], fc_eff[i], exp.stiction_gain, stiction_scale
+                )
+                + integral[i]
             )
             arm_cmds.append(
                 (float(motor_targets[i]), velocities[i], gains.kp, gains.kd, t_ff)
@@ -1852,6 +1925,9 @@ class AxolArm:
         self._vel_fast_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
         self._meas_vel_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
         self._damp_bp = BandPass(n=n, w0=self._damp_w0, q=self._damp_q)
+        self._fric_slew.reset()
+        self._integ.reset()
+        self._exp_last_time = None
 
     def torque_residuals(self) -> np.ndarray:
         """Measured minus model-gravity torque per arm joint, shape (7,).
