@@ -115,6 +115,24 @@ class CaptureSingleEmissionTest(unittest.TestCase):
             ["WARNING:almond_axol.recording.record_proc:child line"],
         )
 
+    def test_noisy_logger_cap_follows_the_op_level_and_the_restored_root(self) -> None:
+        # Bugbot on #304: the cap set for a DEBUG op must not outlive it under
+        # the stricter root the panel restores, and an ERROR op's cap must not
+        # keep muting warnings afterwards.
+        aiortc = logging.getLogger("aiortc")
+        saved = aiortc.level
+        try:
+            root = logging.getLogger()
+            root.setLevel(logging.WARNING)
+            with runner._Capture(_Session(), logging.DEBUG):  # noqa: SLF001
+                self.assertEqual(aiortc.getEffectiveLevel(), logging.INFO)
+            self.assertEqual(aiortc.getEffectiveLevel(), logging.WARNING)
+            with runner._Capture(_Session(), logging.ERROR):  # noqa: SLF001
+                self.assertEqual(aiortc.getEffectiveLevel(), logging.ERROR)
+            self.assertEqual(aiortc.getEffectiveLevel(), logging.WARNING)
+        finally:
+            aiortc.setLevel(saved)
+
 
 if __name__ == "__main__":
     unittest.main()

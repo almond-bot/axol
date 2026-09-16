@@ -1944,6 +1944,12 @@ fn bus_loop(
     let mut have_target = false;
     let mut last_seq: Option<u32> = None;
     let mut last_arrival: Option<Instant> = None;
+    // Arrival of the last *accepted* target: the holdover's clock. A
+    // rejected packet feeds the watchdog (the client is alive) but must not
+    // restart the carry — after a stall the catch-up step can exceed
+    // max_step_rad, and resetting the age there would yank the tracker from
+    // the carried pose back onto the last accepted target.
+    let mut last_accepted: Option<Instant> = None;
 
     let period = Duration::from_secs_f64(1.0 / cfg.loop_hz);
     let watchdog = Duration::from_secs_f64(cfg.watchdog_ms / 1e3);
@@ -2118,14 +2124,15 @@ fn bus_loop(
                                 .filter(|(_, step)| step.is_nan() || *step > cfg.max_step_rad)
                                 .max_by(|a, b| a.1.total_cmp(&b.1))
                         };
-                        // Spacing since the previous adopted target — the
+                        // Spacing since the previous *accepted* target — the
                         // holdover's velocity baseline and the cadence sample.
-                        let gap = last_arrival
+                        let gap = last_accepted
                             .map(|prev| t.arrival.saturating_duration_since(prev).as_secs_f64());
                         match worst {
                             None => {
                                 play = t.cmds;
                                 have_target = true;
+                                last_accepted = Some(t.arrival);
                                 if let Some(gap) = gap {
                                     cadence.observe(gap);
                                 }
@@ -2145,12 +2152,11 @@ fn bus_loop(
                             }
                             Some((m, step)) => {
                                 rejected += 1;
-                                // The stream just showed it cannot be
-                                // trusted for a velocity: hold flat until
-                                // two accepted targets rebuild the estimate.
-                                for h in hold.iter_mut() {
-                                    h.reset();
-                                }
+                                // The holdover is left alone: its carry is
+                                // already gliding to rest within HOLDOVER_MAX
+                                // of the last accepted target, and the
+                                // velocity estimate only ever takes accepted
+                                // targets (see last_accepted).
                                 // A rejected target is a hold the client did
                                 // not ask for. One corrupt packet is what the
                                 // gate is for, but a *stream* of rejections
@@ -2210,9 +2216,9 @@ fn bus_loop(
             } else {
                 tick_dt
             };
-            // Age of the latest target this tick, for the holdover.
+            // Age of the latest accepted target this tick, for the holdover.
             let target_age =
-                last_arrival.map_or(0.0, |a| began.saturating_duration_since(a).as_secs_f64());
+                last_accepted.map_or(0.0, |a| began.saturating_duration_since(a).as_secs_f64());
             carrying = have_target
                 && !watchdog_frozen
                 && cadence
