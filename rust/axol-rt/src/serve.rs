@@ -200,7 +200,7 @@ use std::time::{Duration, Instant};
 
 use crate::bringup::{self, MotorSpec, Vendor};
 use crate::can::CanSock;
-use crate::filter::{self, BandPass, Holdover, LpDiff, Trapezoid};
+use crate::filter::{self, BandPass, Cadence, Holdover, LpDiff, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
@@ -227,18 +227,6 @@ const GRIPPER_SLOT: usize = 7;
 /// really stopped is at rest long before the watchdog names it stalled.
 const HOLDOVER_MAX: f64 = 0.080;
 
-/// Bounds on the running estimate of the target stream's spacing. Python
-/// streams at ~120 Hz; run-policy/dagger at their dataset rate (30-60 Hz).
-/// Estimated from arrivals rather than configured so no client, old or new,
-/// has to declare its rate.
-const CADENCE_MIN: f64 = 0.002;
-const CADENCE_MAX: f64 = 0.100;
-/// Weight of each on-time inter-arrival gap in the cadence estimate.
-const CADENCE_SMOOTHING: f64 = 0.1;
-/// Gaps longer than this many cadences are late arrivals (or a resumed
-/// stream), not the cadence — they must not stretch the estimate, or a
-/// stalling host would teach the core that stalls are normal.
-const CADENCE_OUTLIER: f64 = 1.75;
 /// Config/target protocol generation the client must declare (`proto <n>`).
 /// Bumped whenever the meaning of the config or target layout changes, so a
 /// Python package and an `axol-rt` binary built from different checkouts
@@ -1906,11 +1894,13 @@ fn bus_loop(
     // tracker is given the last target carried forward at the stream's own
     // velocity instead of a target that stops dead and then jumps (see
     // filter::Holdover). Reach is bounded by the same corruption limit as a
-    // raw target step. The stream's cadence is learned from arrivals.
+    // raw target step. The stream's cadence is learned from arrivals
+    // (filter::Cadence — follows a faster stream at once, a slower one
+    // after a run of long gaps, and ignores isolated late arrivals).
     let mut hold: Vec<Holdover> = (0..N_SLOTS)
         .map(|_| Holdover::new(HOLDOVER_MAX, cfg.max_step_rad))
         .collect();
-    let mut cadence: Option<f64> = None;
+    let mut cadence = Cadence::new();
     // Ticks whose target was late enough for the holdover to carry it, and
     // the oldest a target has been when a fresh one landed — the host-side
     // stall the core papered over, for the 5 s stats line.
@@ -2136,13 +2126,8 @@ fn bus_loop(
                             None => {
                                 play = t.cmds;
                                 have_target = true;
-                                if let Some(gap) = gap.filter(|g| *g > 0.0) {
-                                    let sample = gap.clamp(CADENCE_MIN, CADENCE_MAX);
-                                    cadence = Some(match cadence {
-                                        None => sample,
-                                        Some(c) if gap > CADENCE_OUTLIER * c => c,
-                                        Some(c) => c + CADENCE_SMOOTHING * (sample - c),
-                                    });
+                                if let Some(gap) = gap {
+                                    cadence.observe(gap);
                                 }
                                 for m in &motors {
                                     let h = &mut hold[m.slot];
@@ -2154,7 +2139,7 @@ fn bus_loop(
                                         // trajectory to extrapolate.
                                         h.reset();
                                     } else {
-                                        h.observe(c.p_des, gap, cadence);
+                                        h.observe(c.p_des, gap, cadence.get());
                                     }
                                 }
                             }
@@ -2230,7 +2215,9 @@ fn bus_loop(
                 last_arrival.map_or(0.0, |a| began.saturating_duration_since(a).as_secs_f64());
             carrying = have_target
                 && !watchdog_frozen
-                && cadence.is_some_and(|c| target_age > Holdover::SLACK * c);
+                && cadence
+                    .get()
+                    .is_some_and(|c| target_age > Holdover::SLACK * c);
             if carrying {
                 held_ticks += 1;
                 worst_target_age = worst_target_age.max(target_age);
@@ -2320,7 +2307,7 @@ fn bus_loop(
                     // that target is late (identity while the stream is on
                     // time — see filter::Holdover and the adoption above).
                     let p_tgt = if tracked {
-                        hold[m.slot].target(c.p_des, target_age, cadence)
+                        hold[m.slot].target(c.p_des, target_age, cadence.get())
                     } else {
                         c.p_des
                     };
@@ -2642,7 +2629,7 @@ fn bus_loop(
                         "{iface}: {ticks} ticks, {late} late ({:.2}%), {overruns} overruns, {timing_degraded_ticks} timing-degraded ticks in {timing_degraded_episodes} episodes, {missed} missed replies, {degraded_ticks} feedback-degraded ticks in {degraded_episodes} episodes, {rejected} rejected targets, {held_ticks} held-over ticks (oldest target {:.1} ms, cadence {:.1} ms), {trace_dropped} trace drops, seq {:?}",
                         late as f64 / ticks as f64 * 100.0,
                         worst_target_age * 1e3,
-                        cadence.unwrap_or(f64::NAN) * 1e3,
+                        cadence.get().unwrap_or(f64::NAN) * 1e3,
                         last_seq,
                     ),
                 );
