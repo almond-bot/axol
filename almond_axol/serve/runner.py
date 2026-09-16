@@ -513,6 +513,10 @@ class _Capture:
             root.removeHandler(self._handler)
         if self._old_root_level is not None:
             root.setLevel(self._old_root_level)
+            # The cap follows the root level: re-derive it for the restored
+            # level so a finished DEBUG op's INFO cap does not outlive it
+            # under a stricter root (nor an ERROR op's cap mute warnings).
+            quiet_noisy_loggers()
         # Before the saved streams close below: handlers must not be left on them.
         self._restore_handlers()
         self._teardown_fd_tee()
