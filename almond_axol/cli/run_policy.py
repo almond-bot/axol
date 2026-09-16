@@ -50,6 +50,7 @@ from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
 from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
+from ..utils.logquiet import quiet_noisy_loggers
 from .collect_data import check_resume_consistency
 from .config import AggregateFn, LogLevel, PolicyType, parse
 
@@ -611,6 +612,7 @@ def main(argv: list[str]) -> None:
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
 
     # Translate operator-actionable hardware faults into a clean non-zero
     # exit instead of a multi-frame traceback.
