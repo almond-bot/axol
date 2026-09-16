@@ -7,7 +7,9 @@ During ``collect-data`` the box runs five kinds of work that contend for cores:
   process pins the bus threads individually and runs them ``SCHED_FIFO``.
 * **realtime** — the Python 120 Hz target loop plus its web/VR/teleop and
   IK-dispatch threads. It has a separate core from CAN, so Python or camera
-  activity cannot delay a motor tick.
+  activity cannot delay a motor tick. Every control-loop command pins it
+  (``teleop`` too, since 2026-09-15 — unpinned, its loop floated onto the
+  FIFO CAN cores / the IK core and ran one tick in twelve 15–65 ms late).
 * **ik** — the out-of-process JAX IK solver (a ~1-core solve). On 8+ cores it
   gets a dedicated core so recording load can't preempt it mid-solve (which drops
   its rate ~115 -> ~80 Hz); on smaller hosts it shares the realtime cores.

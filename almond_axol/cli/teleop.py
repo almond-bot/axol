@@ -30,9 +30,11 @@ flags, so a direct run uses the same values as a panel-launched one.
 
 import asyncio
 import logging
+import os
 import socket
 from typing import TYPE_CHECKING, Any
 
+from ..utils import affinity
 from ..utils.network import local_ip
 from .config import TeleopCmdConfig, normalize_bool_flags, parse
 
@@ -448,6 +450,45 @@ async def _run_jelly_only(cfg: TeleopCmdConfig, jelly_cfg: "JellyConfig") -> Non
 
 
 async def _run(cfg: TeleopCmdConfig) -> None:
+    """Run teleop under the same CPU-affinity guard as ``collect-data``.
+
+    The 120 Hz control loop, the VR pose thread and the IK dispatch thread
+    all start inside :func:`_run_session`, so pinning the calling thread here
+    puts every one of them on the control core (children inherit the mask)
+    exactly as ``collect-data`` / ``collect-dagger`` do. Until 2026-09-15 plain
+    teleop skipped this and its loop floated across all cores as an ordinary
+    CFS thread — which the kernel then parked on whichever core looked idle,
+    including the two SCHED_FIFO CAN cores, the ``nice -10`` IK core and the
+    camera cores' FIFO capture chain. Runnable-but-waiting time on that thread
+    measured 60–120 ms per second with the headset streaming (near zero with
+    the cameras off), i.e. one in twelve ticks landed 15–65 ms late, which the
+    operator felt as the arms hitching and lunging. The Rust core, IK solve
+    time and the pose transport were all clean in the same sessions.
+
+    The original mask is restored on exit so a long-lived ``serve`` worker is
+    never left narrowed; when it cannot be captured the pin is skipped rather
+    than risk that.
+    """
+    try:
+        original_affinity = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        original_affinity = None
+    if original_affinity is not None:
+        affinity.pin_realtime()
+    try:
+        await _run_session(cfg)
+    finally:
+        if original_affinity is not None:
+            try:
+                os.sched_setaffinity(0, original_affinity)
+            except (AttributeError, OSError):
+                _logger.warning(
+                    "teleop: could not restore the original CPU affinity",
+                    exc_info=True,
+                )
+
+
+async def _run_session(cfg: TeleopCmdConfig) -> None:
     from ..robot import Axol, Sim
     from ..teleop import VRTeleop
 
