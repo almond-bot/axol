@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..utils import affinity
 from ..utils.network import local_ip
+from ..utils.logquiet import quiet_noisy_loggers
 from .config import TeleopCmdConfig, normalize_bool_flags, parse
 
 if TYPE_CHECKING:
@@ -89,6 +90,7 @@ def main(argv: list[str]) -> None:
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop the INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
 
     # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled
     # by the host installer + its boot service, not here — see

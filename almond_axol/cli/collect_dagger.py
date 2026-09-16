@@ -110,6 +110,7 @@ from .collect_data import (
     _start_video_relay,
     check_resume_consistency,
 )
+from ..utils.logquiet import quiet_noisy_loggers
 from .config import DatasetResolution, LogLevel, PolicyType, parse
 from .run_policy import (
     _GATE_CONTACT,
@@ -267,6 +268,7 @@ def main(argv: list[str]) -> None:
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
 
     import sys
 

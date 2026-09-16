@@ -104,6 +104,7 @@ from ..utils.stall_diag import (
     install_gc_pause_logger,
     unfreeze_heap,
 )
+from ..utils.logquiet import quiet_noisy_loggers
 from .config import (
     DatasetResolution,
     LogLevel,
@@ -1032,6 +1033,7 @@ def main(argv: list[str]) -> None:
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
 
     # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled
     # by the host installer + its boot service, not here — see

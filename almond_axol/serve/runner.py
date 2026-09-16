@@ -53,6 +53,7 @@ from .commands import (
     normalize_boolean_args,
     safety_flags,
 )
+from ..utils.logquiet import quiet_noisy_loggers
 from .manager import Session
 
 _logger = logging.getLogger(__name__)
@@ -375,6 +376,9 @@ class _Capture:
         root = logging.getLogger()
         self._old_root_level = root.level
         root.setLevel(self._level)
+        # A DEBUG op must not unmute aiortc's per-packet lines etc. (the
+        # in-process CLIs do the same right after their basicConfig).
+        quiet_noisy_loggers()
         root.addHandler(self._handler)
         self._old_stdout, self._old_stderr = sys.stdout, sys.stderr
         try:
