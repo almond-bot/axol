@@ -749,10 +749,10 @@ class AxolArm:
         # nominal stroke — do not rely on for actual motion.
         self._gripper_open: float = 0.0
         self._gripper_close: float = 0.0
-        # Whether a full open command goes to the open stop (True) or to the
-        # configured ``open_limit_deg`` (False, the default): see
-        # set_gripper_full_stroke.
-        self._gripper_full_stroke = False
+        # Live opening limit (rad of motor travel from the closed stop) a
+        # full open command stops at; None (the default) = the open stop.
+        # See set_gripper_open_limit.
+        self._gripper_open_limit: float | None = None
         self._set_gripper_range(
             open_pos=-self._arm_config.gripper.close_direction
             * _GRIPPER_NOMINAL_TRAVEL,
@@ -1120,23 +1120,22 @@ class AxolArm:
     def _gripper_span(self) -> float:
         """Signed motor travel (rad) a full open command covers from the closed stop.
 
-        The whole calibrated stroke with the full stroke on
-        (:meth:`set_gripper_full_stroke`); otherwise the configured
-        ``open_limit_deg`` (140° for the parcel gripper's blade), if that is
-        shorter. Signed like ``open - close`` so the mirrored grippers'
-        opposite senses fall out.
+        The whole calibrated stroke — to the open stop — unless a shorter
+        opening limit is set (:meth:`set_gripper_open_limit`). Signed like
+        ``open - close`` so the mirrored grippers' opposite senses fall
+        out.
         """
         span = self._gripper_open - self._gripper_close
-        limit = math.radians(float(self._arm_config.gripper.open_limit_deg))
-        if self._gripper_full_stroke or limit <= 0.0 or abs(span) <= limit:
+        limit = self._gripper_open_limit
+        if limit is None or limit <= 0.0 or abs(span) <= limit:
             return span
         return math.copysign(limit, span)
 
     def _gripper_to_raw(self, opening: float) -> float:
         """Normalised opening (0.0 = closed, 1.0 = open) → raw motor rad.
 
-        Open is the working opening (:meth:`_gripper_span`): the configured
-        ``open_limit_deg`` from closed, or the stop with the full stroke on.
+        Open is the working opening (:meth:`_gripper_span`): the stop, or
+        the opening limit while one is set.
         """
         return self._gripper_close + opening * self._gripper_span()
 
@@ -1144,40 +1143,45 @@ class AxolArm:
         """Raw motor rad → normalised opening (0.0 = closed, 1.0 = at the open stop).
 
         Always over the calibrated stroke, whatever the working opening,
-        so a reading means the same thing in every mode (a blade at its
+        so a reading means the same thing in every mode (a blade held at a
         140° limit on a 180° stroke reads ``0.78``).
         """
         return (raw - self._gripper_close) / (self._gripper_open - self._gripper_close)
 
-    def set_gripper_full_stroke(self, full: bool) -> None:
-        """Open the gripper to its stop (``True``) or to ``open_limit_deg`` (``False``).
+    def set_gripper_open_limit(self, limit_deg: float | None) -> None:
+        """Stop a full open command short of the stop, at ``limit_deg`` from closed.
 
-        The parcel gripper's hinged blade is worked at the configured
-        140° from closed in plain teleop and box mode's parallel grasp; in
-        the angled (flush) grasp it is folded to its open stop — wherever
-        the calibration found that — so the flat face lies along the box
-        side. The teleop adapters set this from
-        ``VRTeleopCore.gripper_full_stroke`` before each control tick; it
+        ``limit_deg`` is motor rotation from the closed stop (closed = 0°);
+        ``None`` (the default, and ``0`` or less) opens to the calibrated
+        stop, wherever the sweep found it — no stop angle is ever assumed.
+        Box mode's angled (flush) grasp holds the parcel gripper's hinged
+        blade at ``box_tool_open_deg`` (140°) so its flat face lies along
+        the box side at the grasp's yaw; everywhere else the blade goes to
+        the stop. The teleop adapters set this from
+        ``VRTeleopCore.gripper_open_limit`` before each control tick; it
         applies from the next :meth:`motion_control`, which re-maps the
         same ``[0, 1]`` command over the new span (the blade moves the
         difference at the gripper's ``max_speed``). Pure Python state.
         """
-        self._gripper_full_stroke = bool(full)
+        if limit_deg is None or not (float(limit_deg) > 0.0):
+            self._gripper_open_limit = None
+        else:
+            self._gripper_open_limit = math.radians(float(limit_deg))
 
     @property
-    def gripper_full_stroke(self) -> bool:
-        """Whether a full open command goes to the stop (see :meth:`set_gripper_full_stroke`)."""
-        return self._gripper_full_stroke
+    def gripper_open_limit(self) -> float | None:
+        """The opening limit in degrees from closed, ``None`` for the stop (see :meth:`set_gripper_open_limit`)."""
+        limit = self._gripper_open_limit
+        return None if limit is None else math.degrees(limit)
 
     def gripper_command(self, reading: float) -> float:
         """The ``[0, 1]`` command that holds the gripper where a reading has it.
 
         Readings (:attr:`positions`) are normalised over the whole stroke;
         commands over the working span (:meth:`_gripper_span`). The two
-        agree with the full stroke on, otherwise a reading past the working
-        opening is capped at ``1.0`` (the blade at its stop reads ``1.0``
-        and is commanded to the 140° limit, as it should be). For seeding
-        a teleop session's grip from the measured gripper.
+        agree without an opening limit; with one, a reading past the limit
+        is capped at ``1.0``. For seeding a teleop session's grip from the
+        measured gripper.
         """
         full = self._gripper_open - self._gripper_close
         span = self._gripper_span()
@@ -1278,15 +1282,12 @@ class AxolArm:
                 f"apart (closed {close_pos:.3f} rad, open {open_pos:.3f} rad) — "
                 f"the jaw is jammed or met an obstruction"
             )
-        limit = float(self._arm_config.gripper.open_limit_deg)
         _logger.info(
-            "%s gripper calibrated: closed %.3f rad, open %.3f rad (stroke %.1f°; "
-            "opened to %s except in the angled box grasp)",
+            "%s gripper calibrated: closed %.3f rad, open %.3f rad (stroke %.1f°)",
             side,
             close_pos,
             open_pos,
             math.degrees(travel),
-            f"{limit:.0f}°" if 0.0 < limit < math.degrees(travel) else "the stop",
         )
         self._set_gripper_range(open_pos, close_pos)
         _save_gripper_calibration(self._is_left, open_pos, close_pos)
@@ -3008,14 +3009,14 @@ class AxolHardware(RobotBase):
         if self.right is not None:
             self.right.reset_command_state()
 
-    def set_gripper_full_stroke(self, full: bool) -> None:
-        """Open both grippers to their stops (``True``) or their working opening.
+    def set_gripper_open_limit(self, limit_deg: float | None) -> None:
+        """Limit both grippers' opening to ``limit_deg`` from closed; ``None`` = the stop.
 
-        See :meth:`AxolArm.set_gripper_full_stroke`.
+        See :meth:`AxolArm.set_gripper_open_limit`.
         """
         for arm in (self.left, self.right):
             if arm is not None:
-                arm.set_gripper_full_stroke(full)
+                arm.set_gripper_open_limit(limit_deg)
 
     def set_spring_caps(self, caps: Mapping[Joint, float] | None) -> None:
         """Set the live per-joint spring-torque caps on both arms.

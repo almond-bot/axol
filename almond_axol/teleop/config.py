@@ -148,25 +148,26 @@ class VRTeleopConfig:
             the URDF carries — the mounts themselves are ``width`` apart
             and the flat side of the closed fingers faces the box at tilt 0.
             Live-adjustable.
-        box_tool_open_deg: Parcel gripper only: how far (degrees from
-            closed) the hinged blade is folded at its open stop. The
-            angled (``"flush"``) grasp opens the gripper all the way to
-            that stop (``VRTeleopCore.gripper_full_stroke`` →
-            ``AxolArm.set_gripper_full_stroke``; every other mode works the
-            blade at the robot's ``open_limit_deg``, 140°) and yaws each
-            gripper ``180°`` minus this inward so the folded face lies along
-            the box side. The stop's angle is not known to the robot — this
-            is the geometry's estimate of it, a calibration constant: if
-            the face won't sit flat, read the tilt trim at which it does
-            (HUD) and *subtract* it from this value. Live-adjustable.
+        box_tool_open_deg: Parcel gripper only: the hinged blade's angle
+            (degrees of motor rotation from closed, closed = 0°) in box
+            mode's angled (``"flush"``) grasp. There the gripper is held at
+            this opening rather than its stop (``VRTeleopCore.gripper_open_limit``
+            → ``AxolArm.set_gripper_open_limit``; the trigger's travel is
+            spread over it) and each gripper is yawed ``180°`` minus this
+            inward, which lays the folded blade's flat face along the box
+            side. Everywhere else — plain teleop, the parallel grasp — the
+            blade goes all the way to its open stop, whose angle is never
+            assumed. If the face won't sit flat in the angled grasp, read
+            the tilt trim at which it does (HUD) and *subtract* it from
+            this value. Live-adjustable.
         box_grasp: Which of box mode's two grasps a session starts in.
             ``"straight"`` (the default): fingers straight forward (yaw 0),
             width between the mount frames — the plain flat-hands grasp,
-            the blade at its working 140° like everywhere else. ``"flush"``:
-            the fitted tool's contact face along the box side — for the
-            parcel gripper the blade folded to its open stop (the one place
-            the gripper is opened that far), with the grippers yawed ``180°
-            - box_tool_open_deg`` inward and the width measured between the
+            the blade at its stop like everywhere else. ``"flush"``: the
+            fitted tool's contact face along the box side — for the parcel
+            gripper the blade held at ``box_tool_open_deg`` (140°) rather
+            than its stop, with the grippers yawed ``180° -
+            box_tool_open_deg`` inward and the width measured between the
             faces. Toggled live while a grip is leading by clicking (and
             releasing) either thumbstick — a click that turns into the
             both-sticks box-mode gesture doesn't count — or from the

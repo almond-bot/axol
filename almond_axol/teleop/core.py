@@ -665,26 +665,29 @@ class VRTeleopCore:
             return None
         return {joint: cap for joint in BOX_SQUEEZE_JOINTS}
 
-    def gripper_full_stroke(self) -> bool:
-        """Whether the grippers should open to their stops right now.
+    def gripper_open_limit(self) -> float | None:
+        """How far the grippers may open right now (degrees from closed), ``None`` for the stop.
 
-        The parcel gripper's hinged blade is worked at its configured
-        opening (``PositionForceConfig.open_limit_deg``, 140° from closed)
-        in plain teleop and box mode's parallel grasp, and folded to its
-        open stop — wherever the calibration found it; no angle is assumed
-        — in the angled (``"flush"``) grasp, so the flat face lies along
-        the box side. True for box mode in the flush grasp, leading or
-        not. The adapter hands the result to the robot before each control
-        tick (``set_gripper_full_stroke``, on change); the stock gripper
-        (``box_tool`` ``"urdf"``) has no working limit to lift, so it is
-        never asked. Cheap and pure.
+        The parcel gripper's hinged blade goes all the way to its open
+        stop — wherever the calibration found it; no angle is assumed —
+        in plain teleop and box mode's parallel grasp. In the angled
+        (``"flush"``) grasp it is held at ``config.box_tool_open_deg``
+        (140°) instead, the blade angle the grasp's yaw (``180°`` minus it)
+        lays the flat face along the box side at. Non-``None`` for box mode
+        in the flush grasp with the parcel tool, leading or not. The
+        adapter hands the result to the robot before each control tick
+        (``set_gripper_open_limit``, on change) and clears it when the
+        session ends. Cheap and pure.
         """
         cfg = self.config
-        return (
+        if (
             self.box_mode
             and str(getattr(cfg, "box_tool", "urdf")).strip().lower() == "parcel"
             and str(getattr(cfg, "box_grasp", "straight")).strip().lower() == "flush"
-        )
+        ):
+            limit = float(getattr(cfg, "box_tool_open_deg", 0.0))
+            return limit if limit > 0.0 else None
+        return None
 
     def _disengage_all(self, log_message: str | None = None) -> None:
         """Disengage both arms and clear the edge/ramp state (IK thread).

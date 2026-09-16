@@ -105,18 +105,18 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
     ),
     LiveSettingDef(
         key="box_tool_open_deg",
-        label="Blade stop",
+        label="Blade angle",
         type="number",
         min=90.0,
         max=180.0,
         step=0.5,
         unit="°",
         help=(
-            "Parcel gripper: fold angle of the hinged blade at its open stop "
-            "(degrees from closed) — the angled grasp opens the gripper to "
-            "the stop; the flush yaw is 180° minus this. A geometry "
-            "constant, not a command. If the face sits flat only with a "
-            "box_grip_tilt trim, fold that trim in here."
+            "Parcel gripper: the hinged blade's angle in the angled (flush) "
+            "grasp, degrees from closed — the gripper is held there instead "
+            "of at its stop, and the flush yaw is 180° minus this. Every "
+            "other mode opens to the stop. If the face sits flat only with "
+            "a box_grip_tilt trim, fold that trim in here."
         ),
     ),
     LiveSettingDef(

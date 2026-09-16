@@ -150,7 +150,7 @@ Each returns `(left_array, right_array)` where the absent arm is `None`.
 
 | Method | Description |
 |---|---|
-| `motion_control(left, right)` | Impedance (arm) + position-force (gripper: `[0, 1]` over the working opening — `PositionForceConfig.open_limit_deg`, 140° from closed for the parcel gripper's blade, or the whole stroke after `set_gripper_full_stroke(True)`, which box mode's angled grasp uses); primary control method. Python runs the model math (limits, gravity, pose-scheduled feedforward coefficients); the core renders the trajectory at 240 Hz |
+| `motion_control(left, right)` | Impedance (arm) + position-force (gripper: `[0, 1]` over the calibrated stroke, or over a shorter opening while `set_gripper_open_limit(deg)` is set — box mode's angled grasp holds the parcel gripper's blade at 140° that way); primary control method. Python runs the model math (limits, gravity, pose-scheduled feedforward coefficients); the core renders the trajectory at 240 Hz |
 | `gravity_compensate(kd, free_joints, gripper_targets)` | One gravity-comp cycle — the arms go limp and hand-guidable, held up by feedforward |
 | `set_positions_velocity(left, right, max_speed)` | Motor built-in position controller |
 | `set_velocity(left, right)` | Motor built-in speed controller |
