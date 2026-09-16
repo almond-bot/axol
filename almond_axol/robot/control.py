@@ -229,6 +229,93 @@ def stiction_compensation(
     return gain * fc * math.tanh(err / scale) * (1.0 - abs(sat))
 
 
+# Per-channel phase offset of the torque dither, in radians: the golden angle,
+# which spreads any number of joints about as evenly around the cycle as a
+# fixed offset can. Seven joints dithering in phase would push the structure
+# in unison at one frequency — the one thing a stiction dither must not do.
+DITHER_PHASE_STAGGER = math.pi * (3.0 - math.sqrt(5.0))
+
+
+class TorqueDither:
+    """N-channel stiction-breaking torque dither.
+
+    A small oscillating torque added to the feedforward keeps a joint's
+    friction in its *sliding* regime instead of letting it re-stick between
+    control cycles: the classic remedy for the stick-slip stairs a position
+    command leaves when it creeps through the ``fc/kp`` deadband. It attacks
+    the same defect as :func:`stiction_compensation` from the other side —
+    that term pushes harder in the direction of the error, this one keeps the
+    contact moving — so they are worth trying separately before together.
+
+    The oscillation must sit above everything mechanical that can answer it
+    and below the command rate: the arm's structural modes reach ~35 Hz and
+    the realtime core runs at 240 Hz, leaving roughly 40-80 Hz. Amplitude is a
+    fraction of the joint's Coulomb friction (a dither large enough to move
+    the joint is not a dither), and it fades out as the joint gets moving,
+    where it would only add heat and audible noise.
+
+    Phase advances on a per-update accumulator rather than a wall clock, so a
+    late tick shifts the phase instead of the frequency, and each channel is
+    offset by :data:`DITHER_PHASE_STAGGER`.
+
+    Args:
+        n: Number of channels.
+    """
+
+    def __init__(self, n: int) -> None:
+        self._n = n
+        self._phase = [(i * DITHER_PHASE_STAGGER) % (2.0 * math.pi) for i in range(n)]
+
+    def update(
+        self,
+        velocity: Sequence[float],
+        amplitude: float,
+        hz: float,
+        dt: float,
+        square: bool = False,
+        fade_vel: float = 0.0,
+    ) -> list[float]:
+        """Advance one step; returns the per-channel dither torque (Nm).
+
+        Args:
+            velocity:  Per-channel velocity (rad/s) the fade is taken against
+                       — the *commanded* velocity in the control loop, which
+                       is noise-free and says what the trajectory is asking
+                       for.
+            amplitude: Peak torque (Nm). ``<= 0`` disables (returns zeros).
+            hz:        Dither frequency. ``<= 0`` disables.
+            dt:        Time since the previous update (s).
+            square:    Square wave instead of a sine. A square spends all its
+                       time at full amplitude, so it breaks stiction at a
+                       lower peak — and injects every odd harmonic, which is
+                       how it finds a structural mode. Try the sine first.
+            fade_vel:  Velocity (rad/s) over which the dither fades out,
+                       ``tanh``-shaped: ~24 % left at ``fade_vel``, ~4 % at
+                       twice it. ``<= 0`` never fades.
+        """
+        if amplitude <= 0.0 or hz <= 0.0:
+            return [0.0] * self._n
+        step = 2.0 * math.pi * hz * dt if dt > 0.0 else 0.0
+        out: list[float] = []
+        for i in range(self._n):
+            phase = (self._phase[i] + step) % (2.0 * math.pi)
+            self._phase[i] = phase
+            wave = math.sin(phase)
+            if square:
+                wave = 1.0 if wave >= 0.0 else -1.0
+            fade = (
+                1.0 - math.tanh(abs(velocity[i]) / fade_vel) if fade_vel > 0.0 else 1.0
+            )
+            out.append(amplitude * fade * wave)
+        return out
+
+    def reset(self) -> None:
+        """Restart every channel at its staggered phase."""
+        self._phase = [
+            (i * DITHER_PHASE_STAGGER) % (2.0 * math.pi) for i in range(self._n)
+        ]
+
+
 class ErrorIntegrator:
     """N-channel clamped, freeze-gated position-error integrator → torque.
 

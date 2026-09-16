@@ -15,11 +15,13 @@ from dataclasses import fields
 import numpy as np
 
 from almond_axol.constants import ARM_JOINTS, Joint
-from almond_axol.robot.config import AxolConfig, ControlExperiments
+from almond_axol.robot.config import WIRE_MODES, AxolConfig, ControlExperiments
 from almond_axol.robot.control import (
+    DITHER_PHASE_STAGGER,
     FRICTION_FF_K_MAX,
     ErrorIntegrator,
     SlewLimiter,
+    TorqueDither,
     compute_friction,
     coulomb_unit,
     stiction_compensation,
@@ -38,8 +40,12 @@ class ExperimentsConfigTest(unittest.TestCase):
         self.assertEqual(exp.integrator_hz, 0.0)
         self.assertFalse(exp.tracker_wire_vel)
         self.assertFalse(exp.tracker_accel_ff)
+        self.assertEqual(exp.dither_nm, 0.0)
+        self.assertEqual(exp.wire_mode, "mit")
         self.assertTrue(AxolConfig().experiments.is_default())
         self.assertFalse(ControlExperiments(integrator_hz=0.3).is_default())
+        self.assertFalse(ControlExperiments(dither_nm=0.2).is_default())
+        self.assertFalse(ControlExperiments(wire_mode="a9").is_default())
 
     def test_config_lines_declare_every_field(self) -> None:
         exp = ControlExperiments(friction_slew=30.0, tracker_wire_vel=True)
@@ -52,8 +58,35 @@ class ExperimentsConfigTest(unittest.TestCase):
         # a float).
         self.assertIn("exp tracker_wire_vel 1", lines)
         self.assertIn("exp tracker_accel_ff 0", lines)
+        # Every value is a number the core parses as a float, except
+        # ``wire_mode``, which is the one name-valued field.
         for line in lines:
-            float(line.split()[2])
+            _, name, value = line.split()
+            if name == "wire_mode":
+                self.assertIn(value, WIRE_MODES)
+            else:
+                float(value)
+        self.assertIn("exp wire_mode mit", lines)
+        self.assertIn(
+            "exp wire_mode a9", ControlExperiments(wire_mode="a9").config_lines()
+        )
+
+    def test_validate_rejects_what_the_core_would_refuse(self) -> None:
+        # A mistyped mode is caught at the robot-construction boundary, not
+        # silently ignored and not left for the core's config error.
+        with self.assertRaisesRegex(ValueError, "wire_mode"):
+            AxolConfig(experiments=ControlExperiments(wire_mode="A9")).resolved()
+        with self.assertRaisesRegex(ValueError, "dither_hz"):
+            ControlExperiments(dither_nm=0.2, dither_hz=0.0).validate()
+        with self.assertRaisesRegex(ValueError, "dither_nm"):
+            ControlExperiments(dither_nm=-0.1).validate()
+        with self.assertRaisesRegex(ValueError, "wire_torque_pct"):
+            ControlExperiments(wire_torque_pct=300.0).validate()
+        with self.assertRaisesRegex(ValueError, "wire_speed_scale"):
+            ControlExperiments(wire_speed_scale=0.0).validate()
+        for mode in WIRE_MODES:
+            ControlExperiments(wire_mode=mode).validate()
+        AxolConfig().resolved()
 
     def test_flags_reach_the_config(self) -> None:
         from almond_axol.cli.config import TeleopCmdConfig, parse
@@ -71,6 +104,10 @@ class ExperimentsConfigTest(unittest.TestCase):
                 "0.3",
                 "--axol.experiments.tracker_wire_vel",
                 "true",
+                "--axol.experiments.dither_nm",
+                "0.2",
+                "--axol.experiments.wire_mode",
+                "a9",
             ],
             settings_op=None,
         )
@@ -80,6 +117,8 @@ class ExperimentsConfigTest(unittest.TestCase):
         self.assertEqual(exp.stiction_gain, 0.6)
         self.assertEqual(exp.integrator_hz, 0.3)
         self.assertTrue(exp.tracker_wire_vel)
+        self.assertEqual(exp.dither_nm, 0.2)
+        self.assertEqual(exp.wire_mode, "a9")
         # Untouched fields keep their defaults; the per-joint config is
         # unaffected by the experiments block.
         self.assertFalse(exp.tracker_accel_ff)
@@ -182,6 +221,54 @@ class StictionTest(unittest.TestCase):
     def test_off_by_default(self) -> None:
         self.assertEqual(stiction_compensation(0.01, 0.0, 1.3, 0.0, 1e-3), 0.0)
         self.assertEqual(stiction_compensation(0.01, 0.0, 0.0, 0.6, 1e-3), 0.0)
+
+
+class TorqueDitherTest(unittest.TestCase):
+    def test_runs_at_the_requested_frequency(self) -> None:
+        # A 40 Hz square on the 240 Hz core loop is three ticks each way.
+        d = TorqueDither(1)
+        wave = [d.update([0.0], 0.25, 40.0, DT, True, 0.0)[0] for _ in range(12)]
+        self.assertEqual(wave, [0.25] * 3 + [-0.25] * 3 + [0.25] * 3 + [-0.25] * 3)
+        # The sine form spends most of the cycle below full amplitude, which
+        # is why the square breaks stiction at a lower peak.
+        d = TorqueDither(1)
+        sine = [d.update([0.0], 0.25, 40.0, DT, False, 0.0)[0] for _ in range(6)]
+        self.assertTrue(all(abs(v) <= 0.25 + 1e-12 for v in sine))
+        self.assertLess(sum(abs(v) for v in sine) / 6, 0.25)
+        # Mean-free over a whole number of cycles: a dither must not show up
+        # as a static torque offset.
+        self.assertAlmostEqual(sum(sine), 0.0, places=12)
+
+    def test_fades_out_as_the_joint_moves(self) -> None:
+        d = TorqueDither(1)
+        at_rest = d.update([0.0], 0.25, 40.0, DT, True, 0.05)[0]
+        self.assertAlmostEqual(at_rest, 0.25)
+        d = TorqueDither(1)
+        creeping = d.update([0.05], 0.25, 40.0, DT, True, 0.05)[0]
+        self.assertAlmostEqual(creeping, 0.25 * (1.0 - math.tanh(1.0)))
+        d = TorqueDither(1)
+        moving = d.update([0.5], 0.25, 40.0, DT, True, 0.05)[0]
+        self.assertLess(abs(moving), 1e-6)
+        # fade_vel 0 never fades.
+        d = TorqueDither(1)
+        self.assertAlmostEqual(d.update([5.0], 0.25, 40.0, DT, True, 0.0)[0], 0.25)
+
+    def test_off_by_default_and_staggered_per_channel(self) -> None:
+        d = TorqueDither(3)
+        self.assertEqual(d.update([0.0] * 3, 0.0, 40.0, DT), [0.0, 0.0, 0.0])
+        self.assertEqual(d.update([0.0] * 3, 0.25, 0.0, DT), [0.0, 0.0, 0.0])
+        # Seven joints pushing in phase is the one thing a dither must not
+        # do; each channel starts a golden angle further round.
+        d = TorqueDither(3)
+        first = d.update([0.0] * 3, 1.0, 40.0, 0.0)
+        self.assertAlmostEqual(first[0], math.sin(0.0))
+        self.assertAlmostEqual(first[1], math.sin(DITHER_PHASE_STAGGER))
+        self.assertAlmostEqual(first[2], math.sin(2 * DITHER_PHASE_STAGGER))
+        # reset() returns every channel to its own starting phase.
+        for _ in range(5):
+            d.update([0.0] * 3, 1.0, 40.0, DT)
+        d.reset()
+        self.assertEqual(d.update([0.0] * 3, 1.0, 40.0, 0.0), first)
 
 
 class ErrorIntegratorTest(unittest.TestCase):
@@ -305,6 +392,22 @@ class ClassicPathTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(base[-1][:4], integ[-1][:4])
         self.assertGreater(integ[-1][4], base[-1][4])
         self.assertGreater(integ[-1][4] - base[-1][4], integ[3][4] - base[3][4])
+
+    async def test_dither_oscillates_the_feedforward_about_the_base_law(
+        self,
+    ) -> None:
+        q = np.zeros(8, dtype=np.float32)
+        q[ARM_JOINTS.index(Joint.WRIST_2)] = 0.004
+        base = await self._drive(self._arm(AxolConfig()), q, 12)
+        exp = ControlExperiments(dither_nm=0.2, dither_hz=40.0, dither_square=True)
+        dithered = await self._drive(self._arm(AxolConfig(experiments=exp)), q, 12)
+        # Same command, same gains — only the feedforward moves.
+        self.assertEqual(base[-1][:4], dithered[-1][:4])
+        offsets = [d[4] - b[4] for b, d in zip(base, dithered)]
+        # A square dither is +-the amplitude and changes sign within the run;
+        # neither is true of any other term here.
+        self.assertTrue(all(abs(abs(o) - 0.2) < 1e-6 for o in offsets), offsets)
+        self.assertTrue(any(o > 0 for o in offsets) and any(o < 0 for o in offsets))
 
     async def test_stiction_acts_on_the_error_sign(self) -> None:
         exp = ControlExperiments(stiction_gain=0.6)

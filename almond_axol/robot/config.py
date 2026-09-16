@@ -647,6 +647,14 @@ def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
     )
 
 
+#: Wire frames the MyActuator arm joints can be commanded with — see
+#: ``ControlExperiments.wire_mode``. ``mit`` is the production 0x400
+#: impedance frame; the other two are the 0x140-series position closed-loop
+#: commands, which move the position loop into the motor and answer on the
+#: coarse 0x240 reply frame.
+WIRE_MODES = ("mit", "a9", "tf")
+
+
 @dataclass
 class ControlExperiments:
     """Opt-in tracking-accuracy experiments, every one off by default.
@@ -729,6 +737,80 @@ class ControlExperiments:
             adoption/repeat-tick ripple (see the core README) out of the
             torque; lower it if ``inertia_ff`` in the trace shows a 120 Hz
             comb.
+        dither_nm: Peak amplitude (Nm) of a stiction-breaking torque dither
+            added to the feedforward
+            (:class:`~almond_axol.robot.control.TorqueDither`); ``0`` is off.
+            Keeps the joint's friction sliding instead of re-sticking between
+            cycles — the third angle on the stick-slip stairs, next to
+            ``stiction_gain`` (push harder toward the target) and
+            ``friction_k_max`` (compensate sooner). Start around 15-25 % of
+            the joint's ``fc``: enough to keep the contact moving, not enough
+            to move the joint.
+        dither_hz: Dither frequency. Must clear the arm's structural modes
+            (up to ~35 Hz) and stay under the Nyquist of the loop that emits
+            it — 120 Hz in the realtime core, ~60 Hz on the classic path —
+            which leaves roughly 40-80 Hz. The default sits at 40.
+        dither_square: Square dither wave instead of a sine. A square holds
+            full amplitude the whole cycle, so it breaks stiction at a lower
+            peak, but its odd harmonics reach far above ``dither_hz`` and
+            will find a structural mode if one is up there. Try the sine
+            first.
+        dither_fade_vel: Velocity (rad/s) over which the dither fades out
+            (``tanh``-shaped: ~24 % left at this speed, ~4 % at twice it).
+            Dither earns its keep at rest and through the creep regime; above
+            that it is heat and audible buzz. ``0`` never fades.
+        wire_mode: Which CAN frame the **MyActuator** arm joints
+            (``shoulder_1``..``wrist_1``) are commanded with. Realtime core
+            only; the Damiao wrists and the gripper are unaffected.
+
+            - ``"mit"`` (default): the 0x400 impedance frame — position,
+              velocity, ``kp``, ``kd`` and the full feedforward torque, i.e.
+              the production control law.
+            - ``"a9"``: 0xA9 force-control position closed-loop. The motor's
+              own position loop tracks the streamed trajectory under
+              ``wire_torque_pct`` and a speed cap, with the position at
+              0.01 deg/LSB — 2.2x finer than the MIT frame's ``p_des``, which
+              is the point of trying it. **Everything host-side stops
+              reaching the motor**: no ``kp``/``kd``, no gravity, friction,
+              damping, stiction, integrator or dither. The stored
+              position-loop PI gains become the entire controller, so a
+              gravity-loaded joint holds only by winding up its own integral.
+            - ``"tf"``: 0x73 position control with feedforward torque — the
+              same fine position command, but the host's feedforward still
+              arrives, quantised to ``wire_ff_nm_per_pct`` steps. Needs V4.4
+              firmware; the core refuses to arm an older motor in this mode.
+
+            Both wire modes answer on the 0x240 reply frame instead of the
+            MIT feedback frame, which costs **real telemetry**: measured
+            position drops to 1 deg/LSB (45x coarser), velocity to 1 dps/LSB,
+            and the torque channel becomes q-axis current in amps (see
+            ``wire_torque_nm_per_amp``). Host damping is driven from the
+            motor's reported speed instead of a position derivative, and
+            anything that reads measured torque — the contact watchdog above
+            all — is only as good as that conversion. These are A/B modes for
+            a tracking measurement, not a path to record datasets on.
+        wire_torque_pct: ``a9`` torque limit, as a percentage of the motor's
+            **rated current** (0-255, the wire unit; not Nm and not the MIT
+            ``t_max`` scale). Above the motor's configured stall current the
+            firmware leaves force control off entirely.
+        wire_speed_scale: Multiplier on the joint's tracker velocity limit
+            for the speed cap carried by the ``a9`` / ``tf`` frame. The
+            trajectory is already inside that limit, so this is a runaway
+            guard; below 1.0 it becomes an active limit.
+        wire_ff_nm_per_pct: Nm per 1 % unit of the ``tf`` frame's int8
+            feedforward field. ``0`` (the default) derives it as
+            ``t_max/100``, i.e. treats the MIT torque range as 100 % of rated
+            — an assumption, not a measurement: the two scales are rated
+            *current* and peak *torque*. Fit it against a measured stall or
+            current reading before trusting the absolute level, and note that
+            even at the default the step is ~0.6 Nm on an X6 (~1.3 on an X8)
+            against the MIT frame's ~0.03 Nm.
+        wire_torque_nm_per_amp: Nm per amp of reported q-axis current, used
+            to put the ``a9`` / ``tf`` reply's torque channel back into Nm.
+            ``0`` (the default) reports the raw current, which leaves every
+            consumer of measured torque — the contact watchdog, the trace's
+            ``meas_tau``, ``torque_residuals`` — reading amps where they
+            expect Nm.
     """
 
     friction_k_max: float = 100.0
@@ -744,6 +826,39 @@ class ControlExperiments:
     tracker_vel_pole: float = 60.0
     tracker_accel_ff: bool = False
     tracker_accel_pole: float = 60.0
+    dither_nm: float = 0.0
+    dither_hz: float = 40.0
+    dither_square: bool = False
+    dither_fade_vel: float = 0.05
+    wire_mode: str = "mit"
+    wire_torque_pct: float = 100.0
+    wire_speed_scale: float = 1.0
+    wire_ff_nm_per_pct: float = 0.0
+    wire_torque_nm_per_amp: float = 0.0
+
+    def validate(self) -> None:
+        """Raise ``ValueError`` on a combination the core would reject.
+
+        Called at the robot-construction boundary (:meth:`AxolConfig.resolved`)
+        so a mistyped flag fails with a readable message on the host instead
+        of as a config error from the realtime core — or, worse, as a mode
+        that silently did nothing.
+        """
+        if self.wire_mode not in WIRE_MODES:
+            raise ValueError(
+                f"experiments.wire_mode {self.wire_mode!r} is not one of "
+                f"{', '.join(sorted(WIRE_MODES))}"
+            )
+        if self.dither_nm < 0.0:
+            raise ValueError("experiments.dither_nm must not be negative")
+        if self.dither_nm > 0.0 and self.dither_hz <= 0.0:
+            raise ValueError(
+                "experiments.dither_hz must be positive when dither_nm is set"
+            )
+        if not 0.0 <= self.wire_torque_pct <= 255.0:
+            raise ValueError("experiments.wire_torque_pct must be in [0, 255]")
+        if self.wire_speed_scale <= 0.0:
+            raise ValueError("experiments.wire_speed_scale must be positive")
 
     def is_default(self) -> bool:
         """``True`` when every experiment is off (the production control law)."""
@@ -759,7 +874,14 @@ class ControlExperiments:
         out: list[str] = []
         for f in fields(self):
             v = getattr(self, f.name)
-            text = str(int(v)) if isinstance(v, bool) else repr(float(v))
+            if isinstance(v, bool):
+                text = str(int(v))
+            elif isinstance(v, str):
+                # One bare word (``wire_mode``); the core parses a value that
+                # is not a number as a name.
+                text = v
+            else:
+                text = repr(float(v))
             out.append(f"exp {f.name} {text}")
         return out
 
@@ -837,7 +959,12 @@ class AxolConfig:
         applied once at the single robot-construction boundary
         (``Axol.__init__``) so every consumer sees consistent gains while
         the unresolved config stays safe to serialize and reload.
+
+        Also the point where the opt-in experiments are checked
+        (:meth:`ControlExperiments.validate`), so a bad flag raises here
+        rather than at core-configure time or, worse, not at all.
         """
+        self.experiments.validate()
         return replace(
             self,
             left=_apply_stiffness(self.left, self.left_stiffness),

@@ -14,6 +14,7 @@ from .axol import (
 )
 from .base import RobotBase
 from .config import (
+    WIRE_MODES,
     ArmConfig,
     AxolConfig,
     ControlExperiments,
@@ -36,6 +37,7 @@ __all__ = [
     "ArmConfig",
     "AxolConfig",
     "ControlExperiments",
+    "WIRE_MODES",
     "Jelly",
     "JellyConfig",
     "detect_jelly",

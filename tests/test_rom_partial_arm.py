@@ -297,8 +297,9 @@ class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
         # Slot-by-motor-id arrived with protocol generation 2; a core that
         # predates it would slot these wrists at 0 and 1 and then reject
         # every target, so the config declares the generation and such a
-        # core refuses it. Generation 3 added the ``exp`` experiment lines.
-        self.assertEqual(lines[0], "proto 3")
+        # core refuses it. Generation 3 added the ``exp`` experiment lines,
+        # generation 4 the dither and wire-mode ones.
+        self.assertEqual(lines[0], "proto 4")
         # Every experiment field is declared (all at their production
         # defaults here), so a core from another checkout fails loudly.
         exp_lines = [line for line in lines if line.startswith("exp ")]

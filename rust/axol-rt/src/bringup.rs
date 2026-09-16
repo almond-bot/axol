@@ -55,6 +55,10 @@ pub struct ReadyMotor {
     pub joint: String,
     pub vendor: Vendor,
     pub ranges: proto::MitRanges,
+    /// MyActuator firmware VersionDate (0xB2), `None` when unreadable or on
+    /// a Damiao. The `wire_mode` experiments gate on it: 0x73 did not exist
+    /// before V4.4 ([`proto::MA_FW_V44`]).
+    pub version: Option<u32>,
     /// Measured position at prep time (motor frame, rad).
     pub hold_pos: f64,
     /// Already enabled and holding torque when found (a previous session
@@ -200,6 +204,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
                 t_max,
             },
             hold_pos: proto::ma_decode_position(&pos_frame),
+            version,
             holding,
             kp: spec.kp,
             kd: spec.kd,
@@ -248,6 +253,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
                 kd_max: 5.0,
                 t_max,
             },
+            version: None,
             hold_pos: decoded.position,
             holding: decoded.status == proto::DM_STATUS_ENABLED,
             kp: spec.kp,
@@ -263,6 +269,24 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
         });
     }
     Ok(motors)
+}
+
+/// Read a MyActuator's stored position-planning acceleration (rad/s²).
+///
+/// Read-only, and deliberately so: the paired write (0x43) stores to ROM and
+/// only accepts 100-60000 dps/s, so it cannot produce the 0 that selects
+/// direct tracking mode anyway. The `wire_mode` experiments report this at
+/// arm time because it decides what the motor does with a streamed position
+/// target — track it through its PI controller (0), or plan its own ramp to
+/// every one of the 240 targets a second it receives (anything else).
+pub fn read_position_accel(sock: &CanSock, motor_id: u8) -> io::Result<Option<f64>> {
+    Ok(txn::ma_request(
+        sock,
+        motor_id,
+        proto::ma_read_accel(proto::MA_ACC_POS_PLAN),
+        TIMEOUT,
+    )?
+    .map(|(d, _)| proto::ma_decode_accel(&d)))
 }
 
 pub fn read_ma_model(sock: &CanSock, motor_id: u8) -> io::Result<Option<String>> {

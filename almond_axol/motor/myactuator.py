@@ -41,6 +41,15 @@ _MA_MOTOR_STATUS_2 = 0x9C  # temperature, current, velocity, encoder
 _MA_SET_ENCODER_ZERO = 0x64
 _MA_POS_CONTROL = 0xA4  # absolute position closed-loop control
 _MA_VELOCITY_CONTROL = 0xA2  # speed closed-loop control
+# Position closed-loop variants that carry a per-frame limit or feedforward.
+# Both reply on the standard 0x240 + id frame (see :func:`decode_control_reply`),
+# not on the 0x500 + id MIT frame, and both take the position as a 32-bit
+# 0.01 deg/LSB multi-turn angle — 2.2x finer than the MIT frame's 16-bit
+# p_des, and the reason they are interesting as tracking experiments (see
+# ``ControlExperiments.wire_mode``).
+_MA_FORCE_POS_CONTROL = 0xA9  # force-control position closed-loop; V4.3+
+_MA_POS_TORQUE_FF = 0x73  # "TF": position control with feedforward torque; V4.4+
+_MA_READ_ACCELERATION = 0x42  # read one position/speed planning accel value
 _MA_FUNCTION_CONTROL = 0x20  # function control; byte 1 = index, bytes 4-7 = value
 _MA_FC_SET_CANID = 0x05  # function control index: set CAN ID
 # Loop-gain (PID parameter) access. Protocol V4.2 (2024-05) changed these from
@@ -220,6 +229,127 @@ def _model_max_torque(model: str | None) -> float:
                 int(match.group(1)), _MA_DEFAULT_MAX_TORQUE
             )
     return _MA_DEFAULT_MAX_TORQUE
+
+
+# ------------------------------------------------------------------ 0xA9 / 0x73
+#
+# The two position closed-loop frames that carry a per-frame limit or
+# feedforward. They share a byte layout — command, one signed/unsigned 8-bit
+# knob, a uint16 speed limit in dps, and the target as an int32 multi-turn
+# angle at 0.01 deg/LSB — and differ only in what byte 1 means. Both are
+# encoded here rather than in the driver methods so the realtime core's Rust
+# port (`rust/axol-rt/src/proto.rs`) can be pinned to them by test vector, the
+# way `mit_encode` is pinned to `set_impedance`.
+#
+# What the motor does with them depends on a *stored* setting this code does
+# not write: the position-planning acceleration (0x42 index 0 reads it,
+# :meth:`MyActuatorMotor.get_acceleration` below). At 0 the position loop runs
+# in "direct tracking" mode — a PI controller chasing the target under the
+# frame's speed limit, which is what a host streaming a rendered trajectory
+# wants. Non-zero puts the motor in "profiled motion" mode, where it plans its
+# own accel/decel ramp to every target. 0x43 (the write) only accepts
+# 100-60000 dps/s AND writes to ROM, so switching a motor into direct tracking
+# is a deliberate, persistent act for the vendor setup software, not something
+# to do behind a runtime flag.
+_MA_RAD_TO_CENTIDEG = 18000.0 / math.pi
+_MA_RAD_TO_DPS = 180.0 / math.pi
+_MA_ANGLE_MIN = -(2**31)
+_MA_ANGLE_MAX = 2**31 - 1
+_MA_SPEED_MAX_DPS = 0xFFFF
+
+
+def _round_half_away(x: float) -> int:
+    """Round half away from zero — Rust's ``f64::round``, not Python's banker's
+    rounding, so the core's port of the frame encoders below matches bit for
+    bit on an exact half."""
+    return int(math.floor(x + 0.5)) if x >= 0.0 else int(math.ceil(x - 0.5))
+
+
+def _angle_centideg(position: float) -> int:
+    """Clamped int32 multi-turn angle (0.01 deg/LSB) for a position in rad."""
+    if not math.isfinite(position):
+        raise ValueError("cannot encode a non-finite motor position")
+    return max(_MA_ANGLE_MIN, min(_MA_ANGLE_MAX, int(position * _MA_RAD_TO_CENTIDEG)))
+
+
+def _speed_dps(max_speed: float) -> int:
+    """Clamped uint16 speed limit (1 dps/LSB) for a speed in rad/s."""
+    if not math.isfinite(max_speed):
+        raise ValueError("cannot encode a non-finite speed limit")
+    return max(0, min(_MA_SPEED_MAX_DPS, int(abs(max_speed) * _MA_RAD_TO_DPS)))
+
+
+def force_position_frame(
+    position: float, max_speed: float, max_torque_pct: float
+) -> bytes:
+    """0xA9 force-control position closed-loop payload.
+
+    Args:
+        position:       Target multi-turn angle (rad, motor frame).
+        max_speed:      Output-shaft speed limit (rad/s), capped at the
+                        uint16 dps field.
+        max_torque_pct: Torque limit as a percentage of the motor's *rated
+                        current* (0-255, 1 %/LSB) — not Nm, and not the MIT
+                        ``t_max`` scale. Asking for more than the motor's
+                        configured stall current leaves force control off and
+                        the stall limit in charge.
+    """
+    return (
+        bytes([_MA_FORCE_POS_CONTROL, max(0, min(255, int(max_torque_pct)))])
+        + struct.pack("<H", _speed_dps(max_speed))
+        + struct.pack("<i", _angle_centideg(position))
+    )
+
+
+def position_torque_ff_frame(
+    position: float, max_speed: float, torque_ff_pct: float
+) -> bytes:
+    """0x73 "TF" position-control-with-feedforward-torque payload.
+
+    ``torque_ff_pct`` is an int8 in percent of rated current (-128..127,
+    1 %/LSB) — a far coarser torque channel than the MIT frame's 12-bit
+    ``t_ff``, which is the cost of moving the position loop into the motor.
+    Requires V4.4 firmware (the command did not exist before it).
+    """
+    return (
+        bytes(
+            [
+                _MA_POS_TORQUE_FF,
+                max(-128, min(127, _round_half_away(torque_ff_pct))) & 0xFF,
+            ]
+        )
+        + struct.pack("<H", _speed_dps(max_speed))
+        + struct.pack("<i", _angle_centideg(position))
+    )
+
+
+def decode_control_reply(data: bytes) -> tuple[float, float, float, float]:
+    """Decode a 0x240 + id control reply into ``(pos, vel, current, temp)``.
+
+    Every 0x140-series closed-loop command (0xA1/0xA2/0xA4/0xA9/0x72/0x73)
+    answers with this one layout, which is *not* the MIT feedback frame:
+
+    - position arrives as an int16 in **whole degrees** (0.0175 rad/LSB),
+      45x coarser than the MIT frame's 16-bit p_max-scaled field, and wraps
+      past +-32767 deg;
+    - velocity as an int16 in dps (0.0175 rad/s per LSB);
+    - the torque channel is the *q-axis current* in amps (0.01 A/LSB), not
+      Nm — converting needs a per-motor torque constant this driver does not
+      measure.
+
+    That resolution loss is the price of the 0xA9/0x73 wire modes and the
+    reason they are experiments rather than a production control path.
+    """
+    temp = struct.unpack_from("<b", data, 1)[0]
+    current = struct.unpack_from("<h", data, 2)[0] * 0.01
+    speed_dps = struct.unpack_from("<h", data, 4)[0]
+    degrees = struct.unpack_from("<h", data, 6)[0]
+    return (
+        math.radians(float(degrees)),
+        math.radians(float(speed_dps)),
+        float(current),
+        float(temp),
+    )
 
 
 class MyActuatorMotor(MotorDriver):
@@ -562,6 +692,55 @@ class MyActuatorMotor(MotorDriver):
         centidps = int(velocity * (18000.0 / math.pi))
         data = bytes([_MA_VELOCITY_CONTROL, 0, 0, 0]) + struct.pack("<i", centidps)
         await self._request(data)
+
+    async def set_force_position(
+        self,
+        position: float,
+        max_speed: float,
+        max_torque_pct: float,
+    ) -> None:
+        """Send one 0xA9 force-control position command (firmware V4.3+).
+
+        The motor's own position loop does the work: this frame carries no
+        impedance gains and no feedforward torque, so gravity, friction and
+        host damping are *not* applied — the stored position-loop PI gains
+        (0x30/0x31, see :meth:`get_gains`) are the whole controller, and
+        ``max_torque_pct`` caps what it may pull. See
+        :func:`force_position_frame` for the units and the stored-acceleration
+        caveat.
+        """
+        await self._request(force_position_frame(position, max_speed, max_torque_pct))
+
+    async def set_position_torque_ff(
+        self,
+        position: float,
+        max_speed: float,
+        torque_ff_pct: float,
+    ) -> None:
+        """Send one 0x73 "TF" position + feedforward-torque command (V4.4+).
+
+        Like :meth:`set_force_position`, but the frame's int8 knob is a
+        feedforward torque (percent of rated current) instead of a limit, so
+        a host model — gravity above all — still reaches the motor, at 1 %
+        resolution. See :func:`position_torque_ff_frame`.
+        """
+        await self._request(
+            position_torque_ff_frame(position, max_speed, torque_ff_pct)
+        )
+
+    async def get_acceleration(self, accel_type: int = _MA_ACC_POS_PLAN) -> float:
+        """Read one stored planning acceleration (rad/s²) via 0x42.
+
+        ``accel_type`` is one of the ``_MA_ACC_*`` / ``_MA_DEC_*`` indices.
+        A position-planning acceleration of 0 means the position loop tracks
+        targets directly through its PI controller; any other value makes it
+        plan its own ramp to each target (see :func:`force_position_frame`).
+        """
+        resp = await self._request(
+            bytes([_MA_READ_ACCELERATION, accel_type, 0, 0, 0, 0, 0, 0])
+        )
+        dps_s2 = struct.unpack_from("<i", resp, 4)[0]
+        return float(dps_s2) * (math.pi / 180.0)
 
     async def set_acceleration(
         self, acceleration: float, deceleration: float | None = None

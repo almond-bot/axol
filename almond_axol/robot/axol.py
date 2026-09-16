@@ -47,6 +47,7 @@ from .control import (
     Differentiator,
     ErrorIntegrator,
     SlewLimiter,
+    TorqueDither,
     coulomb_unit,
     stiction_compensation,
 )
@@ -657,6 +658,7 @@ class AxolArm:
         # by. In realtime-core mode the core holds the equivalent state.
         self._fric_slew = SlewLimiter(n_j)
         self._integ = ErrorIntegrator(n_j)
+        self._dither = TorqueDither(n_j)
         self._exp_last_time: float | None = None
         self._last_q_commanded: np.ndarray | None = None
         self._gc_hold_q: np.ndarray | None = None
@@ -1727,6 +1729,18 @@ class AxolArm:
             exp_dt if meas_pos is not None else 0.0,
         )
         stiction_scale = math.radians(exp.stiction_err_deg)
+        # The dither rides the commanded velocity (noise-free, and what the
+        # trajectory is asking for) and fades out as the joint gets moving.
+        # Note the classic path emits at ~120 Hz, so its usable dither band
+        # tops out around 60 Hz where the core's reaches 120.
+        dither = self._dither.update(
+            velocities,
+            exp.dither_nm,
+            exp.dither_hz,
+            exp_dt,
+            exp.dither_square,
+            exp.dither_fade_vel,
+        )
 
         arm_cmds: list[tuple[float, float, float, float, float]] = []
         for i, j in enumerate(ARM_JOINTS):
@@ -1750,6 +1764,7 @@ class AxolArm:
                     err[i], sat[i], fc_eff[i], exp.stiction_gain, stiction_scale
                 )
                 + integral[i]
+                + dither[i]
             )
             arm_cmds.append(
                 (float(motor_targets[i]), velocities[i], gains.kp, gains.kd, t_ff)
@@ -1927,6 +1942,7 @@ class AxolArm:
         self._damp_bp = BandPass(n=n, w0=self._damp_w0, q=self._damp_q)
         self._fric_slew.reset()
         self._integ.reset()
+        self._dither.reset()
         self._exp_last_time = None
 
     def torque_residuals(self) -> np.ndarray:

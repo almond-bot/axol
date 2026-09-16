@@ -43,7 +43,7 @@ impl TimingAggregator {
             }
             e.commands.push_back(now);
         }
-        if let Some(slot) = feedback_slot(id) {
+        if let Some(slot) = feedback_slot(id, data) {
             let e = &mut self.joints[slot];
             e.feedback.push_back(now);
             if let Some(sent) = e.pending.take() {
@@ -180,16 +180,24 @@ impl TimingAggregator {
 fn command_slot(id: u32, data: &[u8; 8]) -> Option<usize> {
     match id {
         0x401..=0x405 => Some((id - 0x401) as usize),
-        0x141..=0x145 if matches!(data[0], 0xA2 | 0xA4) => Some((id - 0x141) as usize),
+        // 0xA9 / 0x73 are the `exp wire_mode` position closed-loop commands
+        // (`WireMode` in serve.rs); 0xA2 / 0xA4 are the maintenance paths'.
+        0x141..=0x145 if matches!(data[0], 0xA2 | 0xA4 | 0xA9 | 0x73) => {
+            Some((id - 0x141) as usize)
+        }
         0x006..=0x008 => Some((id - 1) as usize),
         0x106..=0x108 | 0x206..=0x208 | 0x306..=0x308 => Some(((id & 0xff) - 1) as usize),
         _ => None,
     }
 }
 
-fn feedback_slot(id: u32) -> Option<usize> {
+fn feedback_slot(id: u32, data: &[u8; 8]) -> Option<usize> {
     match id {
         0x501..=0x505 => Some((id - 0x501) as usize),
+        // A 0x240 reply echoes the command byte it answers, which is what
+        // separates a wire-mode feedback frame from the bring-up reads that
+        // share the arbitration ID.
+        0x241..=0x245 if matches!(data[0], 0xA9 | 0x73) => Some((id - 0x241) as usize),
         0x016..=0x018 => Some((id - 0x11) as usize),
         _ => None,
     }
@@ -261,7 +269,26 @@ mod tests {
     fn recognizes_arm_control_frames() {
         assert_eq!(command_slot(0x401, &[0; 8]), Some(0));
         assert_eq!(command_slot(0x207, &[0; 8]), Some(6));
-        assert_eq!(feedback_slot(0x17), Some(6));
+        assert_eq!(feedback_slot(0x17, &[0; 8]), Some(6));
+    }
+
+    /// The `exp wire_mode` frames: 0xA9 / 0x73 on the 0x140 request space,
+    /// answered on 0x240 — which the bring-up reads share, so the reply is
+    /// only feedback when it echoes one of those command bytes.
+    #[test]
+    fn recognizes_wire_mode_frames() {
+        let a9 = |b: u8| {
+            let mut d = [0u8; 8];
+            d[0] = b;
+            d
+        };
+        assert_eq!(command_slot(0x141, &a9(0xA9)), Some(0));
+        assert_eq!(command_slot(0x145, &a9(0x73)), Some(4));
+        assert_eq!(command_slot(0x141, &a9(0x9A)), None);
+        assert_eq!(feedback_slot(0x241, &a9(0xA9)), Some(0));
+        assert_eq!(feedback_slot(0x245, &a9(0x73)), Some(4));
+        // A bring-up status read on the same arbitration ID is not feedback.
+        assert_eq!(feedback_slot(0x241, &a9(0x9A)), None);
     }
 
     #[test]

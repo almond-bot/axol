@@ -199,7 +199,7 @@ use std::time::{Duration, Instant};
 
 use crate::bringup::{self, MotorSpec, Vendor};
 use crate::can::CanSock;
-use crate::filter::{self, BandPass, Integrator, LowPass, LpDiff, SlewLimiter, Trapezoid};
+use crate::filter::{self, BandPass, Dither, Integrator, LowPass, LpDiff, SlewLimiter, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
@@ -232,7 +232,7 @@ const GRIPPER_SLOT: usize = 7;
 /// - 3: the config carries `exp <name> <value>` lines (the opt-in tracking
 ///   experiments, `Experiments`), and the trace gained `stiction_ff` /
 ///   `integral_ff` columns.
-const CONFIG_PROTO: u32 = 3;
+const CONFIG_PROTO: u32 = 4;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -588,6 +588,7 @@ struct Terms {
     v_damp: f64,
     stiction_ff: f64,
     integral_ff: f64,
+    dither_ff: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -631,7 +632,12 @@ struct TraceRow {
     damping_ff: f64,
     stiction_ff: f64,
     integral_ff: f64,
+    dither_ff: f64,
     total_ff: f64,
+    /// Feedforward torque (Nm) that actually reached the wire. Equal to
+    /// `total_ff` on the MIT frame, the `tf` frame's quantised feedforward
+    /// under `exp wire_mode tf`, and NaN under `a9`, which carries none.
+    wire_tau: f64,
     kd_host: f64,
     damp_w0: f64,
     damp_q: f64,
@@ -652,7 +658,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
     let mut out = io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         out,
-        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,integral_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt"
+        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,integral_ff,dither_ff,total_ff,wire_tau,kd_host,damp_w0,damp_q,tick_dt,fb_dt"
     )?;
     Ok(out)
 }
@@ -660,7 +666,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
 fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::Result<()> {
     writeln!(
         out,
-        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9}",
+        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9}",
         r.tick,
         r.time_s,
         r.seq,
@@ -682,7 +688,9 @@ fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::R
         r.damping_ff,
         r.stiction_ff,
         r.integral_ff,
+        r.dither_ff,
         r.total_ff,
+        r.wire_tau,
         r.kd_host,
         r.damp_w0,
         r.damp_q,
@@ -833,6 +841,43 @@ struct Config {
     exp: Experiments,
 }
 
+/// Which CAN frame the MyActuator arm joints are commanded with — `exp
+/// wire_mode`, `ControlExperiments.wire_mode`. Tracked mode only: a
+/// passthrough tick (gravity comp, bring-up hold) and every limp tick keep
+/// the MIT frame, because `kp = 0` plus a gravity feedforward is an
+/// impedance statement and neither position frame can carry it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WireMode {
+    /// 0x400 impedance frame: position, velocity, kp, kd, feedforward torque.
+    Mit,
+    /// 0xA9 force-control position closed-loop. Finer position command
+    /// (0.01 deg/LSB), firmware position loop, per-frame torque and speed
+    /// limits — and no host feedforward of any kind reaches the motor.
+    A9,
+    /// 0x73 "TF": the same position command, plus the host feedforward
+    /// quantised onto an int8 percentage of rated current. V4.4 firmware.
+    Tf,
+}
+
+impl WireMode {
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "mit" => Some(Self::Mit),
+            "a9" => Some(Self::A9),
+            "tf" => Some(Self::Tf),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Mit => "mit",
+            Self::A9 => "a9",
+            Self::Tf => "tf",
+        }
+    }
+}
+
 /// The opt-in tracking-accuracy experiments — `ControlExperiments` in
 /// `almond_axol.robot.config`, one `exp <name> <value>` config line per
 /// field. Defaults reproduce the production control law exactly; each
@@ -866,6 +911,25 @@ struct Experiments {
     /// `tracker_accel_pole`) instead of the double 20 rad/s derivative.
     tracker_accel_ff: bool,
     tracker_accel_pole: f64,
+    /// Stiction-breaking torque dither (`filter::Dither`): peak Nm, frequency,
+    /// square instead of sine, and the velocity (rad/s) it fades out over.
+    dither_nm: f64,
+    dither_hz: f64,
+    dither_square: bool,
+    dither_fade_vel: f64,
+    /// Which frame the MyActuator joints are commanded with.
+    wire_mode: WireMode,
+    /// `a9` torque limit, percent of the motor's rated current (0-255).
+    wire_torque_pct: f64,
+    /// Multiplier on the joint's tracker velocity limit for the speed cap
+    /// carried by the `a9` / `tf` frame.
+    wire_speed_scale: f64,
+    /// Nm per 1 % unit of the `tf` frame's int8 feedforward; 0 derives
+    /// `t_max/100`.
+    wire_ff_nm_per_pct: f64,
+    /// Nm per amp of reported q-axis current, for putting the `a9` / `tf`
+    /// reply's torque channel back into Nm; 0 reports the raw current.
+    wire_torque_nm_per_amp: f64,
 }
 
 impl Default for Experiments {
@@ -884,6 +948,15 @@ impl Default for Experiments {
             tracker_vel_pole: 60.0,
             tracker_accel_ff: false,
             tracker_accel_pole: 60.0,
+            dither_nm: 0.0,
+            dither_hz: 40.0,
+            dither_square: false,
+            dither_fade_vel: 0.05,
+            wire_mode: WireMode::Mit,
+            wire_torque_pct: 100.0,
+            wire_speed_scale: 1.0,
+            wire_ff_nm_per_pct: 0.0,
+            wire_torque_nm_per_amp: 0.0,
         }
     }
 }
@@ -907,6 +980,27 @@ impl Experiments {
             "tracker_vel_pole" => self.tracker_vel_pole = value,
             "tracker_accel_ff" => self.tracker_accel_ff = value >= 0.5,
             "tracker_accel_pole" => self.tracker_accel_pole = value,
+            "dither_nm" => self.dither_nm = value,
+            "dither_hz" => self.dither_hz = value,
+            "dither_square" => self.dither_square = value >= 0.5,
+            "dither_fade_vel" => self.dither_fade_vel = value,
+            "wire_torque_pct" => self.wire_torque_pct = value,
+            "wire_speed_scale" => self.wire_speed_scale = value,
+            "wire_ff_nm_per_pct" => self.wire_ff_nm_per_pct = value,
+            "wire_torque_nm_per_amp" => self.wire_torque_nm_per_amp = value,
+            _ => return Err(()),
+        }
+        Ok(())
+    }
+
+    /// Apply one `exp <name> <word>` line whose value is a name rather than a
+    /// number. `Err` means either the field or the word is unknown, and both
+    /// are fatal for the same reason numbers are: the client emits every
+    /// field, so anything this core cannot read means the two were built from
+    /// different checkouts.
+    fn set_word(&mut self, name: &str, word: &str) -> Result<(), ()> {
+        match name {
+            "wire_mode" => self.wire_mode = WireMode::parse(word).ok_or(())?,
             _ => return Err(()),
         }
         Ok(())
@@ -976,22 +1070,23 @@ fn parse_config(text: &str) -> io::Result<Config> {
                     .ok_or_else(|| bad(line))?
             }
             "exp" => {
-                // exp <name> <value> — see `Experiments`.
+                // exp <name> <value> — see `Experiments`. Most values are
+                // numbers (booleans as 0/1); a value that is not a number is
+                // a name, e.g. `exp wire_mode a9`.
                 let name = f.get(1).ok_or_else(|| bad(line))?;
-                let value: f64 = f
-                    .get(2)
-                    .and_then(|v| v.parse().ok())
-                    .ok_or_else(|| bad(line))?;
-                if !value.is_finite() {
-                    return Err(bad(line));
-                }
-                exp.set(name, value).map_err(|_| {
+                let word = f.get(2).ok_or_else(|| bad(line))?;
+                let applied = match word.parse::<f64>() {
+                    Ok(value) if value.is_finite() => exp.set(name, value),
+                    Ok(_) => return Err(bad(line)),
+                    Err(_) => exp.set_word(name, word),
+                };
+                applied.map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "config: unknown experiment `{name}` — the almond-axol package \
-                             and the axol-rt binary must be built from the same checkout \
-                             (rebuild with `axol rt.install`)"
+                            "config: unknown experiment `{name} {word}` — the almond-axol \
+                             package and the axol-rt binary must be built from the same \
+                             checkout (rebuild with `axol rt.install`)"
                         ),
                     )
                 })?;
@@ -1463,7 +1558,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 3\n\
+            "proto 4\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
@@ -1485,7 +1580,7 @@ mod tests {
         );
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 3\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 4\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
     }
 
     /// A bus carrying only some of the arm joints (a bench wrist assembly)
@@ -1494,7 +1589,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 3\n\
+            "proto 4\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
              gripper 0 can0 8\n",
@@ -1507,10 +1602,10 @@ mod tests {
         );
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
-        assert!(parse_config("proto 3\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
-        assert!(parse_config("proto 3\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 4\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 4\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
         assert!(parse_config(
-            "proto 3\n\
+            "proto 4\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n"
         )
@@ -1533,14 +1628,14 @@ mod tests {
         assert!(err.contains("no `proto` line"), "{err}");
         assert!(err.contains("axol rt.install"), "{err}");
         // A future client generation this core does not understand.
-        let err = error_of(&format!("proto 4\n{joint}"));
+        let err = error_of(&format!("proto 5\n{joint}"));
+        assert!(err.contains("proto 5"), "{err}");
         assert!(err.contains("proto 4"), "{err}");
-        assert!(err.contains("proto 3"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 3\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 4\n")).is_ok());
     }
 
     /// `exp` lines set the tracking experiments; a config without any runs
@@ -1549,12 +1644,12 @@ mod tests {
     #[test]
     fn parse_config_reads_experiments() {
         let joint = "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n";
-        let cfg = parse_config(&format!("proto 3\n{joint}")).unwrap();
+        let cfg = parse_config(&format!("proto 4\n{joint}")).unwrap();
         assert!(cfg.exp.is_default());
         assert_eq!(cfg.exp.friction_k_max, filter::FRICTION_FF_K_MAX);
 
         let cfg = parse_config(&format!(
-            "proto 3\n{joint}\
+            "proto 4\n{joint}\
              exp friction_k_max 400\n\
              exp friction_slew 30\n\
              exp stiction_gain 0.6\n\
@@ -1562,7 +1657,10 @@ mod tests {
              exp integrator_hz 0.3\n\
              exp integrator_freeze_deg 2\n\
              exp tracker_wire_vel 1\n\
-             exp tracker_accel_ff 0\n"
+             exp tracker_accel_ff 0\n\
+             exp dither_nm 0.2\n\
+             exp dither_hz 55\n\
+             exp dither_square 1\n"
         ))
         .unwrap();
         assert!(!cfg.exp.is_default());
@@ -1574,15 +1672,46 @@ mod tests {
         assert!((cfg.exp.integrator_freeze - 2.0_f64.to_radians()).abs() < 1e-15);
         assert!(cfg.exp.tracker_wire_vel);
         assert!(!cfg.exp.tracker_accel_ff);
+        assert_eq!(cfg.exp.dither_nm, 0.2);
+        assert_eq!(cfg.exp.dither_hz, 55.0);
+        assert!(cfg.exp.dither_square);
+        // Nothing asked for a wire mode, so the MIT frame stands.
+        assert_eq!(cfg.exp.wire_mode, WireMode::Mit);
 
-        let err = match parse_config(&format!("proto 3\n{joint}exp bogus 1\n")) {
+        let err = match parse_config(&format!("proto 4\n{joint}exp bogus 1\n")) {
             Ok(_) => panic!("accepted an unknown experiment"),
             Err(err) => err.to_string(),
         };
-        assert!(err.contains("unknown experiment `bogus`"), "{err}");
+        assert!(err.contains("unknown experiment `bogus 1`"), "{err}");
         assert!(err.contains("axol rt.install"), "{err}");
-        assert!(parse_config(&format!("proto 3\n{joint}exp friction_slew\n")).is_err());
-        assert!(parse_config(&format!("proto 3\n{joint}exp friction_slew nan\n")).is_err());
+        assert!(parse_config(&format!("proto 4\n{joint}exp friction_slew\n")).is_err());
+        assert!(parse_config(&format!("proto 4\n{joint}exp friction_slew nan\n")).is_err());
+    }
+
+    /// `wire_mode` is the one experiment whose value is a name rather than a
+    /// number, so it exercises the other half of the `exp` parser — and an
+    /// unreadable name has to be as fatal as an unreadable field, or a
+    /// mistyped mode would quietly run the production law.
+    #[test]
+    fn parse_config_reads_the_wire_mode() {
+        let joint = "joint 0 can0 shoulder_1 1 250 3.5 6.3 22.0 0.6 20 0.1 0\n";
+        for (word, want) in [
+            ("mit", WireMode::Mit),
+            ("a9", WireMode::A9),
+            ("tf", WireMode::Tf),
+        ] {
+            let cfg = parse_config(&format!("proto 4\n{joint}exp wire_mode {word}\n")).unwrap();
+            assert_eq!(cfg.exp.wire_mode, want);
+            assert_eq!(cfg.exp.is_default(), want == WireMode::Mit);
+        }
+        let err = match parse_config(&format!("proto 4\n{joint}exp wire_mode a10\n")) {
+            Ok(_) => panic!("accepted an unknown wire mode"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("unknown experiment `wire_mode a10`"), "{err}");
+        // A name where a number belongs, and a number where a name belongs.
+        assert!(parse_config(&format!("proto 4\n{joint}exp dither_hz fast\n")).is_err());
+        assert!(parse_config(&format!("proto 4\n{joint}exp wire_mode 9\n")).is_err());
     }
 }
 
@@ -2016,6 +2145,83 @@ fn bus_loop(
             return Ok(());
         }
     };
+    // A wire-mode experiment (`exp wire_mode`) changes which frame the
+    // MyActuator joints are commanded with. Check it against the firmware and
+    // report what it costs while the bus is still quiet and nothing is
+    // enabled — an operator reading the log later should not have to work out
+    // from a trace why measured position went blocky.
+    if cfg.exp.wire_mode != WireMode::Mit {
+        let mas: Vec<&bringup::ReadyMotor> = motors
+            .iter()
+            .filter(|m| m.vendor == Vendor::MyActuator)
+            .collect();
+        if cfg.exp.wire_mode == WireMode::Tf {
+            if let Some(m) = mas
+                .iter()
+                .find(|m| !m.version.is_some_and(|v| v >= proto::MA_FW_V44))
+            {
+                let _ = ready_tx.send(Err(io::Error::other(format!(
+                    "{iface}: {} (0x{:02X}) reports firmware VersionDate {} — the 0x73 \
+                     TF command arrived in V4.4 ({}), so `exp wire_mode tf` cannot run \
+                     on this motor; use `a9` or leave the default `mit`",
+                    m.joint,
+                    m.id,
+                    m.version
+                        .map_or_else(|| "unknown".to_string(), |v| v.to_string()),
+                    proto::MA_FW_V44,
+                ))));
+                return Ok(());
+            }
+        }
+        // The position-planning acceleration is a *stored* motor setting and
+        // decides what a streamed position target means: 0 tracks it through
+        // the position PI loop (what this experiment wants), anything else
+        // makes the motor plan its own ramp to each of the 240 targets a
+        // second it gets. The core only reads it — 0x43 writes to ROM and
+        // cannot even express 0.
+        let planning: Vec<String> = mas
+            .iter()
+            .map(
+                |m| match bringup::read_position_accel(&sock, m.id).ok().flatten() {
+                    Some(0.0) => format!("{}: direct tracking", m.joint),
+                    Some(a) => format!("{}: plans {:.0} dps/s", m.joint, a.to_degrees()),
+                    None => format!("{}: acceleration unreadable", m.joint),
+                },
+            )
+            .collect();
+        let _ = sock.drain();
+        send_text(
+            out_tx,
+            b'W',
+            &format!(
+                "{iface}: wire_mode {} — MyActuator joints are commanded with the {} frame \
+                 in tracked mode (passthrough and limp keep MIT). Feedback comes back on \
+                 the 0x240 frame: measured position 1 deg/LSB (45x coarser than MIT), \
+                 velocity 1 dps/LSB, torque reported as q-axis current{}. {}. Position \
+                 loop: {}",
+                cfg.exp.wire_mode.name(),
+                if cfg.exp.wire_mode == WireMode::A9 {
+                    "0xA9"
+                } else {
+                    "0x73"
+                },
+                if cfg.exp.wire_torque_nm_per_amp > 0.0 {
+                    format!(" scaled by {} Nm/A", cfg.exp.wire_torque_nm_per_amp)
+                } else {
+                    " (raw amps — set wire_torque_nm_per_amp to get Nm)".to_string()
+                },
+                if cfg.exp.wire_mode == WireMode::A9 {
+                    "No host feedforward reaches the motor in this mode: gravity, \
+                     friction, damping, stiction, integrator and dither are all inert, \
+                     and the motor's stored position-loop PI is the whole controller"
+                } else {
+                    "The host feedforward reaches the motor quantised onto the frame's \
+                     int8 percent-of-rated-current field"
+                },
+                planning.join(", "),
+            ),
+        );
+    }
     if let Err(err) = bringup::enable(&sock, iface, &motors) {
         let _ = ready_tx.send(Err(err));
         return Ok(());
@@ -2075,9 +2281,10 @@ fn bus_loop(
         integ: Integrator,
         v_trk: LowPass,
         a_trk: LowPass,
+        dither: Dither,
     }
     let mut damp: Vec<Damp> = (0..N_SLOTS)
-        .map(|_| Damp {
+        .map(|slot| Damp {
             v_cmd: LpDiff::new(CONTROL_CUTOFF),
             a_cmd: LpDiff::new(CONTROL_CUTOFF),
             v_cmd_fast: LpDiff::new(VEL_CUTOFF),
@@ -2089,6 +2296,7 @@ fn bus_loop(
             integ: Integrator::new(),
             v_trk: LowPass::new(),
             a_trk: LowPass::new(),
+            dither: Dither::new(slot),
         })
         .collect();
     let exp = &cfg.exp;
@@ -2451,6 +2659,7 @@ fn bus_loop(
                         d.integ.reset();
                         d.v_trk.seed(0.0);
                         d.a_trk.seed(0.0);
+                        d.dither.reset();
                     };
                     let Terms {
                         v_wire,
@@ -2461,6 +2670,7 @@ fn bus_loop(
                         v_damp,
                         stiction_ff,
                         integral_ff,
+                        dither_ff,
                     } = if tracked && overrun {
                         // The gap since the last command is not a trajectory
                         // segment the motor followed — it held. Re-prime the
@@ -2526,6 +2736,19 @@ fn bus_loop(
                             }
                             None => (0.0, d.integ.update(0.0, 0.0, 0.0, 0.0, 0.0)),
                         };
+                        // Stiction-breaking dither. It rides the commanded
+                        // velocity — noise-free, and what the trajectory is
+                        // asking for — so it fades out as the joint gets
+                        // moving, and each slot is a golden angle apart in
+                        // phase (see `filter::Dither`).
+                        let dither_ff = d.dither.update(
+                            v_cmd,
+                            exp.dither_nm,
+                            exp.dither_hz,
+                            tick_dt,
+                            exp.dither_square,
+                            exp.dither_fade_vel,
+                        );
                         let damp_ok = feedback_fresh[m.slot]
                             && timing_on_time
                             && !timing_health.degraded
@@ -2551,14 +2774,71 @@ fn bus_loop(
                             v_damp,
                             stiction_ff,
                             integral_ff,
+                            dither_ff,
                         }
                     } else {
                         reseed(d);
                         Terms::default()
                     };
                     let damping_ff = c.kd_host * v_damp;
-                    let t_ff =
-                        c.t_ff + friction_ff + inertia_ff + damping_ff + stiction_ff + integral_ff;
+                    let t_ff = c.t_ff
+                        + friction_ff
+                        + inertia_ff
+                        + damping_ff
+                        + stiction_ff
+                        + integral_ff
+                        + dither_ff;
+                    // Which frame carries this command (`exp wire_mode`).
+                    // Only MyActuator joints, and only while tracking: a
+                    // passthrough tick (gravity comp, bring-up hold) and
+                    // every limp tick say "kp = 0 with this feedforward",
+                    // which neither position frame can express, so both keep
+                    // MIT whatever the experiment asks for.
+                    let wire = if m.vendor == Vendor::MyActuator && tracked && !is_limp {
+                        exp.wire_mode
+                    } else {
+                        WireMode::Mit
+                    };
+                    // The tracker already bounds the trajectory by this, so
+                    // the frame's speed cap is a runaway guard unless
+                    // `wire_speed_scale` is pulled below 1.
+                    let wire_speed = m.max_vel * exp.wire_speed_scale;
+                    let (arb, frame, wire_tau) = match wire {
+                        WireMode::Mit => (
+                            match m.vendor {
+                                Vendor::MyActuator => proto::MA_MC_REQ + m.id as u16,
+                                Vendor::Damiao => m.id as u16,
+                            },
+                            proto::mit_encode(p_cmd, v_wire, c.kp, c.kd, t_ff, &m.ranges),
+                            t_ff,
+                        ),
+                        WireMode::A9 => (
+                            proto::MA_REQ + m.id as u16,
+                            proto::ma_force_pos_encode(p_cmd, wire_speed, exp.wire_torque_pct),
+                            // The frame carries no feedforward at all — the
+                            // torque byte is a limit, not a command.
+                            f64::NAN,
+                        ),
+                        WireMode::Tf => {
+                            // The int8 field is percent of rated current;
+                            // `t_max/100` is the default bridge to Nm and an
+                            // assumption, not a measurement (see the Python
+                            // `wire_ff_nm_per_pct` docs). Report what the
+                            // quantised field actually asks for, not what the
+                            // control law wanted.
+                            let per_pct = if exp.wire_ff_nm_per_pct > 0.0 {
+                                exp.wire_ff_nm_per_pct
+                            } else {
+                                m.ranges.t_max / 100.0
+                            };
+                            let pct = (t_ff / per_pct).round().clamp(-128.0, 127.0);
+                            (
+                                proto::MA_REQ + m.id as u16,
+                                proto::ma_pos_torque_ff_encode(p_cmd, wire_speed, pct),
+                                pct * per_pct,
+                            )
+                        }
+                    };
                     if trace_this_tick && trace_tx.is_some() {
                         trace_pending[m.slot] = Some(TraceRow {
                             tick: ticks,
@@ -2583,7 +2863,9 @@ fn bus_loop(
                             damping_ff,
                             stiction_ff,
                             integral_ff,
+                            dither_ff,
                             total_ff: t_ff,
+                            wire_tau,
                             kd_host: c.kd_host,
                             damp_w0: c.damp_w0,
                             damp_q: c.damp_q,
@@ -2591,11 +2873,6 @@ fn bus_loop(
                             fb_dt: f64::NAN,
                         });
                     }
-                    let frame = proto::mit_encode(p_cmd, v_wire, c.kp, c.kd, t_ff, &m.ranges);
-                    let arb = match m.vendor {
-                        Vendor::MyActuator => proto::MA_MC_REQ + m.id as u16,
-                        Vendor::Damiao => m.id as u16,
-                    };
                     (arb, frame)
                 };
                 match guarded_send(&sock, arb, &frame, &mut enobufs_since)? {
@@ -2656,7 +2933,11 @@ fn bus_loop(
                 let Some(frame) = sock.recv_timeout(reply_deadline - now)? else {
                     break;
                 };
-                let (idx, pos, vel, tau) = match frame.id {
+                // The last field says the sample came back on a 0x240
+                // control reply (a `wire_mode` tick) rather than the MIT
+                // feedback frame, and is therefore coarse: 1 deg/LSB
+                // position, 1 dps/LSB velocity, current in place of torque.
+                let (idx, pos, vel, tau, coarse) = match frame.id {
                     id if (0x501..=0x505).contains(&id) => {
                         let motor_id = (id - 0x500) as u8;
                         let Some(idx) = motors.iter().position(|m| m.id == motor_id) else {
@@ -2667,7 +2948,29 @@ fn bus_loop(
                             motors[idx].ranges.p_max,
                             motors[idx].ranges.t_max,
                         );
-                        (idx, pos, vel, tau)
+                        (idx, pos, vel, tau, false)
+                    }
+                    // Only while a wire mode is configured: otherwise a
+                    // 0x240 frame on a streaming bus is a stray bring-up
+                    // reply, not feedback.
+                    id if (0x241..=0x245).contains(&id) && exp.wire_mode != WireMode::Mit => {
+                        let motor_id = (id - 0x240) as u8;
+                        let Some(idx) = motors.iter().position(|m| m.id == motor_id) else {
+                            continue;
+                        };
+                        let (pos, vel, current) = proto::ma_decode_control_reply(&frame.data);
+                        // The frame's torque channel is q-axis current in
+                        // amps. Without a measured torque constant
+                        // (`wire_torque_nm_per_amp`) it is passed through as
+                        // it stands, and everything downstream that reads
+                        // "torque" — the contact watchdog above all — is
+                        // reading amps. The arm-time warning says so.
+                        let tau = if exp.wire_torque_nm_per_amp > 0.0 {
+                            current * exp.wire_torque_nm_per_amp
+                        } else {
+                            current
+                        };
+                        (idx, pos, vel, tau, true)
                     }
                     id if (0x16..=0x18).contains(&id) => {
                         let motor_id = (id - 0x10) as u8;
@@ -2681,7 +2984,7 @@ fn bus_loop(
                             m.ranges.v_max,
                             m.ranges.t_max,
                         );
-                        (idx, fb.position, fb.velocity, fb.torque)
+                        (idx, fb.position, fb.velocity, fb.torque, false)
                     }
                     _ => continue,
                 };
@@ -2705,7 +3008,18 @@ fn bus_loop(
                         .last_fb
                         .map_or(0.0, |p| recv_time.duration_since(p).as_secs_f64());
                     d.last_fb = Some(recv_time);
-                    d.vel_meas = d.v_meas.update(pos, dt);
+                    if coarse {
+                        // A 1 deg/LSB position differentiates into nothing
+                        // but quantisation noise at 240 Hz, so take the
+                        // motor's own speed estimate instead — coarse at
+                        // 1 dps/LSB, but not noise. The differentiator is
+                        // re-primed so the first MIT tick after this (a
+                        // passthrough or limp tick) starts clean.
+                        d.v_meas.seed(pos);
+                        d.vel_meas = vel;
+                    } else {
+                        d.vel_meas = d.v_meas.update(pos, dt);
+                    }
                     (d.vel_meas, dt)
                 };
                 if let (Some(tx), Some(mut row)) =

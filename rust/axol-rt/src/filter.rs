@@ -163,6 +163,77 @@ pub fn stiction(err: f64, sat: f64, fc: f64, gain: f64, err_scale: f64) -> f64 {
     gain * fc * (err / err_scale.max(1e-9)).tanh() * (1.0 - sat.abs())
 }
 
+/// Per-channel phase offset of the torque dither: the golden angle,
+/// `π(3 − √5)` — `DITHER_PHASE_STAGGER` in `almond_axol.robot.control`.
+/// Written out because `sqrt` is not available in a `const`; the test below
+/// pins it to the expression.
+pub const DITHER_PHASE_STAGGER: f64 = 2.399_963_229_728_653;
+
+/// Single-channel stiction-breaking torque dither — `TorqueDither` in
+/// `almond_axol.robot.control`, one instance per slot (the Python class is
+/// N-channel; the core keeps its per-joint state in per-joint structs).
+///
+/// A small oscillation added to the feedforward keeps the joint's friction
+/// sliding rather than re-sticking between cycles, which is the classic fix
+/// for the stick-slip stairs a slow position command leaves behind. Phase
+/// advances on an accumulator, so a late tick shifts phase instead of
+/// frequency, and each slot starts [`DITHER_PHASE_STAGGER`] apart so seven
+/// joints never push the structure in unison.
+pub struct Dither {
+    phase0: f64,
+    phase: f64,
+}
+
+impl Dither {
+    pub fn new(channel: usize) -> Self {
+        let phase0 = (channel as f64 * DITHER_PHASE_STAGGER).rem_euclid(std::f64::consts::TAU);
+        Self {
+            phase0,
+            phase: phase0,
+        }
+    }
+
+    /// Advance one step and return the dither torque (Nm). `amplitude <= 0`
+    /// or `hz <= 0` is off and leaves the phase where it was (matching the
+    /// Python original). `fade_vel > 0` fades the amplitude out with
+    /// `1 − tanh(|v| / fade_vel)`, so the dither acts where the joint is
+    /// stuck and stops being heat and noise once it is moving.
+    pub fn update(
+        &mut self,
+        velocity: f64,
+        amplitude: f64,
+        hz: f64,
+        dt: f64,
+        square: bool,
+        fade_vel: f64,
+    ) -> f64 {
+        if amplitude <= 0.0 || hz <= 0.0 {
+            return 0.0;
+        }
+        let step = if dt > 0.0 {
+            std::f64::consts::TAU * hz * dt
+        } else {
+            0.0
+        };
+        self.phase = (self.phase + step).rem_euclid(std::f64::consts::TAU);
+        let mut wave = self.phase.sin();
+        if square {
+            wave = if wave >= 0.0 { 1.0 } else { -1.0 };
+        }
+        let fade = if fade_vel > 0.0 {
+            1.0 - (velocity.abs() / fade_vel).tanh()
+        } else {
+            1.0
+        };
+        amplitude * fade * wave
+    }
+
+    /// Restart at this channel's staggered phase.
+    pub fn reset(&mut self) {
+        self.phase = self.phase0;
+    }
+}
+
 /// Clamped, freeze-gated position-error integrator → torque —
 /// `ErrorIntegrator` in `almond_axol.robot.control`. `ki` is Nm/(rad·s),
 /// `clamp` the anti-windup bound on the output (Nm); `|err| > freeze` (rad)
@@ -350,6 +421,57 @@ mod tests {
                 "bandpass sample {k}: got {got:e}, want {want:e}"
             );
         }
+    }
+
+    /// Golden vectors from `almond_axol.robot.control.TorqueDither`: channel
+    /// 3 (the elbow's stagger offset) of a 40 Hz sine dither at 0.25 Nm,
+    /// faded against a 1 Hz 0.02 rad/s velocity with `fade_vel = 0.05`.
+    #[test]
+    fn dither_matches_python() {
+        let golden = [
+            2.309309714758029e-01,
+            3.219017344380157e-02,
+            -1.942474090353159e-01,
+            -2.236858958780299e-01,
+            -3.117141857461361e-02,
+            1.880510214080443e-01,
+            2.164995766404254e-01,
+            3.016366899355213e-02,
+            -1.819382352135718e-01,
+            -2.094295231161269e-01,
+            -2.917492986113358e-02,
+            1.759571782350752e-01,
+        ];
+        let mut d = Dither::new(3);
+        for (k, want) in golden.iter().enumerate() {
+            let v = 0.02 * (2.0 * std::f64::consts::PI * k as f64 * DT).sin();
+            let got = d.update(v, 0.25, 40.0, DT, false, 0.05);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "dither sample {k}: got {got:e}, want {want:e}"
+            );
+        }
+    }
+
+    /// The stagger is the golden angle, and a 40 Hz square on the 240 Hz loop
+    /// is three ticks each way — the shape that actually reaches the motor.
+    #[test]
+    fn dither_square_and_stagger() {
+        assert!(
+            (DITHER_PHASE_STAGGER - std::f64::consts::PI * (3.0 - 5.0_f64.sqrt())).abs() < 1e-15
+        );
+        let mut d = Dither::new(0);
+        let got: Vec<f64> = (0..12)
+            .map(|_| d.update(0.0, 0.25, 40.0, DT, true, 0.0))
+            .collect();
+        assert_eq!(
+            got,
+            vec![0.25, 0.25, 0.25, -0.25, -0.25, -0.25, 0.25, 0.25, 0.25, -0.25, -0.25, -0.25]
+        );
+        // Off is off, and leaves the phase untouched.
+        assert_eq!(d.update(0.0, 0.0, 40.0, DT, true, 0.0), 0.0);
+        assert_eq!(d.update(0.0, 0.25, 0.0, DT, true, 0.0), 0.0);
+        assert_eq!(d.update(0.0, 0.25, 40.0, DT, true, 0.0), 0.25);
     }
 
     #[test]
