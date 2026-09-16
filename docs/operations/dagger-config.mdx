@@ -44,7 +44,7 @@ axol collect-dagger --policy_path myorg/pick-act --policy_type act \
 |---|---|---|
 | `--repo_id` | required | Dataset id, `<user>/<dataset>`. |
 | `--task` | required | Task description stored with every frame and sent to the policy. |
-| `--fps` | `60` | Recording rate. Camera frames are captured at this rate. |
+| `--fps` | `30` | Recording rate and the policy state's control rate; must match the policy's training fps. Cameras capture at 60 and are decimated to this before encoding. |
 | `--teleop_hz` | `120` | Motor command rate (Hz) while you intervene, independent of `fps`. |
 | `--dataset_resolution` | `SVGA` | Resolution the recorded video is downscaled to, and the resolution the policy sees: `SVGA`, `HD1080`, or `HD1200`. |
 | `--vcodec` | per platform | Dataset video codec: `h264` on Jetson, `auto` elsewhere. |

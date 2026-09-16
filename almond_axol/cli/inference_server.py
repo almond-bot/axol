@@ -48,7 +48,7 @@ class InferenceServerConfig:
 
     host: str = "0.0.0.0"
     port: int = 8765
-    fps: int = 60
+    fps: int = 30
     log_level: LogLevel = "INFO"
 
 

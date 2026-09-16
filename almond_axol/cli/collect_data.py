@@ -652,7 +652,15 @@ class CollectDataConfig:
     # (intentional hand motion lives below ~10 Hz). 0 disables. Ignored for
     # on-robot collection, whose FK poses come from joint encoders.
     mantis_smooth_hz: float = 10.0
-    fps: int = 60
+    # Dataset frame rate: the recorder samples observations/actions at this
+    # rate and the relay decimates every recording camera's 60 fps capture to
+    # it before the encoder. 30 halves the dataset encode/recorder load on the
+    # Orin — with the headset streaming, 60 fps across four SVGA branches left
+    # the encoders starving under any extra host load (2026-09-15: concealed
+    # frames, the recorder's exposure budget tripping, the episode discarded).
+    # Teleop motion itself runs at ``teleop_hz`` regardless. Policies must be
+    # run at the fps they were trained on (run-policy checks).
+    fps: int = 30
     teleop_hz: int = 120
     # Resolution the recorded dataset video is downscaled to (on the relay's VIC,
     # before frames cross to the control process). The headset/teleop stream

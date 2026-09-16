@@ -114,6 +114,7 @@ from ..utils.logquiet import quiet_noisy_loggers
 from .config import DatasetResolution, LogLevel, PolicyType, parse
 from .run_policy import (
     _GATE_CONTACT,
+    _check_training_fps,
     _QueuePolicyControl,
     _StdinPolicyControl,
 )
@@ -219,7 +220,15 @@ class DaggerConfig:
     # Safety cap per episode; hitting it saves the episode. DAgger episodes
     # include interventions, so the default is generous.
     episode_time_s: int = 600
-    fps: int = 60
+    # Dataset rate and the policy state's control rate — must equal the fps
+    # the policy was trained at (collect-data's default, 30; see its note on
+    # why 30 rather than 60); checked against the checkpoint's metadata at
+    # start like run-policy. Teleop ticks at ``teleop_hz`` regardless.
+    fps: int = 30
+    # Escape hatch for that check (see RunPolicyConfig.allow_fps_mismatch):
+    # a detectable mismatch is otherwise a hard error, since the policy would
+    # move at the wrong speed and the dataset be written at the wrong rate.
+    allow_fps_mismatch: bool = False
     # Velocity/acceleration envelope over the policy's arm actions (rad/s,
     # rad/s²) — see PolicyActionLimiter. Transparent for normal trained
     # motion; only engages on discontinuities (policy outliers, re-plans from
@@ -1067,6 +1076,12 @@ def _run(
     root = cfg.root
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
+
+    # Fail fast (before any hardware, the relay, or the dataset) if --fps
+    # disagrees with the fps the checkpoint was trained at — DAgger is the
+    # path that loads existing checkpoints, so a 60 fps policy under the
+    # 30 fps default would otherwise run and record at half speed.
+    _check_training_fps(cfg)
 
     # Resolve and validate the destination before camera enumeration, workers,
     # the relay, or the robot can start. LeRobotDataset.resume keeps the existing
