@@ -2513,11 +2513,17 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
     # LeRobot's codebase_version describes the dataset format, not the Axol
     # URDF/world frame.  Record our pose-frame provenance on fresh Cartesian
     # datasets so future migrations can distinguish them without guessing.
+    # A Mantis session also records which tracker→gripper transforms its
+    # poses were mapped through (``mantis_tcp_transform``), for the same
+    # reason.
     action_names = (config["features"].get("action") or {}).get("names") or []
     if any("_ee." in name for name in action_names):
         from .cartesian_frame import write_cartesian_frame_marker
 
-        write_cartesian_frame_marker(config["dataset_root"])
+        write_cartesian_frame_marker(
+            config["dataset_root"],
+            mantis_tcp_transform=config.get("mantis_tcp_transform"),
+        )
     return dataset
 
 

@@ -37,6 +37,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from typing import Any
 
 import numpy as np
 
@@ -55,15 +56,19 @@ class TCPPoseSnapshot:
     pose_host_ts: float | None
     left: tuple[float, ...]
     right: tuple[float, ...]
+    # Sides whose absolute target lay beyond the arm's reach soft-clamp when
+    # this pose was solved (Mantis QA; empty on the robot).
+    out_of_reach: tuple[str, ...] = ()
 
     @classmethod
     def from_message(
-        cls, tcp: dict[str, list[float]], pose_host_ts: float | None
+        cls, tcp: dict[str, Any], pose_host_ts: float | None
     ) -> TCPPoseSnapshot:
         return cls(
             pose_host_ts=pose_host_ts,
             left=tuple(tcp["left"]),
             right=tuple(tcp["right"]),
+            out_of_reach=tuple(tcp.get("out_of_reach") or ()),
         )
 
 
@@ -154,6 +159,9 @@ class VRTeleopCore:
         # coords ({"pos": [x,y,z], "quat": [x,y,z,w]}), as reported by the IK
         # worker. ``None`` before the first engage / outside absolute mode.
         self.abs_base: dict | None = None
+        # Last engage rejection reason the IK worker reported (logged once per
+        # distinct reason; see _handle_engage_rejection).
+        self._last_engage_rejection: str | None = None
         # Absolute (Mantis) mode: latest base-frame TCP target per side and its
         # host capture timestamp, published with one reference assignment.
         # Keeping the lists received over IPC out of shared state also prevents
@@ -1191,6 +1199,10 @@ class VRTeleopCore:
                     if isinstance(result, tuple) and result[0] == "q":
                         _, q_arr, base_msg, tcp_msg = result
                         self.set_target(q_arr)
+                        if self._handle_engage_rejection(base_msg):
+                            # The worker refused the base fit; no anchor exists,
+                            # so the arms hold and the operator must re-engage.
+                            base_msg = None
                         self.abs_base = base_msg
                         pose_host_ts = getattr(frame, "t_host", None)
                         self._publish_tcp_pose(tcp_msg, pose_host_ts)
@@ -1211,8 +1223,28 @@ class VRTeleopCore:
 
             self._pace(t0, ik_interval)
 
+    def _handle_engage_rejection(self, base_msg: object) -> bool:
+        """Disengage on an IK-worker ``{"rejected": reason}`` base message.
+
+        The worker refuses an absolute engage whose gripper orientations say
+        the left/right rigs are in the opposite hands (see
+        ``IKWorker._side_swap_rejection``). Nothing was anchored, so the
+        session goes through the same forced-disengage gate as a tracking
+        loss: both grips must be released and squeezed again. Returns
+        ``True`` when ``base_msg`` was such a rejection.
+        """
+        if not isinstance(base_msg, dict) or "rejected" not in base_msg:
+            self._last_engage_rejection = None
+            return False
+        reason = str(base_msg["rejected"])
+        if reason != self._last_engage_rejection:
+            self._last_engage_rejection = reason
+            self._logger.error("Teleop engage rejected: %s", reason)
+        self._disengage_all()
+        return True
+
     def _publish_tcp_pose(
-        self, tcp_msg: dict[str, list[float]] | None, pose_host_ts: float | None
+        self, tcp_msg: dict[str, Any] | None, pose_host_ts: float | None
     ) -> None:
         """Publish an IK TCP result and its source timestamp as one sample."""
         previous = self.last_tcp_snapshot

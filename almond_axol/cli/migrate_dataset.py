@@ -1,13 +1,27 @@
-"""Migrate pre-v0.1.32 Cartesian datasets to the forward-facing URDF frame.
+"""In-place repairs for Axol Cartesian LeRobot datasets.
 
-Axol v0.1.32 added a +90 degree yaw to the URDF root.  Cartesian datasets
-recorded by earlier versions therefore contain end-effector poses in the old
-world frame.  Replaying those poses with the new URDF rotates the motion by
-roughly 90 degrees.
+Two migrations share one backup/transform/refresh-stats pipeline:
 
-This command applies the same rigid transform as the URDF change to every
-Cartesian action and observation, then refreshes per-episode and dataset
-statistics.  Videos and all non-Cartesian values are left untouched.
+``--from-version`` — pre-v0.1.32 URDF frame. Axol v0.1.32 added a +90 degree
+yaw to the URDF root.  Cartesian datasets recorded by earlier versions
+therefore contain end-effector poses in the old world frame, and replaying
+them with the new URDF rotates the motion by roughly 90 degrees.  The
+migration applies the same rigid transform as the URDF change to every
+Cartesian action and observation.
+
+``--mantis-tcp-rotation`` — Mantis datasets recorded by axol <= 0.2.4.  Those
+mapped every tracker pose to the gripper through an Rx(+90 deg)
+tracker→gripper rotation that was ~90 degrees off the flat-back Vive mount
+(corrected to Ry(180 deg) in :mod:`almond_axol.mantis.calibration`), so the
+recorded gripper orientations are pitched away from where the operator held
+the rig.  The migration replaces that body-frame rotation.  ``--swap-sides``
+additionally repairs a session whose left/right trackers were bound to the
+opposite rigs: the engage fit then faced the base backwards, so the columns
+are swapped and every pose is yawed 180 degrees about the rest-pose gripper
+midpoint.
+
+Both refresh per-episode and dataset statistics afterwards.  Videos, gripper
+values, timestamps, and all non-Cartesian values are left untouched.
 """
 
 from __future__ import annotations
@@ -17,6 +31,8 @@ import json
 import re
 import stat
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +43,12 @@ from ..utils.state_files import (
 )
 
 _MIGRATION_ID = "axol-urdf-root-yaw-v0.1.32"
+_MANTIS_TCP_MIGRATION_ID = "axol-mantis-vive-tcp-rotation-v0.2.5"
 _FIELDS = ("action", "observation.state")
 _ARMS = ("left", "right")
+
+# Per-arm Cartesian column layout: (position indices, rotation-vector indices).
+_ArmLayout = tuple[list[int], list[int]]
 
 
 def _atomic_json(path: Path, data: dict[str, Any]) -> None:
@@ -132,6 +152,86 @@ def _transform_matrix(matrix: Any, arms: list[tuple[list[int], list[int]]]) -> A
     return out
 
 
+def _rest_gripper_midpoint() -> Any:
+    """Base-frame midpoint of the two rest-pose gripper TCPs.
+
+    The absolute engage fit places this point on the measured gripper
+    midpoint, so a 180 degree base-yaw error (swapped rigs) pivots every
+    recorded position about it. Computed from the default teleop rest pose
+    with the URDF forward kinematics (JAX; a few seconds on first use).
+    """
+    import numpy as np
+
+    from ..kinematics.fk import AxolForwardKinematics
+    from ..teleop.config import VRTeleopConfig
+
+    config = VRTeleopConfig()
+    left, right = AxolForwardKinematics().ee_poses(
+        np.asarray(config.rest_pose_left, dtype=np.float32),
+        np.asarray(config.rest_pose_right, dtype=np.float32),
+    )
+    return 0.5 * (np.asarray(left[:3], dtype=np.float64) + right[:3])
+
+
+def _mantis_tcp_correction_matrix() -> Any:
+    """Body-frame rotation turning a legacy Rx(+90) gripper pose into Ry(180)."""
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    from ..mantis.calibration import (
+        LEGACY_VIVE_TCP_ROTATION_QUAT,
+        VIVE_TCP_ROTATION_QUAT,
+    )
+
+    legacy = Rotation.from_quat(np.asarray(LEGACY_VIVE_TCP_ROTATION_QUAT))
+    current = Rotation.from_quat(np.asarray(VIVE_TCP_ROTATION_QUAT))
+    # Recorded: R_rec = R_base^T R_tracker R_legacy. Wanted:
+    # R_base^T R_tracker R_current = R_rec R_legacy^-1 R_current.
+    return legacy.inv() * current
+
+
+def _transform_mantis_tcp(
+    matrix: Any,
+    arms: list[_ArmLayout],
+    *,
+    swap_sides: bool,
+    rest_midpoint: Any,
+) -> Any:
+    """Replace the legacy tracker→gripper rotation; optionally un-swap the rigs.
+
+    Positions are untouched by the rotation fix (the mount translation was
+    not changed). With ``swap_sides`` the left/right pose columns are
+    exchanged first, then every pose is yawed 180 degrees about the
+    rest-pose gripper midpoint — the engage fit's own pivot — so the frame
+    matches the fit that a correctly bound session would have produced.
+    """
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    out = np.asarray(matrix, dtype=np.float32).copy()
+    correction = _mantis_tcp_correction_matrix()
+    if swap_sides:
+        if len(arms) != 2:
+            raise ValueError("--swap-sides needs both a left and a right arm layout.")
+        (l_pos, l_rot), (r_pos, r_rot) = arms
+        left_pose = out[:, [*l_pos, *l_rot]].copy()
+        out[:, [*l_pos, *l_rot]] = out[:, [*r_pos, *r_rot]]
+        out[:, [*r_pos, *r_rot]] = left_pose
+    yaw_flip = Rotation.from_rotvec(np.array([0.0, 0.0, np.pi]))
+    mid = np.asarray(rest_midpoint, dtype=np.float64)
+    for pos_idx, rot_idx in arms:
+        old_rotation = Rotation.from_rotvec(out[:, rot_idx].astype(np.float64))
+        fixed = old_rotation * correction
+        if swap_sides:
+            fixed = yaw_flip * fixed
+            pos = out[:, pos_idx].astype(np.float64) - mid
+            # Rz(180): (x, y, z) -> (-x, -y, z) about the pivot.
+            out[:, pos_idx[0]] = (-pos[:, 0] + mid[0]).astype(np.float32)
+            out[:, pos_idx[1]] = (-pos[:, 1] + mid[1]).astype(np.float32)
+        out[:, rot_idx] = fixed.as_rotvec().astype(np.float32)
+    return out
+
+
 def _table_matrix(table: Any, field: str) -> Any:
     import numpy as np
 
@@ -162,11 +262,11 @@ def _write_parquet_atomic(path: Path, table: Any) -> None:
 
 
 def _backup_files(
-    dataset_root: Path, files: list[Path], backup_root: Path
+    dataset_root: Path, files: list[Path], backup_root: Path, migration_id: str
 ) -> dict[str, Any]:
     marker = dataset_root / "meta" / "axol.json"
     manifest: dict[str, Any] = {
-        "migration": _MIGRATION_ID,
+        "migration": migration_id,
         "state": "backed_up",
         "files": [str(path.relative_to(dataset_root)) for path in files],
         "marker_existed": marker.exists(),
@@ -259,20 +359,30 @@ def _refresh_episode_stats(
     return all_stats
 
 
-def migrate_dataset(
-    dataset_root: Path, *, source_version: str, dry_run: bool = False
+@dataclass(frozen=True)
+class _Plan:
+    """One in-place migration: eligibility, the pose transform, the marker."""
+
+    migration_id: str
+    # Raises ValueError when the dataset (info.json + parsed meta/axol.json,
+    # or None when absent) must not receive this migration.
+    check_eligible: Callable[[dict[str, Any], dict[str, Any] | None], None]
+    # Rewrites one (rows, dims) float matrix given its per-arm layout.
+    transform: Callable[[Any, list[_ArmLayout]], Any]
+    # Records the migration in meta/axol.json once the data is rewritten.
+    write_marker: Callable[[Path], None]
+
+
+def _run_migration(
+    dataset_root: Path, plan: _Plan, *, dry_run: bool = False
 ) -> dict[str, int]:
-    """Apply the pre-v0.1.32 -> current URDF frame migration in place."""
+    """Back up, transform, refresh stats, and mark — or restore on failure."""
     import pyarrow.parquet as pq
     from lerobot.datasets.compute_stats import aggregate_stats
     from lerobot.datasets.utils import serialize_dict
 
-    from ..recording.cartesian_frame import (
-        CARTESIAN_FRAME_ID,
-        write_cartesian_frame_marker,
-    )
+    from ..recording.cartesian_frame import read_cartesian_frame_marker
 
-    source_version = _validate_source_version(source_version)
     dataset_root = dataset_root.resolve()
     info_path = dataset_root / "meta" / "info.json"
     info = json.loads(info_path.read_text())
@@ -286,7 +396,7 @@ def migrate_dataset(
             "and meta/stats.json. No files were changed."
         )
 
-    backup_root = dataset_root / "meta" / "migrations" / _MIGRATION_ID
+    backup_root = dataset_root / "meta" / "migrations" / plan.migration_id
     manifest_path = backup_root / "manifest.json"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
@@ -298,15 +408,7 @@ def migrate_dataset(
             )
             _restore_backup(dataset_root, backup_root, manifest)
 
-    marker_path = dataset_root / "meta" / "axol.json"
-    if marker_path.exists():
-        marker = json.loads(marker_path.read_text())
-        if marker.get("cartesian_pose_frame") == CARTESIAN_FRAME_ID:
-            raise ValueError("Dataset is already in the v0.1.32+ Cartesian pose frame.")
-        raise ValueError(
-            f"Dataset has an unknown Cartesian pose-frame marker at {marker_path}; "
-            "refusing to guess."
-        )
+    plan.check_eligible(info, read_cartesian_frame_marker(dataset_root))
 
     row_count = sum(pq.ParquetFile(path).metadata.num_rows for path in data_files)
     summary = {
@@ -317,9 +419,14 @@ def migrate_dataset(
     if dry_run:
         return summary
 
+    marker_path = dataset_root / "meta" / "axol.json"
     files_to_backup = [*data_files, *episode_files, stats_path]
+    if marker_path.is_file():
+        files_to_backup.append(marker_path)
     if not manifest_path.exists():
-        manifest = _backup_files(dataset_root, files_to_backup, backup_root)
+        manifest = _backup_files(
+            dataset_root, files_to_backup, backup_root, plan.migration_id
+        )
     else:
         manifest = json.loads(manifest_path.read_text())
         manifest["state"] = "backed_up"
@@ -334,7 +441,7 @@ def migrate_dataset(
                 if field not in table.column_names:
                     raise ValueError(f"{path} is missing the declared {field} column.")
                 table = _replace_matrix(
-                    table, field, _transform_matrix(_table_matrix(table, field), arms)
+                    table, field, plan.transform(_table_matrix(table, field), arms)
                 )
             _write_parquet_atomic(path, table)
 
@@ -347,14 +454,7 @@ def migrate_dataset(
             raise ValueError("No episode statistics were found.")
         _atomic_json(stats_path, serialize_dict(aggregate_stats(episode_stats)))
 
-        write_cartesian_frame_marker(
-            dataset_root,
-            migration={
-                "id": _MIGRATION_ID,
-                "source_axol_version": source_version,
-                "target": "axol >= v0.1.32",
-            },
-        )
+        plan.write_marker(dataset_root)
         manifest["state"] = "complete"
         _atomic_json(manifest_path, manifest)
     except BaseException:
@@ -366,14 +466,161 @@ def migrate_dataset(
     return summary
 
 
+def migrate_dataset(
+    dataset_root: Path, *, source_version: str, dry_run: bool = False
+) -> dict[str, int]:
+    """Apply the pre-v0.1.32 -> current URDF frame migration in place."""
+    from ..recording.cartesian_frame import (
+        CARTESIAN_FRAME_ID,
+        write_cartesian_frame_marker,
+    )
+
+    source_version = _validate_source_version(source_version)
+
+    def check_eligible(_info: dict[str, Any], marker: dict[str, Any] | None) -> None:
+        if marker is None:
+            return
+        if marker.get("cartesian_pose_frame") == CARTESIAN_FRAME_ID:
+            raise ValueError("Dataset is already in the v0.1.32+ Cartesian pose frame.")
+        raise ValueError(
+            "Dataset has an unknown Cartesian pose-frame marker at "
+            f"{dataset_root / 'meta' / 'axol.json'}; refusing to guess."
+        )
+
+    def write_marker(root: Path) -> None:
+        write_cartesian_frame_marker(
+            root,
+            migration={
+                "id": _MIGRATION_ID,
+                "source_axol_version": source_version,
+                "target": "axol >= v0.1.32",
+            },
+        )
+
+    return _run_migration(
+        dataset_root,
+        _Plan(
+            migration_id=_MIGRATION_ID,
+            check_eligible=check_eligible,
+            transform=_transform_matrix,
+            write_marker=write_marker,
+        ),
+        dry_run=dry_run,
+    )
+
+
+def migrate_mantis_tcp_rotation(
+    dataset_root: Path,
+    *,
+    swap_sides: bool = False,
+    dry_run: bool = False,
+    rest_midpoint: Any | None = None,
+) -> dict[str, int]:
+    """Repair a Mantis dataset recorded with the retired Rx(+90) Vive rotation.
+
+    Eligible datasets are Mantis-recorded (``robot_type`` ``axol_mantis``),
+    already in the v0.1.32+ pose frame, and carry no
+    ``mantis_tcp_transform`` marker field — axol <= 0.2.4 wrote none, and
+    every such session used the factory Vive constants unless the operator
+    had a per-unit override (which this command cannot know about; do not
+    run it on those). ``rest_midpoint`` overrides the FK-derived pivot for
+    ``swap_sides`` (tests).
+    """
+    from ..mantis.calibration import DESIGN_TCP_TRANSFORM_ID
+    from ..recording.cartesian_frame import (
+        CARTESIAN_FRAME_ID,
+        MANTIS_TCP_TRANSFORM_KEY,
+        update_cartesian_frame_marker,
+    )
+
+    def check_eligible(info: dict[str, Any], marker: dict[str, Any] | None) -> None:
+        robot_type = info.get("robot_type")
+        if robot_type != "axol_mantis":
+            raise ValueError(
+                f"Dataset robot_type is {robot_type!r}, not 'axol_mantis'. Only "
+                "Mantis-recorded poses went through the tracker→gripper "
+                "transform; robot-recorded datasets do not need this migration."
+            )
+        if marker is None:
+            raise ValueError(
+                "Dataset has no meta/axol.json pose-frame marker, so it predates "
+                "Mantis collection; refusing to guess."
+            )
+        if marker.get("cartesian_pose_frame") != CARTESIAN_FRAME_ID:
+            raise ValueError(
+                "Dataset is not in the v0.1.32+ Cartesian pose frame; run the "
+                "--from-version migration first."
+            )
+        recorded = marker.get(MANTIS_TCP_TRANSFORM_KEY)
+        if recorded is not None:
+            recorded_id = recorded.get("id") if isinstance(recorded, dict) else None
+            if recorded_id == DESIGN_TCP_TRANSFORM_ID:
+                raise ValueError(
+                    "Dataset was recorded (or already migrated) with the corrected "
+                    "Ry(180°) Vive tracker→gripper rotation; nothing to fix."
+                )
+            raise ValueError(
+                f"Dataset records tracker→gripper transforms {recorded_id!r}, not "
+                "the retired factory constants; this migration only applies to "
+                "datasets recorded with the factory Vive transform."
+            )
+
+    pivot = rest_midpoint
+    if swap_sides and pivot is None:
+        pivot = _rest_gripper_midpoint()
+
+    def transform(matrix: Any, arms: list[_ArmLayout]) -> Any:
+        return _transform_mantis_tcp(
+            matrix, arms, swap_sides=swap_sides, rest_midpoint=pivot
+        )
+
+    def write_marker(root: Path) -> None:
+        # The dataset now matches what a current session would have recorded
+        # with the factory constants — stamp that provenance so collect-data
+        # can append to it and this migration refuses to run twice. The
+        # tracker family (and so the exact translation) is not recorded by
+        # old datasets, hence no per-side values.
+        update_cartesian_frame_marker(
+            root,
+            migration={
+                "id": _MANTIS_TCP_MIGRATION_ID,
+                "swap_sides": swap_sides,
+                "from": "vive Rx(+90°) tracker→gripper rotation (axol <= 0.2.4)",
+                "to": DESIGN_TCP_TRANSFORM_ID,
+            },
+            mantis_tcp_transform={
+                "id": DESIGN_TCP_TRANSFORM_ID,
+                "source": None,
+                "left": None,
+                "right": None,
+                "migrated": True,
+            },
+        )
+
+    return _run_migration(
+        dataset_root,
+        _Plan(
+            migration_id=_MANTIS_TCP_MIGRATION_ID,
+            check_eligible=check_eligible,
+            transform=transform,
+            write_marker=write_marker,
+        ),
+        dry_run=dry_run,
+    )
+
+
 def add_parser(subparsers: Any) -> None:
     parser = subparsers.add_parser(
         "migrate-dataset",
-        help="Migrate pre-v0.1.32 Cartesian data to the current URDF frame.",
+        help="Repair Cartesian datasets in place (URDF frame, Mantis TCP rotation).",
         description=(
-            "Rotate Cartesian actions and observations recorded by axol <= v0.1.31 "
-            "into the forward-facing URDF frame introduced in v0.1.32. The migration "
-            "is in-place and creates a recovery backup under meta/migrations first."
+            "In-place repairs for Cartesian LeRobot datasets. --from-version rotates "
+            "actions and observations recorded by axol <= v0.1.31 into the "
+            "forward-facing URDF frame introduced in v0.1.32. --mantis-tcp-rotation "
+            "replaces the retired Rx(+90°) Vive tracker→gripper rotation in Mantis "
+            "datasets recorded by axol <= 0.2.4 (add --swap-sides when the left/right "
+            "trackers were bound to the opposite rigs). Each migration creates a "
+            "recovery backup under meta/migrations first."
         ),
     )
     parser.add_argument(
@@ -383,10 +630,30 @@ def add_parser(subparsers: Any) -> None:
         help="Local repo id under --root, or a path to a LeRobot dataset.",
     )
     parser.add_argument("--root", help="Dataset root (default: $HF_LEROBOT_HOME).")
-    parser.add_argument(
+    which = parser.add_mutually_exclusive_group(required=True)
+    which.add_argument(
         "--from-version",
-        required=True,
-        help="Axol version that recorded the data (must be older than v0.1.32).",
+        help=(
+            "URDF-frame migration: axol version that recorded the data (must be "
+            "older than v0.1.32)."
+        ),
+    )
+    which.add_argument(
+        "--mantis-tcp-rotation",
+        action="store_true",
+        help=(
+            "Mantis migration: replace the retired Rx(+90°) Vive tracker→gripper "
+            "rotation (axol <= 0.2.4) with the corrected Ry(180°)."
+        ),
+    )
+    parser.add_argument(
+        "--swap-sides",
+        action="store_true",
+        help=(
+            "With --mantis-tcp-rotation: the LEFT tracker was on the rig held in "
+            "the RIGHT hand (and vice versa). Swaps the left/right pose columns and "
+            "yaws every pose 180° about the rest-pose gripper midpoint."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -397,13 +664,26 @@ def add_parser(subparsers: Any) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    if args.swap_sides and not args.mantis_tcp_rotation:
+        raise SystemExit(
+            "migrate-dataset: --swap-sides requires --mantis-tcp-rotation."
+        )
     try:
         dataset_root = _resolve_dataset(args.repo_id, args.root)
-        summary = migrate_dataset(
-            dataset_root,
-            source_version=args.from_version,
-            dry_run=args.dry_run,
-        )
+        if args.mantis_tcp_rotation:
+            migration_id = _MANTIS_TCP_MIGRATION_ID
+            summary = migrate_mantis_tcp_rotation(
+                dataset_root,
+                swap_sides=args.swap_sides,
+                dry_run=args.dry_run,
+            )
+        else:
+            migration_id = _MIGRATION_ID
+            summary = migrate_dataset(
+                dataset_root,
+                source_version=args.from_version,
+                dry_run=args.dry_run,
+            )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"migrate-dataset: {exc}") from None
     verb = "Would migrate" if args.dry_run else "Migrated"
@@ -412,5 +692,5 @@ def run(args: argparse.Namespace) -> None:
         f"and refreshed {summary['episode_files']} episode metadata file(s)."
     )
     if not args.dry_run:
-        backup = dataset_root / "meta" / "migrations" / _MIGRATION_ID
+        backup = dataset_root / "meta" / "migrations" / migration_id
         print(f"Original parquet/stat files are recoverable from {backup}.")
