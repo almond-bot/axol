@@ -307,8 +307,14 @@ impl Holdover {
     /// A target is *late* once its age exceeds this many cadences; inside
     /// that window it is the stream's normal spacing plus transport jitter.
     pub const SLACK: f64 = 1.25;
-    /// Inter-arrival gaps beyond this many cadences (stream resumed after a
-    /// hold) carry no velocity information: the estimate restarts from rest.
+    /// A gap is a *stall* (the finite difference across it is the stream's
+    /// mean velocity — Python's trapezoid kept moving, we heard late) up to
+    /// `max_hold` past this many cadences; beyond that the stream *resumed*
+    /// after a hold and the estimate restarts from rest. Tied to `max_hold`
+    /// so the cutoff sits above every stall the carry bridges: a cadence
+    /// multiple alone (4 × 8.3 ms = 33 ms at 120 Hz) fell inside the 15-65 ms
+    /// stalls this exists for, and the late target that ended one stall
+    /// wiped the velocity the next one needed (Bugbot on #306).
     const RESUME: f64 = 4.0;
 
     pub fn new(max_hold: f64, max_reach: f64) -> Self {
@@ -342,7 +348,9 @@ impl Holdover {
     pub fn observe(&mut self, p: f64, dt: Option<f64>, cadence: Option<f64>) {
         match (self.last, dt, cadence) {
             (Some(prev), Some(dt), Some(cadence))
-                if dt > 0.0 && dt.is_finite() && dt <= Self::RESUME * cadence =>
+                if dt > 0.0
+                    && dt.is_finite()
+                    && dt <= self.max_hold.max(0.0) + Self::RESUME * cadence =>
             {
                 let raw = (p - prev) / dt;
                 if raw.is_finite() {
@@ -857,6 +865,32 @@ mod tests {
         // A missing cadence never produces a velocity.
         hold.observe(0.01, Some(CADENCE), None);
         assert_eq!(hold.vel(), 0.0);
+    }
+
+    #[test]
+    fn holdover_velocity_survives_the_stall_it_bridged() {
+        // Bugbot on #306: the late target that ends a 40 ms stall must not
+        // zero the estimate, or a second stall right after (common under the
+        // same load) gets no carry.
+        let mut hold = Holdover::new(0.08, 0.35);
+        let p = streamed(&mut hold, 60);
+        let before = hold.vel();
+        let stall = 0.040;
+        hold.observe(p + STREAM_VEL * stall, Some(stall), Some(CADENCE));
+        assert!(
+            (hold.vel() - before).abs() < 1e-6,
+            "vel {} -> {}",
+            before,
+            hold.vel()
+        );
+        // Even the longest stall the carry covers keeps the estimate ...
+        let p2 = p + STREAM_VEL * stall;
+        let long = 0.08 + 2.0 * CADENCE;
+        hold.observe(p2 + STREAM_VEL * long, Some(long), Some(CADENCE));
+        assert!((hold.vel() - before).abs() < 1e-6);
+        // ... and the next stall is carried, not held flat.
+        let p3 = p2 + STREAM_VEL * long;
+        assert!(hold.target(p3, 0.030, Some(CADENCE)) > p3);
     }
 
     #[test]
