@@ -186,8 +186,24 @@ def _base_collision_safe_step(
     guard_buffer = jnp.array(5e-4, dtype=q_from.dtype)
 
     def bound_step(q_candidate: jax.Array) -> jax.Array:
-        """Shorten a step without changing its joint-space direction."""
+        """Project outward boundary directions, then shorten the step."""
         delta = q_candidate - q_from
+
+        # A solver proposal can point outside a joint limit when q_from is
+        # exactly on that boundary. Remove only that infeasible component so
+        # it cannot make the global limit scale zero for every other joint.
+        outward = jnp.logical_or(
+            jnp.logical_and(
+                q_from <= robot.joints.lower_limits,
+                delta < 0.0,
+            ),
+            jnp.logical_and(
+                q_from >= robot.joints.upper_limits,
+                delta > 0.0,
+            ),
+        )
+        delta = jnp.where(outward, 0.0, delta)
+
         max_abs = jnp.max(jnp.abs(delta))
         rate_scale = jnp.minimum(
             1.0,
