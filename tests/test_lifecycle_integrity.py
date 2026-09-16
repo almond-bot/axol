@@ -42,12 +42,18 @@ class TeleopAffinityIntegrityTest(unittest.TestCase):
             patch.object(teleop_cli.os, "sched_getaffinity", return_value=original),
             patch.object(teleop_cli.os, "sched_setaffinity") as restore,
             patch.object(teleop_cli.affinity, "pin_realtime") as pin,
+            patch.object(
+                teleop_cli.affinity, "prioritize_control_thread", return_value=True
+            ) as fifo,
+            patch.object(teleop_cli.affinity, "release_control_thread") as release,
             patch.object(teleop_cli, "_run_session", new=AsyncMock()) as run_session,
         ):
             asyncio.run(teleop_cli._run(config))  # type: ignore[arg-type]
 
         run_session.assert_awaited_once_with(config)
         pin.assert_called_once_with()
+        fifo.assert_called_once_with()
+        release.assert_called_once_with()
         restore.assert_called_once_with(0, original)
 
     def test_session_failure_still_restores_original_affinity(self) -> None:
@@ -58,6 +64,10 @@ class TeleopAffinityIntegrityTest(unittest.TestCase):
             patch.object(teleop_cli.os, "sched_setaffinity") as restore,
             patch.object(teleop_cli.affinity, "pin_realtime") as pin,
             patch.object(
+                teleop_cli.affinity, "prioritize_control_thread", return_value=False
+            ),
+            patch.object(teleop_cli.affinity, "release_control_thread") as release,
+            patch.object(
                 teleop_cli, "_run_session", new=AsyncMock(side_effect=failure)
             ),
             self.assertRaisesRegex(RuntimeError, "relay refused"),
@@ -65,6 +75,8 @@ class TeleopAffinityIntegrityTest(unittest.TestCase):
             asyncio.run(teleop_cli._run(object()))  # type: ignore[arg-type]
 
         pin.assert_called_once_with()
+        # FIFO was refused (no rtprio grant), so there is nothing to release.
+        release.assert_not_called()
         restore.assert_called_once_with(0, original)
 
     def test_unknown_original_mask_skips_the_pin(self) -> None:
@@ -72,11 +84,13 @@ class TeleopAffinityIntegrityTest(unittest.TestCase):
             patch.object(teleop_cli.os, "sched_getaffinity", side_effect=OSError),
             patch.object(teleop_cli.os, "sched_setaffinity") as restore,
             patch.object(teleop_cli.affinity, "pin_realtime") as pin,
+            patch.object(teleop_cli.affinity, "prioritize_control_thread") as fifo,
             patch.object(teleop_cli, "_run_session", new=AsyncMock()),
         ):
             asyncio.run(teleop_cli._run(object()))  # type: ignore[arg-type]
 
         pin.assert_not_called()
+        fifo.assert_not_called()
         restore.assert_not_called()
 
 

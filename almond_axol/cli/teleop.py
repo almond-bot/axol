@@ -465,19 +465,30 @@ async def _run(cfg: TeleopCmdConfig) -> None:
     operator felt as the arms hitching and lunging. The Rust core, IK solve
     time and the pose transport were all clean in the same sessions.
 
-    The original mask is restored on exit so a long-lived ``serve`` worker is
-    never left narrowed; when it cannot be captured the pin is skipped rather
-    than risk that.
+    Pinned, the loop then shared its single core as an equal CFS peer with the
+    VR pose thread, the IK dispatch thread and the diagnostics scanners and
+    still waited 300 ms of every second for the CPU (one tick in fifty late),
+    so the control thread also runs ``SCHED_FIFO`` — thread-scoped, with the
+    threads and processes it spawns reset to CFS — see
+    :func:`~almond_axol.utils.affinity.prioritize_control_thread`.
+
+    The original mask and policy are restored on exit so a long-lived
+    ``serve`` worker is never left narrowed or FIFO; when the mask cannot be
+    captured the pin is skipped rather than risk that.
     """
     try:
         original_affinity = os.sched_getaffinity(0)
     except (AttributeError, OSError):
         original_affinity = None
+    fifo = False
     if original_affinity is not None:
         affinity.pin_realtime()
+        fifo = affinity.prioritize_control_thread()
     try:
         await _run_session(cfg)
     finally:
+        if fifo:
+            affinity.release_control_thread()
         if original_affinity is not None:
             try:
                 os.sched_setaffinity(0, original_affinity)
