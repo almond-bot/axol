@@ -34,6 +34,13 @@ class FpsDefaultsTest(unittest.TestCase):
         self.assertEqual(_default(CollectDataConfig, "teleop_hz"), 120)
         self.assertEqual(_default(DaggerConfig, "teleop_hz"), 120)
 
+    def test_dagger_policy_ring_rate_is_its_own_default(self) -> None:
+        # ``--policy_fps`` is the relay ring rate feeding the policy's
+        # observations, deliberately distinct from the ``--fps`` control rate:
+        # it thins only the inference RGB ring (capped at the capture rate),
+        # while the loop and recorded rows stay at ``fps``.
+        self.assertEqual(_default(DaggerConfig, "policy_fps"), 20)
+
 
 if __name__ == "__main__":
     unittest.main()
