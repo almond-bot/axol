@@ -1295,478 +1295,6 @@ fn parse_record_gate(payload: &[u8]) -> io::Result<Option<f64>> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Mirrors `RtLink.send_target`'s packing: side u8, seq u32 LE, then
-    /// 8 slots x 9 f64 LE.
-    #[test]
-    fn parse_target_roundtrip() {
-        let mut payload = vec![1u8];
-        payload.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
-        for slot in 0..N_SLOTS {
-            for field in 0..9 {
-                let v = slot as f64 * 10.0 + field as f64;
-                payload.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        let (side, t) = parse_target(&payload).unwrap();
-        assert_eq!(side, 1);
-        assert_eq!(t.seq, 0xDEADBEEF);
-        let c = &t.cmds[2];
-        assert_eq!(
-            (c.p_des, c.mode, c.kp, c.kd, c.t_ff, c.kd_host, c.damp_w0, c.damp_q, c.j_eff),
-            (20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0)
-        );
-        // Wrong size (the previous 8-field layout) must be rejected, not
-        // misparsed — a version-skewed client fails loudly.
-        assert!(parse_target(&payload[..1 + 4 + N_SLOTS * 8 * 8]).is_err());
-    }
-
-    #[test]
-    fn parse_record_gate_roundtrip() {
-        let timestamp = 87_419.125f64;
-        let mut enabled = vec![1];
-        enabled.extend_from_slice(&timestamp.to_le_bytes());
-        assert_eq!(parse_record_gate(&enabled).unwrap(), Some(timestamp));
-        assert_eq!(parse_record_gate(&[0]).unwrap(), None);
-        assert!(parse_record_gate(&[1]).is_err());
-        assert!(parse_record_gate(&[0, 0]).is_err());
-    }
-
-    #[test]
-    fn bus_deadline_never_catches_up_after_overrun() {
-        let base = Instant::now();
-        let period = Duration::from_millis(4);
-        assert_eq!(
-            next_bus_deadline(base + Duration::from_millis(2), period),
-            base + Duration::from_millis(6)
-        );
-    }
-
-    #[test]
-    fn replies_must_be_expected_and_unique() {
-        let expected = [true, true, false];
-        let mut seen = [false; 3];
-        assert!(mark_unique_expected_reply(&expected, &mut seen, 0));
-        assert!(!mark_unique_expected_reply(&expected, &mut seen, 0));
-        assert!(!mark_unique_expected_reply(&expected, &mut seen, 2));
-        assert!(mark_unique_expected_reply(&expected, &mut seen, 1));
-        assert_eq!(seen, [true, true, false]);
-    }
-
-    #[test]
-    fn feedback_health_degrades_on_bursty_loss_and_recovers_after_clean_window() {
-        let limit = silent_feedback_limit(240.0);
-        assert_eq!(limit, 240);
-
-        // The startup pattern from the field: isolated single-tick misses.
-        // Three of them stay quiet; the fourth degrades the joint, and it
-        // remains degraded (Steady, not re-announced) while lossy.
-        let mut bursty = FeedbackHealth::default();
-        for _ in 0..3 {
-            assert_eq!(bursty.record(false, limit), FeedbackVerdict::Steady);
-            assert_eq!(bursty.record(true, limit), FeedbackVerdict::Steady);
-        }
-        assert_eq!(bursty.record(false, limit), FeedbackVerdict::Degraded);
-        assert!(bursty.degraded);
-        assert_eq!(bursty.record(false, limit), FeedbackVerdict::Steady);
-        assert!(bursty.degraded);
-
-        // Hysteresis: dropping below four misses is not enough; the window
-        // must be entirely clean before damping is allowed back on.
-        for _ in 0..31 {
-            assert_eq!(bursty.record(true, limit), FeedbackVerdict::Steady);
-            assert!(bursty.degraded);
-        }
-        assert_eq!(bursty.record(true, limit), FeedbackVerdict::Recovered);
-        assert!(!bursty.degraded);
-
-        // The old 3-consecutive trip is now just a degraded stretch...
-        let mut consecutive = FeedbackHealth::default();
-        for _ in 0..3 {
-            assert_ne!(consecutive.record(false, limit), FeedbackVerdict::Silent);
-        }
-        // ...and only a motor silent for the whole interval faults.
-        for _ in 3..limit - 1 {
-            assert_ne!(consecutive.record(false, limit), FeedbackVerdict::Silent);
-        }
-        assert_eq!(consecutive.record(false, limit), FeedbackVerdict::Silent);
-
-        let mut healthy = FeedbackHealth::default();
-        for tick in 0..128 {
-            assert_eq!(
-                healthy.record(tick % 32 != 0, limit),
-                FeedbackVerdict::Steady
-            );
-            assert!(!healthy.degraded);
-        }
-    }
-
-    const PERIOD: Duration = Duration::from_micros(4_167);
-    const ON_TIME: Duration = Duration::from_micros(50);
-    const LATE: Duration = Duration::from_micros(800);
-
-    #[test]
-    fn timing_health_degrades_on_clustered_late_ticks_and_recovers() {
-        // Alternating late/on-time: the eighth late tick in the window
-        // degrades the bus (the old limp trip), and it stays degraded
-        // (Steady, not re-announced) while the pattern continues.
-        let mut health = TimingHealth::default();
-        for _ in 0..7 {
-            assert_eq!(health.record(LATE, PERIOD), TimingVerdict::Steady);
-            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
-        }
-        assert_eq!(health.record(LATE, PERIOD), TimingVerdict::Degraded);
-        assert!(health.degraded);
-
-        // Hysteresis: only a fully clean window (32 on-time ticks after the
-        // last late one) recovers.
-        for _ in 0..31 {
-            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
-            assert!(health.degraded);
-        }
-        assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
-        assert!(!health.degraded);
-
-        // Three in a row degrades too.
-        let mut consecutive = TimingHealth::default();
-        assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
-        assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
-        assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Degraded);
-    }
-
-    #[test]
-    fn timing_health_isolated_overrun_degrades_not_limps() {
-        // The field record: one 60 ms stall in an otherwise perfect stream.
-        let mut health = TimingHealth::default();
-        for _ in 0..1000 {
-            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
-        }
-        assert_eq!(
-            health.record(Duration::from_millis(60), PERIOD),
-            TimingVerdict::Degraded
-        );
-        assert!(health.degraded);
-        assert_eq!(health.recent_overruns.count_ones(), 1);
-        assert_eq!(health.recent_late.count_ones(), 1);
-        // The next tick is on time again; damping stays off for the window...
-        for _ in 0..31 {
-            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
-        }
-        // ...then comes back.
-        assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
-        assert_eq!(health.recent_overruns, 0);
-    }
-
-    #[test]
-    fn timing_health_never_escalates_past_degraded() {
-        // Repeated whole-cycle overruns inside one window: still degraded,
-        // never a fault — the loop stays in the degraded stretch (Steady,
-        // damping off) and the stretch is what the log reports.
-        let mut health = TimingHealth::default();
-        assert_eq!(health.record(PERIOD, PERIOD), TimingVerdict::Degraded);
-        for _ in 0..20 {
-            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
-        }
-        assert_eq!(health.record(PERIOD * 3, PERIOD), TimingVerdict::Steady);
-        assert!(health.degraded);
-        assert_eq!(health.recent_overruns.count_ones(), 2);
-        // The window must be clean again before it recovers.
-        for _ in 0..31 {
-            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
-        }
-        assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
-
-        // Two overruns further apart than the window are two degraded
-        // episodes.
-        let mut spaced = TimingHealth::default();
-        assert_eq!(spaced.record(PERIOD, PERIOD), TimingVerdict::Degraded);
-        for _ in 0..31 {
-            assert_eq!(spaced.record(ON_TIME, PERIOD), TimingVerdict::Steady);
-        }
-        assert_eq!(spaced.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
-        assert_eq!(spaced.record(PERIOD, PERIOD), TimingVerdict::Degraded);
-
-        // Late on every other tick for a long stretch: one Degraded
-        // transition, then Steady for as long as it lasts.
-        let mut persistent = TimingHealth::default();
-        let mut verdicts = Vec::new();
-        for _ in 0..500 {
-            verdicts.push(persistent.record(LATE, PERIOD));
-            verdicts.push(persistent.record(ON_TIME, PERIOD));
-        }
-        assert_eq!(
-            verdicts
-                .iter()
-                .filter(|v| **v == TimingVerdict::Degraded)
-                .count(),
-            1
-        );
-        assert!(!verdicts.contains(&TimingVerdict::Recovered));
-        assert!(persistent.degraded);
-    }
-
-    #[test]
-    fn trace_writer_forces_normal_scheduling_and_requested_affinity() {
-        let (policy, affinity_ok) = std::thread::spawn(|| {
-            let mut available = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-            let rc = unsafe {
-                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut available)
-            };
-            assert_eq!(rc, 0, "{}", io::Error::last_os_error());
-            let cpu = (0..libc::CPU_SETSIZE as usize)
-                .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &available) })
-                .expect("test thread has no available CPU");
-            let requested = parse_cpu_set(&cpu.to_string(), "test CPU set").unwrap();
-
-            configure_trace_writer_scheduling(Some(&requested)).unwrap();
-
-            let mut applied = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
-            let rc = unsafe {
-                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut applied)
-            };
-            assert_eq!(rc, 0, "{}", io::Error::last_os_error());
-            let only_requested_cpu = (0..libc::CPU_SETSIZE as usize)
-                .filter(|&candidate| unsafe { libc::CPU_ISSET(candidate, &applied) })
-                .eq(std::iter::once(cpu));
-            (unsafe { libc::sched_getscheduler(0) }, only_requested_cpu)
-        })
-        .join()
-        .unwrap();
-        assert_eq!(policy, libc::SCHED_OTHER);
-        assert!(affinity_ok);
-        assert!(parse_cpu_set("", "test CPU set").is_err());
-        assert!(parse_cpu_set("0,nope", "test CPU set").is_err());
-    }
-
-    /// Live stall-detection check against a real interface whose bus has no
-    /// powered nodes (motors off = the e-stop condition). Uses ID 0x7F0 —
-    /// unused by both motor protocols — so the frames left in the TX queue
-    /// are ignored by every motor if they ever transmit. Run explicitly:
-    /// `cargo test stall_detection_live -- --ignored`.
-    #[test]
-    #[ignore = "needs a live CAN interface with unpowered motors"]
-    fn stall_detection_live() {
-        let sock = CanSock::open("can_alm_axol_l").expect("open can_alm_axol_l");
-        sock.set_send_timeout(Duration::from_millis(20)).unwrap();
-        let mut since: Option<Instant> = None;
-        let start = Instant::now();
-        let mut dropped = 0u32;
-        let mut sent = 0u32;
-        loop {
-            match guarded_send(&sock, 0x7F0, &[0u8; 8], &mut since).unwrap() {
-                SendOutcome::Sent => sent += 1,
-                SendOutcome::Dropped => dropped += 1,
-                SendOutcome::Stalled => break,
-            }
-            assert!(
-                start.elapsed() < Duration::from_secs(15),
-                "never stalled (sent {sent}, dropped {dropped})"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        println!(
-            "stalled after {:.2}s: {sent} queued, {dropped} dropped",
-            start.elapsed().as_secs_f64()
-        );
-        assert!(dropped > 0, "expected a Dropped phase before the stall");
-        assert!(start.elapsed() >= STALL_DETECT);
-    }
-
-    /// Layout contract with `RtLink._parse_feedback`: F-packets are
-    /// side u8, mask u8, then 8 x (pos f64, vel f64, tau f64, age_us u32),
-    /// all little-endian.
-    #[test]
-    fn feedback_packet_layout() {
-        let now = Instant::now();
-        let mut latest: [SlotFeedback; N_SLOTS] = [None; N_SLOTS];
-        latest[0] = Some((1.5, -0.25, 3.0, now - Duration::from_micros(1200)));
-        latest[7] = Some((0.5, 0.0, 0.1, now));
-        let msg = build_feedback(1, &latest, now);
-        assert_eq!(msg.len(), 3 + N_SLOTS * 28);
-        assert_eq!(msg[0], b'F');
-        assert_eq!(msg[1], 1);
-        assert_eq!(msg[2], 0b1000_0001);
-        let pos0 = f64::from_le_bytes(msg[3..11].try_into().unwrap());
-        let vel0 = f64::from_le_bytes(msg[11..19].try_into().unwrap());
-        let tau0 = f64::from_le_bytes(msg[19..27].try_into().unwrap());
-        let age0 = u32::from_le_bytes(msg[27..31].try_into().unwrap());
-        assert_eq!((pos0, vel0, tau0, age0), (1.5, -0.25, 3.0, 1200));
-        let slot7 = 3 + 7 * 28;
-        let pos7 = f64::from_le_bytes(msg[slot7..slot7 + 8].try_into().unwrap());
-        assert_eq!(pos7, 0.5);
-    }
-
-    #[test]
-    fn parse_config_assigns_slots() {
-        let cfg = parse_config(
-            "proto 6\n\
-             loop_hz 240\n\
-             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
-             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
-             gripper 0 canL 8\n\
-             joint 0 canL shoulder_3 3 180 2.0 9.4 33.0 0.4 250 0.08 0.0\n",
-        )
-        .unwrap();
-        let specs = &cfg.buses[0].2;
-        assert_eq!(
-            specs.iter().map(|s| s.slot).collect::<Vec<_>>(),
-            vec![0, 1, GRIPPER_SLOT, 2]
-        );
-        assert!(specs[2].gripper);
-        assert_eq!(specs[0].max_vel, 9.4);
-        assert_eq!(specs[0].max_accel, 33.0);
-        assert_eq!(
-            (specs[0].fc, specs[0].k, specs[0].fv, specs[0].fo),
-            (0.6, 250.0, 0.15, 0.02)
-        );
-        // A joint line missing the tracker/friction params (the previous
-        // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 6\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
-    }
-
-    /// A bus carrying only some of the arm joints (a bench wrist assembly)
-    /// keeps each motor in the slot Python's Joint enum assigns it — the
-    /// slot comes from the motor id, not from the order joints are listed.
-    #[test]
-    fn parse_config_subset_keeps_joint_slots() {
-        let cfg = parse_config(
-            "proto 6\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
-             joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
-             gripper 0 can0 8\n",
-        )
-        .unwrap();
-        let specs = &cfg.buses[0].2;
-        assert_eq!(
-            specs.iter().map(|s| s.slot).collect::<Vec<_>>(),
-            vec![5, 6, GRIPPER_SLOT]
-        );
-        // Arm joint ids outside 1..=7 have no slot; a repeated id would
-        // double-book one.
-        assert!(parse_config("proto 6\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
-        assert!(parse_config("proto 6\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
-        assert!(parse_config(
-            "proto 6\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n"
-        )
-        .is_err());
-    }
-
-    /// A client and a core built from different checkouts must fail at
-    /// configure time. Without the guard, a proto-1 core (list-order slots)
-    /// armed against a proto-2 client's subset config and then rejected every
-    /// target on the max-step gate — the arms enabled and never moved.
-    #[test]
-    fn parse_config_requires_matching_proto() {
-        let joint = "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n";
-        let error_of = |text: &str| match parse_config(text) {
-            Ok(_) => panic!("accepted a skewed config: {text:?}"),
-            Err(err) => err.to_string(),
-        };
-        // No `proto` line: a client that predates the slot-by-id layout.
-        let err = error_of(joint);
-        assert!(err.contains("no `proto` line"), "{err}");
-        assert!(err.contains("axol rt.install"), "{err}");
-        // A future client generation this core does not understand.
-        let err = error_of(&format!("proto 7\n{joint}"));
-        assert!(err.contains("proto 7"), "{err}");
-        assert!(err.contains("proto 6"), "{err}");
-        // Malformed declarations are bad lines, not silently accepted.
-        assert!(parse_config(&format!("proto\n{joint}")).is_err());
-        assert!(parse_config(&format!("proto two\n{joint}")).is_err());
-        // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 6\n")).is_ok());
-    }
-
-    /// `exp` lines set the tracking experiments; a config without any runs
-    /// the production law (`Experiments::default`), degrees arrive as
-    /// degrees, booleans as 0/1, and an unknown name is a skewed build.
-    #[test]
-    fn parse_config_reads_experiments() {
-        let joint = "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n";
-        let cfg = parse_config(&format!("proto 6\n{joint}")).unwrap();
-        assert!(cfg.exp.is_default());
-        assert_eq!(cfg.exp.friction_k_max, filter::FRICTION_FF_K_MAX);
-
-        let cfg = parse_config(&format!(
-            "proto 6\n{joint}\
-             exp friction_k_max 400\n\
-             exp friction_slew 30\n\
-             exp stiction_gain 0.6\n\
-             exp stiction_err_deg 0.1\n\
-             exp integrator_hz 0.3\n\
-             exp integrator_freeze_deg 2\n\
-             exp tracker_wire_vel 1\n\
-             exp tracker_accel_ff 0\n\
-             exp dither_nm 0.2\n\
-             exp dither_hz 55\n\
-             exp dither_square 1\n\
-             exp tracker_pos_gain 31.4\n\
-             exp command_lead_ms 25\n"
-        ))
-        .unwrap();
-        assert!(!cfg.exp.is_default());
-        assert_eq!(cfg.exp.friction_k_max, 400.0);
-        assert_eq!(cfg.exp.friction_slew, 30.0);
-        assert_eq!(cfg.exp.stiction_gain, 0.6);
-        assert!((cfg.exp.stiction_err - 0.1_f64.to_radians()).abs() < 1e-15);
-        assert_eq!(cfg.exp.integrator_hz, 0.3);
-        assert!((cfg.exp.integrator_freeze - 2.0_f64.to_radians()).abs() < 1e-15);
-        assert!(cfg.exp.tracker_wire_vel);
-        assert!(!cfg.exp.tracker_accel_ff);
-        assert_eq!(cfg.exp.dither_nm, 0.2);
-        assert_eq!(cfg.exp.dither_hz, 55.0);
-        assert!(cfg.exp.dither_square);
-        // Nothing asked for a wire mode, so the MIT frame stands.
-        assert_eq!(cfg.exp.wire_mode, WireMode::Mit);
-        assert_eq!(cfg.exp.tracker_pos_gain, 31.4);
-        // Arrives in ms, stored in seconds.
-        assert!((cfg.exp.command_lead - 0.025).abs() < 1e-12);
-        // Untouched, so it keeps the shipped value.
-        assert_eq!(cfg.exp.tracker_vel_gain, Trapezoid::VEL_TRACK_GAIN);
-
-        let err = match parse_config(&format!("proto 6\n{joint}exp bogus 1\n")) {
-            Ok(_) => panic!("accepted an unknown experiment"),
-            Err(err) => err.to_string(),
-        };
-        assert!(err.contains("unknown experiment `bogus 1`"), "{err}");
-        assert!(err.contains("axol rt.install"), "{err}");
-        assert!(parse_config(&format!("proto 6\n{joint}exp friction_slew\n")).is_err());
-        assert!(parse_config(&format!("proto 6\n{joint}exp friction_slew nan\n")).is_err());
-    }
-
-    /// `wire_mode` is the one experiment whose value is a name rather than a
-    /// number, so it exercises the other half of the `exp` parser — and an
-    /// unreadable name has to be as fatal as an unreadable field, or a
-    /// mistyped mode would quietly run the production law.
-    #[test]
-    fn parse_config_reads_the_wire_mode() {
-        let joint = "joint 0 can0 shoulder_1 1 250 3.5 6.3 22.0 0.6 20 0.1 0\n";
-        for (word, want) in [
-            ("mit", WireMode::Mit),
-            ("a4", WireMode::A4),
-            ("a9", WireMode::A9),
-            ("tf", WireMode::Tf),
-        ] {
-            let cfg = parse_config(&format!("proto 6\n{joint}exp wire_mode {word}\n")).unwrap();
-            assert_eq!(cfg.exp.wire_mode, want);
-            assert_eq!(cfg.exp.is_default(), want == WireMode::Mit);
-        }
-        let err = match parse_config(&format!("proto 6\n{joint}exp wire_mode a10\n")) {
-            Ok(_) => panic!("accepted an unknown wire mode"),
-            Err(err) => err.to_string(),
-        };
-        assert!(err.contains("unknown experiment `wire_mode a10`"), "{err}");
-        // A name where a number belongs, and a number where a name belongs.
-        assert!(parse_config(&format!("proto 6\n{joint}exp dither_hz fast\n")).is_err());
-        assert!(parse_config(&format!("proto 6\n{joint}exp wire_mode 9\n")).is_err());
-    }
-}
-
 fn read_msg(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf) {
@@ -3331,4 +2859,476 @@ fn bus_loop(
         send_text(out_tx, b'S', &format!("fault: {err}"));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors `RtLink.send_target`'s packing: side u8, seq u32 LE, then
+    /// 8 slots x 9 f64 LE.
+    #[test]
+    fn parse_target_roundtrip() {
+        let mut payload = vec![1u8];
+        payload.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        for slot in 0..N_SLOTS {
+            for field in 0..9 {
+                let v = slot as f64 * 10.0 + field as f64;
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let (side, t) = parse_target(&payload).unwrap();
+        assert_eq!(side, 1);
+        assert_eq!(t.seq, 0xDEADBEEF);
+        let c = &t.cmds[2];
+        assert_eq!(
+            (c.p_des, c.mode, c.kp, c.kd, c.t_ff, c.kd_host, c.damp_w0, c.damp_q, c.j_eff),
+            (20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0)
+        );
+        // Wrong size (the previous 8-field layout) must be rejected, not
+        // misparsed — a version-skewed client fails loudly.
+        assert!(parse_target(&payload[..1 + 4 + N_SLOTS * 8 * 8]).is_err());
+    }
+
+    #[test]
+    fn parse_record_gate_roundtrip() {
+        let timestamp = 87_419.125f64;
+        let mut enabled = vec![1];
+        enabled.extend_from_slice(&timestamp.to_le_bytes());
+        assert_eq!(parse_record_gate(&enabled).unwrap(), Some(timestamp));
+        assert_eq!(parse_record_gate(&[0]).unwrap(), None);
+        assert!(parse_record_gate(&[1]).is_err());
+        assert!(parse_record_gate(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn bus_deadline_never_catches_up_after_overrun() {
+        let base = Instant::now();
+        let period = Duration::from_millis(4);
+        assert_eq!(
+            next_bus_deadline(base + Duration::from_millis(2), period),
+            base + Duration::from_millis(6)
+        );
+    }
+
+    #[test]
+    fn replies_must_be_expected_and_unique() {
+        let expected = [true, true, false];
+        let mut seen = [false; 3];
+        assert!(mark_unique_expected_reply(&expected, &mut seen, 0));
+        assert!(!mark_unique_expected_reply(&expected, &mut seen, 0));
+        assert!(!mark_unique_expected_reply(&expected, &mut seen, 2));
+        assert!(mark_unique_expected_reply(&expected, &mut seen, 1));
+        assert_eq!(seen, [true, true, false]);
+    }
+
+    #[test]
+    fn feedback_health_degrades_on_bursty_loss_and_recovers_after_clean_window() {
+        let limit = silent_feedback_limit(240.0);
+        assert_eq!(limit, 240);
+
+        // The startup pattern from the field: isolated single-tick misses.
+        // Three of them stay quiet; the fourth degrades the joint, and it
+        // remains degraded (Steady, not re-announced) while lossy.
+        let mut bursty = FeedbackHealth::default();
+        for _ in 0..3 {
+            assert_eq!(bursty.record(false, limit), FeedbackVerdict::Steady);
+            assert_eq!(bursty.record(true, limit), FeedbackVerdict::Steady);
+        }
+        assert_eq!(bursty.record(false, limit), FeedbackVerdict::Degraded);
+        assert!(bursty.degraded);
+        assert_eq!(bursty.record(false, limit), FeedbackVerdict::Steady);
+        assert!(bursty.degraded);
+
+        // Hysteresis: dropping below four misses is not enough; the window
+        // must be entirely clean before damping is allowed back on.
+        for _ in 0..31 {
+            assert_eq!(bursty.record(true, limit), FeedbackVerdict::Steady);
+            assert!(bursty.degraded);
+        }
+        assert_eq!(bursty.record(true, limit), FeedbackVerdict::Recovered);
+        assert!(!bursty.degraded);
+
+        // The old 3-consecutive trip is now just a degraded stretch...
+        let mut consecutive = FeedbackHealth::default();
+        for _ in 0..3 {
+            assert_ne!(consecutive.record(false, limit), FeedbackVerdict::Silent);
+        }
+        // ...and only a motor silent for the whole interval faults.
+        for _ in 3..limit - 1 {
+            assert_ne!(consecutive.record(false, limit), FeedbackVerdict::Silent);
+        }
+        assert_eq!(consecutive.record(false, limit), FeedbackVerdict::Silent);
+
+        let mut healthy = FeedbackHealth::default();
+        for tick in 0..128 {
+            assert_eq!(
+                healthy.record(tick % 32 != 0, limit),
+                FeedbackVerdict::Steady
+            );
+            assert!(!healthy.degraded);
+        }
+    }
+
+    const PERIOD: Duration = Duration::from_micros(4_167);
+    const ON_TIME: Duration = Duration::from_micros(50);
+    const LATE: Duration = Duration::from_micros(800);
+
+    #[test]
+    fn timing_health_degrades_on_clustered_late_ticks_and_recovers() {
+        // Alternating late/on-time: the eighth late tick in the window
+        // degrades the bus (the old limp trip), and it stays degraded
+        // (Steady, not re-announced) while the pattern continues.
+        let mut health = TimingHealth::default();
+        for _ in 0..7 {
+            assert_eq!(health.record(LATE, PERIOD), TimingVerdict::Steady);
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        assert_eq!(health.record(LATE, PERIOD), TimingVerdict::Degraded);
+        assert!(health.degraded);
+
+        // Hysteresis: only a fully clean window (32 on-time ticks after the
+        // last late one) recovers.
+        for _ in 0..31 {
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+            assert!(health.degraded);
+        }
+        assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
+        assert!(!health.degraded);
+
+        // Three in a row degrades too.
+        let mut consecutive = TimingHealth::default();
+        assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
+        assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
+        assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Degraded);
+    }
+
+    #[test]
+    fn timing_health_isolated_overrun_degrades_not_limps() {
+        // The field record: one 60 ms stall in an otherwise perfect stream.
+        let mut health = TimingHealth::default();
+        for _ in 0..1000 {
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        assert_eq!(
+            health.record(Duration::from_millis(60), PERIOD),
+            TimingVerdict::Degraded
+        );
+        assert!(health.degraded);
+        assert_eq!(health.recent_overruns.count_ones(), 1);
+        assert_eq!(health.recent_late.count_ones(), 1);
+        // The next tick is on time again; damping stays off for the window...
+        for _ in 0..31 {
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        // ...then comes back.
+        assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
+        assert_eq!(health.recent_overruns, 0);
+    }
+
+    #[test]
+    fn timing_health_never_escalates_past_degraded() {
+        // Repeated whole-cycle overruns inside one window: still degraded,
+        // never a fault — the loop stays in the degraded stretch (Steady,
+        // damping off) and the stretch is what the log reports.
+        let mut health = TimingHealth::default();
+        assert_eq!(health.record(PERIOD, PERIOD), TimingVerdict::Degraded);
+        for _ in 0..20 {
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        assert_eq!(health.record(PERIOD * 3, PERIOD), TimingVerdict::Steady);
+        assert!(health.degraded);
+        assert_eq!(health.recent_overruns.count_ones(), 2);
+        // The window must be clean again before it recovers.
+        for _ in 0..31 {
+            assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        assert_eq!(health.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
+
+        // Two overruns further apart than the window are two degraded
+        // episodes.
+        let mut spaced = TimingHealth::default();
+        assert_eq!(spaced.record(PERIOD, PERIOD), TimingVerdict::Degraded);
+        for _ in 0..31 {
+            assert_eq!(spaced.record(ON_TIME, PERIOD), TimingVerdict::Steady);
+        }
+        assert_eq!(spaced.record(ON_TIME, PERIOD), TimingVerdict::Recovered);
+        assert_eq!(spaced.record(PERIOD, PERIOD), TimingVerdict::Degraded);
+
+        // Late on every other tick for a long stretch: one Degraded
+        // transition, then Steady for as long as it lasts.
+        let mut persistent = TimingHealth::default();
+        let mut verdicts = Vec::new();
+        for _ in 0..500 {
+            verdicts.push(persistent.record(LATE, PERIOD));
+            verdicts.push(persistent.record(ON_TIME, PERIOD));
+        }
+        assert_eq!(
+            verdicts
+                .iter()
+                .filter(|v| **v == TimingVerdict::Degraded)
+                .count(),
+            1
+        );
+        assert!(!verdicts.contains(&TimingVerdict::Recovered));
+        assert!(persistent.degraded);
+    }
+
+    #[test]
+    fn trace_writer_forces_normal_scheduling_and_requested_affinity() {
+        let (policy, affinity_ok) = std::thread::spawn(|| {
+            let mut available = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+            let rc = unsafe {
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut available)
+            };
+            assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+            let cpu = (0..libc::CPU_SETSIZE as usize)
+                .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &available) })
+                .expect("test thread has no available CPU");
+            let requested = parse_cpu_set(&cpu.to_string(), "test CPU set").unwrap();
+
+            configure_trace_writer_scheduling(Some(&requested)).unwrap();
+
+            let mut applied = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+            let rc = unsafe {
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut applied)
+            };
+            assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+            let only_requested_cpu = (0..libc::CPU_SETSIZE as usize)
+                .filter(|&candidate| unsafe { libc::CPU_ISSET(candidate, &applied) })
+                .eq(std::iter::once(cpu));
+            (unsafe { libc::sched_getscheduler(0) }, only_requested_cpu)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(policy, libc::SCHED_OTHER);
+        assert!(affinity_ok);
+        assert!(parse_cpu_set("", "test CPU set").is_err());
+        assert!(parse_cpu_set("0,nope", "test CPU set").is_err());
+    }
+
+    /// Live stall-detection check against a real interface whose bus has no
+    /// powered nodes (motors off = the e-stop condition). Uses ID 0x7F0 —
+    /// unused by both motor protocols — so the frames left in the TX queue
+    /// are ignored by every motor if they ever transmit. Run explicitly:
+    /// `cargo test stall_detection_live -- --ignored`.
+    #[test]
+    #[ignore = "needs a live CAN interface with unpowered motors"]
+    fn stall_detection_live() {
+        let sock = CanSock::open("can_alm_axol_l").expect("open can_alm_axol_l");
+        sock.set_send_timeout(Duration::from_millis(20)).unwrap();
+        let mut since: Option<Instant> = None;
+        let start = Instant::now();
+        let mut dropped = 0u32;
+        let mut sent = 0u32;
+        loop {
+            match guarded_send(&sock, 0x7F0, &[0u8; 8], &mut since).unwrap() {
+                SendOutcome::Sent => sent += 1,
+                SendOutcome::Dropped => dropped += 1,
+                SendOutcome::Stalled => break,
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "never stalled (sent {sent}, dropped {dropped})"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        println!(
+            "stalled after {:.2}s: {sent} queued, {dropped} dropped",
+            start.elapsed().as_secs_f64()
+        );
+        assert!(dropped > 0, "expected a Dropped phase before the stall");
+        assert!(start.elapsed() >= STALL_DETECT);
+    }
+
+    /// Layout contract with `RtLink._parse_feedback`: F-packets are
+    /// side u8, mask u8, then 8 x (pos f64, vel f64, tau f64, age_us u32),
+    /// all little-endian.
+    #[test]
+    fn feedback_packet_layout() {
+        let now = Instant::now();
+        let mut latest: [SlotFeedback; N_SLOTS] = [None; N_SLOTS];
+        latest[0] = Some((1.5, -0.25, 3.0, now - Duration::from_micros(1200)));
+        latest[7] = Some((0.5, 0.0, 0.1, now));
+        let msg = build_feedback(1, &latest, now);
+        assert_eq!(msg.len(), 3 + N_SLOTS * 28);
+        assert_eq!(msg[0], b'F');
+        assert_eq!(msg[1], 1);
+        assert_eq!(msg[2], 0b1000_0001);
+        let pos0 = f64::from_le_bytes(msg[3..11].try_into().unwrap());
+        let vel0 = f64::from_le_bytes(msg[11..19].try_into().unwrap());
+        let tau0 = f64::from_le_bytes(msg[19..27].try_into().unwrap());
+        let age0 = u32::from_le_bytes(msg[27..31].try_into().unwrap());
+        assert_eq!((pos0, vel0, tau0, age0), (1.5, -0.25, 3.0, 1200));
+        let slot7 = 3 + 7 * 28;
+        let pos7 = f64::from_le_bytes(msg[slot7..slot7 + 8].try_into().unwrap());
+        assert_eq!(pos7, 0.5);
+    }
+
+    #[test]
+    fn parse_config_assigns_slots() {
+        let cfg = parse_config(
+            "proto 6\n\
+             loop_hz 240\n\
+             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
+             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
+             gripper 0 canL 8\n\
+             joint 0 canL shoulder_3 3 180 2.0 9.4 33.0 0.4 250 0.08 0.0\n",
+        )
+        .unwrap();
+        let specs = &cfg.buses[0].2;
+        assert_eq!(
+            specs.iter().map(|s| s.slot).collect::<Vec<_>>(),
+            vec![0, 1, GRIPPER_SLOT, 2]
+        );
+        assert!(specs[2].gripper);
+        assert_eq!(specs[0].max_vel, 9.4);
+        assert_eq!(specs[0].max_accel, 33.0);
+        assert_eq!(
+            (specs[0].fc, specs[0].k, specs[0].fv, specs[0].fo),
+            (0.6, 250.0, 0.15, 0.02)
+        );
+        // A joint line missing the tracker/friction params (the previous
+        // 7-field layout) must be rejected, not defaulted.
+        assert!(parse_config("proto 6\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+    }
+
+    /// A bus carrying only some of the arm joints (a bench wrist assembly)
+    /// keeps each motor in the slot Python's Joint enum assigns it — the
+    /// slot comes from the motor id, not from the order joints are listed.
+    #[test]
+    fn parse_config_subset_keeps_joint_slots() {
+        let cfg = parse_config(
+            "proto 6\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
+             joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
+             gripper 0 can0 8\n",
+        )
+        .unwrap();
+        let specs = &cfg.buses[0].2;
+        assert_eq!(
+            specs.iter().map(|s| s.slot).collect::<Vec<_>>(),
+            vec![5, 6, GRIPPER_SLOT]
+        );
+        // Arm joint ids outside 1..=7 have no slot; a repeated id would
+        // double-book one.
+        assert!(parse_config("proto 6\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 6\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config(
+            "proto 6\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n"
+        )
+        .is_err());
+    }
+
+    /// A client and a core built from different checkouts must fail at
+    /// configure time. Without the guard, a proto-1 core (list-order slots)
+    /// armed against a proto-2 client's subset config and then rejected every
+    /// target on the max-step gate — the arms enabled and never moved.
+    #[test]
+    fn parse_config_requires_matching_proto() {
+        let joint = "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n";
+        let error_of = |text: &str| match parse_config(text) {
+            Ok(_) => panic!("accepted a skewed config: {text:?}"),
+            Err(err) => err.to_string(),
+        };
+        // No `proto` line: a client that predates the slot-by-id layout.
+        let err = error_of(joint);
+        assert!(err.contains("no `proto` line"), "{err}");
+        assert!(err.contains("axol rt.install"), "{err}");
+        // A future client generation this core does not understand.
+        let err = error_of(&format!("proto 7\n{joint}"));
+        assert!(err.contains("proto 7"), "{err}");
+        assert!(err.contains("proto 6"), "{err}");
+        // Malformed declarations are bad lines, not silently accepted.
+        assert!(parse_config(&format!("proto\n{joint}")).is_err());
+        assert!(parse_config(&format!("proto two\n{joint}")).is_err());
+        // Order does not matter; the line just has to be there.
+        assert!(parse_config(&format!("{joint}proto 6\n")).is_ok());
+    }
+
+    /// `exp` lines set the tracking experiments; a config without any runs
+    /// the production law (`Experiments::default`), degrees arrive as
+    /// degrees, booleans as 0/1, and an unknown name is a skewed build.
+    #[test]
+    fn parse_config_reads_experiments() {
+        let joint = "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n";
+        let cfg = parse_config(&format!("proto 6\n{joint}")).unwrap();
+        assert!(cfg.exp.is_default());
+        assert_eq!(cfg.exp.friction_k_max, filter::FRICTION_FF_K_MAX);
+
+        let cfg = parse_config(&format!(
+            "proto 6\n{joint}\
+             exp friction_k_max 400\n\
+             exp friction_slew 30\n\
+             exp stiction_gain 0.6\n\
+             exp stiction_err_deg 0.1\n\
+             exp integrator_hz 0.3\n\
+             exp integrator_freeze_deg 2\n\
+             exp tracker_wire_vel 1\n\
+             exp tracker_accel_ff 0\n\
+             exp dither_nm 0.2\n\
+             exp dither_hz 55\n\
+             exp dither_square 1\n\
+             exp tracker_pos_gain 31.4\n\
+             exp command_lead_ms 25\n"
+        ))
+        .unwrap();
+        assert!(!cfg.exp.is_default());
+        assert_eq!(cfg.exp.friction_k_max, 400.0);
+        assert_eq!(cfg.exp.friction_slew, 30.0);
+        assert_eq!(cfg.exp.stiction_gain, 0.6);
+        assert!((cfg.exp.stiction_err - 0.1_f64.to_radians()).abs() < 1e-15);
+        assert_eq!(cfg.exp.integrator_hz, 0.3);
+        assert!((cfg.exp.integrator_freeze - 2.0_f64.to_radians()).abs() < 1e-15);
+        assert!(cfg.exp.tracker_wire_vel);
+        assert!(!cfg.exp.tracker_accel_ff);
+        assert_eq!(cfg.exp.dither_nm, 0.2);
+        assert_eq!(cfg.exp.dither_hz, 55.0);
+        assert!(cfg.exp.dither_square);
+        // Nothing asked for a wire mode, so the MIT frame stands.
+        assert_eq!(cfg.exp.wire_mode, WireMode::Mit);
+        assert_eq!(cfg.exp.tracker_pos_gain, 31.4);
+        // Arrives in ms, stored in seconds.
+        assert!((cfg.exp.command_lead - 0.025).abs() < 1e-12);
+        // Untouched, so it keeps the shipped value.
+        assert_eq!(cfg.exp.tracker_vel_gain, Trapezoid::VEL_TRACK_GAIN);
+
+        let err = match parse_config(&format!("proto 6\n{joint}exp bogus 1\n")) {
+            Ok(_) => panic!("accepted an unknown experiment"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("unknown experiment `bogus 1`"), "{err}");
+        assert!(err.contains("axol rt.install"), "{err}");
+        assert!(parse_config(&format!("proto 6\n{joint}exp friction_slew\n")).is_err());
+        assert!(parse_config(&format!("proto 6\n{joint}exp friction_slew nan\n")).is_err());
+    }
+
+    /// `wire_mode` is the one experiment whose value is a name rather than a
+    /// number, so it exercises the other half of the `exp` parser — and an
+    /// unreadable name has to be as fatal as an unreadable field, or a
+    /// mistyped mode would quietly run the production law.
+    #[test]
+    fn parse_config_reads_the_wire_mode() {
+        let joint = "joint 0 can0 shoulder_1 1 250 3.5 6.3 22.0 0.6 20 0.1 0\n";
+        for (word, want) in [
+            ("mit", WireMode::Mit),
+            ("a4", WireMode::A4),
+            ("a9", WireMode::A9),
+            ("tf", WireMode::Tf),
+        ] {
+            let cfg = parse_config(&format!("proto 6\n{joint}exp wire_mode {word}\n")).unwrap();
+            assert_eq!(cfg.exp.wire_mode, want);
+            assert_eq!(cfg.exp.is_default(), want == WireMode::Mit);
+        }
+        let err = match parse_config(&format!("proto 6\n{joint}exp wire_mode a10\n")) {
+            Ok(_) => panic!("accepted an unknown wire mode"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("unknown experiment `wire_mode a10`"), "{err}");
+        // A name where a number belongs, and a number where a name belongs.
+        assert!(parse_config(&format!("proto 6\n{joint}exp dither_hz fast\n")).is_err());
+        assert!(parse_config(&format!("proto 6\n{joint}exp wire_mode 9\n")).is_err());
+    }
 }
