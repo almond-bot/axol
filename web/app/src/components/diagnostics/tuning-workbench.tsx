@@ -238,8 +238,12 @@ const TABS: WbTab[] = [
         key: "center",
         label: "center (°)",
         type: "number",
-        placeholder: "current",
-        hint: "joint-frame angle to sweep about — use the most gravity-loaded pose the joint works at",
+        placeholder: "where it is now",
+        hint:
+          "Joint-frame angle the sine is centred on (it runs centre ± amp). Empty = wherever " +
+          "the joint sits after homing, i.e. near rest and barely loaded — a gain that holds " +
+          "there can collapse under load (elbow: cliff 0.9 at -45°, 0.3 at -90°). Give it the " +
+          "most gravity-loaded pose the joint works at: elbow -90, shoulders where they run.",
       },
       {
         key: "kp",
