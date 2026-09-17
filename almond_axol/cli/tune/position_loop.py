@@ -242,10 +242,17 @@ async def _track(
             pass
         await asyncio.sleep(0.02)
     else:
+        # Do not measure anyway. On hardware an unloaded pose that never
+        # reached the start still printed 4.86° and 6.66° into the results
+        # table, with a lag of -344 ms — the joint leading its own target by
+        # a third of a second, which is not a tracking figure at all. A row
+        # that looks like data outranks a warning above it.
         print(
-            f"    (did not reach {math.degrees(start):.1f}° within "
-            f"{_APPROACH_MAX_S:.0f}s — the result below includes the approach)"
+            f"    !! never reached {math.degrees(start):.1f}° in "
+            f"{_APPROACH_MAX_S:.0f}s — no result for this pass. The joint is "
+            f"not following 0xA4 here; check the gain, the load and the pose."
         )
+        return float("nan"), float("nan"), float("nan"), float("nan")
     await asyncio.sleep(0.3)
 
     dt = 1.0 / rate_hz
@@ -567,11 +574,15 @@ async def _run(args: argparse.Namespace) -> None:
                         )
                         for _ in range(args.repeat)
                     ]
-                    rms = float(np.mean([t[0] for t in trials]))
-                    spread = float(np.std([t[0] for t in trials]))
-                    mx = float(np.mean([t[1] for t in trials]))
-                    lag = float(np.mean([t[2] for t in trials]))
-                    ripple = float(np.mean([t[3] for t in trials]))
+                    ok = [t for t in trials if math.isfinite(t[0])]
+                    if not ok:
+                        print(f"  {kp:12.4f}   (no usable pass)")
+                        continue
+                    rms = float(np.mean([t[0] for t in ok]))
+                    spread = float(np.std([t[0] for t in ok]))
+                    mx = float(np.mean([t[1] for t in ok]))
+                    lag = float(np.mean([t[2] for t in ok]))
+                    ripple = float(np.mean([t[3] for t in ok]))
                     # A difference smaller than the spread across repeats
                     # is not a difference.
                     noisy = ripple > args.ripple_limit or (

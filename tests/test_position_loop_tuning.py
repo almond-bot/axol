@@ -199,8 +199,10 @@ class AccelerationTest(unittest.TestCase):
         approach = src[: src.index("t0 = time.monotonic()")]
         self.assertIn("set_position_velocity(start", approach)
         self.assertIn("_APPROACH_TOL_RAD", approach)
-        # And it must not silently give up: an unreached start is reported.
-        self.assertIn("includes the approach", src)
+        # And it must not measure anyway: an unreached start yields no row.
+        self.assertIn("no result for this pass", src)
+        tail = src[src.index("_APPROACH_MAX_S:.0f}s") :]
+        self.assertIn('return float("nan")', tail[: tail.index("dt = 1.0 / rate_hz")])
 
     def test_drive_starts_at_rest_so_the_approach_leaves_no_step(self) -> None:
         """The approach parks the joint at a standstill. A sine about the
