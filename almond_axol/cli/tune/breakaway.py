@@ -170,6 +170,38 @@ def detect_release(rows: list[dict], ramp: np.ndarray, move_rad: float) -> float
     return abs(float(ramp[min(i, len(ramp) - 1)]))
 
 
+async def _drift_check(
+    motor: JointFrameMotor,
+    hold_q: float,
+    gravity_nm: float,
+    secs: float,
+    kd: float,
+) -> float:
+    """Hold at ``kp = 0`` with gravity feedforward only; return drift (rad).
+
+    This is the probe's own precondition: the ramp measures the *extra*
+    torque needed to move the joint, which only means something if the joint
+    is standing still to begin with. It is also a direct read of the
+    gravity-model residual at this pose — at high load a small model error is
+    worth more torque than breakaway itself, and then the probe is measuring
+    the model, not the friction.
+    """
+    n = max(8, int(secs * _RATE_HZ))
+    rows = await motor.run_experiment(
+        kp=0.0,
+        kd=kd,
+        rate_hz=_RATE_HZ,
+        samples=[(hold_q, hold_q, gravity_nm)] * n,
+        differentiate=False,
+        feedforward=_NO_FF,
+    )
+    actual = np.array([r["actual"] for r in rows], dtype=float)
+    good = actual[np.isfinite(actual)]
+    if len(good) < 4:
+        return 0.0
+    return float(np.max(np.abs(good - np.median(good[:8]))))
+
+
 async def _measure(
     motor: JointFrameMotor,
     joint: Joint,
@@ -187,6 +219,19 @@ async def _measure(
 ) -> dict[str, list[float]]:
     """Breakaway in both directions at one pose, ``trials`` times each."""
     out: dict[str, list[float]] = {"+": [], "-": []}
+    await _ramp_to(motor, kp_hold, kd, hold_q)
+    drift = await _drift_check(motor, hold_q, gravity_nm, 1.0, kd)
+    out["drift_rad"] = [drift]  # type: ignore[index]
+    if drift > move_rad:
+        print(
+            f"      ! joint drifts {math.degrees(drift):.3f}° at kp=0 on gravity "
+            f"feedforward alone (threshold {math.degrees(move_rad):.3f}°) — the "
+            f"gravity model is off by more than breakaway here, so this pose "
+            f"measures the model, not friction. Skipping."
+        )
+        await _ramp_to(motor, kp_hold, kd, hold_q)
+        return out
+    print(f"      drift at kp=0: {math.degrees(drift):.4f}° (gravity model ok here)")
     for direction, key in ((+1.0, "+"), (-1.0, "-")):
         for trial in range(trials):
             await _ramp_to(motor, kp_hold, kd, hold_q)
@@ -234,43 +279,82 @@ async def _measure(
 def _report(
     joint: Joint, kp: float, fc: float, by_pose: list[tuple[float, float, dict]]
 ) -> None:
-    print(f"\n{'─' * 62}")
+    """Split each pose into its symmetric and antisymmetric parts.
+
+    Probing both directions separates two different things that a single
+    average hides, the same way ``tune.friction`` separates gravity from
+    friction with its bidirectional sweep:
+
+    * **breakaway** = ``(|release+| + |release-|) / 2`` — symmetric, the
+      static friction we came to measure;
+    * **bias** = ``(|release+| - |release-|) / 2`` — antisymmetric, a
+      standing torque the feedforward is not cancelling (gravity-model
+      error or ``fo``). It is *not* friction, and averaging it in makes
+      breakaway look direction-dependent when it is not.
+    """
+    print(f"\n{'-' * 70}")
     print(f"  {joint.value}: breakaway vs sliding friction (fc = {fc:.3f} Nm)\n")
     print(
-        f"  {'pose':>8} {'gravity':>9} {'break +':>9} {'break -':>9} "
-        f"{'mean':>8} {'/fc':>6} {'stair':>8}"
+        f"  {'pose':>8} {'gravity':>9} {'break+':>8} {'break-':>8} "
+        f"{'BREAK':>8} {'/fc':>6} {'bias':>8} {'drift':>8}"
     )
     rows = []
     for q, g, res in by_pose:
-        vals = res["+"] + res["-"]
-        if not vals:
+        if not (res.get("+") or res.get("-")):
+            drift = res.get("drift_rad", [float("nan")])[0]
+            print(
+                f"  {math.degrees(q):8.1f} {g:9.3f} {'—':>8} {'—':>8} "
+                f"{'skipped':>8} {'':>6} {'':>8} {math.degrees(drift):7.3f}°"
+            )
             continue
         mp = float(np.mean(res["+"])) if res["+"] else float("nan")
         mm = float(np.mean(res["-"])) if res["-"] else float("nan")
-        mean = float(np.mean(vals))
-        stair = math.degrees(max(mean - fc, 0.0) / kp)
-        rows.append((abs(g), mean))
+        if res["+"] and res["-"]:
+            brk, bias = (mp + mm) / 2.0, (mp - mm) / 2.0
+        else:
+            brk, bias = (mp if res["+"] else mm), float("nan")
+        drift = res.get("drift_rad", [float("nan")])[0]
+        rows.append((abs(g), brk))
         print(
-            f"  {math.degrees(q):8.1f} {g:9.3f} {mp:9.3f} {mm:9.3f} "
-            f"{mean:8.3f} {mean / fc:6.2f} {stair:7.3f}°"
+            f"  {math.degrees(q):8.1f} {g:9.3f} {mp:8.3f} {mm:8.3f} "
+            f"{brk:8.3f} {brk / fc:6.2f} {bias:8.3f} {math.degrees(drift):7.3f}°"
         )
     if not rows:
-        print("  (no releases recorded)")
+        print("\n  No usable releases. If every pose was skipped, the gravity")
+        print("  model is the thing to fix before friction can be measured here.")
         return
+
     means = [m for _, m in rows]
     ratio = float(np.mean(means)) / fc
     print(f"\n  breakaway / fc = {ratio:.2f}")
-    print(
-        f"    -> suggested --axol.experiments.stiction_gain {min(ratio - 1.0, 0.9):.2f}"
-    )
-    stair = math.degrees(max(float(np.mean(means)) - fc, 0.0) / kp)
-    print(
-        f"    -> predicted stick-slip stair height {stair:.3f}° "
-        f"(compare with the steps in a slow replay)"
-    )
-    print(
-        f"    -> suggested --axol.experiments.stiction_err_deg {max(stair, 0.01):.3f}"
-    )
+    if ratio >= 1.05:
+        # The textbook case: static exceeds sliding, and that gap is the
+        # stick-slip stair.
+        stair = math.degrees((float(np.mean(means)) - fc) / kp)
+        print(
+            f"    -> static exceeds sliding by {ratio - 1:.2f}x fc — stick-slip is expected"
+        )
+        print(f"    -> --axol.experiments.stiction_gain {min(ratio - 1.0, 0.9):.2f}")
+        print(
+            f"    -> predicted stair height {stair:.3f}° "
+            f"(compare with the steps in a slow replay)"
+        )
+        print(f"    -> --axol.experiments.stiction_err_deg {max(stair, 0.01):.3f}")
+    else:
+        # Breakaway at or below the fitted fc. Adding stiction compensation
+        # here pushes harder against friction that is already over-modelled.
+        over = fc - float(np.mean(means))
+        print(f"    -> breakaway is at or BELOW the fitted fc, by {over:.3f} Nm.")
+        print("       The velocity feedforward is over-compensating at rest: it")
+        print(f"       commands {fc:.3f} Nm of Coulomb torque where the joint")
+        print(f"       releases at {float(np.mean(means)):.3f} Nm.")
+        print("    -> do NOT raise stiction_gain or friction_k_max here; both")
+        print("       deliver *more* of an already-too-large fc at low speed.")
+        print("    -> the lever is fc itself: try scaling it toward the measured")
+        print(
+            f"       breakaway, e.g. --axol.<side>.{joint.value}.friction.fc "
+            f"{float(np.mean(means)):.3f}"
+        )
     if len(rows) >= 2:
         g = np.array([x for x, _ in rows])
         m = np.array(means)

@@ -162,6 +162,88 @@ class ReportTest(unittest.TestCase):
         for by_pose in (two, two[:1], [(0.0, -1.35, {"+": [], "-": []})]):
             _report(Joint.SHOULDER_1, 250.0, 0.909, by_pose)
 
+    def test_splits_symmetric_breakaway_from_antisymmetric_bias(self) -> None:
+        # The measurement that matters: probing both directions separates
+        # static friction (symmetric) from an uncancelled standing torque
+        # (antisymmetric). Averaging them together — as the first version
+        # did — makes breakaway look direction-dependent when it is not.
+        import io
+        from contextlib import redirect_stdout
+
+        from almond_axol.cli.tune.breakaway import _report
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _report(
+                Joint.SHOULDER_1,
+                250.0,
+                1.297,
+                [(0.0, -0.22, {"+": [0.810], "-": [0.300], "drift_rad": [1e-4]})],
+            )
+        out = buf.getvalue()
+        self.assertIn("0.555", out)  # (0.810 + 0.300) / 2 = breakaway
+        self.assertIn("0.255", out)  # (0.810 - 0.300) / 2 = bias
+
+    def test_breakaway_below_fc_warns_against_more_compensation(self) -> None:
+        # Static friction under the fitted fc means the feedforward is
+        # already over-compensating; telling the operator to raise
+        # stiction_gain there would push the wrong way.
+        import io
+        from contextlib import redirect_stdout
+
+        from almond_axol.cli.tune.breakaway import _report
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _report(
+                Joint.SHOULDER_1,
+                250.0,
+                1.297,
+                [(0.0, -0.22, {"+": [0.81], "-": [0.30], "drift_rad": [1e-4]})],
+            )
+        out = buf.getvalue()
+        self.assertIn("BELOW the fitted fc", out)
+        self.assertIn("do NOT raise stiction_gain", out)
+        self.assertNotIn("stiction_err_deg", out)
+
+    def test_breakaway_above_fc_suggests_stiction(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+
+        from almond_axol.cli.tune.breakaway import _report
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _report(
+                Joint.ELBOW,
+                130.0,
+                0.602,
+                [(0.0, -0.1, {"+": [0.90], "-": [0.90], "drift_rad": [1e-4]})],
+            )
+        out = buf.getvalue()
+        self.assertIn("stiction_gain", out)
+        self.assertIn("stair height", out)
+
+    def test_skipped_pose_renders_and_is_excluded_from_the_fit(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+
+        from almond_axol.cli.tune.breakaway import _report
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _report(
+                Joint.SHOULDER_1,
+                250.0,
+                1.297,
+                [
+                    (0.0, -0.22, {"+": [0.81], "-": [0.30], "drift_rad": [1e-4]}),
+                    (0.8, 14.9, {"+": [], "-": [], "drift_rad": [0.009]}),
+                ],
+            )
+        out = buf.getvalue()
+        self.assertIn("skipped", out)
+
     def test_one_sided_release_still_reports(self) -> None:
         # A joint that only breaks one way is a real outcome, not a crash.
         from almond_axol.cli.tune.breakaway import _report
