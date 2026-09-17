@@ -80,6 +80,16 @@ _GAIN_FIELDS = (
     "kd_host_hz",
     "kd_host_q",
     "j_eff",
+    # Friction model, addressed as ``joint.friction.fc`` etc. Needed because
+    # a single fc cannot serve a load-dependent joint: on the reference right
+    # shoulder_1, sliding friction measured 0.55 Nm nearly unloaded and
+    # 1.27 Nm under 12-15 Nm of gravity (fit 0.34 + 0.063*|tau_g|), and the
+    # breakaway probe released at 0.58 Nm where fc commanded 1.30. Pair a
+    # lowered fc with ``--experiment friction_load_gain`` to follow that line.
+    "friction.fc",
+    "friction.k",
+    "friction.fv",
+    "friction.fo",
 )
 
 # Column names of a 14-wide motion row: left arm then right arm.
@@ -102,6 +112,11 @@ def _parse_gain_overrides(specs: list[str]) -> dict[tuple[str, str, str], float]
             value = float(raw)
         except ValueError:
             raise SystemExit(f"--gain: bad value in {spec!r} (want PATH=NUMBER)")
+        # The friction model is a nested dataclass, so its fields arrive as
+        # ``friction.fc`` -- fold that back into one field token so the
+        # ``[side.]joint.field`` shape below still holds.
+        if len(parts) >= 2 and parts[-2] == "friction":
+            parts = parts[:-2] + [f"friction.{parts[-1]}"]
         if len(parts) == 3:
             sides, joint, fld = [parts[0]], parts[1], parts[2]
             if sides[0] not in ("left", "right"):
@@ -439,7 +454,11 @@ async def _run(args: argparse.Namespace) -> None:
         settings=not args.no_settings,
     )
     for (side, joint, fld), value in overrides.items():
-        setattr(getattr(getattr(config, side), joint), fld, value)
+        target = getattr(getattr(config, side), joint)
+        head, _, leaf = fld.rpartition(".")
+        if head:
+            target = getattr(target, head)
+        setattr(target, leaf, value)
         print(f"  gain override: {side}.{joint}.{fld} = {value}")
     active_experiments = announce(config.experiments)
 

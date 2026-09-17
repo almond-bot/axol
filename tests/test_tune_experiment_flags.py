@@ -150,3 +150,44 @@ class ParserWiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GainOverrideFrictionTest(unittest.TestCase):
+    """``--gain`` must reach the nested friction model.
+
+    A single fc cannot serve a load-dependent joint. On the reference right
+    shoulder_1 the sliding friction measured 0.55 Nm nearly unloaded and
+    1.27 Nm under 12-15 Nm of gravity, and ``tune.breakaway`` released at
+    0.58 Nm where fc commanded 1.30 -- so A/B-ing a lowered fc together with
+    ``friction_load_gain`` needs the override to address ``friction.fc``.
+    """
+
+    def test_parses_nested_friction_fields(self) -> None:
+        from almond_axol.cli.tune.motion import _parse_gain_overrides
+
+        out = _parse_gain_overrides(
+            ["right.shoulder_1.friction.fc=0.34", "elbow.friction.fo=0.0"]
+        )
+        self.assertEqual(out[("right", "shoulder_1", "friction.fc")], 0.34)
+        self.assertEqual(out[("left", "elbow", "friction.fo")], 0.0)
+        self.assertEqual(out[("right", "elbow", "friction.fo")], 0.0)
+
+    def test_flat_fields_still_parse(self) -> None:
+        from almond_axol.cli.tune.motion import _parse_gain_overrides
+
+        out = _parse_gain_overrides(["right.elbow.kd_host=15"])
+        self.assertEqual(out, {("right", "elbow", "kd_host"): 15.0})
+
+    def test_unknown_friction_field_is_rejected(self) -> None:
+        from almond_axol.cli.tune.motion import _parse_gain_overrides
+
+        with self.assertRaises(SystemExit):
+            _parse_gain_overrides(["right.shoulder_1.friction.bogus=1"])
+
+    def test_override_lands_on_the_nested_dataclass(self) -> None:
+        config = AxolConfig()
+        target = config.right.shoulder_1
+        fld, value = "friction.fc", 0.34
+        head, _, leaf = fld.rpartition(".")
+        setattr(getattr(target, head) if head else target, leaf, value)
+        self.assertEqual(config.right.shoulder_1.friction.fc, 0.34)
