@@ -668,10 +668,18 @@ class ControlExperiments:
     (the realtime core, which is what production runs); the values ride
     the core's config as ``exp <name> <value>`` lines.
 
-    Measure each with ``tune.pid`` step/sine RMS plus an ``AXOL_RT_TRACE``
-    capture (the trace carries ``stiction_ff`` / ``integral_ff`` columns
-    next to the existing feedforwards) and check the 3 / 8–13 / 27–35 Hz
-    modes stay quiet.
+    Measure each with ``tune.motion`` (``--experiment name=value``, or an
+    ``experiments`` block in the settings file) plus an ``AXOL_RT_TRACE``
+    capture — the trace carries ``stiction_ff`` / ``integral_ff`` /
+    ``dither_ff`` columns next to the existing feedforwards — and check the
+    3 / 8–13 / 27–35 Hz modes stay quiet.
+
+    **Not** ``tune.pid``: its single-joint runner is a separate control law
+    in the core's tuning path (``rust/axol-rt/src/experiment.rs``), which
+    has none of this plumbed into it and always runs the shipped
+    feedforward. Every flag here reads as a no-op under it. Only the
+    production ``motion_control`` path — teleop, ``tune.motion``,
+    ``tune.repeatability`` — applies them.
 
     Attributes:
         friction_k_max: Steepness cap on the Coulomb friction feedforward's

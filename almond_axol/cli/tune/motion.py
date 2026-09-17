@@ -8,10 +8,19 @@ thing to a repeatable teleop session.
 The motion (see ``axol motion.list`` / ``motion.build``) streams to both
 arms at its stored rate with absolute-deadline pacing, exactly like teleop
 drives the robot: impedance gains, gravity/friction/inertia feedforward, and
-host-side damping all come from the same ``AxolConfig`` production uses.
+host-side damping all come from the same ``AxolConfig`` production uses —
+the robot's shared settings (``~/.almond/settings.json``, the panel's file)
+over the calibrated defaults, as ``axol teleop`` resolves them.
 Override individual gains per run with ``--gain`` and compare runs on the
 identical motion — the deterministic A/B loop that ad-hoc teleop testing
 can't give you.
+
+That extends to the opt-in control experiments: an ``experiments`` block in
+the settings file is honoured, and ``--experiment name=value`` overrides one
+field per run without editing the file. The resolved set is printed at
+startup and stored on the saved run, so two rows in the Tuning charts are
+never ambiguous about which control law produced them. ``--no-settings``
+replays against the calibrated defaults instead.
 
 With ``--ik`` the run exercises the full Cartesian pipeline instead of raw
 joint replay: every waypoint is converted to its two end-effector poses
@@ -50,11 +59,16 @@ import numpy as np
 
 from ...constants import ARM_JOINTS
 from ...robot import Axol
-from ...robot.config import AxolConfig
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
 from ...utils.logquiet import quiet_noisy_loggers
+from ._experiments import (
+    add_experiment_argument,
+    announce,
+    base_config,
+    parse_experiment_overrides,
+)
 
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — approach/return trajectory speed
 _PLAN_MIN_DURATION = 1.5  # s
@@ -198,6 +212,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         action="store_true",
         help="Run on the gripperless SKU (the gripper motor is never "
         "enabled or calibrated)",
+    )
+    add_experiment_argument(p)
+    p.add_argument(
+        "--no-settings",
+        action="store_true",
+        help="Ignore the robot's shared settings (~/.almond/settings.json) "
+        "and replay against the calibrated defaults instead.",
     )
     p.add_argument(
         "--log-level",
@@ -407,14 +428,20 @@ async def _run(args: argparse.Namespace) -> None:
 
     if not 0.0 <= args.stiffness <= 1.0:
         raise SystemExit("--stiffness must be in [0, 1]")
-    config = AxolConfig(
-        left_stiffness=args.stiffness,
-        right_stiffness=args.stiffness,
+    # The robot's shared settings are the base, so a replay runs the control
+    # law the panel is configured with — including any `experiments` block.
+    # The realtime core applies those; a run that silently dropped them would
+    # score the shipped law no matter what the operator selected.
+    config = base_config(
+        stiffness=args.stiffness,
         has_gripper=not args.no_gripper,
+        experiment_overrides=parse_experiment_overrides(args.experiment),
+        settings=not args.no_settings,
     )
     for (side, joint, fld), value in overrides.items():
         setattr(getattr(getattr(config, side), joint), fld, value)
         print(f"  gain override: {side}.{joint}.{fld} = {value}")
+    active_experiments = announce(config.experiments)
 
     # The kinematics stack plans the collision-aware approach/return moves.
     print("Loading kinematics solver (JIT compile may take a few seconds) ...")
@@ -642,6 +669,9 @@ async def _run(args: argparse.Namespace) -> None:
                 "rate": motion.rate,
                 "stiffness": args.stiffness,
                 "columns": _COLUMNS,
+                # Which control law produced this run — without it two rows
+                # in the Tuning charts are indistinguishable.
+                "experiments": active_experiments,
                 **stream_info,
             },
             label=args.label,

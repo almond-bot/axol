@@ -24,7 +24,11 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or any joint: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3`.
 
 <Accordion title="Tracking experiments (opt-in)">
-  Candidates for stiffening the arm and removing its slow-motion stick-slip stairs, each behind a flag so they can be A/B'd on hardware one at a time. With every flag at its default the controller is exactly the production one. They run in the realtime core (which logs a warning naming the active set), and the control trace gains `stiction_ff` / `integral_ff` columns to read them by. Measure with [`tune.pid`](/cli/tune-pid) step/sine RMS and a trace capture, and check the 3 / 8–13 / 27–35 Hz modes stay quiet. Requires a core rebuilt from the same checkout (`axol rt.install`).
+  Candidates for stiffening the arm and removing its slow-motion stick-slip stairs, each behind a flag so they can be A/B'd on hardware one at a time. With every flag at its default the controller is exactly the production one. They run in the realtime core (which logs a warning naming the active set), and the control trace gains `stiction_ff` / `integral_ff` columns to read them by. Measure with [`tune.motion`](/cli/tune-motion) — `--experiment name=value` per run, or an `experiments` block in the settings file, with the resolved set printed at startup and saved on the run — plus an `AXOL_RT_TRACE` capture, and check the 3 / 8–13 / 27–35 Hz modes stay quiet. Requires a core rebuilt from the same checkout (`axol rt.install`).
+
+<Warning>
+  These do **not** apply under [`tune.pid`](/cli/tune-pid). Its single-joint runner is a separate control law living in the core's tuning path, with none of this plumbed into it, so every flag here reads as a no-op there. Only the production `motion_control` path — teleop, `tune.motion`, `tune.repeatability` — runs them.
+</Warning>
 
   | Flag | Default | Description |
   |---|---|---|

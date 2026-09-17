@@ -35,10 +35,15 @@ import numpy as np
 from ...constants import ARM_JOINTS, Joint
 from ...kinematics.solver import KinematicsSolver
 from ...robot import Axol, closer_end_stop
-from ...robot.config import AxolConfig
 from ...teleop.config import VRTeleopConfig
 from ...teleop.trajectory import plan_collision_aware_trajectory
 from ...utils.logquiet import quiet_noisy_loggers
+from ._experiments import (
+    add_experiment_argument,
+    announce,
+    base_config,
+    parse_experiment_overrides,
+)
 
 _RATE_HZ = (
     250.0  # waypoint density — high for smooth playback (speed is set by --speed)
@@ -259,6 +264,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
             "tracking jitter. Default 1.0 (the tuned production gains)."
         ),
     )
+    add_experiment_argument(p)
+    p.add_argument(
+        "--no-settings",
+        action="store_true",
+        help="Ignore the robot's shared settings (~/.almond/settings.json) "
+        "and run against the calibrated defaults instead.",
+    )
     p.add_argument(
         "--log-level",
         default="INFO",
@@ -318,13 +330,17 @@ async def _run(args: argparse.Namespace) -> None:
 
     # Only the left arm actuates — disable the right channel entirely.
     axol_kwargs: dict = {"right_channel": None}
-    axol_config = AxolConfig(
-        left_stiffness=args.stiffness,
-        right_stiffness=args.stiffness,
+    # Shared settings are the base, so a repeatability run measures the
+    # control law the panel is configured with — experiments included.
+    axol_config = base_config(
+        stiffness=args.stiffness,
         has_gripper=not args.no_gripper,
+        experiment_overrides=parse_experiment_overrides(args.experiment),
+        settings=not args.no_settings,
     )
     axol_config.left.gripper.torque_limit = args.gripper_torque_limit
     axol_config.right.gripper.torque_limit = args.gripper_torque_limit
+    announce(axol_config.experiments)
 
     print(
         f"Repeatability run: "
