@@ -59,7 +59,8 @@ _MA_FC_SET_CANID = 0x05  # function control index: set CAN ID
 # the six uint8 gains in bytes 2-7 (byte 1 zero) — the index echo is how the
 # driver tells the two formats apart at runtime.
 _MA_READ_GAINS = 0x30
-_MA_WRITE_GAINS_ROM = 0x32  # persistent by command; 0x31 (RAM) is not used
+_MA_WRITE_GAINS_RAM = 0x31  # volatile: reverts on the next power cycle
+_MA_WRITE_GAINS_ROM = 0x32  # persistent by command
 
 # Indexed float32 parameter indices for 0x30/0x31/0x32 (V4.2+).
 _MA_PID_IDX = {
@@ -809,8 +810,11 @@ class MyActuatorMotor(MotorDriver):
             values[name] = value
         return MotorGains(**values)
 
-    async def set_gains(self, gains: MotorGains) -> None:
-        # Command 0x32 writes directly to ROM — no separate store step needed.
+    async def set_gains(self, gains: MotorGains, *, persist: bool = True) -> None:
+        # 0x32 writes straight to ROM; 0x31 is the identical frame against RAM,
+        # so a search can iterate without burning ROM cycles or leaving the
+        # motor changed if it is interrupted — a power cycle restores ROM.
+        # The manual warns against writing while the motor is moving.
         # Probe the read format first so a V4.2+ motor never receives the
         # legacy bulk frame (and vice versa), which would store garbage gains.
         probe = await self._read_gain_indexed(_MA_PID_IDX["current_kp"])
@@ -827,10 +831,11 @@ class MyActuatorMotor(MotorDriver):
                 writes["current_kp"] = gains.current_kp
             if gains.current_ki is not None:
                 writes["current_ki"] = gains.current_ki
+            cmd = _MA_WRITE_GAINS_ROM if persist else _MA_WRITE_GAINS_RAM
             for name, value in writes.items():
-                data = bytes(
-                    [_MA_WRITE_GAINS_ROM, _MA_PID_IDX[name], 0, 0]
-                ) + struct.pack("<f", float(value))
+                data = bytes([cmd, _MA_PID_IDX[name], 0, 0]) + struct.pack(
+                    "<f", float(value)
+                )
                 await self._request(data)
             return
 
@@ -843,7 +848,7 @@ class MyActuatorMotor(MotorDriver):
         # Legacy SDK byte layout: [cmd, 0, cur_kp, cur_ki, spd_kp, spd_ki, pos_kp, pos_ki]
         data = bytes(
             [
-                _MA_WRITE_GAINS_ROM,
+                _MA_WRITE_GAINS_ROM if persist else _MA_WRITE_GAINS_RAM,
                 0,
                 current_kp,
                 current_ki,

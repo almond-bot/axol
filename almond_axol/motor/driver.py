@@ -408,13 +408,19 @@ class MotorDriver(ABC):
         ...
 
     @abstractmethod
-    async def set_gains(self, gains: MotorGains) -> None:
+    async def set_gains(self, gains: MotorGains, *, persist: bool = True) -> None:
         """Write PID gains for the speed and position control loops.
 
-        Changes are persisted to non-volatile memory so they survive power cycles.
-
         Args:
-            gains: Gain values to write. Damiao ignores current_kp / current_ki.
+            gains:   Gain values to write. Damiao ignores current_kp /
+                     current_ki.
+            persist: ``True`` (default) stores to non-volatile memory, so the
+                     gains survive a power cycle. ``False`` writes to RAM
+                     only — the motor reverts on the next power cycle, which
+                     is what makes an iterative search safe: every trial is
+                     undone by turning the robot off. Only MyActuator
+                     distinguishes the two (0x31 RAM vs 0x32 ROM); Damiao
+                     always persists.
         """
         ...
 
