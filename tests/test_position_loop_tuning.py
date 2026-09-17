@@ -183,6 +183,31 @@ class AccelerationTest(unittest.TestCase):
         self.assertIn("await motor.get_position()", src)
         self.assertNotIn("motor.motor.position", src)
 
+    def test_tracking_ripple_separates_buzz_from_following_error(self) -> None:
+        """A raised gain trades tracking error for vibration, and rms keeps
+        falling right through it — an operator hears the buzz first. The
+        ripple window must pass the drive sine and keep the buzz."""
+        import numpy as np
+
+        rate = 100.0
+        k = max(3, int(0.15 * rate) | 1)
+
+        def ripple(err):
+            sm = np.convolve(err, np.ones(k) / k, mode="same")
+            return float((err - sm)[k:-k].std())
+
+        t = np.linspace(0, 15, 1500)
+        smooth = 0.4 * np.sin(2 * np.pi * 0.2 * t)
+        self.assertLess(ripple(smooth), 0.005)
+        buzzy = smooth + 0.15 * np.sin(2 * np.pi * 18 * t)
+        self.assertGreater(ripple(buzzy), pl._TRACK_RIPPLE_LIMIT_DEG)
+
+    def test_track_ripple_limit_is_tighter_than_the_hold_one(self) -> None:
+        # Different measurements: the tracking number has the drive sine
+        # removed, so the same physical buzz reads much smaller.
+        self.assertLess(pl._TRACK_RIPPLE_LIMIT_DEG, pl._RIPPLE_LIMIT_DEG)
+        self.assertGreater(pl._TRACK_RIPPLE_JUMP, 1.0)
+
     def test_tracking_metric_reports_lag(self) -> None:
         # A held position cannot reveal profiled-motion mode; only a moving
         # target can, so the tracking path must report a following error.

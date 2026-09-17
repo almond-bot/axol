@@ -88,6 +88,17 @@ _SAG_OK_DEG = 0.3
 #: Position ripple (deg rms) above which a candidate is called oscillating and
 #: the search stops rather than escalating into a louder instability.
 _RIPPLE_LIMIT_DEG = 0.25
+#: Ripple limit for the *tracking* sweep, which is a different measurement:
+#: there the drive sine is removed first, so what remains is buzz alone and a
+#: far smaller number means the same thing. Provisional — on hardware an
+#: operator heard vibration at a gain whose tracking rms was still only
+#: 0.069°, so the absolute figure is calibrated against ears, not theory.
+#: The sweep also stops on a sharp jump relative to the previous gain, which
+#: does not depend on getting this number right.
+_TRACK_RIPPLE_LIMIT_DEG = 0.05
+#: Ripple growth against the previous gain that counts as the onset of
+#: oscillation regardless of the absolute level.
+_TRACK_RIPPLE_JUMP = 3.0
 _SETTLE_S = 2.0
 _MEASURE_S = 2.0
 
@@ -190,8 +201,8 @@ async def _track(
     secs: float,
     max_speed: float,
     rate_hz: float,
-) -> tuple[float, float, float]:
-    """Stream 0xA4 along a sine; return ``(rms_deg, max_deg, lag_ms)``.
+) -> tuple[float, float, float, float]:
+    """Stream 0xA4 along a sine; return ``(rms, max, lag_ms, ripple)`` in deg.
 
     This is the test that matters for ``wire_mode``: a *held* position says
     nothing about whether the firmware loop can follow a target that keeps
@@ -244,7 +255,18 @@ async def _track(
         if m.sum() > 20
         else float("nan")
     )
-    return float(err.std()), float(np.abs(err).max()), float(lag)
+    # Ripple: what is left after removing the smooth following error. A
+    # raised gain buys tracking accuracy and eventually spends it on
+    # oscillation, and rms alone will happily keep falling while the joint
+    # buzzes — an operator hears that long before the mean error notices.
+    # A fixed 0.15 s window: the drive sine passes through it essentially
+    # unchanged, so it leaves no residue, while anything above ~7 Hz is
+    # retained in full. A window sized as a fraction of the record instead
+    # distorts the sine and reports its own smoothing error as ripple.
+    k = max(3, int(0.15 * rate_hz) | 1)
+    smooth = np.convolve(err, np.ones(k) / k, mode="same")
+    ripple = float((err - smooth)[k:-k].std()) if len(err) > 3 * k else float("nan")
+    return float(err.std()), float(np.abs(err).max()), float(lag), ripple
 
 
 async def _measure(
@@ -458,14 +480,16 @@ async def _run(args: argparse.Namespace) -> None:
                     f"{args.rate:.0f} Hz for {args.duration:.0f}s\n"
                 )
                 print(
-                    f"  {'position_kp':>12} {'rms err':>10} {'max err':>10} {'lag':>9}"
+                    f"  {'position_kp':>12} {'rms err':>10} {'max err':>10} "
+                    f"{'lag':>9} {'ripple':>9}"
                 )
                 kps = args.kp or [original.position_kp * m for m in _KP_STEPS]
+                prev_ripple: float | None = None
                 for kp in kps:
                     await test.motor.set_gains(
                         replace(original, position_kp=kp), persist=False
                     )
-                    rms, mx, lag = await _track(
+                    rms, mx, lag, ripple = await _track(
                         test,
                         target,
                         math.radians(args.amp),
@@ -474,7 +498,21 @@ async def _run(args: argparse.Namespace) -> None:
                         max_speed,
                         args.rate,
                     )
-                    print(f"  {kp:12.4f} {rms:9.4f}° {mx:9.4f}° {lag:8.1f}ms")
+                    noisy = ripple > _TRACK_RIPPLE_LIMIT_DEG or (
+                        prev_ripple is not None
+                        and ripple > _TRACK_RIPPLE_JUMP * max(prev_ripple, 1e-4)
+                    )
+                    print(
+                        f"  {kp:12.4f} {rms:9.4f}° {mx:9.4f}° {lag:8.1f}ms "
+                        f"{ripple:8.4f}°" + ("  <- oscillating" if noisy else "")
+                    )
+                    if noisy:
+                        print(
+                            "    stopping: past here the joint buys tracking "
+                            "accuracy with vibration."
+                        )
+                        break
+                    prev_ripple = ripple
                     if best is None or rms < best[2]:
                         best = (kp, 0.0, rms, mx)
                 if best is not None:
