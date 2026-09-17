@@ -398,7 +398,10 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         control_loop.intervention_spans = []
         control_loop.open_span_start = 0.0
 
-        control_loop.run()
+        # Claiming the control role needs an rtprio grant this host may not
+        # have; these assertions are about the recorded action, not scheduling.
+        with mock.patch.object(collect_dagger.affinity, "enter_control_thread"):
+            control_loop.run()
 
         robot.send_action.assert_called_once_with(human_joint_action)
         robot.action_to_dataset.assert_called_once_with(human_joint_action)
@@ -457,7 +460,8 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         control_loop.open_span_start = 0.0
         control_loop._policy_tick = mock.Mock(return_value=None)  # noqa: SLF001
 
-        control_loop.run()
+        with mock.patch.object(collect_dagger.affinity, "enter_control_thread"):
+            control_loop.run()
 
         self.assertEqual(
             robot.send_action.call_args_list,

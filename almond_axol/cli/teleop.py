@@ -35,8 +35,8 @@ import socket
 from typing import TYPE_CHECKING, Any
 
 from ..utils import affinity
-from ..utils.network import local_ip
 from ..utils.logquiet import quiet_noisy_loggers
+from ..utils.network import local_ip
 from .config import TeleopCmdConfig, normalize_bool_flags, parse
 
 if TYPE_CHECKING:
@@ -474,6 +474,12 @@ async def _run(cfg: TeleopCmdConfig) -> None:
     threads and processes it spawns reset to CFS — see
     :func:`~almond_axol.utils.affinity.prioritize_control_thread`.
 
+    A host that offers ``SCHED_FIFO`` and denies it raises
+    :exc:`~almond_axol.utils.affinity.ControlSchedulingError` before the
+    session starts, rather than running a loop that hitches: the denial is
+    almost always an rtprio grant that never reached this login, which is
+    invisible from the code and looks exactly like a regression.
+
     The original mask and policy are restored on exit so a long-lived
     ``serve`` worker is never left narrowed or FIFO; when the mask cannot be
     captured the pin is skipped rather than risk that.
@@ -483,10 +489,12 @@ async def _run(cfg: TeleopCmdConfig) -> None:
     except (AttributeError, OSError):
         original_affinity = None
     fifo = False
-    if original_affinity is not None:
-        affinity.pin_realtime()
-        fifo = affinity.prioritize_control_thread()
     try:
+        # Inside the guard: a denied real-time class raises, and the mask
+        # pin_realtime() just narrowed still has to be handed back.
+        if original_affinity is not None:
+            affinity.pin_realtime()
+            fifo = affinity.prioritize_control_thread()
         await _run_session(cfg)
     finally:
         if fifo:

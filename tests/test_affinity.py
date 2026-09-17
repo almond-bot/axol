@@ -1,4 +1,5 @@
 import io
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import call, patch
@@ -340,6 +341,12 @@ class BackgroundAndIkTest(TestCase):
             self.assertFalse(affinity.pin_background_and_ik())
 
 
+class _NoSchedOs:
+    """``os`` as it looks on a platform with no real-time scheduling at all."""
+
+    environ: dict[str, str] = {}
+
+
 class ControlThreadFifoTest(TestCase):
     """The control thread goes SCHED_FIFO, thread-scoped, children reset to CFS."""
 
@@ -371,23 +378,69 @@ class ControlThreadFifoTest(TestCase):
                 self.assertFalse(affinity.prioritize_control_thread())
         setsched.assert_not_called()
 
-    def test_permission_denied_stays_cfs_with_a_warning(self) -> None:
-        with (
+    def _deny_fifo(self, stack: ExitStack) -> None:
+        """Enter patches for a host that offers SCHED_FIFO and refuses it."""
+        stack.enter_context(
             patch.object(
                 affinity.os,
                 "sched_setscheduler",
                 create=True,
                 side_effect=PermissionError(1, "Operation not permitted"),
-            ),
+            )
+        )
+        stack.enter_context(
             patch.object(
                 affinity.os, "sched_param", create=True, side_effect=lambda p: p
-            ),
-            patch.object(affinity.os, "SCHED_FIFO", 1, create=True),
-            patch.object(affinity.os, "SCHED_RESET_ON_FORK", 0x40000000, create=True),
-            self.assertLogs(affinity._logger, level="WARNING") as logs,
-        ):
+            )
+        )
+        stack.enter_context(patch.object(affinity.os, "SCHED_FIFO", 1, create=True))
+        stack.enter_context(
+            patch.object(affinity.os, "SCHED_RESET_ON_FORK", 0x40000000, create=True)
+        )
+
+    def test_permission_denied_refuses_to_run(self) -> None:
+        # The whole point: a CFS control thread is a silent ~1-in-50 late tick,
+        # indistinguishable from a code regression, so it stops instead.
+        with ExitStack() as stack:
+            self._deny_fifo(stack)
+            env = dict(affinity.os.environ)
+            env.pop(affinity.ALLOW_CFS_CONTROL_ENV, None)
+            stack.enter_context(patch.dict(affinity.os.environ, env, clear=True))
+            with self.assertRaises(affinity.ControlSchedulingError) as caught:
+                affinity.prioritize_control_thread()
+        message = str(caught.exception)
+        self.assertIn("refusing to run without real-time scheduling", message)
+        # It has to name the cause an operator cannot see from the code.
+        self.assertIn("pam_limits", message)
+        self.assertIn(affinity.ALLOW_CFS_CONTROL_ENV, message)
+
+    def test_permission_denied_is_tolerated_when_not_required(self) -> None:
+        with ExitStack() as stack:
+            self._deny_fifo(stack)
+            logs = stack.enter_context(
+                self.assertLogs(affinity._logger, level="WARNING")
+            )
+            self.assertFalse(affinity.prioritize_control_thread(required=False))
+        self.assertIn("SCHED_OTHER", logs.output[0])
+
+    def test_env_escape_hatch_downgrades_the_refusal_to_a_warning(self) -> None:
+        with ExitStack() as stack:
+            self._deny_fifo(stack)
+            stack.enter_context(
+                patch.dict(affinity.os.environ, {affinity.ALLOW_CFS_CONTROL_ENV: "1"})
+            )
+            logs = stack.enter_context(
+                self.assertLogs(affinity._logger, level="WARNING")
+            )
             self.assertFalse(affinity.prioritize_control_thread())
         self.assertIn("SCHED_OTHER", logs.output[0])
+
+    def test_a_platform_without_the_syscall_is_a_silent_no_op(self) -> None:
+        # Nothing was on offer, so there is nothing to refuse — this mirrors
+        # axol-rt, which only insists when the launcher asked for a priority.
+        # Without this, every non-Linux dev box would fail to start.
+        with patch.object(affinity, "os", _NoSchedOs()):
+            self.assertFalse(affinity.prioritize_control_thread())
 
     def test_release_puts_the_thread_back_on_cfs(self) -> None:
         with (
@@ -415,4 +468,14 @@ class ControlThreadFifoTest(TestCase):
         ):
             self.assertTrue(affinity.enter_control_thread())
         pin.assert_called_once_with()
-        fifo.assert_called_once_with()
+        fifo.assert_called_once_with(required=True)
+
+    def test_enter_control_thread_forwards_a_tolerated_denial(self) -> None:
+        with (
+            patch.object(affinity, "pin_realtime", return_value=True),
+            patch.object(
+                affinity, "prioritize_control_thread", return_value=False
+            ) as fifo,
+        ):
+            self.assertTrue(affinity.enter_control_thread(required=False))
+        fifo.assert_called_once_with(required=False)

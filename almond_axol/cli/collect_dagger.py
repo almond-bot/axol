@@ -104,13 +104,13 @@ from ..recording import (
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..utils import affinity
 from ..utils.control_loop import run_blocking_with_sync_control_ticks
+from ..utils.logquiet import quiet_noisy_loggers
 from ..utils.network import local_ip
 from .collect_data import (
     _existing_dataset_resolution,
     _start_video_relay,
     check_resume_consistency,
 )
-from ..utils.logquiet import quiet_noisy_loggers
 from .config import DatasetResolution, LogLevel, PolicyType, parse
 from .run_policy import (
     _GATE_CONTACT,
@@ -618,12 +618,6 @@ class _DaggerControlLoop(threading.Thread):
     def run(self) -> None:
         from lerobot.teleoperators.utils import TeleopEvents
 
-        # This thread paces every command (`send_action` posts motion_control
-        # onto the robot's FIFO event-loop thread and waits for it), so it is
-        # the other half of the control path: same realtime core, SCHED_FIFO,
-        # anything it spawns reset to CFS — see affinity.enter_control_thread.
-        affinity.enter_control_thread()
-
         policy_period = 1.0 / float(self.fps)
         teleop_period = 1.0 / float(self.teleop_hz)
         last_action: dict[str, float] | None = None
@@ -632,6 +626,15 @@ class _DaggerControlLoop(threading.Thread):
         last_rate_log = time.perf_counter()
 
         try:
+            # This thread paces every command (`send_action` posts
+            # motion_control onto the robot's FIFO event-loop thread and waits
+            # for it), so it is the other half of the control path: same
+            # realtime core, SCHED_FIFO, anything it spawns reset to CFS — see
+            # affinity.enter_control_thread. Inside the fault boundary so a
+            # denied real-time class reaches the supervisor through
+            # fatal_error rather than killing this thread on its own.
+            affinity.enter_control_thread()
+
             # Anchor the policy velocity envelope at the robot's measured pose
             # so the episode's first action can't jump either. Keep this inside
             # the fault boundary so startup failures reach the supervisor.

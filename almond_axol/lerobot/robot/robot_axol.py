@@ -488,6 +488,8 @@ class AxolRobot(Robot):
             )
         loop = asyncio.new_event_loop()
         self._loop = loop
+        scheduled = threading.Event()
+        scheduling_error: list[BaseException] = []
 
         def run_control_loop() -> None:
             # This thread *is* the control loop: collect-data / collect-dagger
@@ -497,13 +499,33 @@ class AxolRobot(Robot):
             # ordinary CFS peer of the VR/IK/diag threads on that core it
             # waited ~300 ms of every second for the CPU — one tick in fifty
             # 15-50 ms late, arms hitching). Threads it spawns start CFS.
-            affinity.enter_control_thread()
+            #
+            # A denied real-time class is handed back to connect() instead of
+            # raised here: this thread would otherwise die before
+            # run_forever(), leaving every coroutine scheduled onto the loop
+            # to fail on the 30 s timeout below with nothing naming the cause.
+            try:
+                affinity.enter_control_thread()
+            except BaseException as exc:  # noqa: BLE001 - relayed to connect()
+                scheduling_error.append(exc)
+                scheduled.set()
+                return
+            scheduled.set()
             loop.run_forever()
 
         self._loop_thread = threading.Thread(
             target=run_control_loop, name="axol-event-loop", daemon=True
         )
         self._loop_thread.start()
+        scheduled.wait()
+        if scheduling_error:
+            # The thread has already exited, so nothing will ever service this
+            # loop; drop it and let connect() be retried once the operator has
+            # fixed the grant.
+            self._loop = None
+            self._loop_thread = None
+            loop.close()
+            raise scheduling_error[0]
 
         self._connect_future = asyncio.run_coroutine_threadsafe(
             self._connect_async(), loop
