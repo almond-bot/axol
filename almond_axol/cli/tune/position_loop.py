@@ -139,6 +139,8 @@ class _Holders:
         self._hold: dict[Joint, float] = {}
         self._task: asyncio.Task | None = None
         self.peak_wobble: dict[Joint, float] = {}
+        self._drift_sum: dict[Joint, float] = {}
+        self._drift_n: dict[Joint, int] = {}
 
     async def start(self) -> None:
         for j, m in self._motors.items():
@@ -146,17 +148,31 @@ class _Holders:
                 continue
             self._hold[j] = await m.get_position()
         self.peak_wobble = {j: 0.0 for j in self._hold}
+        self._drift_sum = {j: 0.0 for j in self._hold}
+        self._drift_n = {j: 0 for j in self._hold}
         self._task = asyncio.create_task(self._loop())
 
-    def reset_wobble(self) -> tuple[Joint | None, float]:
-        """Zero the holder drift peaks; return the worst ``(joint, deg)`` seen
-        since the last reset. Per-gain rather than per-run, so the table can
-        say whether a gain that looks unstable is the servo or the arm it is
-        bolted to."""
+    def reset_wobble(self) -> tuple[Joint | None, float, float]:
+        """Zero the holder drift stats; return the worst ``(joint, peak, rms)``
+        in degrees since the last reset.
+
+        Both numbers, because they answer different questions and the peak
+        alone cannot tell them apart. A holder that settles once and then sits
+        there produces the same peak as one oscillating the whole pass -- and
+        on the right elbow shoulder_1 read 1.41, 1.43, 1.43, 1.41, 1.43 deg
+        across five gains, far too repeatable to be dynamic. rms separates
+        them: a static droop has rms near its peak but no variation between
+        passes, while a wobble carries rms well below peak and grows when the
+        joint under it misbehaves.
+        """
         worst = max(self.peak_wobble, key=lambda j: self.peak_wobble[j], default=None)
         peak = self.peak_wobble.get(worst, 0.0) if worst is not None else 0.0
+        n = self._drift_n.get(worst, 0) if worst is not None else 0
+        rms = math.sqrt(self._drift_sum.get(worst, 0.0) / n) if n else 0.0
         self.peak_wobble = {j: 0.0 for j in self._hold}
-        return worst, peak
+        self._drift_sum = {j: 0.0 for j in self._hold}
+        self._drift_n = {j: 0 for j in self._hold}
+        return worst, peak, rms
 
     async def ramp_to(self, joint: Joint, target: float, speed: float) -> None:
         """Walk one holder's target to ``target`` while it keeps streaming.
@@ -216,7 +232,10 @@ class _Holders:
                     drift = abs(self._motors[j].position - self._hold[j])
                 except Exception:
                     continue
-                self.peak_wobble[j] = max(self.peak_wobble[j], math.degrees(drift))
+                deg = math.degrees(drift)
+                self.peak_wobble[j] = max(self.peak_wobble[j], deg)
+                self._drift_sum[j] = self._drift_sum.get(j, 0.0) + deg * deg
+                self._drift_n[j] = self._drift_n.get(j, 0) + 1
             spent = time.monotonic() - t0
             if spent < dt:
                 await asyncio.sleep(dt - spent)
@@ -606,7 +625,7 @@ async def _run(args: argparse.Namespace) -> None:
                 print(
                     f"  {'position_kp':>12} {'position_ki':>12} {'rms err':>10} "
                     f"{'+/-':>9} {'max err':>10} {'lag':>9} {'ripple':>9} "
-                    f"{'buzz':>8} {'holder':>9}"
+                    f"{'buzz':>8} {'holder pk/rms':>14}"
                 )
 
                 async def point(kp: float, ki: float):
@@ -637,7 +656,7 @@ async def _run(args: argparse.Namespace) -> None:
                         )
                         for _ in range(args.repeat)
                     ]
-                    worst, wobble = holders.reset_wobble()
+                    worst, wobble, wobble_rms = holders.reset_wobble()
                     ok = [t for t in trials if math.isfinite(t[0])]
                     if not ok:
                         print(f"  {kp:12.4f} {ki:12.4f}   (no usable pass)")
@@ -650,21 +669,27 @@ async def _run(args: argparse.Namespace) -> None:
                         float(np.mean([t[3] for t in ok])),
                         float(np.mean([t[4] for t in ok])),
                         wobble,
+                        wobble_rms,
                         worst,
                     )
 
                 def row(kp: float, ki: float, m, noisy: bool) -> None:
-                    rms, spread, mx, lag, ripple, buzz, wobble, worst = m
+                    rms, spread, mx, lag, ripple, buzz, wobble, w_rms, worst = m
                     tag = "  <- oscillating" if noisy else ""
                     # Name the holder only when it moved enough to matter: a
                     # joint's own loop cannot be blamed for a base that is
                     # moving as far as the error being measured.
                     if worst is not None and wobble > rms:
-                        tag += f"  ({worst.value} base moved {wobble:.2f}°)"
+                        # Peak vs rms says which kind of movement it is: a
+                        # holder that settles once and sits there has rms near
+                        # its peak, a holder genuinely wobbling has rms well
+                        # below it. Only the second can destabilise the joint.
+                        kind = "sagged" if w_rms > 0.7 * wobble else "wobbled"
+                        tag += f"  ({worst.value} base {kind} {wobble:.2f}°)"
                     print(
                         f"  {kp:12.4f} {ki:12.4f} {rms:9.4f}° {spread:8.4f}° "
                         f"{mx:9.4f}° {lag:8.1f}ms {ripple:8.4f}° {buzz:7.3f}A "
-                        f"{wobble:8.2f}°" + tag
+                        f"{wobble:6.2f}/{w_rms:.2f}°" + tag
                     )
 
                 def oscillating(m, prev: tuple[float, float] | None) -> bool:

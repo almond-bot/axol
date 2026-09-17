@@ -273,7 +273,9 @@ class AccelerationTest(unittest.TestCase):
         src = inspect.getsource(h.reset_wobble)
         # It must hand back the value it is about to clear, not just the name.
         self.assertIn("peak", src)
-        self.assertIn("return worst, peak", src)
+        self.assertIn("return worst, peak, rms", src)
+        # Peak alone cannot tell a one-time settle from continuous wobble.
+        self.assertIn("_drift_sum", src)
         self.assertIn("{j: 0.0 for j in self._hold}", src)
 
         run = inspect.getsource(pl._run)
@@ -281,6 +283,10 @@ class AccelerationTest(unittest.TestCase):
         head = track[: track.index("{'sag':>9}")]
         # Reset before the passes and read after, once per gain.
         self.assertEqual(head.count("reset_wobble()"), 2)
+        # ...and the row must distinguish the two, since only a wobble can
+        # destabilise the joint being tuned; a droop is a gravity-model bug.
+        self.assertIn("sagged", head)
+        self.assertIn("wobbled", head)
         self.assertLess(head.index("holders.reset_wobble()"), head.index("trials = ["))
 
     def test_limit_cycles_are_detected_on_current_not_position(self) -> None:
