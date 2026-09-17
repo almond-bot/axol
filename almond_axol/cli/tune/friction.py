@@ -47,6 +47,7 @@ from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig
+from ...tuning.holders import ImpedanceHolders
 from ...robot.gravity import GravityCompensator
 from ...tuning import (
     JointFrameMotor,
@@ -117,9 +118,18 @@ _HOME_ORDER: tuple[Joint, ...] = (
 
 
 async def _ramp_verified(
-    motors: dict[Joint, JointFrameMotor], targets: dict[Joint, float]
+    motors: dict[Joint, JointFrameMotor],
+    targets: dict[Joint, float],
+    holders: ImpedanceHolders | None = None,
 ) -> None:
-    """Command joint-frame POSITION_VELOCITY targets and verify arrival.
+    """Move joints to joint-frame targets and verify arrival.
+
+    With ``holders`` the joints are ramped under streamed impedance (see
+    :class:`~almond_axol.tuning.holders.ImpedanceHolders`) and stay held
+    afterwards; without it, the legacy one-shot 0xA4 command is sent, which
+    leaves the joint on the firmware position loop at its stored
+    ``position_kp`` -- 0.06 on this elbow, which flopped under ~5 Nm on the
+    bench. New flows pass holders.
 
     Arrival is verified, not assumed: a position command sent right after
     ``set_control_mode`` can be silently dropped (the MyActuator reset drops
@@ -133,9 +143,17 @@ async def _ramp_verified(
         return
     positions: list[float] = []
     for _attempt in range(2):
-        await asyncio.gather(
-            *[motors[j].set_position_velocity(targets[j], _RAMP_SPEED) for j in joints]
-        )
+        if holders is not None:
+            await asyncio.gather(
+                *[holders.ramp_to(j, targets[j], _RAMP_SPEED) for j in joints]
+            )
+        else:
+            await asyncio.gather(
+                *[
+                    motors[j].set_position_velocity(targets[j], _RAMP_SPEED)
+                    for j in joints
+                ]
+            )
         positions = await asyncio.gather(*[motors[j].get_position() for j in joints])
         max_dist = max(
             (abs(pos - targets[j]) for j, pos in zip(joints, positions)),
@@ -168,8 +186,18 @@ async def assign_modes(
     impedance: Joint | None = None,
     kp: float = 0.0,
     kd: float = 0.0,
-) -> None:
+    is_left: bool | None = None,
+    config: AxolConfig | None = None,
+) -> ImpedanceHolders | None:
     """Put every joint in its final control mode, once, before anything moves.
+
+    Every joint goes to IMPEDANCE. The swept joint is taken hold of with a
+    streamed ramp at ``kp``/``kd``; when ``is_left`` and ``config`` are given
+    the other joints are handed to an :class:`ImpedanceHolders` (returned) that
+    streams impedance + gravity feedforward at their configured gains for the
+    rest of the run. A one-shot 0xA4 park at the motor's stored position_kp
+    (0.06 on this elbow) cannot hold a loaded joint -- a shoulder sweep that
+    swings the forearm horizontal dropped the elbow twice on the bench.
 
     A MyActuator has no control-mode register: ``set_control_mode`` issues a
     **system reset** and waits ``_MA_RESET_SETTLE_S`` (2 s) for the motor to
@@ -186,11 +214,12 @@ async def assign_modes(
     All resets are issued together so the arm spends one 2 s window limp
     instead of one per joint, and the caller should have the arm at rest.
     """
+    holders_only_legacy = is_left is None or config is None
     await asyncio.gather(
         *[
             m.set_control_mode(
                 ControlMode.IMPEDANCE
-                if j is impedance
+                if (j is impedance or not holders_only_legacy)
                 else ControlMode.POSITION_VELOCITY
             )
             for j, m in motors.items()
@@ -202,10 +231,16 @@ async def assign_modes(
         await _ramp_to(
             motors[impedance], kp, kd, await motors[impedance].get_position()
         )
+    if holders_only_legacy:
+        return None
+    holders = ImpedanceHolders(motors, impedance, is_left, config)
+    await holders.start()
+    return holders
 
 
 async def _home_all(
     motors: dict[Joint, JointFrameMotor],
+    holders: ImpedanceHolders | None = None,
     exclude: Joint | None = None,
     *,
     impedance: Joint | None = None,
@@ -230,7 +265,7 @@ async def _home_all(
         if j is impedance:
             await _ramp_to(motors[j], kp, kd, 0.0, duration=4.0)
             continue
-        await _ramp_verified(motors, {j: 0.0})
+        await _ramp_verified(motors, {j: 0.0}, holders)
 
 
 async def _run_sweep_raw(
@@ -671,11 +706,13 @@ async def _run(args: argparse.Namespace) -> None:
         # drops commands sent during it.
         # Modes decided once, at rest (see assign_modes): a MyActuator mode
         # switch is a system reset and the joint is limp through it.
-        await assign_modes(motors, impedance=joint, kp=kp, kd=kd)
+        holders = await assign_modes(
+            motors, impedance=joint, kp=kp, kd=kd, is_left=is_left, config=resolved
+        )
 
         try:
             print("  Homing all joints to rest (distal to proximal) ...")
-            await _home_all(motors, impedance=joint, kp=kp, kd=kd)
+            await _home_all(motors, holders, impedance=joint, kp=kp, kd=kd)
 
             # Shared sweep-safety geometry (see sweep_safety): base-collision
             # caps, camera clearance, and gravity-load poses. Staged ramps:
@@ -684,7 +721,7 @@ async def _run(args: argparse.Namespace) -> None:
             for note in notes:
                 print(f"  {note}")
             for stage in ramp_stages(other_targets):
-                await _ramp_verified(motors, stage)
+                await _ramp_verified(motors, stage, holders)
 
             # No mode switch here: the swept joint has been under impedance
             # since before homing, so it was never limp in a loaded pose.
@@ -776,12 +813,18 @@ async def _run(args: argparse.Namespace) -> None:
                 # motor rather than assuming.
                 await _home_all(
                     motors,
+                    holders,
                     impedance=joint
                     if motors[joint].motor.mode == ControlMode.IMPEDANCE
                     else None,
                     kp=kp,
                     kd=kd,
                 )
+            except Exception:
+                pass
+            try:
+                if holders is not None:
+                    await holders.stop()
             except Exception:
                 pass
             await asyncio.gather(

@@ -354,10 +354,12 @@ async def _run(args: argparse.Namespace) -> None:
         # MyActuator mode switch is a system reset and the joint is limp for
         # it (see assign_modes). Switching the swept joint to impedance after
         # the arm was posed is what dropped a loaded wrist.
-        await assign_modes(motors, impedance=joint, kp=kp, kd=kd)
+        holders = await assign_modes(
+            motors, impedance=joint, kp=kp, kd=kd, is_left=is_left, config=resolved
+        )
         try:
             print("  Homing all joints to rest (distal to proximal) ...")
-            await _home_all(motors, impedance=joint, kp=kp, kd=kd)
+            await _home_all(motors, holders, impedance=joint, kp=kp, kd=kd)
 
             # Shared sweep-safety geometry (see sweep_safety): base-collision
             # caps, camera clearance, and the gravity-load poses that tilt
@@ -370,7 +372,7 @@ async def _run(args: argparse.Namespace) -> None:
             for note in notes:
                 print(f"  {note}")
             for stage in ramp_stages(other_targets):
-                await _ramp_verified(motors, stage)
+                await _ramp_verified(motors, stage, holders)
 
             # Fit against the pose the arm is actually in, not the one it was
             # told to reach. The holders sit on their own firmware position
@@ -455,7 +457,12 @@ async def _run(args: argparse.Namespace) -> None:
         finally:
             print("  Returning to rest and disabling ...")
             try:
-                await _home_all(motors, impedance=joint, kp=kp, kd=kd)
+                await _home_all(motors, holders, impedance=joint, kp=kp, kd=kd)
+            except Exception:
+                pass
+            try:
+                if holders is not None:
+                    await holders.stop()
             except Exception:
                 pass
             # Only now, back at rest, is a mode switch free of consequence.

@@ -104,3 +104,45 @@ class GravityPoseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HoldersUnderImpedanceTest(unittest.TestCase):
+    """The non-swept joints must be held by streamed impedance, not parked.
+
+    Bench, twice: a shoulder sweep swung the forearm toward horizontal and the
+    elbow -- "held at 0" by a single 0xA4 command on the motor's stored
+    position_kp of 0.06 -- flopped under ~5 Nm. Impedance carries its gains in
+    every frame and is fed the gravity model; the holders class from
+    tune.position-loop held these joints at -90 deg the night before.
+    """
+
+    def test_assign_modes_puts_every_joint_under_impedance_and_returns_holders(
+        self,
+    ) -> None:
+        src = inspect.getsource(friction.assign_modes)
+        self.assertIn("ImpedanceHolders(motors, impedance, is_left, config)", src)
+        self.assertIn("await holders.start()", src)
+        self.assertIn("return holders", src)
+
+    def test_homing_and_clearance_ramps_go_through_the_holders(self) -> None:
+        home = inspect.getsource(friction._home_all)
+        self.assertIn("_ramp_verified(motors, {j: 0.0}, holders)", home)
+        ramp = inspect.getsource(friction._ramp_verified)
+        self.assertIn("holders.ramp_to(j, targets[j], _RAMP_SPEED)", ramp)
+
+    def test_sweep_tuners_thread_holders_through_and_stop_them(self) -> None:
+        for mod in (gravity, friction):
+            with self.subTest(tuner=mod.__name__):
+                src = inspect.getsource(mod._run)
+                self.assertIn("holders = await assign_modes(", src)
+                self.assertIn("is_left=is_left, config=resolved", src)
+                self.assertIn("_ramp_verified(motors, stage, holders)", src)
+                self.assertIn("await holders.stop()", src)
+                # Stopping the stream must come after homing, never before.
+                self.assertLess(src.rindex("_home_all("), src.index("holders.stop()"))
+
+    def test_shared_module_is_the_one_position_loop_uses(self) -> None:
+        from almond_axol.cli.tune import position_loop
+        from almond_axol.tuning.holders import ImpedanceHolders
+
+        self.assertIs(position_loop._Holders, ImpedanceHolders)
