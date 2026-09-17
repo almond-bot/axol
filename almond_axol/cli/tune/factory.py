@@ -208,7 +208,7 @@ async def _calibrate_joint(
 
     com_fit = None
     if gravity_fit is not None:
-        com_fit, fo, tau_before, tau_after = gravity_fit
+        com_fit, fo, tau_before, tau_after, _mass_fit = gravity_fit
         res_before = tau_meas - tau_before
         res_after = tau_meas - tau_after - fo
         rms_b = float(np.sqrt(np.mean((res_before - np.mean(res_before)) ** 2)))

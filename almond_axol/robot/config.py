@@ -412,7 +412,7 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     """Overlay one joint's calibration-file entry onto its config."""
     overrides: dict[str, Any] = {
         f: entry[f]
-        for f in ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
+        for f in ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q", "mass")
         if f in entry
     }
     friction = entry.get("friction")
