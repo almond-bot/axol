@@ -215,24 +215,35 @@ async def _track(
     moving. In profiled-motion mode it cannot — every frame restarts a ramp —
     so a joint that holds perfectly can still track nothing at all.
     """
-    # Reach the sine's start before timing anything. Without this the first
-    # entry of a sweep measures the joint travelling to `center` from
-    # wherever it was parked — tens of degrees over the whole window — and
-    # reports it as a tracking failure. Every later entry then starts on
-    # target and looks fine, so the artefact lands on whichever gain happens
-    # to be measured first.
+    # Drive a *cosine* from one extreme, so the sweep asks for zero velocity
+    # at the instant it starts timing. A sine about the centre starts at peak
+    # velocity, which after the approach below means peak velocity demanded
+    # from a standstill: the joint has to break stiction before it can track,
+    # and that costs far more than the loop's own settling. Measured on the
+    # right elbow at position_kp 0.96 it was worth 23 % of the reported rms
+    # (0.126° -> 0.155°) -- and it scaled inversely with gain, so it flattered
+    # high gains and tilted the whole sweep. Starting at rest at a turning
+    # point matches the state the approach leaves behind, so there is no step
+    # to recover from.
+    start = center - amp
+
+    # Reach that start before timing anything. Without this the first entry of
+    # a sweep measures the joint travelling there from wherever it was parked
+    # — tens of degrees over the whole window — and reports it as a tracking
+    # failure. Every later entry then starts on target and looks fine, so the
+    # artefact lands on whichever gain happens to be measured first.
     approach_deadline = time.monotonic() + _APPROACH_MAX_S
     while time.monotonic() < approach_deadline:
-        await motor.set_position_velocity(center, max_speed)
+        await motor.set_position_velocity(start, max_speed)
         try:
-            if abs(await motor.get_position() - center) < _APPROACH_TOL_RAD:
+            if abs(await motor.get_position() - start) < _APPROACH_TOL_RAD:
                 break
         except Exception:
             pass
         await asyncio.sleep(0.02)
     else:
         print(
-            f"    (did not reach {math.degrees(center):.1f}° within "
+            f"    (did not reach {math.degrees(start):.1f}° within "
             f"{_APPROACH_MAX_S:.0f}s — the result below includes the approach)"
         )
     await asyncio.sleep(0.3)
@@ -246,7 +257,7 @@ async def _track(
         now = time.monotonic() - t0
         if now >= secs:
             break
-        target = center + amp * math.sin(2.0 * math.pi * freq * now)
+        target = center - amp * math.cos(2.0 * math.pi * freq * now)
         await motor.set_position_velocity(target, max_speed)
         # An explicit 0x92 read, not the cached `position`: that cache is fed
         # by MIT impedance replies, and 0xA4 answers on the 0x240 frame
@@ -263,10 +274,9 @@ async def _track(
         spent = time.monotonic() - t0 - now
         if spent < dt:
             await asyncio.sleep(dt - spent)
-    # Discard the first full cycle. Measured against a simulated first-order
-    # catch-up this changes the rms by under 1 %, so it is hygiene rather than
-    # a fix for anything observed — a start transient is simply not something
-    # to average into a steady-state figure.
+    # Discard the first full cycle anyway. The cosine start removes the step,
+    # but the joint still has to break away from a dead stop once, and a
+    # steady-state figure should not carry it.
     a = np.array(act)
     g = np.array(tgt)
     tt_a = np.array(tt)
@@ -381,11 +391,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--repeat",
         type=int,
-        default=3,
-        help="[track] passes per gain (default 3). A single pass cannot tell "
-        "a real difference from scatter: on hardware one sweep read 0.154, "
-        "0.212, 0.162, 0.089, 0.072 across rising gains — non-monotone, so "
-        "the noise is about the size of the differences being compared.",
+        default=1,
+        help="[track] passes per gain, reporting mean and spread (default 1). "
+        "Two hardware runs at position_kp 0.96 with different preceding gains "
+        "read 0.1540° and 0.1562°, so a single pass resolves ~1 % and repeats "
+        "are only worth their wall time when a difference looks that small.",
     )
     p.add_argument(
         "--ripple-limit",

@@ -197,10 +197,38 @@ class AccelerationTest(unittest.TestCase):
 
         src = inspect.getsource(pl._track)
         approach = src[: src.index("t0 = time.monotonic()")]
-        self.assertIn("set_position_velocity(center", approach)
+        self.assertIn("set_position_velocity(start", approach)
         self.assertIn("_APPROACH_TOL_RAD", approach)
         # And it must not silently give up: an unreached start is reported.
         self.assertIn("includes the approach", src)
+
+    def test_drive_starts_at_rest_so_the_approach_leaves_no_step(self) -> None:
+        """The approach parks the joint at a standstill. A sine about the
+        centre would then demand peak velocity at t=0, forcing a stiction
+        breakaway inside the measured window; on the right elbow that cost
+        23 % of the reported rms at position_kp 0.96 (0.126 -> 0.155 deg) and
+        scaled inversely with gain, flattering high gains. A cosine from a
+        turning point starts where the approach left off, at rest."""
+        import inspect
+
+        src = inspect.getsource(pl._track)
+        self.assertIn("start = center - amp", src)
+        self.assertIn("amp * math.cos(", src)
+
+        # The demanded velocity at t=0 must be zero, not peak.
+        center, amp, freq = -0.785, math.radians(10.0), 0.2
+
+        def drive(t):
+            return center - amp * math.cos(2.0 * math.pi * freq * t)
+
+        dt = 1e-4
+        self.assertAlmostEqual(drive(0.0), center - amp, places=9)
+        self.assertLess(abs((drive(dt) - drive(0.0)) / dt), 1e-3)
+        # ...and it still spans the full commanded amplitude.
+        span = max(drive(t / 100) for t in range(0, 501)) - min(
+            drive(t / 100) for t in range(0, 501)
+        )
+        self.assertAlmostEqual(span, 2 * amp, places=6)
 
     def test_approach_tolerance_is_tight_against_the_error_being_measured(self) -> None:
         # Tracking errors of interest are ~0.1 deg, so starting half a degree
