@@ -46,7 +46,16 @@ const ARM_JOINT_OPTIONS = [
 // Run kinds this workbench presents. Anything else in the store (e.g. old
 // offline-analysis artifacts) is hidden rather than half-rendered. "filter"
 // artifacts (the retired offline-only tab) still render for old runs.
-const KNOWN_KINDS = new Set(["sine", "step", "motion", "gravity", "filter", "build", "kinematics"])
+const KNOWN_KINDS = new Set([
+  "sine",
+  "step",
+  "motion",
+  "gravity",
+  "filter",
+  "build",
+  "kinematics",
+  "position_loop",
+])
 
 /* ------------------------------------------------------------------ */
 /* Inline launcher: what to run, its parameters, and the Run button   */
@@ -192,6 +201,74 @@ const TABS: WbTab[] = [
         label: "target noise (°)",
         type: "number",
         placeholder: "off",
+      },
+      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+    ],
+    required: ["arm", "joint"],
+    drivesMotors: true,
+  },
+  {
+    key: "position_loop",
+    label: "Position loop (0xA4)",
+    command: "tune.position-loop",
+    description:
+      "Tune a MyActuator's internal position PID for the 0xA4 position command in " +
+      "direct-tracking mode (planning acceleration 0, the PI loop tracks the target " +
+      "directly). Streams a sine to one joint and sweeps position_kp, then position_ki " +
+      "at the winning kp, stopping when the motor's q-axis current says it has started " +
+      "to buzz. Every gain point is saved as its own run; the whole sweep shares a group. " +
+      "Writes are RAM-only — a power cycle restores the motor. Pick a loaded centre " +
+      "(e.g. -90 on the elbow): an unloaded joint holds at any gain and teaches nothing.",
+    presets: { mode: "track", accel: 0, save_run: true },
+    fields: [
+      { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
+      { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
+      {
+        key: "center",
+        label: "center (°)",
+        type: "number",
+        placeholder: "current",
+        hint: "joint-frame angle to sweep about — use the most gravity-loaded pose the joint works at",
+      },
+      {
+        key: "kp",
+        label: "position_kp",
+        type: "text",
+        placeholder: "config × 0.5 1 2 4 8",
+        hint: "space-separated sweep, ascending; stops at the first gain that buzzes",
+        width: "w-48",
+      },
+      {
+        key: "ki",
+        label: "position_ki",
+        type: "text",
+        placeholder: "kp × 0.001 … 0.1",
+        hint: "space-separated, tried at the winning kp; 0 to skip the integral stage",
+        width: "w-48",
+      },
+      { key: "amp", label: "amp (°)", type: "number", placeholder: "10" },
+      { key: "freq", label: "freq (Hz)", type: "number", placeholder: "0.2" },
+      { key: "duration", label: "duration (s)", type: "number", placeholder: "15" },
+      {
+        key: "rate",
+        label: "rate (Hz)",
+        type: "number",
+        placeholder: "100",
+        hint: "command rate; two CAN round trips per sample, so ~100 is the ceiling",
+      },
+      {
+        key: "repeat",
+        label: "repeat",
+        type: "number",
+        placeholder: "1",
+        hint: "passes per gain; the spread column shows run-to-run scatter (~1 % measured)",
+      },
+      {
+        key: "ripple_limit",
+        label: "ripple limit (°)",
+        type: "number",
+        placeholder: "0.25",
+        hint: "absolute position-ripple ceiling that stops the sweep; the current-based buzz test needs no limit",
       },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
@@ -979,6 +1056,13 @@ function headline(meta: TuningRunMeta): { label: string; value: string } | null 
     const v = num(m.score)
     return v == null ? null : { label: "score", value: fmtNum(v, 3) }
   }
+  if (meta.kind === "position_loop") {
+    const v = num(m.rms)
+    const g = meta.gains as Record<string, number>
+    const kp = typeof g.position_kp === "number" ? ` @ kp ${fmtNum(g.position_kp, 3)}` : ""
+    const osc = m.oscillating === true ? " ⚠ buzz" : ""
+    return v == null ? null : { label: "tracking", value: `${fmtNum(toDeg(v), 3)}°${kp}${osc}` }
+  }
   if (meta.kind === "gravity") {
     const v = num(m.droop_after_deg)
     return v == null ? null : { label: "droop", value: `${fmtNum(v, 3)}°` }
@@ -1498,6 +1582,17 @@ const SINE_COLS: ScoreCol[] = [
   { key: "score", label: "score", digits: 3 },
 ]
 
+const POSLOOP_COLS: ScoreCol[] = [
+  { key: "rms", label: "tracking RMS °", deg: true, digits: 3, warn: 0.2, bad: 0.5 },
+  { key: "rms_spread", label: "± °", deg: true, digits: 4 },
+  { key: "max", label: "max err °", deg: true, digits: 3, warn: 0.6, bad: 1.5 },
+  { key: "lag_ms", label: "lag ms", digits: 1, warn: 20, bad: 40 },
+  { key: "pos_ripple", label: "ripple °", deg: true, digits: 4, warn: 0.1, bad: 0.25 },
+  { key: "buzz_a", label: "buzz A", digits: 3 },
+  { key: "holder_peak_deg", label: "holder pk °", digits: 2, warn: 1.0, bad: 3.0 },
+  { key: "holder_rms_deg", label: "holder rms °", digits: 2 },
+]
+
 const FILTER_COLS: ScoreCol[] = [
   { key: "input_rms", label: "noise in °", deg: true, digits: 3 },
   { key: "rms_err", label: "error out °", deg: true, digits: 3 },
@@ -1628,6 +1723,9 @@ function scoreRows(
       cols: meta.kind === "sine" ? SINE_COLS : meta.kind === "step" ? STEP_COLS : GRAVITY_COLS,
       rows: [{ joint: meta.joint ?? "joint", values: m }],
     }
+  }
+  if (meta.kind === "position_loop") {
+    return { cols: POSLOOP_COLS, rows: [{ joint: meta.joint ?? "joint", values: m }] }
   }
   return null
 }

@@ -61,7 +61,7 @@ from ...motor.bus import CanBus
 from ...robot.axol import arm_limits
 from ...robot.config import AxolConfig
 from ...robot.gravity import GravityCompensator
-from ...tuning import joint_frame_motors
+from ...tuning import joint_frame_motors, save_run
 from ...tuning.holders import HOLD_HZ as _HOLD_HZ  # noqa: F401
 from ...tuning.holders import ImpedanceHolders as _Holders
 from ...tuning.joint_frame import JointFrameMotor
@@ -134,8 +134,10 @@ async def _track(
 ) -> tuple[float, float, float, float, float]:
     """Stream 0xA4 along a sine.
 
-    Returns ``(rms, max, lag_ms, ripple)`` in degrees plus ``buzz``, the
-    detrended q-axis current in amps.
+    Returns ``(rms, max, lag_ms, ripple)`` in degrees, ``buzz`` (the
+    detrended q-axis current in amps), and the ``series`` dict of the pass
+    (``t``/``target``/``actual`` in rad, ``current`` in A) so a run can be
+    persisted for the dashboard.
 
     This is the test that matters for ``wire_mode``: a *held* position says
     nothing about whether the firmware loop can follow a target that keeps
@@ -179,7 +181,7 @@ async def _track(
             f"{_APPROACH_MAX_S:.0f}s — no result for this pass. The joint is "
             f"not following 0xA4 here; check the gain, the load and the pose."
         )
-        return (float("nan"),) * 5
+        return (float("nan"),) * 5 + ({},)
     await asyncio.sleep(0.3)
 
     dt = 1.0 / rate_hz
@@ -238,7 +240,7 @@ async def _track(
         )
     if good.sum() < 20:
         print(f"    ({good.sum()} of {len(a)} position reads succeeded)")
-        return (float("nan"),) * 5
+        return (float("nan"),) * 5 + ({},)
     err = np.degrees(g[good] - a[good])
     v = np.gradient(g[good], tt_a[good])
     m = np.abs(v) > 1e-3
@@ -268,7 +270,13 @@ async def _track(
     # not measure -- but the *growth* against the previous gain does not need
     # one, and it is the growth that marks the onset of a limit cycle.
     buzz = detrended_std(i_a[good])
-    return float(err.std()), float(np.abs(err).max()), float(lag), ripple, buzz
+    series = {
+        "t": tt_a[good] - tt_a[good][0],
+        "target": g[good],
+        "actual": a[good],
+        "current": i_a[good],
+    }
+    return float(err.std()), float(np.abs(err).max()), float(lag), ripple, buzz, series
 
 
 async def _measure(
@@ -393,6 +401,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "RAM-only (0x31) and a power cycle restores the motor.",
     )
     p.add_argument(
+        "--save-run",
+        action="store_true",
+        help="[track] Persist every gain point as a dashboard tuning run "
+        "(kind position_loop): the target/actual pass plus its scorecard, "
+        "all points of one sweep sharing a group. This is how the tuning "
+        "workbench drives the command.",
+    )
+    p.add_argument("--label", default=None, help="Free-form note stored on saved runs.")
+    p.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -510,6 +527,8 @@ async def _run(args: argparse.Namespace) -> None:
                     f"{'buzz':>8} {'holder pk/rms':>14}"
                 )
 
+                sweep_group = f"position-loop-{int(time.time())}-{joint.value}"
+
                 async def point(kp: float, ki: float):
                     """One gain pair: returns ``(rms, spread, mx, lag, ripple)``."""
                     await test.motor.set_gains(
@@ -553,10 +572,67 @@ async def _run(args: argparse.Namespace) -> None:
                         wobble,
                         wobble_rms,
                         worst,
+                        ok[-1][5],
                     )
 
+                def persist(kp: float, ki: float, m, noisy: bool) -> None:
+                    """One dashboard run per gain point (kind ``position_loop``).
+
+                    The sweep table above is what the operator reads on the
+                    terminal; this is the same point as the workbench sees it:
+                    a chartable target/actual pass plus the scorecard, linked
+                    to the other points of the sweep by ``group``.
+                    """
+                    if not args.save_run:
+                        return
+                    rms, spread, mx, lag, ripple, buzz, wobble, w_rms, worst, series = m
+                    run_id = save_run(
+                        "position_loop",
+                        series,
+                        {
+                            "rms": rms,
+                            "rms_spread": spread,
+                            "max": mx,
+                            "lag_ms": lag,
+                            "pos_ripple": ripple,
+                            "buzz_a": buzz,
+                            "holder_peak_deg": wobble,
+                            "holder_rms_deg": w_rms,
+                            "holder_joint": worst.value if worst is not None else None,
+                            "oscillating": bool(noisy),
+                        },
+                        side="left" if is_left else "right",
+                        joint=joint.value,
+                        gains={"position_kp": kp, "position_ki": ki},
+                        params={
+                            "mode": "track",
+                            "center_deg": math.degrees(target),
+                            "amp_deg": args.amp,
+                            "freq_hz": args.freq,
+                            "duration_s": args.duration,
+                            "rate_hz": args.rate,
+                            "repeat": args.repeat,
+                            "accel": args.accel,
+                            "wire": "0xA4 direct tracking",
+                        },
+                        label=args.label,
+                        group=sweep_group,
+                    )
+                    print(f"      saved run {run_id}")
+
                 def row(kp: float, ki: float, m, noisy: bool) -> None:
-                    rms, spread, mx, lag, ripple, buzz, wobble, w_rms, worst = m
+                    (
+                        rms,
+                        spread,
+                        mx,
+                        lag,
+                        ripple,
+                        buzz,
+                        wobble,
+                        w_rms,
+                        worst,
+                        _series,
+                    ) = m
                     tag = "  <- oscillating" if noisy else ""
                     # Name the holder only when it moved enough to matter: a
                     # joint's own loop cannot be blamed for a base that is
@@ -611,6 +687,7 @@ async def _run(args: argparse.Namespace) -> None:
                         continue
                     noisy = oscillating(m, prev_ripple)
                     row(kp, 0.0, m, noisy)
+                    persist(kp, 0.0, m, noisy)
                     if noisy:
                         print(
                             "    stopping: past here the joint buys tracking "
@@ -642,6 +719,7 @@ async def _run(args: argparse.Namespace) -> None:
                             continue
                         noisy = oscillating(m, prev_ripple)
                         row(best[0], ki, m, noisy)
+                        persist(best[0], ki, m, noisy)
                         if noisy:
                             print(
                                 "    stopping: the integral is winding up "
