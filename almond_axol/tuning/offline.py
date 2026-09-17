@@ -164,6 +164,8 @@ def filtering_analysis(prefix: str) -> tuple[dict, dict, dict]:
     per_axis: dict[str, dict[str, float]] = {}
     lags: list[float] = []
     ratios: list[float] = []
+    bounce_ratios: list[float] = []
+    tgt_bounce: list[float] = []
     tgt_mid: list[float] = []
     for side in _SIDES:
         raw = np.asarray(ik[f"raw_{side}"], dtype=float)[m]
@@ -177,15 +179,33 @@ def filtering_analysis(prefix: str) -> tuple[dict, dict, dict]:
             tb = band_rms(t, tgt[:, ax])
             lag = tracking_lag_ms(t, raw[:, ax], filt[:, ax])
             ratio = fb["rms_mid"] / rb["rms_mid"] if rb["rms_mid"] > 1e-7 else math.nan
+            # The 1-3 Hz band as well as 3-15 Hz. This suite reported only
+            # the latter, so a tracker contributing ~0.9 mm rms of 1-3 Hz
+            # pose noise -- which the arm turns into visible end-effector
+            # bounce -- was invisible here while `rms_mid` read a clean
+            # 0.13 mm. See the band convention in `.metrics`.
+            bounce = (
+                fb["rms_bounce"] / rb["rms_bounce"]
+                if rb["rms_bounce"] > 1e-7
+                else math.nan
+            )
             per_axis[f"{side}_{_AXES[ax]}"] = {
                 "raw_mid_mm": rb["rms_mid"] * 1000,
                 "filt_mid_mm": fb["rms_mid"] * 1000,
                 "tgt_mid_mm": tb["rms_mid"] * 1000,
                 "passthrough": ratio,
+                "raw_bounce_mm": rb["rms_bounce"] * 1000,
+                "filt_bounce_mm": fb["rms_bounce"] * 1000,
+                "tgt_bounce_mm": tb["rms_bounce"] * 1000,
+                "bounce_passthrough": bounce,
                 "lag_ms": lag,
             }
             if math.isfinite(ratio):
                 ratios.append(ratio)
+            if math.isfinite(bounce):
+                bounce_ratios.append(bounce)
+            if math.isfinite(tb["rms_bounce"]):
+                tgt_bounce.append(tb["rms_bounce"] * 1000)
             if math.isfinite(lag):
                 lags.append(lag)
             if math.isfinite(tb["rms_mid"]):
@@ -196,6 +216,10 @@ def filtering_analysis(prefix: str) -> tuple[dict, dict, dict]:
     metrics = {
         "per_axis": per_axis,
         "mean_passthrough": float(np.mean(ratios)) if ratios else math.nan,
+        "mean_bounce_passthrough": (
+            float(np.mean(bounce_ratios)) if bounce_ratios else math.nan
+        ),
+        "worst_tgt_bounce_mm": float(np.max(tgt_bounce)) if tgt_bounce else math.nan,
         "mean_lag_ms": float(np.mean(lags)) if lags else math.nan,
         "worst_lag_ms": float(np.max(lags)) if lags else math.nan,
         "worst_tgt_mid_mm": float(np.max(tgt_mid)) if tgt_mid else math.nan,
@@ -211,26 +235,35 @@ def filtering_analysis(prefix: str) -> tuple[dict, dict, dict]:
 
 def print_filtering_report(metrics: dict) -> None:
     print(f"\n{'═' * 72}")
-    print("  Pose filter stack report (3-15 Hz mid band, mm RMS)")
+    print("  Pose filter stack report (mm RMS per band)")
     print(
-        f"  {'axis':<6} {'raw':>8} {'filtered':>9} {'EE target':>10} "
-        f"{'pass':>6} {'lag ms':>7}"
+        f"  {'axis':<6} {'raw':>8} {'filt':>8} {'target':>8} {'pass':>6}  | "
+        f"{'raw':>8} {'filt':>8} {'target':>8} {'pass':>6} {'lag ms':>7}"
+    )
+    print(
+        f"  {'':6} {'------ bounce 1-3 Hz ------':^32}  | "
+        f"{'------- mid 3-15 Hz -------':^32}"
     )
     for name, row in metrics["per_axis"].items():
-        pas = f"{row['passthrough']:.2f}" if math.isfinite(row["passthrough"]) else "-"
-        lag = f"{row['lag_ms']:.0f}" if math.isfinite(row["lag_ms"]) else "-"
+        fmt = lambda k: f"{row[k]:.2f}" if math.isfinite(row[k]) else "-"  # noqa: E731
         print(
-            f"  {name:<6} {row['raw_mid_mm']:>8.2f} {row['filt_mid_mm']:>9.2f} "
-            f"{row['tgt_mid_mm']:>10.2f} {pas:>6} {lag:>7}"
+            f"  {name:<6} {row['raw_bounce_mm']:>8.2f} {row['filt_bounce_mm']:>8.2f} "
+            f"{row['tgt_bounce_mm']:>8.2f} {fmt('bounce_passthrough'):>6}  | "
+            f"{row['raw_mid_mm']:>8.2f} {row['filt_mid_mm']:>8.2f} "
+            f"{row['tgt_mid_mm']:>8.2f} {fmt('passthrough'):>6} {fmt('lag_ms'):>7}"
         )
     print(f"{'═' * 72}")
     print(
-        f"  mean pass-through {metrics['mean_passthrough']:.2f} "
+        f"  mean pass-through: bounce {metrics['mean_bounce_passthrough']:.2f}, "
+        f"mid {metrics['mean_passthrough']:.2f} "
         f"(0 = filters everything, 1 = filters nothing), "
         f"lag {metrics['mean_lag_ms']:.0f} ms mean / "
         f"{metrics['worst_lag_ms']:.0f} ms worst.\n"
-        "  Mid-band content that reaches the EE target is what the arm is\n"
-        "  asked to reproduce — if it's high, tune the filter, not the motors."
+        "  Content that reaches the EE target is what the arm is asked to\n"
+        "  reproduce — if it is high, tune the filter, not the motors.\n"
+        "  The bounce band is the one an operator SEES. It is only noise\n"
+        "  relative to the capture: 1-3 Hz is real content in a fast motion,\n"
+        "  so read it against where this capture's own energy ends."
     )
 
 

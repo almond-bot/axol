@@ -10,10 +10,26 @@ Two families:
   and the offline analysis suites, and reported alongside the graphs so a
   claim like "kd X tracks better" is backed by numbers.
 
-Band convention (shared with ``axol diag.teleop-jitter``): below
-``BAND_LOW`` is intentional motion, ``BAND_LOW``–``BAND_HIGH`` is the
-structural band the arm responds to ("felt" jitter / vibration), above
-``BAND_HIGH`` is noise the mechanics mostly filter out.
+Band convention (shared with ``axol diag.teleop-jitter``):
+``BAND_BOUNCE``–``BAND_LOW`` is the *bounce* band, ``BAND_LOW``–``BAND_HIGH``
+is the structural band the arm responds to ("felt" jitter / vibration), and
+above ``BAND_HIGH`` is noise the mechanics mostly filter out.
+
+Below ``BAND_LOW`` used to be reported as one number and called intentional
+motion. It is not. On the ``slow_osc`` capture the commanded trajectory held
+99.9 % of its energy below 0.59 Hz, while the tracker contributed 3.36 mm rms
+of 1–3 Hz pose noise — isotropic, and growing with hand speed at roughly
+11 ms × speed. The arm reproduced it faithfully (commanded elbow wobble
+0.264° against 0.269° measured) and the operator saw 1.9 mm rms of vertical
+end-effector bounce. Every suite here filed that under ``rms_low`` and
+reported it as signal, which is why eighteen consecutive control experiments
+improved mean tracking error threefold while the visible defect did not move
+at all.
+
+``rms_bounce`` is therefore only noise *relative to a given capture*: 1–3 Hz
+is genuine content in a fast motion. Read it against ``peak_hz`` and against
+where the capture's own energy ends — a slow reach with energy below 0.6 Hz
+and a fat ``rms_bounce`` is carrying tracker noise, not intent.
 """
 
 from __future__ import annotations
@@ -22,6 +38,11 @@ import math
 
 import numpy as np
 
+#: Bottom of the bounce band. Below this is intentional motion for any
+#: trajectory a human teleoperates; above it, up to ``BAND_LOW``, is where
+#: speed-proportional tracker noise lands and where the arm is still stiff
+#: enough to reproduce it at unity gain.
+BAND_BOUNCE = 1.0
 BAND_LOW = 3.0
 BAND_HIGH = 15.0
 
@@ -46,15 +67,29 @@ def _resample_uniform(t: np.ndarray, x: np.ndarray) -> tuple[float, np.ndarray]:
 
 
 def band_rms(t: np.ndarray, x: np.ndarray) -> dict[str, float]:
-    """Spectral RMS split into the low/mid/high bands, plus the dominant peak.
+    """Spectral RMS split into bands, plus the dominant peak.
 
-    Returns ``{"rms_low", "rms_mid", "rms_high", "peak_hz", "peak_rms"}`` in
-    the input's units; ``peak_hz``/``peak_rms`` are NaN when no spectral line
-    stands clear (8×) of the local noise floor. ``rms_mid`` (3–15 Hz) is the
-    "felt jitter" number.
+    Returns ``{"rms_low", "rms_bounce", "rms_mid", "rms_high", "peak_hz",
+    "peak_rms"}`` in the input's units; ``peak_hz``/``peak_rms`` are NaN when
+    no spectral line stands clear (8×) of the local noise floor.
+    ``rms_mid`` (3–15 Hz) is the "felt jitter" number and ``rms_bounce``
+    (1–3 Hz) is the visible-bounce number — see the module docstring for why
+    the latter is not automatically intent.
+
+    ``rms_low`` keeps its old meaning (everything below ``BAND_LOW``) so
+    stored runs stay comparable; ``rms_bounce`` is a subdivision of it, not a
+    replacement, and the two overlap by construction.
     """
     nan = {
-        k: math.nan for k in ("rms_low", "rms_mid", "rms_high", "peak_hz", "peak_rms")
+        k: math.nan
+        for k in (
+            "rms_low",
+            "rms_bounce",
+            "rms_mid",
+            "rms_high",
+            "peak_hz",
+            "peak_rms",
+        )
     }
     mask = np.isfinite(x)
     if mask.sum() < 64:
@@ -73,6 +108,7 @@ def band_rms(t: np.ndarray, x: np.ndarray) -> dict[str, float]:
 
     out = {
         "rms_low": band(0.0, BAND_LOW),
+        "rms_bounce": band(BAND_BOUNCE, BAND_LOW),
         "rms_mid": band(BAND_LOW, BAND_HIGH),
         "rms_high": band(BAND_HIGH, fs / 2),
         "peak_hz": math.nan,
