@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from almond_axol.cli.can import setup as can_setup
 from almond_axol.constants import CAN_BRINGUP_SCRIPT, CAN_LEFT, CAN_RIGHT
@@ -50,6 +50,20 @@ class PurgeGrantTest(unittest.TestCase):
                 )
         for command in commands:
             self.assertTrue(command.startswith("/"), command)
+
+    def test_grants_every_form_the_fallback_flap_issues(self) -> None:
+        # bring_up_interfaces configures between the down and the up. A grant
+        # covering only down/up lets a non-root backstop take the interfaces
+        # down and then stop, which is worse than never flapping.
+        commands = can_purge.purge_commands()
+        for form in ("type can bitrate 1000000", "txqueuelen 512"):
+            self.assertTrue(
+                any(
+                    command.endswith(f"ip link set {CAN_LEFT} {form}")
+                    for command in commands
+                ),
+                form,
+            )
 
     def test_grant_is_scoped_to_the_operator_and_needs_no_password(self) -> None:
         text = can_purge.sudoers_text("shawn")
@@ -288,6 +302,153 @@ class ConnectPurgesTest(unittest.IsolatedAsyncioTestCase):
             await axol.connect()
         self.assertIn("still hold queued frames", str(raised.exception))
         self.assertEqual(opened, [])
+
+
+class FlapChoiceTest(unittest.TestCase):
+    """How the backstop cycles the interfaces once it finds queued frames."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.script = Path(scratch.name) / "startup.sh"
+
+    def _installed(self) -> Path:
+        self.script.write_text("#!/bin/bash\n")
+        return self.script
+
+    def test_prefers_the_bring_up_script_for_managed_channels(self) -> None:
+        # One granted command, and the only ordering that takes the dual
+        # adapter's two channels down and up together.
+        runs: list[list[str]] = []
+        with (
+            patch.object(can_setup, "CAN_BRINGUP_SCRIPT", self._installed()),
+            patch.object(
+                can_setup,
+                "run_root",
+                lambda argv, **_kw: runs.append(argv) or _completed(0),
+            ),
+            patch.object(can_setup, "bring_up_interfaces", side_effect=AssertionError),
+        ):
+            can_setup._flap_for_purge([CAN_LEFT, CAN_RIGHT])
+        self.assertEqual(runs, [["bash", str(self.script)]])
+
+    def test_unmanaged_channels_fall_back_to_explicit_configuration(self) -> None:
+        flapped: list[tuple[list[str], bool]] = []
+        with (
+            patch.object(can_setup, "CAN_BRINGUP_SCRIPT", self._installed()),
+            patch.object(can_setup, "run_root", side_effect=AssertionError),
+            patch.object(
+                can_setup,
+                "bring_up_interfaces",
+                side_effect=lambda chans, *, force_cycle=False: flapped.append(
+                    (chans, force_cycle)
+                ),
+            ),
+        ):
+            can_setup._flap_for_purge(["can0"])
+        self.assertEqual(flapped, [(["can0"], True)])
+
+    def test_missing_script_falls_back_too(self) -> None:
+        flapped: list[list[str]] = []
+        with (
+            patch.object(can_setup, "CAN_BRINGUP_SCRIPT", self.script),
+            patch.object(can_setup, "run_root", side_effect=AssertionError),
+            patch.object(
+                can_setup,
+                "bring_up_interfaces",
+                side_effect=lambda chans, **_kw: flapped.append(chans),
+            ),
+        ):
+            can_setup._flap_for_purge([CAN_LEFT, CAN_RIGHT])
+        self.assertEqual(flapped, [[CAN_LEFT, CAN_RIGHT]])
+
+
+class _LinkStartReached(Exception):
+    """Sentinel: the core was about to take the interfaces."""
+
+
+class RealtimeEnablePurgesTest(unittest.IsolatedAsyncioTestCase):
+    """The production path: `Axol.enable()` never reaches `connect()` in time.
+
+    `rt.robot.Axol._enable` hands the interfaces to the realtime core, which
+    preps and streams on them; its `self._robot.connect()` runs *after* that.
+    A purge hooked only into `connect()` would therefore fire once the stale
+    frames had already flushed into the motors — and would be flapping a bus
+    the core owns.
+    """
+
+    def setUp(self) -> None:
+        from almond_axol.robot import Axol
+
+        self.enterContext(patch("almond_axol.rt.robot.RtLink"))
+        self.robot = Axol(left_channel=CAN_LEFT, right_channel=None)
+        self.hardware = self.robot._robot
+        self.events: list[str] = []
+        self.robot._link.start = AsyncMock(
+            side_effect=lambda *_a, **_k: self.events.append("core-start")
+            or (_ for _ in ()).throw(_LinkStartReached())
+        )
+        self.enterContext(patch.object(self.hardware, "disable", AsyncMock()))
+
+    async def test_purge_runs_before_the_core_takes_the_interfaces(self) -> None:
+        def fake_purge(channels: list[str]) -> list[str]:
+            self.events.append(f"purge:{','.join(channels)}")
+            return []
+
+        with (
+            patch.object(can_setup, "purge_stale_tx", fake_purge),
+            self.assertRaises(_LinkStartReached),
+        ):
+            await self.robot.enable()
+
+        self.assertEqual(self.events, [f"purge:{CAN_LEFT}", "core-start"])
+
+    async def test_an_unpurgeable_queue_stops_the_bring_up(self) -> None:
+        from almond_axol.motor import MotorError
+
+        with (
+            patch.object(
+                can_setup,
+                "purge_stale_tx",
+                side_effect=RuntimeError("still hold queued frames"),
+            ),
+            self.assertRaises(MotorError),
+        ):
+            await self.robot.enable()
+        self.robot._link.start.assert_not_awaited()
+
+
+class ConnectPurgeOptOutTest(unittest.IsolatedAsyncioTestCase):
+    """`connect(purge_stale=False)` for callers that must not flap the bus."""
+
+    async def test_opt_out_skips_the_purge(self) -> None:
+        from almond_axol.robot.axol import AxolHardware
+
+        class _Bus:
+            def __init__(self, channel: str) -> None:
+                self.channel = channel
+
+            async def start(self) -> None:
+                pass
+
+            def _add_listener(self, _listener) -> None:
+                pass
+
+        with (
+            patch("almond_axol.robot.axol.CanBus", side_effect=_Bus),
+            patch(
+                "almond_axol.motor.motor.make_driver",
+                side_effect=lambda *_a, **_k: SimpleNamespace(
+                    kp_max=500.0,
+                    kd_max=5.0,
+                    set_feedback_callback=lambda _cb: None,
+                ),
+            ),
+        ):
+            axol = AxolHardware(left_channel=CAN_LEFT, right_channel=None)
+
+        with patch.object(can_setup, "purge_stale_tx", side_effect=AssertionError):
+            await axol.connect(purge_stale=False)
 
 
 if __name__ == "__main__":

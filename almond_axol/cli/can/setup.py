@@ -2342,6 +2342,41 @@ def tx_backlog(channel: str) -> int | None:
     return int(matched.group(1)) if matched else None
 
 
+# Interfaces the generated bring-up script configures itself, so flapping
+# them is one granted command instead of four ungranted ones.
+_SCRIPT_MANAGED_CHANNELS = frozenset({_CAN_L, _CAN_R, _CAN_B, _CAN_C})
+
+
+def _flap_for_purge(channels: list[str]) -> None:
+    """Cycle *channels* to drop what the kernel has queued on them.
+
+    Prefers the installed bring-up script, which is what the realtime core
+    runs for the same job (``purge_tx_queue`` in
+    ``rust/axol-rt/src/safety.rs``) and what ``axol provision`` grants the
+    operator passwordless use of (:mod:`almond_axol.utils.can_purge`). Going
+    through :func:`bring_up_interfaces` instead would issue four separate
+    privileged ``ip link`` commands — including the ``type can bitrate`` and
+    ``txqueuelen`` forms — and a non-root session that cannot run them all
+    would stop with the interfaces *down*, which is worse than not starting.
+
+    The script is also the safer flap: it takes the dual-channel adapter's
+    two arm channels down and back up together, the only ordering that
+    reliably avoids the TX-only wedge (see :func:`rx_alive_per_arm`).
+
+    Anything the script does not manage — a bench adapter, a renamed
+    ``can0``, a host that has never run ``can.setup`` — falls back to
+    :func:`bring_up_interfaces`, which configures each channel explicitly.
+    """
+    if CAN_BRINGUP_SCRIPT.exists() and set(channels) <= _SCRIPT_MANAGED_CHANNELS:
+        # The script takes its own locks, so this deliberately does not hold
+        # the global setup lock: a caller that did would deadlock it.
+        run_root(["bash", str(CAN_BRINGUP_SCRIPT)], check=True)
+        return
+    # Cycles the whole group, not just the poisoned members: the arm channels
+    # are two halves of one dual-channel adapter.
+    bring_up_interfaces(channels, force_cycle=True)
+
+
 def purge_stale_tx(channels: list[str]) -> list[str]:
     """Flap *channels* when stale motion commands are still queued on them.
 
@@ -2378,10 +2413,7 @@ def purge_stale_tx(channels: list[str]) -> list[str]:
         "motor power was cut (e-stop?) while commands were in flight. Flapping "
         "the interfaces so they cannot replay on enable."
     )
-    # Flap the whole group, not just the poisoned members: the arm channels
-    # are two halves of one dual-channel adapter, which only comes back
-    # reliably when both are cycled together (see the bring-up script).
-    bring_up_interfaces(present, force_cycle=True)
+    _flap_for_purge(present)
     remaining = {
         channel: queued
         for channel, queued in ((ch, tx_backlog(ch)) for ch in poisoned)

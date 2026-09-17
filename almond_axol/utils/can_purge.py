@@ -91,17 +91,34 @@ def _program_paths(program: str, candidates: tuple[str, ...]) -> list[str]:
 def purge_commands() -> list[str]:
     """Every command line the realtime core runs to purge a poisoned queue.
 
-    Mirrors ``purge_tx_queue`` (``rust/axol-rt/src/safety.rs``): the bring-up
-    script when one is installed, otherwise a per-interface down/up pair.
+    Two callers, one grant: the realtime core's ``purge_tx_queue``
+    (``rust/axol-rt/src/safety.rs``) runs the bring-up script, falling back
+    to a per-interface down/up pair, and the bring-up backstop
+    (``almond_axol.cli.can.setup.purge_stale_tx``) runs the same script,
+    falling back to the full configure sequence.
+
+    Imported lazily: ``cli.can.setup`` is a heavy import and this is the only
+    thing needed from it.
     """
+    from ..cli.can.setup import _BITRATE, _TXQUEUELEN
+
     commands = [
         f"{bash} {CAN_BRINGUP_SCRIPT}"
         for bash in _program_paths("bash", ("/usr/bin/bash", "/bin/bash"))
     ]
     for ip in _program_paths("ip", ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip")):
         for iface in _PURGEABLE_INTERFACES:
-            commands.append(f"{ip} link set {iface} down")
-            commands.append(f"{ip} link set {iface} up")
+            for form in (
+                "down",
+                "up",
+                # The configure steps a flap through `bring_up_interfaces`
+                # issues between the two (`_bring_up_interfaces_locked`).
+                # Without them a non-root fallback flap stops with the
+                # interface down, which is worse than never flapping.
+                f"type can bitrate {_BITRATE}",
+                f"txqueuelen {_TXQUEUELEN}",
+            ):
+                commands.append(f"{ip} link set {iface} {form}")
     return commands
 
 

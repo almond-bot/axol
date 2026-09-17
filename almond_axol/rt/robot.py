@@ -409,6 +409,15 @@ class Axol(RobotBase):
         # must not cache a pre-reset frame; torque is untouched by this.
         if any(bus.is_open for bus in self._buses()):
             await self._robot.disconnect()
+        # Nothing owns the interfaces at this instant, which is the only
+        # point in a bring-up where they can be flapped: drop anything a
+        # dead bus left queued (an e-stop's in-flight position commands,
+        # which the kernel holds on the interface and replays the moment the
+        # motors answer again) before the core takes them. Doing it here
+        # rather than in the `connect()` below is the whole point — by then
+        # the core has started, prepped, and already flushed the queue into
+        # the motors.
+        await self._robot._purge_stale_can_queues()
         await self._link.start()
         self._core_started = True
         await self._link.configure(self._config_text())
@@ -421,7 +430,9 @@ class Axol(RobotBase):
         # per-motor idempotency as the classic AxolHardware.enable().
         await self._link.prep()
 
-        await self._robot.connect()
+        # The core owns the interfaces now, so this must not flap them; the
+        # purge above already ran while they were free.
+        await self._robot.connect(purge_stale=False)
         # The transaction snapshot, taken before anything is enabled: after
         # prep a cold joint has just been reset (not running) and a held one
         # is still holding, so this is exactly the classic held/cold split.
@@ -537,7 +548,10 @@ class Axol(RobotBase):
             # motors cannot be reached: report that as an uncertain cleanup
             # rather than pretend they are off.
             try:
-                await self._robot.connect()
+                # No purge on a cleanup path: this exists to reach the cold
+                # motors and torque them off, and must not fail (or flap a
+                # bus) on the way there.
+                await self._robot.connect(purge_stale=False)
             except BaseException as bus_error:  # noqa: BLE001 - reported below
                 setup_error.add_note(
                     "Startup rollback could not reopen the CAN buses to torque "

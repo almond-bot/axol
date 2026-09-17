@@ -2090,7 +2090,7 @@ class AxolHardware(RobotBase):
     # Arm-wide commands                                                    #
     # ------------------------------------------------------------------ #
 
-    async def connect(self) -> None:
+    async def connect(self, *, purge_stale: bool = True) -> None:
         """Open the CAN buses without touching motor state.
 
         Purely the transport step: after this, every read API works —
@@ -2115,12 +2115,23 @@ class AxolHardware(RobotBase):
         :meth:`AxolArm.disable` assume the bus is already open, so a
         controller that toggles arms individually must await ``connect()``
         (idempotent — safe to call again) before its first per-arm call.
+
+        Args:
+            purge_stale: Whether to clear frames a dead bus left queued
+                         before opening (see
+                         :meth:`_purge_stale_can_queues`). Pass ``False``
+                         only when the interfaces are not this call's to
+                         flap — the realtime core owns them, or a caller
+                         purged already before handing them over — which is
+                         what ``almond_axol.rt.robot.Axol`` does around the
+                         core's bring-up and startup rollback.
         """
         if self._shutdown_pending:
             raise MotorError(
                 "robot shutdown is incomplete; retry disable before reconnecting"
             )
-        await self._purge_stale_can_queues()
+        if purge_stale:
+            await self._purge_stale_can_queues()
         bus_tasks = []
         if self.left is not None:
             bus_tasks.append(self._left_bus.start())
@@ -2140,6 +2151,12 @@ class AxolHardware(RobotBase):
         frames encode: the target it was *commanded* as power died, not the
         pose it sagged to afterwards, which is why the jerk goes somewhere the
         operator never left the robot.
+
+        Must run on a bus nobody owns: it flaps the interface. That is why
+        :meth:`connect` takes ``purge_stale``, and why the realtime path
+        (``almond_axol.rt.robot.Axol._enable``) calls this itself *before*
+        handing the interfaces to the core rather than relying on the
+        ``connect()`` it performs afterwards.
 
         The realtime core purges the queue as soon as it declares a stall
         (``purge_tx_queue`` in ``rust/axol-rt/src/safety.rs``), so this is
