@@ -13,16 +13,28 @@ shell that happened to have the allowance.
 
 :func:`install` writes a ``/etc/security/limits.d`` drop-in granting the
 operator's account the top rung of the stack's FIFO ladder
-(:data:`almond_axol.utils.affinity.MAX_FIFO_PRIORITY`). PAM applies it at the
-next login, so it survives reboots and needs no per-shell ``prlimit``. It is
-an ``axol provision`` step: an install-time, host-level grant like the udev
-rules and group memberships provisioned alongside it.
+(:data:`almond_axol.utils.affinity.MAX_FIFO_PRIORITY`). It is an ``axol
+provision`` step: an install-time, host-level grant like the udev rules and
+group memberships provisioned alongside it.
+
+Only ``pam_limits`` applies that file, and it is wired into the ``sshd`` and
+``login`` PAM stacks alone — so the grant reaches a normal ``ssh`` login and
+nothing else. A session logind registers under any other service inherits its
+parent's limit instead and stays at zero however many times ``axol provision``
+runs: Tailscale SSH (``Service=tailscaled``, whose unit has
+``LimitRTPRIO=0``), a systemd unit without ``LimitRTPRIO``, cron, a container.
+Since #312 the control loop refuses to start in that state rather than hitch,
+so writing the file is no longer the whole job — :func:`verify_session` checks
+whether the session running ``provision`` can actually use what was just
+granted, because reporting success while ``ulimit -r`` stays 0 is what cost a
+day on 2026-09-17.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import pwd
 import resource
 from pathlib import Path
 
@@ -89,6 +101,139 @@ def current_limit() -> int:
     return 99 if hard == resource.RLIM_INFINITY else int(hard)
 
 
+# Ancestors that only pass rlimits along; naming one would say nothing about
+# where a zero came from.
+_TRANSPARENT_COMMS = frozenset(
+    {
+        "axol",
+        "bash",
+        "dash",
+        "fish",
+        "ksh",
+        "login",
+        "python",
+        "python3",
+        "sh",
+        "su",
+        "sudo",
+        "uv",
+        "zsh",
+    }
+)
+
+
+def _limit_inherited_from() -> str | None:
+    """Name the nearest ancestor this process's rlimits were inherited from.
+
+    ``RLIMIT_RTPRIO`` crosses fork and exec untouched, so when ``pam_limits``
+    never ran the effective limit is simply whatever the session's parent
+    held. Naming that ancestor is the quickest way to explain a zero —
+    ``tailscaled`` for Tailscale SSH, ``cron``, a container shim, a systemd
+    unit — and it needs nothing but ``/proc``. Shells and interpreters in
+    between are skipped: they only pass the limit down. ``None`` when
+    ``/proc`` is unreadable or only transparent ancestors are found.
+    """
+    pid = os.getppid()
+    for _ in range(32):  # bounded; a login session is never this deep
+        if pid <= 1:
+            return None
+        try:
+            comm = Path(f"/proc/{pid}/comm").read_text().strip()
+            status = Path(f"/proc/{pid}/status").read_text()
+        except OSError:
+            return None
+        if comm and comm not in _TRANSPARENT_COMMS:
+            return comm
+        parent = None
+        for line in status.splitlines():
+            if line.startswith("PPid:"):
+                try:
+                    parent = int(line.split()[1])
+                except (IndexError, ValueError):
+                    return None
+                break
+        if parent is None:
+            return None
+        pid = parent
+    return None
+
+
+def _current_user() -> str | None:
+    """This process's effective login name, or None when it cannot be read."""
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except (KeyError, OSError):
+        return None
+
+
+def verify_session(user: str) -> bool:
+    """Report whether *this* session can actually use the grant for ``user``.
+
+    :func:`install` writes the drop-in, but only ``pam_limits`` applies it,
+    and that is wired into the ``sshd`` and ``login`` PAM stacks alone. A
+    session logind registers under any other service — Tailscale SSH reports
+    ``Service=tailscaled`` — never runs it and silently keeps whatever limit
+    its parent held. Provisioning then reports a grant that is real on disk
+    and absent from every shell the operator actually uses: on 2026-09-17 a
+    manual ``axol provision`` logged success while ``ulimit -r`` stayed 0, the
+    control loop ran CFS, and the hitching that caused was read as a
+    regression in the two PRs that had just fixed it.
+
+    Silent in the two cases where this process's own limit says nothing:
+
+    * **running as root** — the hosted installer and the systemd unit. Root
+      holds ``CAP_SYS_NICE``, whose check short-circuits ``RLIMIT_RTPRIO``
+      entirely (``sched(7)``), so a zero there is both normal and harmless.
+      Root's default limit *is* zero on a stock Ubuntu, so warning here would
+      fire on every install and mean nothing.
+    * **provisioning for somebody else** — under ``sudo``, ``user`` is the
+      operator :func:`operator_user` resolved rather than whoever is running
+      this, so the current limit is unrelated to their future logins.
+
+    Returns True when the grant is usable here, or when the check
+    does not apply.
+    """
+    if os.geteuid() == 0:
+        _logger.debug(
+            "root holds CAP_SYS_NICE, which bypasses RLIMIT_RTPRIO; not "
+            "checking this session's limit"
+        )
+        return True
+    current = _current_user()
+    if current is not None and current != user:
+        _logger.debug(
+            "granted rtprio to %s while running as %s; this session's limit "
+            "says nothing about theirs",
+            user,
+            current,
+        )
+        return True
+    limit = current_limit()
+    if limit >= MAX_FIFO_PRIORITY:
+        _logger.info(
+            "this session's rtprio limit is %d — real-time scheduling available",
+            limit,
+        )
+        return True
+    source = _limit_inherited_from()
+    _logger.warning(
+        "this session's rtprio limit is %d, not %d, so the grant in %s is not "
+        "in effect here: pam_limits applies it and only the `sshd` and `login` "
+        "PAM stacks run pam_limits%s. Reconnect over `ssh` and confirm with "
+        "`ulimit -r`, or raise it in place with `sudo prlimit --pid $$ "
+        "--rtprio=%d:%d`. Until then the control loop refuses to start and the "
+        "camera relay's capture chain runs CFS, dropping exposures under "
+        "recording load",
+        limit,
+        MAX_FIFO_PRIORITY,
+        LIMITS_PATH,
+        f" — this shell descends from {source}" if source else "",
+        MAX_FIFO_PRIORITY,
+        MAX_FIFO_PRIORITY,
+    )
+    return False
+
+
 def install() -> None:
     """Grant the operator a persistent rtprio allowance via ``limits.d``.
 
@@ -105,6 +250,7 @@ def install() -> None:
     try:
         if LIMITS_PATH.read_text() == wanted:
             _logger.info("rtprio grant already in place for %s (%s)", user, LIMITS_PATH)
+            verify_session(user)
             return
     except OSError:
         pass
@@ -123,11 +269,10 @@ def install() -> None:
     run_root(["mkdir", "-p", str(LIMITS_PATH.parent)], check=True)
     run_root(["tee", str(LIMITS_PATH)], input_text=wanted, check=True)
     _logger.info(
-        "rtprio %d granted to %s via %s — takes effect at %s's next login "
-        "(current shells keep ulimit -r %d)",
+        "rtprio %d granted to %s via %s — takes effect at %s's next login",
         MAX_FIFO_PRIORITY,
         user,
         LIMITS_PATH,
         user,
-        current_limit(),
     )
+    verify_session(user)
