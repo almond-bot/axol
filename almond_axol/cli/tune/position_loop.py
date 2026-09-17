@@ -93,14 +93,15 @@ _SAG_OK_DEG = 0.3
 #: Position ripple (deg rms) above which a candidate is called oscillating and
 #: the search stops rather than escalating into a louder instability.
 _RIPPLE_LIMIT_DEG = 0.25
-#: Ripple limit for the *tracking* sweep, which is a different measurement:
-#: there the drive sine is removed first, so what remains is buzz alone and a
-#: far smaller number means the same thing. Provisional — on hardware an
-#: operator heard vibration at a gain whose tracking rms was still only
-#: 0.069°, so the absolute figure is calibrated against ears, not theory.
-#: The sweep also stops on a sharp jump relative to the previous gain, which
-#: does not depend on getting this number right.
-_TRACK_RIPPLE_LIMIT_DEG = 0.05
+#: Default ripple limit for the *tracking* sweep. Deliberately permissive.
+#: There is no calibration for this number: on hardware an operator heard
+#: nothing at a gain measuring 0.088° and heard clear vibration at a higher
+#: one that was never measured. A tight guess simply truncates the sweep
+#: before it can produce the data that would calibrate it, so the default
+#: lets the sweep run and prints the column. The relative jump below is the
+#: detector that does not need a calibrated absolute level, and
+#: ``--ripple-limit`` sets this once the joint's own numbers are known.
+_TRACK_RIPPLE_LIMIT_DEG = 0.25
 #: Ripple growth against the previous gain that counts as the onset of
 #: oscillation regardless of the absolute level.
 _TRACK_RIPPLE_JUMP = 3.0
@@ -370,6 +371,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "back and reported. Restored afterwards unless --save.",
     )
     p.add_argument(
+        "--ripple-limit",
+        type=float,
+        default=_TRACK_RIPPLE_LIMIT_DEG,
+        help=f"[track] ripple (deg) that stops the sweep (default "
+        f"{_TRACK_RIPPLE_LIMIT_DEG}). The sweep also stops on a "
+        f"{_TRACK_RIPPLE_JUMP:.0f}x jump against the previous gain, which "
+        f"needs no calibration. Read the column and trust your ears: a joint "
+        f"buys tracking accuracy with vibration, and rms falls right through "
+        f"the point where it becomes audible.",
+    )
+    p.add_argument(
         "--mode",
         choices=("hold", "track"),
         default="hold",
@@ -525,7 +537,7 @@ async def _run(args: argparse.Namespace) -> None:
                         max_speed,
                         args.rate,
                     )
-                    noisy = ripple > _TRACK_RIPPLE_LIMIT_DEG or (
+                    noisy = ripple > args.ripple_limit or (
                         prev_ripple is not None
                         and ripple > _TRACK_RIPPLE_JUMP * max(prev_ripple, 1e-4)
                     )

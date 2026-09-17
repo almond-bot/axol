@@ -223,15 +223,32 @@ class AccelerationTest(unittest.TestCase):
 
         t = np.linspace(0, 15, 1500)
         smooth = 0.4 * np.sin(2 * np.pi * 0.2 * t)
+        # The metric's job is separation, not clearing a threshold: the
+        # threshold is uncalibrated and deliberately permissive.
         self.assertLess(ripple(smooth), 0.005)
         buzzy = smooth + 0.15 * np.sin(2 * np.pi * 18 * t)
-        self.assertGreater(ripple(buzzy), pl._TRACK_RIPPLE_LIMIT_DEG)
+        self.assertGreater(ripple(buzzy), 20 * ripple(smooth))
+        self.assertGreater(ripple(buzzy), 0.05)
 
-    def test_track_ripple_limit_is_tighter_than_the_hold_one(self) -> None:
-        # Different measurements: the tracking number has the drive sine
-        # removed, so the same physical buzz reads much smaller.
-        self.assertLess(pl._TRACK_RIPPLE_LIMIT_DEG, pl._RIPPLE_LIMIT_DEG)
+    def test_ripple_limit_is_permissive_and_overridable(self) -> None:
+        """An uncalibrated threshold must not truncate the sweep.
+
+        A tight default stopped the sweep at a gain the operator could not
+        hear, which is exactly the run that would have calibrated it. The
+        relative jump is the detector that needs no absolute level.
+        """
+        parser = argparse.ArgumentParser()
+        pl.add_parser(parser.add_subparsers())
+        args = parser.parse_args(["tune.position-loop", "--r", "--joint", "elbow"])
+        self.assertEqual(args.ripple_limit, pl._TRACK_RIPPLE_LIMIT_DEG)
+        # Permissive enough to clear the 0.088 deg that measured quiet.
+        self.assertGreater(pl._TRACK_RIPPLE_LIMIT_DEG, 0.09)
         self.assertGreater(pl._TRACK_RIPPLE_JUMP, 1.0)
+
+        over = parser.parse_args(
+            ["tune.position-loop", "--r", "--joint", "elbow", "--ripple-limit", "0.04"]
+        )
+        self.assertEqual(over.ripple_limit, 0.04)
 
     def test_tracking_metric_reports_lag(self) -> None:
         # A held position cannot reveal profiled-motion mode; only a moving
