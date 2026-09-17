@@ -119,9 +119,13 @@ _MAX_SHIFT_M = 0.060
 #: CoM component; ``_MASS_PRIOR_FRAC`` is loose so mass takes that content.
 _COM_PRIOR_ALONG_M = 0.002
 _MASS_PRIOR_FRAC = 1.0
-#: Mass plausibility cap: half the configured mass, or 0.35 kg, whichever is
-#: larger -- so a light distal link may legitimately carry a harness's worth.
-_MAX_MASS_FRAC = 0.50
+#: Mass plausibility cap, absolute: a harness's worth. It is deliberately
+#: NOT a fraction of the link mass. Bench: with a 50 % cap, shoulder_3
+#: (3.75 kg) accepted -0.77 kg while its residual barely moved -- that was
+#: the uncalibrated elbow's error, lumped in and booked as mass. A heavy
+#: proximal link's mass is well known; the only unmodelled mass a sweep
+#: should be allowed to discover is cabling and hand-side hardware, which
+#: is the same few hundred grams whatever link it is attributed to.
 _MAX_MASS_ABS_KG = 0.35
 _DEFAULT_VELOCITY_DEG = 18.0
 
@@ -289,13 +293,13 @@ def fit_com(
             "feedback, or distal links not yet calibrated — run distal → "
             "proximal); not applying it"
         )
-    mass_cap = max(_MAX_MASS_FRAC * mass0, _MAX_MASS_ABS_KG)
-    if abs(dmass) > mass_cap:
+    if abs(dmass) > _MAX_MASS_ABS_KG:
         raise RuntimeError(
-            f"fitted mass change {dmass:+.3f} kg exceeds the {mass_cap:.2f} kg "
-            f"plausibility cap for a {mass0:.3f} kg link. That much unmodelled "
-            "mass is a payload or a wrong link model, not build spread or a "
-            "harness; not applying it"
+            f"fitted mass change {dmass:+.3f} kg exceeds the "
+            f"{_MAX_MASS_ABS_KG:.2f} kg plausibility cap (a harness's worth). "
+            f"On a {mass0:.3f} kg link that much unmodelled mass is a payload, "
+            "a wrong link model, or a distal link's error lumped in -- run "
+            "distal to proximal; not applying it"
         )
     com_fit = tuple(float(v) for v in com0 + delta)
     mass_fit = mass0 + dmass
