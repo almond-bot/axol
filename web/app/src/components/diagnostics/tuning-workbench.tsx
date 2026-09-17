@@ -217,6 +217,9 @@ const TABS: WbTab[] = [
       "directly). Streams a sine to one joint and sweeps position_kp, then position_ki " +
       "at the winning kp, stopping when the motor's q-axis current says it has started " +
       "to buzz. Every gain point is saved as its own run; the whole sweep shares a group. " +
+      "Give speed_kp / speed_ki several values to sweep the inner speed loop FIRST — " +
+      "innermost loop first; the position loop's cliff is set by the speed loop's phase " +
+      "margin — or one value to pin it. Current-loop gains are not touched. " +
       "Writes are RAM-only — a power cycle restores the motor. Pick a loaded centre " +
       "(e.g. -90 on the elbow): an unloaded joint holds at any gain and teaches nothing.",
     presets: { mode: "track", accel: 0, save_run: true },
@@ -244,6 +247,22 @@ const TABS: WbTab[] = [
         type: "text",
         placeholder: "kp × 0.001 … 0.1",
         hint: "space-separated, tried at the winning kp; 0 to skip the integral stage",
+        width: "w-48",
+      },
+      {
+        key: "speed_kp",
+        label: "speed_kp",
+        type: "text",
+        placeholder: "motor's",
+        hint: "inner speed loop; several values = swept first at the configured position gains, one = fixed override",
+        width: "w-48",
+      },
+      {
+        key: "speed_ki",
+        label: "speed_ki",
+        type: "text",
+        placeholder: "motor's",
+        hint: "inner speed loop integral; same semantics as speed_kp",
         width: "w-48",
       },
       { key: "amp", label: "amp (°)", type: "number", placeholder: "10" },

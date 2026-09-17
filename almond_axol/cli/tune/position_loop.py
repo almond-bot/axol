@@ -322,6 +322,27 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     )
     p.add_argument("--kp", type=float, nargs="+", help="Explicit position_kp values")
     p.add_argument(
+        "--speed-kp",
+        type=float,
+        nargs="+",
+        default=None,
+        help="[track] Inner speed-loop kp. One value: fixed override for the "
+        "run. Several: swept FIRST, ascending, at the configured position "
+        "gains (innermost loop first -- the position loop's stability cliff "
+        "is bounded by the speed loop's phase margin); the winner is used by "
+        "the position stages. RAM-only like every other write here.",
+    )
+    p.add_argument(
+        "--speed-ki",
+        type=float,
+        nargs="+",
+        default=None,
+        help="[track] Inner speed-loop ki; same one-value / sweep semantics "
+        "as --speed-kp. Current-loop gains are printed, never written: they "
+        "are tuned to the motor's electrical constants and mistuning them "
+        "heats or faults the motor rather than making a visible step.",
+    )
+    p.add_argument(
         "--ki",
         type=float,
         nargs="+",
@@ -448,9 +469,18 @@ async def _run(args: argparse.Namespace) -> None:
         test = motors[joint]
         original = await test.motor.get_gains()
         print(
-            f"  current gains: kp={original.position_kp:.4f} "
-            f"ki={original.position_ki:.4f} kd={original.position_kd}"
+            f"  current gains: position kp={original.position_kp:.4f} "
+            f"ki={original.position_ki:.4f} kd={original.position_kd} | "
+            f"speed kp={original.speed_kp:.4f} ki={original.speed_ki:.4f} | "
+            f"current kp={original.current_kp} ki={original.current_ki} (not tuned here)"
         )
+        # The inner speed loop, as the position stages will run it. One value
+        # on the flag is a fixed override; several are swept first (see the
+        # speed stage below), and the winner lands here.
+        inner = {
+            "speed_kp": (args.speed_kp[0] if args.speed_kp else original.speed_kp),
+            "speed_ki": (args.speed_ki[0] if args.speed_ki else original.speed_ki),
+        }
 
         # Holders to impedance, test joint to position mode. Both are mode
         # switches (a ~2 s reset each on MyActuator), so they happen once.
@@ -530,9 +560,15 @@ async def _run(args: argparse.Namespace) -> None:
                 sweep_group = f"position-loop-{int(time.time())}-{joint.value}"
 
                 async def point(kp: float, ki: float):
-                    """One gain pair: returns ``(rms, spread, mx, lag, ripple)``."""
+                    """One position-gain pair at the current inner-loop gains."""
                     await test.motor.set_gains(
-                        replace(original, position_kp=kp, position_ki=ki),
+                        replace(
+                            original,
+                            position_kp=kp,
+                            position_ki=ki,
+                            speed_kp=inner["speed_kp"],
+                            speed_ki=inner["speed_ki"],
+                        ),
                         persist=False,
                     )
                     # Per-gain holder drift. The holders run MIT impedance and
@@ -603,7 +639,12 @@ async def _run(args: argparse.Namespace) -> None:
                         },
                         side="left" if is_left else "right",
                         joint=joint.value,
-                        gains={"position_kp": kp, "position_ki": ki},
+                        gains={
+                            "position_kp": kp,
+                            "position_ki": ki,
+                            "speed_kp": inner["speed_kp"],
+                            "speed_ki": inner["speed_ki"],
+                        },
                         params={
                             "mode": "track",
                             "center_deg": math.degrees(target),
@@ -679,6 +720,51 @@ async def _run(args: argparse.Namespace) -> None:
                         return True
                     return ripple > _TRACK_RIPPLE_JUMP * max(p_ripple, 1e-4)
 
+                # Stage 0: the inner speed loop, innermost first. The
+                # position loop's stability cliff is bounded by the phase
+                # margin of the speed loop under it -- on the right elbow
+                # position_kp fell off between 0.84-0.96 at -45° and 0.24-0.36
+                # at -90° with the speed loop at factory, and no outer gain can
+                # buy back margin the inner loop does not have. Swept at the
+                # configured position gains, ascending, same buzz/ripple stop;
+                # the winner is what every later stage runs on.
+                for name in ("speed_kp", "speed_ki"):
+                    values = getattr(args, name)
+                    if not values or len(values) < 2:
+                        continue
+                    print(
+                        f"\n  speed-loop stage: sweeping {name} at position kp={original.position_kp:.4f}"
+                    )
+                    best_inner: tuple[float, float] | None = None
+                    prev_inner: tuple[float, float] | None = None
+                    for v in values:
+                        inner[name] = v
+                        m = await point(original.position_kp, original.position_ki)
+                        if m is None:
+                            continue
+                        noisy = oscillating(m, prev_inner)
+                        print(f"    {name}={v:.4f}", end="")
+                        row(original.position_kp, original.position_ki, m, noisy)
+                        persist(original.position_kp, original.position_ki, m, noisy)
+                        if noisy:
+                            print(
+                                f"    stopping: the speed loop is buzzing at {name}={v:.4f}."
+                            )
+                            break
+                        prev_inner = (m[4], m[5])
+                        if best_inner is None or m[0] < best_inner[1]:
+                            best_inner = (v, m[0])
+                    if best_inner is not None:
+                        inner[name] = best_inner[0]
+                        print(
+                            f"  -> {name}={best_inner[0]:.4f} (tracking rms {best_inner[1]:.4f}°)"
+                        )
+                    else:
+                        inner[name] = values[0]
+                print(
+                    f"\n  position stages run with speed kp={inner['speed_kp']:.4f} ki={inner['speed_ki']:.4f}"
+                )
+
                 kps = args.kp or [original.position_kp * m for m in _KP_STEPS]
                 prev_ripple: tuple[float, float] | None = None
                 for kp in kps:
@@ -732,8 +818,9 @@ async def _run(args: argparse.Namespace) -> None:
 
                     print(
                         f"\n  best: position_kp={best[0]:.4f} "
-                        f"position_ki={best[1]:.4f} -> tracking rms "
-                        f"{best[2]:.4f}°"
+                        f"position_ki={best[1]:.4f} "
+                        f"(speed kp={inner['speed_kp']:.4f} ki={inner['speed_ki']:.4f}) "
+                        f"-> tracking rms {best[2]:.4f}°"
                     )
                     if best[2] > 1.0:
                         print(

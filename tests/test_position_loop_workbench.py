@@ -44,6 +44,11 @@ class RegistryTest(unittest.TestCase):
             "label",
         ):
             self.assertIn(key, emit)
+        # The inner speed loop is sweepable; the current loop is not exposed.
+        self.assertEqual(emit["speed_kp"]["t"], "optlist")
+        self.assertEqual(emit["speed_ki"]["t"], "optlist")
+        self.assertNotIn("current_kp", emit)
+        self.assertNotIn("current_ki", emit)
 
     def test_argv_round_trip(self) -> None:
         argv = build_argv(
@@ -95,7 +100,8 @@ class PersistedRunTest(unittest.TestCase):
         self.assertEqual(src.count("persist(kp, 0.0, m, noisy)"), 1)
         self.assertEqual(src.count("persist(best[0], ki, m, noisy)"), 1)
         self.assertIn("if not args.save_run:", src)
-        self.assertIn('gains={"position_kp": kp, "position_ki": ki}', src)
+        self.assertIn('"position_kp": kp,', src)
+        self.assertIn('"speed_kp": inner["speed_kp"],', src)
         self.assertIn("group=sweep_group", src)
 
     def test_track_returns_the_series_the_chart_draws(self) -> None:
