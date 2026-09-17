@@ -47,7 +47,6 @@ from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig
-from ...tuning.holders import ImpedanceHolders
 from ...robot.gravity import GravityCompensator
 from ...tuning import (
     JointFrameMotor,
@@ -55,6 +54,7 @@ from ...tuning import (
     ramp_stages,
     sweep_safety,
 )
+from ...tuning.holders import ImpedanceHolders, read_position
 from ...utils.paths import almond_home
 from ...utils.state_files import (
     privileged_service_active,
@@ -83,7 +83,7 @@ async def _ramp_to(
     target: float,
     duration: float = 2.0,
 ) -> None:
-    start_pos = await motor.get_position()
+    start_pos = await read_position(motor)
     count = max(2, math.ceil(duration * _RATE_HZ) + 1)
     samples = [
         (start_pos + i / (count - 1) * (target - start_pos), target, 0.0)
@@ -154,7 +154,7 @@ async def _ramp_verified(
                     for j in joints
                 ]
             )
-        positions = await asyncio.gather(*[motors[j].get_position() for j in joints])
+        positions = await asyncio.gather(*[read_position(motors[j]) for j in joints])
         max_dist = max(
             (abs(pos - targets[j]) for j, pos in zip(joints, positions)),
             default=0.0,
@@ -164,7 +164,7 @@ async def _ramp_verified(
         while time.monotonic() - t0 < timeout:
             await asyncio.sleep(0.1)
             positions = await asyncio.gather(
-                *[motors[j].get_position() for j in joints]
+                *[read_position(motors[j]) for j in joints]
             )
             if all(abs(pos - targets[j]) < 0.05 for j, pos in zip(joints, positions)):
                 return
@@ -229,13 +229,98 @@ async def assign_modes(
     # has just spent 2 s limp. Take hold of it before the caller poses the arm.
     if impedance is not None and impedance in motors:
         await _ramp_to(
-            motors[impedance], kp, kd, await motors[impedance].get_position()
+            motors[impedance], kp, kd, await read_position(motors[impedance])
         )
     if holders_only_legacy:
         return None
     holders = ImpedanceHolders(motors, impedance, is_left, config)
     await holders.start()
     return holders
+
+
+async def safe_return_to_rest(
+    motors: dict[Joint, JointFrameMotor],
+    holders: ImpedanceHolders | None,
+    swept: Joint,
+    kp: float,
+    kd: float,
+) -> None:
+    """Bring the arm home and release it -- but only once it *is* home.
+
+    Bench, right shoulder_2: a position read timed out at the top of a sweep,
+    the abort's teardown tried to home, that read timed out too, the failure
+    was swallowed, and the code went on to reset and disable every motor with
+    the arm raised. The arm slammed down. A teardown may never cut torque on
+    a raised arm. So:
+
+    1. adopt the swept joint into the impedance holders first -- from the
+       moment the sweep stopped streaming, nothing was holding it;
+    2. home under impedance, several attempts, with retried reads;
+    3. verify every joint is within ``REST_TOL`` of rest from the motors;
+    4. only then stop the stream, reset modes and disable.
+
+    If the arm cannot be verified at rest the holders keep streaming and the
+    operator is asked. Typing ``drop`` releases anyway (someone is holding
+    the arm); anything else retries.
+    """
+    if holders is None:
+        # Legacy 0xA4 flow (tune.factory): nothing streams, so the best on
+        # offer is the old homing; still refuse to disable when off-rest.
+        try:
+            await _home_all(motors, None, impedance=swept, kp=kp, kd=kd)
+        except Exception as exc:
+            print(f"  ! homing failed: {exc}")
+    else:
+        try:
+            await holders.adopt(swept)
+        except Exception as exc:
+            print(f"  ! could not take hold of {swept.value}: {exc}")
+        for attempt in range(3):
+            try:
+                for j in _HOME_ORDER:
+                    if j in motors:
+                        await holders.ramp_to(j, 0.0, _RAMP_SPEED)
+                break
+            except Exception as exc:
+                print(f"  ! homing attempt {attempt + 1} failed: {exc}")
+                await asyncio.sleep(0.5)
+        while True:
+            try:
+                off = await holders.at_rest()
+            except Exception as exc:
+                off = [(swept, float("nan"))]
+                print(f"  ! could not read positions: {exc}")
+            if not off:
+                break
+            print(
+                "\n  !! ARM IS NOT AT REST -- holding under impedance, NOT releasing:"
+            )
+            for j, pos in off:
+                print(f"       {j.value}: {math.degrees(pos):+.1f}°")
+            answer = await asyncio.to_thread(
+                input,
+                "  Support the arm, then press Enter to retry homing "
+                "(or type 'drop' to release anyway): ",
+            )
+            if answer.strip().lower() == "drop":
+                print("  releasing on operator request.")
+                break
+            for j in _HOME_ORDER:
+                if j in motors:
+                    try:
+                        await holders.ramp_to(j, 0.0, _RAMP_SPEED)
+                    except Exception as exc:
+                        print(f"  ! {j.value}: {exc}")
+        await holders.stop()
+    # Only now, at rest (or on the operator's word), is a mode switch and a
+    # disable free of consequence.
+    await asyncio.gather(
+        *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()],
+        return_exceptions=True,
+    )
+    await asyncio.gather(
+        *[m.disable() for m in motors.values()], return_exceptions=True
+    )
 
 
 async def _home_all(
@@ -527,13 +612,13 @@ async def _identify_joint(
             print(f"\n  v = {math.degrees(v):.1f} deg/s ...")
 
             # Ramp to sweep start with time proportional to distance
-            cur = await motor.get_position()
+            cur = await read_position(motor)
             ramp_dur = abs(sweep_lo - cur) / _RAMP_SPEED + 1.0
             await _ramp_to(motor, kp, kd, sweep_lo, duration=ramp_dur)
             await asyncio.sleep(0.3)
 
             fwd = await _run_sweep_raw(motor, kp, kd, sweep_lo, +v, sweep_hi)
-            cur = await motor.get_position()
+            cur = await read_position(motor)
             print(f"    fwd: {len(fwd)} samples")
 
             # Hold at turnaround to damp velocity before reversing
@@ -806,28 +891,4 @@ async def _run(args: argparse.Namespace) -> None:
             print("\n  Interrupted.")
         finally:
             print("  Returning to rest and disabling ...")
-            try:
-                # Distal-to-proximal, with the swept joint ramped under
-                # impedance in its own place in that order. A Damiao left in
-                # POSITION_VELOCITY ignores impedance frames, so ask the
-                # motor rather than assuming.
-                await _home_all(
-                    motors,
-                    holders,
-                    impedance=joint
-                    if motors[joint].motor.mode == ControlMode.IMPEDANCE
-                    else None,
-                    kp=kp,
-                    kd=kd,
-                )
-            except Exception:
-                pass
-            try:
-                if holders is not None:
-                    await holders.stop()
-            except Exception:
-                pass
-            await asyncio.gather(
-                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
-            )
-            await asyncio.gather(*[m.disable() for m in motors.values()])
+            await safe_return_to_rest(motors, holders, joint, kp, kd)

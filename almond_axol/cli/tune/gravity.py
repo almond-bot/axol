@@ -56,7 +56,7 @@ from dataclasses import replace
 import numpy as np
 
 from ...constants import ARM_JOINTS
-from ...motor import CanBus, ControlMode, Joint, Motor
+from ...motor import CanBus, Joint, Motor
 from ...robot.calibration import (
     CALIBRATION_PATH,
     load_calibration,
@@ -72,6 +72,7 @@ from .friction import (
     _identify_joint,
     _ramp_verified,
     assign_modes,
+    safe_return_to_rest,
 )
 
 # Central-difference step for the CoM sensitivity columns (metres). Gravity
@@ -456,20 +457,7 @@ async def _run(args: argparse.Namespace) -> None:
             print("\n  Interrupted.")
         finally:
             print("  Returning to rest and disabling ...")
-            try:
-                await _home_all(motors, holders, impedance=joint, kp=kp, kd=kd)
-            except Exception:
-                pass
-            try:
-                if holders is not None:
-                    await holders.stop()
-            except Exception:
-                pass
-            # Only now, back at rest, is a mode switch free of consequence.
-            await asyncio.gather(
-                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
-            )
-            await asyncio.gather(*[m.disable() for m in motors.values()])
+            await safe_return_to_rest(motors, holders, joint, kp, kd)
 
 
 def _report_and_save(

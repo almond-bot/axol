@@ -32,6 +32,31 @@ from ..robot.gravity import GravityCompensator
 #: the holders' kp/kd were tuned at.
 HOLD_HZ = 100.0
 
+#: How far from the rest pose a joint may sit (rad) for a teardown to be
+#: allowed to cut torque. Five degrees at the shoulder is a few centimetres of
+#: drop, not a slam.
+REST_TOL = math.radians(5.0)
+
+
+async def read_position(motor, *, retries: int = 6, delay: float = 0.05) -> float:
+    """``motor.get_position()`` with retries for a transient bus timeout.
+
+    A 0x92 read has a 0.1 s timeout. With six holders streaming impedance at
+    100 Hz beside the swept joint's own stream, one reply arriving late is
+    ordinary, and on the bench a single such timeout aborted a sweep with the
+    arm at the top of its travel. Nothing about one late frame is worth that;
+    six attempts over ~0.3 s is.
+    """
+    last: Exception | None = None
+    for _ in range(max(1, retries)):
+        try:
+            return await motor.get_position()
+        except Exception as exc:  # MotorError / TimeoutError from the driver
+            last = exc
+            await asyncio.sleep(delay)
+    assert last is not None
+    raise last
+
 
 class ImpedanceHolders:
     """Streams MIT impedance + gravity feedforward to the non-test joints.
@@ -57,7 +82,7 @@ class ImpedanceHolders:
         for j, m in self._motors.items():
             if j is self._exclude:
                 continue
-            self._hold[j] = await m.get_position()
+            self._hold[j] = await read_position(m)
         self.peak_wobble = {j: 0.0 for j in self._hold}
         self._drift_sum = {j: 0.0 for j in self._hold}
         self._drift_n = {j: 0 for j in self._hold}
@@ -84,6 +109,39 @@ class ImpedanceHolders:
         self._drift_sum = {j: 0.0 for j in self._hold}
         self._drift_n = {j: 0 for j in self._hold}
         return worst, peak, rms
+
+    async def adopt(self, joint: Joint) -> None:
+        """Start holding ``joint`` where it is, under its configured impedance.
+
+        For the swept joint the moment a run aborts: whatever was streaming to
+        it has stopped, and until something else does it is limp. Called first
+        in every teardown, before any attempt to home.
+        """
+        if joint in self._hold:
+            return
+        self._hold[joint] = await read_position(self._motors[joint])
+        self.peak_wobble[joint] = 0.0
+        self._drift_sum[joint] = 0.0
+        self._drift_n[joint] = 0
+
+    async def at_rest(self, tol: float = REST_TOL) -> list[tuple[Joint, float]]:
+        """Joints in the hold set that are *not* within ``tol`` of 0 (rad).
+
+        Read from the motors, not from the hold targets: a target of zero says
+        nothing about where a joint that failed to follow it actually is.
+        """
+        off = []
+        for j, m in self._motors.items():
+            if j not in self._hold:
+                continue
+            try:
+                pos = await read_position(m)
+            except Exception:
+                off.append((j, float("nan")))
+                continue
+            if abs(pos) > tol:
+                off.append((j, pos))
+        return off
 
     async def ramp_to(self, joint: Joint, target: float, speed: float) -> None:
         """Walk one holder's target to ``target`` while it keeps streaming.

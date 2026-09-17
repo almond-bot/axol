@@ -55,17 +55,24 @@ class ModeSwitchOrderingTest(unittest.TestCase):
                 posed = _calls(run, poser)
                 switches = _calls(run, "set_control_mode")
                 self.assertTrue(posed, f"{mod.__name__}: no posing call found")
-                self.assertTrue(switches, f"{mod.__name__}: no mode switch found")
-                # Every switch is either before the arm is posed, or in the
-                # teardown after it has been brought home again.
-                homed = max(_calls(run, "_home_all") or _calls(run, "_ramp_to") or [0])
+                # The only mode switches left in _run are assign_modes'
+                # (before posing); the teardown's live in safe_return_to_rest,
+                # after the arm is verified at rest (tests/test_safe_teardown).
                 for line in switches:
-                    self.assertTrue(
-                        line < min(posed) or line > homed,
+                    self.assertLess(
+                        line,
+                        min(posed),
                         f"{mod.__name__}: set_control_mode at offset {line} lands "
-                        f"between posing ({min(posed)}) and homing ({homed}) — "
-                        f"that is 2 s of free fall in a loaded pose",
+                        f"after posing ({min(posed)}) — 2 s of free fall in a "
+                        f"loaded pose",
                     )
+                self.assertIn("safe_return_to_rest(", inspect.getsource(run))
+                if mod is breakaway:
+                    continue
+                td = inspect.getsource(friction.safe_return_to_rest)
+                self.assertLess(
+                    td.index("holders.at_rest()"), td.index("set_control_mode")
+                )
 
     def test_gravity_and_friction_assign_modes_before_homing(self) -> None:
         for mod in (gravity, friction):
@@ -137,9 +144,15 @@ class HoldersUnderImpedanceTest(unittest.TestCase):
                 self.assertIn("holders = await assign_modes(", src)
                 self.assertIn("is_left=is_left, config=resolved", src)
                 self.assertIn("_ramp_verified(motors, stage, holders)", src)
-                self.assertIn("await holders.stop()", src)
-                # Stopping the stream must come after homing, never before.
-                self.assertLess(src.rindex("_home_all("), src.index("holders.stop()"))
+                # The stream is stopped inside safe_return_to_rest, only after
+                # homing and the at-rest check (tests/test_safe_teardown).
+                self.assertIn(
+                    "safe_return_to_rest(motors, holders, joint, kp, kd)", src
+                )
+                td = inspect.getsource(friction.safe_return_to_rest)
+                self.assertLess(
+                    td.index("holders.ramp_to("), td.index("holders.stop()")
+                )
 
     def test_shared_module_is_the_one_position_loop_uses(self) -> None:
         from almond_axol.cli.tune import position_loop
