@@ -20,26 +20,36 @@ Stick-slip exists precisely *because* breakaway exceeds sliding friction. That
 gap is what this measures, and it needs no velocity signal at all — only the
 torque at the instant position moves.
 
-Method, per direction and per pose:
+Method, per pose:
 
-1. Park the joint and hold the rest of the arm on the shared sweep-safety
-   geometry (the same poses ``tune.friction`` uses).
-2. Command the joint with ``kp = 0`` — no position spring — and a small ``kd``
-   so it cannot run away once it releases. The only torque is gravity
-   feedforward plus a slow, deliberately shaped ramp.
-3. Ramp that extra torque up and back down in a triangle, and watch for the
-   first motion past ``--move-lsb`` encoder counts.
-4. Escalate the ramp's peak over successive trials and stop at the first
-   release, so the joint never sees more torque than it took to move it.
+1. Park every other joint at rest and ramp the test joint to the pose.
+2. Command it with ``kp = 0`` — no position spring — and a small ``kd`` so it
+   cannot run away once it releases. Gravity feedforward is then the only
+   thing holding it.
+3. Trim that feedforward until the joint actually stands still. A joint sits
+   still for any trim inside its stiction band, so this converges quickly —
+   and the trim it lands on is a direct measurement of the gravity-model
+   residual at this pose. Without it, loaded poses are unmeasurable: at
+   15 Nm a 2 % model error outweighs the whole breakaway torque.
+4. Ramp an extra torque up and back down in a triangle and watch for the
+   first motion past ``--move-lsb`` encoder counts. Peaks escalate over
+   trials and the search stops at the first release, so the joint never sees
+   more torque than it took to move it.
+5. Repeat in both directions.
 
-What comes out, and what it is for:
+What comes out, and what it is for. Probing both directions separates two
+things a single average hides — the symmetric half is friction, the
+antisymmetric half is whatever standing torque the feedforward missed:
 
-* ``fc_break`` per direction, and ``fc_break/fc`` — which is what
-  ``--axol.experiments.stiction_gain`` should be set to, instead of a guess.
-* ``(fc_break − fc)/kp`` — the predicted stick-slip stair height. If it
+* **breakaway** and ``breakaway/fc``. Above ``fc``, the excess is what
+  ``--axol.experiments.stiction_gain`` should be. At or below ``fc``, the
+  velocity feedforward is over-compensating at rest and raising
+  ``stiction_gain`` or ``friction_k_max`` pushes the wrong way.
+* ``(breakaway − fc)/kp`` — the predicted stick-slip stair height. If it
   matches the steps seen in a slow replay, the diagnosis is closed.
-* With ``--poses``, breakaway against gravity load at several points in the
-  range: the slope is ``--axol.experiments.friction_load_gain``.
+* With ``--poses``, breakaway against gravity load: the slope is
+  ``--axol.experiments.friction_load_gain``, and the per-pose trim is the
+  gravity model's own error curve.
 
 Examples:
     axol tune.breakaway --l --joint shoulder_1
@@ -229,6 +239,73 @@ async def _drift_check(
     return float(np.max(np.abs(good - np.median(good[:8]))))
 
 
+async def _null_bias(
+    motor: JointFrameMotor,
+    hold_q: float,
+    gravity_nm: float,
+    kd: float,
+    move_rad: float,
+    fc: float,
+    kp_hold: float,
+    max_steps: int = 8,
+) -> tuple[float, float, bool]:
+    """Find a trim torque that holds the joint still at ``kp = 0``.
+
+    The ramp measures the *extra* torque needed to move a stationary joint,
+    so the joint has to be stationary first. Under load it often is not:
+    gravity feedforward is the only thing holding it, and a small model error
+    there is worth more torque than breakaway itself — which is why every
+    loaded pose was skipped.
+
+    A joint sits still for any trim within its stiction band, so the band is
+    what this searches for: step the trim against the observed drift until
+    the motion stops. The trim that results is a direct measurement of the
+    gravity-model residual at this pose, and the bidirectional ramp that
+    follows still cancels whatever bias remains.
+
+    Returns ``(trim_nm, drift_rad, ok)``.
+    """
+    trim = 0.0
+    step = 0.15 * fc
+    drift = await _drift_check(motor, hold_q, gravity_nm, 0.6, kd)
+    for _ in range(max_steps):
+        if abs(drift) <= move_rad:
+            return trim, drift, True
+        # Which way did it fall? Re-park, then push back by one step.
+        await _ramp_to(motor, kp_hold, kd, hold_q)
+        signed = await _signed_drift(motor, hold_q, gravity_nm + trim, 0.6, kd)
+        trim -= math.copysign(step, signed)
+        if abs(trim) > 3.0 * fc:
+            return trim, drift, False
+        await _ramp_to(motor, kp_hold, kd, hold_q)
+        drift = await _drift_check(motor, hold_q, gravity_nm + trim, 0.6, kd)
+    return trim, drift, abs(drift) <= move_rad
+
+
+async def _signed_drift(
+    motor: JointFrameMotor,
+    hold_q: float,
+    torque_nm: float,
+    secs: float,
+    kd: float,
+) -> float:
+    """Drift with its sign — which way the joint falls at ``kp = 0``."""
+    n = max(8, int(secs * _RATE_HZ))
+    rows = await motor.run_experiment(
+        kp=0.0,
+        kd=kd,
+        rate_hz=_RATE_HZ,
+        samples=[(hold_q, hold_q, torque_nm)] * n,
+        differentiate=False,
+        feedforward=_NO_FF,
+    )
+    actual = np.array([r["actual"] for r in rows], dtype=float)
+    good = actual[np.isfinite(actual)]
+    if len(good) < 4:
+        return 0.0
+    return float(np.median(good[-8:]) - np.median(good[:8]))
+
+
 async def _measure(
     motor: JointFrameMotor,
     joint: Joint,
@@ -247,18 +324,44 @@ async def _measure(
     """Breakaway in both directions at one pose, ``trials`` times each."""
     out: dict[str, list[float]] = {"+": [], "-": []}
     await _ramp_to(motor, kp_hold, kd, hold_q)
-    drift = await _drift_check(motor, hold_q, gravity_nm, 1.0, kd)
+    trim, drift, ok = await _null_bias(
+        motor, hold_q, gravity_nm, kd, move_rad, fc, kp_hold
+    )
     out["drift_rad"] = [drift]  # type: ignore[index]
-    if drift > move_rad:
+    out["trim_nm"] = [trim]  # type: ignore[index]
+    if not ok:
         print(
-            f"      ! joint drifts {math.degrees(drift):.3f}° at kp=0 on gravity "
-            f"feedforward alone (threshold {math.degrees(move_rad):.3f}°) — the "
-            f"gravity model is off by more than breakaway here, so this pose "
-            f"measures the model, not friction. Skipping."
+            f"      ! joint will not hold still at kp=0 even with {trim:+.3f} Nm "
+            f"of trim (drift {math.degrees(drift):.3f}° > "
+            f"{math.degrees(move_rad):.3f}°) — skipping this pose."
         )
+        if writer is not None:
+            writer.writerow(
+                [
+                    joint.value,
+                    "left" if is_left else "right",
+                    f"{math.degrees(hold_q):.3f}",
+                    "skipped",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    f"{trim:.4f}",
+                    f"{math.degrees(drift):.4f}",
+                ]
+            )
         await _ramp_to(motor, kp_hold, kd, hold_q)
         return out
-    print(f"      drift at kp=0: {math.degrees(drift):.4f}° (gravity model ok here)")
+    if abs(trim) > 1e-9:
+        print(
+            f"      gravity-model residual at this pose: {trim:+.3f} Nm "
+            f"(trimmed out; drift now {math.degrees(drift):.4f}°)"
+        )
+    else:
+        print(f"      drift at kp=0: {math.degrees(drift):.4f}° (no trim needed)")
+    gravity_nm = gravity_nm + trim
     for direction, key in ((+1.0, "+"), (-1.0, "-")):
         for trial in range(trials):
             await _ramp_to(motor, kp_hold, kd, hold_q)
@@ -285,6 +388,8 @@ async def _measure(
                                 f"{r['actual']:.6f}",
                                 f"{gravity_nm + tau:.4f}",
                                 f"{r['torque']:.4f}",
+                                f"{trim:.4f}",
+                                f"{math.degrees(drift):.4f}",
                             ]
                         )
                 if found is not None:
@@ -507,6 +612,8 @@ async def _run(args: argparse.Namespace) -> None:
                 "actual_rad",
                 "cmd_torque_nm",
                 "meas_torque_nm",
+                "trim_nm",
+                "drift_deg",
             ]
         )
 
