@@ -263,8 +263,16 @@ async def _track(
         spent = time.monotonic() - t0 - now
         if spent < dt:
             await asyncio.sleep(dt - spent)
+    # Discard the first full cycle. Measured against a simulated first-order
+    # catch-up this changes the rms by under 1 %, so it is hygiene rather than
+    # a fix for anything observed — a start transient is simply not something
+    # to average into a steady-state figure.
     a = np.array(act)
     g = np.array(tgt)
+    tt_a = np.array(tt)
+    warm = tt_a >= min(1.0 / max(freq, 1e-6), 0.5 * secs)
+    a, g, tt_a = a[warm], g[warm], tt_a[warm]
+    tt = list(tt_a)
     good = np.isfinite(a)
     achieved = len(tt) / max(tt[-1] - tt[0], 1e-9) if len(tt) > 1 else 0.0
     if achieved < 0.8 * rate_hz:
@@ -276,7 +284,7 @@ async def _track(
         print(f"    ({good.sum()} of {len(a)} position reads succeeded)")
         return float("nan"), float("nan"), float("nan")
     err = np.degrees(g[good] - a[good])
-    v = np.gradient(g[good], np.array(tt)[good])
+    v = np.gradient(g[good], tt_a[good])
     m = np.abs(v) > 1e-3
     lag = (
         1e3 * np.polyfit(np.abs(v[m]), np.abs(np.radians(err[m])), 1)[0]
@@ -369,6 +377,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "every frame restarts its own ramp. 0 is outside the documented "
         "100-60000 range and the motor may refuse it — the value is read "
         "back and reported. Restored afterwards unless --save.",
+    )
+    p.add_argument(
+        "--repeat",
+        type=int,
+        default=3,
+        help="[track] passes per gain (default 3). A single pass cannot tell "
+        "a real difference from scatter: on hardware one sweep read 0.154, "
+        "0.212, 0.162, 0.089, 0.072 across rising gains — non-monotone, so "
+        "the noise is about the size of the differences being compared.",
     )
     p.add_argument(
         "--ripple-limit",
@@ -519,8 +536,8 @@ async def _run(args: argparse.Namespace) -> None:
                     f"{args.rate:.0f} Hz for {args.duration:.0f}s\n"
                 )
                 print(
-                    f"  {'position_kp':>12} {'rms err':>10} {'max err':>10} "
-                    f"{'lag':>9} {'ripple':>9}"
+                    f"  {'position_kp':>12} {'rms err':>10} {'+/-':>9} "
+                    f"{'max err':>10} {'lag':>9} {'ripple':>9}"
                 )
                 kps = args.kp or [original.position_kp * m for m in _KP_STEPS]
                 prev_ripple: float | None = None
@@ -528,22 +545,33 @@ async def _run(args: argparse.Namespace) -> None:
                     await test.motor.set_gains(
                         replace(original, position_kp=kp), persist=False
                     )
-                    rms, mx, lag, ripple = await _track(
-                        test,
-                        target,
-                        math.radians(args.amp),
-                        args.freq,
-                        args.duration,
-                        max_speed,
-                        args.rate,
-                    )
+                    trials = [
+                        await _track(
+                            test,
+                            target,
+                            math.radians(args.amp),
+                            args.freq,
+                            args.duration,
+                            max_speed,
+                            args.rate,
+                        )
+                        for _ in range(args.repeat)
+                    ]
+                    rms = float(np.mean([t[0] for t in trials]))
+                    spread = float(np.std([t[0] for t in trials]))
+                    mx = float(np.mean([t[1] for t in trials]))
+                    lag = float(np.mean([t[2] for t in trials]))
+                    ripple = float(np.mean([t[3] for t in trials]))
+                    # A difference smaller than the spread across repeats
+                    # is not a difference.
                     noisy = ripple > args.ripple_limit or (
                         prev_ripple is not None
                         and ripple > _TRACK_RIPPLE_JUMP * max(prev_ripple, 1e-4)
                     )
                     print(
-                        f"  {kp:12.4f} {rms:9.4f}° {mx:9.4f}° {lag:8.1f}ms "
-                        f"{ripple:8.4f}°" + ("  <- oscillating" if noisy else "")
+                        f"  {kp:12.4f} {rms:9.4f}° {spread:8.4f}° {mx:9.4f}° "
+                        f"{lag:8.1f}ms {ripple:8.4f}°"
+                        + ("  <- oscillating" if noisy else "")
                     )
                     if noisy:
                         print(
