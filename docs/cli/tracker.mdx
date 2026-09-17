@@ -187,9 +187,15 @@ Rules the loader enforces:
 - An old unkeyed entry, a bare `survive` / `ultimate` key, or a same-family entry left behind after rebinding also suppresses the factory value for that side until it is re-keyed or deleted.
 - A standalone Advanced/CLI transform can support a bring-up capture, but production `collect-data` requires an active device-keyed override or an approved factory value on both sides; `--mantis_allow_uncalibrated true` is only for a calibration capture that will not be used for training.
 
-### Ultimate factory value
+### Vive factory values
 
-The Ultimate constant derives from the Tracker 3.0 mount transform. In the shared gripper/CAD frame the V3 and Ultimate reference origins are `[47, 0, 35]` mm and `[47, 0, 46]` mm, so the tracker-origin change is `ΔO = [0, 0, +11]` mm. For the stored tracker→TCP transform, `Δp = −R·ΔO`; the inherited quaternion `[0.7071068, 0, 0, 0.7071068]` is `R = Rx(+90°)` and maps CAD +z to tracker −y, so `Δp = [0, +11, 0]` mm: the 35.5 mm tracker-y component becomes 46.5 mm while the −92 mm forward component is unchanged. The approved value is `[0, 0.0465, -0.092, 0.7071068, 0, 0, 0.7071068]` for both sides; the tracker-local axes and flat-back orientation match V3, so there is no additional rotation. This mount-frame calculation is distinct from the bridge's world-frame z-up→y-up relabel.
+Both Vive families share the flat-back mount rotation **`Ry(180°)`**, stored as the quaternion `[0, 1, 0, 0]`: the tracker's face normal lies along the gripper's finger direction (gripper −z) and the tracker's +x along the gripper's −x, with the y axis shared. The Tracker 3.0 value is `[0, 0.0355, -0.092, 0, 1, 0, 0]` for both sides.
+
+<Warning>
+axol ≤ 0.2.4 shipped `Rx(+90°)` (`[0.7071068, 0, 0, 0.7071068]`) here. That rotation is the mount-CAD frame convention, not the bridge's device frame, so every recorded gripper orientation was pitched ~90° from where the operator actually held the rig and Axol could not replay Mantis datasets. Repair datasets recorded with it using [`axol migrate-dataset --mantis-tcp-rotation`](/cli/migrate-dataset#mantis-tracker-gripper-rotation). Datasets recorded from 0.2.5 on carry a `mantis_tcp_transform` record in `meta/axol.json`, and `collect-data` refuses to append new episodes to an unrepaired dataset.
+</Warning>
+
+The Ultimate constant derives from the Tracker 3.0 translation. In the shared gripper/CAD frame the V3 and Ultimate reference origins are `[47, 0, 35]` mm and `[47, 0, 46]` mm, so the tracker-origin change is `ΔO = [0, 0, +11]` mm; under the mount-CAD convention the translation was derived in, that is `Δp = [0, +11, 0]` mm of tracker-y: the 35.5 mm component becomes 46.5 mm while the −92 mm forward component is unchanged. The approved value is `[0, 0.0465, -0.092, 0, 1, 0, 0]` for both sides; the tracker-local axes and flat-back orientation match V3, so there is no additional rotation. This mount-frame calculation is distinct from the bridge's world-frame z-up→y-up relabel. The translation itself has not yet been re-verified on the bench under the corrected rotation; if the URDF overlay shows a constant TCP offset, measure and save a per-unit override.
 
 ### Deriving a missing constant
 

@@ -50,6 +50,7 @@ from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
 from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
+from ..utils.logquiet import quiet_noisy_loggers
 from .collect_data import check_resume_consistency
 from .config import AggregateFn, LogLevel, PolicyType, parse
 
@@ -127,7 +128,11 @@ class RunPolicyConfig:
     task: str
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
     episode_time_s: int = 120
-    fps: int = 60
+    # Control/recording rate — must equal the fps the policy was trained at
+    # (collect-data's default, 30). A 60 fps checkpoint needs --fps 60; the
+    # sanity check below refuses a mismatch rather than replaying actions at
+    # the wrong speed.
+    fps: int = 30
     # Escape hatch for the training-fps sanity check: when the checkpoint
     # records the fps its dataset was collected at (see _training_fps) and it
     # differs from --fps, run-policy refuses to start — actions would replay
@@ -611,6 +616,7 @@ def main(argv: list[str]) -> None:
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
 
     # Translate operator-actionable hardware faults into a clean non-zero
     # exit instead of a multi-frame traceback.

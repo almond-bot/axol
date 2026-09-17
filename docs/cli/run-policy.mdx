@@ -23,7 +23,7 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--policy_type {act,smolvla,diffusion,tdmpc,vqbet,pi0,pi05,groot}` | Policy architecture; must match the checkpoint at `--policy_path` (required) |
 | `--task TEXT` | Natural language task description (required) |
 | `--episode_time_s INT` | Safety cap on episode duration in seconds (default: 120). Episodes normally end on operator keypress |
-| `--fps INT` | Control loop frame rate (default: 60). Must match the fps the policy was trained on |
+| `--fps INT` | Control loop frame rate (default: 30). Must match the fps the policy was trained on (a checkpoint trained on 60 fps data needs `--fps 60`) |
 | `--repo_id <user>/<dataset>` | Optional dataset repo ID to save rollouts |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push_to_hub true` | Push rollout dataset to HuggingFace Hub when done |

@@ -117,9 +117,13 @@ Absolute (Mantis) IK solves the world yaw and translation at engage time, but it
 
 | Source | Transform |
 |---|---|
-| Lighthouse (Tracker 3.0) | Built-in factory value for the flat-back mount, applied automatically after Identify. |
-| Ultimate | Built-in factory value `[0, 0.0465, -0.092, 0.7071068, 0, 0, 0.7071068]` for both sides (Tracker 3.0's mount rotation with the 11 mm origin rise), approved for the pinned `wxyz` / z-up convention. |
+| Lighthouse (Tracker 3.0) | Built-in factory value `[0, 0.0355, -0.092, 0, 1, 0, 0]` (`Ry(180°)` flat-back mount rotation) for both sides, applied automatically after Identify. |
+| Ultimate | Built-in factory value `[0, 0.0465, -0.092, 0, 1, 0, 0]` for both sides (Tracker 3.0's mount rotation with the 11 mm origin rise), approved for the pinned `wxyz` / z-up convention. |
 | Quest | No factory value: measure the gripper TCP in each controller's grip frame and save it under the exact `quest:<reported-profile>:grip` key for both sides. |
+
+<Warning>
+Mantis datasets recorded with axol ≤ 0.2.4 used an `Rx(+90°)` Vive rotation that pitched every recorded gripper ~90° away from the operator's hold; Axol could not replay them. Repair them with [`axol migrate-dataset --mantis-tcp-rotation`](/cli/migrate-dataset#mantis-tracker-gripper-rotation) before replay or training.
+</Warning>
 
 Overrides and Quest measurements live in `~/.almond/mantis/tcp_transform.json`, keyed per side by the identified device (`survive:<codename>`, `ultimate:<mac>`, or `quest:<profile>:grip`). `pos` is the gripper TCP origin in the tracker's local frame in **metres**; `quat` is the TCP orientation in that frame as **`[qx, qy, qz, qw]`**. The file is edited directly (or via `PUT /api/tracker/calibration/<source>`); the panel does not edit transforms. The full schema, the Ultimate convention rules, and the bring-up route for a missing constant (`--mantis_allow_uncalibrated true` for a calibration-only capture) are in the [tracker CLI reference](/cli/tracker#transform-file). Production `collect-data` refuses to start with a missing, stale, or unapproved transform on either side.
 
@@ -129,6 +133,10 @@ Before recording training data, run a short **bring-up collection run** (`axol c
 
 1. Physical **left/right**, scale, every translation axis, wrist rotation, and tracker→TCP alignment. With Quest, the headset's live URDF overlay shows the virtual arms; with Lighthouse/Ultimate, use the control panel's mirrored view.
 2. **Recovery**: deliberately occlude or de-localize one side and confirm both freeze; restore tracking and confirm nothing moves until the start gesture is repeated.
+
+`tracker.identify` binds a tracker to a side by which one you move, not by which rig it is mounted on. If the tracker bound as *left* sits on the rig held in the right hand, the engage fit faces the robot base backwards and every recorded pose is yawed 180° with the columns swapped. With both sides calibrated, the engage refuses this: the log reports `Teleop engage rejected: both grippers face away from the robot's rest heading`, the session disengages, and nothing is recorded until both grips are released and squeezed again with the rigs in the correct hands (or re-identified). Hold each rig like the robot holds its rest gripper — fingers down, tracker face up, handle towards you — when engaging; a rig pointed straight up or down is not checked.
+
+Recording also counts frames where a hand travelled beyond Axol's reach (`out_of_reach` in the episode QA line, plus a warning): the rig has no arm to stop you, but Axol cannot follow those poses on replay.
 
 A source that jumps, drifts, swaps sides, or cannot recover cleanly is not ready for collection. Mantis teleop never tracks, and `axol teleop --sim --teleop.absolute_mode true` is only a generic mapping demo; physical acceptance must use the real source, Mantis selected, in a collection run.
 

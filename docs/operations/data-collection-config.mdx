@@ -32,7 +32,7 @@ axol collect-data --repo_id myorg/pick --task "pick up the cup" \
 |---|---|---|
 | `--repo_id` | required | Dataset id, `<user>/<dataset>`. |
 | `--task` | required | Task description stored with every frame. |
-| `--fps` | `60` | Recording rate. Camera frames are captured at this rate. |
+| `--fps` | `30` | Recording rate. Cameras capture at 60 and are decimated to this before encoding; 60 doubles the dataset encode/recorder load on the Jetson. |
 | `--teleop_hz` | `120` | Motor command rate (Hz) while teleoperating, independent of `fps`. |
 | `--dataset_resolution` | `SVGA` | Resolution the recorded video is downscaled to: `SVGA`, `HD1080`, or `HD1200`. The headset stream keeps the capture resolution. |
 | `--vcodec` | per platform | Dataset video codec: `h264` on Jetson, `auto` elsewhere. |

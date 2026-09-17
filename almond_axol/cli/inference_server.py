@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from ..utils.logquiet import quiet_noisy_loggers
 from .config import LogLevel, parse
 
 _logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ class InferenceServerConfig:
 
     host: str = "0.0.0.0"
     port: int = 8765
-    fps: int = 60
+    fps: int = 30
     log_level: LogLevel = "INFO"
 
 
@@ -55,6 +56,7 @@ def main(argv: list[str]) -> None:
     """Parse the CLI config and serve policy inference until Ctrl+C."""
     cfg = parse(InferenceServerConfig, argv)
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
 
     from ..lerobot.inference_patch import (
         disable_observation_similarity_filter,

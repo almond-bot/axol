@@ -71,6 +71,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             cfg = self._config(root)
 
             with (
+                mock.patch.object(collect_dagger, "_check_training_fps"),
                 mock.patch.object(collect_dagger, "IKResetController") as reset,
                 mock.patch.object(collect_dagger, "_start_video_relay") as relay,
                 mock.patch.object(collect_dagger, "DatasetRecorderProcess") as recorder,
@@ -100,6 +101,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             cfg = self._config(root)
 
             with (
+                mock.patch.object(collect_dagger, "_check_training_fps"),
                 mock.patch.object(collect_dagger, "IKResetController") as reset,
                 mock.patch.object(collect_dagger, "_start_video_relay") as relay,
                 mock.patch.object(collect_dagger, "DatasetRecorderProcess") as recorder,
@@ -117,6 +119,46 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             relay.assert_not_called()
             recorder.assert_not_called()
             robot.assert_not_called()
+
+    def test_training_fps_mismatch_fails_before_hardware_or_workers_start(self) -> None:
+        # Bugbot on #306: DAgger loads existing checkpoints, so a 60 fps
+        # policy under the 30 fps default must be refused up front (same
+        # guard as run-policy), not run and recorded at half speed.
+        with tempfile.TemporaryDirectory() as directory:
+            policy_dir = Path(directory) / "policy"
+            policy_dir.mkdir()
+            (policy_dir / "train_config.json").write_text(json.dumps({"fps": 60}))
+            cfg = collect_dagger.DaggerConfig(
+                policy_path=str(policy_dir),
+                policy_type="act",
+                task="pick",
+                repo_id="local/dagger",
+                root=str(Path(directory) / "dataset"),
+            )
+            self.assertEqual(cfg.fps, 30)
+            with (
+                mock.patch.object(collect_dagger, "IKResetController") as reset,
+                mock.patch.object(collect_dagger, "_start_video_relay") as relay,
+                mock.patch.object(collect_dagger, "DatasetRecorderProcess") as recorder,
+                mock.patch("almond_axol.lerobot.robot.robot_axol.AxolRobot") as robot,
+                self.assertRaisesRegex(ValueError, r"--fps 30.*trained at \(60"),
+            ):
+                collect_dagger._run(  # noqa: SLF001
+                    cfg,
+                    stop_event=threading.Event(),
+                    control=object(),
+                )
+            reset.assert_not_called()
+            relay.assert_not_called()
+            recorder.assert_not_called()
+            robot.assert_not_called()
+            # The escape hatch mirrors run-policy's.
+            cfg.allow_fps_mismatch = True
+            with mock.patch.object(collect_dagger, "_start_video_relay"):
+                try:
+                    collect_dagger._check_training_fps(cfg)  # noqa: SLF001
+                except ValueError as exc:  # pragma: no cover - defensive
+                    self.fail(f"allow_fps_mismatch did not bypass the guard: {exc}")
 
     def test_gripper_capability_is_bound_before_teleop_construction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -138,6 +180,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
                 raise RuntimeError("teleop construction sentinel")
 
             with (
+                mock.patch.object(collect_dagger, "_check_training_fps"),
                 mock.patch("almond_axol.zed.stereo_serials", return_value=set()),
                 mock.patch("almond_axol.lerobot.robot.robot_axol.AxolRobot"),
                 mock.patch(
@@ -355,7 +398,10 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         control_loop.intervention_spans = []
         control_loop.open_span_start = 0.0
 
-        control_loop.run()
+        # Claiming the control role needs an rtprio grant this host may not
+        # have; these assertions are about the recorded action, not scheduling.
+        with mock.patch.object(collect_dagger.affinity, "enter_control_thread"):
+            control_loop.run()
 
         robot.send_action.assert_called_once_with(human_joint_action)
         robot.action_to_dataset.assert_called_once_with(human_joint_action)
@@ -414,7 +460,8 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         control_loop.open_span_start = 0.0
         control_loop._policy_tick = mock.Mock(return_value=None)  # noqa: SLF001
 
-        control_loop.run()
+        with mock.patch.object(collect_dagger.affinity, "enter_control_thread"):
+            control_loop.run()
 
         self.assertEqual(
             robot.send_action.call_args_list,

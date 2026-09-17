@@ -30,9 +30,12 @@ flags, so a direct run uses the same values as a panel-launched one.
 
 import asyncio
 import logging
+import os
 import socket
 from typing import TYPE_CHECKING, Any
 
+from ..utils import affinity
+from ..utils.logquiet import quiet_noisy_loggers
 from ..utils.network import local_ip
 from .config import TeleopCmdConfig, normalize_bool_flags, parse
 
@@ -87,6 +90,7 @@ def main(argv: list[str]) -> None:
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop the INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
 
     # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled
     # by the host installer + its boot service, not here — see
@@ -448,6 +452,64 @@ async def _run_jelly_only(cfg: TeleopCmdConfig, jelly_cfg: "JellyConfig") -> Non
 
 
 async def _run(cfg: TeleopCmdConfig) -> None:
+    """Run teleop under the same CPU-affinity guard as ``collect-data``.
+
+    The 120 Hz control loop, the VR pose thread and the IK dispatch thread
+    all start inside :func:`_run_session`, so pinning the calling thread here
+    puts every one of them on the control core (children inherit the mask)
+    exactly as ``collect-data`` / ``collect-dagger`` do. Until 2026-09-15 plain
+    teleop skipped this and its loop floated across all cores as an ordinary
+    CFS thread — which the kernel then parked on whichever core looked idle,
+    including the two SCHED_FIFO CAN cores, the ``nice -10`` IK core and the
+    camera cores' FIFO capture chain. Runnable-but-waiting time on that thread
+    measured 60–120 ms per second with the headset streaming (near zero with
+    the cameras off), i.e. one in twelve ticks landed 15–65 ms late, which the
+    operator felt as the arms hitching and lunging. The Rust core, IK solve
+    time and the pose transport were all clean in the same sessions.
+
+    Pinned, the loop then shared its single core as an equal CFS peer with the
+    VR pose thread, the IK dispatch thread and the diagnostics scanners and
+    still waited 300 ms of every second for the CPU (one tick in fifty late),
+    so the control thread also runs ``SCHED_FIFO`` — thread-scoped, with the
+    threads and processes it spawns reset to CFS — see
+    :func:`~almond_axol.utils.affinity.prioritize_control_thread`.
+
+    A host that offers ``SCHED_FIFO`` and denies it raises
+    :exc:`~almond_axol.utils.affinity.ControlSchedulingError` before the
+    session starts, rather than running a loop that hitches: the denial is
+    almost always an rtprio grant that never reached this login, which is
+    invisible from the code and looks exactly like a regression.
+
+    The original mask and policy are restored on exit so a long-lived
+    ``serve`` worker is never left narrowed or FIFO; when the mask cannot be
+    captured the pin is skipped rather than risk that.
+    """
+    try:
+        original_affinity = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        original_affinity = None
+    fifo = False
+    try:
+        # Inside the guard: a denied real-time class raises, and the mask
+        # pin_realtime() just narrowed still has to be handed back.
+        if original_affinity is not None:
+            affinity.pin_realtime()
+            fifo = affinity.prioritize_control_thread()
+        await _run_session(cfg)
+    finally:
+        if fifo:
+            affinity.release_control_thread()
+        if original_affinity is not None:
+            try:
+                os.sched_setaffinity(0, original_affinity)
+            except (AttributeError, OSError):
+                _logger.warning(
+                    "teleop: could not restore the original CPU affinity",
+                    exc_info=True,
+                )
+
+
+async def _run_session(cfg: TeleopCmdConfig) -> None:
     from ..robot import Axol, Sim
     from ..teleop import VRTeleop
 

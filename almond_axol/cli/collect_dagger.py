@@ -102,7 +102,9 @@ from ..recording import (
     restore_dataset_ownership,
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
+from ..utils import affinity
 from ..utils.control_loop import run_blocking_with_sync_control_ticks
+from ..utils.logquiet import quiet_noisy_loggers
 from ..utils.network import local_ip
 from .collect_data import (
     _existing_dataset_resolution,
@@ -112,6 +114,7 @@ from .collect_data import (
 from .config import DatasetResolution, LogLevel, PolicyType, parse
 from .run_policy import (
     _GATE_CONTACT,
+    _check_training_fps,
     _QueuePolicyControl,
     _StdinPolicyControl,
 )
@@ -217,7 +220,15 @@ class DaggerConfig:
     # Safety cap per episode; hitting it saves the episode. DAgger episodes
     # include interventions, so the default is generous.
     episode_time_s: int = 600
-    fps: int = 60
+    # Dataset rate and the policy state's control rate — must equal the fps
+    # the policy was trained at (collect-data's default, 30; see its note on
+    # why 30 rather than 60); checked against the checkpoint's metadata at
+    # start like run-policy. Teleop ticks at ``teleop_hz`` regardless.
+    fps: int = 30
+    # Escape hatch for that check (see RunPolicyConfig.allow_fps_mismatch):
+    # a detectable mismatch is otherwise a hard error, since the policy would
+    # move at the wrong speed and the dataset be written at the wrong rate.
+    allow_fps_mismatch: bool = False
     # Velocity/acceleration envelope over the policy's arm actions (rad/s,
     # rad/s²) — see PolicyActionLimiter. Transparent for normal trained
     # motion; only engages on discontinuities (policy outliers, re-plans from
@@ -263,6 +274,7 @@ def main(argv: list[str]) -> None:
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
 
     import sys
 
@@ -614,6 +626,15 @@ class _DaggerControlLoop(threading.Thread):
         last_rate_log = time.perf_counter()
 
         try:
+            # This thread paces every command (`send_action` posts
+            # motion_control onto the robot's FIFO event-loop thread and waits
+            # for it), so it is the other half of the control path: same
+            # realtime core, SCHED_FIFO, anything it spawns reset to CFS — see
+            # affinity.enter_control_thread. Inside the fault boundary so a
+            # denied real-time class reaches the supervisor through
+            # fatal_error rather than killing this thread on its own.
+            affinity.enter_control_thread()
+
             # Anchor the policy velocity envelope at the robot's measured pose
             # so the episode's first action can't jump either. Keep this inside
             # the fault boundary so startup failures reach the supervisor.
@@ -1039,7 +1060,6 @@ def _run(
 
     from ..lerobot.robot.robot_axol import AxolRobot
     from ..lerobot.teleop.teleop_vr_dagger import DaggerVRTeleop
-    from ..utils import affinity
     from ..vr.models import VRState
 
     # Defaults keep the CLI path unchanged: a stop event nothing ever sets, and
@@ -1059,6 +1079,12 @@ def _run(
     root = cfg.root
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
+
+    # Fail fast (before any hardware, the relay, or the dataset) if --fps
+    # disagrees with the fps the checkpoint was trained at — DAgger is the
+    # path that loads existing checkpoints, so a 60 fps policy under the
+    # 30 fps default would otherwise run and record at half speed.
+    _check_training_fps(cfg)
 
     # Resolve and validate the destination before camera enumeration, workers,
     # the relay, or the robot can start. LeRobotDataset.resume keeps the existing

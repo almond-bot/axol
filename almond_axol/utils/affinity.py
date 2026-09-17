@@ -7,7 +7,9 @@ During ``collect-data`` the box runs five kinds of work that contend for cores:
   process pins the bus threads individually and runs them ``SCHED_FIFO``.
 * **realtime** — the Python 120 Hz target loop plus its web/VR/teleop and
   IK-dispatch threads. It has a separate core from CAN, so Python or camera
-  activity cannot delay a motor tick.
+  activity cannot delay a motor tick. Every control-loop command pins it
+  (``teleop`` too, since 2026-09-15 — unpinned, its loop floated onto the
+  FIFO CAN cores / the IK core and ran one tick in twelve 15–65 ms late).
 * **ik** — the out-of-process JAX IK solver (a ~1-core solve). On 8+ cores it
   gets a dedicated core so recording load can't preempt it mid-solve (which drops
   its rate ~115 -> ~80 Hz); on smaller hosts it shares the realtime cores.
@@ -393,13 +395,168 @@ def isolate_relay_cpu() -> bool:
 # The SCHED_FIFO ladder across the stack, lowest to highest:
 #   CAPTURE_FIFO_PRIORITY  (5)  relay camera capture chain
 #   capture daemon         (6)  nvargus-daemon, see utils.jetson
+#   CONTROL_FIFO_PRIORITY (10)  the Python 120 Hz control thread
 #   axol-rt CAN loops     (20)  AXOL_RT_FIFO_PRIORITY, rt.link
 # Camera work sits above every CFS thread so a capture wake-up never queues
-# behind the encode/mux workers; the CAN loops outrank everything and run on
-# disjoint cores anyway. The top rung is also what the persistent rtprio grant
-# (utils.rtprio, LimitRTPRIO in the service unit) allows a non-root launcher.
+# behind the encode/mux workers; the control thread sits above camera work in
+# case a small layout ever puts them on one core (it feeds motor targets); the
+# CAN loops outrank everything and run on disjoint cores anyway. The top rung
+# is also what the persistent rtprio grant (utils.rtprio, LimitRTPRIO in the
+# service unit) allows a non-root launcher.
 CAPTURE_FIFO_PRIORITY = 5
+CONTROL_FIFO_PRIORITY = 10
 MAX_FIFO_PRIORITY = 20
+
+# Opt back into the pre-2026-09-17 behaviour: warn about a CFS control thread
+# and run anyway. For a dev box or a demo where the hitching is acceptable and
+# arranging the rtprio grant is not worth it; never for data collection.
+ALLOW_CFS_CONTROL_ENV = "AXOL_ALLOW_CFS_CONTROL"
+
+
+class ControlSchedulingError(RuntimeError):
+    """The control thread was denied ``SCHED_FIFO`` on a host that offers it.
+
+    Raised instead of quietly continuing because the degraded mode is hard to
+    spot and easy to mistake for a code regression: the loop still runs, the
+    Rust core still arms, and the only symptom is the arms hitching — which
+    also disappears when the cameras are off, so it reads as mechanical.
+    ``axol-rt`` already refuses to arm in the same situation (see
+    ``configure_bus_scheduling`` in ``rust/axol-rt/src/serve.rs``); this makes
+    the Python half consistent with it.
+
+    The two halves fail apart because they get the privilege from different
+    places: ``axol rt.install`` puts ``cap_sys_nice`` on the ``axol-rt``
+    *binary*, so the core is unaffected by how the operator logged in, while
+    the Python control thread has only the launching session's
+    ``RLIMIT_RTPRIO``. A login that bypasses PAM therefore produces a box
+    whose CAN loops are real-time and whose control loop is not.
+    """
+
+
+def prioritize_control_thread(*, required: bool = True) -> bool:
+    """Run the calling thread ``SCHED_FIFO`` so it outranks its core-mates.
+
+    The realtime core is one CPU on every layout, and the control loop shares
+    it with everything :func:`pin_realtime` drags along: the VR pose thread
+    (pose ingest + SSL websocket), the IK dispatch thread, the diagnostics
+    scanners and whatever spills over from the IK worker's XLA pool. All of
+    them are CFS ``nice 0`` and CFS shares the core evenly, so the biggest
+    consumer — the 120 Hz tick itself at ~35 % of the core — waits as long as
+    it runs. Measured on the ZED box on 2026-09-15 with the headset streaming
+    (``/proc/<tid>/schedstat``): control thread 320-370 ms/s on CPU and
+    300-340 ms/s runnable-but-waiting, the vr-server 140 ms/s, ik-loop 115,
+    diag 30, XLA spill 60; the flight recorder saw one command tick in fifty
+    15-53 ms late, felt as the arms hitching. A FIFO thread preempts its CFS
+    core-mates the moment it wakes, exactly the treatment ``axol-rt`` gives
+    the CAN loops and the relay gives camera capture. It still blocks like
+    any other thread (select, the GIL, socket writes), so the others run in
+    the ~65 % of the core it leaves free.
+
+    Thread-scoped: ``sched_setscheduler(0, ...)`` on Linux acts on the calling
+    thread. ``SCHED_RESET_ON_FORK`` is set so threads and processes this one
+    spawns afterwards (IK dispatch, flight-recorder dumps, asyncio executors,
+    the relay and IK worker processes) start ``SCHED_OTHER``/``nice 0`` — the
+    kernel applies the reset on every clone, threads included (verified on
+    5.15). A platform with no ``sched_setscheduler``/reset flag stays a silent
+    no-op — nothing was on offer there, which matches ``axol-rt``: it too
+    insists only when the launcher actually asked for a priority. A host that
+    *does* offer real-time scheduling and refuses the request raises
+    :exc:`ControlSchedulingError`, because that is the case worth stopping
+    for. Pair with :func:`release_control_thread` when the loop ends so a
+    long-lived serve worker thread is not left FIFO.
+
+    Args:
+        required: Refuse (raise) when the host offers ``SCHED_FIFO`` but
+            denies it. ``False`` keeps the old best-effort behaviour — warn
+            once and stay CFS — for a caller that genuinely tolerates a
+            non-real-time control thread. Operators get the same escape hatch
+            without a code change via ``AXOL_ALLOW_CFS_CONTROL=1``.
+
+    Returns:
+        True when the thread is now ``SCHED_FIFO``; False when the platform
+        had nothing to offer, or when the denial was tolerated.
+
+    Raises:
+        ControlSchedulingError: The host offers ``SCHED_FIFO`` and denied it
+            while ``required`` and without the env escape hatch.
+    """
+    if not hasattr(os, "sched_setscheduler") or not hasattr(os, "SCHED_FIFO"):
+        return False
+    reset_on_fork = getattr(os, "SCHED_RESET_ON_FORK", None)
+    if reset_on_fork is None:
+        # Without the reset flag every thread spawned from here would inherit
+        # FIFO — the 1 kHz IK-dispatch poll above the control loop itself.
+        return False
+    param = os.sched_param(CONTROL_FIFO_PRIORITY)  # type: ignore[attr-defined]
+    try:
+        os.sched_setscheduler(0, os.SCHED_FIFO | reset_on_fork, param)  # type: ignore[attr-defined]
+    except PermissionError as exc:
+        if required and os.environ.get(ALLOW_CFS_CONTROL_ENV) != "1":
+            raise ControlSchedulingError(
+                f"control thread cannot enter SCHED_FIFO "
+                f"{CONTROL_FIFO_PRIORITY} ({exc}); refusing to run without "
+                "real-time scheduling. Pinned but CFS it shares its core with "
+                "the VR pose, IK-dispatch and diagnostics threads and lands "
+                "about one tick in fifty 15-65 ms late, felt as the arms "
+                "hitching and lunging — and masked by turning the cameras "
+                "off, which is what makes it look mechanical. The rtprio "
+                "grant `axol provision` writes is applied by pam_limits, so "
+                "it reaches a PAM login only: a session that bypasses PAM "
+                "(Tailscale SSH, or a systemd unit without LimitRTPRIO) never "
+                "receives it. Log in again over ssh, or run `sudo prlimit "
+                f"--pid $$ --rtprio={MAX_FIFO_PRIORITY}:{MAX_FIFO_PRIORITY}` "
+                f"in this shell. Set {ALLOW_CFS_CONTROL_ENV}=1 to run "
+                "degraded anyway."
+            ) from exc
+        _logger.warning(
+            "control thread stays SCHED_OTHER (no CAP_SYS_NICE: %s); expect "
+            "late control ticks while the VR/IK threads share its core. Run "
+            "`axol provision` and log in again (or `sudo prlimit --pid $$ "
+            "--rtprio=%d:%d` in this shell) so it may use SCHED_FIFO",
+            exc,
+            MAX_FIFO_PRIORITY,
+            MAX_FIFO_PRIORITY,
+        )
+        return False
+    except OSError as exc:
+        _logger.debug("could not make the control thread SCHED_FIFO: %s", exc)
+        return False
+    _logger.info("control thread -> SCHED_FIFO %d", CONTROL_FIFO_PRIORITY)
+    return True
+
+
+def enter_control_thread(*, required: bool = True) -> bool:
+    """Make the calling thread *the* control thread: realtime core + ``SCHED_FIFO``.
+
+    For loops that live on a thread of their own rather than the command's
+    calling thread — ``AxolRobot``'s ``axol-event-loop``, which runs
+    ``motion_control`` for ``collect-data`` / ``collect-dagger`` (their hot
+    loop is scheduled onto it) and ``run-policy`` (whose 60 Hz thread hands
+    each action to it). Call it first thing on that thread: the pin is
+    thread-scoped (a no-op re-pin when the process already sits on the
+    realtime cores, the one thread moved there when it does not — run-policy
+    leaves its observation/inference threads free to float), and the FIFO
+    policy is thread-scoped with the reset-on-fork flag as in
+    :func:`prioritize_control_thread`. Returns True when either took effect,
+    and propagates :exc:`ControlSchedulingError` when the host offers
+    ``SCHED_FIFO`` but denies it — the control loop of ``collect-data`` /
+    ``collect-dagger`` / ``run-policy`` is exactly where a silently CFS thread
+    does its damage, so it refuses rather than collect hitched data. Pass
+    ``required=False`` to keep the old best-effort behaviour.
+    """
+    pinned = pin_realtime()
+    fifo = prioritize_control_thread(required=required)
+    return pinned or fifo
+
+
+def release_control_thread() -> None:
+    """Undo :func:`prioritize_control_thread` for the calling thread."""
+    if not hasattr(os, "sched_setscheduler") or not hasattr(os, "SCHED_OTHER"):
+        return
+    try:
+        os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))  # type: ignore[attr-defined]
+    except OSError:
+        pass
 
 
 def prioritize_capture_threads(thread_comms: Iterable[str]) -> int:

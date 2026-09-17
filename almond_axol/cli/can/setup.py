@@ -61,6 +61,7 @@ import fcntl
 import os
 import re
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -2306,6 +2307,127 @@ def _bring_up_interfaces_locked(
     for channel in pending:
         run_root(["ip", "link", "set", channel, "up"], check=True)
     print("  Done.")
+
+
+# `tc -s qdisc show dev X` reports the qdisc's pending frames as "<n>p" in its
+# backlog line: `backlog 0b 0p requeues 3`.
+_BACKLOG_RE = re.compile(r"backlog\s+\S+\s+(\d+)p")
+
+
+def _iface_present(channel: str) -> bool:
+    """True when *channel* exists as a network interface on this host."""
+    return (Path("/sys/class/net") / channel).exists()
+
+
+def tx_backlog(channel: str) -> int | None:
+    """Frames queued on *channel* and not yet on the wire (``None`` if unknown).
+
+    A healthy bus drains its queue in microseconds, so anything here at rest
+    is a poisoned queue: motor power died (the e-stop), nothing ACKed, and the
+    kernel parked up to ``txqueuelen`` position commands that will replay the
+    moment the motors come back. Reading it needs no privileges.
+    """
+    tc = shutil.which("tc") or "/usr/sbin/tc"
+    try:
+        shown = subprocess.run(
+            [tc, "-s", "qdisc", "show", "dev", channel],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if shown.returncode != 0:
+        return None
+    matched = _BACKLOG_RE.search(shown.stdout)
+    return int(matched.group(1)) if matched else None
+
+
+# Interfaces the generated bring-up script configures itself, so flapping
+# them is one granted command instead of four ungranted ones.
+_SCRIPT_MANAGED_CHANNELS = frozenset({_CAN_L, _CAN_R, _CAN_B, _CAN_C})
+
+
+def _flap_for_purge(channels: list[str]) -> None:
+    """Cycle *channels* to drop what the kernel has queued on them.
+
+    Prefers the installed bring-up script, which is what the realtime core
+    runs for the same job (``purge_tx_queue`` in
+    ``rust/axol-rt/src/safety.rs``) and what ``axol provision`` grants the
+    operator passwordless use of (:mod:`almond_axol.utils.can_purge`). Going
+    through :func:`bring_up_interfaces` instead would issue four separate
+    privileged ``ip link`` commands — including the ``type can bitrate`` and
+    ``txqueuelen`` forms — and a non-root session that cannot run them all
+    would stop with the interfaces *down*, which is worse than not starting.
+
+    The script is also the safer flap: it takes the dual-channel adapter's
+    two arm channels down and back up together, the only ordering that
+    reliably avoids the TX-only wedge (see :func:`rx_alive_per_arm`).
+
+    Anything the script does not manage — a bench adapter, a renamed
+    ``can0``, a host that has never run ``can.setup`` — falls back to
+    :func:`bring_up_interfaces`, which configures each channel explicitly.
+    """
+    if CAN_BRINGUP_SCRIPT.exists() and set(channels) <= _SCRIPT_MANAGED_CHANNELS:
+        # The script takes its own locks, so this deliberately does not hold
+        # the global setup lock: a caller that did would deadlock it.
+        run_root(["bash", str(CAN_BRINGUP_SCRIPT)], check=True)
+        return
+    # Cycles the whole group, not just the poisoned members: the arm channels
+    # are two halves of one dual-channel adapter.
+    bring_up_interfaces(channels, force_cycle=True)
+
+
+def purge_stale_tx(channels: list[str]) -> list[str]:
+    """Flap *channels* when stale motion commands are still queued on them.
+
+    The realtime core purges the queue itself the moment it declares the bus
+    stalled (``purge_tx_queue`` in ``rust/axol-rt/src/safety.rs``), but only
+    when it can escalate and only when it is still alive to notice — an
+    operator who kills the session, or a host that loses the whole robot
+    PSU, leaves the frames queued with nobody to clear them. This is the
+    second line: every bring-up starts from a queue that is known empty.
+
+    Cheap in the normal case — the backlog read is a ``tc`` call per channel
+    and a clean queue flaps nothing. Missing interfaces and channels whose
+    backlog cannot be read are skipped (a sim or bench setup has neither).
+
+    Returns the channels that had frames queued, empty when there was nothing
+    to purge.
+
+    Raises:
+        RuntimeError: If a poisoned channel could not be cleared — enabling
+            motors into a queue that still holds stale commands is what
+            snaps the arm, so the caller must not proceed.
+    """
+    present = [ch for ch in channels if _iface_present(ch)]
+    poisoned = {
+        channel: queued
+        for channel, queued in ((ch, tx_backlog(ch)) for ch in present)
+        if queued
+    }
+    if not poisoned:
+        return []
+    print(
+        "CAN: stale frames are still queued from a dead bus "
+        f"({', '.join(f'{ch}: {n}' for ch, n in sorted(poisoned.items()))}) — "
+        "motor power was cut (e-stop?) while commands were in flight. Flapping "
+        "the interfaces so they cannot replay on enable."
+    )
+    _flap_for_purge(present)
+    remaining = {
+        channel: queued
+        for channel, queued in ((ch, tx_backlog(ch)) for ch in poisoned)
+        if queued
+    }
+    if remaining:
+        raise RuntimeError(
+            "CAN interfaces still hold queued frames after a flap ("
+            + ", ".join(f"{ch}: {n}" for ch, n in sorted(remaining.items()))
+            + "); refusing to enable motors, which would replay them. Run "
+            "`axol can.setup` and check the adapter."
+        )
+    print("  Done — the queued frames are gone.")
+    return sorted(poisoned)
 
 
 def is_configured() -> bool:
