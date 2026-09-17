@@ -146,6 +146,59 @@ class _Holders:
                 await asyncio.sleep(dt - spent)
 
 
+async def _track(
+    motor: JointFrameMotor,
+    center: float,
+    amp: float,
+    freq: float,
+    secs: float,
+    max_speed: float,
+    rate_hz: float,
+) -> tuple[float, float, float]:
+    """Stream 0xA4 along a sine; return ``(rms_deg, max_deg, lag_ms)``.
+
+    This is the test that matters for ``wire_mode``: a *held* position says
+    nothing about whether the firmware loop can follow a target that keeps
+    moving. In profiled-motion mode it cannot — every frame restarts a ramp —
+    so a joint that holds perfectly can still track nothing at all.
+    """
+    dt = 1.0 / rate_hz
+    t0 = time.monotonic()
+    tt: list[float] = []
+    tgt: list[float] = []
+    act: list[float] = []
+    while True:
+        now = time.monotonic() - t0
+        if now >= secs:
+            break
+        target = center + amp * math.sin(2.0 * math.pi * freq * now)
+        await motor.set_position_velocity(target, max_speed)
+        try:
+            pos = motor.motor.position
+        except Exception:
+            pos = float("nan")
+        tt.append(now)
+        tgt.append(target)
+        act.append(pos)
+        spent = time.monotonic() - t0 - now
+        if spent < dt:
+            await asyncio.sleep(dt - spent)
+    a = np.array(act)
+    g = np.array(tgt)
+    good = np.isfinite(a)
+    if good.sum() < 20:
+        return float("nan"), float("nan"), float("nan")
+    err = np.degrees(g[good] - a[good])
+    v = np.gradient(g[good], np.array(tt)[good])
+    m = np.abs(v) > 1e-3
+    lag = (
+        1e3 * np.polyfit(np.abs(v[m]), np.abs(np.radians(err[m])), 1)[0]
+        if m.sum() > 20
+        else float("nan")
+    )
+    return float(err.std()), float(np.abs(err).max()), float(lag)
+
+
 async def _measure(
     motor: JointFrameMotor, target: float, max_speed: float
 ) -> tuple[float, float]:
@@ -209,6 +262,36 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help=f"Sag counted as holding (default: {_SAG_OK_DEG})",
     )
     p.add_argument(
+        "--accel",
+        type=float,
+        default=None,
+        help="Write this position-planning acceleration (deg/s^2) before "
+        "testing. **0 selects direct tracking mode**, which is what a "
+        "streamed target needs; anything else is profiled motion, where "
+        "every frame restarts its own ramp. 0 is outside the documented "
+        "100-60000 range and the motor may refuse it — the value is read "
+        "back and reported. Restored afterwards unless --save.",
+    )
+    p.add_argument(
+        "--mode",
+        choices=("hold", "track"),
+        default="hold",
+        help="hold: measure sag at a fixed target (default). track: stream a "
+        "sine and measure following error — the test that matters for "
+        "wire_mode, since a joint can hold perfectly and track nothing.",
+    )
+    p.add_argument("--amp", type=float, default=10.0, help="[track] amplitude (deg)")
+    p.add_argument("--freq", type=float, default=0.2, help="[track] frequency (Hz)")
+    p.add_argument(
+        "--duration", type=float, default=15.0, help="[track] seconds (default 15)"
+    )
+    p.add_argument(
+        "--rate",
+        type=float,
+        default=100.0,
+        help="[track] command rate Hz (default 100)",
+    )
+    p.add_argument(
         "--save",
         action="store_true",
         help="Commit the winner to ROM (0x32). Without this every write is "
@@ -269,6 +352,35 @@ async def _run(args: argparse.Namespace) -> None:
         await test.set_control_mode(ControlMode.POSITION_VELOCITY)
         await asyncio.sleep(1.0)
 
+        accel_before: float | None = None
+        if args.accel is not None:
+            try:
+                accel_before = await test.motor._driver.get_acceleration()
+                print(
+                    f"  position-planning accel: {math.degrees(accel_before):.0f} dps/s "
+                    f"-> writing {args.accel:.0f}"
+                )
+                await test.motor._driver.set_acceleration(
+                    math.radians(args.accel), allow_zero=True
+                )
+                readback = await test.motor._driver.get_acceleration()
+                print(f"  read back: {math.degrees(readback):.0f} dps/s", end="")
+                if abs(math.degrees(readback) - args.accel) > 1.0:
+                    print(
+                        "  ! the motor did not accept it — it clamps or refuses "
+                        "out-of-range values, so direct tracking is not reachable "
+                        "over CAN on this firmware."
+                    )
+                else:
+                    print("  (accepted)")
+                    if args.accel == 0.0:
+                        print(
+                            "  -> direct tracking mode: 0xA4 now chases the target "
+                            "through its PI loop under the frame's speed limit."
+                        )
+            except Exception as e:
+                print(f"  ! could not set acceleration: {e}")
+
         holders = _Holders(motors, joint, is_left, config)
         await holders.start()
         await asyncio.sleep(0.5)
@@ -291,6 +403,44 @@ async def _run(args: argparse.Namespace) -> None:
                     "  ! this pose is nearly unloaded — the joint will hold at "
                     "any gain. Pass --center for a loaded one.\n"
                 )
+
+            if args.mode == "track":
+                print(
+                    f"  streaming a {args.amp:.0f}° {args.freq:.2f} Hz sine at "
+                    f"{args.rate:.0f} Hz for {args.duration:.0f}s\n"
+                )
+                print(
+                    f"  {'position_kp':>12} {'rms err':>10} {'max err':>10} {'lag':>9}"
+                )
+                kps = args.kp or [original.position_kp * m for m in _KP_STEPS]
+                for kp in kps:
+                    await test.motor.set_gains(
+                        replace(original, position_kp=kp), persist=False
+                    )
+                    rms, mx, lag = await _track(
+                        test,
+                        target,
+                        math.radians(args.amp),
+                        args.freq,
+                        args.duration,
+                        max_speed,
+                        args.rate,
+                    )
+                    print(f"  {kp:12.4f} {rms:9.4f}° {mx:9.4f}° {lag:8.1f}ms")
+                    if best is None or rms < best[2]:
+                        best = (kp, 0.0, rms, mx)
+                if best is not None:
+                    print(
+                        f"\n  best: position_kp={best[0]:.4f} -> tracking rms "
+                        f"{best[2]:.4f}°"
+                    )
+                    if best[2] > 1.0:
+                        print(
+                            "  ! still not tracking. If the acceleration read back "
+                            "non-zero above, that is why: profiled motion cannot "
+                            "follow a stream at any gain."
+                        )
+                return
 
             kps = args.kp or [original.position_kp * m for m in _KP_STEPS]
             print(f"  {'position_kp':>12} {'position_ki':>12} {'sag':>9} {'ripple':>9}")
@@ -356,6 +506,20 @@ async def _run(args: argparse.Namespace) -> None:
                     print("  not saved; re-run with --save to commit.")
         finally:
             await holders.stop()
+            if accel_before is not None and not args.save:
+                try:
+                    await test.motor._driver.set_acceleration(
+                        accel_before, allow_zero=True
+                    )
+                    print(
+                        f"  acceleration restored to "
+                        f"{math.degrees(accel_before):.0f} dps/s."
+                    )
+                except Exception as e:
+                    print(
+                        f"  ! could not restore acceleration ({e}) — it was "
+                        f"{math.degrees(accel_before):.0f} dps/s."
+                    )
             if not args.save:
                 try:
                     await test.motor.set_gains(original, persist=False)

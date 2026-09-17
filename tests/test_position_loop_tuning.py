@@ -99,6 +99,37 @@ class SearchGuardsTest(unittest.TestCase):
         self.assertFalse(args.save)
 
 
+class AccelerationTest(unittest.TestCase):
+    """Zero is the value that selects direct tracking, and the clamp hid it."""
+
+    def test_zero_is_clamped_unless_explicitly_allowed(self) -> None:
+        import inspect
+
+        from almond_axol.motor.myactuator import MyActuatorMotor
+
+        sig = inspect.signature(MyActuatorMotor.set_acceleration)
+        self.assertIs(sig.parameters["allow_zero"].default, False)
+        src = inspect.getsource(MyActuatorMotor.set_acceleration)
+        # The clamp still applies to every value except an explicit zero.
+        self.assertIn("allow_zero and dps_s2 == 0", src)
+
+    def test_track_mode_is_opt_in(self) -> None:
+        parser = argparse.ArgumentParser()
+        pl.add_parser(parser.add_subparsers())
+        args = parser.parse_args(["tune.position-loop", "--r", "--joint", "elbow"])
+        self.assertEqual(args.mode, "hold")
+        self.assertIsNone(args.accel)
+
+    def test_tracking_metric_reports_lag(self) -> None:
+        # A held position cannot reveal profiled-motion mode; only a moving
+        # target can, so the tracking path must report a following error.
+        import inspect
+
+        src = inspect.getsource(pl._track)
+        self.assertIn("set_position_velocity", src)
+        self.assertIn("lag", src)
+
+
 class RestorePathTest(unittest.TestCase):
     """`motor.restore-config` recorded loop gains but never wrote them back."""
 

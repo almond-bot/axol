@@ -759,16 +759,31 @@ class MyActuatorMotor(MotorDriver):
         return float(dps_s2) * (math.pi / 180.0)
 
     async def set_acceleration(
-        self, acceleration: float, deceleration: float | None = None
+        self,
+        acceleration: float,
+        deceleration: float | None = None,
+        *,
+        allow_zero: bool = False,
     ) -> None:
-        # Command 0x43 writes to both RAM and ROM — no separate store step needed.
+        """Write the planning accelerations (0x43, RAM **and** ROM).
+
+        ``allow_zero`` passes a literal 0 through instead of clamping it up to
+        :data:`_MA_ACC_MIN_DPS_S2`. Zero is outside the documented 100-60000
+        range but is not meaningless: the protocol says a *position*-planning
+        acceleration of 0 switches the position loop from "profiled motion"
+        — where every 0xA4 command plans its own accel/decel ramp to the
+        target — into "direct tracking", where a PI controller chases the
+        target under the frame's speed limit. Streaming targets at the
+        control rate only works in the latter; in profiled mode each frame
+        restarts a ramp that never completes. The motor may reject the
+        out-of-range value, so callers should read it back.
+        """
         dec = deceleration if deceleration is not None else acceleration
 
         async def _send(accel_type: int, value_rad_s2: float) -> None:
-            dps_s2 = max(
-                _MA_ACC_MIN_DPS_S2,
-                min(_MA_ACC_MAX_DPS_S2, int(value_rad_s2 * (180.0 / math.pi))),
-            )
+            dps_s2 = int(value_rad_s2 * (180.0 / math.pi))
+            if not (allow_zero and dps_s2 == 0):
+                dps_s2 = max(_MA_ACC_MIN_DPS_S2, min(_MA_ACC_MAX_DPS_S2, dps_s2))
             data = bytes([_MA_SET_ACCELERATION, accel_type, 0, 0]) + struct.pack(
                 "<I", dps_s2
             )
