@@ -229,11 +229,55 @@ class ReportTest(unittest.TestCase):
                 Joint.SHOULDER_1,
                 250.0,
                 1.297,
-                [(0.0, -0.22, {"+": [0.810], "-": [0.300], "drift_rad": [1e-4]})],
+                [
+                    (
+                        0.0,
+                        -0.22,
+                        {"+": [0.810], "-": [0.300], "trim_nm": [0.0]},
+                    )
+                ],
             )
         out = buf.getvalue()
         self.assertIn("0.555", out)  # (0.810 + 0.300) / 2 = breakaway
-        self.assertIn("0.255", out)  # (0.810 - 0.300) / 2 = bias
+        # With no trim applied the residual is just the offset to the band
+        # centre: (0.810 - 0.300) / 2.
+        self.assertIn("0.255", out)
+
+    def test_breakaway_is_independent_of_where_the_trim_stopped(self) -> None:
+        """The invariant the whole loaded measurement rests on.
+
+        The trim search stops at a band *edge*, not its centre. Writing the
+        stiction band as [c-b, c+b] and the start as t, the two ramps cover
+        (c+b)-t and t-(c-b): their mean is b for any t inside the band. So
+        breakaway does not care where the search stopped — only the
+        half-difference does, and that is reported as an offset.
+        """
+        rng = np.random.default_rng(0)
+        for _ in range(50):
+            c, b = rng.uniform(-1, 1), rng.uniform(0.2, 0.9)
+            t = rng.uniform(c - b, c + b)
+            plus, minus = (c + b) - t, t - (c - b)
+            self.assertAlmostEqual((plus + minus) / 2, b, places=12)
+            self.assertAlmostEqual((plus - minus) / 2, c - t, places=12)
+
+    def test_residual_column_is_trim_plus_offset(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+
+        from almond_axol.cli.tune.breakaway import _report
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _report(
+                Joint.SHOULDER_1,
+                250.0,
+                1.297,
+                [(0.26, 5.30, {"+": [0.311], "-": [1.010], "trim_nm": [-1.362]})],
+            )
+        out = buf.getvalue()
+        # breakaway (0.311+1.010)/2, and residual -1.362 + (0.311-1.010)/2
+        self.assertIn("0.660", out)
+        self.assertIn("-1.712", out)
 
     def test_breakaway_below_fc_warns_against_more_compensation(self) -> None:
         # Static friction under the fitted fc means the feedforward is

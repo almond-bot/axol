@@ -27,10 +27,13 @@ Method, per pose:
    cannot run away once it releases. Gravity feedforward is then the only
    thing holding it.
 3. Trim that feedforward until the joint actually stands still. A joint sits
-   still for any trim inside its stiction band, so this converges quickly —
-   and the trim it lands on is a direct measurement of the gravity-model
-   residual at this pose. Without it, loaded poses are unmeasurable: at
-   15 Nm a 2 % model error outweighs the whole breakaway torque.
+   still for any trim inside its stiction band, so this converges quickly.
+   Without it, loaded poses are unmeasurable: at 15 Nm a 2 % gravity-model
+   error outweighs the whole breakaway torque.
+
+   The search stops at the first trim that holds, which is a band *edge*,
+   not its centre — so the trim on its own is not the gravity residual.
+   Adding the half-difference below recovers the centre, and that sum is.
 4. Ramp an extra torque up and back down in a triangle and watch for the
    first motion past ``--move-lsb`` encoder counts. Peaks escalate over
    trials and the search stops at the first release, so the joint never sees
@@ -418,25 +421,30 @@ def _report(
     friction with its bidirectional sweep:
 
     * **breakaway** = ``(|release+| + |release-|) / 2`` — symmetric, the
-      static friction we came to measure;
-    * **bias** = ``(|release+| - |release-|) / 2`` — antisymmetric, a
-      standing torque the feedforward is not cancelling (gravity-model
-      error or ``fo``). It is *not* friction, and averaging it in makes
-      breakaway look direction-dependent when it is not.
+      static friction we came to measure. Writing the stiction band as
+      ``[c - b, c + b]`` in trim space and the trim we started from as
+      ``t``, the two ramps must cover ``(c + b) - t`` and ``t - (c - b)``,
+      whose mean is ``b`` *whatever* ``t`` was. So this number does not
+      care where inside the band the trim search happened to stop.
+    * **offset** = ``(|release+| - |release-|) / 2`` = ``c - t`` — how far
+      the band centre sits from where we started. Added to the trim it
+      gives ``c``, the standing torque the gravity feedforward is not
+      cancelling at this pose (``residual`` in the table). That is a
+      gravity-model error, not friction.
     """
     print(f"\n{'-' * 70}")
     print(f"  {joint.value}: breakaway vs sliding friction (fc = {fc:.3f} Nm)\n")
     print(
         f"  {'pose':>8} {'gravity':>9} {'break+':>8} {'break-':>8} "
-        f"{'BREAK':>8} {'/fc':>6} {'bias':>8} {'drift':>8}"
+        f"{'BREAK':>8} {'/fc':>6} {'trim':>8} {'residual':>9}"
     )
     rows = []
     for q, g, res in by_pose:
         if not (res.get("+") or res.get("-")):
-            drift = res.get("drift_rad", [float("nan")])[0]
+            trim = res.get("trim_nm", [float("nan")])[0]
             print(
                 f"  {math.degrees(q):8.1f} {g:9.3f} {'—':>8} {'—':>8} "
-                f"{'skipped':>8} {'':>6} {'':>8} {math.degrees(drift):7.3f}°"
+                f"{'skipped':>8} {'':>6} {trim:8.3f} {'':>9}"
             )
             continue
         mp = float(np.mean(res["+"])) if res["+"] else float("nan")
@@ -445,11 +453,14 @@ def _report(
             brk, bias = (mp + mm) / 2.0, (mp - mm) / 2.0
         else:
             brk, bias = (mp if res["+"] else mm), float("nan")
-        drift = res.get("drift_rad", [float("nan")])[0]
+        # `bias` here is the offset from wherever the trim search stopped,
+        # not an absolute torque; trim + offset is the standing torque the
+        # gravity feedforward failed to cancel at this pose.
+        trim = res.get("trim_nm", [float("nan")])[0]
         rows.append((abs(g), brk))
         print(
             f"  {math.degrees(q):8.1f} {g:9.3f} {mp:8.3f} {mm:8.3f} "
-            f"{brk:8.3f} {brk / fc:6.2f} {bias:8.3f} {math.degrees(drift):7.3f}°"
+            f"{brk:8.3f} {brk / fc:6.2f} {trim:8.3f} {trim + bias:9.3f}"
         )
     if not rows:
         print("\n  No usable releases. If every pose was skipped, the gravity")
