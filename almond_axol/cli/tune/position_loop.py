@@ -105,6 +105,14 @@ _TRACK_RIPPLE_LIMIT_DEG = 0.25
 #: Ripple growth against the previous gain that counts as the onset of
 #: oscillation regardless of the absolute level.
 _TRACK_RIPPLE_JUMP = 3.0
+#: position_ki ladder for the tracking sweep, as fractions of the winning
+#: position_kp. A P-only position loop is type 1: it cannot follow a ramp
+#: without a standing error proportional to velocity, which is the whole
+#: ``a/kp`` term the sweep measures. The integral is what removes it, and it
+#: does so without moving position_kp toward the stability cliff. Geometric
+#: and ascending, because the firmware's integral units are not documented
+#: against a loop rate, so the decade is the unit of ignorance here.
+_KI_STEPS: tuple[float, ...] = (0.001, 0.003, 0.01, 0.03, 0.1)
 _SETTLE_S = 2.0
 _MEASURE_S = 2.0
 
@@ -369,8 +377,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         type=float,
         nargs="+",
         default=None,
-        help="position_ki values to try at the winning kp (default: 0 and "
-        "kp/100 — an integral is what removes the last of the sag)",
+        help="position_ki values to try at the winning kp. [hold] default "
+        "kp/100, which removes the last of the sag. [track] default is the "
+        "ladder kp x (0.001, 0.003, 0.01, 0.03, 0.1): a P-only position loop "
+        "carries a velocity-following error it cannot remove, and the "
+        "integral removes it without pushing kp toward the stability cliff.",
     )
     p.add_argument(
         "--max-speed",
@@ -553,14 +564,15 @@ async def _run(args: argparse.Namespace) -> None:
                     f"{args.rate:.0f} Hz for {args.duration:.0f}s\n"
                 )
                 print(
-                    f"  {'position_kp':>12} {'rms err':>10} {'+/-':>9} "
-                    f"{'max err':>10} {'lag':>9} {'ripple':>9}"
+                    f"  {'position_kp':>12} {'position_ki':>12} {'rms err':>10} "
+                    f"{'+/-':>9} {'max err':>10} {'lag':>9} {'ripple':>9}"
                 )
-                kps = args.kp or [original.position_kp * m for m in _KP_STEPS]
-                prev_ripple: float | None = None
-                for kp in kps:
+
+                async def point(kp: float, ki: float):
+                    """One gain pair: returns ``(rms, spread, mx, lag, ripple)``."""
                     await test.motor.set_gains(
-                        replace(original, position_kp=kp), persist=False
+                        replace(original, position_kp=kp, position_ki=ki),
+                        persist=False,
                     )
                     trials = [
                         await _track(
@@ -576,36 +588,85 @@ async def _run(args: argparse.Namespace) -> None:
                     ]
                     ok = [t for t in trials if math.isfinite(t[0])]
                     if not ok:
-                        print(f"  {kp:12.4f}   (no usable pass)")
-                        continue
-                    rms = float(np.mean([t[0] for t in ok]))
-                    spread = float(np.std([t[0] for t in ok]))
-                    mx = float(np.mean([t[1] for t in ok]))
-                    lag = float(np.mean([t[2] for t in ok]))
-                    ripple = float(np.mean([t[3] for t in ok]))
-                    # A difference smaller than the spread across repeats
-                    # is not a difference.
-                    noisy = ripple > args.ripple_limit or (
-                        prev_ripple is not None
-                        and ripple > _TRACK_RIPPLE_JUMP * max(prev_ripple, 1e-4)
+                        print(f"  {kp:12.4f} {ki:12.4f}   (no usable pass)")
+                        return None
+                    return (
+                        float(np.mean([t[0] for t in ok])),
+                        float(np.std([t[0] for t in ok])),
+                        float(np.mean([t[1] for t in ok])),
+                        float(np.mean([t[2] for t in ok])),
+                        float(np.mean([t[3] for t in ok])),
                     )
+
+                def row(kp: float, ki: float, m, noisy: bool) -> None:
+                    rms, spread, mx, lag, ripple = m
                     print(
-                        f"  {kp:12.4f} {rms:9.4f}° {spread:8.4f}° {mx:9.4f}° "
-                        f"{lag:8.1f}ms {ripple:8.4f}°"
+                        f"  {kp:12.4f} {ki:12.4f} {rms:9.4f}° {spread:8.4f}° "
+                        f"{mx:9.4f}° {lag:8.1f}ms {ripple:8.4f}°"
                         + ("  <- oscillating" if noisy else "")
                     )
+
+                def oscillating(ripple: float, prev: float | None) -> bool:
+                    # A difference smaller than the spread across repeats is
+                    # not a difference; a 3x jump against the previous step is
+                    # one, and needs no calibrated absolute level.
+                    return ripple > args.ripple_limit or (
+                        prev is not None
+                        and ripple > _TRACK_RIPPLE_JUMP * max(prev, 1e-4)
+                    )
+
+                kps = args.kp or [original.position_kp * m for m in _KP_STEPS]
+                prev_ripple: float | None = None
+                for kp in kps:
+                    m = await point(kp, 0.0)
+                    if m is None:
+                        continue
+                    noisy = oscillating(m[4], prev_ripple)
+                    row(kp, 0.0, m, noisy)
                     if noisy:
                         print(
                             "    stopping: past here the joint buys tracking "
                             "accuracy with vibration."
                         )
                         break
-                    prev_ripple = ripple
-                    if best is None or rms < best[2]:
-                        best = (kp, 0.0, rms, mx)
+                    prev_ripple = m[4]
+                    if best is None or m[0] < best[2]:
+                        best = (kp, 0.0, m[0], m[2])
+
+                # Then the integral, at the kp that won. This is the term that
+                # removes the velocity-following error a P-only loop cannot
+                # avoid -- and it does it without pushing position_kp toward
+                # the cliff, which on the right elbow moved from above 0.84 at
+                # -45° to below 0.72 at -90° as gravity rose 3.86 -> 5.46 Nm.
+                # Ascending and stopping on ripple, because an integral
+                # winding up against stiction limit-cycles rather than
+                # diverging, and this joint's friction rises with that load.
                 if best is not None:
+                    kis = (
+                        args.ki
+                        if args.ki is not None
+                        else [best[0] * s for s in _KI_STEPS]
+                    )
+                    prev_ripple = None
+                    for ki in kis:
+                        m = await point(best[0], ki)
+                        if m is None:
+                            continue
+                        noisy = oscillating(m[4], prev_ripple)
+                        row(best[0], ki, m, noisy)
+                        if noisy:
+                            print(
+                                "    stopping: the integral is winding up "
+                                "against friction faster than it is helping."
+                            )
+                            break
+                        prev_ripple = m[4]
+                        if m[0] < best[2]:
+                            best = (best[0], ki, m[0], m[2])
+
                     print(
-                        f"\n  best: position_kp={best[0]:.4f} -> tracking rms "
+                        f"\n  best: position_kp={best[0]:.4f} "
+                        f"position_ki={best[1]:.4f} -> tracking rms "
                         f"{best[2]:.4f}°"
                     )
                     if best[2] > 1.0:

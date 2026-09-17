@@ -232,6 +232,30 @@ class AccelerationTest(unittest.TestCase):
         )
         self.assertAlmostEqual(span, 2 * amp, places=6)
 
+    def test_tracking_sweep_tunes_the_integral_after_the_proportional(self) -> None:
+        """kp alone cannot remove a velocity-following error.
+
+        The measured law on the right elbow was rms = 0.0794/kp + 0.0404 deg
+        and lag = 8.70/kp + 4.07 ms, so at kp=0.84 the P-loop lag is 10.3 ms
+        against a 4.07 ms transport floor -- 70 % of the error is the term a
+        type-1 loop cannot avoid. Raising kp to chase it runs into a cliff
+        that moves with load (above 0.84 at -45 deg, below 0.72 at -90 deg),
+        so the integral has to be swept too.
+        """
+        import inspect
+
+        src = inspect.getsource(pl._run)
+        # The track branch: from its banner to where the hold branch starts.
+        track = src[src.index("streaming a") :]
+        head = track[: track.index("{'sag':>9}")]
+        self.assertIn("position_ki", head)
+        # Ascending, and stopping on ripple: an integral winding up against
+        # stiction limit-cycles rather than diverging.
+        self.assertEqual(list(pl._KI_STEPS), sorted(pl._KI_STEPS))
+        self.assertIn("winding up", head)
+        # The ladder is relative to the winning kp, not absolute.
+        self.assertTrue(all(0 < s <= 0.1 for s in pl._KI_STEPS))
+
     def test_approach_tolerance_is_tight_against_the_error_being_measured(self) -> None:
         # Tracking errors of interest are ~0.1 deg, so starting half a degree
         # off is already several times the signal.
