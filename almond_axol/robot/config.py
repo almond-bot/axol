@@ -652,7 +652,7 @@ def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
 #: impedance frame; the other two are the 0x140-series position closed-loop
 #: commands, which move the position loop into the motor and answer on the
 #: coarse 0x240 reply frame.
-WIRE_MODES = ("mit", "a9", "tf")
+WIRE_MODES = ("mit", "a4", "a9", "tf")
 
 
 @dataclass
@@ -774,6 +774,13 @@ class ControlExperiments:
             - ``"mit"`` (default): the 0x400 impedance frame — position,
               velocity, ``kp``, ``kd`` and the full feedforward torque, i.e.
               the production control law.
+            - ``"a4"``: 0xA4 absolute position closed-loop — a target and a
+              speed cap, no torque byte. The firmware position loop does the
+              work. This is the command the tuning probes already use to hold
+              the joints they are not testing, so the loop is known to carry
+              these joints' gravity load; and unlike ``a9`` there is no
+              per-frame current cap that can be set too low to hold the arm
+              up. Like ``a9`` it sends no host feedforward.
             - ``"a9"``: 0xA9 force-control position closed-loop. The motor's
               own position loop tracks the streamed trajectory under
               ``wire_torque_pct`` and a speed cap, with the position at
@@ -788,7 +795,7 @@ class ControlExperiments:
               arrives, quantised to ``wire_ff_nm_per_pct`` steps. Needs V4.4
               firmware; the core refuses to arm an older motor in this mode.
 
-            Both wire modes answer on the 0x240 reply frame instead of the
+            All three answer on the 0x240 reply frame instead of the
             MIT feedback frame, which costs **real telemetry**: measured
             position drops to 1 deg/LSB (45x coarser), velocity to 1 dps/LSB,
             and the torque channel becomes q-axis current in amps (see

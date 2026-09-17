@@ -23,6 +23,7 @@ pub const MA_MOTOR_STATUS_2: u8 = 0x9C;
 /// per-frame torque limit, 0x73 ("TF") a per-frame feedforward torque. Both go
 /// to 0x140 + id and answer on 0x240 + id — see [`ma_decode_control_reply`].
 /// Selected by `exp wire_mode` (`ControlExperiments.wire_mode`).
+pub const MA_POS_CONTROL: u8 = 0xA4;
 pub const MA_FORCE_POS_CONTROL: u8 = 0xA9;
 pub const MA_POS_TORQUE_FF: u8 = 0x73;
 /// Read one stored planning acceleration; index 0 is the position loop's.
@@ -111,6 +112,19 @@ fn angle_centideg(position: f64) -> i32 {
 /// Clamped uint16 speed limit (1 dps/LSB) — `_speed_dps` in the Python driver.
 fn speed_dps(max_speed: f64) -> u16 {
     (max_speed.abs() * RAD_TO_DPS).clamp(0.0, u16::MAX as f64) as u16
+}
+
+/// 0xA4 absolute position closed-loop frame — `position_velocity_frame` in
+/// `almond_axol/motor/myactuator.py`. Target plus a speed limit, no torque
+/// byte: the motor's configured stall current is the only cap. This is the
+/// command the tuning probes already use to hold idle joints, so the
+/// firmware loop is known to carry these joints' gravity load.
+pub fn ma_pos_velocity_encode(position: f64, max_speed: f64) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[0] = MA_POS_CONTROL;
+    out[2..4].copy_from_slice(&speed_dps(max_speed).to_le_bytes());
+    out[4..8].copy_from_slice(&angle_centideg(position).to_le_bytes());
+    out
 }
 
 /// 0xA9 force-control position closed-loop frame — `force_position_frame` in
@@ -395,6 +409,15 @@ mod tests {
         assert_eq!(
             ma_force_pos_encode(1.2345, 2.0, 60.0),
             [169, 60, 114, 0, 161, 27, 0, 0]
+        );
+        // 0xA4 is the same frame with the torque byte left at zero.
+        assert_eq!(
+            ma_pos_velocity_encode(1.2345, 2.0),
+            [164, 0, 114, 0, 161, 27, 0, 0]
+        );
+        assert_eq!(
+            ma_pos_velocity_encode(360.0_f64.to_radians(), 500.0_f64.to_radians()),
+            [0xA4, 0x00, 0xF4, 0x01, 0xA0, 0x8C, 0x00, 0x00]
         );
         assert_eq!(
             ma_pos_torque_ff_encode(-0.5, 3.5, -12.4),

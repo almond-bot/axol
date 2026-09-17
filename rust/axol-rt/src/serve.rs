@@ -865,6 +865,12 @@ struct Config {
 enum WireMode {
     /// 0x400 impedance frame: position, velocity, kp, kd, feedforward torque.
     Mit,
+    /// 0xA4 absolute position closed-loop: target plus a speed cap, no
+    /// torque byte. The firmware position loop does the work, and this is
+    /// the command the tuning probes already use to hold idle joints — so
+    /// unlike `a9` there is no per-frame current cap that can be set too
+    /// low to hold the arm up. Like `a9`, no host feedforward is sent.
+    A4,
     /// 0xA9 force-control position closed-loop. Finer position command
     /// (0.01 deg/LSB), firmware position loop, per-frame torque and speed
     /// limits — and no host feedforward of any kind reaches the motor.
@@ -878,6 +884,7 @@ impl WireMode {
     fn parse(word: &str) -> Option<Self> {
         match word {
             "mit" => Some(Self::Mit),
+            "a4" => Some(Self::A4),
             "a9" => Some(Self::A9),
             "tf" => Some(Self::Tf),
             _ => None,
@@ -887,6 +894,7 @@ impl WireMode {
     fn name(self) -> &'static str {
         match self {
             Self::Mit => "mit",
+            Self::A4 => "a4",
             Self::A9 => "a9",
             Self::Tf => "tf",
         }
@@ -1712,6 +1720,7 @@ mod tests {
         let joint = "joint 0 can0 shoulder_1 1 250 3.5 6.3 22.0 0.6 20 0.1 0\n";
         for (word, want) in [
             ("mit", WireMode::Mit),
+            ("a4", WireMode::A4),
             ("a9", WireMode::A9),
             ("tf", WireMode::Tf),
         ] {
@@ -2215,10 +2224,10 @@ fn bus_loop(
                  velocity 1 dps/LSB, torque reported as q-axis current{}. {}. Position \
                  loop: {}",
                 cfg.exp.wire_mode.name(),
-                if cfg.exp.wire_mode == WireMode::A9 {
-                    "0xA9"
-                } else {
-                    "0x73"
+                match cfg.exp.wire_mode {
+                    WireMode::A4 => "0xA4",
+                    WireMode::A9 => "0xA9",
+                    _ => "0x73",
                 },
                 if cfg.exp.wire_torque_nm_per_amp > 0.0 {
                     format!(" scaled by {} Nm/A", cfg.exp.wire_torque_nm_per_amp)
@@ -2896,6 +2905,12 @@ fn bus_loop(
                             },
                             proto::mit_encode(p_cmd, v_wire, c.kp, c.kd, t_ff, &m.ranges),
                             t_ff,
+                        ),
+                        WireMode::A4 => (
+                            proto::MA_REQ + m.id as u16,
+                            proto::ma_pos_velocity_encode(p_cmd, wire_speed),
+                            // No torque field at all on this frame.
+                            f64::NAN,
                         ),
                         WireMode::A9 => (
                             proto::MA_REQ + m.id as u16,

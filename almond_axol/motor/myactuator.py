@@ -279,6 +279,22 @@ def _speed_dps(max_speed: float) -> int:
     return max(0, min(_MA_SPEED_MAX_DPS, int(abs(max_speed) * _MA_RAD_TO_DPS)))
 
 
+def position_velocity_frame(position: float, max_speed: float) -> bytes:
+    """0xA4 absolute position closed-loop payload.
+
+    The plainest of the three position frames: a target and a speed limit,
+    with no torque byte at all — the motor's configured stall current is the
+    only limit. This is the command every tuning probe already uses to park
+    and hold the joints it is not testing (``set_position_velocity`` below),
+    so the firmware loop is known to hold these joints against gravity.
+    """
+    return (
+        bytes([_MA_POS_CONTROL, 0x00])
+        + struct.pack("<H", _speed_dps(max_speed))
+        + struct.pack("<i", _angle_centideg(position))
+    )
+
+
 def force_position_frame(
     position: float, max_speed: float, max_torque_pct: float
 ) -> bytes:
@@ -677,15 +693,14 @@ class MyActuatorMotor(MotorDriver):
         return _ma_error_to_status(error_bits)
 
     async def set_position_velocity(self, position: float, max_speed: float) -> None:
-        # bytes 2-3: uint16 max speed in dps; bytes 4-7: int32 position in 0.01 degree units
-        speed_dps = int(max_speed * (180.0 / math.pi))
-        pos_centideg = int(position * (18000.0 / math.pi))  # rad → 0.01 deg units
-        data = (
-            bytes([_MA_POS_CONTROL, 0x00])
-            + struct.pack("<H", speed_dps)
-            + struct.pack("<i", pos_centideg)
-        )
-        await self._request(data)
+        """Send one 0xA4 absolute position command (see
+        :func:`position_velocity_frame`).
+
+        The frame builder clamps both fields into their wire widths; the
+        inline packing this used to do raised ``struct.error`` mid-stream on
+        an out-of-range speed instead.
+        """
+        await self._request(position_velocity_frame(position, max_speed))
 
     async def set_velocity(self, velocity: float) -> None:
         # bytes 4-7: int32 in centidps (dps × 100); rad/s → dps → centidps
