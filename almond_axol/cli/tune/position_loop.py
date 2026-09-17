@@ -67,6 +67,18 @@ from ...utils.logquiet import quiet_noisy_loggers
 from ..motor import add_side_and_channel_arguments, resolve_channel
 
 _HOLD_HZ = 100.0
+#: Homing order, distal first: straightening the wrists and elbow before the
+#: shoulders means each shoulder later swings a folded arm.
+_HOME_ORDER: tuple[Joint, ...] = (
+    Joint.WRIST_3,
+    Joint.WRIST_2,
+    Joint.WRIST_1,
+    Joint.ELBOW,
+    Joint.SHOULDER_3,
+    Joint.SHOULDER_2,
+    Joint.SHOULDER_1,
+)
+_HOME_SPEED = 0.25  # rad/s
 #: Multipliers applied to the joint's current `position_kp`, low to high. The
 #: search stops at the first value that holds, so a joint that is nearly right
 #: never sees the large ones.
@@ -105,6 +117,30 @@ class _Holders:
             self._hold[j] = await m.get_position()
         self.peak_wobble = {j: 0.0 for j in self._hold}
         self._task = asyncio.create_task(self._loop())
+
+    async def ramp_to(self, joint: Joint, target: float, speed: float) -> None:
+        """Walk one holder's target to ``target`` while it keeps streaming.
+
+        The hold loop keeps commanding throughout, so the joint is under
+        impedance the whole way — unlike a one-shot position command, which
+        is what leaves an arm unsupported.
+        """
+        if joint not in self._hold:
+            return
+        start = self._hold[joint]
+        dist = abs(target - start)
+        if dist < 1e-4:
+            return
+        secs = dist / max(speed, 1e-3)
+        t0 = time.monotonic()
+        while True:
+            frac = (time.monotonic() - t0) / secs
+            if frac >= 1.0:
+                break
+            self._hold[joint] = start + (target - start) * frac
+            await asyncio.sleep(0.01)
+        self._hold[joint] = target
+        await asyncio.sleep(0.3)
 
     async def stop(self) -> None:
         if self._task is not None:
@@ -517,6 +553,24 @@ async def _run(args: argparse.Namespace) -> None:
                 else:
                     print("  not saved; re-run with --save to commit.")
         finally:
+            # Home before disabling. The holders keep streaming impedance
+            # while their targets are walked to rest, so nothing is
+            # unsupported mid-move; the test joint rides its own position
+            # command. Distal to proximal, so each shoulder swings a folded
+            # arm. Best-effort: a failure here must not skip the disable.
+            try:
+                print("  Returning to rest ...")
+                for j in _HOME_ORDER:
+                    if j is joint:
+                        await test.set_position_velocity(0.0, math.radians(20.0))
+                        for _ in range(60):
+                            if abs(await test.get_position()) < 0.02:
+                                break
+                            await asyncio.sleep(0.1)
+                    elif j in motors:
+                        await holders.ramp_to(j, 0.0, _HOME_SPEED)
+            except Exception as e:
+                print(f"  ! could not return to rest ({e}) — support the arm.")
             await holders.stop()
             if accel_before is not None and not args.save:
                 try:

@@ -99,6 +99,56 @@ class SearchGuardsTest(unittest.TestCase):
         self.assertFalse(args.save)
 
 
+class TeardownTest(unittest.TestCase):
+    """The arm must be returned to rest before torque comes off.
+
+    Disabling from wherever the probe finished drops the arm. This shipped
+    broken once already in tune.breakaway; the same mistake reached here.
+    """
+
+    def test_homes_before_disabling(self) -> None:
+        import inspect
+
+        src = inspect.getsource(pl._run)
+        block = src[src.index("finally:") :]
+        self.assertIn("Returning to rest", block)
+        self.assertLess(block.index("_HOME_ORDER"), block.index("m.disable()"))
+
+    def test_home_order_is_distal_first_and_complete(self) -> None:
+        self.assertEqual(set(pl._HOME_ORDER), set(ARM_JOINTS))
+        self.assertEqual(pl._HOME_ORDER[0], Joint.WRIST_3)
+        self.assertEqual(pl._HOME_ORDER[-1], Joint.SHOULDER_1)
+
+    def test_holders_keep_streaming_while_their_target_moves(self) -> None:
+        # A one-shot position command would leave the joint unsupported
+        # mid-move; ramp_to only moves the target the hold loop is chasing.
+        import inspect
+
+        src = inspect.getsource(pl._Holders.ramp_to)
+        self.assertIn("self._hold[joint]", src)
+        self.assertNotIn("set_position_velocity", src)
+
+    def test_ramp_to_walks_the_target_and_lands_on_it(self) -> None:
+        from almond_axol.robot.config import AxolConfig
+
+        motors = {}
+        for j in ARM_JOINTS:
+            m = MagicMock()
+            m.get_position = AsyncMock(return_value=0.5)
+            m.set_impedance = AsyncMock()
+            m.position = 0.5
+            motors[j] = m
+        h = pl._Holders(motors, Joint.ELBOW, True, AxolConfig().resolved())
+
+        async def go():
+            await h.start()
+            await h.stop()  # no streaming needed to exercise the target walk
+            await h.ramp_to(Joint.WRIST_1, 0.0, 5.0)
+            return h._hold[Joint.WRIST_1]
+
+        self.assertAlmostEqual(asyncio.run(go()), 0.0)
+
+
 class AccelerationTest(unittest.TestCase):
     """Zero is the value that selects direct tracking, and the clamp hid it."""
 
