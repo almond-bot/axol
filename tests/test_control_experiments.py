@@ -45,11 +45,13 @@ class ExperimentsConfigTest(unittest.TestCase):
         # The tracker gains ship at the values filter.rs uses.
         self.assertEqual(exp.tracker_pos_gain, 15.7)
         self.assertEqual(exp.tracker_vel_gain, 62.8)
+        self.assertEqual(exp.command_lead_ms, 0.0)
         self.assertTrue(AxolConfig().experiments.is_default())
         self.assertFalse(ControlExperiments(integrator_hz=0.3).is_default())
         self.assertFalse(ControlExperiments(dither_nm=0.2).is_default())
         self.assertFalse(ControlExperiments(wire_mode="a9").is_default())
         self.assertFalse(ControlExperiments(tracker_pos_gain=31.4).is_default())
+        self.assertFalse(ControlExperiments(command_lead_ms=25.0).is_default())
 
     def test_config_lines_declare_every_field(self) -> None:
         exp = ControlExperiments(friction_slew=30.0, tracker_wire_vel=True)
@@ -94,6 +96,13 @@ class ExperimentsConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tracker_.*gain"):
             ControlExperiments(tracker_vel_gain=-1.0).validate()
         ControlExperiments(tracker_pos_gain=31.4, tracker_vel_gain=125.6).validate()
+        # The lead is a position offset of lead x velocity; a large one is a
+        # big commanded jump on a fast joint.
+        with self.assertRaisesRegex(ValueError, "command_lead_ms"):
+            ControlExperiments(command_lead_ms=250.0).validate()
+        with self.assertRaisesRegex(ValueError, "command_lead_ms"):
+            ControlExperiments(command_lead_ms=-5.0).validate()
+        ControlExperiments(command_lead_ms=25.0).validate()
         for mode in WIRE_MODES:
             ControlExperiments(wire_mode=mode).validate()
         AxolConfig().resolved()

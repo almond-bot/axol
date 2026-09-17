@@ -87,6 +87,7 @@ _RT_TRACE_COLUMNS = (
     "dither_ff",
     "total_ff",
     "wire_tau",
+    "wire_p",
     "kd_host",
     "damp_w0",
     "damp_q",

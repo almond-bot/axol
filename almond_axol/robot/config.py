@@ -841,6 +841,30 @@ class ControlExperiments:
             which is what the earlier bang-bang and sqrt-braking designs were
             replaced for. Watch the 2-3 Hz band as you raise it; ringing
             there is the ceiling.
+        command_lead_ms: Realtime core only. Phase lead (ms) on the **wire
+            position only**: the frame carries ``p_cmd + lead x v_tracker``
+            instead of ``p_cmd``. ``0`` is off.
+
+            This cancels the velocity-proportional tracking lag rather than
+            trying to reduce it, and the lag is exactly the quantity to cancel
+            because both halves are known: the time constant is measurable
+            per joint (right shoulder_1 20 ms, right elbow 28 ms at
+            ``tracker_pos_gain`` 62.8) and the velocity is the tracker's own
+            acceleration-bounded state, not a differentiated signal. It is the
+            same extrapolation :class:`filter::Holdover` already does for late
+            targets, applied deliberately.
+
+            Only the wire position moves. The derivative chains, the
+            stiction/integrator position error and the trace's ``cmd_p`` all
+            stay on the unled command, so every error term keeps measuring
+            real tracking error rather than the lead; the trace's ``wire_p``
+            column is what actually went out.
+
+            One value covers every joint, so it is a compromise where the
+            per-joint lags differ — a per-joint lead would have to ride the
+            streamed target packet rather than the config. Overshoot at
+            direction reversals is the failure mode to watch: the lead is
+            largest exactly where the velocity is about to change sign.
         tracker_vel_gain: Realtime core only. Velocity-tracking gain (1/s) of
             the same loop, ``2*wn`` against the position gain's ``wn/2``.
             Keep the 4:1 ratio when changing ``tracker_pos_gain`` or the loop
@@ -877,6 +901,7 @@ class ControlExperiments:
     wire_torque_nm_per_amp: float = 0.0
     tracker_pos_gain: float = 15.7
     tracker_vel_gain: float = 62.8
+    command_lead_ms: float = 0.0
 
     def validate(self) -> None:
         """Raise ``ValueError`` on a combination the core would reject.
@@ -903,6 +928,11 @@ class ControlExperiments:
             raise ValueError("experiments.wire_speed_scale must be positive")
         if self.tracker_pos_gain <= 0.0 or self.tracker_vel_gain <= 0.0:
             raise ValueError("experiments.tracker_*_gain must be positive")
+        # A lead is a position offset of lead x velocity; past ~100 ms that is
+        # a large commanded jump on a fast joint, and the term it cancels is
+        # only tens of ms to begin with.
+        if not 0.0 <= self.command_lead_ms <= 100.0:
+            raise ValueError("experiments.command_lead_ms must be in [0, 100]")
 
     def is_default(self) -> bool:
         """``True`` when every experiment is off (the production control law)."""
