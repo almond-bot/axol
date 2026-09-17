@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import logging
 import math
 from pathlib import Path
 
@@ -66,6 +67,7 @@ from ...robot.gravity import GravityCompensator
 from ...tuning import joint_frame_motors, ramp_stages, sweep_safety
 from ...tuning.joint_frame import JointFrameMotor
 from ...utils.logquiet import quiet_noisy_loggers
+from ..motor import add_side_and_channel_arguments, resolve_channel
 
 _RATE_HZ = 240.0
 _RAMP_SPEED = 0.25  # rad/s, for repositioning between trials
@@ -272,7 +274,7 @@ def _report(
     if len(rows) >= 2:
         g = np.array([x for x, _ in rows])
         m = np.array(means)
-        if g.ptp() > 0.2:
+        if float(np.ptp(g)) > 0.2:
             slope = float(np.polyfit(g, m, 1)[0])
             print(
                 f"    -> breakaway rises {slope:.3f} Nm per Nm of gravity load"
@@ -294,16 +296,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    side = p.add_mutually_exclusive_group(required=True)
-    side.add_argument("--l", action="store_true", help="Left arm")
-    side.add_argument("--r", action="store_true", help="Right arm")
+    add_side_and_channel_arguments(p)
     p.add_argument(
         "--joint",
         required=True,
         choices=[j.value for j in ARM_JOINTS],
         help="Joint to probe",
     )
-    p.add_argument("--channel", help="CAN interface (default: from settings)")
     p.add_argument(
         "--trials", type=int, default=3, help="Releases per direction (default: 3)"
     )
@@ -349,13 +348,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 
 def run(args: argparse.Namespace) -> None:
-    quiet_noisy_loggers(args.log_level)
-    asyncio.run(_run(args))
+    # `quiet_noisy_loggers` caps the chatty third-party packages; the root
+    # level comes from basicConfig, as in the other tune commands.
+    logging.basicConfig(level=getattr(logging, args.log_level))
+    quiet_noisy_loggers()
+    try:
+        asyncio.run(_run(args))
+    except KeyboardInterrupt:
+        print("\nExiting tune.breakaway ...")
 
 
 async def _run(args: argparse.Namespace) -> None:
-    from ..can.driver import resolve_channel
-
     is_left = bool(args.l)
     joint = Joint(args.joint)
     config = AxolConfig().resolved()
@@ -432,10 +435,15 @@ async def _run(args: argparse.Namespace) -> None:
 
             by_pose = []
             for q in poses:
+                # Gravity feedforward is the *only* thing holding this joint
+                # once kp goes to zero, so it has to come from where the arm
+                # actually is. `sweep_safety` has no hold pose for several
+                # joints (shoulder_1 among them), and assuming one would put
+                # the wrong torque on the wire.
                 q_arm = np.zeros(len(ARM_JOINTS))
-                for j, target in other_targets.items():
-                    if j in ARM_JOINTS:
-                        q_arm[ARM_JOINTS.index(j)] = target
+                for idx, j in enumerate(ARM_JOINTS):
+                    if j in motors:
+                        q_arm[idx] = await motors[j].get_position()
                 q_arm[ARM_JOINTS.index(joint)] = q
                 g = float(
                     gravity.gravity_arm(q_arm, is_left=is_left)[ARM_JOINTS.index(joint)]

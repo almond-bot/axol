@@ -18,6 +18,7 @@ from almond_axol.cli.tune.breakaway import (
     _triangle,
     detect_release,
 )
+from almond_axol.constants import Joint
 
 
 class RampShapeTest(unittest.TestCase):
@@ -96,6 +97,76 @@ class ReleaseDetectionTest(unittest.TestCase):
         got = detect_release(self._rows(pos), ramp, 3 * _FEEDBACK_LSB)
         self.assertAlmostEqual(got, abs(ramp[70]), places=9)
         self.assertLess(got, ramp.max())
+
+
+class EntryPointTest(unittest.TestCase):
+    """The arg-parse -> run() path, short of touching CAN.
+
+    This is the seam that shipped broken: `run()` passed the `--log-level`
+    *string* to `quiet_noisy_loggers`, which takes an int, and nothing
+    exercised it because the unit tests all called the pure helpers.
+    """
+
+    def _args(self, argv):
+        import argparse
+
+        from almond_axol.cli.tune import breakaway
+
+        parser = argparse.ArgumentParser()
+        breakaway.add_parser(parser.add_subparsers(dest="cmd"))
+        return parser.parse_args(["tune.breakaway", *argv])
+
+    def test_run_reaches_the_async_body(self) -> None:
+        from unittest.mock import patch
+
+        from almond_axol.cli.tune import breakaway
+
+        args = self._args(["--l", "--joint", "shoulder_1"])
+        with patch.object(breakaway.asyncio, "run") as run_async:
+            breakaway.run(args)
+        self.assertEqual(run_async.call_count, 1)
+        run_async.call_args.args[0].close()  # never awaited; don't warn
+
+    def test_every_log_level_choice_is_accepted(self) -> None:
+        from unittest.mock import patch
+
+        from almond_axol.cli.tune import breakaway
+
+        for level in ("DEBUG", "INFO", "WARNING", "ERROR"):
+            args = self._args(["--l", "--joint", "elbow", "--log-level", level])
+            with patch.object(breakaway.asyncio, "run") as run_async:
+                breakaway.run(args)
+            run_async.call_args.args[0].close()
+
+    def test_defaults_are_the_safe_ones(self) -> None:
+        args = self._args(["--l", "--joint", "shoulder_1"])
+        self.assertEqual(args.trials, 3)
+        self.assertEqual(args.max_torque, 2.5)
+        self.assertEqual(args.move_lsb, 3.0)
+        self.assertIsNone(args.poses)
+        self.assertGreater(args.kd, 0.0)  # the runaway brake is never off
+
+
+class ReportTest(unittest.TestCase):
+    """The report path itself — it runs on every measurement, and a crash
+    there loses the run. `ndarray.ptp()` (removed in NumPy 2.0) shipped
+    through here once already."""
+
+    def test_renders_for_one_pose_two_poses_and_no_releases(self) -> None:
+        from almond_axol.cli.tune.breakaway import _report
+
+        two = [
+            (math.radians(-20), -1.41, {"+": [1.30, 1.28], "-": [1.31, 1.29]}),
+            (math.radians(20), -2.60, {"+": [1.42], "-": [1.40]}),
+        ]
+        for by_pose in (two, two[:1], [(0.0, -1.35, {"+": [], "-": []})]):
+            _report(Joint.SHOULDER_1, 250.0, 0.909, by_pose)
+
+    def test_one_sided_release_still_reports(self) -> None:
+        # A joint that only breaks one way is a real outcome, not a crash.
+        from almond_axol.cli.tune.breakaway import _report
+
+        _report(Joint.ELBOW, 130.0, 0.602, [(0.0, -1.35, {"+": [0.71], "-": []})])
 
 
 class SuggestionMathTest(unittest.TestCase):
