@@ -22,6 +22,7 @@ from almond_axol.recording.record_proc import (
 )
 from almond_axol.robot.base import is_hardware_cleanup_uncertain
 from almond_axol.teleop.teleop import VRTeleop
+from almond_axol.utils import affinity
 from almond_axol.utils.state_files import UnsafeStatePathError
 from almond_axol.video import video_proc
 
@@ -76,6 +77,34 @@ class TeleopAffinityIntegrityTest(unittest.TestCase):
 
         pin.assert_called_once_with()
         # FIFO was refused (no rtprio grant), so there is nothing to release.
+        release.assert_not_called()
+        restore.assert_called_once_with(0, original)
+
+    def test_refused_realtime_scheduling_restores_the_mask_and_skips_the_session(
+        self,
+    ) -> None:
+        # pin_realtime() has already narrowed the mask by the time the FIFO
+        # request is refused, so the guard still has to hand it back — a
+        # long-lived `serve` worker must never be left pinned to one core.
+        original = {0, 1, 2, 3}
+        refusal = affinity.ControlSchedulingError("no rtprio grant")
+        with (
+            patch.object(teleop_cli.os, "sched_getaffinity", return_value=original),
+            patch.object(teleop_cli.os, "sched_setaffinity") as restore,
+            patch.object(teleop_cli.affinity, "pin_realtime") as pin,
+            patch.object(
+                teleop_cli.affinity,
+                "prioritize_control_thread",
+                side_effect=refusal,
+            ),
+            patch.object(teleop_cli.affinity, "release_control_thread") as release,
+            patch.object(teleop_cli, "_run_session", new=AsyncMock()) as run_session,
+            self.assertRaises(affinity.ControlSchedulingError),
+        ):
+            asyncio.run(teleop_cli._run(object()))  # type: ignore[arg-type]
+
+        pin.assert_called_once_with()
+        run_session.assert_not_awaited()
         release.assert_not_called()
         restore.assert_called_once_with(0, original)
 

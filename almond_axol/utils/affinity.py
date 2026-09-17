@@ -407,8 +407,33 @@ CAPTURE_FIFO_PRIORITY = 5
 CONTROL_FIFO_PRIORITY = 10
 MAX_FIFO_PRIORITY = 20
 
+# Opt back into the pre-2026-09-17 behaviour: warn about a CFS control thread
+# and run anyway. For a dev box or a demo where the hitching is acceptable and
+# arranging the rtprio grant is not worth it; never for data collection.
+ALLOW_CFS_CONTROL_ENV = "AXOL_ALLOW_CFS_CONTROL"
 
-def prioritize_control_thread() -> bool:
+
+class ControlSchedulingError(RuntimeError):
+    """The control thread was denied ``SCHED_FIFO`` on a host that offers it.
+
+    Raised instead of quietly continuing because the degraded mode is hard to
+    spot and easy to mistake for a code regression: the loop still runs, the
+    Rust core still arms, and the only symptom is the arms hitching — which
+    also disappears when the cameras are off, so it reads as mechanical.
+    ``axol-rt`` already refuses to arm in the same situation (see
+    ``configure_bus_scheduling`` in ``rust/axol-rt/src/serve.rs``); this makes
+    the Python half consistent with it.
+
+    The two halves fail apart because they get the privilege from different
+    places: ``axol rt.install`` puts ``cap_sys_nice`` on the ``axol-rt``
+    *binary*, so the core is unaffected by how the operator logged in, while
+    the Python control thread has only the launching session's
+    ``RLIMIT_RTPRIO``. A login that bypasses PAM therefore produces a box
+    whose CAN loops are real-time and whose control loop is not.
+    """
+
+
+def prioritize_control_thread(*, required: bool = True) -> bool:
     """Run the calling thread ``SCHED_FIFO`` so it outranks its core-mates.
 
     The realtime core is one CPU on every layout, and the control loop shares
@@ -432,11 +457,28 @@ def prioritize_control_thread() -> bool:
     spawns afterwards (IK dispatch, flight-recorder dumps, asyncio executors,
     the relay and IK worker processes) start ``SCHED_OTHER``/``nice 0`` — the
     kernel applies the reset on every clone, threads included (verified on
-    5.15). Best-effort like :func:`prioritize_capture_threads`: without
-    ``sched_setscheduler``/the reset flag it is a no-op, and without the
-    rtprio allowance the thread stays CFS with one warning. Pair with
-    :func:`release_control_thread` when the loop ends so a long-lived serve
-    worker thread is not left FIFO.
+    5.15). A platform with no ``sched_setscheduler``/reset flag stays a silent
+    no-op — nothing was on offer there, which matches ``axol-rt``: it too
+    insists only when the launcher actually asked for a priority. A host that
+    *does* offer real-time scheduling and refuses the request raises
+    :exc:`ControlSchedulingError`, because that is the case worth stopping
+    for. Pair with :func:`release_control_thread` when the loop ends so a
+    long-lived serve worker thread is not left FIFO.
+
+    Args:
+        required: Refuse (raise) when the host offers ``SCHED_FIFO`` but
+            denies it. ``False`` keeps the old best-effort behaviour — warn
+            once and stay CFS — for a caller that genuinely tolerates a
+            non-real-time control thread. Operators get the same escape hatch
+            without a code change via ``AXOL_ALLOW_CFS_CONTROL=1``.
+
+    Returns:
+        True when the thread is now ``SCHED_FIFO``; False when the platform
+        had nothing to offer, or when the denial was tolerated.
+
+    Raises:
+        ControlSchedulingError: The host offers ``SCHED_FIFO`` and denied it
+            while ``required`` and without the env escape hatch.
     """
     if not hasattr(os, "sched_setscheduler") or not hasattr(os, "SCHED_FIFO"):
         return False
@@ -449,6 +491,23 @@ def prioritize_control_thread() -> bool:
     try:
         os.sched_setscheduler(0, os.SCHED_FIFO | reset_on_fork, param)  # type: ignore[attr-defined]
     except PermissionError as exc:
+        if required and os.environ.get(ALLOW_CFS_CONTROL_ENV) != "1":
+            raise ControlSchedulingError(
+                f"control thread cannot enter SCHED_FIFO "
+                f"{CONTROL_FIFO_PRIORITY} ({exc}); refusing to run without "
+                "real-time scheduling. Pinned but CFS it shares its core with "
+                "the VR pose, IK-dispatch and diagnostics threads and lands "
+                "about one tick in fifty 15-65 ms late, felt as the arms "
+                "hitching and lunging — and masked by turning the cameras "
+                "off, which is what makes it look mechanical. The rtprio "
+                "grant `axol provision` writes is applied by pam_limits, so "
+                "it reaches a PAM login only: a session that bypasses PAM "
+                "(Tailscale SSH, or a systemd unit without LimitRTPRIO) never "
+                "receives it. Log in again over ssh, or run `sudo prlimit "
+                f"--pid $$ --rtprio={MAX_FIFO_PRIORITY}:{MAX_FIFO_PRIORITY}` "
+                f"in this shell. Set {ALLOW_CFS_CONTROL_ENV}=1 to run "
+                "degraded anyway."
+            ) from exc
         _logger.warning(
             "control thread stays SCHED_OTHER (no CAP_SYS_NICE: %s); expect "
             "late control ticks while the VR/IK threads share its core. Run "
@@ -466,7 +525,7 @@ def prioritize_control_thread() -> bool:
     return True
 
 
-def enter_control_thread() -> bool:
+def enter_control_thread(*, required: bool = True) -> bool:
     """Make the calling thread *the* control thread: realtime core + ``SCHED_FIFO``.
 
     For loops that live on a thread of their own rather than the command's
@@ -478,10 +537,15 @@ def enter_control_thread() -> bool:
     realtime cores, the one thread moved there when it does not — run-policy
     leaves its observation/inference threads free to float), and the FIFO
     policy is thread-scoped with the reset-on-fork flag as in
-    :func:`prioritize_control_thread`. Returns True when either took effect.
+    :func:`prioritize_control_thread`. Returns True when either took effect,
+    and propagates :exc:`ControlSchedulingError` when the host offers
+    ``SCHED_FIFO`` but denies it — the control loop of ``collect-data`` /
+    ``collect-dagger`` / ``run-policy`` is exactly where a silently CFS thread
+    does its damage, so it refuses rather than collect hitched data. Pass
+    ``required=False`` to keep the old best-effort behaviour.
     """
     pinned = pin_realtime()
-    fifo = prioritize_control_thread()
+    fifo = prioritize_control_thread(required=required)
     return pinned or fifo
 
 
