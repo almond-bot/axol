@@ -21,6 +21,7 @@ import {
   type TuningRunData,
   type TuningRunMeta,
 } from "@/lib/tuning"
+import { fetchMotorDetails } from "@/lib/telemetry"
 
 const COMMANDED_COLOR = "rgba(255,255,255,0.45)"
 const ACTUAL_COLOR = "#eff483"
