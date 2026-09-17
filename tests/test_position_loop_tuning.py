@@ -256,6 +256,33 @@ class AccelerationTest(unittest.TestCase):
         # The ladder is relative to the winning kp, not absolute.
         self.assertTrue(all(0 < s <= 0.1 for s in pl._KI_STEPS))
 
+    def test_holder_drift_is_reported_per_gain_in_the_tracking_sweep(self) -> None:
+        """A gain is not unstable if the arm under it is moving.
+
+        The holders run MIT impedance, not a rigid clamp. On the right elbow
+        gravity rose 1.41x from -45 to -90 deg (3.86 -> 5.46 Nm) but the
+        stability cliff fell about 3.5x (0.84-0.96 -> 0.24-0.36). Load-
+        dependent friction does not scale like that; a base that moves under
+        the joint's own reaction torque does. The peaks must reset per gain,
+        or every row inherits the worst moment of the whole run.
+        """
+        import inspect
+
+        h = pl._Holders
+        self.assertTrue(hasattr(h, "reset_wobble"))
+        src = inspect.getsource(h.reset_wobble)
+        # It must hand back the value it is about to clear, not just the name.
+        self.assertIn("peak", src)
+        self.assertIn("return worst, peak", src)
+        self.assertIn("{j: 0.0 for j in self._hold}", src)
+
+        run = inspect.getsource(pl._run)
+        track = run[run.index("streaming a") :]
+        head = track[: track.index("{'sag':>9}")]
+        # Reset before the passes and read after, once per gain.
+        self.assertEqual(head.count("reset_wobble()"), 2)
+        self.assertLess(head.index("holders.reset_wobble()"), head.index("trials = ["))
+
     def test_approach_tolerance_is_tight_against_the_error_being_measured(self) -> None:
         # Tracking errors of interest are ~0.1 deg, so starting half a degree
         # off is already several times the signal.

@@ -143,6 +143,16 @@ class _Holders:
         self.peak_wobble = {j: 0.0 for j in self._hold}
         self._task = asyncio.create_task(self._loop())
 
+    def reset_wobble(self) -> tuple[Joint | None, float]:
+        """Zero the holder drift peaks; return the worst ``(joint, deg)`` seen
+        since the last reset. Per-gain rather than per-run, so the table can
+        say whether a gain that looks unstable is the servo or the arm it is
+        bolted to."""
+        worst = max(self.peak_wobble, key=lambda j: self.peak_wobble[j], default=None)
+        peak = self.peak_wobble.get(worst, 0.0) if worst is not None else 0.0
+        self.peak_wobble = {j: 0.0 for j in self._hold}
+        return worst, peak
+
     async def ramp_to(self, joint: Joint, target: float, speed: float) -> None:
         """Walk one holder's target to ``target`` while it keeps streaming.
 
@@ -565,7 +575,8 @@ async def _run(args: argparse.Namespace) -> None:
                 )
                 print(
                     f"  {'position_kp':>12} {'position_ki':>12} {'rms err':>10} "
-                    f"{'+/-':>9} {'max err':>10} {'lag':>9} {'ripple':>9}"
+                    f"{'+/-':>9} {'max err':>10} {'lag':>9} {'ripple':>9} "
+                    f"{'holder':>9}"
                 )
 
                 async def point(kp: float, ki: float):
@@ -574,6 +585,16 @@ async def _run(args: argparse.Namespace) -> None:
                         replace(original, position_kp=kp, position_ki=ki),
                         persist=False,
                     )
+                    # Per-gain holder drift. The holders run MIT impedance and
+                    # are not rigid: at -90° the right elbow carries 5.46 Nm
+                    # against 3.86 at -45°, a 1.41x load, but its stability
+                    # cliff fell from 0.84-0.96 to 0.24-0.36, about 3.5x. That
+                    # is far too steep for load-dependent friction, and the
+                    # obvious candidate is the arm moving under the joint:
+                    # a compliant base feeds the joint's own reaction torque
+                    # back into its loop. If wobble tracks ripple, the limit
+                    # is structural and no gain on this joint will fix it.
+                    holders.reset_wobble()
                     trials = [
                         await _track(
                             test,
@@ -586,6 +607,7 @@ async def _run(args: argparse.Namespace) -> None:
                         )
                         for _ in range(args.repeat)
                     ]
+                    worst, wobble = holders.reset_wobble()
                     ok = [t for t in trials if math.isfinite(t[0])]
                     if not ok:
                         print(f"  {kp:12.4f} {ki:12.4f}   (no usable pass)")
@@ -596,14 +618,21 @@ async def _run(args: argparse.Namespace) -> None:
                         float(np.mean([t[1] for t in ok])),
                         float(np.mean([t[2] for t in ok])),
                         float(np.mean([t[3] for t in ok])),
+                        wobble,
+                        worst,
                     )
 
                 def row(kp: float, ki: float, m, noisy: bool) -> None:
-                    rms, spread, mx, lag, ripple = m
+                    rms, spread, mx, lag, ripple, wobble, worst = m
+                    tag = "  <- oscillating" if noisy else ""
+                    # Name the holder only when it moved enough to matter: a
+                    # joint's own loop cannot be blamed for a base that is
+                    # moving as far as the error being measured.
+                    if worst is not None and wobble > rms:
+                        tag += f"  ({worst.value} base moved {wobble:.2f}°)"
                     print(
                         f"  {kp:12.4f} {ki:12.4f} {rms:9.4f}° {spread:8.4f}° "
-                        f"{mx:9.4f}° {lag:8.1f}ms {ripple:8.4f}°"
-                        + ("  <- oscillating" if noisy else "")
+                        f"{mx:9.4f}° {lag:8.1f}ms {ripple:8.4f}° {wobble:8.2f}°" + tag
                     )
 
                 def oscillating(ripple: float, prev: float | None) -> bool:
