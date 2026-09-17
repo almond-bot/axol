@@ -28,6 +28,11 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       via rustup if needed; sources fetched at the installed
                       package's ref for tool installs), required by hardware
                       control (see :mod:`almond_axol.rt`).
+* CAN purge grant   — a ``sudoers.d`` drop-in letting a manual ``axol serve``
+                      flap the CAN interfaces without a password when motor
+                      power dies, so the e-stop's queued position commands
+                      cannot replay on the next bring-up (see
+                      :mod:`almond_axol.utils.can_purge`).
 * rtprio grant      — a ``limits.d`` drop-in letting the operator's login run
                       the camera relay's capture chain ``SCHED_FIFO`` from a
                       manual ``axol serve`` (the systemd unit already has
@@ -65,7 +70,7 @@ from pathlib import Path
 
 from ..robot import gyro
 from ..rt import install as rt_install
-from ..utils import adb, rtprio
+from ..utils import adb, can_purge, rtprio
 from ..utils.host_update_lock import (
     HOLDER_READY,
     HostUpdateLockError,
@@ -316,6 +321,11 @@ def _run_locked() -> None:
     # `axol serve` can run the camera relay's capture chain SCHED_FIFO like
     # the systemd unit does (LimitRTPRIO). Applies at the next login.
     step("rtprio grant (utils.rtprio)", rtprio.install)
+    # Passwordless escalation for the one privileged thing a running session
+    # must do on its own: flapping a CAN interface whose TX queue stalled
+    # because motor power died. Without it a manual `axol serve` cannot purge,
+    # and the e-stop's queued commands replay on the next enable.
+    step("CAN e-stop purge grant (utils.can_purge)", can_purge.install)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
         step("pyzed (zed.install)", zed_install.run)
