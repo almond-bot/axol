@@ -170,3 +170,27 @@ class HoldersUnderImpedanceTest(unittest.TestCase):
         from almond_axol.tuning.holders import ImpedanceHolders
 
         self.assertIs(position_loop._Holders, ImpedanceHolders)
+
+
+class HolderDriftReportTest(unittest.TestCase):
+    def test_tied_drifts_do_not_compare_joint_enums(self) -> None:
+        """Bench: two holders off by the same amount raised
+        TypeError: '<' not supported between instances of 'Joint' and 'Joint',
+        after the arm was already posed."""
+        import re
+
+        src = inspect.getsource(gravity._run)
+        block = src[src.index("drift = sorted(") : src.index("reverse=True")]
+        self.assertIn("key=lambda d: d[0]", block)
+        # And the expression itself survives a tie.
+        from almond_axol.constants import Joint
+
+        held = {Joint.SHOULDER_1: 0.02, Joint.ELBOW: 0.02}
+        targets: dict = {}
+        drift = sorted(
+            ((abs(held[j] - targets.get(j, 0.0)), j) for j in held),
+            key=lambda d: d[0],
+            reverse=True,
+        )
+        self.assertEqual(len(drift), 2)
+        self.assertTrue(re.search(r"key=lambda d: d\[0\]", block))

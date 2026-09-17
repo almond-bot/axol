@@ -390,8 +390,11 @@ async def _run(args: argparse.Namespace) -> None:
                     held[j] = await m.get_position()
                 except Exception:
                     held[j] = other_targets.get(j, 0.0)
+            # Sort on the drift alone: a tie would otherwise fall through to
+            # comparing Joint enums, which have no ordering (bench traceback).
             drift = sorted(
                 ((abs(held[j] - other_targets.get(j, 0.0)), j) for j in held),
+                key=lambda d: d[0],
                 reverse=True,
             )
             if drift and drift[0][0] > _HOLDER_DRIFT_WARN:
