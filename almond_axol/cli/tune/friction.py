@@ -162,16 +162,73 @@ async def _ramp_verified(
     )
 
 
+async def assign_modes(
+    motors: dict[Joint, JointFrameMotor],
+    *,
+    impedance: Joint | None = None,
+    kp: float = 0.0,
+    kd: float = 0.0,
+) -> None:
+    """Put every joint in its final control mode, once, before anything moves.
+
+    A MyActuator has no control-mode register: ``set_control_mode`` issues a
+    **system reset** and waits ``_MA_RESET_SETTLE_S`` (2 s) for the motor to
+    come back. A resetting motor holds nothing, so switching a joint's mode
+    is two seconds of free fall.
+
+    That is survivable at the rest pose and destructive anywhere else, which
+    is why the mode must be decided up front rather than when the sweep needs
+    it. Switching the swept joint to impedance *after* ramping the arm into a
+    deliberately gravity-loaded pose dropped a wrist on the floor of its
+    travel and let an elbow flop out of its hold — the joint is limp for the
+    2 s reset plus whatever settle the caller sleeps afterwards.
+
+    All resets are issued together so the arm spends one 2 s window limp
+    instead of one per joint, and the caller should have the arm at rest.
+    """
+    await asyncio.gather(
+        *[
+            m.set_control_mode(
+                ControlMode.IMPEDANCE
+                if j is impedance
+                else ControlMode.POSITION_VELOCITY
+            )
+            for j, m in motors.items()
+        ]
+    )
+    # The impedance joint holds nothing until something streams to it, and it
+    # has just spent 2 s limp. Take hold of it before the caller poses the arm.
+    if impedance is not None and impedance in motors:
+        await _ramp_to(
+            motors[impedance], kp, kd, await motors[impedance].get_position()
+        )
+
+
 async def _home_all(
-    motors: dict[Joint, JointFrameMotor], exclude: Joint | None = None
+    motors: dict[Joint, JointFrameMotor],
+    exclude: Joint | None = None,
+    *,
+    impedance: Joint | None = None,
+    kp: float = 0.0,
+    kd: float = 0.0,
 ) -> None:
     """Ramp every joint to 0 (the rest pose), one at a time in ``_HOME_ORDER``.
 
     Joints already at rest verify in one poll, so a mostly-homed arm costs
     a fraction of a second per joint.
+
+    ``impedance`` names a joint already in IMPEDANCE mode (see
+    :func:`assign_modes`): it is homed with a streamed impedance ramp at
+    ``kp``/``kd`` rather than a position command, keeping the distal→proximal
+    order intact. Homing it separately afterwards would break that order,
+    which is the thing that makes commanding the all-zero pose safe from an
+    arbitrary start.
     """
     for j in _HOME_ORDER:
         if j == exclude or j not in motors:
+            continue
+        if j is impedance:
+            await _ramp_to(motors[j], kp, kd, 0.0, duration=4.0)
             continue
         await _ramp_verified(motors, {j: 0.0})
 
@@ -612,16 +669,13 @@ async def _run(args: argparse.Namespace) -> None:
         # switches to IMPEDANCE only after homing and the clearance move,
         # because the MyActuator mode switch is a ~2 s reset that silently
         # drops commands sent during it.
-        await asyncio.gather(
-            *[
-                m.set_control_mode(ControlMode.POSITION_VELOCITY)
-                for m in motors.values()
-            ]
-        )
+        # Modes decided once, at rest (see assign_modes): a MyActuator mode
+        # switch is a system reset and the joint is limp through it.
+        await assign_modes(motors, impedance=joint, kp=kp, kd=kd)
 
         try:
             print("  Homing all joints to rest (distal to proximal) ...")
-            await _home_all(motors)
+            await _home_all(motors, impedance=joint, kp=kp, kd=kd)
 
             # Shared sweep-safety geometry (see sweep_safety): base-collision
             # caps, camera clearance, and gravity-load poses. Staged ramps:
@@ -632,9 +686,8 @@ async def _run(args: argparse.Namespace) -> None:
             for stage in ramp_stages(other_targets):
                 await _ramp_verified(motors, stage)
 
-            await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
-            await asyncio.sleep(1.0)
-
+            # No mode switch here: the swept joint has been under impedance
+            # since before homing, so it was never limp in a loaded pose.
             avg_samples, halfdiff_samples = await _identify_joint(
                 motors[joint],
                 joint,
@@ -716,21 +769,19 @@ async def _run(args: argparse.Namespace) -> None:
             print("\n  Interrupted.")
         finally:
             print("  Returning to rest and disabling ...")
-            # The test joint gets an impedance ramp only if it actually made
-            # it into IMPEDANCE mode (a homing failure aborts before the
-            # switch, and a Damiao in POSITION_VELOCITY ignores impedance
-            # frames); otherwise _home_all covers it like any other joint.
-            in_impedance = motors[joint].motor.mode == ControlMode.IMPEDANCE
-            if in_impedance:
-                try:
-                    await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
-                except Exception:
-                    pass
             try:
-                # Home the rest in the safe distal-to-proximal order,
-                # including the base-collision joints the old flow used to
-                # leave in place.
-                await _home_all(motors, exclude=joint if in_impedance else None)
+                # Distal-to-proximal, with the swept joint ramped under
+                # impedance in its own place in that order. A Damiao left in
+                # POSITION_VELOCITY ignores impedance frames, so ask the
+                # motor rather than assuming.
+                await _home_all(
+                    motors,
+                    impedance=joint
+                    if motors[joint].motor.mode == ControlMode.IMPEDANCE
+                    else None,
+                    kp=kp,
+                    kd=kd,
+                )
             except Exception:
                 pass
             await asyncio.gather(

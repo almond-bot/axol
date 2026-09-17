@@ -70,14 +70,18 @@ from ..motor import add_side_and_channel_arguments, resolve_channel
 from .friction import (
     _home_all,
     _identify_joint,
-    _ramp_to,
     _ramp_verified,
+    assign_modes,
 )
 
 # Central-difference step for the CoM sensitivity columns (metres). Gravity
 # torque is exactly linear in the CoM, so any small step gives the exact
 # Jacobian up to float noise; 5 mm keeps the difference well above it.
 _FD_STEP = 0.005
+# Holder drift (rad) worth reporting before the fit. The holders run on the
+# motors' own position loops with no host feedback, so this is the only place
+# a sagging hold becomes visible instead of quietly biasing the CoM.
+_HOLDER_DRIFT_WARN = math.radians(1.0)
 # Per-bin torque noise scale (Nm): MIT-feedback quantization plus the
 # residual imbalance the fwd/bwd average leaves. Sets both the ridge weight
 # and the observability gate below.
@@ -346,15 +350,14 @@ async def _run(args: argparse.Namespace) -> None:
         raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw_motors.values()])
         motors = await joint_frame_motors(raw_motors, is_left)
-        await asyncio.gather(
-            *[
-                m.set_control_mode(ControlMode.POSITION_VELOCITY)
-                for m in motors.values()
-            ]
-        )
+        # Modes are decided here, at rest, and never changed again: a
+        # MyActuator mode switch is a system reset and the joint is limp for
+        # it (see assign_modes). Switching the swept joint to impedance after
+        # the arm was posed is what dropped a loaded wrist.
+        await assign_modes(motors, impedance=joint, kp=kp, kd=kd)
         try:
             print("  Homing all joints to rest (distal to proximal) ...")
-            await _home_all(motors)
+            await _home_all(motors, impedance=joint, kp=kp, kd=kd)
 
             # Shared sweep-safety geometry (see sweep_safety): base-collision
             # caps, camera clearance, and the gravity-load poses that tilt
@@ -369,9 +372,43 @@ async def _run(args: argparse.Namespace) -> None:
             for stage in ramp_stages(other_targets):
                 await _ramp_verified(motors, stage)
 
-            await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
-            await asyncio.sleep(1.0)
+            # Fit against the pose the arm is actually in, not the one it was
+            # told to reach. The holders sit on their own firmware position
+            # loop at whatever position_kp the motor shipped with, and a
+            # loaded one sags: an elbow posed to its midpoint carries several
+            # Nm there. Feeding the *commanded* pose to the model makes the
+            # fitted CoM absorb that sag, which is a silent wrong answer
+            # rather than a visible failure.
+            held = {}
+            for j, m in motors.items():
+                if j is joint:
+                    continue
+                try:
+                    held[j] = await m.get_position()
+                except Exception:
+                    held[j] = other_targets.get(j, 0.0)
+            drift = sorted(
+                ((abs(held[j] - other_targets.get(j, 0.0)), j) for j in held),
+                reverse=True,
+            )
+            if drift and drift[0][0] > _HOLDER_DRIFT_WARN:
+                print("  ! holders are not where they were put:")
+                for d, j in drift:
+                    if d <= _HOLDER_DRIFT_WARN:
+                        break
+                    print(
+                        f"      {j.value}: {math.degrees(held[j]):+.2f}° "
+                        f"(asked {math.degrees(other_targets.get(j, 0.0)):+.2f}°, "
+                        f"off by {math.degrees(d):.2f}°)"
+                    )
+                print(
+                    "    Fitting at the measured pose. A large sag means the "
+                    "holder's firmware position loop is too soft for the load "
+                    "— see axol tune.position-loop --mode hold."
+                )
 
+            # The swept joint has been under impedance since before homing,
+            # so there is no mode switch here and nothing to settle from.
             avg_samples, _halfdiff = await _identify_joint(
                 motors[joint],
                 joint,
@@ -396,7 +433,7 @@ async def _run(args: argparse.Namespace) -> None:
             q_bins, tau_meas = q_bins[order], tau_meas[order]
 
             try:
-                fit = fit_com(q_bins, tau_meas, joint, is_left, other_targets)
+                fit = fit_com(q_bins, tau_meas, joint, is_left, held)
             except RuntimeError as exc:
                 print(f"\n  ! Gravity fit rejected: {exc}")
                 return
@@ -408,7 +445,7 @@ async def _run(args: argparse.Namespace) -> None:
                 q_bins,
                 tau_meas,
                 fit,
-                other_targets,
+                held,
                 serial,
                 cal_side,
             )
@@ -417,16 +454,11 @@ async def _run(args: argparse.Namespace) -> None:
             print("\n  Interrupted.")
         finally:
             print("  Returning to rest and disabling ...")
-            in_impedance = motors[joint].motor.mode == ControlMode.IMPEDANCE
-            if in_impedance:
-                try:
-                    await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
-                except Exception:
-                    pass
             try:
-                await _home_all(motors, exclude=joint if in_impedance else None)
+                await _home_all(motors, impedance=joint, kp=kp, kd=kd)
             except Exception:
                 pass
+            # Only now, back at rest, is a mode switch free of consequence.
             await asyncio.gather(
                 *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
             )
@@ -441,7 +473,7 @@ def _report_and_save(
     q_bins: np.ndarray,
     tau_meas: np.ndarray,
     fit: tuple[tuple[float, float, float], float, np.ndarray, np.ndarray] | None,
-    clearance: dict[Joint, float],
+    clearance: dict[Joint, float],  # measured, not commanded — see _run
     hub_serial: str | None,
     cal_side: dict[str, dict],
 ) -> None:
@@ -518,6 +550,9 @@ def _report_and_save(
                 "com_cad": list(jc.com),
                 "com_fit": list(com_fit),
                 "saved": bool(args.save),
+                # The pose the fit was computed at, as measured after the
+                # ramps — a sagging holder makes this differ from what was
+                # commanded, and the fit is only meaningful alongside it.
                 "clearance_deg": {
                     j.value: round(math.degrees(v), 1) for j, v in clearance.items()
                 },

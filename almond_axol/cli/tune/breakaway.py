@@ -633,10 +633,19 @@ async def _run(args: argparse.Namespace) -> None:
         raw = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw.values()])
         motors = await joint_frame_motors(raw, is_left)
+        # One reset window, before anything moves. A MyActuator mode switch
+        # is a system reset and the joint holds nothing for the ~2 s it takes,
+        # so the probed joint takes its impedance mode here rather than after
+        # the arm has been parked — same reason tune.gravity/tune.friction
+        # assign modes up front (see friction.assign_modes).
         await asyncio.gather(
             *[
-                m.set_control_mode(ControlMode.POSITION_VELOCITY)
-                for m in motors.values()
+                m.set_control_mode(
+                    ControlMode.IMPEDANCE
+                    if j is joint
+                    else ControlMode.POSITION_VELOCITY
+                )
+                for j, m in motors.items()
             ]
         )
         try:
@@ -652,10 +661,9 @@ async def _run(args: argparse.Namespace) -> None:
             await ramp_others_to_zero(motors, joint, is_left)
             # The test joint starts from rest too, so a probe pose is always
             # reached by a ramp from a known place rather than from wherever
-            # the last run left it.
-            await ramp_joints_to(motors, {joint: 0.0})
-            await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
-            await asyncio.sleep(1.0)
+            # the last run left it. It is already in impedance, so it ramps
+            # under its own spring rather than a position command.
+            await _ramp_to(motors[joint], kp_cfg, args.kd, 0.0)
 
             lo, hi = arm_limits(joint, is_left)
             lo = lo_default if lo_default is not None else lo
