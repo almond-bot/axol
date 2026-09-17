@@ -194,3 +194,16 @@ class HolderDriftReportTest(unittest.TestCase):
         )
         self.assertEqual(len(drift), 2)
         self.assertTrue(re.search(r"key=lambda d: d\[0\]", block))
+
+
+class RejectedSweepIsSavedTest(unittest.TestCase):
+    def test_gravity_persists_the_sweep_when_the_fit_is_rejected(self) -> None:
+        """The report path never runs for a rejected fit, so without this
+        `--save-run` saved nothing for exactly the joint that needed
+        diagnosing (bench: the elbow, rejected at 93 mm then 68 mm)."""
+        src = inspect.getsource(gravity._run)
+        block = src[src.index("Gravity fit rejected") : src.index("_report_and_save(")]
+        self.assertIn("args.save_run", block)
+        self.assertIn("save_run(", block)
+        self.assertIn('"rejected": True', block)
+        self.assertLess(block.index("save_run("), block.index("return"))

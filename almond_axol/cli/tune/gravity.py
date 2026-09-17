@@ -526,6 +526,39 @@ async def _run(args: argparse.Namespace) -> None:
                 fit = fit_com(q_bins, tau_meas, joint, is_left, held)
             except RuntimeError as exc:
                 print(f"\n  ! Gravity fit rejected: {exc}")
+                # A rejected sweep is exactly the one worth keeping: the
+                # report path never runs for it, so persist the raw torque
+                # curve against the model here or --save-run saves nothing
+                # for the joint that most needs diagnosing.
+                if args.save_run:
+                    tau_model = _model_torques(
+                        AxolConfig(), joint, is_left, q_bins, held
+                    )
+                    res = tau_meas - tau_model
+                    run_id = save_run(
+                        "gravity",
+                        {"q": q_bins, "measured": tau_meas, "model_before": tau_model},
+                        {
+                            "rms_before": float(
+                                np.sqrt(np.mean((res - res.mean()) ** 2))
+                            ),
+                            "rejected": str(exc),
+                        },
+                        side=side_str,
+                        joint=joint.value,
+                        params={
+                            "velocity_deg_s": args.velocity,
+                            "com_cad": list(jc.com),
+                            "mass_cad": float(jc.mass),
+                            "saved": False,
+                            "rejected": True,
+                            "clearance_deg": {
+                                j.value: round(math.degrees(v), 1)
+                                for j, v in held.items()
+                            },
+                        },
+                    )
+                    print(f"  Saved rejected sweep as run {run_id}")
                 return
             _report_and_save(
                 args,
