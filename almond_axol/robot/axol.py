@@ -2120,12 +2120,61 @@ class AxolHardware(RobotBase):
             raise MotorError(
                 "robot shutdown is incomplete; retry disable before reconnecting"
             )
+        await self._purge_stale_can_queues()
         bus_tasks = []
         if self.left is not None:
             bus_tasks.append(self._left_bus.start())
         if self.right is not None:
             bus_tasks.append(self._right_bus.start())
         await _await_all_hardware_actions(*bus_tasks)
+
+    async def _purge_stale_can_queues(self) -> None:
+        """Drop frames a dead bus left queued, before anything can enable motors.
+
+        Losing motor power mid-command (the e-stop) fills the kernel TX queue:
+        nothing ACKs, so up to ``txqueuelen`` position commands pile up on the
+        interface instead of reaching the wire. They outlive the session that
+        sent them — the queue belongs to the interface, not to the socket or
+        the process — and the instant the motors are powered back up and
+        enabled the kernel flushes the lot. The arm snaps to whatever those
+        frames encode: the target it was *commanded* as power died, not the
+        pose it sagged to afterwards, which is why the jerk goes somewhere the
+        operator never left the robot.
+
+        The realtime core purges the queue as soon as it declares a stall
+        (``purge_tx_queue`` in ``rust/axol-rt/src/safety.rs``), so this is
+        normally a no-op costing one ``tc`` read per bus. It catches what that
+        cannot: a purge that could not escalate, a session killed before the
+        stall was declared, or the host losing the robot's whole supply.
+
+        Raises:
+            MotorError: If a poisoned queue could not be cleared. Enabling
+                into it is precisely the failure being prevented, so the
+                connection fails instead.
+        """
+        from ..cli.can.setup import purge_stale_tx
+
+        channels = [
+            bus.channel
+            for arm, bus in (
+                (self.left, getattr(self, "_left_bus", None)),
+                (self.right, getattr(self, "_right_bus", None)),
+            )
+            if arm is not None and bus is not None
+        ]
+        if not channels:
+            return
+        try:
+            purged = await asyncio.to_thread(purge_stale_tx, channels)
+        except RuntimeError as exc:
+            raise MotorError(str(exc)) from exc
+        if purged:
+            _logger.warning(
+                "purged stale CAN frames queued on %s before bring-up — motor "
+                "power was cut while commands were in flight (e-stop?); they "
+                "would have replayed on enable",
+                ", ".join(purged),
+            )
 
     async def enable(self, hold: bool = True) -> None:
         """Start CAN buses and bring every motor up, never dropping held joints.
