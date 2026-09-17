@@ -105,6 +105,11 @@ _TRACK_RIPPLE_LIMIT_DEG = 0.25
 #: Ripple growth against the previous gain that counts as the onset of
 #: oscillation regardless of the absolute level.
 _TRACK_RIPPLE_JUMP = 3.0
+#: The same test on q-axis current, which is the channel that actually sees a
+#: limit cycle. Tighter than the position jump because current carries the
+#: cycle at full amplitude instead of aliased down to nothing, and because a
+#: smooth gain increase moves it far less than a cycle does.
+_TRACK_BUZZ_JUMP = 2.0
 #: position_ki ladder for the tracking sweep, as fractions of the winning
 #: position_kp. A P-only position loop is type 1: it cannot follow a ramp
 #: without a standing error proportional to velocity, which is the whole
@@ -225,8 +230,11 @@ async def _track(
     secs: float,
     max_speed: float,
     rate_hz: float,
-) -> tuple[float, float, float, float]:
-    """Stream 0xA4 along a sine; return ``(rms, max, lag_ms, ripple)`` in deg.
+) -> tuple[float, float, float, float, float]:
+    """Stream 0xA4 along a sine.
+
+    Returns ``(rms, max, lag_ms, ripple)`` in degrees plus ``buzz``, the
+    detrended q-axis current in amps.
 
     This is the test that matters for ``wire_mode``: a *held* position says
     nothing about whether the firmware loop can follow a target that keeps
@@ -270,7 +278,7 @@ async def _track(
             f"{_APPROACH_MAX_S:.0f}s — no result for this pass. The joint is "
             f"not following 0xA4 here; check the gain, the load and the pose."
         )
-        return float("nan"), float("nan"), float("nan"), float("nan")
+        return (float("nan"),) * 5
     await asyncio.sleep(0.3)
 
     dt = 1.0 / rate_hz
@@ -278,12 +286,23 @@ async def _track(
     tt: list[float] = []
     tgt: list[float] = []
     act: list[float] = []
+    amps: list[float] = []
     while True:
         now = time.monotonic() - t0
         if now >= secs:
             break
         target = center - amp * math.cos(2.0 * math.pi * freq * now)
-        await motor.set_position_velocity(target, max_speed)
+        # The q-axis current rides the command's own reply, so it costs no
+        # extra round trip -- and it is the only channel here that can see a
+        # limit cycle. A cycle the motor runs at tens of Hz is a fraction of
+        # an encoder count in position and this loop samples position at
+        # ~50 Hz, so it aliases away: an elbow measured 0.0615° of position
+        # ripple while visibly oscillating. The same cycle swings amps.
+        try:
+            amps.append((await motor.set_position_velocity_reply(target, max_speed))[2])
+        except AttributeError:
+            await motor.set_position_velocity(target, max_speed)
+            amps.append(float("nan"))
         # An explicit 0x92 read, not the cached `position`: that cache is fed
         # by MIT impedance replies, and 0xA4 answers on the 0x240 frame
         # instead, so it is never populated here. The 0xA4 reply does carry a
@@ -304,9 +323,10 @@ async def _track(
     # steady-state figure should not carry it.
     a = np.array(act)
     g = np.array(tgt)
+    i_a = np.array(amps)
     tt_a = np.array(tt)
     warm = tt_a >= min(1.0 / max(freq, 1e-6), 0.5 * secs)
-    a, g, tt_a = a[warm], g[warm], tt_a[warm]
+    a, g, i_a, tt_a = a[warm], g[warm], i_a[warm], tt_a[warm]
     tt = list(tt_a)
     good = np.isfinite(a)
     achieved = len(tt) / max(tt[-1] - tt[0], 1e-9) if len(tt) > 1 else 0.0
@@ -317,7 +337,7 @@ async def _track(
         )
     if good.sum() < 20:
         print(f"    ({good.sum()} of {len(a)} position reads succeeded)")
-        return float("nan"), float("nan"), float("nan")
+        return (float("nan"),) * 5
     err = np.degrees(g[good] - a[good])
     v = np.gradient(g[good], tt_a[good])
     m = np.abs(v) > 1e-3
@@ -335,9 +355,19 @@ async def _track(
     # retained in full. A window sized as a fraction of the record instead
     # distorts the sine and reports its own smoothing error as ripple.
     k = max(3, int(0.15 * rate_hz) | 1)
-    smooth = np.convolve(err, np.ones(k) / k, mode="same")
-    ripple = float((err - smooth)[k:-k].std()) if len(err) > 3 * k else float("nan")
-    return float(err.std()), float(np.abs(err).max()), float(lag), ripple
+
+    def detrended_std(x: np.ndarray) -> float:
+        if len(x) <= 3 * k or not np.isfinite(x).all():
+            return float("nan")
+        return float((x - np.convolve(x, np.ones(k) / k, mode="same"))[k:-k].std())
+
+    ripple = detrended_std(err)
+    # Same detrending on the q-axis current. Units are amps, and the absolute
+    # level means nothing without a per-motor torque constant this driver does
+    # not measure -- but the *growth* against the previous gain does not need
+    # one, and it is the growth that marks the onset of a limit cycle.
+    buzz = detrended_std(i_a[good])
+    return float(err.std()), float(np.abs(err).max()), float(lag), ripple, buzz
 
 
 async def _measure(
@@ -576,7 +606,7 @@ async def _run(args: argparse.Namespace) -> None:
                 print(
                     f"  {'position_kp':>12} {'position_ki':>12} {'rms err':>10} "
                     f"{'+/-':>9} {'max err':>10} {'lag':>9} {'ripple':>9} "
-                    f"{'holder':>9}"
+                    f"{'buzz':>8} {'holder':>9}"
                 )
 
                 async def point(kp: float, ki: float):
@@ -618,12 +648,13 @@ async def _run(args: argparse.Namespace) -> None:
                         float(np.mean([t[1] for t in ok])),
                         float(np.mean([t[2] for t in ok])),
                         float(np.mean([t[3] for t in ok])),
+                        float(np.mean([t[4] for t in ok])),
                         wobble,
                         worst,
                     )
 
                 def row(kp: float, ki: float, m, noisy: bool) -> None:
-                    rms, spread, mx, lag, ripple, wobble, worst = m
+                    rms, spread, mx, lag, ripple, buzz, wobble, worst = m
                     tag = "  <- oscillating" if noisy else ""
                     # Name the holder only when it moved enough to matter: a
                     # joint's own loop cannot be blamed for a base that is
@@ -632,25 +663,46 @@ async def _run(args: argparse.Namespace) -> None:
                         tag += f"  ({worst.value} base moved {wobble:.2f}°)"
                     print(
                         f"  {kp:12.4f} {ki:12.4f} {rms:9.4f}° {spread:8.4f}° "
-                        f"{mx:9.4f}° {lag:8.1f}ms {ripple:8.4f}° {wobble:8.2f}°" + tag
+                        f"{mx:9.4f}° {lag:8.1f}ms {ripple:8.4f}° {buzz:7.3f}A "
+                        f"{wobble:8.2f}°" + tag
                     )
 
-                def oscillating(ripple: float, prev: float | None) -> bool:
-                    # A difference smaller than the spread across repeats is
-                    # not a difference; a 3x jump against the previous step is
-                    # one, and needs no calibrated absolute level.
-                    return ripple > args.ripple_limit or (
-                        prev is not None
-                        and ripple > _TRACK_RIPPLE_JUMP * max(prev, 1e-4)
-                    )
+                def oscillating(m, prev: tuple[float, float] | None) -> bool:
+                    """Has this gain started a limit cycle?
+
+                    Current first, position second. On the right elbow at
+                    kp=0.36, adding position_ki=0.00036 took position ripple
+                    *down* (0.0664 -> 0.0615°) while the joint visibly
+                    oscillated: the cycle is faster than this loop's ~50 Hz
+                    position sampling and aliases away. The q-axis current
+                    sees it, because a cycle that is a fraction of an encoder
+                    count still swings amps.
+
+                    Both jump tests are relative -- neither channel has a
+                    calibrated absolute level. A permissive absolute ceiling
+                    stays on position so a runaway still stops the sweep.
+                    """
+                    ripple, buzz = m[4], m[5]
+                    if ripple > args.ripple_limit:
+                        return True
+                    if prev is None:
+                        return False
+                    p_ripple, p_buzz = prev
+                    if (
+                        np.isfinite(buzz)
+                        and np.isfinite(p_buzz)
+                        and buzz > _TRACK_BUZZ_JUMP * max(p_buzz, 1e-3)
+                    ):
+                        return True
+                    return ripple > _TRACK_RIPPLE_JUMP * max(p_ripple, 1e-4)
 
                 kps = args.kp or [original.position_kp * m for m in _KP_STEPS]
-                prev_ripple: float | None = None
+                prev_ripple: tuple[float, float] | None = None
                 for kp in kps:
                     m = await point(kp, 0.0)
                     if m is None:
                         continue
-                    noisy = oscillating(m[4], prev_ripple)
+                    noisy = oscillating(m, prev_ripple)
                     row(kp, 0.0, m, noisy)
                     if noisy:
                         print(
@@ -658,7 +710,7 @@ async def _run(args: argparse.Namespace) -> None:
                             "accuracy with vibration."
                         )
                         break
-                    prev_ripple = m[4]
+                    prev_ripple = (m[4], m[5])
                     if best is None or m[0] < best[2]:
                         best = (kp, 0.0, m[0], m[2])
 
@@ -681,7 +733,7 @@ async def _run(args: argparse.Namespace) -> None:
                         m = await point(best[0], ki)
                         if m is None:
                             continue
-                        noisy = oscillating(m[4], prev_ripple)
+                        noisy = oscillating(m, prev_ripple)
                         row(best[0], ki, m, noisy)
                         if noisy:
                             print(
@@ -689,7 +741,7 @@ async def _run(args: argparse.Namespace) -> None:
                                 "against friction faster than it is helping."
                             )
                             break
-                        prev_ripple = m[4]
+                        prev_ripple = (m[4], m[5])
                         if m[0] < best[2]:
                             best = (best[0], ki, m[0], m[2])
 

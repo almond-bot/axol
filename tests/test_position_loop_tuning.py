@@ -202,7 +202,7 @@ class AccelerationTest(unittest.TestCase):
         # And it must not measure anyway: an unreached start yields no row.
         self.assertIn("no result for this pass", src)
         tail = src[src.index("_APPROACH_MAX_S:.0f}s") :]
-        self.assertIn('return float("nan")', tail[: tail.index("dt = 1.0 / rate_hz")])
+        self.assertIn('(float("nan"),) * 5', tail[: tail.index("dt = 1.0 / rate_hz")])
 
     def test_drive_starts_at_rest_so_the_approach_leaves_no_step(self) -> None:
         """The approach parks the joint at a standstill. A sine about the
@@ -282,6 +282,42 @@ class AccelerationTest(unittest.TestCase):
         # Reset before the passes and read after, once per gain.
         self.assertEqual(head.count("reset_wobble()"), 2)
         self.assertLess(head.index("holders.reset_wobble()"), head.index("trials = ["))
+
+    def test_limit_cycles_are_detected_on_current_not_position(self) -> None:
+        """Position ripple cannot see a limit cycle; current can.
+
+        Measured on the right elbow at position_kp 0.36: adding
+        position_ki=0.00036 took position ripple *down*, 0.0664 -> 0.0615 deg,
+        while the joint visibly oscillated. This loop samples position at
+        ~50 Hz (two CAN round trips per sample), so a cycle above ~25 Hz
+        aliases away. The q-axis current arrives on the command's own reply
+        at no extra cost and carries the cycle at full amplitude.
+        """
+        import inspect
+
+        import numpy as np
+
+        self.assertIn("set_position_velocity_reply", inspect.getsource(pl._track))
+        run = inspect.getsource(pl._run)
+        head = run[run.index("streaming a") : run.index("{'sag':>9}")]
+        self.assertIn("buzz", head)
+        self.assertIn("_TRACK_BUZZ_JUMP", head)
+        # Tighter than the position test, since current is not aliased down.
+        self.assertLess(pl._TRACK_BUZZ_JUMP, pl._TRACK_RIPPLE_JUMP)
+
+        # The detector must fire on a cycle that position ripple misses.
+        k = max(3, int(0.15 * 100.0) | 1)
+
+        def detrended(x):
+            return float((x - np.convolve(x, np.ones(k) / k, "same"))[k:-k].std())
+
+        t = np.linspace(0, 10, 1000)
+        quiet_i = 0.02 * np.random.default_rng(0).standard_normal(len(t))
+        # A 40 Hz cycle: aliased in position at this rate, plain in current.
+        cycling_i = quiet_i + 0.9 * np.sin(2 * np.pi * 40 * t)
+        self.assertGreater(
+            detrended(cycling_i), pl._TRACK_BUZZ_JUMP * detrended(quiet_i)
+        )
 
     def test_approach_tolerance_is_tight_against_the_error_being_measured(self) -> None:
         # Tracking errors of interest are ~0.1 deg, so starting half a degree

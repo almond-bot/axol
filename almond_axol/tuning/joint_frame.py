@@ -82,6 +82,18 @@ class JointFrameMotor:
         """Position-velocity command with ``position`` in the joint frame."""
         await self.motor.set_position_velocity(position - self.offset, max_speed)
 
+    async def set_position_velocity_reply(
+        self, position: float, max_speed: float
+    ) -> tuple[float, float, float, float]:
+        """As :meth:`set_position_velocity`, returning the decoded reply.
+
+        MyActuator only — the reply layout is the 0x240 control frame.
+        """
+        pos, vel, cur, temp = await self.motor.set_position_velocity_reply(
+            position - self.offset, max_speed
+        )
+        return pos + self.offset, vel, cur, temp
+
     async def set_control_mode(self, mode: ControlMode) -> None:
         await self.motor.set_control_mode(mode)
 

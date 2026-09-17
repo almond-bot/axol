@@ -703,6 +703,22 @@ class MyActuatorMotor(MotorDriver):
         """
         await self._request(position_velocity_frame(position, max_speed))
 
+    async def set_position_velocity_reply(
+        self, position: float, max_speed: float
+    ) -> tuple[float, float, float, float]:
+        """0xA4, returning its decoded reply ``(pos, vel, current_A, temp_C)``.
+
+        The reply rides the command's own round trip, so the q-axis current
+        is free. It is the only channel in this loop that can see a limit
+        cycle: a cycle the motor runs at tens of Hz is a fraction of an
+        encoder count in position, and the position sampler here manages
+        ~50 Hz, but the same cycle swings amps. Position ripple of 0.0615 deg
+        was measured on an elbow that was visibly oscillating.
+        """
+        return decode_control_reply(
+            await self._request(position_velocity_frame(position, max_speed))
+        )
+
     async def set_velocity(self, velocity: float) -> None:
         # bytes 4-7: int32 in centidps (dps × 100); rad/s → dps → centidps
         centidps = int(velocity * (18000.0 / math.pi))
