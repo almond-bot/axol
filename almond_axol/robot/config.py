@@ -820,6 +820,31 @@ class ControlExperiments:
             current reading before trusting the absolute level, and note that
             even at the default the step is ~0.6 Nm on an X6 (~1.3 on an X8)
             against the MIT frame's ~0.03 Nm.
+        tracker_pos_gain: Realtime core only. Position-tracking gain (1/s) of
+            the in-core target tracker
+            (``Trapezoid`` in ``rust/axol-rt/src/filter.rs``; the Python twin
+            is :class:`~almond_axol.teleop.filter.TrapezoidalFilter`). It is a
+            first-order pole, so the shipped 15.7 is a **64 ms lag** — and
+            that lag is the single largest tracking error on this robot.
+
+            It reaches the end effector as path deviation proportional to
+            commanded speed, which is what makes a curved path cut its corner:
+            measured on hardware as ``deviation = 1.4 mm + 58 ms x speed``
+            (correlation 0.98 between commanded TCP speed and deviation), i.e.
+            3 mm while creeping and 36 mm at 0.6 m/s. The ``TrapezoidalFilter``
+            docstring predicts the same thing in joint space — "~v/kp tracking
+            lag (~1 deg at the ~0.3 rad/s joint speeds of normal teleop)".
+
+            Raising it buys that accuracy back proportionally (double the gain,
+            halve the lag) and spends it on the reason the tracker is slow:
+            its velocity feedforward peaks at the arm's structural resonance,
+            which is what the earlier bang-bang and sqrt-braking designs were
+            replaced for. Watch the 2-3 Hz band as you raise it; ringing
+            there is the ceiling.
+        tracker_vel_gain: Realtime core only. Velocity-tracking gain (1/s) of
+            the same loop, ``2*wn`` against the position gain's ``wn/2``.
+            Keep the 4:1 ratio when changing ``tracker_pos_gain`` or the loop
+            stops being critically damped.
         wire_torque_nm_per_amp: Nm per amp of reported q-axis current, used
             to put the ``a9`` / ``tf`` reply's torque channel back into Nm.
             ``0`` (the default) reports the raw current, which leaves every
@@ -850,6 +875,8 @@ class ControlExperiments:
     wire_speed_scale: float = 1.0
     wire_ff_nm_per_pct: float = 0.0
     wire_torque_nm_per_amp: float = 0.0
+    tracker_pos_gain: float = 15.7
+    tracker_vel_gain: float = 62.8
 
     def validate(self) -> None:
         """Raise ``ValueError`` on a combination the core would reject.
@@ -874,6 +901,8 @@ class ControlExperiments:
             raise ValueError("experiments.wire_torque_pct must be in [0, 255]")
         if self.wire_speed_scale <= 0.0:
             raise ValueError("experiments.wire_speed_scale must be positive")
+        if self.tracker_pos_gain <= 0.0 or self.tracker_vel_gain <= 0.0:
+            raise ValueError("experiments.tracker_*_gain must be positive")
 
     def is_default(self) -> bool:
         """``True`` when every experiment is off (the production control law)."""

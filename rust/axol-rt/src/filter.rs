@@ -314,22 +314,57 @@ impl LowPass {
 pub struct Trapezoid {
     pub max_vel: f64,
     pub max_accel: f64,
+    /// Position- and velocity-tracking gains (1/s). Defaults are
+    /// [`Trapezoid::POS_TRACK_GAIN`] / [`Trapezoid::VEL_TRACK_GAIN`]; the
+    /// `tracker_pos_gain` / `tracker_vel_gain` experiments override them.
+    ///
+    /// The position gain *is* the tracker's lag: a first-order pole at
+    /// `pos_gain` rad/s, so 15.7 is a 64 ms time constant. That lag shows up
+    /// at the end effector as path deviation proportional to commanded speed
+    /// — measured at 58 ms on hardware, which is what makes a curved path
+    /// cut its corner. Raising it trades that accuracy against the reason it
+    /// is slow: velocity feedforward peaking at the arm's structural
+    /// resonance (see the type docs).
+    pos_gain: f64,
+    vel_gain: f64,
     pos: f64,
     vel: f64,
     seeded: bool,
 }
 
 impl Trapezoid {
-    const POS_TRACK_GAIN: f64 = 15.7; // 1/s = ωn/2 with ωn = 2π·5 Hz
-    const VEL_TRACK_GAIN: f64 = 62.8; // 1/s = 2·ωn
+    pub const POS_TRACK_GAIN: f64 = 15.7; // 1/s = ωn/2 with ωn = 2π·5 Hz
+    pub const VEL_TRACK_GAIN: f64 = 62.8; // 1/s = 2·ωn
     const BRAKE_MARGIN: f64 = 0.8;
 
     /// Unseeded, matching the Python original: the first `update` adopts
     /// the target as the output (no transient).
     pub fn new(max_vel: f64, max_accel: f64) -> Self {
+        Self::with_gains(
+            max_vel,
+            max_accel,
+            Self::POS_TRACK_GAIN,
+            Self::VEL_TRACK_GAIN,
+        )
+    }
+
+    /// As [`Trapezoid::new`], with the tracking gains overridden. A
+    /// non-positive gain falls back to its default, so a zeroed experiment
+    /// value cannot stall the tracker.
+    pub fn with_gains(max_vel: f64, max_accel: f64, pos_gain: f64, vel_gain: f64) -> Self {
         Self {
             max_vel,
             max_accel,
+            pos_gain: if pos_gain > 0.0 {
+                pos_gain
+            } else {
+                Self::POS_TRACK_GAIN
+            },
+            vel_gain: if vel_gain > 0.0 {
+                vel_gain
+            } else {
+                Self::VEL_TRACK_GAIN
+            },
             pos: 0.0,
             vel: 0.0,
             seeded: false,
@@ -365,11 +400,10 @@ impl Trapezoid {
         let v_stop = -bdt + (bdt * bdt + 2.0 * a_brake * dist).sqrt();
 
         let ceiling = self.max_vel.min(v_stop);
-        let desired = (Self::POS_TRACK_GAIN * err).clamp(-ceiling, ceiling);
+        let desired = (self.pos_gain * err).clamp(-ceiling, ceiling);
 
         let vel_prev = self.vel;
-        let mut vel =
-            vel_prev + (Self::VEL_TRACK_GAIN * (desired - vel_prev) * dt).clamp(-adt, adt);
+        let mut vel = vel_prev + (self.vel_gain * (desired - vel_prev) * dt).clamp(-adt, adt);
 
         // Acceleration-gated arrival (see the Python docstring: an
         // unconditional snap degenerates into a pass-through).
@@ -657,6 +691,60 @@ mod tests {
         assert_eq!(d.update(0.0, 0.0, 40.0, DT, true, 0.0), 0.0);
         assert_eq!(d.update(0.0, 0.25, 0.0, DT, true, 0.0), 0.0);
         assert_eq!(d.update(0.0, 0.25, 40.0, DT, true, 0.0), 0.25);
+    }
+
+    /// Steady-state lag against a constant-velocity target, as a function of
+    /// the position-tracking gain. This is the number that reaches the end
+    /// effector as speed-proportional path deviation, and the reason
+    /// `tracker_pos_gain` is an experiment at all.
+    ///
+    /// At the shipped gain it is ~55 ms here, against 58 ms measured on
+    /// hardware from TCP path deviation vs commanded speed (correlation
+    /// 0.98) and 59 ms from the joint traces — three independent reads of
+    /// the same constant. Doubling the gain more than halves it: the loop is
+    /// second order, so the lag falls faster than `1/gain`.
+    fn steady_lag_ms(gain: f64) -> f64 {
+        let v = 0.30; // rad/s, ~normal teleop joint speed
+        let mut trk = Trapezoid::with_gains(10.0, 200.0, gain, 4.0 * gain);
+        let mut target = 0.0;
+        // Long enough to leave the acceleration transient behind.
+        for _ in 0..4000 {
+            target += v * DT;
+            trk.update(target, DT);
+        }
+        1e3 * (target - trk.update(target + v * DT, DT).0) / v
+    }
+
+    #[test]
+    fn tracker_lag_falls_with_the_position_gain() {
+        let shipped = steady_lag_ms(Trapezoid::POS_TRACK_GAIN);
+        assert!(
+            (50.0..60.0).contains(&shipped),
+            "shipped tracker lag {shipped:.1} ms - hardware measures 58"
+        );
+        let doubled = steady_lag_ms(2.0 * Trapezoid::POS_TRACK_GAIN);
+        assert!(
+            doubled < shipped / 2.0,
+            "doubling the gain should more than halve the lag: {shipped:.1} -> {doubled:.1} ms"
+        );
+        let mut prev = f64::INFINITY;
+        for mult in [0.5, 1.0, 2.0, 4.0] {
+            let lag = steady_lag_ms(Trapezoid::POS_TRACK_GAIN * mult);
+            assert!(lag < prev, "lag must fall monotonically with gain");
+            prev = lag;
+        }
+    }
+
+    /// A zeroed or negative gain must not stall the tracker — it falls back
+    /// to the shipped value rather than freezing the arm.
+    #[test]
+    fn tracker_rejects_non_positive_gains() {
+        let mut bad = Trapezoid::with_gains(10.0, 200.0, 0.0, -5.0);
+        let mut good = Trapezoid::new(10.0, 200.0);
+        for k in 1..200 {
+            let target = 0.001 * k as f64;
+            assert_eq!(bad.update(target, DT).0, good.update(target, DT).0);
+        }
     }
 
     #[test]

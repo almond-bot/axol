@@ -247,7 +247,7 @@ const HOLDOVER_MAX: f64 = 0.080;
 /// - 3: the config carries `exp <name> <value>` lines (the opt-in tracking
 ///   experiments, `Experiments`), and the trace gained `stiction_ff` /
 ///   `integral_ff` columns.
-const CONFIG_PROTO: u32 = 4;
+const CONFIG_PROTO: u32 = 5;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -953,6 +953,12 @@ struct Experiments {
     /// Nm per amp of reported q-axis current, for putting the `a9` / `tf`
     /// reply's torque channel back into Nm; 0 reports the raw current.
     wire_torque_nm_per_amp: f64,
+    /// In-core target tracker gains (1/s) — `filter::Trapezoid`. The position
+    /// gain is a first-order pole, so the shipped 15.7 is a 64 ms lag that
+    /// reaches the end effector as path deviation proportional to commanded
+    /// speed.
+    tracker_pos_gain: f64,
+    tracker_vel_gain: f64,
 }
 
 impl Default for Experiments {
@@ -980,6 +986,8 @@ impl Default for Experiments {
             wire_speed_scale: 1.0,
             wire_ff_nm_per_pct: 0.0,
             wire_torque_nm_per_amp: 0.0,
+            tracker_pos_gain: Trapezoid::POS_TRACK_GAIN,
+            tracker_vel_gain: Trapezoid::VEL_TRACK_GAIN,
         }
     }
 }
@@ -1011,6 +1019,8 @@ impl Experiments {
             "wire_speed_scale" => self.wire_speed_scale = value,
             "wire_ff_nm_per_pct" => self.wire_ff_nm_per_pct = value,
             "wire_torque_nm_per_amp" => self.wire_torque_nm_per_amp = value,
+            "tracker_pos_gain" => self.tracker_pos_gain = value,
+            "tracker_vel_gain" => self.tracker_vel_gain = value,
             _ => return Err(()),
         }
         Ok(())
@@ -1581,7 +1591,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 4\n\
+            "proto 5\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
@@ -1603,7 +1613,7 @@ mod tests {
         );
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 4\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 5\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
     }
 
     /// A bus carrying only some of the arm joints (a bench wrist assembly)
@@ -1612,7 +1622,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 4\n\
+            "proto 5\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
              gripper 0 can0 8\n",
@@ -1625,10 +1635,10 @@ mod tests {
         );
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
-        assert!(parse_config("proto 4\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
-        assert!(parse_config("proto 4\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 5\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 5\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
         assert!(parse_config(
-            "proto 4\n\
+            "proto 5\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n"
         )
@@ -1651,14 +1661,14 @@ mod tests {
         assert!(err.contains("no `proto` line"), "{err}");
         assert!(err.contains("axol rt.install"), "{err}");
         // A future client generation this core does not understand.
-        let err = error_of(&format!("proto 5\n{joint}"));
+        let err = error_of(&format!("proto 6\n{joint}"));
+        assert!(err.contains("proto 6"), "{err}");
         assert!(err.contains("proto 5"), "{err}");
-        assert!(err.contains("proto 4"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 4\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 5\n")).is_ok());
     }
 
     /// `exp` lines set the tracking experiments; a config without any runs
@@ -1667,12 +1677,12 @@ mod tests {
     #[test]
     fn parse_config_reads_experiments() {
         let joint = "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n";
-        let cfg = parse_config(&format!("proto 4\n{joint}")).unwrap();
+        let cfg = parse_config(&format!("proto 5\n{joint}")).unwrap();
         assert!(cfg.exp.is_default());
         assert_eq!(cfg.exp.friction_k_max, filter::FRICTION_FF_K_MAX);
 
         let cfg = parse_config(&format!(
-            "proto 4\n{joint}\
+            "proto 5\n{joint}\
              exp friction_k_max 400\n\
              exp friction_slew 30\n\
              exp stiction_gain 0.6\n\
@@ -1683,7 +1693,8 @@ mod tests {
              exp tracker_accel_ff 0\n\
              exp dither_nm 0.2\n\
              exp dither_hz 55\n\
-             exp dither_square 1\n"
+             exp dither_square 1\n\
+             exp tracker_pos_gain 31.4\n"
         ))
         .unwrap();
         assert!(!cfg.exp.is_default());
@@ -1700,15 +1711,18 @@ mod tests {
         assert!(cfg.exp.dither_square);
         // Nothing asked for a wire mode, so the MIT frame stands.
         assert_eq!(cfg.exp.wire_mode, WireMode::Mit);
+        assert_eq!(cfg.exp.tracker_pos_gain, 31.4);
+        // Untouched, so it keeps the shipped value.
+        assert_eq!(cfg.exp.tracker_vel_gain, Trapezoid::VEL_TRACK_GAIN);
 
-        let err = match parse_config(&format!("proto 4\n{joint}exp bogus 1\n")) {
+        let err = match parse_config(&format!("proto 5\n{joint}exp bogus 1\n")) {
             Ok(_) => panic!("accepted an unknown experiment"),
             Err(err) => err.to_string(),
         };
         assert!(err.contains("unknown experiment `bogus 1`"), "{err}");
         assert!(err.contains("axol rt.install"), "{err}");
-        assert!(parse_config(&format!("proto 4\n{joint}exp friction_slew\n")).is_err());
-        assert!(parse_config(&format!("proto 4\n{joint}exp friction_slew nan\n")).is_err());
+        assert!(parse_config(&format!("proto 5\n{joint}exp friction_slew\n")).is_err());
+        assert!(parse_config(&format!("proto 5\n{joint}exp friction_slew nan\n")).is_err());
     }
 
     /// `wire_mode` is the one experiment whose value is a name rather than a
@@ -1724,18 +1738,18 @@ mod tests {
             ("a9", WireMode::A9),
             ("tf", WireMode::Tf),
         ] {
-            let cfg = parse_config(&format!("proto 4\n{joint}exp wire_mode {word}\n")).unwrap();
+            let cfg = parse_config(&format!("proto 5\n{joint}exp wire_mode {word}\n")).unwrap();
             assert_eq!(cfg.exp.wire_mode, want);
             assert_eq!(cfg.exp.is_default(), want == WireMode::Mit);
         }
-        let err = match parse_config(&format!("proto 4\n{joint}exp wire_mode a10\n")) {
+        let err = match parse_config(&format!("proto 5\n{joint}exp wire_mode a10\n")) {
             Ok(_) => panic!("accepted an unknown wire mode"),
             Err(err) => err.to_string(),
         };
         assert!(err.contains("unknown experiment `wire_mode a10`"), "{err}");
         // A name where a number belongs, and a number where a name belongs.
-        assert!(parse_config(&format!("proto 4\n{joint}exp dither_hz fast\n")).is_err());
-        assert!(parse_config(&format!("proto 4\n{joint}exp wire_mode 9\n")).is_err());
+        assert!(parse_config(&format!("proto 5\n{joint}exp dither_hz fast\n")).is_err());
+        assert!(parse_config(&format!("proto 5\n{joint}exp wire_mode 9\n")).is_err());
     }
 }
 
@@ -2282,7 +2296,12 @@ fn bus_loop(
     // transient-free.
     let mut trk: Vec<Trapezoid> = (0..N_SLOTS).map(|_| Trapezoid::new(0.0, 0.0)).collect();
     for m in &motors {
-        trk[m.slot] = Trapezoid::new(m.max_vel, m.max_accel);
+        trk[m.slot] = Trapezoid::with_gains(
+            m.max_vel,
+            m.max_accel,
+            cfg.exp.tracker_pos_gain,
+            cfg.exp.tracker_vel_gain,
+        );
         trk[m.slot].seed(m.hold_pos);
     }
     // Late-target holdover, per slot: when Python's tick is late the

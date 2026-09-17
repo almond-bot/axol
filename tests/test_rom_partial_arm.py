@@ -299,7 +299,7 @@ class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
         # every target, so the config declares the generation and such a
         # core refuses it. Generation 3 added the ``exp`` experiment lines,
         # generation 4 the dither and wire-mode ones.
-        self.assertEqual(lines[0], "proto 4")
+        self.assertEqual(lines[0], "proto 5")
         # Every experiment field is declared (all at their production
         # defaults here), so a core from another checkout fails loudly.
         exp_lines = [line for line in lines if line.startswith("exp ")]

@@ -99,21 +99,21 @@ class RtLinkConfigureTest(unittest.IsolatedAsyncioTestCase):
 
     def test_config_header_declares_the_protocol(self) -> None:
         self.assertEqual(link.config_header(), [f"proto {link.CONFIG_PROTO}"])
-        self.assertEqual(link.CONFIG_PROTO, 4)
+        self.assertEqual(link.CONFIG_PROTO, 5)
 
     async def test_configure_names_a_stale_binary_when_the_core_exits(self) -> None:
         rt = self._link(_ExitedProc())
         started = asyncio.get_running_loop().time()
         with self.assertRaises(link.RtLinkError) as ctx:
-            await rt.configure("proto 4\nloop_hz 240\n")
+            await rt.configure("proto 5\nloop_hz 240\n")
         message = str(ctx.exception)
         self.assertIn("/opt/axol-rt", message)
-        self.assertIn("proto 4", message)
+        self.assertIn("proto 5", message)
         self.assertIn("axol rt.install", message)
         # The exit is noticed in well under the 5 s ack timeout.
         self.assertLess(asyncio.get_running_loop().time() - started, 2.0)
         sent = rt._writer.write.call_args.args[0]
-        self.assertTrue(sent.endswith(b"Cproto 4\nloop_hz 240\n"))
+        self.assertTrue(sent.endswith(b"Cproto 5\nloop_hz 240\n"))
 
     async def test_configure_keeps_a_generic_error_while_the_core_runs(self) -> None:
         # A core that is alive but silent is a different failure (not skew):
@@ -123,7 +123,7 @@ class RtLinkConfigureTest(unittest.IsolatedAsyncioTestCase):
             rt, "_await_state", side_effect=link.RtLinkError("timed out")
         ):
             with self.assertRaises(link.RtLinkError) as ctx:
-                await rt.configure("proto 4\n")
+                await rt.configure("proto 5\n")
         self.assertEqual(str(ctx.exception), "timed out")
 
     async def test_await_state_still_takes_an_ack_sent_just_before_exit(self) -> None:

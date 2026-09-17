@@ -42,10 +42,14 @@ class ExperimentsConfigTest(unittest.TestCase):
         self.assertFalse(exp.tracker_accel_ff)
         self.assertEqual(exp.dither_nm, 0.0)
         self.assertEqual(exp.wire_mode, "mit")
+        # The tracker gains ship at the values filter.rs uses.
+        self.assertEqual(exp.tracker_pos_gain, 15.7)
+        self.assertEqual(exp.tracker_vel_gain, 62.8)
         self.assertTrue(AxolConfig().experiments.is_default())
         self.assertFalse(ControlExperiments(integrator_hz=0.3).is_default())
         self.assertFalse(ControlExperiments(dither_nm=0.2).is_default())
         self.assertFalse(ControlExperiments(wire_mode="a9").is_default())
+        self.assertFalse(ControlExperiments(tracker_pos_gain=31.4).is_default())
 
     def test_config_lines_declare_every_field(self) -> None:
         exp = ControlExperiments(friction_slew=30.0, tracker_wire_vel=True)
@@ -84,6 +88,12 @@ class ExperimentsConfigTest(unittest.TestCase):
             ControlExperiments(wire_torque_pct=300.0).validate()
         with self.assertRaisesRegex(ValueError, "wire_speed_scale"):
             ControlExperiments(wire_speed_scale=0.0).validate()
+        # A zero tracker gain would stall the in-core trajectory generator.
+        with self.assertRaisesRegex(ValueError, "tracker_.*gain"):
+            ControlExperiments(tracker_pos_gain=0.0).validate()
+        with self.assertRaisesRegex(ValueError, "tracker_.*gain"):
+            ControlExperiments(tracker_vel_gain=-1.0).validate()
+        ControlExperiments(tracker_pos_gain=31.4, tracker_vel_gain=125.6).validate()
         for mode in WIRE_MODES:
             ControlExperiments(wire_mode=mode).validate()
         AxolConfig().resolved()
