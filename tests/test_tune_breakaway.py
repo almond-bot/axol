@@ -99,6 +99,37 @@ class HomingTest(unittest.TestCase):
         self.assertEqual(set(seen), set(partial))
 
 
+class ControlModeTest(unittest.TestCase):
+    """Modes must be restored on the way out.
+
+    Homing puts every joint in POSITION_VELOCITY. The realtime core checks
+    each Damiao's control mode at bring-up and refuses to arm on anything
+    but MIT, so a run that exits without restoring it leaves the robot
+    unable to teleop: "wrist_2 (0x06): control mode 2 (expected 1)".
+    """
+
+    def test_teardown_restores_impedance_before_disabling(self) -> None:
+        import inspect
+
+        from almond_axol.cli.tune import breakaway
+
+        src = inspect.getsource(breakaway._run)
+        finally_block = src[src.index("finally:") :]
+        self.assertIn("ControlMode.IMPEDANCE", finally_block)
+        # ...and does it before the disable, not after.
+        self.assertLess(
+            finally_block.index("ControlMode.IMPEDANCE"),
+            finally_block.index("m.disable()"),
+        )
+
+    def test_the_gripper_is_never_mode_switched(self) -> None:
+        # `motors` is built from ARM_JOINTS, which excludes the gripper — it
+        # has to keep POSITION_FORCE or its own bring-up check fails.
+        from almond_axol.constants import ARM_JOINTS
+
+        self.assertNotIn(Joint.GRIPPER, ARM_JOINTS)
+
+
 class ReleaseDetectionTest(unittest.TestCase):
     @staticmethod
     def _rows(positions):

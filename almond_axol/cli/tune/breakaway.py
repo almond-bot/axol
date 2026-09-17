@@ -720,6 +720,22 @@ async def _run(args: argparse.Namespace) -> None:
                 await _home_all(motors, exclude=joint if in_impedance else None)
             except Exception:
                 pass
+            # Homing put every joint in POSITION_VELOCITY. Leaving them there
+            # is not cosmetic: the realtime core checks each Damiao's control
+            # mode at bring-up and refuses to arm on anything but MIT, so a
+            # run that exits without restoring it bricks the next teleop or
+            # tune.motion with "control mode 2 (expected 1)". The gripper is
+            # not in `motors` and keeps its POSITION_FORCE mode.
+            try:
+                await asyncio.gather(
+                    *[
+                        m.set_control_mode(ControlMode.IMPEDANCE)
+                        for m in motors.values()
+                    ],
+                    return_exceptions=True,
+                )
+            except Exception:
+                pass
             await asyncio.gather(
                 *[m.disable() for m in raw.values()], return_exceptions=True
             )
