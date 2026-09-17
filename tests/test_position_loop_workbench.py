@@ -112,3 +112,29 @@ class PersistedRunTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DirectTrackingPresetTest(unittest.TestCase):
+    def test_a_numeric_zero_accel_preset_reaches_the_command_line(self) -> None:
+        """The tab presets accel=0 (direct tracking). Zero is the one value an
+        argv builder is most likely to drop as falsy -- and dropping it would
+        leave the motor in profiled-motion mode, where the sine test tracks
+        nothing at any gain. The browser sends the preset as a number."""
+        argv = build_argv(
+            "tune.position-loop",
+            {
+                "arm": "right",
+                "joint": "elbow",
+                "mode": "track",
+                "accel": 0,
+                "kp": "0.24",
+            },
+        )
+        i = argv.index("--accel")
+        self.assertEqual(argv[i + 1], "0")
+
+    def test_cli_treats_zero_as_a_value_not_as_unset(self) -> None:
+        src = inspect.getsource(pl._run)
+        self.assertIn("if args.accel is not None:", src)
+        self.assertIn("if args.accel == 0.0:", src)
+        self.assertIn("direct tracking mode", src)
