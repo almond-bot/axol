@@ -9,6 +9,7 @@ from almond_axol.cli.collect_dagger import (
     _DaggerControlLoop,
     _stop_dagger_control_worker,
 )
+from almond_axol.utils import affinity
 
 
 class _BlockingControlThread(threading.Thread):
@@ -46,6 +47,29 @@ class DaggerControlCleanupTest(unittest.TestCase):
         enter.assert_called_once_with()
         self.assertEqual(control_loop.capture_error, "camera alignment failed")
         self.assertIsNone(control_loop.fatal_error)
+
+    def test_refused_realtime_scheduling_is_fatal_for_the_episode(self) -> None:
+        # Claiming the control role sits inside the fault boundary, so a denied
+        # real-time class reaches the supervisor instead of quietly collecting
+        # an episode of hitched actions.
+        control_loop = _DaggerControlLoop(
+            robot=object(),
+            policy=object(),
+            teleop=object(),
+            recorder=_RejectedRecorder(),
+            fps=30,
+            teleop_hz=120,
+        )
+        refusal = affinity.ControlSchedulingError("no rtprio grant")
+
+        with patch.object(
+            collect_dagger.affinity, "enter_control_thread", side_effect=refusal
+        ):
+            control_loop.run()
+
+        self.assertIs(control_loop.fatal_error, refusal)
+        # It failed before the loop body, so no capture verdict was reached.
+        self.assertIsNone(control_loop.capture_error)
 
     def test_outer_cleanup_signals_and_joins_started_control_thread(self) -> None:
         control_thread = _BlockingControlThread()
