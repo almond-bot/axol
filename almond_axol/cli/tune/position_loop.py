@@ -173,8 +173,13 @@ async def _track(
             break
         target = center + amp * math.sin(2.0 * math.pi * freq * now)
         await motor.set_position_velocity(target, max_speed)
+        # An explicit 0x92 read, not the cached `position`: that cache is fed
+        # by MIT impedance replies, and 0xA4 answers on the 0x240 frame
+        # instead, so it is never populated here. The 0xA4 reply does carry a
+        # position but only at 1 deg/LSB — useless for a tracking error this
+        # size — hence the extra round trip.
         try:
-            pos = motor.motor.position
+            pos = await motor.get_position()
         except Exception:
             pos = float("nan")
         tt.append(now)
@@ -186,7 +191,14 @@ async def _track(
     a = np.array(act)
     g = np.array(tgt)
     good = np.isfinite(a)
+    achieved = len(tt) / max(tt[-1] - tt[0], 1e-9) if len(tt) > 1 else 0.0
+    if achieved < 0.8 * rate_hz:
+        print(
+            f"    (achieved {achieved:.0f} Hz of the requested {rate_hz:.0f} — two "
+            f"CAN round trips per sample; lower --rate for a clean cadence)"
+        )
     if good.sum() < 20:
+        print(f"    ({good.sum()} of {len(a)} position reads succeeded)")
         return float("nan"), float("nan"), float("nan")
     err = np.degrees(g[good] - a[good])
     v = np.gradient(g[good], np.array(tt)[good])

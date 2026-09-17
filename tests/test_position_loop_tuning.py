@@ -120,6 +120,19 @@ class AccelerationTest(unittest.TestCase):
         self.assertEqual(args.mode, "hold")
         self.assertIsNone(args.accel)
 
+    def test_tracking_reads_position_explicitly_not_from_the_mit_cache(self) -> None:
+        """The first hardware run returned all-NaN because of this.
+
+        `motor.position` is fed by MIT impedance replies. 0xA4 answers on the
+        0x240 control frame, so under a position-mode stream that cache is
+        never populated and every sample raises.
+        """
+        import inspect
+
+        src = inspect.getsource(pl._track)
+        self.assertIn("await motor.get_position()", src)
+        self.assertNotIn("motor.motor.position", src)
+
     def test_tracking_metric_reports_lag(self) -> None:
         # A held position cannot reveal profiled-motion mode; only a moving
         # target can, so the tracking path must report a following error.
