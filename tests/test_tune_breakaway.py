@@ -18,7 +18,7 @@ from almond_axol.cli.tune.breakaway import (
     _triangle,
     detect_release,
 )
-from almond_axol.constants import Joint
+from almond_axol.constants import ARM_JOINTS, Joint
 
 
 class RampShapeTest(unittest.TestCase):
@@ -46,6 +46,57 @@ class RampShapeTest(unittest.TestCase):
         # fc, k, fv, fo, j_eff, host_kd all zero: the joint feels exactly the
         # gravity + ramp the caller injects, with no friction model on top.
         self.assertEqual(_NO_FF[:6], (0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+
+class HomingTest(unittest.TestCase):
+    """Every other joint is parked at rest, and the arm goes home afterwards."""
+
+    def test_home_order_is_every_joint_distal_first(self) -> None:
+        from almond_axol.cli.tune.breakaway import _HOME_ORDER
+
+        self.assertEqual(set(_HOME_ORDER), set(ARM_JOINTS))
+        self.assertEqual(len(_HOME_ORDER), len(set(_HOME_ORDER)))
+        # Distal first: straightening the wrists and elbow before the
+        # shoulders means each shoulder later swings a folded arm.
+        self.assertEqual(_HOME_ORDER[0], Joint.WRIST_3)
+        self.assertEqual(_HOME_ORDER[-1], Joint.SHOULDER_1)
+        self.assertLess(
+            _HOME_ORDER.index(Joint.ELBOW), _HOME_ORDER.index(Joint.SHOULDER_2)
+        )
+
+    def test_home_all_visits_every_joint_but_the_excluded_one(self) -> None:
+        import asyncio
+        from unittest.mock import patch
+
+        from almond_axol.cli.tune import breakaway
+
+        seen: list[Joint] = []
+
+        async def fake_ramp(motors, targets):
+            seen.extend(targets)
+
+        motors = {j: object() for j in ARM_JOINTS}
+        with patch.object(breakaway, "ramp_joints_to", fake_ramp):
+            asyncio.run(breakaway._home_all(motors, exclude=Joint.SHOULDER_1))
+        self.assertNotIn(Joint.SHOULDER_1, seen)
+        self.assertEqual(set(seen), set(ARM_JOINTS) - {Joint.SHOULDER_1})
+        self.assertEqual(seen, [j for j in breakaway._HOME_ORDER if j in seen])
+
+    def test_home_all_skips_joints_absent_from_the_arm(self) -> None:
+        import asyncio
+        from unittest.mock import patch
+
+        from almond_axol.cli.tune import breakaway
+
+        seen: list[Joint] = []
+
+        async def fake_ramp(motors, targets):
+            seen.extend(targets)
+
+        partial = {Joint.WRIST_2: object(), Joint.WRIST_3: object()}
+        with patch.object(breakaway, "ramp_joints_to", fake_ramp):
+            asyncio.run(breakaway._home_all(partial))
+        self.assertEqual(set(seen), set(partial))
 
 
 class ReleaseDetectionTest(unittest.TestCase):

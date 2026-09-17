@@ -64,7 +64,12 @@ from ...motor.bus import CanBus
 from ...robot.axol import arm_limits
 from ...robot.config import AxolConfig
 from ...robot.gravity import GravityCompensator
-from ...tuning import joint_frame_motors, ramp_stages, sweep_safety
+from ...tuning import (
+    joint_frame_motors,
+    ramp_joints_to,
+    ramp_others_to_zero,
+    sweep_safety,
+)
 from ...tuning.joint_frame import JointFrameMotor
 from ...utils.logquiet import quiet_noisy_loggers
 from ..motor import add_side_and_channel_arguments, resolve_channel
@@ -80,6 +85,28 @@ _FEEDBACK_LSB = 2 * 12.566 / 65535
 #: never sees the larger ones.
 _ESCALATION = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5)
 _NO_FF = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 20.0, 0.8)
+#: Homing order. Distal first: straightening the wrists and then the elbow
+#: means each shoulder later swings a folded arm, so commanding the rest pose
+#: is safe from any starting pose.
+_HOME_ORDER: tuple[Joint, ...] = (
+    Joint.WRIST_3,
+    Joint.WRIST_2,
+    Joint.WRIST_1,
+    Joint.ELBOW,
+    Joint.SHOULDER_3,
+    Joint.SHOULDER_2,
+    Joint.SHOULDER_1,
+)
+
+
+async def _home_all(
+    motors: dict[Joint, JointFrameMotor], exclude: Joint | None = None
+) -> None:
+    """Ramp every joint to rest, one at a time, in :data:`_HOME_ORDER`."""
+    for j in _HOME_ORDER:
+        if j == exclude or j not in motors:
+            continue
+        await ramp_joints_to(motors, {j: 0.0})
 
 
 async def _hold(motor: JointFrameMotor, kp: float, kd: float, q: float, secs: float):
@@ -495,17 +522,20 @@ async def _run(args: argparse.Namespace) -> None:
             ]
         )
         try:
-            other_targets, lo_default, hi_default, notes = sweep_safety(joint, is_left)
+            # `sweep_safety` supplies this joint's safe range and any notes;
+            # the holding itself goes through `ramp_others_to_zero`, which
+            # parks every other joint at rest under its own position loop and
+            # already knows which ones must not be blindly commanded (their
+            # inboard half can meet the base) and which need a clearance pose.
+            _, lo_default, hi_default, notes = sweep_safety(joint, is_left)
             for note in notes:
                 print(f"  {note}")
-            for stage in ramp_stages(other_targets):
-                await asyncio.gather(
-                    *[
-                        _ramp_to(motors[j], getattr(arm_cfg, j.value).kp, args.kd, q)
-                        for j, q in stage.items()
-                        if j in motors
-                    ]
-                )
+            print("  Parking every other joint at rest ...")
+            await ramp_others_to_zero(motors, joint, is_left)
+            # The test joint starts from rest too, so a probe pose is always
+            # reached by a ramp from a known place rather than from wherever
+            # the last run left it.
+            await ramp_joints_to(motors, {joint: 0.0})
             await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
             await asyncio.sleep(1.0)
 
@@ -552,9 +582,26 @@ async def _run(args: argparse.Namespace) -> None:
             _report(joint, kp_cfg, fc, by_pose)
             if args.csv is not None:
                 print(f"\n  raw ramp samples -> {args.csv}")
+        except KeyboardInterrupt:
+            print("\n  Interrupted.")
         finally:
             if csv_file is not None:
                 csv_file.close()
+            print("  Returning to rest and disabling ...")
+            # The test joint gets an impedance ramp home only if it actually
+            # reached IMPEDANCE mode; otherwise `_home_all` covers it like
+            # any other joint. Both are best-effort: a failure here must not
+            # stop the disable below.
+            in_impedance = motors[joint].motor.mode == ControlMode.IMPEDANCE
+            if in_impedance:
+                try:
+                    await _ramp_to(motors[joint], kp_cfg, args.kd, 0.0)
+                except Exception:
+                    pass
+            try:
+                await _home_all(motors, exclude=joint if in_impedance else None)
+            except Exception:
+                pass
             await asyncio.gather(
                 *[m.disable() for m in raw.values()], return_exceptions=True
             )
