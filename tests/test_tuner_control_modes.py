@@ -55,9 +55,22 @@ class ModeSwitchOrderingTest(unittest.TestCase):
                 posed = _calls(run, poser)
                 switches = _calls(run, "set_control_mode")
                 self.assertTrue(posed, f"{mod.__name__}: no posing call found")
-                # The only mode switches left in _run are assign_modes'
-                # (before posing); the teardown's live in safe_return_to_rest,
-                # after the arm is verified at rest (tests/test_safe_teardown).
+                if mod is breakaway:
+                    # Still on its own teardown: a switch is either before the
+                    # arm is posed or after it has been brought home again.
+                    homed = max(
+                        _calls(run, "_home_all") or _calls(run, "_ramp_to") or [0]
+                    )
+                    for line in switches:
+                        self.assertTrue(
+                            line < min(posed) or line > homed,
+                            f"breakaway: set_control_mode at offset {line} lands "
+                            f"between posing ({min(posed)}) and homing ({homed})",
+                        )
+                    continue
+                # gravity/friction: the only switches left in _run are
+                # assign_modes' (before posing); the teardown's live in
+                # safe_return_to_rest, after the arm is verified at rest.
                 for line in switches:
                     self.assertLess(
                         line,
@@ -67,8 +80,6 @@ class ModeSwitchOrderingTest(unittest.TestCase):
                         f"loaded pose",
                     )
                 self.assertIn("safe_return_to_rest(", inspect.getsource(run))
-                if mod is breakaway:
-                    continue
                 td = inspect.getsource(friction.safe_return_to_rest)
                 self.assertLess(
                     td.index("holders.at_rest()"), td.index("set_control_mode")
