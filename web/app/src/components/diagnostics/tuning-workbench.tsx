@@ -77,6 +77,13 @@ interface WbField {
    * and an empty box means "run with config".
    */
   gainKey?: string
+  /**
+   * Key into the selected motor's live firmware loop gains (`position_kp`,
+   * `position_ki`, `speed_kp`, `speed_ki`, read over the idle link): the
+   * field shows the value the motor holds right now and an empty box is
+   * seeded with it, so a sweep is always typed around a known point.
+   */
+  motorGainKey?: string
   /** Render a slider next to the value box, over this range. */
   slider?: { min: number; max: number; step: number }
 }
@@ -237,32 +244,48 @@ const TABS: WbTab[] = [
         key: "kp",
         label: "position_kp",
         type: "text",
-        placeholder: "config × 0.5 1 2 4 8",
-        hint: "space-separated sweep, ascending; stops at the first gain that buzzes",
+        motorGainKey: "position_kp",
+        placeholder: "motor's",
+        hint:
+          "Stiffness of the motor's position loop: how much speed it asks for per degree of " +
+          "error. Higher = less lag and tighter tracking, until the joint buzzes (the cliff). " +
+          "Space-separated ascending values sweep it and stop at the first that buzzes.",
         width: "w-48",
       },
       {
         key: "ki",
         label: "position_ki",
         type: "text",
-        placeholder: "kp × 0.001 … 0.1",
-        hint: "space-separated, tried at the winning kp; 0 to skip the integral stage",
+        motorGainKey: "position_ki",
+        placeholder: "motor's",
+        hint:
+          "Integral of the position loop: removes the standing lag a P-only loop keeps while " +
+          "moving (lag ≈ 8.7/kp ms measured) without raising kp toward the cliff — but it " +
+          "winds up against friction and limit-cycles; kp×0.001 already oscillated the elbow. " +
+          "Tried at the winning kp; 0 skips the stage.",
         width: "w-48",
       },
       {
         key: "speed_kp",
         label: "speed_kp",
         type: "text",
+        motorGainKey: "speed_kp",
         placeholder: "motor's",
-        hint: "inner speed loop; several values = swept first at the configured position gains, one = fixed override",
+        hint:
+          "Inner speed loop: how hard the motor pushes per unit of speed error. Its phase " +
+          "margin bounds how high position_kp can go before buzzing, so it is tuned FIRST. " +
+          "Several values = swept ascending at the configured position gains; one = pinned.",
         width: "w-48",
       },
       {
         key: "speed_ki",
         label: "speed_ki",
         type: "text",
+        motorGainKey: "speed_ki",
         placeholder: "motor's",
-        hint: "inner speed loop integral; same semantics as speed_kp",
+        hint:
+          "Integral of the speed loop: removes the steady speed error a P-only speed loop " +
+          "leaves (factory is ~0). Same sweep/pin semantics as speed_kp; tune it last.",
         width: "w-48",
       },
       { key: "amp", label: "amp (°)", type: "number", placeholder: "10" },
@@ -1975,6 +1998,14 @@ export function TuningWorkbench({
   // Effective per-joint config gains (defaults + calibration): the slider
   // baselines and "config N" labels on the gain fields.
   const [gains, setGains] = useState<TuningGains | null>(null)
+  // The selected motor's live firmware loop gains (0x30 over the idle link),
+  // for tabs whose fields are bound to them via `motorGainKey`. Keyed by
+  // "arm/joint" so a stale read for another motor is never shown.
+  const [motorGains, setMotorGains] = useState<{
+    key: string
+    gains: Record<string, number | null> | null
+    error: string | null
+  } | null>(null)
 
   const [runs, setRuns] = useState<TuningRunMeta[]>([])
   const [loading, setLoading] = useState(false)
@@ -2188,6 +2219,61 @@ export function TuningWorkbench({
     onLaunch(tab.command, args)
   }
 
+  const motorFields = useMemo(() => tab.fields.filter((f) => f.motorGainKey), [tab])
+  const motorKey =
+    motorFields.length > 0 && tabValues["arm"] && tabValues["joint"]
+      ? `${tabValues["arm"]}/${tabValues["joint"]}`
+      : null
+  useEffect(() => {
+    if (!enabled || !motorKey) return
+    const [side, joint] = motorKey.split("/")
+    let active = true
+    // The server addresses motors by enum name (SHOULDER_1 …), the form by value.
+    fetchMotorDetails(side, joint.toUpperCase())
+      .then((d) => {
+        if (!active) return
+        setMotorGains({ key: motorKey, gains: d.gains, error: null })
+        // Seed empty boxes with what the motor holds, so a sweep is typed
+        // around a known point instead of into a blank.
+        if (d.gains) {
+          setValues((prev) => {
+            const cur = { ...(prev[tab.key] ?? {}) }
+            let changed = false
+            for (const f of motorFields) {
+              const v = f.motorGainKey ? d.gains?.[f.motorGainKey] : null
+              if ((cur[f.key] ?? "").trim() === "" && typeof v === "number") {
+                cur[f.key] = fmtNum(v, 4)
+                changed = true
+              }
+            }
+            return changed ? { ...prev, [tab.key]: cur } : prev
+          })
+        }
+      })
+      .catch((e) => {
+        if (active) {
+          setMotorGains({
+            key: motorKey,
+            gains: null,
+            error: String(e).replace(/^Error:\s*/, ""),
+          })
+        }
+      })
+    return () => {
+      active = false
+    }
+  }, [enabled, motorKey, motorFields, tab.key])
+
+  /** What the selected motor holds right now for a motor-bound field. */
+  const motorValue = useCallback(
+    (f: WbField): number | null => {
+      if (!f.motorGainKey || !motorGains || motorGains.key !== motorKey) return null
+      const v = motorGains.gains?.[f.motorGainKey]
+      return typeof v === "number" && Number.isFinite(v) ? v : null
+    },
+    [motorGains, motorKey]
+  )
+
   /**
    * The selected joint's current config value for a gain field, or null
    * until an arm and joint are picked (or while gains haven't loaded).
@@ -2355,12 +2441,26 @@ export function TuningWorkbench({
         <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
           {tab.fields.map((f) => {
             const cfg = configValue(f)
+            const mot = motorValue(f)
+            const motErr =
+              f.motorGainKey && motorGains?.key === motorKey && motorGains.error
+                ? motorGains.error
+                : null
             return (
               <label key={f.key} className="flex flex-col gap-1">
                 <span className="text-[0.65rem] text-white/40">
                   {f.label}
                   {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
                   {cfg != null && <span className="text-white/25"> · config {fmtNum(cfg)}</span>}
+                  {mot != null && (
+                    <span className="text-[#eff483]/60"> · motor {fmtNum(mot, 4)}</span>
+                  )}
+                  {motErr && (
+                    <span className="text-white/25" title={motErr}>
+                      {" "}
+                      · motor: connect the arm to read
+                    </span>
+                  )}
                 </span>
                 {f.type === "overrides" ? (
                   <GainOverrideEditor

@@ -320,7 +320,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Angle (deg) to hold at. Pick a loaded pose — an unloaded joint "
         "holds at any gain and teaches nothing. Default: current position.",
     )
-    p.add_argument("--kp", type=float, nargs="+", help="Explicit position_kp values")
+    p.add_argument(
+        "--kp",
+        type=float,
+        nargs="+",
+        help="position_kp values to sweep, ascending. This is the stiffness of "
+        "the motor's own position loop: how much speed it asks for per degree "
+        "of error. Higher means less lag and tighter tracking until the joint "
+        "buzzes -- the sweep stops at the first value that does. Default: the "
+        "motor's current value times 1, 4, 16 ...",
+    )
     p.add_argument(
         "--speed-kp",
         type=float,
