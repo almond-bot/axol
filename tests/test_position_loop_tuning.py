@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import unittest
 from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock
@@ -182,6 +183,30 @@ class AccelerationTest(unittest.TestCase):
         src = inspect.getsource(pl._track)
         self.assertIn("await motor.get_position()", src)
         self.assertNotIn("motor.motor.position", src)
+
+    def test_tracking_reaches_the_sine_start_before_timing(self) -> None:
+        """Otherwise the first gain in a sweep measures the approach.
+
+        Observed on hardware: kp=0.96 read 0.126 deg when it ran third and
+        6.12 deg when it ran first, because the sine simply began commanding
+        `center` from wherever the arm was parked and the 40 deg journey
+        filled the window. The artefact attaches to whichever gain is
+        measured first, which makes a sweep read backwards.
+        """
+        import inspect
+
+        src = inspect.getsource(pl._track)
+        approach = src[: src.index("t0 = time.monotonic()")]
+        self.assertIn("set_position_velocity(center", approach)
+        self.assertIn("_APPROACH_TOL_RAD", approach)
+        # And it must not silently give up: an unreached start is reported.
+        self.assertIn("includes the approach", src)
+
+    def test_approach_tolerance_is_tight_against_the_error_being_measured(self) -> None:
+        # Tracking errors of interest are ~0.1 deg, so starting half a degree
+        # off is already several times the signal.
+        self.assertLessEqual(math.degrees(pl._APPROACH_TOL_RAD), 0.5)
+        self.assertGreater(pl._APPROACH_MAX_S, 5.0)
 
     def test_tracking_ripple_separates_buzz_from_following_error(self) -> None:
         """A raised gain trades tracking error for vibration, and rms keeps

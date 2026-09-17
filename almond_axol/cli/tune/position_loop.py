@@ -79,6 +79,11 @@ _HOME_ORDER: tuple[Joint, ...] = (
     Joint.SHOULDER_1,
 )
 _HOME_SPEED = 0.25  # rad/s
+#: How long the tracking test will chase the sine's start before giving up
+#: and measuring anyway (saying so, rather than silently reporting the
+#: approach as tracking error).
+_APPROACH_MAX_S = 20.0
+_APPROACH_TOL_RAD = math.radians(0.5)
 #: Multipliers applied to the joint's current `position_kp`, low to high. The
 #: search stops at the first value that holds, so a joint that is nearly right
 #: never sees the large ones.
@@ -209,6 +214,28 @@ async def _track(
     moving. In profiled-motion mode it cannot — every frame restarts a ramp —
     so a joint that holds perfectly can still track nothing at all.
     """
+    # Reach the sine's start before timing anything. Without this the first
+    # entry of a sweep measures the joint travelling to `center` from
+    # wherever it was parked — tens of degrees over the whole window — and
+    # reports it as a tracking failure. Every later entry then starts on
+    # target and looks fine, so the artefact lands on whichever gain happens
+    # to be measured first.
+    approach_deadline = time.monotonic() + _APPROACH_MAX_S
+    while time.monotonic() < approach_deadline:
+        await motor.set_position_velocity(center, max_speed)
+        try:
+            if abs(await motor.get_position() - center) < _APPROACH_TOL_RAD:
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(0.02)
+    else:
+        print(
+            f"    (did not reach {math.degrees(center):.1f}° within "
+            f"{_APPROACH_MAX_S:.0f}s — the result below includes the approach)"
+        )
+    await asyncio.sleep(0.3)
+
     dt = 1.0 / rate_hz
     t0 = time.monotonic()
     tt: list[float] = []
