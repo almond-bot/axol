@@ -74,10 +74,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     b.add_argument(
         "--cutoff",
         type=float,
-        default=6.0,
+        default=None,
         metavar="HZ",
-        help="Zero-phase low-pass cutoff (Hz) for the smoothing pass "
-        "(default: 6.0 — keeps deliberate motion, drops tremor/jitter)",
+        help="Zero-phase low-pass cutoff (Hz) for the smoothing pass. "
+        "Default: read off the capture's own spectrum — the lowest cutoff "
+        "keeping 99.9%% of its energy, clamped to 0.8-6 Hz. The old fixed "
+        "6 Hz sat above every tracker artifact worth removing: a slow "
+        "capture holds its energy below ~0.6 Hz while the tracker adds "
+        "pose noise at 1-3 Hz that grows with hand speed, and the arm "
+        "reproduced that noise as a visible bounce.",
     )
     b.add_argument(
         "--time-scale",
@@ -210,7 +215,7 @@ def _save_build_run(args: argparse.Namespace, prefix: str, motion, raw) -> None:
             "prefix": str(prefix),
             "source_kind": motion.meta.get("source_kind"),
             "rate": float(motion.rate),
-            "cutoff": float(args.cutoff),
+            "cutoff": motion.meta.get("smooth_cutoff_hz"),
             "time_scale": float(args.time_scale),
             "projected": not args.no_project,
             "columns": columns,

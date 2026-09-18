@@ -13,6 +13,10 @@ import os
 import struct
 import subprocess
 
+# Taken from the package rather than written out, so this check cannot go
+# stale behind a generation bump the way a literal did between proto 2 and 4.
+from almond_axol.rt.link import CONFIG_PROTO
+
 BIN = os.environ.get(
     "AXOL_RT_BIN",
     os.path.join(os.path.dirname(__file__), "..", "target", "release", "axol-rt"),
@@ -58,7 +62,7 @@ async def session(name, actions):
 
 
 joint_line = b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
-cfg = b"C" + b"proto 2\n" + b"loop_hz 240\n" + joint_line
+cfg = b"C" + f"proto {CONFIG_PROTO}\n".encode() + b"loop_hz 240\n" + joint_line
 
 
 async def clean(send, recv, w):

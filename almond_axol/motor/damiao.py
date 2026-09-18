@@ -544,7 +544,11 @@ class DamiaoMotor(MotorDriver):
             position_ki=float(pos_ki),
         )
 
-    async def set_gains(self, gains: MotorGains) -> None:
+    async def set_gains(self, gains: MotorGains, *, persist: bool = True) -> None:
+        # Damiao has no RAM-only path: register writes are committed by
+        # `_store_parameters` regardless, so `persist` is accepted for
+        # interface parity and ignored.
+        del persist
         await self._write_register(_DM_REG_SPEED_KP, gains.speed_kp)
         await self._write_register(_DM_REG_SPEED_KI, gains.speed_ki)
         await self._write_register(_DM_REG_POS_KP, gains.position_kp)

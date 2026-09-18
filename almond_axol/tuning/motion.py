@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from scipy import signal
 
 MOTIONS_DIR = Path(__file__).parent / "motions"
 
@@ -156,24 +157,77 @@ def _trim_still_ends(
     return t[s:e], q[s:e]
 
 
-def _zero_phase_lowpass(x: np.ndarray, rate: float, cutoff_hz: float) -> np.ndarray:
-    """Forward-backward one-pole low-pass per column: zero phase, -40 dB/dec.
+#: Order of the zero-phase smoothing filter. The original cascaded one-pole
+#: rolled off at only -40 dB/dec, which is too gentle to separate a recorded
+#: motion from the tracker noise riding on it: measured on the `slow_osc`
+#: capture, 99.9% of the commanded trajectory's energy sits below 0.59 Hz
+#: while the tracker contributes 3.36 mm rms of 1-3 Hz pose noise. At a 0.8 Hz
+#: cutoff the one-pole cascade left 10.6% of that noise and cost 3.8% of the
+#: motion; a 4th-order Butterworth leaves 1.95% and costs nothing measurable
+#: (intent energy retained 1.0000).
+_SMOOTH_ORDER = 4
+#: Fraction of a motion's own energy the cutoff must preserve.
+_SMOOTH_KEEP = 0.999
+#: Cutoff bounds (Hz). The floor keeps a nearly-static capture from being
+#: filtered into a straight line; the ceiling is the old fixed default, so
+#: no motion is smoothed *less* than it used to be.
+_SMOOTH_MIN_HZ = 0.8
+_SMOOTH_MAX_HZ = 6.0
 
-    Two passes of a one-pole filter (forward then reversed) cancel the phase
-    lag exactly and square the magnitude response, so the stored motion is
-    smoothed without being time-shifted relative to the operator's intent.
+
+def _zero_phase_lowpass(
+    x: np.ndarray, rate: float, cutoff_hz: float, *, order: int = _SMOOTH_ORDER
+) -> np.ndarray:
+    """Zero-phase Butterworth low-pass per column (``filtfilt``).
+
+    Forward-backward filtering cancels the phase lag exactly, so the stored
+    motion is smoothed without being time-shifted relative to the operator's
+    intent — the property that makes an offline motion worth smoothing hard.
+    A recorded path is not live teleop: there is no causality constraint
+    here, so there is no reason to accept the shallow rolloff a real-time
+    filter is stuck with.
     """
-    alpha = 1.0 / (1.0 + rate / (2.0 * math.pi * cutoff_hz))
+    nyq = 0.5 * rate
+    wn = min(max(cutoff_hz, 1e-6), 0.99 * nyq) / nyq
+    sos = signal.butter(order, wn, btype="low", output="sos")
+    # Pad for the filter's own settling time, not `filtfilt`'s default
+    # 3*(2*order+1) samples. At 0.8 Hz that default is 0.22 s against a
+    # ~1.25 s transient, and the residue lands on the first and last
+    # waypoints — precisely where a motion is at rest and a step would be
+    # replayed into the arm as a jerk. Three cycles of the cutoff covers it.
+    padlen = min(
+        len(x) - 1, max(3 * (2 * order + 1), int(3.0 * rate / max(cutoff_hz, 1e-6)))
+    )
+    if len(x) <= 3 * (2 * order + 1):
+        return x.copy()
+    return np.asarray(signal.sosfiltfilt(sos, x, axis=0, padlen=padlen), dtype=x.dtype)
 
-    def one_pole(y: np.ndarray) -> np.ndarray:
-        out = np.empty_like(y)
-        acc = y[0].copy()
-        for i in range(len(y)):
-            acc = acc + alpha * (y[i] - acc)
-            out[i] = acc
-        return out
 
-    return one_pole(one_pole(x)[::-1])[::-1]
+def _spectral_cutoff(
+    x: np.ndarray,
+    rate: float,
+    *,
+    keep: float = _SMOOTH_KEEP,
+    lo: float = _SMOOTH_MIN_HZ,
+    hi: float = _SMOOTH_MAX_HZ,
+) -> float:
+    """Lowest cutoff (Hz) that preserves ``keep`` of this motion's energy.
+
+    A fixed cutoff cannot serve both a slow reach and a fast swing: it is
+    either too high to remove the tracker noise from the first or too low to
+    pass the second. The motion itself says where its content ends, so read
+    the cutoff off its own cumulative spectrum and filter above that.
+    """
+    n = min(1024, len(x))
+    if n < 32:
+        return hi
+    f, p = signal.welch(x - x.mean(axis=0), rate, nperseg=n, axis=0)
+    total = p.sum(axis=1)
+    if not np.isfinite(total).all() or total.sum() <= 0:
+        return hi
+    cum = np.cumsum(total) / total.sum()
+    knee = float(f[min(int(np.searchsorted(cum, keep)), len(f) - 1)])
+    return float(min(max(knee, lo), hi))
 
 
 def build_motion(
@@ -181,7 +235,7 @@ def build_motion(
     name: str,
     *,
     rate: float = 100.0,
-    smooth_cutoff_hz: float = 6.0,
+    smooth_cutoff_hz: float | None = None,
     time_scale: float = 1.0,
     collision_project: bool = True,
     notes: str = "",
@@ -199,8 +253,15 @@ def build_motion(
                            both exist.
         name:              Motion name (file stem in the motions directory).
         rate:              Uniform playback rate (Hz).
-        smooth_cutoff_hz:  Zero-phase low-pass cutoff. ~6 Hz keeps deliberate
-                           motion and drops tremor/jitter.
+        smooth_cutoff_hz:  Zero-phase low-pass cutoff (Hz). ``None`` (the
+                           default) reads it off the capture's own cumulative
+                           spectrum — see :func:`_spectral_cutoff`. The old
+                           fixed 6 Hz was above every tracker artifact worth
+                           removing: on the ``slow_osc`` capture the recorded
+                           trajectory holds 99.9% of its energy below 0.59 Hz
+                           while the tracker adds 3.36 mm rms of 1-3 Hz pose
+                           noise, so 6 Hz passed the noise through untouched
+                           and the arm reproduced it as a visible bounce.
         time_scale:        Stretch factor for playback time (2.0 = half
                            speed). Applied before the velocity report.
         collision_project: Project every waypoint through the collision-aware
@@ -264,7 +325,11 @@ def build_motion(
     grid = np.linspace(t[0], t[-1], n)
     q_u = np.stack([np.interp(grid, t, q[:, i]) for i in range(q.shape[1])], axis=1)
 
-    q_s = _zero_phase_lowpass(q_u, rate, smooth_cutoff_hz)
+    cutoff = (
+        _spectral_cutoff(q_u, rate) if smooth_cutoff_hz is None else smooth_cutoff_hz
+    )
+    print(f"  smoothing: zero-phase order-{_SMOOTH_ORDER} low-pass at {cutoff:.2f} Hz")
+    q_s = _zero_phase_lowpass(q_u, rate, cutoff)
 
     if collision_project:
         print(f"  projecting {len(q_s)} waypoints through the collision solver ...")
@@ -296,7 +361,7 @@ def build_motion(
             "source": str(prefix),
             "source_kind": source_kind,
             "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "smooth_cutoff_hz": smooth_cutoff_hz,
+            "smooth_cutoff_hz": cutoff,
             "time_scale": time_scale,
             "collision_projected": collision_project,
             "engaged_span_s": round(duration, 2),
@@ -390,5 +455,5 @@ def _project_waypoints(q: np.ndarray, rate: float) -> np.ndarray:
     if moved > 1e-4:
         # Smooth the projection's own kinks; a light pass barely re-enters
         # the collision margin (the cost activates well before contact).
-        out = _zero_phase_lowpass(out, rate, 6.0)
+        out = _zero_phase_lowpass(out, rate, _SMOOTH_MAX_HZ)
     return out

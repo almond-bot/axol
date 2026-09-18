@@ -56,7 +56,7 @@ from dataclasses import replace
 import numpy as np
 
 from ...constants import ARM_JOINTS
-from ...motor import CanBus, ControlMode, Joint, Motor
+from ...motor import CanBus, Joint, Motor
 from ...robot.calibration import (
     CALIBRATION_PATH,
     load_calibration,
@@ -70,14 +70,19 @@ from ..motor import add_side_and_channel_arguments, resolve_channel
 from .friction import (
     _home_all,
     _identify_joint,
-    _ramp_to,
     _ramp_verified,
+    assign_modes,
+    safe_return_to_rest,
 )
 
 # Central-difference step for the CoM sensitivity columns (metres). Gravity
 # torque is exactly linear in the CoM, so any small step gives the exact
 # Jacobian up to float noise; 5 mm keeps the difference well above it.
 _FD_STEP = 0.005
+# Holder drift (rad) worth reporting before the fit. The holders run on the
+# motors' own position loops with no host feedback, so this is the only place
+# a sagging hold becomes visible instead of quietly biasing the CoM.
+_HOLDER_DRIFT_WARN = math.radians(1.0)
 # Per-bin torque noise scale (Nm): MIT-feedback quantization plus the
 # residual imbalance the fwd/bwd average leaves. Sets both the ridge weight
 # and the observability gate below.
@@ -96,6 +101,32 @@ _COM_PRIOR_M = 0.020
 # this; beyond it the sweep data is suspect (collision, something touching
 # the arm, distal links not yet calibrated).
 _MAX_SHIFT_M = 0.060
+#: Prior scale and plausibility cap on the fitted link MASS, as fractions of
+#: the configured mass. A CoM-only fit cannot represent a mass error: on the
+#: right elbow the link weighs 0.25 kg in the model and the sweep demanded a
+#: 93 mm CoM shift -- 0.23 Nm of torque the light link can only produce with
+#: an absurd lever, i.e. ~78 g of unmodelled mass at the hand. Fit mass and
+#: CoM together so a few-percent mass error lands on the mass, where it is
+#: a small number, instead of on a lever, where it is a rejected one.
+#: A sweep about one axis observes only m·r: the link's mass and its CoM
+#: *along the lever* produce identical torque curves, so the two are
+#: collinear and only a prior can split them. The rule here is: along the
+#: lever goes to MASS, perpendicular goes to CoM. Physically that is the
+#: right attribution -- a light link's own CoM does not move 93 mm, but a
+#: harness or hand carrying ~80 g at 0.3 m looks to the elbow exactly like
+#: +0.3 kg on its link, and as mass it propagates to the shoulders with
+#: nearly the right moment. ``_COM_PRIOR_ALONG_M`` pins the along-lever
+#: CoM component; ``_MASS_PRIOR_FRAC`` is loose so mass takes that content.
+_COM_PRIOR_ALONG_M = 0.002
+_MASS_PRIOR_FRAC = 1.0
+#: Mass plausibility cap, absolute: a harness's worth. It is deliberately
+#: NOT a fraction of the link mass. Bench: with a 50 % cap, shoulder_3
+#: (3.75 kg) accepted -0.77 kg while its residual barely moved -- that was
+#: the uncalibrated elbow's error, lumped in and booked as mass. A heavy
+#: proximal link's mass is well known; the only unmodelled mass a sweep
+#: should be allowed to discover is cabling and hand-side hardware, which
+#: is the same few hundred grams whatever link it is attributed to.
+_MAX_MASS_ABS_KG = 0.35
 _DEFAULT_VELOCITY_DEG = 18.0
 
 
@@ -105,6 +136,15 @@ def _with_com(
     """Return a config copy with one joint's link CoM replaced."""
     arm = cfg.left if is_left else cfg.right
     new_arm = replace(arm, **{joint.value: replace(getattr(arm, joint.value), com=com)})
+    return replace(cfg, **{"left" if is_left else "right": new_arm})
+
+
+def _with_mass(cfg: AxolConfig, is_left: bool, joint: Joint, mass: float) -> AxolConfig:
+    """Return a config copy with one joint's link mass replaced."""
+    arm = cfg.left if is_left else cfg.right
+    new_arm = replace(
+        arm, **{joint.value: replace(getattr(arm, joint.value), mass=mass)}
+    )
     return replace(cfg, **{"left" if is_left else "right": new_arm})
 
 
@@ -135,12 +175,16 @@ def fit_com(
     joint: Joint,
     is_left: bool,
     other_targets: dict[Joint, float],
-) -> tuple[tuple[float, float, float], float, np.ndarray, np.ndarray] | None:
-    """Fit this link's CoM (and a constant offset) to the measured torques.
+) -> tuple[tuple[float, float, float], float, np.ndarray, np.ndarray, float] | None:
+    """Fit this link's CoM, its mass, and a constant offset to the torques.
 
-    Returns ``(com_fit, offset, tau_model_before, tau_model_after)``, or
-    ``None`` when the sweep cannot observe this link's CoM. The offset is
-    the friction ``Fo`` re-estimated against the corrected model.
+    Returns ``(com_fit, offset, tau_model_before, tau_model_after,
+    mass_fit)``, or ``None`` when the sweep cannot observe this link's CoM.
+    The offset is the friction ``Fo`` re-estimated against the corrected
+    model. Mass is fitted alongside the CoM because a CoM-only fit cannot
+    express a mass error at a light link except as an implausible lever
+    (see ``_MASS_PRIOR_FRAC``); its prior is tighter than the CoM's so a
+    sweep that a CoM shift explains equally well still lands on the CoM.
 
     The design matrix is built by central differences of the full MuJoCo
     gravity model around the current (calibrated) CoM — torque is linear in
@@ -160,6 +204,7 @@ def fit_com(
     cfg = AxolConfig()
     jc = getattr(cfg.left if is_left else cfg.right, joint.value)
     com0 = np.array(jc.com, dtype=float)
+    mass0 = float(jc.mass)
 
     tau_before = _model_torques(cfg, joint, is_left, q_bins, other_targets)
     residual = tau_meas - tau_before
@@ -192,18 +237,53 @@ def fit_com(
     if max_sens == 0.0 or _TAU_NOISE_NM / max_sens > _MAX_SHIFT_M:
         return None
 
+    # dτ/d(mass): torque is linear in the link mass, so the central
+    # difference is exact for any step. Column in Nm per kg.
+    dm = max(0.05 * mass0, 1e-3)
+    hi_m = _model_torques(
+        _with_mass(cfg, is_left, joint, mass0 + dm),
+        joint,
+        is_left,
+        q_bins,
+        other_targets,
+    )
+    lo_m = _model_torques(
+        _with_mass(cfg, is_left, joint, mass0 - dm),
+        joint,
+        is_left,
+        q_bins,
+        other_targets,
+    )
+    cols.append((hi_m - lo_m) / (2 * dm))
+
     cols.append(np.ones(len(q_bins)))
     design = np.column_stack(cols)
 
-    # Ridge solve: (AᵀA + λI₃)x = Aᵀr with λ = (noise/prior)², identity on
-    # the CoM block only. Exactly-unobservable directions (zero columns)
-    # come out as exactly zero shift; weak ones shrink toward the prior.
-    lam = (_TAU_NOISE_NM / _COM_PRIOR_M) ** 2
-    reg = np.zeros((4, 4))
-    reg[:3, :3] = lam * np.eye(3)
+    # Ridge solve: (AᵀA + Λ)x = Aᵀr with λ = (noise/prior)² per block —
+    # CoM block on a metres prior, mass on a kg prior. Exactly-unobservable
+    # directions (zero columns) come out as exactly zero; weak ones shrink
+    # toward the configured value. The constant (Fo) column is never
+    # penalised.
+    reg = np.zeros((5, 5))
+    # The direction degenerate with mass is the CoM's projection onto the
+    # plane the sweep observes: components along the joint axis have zero
+    # torque sensitivity (their columns are ~0) and take no part in it.
+    observable = np.array([np.linalg.norm(c) > 1e-9 for c in cols[:3]])
+    com_plane = np.where(observable, com0, 0.0)
+    r0 = np.linalg.norm(com_plane)
+    if r0 > 1e-6:
+        u = com_plane / r0
+        perp = np.eye(3) - np.outer(u, u)
+        reg[:3, :3] = (_TAU_NOISE_NM / _COM_PRIOR_M) ** 2 * perp + (
+            _TAU_NOISE_NM / _COM_PRIOR_ALONG_M
+        ) ** 2 * np.outer(u, u)
+    else:
+        reg[:3, :3] = (_TAU_NOISE_NM / _COM_PRIOR_M) ** 2 * np.eye(3)
+    reg[3, 3] = (_TAU_NOISE_NM / max(_MASS_PRIOR_FRAC * mass0, 1e-6)) ** 2
     solution = np.linalg.solve(design.T @ design + reg, design.T @ residual)
 
     delta = solution[:3]
+    dmass = float(solution[3])
     shift = float(np.linalg.norm(delta))
     if shift > _MAX_SHIFT_M:
         raise RuntimeError(
@@ -213,16 +293,25 @@ def fit_com(
             "feedback, or distal links not yet calibrated — run distal → "
             "proximal); not applying it"
         )
+    if abs(dmass) > _MAX_MASS_ABS_KG:
+        raise RuntimeError(
+            f"fitted mass change {dmass:+.3f} kg exceeds the "
+            f"{_MAX_MASS_ABS_KG:.2f} kg plausibility cap (a harness's worth). "
+            f"On a {mass0:.3f} kg link that much unmodelled mass is a payload, "
+            "a wrong link model, or a distal link's error lumped in -- run "
+            "distal to proximal; not applying it"
+        )
     com_fit = tuple(float(v) for v in com0 + delta)
-    offset = float(solution[3])
+    mass_fit = mass0 + dmass
+    offset = float(solution[4])
     tau_after = _model_torques(
-        _with_com(cfg, is_left, joint, com_fit),
+        _with_mass(_with_com(cfg, is_left, joint, com_fit), is_left, joint, mass_fit),
         joint,
         is_left,
         q_bins,
         other_targets,
     )
-    return com_fit, offset, tau_before, tau_after
+    return com_fit, offset, tau_before, tau_after, mass_fit
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -346,15 +435,16 @@ async def _run(args: argparse.Namespace) -> None:
         raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw_motors.values()])
         motors = await joint_frame_motors(raw_motors, is_left)
-        await asyncio.gather(
-            *[
-                m.set_control_mode(ControlMode.POSITION_VELOCITY)
-                for m in motors.values()
-            ]
+        # Modes are decided here, at rest, and never changed again: a
+        # MyActuator mode switch is a system reset and the joint is limp for
+        # it (see assign_modes). Switching the swept joint to impedance after
+        # the arm was posed is what dropped a loaded wrist.
+        holders = await assign_modes(
+            motors, impedance=joint, kp=kp, kd=kd, is_left=is_left, config=resolved
         )
         try:
             print("  Homing all joints to rest (distal to proximal) ...")
-            await _home_all(motors)
+            await _home_all(motors, holders, impedance=joint, kp=kp, kd=kd)
 
             # Shared sweep-safety geometry (see sweep_safety): base-collision
             # caps, camera clearance, and the gravity-load poses that tilt
@@ -367,11 +457,48 @@ async def _run(args: argparse.Namespace) -> None:
             for note in notes:
                 print(f"  {note}")
             for stage in ramp_stages(other_targets):
-                await _ramp_verified(motors, stage)
+                await _ramp_verified(motors, stage, holders)
 
-            await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
-            await asyncio.sleep(1.0)
+            # Fit against the pose the arm is actually in, not the one it was
+            # told to reach. The holders sit on their own firmware position
+            # loop at whatever position_kp the motor shipped with, and a
+            # loaded one sags: an elbow posed to its midpoint carries several
+            # Nm there. Feeding the *commanded* pose to the model makes the
+            # fitted CoM absorb that sag, which is a silent wrong answer
+            # rather than a visible failure.
+            held = {}
+            for j, m in motors.items():
+                if j is joint:
+                    continue
+                try:
+                    held[j] = await m.get_position()
+                except Exception:
+                    held[j] = other_targets.get(j, 0.0)
+            # Sort on the drift alone: a tie would otherwise fall through to
+            # comparing Joint enums, which have no ordering (bench traceback).
+            drift = sorted(
+                ((abs(held[j] - other_targets.get(j, 0.0)), j) for j in held),
+                key=lambda d: d[0],
+                reverse=True,
+            )
+            if drift and drift[0][0] > _HOLDER_DRIFT_WARN:
+                print("  ! holders are not where they were put:")
+                for d, j in drift:
+                    if d <= _HOLDER_DRIFT_WARN:
+                        break
+                    print(
+                        f"      {j.value}: {math.degrees(held[j]):+.2f}° "
+                        f"(asked {math.degrees(other_targets.get(j, 0.0)):+.2f}°, "
+                        f"off by {math.degrees(d):.2f}°)"
+                    )
+                print(
+                    "    Fitting at the measured pose. A large sag means the "
+                    "holder's firmware position loop is too soft for the load "
+                    "— see axol tune.position-loop --mode hold."
+                )
 
+            # The swept joint has been under impedance since before homing,
+            # so there is no mode switch here and nothing to settle from.
             avg_samples, _halfdiff = await _identify_joint(
                 motors[joint],
                 joint,
@@ -396,9 +523,42 @@ async def _run(args: argparse.Namespace) -> None:
             q_bins, tau_meas = q_bins[order], tau_meas[order]
 
             try:
-                fit = fit_com(q_bins, tau_meas, joint, is_left, other_targets)
+                fit = fit_com(q_bins, tau_meas, joint, is_left, held)
             except RuntimeError as exc:
                 print(f"\n  ! Gravity fit rejected: {exc}")
+                # A rejected sweep is exactly the one worth keeping: the
+                # report path never runs for it, so persist the raw torque
+                # curve against the model here or --save-run saves nothing
+                # for the joint that most needs diagnosing.
+                if args.save_run:
+                    tau_model = _model_torques(
+                        AxolConfig(), joint, is_left, q_bins, held
+                    )
+                    res = tau_meas - tau_model
+                    run_id = save_run(
+                        "gravity",
+                        {"q": q_bins, "measured": tau_meas, "model_before": tau_model},
+                        {
+                            "rms_before": float(
+                                np.sqrt(np.mean((res - res.mean()) ** 2))
+                            ),
+                            "rejected": str(exc),
+                        },
+                        side=side_str,
+                        joint=joint.value,
+                        params={
+                            "velocity_deg_s": args.velocity,
+                            "com_cad": list(jc.com),
+                            "mass_cad": float(jc.mass),
+                            "saved": False,
+                            "rejected": True,
+                            "clearance_deg": {
+                                j.value: round(math.degrees(v), 1)
+                                for j, v in held.items()
+                            },
+                        },
+                    )
+                    print(f"  Saved rejected sweep as run {run_id}")
                 return
             _report_and_save(
                 args,
@@ -408,7 +568,7 @@ async def _run(args: argparse.Namespace) -> None:
                 q_bins,
                 tau_meas,
                 fit,
-                other_targets,
+                held,
                 serial,
                 cal_side,
             )
@@ -417,20 +577,7 @@ async def _run(args: argparse.Namespace) -> None:
             print("\n  Interrupted.")
         finally:
             print("  Returning to rest and disabling ...")
-            in_impedance = motors[joint].motor.mode == ControlMode.IMPEDANCE
-            if in_impedance:
-                try:
-                    await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
-                except Exception:
-                    pass
-            try:
-                await _home_all(motors, exclude=joint if in_impedance else None)
-            except Exception:
-                pass
-            await asyncio.gather(
-                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
-            )
-            await asyncio.gather(*[m.disable() for m in motors.values()])
+            await safe_return_to_rest(motors, holders, joint, kp, kd)
 
 
 def _report_and_save(
@@ -441,7 +588,7 @@ def _report_and_save(
     q_bins: np.ndarray,
     tau_meas: np.ndarray,
     fit: tuple[tuple[float, float, float], float, np.ndarray, np.ndarray] | None,
-    clearance: dict[Joint, float],
+    clearance: dict[Joint, float],  # measured, not commanded — see _run
     hub_serial: str | None,
     cal_side: dict[str, dict],
 ) -> None:
@@ -457,7 +604,7 @@ def _report_and_save(
         )
         return
 
-    com_fit, offset, tau_before, tau_after = fit
+    com_fit, offset, tau_before, tau_after, mass_fit = fit
     res_before = tau_meas - tau_before
     res_after = tau_meas - tau_after - offset
     rms_before = float(np.sqrt(np.mean((res_before - np.mean(res_before)) ** 2)))
@@ -474,6 +621,10 @@ def _report_and_save(
     print(
         f"    Fitted : ({com_fit[0]:+.4f}, {com_fit[1]:+.4f}, {com_fit[2]:+.4f})"
         f"   (shift {delta_mm[0]:+.1f}, {delta_mm[1]:+.1f}, {delta_mm[2]:+.1f} mm)"
+    )
+    print(
+        f"    Mass   : {jc.mass:.3f} -> {mass_fit:.3f} kg "
+        f"({100 * (mass_fit / jc.mass - 1):+.1f}%)"
     )
     print(f"    Fo     : {offset:+.4f} Nm  (friction offset refit to match)")
     print(
@@ -517,7 +668,11 @@ def _report_and_save(
                 "velocity_deg_s": args.velocity,
                 "com_cad": list(jc.com),
                 "com_fit": list(com_fit),
+                "mass_fit": mass_fit,
                 "saved": bool(args.save),
+                # The pose the fit was computed at, as measured after the
+                # ramps — a sagging holder makes this differ from what was
+                # commanded, and the fit is only meaningful alongside it.
                 "clearance_deg": {
                     j.value: round(math.degrees(v), 1) for j, v in clearance.items()
                 },
@@ -540,6 +695,7 @@ def _report_and_save(
         side_str,
         joint.value,
         com=tuple(round(v, 5) for v in com_fit),
+        mass=round(mass_fit, 4),
         friction=friction_update,
         hub_serial=hub_serial,
     )

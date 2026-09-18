@@ -307,14 +307,18 @@ class Axol(RobotBase):
         return out
 
     def _config_text(self) -> str:
-        max_step = self._arms()[0][1]._config.max_step_rad
+        config = self._arms()[0][1]._config
         lines = [
             *config_header(),
             f"loop_hz {self._loop_hz}",
             f"watchdog_ms {self._watchdog_ms}",
             # Corruption defense on the core side; the Python max-step gate
             # in motion_control is the real per-command limit.
-            f"max_step_rad {max_step}",
+            f"max_step_rad {config.max_step_rad}",
+            # The opt-in tracking experiments (``--axol.experiments.*``);
+            # every field is sent so a core from another checkout refuses
+            # the config instead of running a different law.
+            *config.experiments.config_lines(),
         ]
         trk_vel = self._TRACKER_HEADROOM * self._max_vel
         trk_acc = self._TRACKER_HEADROOM * self._max_accel

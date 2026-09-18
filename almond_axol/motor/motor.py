@@ -526,15 +526,18 @@ class Motor:
         """Read the stored PID gains for the speed and position control loops."""
         return await self._driver.get_gains()
 
-    async def set_gains(self, gains: MotorGains) -> None:
+    async def set_gains(self, gains: MotorGains, *, persist: bool = True) -> None:
         """Write PID gains for the speed and position control loops.
 
-        Changes are persisted to non-volatile memory so they survive power cycles.
-
         Args:
-            gains: Gain values to write. Damiao ignores current_kp / current_ki.
+            gains:   Gain values to write. Damiao ignores current_kp /
+                     current_ki.
+            persist: ``True`` (default) stores to non-volatile memory.
+                     ``False`` writes RAM only (MyActuator 0x31), so a power
+                     cycle restores whatever was in ROM — use it while
+                     searching for values.
         """
-        await self._driver.set_gains(gains)
+        await self._driver.set_gains(gains, persist=persist)
 
     async def set_can_id(self, can_id: int) -> None:
         """Change the motor's CAN ID and persist it to flash.

@@ -19,6 +19,16 @@ pub const MA_READ_VERSION: u8 = 0xB2;
 pub const MA_READ_MODEL: u8 = 0xB5;
 pub const MA_MULTI_TURN_ANGLE: u8 = 0x92;
 pub const MA_MOTOR_STATUS_2: u8 = 0x9C;
+/// Position closed-loop commands that are *not* the MIT frame: 0xA9 carries a
+/// per-frame torque limit, 0x73 ("TF") a per-frame feedforward torque. Both go
+/// to 0x140 + id and answer on 0x240 + id — see [`ma_decode_control_reply`].
+/// Selected by `exp wire_mode` (`ControlExperiments.wire_mode`).
+pub const MA_POS_CONTROL: u8 = 0xA4;
+pub const MA_FORCE_POS_CONTROL: u8 = 0xA9;
+pub const MA_POS_TORQUE_FF: u8 = 0x73;
+/// Read one stored planning acceleration; index 0 is the position loop's.
+pub const MA_READ_ACCEL: u8 = 0x42;
+pub const MA_ACC_POS_PLAN: u8 = 0x00;
 pub const MA_RELEASE_BRAKE: u8 = 0x77;
 pub const MA_SHUTDOWN: u8 = 0x80;
 /// System reset — no response; the motor reboots (~1.1 s, allow 2+).
@@ -85,6 +95,86 @@ pub fn ma_decode_mit_feedback(data: &[u8; 8], p_max: f64, t_max: f64) -> (f64, f
         uint_to_float(vel_int, -MA_V_MAX, MA_V_MAX, 12),
         uint_to_float(torq_int, -t_max, t_max, 12),
     )
+}
+
+/// Scale factors for the 0x140-series position commands (0.01 deg/LSB target,
+/// 1 dps/LSB speed limit) and their reply (1 deg/LSB, 1 dps/LSB).
+const RAD_TO_CENTIDEG: f64 = 18000.0 / std::f64::consts::PI;
+const RAD_TO_DPS: f64 = 180.0 / std::f64::consts::PI;
+const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
+
+/// Clamped int32 multi-turn angle (0.01 deg/LSB) — `_angle_centideg` in the
+/// Python driver.
+fn angle_centideg(position: f64) -> i32 {
+    (position * RAD_TO_CENTIDEG).clamp(i32::MIN as f64, i32::MAX as f64) as i32
+}
+
+/// Clamped uint16 speed limit (1 dps/LSB) — `_speed_dps` in the Python driver.
+fn speed_dps(max_speed: f64) -> u16 {
+    (max_speed.abs() * RAD_TO_DPS).clamp(0.0, u16::MAX as f64) as u16
+}
+
+/// 0xA4 absolute position closed-loop frame — `position_velocity_frame` in
+/// `almond_axol/motor/myactuator.py`. Target plus a speed limit, no torque
+/// byte: the motor's configured stall current is the only cap. This is the
+/// command the tuning probes already use to hold idle joints, so the
+/// firmware loop is known to carry these joints' gravity load.
+pub fn ma_pos_velocity_encode(position: f64, max_speed: f64) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[0] = MA_POS_CONTROL;
+    out[2..4].copy_from_slice(&speed_dps(max_speed).to_le_bytes());
+    out[4..8].copy_from_slice(&angle_centideg(position).to_le_bytes());
+    out
+}
+
+/// 0xA9 force-control position closed-loop frame — `force_position_frame` in
+/// `almond_axol/motor/myactuator.py`. `max_torque_pct` is a percentage of the
+/// motor's *rated current* (0-255), not Nm and not the MIT `t_max` scale.
+pub fn ma_force_pos_encode(position: f64, max_speed: f64, max_torque_pct: f64) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[0] = MA_FORCE_POS_CONTROL;
+    out[1] = max_torque_pct.clamp(0.0, 255.0) as u8;
+    out[2..4].copy_from_slice(&speed_dps(max_speed).to_le_bytes());
+    out[4..8].copy_from_slice(&angle_centideg(position).to_le_bytes());
+    out
+}
+
+/// 0x73 "TF" position + feedforward-torque frame — `position_torque_ff_frame`
+/// in the Python driver. The feedforward is an int8 in percent of rated
+/// current, i.e. ~1.7 % of full scale per step against the MIT frame's 12 bits.
+/// Requires V4.4 firmware ([`MA_FW_V44`]).
+pub fn ma_pos_torque_ff_encode(position: f64, max_speed: f64, torque_ff_pct: f64) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[0] = MA_POS_TORQUE_FF;
+    out[1] = (torque_ff_pct.round().clamp(-128.0, 127.0) as i8) as u8;
+    out[2..4].copy_from_slice(&speed_dps(max_speed).to_le_bytes());
+    out[4..8].copy_from_slice(&angle_centideg(position).to_le_bytes());
+    out
+}
+
+/// Decode a 0x240 + id control reply: `(position rad, velocity rad/s, q-axis
+/// current A)` — `decode_control_reply` in the Python driver, and the same
+/// layout as 0x9C. Every 0x140-series closed-loop command answers with this
+/// frame instead of the MIT feedback frame, at 1 deg/LSB position (45x coarser
+/// than MIT) and with current in amps where MIT reports torque in Nm.
+pub fn ma_decode_control_reply(data: &[u8; 8]) -> (f64, f64, f64) {
+    let current = i16::from_le_bytes([data[2], data[3]]) as f64 * 0.01;
+    let speed_dps = i16::from_le_bytes([data[4], data[5]]) as f64;
+    let degrees = i16::from_le_bytes([data[6], data[7]]) as f64;
+    (degrees * DEG_TO_RAD, speed_dps * DEG_TO_RAD, current)
+}
+
+/// 0x42 read request for one planning acceleration index.
+pub fn ma_read_accel(accel_type: u8) -> [u8; 8] {
+    [MA_READ_ACCEL, accel_type, 0, 0, 0, 0, 0, 0]
+}
+
+/// Decode a 0x42 reply into rad/s². Zero means the position loop tracks its
+/// target directly through its PI controller rather than planning a ramp to
+/// each one — which is the regime a streamed trajectory wants (see
+/// `ControlExperiments.wire_mode`).
+pub fn ma_decode_accel(data: &[u8; 8]) -> f64 {
+    i32::from_le_bytes([data[4], data[5], data[6], data[7]]) as f64 * DEG_TO_RAD
 }
 
 /// Damiao register access + feedback requests all go to this arbitration ID.
@@ -308,6 +398,74 @@ mod tests {
         };
         let frame = mit_encode(1.2345, -0.5, 130.0, 3.0, 2.75, &ranges);
         assert_eq!(frame, [140, 163, 126, 132, 40, 153, 153, 56]);
+    }
+
+    /// Both position closed-loop encoders against the Python originals
+    /// (`force_position_frame` / `position_torque_ff_frame`), plus the frame
+    /// printed in the vendor manual's 0xA9 example: 60 % rated current,
+    /// 500 dps, 360.00 deg.
+    #[test]
+    fn position_closed_loop_frames_match_python() {
+        assert_eq!(
+            ma_force_pos_encode(1.2345, 2.0, 60.0),
+            [169, 60, 114, 0, 161, 27, 0, 0]
+        );
+        // 0xA4 is the same frame with the torque byte left at zero.
+        assert_eq!(
+            ma_pos_velocity_encode(1.2345, 2.0),
+            [164, 0, 114, 0, 161, 27, 0, 0]
+        );
+        assert_eq!(
+            ma_pos_velocity_encode(360.0_f64.to_radians(), 500.0_f64.to_radians()),
+            [0xA4, 0x00, 0xF4, 0x01, 0xA0, 0x8C, 0x00, 0x00]
+        );
+        assert_eq!(
+            ma_pos_torque_ff_encode(-0.5, 3.5, -12.4),
+            [115, 244, 200, 0, 208, 244, 255, 255]
+        );
+        assert_eq!(
+            ma_force_pos_encode(360.0_f64.to_radians(), 500.0_f64.to_radians(), 60.0),
+            [0xA9, 0x3C, 0xF4, 0x01, 0xA0, 0x8C, 0x00, 0x00]
+        );
+    }
+
+    /// Out-of-range inputs saturate into the wire fields rather than
+    /// wrapping: a torque percentage past the byte, a speed past the u16 dps
+    /// field, and a feedforward past the int8.
+    #[test]
+    fn position_closed_loop_frames_clamp() {
+        let over = ma_force_pos_encode(0.0, 1e6, 900.0);
+        assert_eq!(over[1], 255);
+        assert_eq!(u16::from_le_bytes([over[2], over[3]]), u16::MAX);
+        assert_eq!(ma_pos_torque_ff_encode(0.0, 0.0, 400.0)[1] as i8, 127);
+        assert_eq!(ma_pos_torque_ff_encode(0.0, 0.0, -400.0)[1] as i8, -128);
+    }
+
+    /// The reply frame from the same manual example: 50 °C, 1 A, 500 dps,
+    /// 45 deg — and the 1 deg/LSB quantisation that makes these modes
+    /// experiments (see `ControlExperiments.wire_mode`).
+    #[test]
+    fn control_reply_matches_python() {
+        let (pos, vel, current) =
+            ma_decode_control_reply(&[0xA9, 0x32, 0x64, 0x00, 0xF4, 0x01, 0x2D, 0x00]);
+        assert!((pos - 45.0_f64.to_radians()).abs() < 1e-15);
+        assert!((vel - 500.0_f64.to_radians()).abs() < 1e-15);
+        assert!((current - 1.0).abs() < 1e-12);
+        // One LSB of position is a whole degree.
+        let (next, _, _) =
+            ma_decode_control_reply(&[0xA9, 0x32, 0x64, 0x00, 0xF4, 0x01, 0x2E, 0x00]);
+        assert!((next - pos - 1.0_f64.to_radians()).abs() < 1e-12);
+    }
+
+    /// A zero position-planning acceleration is what puts the motor in direct
+    /// tracking mode; the write command (0x43) cannot produce it, so the core
+    /// only ever reads this.
+    #[test]
+    fn accel_read_roundtrip() {
+        assert_eq!(ma_read_accel(MA_ACC_POS_PLAN)[0], MA_READ_ACCEL);
+        assert_eq!(ma_decode_accel(&[0x42, 0, 0, 0, 0, 0, 0, 0]), 0.0);
+        let ten_k = ma_decode_accel(&[0x42, 0, 0, 0, 0x10, 0x27, 0x00, 0x00]);
+        assert!((ten_k - 10000.0_f64.to_radians()).abs() < 1e-9);
     }
 
     #[test]

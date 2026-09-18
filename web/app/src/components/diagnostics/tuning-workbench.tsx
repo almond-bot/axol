@@ -21,6 +21,7 @@ import {
   type TuningRunData,
   type TuningRunMeta,
 } from "@/lib/tuning"
+import { fetchMotorDetails } from "@/lib/telemetry"
 
 const COMMANDED_COLOR = "rgba(255,255,255,0.45)"
 const ACTUAL_COLOR = "#eff483"
@@ -46,7 +47,16 @@ const ARM_JOINT_OPTIONS = [
 // Run kinds this workbench presents. Anything else in the store (e.g. old
 // offline-analysis artifacts) is hidden rather than half-rendered. "filter"
 // artifacts (the retired offline-only tab) still render for old runs.
-const KNOWN_KINDS = new Set(["sine", "step", "motion", "gravity", "filter", "build", "kinematics"])
+const KNOWN_KINDS = new Set([
+  "sine",
+  "step",
+  "motion",
+  "gravity",
+  "filter",
+  "build",
+  "kinematics",
+  "position_loop",
+])
 
 /* ------------------------------------------------------------------ */
 /* Inline launcher: what to run, its parameters, and the Run button   */
@@ -68,6 +78,13 @@ interface WbField {
    * and an empty box means "run with config".
    */
   gainKey?: string
+  /**
+   * Key into the selected motor's live firmware loop gains (`position_kp`,
+   * `position_ki`, `speed_kp`, `speed_ki`, read over the idle link): the
+   * field shows the value the motor holds right now and an empty box is
+   * seeded with it, so a sweep is always typed around a known point.
+   */
+  motorGainKey?: string
   /** Render a slider next to the value box, over this range. */
   slider?: { min: number; max: number; step: number }
 }
@@ -192,6 +209,113 @@ const TABS: WbTab[] = [
         label: "target noise (°)",
         type: "number",
         placeholder: "off",
+      },
+      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+    ],
+    required: ["arm", "joint"],
+    drivesMotors: true,
+  },
+  {
+    key: "position_loop",
+    label: "Position loop (0xA4)",
+    command: "tune.position-loop",
+    description:
+      "Tune a MyActuator's internal position PID for the 0xA4 position command in " +
+      "direct-tracking mode (planning acceleration 0, the PI loop tracks the target " +
+      "directly). Streams a sine to one joint and sweeps position_kp, then position_ki " +
+      "at the winning kp, stopping when the motor's q-axis current says it has started " +
+      "to buzz. Every gain point is saved as its own run; the whole sweep shares a group. " +
+      "Give speed_kp / speed_ki several values to sweep the inner speed loop FIRST — " +
+      "innermost loop first; the position loop's cliff is set by the speed loop's phase " +
+      "margin — or one value to pin it. Current-loop gains are not touched. " +
+      "Writes are RAM-only — a power cycle restores the motor. Pick a loaded centre " +
+      "(e.g. -90 on the elbow): an unloaded joint holds at any gain and teaches nothing.",
+    presets: { mode: "track", accel: 0, save_run: true },
+    fields: [
+      { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
+      { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
+      {
+        key: "center",
+        label: "center (°)",
+        type: "number",
+        placeholder: "where it is now",
+        hint:
+          "Joint-frame angle the sine is centred on (it runs centre ± amp). Empty = wherever " +
+          "the joint sits after homing, i.e. near rest and barely loaded — a gain that holds " +
+          "there can collapse under load (elbow: cliff 0.9 at -45°, 0.3 at -90°). Give it the " +
+          "most gravity-loaded pose the joint works at: elbow -90, shoulders where they run.",
+      },
+      {
+        key: "kp",
+        label: "position_kp",
+        type: "text",
+        motorGainKey: "position_kp",
+        placeholder: "motor's",
+        hint:
+          "Stiffness of the motor's position loop: how much speed it asks for per degree of " +
+          "error. Higher = less lag and tighter tracking, until the joint buzzes (the cliff). " +
+          "Space-separated ascending values sweep it and stop at the first that buzzes.",
+        width: "w-48",
+      },
+      {
+        key: "ki",
+        label: "position_ki",
+        type: "text",
+        motorGainKey: "position_ki",
+        placeholder: "motor's",
+        hint:
+          "Integral of the position loop: removes the standing lag a P-only loop keeps while " +
+          "moving (lag ≈ 8.7/kp ms measured) without raising kp toward the cliff — but it " +
+          "winds up against friction and limit-cycles; kp×0.001 already oscillated the elbow. " +
+          "Tried at the winning kp; 0 skips the stage.",
+        width: "w-48",
+      },
+      {
+        key: "speed_kp",
+        label: "speed_kp",
+        type: "text",
+        motorGainKey: "speed_kp",
+        placeholder: "motor's",
+        hint:
+          "Inner speed loop: how hard the motor pushes per unit of speed error. Its phase " +
+          "margin bounds how high position_kp can go before buzzing, so it is tuned FIRST. " +
+          "Several values = swept ascending at the configured position gains; one = pinned.",
+        width: "w-48",
+      },
+      {
+        key: "speed_ki",
+        label: "speed_ki",
+        type: "text",
+        motorGainKey: "speed_ki",
+        placeholder: "motor's",
+        hint:
+          "Integral of the speed loop: removes the steady speed error a P-only speed loop " +
+          "leaves (factory is ~0). Same sweep/pin semantics as speed_kp; tune it last.",
+        width: "w-48",
+      },
+      { key: "amp", label: "amp (°)", type: "number", placeholder: "10" },
+      { key: "freq", label: "freq (Hz)", type: "number", placeholder: "0.2" },
+      { key: "duration", label: "duration (s)", type: "number", placeholder: "15" },
+      {
+        key: "rate",
+        label: "rate (Hz)",
+        type: "number",
+        placeholder: "100",
+        hint: "command rate; two CAN round trips per sample, so ~100 is the ceiling",
+      },
+      {
+        key: "repeat",
+        label: "repeat",
+        type: "number",
+        placeholder: "1",
+        hint: "passes per gain; the spread column shows run-to-run scatter (~1 % measured)",
+      },
+      {
+        key: "ripple_limit",
+        label: "ripple limit (°)",
+        type: "number",
+        placeholder: "0.25",
+        hint: "absolute position-ripple ceiling that stops the sweep; the current-based buzz test needs no limit",
       },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
@@ -979,6 +1103,13 @@ function headline(meta: TuningRunMeta): { label: string; value: string } | null 
     const v = num(m.score)
     return v == null ? null : { label: "score", value: fmtNum(v, 3) }
   }
+  if (meta.kind === "position_loop") {
+    const v = num(m.rms)
+    const g = meta.gains as Record<string, number>
+    const kp = typeof g.position_kp === "number" ? ` @ kp ${fmtNum(g.position_kp, 3)}` : ""
+    const osc = m.oscillating === true ? " ⚠ buzz" : ""
+    return v == null ? null : { label: "tracking", value: `${fmtNum(toDeg(v), 3)}°${kp}${osc}` }
+  }
   if (meta.kind === "gravity") {
     const v = num(m.droop_after_deg)
     return v == null ? null : { label: "droop", value: `${fmtNum(v, 3)}°` }
@@ -1498,6 +1629,17 @@ const SINE_COLS: ScoreCol[] = [
   { key: "score", label: "score", digits: 3 },
 ]
 
+const POSLOOP_COLS: ScoreCol[] = [
+  { key: "rms", label: "tracking RMS °", deg: true, digits: 3, warn: 0.2, bad: 0.5 },
+  { key: "rms_spread", label: "± °", deg: true, digits: 4 },
+  { key: "max", label: "max err °", deg: true, digits: 3, warn: 0.6, bad: 1.5 },
+  { key: "lag_ms", label: "lag ms", digits: 1, warn: 20, bad: 40 },
+  { key: "pos_ripple", label: "ripple °", deg: true, digits: 4, warn: 0.1, bad: 0.25 },
+  { key: "buzz_a", label: "buzz A", digits: 3 },
+  { key: "holder_peak_deg", label: "holder pk °", digits: 2, warn: 1.0, bad: 3.0 },
+  { key: "holder_rms_deg", label: "holder rms °", digits: 2 },
+]
+
 const FILTER_COLS: ScoreCol[] = [
   { key: "input_rms", label: "noise in °", deg: true, digits: 3 },
   { key: "rms_err", label: "error out °", deg: true, digits: 3 },
@@ -1628,6 +1770,9 @@ function scoreRows(
       cols: meta.kind === "sine" ? SINE_COLS : meta.kind === "step" ? STEP_COLS : GRAVITY_COLS,
       rows: [{ joint: meta.joint ?? "joint", values: m }],
     }
+  }
+  if (meta.kind === "position_loop") {
+    return { cols: POSLOOP_COLS, rows: [{ joint: meta.joint ?? "joint", values: m }] }
   }
   return null
 }
@@ -1858,6 +2003,14 @@ export function TuningWorkbench({
   // Effective per-joint config gains (defaults + calibration): the slider
   // baselines and "config N" labels on the gain fields.
   const [gains, setGains] = useState<TuningGains | null>(null)
+  // The selected motor's live firmware loop gains (0x30 over the idle link),
+  // for tabs whose fields are bound to them via `motorGainKey`. Keyed by
+  // "arm/joint" so a stale read for another motor is never shown.
+  const [motorGains, setMotorGains] = useState<{
+    key: string
+    gains: Record<string, number | null> | null
+    error: string | null
+  } | null>(null)
 
   const [runs, setRuns] = useState<TuningRunMeta[]>([])
   const [loading, setLoading] = useState(false)
@@ -2071,6 +2224,61 @@ export function TuningWorkbench({
     onLaunch(tab.command, args)
   }
 
+  const motorFields = useMemo(() => tab.fields.filter((f) => f.motorGainKey), [tab])
+  const motorKey =
+    motorFields.length > 0 && tabValues["arm"] && tabValues["joint"]
+      ? `${tabValues["arm"]}/${tabValues["joint"]}`
+      : null
+  useEffect(() => {
+    if (!enabled || !motorKey) return
+    const [side, joint] = motorKey.split("/")
+    let active = true
+    // The server addresses motors by enum name (SHOULDER_1 …), the form by value.
+    fetchMotorDetails(side, joint.toUpperCase())
+      .then((d) => {
+        if (!active) return
+        setMotorGains({ key: motorKey, gains: d.gains, error: null })
+        // Seed empty boxes with what the motor holds, so a sweep is typed
+        // around a known point instead of into a blank.
+        if (d.gains) {
+          setValues((prev) => {
+            const cur = { ...(prev[tab.key] ?? {}) }
+            let changed = false
+            for (const f of motorFields) {
+              const v = f.motorGainKey ? d.gains?.[f.motorGainKey] : null
+              if ((cur[f.key] ?? "").trim() === "" && typeof v === "number") {
+                cur[f.key] = fmtNum(v, 4)
+                changed = true
+              }
+            }
+            return changed ? { ...prev, [tab.key]: cur } : prev
+          })
+        }
+      })
+      .catch((e) => {
+        if (active) {
+          setMotorGains({
+            key: motorKey,
+            gains: null,
+            error: String(e).replace(/^Error:\s*/, ""),
+          })
+        }
+      })
+    return () => {
+      active = false
+    }
+  }, [enabled, motorKey, motorFields, tab.key])
+
+  /** What the selected motor holds right now for a motor-bound field. */
+  const motorValue = useCallback(
+    (f: WbField): number | null => {
+      if (!f.motorGainKey || !motorGains || motorGains.key !== motorKey) return null
+      const v = motorGains.gains?.[f.motorGainKey]
+      return typeof v === "number" && Number.isFinite(v) ? v : null
+    },
+    [motorGains, motorKey]
+  )
+
   /**
    * The selected joint's current config value for a gain field, or null
    * until an arm and joint are picked (or while gains haven't loaded).
@@ -2238,12 +2446,26 @@ export function TuningWorkbench({
         <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
           {tab.fields.map((f) => {
             const cfg = configValue(f)
+            const mot = motorValue(f)
+            const motErr =
+              f.motorGainKey && motorGains?.key === motorKey && motorGains.error
+                ? motorGains.error
+                : null
             return (
               <label key={f.key} className="flex flex-col gap-1">
                 <span className="text-[0.65rem] text-white/40">
                   {f.label}
                   {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
                   {cfg != null && <span className="text-white/25"> · config {fmtNum(cfg)}</span>}
+                  {mot != null && (
+                    <span className="text-[#eff483]/60"> · motor {fmtNum(mot, 4)}</span>
+                  )}
+                  {motErr && (
+                    <span className="text-white/25" title={motErr}>
+                      {" "}
+                      · motor: connect the arm to read
+                    </span>
+                  )}
                 </span>
                 {f.type === "overrides" ? (
                   <GainOverrideEditor

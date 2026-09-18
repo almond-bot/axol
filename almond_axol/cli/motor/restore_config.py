@@ -19,6 +19,8 @@ Examples:
 import argparse
 import asyncio
 import json
+import math
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +93,45 @@ def _confirm(motor_ids: list[int], channel: str, include_protected: bool) -> boo
     return reply.strip().lower() in ("y", "yes")
 
 
+async def _restore_loop_gains(motor: Any, record: dict[str, Any]) -> None:
+    """Write back the snapshot's internal loop gains, if it has any.
+
+    ``motor.dump-config`` has always recorded these (MyActuator 0x30 /
+    Damiao registers) but nothing wrote them back, so a snapshot was not
+    actually a full undo for the one set of values a tuning session is most
+    likely to change. They live behind their own command rather than the
+    parameter table, hence the separate step.
+    """
+    saved = record.get("loop_gains")
+    if not saved:
+        return
+    try:
+        current = await motor.get_gains()
+    except Exception as e:
+        print(f"    loop gains: could not read — {e}")
+        return
+    fields = {
+        name: float(value)
+        for name, value in saved.items()
+        if hasattr(current, name) and getattr(current, name) is not None
+    }
+    if not fields:
+        return
+    if all(
+        math.isclose(getattr(current, n), v, rel_tol=1e-6, abs_tol=1e-9)
+        for n, v in fields.items()
+    ):
+        print("    loop gains already match the snapshot")
+        return
+    try:
+        await motor.set_gains(replace(current, **fields))
+    except Exception as e:
+        print(f"    loop gains: could not restore — {e}")
+        return
+    for name, value in fields.items():
+        print(f"    wrote {name:<30} {value:>14.4f}")
+
+
 async def _restore_motor(
     bus: CanBus, record: dict[str, Any], include_protected: bool
 ) -> None:
@@ -108,6 +149,8 @@ async def _restore_motor(
     except ValueError as e:
         print(f"    ERROR: {e}")
         return
+    await _restore_loop_gains(motor, record)
+
     if not params:
         print("    nothing to restore")
         return

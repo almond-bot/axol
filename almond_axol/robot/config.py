@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 from ..constants import ARM_JOINTS
@@ -412,7 +412,7 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     """Overlay one joint's calibration-file entry onto its config."""
     overrides: dict[str, Any] = {
         f: entry[f]
-        for f in ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
+        for f in ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q", "mass")
         if f in entry
     }
     friction = entry.get("friction")
@@ -647,6 +647,319 @@ def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
     )
 
 
+#: Wire frames the MyActuator arm joints can be commanded with — see
+#: ``ControlExperiments.wire_mode``. ``mit`` is the production 0x400
+#: impedance frame; the other two are the 0x140-series position closed-loop
+#: commands, which move the position loop into the motor and answer on the
+#: coarse 0x240 reply frame.
+WIRE_MODES = ("mit", "a4", "a9", "tf")
+
+
+@dataclass
+class ControlExperiments:
+    """Opt-in tracking-accuracy experiments, every one off by default.
+
+    Each field is a flag (``--axol.experiments.<name>``) so the candidates
+    for stiffening the arm / removing its slow-motion stick-slip stairs can
+    be A/B'd on hardware one at a time against the shipped controller. With
+    every field at its default the control law is bit-for-bit the
+    production one. The math lives in :mod:`almond_axol.robot.control`
+    (classic path, golden reference) and ``rust/axol-rt/src/filter.rs``
+    (the realtime core, which is what production runs); the values ride
+    the core's config as ``exp <name> <value>`` lines.
+
+    Measure each with ``tune.motion`` (``--experiment name=value``, or an
+    ``experiments`` block in the settings file) plus an ``AXOL_RT_TRACE``
+    capture — the trace carries ``stiction_ff`` / ``integral_ff`` /
+    ``dither_ff`` columns next to the existing feedforwards — and check the
+    3 / 8–13 / 27–35 Hz modes stay quiet.
+
+    **Not** ``tune.pid``: its single-joint runner is a separate control law
+    in the core's tuning path (``rust/axol-rt/src/experiment.rs``), which
+    has none of this plumbed into it and always runs the shipped
+    feedforward. Every flag here reads as a no-op under it. Only the
+    production ``motion_control`` path — teleop, ``tune.motion``,
+    ``tune.repeatability`` — applies them.
+
+    Attributes:
+        friction_k_max: Steepness cap on the Coulomb friction feedforward's
+            tanh (:data:`~almond_axol.robot.control.FRICTION_FF_K_MAX`,
+            100). The cap makes the FF deliver only ~20 % of ``fc`` at
+            0.02 rad/s and ~46 % at 0.05 — slow extended-reach moves creep
+            in stick-slip stairs of ``(fc_break − fc_kinetic)/kp``. At 400
+            those become ~66 % and ~96 % (the FF saturates by ~0.05 rad/s
+            instead of ~0.2); pair with ``friction_slew`` so the ``±fc``
+            reversal step stays off the shoulders' 2–3 Hz mode (the reason
+            the cap exists).
+        friction_slew: Rate limit (Nm/s) on the Coulomb friction term;
+            ``0`` is off. 20–40 turns a reversal into a ~60–130 ms ramp on
+            the shoulders while leaving steady low-speed compensation intact.
+        friction_load_gain: Load-dependent Coulomb friction,
+            ``fc_eff = fc + gain·|τ_gravity|`` (dimensionless, ~0.03–0.1).
+            Gear friction rises with load torque, and the friction fits
+            were taken at moderate poses — at extended reach the shoulders
+            and elbow are under-compensated exactly where the stairs show.
+        stiction_gain: Error-sign Coulomb compensation as a fraction of
+            ``fc`` (:func:`~almond_axol.robot.control.stiction_compensation`);
+            ``0`` is off, 0.6 the suggested start. Acts while the joint is
+            stuck and the commanded velocity is ~0 — the textbook stick-slip
+            and deadband fix. Keep it under 1 so it can never overpower
+            friction alone (hunting); drop to 0.4 or off on a joint that
+            limit-cycles at rest. Wants a per-robot ``tune.friction`` fit.
+        stiction_err_deg: Position error (degrees) at which the stiction
+            term saturates (``tanh(err/scale)``).
+        integrator_hz: Crossover frequency (Hz) of a slow, clamped integral
+            of position error added to ``t_ff``
+            (:class:`~almond_axol.robot.control.ErrorIntegrator`); ``0`` is
+            off, 0.3 the suggested start (well below the 2–13 Hz modes the
+            damping design fights). ``ki = kp·2π·f`` per joint, i.e. the
+            integral equals the proportional term at ``f``. Collapses the
+            friction/gravity-model/payload residual after arrival; too fast
+            and it winds up during the stick phase and fires bigger slips —
+            if the stairs grow, lower it.
+        integrator_clamp_fc: Anti-windup bound on the integral torque as a
+            multiple of the joint's ``fc`` (so it can eat friction plus a
+            small model error, never a contact). Sized for uncalibrated
+            robots at 2×.
+        integrator_clamp_min_nm: Floor (Nm) on that bound, for the low-fc
+            wrists.
+        integrator_freeze_deg: Position error (degrees) above which the
+            integrator holds instead of winding up — a large error is a
+            move in progress or a contact, not a residual.
+        tracker_wire_vel: Realtime core only. Send the in-core tracker's own
+            velocity state (through ``tracker_vel_pole``) as the MIT wire
+            velocity instead of the 20 rad/s low-pass derivative of tracker
+            position. The derivative lags ~50 ms, and firmware ``kd·(v_des −
+            v)`` brakes by ``kd × lag`` during every acceleration (~0.75 Nm
+            on the kd=5 joints); the tracker velocity is
+            acceleration-bounded by construction.
+        tracker_vel_pole: First-order pole (rad/s) on that tracker velocity.
+        tracker_accel_ff: Realtime core only. Drive the ``j_eff`` inertia
+            feedforward from the tracker's own acceleration (through
+            ``tracker_accel_pole``) instead of two 20 rad/s poles on
+            position, which arrive ~−90° late at the shoulder mode. The
+            fitted ``j_eff`` values absorb the old lag, so re-fit them with
+            ``tune.pid`` when this is on.
+        tracker_accel_pole: First-order pole (rad/s) on that acceleration.
+            One mild pole (~60) keeps the 120 Hz target staircase's
+            adoption/repeat-tick ripple (see the core README) out of the
+            torque; lower it if ``inertia_ff`` in the trace shows a 120 Hz
+            comb.
+        dither_nm: Peak amplitude (Nm) of a stiction-breaking torque dither
+            added to the feedforward
+            (:class:`~almond_axol.robot.control.TorqueDither`); ``0`` is off.
+            Keeps the joint's friction sliding instead of re-sticking between
+            cycles — the third angle on the stick-slip stairs, next to
+            ``stiction_gain`` (push harder toward the target) and
+            ``friction_k_max`` (compensate sooner). Start around 15-25 % of
+            the joint's ``fc``: enough to keep the contact moving, not enough
+            to move the joint.
+        dither_hz: Dither frequency. Must clear the arm's structural modes
+            (up to ~35 Hz) and stay under the Nyquist of the loop that emits
+            it — 120 Hz in the realtime core, ~60 Hz on the classic path —
+            which leaves roughly 40-80 Hz. The default sits at 40.
+        dither_square: Square dither wave instead of a sine. A square holds
+            full amplitude the whole cycle, so it breaks stiction at a lower
+            peak, but its odd harmonics reach far above ``dither_hz`` and
+            will find a structural mode if one is up there. Try the sine
+            first.
+        dither_fade_vel: Velocity (rad/s) over which the dither fades out
+            (``tanh``-shaped: ~24 % left at this speed, ~4 % at twice it).
+            Dither earns its keep at rest and through the creep regime; above
+            that it is heat and audible buzz. ``0`` never fades.
+        wire_mode: Which CAN frame the **MyActuator** arm joints
+            (``shoulder_1``..``wrist_1``) are commanded with. Realtime core
+            only; the Damiao wrists and the gripper are unaffected.
+
+            - ``"mit"`` (default): the 0x400 impedance frame — position,
+              velocity, ``kp``, ``kd`` and the full feedforward torque, i.e.
+              the production control law.
+            - ``"a4"``: 0xA4 absolute position closed-loop — a target and a
+              speed cap, no torque byte. The firmware position loop does the
+              work. This is the command the tuning probes already use to hold
+              the joints they are not testing, so the loop is known to carry
+              these joints' gravity load; and unlike ``a9`` there is no
+              per-frame current cap that can be set too low to hold the arm
+              up. Like ``a9`` it sends no host feedforward.
+            - ``"a9"``: 0xA9 force-control position closed-loop. The motor's
+              own position loop tracks the streamed trajectory under
+              ``wire_torque_pct`` and a speed cap, with the position at
+              0.01 deg/LSB — 2.2x finer than the MIT frame's ``p_des``, which
+              is the point of trying it. **Everything host-side stops
+              reaching the motor**: no ``kp``/``kd``, no gravity, friction,
+              damping, stiction, integrator or dither. The stored
+              position-loop PI gains become the entire controller, so a
+              gravity-loaded joint holds only by winding up its own integral.
+            - ``"tf"``: 0x73 position control with feedforward torque — the
+              same fine position command, but the host's feedforward still
+              arrives, quantised to ``wire_ff_nm_per_pct`` steps. Needs V4.4
+              firmware; the core refuses to arm an older motor in this mode.
+
+            All three answer on the 0x240 reply frame instead of the
+            MIT feedback frame, which costs **real telemetry**: measured
+            position drops to 1 deg/LSB (45x coarser), velocity to 1 dps/LSB,
+            and the torque channel becomes q-axis current in amps (see
+            ``wire_torque_nm_per_amp``). Host damping is driven from the
+            motor's reported speed instead of a position derivative, and
+            anything that reads measured torque — the contact watchdog above
+            all — is only as good as that conversion. These are A/B modes for
+            a tracking measurement, not a path to record datasets on.
+        wire_torque_pct: ``a9`` torque limit, as a percentage of the motor's
+            **rated current** (0-255, the wire unit; not Nm and not the MIT
+            ``t_max`` scale). Above the motor's configured stall current the
+            firmware leaves force control off entirely.
+        wire_speed_scale: Multiplier on the joint's tracker velocity limit
+            for the speed cap carried by the ``a9`` / ``tf`` frame. The
+            trajectory is already inside that limit, so this is a runaway
+            guard; below 1.0 it becomes an active limit.
+        wire_ff_nm_per_pct: Nm per 1 % unit of the ``tf`` frame's int8
+            feedforward field. ``0`` (the default) derives it as
+            ``t_max/100``, i.e. treats the MIT torque range as 100 % of rated
+            — an assumption, not a measurement: the two scales are rated
+            *current* and peak *torque*. Fit it against a measured stall or
+            current reading before trusting the absolute level, and note that
+            even at the default the step is ~0.6 Nm on an X6 (~1.3 on an X8)
+            against the MIT frame's ~0.03 Nm.
+        tracker_pos_gain: Realtime core only. Position-tracking gain (1/s) of
+            the in-core target tracker
+            (``Trapezoid`` in ``rust/axol-rt/src/filter.rs``; the Python twin
+            is :class:`~almond_axol.teleop.filter.TrapezoidalFilter`). It is a
+            first-order pole, so the shipped 15.7 is a **64 ms lag** — and
+            that lag is the single largest tracking error on this robot.
+
+            It reaches the end effector as path deviation proportional to
+            commanded speed, which is what makes a curved path cut its corner:
+            measured on hardware as ``deviation = 1.4 mm + 58 ms x speed``
+            (correlation 0.98 between commanded TCP speed and deviation), i.e.
+            3 mm while creeping and 36 mm at 0.6 m/s. The ``TrapezoidalFilter``
+            docstring predicts the same thing in joint space — "~v/kp tracking
+            lag (~1 deg at the ~0.3 rad/s joint speeds of normal teleop)".
+
+            Raising it buys that accuracy back proportionally (double the gain,
+            halve the lag) and spends it on the reason the tracker is slow:
+            its velocity feedforward peaks at the arm's structural resonance,
+            which is what the earlier bang-bang and sqrt-braking designs were
+            replaced for. Watch the 2-3 Hz band as you raise it; ringing
+            there is the ceiling.
+        command_lead_ms: Realtime core only. Phase lead (ms) on the **wire
+            position only**: the frame carries ``p_cmd + lead x v_tracker``
+            instead of ``p_cmd``. ``0`` is off.
+
+            This cancels the velocity-proportional tracking lag rather than
+            trying to reduce it, and the lag is exactly the quantity to cancel
+            because both halves are known: the time constant is measurable
+            per joint (right shoulder_1 20 ms, right elbow 28 ms at
+            ``tracker_pos_gain`` 62.8) and the velocity is the tracker's own
+            acceleration-bounded state, not a differentiated signal. It is the
+            same extrapolation :class:`filter::Holdover` already does for late
+            targets, applied deliberately.
+
+            Only the wire position moves. The derivative chains, the
+            stiction/integrator position error and the trace's ``cmd_p`` all
+            stay on the unled command, so every error term keeps measuring
+            real tracking error rather than the lead; the trace's ``wire_p``
+            column is what actually went out.
+
+            One value covers every joint, so it is a compromise where the
+            per-joint lags differ — a per-joint lead would have to ride the
+            streamed target packet rather than the config. Overshoot at
+            direction reversals is the failure mode to watch: the lead is
+            largest exactly where the velocity is about to change sign.
+        tracker_vel_gain: Realtime core only. Velocity-tracking gain (1/s) of
+            the same loop, ``2*wn`` against the position gain's ``wn/2``.
+            Keep the 4:1 ratio when changing ``tracker_pos_gain`` or the loop
+            stops being critically damped.
+        wire_torque_nm_per_amp: Nm per amp of reported q-axis current, used
+            to put the ``a9`` / ``tf`` reply's torque channel back into Nm.
+            ``0`` (the default) reports the raw current, which leaves every
+            consumer of measured torque — the contact watchdog, the trace's
+            ``meas_tau``, ``torque_residuals`` — reading amps where they
+            expect Nm.
+    """
+
+    friction_k_max: float = 100.0
+    friction_slew: float = 0.0
+    friction_load_gain: float = 0.0
+    stiction_gain: float = 0.0
+    stiction_err_deg: float = 0.1
+    integrator_hz: float = 0.0
+    integrator_clamp_fc: float = 2.0
+    integrator_clamp_min_nm: float = 0.3
+    integrator_freeze_deg: float = 2.0
+    tracker_wire_vel: bool = False
+    tracker_vel_pole: float = 60.0
+    tracker_accel_ff: bool = False
+    tracker_accel_pole: float = 60.0
+    dither_nm: float = 0.0
+    dither_hz: float = 40.0
+    dither_square: bool = False
+    dither_fade_vel: float = 0.05
+    wire_mode: str = "mit"
+    wire_torque_pct: float = 100.0
+    wire_speed_scale: float = 1.0
+    wire_ff_nm_per_pct: float = 0.0
+    wire_torque_nm_per_amp: float = 0.0
+    tracker_pos_gain: float = 15.7
+    tracker_vel_gain: float = 62.8
+    command_lead_ms: float = 0.0
+
+    def validate(self) -> None:
+        """Raise ``ValueError`` on a combination the core would reject.
+
+        Called at the robot-construction boundary (:meth:`AxolConfig.resolved`)
+        so a mistyped flag fails with a readable message on the host instead
+        of as a config error from the realtime core — or, worse, as a mode
+        that silently did nothing.
+        """
+        if self.wire_mode not in WIRE_MODES:
+            raise ValueError(
+                f"experiments.wire_mode {self.wire_mode!r} is not one of "
+                f"{', '.join(sorted(WIRE_MODES))}"
+            )
+        if self.dither_nm < 0.0:
+            raise ValueError("experiments.dither_nm must not be negative")
+        if self.dither_nm > 0.0 and self.dither_hz <= 0.0:
+            raise ValueError(
+                "experiments.dither_hz must be positive when dither_nm is set"
+            )
+        if not 0.0 <= self.wire_torque_pct <= 255.0:
+            raise ValueError("experiments.wire_torque_pct must be in [0, 255]")
+        if self.wire_speed_scale <= 0.0:
+            raise ValueError("experiments.wire_speed_scale must be positive")
+        if self.tracker_pos_gain <= 0.0 or self.tracker_vel_gain <= 0.0:
+            raise ValueError("experiments.tracker_*_gain must be positive")
+        # A lead is a position offset of lead x velocity; past ~100 ms that is
+        # a large commanded jump on a fast joint, and the term it cancels is
+        # only tens of ms to begin with.
+        if not 0.0 <= self.command_lead_ms <= 100.0:
+            raise ValueError("experiments.command_lead_ms must be in [0, 100]")
+
+    def is_default(self) -> bool:
+        """``True`` when every experiment is off (the production control law)."""
+        return self == ControlExperiments()
+
+    def config_lines(self) -> list[str]:
+        """The ``exp <name> <value>`` lines the realtime core parses.
+
+        Every field is emitted (booleans as ``0``/``1``) so a core built from
+        another checkout, which would not know a name, fails at configure
+        time instead of silently running a different control law.
+        """
+        out: list[str] = []
+        for f in fields(self):
+            v = getattr(self, f.name)
+            if isinstance(v, bool):
+                text = str(int(v))
+            elif isinstance(v, str):
+                # One bare word (``wire_mode``); the core parses a value that
+                # is not a number as a name.
+                text = v
+            else:
+                text = repr(float(v))
+            out.append(f"exp {f.name} {text}")
+        return out
+
+
 @dataclass
 class AxolConfig:
     """Top-level configuration for both arms and grippers.
@@ -692,6 +1005,9 @@ class AxolConfig:
                          round-trips cleanly (loading a dumped config and
                          resolving it again is idempotent).
         right_stiffness: Same, for the **right** arm.
+        experiments:     Opt-in tracking-accuracy experiments
+                         (:class:`ControlExperiments`), all off by default.
+                         Flags: ``--axol.experiments.<name>``.
     """
 
     left: ArmConfig = field(
@@ -704,6 +1020,7 @@ class AxolConfig:
     max_step_rad: float = 0.5
     left_stiffness: float | list[float] = 1.0
     right_stiffness: float | list[float] = 1.0
+    experiments: ControlExperiments = field(default_factory=ControlExperiments)
 
     def resolved(self) -> "AxolConfig":
         """Return a copy with stiffness baked into the ``left``/``right`` gains.
@@ -716,7 +1033,12 @@ class AxolConfig:
         applied once at the single robot-construction boundary
         (``Axol.__init__``) so every consumer sees consistent gains while
         the unresolved config stays safe to serialize and reload.
+
+        Also the point where the opt-in experiments are checked
+        (:meth:`ControlExperiments.validate`), so a bad flag raises here
+        rather than at core-configure time or, worse, not at all.
         """
+        self.experiments.validate()
         return replace(
             self,
             left=_apply_stiffness(self.left, self.left_stiffness),

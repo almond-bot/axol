@@ -105,7 +105,195 @@ impl BandPass {
 pub const FRICTION_FF_K_MAX: f64 = 100.0;
 
 pub fn friction(v: f64, fc: f64, k: f64, fv: f64, fo: f64) -> f64 {
-    fc * (0.1 * k.min(FRICTION_FF_K_MAX) * v).tanh() + fv * v + fo
+    fc * coulomb_unit(v, k, FRICTION_FF_K_MAX) + fv * v + fo
+}
+
+/// Saturation fraction of the Coulomb feedforward,
+/// `tanh(0.1·min(k, k_max)·v)` ∈ (−1, 1) — `coulomb_unit` in
+/// `almond_axol.robot.control`. `k_max` is the experiment-adjustable cap
+/// (`exp friction_k_max`, default `FRICTION_FF_K_MAX`).
+pub fn coulomb_unit(v: f64, k: f64, k_max: f64) -> f64 {
+    (0.1 * k.min(k_max) * v).tanh()
+}
+
+/// Rate limiter, `|y[k] − y[k−1]| ≤ rate·dt` — `SlewLimiter` in
+/// `almond_axol.robot.control`. Applied to the Coulomb friction term when
+/// its tanh is steepened past the cap (`exp friction_slew`): the ±fc step at
+/// every arrival/reversal is what the cap protects the shoulders' 2–3 Hz
+/// mode from, and a slew does that job without dulling low-speed
+/// compensation. `rate <= 0` passes through. The first update adopts `x`.
+#[derive(Default)]
+pub struct SlewLimiter {
+    y: Option<f64>,
+}
+
+impl SlewLimiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&mut self, x: f64, rate: f64, dt: f64) -> f64 {
+        let y = match self.y {
+            Some(prev) if rate > 0.0 && dt > 0.0 => {
+                let step = rate * dt;
+                prev + (x - prev).clamp(-step, step)
+            }
+            _ => x,
+        };
+        self.y = Some(y);
+        y
+    }
+
+    /// Forget the held output; the next update adopts its input.
+    pub fn reset(&mut self) {
+        self.y = None;
+    }
+}
+
+/// Error-sign Coulomb compensation — `stiction_compensation` in
+/// `almond_axol.robot.control`: `gain·fc·tanh(err/err_scale)·(1 − |sat|)`.
+/// Pushes the fitted Coulomb torque toward the target (`err = q_des −
+/// q_meas`) while the joint is stuck and the velocity feedforward has
+/// switched itself off, and fades out as that feedforward saturates (`sat`
+/// from [`coulomb_unit`]) so the two never stack past `(1 + gain)·fc`.
+pub fn stiction(err: f64, sat: f64, fc: f64, gain: f64, err_scale: f64) -> f64 {
+    if gain == 0.0 || fc == 0.0 {
+        return 0.0;
+    }
+    gain * fc * (err / err_scale.max(1e-9)).tanh() * (1.0 - sat.abs())
+}
+
+/// Per-channel phase offset of the torque dither: the golden angle,
+/// `π(3 − √5)` — `DITHER_PHASE_STAGGER` in `almond_axol.robot.control`.
+/// Written out because `sqrt` is not available in a `const`; the test below
+/// pins it to the expression.
+pub const DITHER_PHASE_STAGGER: f64 = 2.399_963_229_728_653;
+
+/// Single-channel stiction-breaking torque dither — `TorqueDither` in
+/// `almond_axol.robot.control`, one instance per slot (the Python class is
+/// N-channel; the core keeps its per-joint state in per-joint structs).
+///
+/// A small oscillation added to the feedforward keeps the joint's friction
+/// sliding rather than re-sticking between cycles, which is the classic fix
+/// for the stick-slip stairs a slow position command leaves behind. Phase
+/// advances on an accumulator, so a late tick shifts phase instead of
+/// frequency, and each slot starts [`DITHER_PHASE_STAGGER`] apart so seven
+/// joints never push the structure in unison.
+pub struct Dither {
+    phase0: f64,
+    phase: f64,
+}
+
+impl Dither {
+    pub fn new(channel: usize) -> Self {
+        let phase0 = (channel as f64 * DITHER_PHASE_STAGGER).rem_euclid(std::f64::consts::TAU);
+        Self {
+            phase0,
+            phase: phase0,
+        }
+    }
+
+    /// Advance one step and return the dither torque (Nm). `amplitude <= 0`
+    /// or `hz <= 0` is off and leaves the phase where it was (matching the
+    /// Python original). `fade_vel > 0` fades the amplitude out with
+    /// `1 − tanh(|v| / fade_vel)`, so the dither acts where the joint is
+    /// stuck and stops being heat and noise once it is moving.
+    pub fn update(
+        &mut self,
+        velocity: f64,
+        amplitude: f64,
+        hz: f64,
+        dt: f64,
+        square: bool,
+        fade_vel: f64,
+    ) -> f64 {
+        if amplitude <= 0.0 || hz <= 0.0 {
+            return 0.0;
+        }
+        let step = if dt > 0.0 {
+            std::f64::consts::TAU * hz * dt
+        } else {
+            0.0
+        };
+        self.phase = (self.phase + step).rem_euclid(std::f64::consts::TAU);
+        let mut wave = self.phase.sin();
+        if square {
+            wave = if wave >= 0.0 { 1.0 } else { -1.0 };
+        }
+        let fade = if fade_vel > 0.0 {
+            1.0 - (velocity.abs() / fade_vel).tanh()
+        } else {
+            1.0
+        };
+        amplitude * fade * wave
+    }
+
+    /// Restart at this channel's staggered phase.
+    pub fn reset(&mut self) {
+        self.phase = self.phase0;
+    }
+}
+
+/// Clamped, freeze-gated position-error integrator → torque —
+/// `ErrorIntegrator` in `almond_axol.robot.control`. `ki` is Nm/(rad·s),
+/// `clamp` the anti-windup bound on the output (Nm); `|err| > freeze` (rad)
+/// or `dt <= 0` holds the state instead of winding up (a large error is a
+/// move or a contact, not a residual; no fresh feedback means no fresh
+/// error). `ki <= 0` or `clamp <= 0` zeroes it.
+#[derive(Default)]
+pub struct Integrator {
+    i: f64,
+}
+
+impl Integrator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&mut self, err: f64, ki: f64, clamp: f64, freeze: f64, dt: f64) -> f64 {
+        if ki <= 0.0 || clamp <= 0.0 {
+            self.i = 0.0;
+        } else if dt > 0.0 && err.abs() <= freeze {
+            self.i = (self.i + ki * err * dt).clamp(-clamp, clamp);
+        }
+        self.i
+    }
+
+    pub fn reset(&mut self) {
+        self.i = 0.0;
+    }
+}
+
+/// First-order low-pass, `a = 1/(1 + dt·ω)`, `y ← a·y + (1 − a)·x`. The first
+/// update adopts `x`. Used on the tracker's own velocity/acceleration states
+/// when they replace the position-derivative chains (`exp tracker_wire_vel`
+/// / `exp tracker_accel_ff`).
+#[derive(Default)]
+pub struct LowPass {
+    y: Option<f64>,
+}
+
+impl LowPass {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&mut self, x: f64, pole: f64, dt: f64) -> f64 {
+        let y = match self.y {
+            Some(prev) if pole > 0.0 && dt > 0.0 => {
+                let a = 1.0 / (1.0 + dt * pole);
+                a * prev + (1.0 - a) * x
+            }
+            _ => x,
+        };
+        self.y = Some(y);
+        y
+    }
+
+    /// Adopt `x` as the current output (re-priming at rest).
+    pub fn seed(&mut self, x: f64) {
+        self.y = Some(x);
+    }
 }
 
 /// Velocity/acceleration-limited target tracker — the per-joint
@@ -126,22 +314,57 @@ pub fn friction(v: f64, fc: f64, k: f64, fv: f64, fo: f64) -> f64 {
 pub struct Trapezoid {
     pub max_vel: f64,
     pub max_accel: f64,
+    /// Position- and velocity-tracking gains (1/s). Defaults are
+    /// [`Trapezoid::POS_TRACK_GAIN`] / [`Trapezoid::VEL_TRACK_GAIN`]; the
+    /// `tracker_pos_gain` / `tracker_vel_gain` experiments override them.
+    ///
+    /// The position gain *is* the tracker's lag: a first-order pole at
+    /// `pos_gain` rad/s, so 15.7 is a 64 ms time constant. That lag shows up
+    /// at the end effector as path deviation proportional to commanded speed
+    /// — measured at 58 ms on hardware, which is what makes a curved path
+    /// cut its corner. Raising it trades that accuracy against the reason it
+    /// is slow: velocity feedforward peaking at the arm's structural
+    /// resonance (see the type docs).
+    pos_gain: f64,
+    vel_gain: f64,
     pos: f64,
     vel: f64,
     seeded: bool,
 }
 
 impl Trapezoid {
-    const POS_TRACK_GAIN: f64 = 15.7; // 1/s = ωn/2 with ωn = 2π·5 Hz
-    const VEL_TRACK_GAIN: f64 = 62.8; // 1/s = 2·ωn
+    pub const POS_TRACK_GAIN: f64 = 15.7; // 1/s = ωn/2 with ωn = 2π·5 Hz
+    pub const VEL_TRACK_GAIN: f64 = 62.8; // 1/s = 2·ωn
     const BRAKE_MARGIN: f64 = 0.8;
 
     /// Unseeded, matching the Python original: the first `update` adopts
     /// the target as the output (no transient).
     pub fn new(max_vel: f64, max_accel: f64) -> Self {
+        Self::with_gains(
+            max_vel,
+            max_accel,
+            Self::POS_TRACK_GAIN,
+            Self::VEL_TRACK_GAIN,
+        )
+    }
+
+    /// As [`Trapezoid::new`], with the tracking gains overridden. A
+    /// non-positive gain falls back to its default, so a zeroed experiment
+    /// value cannot stall the tracker.
+    pub fn with_gains(max_vel: f64, max_accel: f64, pos_gain: f64, vel_gain: f64) -> Self {
         Self {
             max_vel,
             max_accel,
+            pos_gain: if pos_gain > 0.0 {
+                pos_gain
+            } else {
+                Self::POS_TRACK_GAIN
+            },
+            vel_gain: if vel_gain > 0.0 {
+                vel_gain
+            } else {
+                Self::VEL_TRACK_GAIN
+            },
             pos: 0.0,
             vel: 0.0,
             seeded: false,
@@ -177,11 +400,10 @@ impl Trapezoid {
         let v_stop = -bdt + (bdt * bdt + 2.0 * a_brake * dist).sqrt();
 
         let ceiling = self.max_vel.min(v_stop);
-        let desired = (Self::POS_TRACK_GAIN * err).clamp(-ceiling, ceiling);
+        let desired = (self.pos_gain * err).clamp(-ceiling, ceiling);
 
         let vel_prev = self.vel;
-        let mut vel =
-            vel_prev + (Self::VEL_TRACK_GAIN * (desired - vel_prev) * dt).clamp(-adt, adt);
+        let mut vel = vel_prev + (self.vel_gain * (desired - vel_prev) * dt).clamp(-adt, adt);
 
         // Acceleration-gated arrival (see the Python docstring: an
         // unconditional snap degenerates into a pass-through).
@@ -420,6 +642,111 @@ mod tests {
         }
     }
 
+    /// Golden vectors from `almond_axol.robot.control.TorqueDither`: channel
+    /// 3 (the elbow's stagger offset) of a 40 Hz sine dither at 0.25 Nm,
+    /// faded against a 1 Hz 0.02 rad/s velocity with `fade_vel = 0.05`.
+    #[test]
+    fn dither_matches_python() {
+        let golden = [
+            2.309309714758029e-01,
+            3.219017344380157e-02,
+            -1.942474090353159e-01,
+            -2.236858958780299e-01,
+            -3.117141857461361e-02,
+            1.880510214080443e-01,
+            2.164995766404254e-01,
+            3.016366899355213e-02,
+            -1.819382352135718e-01,
+            -2.094295231161269e-01,
+            -2.917492986113358e-02,
+            1.759571782350752e-01,
+        ];
+        let mut d = Dither::new(3);
+        for (k, want) in golden.iter().enumerate() {
+            let v = 0.02 * (2.0 * std::f64::consts::PI * k as f64 * DT).sin();
+            let got = d.update(v, 0.25, 40.0, DT, false, 0.05);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "dither sample {k}: got {got:e}, want {want:e}"
+            );
+        }
+    }
+
+    /// The stagger is the golden angle, and a 40 Hz square on the 240 Hz loop
+    /// is three ticks each way — the shape that actually reaches the motor.
+    #[test]
+    fn dither_square_and_stagger() {
+        assert!(
+            (DITHER_PHASE_STAGGER - std::f64::consts::PI * (3.0 - 5.0_f64.sqrt())).abs() < 1e-15
+        );
+        let mut d = Dither::new(0);
+        let got: Vec<f64> = (0..12)
+            .map(|_| d.update(0.0, 0.25, 40.0, DT, true, 0.0))
+            .collect();
+        assert_eq!(
+            got,
+            vec![0.25, 0.25, 0.25, -0.25, -0.25, -0.25, 0.25, 0.25, 0.25, -0.25, -0.25, -0.25]
+        );
+        // Off is off, and leaves the phase untouched.
+        assert_eq!(d.update(0.0, 0.0, 40.0, DT, true, 0.0), 0.0);
+        assert_eq!(d.update(0.0, 0.25, 0.0, DT, true, 0.0), 0.0);
+        assert_eq!(d.update(0.0, 0.25, 40.0, DT, true, 0.0), 0.25);
+    }
+
+    /// Steady-state lag against a constant-velocity target, as a function of
+    /// the position-tracking gain. This is the number that reaches the end
+    /// effector as speed-proportional path deviation, and the reason
+    /// `tracker_pos_gain` is an experiment at all.
+    ///
+    /// At the shipped gain it is ~55 ms here, against 58 ms measured on
+    /// hardware from TCP path deviation vs commanded speed (correlation
+    /// 0.98) and 59 ms from the joint traces — three independent reads of
+    /// the same constant. Doubling the gain more than halves it: the loop is
+    /// second order, so the lag falls faster than `1/gain`.
+    fn steady_lag_ms(gain: f64) -> f64 {
+        let v = 0.30; // rad/s, ~normal teleop joint speed
+        let mut trk = Trapezoid::with_gains(10.0, 200.0, gain, 4.0 * gain);
+        let mut target = 0.0;
+        // Long enough to leave the acceleration transient behind.
+        for _ in 0..4000 {
+            target += v * DT;
+            trk.update(target, DT);
+        }
+        1e3 * (target - trk.update(target + v * DT, DT).0) / v
+    }
+
+    #[test]
+    fn tracker_lag_falls_with_the_position_gain() {
+        let shipped = steady_lag_ms(Trapezoid::POS_TRACK_GAIN);
+        assert!(
+            (50.0..60.0).contains(&shipped),
+            "shipped tracker lag {shipped:.1} ms - hardware measures 58"
+        );
+        let doubled = steady_lag_ms(2.0 * Trapezoid::POS_TRACK_GAIN);
+        assert!(
+            doubled < shipped / 2.0,
+            "doubling the gain should more than halve the lag: {shipped:.1} -> {doubled:.1} ms"
+        );
+        let mut prev = f64::INFINITY;
+        for mult in [0.5, 1.0, 2.0, 4.0] {
+            let lag = steady_lag_ms(Trapezoid::POS_TRACK_GAIN * mult);
+            assert!(lag < prev, "lag must fall monotonically with gain");
+            prev = lag;
+        }
+    }
+
+    /// A zeroed or negative gain must not stall the tracker — it falls back
+    /// to the shipped value rather than freezing the arm.
+    #[test]
+    fn tracker_rejects_non_positive_gains() {
+        let mut bad = Trapezoid::with_gains(10.0, 200.0, 0.0, -5.0);
+        let mut good = Trapezoid::new(10.0, 200.0);
+        for k in 1..200 {
+            let target = 0.001 * k as f64;
+            assert_eq!(bad.update(target, DT).0, good.update(target, DT).0);
+        }
+    }
+
     #[test]
     fn lpdiff_matches_python() {
         let golden = [
@@ -595,6 +922,189 @@ mod tests {
                 "friction({v}): got {got:e}, want {want:e}"
             );
         }
+    }
+
+    /// Golden values from `almond_axol.robot.control.compute_friction` with
+    /// the cap raised to 400 (`exp friction_k_max`): fc=0.6, k=800, fv=0.15,
+    /// fo=0.02 — the Coulomb term now reaches ~66 % of fc at 0.02 rad/s
+    /// (vs ~20 % under the production cap).
+    #[test]
+    fn friction_k_max_matches_python() {
+        let golden = [
+            (-0.05, -5.659165480454901e-01),
+            (-0.01, -2.094693773531350e-01),
+            (0.0, 2.000000000000000e-02),
+            (0.005, 1.391751921349424e-01),
+            (0.02, 4.214220621607095e-01),
+        ];
+        for (v, want) in golden {
+            let got = 0.6 * coulomb_unit(v, 800.0, 400.0) + 0.15 * v + 0.02;
+            assert!(
+                (got - want).abs() < 1e-12,
+                "friction_k_max({v}): got {got:e}, want {want:e}"
+            );
+        }
+        // The production path is the cap at FRICTION_FF_K_MAX.
+        assert_eq!(
+            friction(0.02, 0.6, 800.0, 0.15, 0.02),
+            0.6 * coulomb_unit(0.02, 800.0, FRICTION_FF_K_MAX) + 0.15 * 0.02 + 0.02
+        );
+    }
+
+    /// Golden values from `almond_axol.robot.control.SlewLimiter`: a 1.3 Nm
+    /// Coulomb term (k=800 under a 400 cap) through a fast reversal at
+    /// 30 Nm/s — the output ramps at exactly rate·dt = 0.125 Nm per tick.
+    #[test]
+    fn slew_limiter_matches_python() {
+        let golden = [
+            0.000000000000000e+00,
+            1.250000000000000e-01,
+            2.500000000000000e-01,
+            3.750000000000000e-01,
+            5.000000000000000e-01,
+            6.250000000000000e-01,
+            5.000000000000000e-01,
+            3.750000000000000e-01,
+            2.500000000000000e-01,
+            1.250000000000000e-01,
+            0.000000000000000e+00,
+            -1.250000000000000e-01,
+        ];
+        let mut sl = SlewLimiter::new();
+        for (k, want) in golden.iter().enumerate() {
+            let v = 0.05 * (2.0 * std::f64::consts::PI * 20.0 * k as f64 * DT).sin();
+            let x = 1.3 * coulomb_unit(v, 800.0, 400.0);
+            let got = sl.update(x, 30.0, DT);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "slew sample {k}: got {got:e}, want {want:e}"
+            );
+        }
+        // rate <= 0 passes through; reset re-adopts the input.
+        let mut sl = SlewLimiter::new();
+        sl.update(0.0, 0.0, DT);
+        assert_eq!(sl.update(5.0, 0.0, DT), 5.0);
+        sl.update(0.0, 30.0, DT);
+        sl.reset();
+        assert_eq!(sl.update(-5.0, 30.0, DT), -5.0);
+    }
+
+    /// Golden values from `almond_axol.robot.control.stiction_compensation`
+    /// (fc=1.3, gain=0.6, scale=0.1°, `sat` from k=800 under the 100 cap):
+    /// saturates toward 0.78 Nm within a few mrad of error, and fades to
+    /// nothing once the velocity FF is delivering fc itself.
+    #[test]
+    fn stiction_matches_python() {
+        let scale = 0.1_f64.to_radians();
+        let golden = [
+            (0.0, 0.0, 0.000000000000000e+00),
+            (0.0005, 0.0, 2.175348090835001e-01),
+            (0.002, 0.0, 6.367892504091777e-01),
+            (-0.002, 0.0, -6.367892504091777e-01),
+            (0.01, 0.0, 7.799835384077637e-01),
+            (0.002, 0.05, 3.425180122363560e-01),
+            (0.002, 0.5, 5.781774956240957e-05),
+            (-0.01, -0.02, -6.260340377443776e-01),
+        ];
+        for (err, v, want) in golden {
+            let sat = coulomb_unit(v, 800.0, FRICTION_FF_K_MAX);
+            let got = stiction(err, sat, 1.3, 0.6, scale);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "stiction({err}, v={v}): got {got:e}, want {want:e}"
+            );
+        }
+        assert_eq!(stiction(0.01, 0.0, 1.3, 0.0, scale), 0.0);
+    }
+
+    /// Golden values from `almond_axol.robot.control.ErrorIntegrator`
+    /// (kp=250 at a 0.3 Hz crossover → ki = 471.24, clamp 2.6 Nm, freeze
+    /// 2°): winds on a 4 mrad error, holds through two 60 mrad (frozen)
+    /// samples, unwinds on the reversed error.
+    #[test]
+    fn integrator_matches_python() {
+        let ki = 471.2388980384689;
+        let freeze = 2.0_f64.to_radians();
+        let golden = [
+            7.853981633974482e-03,
+            1.570796326794896e-02,
+            2.356194490192345e-02,
+            3.141592653589793e-02,
+            3.926990816987241e-02,
+            4.712388980384689e-02,
+            4.712388980384689e-02,
+            4.712388980384689e-02,
+            3.926990816987241e-02,
+            3.141592653589793e-02,
+            2.356194490192345e-02,
+            1.570796326794897e-02,
+        ];
+        let errs = [0.004; 6]
+            .iter()
+            .chain([0.06; 2].iter())
+            .chain([-0.004; 4].iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let mut it = Integrator::new();
+        for (k, (e, want)) in errs.iter().zip(golden.iter()).enumerate() {
+            let got = it.update(*e, ki, 2.6, freeze, DT);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "integrator sample {k}: got {got:e}, want {want:e}"
+            );
+        }
+        // Clamp, dt=0 hold, and ki=0 zeroing.
+        let mut it = Integrator::new();
+        for _ in 0..10_000 {
+            it.update(0.01, ki, 0.5, freeze, DT);
+        }
+        assert_eq!(it.update(0.01, ki, 0.5, freeze, DT), 0.5);
+        assert_eq!(it.update(-0.01, ki, 0.5, freeze, 0.0), 0.5);
+        assert_eq!(it.update(0.01, 0.0, 0.5, freeze, DT), 0.0);
+    }
+
+    /// The tracker-acceleration inertia path (`exp tracker_accel_ff`) must
+    /// also keep the 120 Hz target staircase's adoption/repeat-tick ripple
+    /// out of the torque. A single 60 rad/s pole attenuates the Nyquist
+    /// comb ~10×; this pins that it is at least 5× below the raw ripple so a
+    /// future pole change cannot quietly re-introduce the vibration the
+    /// classic double-pole chain was built to remove (see the test above).
+    #[test]
+    fn tracker_accel_low_pass_rejects_target_rate_ripple() {
+        let mut trk = Trapezoid::new(
+            1.5 * 2.0 * std::f64::consts::PI,
+            1.5 * 7.0 * std::f64::consts::PI,
+        );
+        trk.seed(0.0);
+        let mut lp = LowPass::new();
+        lp.seed(0.0);
+        let mut raw_sq = 0.0;
+        let mut lp_sq = 0.0;
+        let mut pairs = 0usize;
+        let (mut raw_first, mut lp_first) = (0.0, 0.0);
+        for k in 0..1200usize {
+            let target_t = (k / 2) as f64 / 120.0;
+            let target = 0.6 * (2.0 * std::f64::consts::PI * 0.5 * target_t).sin();
+            let (_, _, raw_accel) = trk.update(target, DT);
+            let a = lp.update(raw_accel, 60.0, DT);
+            if k >= 240 {
+                if k % 2 == 0 {
+                    raw_first = raw_accel;
+                    lp_first = a;
+                } else {
+                    raw_sq += (raw_accel - raw_first).powi(2);
+                    lp_sq += (a - lp_first).powi(2);
+                    pairs += 1;
+                }
+            }
+        }
+        let raw_rms = (raw_sq / pairs as f64).sqrt();
+        let lp_rms = (lp_sq / pairs as f64).sqrt();
+        assert!(raw_rms > 1.0, "fixture must expose the raw ripple");
+        assert!(
+            lp_rms < 0.2 * raw_rms,
+            "60 rad/s pole must cut target-rate ripple: raw {raw_rms:e}, filtered {lp_rms:e}"
+        );
     }
 
     /// The reason host damping moved into the core: dissipated power vs the

@@ -66,7 +66,8 @@ FACTORY_CALIBRATION_PATH = Path.home() / ".almond" / "factory_calibration.json"
 
 _SIDES = ("left", "right")
 # ``kd_soft`` entries written by older versions are silently dropped on load.
-_SCALAR_FIELDS = ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
+# ``mass`` is the link mass fitted by ``axol tune.gravity --save`` beside ``com``.
+_SCALAR_FIELDS = ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q", "mass")
 _FRICTION_FIELDS = ("fc", "k", "fv", "fo")
 
 # A corrupt file must never take the robot down, but silently ignoring it
@@ -264,6 +265,7 @@ def update_joint_calibration(
     kd_host_q: float | None = None,
     friction: dict[str, float] | None = None,
     com: tuple[float, float, float] | None = None,
+    mass: float | None = None,
     hub_serial: str | None = None,
     path: Path = CALIBRATION_PATH,
 ) -> Path:
@@ -351,6 +353,7 @@ def update_joint_calibration(
         ("kd_host", kd_host),
         ("kd_host_hz", kd_host_hz),
         ("kd_host_q", kd_host_q),
+        ("mass", mass),
     ):
         if value is not None:
             entry[field] = float(value)

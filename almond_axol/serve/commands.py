@@ -559,6 +559,23 @@ COMMANDS: dict[str, CommandDef] = {
         hardware_profiles=("axol",),
         section="tuning",
     ),
+    "tune.position-loop": CommandDef(
+        "tune.position-loop",
+        "tune.position-loop",
+        "Position-loop tuning (0xA4)",
+        "Tune a MyActuator's internal position PID for the 0xA4 position "
+        "command in direct-tracking mode (position-planning acceleration 0). "
+        "Streams a sine to one joint and sweeps position_kp, then position_ki "
+        "at the winning kp, stopping when the q-axis current says the joint "
+        "has started to buzz. Writes are RAM-only unless saved.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.position_loop"),
+        requires_hardware=True,
+        drives_motors=True,
+        hardware_profiles=("axol",),
+        section="tuning",
+    ),
     "tune.friction": CommandDef(
         "tune.friction",
         "tune.friction",

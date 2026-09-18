@@ -14,8 +14,10 @@ from .axol import (
 )
 from .base import RobotBase
 from .config import (
+    WIRE_MODES,
     ArmConfig,
     AxolConfig,
+    ControlExperiments,
     FrictionParams,
     JointConfig,
     PositionForceConfig,
@@ -34,6 +36,8 @@ __all__ = [
     "end_stop_offset_from_position",
     "ArmConfig",
     "AxolConfig",
+    "ControlExperiments",
+    "WIRE_MODES",
     "Jelly",
     "JellyConfig",
     "detect_jelly",

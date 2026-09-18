@@ -34,6 +34,7 @@ _MA_SHUTDOWN = 0x80
 _MA_RELEASE_BRAKE = 0x77
 _MA_RESET = 0x76  # system reset; no response — motor restarts immediately
 _MA_READ_STATUS1 = 0x9A  # temperature, voltage, error flags
+_MA_CLEAR_ERROR = 0x9B  # read status 1 and clear the error flag (if the fault is gone)
 _MA_READ_VERSION = 0xB2  # system software VersionDate (uint32, e.g. 2026042402)
 _MA_READ_MODEL = 0xB5  # motor model string (5 ASCII chars per index)
 _MA_MULTI_TURN_ANGLE = 0x92
@@ -41,6 +42,15 @@ _MA_MOTOR_STATUS_2 = 0x9C  # temperature, current, velocity, encoder
 _MA_SET_ENCODER_ZERO = 0x64
 _MA_POS_CONTROL = 0xA4  # absolute position closed-loop control
 _MA_VELOCITY_CONTROL = 0xA2  # speed closed-loop control
+# Position closed-loop variants that carry a per-frame limit or feedforward.
+# Both reply on the standard 0x240 + id frame (see :func:`decode_control_reply`),
+# not on the 0x500 + id MIT frame, and both take the position as a 32-bit
+# 0.01 deg/LSB multi-turn angle — 2.2x finer than the MIT frame's 16-bit
+# p_des, and the reason they are interesting as tracking experiments (see
+# ``ControlExperiments.wire_mode``).
+_MA_FORCE_POS_CONTROL = 0xA9  # force-control position closed-loop; V4.3+
+_MA_POS_TORQUE_FF = 0x73  # "TF": position control with feedforward torque; V4.4+
+_MA_READ_ACCELERATION = 0x42  # read one position/speed planning accel value
 _MA_FUNCTION_CONTROL = 0x20  # function control; byte 1 = index, bytes 4-7 = value
 _MA_FC_SET_CANID = 0x05  # function control index: set CAN ID
 # Loop-gain (PID parameter) access. Protocol V4.2 (2024-05) changed these from
@@ -50,7 +60,8 @@ _MA_FC_SET_CANID = 0x05  # function control index: set CAN ID
 # the six uint8 gains in bytes 2-7 (byte 1 zero) — the index echo is how the
 # driver tells the two formats apart at runtime.
 _MA_READ_GAINS = 0x30
-_MA_WRITE_GAINS_ROM = 0x32  # persistent by command; 0x31 (RAM) is not used
+_MA_WRITE_GAINS_RAM = 0x31  # volatile: reverts on the next power cycle
+_MA_WRITE_GAINS_ROM = 0x32  # persistent by command
 
 # Indexed float32 parameter indices for 0x30/0x31/0x32 (V4.2+).
 _MA_PID_IDX = {
@@ -220,6 +231,143 @@ def _model_max_torque(model: str | None) -> float:
                 int(match.group(1)), _MA_DEFAULT_MAX_TORQUE
             )
     return _MA_DEFAULT_MAX_TORQUE
+
+
+# ------------------------------------------------------------------ 0xA9 / 0x73
+#
+# The two position closed-loop frames that carry a per-frame limit or
+# feedforward. They share a byte layout — command, one signed/unsigned 8-bit
+# knob, a uint16 speed limit in dps, and the target as an int32 multi-turn
+# angle at 0.01 deg/LSB — and differ only in what byte 1 means. Both are
+# encoded here rather than in the driver methods so the realtime core's Rust
+# port (`rust/axol-rt/src/proto.rs`) can be pinned to them by test vector, the
+# way `mit_encode` is pinned to `set_impedance`.
+#
+# What the motor does with them depends on a *stored* setting this code does
+# not write: the position-planning acceleration (0x42 index 0 reads it,
+# :meth:`MyActuatorMotor.get_acceleration` below). At 0 the position loop runs
+# in "direct tracking" mode — a PI controller chasing the target under the
+# frame's speed limit, which is what a host streaming a rendered trajectory
+# wants. Non-zero puts the motor in "profiled motion" mode, where it plans its
+# own accel/decel ramp to every target. 0x43 (the write) only accepts
+# 100-60000 dps/s AND writes to ROM, so switching a motor into direct tracking
+# is a deliberate, persistent act for the vendor setup software, not something
+# to do behind a runtime flag.
+_MA_RAD_TO_CENTIDEG = 18000.0 / math.pi
+_MA_RAD_TO_DPS = 180.0 / math.pi
+_MA_ANGLE_MIN = -(2**31)
+_MA_ANGLE_MAX = 2**31 - 1
+_MA_SPEED_MAX_DPS = 0xFFFF
+
+
+def _round_half_away(x: float) -> int:
+    """Round half away from zero — Rust's ``f64::round``, not Python's banker's
+    rounding, so the core's port of the frame encoders below matches bit for
+    bit on an exact half."""
+    return int(math.floor(x + 0.5)) if x >= 0.0 else int(math.ceil(x - 0.5))
+
+
+def _angle_centideg(position: float) -> int:
+    """Clamped int32 multi-turn angle (0.01 deg/LSB) for a position in rad."""
+    if not math.isfinite(position):
+        raise ValueError("cannot encode a non-finite motor position")
+    return max(_MA_ANGLE_MIN, min(_MA_ANGLE_MAX, int(position * _MA_RAD_TO_CENTIDEG)))
+
+
+def _speed_dps(max_speed: float) -> int:
+    """Clamped uint16 speed limit (1 dps/LSB) for a speed in rad/s."""
+    if not math.isfinite(max_speed):
+        raise ValueError("cannot encode a non-finite speed limit")
+    return max(0, min(_MA_SPEED_MAX_DPS, int(abs(max_speed) * _MA_RAD_TO_DPS)))
+
+
+def position_velocity_frame(position: float, max_speed: float) -> bytes:
+    """0xA4 absolute position closed-loop payload.
+
+    The plainest of the three position frames: a target and a speed limit,
+    with no torque byte at all — the motor's configured stall current is the
+    only limit. This is the command every tuning probe already uses to park
+    and hold the joints it is not testing (``set_position_velocity`` below),
+    so the firmware loop is known to hold these joints against gravity.
+    """
+    return (
+        bytes([_MA_POS_CONTROL, 0x00])
+        + struct.pack("<H", _speed_dps(max_speed))
+        + struct.pack("<i", _angle_centideg(position))
+    )
+
+
+def force_position_frame(
+    position: float, max_speed: float, max_torque_pct: float
+) -> bytes:
+    """0xA9 force-control position closed-loop payload.
+
+    Args:
+        position:       Target multi-turn angle (rad, motor frame).
+        max_speed:      Output-shaft speed limit (rad/s), capped at the
+                        uint16 dps field.
+        max_torque_pct: Torque limit as a percentage of the motor's *rated
+                        current* (0-255, 1 %/LSB) — not Nm, and not the MIT
+                        ``t_max`` scale. Asking for more than the motor's
+                        configured stall current leaves force control off and
+                        the stall limit in charge.
+    """
+    return (
+        bytes([_MA_FORCE_POS_CONTROL, max(0, min(255, int(max_torque_pct)))])
+        + struct.pack("<H", _speed_dps(max_speed))
+        + struct.pack("<i", _angle_centideg(position))
+    )
+
+
+def position_torque_ff_frame(
+    position: float, max_speed: float, torque_ff_pct: float
+) -> bytes:
+    """0x73 "TF" position-control-with-feedforward-torque payload.
+
+    ``torque_ff_pct`` is an int8 in percent of rated current (-128..127,
+    1 %/LSB) — a far coarser torque channel than the MIT frame's 12-bit
+    ``t_ff``, which is the cost of moving the position loop into the motor.
+    Requires V4.4 firmware (the command did not exist before it).
+    """
+    return (
+        bytes(
+            [
+                _MA_POS_TORQUE_FF,
+                max(-128, min(127, _round_half_away(torque_ff_pct))) & 0xFF,
+            ]
+        )
+        + struct.pack("<H", _speed_dps(max_speed))
+        + struct.pack("<i", _angle_centideg(position))
+    )
+
+
+def decode_control_reply(data: bytes) -> tuple[float, float, float, float]:
+    """Decode a 0x240 + id control reply into ``(pos, vel, current, temp)``.
+
+    Every 0x140-series closed-loop command (0xA1/0xA2/0xA4/0xA9/0x72/0x73)
+    answers with this one layout, which is *not* the MIT feedback frame:
+
+    - position arrives as an int16 in **whole degrees** (0.0175 rad/LSB),
+      45x coarser than the MIT frame's 16-bit p_max-scaled field, and wraps
+      past +-32767 deg;
+    - velocity as an int16 in dps (0.0175 rad/s per LSB);
+    - the torque channel is the *q-axis current* in amps (0.01 A/LSB), not
+      Nm — converting needs a per-motor torque constant this driver does not
+      measure.
+
+    That resolution loss is the price of the 0xA9/0x73 wire modes and the
+    reason they are experiments rather than a production control path.
+    """
+    temp = struct.unpack_from("<b", data, 1)[0]
+    current = struct.unpack_from("<h", data, 2)[0] * 0.01
+    speed_dps = struct.unpack_from("<h", data, 4)[0]
+    degrees = struct.unpack_from("<h", data, 6)[0]
+    return (
+        math.radians(float(degrees)),
+        math.radians(float(speed_dps)),
+        float(current),
+        float(temp),
+    )
 
 
 class MyActuatorMotor(MotorDriver):
@@ -471,7 +619,20 @@ class MyActuatorMotor(MotorDriver):
         await asyncio.sleep(_MA_RESET_SETTLE_S)
 
     async def clear_errors(self) -> None:
-        pass  # MyActuator has no clear-errors command
+        """Clear a latched error flag (0x9B) -- best effort.
+
+        The RMD protocol's 0x9B reads status 1 like 0x9A and clears the error
+        flag when the underlying condition has passed. A stall (0x0002) latches
+        after ``STALL_TIME_LIMIT`` of being driven without moving and, while
+        set, the motor ignores position commands ("can be run when the motor
+        is not faulty"), so a tuner that ends on one leaves the next run dead
+        on arrival. Firmware without 0x9B simply does not answer; that is not
+        an error here.
+        """
+        try:
+            await self._request(self._cmd(_MA_CLEAR_ERROR))
+        except MotorError:
+            pass
 
     async def set_zero_position(self) -> None:
         await self._request(self._cmd(_MA_SET_ENCODER_ZERO))
@@ -547,15 +708,30 @@ class MyActuatorMotor(MotorDriver):
         return _ma_error_to_status(error_bits)
 
     async def set_position_velocity(self, position: float, max_speed: float) -> None:
-        # bytes 2-3: uint16 max speed in dps; bytes 4-7: int32 position in 0.01 degree units
-        speed_dps = int(max_speed * (180.0 / math.pi))
-        pos_centideg = int(position * (18000.0 / math.pi))  # rad → 0.01 deg units
-        data = (
-            bytes([_MA_POS_CONTROL, 0x00])
-            + struct.pack("<H", speed_dps)
-            + struct.pack("<i", pos_centideg)
+        """Send one 0xA4 absolute position command (see
+        :func:`position_velocity_frame`).
+
+        The frame builder clamps both fields into their wire widths; the
+        inline packing this used to do raised ``struct.error`` mid-stream on
+        an out-of-range speed instead.
+        """
+        await self._request(position_velocity_frame(position, max_speed))
+
+    async def set_position_velocity_reply(
+        self, position: float, max_speed: float
+    ) -> tuple[float, float, float, float]:
+        """0xA4, returning its decoded reply ``(pos, vel, current_A, temp_C)``.
+
+        The reply rides the command's own round trip, so the q-axis current
+        is free. It is the only channel in this loop that can see a limit
+        cycle: a cycle the motor runs at tens of Hz is a fraction of an
+        encoder count in position, and the position sampler here manages
+        ~50 Hz, but the same cycle swings amps. Position ripple of 0.0615 deg
+        was measured on an elbow that was visibly oscillating.
+        """
+        return decode_control_reply(
+            await self._request(position_velocity_frame(position, max_speed))
         )
-        await self._request(data)
 
     async def set_velocity(self, velocity: float) -> None:
         # bytes 4-7: int32 in centidps (dps × 100); rad/s → dps → centidps
@@ -563,17 +739,95 @@ class MyActuatorMotor(MotorDriver):
         data = bytes([_MA_VELOCITY_CONTROL, 0, 0, 0]) + struct.pack("<i", centidps)
         await self._request(data)
 
-    async def set_acceleration(
-        self, acceleration: float, deceleration: float | None = None
+    async def set_force_position(
+        self,
+        position: float,
+        max_speed: float,
+        max_torque_pct: float,
     ) -> None:
-        # Command 0x43 writes to both RAM and ROM — no separate store step needed.
+        """Send one 0xA9 force-control position command (firmware V4.3+).
+
+        The motor's own position loop does the work: this frame carries no
+        impedance gains and no feedforward torque, so gravity, friction and
+        host damping are *not* applied — the stored position-loop PI gains
+        (0x30/0x31, see :meth:`get_gains`) are the whole controller, and
+        ``max_torque_pct`` caps what it may pull. See
+        :func:`force_position_frame` for the units and the stored-acceleration
+        caveat.
+        """
+        await self._request(force_position_frame(position, max_speed, max_torque_pct))
+
+    async def set_position_torque_ff(
+        self,
+        position: float,
+        max_speed: float,
+        torque_ff_pct: float,
+    ) -> None:
+        """Send one 0x73 "TF" position + feedforward-torque command (V4.4+).
+
+        Like :meth:`set_force_position`, but the frame's int8 knob is a
+        feedforward torque (percent of rated current) instead of a limit, so
+        a host model — gravity above all — still reaches the motor, at 1 %
+        resolution. See :func:`position_torque_ff_frame`.
+        """
+        await self._request(
+            position_torque_ff_frame(position, max_speed, torque_ff_pct)
+        )
+
+    async def get_acceleration(self, accel_type: int = _MA_ACC_POS_PLAN) -> float:
+        """Read one stored planning acceleration (rad/s²) via 0x42.
+
+        ``accel_type`` is one of the ``_MA_ACC_*`` / ``_MA_DEC_*`` indices.
+        A position-planning acceleration of 0 means the position loop tracks
+        targets directly through its PI controller; any other value makes it
+        plan its own ramp to each target (see :func:`force_position_frame`).
+        """
+        resp = await self._request(
+            bytes([_MA_READ_ACCELERATION, accel_type, 0, 0, 0, 0, 0, 0])
+        )
+        dps_s2 = struct.unpack_from("<i", resp, 4)[0]
+        return float(dps_s2) * (math.pi / 180.0)
+
+    async def set_acceleration(
+        self,
+        acceleration: float,
+        deceleration: float | None = None,
+        *,
+        allow_zero: bool = False,
+        position_only: bool = False,
+        settle_s: float = 1.0,
+    ) -> None:
+        """Write the planning accelerations (0x43, RAM **and** ROM).
+
+        Each 0x43 is a flash write, and the motor **drops commands that
+        arrive while it is busy with one** -- it acknowledges them and does
+        not act. Bench, right elbow: a gain restore sent straight after this
+        call was acked and never applied (the next run found the homing gain
+        still in the motor, twice, compounding 0.24 -> 0.96), and a 0xA4 sent
+        straight after it was acked and ignored for 15 s. So this call waits
+        ``settle_s`` after the last write and reads the position-planning
+        value back once, and callers that must be sure verify their own
+        follow-up writes. ``position_only`` writes just the two position-
+        planning values: the tuners have no business touching the speed
+        planner, and it halves the flash writes.
+
+        ``allow_zero`` passes a literal 0 through instead of clamping it up to
+        :data:`_MA_ACC_MIN_DPS_S2`. Zero is outside the documented 100-60000
+        range but is not meaningless: the protocol says a *position*-planning
+        acceleration of 0 switches the position loop from "profiled motion"
+        — where every 0xA4 command plans its own accel/decel ramp to the
+        target — into "direct tracking", where a PI controller chases the
+        target under the frame's speed limit. Streaming targets at the
+        control rate only works in the latter; in profiled mode each frame
+        restarts a ramp that never completes. The motor may reject the
+        out-of-range value, so callers should read it back.
+        """
         dec = deceleration if deceleration is not None else acceleration
 
         async def _send(accel_type: int, value_rad_s2: float) -> None:
-            dps_s2 = max(
-                _MA_ACC_MIN_DPS_S2,
-                min(_MA_ACC_MAX_DPS_S2, int(value_rad_s2 * (180.0 / math.pi))),
-            )
+            dps_s2 = int(value_rad_s2 * (180.0 / math.pi))
+            if not (allow_zero and dps_s2 == 0):
+                dps_s2 = max(_MA_ACC_MIN_DPS_S2, min(_MA_ACC_MAX_DPS_S2, dps_s2))
             data = bytes([_MA_SET_ACCELERATION, accel_type, 0, 0]) + struct.pack(
                 "<I", dps_s2
             )
@@ -582,8 +836,16 @@ class MyActuatorMotor(MotorDriver):
         # All four types share the same response CAN ID — must be sequential.
         await _send(_MA_ACC_POS_PLAN, acceleration)
         await _send(_MA_DEC_POS_PLAN, dec)
-        await _send(_MA_ACC_VEL_PLAN, acceleration)
-        await _send(_MA_DEC_VEL_PLAN, dec)
+        if not position_only:
+            await _send(_MA_ACC_VEL_PLAN, acceleration)
+            await _send(_MA_DEC_VEL_PLAN, dec)
+        if settle_s > 0:
+            await asyncio.sleep(settle_s)
+            # One read-back proves the motor is answering *and* acting again.
+            try:
+                await self.get_acceleration()
+            except MotorError:
+                await asyncio.sleep(settle_s)
 
     async def _read_gain_indexed(self, index: int) -> float | None:
         """Read one loop gain via the V4.2+ indexed float32 format.
@@ -615,8 +877,11 @@ class MyActuatorMotor(MotorDriver):
             values[name] = value
         return MotorGains(**values)
 
-    async def set_gains(self, gains: MotorGains) -> None:
-        # Command 0x32 writes directly to ROM — no separate store step needed.
+    async def set_gains(self, gains: MotorGains, *, persist: bool = True) -> None:
+        # 0x32 writes straight to ROM; 0x31 is the identical frame against RAM,
+        # so a search can iterate without burning ROM cycles or leaving the
+        # motor changed if it is interrupted — a power cycle restores ROM.
+        # The manual warns against writing while the motor is moving.
         # Probe the read format first so a V4.2+ motor never receives the
         # legacy bulk frame (and vice versa), which would store garbage gains.
         probe = await self._read_gain_indexed(_MA_PID_IDX["current_kp"])
@@ -633,10 +898,11 @@ class MyActuatorMotor(MotorDriver):
                 writes["current_kp"] = gains.current_kp
             if gains.current_ki is not None:
                 writes["current_ki"] = gains.current_ki
+            cmd = _MA_WRITE_GAINS_ROM if persist else _MA_WRITE_GAINS_RAM
             for name, value in writes.items():
-                data = bytes(
-                    [_MA_WRITE_GAINS_ROM, _MA_PID_IDX[name], 0, 0]
-                ) + struct.pack("<f", float(value))
+                data = bytes([cmd, _MA_PID_IDX[name], 0, 0]) + struct.pack(
+                    "<f", float(value)
+                )
                 await self._request(data)
             return
 
@@ -649,7 +915,7 @@ class MyActuatorMotor(MotorDriver):
         # Legacy SDK byte layout: [cmd, 0, cur_kp, cur_ki, spd_kp, spd_ki, pos_kp, pos_ki]
         data = bytes(
             [
-                _MA_WRITE_GAINS_ROM,
+                _MA_WRITE_GAINS_ROM if persist else _MA_WRITE_GAINS_RAM,
                 0,
                 current_kp,
                 current_ki,

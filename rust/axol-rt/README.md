@@ -242,9 +242,21 @@ AXOL_RT_TRACE=/tmp/axol-run axol teleop
 
 Each 240 Hz joint row includes the streamed target, wire position/velocity,
 measured position/velocity/torque, filter states, and separate gravity,
-friction, inertia, and host-damping torque contributions. The bus threads
+friction, inertia, host-damping, stiction, integral and dither torque
+contributions (the last three are the opt-in tracking experiments,
+`--axol.experiments.*`, zero unless enabled), plus `wire_tau` — the
+feedforward that actually reached the wire, which equals `total_ff` on the
+MIT frame, is quantised under `wire_mode tf`, and is NaN under `wire_mode
+a9`, whose frame carries no feedforward at all. The bus threads
 enqueue fixed-size rows into bounded channels; background threads format and
 write them, and the regular five-second status line reports any trace drops.
+
+`wire_mode` also changes what comes back: `a9` / `tf` are answered on the
+0x240 control reply rather than the MIT feedback frame, so `meas_p` steps in
+whole degrees, `meas_v` is the motor's own 1 dps/LSB estimate instead of a
+differentiated position, and `meas_tau` carries q-axis current unless
+`wire_torque_nm_per_amp` is set. The core prints all of this, and each
+motor's stored position-planning acceleration, in a warning as it arms.
 
 ## Safety
 
