@@ -150,13 +150,24 @@ async def _home_test_with_fallback(
     original,
     accel_before: float | None,
     kp_hint: float = 0.0,
+    *,
+    profiled_first: bool = True,
 ) -> bool:
-    """Home on the motor's own profiled planner; if it will not move, fall
-    back to direct tracking (accel 0) at a moderate gain -- the mode that
-    homed this joint all day -- and put the planner and gains back after."""
-    if await _home_test_joint(test, joint, "profiled"):
+    """Home the swept joint, then put the planner and gains back.
+
+    ``profiled_first`` tries the motor's own planner before anything else --
+    right for a fresh motor at the start of a run, where tune.gravity's
+    homing works the same way. At the END of a run it is False: bench, after
+    this tool's 0x43 acceleration writes the profiled 0xA4 was acknowledged
+    and ignored ("has not moved for 3 s at -100.0°") while direct tracking at
+    a moderate gain brought the joint home -- -100 -> -60 -> -21 -> rest. So
+    direct tracking is the primary strategy there, and the stored planner
+    and gains are restored once, at rest.
+    """
+    if profiled_first and await _home_test_joint(test, joint, "profiled"):
         return True
-    await test.motor.clear_errors()
+    if profiled_first:
+        await test.motor.clear_errors()
     try:
         await test.motor._driver.set_acceleration(0.0, allow_zero=True)
         kp_home = max(original.position_kp * 4.0, kp_hint)
@@ -765,12 +776,15 @@ async def _run(args: argparse.Namespace) -> None:
                     run_id = save_run(
                         "position_loop",
                         series,
+                        # Radians, like every other run kind -- the workbench
+                        # converts for display. Saving degrees here once made
+                        # the card read "tracking 77.6°" for a 1.35° run.
                         {
-                            "rms": rms,
-                            "rms_spread": spread,
-                            "max": mx,
+                            "rms": math.radians(rms),
+                            "rms_spread": math.radians(spread),
+                            "max": math.radians(mx),
                             "lag_ms": lag,
-                            "pos_ripple": ripple,
+                            "pos_ripple": math.radians(ripple),
                             "buzz_a": buzz,
                             "holder_peak_deg": wobble,
                             "holder_rms_deg": w_rms,
@@ -941,6 +955,10 @@ async def _run(args: argparse.Namespace) -> None:
                         if args.ki is not None
                         else [best[0] * s for s in _KI_STEPS]
                     )
+                    # ki=0 at the winning kp is the point the kp stage just
+                    # measured; measuring (and saving) it again is the
+                    # duplicate row the dashboard showed.
+                    kis = [k for k in kis if k != 0.0]
                     prev_ripple = None
                     for ki in kis:
                         try:
@@ -1044,41 +1062,10 @@ async def _run(args: argparse.Namespace) -> None:
             # unsupported mid-move; the test joint rides its own position
             # command. Distal to proximal, so each shoulder swings a folded
             # arm. Best-effort: a failure here must not skip the disable.
-            # Order matters, and it used to be wrong. Homing ran FIRST, under
-            # whatever gains the sweep had just left in RAM -- often the ones
-            # it stopped at for buzzing -- and in direct-tracking mode, then
-            # the stored gains and planner were restored. A loaded elbow asked
-            # to travel 90 deg on a buzzing or too-weak loop stalls; the motor's
-            # stall protection latches after STALL_TIME_LIMIT (1.5 s) and the
-            # motor then ignores 0xA4, so it never arrived, the code fell
-            # through to disable, and the next run met a faulted motor.
-            #
-            # Now: restore the stored gains and planner first, so homing runs
-            # on the profiled-motion planner the motor ships with; home and
-            # VERIFY; clear the protection flag once at rest (0x9B, best
-            # effort); only then release.
-            if accel_before is not None and not args.save:
-                try:
-                    await test.motor._driver.set_acceleration(
-                        accel_before, allow_zero=True
-                    )
-                    print(
-                        f"  acceleration restored to "
-                        f"{math.degrees(accel_before):.0f} dps/s."
-                    )
-                except Exception as e:
-                    print(
-                        f"  ! could not restore acceleration ({e}) — it was "
-                        f"{math.degrees(accel_before):.0f} dps/s."
-                    )
-            if not args.save:
-                try:
-                    await test.motor.set_gains(original, persist=False)
-                    print("  RAM gains restored to the values found at start.")
-                except Exception as e:
-                    print(
-                        f"  ! could not restore RAM gains ({e}) — power-cycle to reset."
-                    )
+            # Homing first, restore after -- see _home_test_with_fallback: after
+            # this tool's acceleration writes the profiled 0xA4 is ignored, so
+            # the end of a run homes under direct tracking and the helper puts
+            # the stored planner and gains back once the joint is at rest.
             # Homing must be OBSERVABLE and self-correcting. Bench: after the
             # planner and stock gains were restored, a 0xA4 to rest was
             # acknowledged and then ignored -- the elbow sat at its last
@@ -1112,6 +1099,7 @@ async def _run(args: argparse.Namespace) -> None:
                             original,
                             accel_before,
                             best[0] if best else 0.0,
+                            profiled_first=False,
                         )
                     elif j in motors:
                         await holders.ramp_to(j, 0.0, _HOME_SPEED)

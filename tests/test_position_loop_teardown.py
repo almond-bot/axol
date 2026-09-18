@@ -21,25 +21,33 @@ from almond_axol.motor import myactuator as ma
 
 
 class TeardownOrderTest(unittest.TestCase):
-    def test_restore_then_home_then_verify_then_clear_then_release(self) -> None:
+    def test_home_then_verify_then_clear_then_release(self) -> None:
+        """End of a run: home under direct tracking (bench: after this tool's
+        acceleration writes the profiled 0xA4 was ignored -- "has not moved
+        for 3 s at -100.0°" -- while direct tracking at kp 0.24 brought the
+        joint -100 -> -60 -> -21 -> rest), verify, clear the flag, and only
+        then release. The planner and gains are restored by the helper once
+        the joint is at rest, so _run must not restore them before homing."""
         src = inspect.getsource(pl._run)
-        i_restore = src.index("RAM gains restored")
-        i_accel = src.index("acceleration restored")
         i_home = src.index('print("  Returning to rest ...")')
         i_verify = src.index("while not at_rest:")
         i_clear = src.rindex("await test.motor.clear_errors()")
-        # The unverified 0x9B is not on the critical path before the first
-        # homing attempt: it is tried only after an attempt has failed.
-        helper = inspect.getsource(pl._home_test_with_fallback)
-        self.assertLess(helper.index('"profiled"'), helper.index("clear_errors()"))
         i_stop = src.index("await holders.stop()")
         i_disable = src.index("m.disable()")
-        self.assertLess(i_accel, i_home)
-        self.assertLess(i_restore, i_home)
+        self.assertNotIn("RAM gains restored", src[:i_home])
+        self.assertNotIn("acceleration restored", src[:i_home])
+        self.assertIn("profiled_first=False", src[i_home:i_verify])
         self.assertLess(i_home, i_verify)
         self.assertLess(i_verify, i_clear)
         self.assertLess(i_clear, i_stop)
         self.assertLess(i_stop, i_disable)
+        helper = inspect.getsource(pl._home_test_with_fallback)
+        # direct tracking is attempted, and the stored planner + gains come
+        # back after it, inside the helper
+        self.assertLess(helper.index('"direct"'), helper.index("set_gains(original"))
+        self.assertIn("set_acceleration(accel_before", helper)
+        # the unverified 0x9B is only ever tried after a failed attempt
+        self.assertLess(helper.index('"profiled"'), helper.index("clear_errors()"))
         # A raised arm is never released without the operator's word.
         self.assertIn("not releasing", src)
         self.assertIn("'drop'", src)
