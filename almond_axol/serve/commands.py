@@ -191,9 +191,11 @@ class CommandDef:
         # ``python -m <module>`` target for the subprocess path, so a command
         # registered by a downstream package runs out of that package's CLI.
         self.module = module
-        # Dashboard grouping within the Diagnostics category:
-        # "helper" (utility moves like the lift), "test" (pass/fail checks
-        # like the ROM soak), or "tuning" (the tuning workbench's suites).
+        # Dashboard grouping within the Diagnostics category — each command
+        # renders in exactly one: "test" (pass/fail checks like the ROM
+        # soak), "helper" (utility moves like the lift or the ROM cleanup),
+        # or "tuning" (the tuning workbench's suites). Meaningless outside
+        # that category; leave it None there.
         self.section = section
         self._loader = loader
 
@@ -515,7 +517,8 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..diagnostics.rom.disable"),
         requires_hardware=True,
         drives_motors=True,
-        section="test",
+        # Cleanup after the soak, not a check of its own.
+        section="helper",
     ),
     "diag.lift-cycle": CommandDef(
         "diag.lift-cycle",
@@ -529,6 +532,7 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         drives_motors=True,
         hardware_profiles=("axol",),
+        section="test",
     ),
     "diag.zed-cable": CommandDef(
         "diag.zed-cable",
@@ -619,7 +623,6 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=False,
         uses_can_bus=False,
         drives_motors=False,
-        section="helper",
     ),
     "tune.motion": CommandDef(
         "tune.motion",
