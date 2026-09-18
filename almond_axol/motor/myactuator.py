@@ -34,6 +34,7 @@ _MA_SHUTDOWN = 0x80
 _MA_RELEASE_BRAKE = 0x77
 _MA_RESET = 0x76  # system reset; no response — motor restarts immediately
 _MA_READ_STATUS1 = 0x9A  # temperature, voltage, error flags
+_MA_CLEAR_ERROR = 0x9B  # read status 1 and clear the error flag (if the fault is gone)
 _MA_READ_VERSION = 0xB2  # system software VersionDate (uint32, e.g. 2026042402)
 _MA_READ_MODEL = 0xB5  # motor model string (5 ASCII chars per index)
 _MA_MULTI_TURN_ANGLE = 0x92
@@ -618,7 +619,20 @@ class MyActuatorMotor(MotorDriver):
         await asyncio.sleep(_MA_RESET_SETTLE_S)
 
     async def clear_errors(self) -> None:
-        pass  # MyActuator has no clear-errors command
+        """Clear a latched error flag (0x9B) -- best effort.
+
+        The RMD protocol's 0x9B reads status 1 like 0x9A and clears the error
+        flag when the underlying condition has passed. A stall (0x0002) latches
+        after ``STALL_TIME_LIMIT`` of being driven without moving and, while
+        set, the motor ignores position commands ("can be run when the motor
+        is not faulty"), so a tuner that ends on one leaves the next run dead
+        on arrival. Firmware without 0x9B simply does not answer; that is not
+        an error here.
+        """
+        try:
+            await self._request(self._cmd(_MA_CLEAR_ERROR))
+        except MotorError:
+            pass
 
     async def set_zero_position(self) -> None:
         await self._request(self._cmd(_MA_SET_ENCODER_ZERO))

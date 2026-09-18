@@ -63,6 +63,7 @@ from ...robot.config import AxolConfig
 from ...robot.gravity import GravityCompensator
 from ...tuning import joint_frame_motors, save_run
 from ...tuning.holders import HOLD_HZ as _HOLD_HZ  # noqa: F401
+from ...tuning.holders import read_position
 from ...tuning.holders import ImpedanceHolders as _Holders
 from ...tuning.joint_frame import JointFrameMotor
 from ...utils.logquiet import quiet_noisy_loggers
@@ -89,6 +90,12 @@ _APPROACH_TOL_RAD = math.radians(0.5)
 #: search stops at the first value that holds, so a joint that is nearly right
 #: never sees the large ones.
 _KP_STEPS = (1.0, 4.0, 16.0, 64.0, 256.0, 1024.0)
+
+
+class _MotorFaulted(Exception):
+    """The motor's own protection latched during a gain point."""
+
+
 #: Sag (deg) at or below which the joint counts as holding.
 _SAG_OK_DEG = 0.3
 #: Position ripple (deg rms) above which a candidate is called oscillating and
@@ -603,6 +610,22 @@ async def _run(args: argparse.Namespace) -> None:
                         for _ in range(args.repeat)
                     ]
                     worst, wobble, wobble_rms = holders.reset_wobble()
+                    # The motor's own protection is the last word. Its stall
+                    # bit latches after STALL_TIME_LIMIT (1.5 s on this elbow)
+                    # of being driven without moving -- a limit cycle at the
+                    # cliff can do that -- and while it is set the motor ignores
+                    # 0xA4, so every later point would measure a dead motor.
+                    try:
+                        status = await test.motor.get_error_code()
+                    except Exception:
+                        status = None
+                    if status is not None and status.name not in ("OK", "NORMAL"):
+                        print(
+                            f"\n  !! motor reports {status.name} at position_kp={kp:.4f} "
+                            f"position_ki={ki:.4f} -- its protection tripped. Stopping "
+                            "the sweep; the flag is cleared once the arm is back at rest."
+                        )
+                        raise _MotorFaulted(status.name)
                     ok = [t for t in trials if math.isfinite(t[0])]
                     if not ok:
                         print(f"  {kp:12.4f} {ki:12.4f}   (no usable pass)")
@@ -777,7 +800,10 @@ async def _run(args: argparse.Namespace) -> None:
                 kps = args.kp or [original.position_kp * m for m in _KP_STEPS]
                 prev_ripple: tuple[float, float] | None = None
                 for kp in kps:
-                    m = await point(kp, 0.0)
+                    try:
+                        m = await point(kp, 0.0)
+                    except _MotorFaulted:
+                        break
                     if m is None:
                         continue
                     noisy = oscillating(m, prev_ripple)
@@ -809,7 +835,10 @@ async def _run(args: argparse.Namespace) -> None:
                     )
                     prev_ripple = None
                     for ki in kis:
-                        m = await point(best[0], ki)
+                        try:
+                            m = await point(best[0], ki)
+                        except _MotorFaulted:
+                            break
                         if m is None:
                             continue
                         noisy = oscillating(m, prev_ripple)
@@ -907,20 +936,19 @@ async def _run(args: argparse.Namespace) -> None:
             # unsupported mid-move; the test joint rides its own position
             # command. Distal to proximal, so each shoulder swings a folded
             # arm. Best-effort: a failure here must not skip the disable.
-            try:
-                print("  Returning to rest ...")
-                for j in _HOME_ORDER:
-                    if j is joint:
-                        await test.set_position_velocity(0.0, math.radians(20.0))
-                        for _ in range(60):
-                            if abs(await test.get_position()) < 0.02:
-                                break
-                            await asyncio.sleep(0.1)
-                    elif j in motors:
-                        await holders.ramp_to(j, 0.0, _HOME_SPEED)
-            except Exception as e:
-                print(f"  ! could not return to rest ({e}) — support the arm.")
-            await holders.stop()
+            # Order matters, and it used to be wrong. Homing ran FIRST, under
+            # whatever gains the sweep had just left in RAM -- often the ones
+            # it stopped at for buzzing -- and in direct-tracking mode, then
+            # the stored gains and planner were restored. A loaded elbow asked
+            # to travel 90 deg on a buzzing or too-weak loop stalls; the motor's
+            # stall protection latches after STALL_TIME_LIMIT (1.5 s) and the
+            # motor then ignores 0xA4, so it never arrived, the code fell
+            # through to disable, and the next run met a faulted motor.
+            #
+            # Now: restore the stored gains and planner first, so homing runs
+            # on the profiled-motion planner the motor ships with; home and
+            # VERIFY; clear the protection flag once at rest (0x9B, best
+            # effort); only then release.
             if accel_before is not None and not args.save:
                 try:
                     await test.motor._driver.set_acceleration(
@@ -943,6 +971,61 @@ async def _run(args: argparse.Namespace) -> None:
                     print(
                         f"  ! could not restore RAM gains ({e}) — power-cycle to reset."
                     )
+            # A faulted motor ignores the homing command: clear first, so a
+            # protection that tripped mid-sweep does not also strand the arm.
+            await test.motor.clear_errors()
+
+            async def home_test_joint() -> bool:
+                await test.set_position_velocity(0.0, math.radians(20.0))
+                for _ in range(150):  # 90 deg at 20 dps is 4.5 s; allow 15 s
+                    try:
+                        if abs(await read_position(test)) < math.radians(2.0):
+                            return True
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.1)
+                return False
+
+            print("  Returning to rest ...")
+            at_rest = False
+            try:
+                for j in _HOME_ORDER:
+                    if j is joint:
+                        at_rest = await home_test_joint()
+                    elif j in motors:
+                        await holders.ramp_to(j, 0.0, _HOME_SPEED)
+            except Exception as e:
+                print(f"  ! could not return to rest ({e}) — support the arm.")
+            while not at_rest:
+                try:
+                    status = (await test.motor.get_error_code()).name
+                except Exception:
+                    status = "unreadable"
+                print(
+                    f"\n  !! {joint.value} is NOT at rest (motor status {status}) -- "
+                    "holders are streaming, not releasing."
+                )
+                answer = await asyncio.to_thread(
+                    input,
+                    "  Support the arm, then press Enter to retry homing "
+                    "(or type 'drop' to release anyway): ",
+                )
+                if answer.strip().lower() == "drop":
+                    print("  releasing on operator request.")
+                    break
+                await test.motor.clear_errors()
+                at_rest = await home_test_joint()
+            # At rest and unloaded the stall condition is gone: clear the flag
+            # so the next run does not start on a faulted motor, and say what
+            # the motor reports either way.
+            await test.motor.clear_errors()
+            try:
+                print(
+                    f"  motor status at rest: {(await test.motor.get_error_code()).name}"
+                )
+            except Exception:
+                pass
+            await holders.stop()
             await asyncio.gather(
                 *[m.disable() for m in raw.values()], return_exceptions=True
             )
