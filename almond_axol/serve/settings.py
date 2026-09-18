@@ -1324,6 +1324,8 @@ class SettingsStore:
                     for key, value in flat.items():
                         for canonical in canonical_keys(key):
                             values[canonical] = value
+                if not self._strict:
+                    self._repair_axol_channels(values)
                 return {"values": values, "cameras": raw.get("cameras")}
         except FileNotFoundError:
             pass
@@ -1332,6 +1334,30 @@ class SettingsStore:
                 raise
             _logger.exception("failed to load %s; starting empty", self._path)
         return {"values": {}, "cameras": None}
+
+    def _repair_axol_channels(self, values: dict[str, Any]) -> None:
+        """Drop a persisted Axol arm map that the store would refuse to save.
+
+        Files written before ``update`` validated the pair (or hand-edited
+        since) can map both arms onto one interface. ``can_channels`` rejects
+        that, and serve resolves it at ``create_app`` — so an invalid pair
+        would crash every restart while the only UI able to fix it is the
+        panel serve hosts. Fall back to the hub's default names (logged, not
+        rewritten until the next save) so the operator can repair it in
+        Settings. The strict CLI/SDK store keeps the values and fails on use.
+        """
+        keys = ("robot.left_channel", "robot.right_channel")
+        try:
+            _axol_channels_from_values(values)
+        except ValueError as exc:
+            _logger.error(
+                "ignoring the Axol CAN channels saved in %s (%s); using the "
+                "defaults until Settings → Robot is corrected",
+                self._path,
+                exc,
+            )
+            for key in keys:
+                values.pop(key, None)
 
     @staticmethod
     def _migrate_v1(raw: dict[str, Any]) -> dict[str, Any]:

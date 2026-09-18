@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from almond_axol.constants import CAN_LEFT
+from almond_axol.constants import CAN_LEFT, CAN_RIGHT
 from almond_axol.serve.commands import COMMANDS, build_argv, normalize_boolean_args
 from almond_axol.serve.settings import SettingsStore
 from almond_axol.utils import certs, state_files
@@ -382,6 +382,38 @@ class DiagnosticSettingsTest(unittest.TestCase):
 
             store.update(values={"robot.left_channel": "null"})
             self.assertIsNone(store.can_channels()[0])
+
+    def test_invalid_persisted_axol_channels_do_not_prevent_startup(self) -> None:
+        # A file saved before the pair was validated (or hand-edited since)
+        # can map both arms to one interface; serve must still come up so
+        # the operator can fix it from Settings.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "robot": {"left_channel": "can0", "right_channel": "can0"},
+                        "teleop": {"frequency": 120},
+                    }
+                )
+            )
+
+            with self.assertLogs("almond_axol.serve.settings", level="ERROR") as logs:
+                store = SettingsStore(path)
+            self.assertIn("both 'can0'", "\n".join(logs.output))
+            self.assertEqual(store.can_channels(), (CAN_LEFT, CAN_RIGHT))
+            self.assertNotIn("robot.left_channel", store.snapshot()["values"])
+            self.assertEqual(store.snapshot()["values"]["teleop.frequency"], 120)
+            # Not rewritten behind the operator's back until the next save.
+            self.assertEqual(
+                json.loads(path.read_text())["robot"]["left_channel"], "can0"
+            )
+
+            # The strict CLI/SDK store keeps the saved values and fails on use.
+            strict = SettingsStore(path, strict=True)
+            with self.assertRaisesRegex(ValueError, "distinct interfaces"):
+                strict.can_channels()
 
     def test_effective_axol_channels_match_direct_and_nested_operation_args(
         self,
