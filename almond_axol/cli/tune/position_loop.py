@@ -971,31 +971,113 @@ async def _run(args: argparse.Namespace) -> None:
                     print(
                         f"  ! could not restore RAM gains ({e}) — power-cycle to reset."
                     )
-            # A faulted motor ignores the homing command: clear first, so a
-            # protection that tripped mid-sweep does not also strand the arm.
-            await test.motor.clear_errors()
+            # Homing must be OBSERVABLE and self-correcting. Bench: after the
+            # planner and stock gains were restored, a 0xA4 to rest was
+            # acknowledged and then ignored -- the elbow sat at its last
+            # target for 15 s at constant torque while the tool waited.
+            # Yesterday's teardown homed under direct tracking (accel 0) and
+            # never failed, so that is the fallback. The target is re-sent
+            # continuously, progress is logged every 2 s, and a joint that has
+            # not moved in 3 s switches strategy instead of waiting.
+            home_target_speed = math.radians(20.0)
 
-            async def home_test_joint() -> bool:
-                await test.set_position_velocity(0.0, math.radians(20.0))
-                for _ in range(150):  # 90 deg at 20 dps is 4.5 s; allow 15 s
+            async def home_test_joint(label: str, timeout_s: float = 20.0) -> bool:
+                start = None
+                t_start = time.monotonic()
+                last_log = t_start
+                last_pos = None
+                last_move = t_start
+                while time.monotonic() - t_start < timeout_s:
                     try:
-                        if abs(await read_position(test)) < math.radians(2.0):
-                            return True
+                        await test.set_position_velocity(0.0, home_target_speed)
+                    except Exception as e:
+                        print(f"    ({label}) command failed: {e}")
+                    try:
+                        pos = await read_position(test)
                     except Exception:
-                        pass
-                    await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.5)
+                        continue
+                    if start is None:
+                        start = last_pos = pos
+                    if abs(pos) < math.radians(2.0):
+                        print(
+                            f"    ({label}) {joint.value} at rest ({math.degrees(pos):+.1f}°)"
+                        )
+                        return True
+                    if last_pos is not None and abs(pos - last_pos) > math.radians(0.5):
+                        last_move = time.monotonic()
+                    last_pos = pos
+                    now = time.monotonic()
+                    if now - last_log >= 2.0:
+                        print(
+                            f"    ({label}) {joint.value} at {math.degrees(pos):+.1f}° ..."
+                        )
+                        last_log = now
+                    if now - last_move > 3.0:
+                        print(
+                            f"    ({label}) {joint.value} has not moved for 3 s at "
+                            f"{math.degrees(pos):+.1f}° -- the motor is not acting on 0xA4"
+                        )
+                        return False
+                    await asyncio.sleep(0.5)
                 return False
+
+            async def home_with_fallback() -> bool:
+                # 1. as restored: the motor's own profiled planner, stock gains
+                if await home_test_joint("profiled"):
+                    return True
+                # 2. clear a possible protection flag, then direct tracking at a
+                #    moderate gain -- the mode that homed this joint all day
+                await test.motor.clear_errors()
+                try:
+                    await test.motor._driver.set_acceleration(0.0, allow_zero=True)
+                    kp_home = max(original.position_kp * 4.0, best[0] if best else 0.0)
+                    await test.motor.set_gains(
+                        replace(original, position_kp=kp_home, position_ki=0.0),
+                        persist=False,
+                    )
+                    print(
+                        f"    falling back to direct tracking at position_kp={kp_home:.4f}"
+                    )
+                except Exception as e:
+                    print(f"    fallback setup failed: {e}")
+                ok = await home_test_joint("direct")
+                # put the planner and gains back regardless, so nothing lingers
+                try:
+                    if accel_before is not None:
+                        await test.motor._driver.set_acceleration(
+                            accel_before, allow_zero=True
+                        )
+                    await test.motor.set_gains(original, persist=False)
+                except Exception as e:
+                    print(f"    could not restore after fallback: {e}")
+                return ok
 
             print("  Returning to rest ...")
             at_rest = False
+            stop_requested = False
+
+            def _on_term(*_: object) -> None:
+                nonlocal stop_requested
+                stop_requested = True
+
+            import signal
+            import sys
+
+            loop_ = asyncio.get_running_loop()
+            try:
+                loop_.add_signal_handler(signal.SIGTERM, _on_term)
+            except (NotImplementedError, RuntimeError):
+                pass
             try:
                 for j in _HOME_ORDER:
                     if j is joint:
-                        at_rest = await home_test_joint()
+                        at_rest = await home_with_fallback()
                     elif j in motors:
                         await holders.ramp_to(j, 0.0, _HOME_SPEED)
             except Exception as e:
                 print(f"  ! could not return to rest ({e}) — support the arm.")
+            interactive = sys.stdin is not None and sys.stdin.isatty()
             while not at_rest:
                 try:
                     status = (await test.motor.get_error_code()).name
@@ -1005,16 +1087,33 @@ async def _run(args: argparse.Namespace) -> None:
                     f"\n  !! {joint.value} is NOT at rest (motor status {status}) -- "
                     "holders are streaming, not releasing."
                 )
-                answer = await asyncio.to_thread(
-                    input,
-                    "  Support the arm, then press Enter to retry homing "
-                    "(or type 'drop' to release anyway): ",
-                )
-                if answer.strip().lower() == "drop":
-                    print("  releasing on operator request.")
-                    break
+                if interactive:
+                    answer = await asyncio.to_thread(
+                        input,
+                        "  Support the arm, then press Enter to retry homing "
+                        "(or type 'drop' to release anyway): ",
+                    )
+                    if answer.strip().lower() == "drop":
+                        print("  releasing on operator request.")
+                        break
+                else:
+                    # Launched from the dashboard: nobody can type. Keep
+                    # holding and retry; Stop from the UI ends the wait.
+                    if stop_requested:
+                        print(
+                            "  stop requested from the dashboard; one last homing "
+                            "attempt, then releasing -- SUPPORT THE ARM."
+                        )
+                        at_rest = await home_with_fallback()
+                        break
+                    print(
+                        "  retrying homing in 5 s (press Stop in the dashboard to end)"
+                    )
+                    await asyncio.sleep(5.0)
+                    if stop_requested:
+                        continue
                 await test.motor.clear_errors()
-                at_rest = await home_test_joint()
+                at_rest = await home_with_fallback()
             # At rest and unloaded the stall condition is gone: clear the flag
             # so the next run does not start on a faulted motor, and say what
             # the motor reports either way.

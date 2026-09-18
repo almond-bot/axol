@@ -28,6 +28,11 @@ class TeardownOrderTest(unittest.TestCase):
         i_home = src.index('print("  Returning to rest ...")')
         i_verify = src.index("while not at_rest:")
         i_clear = src.rindex("await test.motor.clear_errors()")
+        # The unverified 0x9B is not on the critical path before the first
+        # homing attempt: it is tried only after an attempt has failed.
+        i_first_home = src.index('await home_test_joint("profiled")')
+        i_first_clear = src.index("await test.motor.clear_errors()")
+        self.assertLess(i_first_home, i_first_clear)
         i_stop = src.index("await holders.stop()")
         i_disable = src.index("m.disable()")
         self.assertLess(i_accel, i_home)
@@ -42,8 +47,30 @@ class TeardownOrderTest(unittest.TestCase):
 
     def test_homing_is_verified_not_assumed(self) -> None:
         src = inspect.getsource(pl._run)
-        self.assertIn("async def home_test_joint() -> bool:", src)
+        self.assertIn("async def home_test_joint(", src)
         self.assertIn("read_position(test)", src)
+
+    def test_homing_is_observable_and_falls_back_to_direct_tracking(self) -> None:
+        """Bench: after the planner and stock gains were restored, a 0xA4 to
+        rest was acknowledged and ignored -- the elbow sat at its last target
+        for 15 s at constant torque while the tool waited in silence. The
+        target is re-sent, progress is logged, a joint that has not moved in
+        3 s switches to the mode that homed it all day (direct tracking)."""
+        src = inspect.getsource(pl._run)
+        self.assertIn("has not moved for 3 s", src)
+        self.assertIn('await home_test_joint("profiled")', src)
+        self.assertIn('await home_test_joint("direct")', src)
+        self.assertIn("set_acceleration(0.0, allow_zero=True)", src)
+
+    def test_headless_launch_never_blocks_on_a_prompt(self) -> None:
+        """From the dashboard there is no keyboard: input() would wait
+        forever. Keep holding, retry, and let Stop end it."""
+        src = inspect.getsource(pl._run)
+        self.assertIn("sys.stdin.isatty()", src)
+        self.assertIn("SIGTERM", src)
+        self.assertIn("retrying homing in 5 s", src)
+        # input() is only ever reached on a TTY
+        self.assertLess(src.index("if interactive:"), src.index("input,"))
 
 
 class FaultWatchTest(unittest.TestCase):
