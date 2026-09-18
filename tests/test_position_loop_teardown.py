@@ -219,3 +219,26 @@ class VerifiedRestoreTest(unittest.TestCase):
         src = inspect.getsource(pl._run) + helper
         for call in [s for s in src.split("set_acceleration(")[1:]]:
             self.assertIn("position_only=True", call[:120])
+
+
+class HomingGainAndLatchedFaultTest(unittest.TestCase):
+    def test_homing_gain_is_a_fixed_safe_band_not_scaled_from_the_motor(self) -> None:
+        """Bench: 4x a leftover 0.96 produced a homing gain of 3.84."""
+        helper = inspect.getsource(pl._home_test_with_fallback)
+        self.assertNotIn("original.position_kp * 4.0", helper)
+        self.assertIn("min(max(_HOME_KP_MIN, kp_hint), _HOME_KP_MAX)", helper)
+        self.assertLessEqual(pl._HOME_KP_MAX, 0.5)
+        self.assertGreaterEqual(pl._HOME_KP_MIN, 0.2)
+
+    def test_a_fault_that_will_not_clear_is_reset_before_homing_again(self) -> None:
+        """0x9B did not clear MOTOR_STALL on this firmware and a faulted motor
+        ignores 0xA4; the 0x76 reset (mode switch) is what clears it."""
+        src = inspect.getsource(pl._run)
+        block = src[src.index("while not at_rest:") : src.index("motor status at rest")]
+        self.assertIn("set_control_mode(ControlMode.POSITION_VELOCITY)", block)
+        self.assertLess(block.index("clear_errors()"), block.index("set_control_mode("))
+
+    def test_leftover_gains_are_called_out_at_the_start(self) -> None:
+        src = inspect.getsource(pl._run)
+        self.assertIn("is no stock value", src)
+        self.assertLess(src.index("is no stock value"), src.index("Homing all joints"))

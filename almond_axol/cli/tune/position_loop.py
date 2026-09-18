@@ -93,6 +93,16 @@ _KP_STEPS = (1.0, 4.0, 16.0, 64.0, 256.0, 1024.0)
 
 
 _HOME_TARGET_SPEED = math.radians(20.0)
+#: Direct-tracking gain used to bring the swept joint home. Fixed, not derived
+#: from the gains found in the motor: those may be a previous run's leftovers,
+#: and 4x a leftover 0.96 produced a homing gain of 3.84 -- the value that
+#: shook the elbow the day before. 0.24 homed the loaded elbow -100 -> rest
+#: twice on the bench; 0.5 is the ceiling.
+_HOME_KP_MIN = 0.24
+_HOME_KP_MAX = 0.5
+#: position_kp above this is no stock value on any of these motors (0.008 /
+#: 0.06) -- it is a previous run's write still in RAM.
+_LEFTOVER_KP = 0.5
 
 
 async def _write_gains_verified(test: JointFrameMotor, gains, what: str) -> bool:
@@ -212,7 +222,7 @@ async def _home_test_with_fallback(
         await test.motor._driver.set_acceleration(
             0.0, allow_zero=True, position_only=True
         )
-        kp_home = max(original.position_kp * 4.0, kp_hint)
+        kp_home = min(max(_HOME_KP_MIN, kp_hint), _HOME_KP_MAX)
         print(f"    falling back to direct tracking at position_kp={kp_home:.4f}")
         await _write_gains_verified(
             test, replace(original, position_kp=kp_home, position_ki=0.0), "homing gain"
@@ -629,6 +639,13 @@ async def _run(args: argparse.Namespace) -> None:
             f"speed kp={original.speed_kp:.4f} ki={original.speed_ki:.4f} | "
             f"current kp={original.current_kp} ki={original.current_ki} (not tuned here)"
         )
+        if original.position_kp > _LEFTOVER_KP:
+            print(
+                f"  !! position_kp={original.position_kp:.4f} is no stock value -- a "
+                "previous run's write is still in the motor, and every 'restore' "
+                "in this run will put THAT back. Power-cycle, or commit stock gains "
+                "with --save, before trusting a sweep."
+            )
         # The inner speed loop, as the position stages will run it. One value
         # on the flag is a fixed override; several are swept first (see the
         # speed stage below), and the winner lands here.
@@ -1191,6 +1208,24 @@ async def _run(args: argparse.Namespace) -> None:
                     if stop_requested:
                         continue
                 await test.motor.clear_errors()
+                try:
+                    still = (await test.motor.get_error_code()).name
+                except Exception:
+                    still = "OK"
+                if still not in ("OK", "NORMAL"):
+                    # 0x9B did not clear it on this firmware (bench: MOTOR_STALL
+                    # survived repeated clears) and a faulted motor ignores
+                    # 0xA4, so homing cannot proceed. The mode switch's 0x76
+                    # reset is what clears it between runs. The joint is limp
+                    # for the ~2 s reset either way -- it is already faulted.
+                    print(
+                        f"  {joint.value} still reports {still}; resetting the motor "
+                        "(0x76) to clear the latched protection, then homing again."
+                    )
+                    try:
+                        await test.set_control_mode(ControlMode.POSITION_VELOCITY)
+                    except Exception as e:
+                        print(f"  ! reset failed: {e}")
                 at_rest = await _home_test_with_fallback(
                     test, joint, original, accel_before, best[0] if best else 0.0
                 )
