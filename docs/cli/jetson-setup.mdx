@@ -31,5 +31,5 @@ If changing the power-gating configuration requires a reboot, Axol declines the 
 </Note>
 
 <Note>
-  `jetson.setup` is the per-boot half. The install-time half is [`axol provision`](/cli/provision), which grants your login the `rtprio` allowance a manual `axol serve` needs before the camera relay can run its capture chain `SCHED_FIFO` at all. Without both, the relay logs `camera capture threads stay SCHED_OTHER` at startup and recordings drop exposures under load.
+  `jetson.setup` is the per-boot half. The install-time half is [`axol provision`](/cli/provision), which grants your login the `rtprio` allowance a manual `axol serve` / `axol teleop` needs to run its control loop and the camera relay's capture chain `SCHED_FIFO`. Without both, the control loop **refuses to start** (set `AXOL_ALLOW_CFS_CONTROL=1` to run degraded) and the camera relay falls back to `SCHED_OTHER` (`camera capture threads stay SCHED_OTHER` at startup), dropping exposures under load. Only PAM applies that grant, so a session over Tailscale SSH or a PAM-less systemd unit inherits a zero limit no matter how often you provision — [`axol provision`](/cli/provision) reports whether the current session can actually use it.
 </Note>
