@@ -332,7 +332,7 @@ class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
 class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
     """A partial arm is off the robot; drive it as plain soft PD.
 
-    The production wrist gains (130/3.5 on wrist_2) plus the model
+    The production wrist gains (130/2.25 on wrist_2) plus the model
     feedforwards vibrated heavily on a wrist kit clamped to a bench. The bench
     config is the soft end of the stiffness slider with every model term off,
     so what reaches the core is kp/kd and a zero feedforward.

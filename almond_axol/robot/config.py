@@ -308,9 +308,19 @@ class ArmConfig:
             kp=130.0,
             # The same trace measured 0.36° RMS at the coupled 3.5 Hz mode
             # versus 0.08° commanded, with materially weaker motor damping
-            # than shoulder_3. kd=3.5 was previously replay-verified clean;
-            # stop there because kd=5 produced a unit-dependent 110 Hz buzz.
-            kd=3.5,
+            # than shoulder_3. The bracket above is firm: kd=5 produced a
+            # unit-dependent 110 Hz buzz, so never go back up.
+            # 2.25 (was 3.5): 3.5 was replay-verified clean when it was set,
+            # but a wrist buzz then showed up in the field at those gains —
+            # intermittent, latching at a static hold as well as mid-sweep,
+            # on both the ROM soak and teleop, with and without a gripped
+            # payload. The ring was never captured spectrally, so which mode
+            # it is remains open; this backs the joint off the damping edge
+            # while that is measured (``axol teleop --teleop.record`` +
+            # ``axol diag.teleop-jitter`` prints the line). If the ring gets
+            # *worse* here it was kp-driven, not kd-driven, and this should
+            # be reverted in favour of lowering kp.
+            kd=2.25,
             friction=_ZERO_FRICTION,
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
@@ -556,6 +566,14 @@ class _ArmGains:
 # geometric blend in :func:`_blend_joint` holds the damping ratio at every
 # ``s`` (verified on left wrist_3: 100/0.8 overshot 23.8% on a 10° step,
 # the consistent 100/1.6 overshot 0.5%).
+#
+# wrist_2 is currently the one exception: its tuned kd came down to 2.25
+# (see the joint) without its soft endpoint following, so the consistent
+# value here would be 2.25·sqrt(25/130) = 0.99 rather than 1.5. The blend
+# therefore carries ~1.5x the tuned damping ratio at s=0, tapering to the
+# tuned one at s=1 — i.e. soft sessions are over-damped rather than
+# under-damped, which is the safe direction but no longer the documented
+# invariant. Re-derive this once the tuned kd settles.
 _SOFT_GAINS = _ArmGains(
     shoulder_1=(40.0, 1.4),
     shoulder_2=(50.0, 1.57),
