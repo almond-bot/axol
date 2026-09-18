@@ -30,9 +30,8 @@ class TeardownOrderTest(unittest.TestCase):
         i_clear = src.rindex("await test.motor.clear_errors()")
         # The unverified 0x9B is not on the critical path before the first
         # homing attempt: it is tried only after an attempt has failed.
-        i_first_home = src.index('await home_test_joint("profiled")')
-        i_first_clear = src.index("await test.motor.clear_errors()")
-        self.assertLess(i_first_home, i_first_clear)
+        helper = inspect.getsource(pl._home_test_with_fallback)
+        self.assertLess(helper.index('"profiled"'), helper.index("clear_errors()"))
         i_stop = src.index("await holders.stop()")
         i_disable = src.index("m.disable()")
         self.assertLess(i_accel, i_home)
@@ -46,9 +45,13 @@ class TeardownOrderTest(unittest.TestCase):
         self.assertIn("'drop'", src)
 
     def test_homing_is_verified_not_assumed(self) -> None:
+        helper = inspect.getsource(pl._home_test_joint)
+        self.assertIn("read_position(test)", helper)
+        self.assertIn("abs(pos) < math.radians(2.0)", helper)
+        # _run never homes the swept joint with a bare fire-and-forget command.
         src = inspect.getsource(pl._run)
-        self.assertIn("async def home_test_joint(", src)
-        self.assertIn("read_position(test)", src)
+        self.assertNotIn("await test.set_position_velocity(0.0", src)
+        self.assertIn("_home_test_with_fallback(", src)
 
     def test_homing_is_observable_and_falls_back_to_direct_tracking(self) -> None:
         """Bench: after the planner and stock gains were restored, a 0xA4 to
@@ -56,11 +59,13 @@ class TeardownOrderTest(unittest.TestCase):
         for 15 s at constant torque while the tool waited in silence. The
         target is re-sent, progress is logged, a joint that has not moved in
         3 s switches to the mode that homed it all day (direct tracking)."""
-        src = inspect.getsource(pl._run)
-        self.assertIn("has not moved for 3 s", src)
-        self.assertIn('await home_test_joint("profiled")', src)
-        self.assertIn('await home_test_joint("direct")', src)
-        self.assertIn("set_acceleration(0.0, allow_zero=True)", src)
+        helper = inspect.getsource(pl._home_test_joint) + inspect.getsource(
+            pl._home_test_with_fallback
+        )
+        self.assertIn("has not moved for 3 s", helper)
+        self.assertIn('_home_test_joint(test, joint, "profiled")', helper)
+        self.assertIn('_home_test_joint(test, joint, "direct")', helper)
+        self.assertIn("set_acceleration(0.0, allow_zero=True)", helper)
 
     def test_headless_launch_never_blocks_on_a_prompt(self) -> None:
         """From the dashboard there is no keyboard: input() would wait
@@ -113,3 +118,26 @@ class ClearErrorsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HomeBeforeSweepTest(unittest.TestCase):
+    def test_every_joint_is_homed_before_the_acceleration_is_written(self) -> None:
+        """A sweep must start from a known pose. The holders otherwise hold
+        whatever they were snapshotted at -- wherever the previous run stopped
+        -- and the swept joint approached its sine from there."""
+        src = inspect.getsource(pl._run)
+        i_holders = src.index("await holders.start()")
+        i_home = src.index(
+            'print("  Homing all joints to rest (distal to proximal) ...")'
+        )
+        i_accel_write = src.index("-> writing {args.accel:.0f}")
+        i_sweep = src.index("streaming a")
+        self.assertLess(i_holders, i_home)
+        self.assertLess(i_home, i_accel_write)
+        self.assertLess(i_accel_write, i_sweep)
+        # Same observable homing at start and end, and a start that fails
+        # refuses to sweep rather than guessing the pose.
+        self.assertGreaterEqual(src.count("_home_test_with_fallback("), 3)
+        self.assertIn("would not come to rest before the sweep", src)
+        # The planner is read (not written) before homing so a fallback can restore it.
+        self.assertLess(src.index("get_acceleration()"), i_home)
