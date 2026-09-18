@@ -44,8 +44,11 @@ class TeardownOrderTest(unittest.TestCase):
         helper = inspect.getsource(pl._home_test_with_fallback)
         # direct tracking is attempted, and the stored planner + gains come
         # back after it, inside the helper
-        self.assertLess(helper.index('"direct"'), helper.index("set_gains(original"))
-        self.assertIn("set_acceleration(accel_before", helper)
+        self.assertLess(
+            helper.index('"direct"'),
+            helper.index('_write_gains_verified(test, original, "restore")'),
+        )
+        self.assertIn("set_acceleration(", helper[helper.index('"direct"') :])
         # the unverified 0x9B is only ever tried after a failed attempt
         self.assertLess(helper.index('"profiled"'), helper.index("clear_errors()"))
         # A raised arm is never released without the operator's word.
@@ -73,7 +76,8 @@ class TeardownOrderTest(unittest.TestCase):
         self.assertIn("has not moved for 3 s", helper)
         self.assertIn('_home_test_joint(test, joint, "profiled")', helper)
         self.assertIn('_home_test_joint(test, joint, "direct")', helper)
-        self.assertIn("set_acceleration(0.0, allow_zero=True)", helper)
+        i = helper.index("set_acceleration(")
+        self.assertIn("0.0, allow_zero=True, position_only=True", helper[i : i + 140])
 
     def test_headless_launch_never_blocks_on_a_prompt(self) -> None:
         """From the dashboard there is no keyboard: input() would wait
@@ -149,3 +153,69 @@ class HomeBeforeSweepTest(unittest.TestCase):
         self.assertIn("would not come to rest before the sweep", src)
         # The planner is read (not written) before homing so a fallback can restore it.
         self.assertLess(src.index("get_acceleration()"), i_home)
+
+
+class _AccelMotor:
+    """Enough of MyActuatorMotor to exercise set_acceleration."""
+
+    def __init__(self) -> None:
+        self.frames: list[bytes] = []
+        self.slept: list[float] = []
+
+    async def _request(self, data: bytes, timeout: float = 0.1) -> bytes:
+        self.frames.append(data)
+        return bytes(8)
+
+    async def get_acceleration(self) -> float:
+        return 0.0
+
+
+class FlashWriteSettleTest(unittest.TestCase):
+    """0x43 is a flash write and the motor drops commands sent during it.
+
+    Bench: a gain restore sent straight after set_acceleration was acked and
+    not applied -- the next run found the homing gain still in the motor,
+    compounding 0.24 -> 0.96 -- and a 0xA4 sent straight after it was ignored
+    for 15 s while the tool waited."""
+
+    def test_settles_and_reads_back_after_the_last_write(self) -> None:
+        m = _AccelMotor()
+
+        async def fake_sleep(s: float) -> None:
+            m.slept.append(s)
+
+        orig_sleep = ma.asyncio.sleep
+        ma.asyncio.sleep = fake_sleep  # type: ignore[assignment]
+        try:
+            asyncio.run(ma.MyActuatorMotor.set_acceleration(m, 0.0, allow_zero=True))
+        finally:
+            ma.asyncio.sleep = orig_sleep  # type: ignore[assignment]
+        self.assertEqual(len(m.frames), 4)
+        self.assertTrue(all(f[0] == 0x43 for f in m.frames))
+        self.assertTrue(m.slept and m.slept[0] >= 0.5)
+
+    def test_position_only_writes_two_frames(self) -> None:
+        m = _AccelMotor()
+        asyncio.run(
+            ma.MyActuatorMotor.set_acceleration(
+                m, 0.0, allow_zero=True, position_only=True, settle_s=0.0
+            )
+        )
+        self.assertEqual(
+            [f[1] for f in m.frames], [ma._MA_ACC_POS_PLAN, ma._MA_DEC_POS_PLAN]
+        )
+
+
+class VerifiedRestoreTest(unittest.TestCase):
+    def test_restores_and_homing_gains_are_read_back_not_assumed(self) -> None:
+        helper = inspect.getsource(pl._home_test_with_fallback)
+        self.assertNotIn("set_gains(original, persist=False)", helper)
+        self.assertIn('_write_gains_verified(test, original, "restore")', helper)
+        self.assertIn('"homing gain"', helper)
+        verify = inspect.getsource(pl._write_gains_verified)
+        self.assertIn("get_gains()", verify)
+        self.assertIn("retrying", verify)
+        # the tuner never touches the speed planner
+        src = inspect.getsource(pl._run) + helper
+        for call in [s for s in src.split("set_acceleration(")[1:]]:
+            self.assertIn("position_only=True", call[:120])

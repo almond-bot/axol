@@ -794,8 +794,22 @@ class MyActuatorMotor(MotorDriver):
         deceleration: float | None = None,
         *,
         allow_zero: bool = False,
+        position_only: bool = False,
+        settle_s: float = 1.0,
     ) -> None:
         """Write the planning accelerations (0x43, RAM **and** ROM).
+
+        Each 0x43 is a flash write, and the motor **drops commands that
+        arrive while it is busy with one** -- it acknowledges them and does
+        not act. Bench, right elbow: a gain restore sent straight after this
+        call was acked and never applied (the next run found the homing gain
+        still in the motor, twice, compounding 0.24 -> 0.96), and a 0xA4 sent
+        straight after it was acked and ignored for 15 s. So this call waits
+        ``settle_s`` after the last write and reads the position-planning
+        value back once, and callers that must be sure verify their own
+        follow-up writes. ``position_only`` writes just the two position-
+        planning values: the tuners have no business touching the speed
+        planner, and it halves the flash writes.
 
         ``allow_zero`` passes a literal 0 through instead of clamping it up to
         :data:`_MA_ACC_MIN_DPS_S2`. Zero is outside the documented 100-60000
@@ -822,8 +836,16 @@ class MyActuatorMotor(MotorDriver):
         # All four types share the same response CAN ID — must be sequential.
         await _send(_MA_ACC_POS_PLAN, acceleration)
         await _send(_MA_DEC_POS_PLAN, dec)
-        await _send(_MA_ACC_VEL_PLAN, acceleration)
-        await _send(_MA_DEC_VEL_PLAN, dec)
+        if not position_only:
+            await _send(_MA_ACC_VEL_PLAN, acceleration)
+            await _send(_MA_DEC_VEL_PLAN, dec)
+        if settle_s > 0:
+            await asyncio.sleep(settle_s)
+            # One read-back proves the motor is answering *and* acting again.
+            try:
+                await self.get_acceleration()
+            except MotorError:
+                await asyncio.sleep(settle_s)
 
     async def _read_gain_indexed(self, index: int) -> float | None:
         """Read one loop gain via the V4.2+ indexed float32 format.

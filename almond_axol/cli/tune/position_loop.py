@@ -95,6 +95,46 @@ _KP_STEPS = (1.0, 4.0, 16.0, 64.0, 256.0, 1024.0)
 _HOME_TARGET_SPEED = math.radians(20.0)
 
 
+async def _write_gains_verified(test: JointFrameMotor, gains, what: str) -> bool:
+    """RAM-write the loop gains and READ THEM BACK; retry while they differ.
+
+    A 0x31 sent while the motor is busy with a 0x43 flash write is acked and
+    not applied (bench: "RAM gains restored" was printed and the next run
+    found the homing gain still in the motor, twice). So a restore is only
+    claimed once the motor reports the values. Compares the four gains the
+    tuners touch.
+    """
+    for attempt in range(4):
+        try:
+            await test.motor.set_gains(gains, persist=False)
+            await asyncio.sleep(0.2)
+            got = await test.motor.get_gains()
+        except Exception as e:
+            print(f"    ({what}) gain write/readback failed: {e}")
+            await asyncio.sleep(0.5)
+            continue
+        ok = all(
+            abs(getattr(got, f) - getattr(gains, f))
+            <= 1e-4 * max(1.0, abs(getattr(gains, f)))
+            for f in ("position_kp", "position_ki", "speed_kp", "speed_ki")
+        )
+        if ok:
+            print(
+                f"    ({what}) gains verified: position kp={got.position_kp:.4f} "
+                f"ki={got.position_ki:.4f} | speed kp={got.speed_kp:.4f} ki={got.speed_ki:.4f}"
+            )
+            return True
+        print(
+            f"    ({what}) motor did not take the gains (attempt {attempt + 1}): "
+            f"kp={got.position_kp:.4f} speed_kp={got.speed_kp:.4f}; retrying"
+        )
+        await asyncio.sleep(0.5)
+    print(
+        f"  !! ({what}) gains could NOT be verified after 4 attempts -- power-cycle to reset."
+    )
+    return False
+
+
 async def _home_test_joint(
     test: JointFrameMotor, joint: Joint, label: str, timeout_s: float = 20.0
 ) -> bool:
@@ -169,19 +209,23 @@ async def _home_test_with_fallback(
     if profiled_first:
         await test.motor.clear_errors()
     try:
-        await test.motor._driver.set_acceleration(0.0, allow_zero=True)
-        kp_home = max(original.position_kp * 4.0, kp_hint)
-        await test.motor.set_gains(
-            replace(original, position_kp=kp_home, position_ki=0.0), persist=False
+        await test.motor._driver.set_acceleration(
+            0.0, allow_zero=True, position_only=True
         )
+        kp_home = max(original.position_kp * 4.0, kp_hint)
         print(f"    falling back to direct tracking at position_kp={kp_home:.4f}")
+        await _write_gains_verified(
+            test, replace(original, position_kp=kp_home, position_ki=0.0), "homing gain"
+        )
     except Exception as e:
         print(f"    fallback setup failed: {e}")
     ok = await _home_test_joint(test, joint, "direct")
     try:
         if accel_before is not None:
-            await test.motor._driver.set_acceleration(accel_before, allow_zero=True)
-        await test.motor.set_gains(original, persist=False)
+            await test.motor._driver.set_acceleration(
+                accel_before, allow_zero=True, position_only=True
+            )
+        await _write_gains_verified(test, original, "restore")
     except Exception as e:
         print(f"    could not restore after fallback: {e}")
     return ok
@@ -642,7 +686,7 @@ async def _run(args: argparse.Namespace) -> None:
                     f"-> writing {args.accel:.0f}"
                 )
                 await test.motor._driver.set_acceleration(
-                    math.radians(args.accel), allow_zero=True
+                    math.radians(args.accel), allow_zero=True, position_only=True
                 )
                 readback = await test.motor._driver.get_acceleration()
                 print(f"  read back: {math.degrees(readback):.0f} dps/s", end="")
