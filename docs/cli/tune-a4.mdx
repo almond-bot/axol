@@ -33,7 +33,7 @@ Safety, built in:
 | `--persist` | Write gains to ROM instead of RAM |
 | `--keep` | Leave the run's gains and planner acceleration in the motor |
 | `--buzz-abort DEG` | Abort past this >10 Hz position motion, degrees RMS over 0.1 s (default: 0.3; 0 off) |
-| `--iq-abort A` | Abort past this reply current (default: 10; 0 off) |
+| `--iq-abort A` | Abort past this reply current (default: 30; 0 off). A loaded X8 shoulder draws ~10 A just holding gravity at −55°, so keep this above the pose's static current |
 | `--save-run` | Persist the run artifact |
 | `--label TEXT`, `--group ID` | Note and sweep id stored on the run |
 

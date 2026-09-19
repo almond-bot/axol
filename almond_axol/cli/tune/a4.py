@@ -25,7 +25,8 @@ Safety:
 * A buzz guard watches the fine position for high-frequency motion and the
   reply current; past ``--buzz-abort`` degrees of >10 Hz content or
   ``--iq-abort`` amps it restores the previous gains at once, holds, and
-  ends the run. Shoulder_1 at speed_kp 0.1 (3× stock) vibrated immediately
+  ends the run. Size the current limit for the pose: a loaded X8 shoulder
+  draws ~10 A holding gravity alone at -55°. Shoulder_1 at speed_kp 0.1 (3× stock) vibrated immediately
   on 2026-09-18; start every sweep from the stock values in small steps.
 * The joint under test holds position stiffly in this mode and will push
   back against contact up to motor torque. Keep the workspace clear.
@@ -441,8 +442,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--iq-abort",
         type=float,
-        default=10.0,
-        help="Abort past this reply current, amps (default: 10; 0 off)",
+        default=30.0,
+        help="Abort past this reply current, amps (default: 30; 0 off). A loaded X8 "
+        "shoulder draws ~10 A just holding gravity at -55°, so keep this well above "
+        "the pose's static current",
     )
     p.add_argument(
         "--save-run",
@@ -528,6 +531,9 @@ async def _run(args: argparse.Namespace) -> None:
             # Planner and gains: written after every mode switch/homing is
             # done (those reset the motor and reload ROM).
             stored_accel = await _read_accel(driver)
+            print(
+                f"  planner accel/decel stored: {stored_accel[0]}/{stored_accel[1]} dps/s"
+            )
             if args.accel is not None and stored_accel != (args.accel, args.accel):
                 before_accel = stored_accel
                 accel_used = await _write_accel(driver, args.accel, args.accel)
@@ -571,7 +577,9 @@ async def _run(args: argparse.Namespace) -> None:
                     await _write_gains(driver, before_gains, args.persist)
                     print("  previous gains restored")
                     before_gains = None
-            here = motor.position
+            # The raw 0xA4 stream never fills the driver's position cache;
+            # read the joint explicitly before holding it where it stopped.
+            here = await motor.get_position()
             await _hold(driver, motor, here, args.cap, 0.5)
             report_achieved_rate(log, args.rate)
         except KeyboardInterrupt:
