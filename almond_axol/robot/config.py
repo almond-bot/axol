@@ -165,6 +165,56 @@ class JointConfig:
                   q=3 on both arms even with its pose-tracked centre: hardware
                   traces found a separate 12.5-13.6 Hz mast/forearm mode that
                   the old wide band could feed.
+        stiction_gain: Error-sign Coulomb compensation, as a fraction of
+                  ``friction.fc`` (see
+                  :func:`almond_axol.robot.control.stiction_compensation`).
+                  ``0`` (default) is the production law. Pushes up to
+                  ``gain·fc`` toward the target while the joint is stuck and
+                  the velocity feedforward has switched itself off, fading
+                  out as that feedforward saturates — the lever for the
+                  slow-motion stick-slip stairs of the high-ratio X8-P20
+                  shoulders (0.3-0.6° at 2 Hz on right shoulder_1, where
+                  breakaway is ~2.3× the fitted sliding ``fc``). Keep it
+                  below the breakaway/``fc`` ratio ``axol tune.breakaway``
+                  measures, or the term hunts around the target at rest.
+        stiction_load_gain: Load-proportional part of that push, in Nm per
+                  Nm of the joint's gravity feedforward: the peak push is
+                  ``stiction_gain·fc + stiction_load_gain·|gravity|``.
+                  Gear friction follows the transmitted torque — right
+                  shoulder_1 broke away at 0.66 Nm at rest but at 2-3.3 Nm
+                  under 10-15 Nm of gravity load — so a constant push
+                  either hunts at rest or does nothing extended. Size it
+                  from ``tune.breakaway --poses`` at loaded poses, or from
+                  the excess torque at release in a slow replay trace.
+        stiction_err_deg: Position error (degrees) at which that term
+                  saturates. Smaller is a stiffer push-off; 0.1° is a few
+                  encoder LSBs above the feedback noise floor.
+        dither_nm: Peak amplitude (Nm) of a sinusoidal torque dither on the
+                  feedforward (see :func:`almond_axol.robot.control.dither_step`);
+                  ``0`` (default) off. Keeps a geared joint's meshes sliding
+                  so its velocity-weakening friction cannot re-stick between
+                  cycles — the lever for the X8-P20 shoulders' 2 Hz
+                  stick-slip once feedforward and stiction compensation
+                  have shrunk the stairs as far as they can. Start at 1-2 Nm
+                  on a shoulder; it is audible.
+        dither_hz: Dither frequency; above the arm's structural modes
+                  (~35 Hz), below the core's 120 Hz Nyquist.
+        wire_mode: Which frame the realtime core commands this joint with
+                  while tracking (MyActuator joints only; Damiao joints,
+                  the gripper, gravity comp and the limp fallback always use
+                  MIT). ``"mit"`` (default) is the impedance frame and the
+                  production law. ``"a4"`` hands the joint to the firmware's
+                  own position loop (0xA4 absolute position closed-loop,
+                  speed-capped at the tracker's velocity limit): its kHz
+                  position/speed PI on the motor-side encoder is the
+                  candidate for creeping through the X8-P20's stick-slip.
+                  Costs: no compliance (the joint holds position with
+                  integral action and pushes back up to motor torque), no
+                  host feedforward (gravity, friction, stiction, dither and
+                  damping are all inert), and no torque telemetry — the
+                  reply carries q-axis current, so measured torque reads
+                  NaN and the contact watchdog is blind on that joint.
+                  Position stays 0.01° via a paired 0x92 read each tick.
     """
 
     kp: float
@@ -176,6 +226,12 @@ class JointConfig:
     kd_host: float = 0.0
     kd_host_hz: float | None = None
     kd_host_q: float | None = None
+    stiction_gain: float = 0.0
+    stiction_load_gain: float = 0.0
+    stiction_err_deg: float = 0.1
+    dither_nm: float = 0.0
+    dither_hz: float = 60.0
+    wire_mode: str = "mit"
 
 
 @dataclass
@@ -412,7 +468,20 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     """Overlay one joint's calibration-file entry onto its config."""
     overrides: dict[str, Any] = {
         f: entry[f]
-        for f in ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
+        for f in (
+            "kp",
+            "kd",
+            "j_eff",
+            "kd_host",
+            "kd_host_hz",
+            "kd_host_q",
+            "stiction_gain",
+            "stiction_load_gain",
+            "stiction_err_deg",
+            "dither_nm",
+            "dither_hz",
+            "wire_mode",
+        )
         if f in entry
     }
     friction = entry.get("friction")

@@ -176,6 +176,8 @@
                 "pages": [
                   "cli/tune-pid",
                   "cli/tune-friction",
+                  "cli/tune-breakaway",
+                  "cli/tune-a4",
                   "cli/tune-gravity",
                   "cli/tune-factory",
                   "cli/tune-motion",

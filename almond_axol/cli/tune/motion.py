@@ -36,6 +36,7 @@ Examples:
     axol tune.motion --motion reach-and-place --gain shoulder_3.kd_host=8 --label "s3 damp"
     axol tune.motion --motion reach-and-place --stiffness 0.8
     axol tune.motion --motion reach-and-place --ik   # drive through the IK solver
+    axol tune.motion --motion slow_osc --arms right  # one arm only
 """
 
 from __future__ import annotations
@@ -66,6 +67,11 @@ _GAIN_FIELDS = (
     "kd_host_hz",
     "kd_host_q",
     "j_eff",
+    "stiction_gain",
+    "stiction_load_gain",
+    "stiction_err_deg",
+    "dither_nm",
+    "dither_hz",
 )
 
 # Column names of a 14-wide motion row: left arm then right arm.
@@ -192,6 +198,25 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--no-save-run",
         action="store_true",
         help="Don't persist the run artifact (dry run)",
+    )
+    p.add_argument(
+        "--a4",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT",
+        help="Drive this MyActuator joint with the firmware's own position loop "
+        "(0xA4 absolute position closed-loop) instead of the MIT impedance frame, "
+        "e.g. right.shoulder_1. Repeatable. The joint then has no compliance, no "
+        "host feedforward and NaN torque telemetry (contact watchdog blind on it); "
+        "everything else about the replay is unchanged, so runs compare directly.",
+    )
+    p.add_argument(
+        "--arms",
+        choices=("both", "left", "right"),
+        default="both",
+        help="Which arm(s) to bring up and drive (default: both). The other "
+        "arm's channel is left untouched, so a single-arm bench or an "
+        "unpowered arm does not block the run.",
     )
     p.add_argument(
         "--no-gripper",
@@ -415,6 +440,15 @@ async def _run(args: argparse.Namespace) -> None:
     for (side, joint, fld), value in overrides.items():
         setattr(getattr(getattr(config, side), joint), fld, value)
         print(f"  gain override: {side}.{joint}.{fld} = {value}")
+    for spec in args.a4:
+        parts = spec.split(".")
+        if len(parts) != 2 or parts[0] not in ("left", "right"):
+            raise SystemExit(f"--a4 wants SIDE.JOINT, got {spec!r}")
+        side, joint = parts
+        if joint not in {j.value for j in ARM_JOINTS}:
+            raise SystemExit(f"--a4: unknown joint {joint!r}")
+        getattr(getattr(config, side), joint).wire_mode = "a4"
+        print(f"  wire mode: {side}.{joint} = a4 (firmware position loop)")
 
     # The kinematics stack plans the collision-aware approach/return moves.
     print("Loading kinematics solver (JIT compile may take a few seconds) ...")
@@ -529,7 +563,12 @@ async def _run(args: argparse.Namespace) -> None:
     traj_playback = [to_full(row) for row in sent]
 
     # Production playback always runs through the Rust core, matching teleop.
-    robot = Axol(config=config)
+    arm_channels: dict[str, None] = {}
+    if args.arms == "right":
+        arm_channels["left_channel"] = None
+    elif args.arms == "left":
+        arm_channels["right_channel"] = None
+    robot = Axol(config=config, **arm_channels)
 
     async with robot as axol:
         contact: tuple[str, float] | None = None

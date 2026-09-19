@@ -251,6 +251,65 @@ const TABS: WbTab[] = [
     drivesMotors: true,
   },
   {
+    key: "a4",
+    label: "Firmware loop",
+    command: "tune.a4",
+    description:
+      "Tune a MyActuator joint's own position loop (0xA4, the controller " +
+      "behind wire_mode a4) with a sine or a constant-speed triangle. Firmware " +
+      "gains are written to RAM for the run and restored afterwards (persist " +
+      "writes ROM, keep leaves them); planner acceleration must be 0 for the " +
+      "joint to follow a stream. A buzz guard restores the previous gains on " +
+      "any high-frequency motion. Compare runs on velocity ripple (MIT " +
+      "stick-slip ≈ 0.8, smooth < 0.2), stuck windows, lag and the 1–4 Hz band. " +
+      "The joint holds stiffly and does not yield to a hand: clear the space.",
+    presets: { save_run: true },
+    fields: [
+      { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
+      {
+        key: "joint",
+        label: "joint",
+        type: "select",
+        options: ["shoulder_1", "shoulder_2", "shoulder_3", "elbow", "wrist_1"],
+      },
+      { key: "mode", label: "wave", type: "select", options: ["triangle", "sine"] },
+      {
+        key: "center",
+        label: "center (°)",
+        type: "number",
+        placeholder: "mid",
+        hint: "joint-frame centre (0 = rest); probe under gravity load, e.g. -35 on shoulder_1",
+      },
+      { key: "amp", label: "half-travel (°)", type: "number", placeholder: "10" },
+      { key: "speed", label: "triangle speed (°/s)", type: "number", placeholder: "3" },
+      { key: "freq", label: "sine freq (Hz)", type: "number", placeholder: "0.3" },
+      { key: "duration", label: "duration (s)", type: "number", placeholder: "12" },
+      { key: "rate", label: "rate (Hz)", type: "number", placeholder: "200" },
+      { key: "cap", label: "speed cap (°/s)", type: "number", placeholder: "60" },
+      {
+        key: "accel",
+        label: "planner accel (dps/s)",
+        type: "number",
+        placeholder: "stored",
+        hint: "0 = direct PI tracking (required to follow the stream); restored after the run unless kept",
+      },
+      { key: "position_kp", label: "position_kp", type: "number", placeholder: "stock", hint: "X8 shoulders ship 0.008" },
+      { key: "position_ki", label: "position_ki", type: "number", placeholder: "stock" },
+      { key: "position_kd", label: "position_kd", type: "number", placeholder: "stock" },
+      { key: "speed_kp", label: "speed_kp", type: "number", placeholder: "stock", hint: "X8 shoulders ship 0.03; 0.1 vibrated — step in small increments" },
+      { key: "speed_ki", label: "speed_ki", type: "number", placeholder: "stock" },
+      { key: "current_kp", label: "current_kp", type: "number", placeholder: "stock" },
+      { key: "current_ki", label: "current_ki", type: "number", placeholder: "stock" },
+      { key: "buzz_abort", label: "buzz abort (°)", type: "number", placeholder: "0.3" },
+      { key: "iq_abort", label: "current abort (A)", type: "number", placeholder: "10" },
+      { key: "persist", label: "persist gains to ROM", type: "boolean" },
+      { key: "keep", label: "keep gains + planner after run", type: "boolean" },
+      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+    ],
+    required: ["arm", "joint"],
+    drivesMotors: true,
+  },
+  {
     key: "motion",
     label: "Recorded motion",
     command: "tune.motion",

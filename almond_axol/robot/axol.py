@@ -40,12 +40,15 @@ from ..utils.state_files import secure_atomic_write_json, secure_read_text
 from .base import RobotBase, mark_hardware_cleanup_uncertain
 from .config import AxolConfig
 from .control import (
+    BandPass,
     DAMP_BP_Q,
     DAMP_BP_W0,
-    VEL_CUTOFF_FREQ,
-    BandPass,
     Differentiator,
+    TorqueDither,
+    VEL_CUTOFF_FREQ,
     compute_friction,
+    stiction_amplitude,
+    stiction_compensation,
 )
 from .gravity import GravityCompensator
 
@@ -648,6 +651,7 @@ class AxolArm:
             for j in Joint
         ]
         self._damp_bp = BandPass(n=n_j, w0=self._damp_w0, q=self._damp_q)
+        self._dither = TorqueDither(len(ARM_JOINTS))
         self._last_q_commanded: np.ndarray | None = None
         self._gc_hold_q: np.ndarray | None = None
         self._gc_hold_free: frozenset[Joint] | None = None
@@ -1662,6 +1666,10 @@ class AxolArm:
             return
 
         arm_cmds: list[tuple[float, float, float, float, float]] = []
+        dither = self._dither.update(
+            [getattr(self._arm_config, j.value).dither_nm for j in ARM_JOINTS],
+            [getattr(self._arm_config, j.value).dither_hz for j in ARM_JOINTS],
+        )
         for i, j in enumerate(ARM_JOINTS):
             gains = getattr(self._arm_config, j.value)
             f = gains.friction
@@ -1672,9 +1680,34 @@ class AxolArm:
             # phase-safe on the slow shoulder modes, so silently converting
             # excess firmware damping into it could excite the very
             # oscillation the oversized kd was meant to kill.
+            # Stiction compensation acts on the measured error (motor frame
+            # on both sides); zero until the first feedback frame is cached.
+            stiction = 0.0
+            if gains.stiction_gain != 0.0 or gains.stiction_load_gain != 0.0:
+                motor = self.motors.get(j)
+                try:
+                    q_meas = motor.position if motor is not None else None
+                    v_meas = motor.velocity if motor is not None else 0.0
+                except MotorError:
+                    q_meas = None
+                    v_meas = 0.0
+                if q_meas is not None:
+                    stiction = stiction_compensation(
+                        float(motor_targets[i]) - q_meas,
+                        v_meas,
+                        stiction_amplitude(
+                            f.fc,
+                            gains.stiction_gain,
+                            gains.stiction_load_gain,
+                            float(gravity[i]),
+                        ),
+                        math.radians(gains.stiction_err_deg),
+                    )
             t_ff = (
                 float(gravity[i])
                 + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
+                + stiction
+                + dither[i]
                 + gains.j_eff * float(j_scale[i]) * accelerations[i]
                 + float(host_scale[i]) * gains.kd_host * v_damp[i]
             )
@@ -1852,6 +1885,7 @@ class AxolArm:
         self._vel_fast_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
         self._meas_vel_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
         self._damp_bp = BandPass(n=n, w0=self._damp_w0, q=self._damp_q)
+        self._dither = TorqueDither(len(ARM_JOINTS))
 
     def torque_residuals(self) -> np.ndarray:
         """Measured minus model-gravity torque per arm joint, shape (7,).

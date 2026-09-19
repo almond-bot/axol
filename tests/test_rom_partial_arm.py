@@ -295,7 +295,9 @@ class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
         # Slot-by-motor-id is protocol generation 2; a core that predates it
         # would slot these wrists at 0 and 1 and then reject every target,
         # so the config declares the generation and such a core refuses it.
-        self.assertEqual(lines[0], "proto 2")
+        from almond_axol.rt.link import CONFIG_PROTO
+
+        self.assertEqual(lines[0], f"proto {CONFIG_PROTO}")
         joint_lines = [line for line in lines if line.startswith("joint ")]
         self.assertEqual(
             [line.split()[3:5] for line in joint_lines],
@@ -395,7 +397,14 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
         rt = Axol._wrap(axol)
         for line in rt._config_text().splitlines():
             if line.startswith("joint "):
-                self.assertEqual(line.split()[9:], ["0.0", "0.0", "0.0", "0.0"], line)
+                self.assertEqual(line.split()[9:13], ["0.0", "0.0", "0.0", "0.0"], line)
+                # Stiction and dither terms stay off on the bench too, and
+                # every joint is on the MIT frame.
+                self.assertEqual(
+                    line.split()[13:],
+                    ["0.0", "0.0017453292519943296", "0.0", "0.0", "60.0", "mit"],
+                    line,
+                )
 
     def test_only_a_partial_arm_is_a_bench_run(self) -> None:
         """A full arm on the bus — even with a joint subset selected — is the
