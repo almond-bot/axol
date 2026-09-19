@@ -402,7 +402,19 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
                 # every joint is on the MIT frame.
                 self.assertEqual(
                     line.split()[13:],
-                    ["0.0", "0.0017453292519943296", "0.0", "0.0", "60.0", "mit"],
+                    [
+                        "0.0",
+                        "0.0017453292519943296",
+                        "0.0",
+                        "0.0",
+                        "60.0",
+                        "mit",
+                        "0.0",
+                        "0.3",
+                        "0.1",
+                        "0.1",
+                        "0.0",
+                    ],
                     line,
                 )
 

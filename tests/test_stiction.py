@@ -26,6 +26,8 @@ from almond_axol.robot.control import (
     dither_step,
     stiction_amplitude,
     stiction_compensation,
+    stribeck_amplitude,
+    stribeck_excess,
 )
 
 _SCALE = math.radians(0.1)
@@ -119,6 +121,63 @@ class StictionMathTest(unittest.TestCase):
             )
 
 
+# (v_meas rad/s, want) for amp = 1, v_s = 0.1, v0 = 0.02.
+_STRIBECK_GOLDEN = [
+    (-0.3, -0.00012340980408665668),
+    (-0.1, -0.36784603928630505),
+    (-0.05, -0.7683759879897785),
+    (-0.02, -0.7317316219624262),
+    (0.0, 0.0),
+    (0.01, 0.4575190147179108),
+    (0.02, 0.7317316219624262),
+    (0.05, 0.7683759879897785),
+    (0.1, 0.36784603928630505),
+    (0.2, 0.018315638813231488),
+]
+
+
+class StribeckTest(unittest.TestCase):
+    def test_golden_vectors_shared_with_the_core(self) -> None:
+        for v, want in _STRIBECK_GOLDEN:
+            self.assertAlmostEqual(
+                stribeck_excess(v, 1.0, 0.1), want, places=12, msg=f"v={v}"
+            )
+
+    def test_zero_at_rest_and_off_by_default(self) -> None:
+        self.assertEqual(stribeck_excess(0.0, 1.0, 0.1), 0.0)
+        self.assertEqual(stribeck_excess(0.05, 0.0, 0.1), 0.0)
+        self.assertEqual(stribeck_amplitude(0.0, 0.3, 0.1, 12.0), 0.0)
+
+    def test_has_the_measured_shape(self) -> None:
+        # Excess peaks in the creep band and is gone by 3·v_s; the slope
+        # between 0.05 and 0.2 rad/s is negative, like the measured curve.
+        amp = stribeck_amplitude(1.0, 0.3, 0.1, 12.0)  # 1.5 Nm under 12 Nm of load
+        self.assertAlmostEqual(amp, 1.5)
+        creep = stribeck_excess(0.05, amp, 0.1)
+        fast = stribeck_excess(0.2, amp, 0.1)
+        self.assertGreater(creep, 1.0)
+        self.assertLess(fast, 0.05)
+        self.assertLess(stribeck_excess(-0.05, amp, 0.1), 0.0)
+
+
+class LoadFrictionTest(unittest.TestCase):
+    def test_fl_defaults_to_zero_and_loads_from_calibration(self) -> None:
+        from almond_axol.robot.config import FrictionParams
+
+        self.assertEqual(FrictionParams(fc=0.6, k=100.0, fv=0.0, fo=0.0).fl, 0.0)
+        out = _calibrated_joint(
+            ArmConfig().shoulder_1,
+            {"friction": {"fc": 0.6, "k": 100.0, "fv": 0.0, "fo": 0.0, "fl": 0.08}},
+        )
+        self.assertEqual((out.friction.fc, out.friction.fl), (0.6, 0.08))
+        # An older calibration file without fl still loads.
+        out = _calibrated_joint(
+            ArmConfig().shoulder_1,
+            {"friction": {"fc": 0.6, "k": 100.0, "fv": 0.0, "fo": 0.0}},
+        )
+        self.assertEqual(out.friction.fl, 0.0)
+
+
 class StictionConfigTest(unittest.TestCase):
     def test_defaults_are_off_on_every_joint(self) -> None:
         arm = ArmConfig()
@@ -136,6 +195,7 @@ class StictionConfigTest(unittest.TestCase):
             self.assertEqual(jc.stiction_err_deg, 0.1, name)
             self.assertEqual(jc.dither_nm, 0.0, name)
             self.assertEqual(jc.wire_mode, "mit", name)
+            self.assertEqual(jc.stribeck_gain, 0.0, name)
 
     def test_calibration_file_can_set_the_fields(self) -> None:
         base = ArmConfig().shoulder_1

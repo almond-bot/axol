@@ -52,6 +52,15 @@ pub struct MotorSpec {
     pub dither_hz: f64,
     /// Command frame for tracked ticks (MyActuator joints only).
     pub wire: WireMode,
+    /// Stribeck cancellation on measured velocity (`filter::stribeck_excess`):
+    /// gain, zero-load excess (Nm), excess per Nm of gravity, 1/e speed.
+    pub stribeck_gain: f64,
+    pub stribeck_dfs: f64,
+    pub stribeck_load_gain: f64,
+    pub stribeck_vs: f64,
+    /// Load-proportional Coulomb friction, Nm per Nm of gravity feedforward:
+    /// the tracked-mode friction term uses `fc + fl·|t_ff|`.
+    pub fl: f64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -117,6 +126,11 @@ pub struct ReadyMotor {
     pub dither_nm: f64,
     pub dither_hz: f64,
     pub wire: WireMode,
+    pub stribeck_gain: f64,
+    pub stribeck_dfs: f64,
+    pub stribeck_load_gain: f64,
+    pub stribeck_vs: f64,
+    pub fl: f64,
 }
 
 /// Status-probe attempts before a silent motor fails the bring-up.
@@ -261,6 +275,11 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             dither_nm: spec.dither_nm,
             dither_hz: spec.dither_hz,
             wire: spec.wire,
+            stribeck_gain: spec.stribeck_gain,
+            stribeck_dfs: spec.stribeck_dfs,
+            stribeck_load_gain: spec.stribeck_load_gain,
+            stribeck_vs: spec.stribeck_vs,
+            fl: spec.fl,
         });
     }
 
@@ -316,6 +335,11 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             dither_nm: spec.dither_nm,
             dither_hz: spec.dither_hz,
             wire: spec.wire,
+            stribeck_gain: spec.stribeck_gain,
+            stribeck_dfs: spec.stribeck_dfs,
+            stribeck_load_gain: spec.stribeck_load_gain,
+            stribeck_vs: spec.stribeck_vs,
+            fl: spec.fl,
         });
     }
     Ok(motors)

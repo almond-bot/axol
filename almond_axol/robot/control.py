@@ -227,6 +227,48 @@ def stiction_compensation(
     return amp * math.tanh(err / max(err_scale, 1e-9)) * fade
 
 
+# Speed (rad/s) over which the Stribeck term passes through zero — a hair above
+# the measured-velocity noise, so the sign change is smooth and a joint at rest
+# gets no push from it (breakaway is the stiction term's job).
+STRIBECK_V0 = 0.02
+
+
+def stribeck_amplitude(
+    gain: float, dfs: float, load_gain: float, gravity: float
+) -> float:
+    """Excess of low-speed over sliding friction (Nm) this cycle:
+    ``gain·(dfs + load_gain·|gravity|)``, load-scaled like the stiction push."""
+    return gain * (dfs + load_gain * abs(gravity))
+
+
+def stribeck_excess(
+    v_meas: float, amp: float, v_s: float, v0: float = STRIBECK_V0
+) -> float:
+    """Friction cancellation keyed on *measured* velocity:
+    ``amp·exp(−(v/v_s)²)·tanh(v/v0)``.
+
+    The X8-P20 shoulders' friction falls as they speed up — 2.1 Nm sliding
+    at 0.05 rad/s, 1.4 at 0.1, 0.7 at 0.2 rad/s under load — and that
+    negative slope is negative damping: a joint that speeds up sees less
+    resistance and speeds up more, until the impedance spring catches it and
+    it slows back into the friction rise and sticks. That is the 2 Hz
+    stick-slip cycle no command-driven feedforward can stabilise, because a
+    term computed from the *commanded* velocity does not change when the
+    real velocity does.
+
+    This term follows the measured velocity with the measured curve's
+    shape, so when the joint speeds up the feedforward drops by what the real
+    friction drops and the net slope is flattened; at ``v_s`` (where the
+    excess has fallen to 1/e) it hands over to the ordinary Coulomb term.
+    ``gain`` below 1 under-cancels and leaves some cycle; above the true curve
+    it over-cancels and the net damping goes negative, which shows as the
+    arm's 3 Hz mode growing. Zero at rest, so it cannot hunt.
+    """
+    if amp == 0.0 or v_s <= 0.0:
+        return 0.0
+    return amp * math.exp(-((v_meas / v_s) ** 2)) * math.tanh(v_meas / max(v0, 1e-9))
+
+
 def dither_step(phase: float, nm: float, hz: float, dt: float) -> tuple[float, float]:
     """Advance a torque-dither oscillator one step: ``(new_phase, torque)``.
 

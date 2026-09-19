@@ -49,22 +49,33 @@ _warned_calibration_identity = False
 class FrictionParams:
     """tanh-Coulomb + viscous friction model.
 
-    ``τ_friction = fc · tanh(k · v) + fv · v + fo``
+    ``τ_friction = (fc + fl · |τ_gravity|) · tanh(k · v) + fv · v + fo``
 
-    where ``v`` is the joint velocity (rad/s).
+    where ``v`` is the joint velocity (rad/s) and ``τ_gravity`` the gravity
+    feedforward the joint is carrying.
 
     Attributes:
-        fc: Coulomb friction magnitude (Nm).
+        fc: Coulomb friction magnitude (Nm) at zero gravity load.
         k:  Tanh sharpness factor — larger is closer to a sign() function.
         fv: Viscous friction coefficient (Nm·s/rad).
         fo: Constant friction offset (Nm). Captures direction-independent
             biases such as imperfect gravity compensation or motor cogging.
+        fl: Load-proportional Coulomb friction, Nm per Nm of gravity
+            feedforward. Planetary gear friction grows with the torque the
+            meshes carry: right shoulder_1's sliding friction measured
+            ~0.6 Nm at rest and ~1.5 Nm under 12 Nm of load (slope ≈ 0.08),
+            and its breakaway 0.66 Nm at rest against 2.4–3.3 Nm loaded. A
+            constant ``fc`` fitted at moderate load therefore over-compensates
+            at rest (kicking the joint at every reversal) and under-compensates
+            at reach. ``0`` (default) keeps the constant model; ``tune.friction``
+            fits it when its sweep spans enough load.
     """
 
     fc: float
     k: float
     fv: float
     fo: float
+    fl: float = 0.0
 
 
 @dataclass
@@ -215,6 +226,19 @@ class JointConfig:
                   reply carries q-axis current, so measured torque reads
                   NaN and the contact watchdog is blind on that joint.
                   Position stays 0.01° via a paired 0x92 read each tick.
+        stribeck_gain: Friction cancellation on *measured* velocity (see
+                  :func:`almond_axol.robot.control.stribeck_excess`), as a
+                  fraction of the measured static-minus-sliding excess.
+                  ``0`` (default) off. The one feedforward that acts on the
+                  velocity-weakening slope behind the X8-P20 shoulders'
+                  2 Hz stick-slip; sweep 0.5 → 0.7 → 0.9 and stop when the
+                  arm's 3 Hz mode starts to grow (over-cancellation).
+        stribeck_dfs: Static-minus-sliding friction excess (Nm) at zero
+                  gravity load; right shoulder_1 measured ~0.3.
+        stribeck_load_gain: Its growth per Nm of gravity feedforward
+                  (~0.1 on right shoulder_1: excess ≈ 1.5 Nm under 12 Nm).
+        stribeck_vs: Speed (rad/s) at which the excess has fallen to 1/e
+                  (~0.1 on the X8 shoulders).
     """
 
     kp: float
@@ -232,6 +256,10 @@ class JointConfig:
     dither_nm: float = 0.0
     dither_hz: float = 60.0
     wire_mode: str = "mit"
+    stribeck_gain: float = 0.0
+    stribeck_dfs: float = 0.3
+    stribeck_load_gain: float = 0.1
+    stribeck_vs: float = 0.1
 
 
 @dataclass
@@ -481,6 +509,10 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
             "dither_nm",
             "dither_hz",
             "wire_mode",
+            "stribeck_gain",
+            "stribeck_dfs",
+            "stribeck_load_gain",
+            "stribeck_vs",
         )
         if f in entry
     }

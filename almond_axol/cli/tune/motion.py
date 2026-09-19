@@ -72,6 +72,17 @@ _GAIN_FIELDS = (
     "stiction_err_deg",
     "dither_nm",
     "dither_hz",
+    "stribeck_gain",
+    "stribeck_dfs",
+    "stribeck_load_gain",
+    "stribeck_vs",
+    # Friction model, addressed as ``joint.friction.fc`` etc. — the sliding
+    # friction feedforward is the other half of every stick-slip A/B.
+    "friction.fc",
+    "friction.k",
+    "friction.fv",
+    "friction.fo",
+    "friction.fl",
 )
 
 # Column names of a 14-wide motion row: left arm then right arm.
@@ -94,6 +105,9 @@ def _parse_gain_overrides(specs: list[str]) -> dict[tuple[str, str, str], float]
             value = float(raw)
         except ValueError:
             raise SystemExit(f"--gain: bad value in {spec!r} (want PATH=NUMBER)")
+        # ``[side.]joint.friction.fc``: fold the sub-field back into one token.
+        if len(parts) >= 2 and parts[-2] == "friction":
+            parts = parts[:-2] + [f"friction.{parts[-1]}"]
         if len(parts) == 3:
             sides, joint, fld = [parts[0]], parts[1], parts[2]
             if sides[0] not in ("left", "right"):
@@ -438,7 +452,11 @@ async def _run(args: argparse.Namespace) -> None:
         has_gripper=not args.no_gripper,
     )
     for (side, joint, fld), value in overrides.items():
-        setattr(getattr(getattr(config, side), joint), fld, value)
+        target = getattr(getattr(config, side), joint)
+        if fld.startswith("friction."):
+            setattr(target.friction, fld.split(".", 1)[1], value)
+        else:
+            setattr(target, fld, value)
         print(f"  gain override: {side}.{joint}.{fld} = {value}")
     for spec in args.a4:
         parts = spec.split(".")

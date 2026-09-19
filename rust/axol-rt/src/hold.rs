@@ -79,6 +79,11 @@ pub fn parse_params(path: &str) -> io::Result<Vec<JointParams>> {
                     dither_nm: 0.0,
                     dither_hz: 0.0,
                     wire: WireMode::Mit,
+                    stribeck_gain: 0.0,
+                    stribeck_dfs: 0.0,
+                    stribeck_load_gain: 0.0,
+                    stribeck_vs: 0.0,
+                    fl: 0.0,
                 },
                 t_ff: fields.get(5)?.parse().ok()?,
             })

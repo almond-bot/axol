@@ -19,6 +19,10 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}left.elbow.stiction_err_deg</F> | `0.1` | Position error (degrees) at which that term saturates. The push fades on *measured* velocity (gone above ~0.05 rad/s), so it never drives the slip. |
 | <F>--{prefix}left.elbow.dither_nm</F> | `0.0` | Peak amplitude (Nm) of a sinusoidal torque dither on the feed-forward, `0` off. Keeps a geared joint's meshes sliding so its velocity-weakening friction (the X8-P20 shoulders: 2.1 Nm sliding at 0.05 rad/s, 0.7 Nm at 0.2 rad/s) cannot re-stick between cycles. Start at 1–2 Nm on a shoulder; it is audible. |
 | <F>--{prefix}left.elbow.dither_hz</F> | `60.0` | Dither frequency: above the arm's structural modes (~35 Hz), below the core's 120 Hz Nyquist. |
+| <F>--{prefix}left.elbow.stribeck_gain</F> | `0.0` | Friction cancellation on **measured** velocity, as a fraction of the measured static-minus-sliding excess: `gain × (stribeck_dfs + stribeck_load_gain × |gravity|) × exp(−(v/stribeck_vs)²) × tanh(v/0.02)`. The one feed-forward that acts on the velocity-weakening slope behind the X8 shoulders' 2 Hz stick-slip (a command-driven term cannot). Zero at rest. Sweep 0.5 → 0.9 and stop when the arm's 3 Hz mode grows. |
+| <F>--{prefix}left.elbow.stribeck_dfs</F> | `0.3` | Static-minus-sliding friction excess (Nm) at zero gravity load. |
+| <F>--{prefix}left.elbow.stribeck_load_gain</F> | `0.1` | Growth of that excess per Nm of gravity feed-forward (right shoulder_1: ~1.5 Nm under 12 Nm). |
+| <F>--{prefix}left.elbow.stribeck_vs</F> | `0.1` | Speed (rad/s) at which the excess has fallen to 1/e. |
 | <F>--{prefix}left.elbow.wire_mode</F> | `mit` | Frame the realtime core commands a **MyActuator** joint with while tracking. `mit` is the impedance frame (production). `a4` hands the joint to the firmware's own position loop (0xA4, speed-capped at the tracker limit) with a paired 0x92 read for 0.01° position — the candidate for creeping through X8-P20 stick-slip. Costs: no compliance, no host feed-forward, and NaN torque telemetry (the contact watchdog is blind on that joint). Damiao joints, the gripper, gravity comp and the limp fallback always use MIT. |
 | <F>--{prefix}left.elbow.mass</F> | per joint | Mass (kg) of the link, used for gravity compensation. Tune if an arm sags or pushes back in [gravity comp](/operations/gravity-comp). |
 | <F>--{prefix}left.elbow.com</F> | per joint | Centre of mass `[x, y, z]` (m) of the link. |
@@ -26,6 +30,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}left.elbow.friction.k</F> | per motor | Friction curve sharpness. |
 | <F>--{prefix}left.elbow.friction.fv</F> | per motor | Viscous friction (Nm·s/rad). |
 | <F>--{prefix}left.elbow.friction.fo</F> | per motor | Constant torque offset (Nm). |
+| <F>--{prefix}left.elbow.friction.fl</F> | `0.0` | Load-proportional Coulomb friction, Nm per Nm of gravity feed-forward: the effective `fc` is `fc + fl × |gravity|`. Planetary gear friction grows with the torque it carries (right shoulder_1: ~0.6 Nm sliding at rest, ~1.5 Nm under 12 Nm), so a constant `fc` over-compensates at rest and under-compensates at reach. `0` keeps the constant model. |
 
 Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or any joint: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3`.
 

@@ -1968,6 +1968,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         "stiction_gain": jc.stiction_gain,
                         "stiction_load_gain": jc.stiction_load_gain,
                         "dither_nm": jc.dither_nm,
+                        "stribeck_gain": jc.stribeck_gain,
                     }
                 out[side] = joints
             return out

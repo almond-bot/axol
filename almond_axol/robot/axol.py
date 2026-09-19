@@ -49,6 +49,8 @@ from .control import (
     compute_friction,
     stiction_amplitude,
     stiction_compensation,
+    stribeck_amplitude,
+    stribeck_excess,
 )
 from .gravity import GravityCompensator
 
@@ -1703,10 +1705,30 @@ class AxolArm:
                         ),
                         math.radians(gains.stiction_err_deg),
                     )
+            stribeck = 0.0
+            if gains.stribeck_gain != 0.0:
+                motor = self.motors.get(j)
+                try:
+                    v_now = motor.velocity if motor is not None else 0.0
+                except MotorError:
+                    v_now = 0.0
+                stribeck = stribeck_excess(
+                    v_now,
+                    stribeck_amplitude(
+                        gains.stribeck_gain,
+                        gains.stribeck_dfs,
+                        gains.stribeck_load_gain,
+                        float(gravity[i]),
+                    ),
+                    gains.stribeck_vs,
+                )
             t_ff = (
                 float(gravity[i])
-                + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
+                + compute_friction(
+                    velocities[i], f.fc + f.fl * abs(float(gravity[i])), f.k, f.fv, f.fo
+                )
                 + stiction
+                + stribeck
                 + dither[i]
                 + gains.j_eff * float(j_scale[i]) * accelerations[i]
                 + float(host_scale[i]) * gains.kd_host * v_damp[i]

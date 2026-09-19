@@ -243,7 +243,9 @@ const HOLDOVER_MAX: f64 = 0.080;
 /// - 4: plus the load-proportional stiction gain (`filter::stiction_amplitude`).
 /// - 5: plus the torque dither amplitude and frequency (`filter::dither_step`).
 /// - 6: plus the wire mode token (`mit` | `a4`, `bringup::WireMode`).
-const CONFIG_PROTO: u32 = 6;
+/// - 7: plus the four Stribeck cancellation fields (`filter::stribeck_excess`).
+/// - 8: plus the load-proportional Coulomb friction `fl` (Nm per Nm of gravity).
+const CONFIG_PROTO: u32 = 8;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -634,6 +636,7 @@ struct TraceRow {
     damping_ff: f64,
     stiction_ff: f64,
     dither_ff: f64,
+    stribeck_ff: f64,
     total_ff: f64,
     kd_host: f64,
     damp_w0: f64,
@@ -655,7 +658,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
     let mut out = io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         out,
-        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,dither_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt"
+        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,dither_ff,stribeck_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt"
     )?;
     Ok(out)
 }
@@ -663,7 +666,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
 fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::Result<()> {
     writeln!(
         out,
-        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9}",
+        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9}",
         r.tick,
         r.time_s,
         r.seq,
@@ -685,6 +688,7 @@ fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::R
         r.damping_ff,
         r.stiction_ff,
         r.dither_ff,
+        r.stribeck_ff,
         r.total_ff,
         r.kd_host,
         r.damp_w0,
@@ -896,6 +900,8 @@ fn parse_config(text: &str) -> io::Result<Config> {
                 //       <max_vel> <max_accel> <fc> <k> <fv> <fo>
                 //       <stiction_gain> <stiction_err> <stiction_load_gain>
                 //       <dither_nm> <dither_hz> <wire mit|a4>
+                //       <stribeck_gain> <stribeck_dfs> <stribeck_load_gain> <stribeck_vs>
+                //       <fl>
                 // gripper <side 0|1> <iface> <motor_id>
                 let gripper = f[0] == "gripper";
                 let side: u8 = f
@@ -938,6 +944,11 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         dither_nm: 0.0,
                         dither_hz: 0.0,
                         wire: WireMode::Mit,
+                        stribeck_gain: 0.0,
+                        stribeck_dfs: 0.0,
+                        stribeck_load_gain: 0.0,
+                        stribeck_vs: 0.0,
+                        fl: 0.0,
                     }
                 } else {
                     let motor_id: u8 = f
@@ -974,6 +985,11 @@ fn parse_config(text: &str) -> io::Result<Config> {
                             .get(18)
                             .and_then(|t| WireMode::parse(t))
                             .ok_or_else(|| bad(line))?,
+                        stribeck_gain: num(19)?,
+                        stribeck_dfs: num(20)?,
+                        stribeck_load_gain: num(21)?,
+                        stribeck_vs: num(22)?,
+                        fl: num(23)?,
                     }
                 };
                 if spec.slot >= N_SLOTS || bus.2.iter().any(|s| s.slot == spec.slot) {
@@ -1382,12 +1398,12 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 6\n\
+            "proto 8\n\
              loop_hz 240\n\
-             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n\
-             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit\n\
+             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n\
+             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n\
              gripper 0 canL 8\n\
-             joint 0 canL shoulder_3 3 180 2.0 9.4 33.0 0.4 250 0.08 0.0 0.6 0.0017 0.2 1.5 60 a4\n",
+             joint 0 canL shoulder_3 3 180 2.0 9.4 33.0 0.4 250 0.08 0.0 0.6 0.0017 0.2 1.5 60 a4 0.7 0.3 0.1 0.1 0.08\n",
         )
         .unwrap();
         let specs = &cfg.buses[0].2;
@@ -1417,29 +1433,48 @@ mod tests {
             (specs[0].wire, specs[3].wire),
             (WireMode::Mit, WireMode::A4)
         );
+        assert_eq!(specs[0].stribeck_gain, 0.0);
+        assert_eq!(
+            (
+                specs[3].stribeck_gain,
+                specs[3].stribeck_dfs,
+                specs[3].stribeck_load_gain,
+                specs[3].stribeck_vs
+            ),
+            (0.7, 0.3, 0.1, 0.1)
+        );
+        assert_eq!((specs[0].fl, specs[3].fl), (0.0, 0.08));
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 6\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9\n"
+            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 6\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
-        // ... and so must the proto-2/3/4/5 layouts (13, 15, 16 or 18 fields).
+        assert!(parse_config("proto 8\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        // ... and so must the proto-2/3/4/5/6/7 layouts (13 … 23 fields).
         assert!(parse_config(
-            "proto 6\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 6\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 6\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 6\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
     }
@@ -1450,9 +1485,9 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 6\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit\n\
-             joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit\n\
+            "proto 8\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n\
+             joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n\
              gripper 0 can0 8\n",
         )
         .unwrap();
@@ -1464,17 +1499,17 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 6\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit\n"
+            "proto 8\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 6\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit\n"
+            "proto 8\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 6\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit\n"
+            "proto 8\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -1485,7 +1520,8 @@ mod tests {
     /// target on the max-step gate — the arms enabled and never moved.
     #[test]
     fn parse_config_requires_matching_proto() {
-        let joint = "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit\n";
+        let joint =
+            "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n";
         let error_of = |text: &str| match parse_config(text) {
             Ok(_) => panic!("accepted a skewed config: {text:?}"),
             Err(err) => err.to_string(),
@@ -1497,12 +1533,12 @@ mod tests {
         // A future client generation this core does not understand.
         let err = error_of(&format!("proto 99\n{joint}"));
         assert!(err.contains("proto 99"), "{err}");
-        assert!(err.contains("proto 6"), "{err}");
+        assert!(err.contains("proto 8"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 6\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 8\n")).is_ok());
     }
 }
 
@@ -2004,6 +2040,11 @@ fn bus_loop(
         v_meas: LpDiff,
         bp: BandPass,
         vel_meas: f64,
+        /// Slower (20 rad/s) measured-velocity estimate for the Stribeck
+        /// term: smooth enough at 0.05 rad/s that the feedforward does not
+        /// step with the encoder, ~30° behind at the 2 Hz cycle.
+        v_meas_slow: LpDiff,
+        vel_meas_slow: f64,
         last_fb: Option<Instant>,
         /// Torque-dither oscillator phase (`filter::dither_step`), started a
         /// golden angle apart per slot.
@@ -2017,6 +2058,8 @@ fn bus_loop(
             v_meas: LpDiff::new(VEL_CUTOFF),
             bp: BandPass::new(),
             vel_meas: 0.0,
+            v_meas_slow: LpDiff::new(CONTROL_CUTOFF),
+            vel_meas_slow: 0.0,
             last_fb: None,
             dither_phase: slot as f64 * filter::DITHER_PHASE_STAGGER,
         })
@@ -2428,6 +2471,7 @@ fn bus_loop(
                         v_damp,
                         stiction_ff,
                         dither_ff,
+                        stribeck_ff,
                     ) = if tracked && overrun {
                         // The gap since the last command is not a trajectory
                         // segment the motor followed — it held. Re-prime the
@@ -2439,7 +2483,7 @@ fn bus_loop(
                         d.a_cmd.seed(0.0);
                         d.v_cmd_fast.seed(p_cmd);
                         d.bp.reset();
-                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                     } else if tracked {
                         // Match classic AxolArm.motion_control: friction uses
                         // the 20 rad/s low-pass position derivative, inertia
@@ -2450,7 +2494,10 @@ fn bus_loop(
                         let v_cmd = d.v_cmd.update(p_cmd, tick_dt);
                         let a_cmd = d.a_cmd.update(v_cmd, tick_dt);
                         let v_cmd_fast = d.v_cmd_fast.update(p_cmd, tick_dt);
-                        let friction_ff = filter::friction(v_cmd, m.fc, m.k, m.fv, m.fo);
+                        // Sliding friction grows with the torque the gear
+                        // meshes carry (`fl`, Nm per Nm of gravity).
+                        let fc_eff = m.fc + m.fl * c.t_ff.abs();
+                        let friction_ff = filter::friction(v_cmd, fc_eff, m.k, m.fv, m.fo);
                         // Stiction compensation acts on the measured error
                         // against the latest accepted feedback. It is a slow
                         // term (it resolves a stuck joint over tens of ms),
@@ -2477,6 +2524,23 @@ fn bus_loop(
                             m.dither_hz,
                             tick_dt,
                         );
+                        // Stribeck cancellation on the measured velocity —
+                        // only with a fresh sample behind it, like the
+                        // stiction push.
+                        let stribeck_ff = if feedback_fresh[m.slot] {
+                            filter::stribeck_excess(
+                                d.vel_meas_slow,
+                                filter::stribeck_amplitude(
+                                    m.stribeck_gain,
+                                    m.stribeck_dfs,
+                                    m.stribeck_load_gain,
+                                    c.t_ff,
+                                ),
+                                m.stribeck_vs,
+                            )
+                        } else {
+                            0.0
+                        };
                         let inertia_ff = c.j_eff * a_cmd;
                         let damp_ok = feedback_fresh[m.slot]
                             && timing_on_time
@@ -2503,17 +2567,23 @@ fn bus_loop(
                             v_damp,
                             stiction_ff,
                             dither_ff,
+                            stribeck_ff,
                         )
                     } else {
                         d.v_cmd.seed(p_cmd);
                         d.a_cmd.seed(0.0);
                         d.v_cmd_fast.seed(p_cmd);
                         d.bp.reset();
-                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                     };
                     let damping_ff = c.kd_host * v_damp;
-                    let t_ff =
-                        c.t_ff + friction_ff + stiction_ff + dither_ff + inertia_ff + damping_ff;
+                    let t_ff = c.t_ff
+                        + friction_ff
+                        + stiction_ff
+                        + dither_ff
+                        + stribeck_ff
+                        + inertia_ff
+                        + damping_ff;
                     if trace_this_tick && trace_tx.is_some() {
                         trace_pending[m.slot] = Some(TraceRow {
                             tick: ticks,
@@ -2538,6 +2608,7 @@ fn bus_loop(
                             damping_ff,
                             stiction_ff,
                             dither_ff,
+                            stribeck_ff,
                             total_ff: t_ff,
                             kd_host: c.kd_host,
                             damp_w0: c.damp_w0,
@@ -2723,6 +2794,7 @@ fn bus_loop(
                         .map_or(0.0, |p| recv_time.duration_since(p).as_secs_f64());
                     d.last_fb = Some(recv_time);
                     d.vel_meas = d.v_meas.update(pos, dt);
+                    d.vel_meas_slow = d.v_meas_slow.update(pos, dt);
                     (d.vel_meas, dt)
                 };
                 if let (Some(tx), Some(mut row)) =

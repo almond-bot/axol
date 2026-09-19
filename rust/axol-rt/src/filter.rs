@@ -143,6 +143,30 @@ pub fn stiction(err: f64, v_meas: f64, amp: f64, err_scale: f64) -> f64 {
     amp * (err / err_scale.max(1e-9)).tanh() * fade
 }
 
+/// Speed (rad/s) over which the Stribeck term passes through zero —
+/// `STRIBECK_V0` in `almond_axol.robot.control`.
+pub const STRIBECK_V0: f64 = 0.02;
+
+/// Excess of low-speed over sliding friction this tick, Nm —
+/// `stribeck_amplitude` in `almond_axol.robot.control`:
+/// `gain·(dfs + load_gain·|gravity|)`.
+pub fn stribeck_amplitude(gain: f64, dfs: f64, load_gain: f64, gravity: f64) -> f64 {
+    gain * (dfs + load_gain * gravity.abs())
+}
+
+/// Friction cancellation on *measured* velocity — `stribeck_excess` in
+/// `almond_axol.robot.control`: `amp·exp(−(v/v_s)²)·tanh(v/STRIBECK_V0)`.
+/// Follows the measured velocity with the measured friction curve's shape,
+/// so a joint that speeds up sees the feedforward fall by what the real
+/// friction falls and the velocity-weakening slope (negative damping — the
+/// engine of the 2 Hz stick-slip) is flattened. Zero at rest.
+pub fn stribeck_excess(v_meas: f64, amp: f64, v_s: f64) -> f64 {
+    if amp == 0.0 || v_s <= 0.0 {
+        return 0.0;
+    }
+    amp * (-(v_meas / v_s).powi(2)).exp() * (v_meas / STRIBECK_V0).tanh()
+}
+
 /// Per-slot phase offset of the torque dither, the golden angle π(3 − √5) —
 /// `DITHER_PHASE_STAGGER` in `almond_axol.robot.control`.
 pub const DITHER_PHASE_STAGGER: f64 = 2.399_963_229_728_653;
@@ -627,6 +651,34 @@ mod tests {
 
     /// Golden values from `almond_axol.robot.control.compute_friction`
     /// with fc=0.6, k=250 (above the cap), fv=0.15, fo=0.02.
+    /// Reference vectors from `almond_axol.robot.control.stribeck_excess`
+    /// (amp = 1, v_s = 0.1): `(v_meas, want)`.
+    #[test]
+    fn stribeck_matches_python() {
+        let golden = [
+            (-0.3, -0.00012340980408665668),
+            (-0.1, -0.36784603928630505),
+            (-0.05, -0.7683759879897785),
+            (-0.02, -0.7317316219624262),
+            (0.0, 0.0),
+            (0.01, 0.4575190147179108),
+            (0.02, 0.7317316219624262),
+            (0.05, 0.7683759879897785),
+            (0.1, 0.36784603928630505),
+            (0.2, 0.018315638813231488),
+        ];
+        for (v, want) in golden {
+            let got = stribeck_excess(v, 1.0, 0.1);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "stribeck({v}): got {got:e}, want {want:e}"
+            );
+        }
+        assert_eq!(stribeck_excess(0.05, 0.0, 0.1), 0.0);
+        assert!((stribeck_amplitude(1.0, 0.3, 0.1, -12.0) - 1.5).abs() < 1e-12);
+        assert_eq!(stribeck_amplitude(0.0, 0.3, 0.1, 12.0), 0.0);
+    }
+
     /// Reference vectors from `almond_axol.robot.control.dither_step`:
     /// 1.5 Nm at 60 Hz stepped at 240 Hz, slots 0 and 1.
     #[test]

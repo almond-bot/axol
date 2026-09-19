@@ -84,6 +84,7 @@ _RT_TRACE_COLUMNS = (
     "damping_ff",
     "stiction_ff",
     "dither_ff",
+    "stribeck_ff",
     "total_ff",
     "kd_host",
     "damp_w0",

@@ -677,6 +677,7 @@ const OVERRIDE_FIELDS = [
   "stiction_gain",
   "stiction_load_gain",
   "dither_nm",
+  "stribeck_gain",
 ]
 
 /** Format a config gain for seeding/comparison (trims float32 noise). */

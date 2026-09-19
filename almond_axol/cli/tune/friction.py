@@ -417,6 +417,9 @@ async def _identify_joint(
 
     all_avg: list[tuple[float, float]] = []
     all_halfdiff: list[tuple[float, float]] = []
+    # (q, v, tau_half): the half-difference against the pose it was taken at,
+    # for the load-dependent fit (gear friction grows with gravity torque).
+    all_halfdiff_q: list[tuple[float, float, float]] = []
 
     csv_file = None
     csv_writer = None
@@ -494,6 +497,7 @@ async def _identify_joint(
                     tau_half = (tau_f - tau_b) / 2.0
                     all_avg.append((q_center, tau_avg))
                     all_halfdiff.append((v, tau_half))
+                    all_halfdiff_q.append((q_center, v, tau_half))
                     if csv_writer is not None:
                         csv_writer.writerow(
                             [
@@ -518,7 +522,49 @@ async def _identify_joint(
         if raw_file is not None:
             raw_file.close()
 
+    _identify_joint.last_halfdiff_q = all_halfdiff_q  # type: ignore[attr-defined]
     return all_avg, all_halfdiff
+
+
+def _fit_load_friction(
+    samples: list[tuple[float, float, float]],
+    joint: Joint,
+    is_left: bool,
+    other_targets: dict[Joint, float],
+    k_fixed: float,
+    fv_fixed: float,
+) -> tuple[float, float, float] | None:
+    """Fit ``(Fc + Fl·|g(q)|)·tanh(0.1·k·v) + Fv·v`` to ``(q, v, tau_half)``.
+
+    ``k`` and ``Fv`` are held at the constant-model fit so the two fits differ
+    only in how the Coulomb level depends on gravity load. Returns
+    ``(Fc0, Fl, load_span)`` — the zero-load Coulomb level, its slope per Nm
+    of gravity torque, and how many Nm of load the sweep spanned. A sweep that
+    stayed within ~3 Nm of load cannot separate the two and returns ``None``.
+    """
+    if len(samples) < 8:
+        return None
+    gc = GravityCompensator()
+    test_idx = ARM_JOINTS.index(joint)
+    arm_q = np.zeros(len(ARM_JOINTS), dtype=np.float32)
+    for j, target in other_targets.items():
+        if j in ARM_JOINTS and j != joint:
+            arm_q[ARM_JOINTS.index(j)] = float(target)
+    load = np.empty(len(samples))
+    for i, (q, _v, _t) in enumerate(samples):
+        arm_q[test_idx] = float(q)
+        load[i] = abs(float(gc.gravity_arm(arm_q, is_left=is_left)[test_idx]))
+    span = float(np.ptp(load))
+    if span < 3.0:
+        return None
+    v = np.array([s[1] for s in samples])
+    tau = np.maximum(np.array([s[2] for s in samples]) - fv_fixed * v, 0.0)
+    sat = np.tanh(0.1 * k_fixed * v)
+    # Linear least squares in (Fc0, Fl): tau ≈ sat·Fc0 + (sat·load)·Fl.
+    A = np.c_[sat, sat * load]
+    coef, _, _, _ = np.linalg.lstsq(A, tau, rcond=None)
+    fc0, fl = float(coef[0]), float(coef[1])
+    return max(fc0, 0.0), max(fl, 0.0), span
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -718,12 +764,37 @@ async def _run(args: argparse.Namespace) -> None:
             Fo_out = Fo_result if Fo_result is not None else 0.0
             Fc_out = k_out = Fv_out = 0.0
 
+            Fl_out = 0.0
             if friction_result is not None:
                 Fc_out, k_out, Fv_out = friction_result
                 print("\n  Fitted friction model: τ = Fc·tanh(0.1·k·v) + Fv·v + Fo")
                 print(f"    Fc = {Fc_out:.4f} Nm  (Coulomb)")
                 print(f"    k  = {k_out:.2f}      (tanh steepness)")
                 print(f"    Fv = {Fv_out:.4f} Nm·s/rad  (viscous)")
+                load_fit = _fit_load_friction(
+                    getattr(_identify_joint, "last_halfdiff_q", []),
+                    joint,
+                    is_left,
+                    other_targets,
+                    k_out,
+                    Fv_out,
+                )
+                if load_fit is not None:
+                    fc0, fl, span = load_fit
+                    print(
+                        f"\n  Load-dependent Coulomb (gear friction grows with the torque it carries),\n"
+                        f"  fitted over {span:.1f} Nm of gravity-load variation:\n"
+                        f"    Fc0 = {fc0:.4f} Nm at zero load, Fl = {fl:.4f} Nm per Nm of gravity\n"
+                        f"    → {fc0 + fl * 5:.2f} Nm at 5 Nm, {fc0 + fl * 12:.2f} Nm at 12 Nm "
+                        f"(constant model: {Fc_out:.2f} everywhere)"
+                    )
+                    if fl > 0.0:
+                        Fc_out, Fl_out = fc0, fl
+                else:
+                    print(
+                        "\n  (load-dependent Coulomb not fitted: the sweep spanned < 3 Nm of "
+                        "gravity load — pose the joint under load, e.g. --lo/--hi, to fit fl)"
+                    )
 
             if friction_result is not None or Fo_result is not None:
                 if args.save and friction_result is None:
@@ -744,6 +815,7 @@ async def _run(args: argparse.Namespace) -> None:
                             "k": round(k_out, 2),
                             "fv": round(Fv_out, 4),
                             "fo": round(Fo_out, 4),
+                            "fl": round(Fl_out, 4),
                         },
                     )
                     print(f"\n  Saved to {path}")
@@ -758,7 +830,7 @@ async def _run(args: argparse.Namespace) -> None:
                     )
                     print(
                         f"    FrictionParams(fc={Fc_out:.4f}, k={k_out:.2f}, "
-                        f"fv={Fv_out:.4f}, fo={Fo_out:.4f}),"
+                        f"fv={Fv_out:.4f}, fo={Fo_out:.4f}, fl={Fl_out:.4f}),"
                     )
 
             print(f"{'─' * 50}")
