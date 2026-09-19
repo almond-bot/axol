@@ -379,6 +379,8 @@ async def _identify_joint(
     lo_override: float | None = None,
     hi_override: float | None = None,
     dump_csv: Path | None = None,
+    raw_csv: Path | None = None,
+    n_bins: int = _N_BINS,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """Run bidirectional multi-velocity sweep over the full joint range.
 
@@ -389,6 +391,11 @@ async def _identify_joint(
     If ``dump_csv`` is given, every matched (fwd, bwd) bin is also written to
     a CSV with the per-velocity, per-position torque values. Useful for
     plotting the raw friction-vs-velocity curve and comparing arms.
+
+    ``raw_csv`` writes every cruise sample (``q``, ``tau``, speed, direction)
+    unbinned — the input for a position-periodic (cogging / gear-mesh) torque
+    analysis, which needs sub-degree resolution the bins do not keep (see
+    ``scripts/cogging_map.py``). ``n_bins`` sets the bin count for the fit.
     """
     lo, hi = arm_limits(joint, is_left)
     if lo_override is not None:
@@ -413,6 +420,15 @@ async def _identify_joint(
 
     csv_file = None
     csv_writer = None
+    raw_file = None
+    raw_writer = None
+    if raw_csv is not None:
+        raw_file = secure_open_new_text(raw_csv, newline="")
+        raw_writer = csv.writer(raw_file)
+        raw_writer.writerow(
+            ["joint", "side", "v_rad_s", "direction", "q_rad", "tau_nm"]
+        )
+        print(f"  Dumping every cruise sample to {raw_csv}")
     if dump_csv is not None:
         csv_file = secure_open_new_text(dump_csv, newline="")
         csv_writer = csv.writer(csv_file)
@@ -449,11 +465,26 @@ async def _identify_joint(
 
             bwd = await _run_sweep_raw(motor, kp, kd, cur, -v, sweep_lo)
             print(f"    bwd: {len(bwd)} samples")
+            if raw_writer is not None:
+                side_name = "left" if is_left else "right"
+                for direction, rows in (("+", fwd), ("-", bwd)):
+                    for q, tau in rows:
+                        raw_writer.writerow(
+                            [
+                                joint.value,
+                                side_name,
+                                f"{v:.6f}",
+                                direction,
+                                f"{q:.6f}",
+                                f"{tau:.6f}",
+                            ]
+                        )
+                raw_file.flush()  # type: ignore[union-attr]
 
-            fwd_bins = _bin_by_position(fwd, sweep_lo, sweep_hi)
-            bwd_bins = _bin_by_position(bwd, sweep_lo, sweep_hi)
+            fwd_bins = _bin_by_position(fwd, sweep_lo, sweep_hi, n_bins)
+            bwd_bins = _bin_by_position(bwd, sweep_lo, sweep_hi, n_bins)
             matched = sum(1 for q in fwd_bins if q in bwd_bins)
-            print(f"    {matched}/{_N_BINS} position bins matched")
+            print(f"    {matched}/{n_bins} position bins matched")
 
             for q_center, tau_f in fwd_bins.items():
                 if q_center in bwd_bins:
@@ -483,6 +514,8 @@ async def _identify_joint(
     finally:
         if csv_file is not None:
             csv_file.close()
+        if raw_file is not None:
+            raw_file.close()
 
     return all_avg, all_halfdiff
 
@@ -533,6 +566,21 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         default=None,
         metavar="DEG",
         help="Override upper joint limit for the sweep (degrees)",
+    )
+    p.add_argument(
+        "--raw-csv",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Write every cruise sample (q, tau, speed, direction) unbinned — the "
+        "input for scripts/cogging_map.py, which looks for position-periodic "
+        "torque (cogging / gear mesh) and builds a feedforward table from it",
+    )
+    p.add_argument(
+        "--bins",
+        type=int,
+        default=_N_BINS,
+        help=f"Position bins the fwd/bwd matching and fit use (default: {_N_BINS})",
     )
     p.add_argument(
         "--dump-csv",
@@ -649,6 +697,8 @@ async def _run(args: argparse.Namespace) -> None:
                 if args.hi is not None
                 else hi_default,
                 dump_csv=dump_csv,
+                raw_csv=args.raw_csv,
+                n_bins=args.bins,
             )
 
             if not avg_samples and not halfdiff_samples:
