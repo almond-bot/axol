@@ -43,7 +43,7 @@ import numpy as np
 from scipy.optimize import curve_fit
 
 from ...constants import ARM_JOINTS
-from ...motor import CanBus, ControlMode, Joint, Motor
+from ...motor import CanBus, ControlMode, Joint, Motor, MotorError
 from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig
@@ -160,6 +160,54 @@ async def _ramp_verified(
         f"joints never reached their target after a resend: {stragglers} "
         f"— aborting before anything runs from an unsafe pose"
     )
+
+
+#: A joint this far (rad) from its rest pose still carries gravity load; the
+#: tuners refuse to reset/disable it and leave it holding instead.
+_REST_TOL = math.radians(5.0)
+
+
+async def _safe_torque_off(
+    motors: dict[Joint, JointFrameMotor], raw: dict[Joint, Motor] | None = None
+) -> bool:
+    """Reset every joint to IMPEDANCE and disable — but only when every arm
+    joint is within ``_REST_TOL`` of rest.
+
+    The MyActuator mode switch is a firmware reset (torque drops for ~2 s)
+    and disable is torque-off; a joint that did not make it home would fall.
+    That happened on the elbow after a 0xA4 probe whose return climb stalled
+    on the stock firmware position loop. When a joint is off rest this leaves
+    every motor holding its last command, says which joint and where, and
+    returns ``False`` so the caller can tell the operator what to do.
+    """
+    off_rest: list[str] = []
+    for j, m in motors.items():
+        try:
+            pos = await m.get_position()
+        except MotorError:
+            off_rest.append(f"{j.value} (no position reply)")
+            continue
+        if abs(pos) > _REST_TOL:
+            off_rest.append(f"{j.value} at {math.degrees(pos):+.1f}°")
+    if off_rest:
+        print(
+            "  ! NOT disabling: "
+            + ", ".join(off_rest)
+            + " — still under gravity load. Motors are left holding their last "
+            "command. Home the arm (gravity-comp, or hand-guide it to rest) before "
+            "powering down."
+        )
+        return False
+    await asyncio.gather(
+        *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
+    )
+    await asyncio.gather(
+        *[
+            m.disable()
+            for m in (raw or {j: m.motor for j, m in motors.items()}).values()
+        ]
+    )
+    return True
 
 
 async def _home_all(
@@ -854,9 +902,6 @@ async def _run(args: argparse.Namespace) -> None:
                 # including the base-collision joints the old flow used to
                 # leave in place.
                 await _home_all(motors, exclude=joint if in_impedance else None)
-            except Exception:
-                pass
-            await asyncio.gather(
-                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
-            )
-            await asyncio.gather(*[m.disable() for m in motors.values()])
+            except Exception as exc:  # noqa: BLE001 - reported, arm keeps holding
+                print(f"  ! return to rest did not complete: {exc}")
+            await _safe_torque_off(motors)

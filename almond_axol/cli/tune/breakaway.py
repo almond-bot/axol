@@ -85,7 +85,7 @@ from ...tuning import (
     sweep_safety,
 )
 from ..motor import add_side_and_channel_arguments, resolve_channel
-from .friction import _home_all, _ramp_verified
+from .friction import _home_all, _ramp_verified, _safe_torque_off
 
 _RATE_HZ = 100.0
 #: Drift (rad) over one trim hold below which the joint counts as standing
@@ -591,12 +591,9 @@ async def _run(args: argparse.Namespace) -> None:
                     pass
             try:
                 await _home_all(motors, exclude=joint if in_impedance else None)
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                pass
-            await asyncio.gather(
-                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
-            )
-            await asyncio.gather(*[m.disable() for m in motors.values()])
+            except Exception as exc:  # noqa: BLE001 - reported, arm keeps holding
+                print(f"  ! return to rest did not complete: {exc}")
+            await _safe_torque_off(motors)
 
     _report(results, fc, kp, gains.stiction_gain)
 

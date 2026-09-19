@@ -64,7 +64,7 @@ from ...tuning import (
 )
 from ...tuning.runner import LiveStream, report_achieved_rate
 from ..motor import add_side_and_channel_arguments, resolve_channel
-from .friction import _home_all, _ramp_verified
+from .friction import _home_all, _ramp_verified, _safe_torque_off
 
 _MA_POS_CONTROL = 0xA4
 _MA_MULTI_TURN_ANGLE = 0x92
@@ -585,7 +585,29 @@ async def _run(args: argparse.Namespace) -> None:
         except KeyboardInterrupt:
             print("\n  Interrupted.")
         finally:
-            print("  Returning to rest and disabling ...")
+            print("  Returning to rest ...")
+            # Home *before* restoring the firmware gains: the run's gains are
+            # the stiffer set, and the stock position loop has been seen to
+            # stall short of rest on a gravity-loaded elbow. The planner is
+            # restored first only when the run left it at 0, because a
+            # direct-tracking joint would otherwise execute the homing target
+            # at the speed cap.
+            homed = False
+            try:
+                if (
+                    before_accel is not None
+                    and not args.keep
+                    and accel_used
+                    and accel_used[0] == 0
+                ):
+                    got = await _write_accel(driver, before_accel[0], before_accel[1])
+                    print(f"  planner accel/decel restored to {got[0]}/{got[1]} dps/s")
+                    before_accel = None
+                await _ramp_verified(motors, {joint: 0.0})
+                await _home_all(motors)
+                homed = True
+            except Exception as exc:  # noqa: BLE001 - reported below, arm keeps holding
+                print(f"  ! return to rest did not complete: {exc}")
             try:
                 if before_gains is not None and not args.keep:
                     await _write_gains(driver, before_gains, args.persist)
@@ -595,21 +617,15 @@ async def _run(args: argparse.Namespace) -> None:
                 if before_accel is not None and not args.keep:
                     got = await _write_accel(driver, before_accel[0], before_accel[1])
                     print(f"  planner accel/decel restored to {got[0]}/{got[1]} dps/s")
-                elif before_accel is not None:
+                elif before_accel is not None and args.keep:
                     print(
                         f"  planner left at {accel_used[0]}/{accel_used[1]} dps/s (--keep) — a direct-tracking joint executes a stored target on wake"
                     )
             except Exception as exc:  # noqa: BLE001 - report, then keep tearing down
                 print(f"  ! restore failed: {exc}")
-            try:
-                await _ramp_verified(motors, {joint: 0.0})
-                await _home_all(motors)
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                pass
-            await asyncio.gather(
-                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
-            )
-            await asyncio.gather(*[m.disable() for m in raw.values()])
+            if not homed:
+                print("  (torque-off will be refused unless every joint is at rest)")
+            await _safe_torque_off(motors, raw)
 
     if len(log) < 20:
         print("\nToo few samples to score.")
