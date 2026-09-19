@@ -257,6 +257,24 @@ class IKWorker:
         # otherwise-engaged session is *frozen* — held at the pose it had when
         # its lock dropped (see ``_hold_fk`` / ``_hold_elbow_fk``).
         self._active: dict[str, bool] = {"left": False, "right": False}
+        # Frames can arrive before the first reset or engage. Absolute-mode
+        # replies have no calibrated base transform until that first engage.
+        self._abs_active = False
+        self._abs_base: tuple[np.ndarray, np.ndarray] | None = None
+        self._abs_offset: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.abs_base_msg: dict[str, list[float]] | None = None
+        self.last_tcp_msg: dict[str, list[float]] | None = None
+        self._tcp_transforms: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for side, transform in (
+            ("left", config.tcp_transform_left),
+            ("right", config.tcp_transform_right),
+        ):
+            if transform is not None:
+                self._tcp_transforms[side] = (
+                    np.asarray(transform[:3], dtype=np.float64),
+                    _quat_xyzw_to_matrix(*transform[3:]).astype(np.float64),
+                )
+        self._last_mapped_quat: dict[str, np.ndarray] = {}
         self._hold_fk: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._hold_elbow_fk: dict[str, np.ndarray] = {}
         # Per-arm freeze state. A bimanual solve can leave one arm's joint slice
