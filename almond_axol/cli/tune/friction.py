@@ -426,7 +426,7 @@ async def _identify_joint(
         raw_file = secure_open_new_text(raw_csv, newline="")
         raw_writer = csv.writer(raw_file)
         raw_writer.writerow(
-            ["joint", "side", "v_rad_s", "direction", "q_rad", "tau_nm"]
+            ["joint", "side", "pass", "v_rad_s", "direction", "q_rad", "tau_nm"]
         )
         print(f"  Dumping every cruise sample to {raw_csv}")
     if dump_csv is not None:
@@ -447,7 +447,7 @@ async def _identify_joint(
         print(f"  Dumping per-bin samples to {dump_csv}")
 
     try:
-        for v in velocities:
+        for pass_index, v in enumerate(velocities):
             print(f"\n  v = {math.degrees(v):.1f} deg/s ...")
 
             # Ramp to sweep start with time proportional to distance
@@ -473,6 +473,7 @@ async def _identify_joint(
                             [
                                 joint.value,
                                 side_name,
+                                pass_index,
                                 f"{v:.6f}",
                                 direction,
                                 f"{q:.6f}",

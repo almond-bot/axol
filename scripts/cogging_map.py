@@ -63,14 +63,18 @@ def angle_spectrum(y: np.ndarray, grid_deg: float) -> tuple[np.ndarray, np.ndarr
 
 
 def analyse(path: Path, grid_deg: float, table: Path | None) -> None:
-    by_speed: dict[float, dict[str, list[tuple[float, float]]]] = defaultdict(
-        lambda: {"+": [], "-": []}
+    # Keyed by (pass index, speed) so repeated passes at one speed stay apart —
+    # pass-to-pass repeatability at the same speed is the strictest test of
+    # whether a position table could cancel anything.
+    by_speed: dict[tuple[int, float], dict[str, list[tuple[float, float]]]] = (
+        defaultdict(lambda: {"+": [], "-": []})
     )
     joint = side = ""
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
             joint, side = row["joint"], row["side"]
-            by_speed[round(float(row["v_rad_s"]), 4)][row["direction"]].append(
+            key = (int(row.get("pass", 0) or 0), round(float(row["v_rad_s"]), 4))
+            by_speed[key][row["direction"]].append(
                 (math.degrees(float(row["q_rad"])), float(row["tau_nm"]))
             )
     if not by_speed:
@@ -88,10 +92,11 @@ def analyse(path: Path, grid_deg: float, table: Path | None) -> None:
     print(
         f"{'speed':>8s} {'periodic RMS':>13s} {'noise floor':>12s} {'top spatial peaks (° per cycle : Nm)':>40s}"
     )
-    residuals: dict[float, np.ndarray] = {}
-    for v in sorted(by_speed):
-        fwd = np.array(by_speed[v]["+"]) if by_speed[v]["+"] else np.empty((0, 2))
-        bwd = np.array(by_speed[v]["-"]) if by_speed[v]["-"] else np.empty((0, 2))
+    residuals: dict[tuple[int, float], np.ndarray] = {}
+    for key in sorted(by_speed):
+        _pass, v = key
+        fwd = np.array(by_speed[key]["+"]) if by_speed[key]["+"] else np.empty((0, 2))
+        bwd = np.array(by_speed[key]["-"]) if by_speed[key]["-"] else np.empty((0, 2))
         if len(fwd) < 50 or len(bwd) < 50:
             continue
         f_avg = grid_average(fwd[:, 0], fwd[:, 1], grid)
@@ -109,7 +114,7 @@ def analyse(path: Path, grid_deg: float, table: Path | None) -> None:
         good = np.isfinite(y)
         y = np.interp(x, x[good], y[good])
         resid = detrend(x, y)
-        residuals[v] = np.interp(centres, x, resid, left=np.nan, right=np.nan)
+        residuals[key] = np.interp(centres, x, resid, left=np.nan, right=np.nan)
         freq, power = angle_spectrum(resid, grid_deg)
         # Ignore anything slower than one cycle per 10° (that is the trend).
         sel = freq > 0.1
@@ -127,25 +132,26 @@ def analyse(path: Path, grid_deg: float, table: Path | None) -> None:
             * math.sqrt(2)
         )
         print(
-            f"{math.degrees(v):7.1f}°/s {resid.std():10.3f} Nm {floor:9.3f} Nm   {peaks}"
+            f"{math.degrees(v):5.1f}°/s #{_pass} {resid.std():8.3f} Nm {floor:9.3f} Nm   {peaks}"
         )
 
     if len(residuals) >= 2:
-        speeds = sorted(residuals)
-        stack = np.array([residuals[v] for v in speeds])
+        keys = sorted(residuals)
+        stack = np.array([residuals[k] for k in keys])
         common = np.all(np.isfinite(stack), axis=0)
         if common.sum() > 20:
             c = np.corrcoef(stack[:, common])
+            label = lambda k: f"{math.degrees(k[1]):.1f}°/s #{k[0]}"  # noqa: E731
             pairs = [
-                (math.degrees(speeds[i]), math.degrees(speeds[j]), c[i, j])
-                for i in range(len(speeds))
-                for j in range(i + 1, len(speeds))
+                (label(keys[i]), label(keys[j]), c[i, j])
+                for i in range(len(keys))
+                for j in range(i + 1, len(keys))
             ]
             print(
-                "\ncorrelation of the position residual between speeds (cogging repeats, stick-slip does not):"
+                "\ncorrelation of the position residual between passes (cogging repeats, stick-slip does not):"
             )
             for a, b, r in pairs:
-                print(f"   {a:.1f} vs {b:.1f} °/s: r = {r:+.2f}")
+                print(f"   {a} vs {b}: r = {r:+.2f}")
             mean_resid = stack[:, common].mean(axis=0)
             print(
                 f"speed-averaged periodic torque: {mean_resid.std():.3f} Nm RMS, {np.ptp(mean_resid):.3f} Nm peak-to-peak"
