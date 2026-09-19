@@ -182,7 +182,9 @@ const FW_GAIN_FIELDS: WbField[] = [
     type: "text",
     fwGainKey: "speed_kp",
     slider: { min: 0, max: 0.15, step: 0.001 },
-    hint: "firmware speed loop P — the loop that cycles at creep; 0.1 vibrated on shoulder_1 (stock 0.03)",
+    hint:
+      "firmware speed loop P — the loop that cycles at creep; 0.1 vibrated on shoulder_1 " +
+      "(stock 0.03)",
   },
   {
     key: "speed_ki",
@@ -364,7 +366,9 @@ const TABS: WbTab[] = [
         label: "planner accel (dps/s)",
         type: "number",
         placeholder: "stored",
-        hint: "0 = direct PI tracking (required to follow the stream); restored after the run unless kept",
+        hint:
+          "0 = direct PI tracking (required to follow the stream); restored after the run " +
+          "unless kept",
       },
       ...FW_GAIN_FIELDS,
       { key: "buzz_abort", label: "buzz abort (°)", type: "number", placeholder: "0.3" },
@@ -654,7 +658,17 @@ const KIND_TABS: Record<string, string> = {
 /* ------------------------------------------------------------------ */
 
 // Matches tune.motion's --gain fields (see _GAIN_FIELDS there).
-const OVERRIDE_FIELDS = ["kp", "kd", "kd_host", "kd_host_hz", "kd_host_q", "j_eff"]
+const OVERRIDE_FIELDS = [
+  "kp",
+  "kd",
+  "kd_host",
+  "kd_host_hz",
+  "kd_host_q",
+  "j_eff",
+  "stiction_gain",
+  "stiction_load_gain",
+  "dither_nm",
+]
 
 /** Format a config gain for seeding/comparison (trims float32 noise). */
 function fmtGain(v: unknown): string {
@@ -1061,10 +1075,16 @@ function parseLiveProbe(lines: string[]): LiveProbe | null {
   return probe
 }
 
-/** Firmware gains span 0.0001 … 1: four significant digits, no padding. */
-function fmtGain(v: unknown): string {
+/** Firmware loop gains span 0.0001 … 1: four significant digits, no padding. */
+function fmtFwGain(v: unknown): string {
   if (v == null || typeof v !== "number" || !Number.isFinite(v)) return "–"
   return String(Number(v.toPrecision(4)))
+}
+
+/** The baseline a gain box falls back to: the motor's live value, or config. */
+function baselineText(f: WbField, cfg: number | null): string {
+  if (cfg == null) return f.fwGainKey ? "motor" : "config"
+  return f.fwGainKey ? fmtFwGain(cfg) : fmtNum(cfg)
 }
 
 function fmtNum(v: unknown, digits = 2): string {
@@ -2404,7 +2424,7 @@ export function TuningWorkbench({
                   {cfg != null && (
                     <span className="text-white/25">
                       {f.fwGainKey ? " · motor " : " · config "}
-                      {f.fwGainKey ? fmtGain(cfg) : fmtNum(cfg)}
+                      {baselineText(f, cfg)}
                     </span>
                   )}
                   {f.fwGainKey && cfg == null && fwArm && fwJoint && (
@@ -2491,9 +2511,7 @@ export function TuningWorkbench({
                           type="text"
                           inputMode="decimal"
                           value={tabValues[f.key] ?? ""}
-                          placeholder={
-                            cfg != null ? (f.fwGainKey ? fmtGain(cfg) : fmtNum(cfg)) : f.fwGainKey ? "motor" : "config"
-                          }
+                          placeholder={baselineText(f, cfg)}
                           title={f.hint}
                           onChange={(e) => setValue(f.key, e.target.value)}
                           disabled={runningOurs || busy}
