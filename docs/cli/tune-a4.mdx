@@ -29,7 +29,7 @@ Safety, built in:
 | `--rate HZ` | Command rate (default: 200) |
 | `--cap DPS` | 0xA4 speed cap (default: 60) |
 | `--accel DPS/S` | Planner acceleration for the run; `0` = direct tracking. Written to ROM, restored afterwards unless `--keep` |
-| `--position-kp`, `--position-ki`, `--position-kd`, `--speed-kp`, `--speed-ki`, `--current-kp`, `--current-ki` | Firmware gains for the run (default: leave as is) |
+| `--position-kp`, `--position-ki`, `--position-kd`, `--speed-kp`, `--speed-ki`, `--current-kp`, `--current-ki` | Firmware gains for the run (default: leave as is). The tool prints the motor's live values at start; the dashboard tab shows them next to each field and seeds its sliders there |
 | `--persist` | Write gains to ROM instead of RAM |
 | `--keep` | Leave the run's gains and planner acceleration in the motor |
 | `--buzz-abort DEG` | Abort past this >10 Hz position motion, degrees RMS over 0.1 s (default: 0.3; 0 off) |
