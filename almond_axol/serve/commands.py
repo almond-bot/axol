@@ -563,6 +563,24 @@ COMMANDS: dict[str, CommandDef] = {
         hardware_profiles=("axol",),
         section="tuning",
     ),
+    "tune.a4": CommandDef(
+        "tune.a4",
+        "tune.a4",
+        "Firmware position loop (0xA4)",
+        "Tune a MyActuator joint's own position/speed loop — the controller "
+        "behind wire_mode a4 — with a sine or constant-speed triangle: set "
+        "firmware gains (RAM unless persisted), the speed cap and the "
+        "planner acceleration, score tracking and creep smoothness, and "
+        "save the run. A buzz guard restores the previous gains on any "
+        "high-frequency motion.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.a4"),
+        requires_hardware=True,
+        drives_motors=True,
+        hardware_profiles=("axol",),
+        section="tuning",
+    ),
     "tune.friction": CommandDef(
         "tune.friction",
         "tune.friction",

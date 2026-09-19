@@ -99,7 +99,11 @@ class RtLinkConfigureTest(unittest.IsolatedAsyncioTestCase):
 
     def test_config_header_declares_the_protocol(self) -> None:
         self.assertEqual(link.config_header(), [f"proto {link.CONFIG_PROTO}"])
-        self.assertEqual(link.CONFIG_PROTO, 2)
+        # 2: slot-by-motor-id; 3/4: stiction fields; 5: dither fields; 6: wire
+        # mode token; 7: Stribeck fields; 8: load-proportional friction fl;
+        # 9: the Stribeck velocity pole on every joint line. Bump both sides
+        # together (rust/axol-rt/src/serve.rs CONFIG_PROTO).
+        self.assertEqual(link.CONFIG_PROTO, 9)
 
     async def test_configure_names_a_stale_binary_when_the_core_exits(self) -> None:
         rt = self._link(_ExitedProc())
@@ -108,7 +112,7 @@ class RtLinkConfigureTest(unittest.IsolatedAsyncioTestCase):
             await rt.configure("proto 2\nloop_hz 240\n")
         message = str(ctx.exception)
         self.assertIn("/opt/axol-rt", message)
-        self.assertIn("proto 2", message)
+        self.assertIn(f"proto {link.CONFIG_PROTO}", message)
         self.assertIn("axol rt.install", message)
         # The exit is noticed in well under the 5 s ack timeout.
         self.assertLess(asyncio.get_running_loop().time() - started, 2.0)

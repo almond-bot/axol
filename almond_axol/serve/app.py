@@ -1965,6 +1965,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                             jc.kd_host_q if jc.kd_host_q is not None else DAMP_BP_Q
                         ),
                         "j_eff": jc.j_eff,
+                        "stiction_gain": jc.stiction_gain,
+                        "stiction_load_gain": jc.stiction_load_gain,
+                        "dither_nm": jc.dither_nm,
+                        "stribeck_gain": jc.stribeck_gain,
                     }
                 out[side] = joints
             return out

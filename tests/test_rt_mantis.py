@@ -211,7 +211,9 @@ class MantisTakeLifecycleTest(unittest.IsolatedAsyncioTestCase):
         (link,) = _FakeLink.instances
         config_lines = link.config.splitlines()
         # The protocol declaration leads every config (see RtLink.configure).
-        self.assertEqual(config_lines[0], "proto 2")
+        from almond_axol.rt.link import CONFIG_PROTO
+
+        self.assertEqual(config_lines[0], f"proto {CONFIG_PROTO}")
         self.assertEqual(
             config_lines[4:],
             ["gripper 0 can_mantis_l 8", "gripper 1 can_mantis_r 8"],

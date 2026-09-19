@@ -95,6 +95,9 @@ _N_ARM = len(ARM_JOINTS)
 # ``VRTeleopConfig.reset_gravity_comp_kd`` (the classic contact hold).
 _LIMP_KD = 0.25
 
+# Wire-mode tokens the core understands (``bringup::WireMode::parse``).
+_WIRE_MODES = frozenset({"mit", "a4"})
+
 
 class Axol(RobotBase):
     """Dual-arm Axol robot interface.
@@ -307,6 +310,14 @@ class Axol(RobotBase):
         return out
 
     def _config_text(self) -> str:
+        def _wire_token(mode: str) -> str:
+            token = str(mode).lower()
+            if token not in _WIRE_MODES:
+                raise ValueError(
+                    f"wire_mode {mode!r} is not one of {sorted(_WIRE_MODES)}"
+                )
+            return token
+
         max_step = self._arms()[0][1]._config.max_step_rad
         lines = [
             *config_header(),
@@ -333,13 +344,35 @@ class Axol(RobotBase):
                 lines.append(
                     f"joint {side} {iface} {j.value} {motor_id} "
                     f"{gains.kp} {gains.kd} {trk_vel} {trk_acc} "
-                    f"{f.fc} {f.k} {f.fv} {f.fo}"
+                    f"{f.fc} {f.k} {f.fv} {f.fo} "
+                    f"{gains.stiction_gain} {math.radians(gains.stiction_err_deg)} "
+                    f"{gains.stiction_load_gain} {gains.dither_nm} {gains.dither_hz} "
+                    f"{_wire_token(gains.wire_mode)} "
+                    f"{gains.stribeck_gain} {gains.stribeck_dfs} "
+                    f"{gains.stribeck_load_gain} {gains.stribeck_vs} {f.fl} "
+                    f"{gains.stribeck_pole}"
                 )
             if arm._has_gripper:
                 lines.append(
                     f"gripper {side} {iface} {_JOINT_CONFIG[Joint.GRIPPER].motor_id}"
                 )
         return "\n".join(lines) + "\n"
+
+    def _warn_wire_modes(self) -> None:
+        a4 = [
+            f"{'left' if side == 0 else 'right'}.{j.value}"
+            for side, arm in self._arms()
+            for j in ARM_JOINTS
+            if j in arm.motors
+            and str(getattr(arm._arm_config, j.value).wire_mode).lower() == "a4"
+        ]
+        if a4:
+            _logger.warning(
+                "rt: %s on the firmware position loop (wire_mode a4): no "
+                "compliance, no host feedforward, torque telemetry NaN — the "
+                "contact watchdog cannot see these joints",
+                ", ".join(a4),
+            )
 
     async def enable(self, hold: bool = True) -> None:
         """Bring every motor up.
@@ -365,6 +398,7 @@ class Axol(RobotBase):
             self._require_quiet_bus("enable(hold=False)")
             await self._robot.enable(hold=False)
             return
+        self._warn_wire_modes()
         try:
             await self._enable()
         except BaseException as setup_error:

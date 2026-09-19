@@ -149,6 +149,8 @@ export interface MotorDetails {
   temperature: number | null
   voltage: number | null
   gains: Record<string, number | null> | null
+  /** MyActuator only: the 0xA4 position planner's stored accel/decel (dps/s). */
+  planner: { accel: number | null; decel: number | null } | null
 }
 
 export async function fetchMotorDetails(arm: string, joint: string): Promise<MotorDetails> {

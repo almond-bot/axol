@@ -1164,6 +1164,16 @@ async def _read_motor_details(arm_link: _ArmLink, joint: Joint) -> dict[str, Any
         status = await read(motor.get_error_code())
         mode = await read(motor.get_control_mode())
         gains = await read(motor.get_gains())
+        # MyActuator only: the 0xA4 position planner's stored acceleration —
+        # 0 = direct tracking (what wire_mode a4 and tune.a4 need), anything
+        # else re-plans every streamed target. Shown and edited on the
+        # dashboard's Firmware-loop tab next to the loop gains.
+        planner = None
+        driver = getattr(motor, "_driver", None)
+        if isinstance(driver, MyActuatorMotor):
+            acc = await read(driver.get_planner_acceleration())
+            if acc is not None:
+                planner = {"accel": acc[0], "decel": acc[1]}
         return {
             "arm": arm_link.side,
             "joint": joint.name,
@@ -1177,4 +1187,5 @@ async def _read_motor_details(arm_link: _ArmLink, joint: Joint) -> dict[str, Any
             "temperature": await read(motor.get_temperature()),
             "voltage": await read(motor.get_voltage()),
             "gains": vars(gains) if gains is not None else None,
+            "planner": planner,
         }

@@ -21,6 +21,7 @@ import {
   type TuningRunData,
   type TuningRunMeta,
 } from "@/lib/tuning"
+import { fetchMotorDetails } from "@/lib/telemetry"
 
 const COMMANDED_COLOR = "rgba(255,255,255,0.45)"
 const ACTUAL_COLOR = "#eff483"
@@ -68,6 +69,12 @@ interface WbField {
    * and an empty box means "run with config".
    */
   gainKey?: string
+  /**
+   * Key into the selected motor's *firmware* loop gains (`position_kp`,
+   * `speed_kp`, …), read live from the motor over the idle link: the field
+   * shows that value as its baseline and an empty box runs with it.
+   */
+  fwGainKey?: string
   /** Render a slider next to the value box, over this range. */
   slider?: { min: number; max: number; step: number }
 }
@@ -134,6 +141,74 @@ const GAIN_FIELDS: WbField[] = [
       "band width = centre/q. 0.8 default is an octave wide and drags the slow " +
       "final approach when the centre sits low (accuracy slips); q 2-3 with the " +
       "centre on the measured ring damps the ring only",
+  },
+]
+
+/**
+ * The firmware loop gains of the Firmware-loop tab. Each shows the selected
+ * motor's *live* value ("motor N", read over the idle link when arm and joint
+ * are picked) and a slider seeded there; an empty box runs with the motor's
+ * value. Ranges are deliberately tight: on the X8 shoulders 3× the stock
+ * speed_kp already vibrated, so a sweep steps in small increments.
+ */
+const FW_GAIN_FIELDS: WbField[] = [
+  {
+    key: "position_kp",
+    label: "position_kp",
+    type: "text",
+    fwGainKey: "position_kp",
+    slider: { min: 0, max: 0.3, step: 0.001 },
+    hint: "firmware position loop P — lag ∝ 1/kp; X8 shoulders read 0.008, elbow 0.06",
+  },
+  {
+    key: "position_ki",
+    label: "position_ki",
+    type: "text",
+    fwGainKey: "position_ki",
+    slider: { min: 0, max: 0.02, step: 0.0001 },
+    hint: "firmware position loop I",
+  },
+  {
+    key: "position_kd",
+    label: "position_kd",
+    type: "text",
+    fwGainKey: "position_kd",
+    slider: { min: 0, max: 2, step: 0.01 },
+    hint: "firmware position loop D",
+  },
+  {
+    key: "speed_kp",
+    label: "speed_kp",
+    type: "text",
+    fwGainKey: "speed_kp",
+    slider: { min: 0, max: 0.15, step: 0.001 },
+    hint:
+      "firmware speed loop P — the loop that cycles at creep; 0.1 vibrated on shoulder_1 " +
+      "(stock 0.03)",
+  },
+  {
+    key: "speed_ki",
+    label: "speed_ki",
+    type: "text",
+    fwGainKey: "speed_ki",
+    slider: { min: 0, max: 0.005, step: 0.00005 },
+    hint: "firmware speed loop I — what pushes through stiction",
+  },
+  {
+    key: "current_kp",
+    label: "current_kp",
+    type: "text",
+    fwGainKey: "current_kp",
+    slider: { min: 0, max: 2, step: 0.01 },
+    hint: "firmware current loop P — leave unless the vendor says otherwise",
+  },
+  {
+    key: "current_ki",
+    label: "current_ki",
+    type: "text",
+    fwGainKey: "current_ki",
+    slider: { min: 0, max: 0.5, step: 0.001 },
+    hint: "firmware current loop I",
   },
 ]
 
@@ -245,6 +320,70 @@ const TABS: WbTab[] = [
         options: ["full", "gravity", "friction", "none"],
       },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "—" },
+      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+    ],
+    required: ["arm", "joint"],
+    drivesMotors: true,
+  },
+  {
+    key: "a4",
+    label: "Firmware loop",
+    command: "tune.a4",
+    description:
+      "Tune a MyActuator joint's own position loop (0xA4, the controller " +
+      "behind wire_mode a4) with a sine or a constant-speed triangle. Firmware " +
+      "gains are written to RAM for the run and restored afterwards (persist " +
+      "writes ROM, keep leaves them); planner acceleration must be 0 for the " +
+      "joint to follow a stream. A buzz guard restores the previous gains on " +
+      "any high-frequency motion. Compare runs on velocity ripple (MIT " +
+      "stick-slip ≈ 0.8, smooth < 0.2), stuck windows, lag and the 1–4 Hz band. " +
+      "The joint holds stiffly and does not yield to a hand: clear the space.",
+    presets: { save_run: true },
+    fields: [
+      { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
+      {
+        key: "joint",
+        label: "joint",
+        type: "select",
+        options: ["shoulder_1", "shoulder_2", "shoulder_3", "elbow", "wrist_1"],
+      },
+      { key: "mode", label: "wave", type: "select", options: ["triangle", "sine"] },
+      {
+        key: "center",
+        label: "center (°)",
+        type: "number",
+        placeholder: "mid",
+        hint: "joint-frame centre (0 = rest); probe under gravity load, e.g. -35 on shoulder_1",
+      },
+      { key: "amp", label: "half-travel (°)", type: "number", placeholder: "10" },
+      { key: "speed", label: "triangle speed (°/s)", type: "number", placeholder: "3" },
+      { key: "freq", label: "sine freq (Hz)", type: "number", placeholder: "0.3" },
+      { key: "duration", label: "duration (s)", type: "number", placeholder: "12" },
+      { key: "rate", label: "rate (Hz)", type: "number", placeholder: "200" },
+      { key: "cap", label: "speed cap (°/s)", type: "number", placeholder: "60" },
+      {
+        key: "accel",
+        label: "planner accel (dps/s)",
+        type: "text",
+        fwGainKey: "planner_accel",
+        width: "w-24",
+        hint:
+          "shows what the motor stores; 0 = direct PI tracking (required to follow the " +
+          "stream). Written for the run and restored afterwards unless kept",
+      },
+      ...FW_GAIN_FIELDS,
+      { key: "buzz_abort", label: "buzz abort (°)", type: "number", placeholder: "0.3" },
+      {
+        key: "iq_abort",
+        label: "current abort (A)",
+        type: "number",
+        placeholder: "30",
+        hint:
+          "a loaded X8 shoulder holds ~10 A of gravity alone at -55°; keep this above the " +
+          "pose's static current",
+      },
+      { key: "persist", label: "persist gains to ROM", type: "boolean" },
+      { key: "keep", label: "keep gains + planner after run", type: "boolean" },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
     required: ["arm", "joint"],
@@ -528,7 +667,18 @@ const KIND_TABS: Record<string, string> = {
 /* ------------------------------------------------------------------ */
 
 // Matches tune.motion's --gain fields (see _GAIN_FIELDS there).
-const OVERRIDE_FIELDS = ["kp", "kd", "kd_host", "kd_host_hz", "kd_host_q", "j_eff"]
+const OVERRIDE_FIELDS = [
+  "kp",
+  "kd",
+  "kd_host",
+  "kd_host_hz",
+  "kd_host_q",
+  "j_eff",
+  "stiction_gain",
+  "stiction_load_gain",
+  "dither_nm",
+  "stribeck_gain",
+]
 
 /** Format a config gain for seeding/comparison (trims float32 noise). */
 function fmtGain(v: unknown): string {
@@ -933,6 +1083,18 @@ function parseLiveProbe(lines: string[]): LiveProbe | null {
     }
   }
   return probe
+}
+
+/** Firmware loop gains span 0.0001 … 1: four significant digits, no padding. */
+function fmtFwGain(v: unknown): string {
+  if (v == null || typeof v !== "number" || !Number.isFinite(v)) return "–"
+  return String(Number(v.toPrecision(4)))
+}
+
+/** The baseline a gain box falls back to: the motor's live value, or config. */
+function baselineText(f: WbField, cfg: number | null): string {
+  if (cfg == null) return f.fwGainKey ? "motor" : "config"
+  return f.fwGainKey ? fmtFwGain(cfg) : fmtNum(cfg)
 }
 
 function fmtNum(v: unknown, digits = 2): string {
@@ -1858,6 +2020,10 @@ export function TuningWorkbench({
   // Effective per-joint config gains (defaults + calibration): the slider
   // baselines and "config N" labels on the gain fields.
   const [gains, setGains] = useState<TuningGains | null>(null)
+  // The selected motor's live firmware loop gains (Firmware-loop tab): read
+  // from the motor over the idle link whenever arm/joint change or a run
+  // ends, so the baselines are what the motor actually holds right now.
+  const [fwGains, setFwGains] = useState<Record<string, number | null> | null>(null)
 
   const [runs, setRuns] = useState<TuningRunMeta[]>([])
   const [loading, setLoading] = useState(false)
@@ -2027,6 +2193,31 @@ export function TuningWorkbench({
   )
   const tabValues = useMemo(() => values[tab.key] ?? {}, [values, tab.key])
 
+  const fwArm = tabValues["arm"] ?? ""
+  const fwJoint = tabValues["joint"] ?? ""
+  useEffect(() => {
+    if (tabKey !== "a4" || !fwArm || !fwJoint || runningOurs) return
+    let stale = false
+    setFwGains(null)
+    fetchMotorDetails(fwArm, fwJoint.toUpperCase())
+      .then((d) => {
+        if (stale) return
+        // Loop gains plus the planner acceleration, under one lookup so the
+        // accel field gets the same "motor N" baseline as the gains.
+        setFwGains({
+          ...(d.gains ?? {}),
+          planner_accel: d.planner?.accel ?? null,
+          planner_decel: d.planner?.decel ?? null,
+        })
+      })
+      .catch(() => {
+        if (!stale) setFwGains(null)
+      })
+    return () => {
+      stale = true
+    }
+  }, [tabKey, fwArm, fwJoint, runningOurs])
+
   // Sine and step probe the same joint with the same gains, so their shared
   // fields (arm, joint, kp/kd/kd_host/…, amp, rate, …) behave as one set:
   // switching between the two tabs carries the current values across —
@@ -2077,6 +2268,10 @@ export function TuningWorkbench({
    */
   const configValue = useCallback(
     (f: WbField): number | null => {
+      if (f.fwGainKey) {
+        const v = fwGains?.[f.fwGainKey]
+        return typeof v === "number" && Number.isFinite(v) ? v : null
+      }
       if (!f.gainKey || !gains) return null
       const side = tabValues["arm"]
       const joint = tabValues["joint"]
@@ -2084,7 +2279,7 @@ export function TuningWorkbench({
       const v = gains[side]?.[joint]?.[f.gainKey]
       return typeof v === "number" && Number.isFinite(v) ? v : null
     },
-    [gains, tabValues]
+    [gains, fwGains, tabValues]
   )
 
   const meta = run?.meta ?? null
@@ -2243,7 +2438,15 @@ export function TuningWorkbench({
                 <span className="text-[0.65rem] text-white/40">
                   {f.label}
                   {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
-                  {cfg != null && <span className="text-white/25"> · config {fmtNum(cfg)}</span>}
+                  {cfg != null && (
+                    <span className="text-white/25">
+                      {f.fwGainKey ? " · motor " : " · config "}
+                      {baselineText(f, cfg)}
+                    </span>
+                  )}
+                  {f.fwGainKey && cfg == null && fwArm && fwJoint && (
+                    <span className="text-white/25"> · motor …</span>
+                  )}
                 </span>
                 {f.type === "overrides" ? (
                   <GainOverrideEditor
@@ -2325,7 +2528,7 @@ export function TuningWorkbench({
                           type="text"
                           inputMode="decimal"
                           value={tabValues[f.key] ?? ""}
-                          placeholder={cfg != null ? fmtNum(cfg) : "config"}
+                          placeholder={baselineText(f, cfg)}
                           title={f.hint}
                           onChange={(e) => setValue(f.key, e.target.value)}
                           disabled={runningOurs || busy}

@@ -242,7 +242,7 @@ AXOL_RT_TRACE=/tmp/axol-run axol teleop
 
 Each 240 Hz joint row includes the streamed target, wire position/velocity,
 measured position/velocity/torque, filter states, and separate gravity,
-friction, inertia, and host-damping torque contributions. The bus threads
+friction, inertia, host-damping, and stiction torque contributions. The bus threads
 enqueue fixed-size rows into bounded channels; background threads format and
 write them, and the regular five-second status line reports any trace drops.
 

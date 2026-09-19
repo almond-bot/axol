@@ -40,12 +40,62 @@ pub struct MotorSpec {
     pub k: f64,
     pub fv: f64,
     pub fo: f64,
+    /// Error-sign stiction compensation (`filter::stiction`): gain as a
+    /// fraction of `fc`, and the error (rad) it saturates at. Zero gain is
+    /// the production law; zero for the gripper.
+    pub stiction_gain: f64,
+    pub stiction_err: f64,
+    /// Load-proportional stiction push, Nm per Nm of gravity feedforward.
+    pub stiction_load_gain: f64,
+    /// Torque dither (`filter::dither_step`): peak Nm (0 off) and frequency.
+    pub dither_nm: f64,
+    pub dither_hz: f64,
+    /// Command frame for tracked ticks (MyActuator joints only).
+    pub wire: WireMode,
+    /// Stribeck cancellation on measured velocity (`filter::stribeck_excess`):
+    /// gain, zero-load excess (Nm), excess per Nm of gravity, 1/e speed.
+    pub stribeck_gain: f64,
+    pub stribeck_dfs: f64,
+    pub stribeck_load_gain: f64,
+    pub stribeck_vs: f64,
+    /// Load-proportional Coulomb friction, Nm per Nm of gravity feedforward:
+    /// the tracked-mode friction term uses `fc + fl·|t_ff|`.
+    pub fl: f64,
+    /// Low-pass pole (rad/s) of the measured velocity the Stribeck term
+    /// follows; `<= 0` falls back to the control derivative pole.
+    pub stribeck_pole: f64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Vendor {
     MyActuator,
     Damiao,
+}
+
+/// Which frame a MyActuator arm joint is commanded with in tracked mode.
+/// Damiao joints, the gripper, and every passthrough/limp tick use MIT
+/// regardless.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum WireMode {
+    /// The 0x400 impedance frame: the production control law.
+    Mit,
+    /// 0xA4 absolute position closed-loop: the firmware's own position PI
+    /// (and speed PI beneath it, at its kHz rate) tracks the streamed target
+    /// under a speed cap. No host feedforward reaches the motor; gravity and
+    /// friction are the firmware integrator's job. Paired with a 0x92 read
+    /// per tick for 0.01° position; the reply's torque channel is iq in
+    /// amps, so measured torque is reported as NaN on these joints.
+    A4,
+}
+
+impl WireMode {
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "mit" => Some(Self::Mit),
+            "a4" => Some(Self::A4),
+            _ => None,
+        }
+    }
 }
 
 /// A motor that passed bring-up prep: identified, fault-free, ranges known.
@@ -73,6 +123,17 @@ pub struct ReadyMotor {
     pub k: f64,
     pub fv: f64,
     pub fo: f64,
+    pub stiction_gain: f64,
+    pub stiction_err: f64,
+    pub stiction_load_gain: f64,
+    pub dither_nm: f64,
+    pub dither_hz: f64,
+    pub wire: WireMode,
+    pub stribeck_gain: f64,
+    pub stribeck_dfs: f64,
+    pub stribeck_load_gain: f64,
+    pub stribeck_vs: f64,
+    pub fl: f64,
 }
 
 /// Status-probe attempts before a silent motor fails the bring-up.
@@ -211,6 +272,17 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             k: spec.k,
             fv: spec.fv,
             fo: spec.fo,
+            stiction_gain: spec.stiction_gain,
+            stiction_err: spec.stiction_err,
+            stiction_load_gain: spec.stiction_load_gain,
+            dither_nm: spec.dither_nm,
+            dither_hz: spec.dither_hz,
+            wire: spec.wire,
+            stribeck_gain: spec.stribeck_gain,
+            stribeck_dfs: spec.stribeck_dfs,
+            stribeck_load_gain: spec.stribeck_load_gain,
+            stribeck_vs: spec.stribeck_vs,
+            fl: spec.fl,
         });
     }
 
@@ -260,6 +332,17 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             k: spec.k,
             fv: spec.fv,
             fo: spec.fo,
+            stiction_gain: spec.stiction_gain,
+            stiction_err: spec.stiction_err,
+            stiction_load_gain: spec.stiction_load_gain,
+            dither_nm: spec.dither_nm,
+            dither_hz: spec.dither_hz,
+            wire: spec.wire,
+            stribeck_gain: spec.stribeck_gain,
+            stribeck_dfs: spec.stribeck_dfs,
+            stribeck_load_gain: spec.stribeck_load_gain,
+            stribeck_vs: spec.stribeck_vs,
+            fl: spec.fl,
         });
     }
     Ok(motors)
