@@ -33,6 +33,27 @@ from almond_axol.motor.myactuator import _MA_PID_IDX, MyActuatorMotor
 _READ = 0x30
 _WRITE_RAM = 0x31
 _WRITE_ROM = 0x32
+_READ_ACCEL = 0x42
+_WRITE_ACCEL = 0x43  # RAM + ROM
+
+
+async def _read_accel(driver: MyActuatorMotor) -> tuple[int, int]:
+    out = []
+    for kind in (0x00, 0x01):
+        resp = await driver._request(bytes([_READ_ACCEL, kind, 0, 0, 0, 0, 0, 0]))
+        out.append(int(struct.unpack_from("<i", resp, 4)[0]))
+    return out[0], out[1]
+
+
+async def _write_accel(driver: MyActuatorMotor, dps_s2: int) -> tuple[int, int]:
+    """Position-planner accel and decel, written raw (0 = direct tracking of a
+    streamed 0xA4 target, which wire_mode a4 needs). Persists in ROM."""
+    for kind in (0x00, 0x01):
+        await driver._request(
+            bytes([_WRITE_ACCEL, kind, 0, 0]) + struct.pack("<I", int(dps_s2))
+        )
+        await asyncio.sleep(0.3)
+    return await _read_accel(driver)
 
 
 async def _read(driver: MyActuatorMotor, name: str) -> float:
@@ -64,9 +85,27 @@ async def _run(args: argparse.Namespace) -> None:
         if not isinstance(driver, MyActuatorMotor):
             raise SystemExit(f"motor {args.id:#04x} is not a MyActuator")
         before = {n: await _read(driver, n) for n in _MA_PID_IDX}
+        acc = await _read_accel(driver)
         print(f"motor {args.id:#04x} gains now:")
         for n, v in before.items():
             print(f"  {n:12s} {v:.6g}")
+        print(
+            f"  planner accel/decel {acc[0]}/{acc[1]} dps/s"
+            + (
+                "  (direct tracking)"
+                if acc[0] == 0
+                else "  (profiled — a streamed 0xA4 will not follow)"
+            )
+        )
+        if args.accel is not None and acc != (args.accel, args.accel):
+            got = await _write_accel(driver, args.accel)
+            print(
+                f"  planner accel/decel {acc[0]}/{acc[1]} -> {got[0]}/{got[1]} dps/s (ROM)"
+            )
+            if got[0] == 0:
+                print(
+                    "  ! this joint now executes a stored 0xA4 target at its speed cap the moment it wakes — set it back (--accel 5000) when done with wire_mode a4"
+                )
         if not writes:
             return
         for n, v in writes.items():
@@ -91,6 +130,13 @@ def main() -> None:
     add_side_and_channel_arguments(p)
     p.add_argument("--id", type=lambda x: int(x, 0), required=True, help="Motor CAN ID")
     p.add_argument("gains", nargs="*", metavar="NAME=VALUE", help="Gains to write")
+    p.add_argument(
+        "--accel",
+        type=int,
+        default=None,
+        help="Also set the position-planner accel/decel (dps/s, ROM): 0 for the direct "
+        "tracking wire_mode a4 needs, 5000 to put a joint back",
+    )
     p.add_argument(
         "--persist",
         action="store_true",
