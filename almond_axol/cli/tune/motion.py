@@ -76,6 +76,7 @@ _GAIN_FIELDS = (
     "stribeck_dfs",
     "stribeck_load_gain",
     "stribeck_vs",
+    "stribeck_pole",
     # Friction model, addressed as ``joint.friction.fc`` etc. — the sliding
     # friction feedforward is the other half of every stick-slip A/B.
     "friction.fc",

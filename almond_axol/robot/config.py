@@ -239,6 +239,12 @@ class JointConfig:
                   (~0.1 on right shoulder_1: excess ≈ 1.5 Nm under 12 Nm).
         stribeck_vs: Speed (rad/s) at which the excess has fallen to 1/e
                   (~0.1 on the X8 shoulders).
+        stribeck_pole: Low-pass pole (rad/s) of the measured-velocity
+                  estimate the term follows. 20 rad/s (3.2 Hz) is smooth at
+                  0.05 rad/s but ~40° behind the 2.6 Hz ring, which halved
+                  the cancellation in the first A/B; 40-80 rad/s follows the
+                  surge more closely at the cost of encoder-step noise in
+                  the torque (a 16-bit count at 240 Hz is 0.09 rad/s).
     """
 
     kp: float
@@ -260,6 +266,7 @@ class JointConfig:
     stribeck_dfs: float = 0.3
     stribeck_load_gain: float = 0.1
     stribeck_vs: float = 0.1
+    stribeck_pole: float = 20.0
 
 
 @dataclass
@@ -513,6 +520,7 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
             "stribeck_dfs",
             "stribeck_load_gain",
             "stribeck_vs",
+            "stribeck_pole",
         )
         if f in entry
     }

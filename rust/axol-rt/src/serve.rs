@@ -245,7 +245,8 @@ const HOLDOVER_MAX: f64 = 0.080;
 /// - 6: plus the wire mode token (`mit` | `a4`, `bringup::WireMode`).
 /// - 7: plus the four Stribeck cancellation fields (`filter::stribeck_excess`).
 /// - 8: plus the load-proportional Coulomb friction `fl` (Nm per Nm of gravity).
-const CONFIG_PROTO: u32 = 8;
+/// - 9: plus the Stribeck term's measured-velocity pole (rad/s).
+const CONFIG_PROTO: u32 = 9;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -901,7 +902,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                 //       <stiction_gain> <stiction_err> <stiction_load_gain>
                 //       <dither_nm> <dither_hz> <wire mit|a4>
                 //       <stribeck_gain> <stribeck_dfs> <stribeck_load_gain> <stribeck_vs>
-                //       <fl>
+                //       <fl> <stribeck_pole>
                 // gripper <side 0|1> <iface> <motor_id>
                 let gripper = f[0] == "gripper";
                 let side: u8 = f
@@ -949,6 +950,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         stribeck_load_gain: 0.0,
                         stribeck_vs: 0.0,
                         fl: 0.0,
+                        stribeck_pole: 0.0,
                     }
                 } else {
                     let motor_id: u8 = f
@@ -990,6 +992,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         stribeck_load_gain: num(21)?,
                         stribeck_vs: num(22)?,
                         fl: num(23)?,
+                        stribeck_pole: num(24)?,
                     }
                 };
                 if spec.slot >= N_SLOTS || bus.2.iter().any(|s| s.slot == spec.slot) {
@@ -1398,12 +1401,12 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 8\n\
+            "proto 9\n\
              loop_hz 240\n\
-             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n\
-             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n\
+             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
+             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 canL 8\n\
-             joint 0 canL shoulder_3 3 180 2.0 9.4 33.0 0.4 250 0.08 0.0 0.6 0.0017 0.2 1.5 60 a4 0.7 0.3 0.1 0.1 0.08\n",
+             joint 0 canL shoulder_3 3 180 2.0 9.4 33.0 0.4 250 0.08 0.0 0.6 0.0017 0.2 1.5 60 a4 0.7 0.3 0.1 0.1 0.08 40\n",
         )
         .unwrap();
         let specs = &cfg.buses[0].2;
@@ -1444,37 +1447,45 @@ mod tests {
             (0.7, 0.3, 0.1, 0.1)
         );
         assert_eq!((specs[0].fl, specs[3].fl), (0.0, 0.08));
+        assert_eq!(
+            (specs[0].stribeck_pole, specs[3].stribeck_pole),
+            (20.0, 40.0)
+        );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0\n"
+            "proto 9\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 8\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
-        // ... and so must the proto-2/3/4/5/6/7 layouts (13 … 23 fields).
+        assert!(parse_config("proto 9\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 9\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 9\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 9\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 9\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 9\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 8\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 9\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "proto 9\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -1485,9 +1496,9 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 8\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n\
-             joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n\
+            "proto 9\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
+             joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
         )
         .unwrap();
@@ -1499,17 +1510,17 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 8\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 9\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 8\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 9\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 8\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 9\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
     }
@@ -1521,7 +1532,7 @@ mod tests {
     #[test]
     fn parse_config_requires_matching_proto() {
         let joint =
-            "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n";
+            "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n";
         let error_of = |text: &str| match parse_config(text) {
             Ok(_) => panic!("accepted a skewed config: {text:?}"),
             Err(err) => err.to_string(),
@@ -1533,12 +1544,12 @@ mod tests {
         // A future client generation this core does not understand.
         let err = error_of(&format!("proto 99\n{joint}"));
         assert!(err.contains("proto 99"), "{err}");
-        assert!(err.contains("proto 8"), "{err}");
+        assert!(err.contains("proto 9"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 8\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 9\n")).is_ok());
     }
 }
 
@@ -2058,7 +2069,13 @@ fn bus_loop(
             v_meas: LpDiff::new(VEL_CUTOFF),
             bp: BandPass::new(),
             vel_meas: 0.0,
-            v_meas_slow: LpDiff::new(CONTROL_CUTOFF),
+            v_meas_slow: LpDiff::new(
+                specs
+                    .iter()
+                    .find(|s| s.slot == slot && !s.gripper && s.stribeck_pole > 0.0)
+                    .map(|s| s.stribeck_pole)
+                    .unwrap_or(CONTROL_CUTOFF),
+            ),
             vel_meas_slow: 0.0,
             last_fb: None,
             dither_phase: slot as f64 * filter::DITHER_PHASE_STAGGER,

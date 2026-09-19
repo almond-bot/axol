@@ -349,7 +349,8 @@ class Axol(RobotBase):
                     f"{gains.stiction_load_gain} {gains.dither_nm} {gains.dither_hz} "
                     f"{_wire_token(gains.wire_mode)} "
                     f"{gains.stribeck_gain} {gains.stribeck_dfs} "
-                    f"{gains.stribeck_load_gain} {gains.stribeck_vs} {f.fl}"
+                    f"{gains.stribeck_load_gain} {gains.stribeck_vs} {f.fl} "
+                    f"{gains.stribeck_pole}"
                 )
             if arm._has_gripper:
                 lines.append(

@@ -61,6 +61,9 @@ pub struct MotorSpec {
     /// Load-proportional Coulomb friction, Nm per Nm of gravity feedforward:
     /// the tracked-mode friction term uses `fc + fl·|t_ff|`.
     pub fl: f64,
+    /// Low-pass pole (rad/s) of the measured velocity the Stribeck term
+    /// follows; `<= 0` falls back to the control derivative pole.
+    pub stribeck_pole: f64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -131,6 +134,7 @@ pub struct ReadyMotor {
     pub stribeck_load_gain: f64,
     pub stribeck_vs: f64,
     pub fl: f64,
+    pub stribeck_pole: f64,
 }
 
 /// Status-probe attempts before a silent motor fails the bring-up.
@@ -280,6 +284,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             stribeck_load_gain: spec.stribeck_load_gain,
             stribeck_vs: spec.stribeck_vs,
             fl: spec.fl,
+            stribeck_pole: spec.stribeck_pole,
         });
     }
 
@@ -340,6 +345,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             stribeck_load_gain: spec.stribeck_load_gain,
             stribeck_vs: spec.stribeck_vs,
             fl: spec.fl,
+            stribeck_pole: spec.stribeck_pole,
         });
     }
     Ok(motors)
