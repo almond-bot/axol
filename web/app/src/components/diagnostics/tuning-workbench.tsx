@@ -364,11 +364,12 @@ const TABS: WbTab[] = [
       {
         key: "accel",
         label: "planner accel (dps/s)",
-        type: "number",
-        placeholder: "stored",
+        type: "text",
+        fwGainKey: "planner_accel",
+        width: "w-24",
         hint:
-          "0 = direct PI tracking (required to follow the stream); restored after the run " +
-          "unless kept",
+          "shows what the motor stores; 0 = direct PI tracking (required to follow the " +
+          "stream). Written for the run and restored afterwards unless kept",
       },
       ...FW_GAIN_FIELDS,
       { key: "buzz_abort", label: "buzz abort (°)", type: "number", placeholder: "0.3" },
@@ -377,7 +378,9 @@ const TABS: WbTab[] = [
         label: "current abort (A)",
         type: "number",
         placeholder: "30",
-        hint: "a loaded X8 shoulder holds ~10 A of gravity alone at -55°; keep this above the pose's static current",
+        hint:
+          "a loaded X8 shoulder holds ~10 A of gravity alone at -55°; keep this above the " +
+          "pose's static current",
       },
       { key: "persist", label: "persist gains to ROM", type: "boolean" },
       { key: "keep", label: "keep gains + planner after run", type: "boolean" },
@@ -2197,7 +2200,14 @@ export function TuningWorkbench({
     setFwGains(null)
     fetchMotorDetails(fwArm, fwJoint.toUpperCase())
       .then((d) => {
-        if (!stale) setFwGains(d.gains)
+        if (stale) return
+        // Loop gains plus the planner acceleration, under one lookup so the
+        // accel field gets the same "motor N" baseline as the gains.
+        setFwGains({
+          ...(d.gains ?? {}),
+          planner_accel: d.planner?.accel ?? null,
+          planner_decel: d.planner?.decel ?? null,
+        })
       })
       .catch(() => {
         if (!stale) setFwGains(null)

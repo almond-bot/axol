@@ -63,6 +63,7 @@ _MA_PID_IDX = {
     "position_kd": 0x09,
 }
 _MA_SET_ACCELERATION = 0x43  # write acceleration to RAM and ROM; persistent by command
+_MA_READ_ACCELERATION = 0x42  # read one acceleration type; int32 dps/s in bytes 4-7
 
 # Configuration-parameter access. These two commands are absent from MyActuator's
 # published protocol (V4.4) — they were recovered from the vendor setup software,
@@ -456,6 +457,24 @@ class MyActuatorMotor(MotorDriver):
 
     async def get_firmware_version(self) -> int | None:
         return await self._read_firmware_version()
+
+    async def get_planner_acceleration(self) -> tuple[int, int]:
+        """The position planner's stored ``(acceleration, deceleration)`` in
+        dps/s (0x42 types 0x00 / 0x01).
+
+        0 puts the position loop (0xA4) in direct PI tracking of each new
+        target, which a streamed trajectory needs; any other value makes the
+        firmware plan a velocity profile to every target and a 200 Hz stream
+        then never gets going. Note that a joint left at 0 executes a stored
+        target at its speed cap the moment it wakes.
+        """
+        out: list[int] = []
+        for kind in (_MA_ACC_POS_PLAN, _MA_DEC_POS_PLAN):
+            resp = await self._request(
+                bytes([_MA_READ_ACCELERATION, kind, 0, 0, 0, 0, 0, 0])
+            )
+            out.append(int(struct.unpack_from("<i", resp, 4)[0]))
+        return out[0], out[1]
 
     async def get_model(self) -> str | None:
         return await self._read_model()
