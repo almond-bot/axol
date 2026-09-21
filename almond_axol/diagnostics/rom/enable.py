@@ -230,7 +230,7 @@ def resolve_bus_joints(
 # Gains for a partial arm off the robot: the soft end of the stiffness
 # slider — the hand-guidable gains (wrist_2 25/1.5, wrist_3 25/0.9, see
 # ``_SOFT_GAINS`` in robot/config.py), damping-ratio-consistent with the tuned
-# set. The production gains (wrist_2 130/3.5) vibrate heavily on a wrist kit
+# set. The production gains (wrist_2 130/2.25) vibrate heavily on a wrist kit
 # clamped to a bench: firmware kd on the Damiao wrists already sits at the
 # edge of a unit-dependent buzz on the robot (kd=5 buzzes at 110 Hz), and a
 # rigid mount with none of the arm's compliance behind the stator moves that
