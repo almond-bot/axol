@@ -518,10 +518,31 @@ export interface JellyWheelsStatus extends JellyLinkStatusBase {
   reachableCount: number
 }
 
+/**
+ * Jelly's battery, estimated from the 24 V rail the lift board measures
+ * (two LiFePO4 packs in parallel; see almond_axol/robot/battery.py).
+ */
+export interface JellyBattery {
+  /** Pack volts (smoothed while resting). */
+  voltage: number
+  /** State of charge, 0-100, from the resting-voltage curve. */
+  percent: number
+  /** Rail held above any resting voltage: a charger is connected. */
+  charging: boolean
+  /** Only a reading taken under lift/wheel load so far: reads low. */
+  underLoad: boolean
+  /** Seconds since the reading, measured on the robot. */
+  ageSeconds: number
+  /** False while a task owns the bus or the board went quiet: last known. */
+  live: boolean
+}
+
 export interface JellyLiftStatus extends JellyLinkStatusBase {
   /** Whether the board answered recently; null while nobody polls it. */
   reachable: boolean | null
   status: LiftBoardStatus | null
+  /** Absent on older hosts; null before a reading, with no pack, or on old firmware. */
+  battery?: JellyBattery | null
 }
 
 export interface JellyStatus {

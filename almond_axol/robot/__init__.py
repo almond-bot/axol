@@ -13,6 +13,7 @@ from .axol import (
     end_stop_offset_from_position,
 )
 from .base import RobotBase
+from .battery import BatteryStatus, battery_percent, estimate_battery
 from .config import (
     ArmConfig,
     AxolConfig,
@@ -22,6 +23,7 @@ from .config import (
     PositionForceConfig,
 )
 from .jelly import Jelly, JellyConfig, detect_jelly
+from .lift import PowerStatus, read_battery, read_power
 from .mantis import MantisGripperArm
 from .sim import Sim
 
@@ -39,6 +41,12 @@ __all__ = [
     "JellyConfig",
     "detect_jelly",
     "FirmwareGains",
+    "BatteryStatus",
+    "battery_percent",
+    "estimate_battery",
+    "PowerStatus",
+    "read_battery",
+    "read_power",
     "FrictionParams",
     "JointConfig",
     "PositionForceConfig",
