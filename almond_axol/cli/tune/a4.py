@@ -80,6 +80,7 @@ from .friction import _home_all, _ramp_verified, _safe_torque_off, rest_target
 
 _MA_POS_CONTROL = 0xA4
 _MA_MULTI_TURN_ANGLE = 0x92
+_MA_STATUS2 = 0x9C  # temperature, iq (0.01 A), speed (dps), angle
 _MA_READ_ACCEL = 0x42
 _MA_WRITE_ACCEL = 0x43
 _MA_READ_GAIN = 0x30
@@ -397,6 +398,96 @@ def held_summary(
     return out
 
 
+#: Half-width (Hz) of the band around the ring frequency that
+#: :func:`ring_power` keeps: wide enough for a ring that wanders a few tenths
+#: of a hertz over the run, narrow enough to leave the wave itself (the
+#: triangle's fundamental is well under 1 Hz) and gravity's DC out.
+_RING_HALF_BAND_HZ = 0.75
+
+
+def _band(t: np.ndarray, x: np.ndarray, lo: float, hi: float, fs: float) -> np.ndarray:
+    """``x`` resampled onto a uniform ``fs`` grid and band-passed to [lo, hi]."""
+    tu = np.arange(t[0], t[-1], 1.0 / fs)
+    xu = np.interp(tu, t, x)
+    X = np.fft.rfft(xu - xu.mean())
+    f = np.fft.rfftfreq(len(xu), 1.0 / fs)
+    X[(f < lo) | (f > hi)] = 0.0
+    return np.fft.irfft(X, len(xu))
+
+
+def ring_power(
+    dyn: dict[str, list[tuple[float, float, float]]], ring_hz: float
+) -> dict[str, dict[str, float]]:
+    """Which joint feeds a shared ring: each joint's power at ``ring_hz``.
+
+    ``dyn`` maps a joint to ``[(t, velocity rad/s, torque Nm), ...]``. Both
+    signals are band-passed to ``ring_hz`` ± :data:`_RING_HALF_BAND_HZ` and
+    ``power_w`` is the mean of their product — the mechanical power that
+    joint's motor puts into the ring. In a ring every joint shares, the one
+    whose loop drives it (torque in phase with velocity) shows positive
+    power; the joints being shaken by it only absorb (negative). ``cos_phi``
+    is that phase as a correlation (+1 pure drive, -1 pure damping, ~0 a
+    spring), ``vel_amp`` / ``tau_amp`` the ring's amplitude in each signal.
+    Joints with under ~2 s of samples, or sampled too slowly to resolve the
+    band, are left out.
+    """
+    lo, hi = ring_hz - _RING_HALF_BAND_HZ, ring_hz + _RING_HALF_BAND_HZ
+    out: dict[str, dict[str, float]] = {}
+    for name, samples in dyn.items():
+        if len(samples) < 16:
+            continue
+        t = np.array([a for a, _, _ in samples])
+        if t[-1] - t[0] < 2.0:
+            continue
+        fs = (len(t) - 1) / (t[-1] - t[0])
+        if hi >= fs / 2:
+            continue
+        w = _band(t, np.array([b for _, b, _ in samples]), lo, hi, fs)
+        tau = _band(t, np.array([c for _, _, c in samples]), lo, hi, fs)
+        sw, st = float(w.std()), float(tau.std())
+        power = float(np.mean(w * tau))
+        out[name] = {
+            "power_w": power,
+            "cos_phi": power / (sw * st) if sw > 0 and st > 0 else math.nan,
+            "vel_amp": math.sqrt(2.0) * sw,
+            "tau_amp": math.sqrt(2.0) * st,
+        }
+    return out
+
+
+def ring_hz(held_scores: dict[str, dict[str, float]]) -> float | None:
+    """The shared ring's frequency: the most-moving oscillating held joint's."""
+    ringing = [
+        r for r in held_scores.values() if r["std"] > 0.05 and r["hz"] == r["hz"]
+    ]
+    if not ringing:
+        return None
+    return max(ringing, key=lambda r: r["std"])["hz"]
+
+
+def held_series(
+    held_log: dict[str, list[tuple[float, float]]],
+    held_dyn: dict[str, list[tuple[float, float, float]]],
+) -> dict[str, np.ndarray]:
+    """The held joints' raw samples as run series, one key set per joint.
+
+    ``held_<joint>_pos_t`` / ``_pos`` (rad, joint frame) and ``_dyn_t`` /
+    ``_vel`` (rad/s) / ``_tau`` (Nm). Each joint has its own time base — the
+    reads are round-robin — so these are not aligned with the wave's ``t``.
+    """
+    out: dict[str, np.ndarray] = {}
+    for name, samples in held_log.items():
+        if samples:
+            out[f"held_{name}_pos_t"] = np.array([a for a, _ in samples])
+            out[f"held_{name}_pos"] = np.array([b for _, b in samples])
+    for name, samples in held_dyn.items():
+        if samples:
+            out[f"held_{name}_dyn_t"] = np.array([a for a, _, _ in samples])
+            out[f"held_{name}_vel"] = np.array([b for _, b, _ in samples])
+            out[f"held_{name}_tau"] = np.array([c for _, _, c in samples])
+    return out
+
+
 def _a4_frame(position_rad: float, cap_dps: float) -> bytes:
     cap = int(max(0.0, min(65535.0, round(cap_dps))))
     return (
@@ -524,11 +615,20 @@ async def _stream(
     cap_track: float = 0.0,
     cap_floor_dps: float = 1.0,
     held: dict[Joint, JointFrameMotor] | None = None,
-) -> tuple[list[dict], str | None, dict[str, list[tuple[float, float]]]]:
+) -> tuple[
+    list[dict],
+    str | None,
+    dict[str, list[tuple[float, float]]],
+    dict[str, list[tuple[float, float, float]]],
+]:
     """Stream the wave; returns the log, the abort reason (if any), and the
-    held joints' ``{joint: [(t, position_rad), ...]}`` sampled round-robin —
-    one 0x92 read of one held joint per tick, so each is seen at
-    ``rate / len(held)`` Hz and the wave's own two round trips stay first."""
+    held joints' samples, one read of one held joint per tick after the
+    wave's own round trips. Turns alternate between a position read (0x92 /
+    Damiao p_m) into ``{joint: [(t, position_rad), ...]}`` and a velocity +
+    torque read (0x9C / Damiao 0xCC feedback) into ``{joint: [(t, vel_rad_s,
+    torque_nm), ...]}``, so each held joint gets each at ``rate / (2 *
+    len(held))`` Hz — ~33 Hz on a full arm at 400 Hz, ample for the few-Hz
+    rings the held table and :func:`ring_power` look for."""
     offset = motor.frame_offset
     period = 1.0 / rate
     log: list[dict] = []
@@ -538,6 +638,9 @@ async def _stream(
         if isinstance(jm.motor._driver, (MyActuatorMotor, DamiaoMotor))
     ]
     held_log: dict[str, list[tuple[float, float]]] = {n: [] for n, _, _ in held_items}
+    held_dyn: dict[str, list[tuple[float, float, float]]] = {
+        n: [] for n, _, _ in held_items
+    }
     is_dm = isinstance(driver, DamiaoMotor)
     loop = asyncio.get_running_loop()
     t0 = time.perf_counter()
@@ -571,20 +674,41 @@ async def _stream(
             )
         now = time.perf_counter() - t0
         if held_items:
-            name, hdrv, hoff = held_items[k % len(held_items)]
+            slot = k % (2 * len(held_items))
+            name, hdrv, hoff = held_items[slot % len(held_items)]
             try:
-                if isinstance(hdrv, DamiaoMotor):
-                    hp = float(
-                        await hdrv._read_register(
-                            _DM_REG_PM, timeout=_DM_REPLY_TIMEOUT_S, attempts=1
+                if slot >= len(held_items):
+                    # The dynamics turn: velocity and torque from one reply,
+                    # so the two are simultaneous for the power product.
+                    if isinstance(hdrv, DamiaoMotor):
+                        fb = await hdrv._request_feedback(
+                            timeout=_DM_REPLY_TIMEOUT_S, attempts=1
                         )
-                    )
+                        held_dyn[name].append((now, fb.velocity, fb.torque))
+                    else:
+                        st = await hdrv._request(
+                            bytes([_MA_STATUS2, 0, 0, 0, 0, 0, 0, 0])
+                        )
+                        # Own names: iq/speed are the driven joint's, read
+                        # below by the log and the buzz guard.
+                        h_iq = struct.unpack_from("<h", st, 2)[0] * 0.01
+                        h_speed = math.radians(struct.unpack_from("<h", st, 4)[0])
+                        held_dyn[name].append((now, h_speed, h_iq * hdrv._kt))
                 else:
-                    hf = await hdrv._request(
-                        bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0])
-                    )
-                    hp = struct.unpack_from("<i", hf, 4)[0] * (0.01 * math.pi / 180.0)
-                held_log[name].append((now, hp + hoff))
+                    if isinstance(hdrv, DamiaoMotor):
+                        hp = float(
+                            await hdrv._read_register(
+                                _DM_REG_PM, timeout=_DM_REPLY_TIMEOUT_S, attempts=1
+                            )
+                        )
+                    else:
+                        hf = await hdrv._request(
+                            bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0])
+                        )
+                        hp = struct.unpack_from("<i", hf, 4)[0] * (
+                            0.01 * math.pi / 180.0
+                        )
+                    held_log[name].append((now, hp + hoff))
             except MotorError:
                 pass
         log.append(
@@ -604,9 +728,9 @@ async def _stream(
         if reason is None and abs(pos - target) > _ERR_ABORT:
             reason = f"tracking error {math.degrees(pos - target):+.1f}° — the loop is not following"
         if reason is not None:
-            return log, reason, held_log
+            return log, reason, held_log, held_dyn
         await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
-    return log, None, held_log
+    return log, None, held_log, held_dyn
 
 
 async def _hold(
@@ -853,6 +977,10 @@ async def _run(args: argparse.Namespace) -> None:
         accel_used: tuple[int, int] | None = None
         ramps_used: tuple[float, float] | None = None
         held_scores: dict[str, dict[str, float]] = {}
+        held_log: dict[str, list[tuple[float, float]]] = {}
+        held_dyn: dict[str, list[tuple[float, float, float]]] = {}
+        ring_at: float | None = None
+        ring_scores: dict[str, dict[str, float]] = {}
         current_label = "torque" if is_dm else "current"
         current_unit = "Nm" if is_dm else "A"
 
@@ -973,7 +1101,7 @@ async def _run(args: argparse.Namespace) -> None:
             guard = BuzzGuard(args.rate, math.radians(args.buzz_abort), args.iq_abort)
             live = LiveStream("sine", joint)
             print("  Running ...")
-            log, reason, held_log = await _stream(
+            log, reason, held_log, held_dyn = await _stream(
                 motor,
                 driver,
                 samples,
@@ -1010,6 +1138,36 @@ async def _run(args: argparse.Namespace) -> None:
                         + (f"{r['hz']:4.1f} Hz" if r["hz"] == r["hz"] else "   — ")
                         + flag
                     )
+            ring_at = ring_hz(held_scores) if held_scores else None
+            if ring_at is not None:
+                # The joint under test is in the ring too: its own echo
+                # carries speed and current (Damiao: torque) every tick.
+                kt = 1.0 if is_dm else float(driver._kt)
+                dyn = {
+                    f"{joint.value} (driven)": [
+                        (r["t"], r["speed"], r["iq"] * kt) for r in log
+                    ],
+                    **held_dyn,
+                }
+                ring_scores = ring_power(dyn, ring_at)
+                if ring_scores:
+                    print(
+                        f"  power into the {ring_at:.1f} Hz ring (W; + feeds it, "
+                        "- absorbs it) / phase corr / velocity ° s⁻¹ / torque Nm:"
+                    )
+                    ranked = sorted(
+                        ring_scores.items(), key=lambda kv: -kv[1]["power_w"]
+                    )
+                    for i, (name, r) in enumerate(ranked):
+                        mark = (
+                            "  <-- feeds the ring"
+                            if i == 0 and r["power_w"] > 0
+                            else ""
+                        )
+                        print(
+                            f"    {name:20s} {r['power_w']:+8.4f} / {r['cos_phi']:+5.2f} / "
+                            f"{math.degrees(r['vel_amp']):6.2f} / {r['tau_amp']:6.3f}{mark}"
+                        )
             # The other joints were parked on their own 0xA4 loops and then
             # received no frames for the whole wave. Say so if any let go:
             # the elbow was found several degrees off rest across runs
@@ -1120,6 +1278,8 @@ async def _run(args: argparse.Namespace) -> None:
     metrics["aborted"] = reason is not None
     if held_scores:
         metrics["held"] = held_scores
+    if ring_scores:
+        metrics["ring"] = {"hz": ring_at, "joints": ring_scores}
     print(f"\n{'─' * 66}")
     print(
         f"  tracking RMS {math.degrees(metrics['rms']):.3f}°   max {math.degrees(metrics['max']):.3f}°   lag {metrics['lag_ms']:.0f} ms"
@@ -1158,7 +1318,7 @@ async def _run(args: argparse.Namespace) -> None:
         }
         run_id = save_run(
             "sine",
-            log_to_series(log),
+            {**log_to_series(log), **held_series(held_log, held_dyn)},
             metrics,
             side=side,
             joint=joint.value,

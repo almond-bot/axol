@@ -231,6 +231,80 @@ class PoseAndHeldJointsTest(unittest.TestCase):
         self.assertEqual(out["elbow"]["std"], 0.0)
 
 
+class RingPowerTest(unittest.TestCase):
+    """Finding the joint that feeds a ring every held joint shares."""
+
+    def _joint(
+        self, phase: float, fs: float = 33.0, hz: float = 4.25, jitter: bool = True
+    ) -> list[tuple[float, float, float]]:
+        # Round-robin reads land unevenly; the scorer resamples.
+        rng = np.random.default_rng(0)
+        t = np.arange(0, 12.0, 1 / fs)
+        if jitter:
+            t = t + rng.uniform(0, 0.3 / fs, len(t))
+        w = 0.1 * np.sin(2 * math.pi * hz * t)
+        # Gravity's DC and the wave's slow content must not count.
+        tau = 2.0 + 0.3 * np.sin(2 * math.pi * 0.07 * t)
+        tau = tau + 0.5 * np.sin(2 * math.pi * hz * t + phase)
+        return list(zip(t, w, tau))
+
+    def test_the_driving_joint_is_the_only_positive_one(self) -> None:
+        out = a4.ring_power(
+            {
+                "wrist_3": self._joint(0.0),  # torque in phase: drives
+                "shoulder_2": self._joint(math.pi),  # opposes velocity: damps
+                "elbow": self._joint(math.pi / 2),  # spring-like: no net power
+            },
+            4.25,
+        )
+        self.assertGreater(out["wrist_3"]["power_w"], 0.02)
+        self.assertAlmostEqual(out["wrist_3"]["cos_phi"], 1.0, delta=0.05)
+        self.assertLess(out["shoulder_2"]["power_w"], -0.02)
+        self.assertAlmostEqual(out["shoulder_2"]["cos_phi"], -1.0, delta=0.05)
+        self.assertAlmostEqual(out["elbow"]["cos_phi"], 0.0, delta=0.1)
+        # 0.1 rad/s and 0.5 Nm amplitudes come back through the band-pass.
+        self.assertAlmostEqual(out["wrist_3"]["vel_amp"], 0.1, delta=0.01)
+        self.assertAlmostEqual(out["wrist_3"]["tau_amp"], 0.5, delta=0.05)
+
+    def test_short_or_too_slow_joints_are_left_out(self) -> None:
+        out = a4.ring_power(
+            {
+                "short": self._joint(0.0)[:10],
+                "slow": self._joint(0.0, fs=8.0, jitter=False),  # Nyquist 4 Hz
+            },
+            4.25,
+        )
+        self.assertEqual(out, {})
+
+    def test_ring_hz_is_the_most_moving_oscillating_joint(self) -> None:
+        scores = {
+            "shoulder_2": {"std": 0.075, "hz": 4.26},
+            "wrist_3": {"std": 0.167, "hz": 4.25},
+            "shoulder_1": {"std": 0.006, "hz": 6.9},  # quiet: not a ring
+        }
+        self.assertEqual(a4.ring_hz(scores), 4.25)
+        self.assertIsNone(a4.ring_hz({"elbow": {"std": 0.01, "hz": 4.0}}))
+        self.assertIsNone(a4.ring_hz({"elbow": {"std": 0.2, "hz": math.nan}}))
+
+    def test_held_series_keys_each_joint_on_its_own_time_base(self) -> None:
+        out = a4.held_series(
+            {"elbow": [(0.0, 1.0), (0.1, 1.1)], "wrist_1": []},
+            {"elbow": [(0.05, 0.2, 3.0)]},
+        )
+        self.assertEqual(
+            sorted(out),
+            [
+                "held_elbow_dyn_t",
+                "held_elbow_pos",
+                "held_elbow_pos_t",
+                "held_elbow_tau",
+                "held_elbow_vel",
+            ],
+        )
+        np.testing.assert_array_equal(out["held_elbow_pos"], [1.0, 1.1])
+        np.testing.assert_array_equal(out["held_elbow_tau"], [3.0])
+
+
 class DamiaoPathTest(unittest.TestCase):
     def test_dm_frame_is_two_little_endian_floats_in_rad_units(self) -> None:
         import struct
@@ -255,3 +329,78 @@ class DamiaoPathTest(unittest.TestCase):
             },
         )
         self.assertEqual((a4._DM_REG_ACC, a4._DM_REG_DEC, a4._DM_REG_PM), (4, 5, 0x50))
+
+
+class HeldSamplingTest(unittest.TestCase):
+    """``_stream``'s round-robin reads of the held joints, on fake drivers."""
+
+    def test_turns_alternate_position_and_dynamics_without_touching_the_wave(
+        self,
+    ) -> None:
+        import asyncio
+        import struct
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from almond_axol.constants import Joint
+        from almond_axol.motor.damiao import DamiaoMotor
+        from almond_axol.motor.myactuator import MyActuatorMotor
+
+        def myactuator() -> MagicMock:
+            d = MagicMock(spec=MyActuatorMotor)
+            d._kt = 2.0
+
+            async def request(frame: bytes) -> bytes:
+                if frame[0] == 0xA4:  # the wave: iq 1.5 A, 10 dps
+                    return bytes([0xA4, 0]) + struct.pack("<hhh", 150, 10, 5)
+                if frame[0] == 0x92:
+                    return bytes([0x92, 0, 0, 0]) + struct.pack("<i", 1234)
+                if frame[0] == 0x9C:  # held: iq -2.5 A, 7 dps
+                    return bytes([0x9C, 30]) + struct.pack("<hhh", -250, 7, 0)
+                raise AssertionError(hex(frame[0]))
+
+            d._request = AsyncMock(side_effect=request)
+            return d
+
+        damiao = MagicMock(spec=DamiaoMotor)
+        damiao._read_register = AsyncMock(return_value=0.5)
+        damiao._request_feedback = AsyncMock(
+            return_value=SimpleNamespace(velocity=0.3, torque=-0.4, position=0.5)
+        )
+
+        def held(driver: MagicMock) -> SimpleNamespace:
+            return SimpleNamespace(
+                motor=SimpleNamespace(_driver=driver), frame_offset=0.0
+            )
+
+        guard = MagicMock()
+        guard.feed.return_value = None
+        log, reason, pos, dyn = asyncio.run(
+            a4._stream(
+                SimpleNamespace(frame_offset=0.0),
+                myactuator(),
+                [(i / 400, 0.0, 0.0) for i in range(40)],
+                60.0,
+                400.0,
+                guard,
+                MagicMock(),
+                held={Joint.ELBOW: held(myactuator()), Joint.WRIST_2: held(damiao)},
+            )
+        )
+        self.assertIsNone(reason)
+        # 40 ticks over 2 joints x 2 kinds: 10 of each, nothing double-counted.
+        self.assertEqual(
+            {k: len(v) for k, v in pos.items()}, {"elbow": 10, "wrist_2": 10}
+        )
+        self.assertEqual(
+            {k: len(v) for k, v in dyn.items()}, {"elbow": 10, "wrist_2": 10}
+        )
+        _, vel, tau = dyn["elbow"][0]
+        self.assertAlmostEqual(vel, math.radians(7))
+        self.assertAlmostEqual(tau, -2.5 * 2.0)  # iq x kt
+        self.assertEqual(dyn["wrist_2"][0][1:], (0.3, -0.4))
+        # The held reads never leak into the wave's own iq/speed.
+        for row in log:
+            self.assertAlmostEqual(row["iq"], 1.5)
+            self.assertAlmostEqual(row["speed"], math.radians(10))
+            guard.feed.assert_any_call(row["actual"], 1.5)
