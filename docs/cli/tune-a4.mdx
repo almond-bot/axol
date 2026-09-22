@@ -26,7 +26,7 @@ Safety, built in:
 | `--freq HZ` | Sine frequency (default: 0.3) |
 | `--speed DPS` | Triangle pass speed, deg/s (default: 3) |
 | `--duration S` | Seconds of wave (default: 12) |
-| `--rate HZ` | Command rate (default: 200) |
+| `--rate HZ` | Command rate (default: 400, the rate the realtime core streams a4 joints at; tune at the rate you will run — the step size is the excitation, and 200 Hz put an audible staircase on the shoulder at 12 deg/s that 400 removed) |
 | `--cap DPS` | 0xA4 speed cap (default: 60) |
 | `--cap-track K` | Per-command cap = `K × |commanded speed|`, floored at `--cap-floor`, never above `--cap` (default: 0 = fixed cap). With `--accel 60000` a fixed cap lets the planner burst through each 200 Hz step at the cap and idle the rest of the tick — 4× the current spread on the elbow, 68–82 Hz velocity content; `1.1`–`1.2` keeps the joint moving continuously at about the commanded speed. Ignored (with a warning) when the planner is at 0: under direct tracking the cap is a hard limit on the PI output and would only throttle the loop |
 | `--cap-floor DPS` | Lowest cap `--cap-track` may set, so a stationary or reversing target still corrects (default: 1) |

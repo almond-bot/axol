@@ -367,7 +367,7 @@ const TABS: WbTab[] = [
       { key: "speed", label: "triangle speed (°/s)", type: "number", placeholder: "3" },
       { key: "freq", label: "sine freq (Hz)", type: "number", placeholder: "0.3" },
       { key: "duration", label: "duration (s)", type: "number", placeholder: "12" },
-      { key: "rate", label: "rate (Hz)", type: "number", placeholder: "200" },
+      { key: "rate", label: "rate (Hz)", type: "number", placeholder: "400" },
       { key: "cap", label: "speed cap (°/s)", type: "number", placeholder: "60" },
       {
         key: "cap_track",

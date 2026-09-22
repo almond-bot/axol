@@ -353,35 +353,37 @@ _ZERO_FRICTION = FrictionParams(fc=0.0, k=1.0, fv=0.0, fo=0.0)
 
 
 # Firmware loop gains for the X8-P20 shoulders (shoulder_1 / shoulder_2),
-# from the ``tune.a4`` sweeps on right shoulder_1 (2026-09-18/21, 3 and
-# 12 deg/s triangles at -45°): position_kp 0.3 is the knee where the creep
-# stairs are gone (velocity ripple 0.26 vs 0.86 stock, zero stuck windows)
-# and the >20 Hz current is still at the stock floor; 0.5 starts a ~5 Hz
-# loop mode, 1.0 buzzes. speed_kp 0.1 (3x stock) is the damping — 0.15
-# doubled the buzz. speed_ki is *lowered* from the stock 1e-4: the
-# integrator winds up while the joint is stuck and dumps it at release.
-# position_kd is the stock value; the firmware stores it but the 0xA4 loop
-# measured inert to it. Written to ROM once at enable (see
-# :class:`FirmwareGains`); they only act under ``wire_mode`` ``a4``.
+# from the 2026-09-21 ``tune.a4`` sweeps on right shoulder_1 — the 400 Hz
+# stream the realtime core is moving to, 12 deg/s triangle and 40 deg/s
+# sine at -45°, checked at -10° and -70°. Stiffness: the stick-slip stairs
+# are gone by position_kp 0.2 and tracking keeps improving (0.44° / 36 ms
+# at 0.3 → 0.17° / 12 ms at 1.0 → 0.13° / 9 ms at 1.4); at 400 Hz the
+# >10 Hz position buzz no longer moves with it. Damping: speed_kp is the
+# speed loop's own ~100 Hz resonance knob, not a damper — it did nothing
+# for the 5 Hz reversal mode (2.2 A at 0.13 and 0.16 alike) while the
+# 100 Hz current tone went 0.07 → 0.30 → 0.41 → 1.0 A (unstable, 32 A
+# abort) at 0.1 / 0.13 / 0.16 / 0.2. Lowering it to 0.07 puts the tone at
+# the stock floor (0.04 A) with the tracking intact; 1.4 / 0.07 was also
+# clean, so 1.0 / 0.07 carries margin. speed_ki 1e-5: 1e-6 was identical.
 _X8_FIRMWARE_GAINS = FirmwareGains(
-    position_kp=0.3,
+    position_kp=1.0,
     position_kd=0.1,
-    speed_kp=0.1,
+    speed_kp=0.07,
     speed_ki=1e-5,
 )
 
-# The X6-P20 elbow's set (its stock position_kp is 0.15, speed_kp 0.01 on
-# firmware 2025070202): position_kp 0.5 with the shoulders' speed loop, from
-# the 2026-09-21 direct-tracking sweep on right elbow (3 deg/s triangle at
-# -75°, planner 0): 0.2 → 0.3 → 0.5 took tracking 0.17° → 0.11° → 0.07°
-# RMS and lag 54 → 37 → 23 ms with every smoothness figure at the floor
-# (velocity ripple 0.13, buzz 0.005°, current spread 0.31 A) and >20 Hz
-# current only 0.05 → 0.12 A; the shoulder's buzz began past 0.5, so this
-# is the knee, not a ceiling. Same ROM write at enable, same a4-only.
+# The X6-P20 elbow's set (stock position_kp 0.15, speed_kp 0.01 on firmware
+# 2025070202), from the same 2026-09-21 400 Hz sweeps on right elbow (12 deg/s
+# triangle and 40 deg/s sine at -75°, checked at -30° and -120°). Same law
+# as the shoulders with the speed loop's resonance at ~135 Hz: at speed_kp
+# 0.1 it grew 0.04 → 0.21 A from position_kp 0.5 → 1.0 and went unstable at
+# 1.5 (34 A abort); at 0.05 it stays at 0.05-0.08 A through 1.4 and even
+# 1.8. 1.4 / 0.05: 0.098° RMS, 8 ms lag, velocity ripple 0.13, current
+# spread 0.41 A — 1.8 was still clean, so this carries margin.
 _X6_ELBOW_FIRMWARE_GAINS = FirmwareGains(
-    position_kp=0.5,
+    position_kp=1.4,
     position_kd=0.1,
-    speed_kp=0.1,
+    speed_kp=0.05,
     speed_ki=1e-5,
 )
 

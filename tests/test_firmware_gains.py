@@ -16,7 +16,7 @@ from almond_axol.robot import FirmwareGains, JointConfig
 from almond_axol.robot.axol import apply_firmware_gains
 from almond_axol.robot.config import AxolConfig, _calibrated_joint
 
-_X8 = {"position_kp": 0.3, "position_kd": 0.1, "speed_kp": 0.1, "speed_ki": 1e-5}
+_X8 = {"position_kp": 1.0, "position_kd": 0.1, "speed_kp": 0.07, "speed_ki": 1e-5}
 
 
 class ConfigTest(unittest.TestCase):
@@ -33,9 +33,9 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(
                 arm.elbow.firmware.as_dict(),
                 {
-                    "position_kp": 0.5,
+                    "position_kp": 1.4,
                     "position_kd": 0.1,
-                    "speed_kp": 0.1,
+                    "speed_kp": 0.05,
                     "speed_ki": 1e-5,
                 },
             )
@@ -124,7 +124,7 @@ class EnsureRomGainsTest(unittest.IsolatedAsyncioTestCase):
             [_MA_PID_IDX[n] for n in ("position_kp", "speed_kp", "speed_ki")],
         )
         self.assertAlmostEqual(changed["position_kp"][0], 0.008)
-        self.assertAlmostEqual(changed["position_kp"][1], 0.3, places=6)
+        self.assertAlmostEqual(changed["position_kp"][1], 1.0, places=6)
         self.assertAlmostEqual(motor.store[_MA_PID_IDX["speed_ki"]], 1e-5, places=9)
 
     async def test_second_call_is_read_only(self) -> None:
@@ -188,10 +188,12 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
                 arm, [Joint.SHOULDER_1, Joint.SHOULDER_2, Joint.ELBOW, Joint.SHOULDER_3]
             )
         for motor in (s1, s2):
-            self.assertAlmostEqual(motor.store[_MA_PID_IDX["position_kp"]], 0.3, 6)
-        self.assertAlmostEqual(elbow.store[_MA_PID_IDX["position_kp"]], 0.5, 6)
+            self.assertAlmostEqual(motor.store[_MA_PID_IDX["position_kp"]], 1.0, 6)
+        self.assertAlmostEqual(elbow.store[_MA_PID_IDX["position_kp"]], 1.4, 6)
+        for motor in (s1, s2):
+            self.assertAlmostEqual(motor.store[_MA_PID_IDX["speed_kp"]], 0.07, 6)
+        self.assertAlmostEqual(elbow.store[_MA_PID_IDX["speed_kp"]], 0.05, 6)
         for motor in (s1, s2, elbow):
-            self.assertAlmostEqual(motor.store[_MA_PID_IDX["speed_kp"]], 0.1, 6)
             self.assertAlmostEqual(motor.store[_MA_PID_IDX["speed_ki"]], 1e-5, 9)
             # position_kd 0.1 is already the stock value: read, never written.
             self.assertNotIn(_MA_PID_IDX["position_kd"], [i for i, _ in motor.writes])

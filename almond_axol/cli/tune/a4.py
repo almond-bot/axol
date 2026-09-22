@@ -464,7 +464,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--duration", type=float, default=12.0, help="Seconds of wave (default: 12)"
     )
     p.add_argument(
-        "--rate", type=float, default=200.0, help="Command rate, Hz (default: 200)"
+        "--rate",
+        type=float,
+        default=400.0,
+        help="Command rate, Hz (default: 400 — the realtime core's a4 stream rate; 200 Hz put an audible target staircase on the X8-P20 shoulder at 12 deg/s that 400 removed)",
     )
     p.add_argument(
         "--cap", type=float, default=60.0, help="0xA4 speed cap, deg/s (default: 60)"
