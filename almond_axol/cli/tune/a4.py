@@ -76,7 +76,7 @@ from ...tuning import (
 )
 from ...tuning.runner import LiveStream, report_achieved_rate
 from ..motor import add_side_and_channel_arguments, resolve_channel
-from .friction import _home_all, _ramp_verified, _safe_torque_off
+from .friction import _home_all, _ramp_verified, _safe_torque_off, rest_target
 
 _MA_POS_CONTROL = 0xA4
 _MA_MULTI_TURN_ANGLE = 0x92
@@ -987,7 +987,13 @@ async def _run(args: argparse.Namespace) -> None:
             )
             live.flush()
             held_scores = held_summary(
-                held_log, {j.value: q for j, q in other_targets.items()}
+                held_log,
+                {
+                    j.value: other_targets.get(
+                        j, rest_target(j, getattr(jm, "_is_left", None))
+                    )
+                    for j, jm in motors.items()
+                },
             )
             if held_scores:
                 print(
@@ -1014,7 +1020,9 @@ async def _run(args: argparse.Namespace) -> None:
             for j, jm in motors.items():
                 if j == joint:
                     continue
-                hold = other_targets.get(j, 0.0)
+                hold = other_targets.get(
+                    j, rest_target(j, getattr(jm, "_is_left", None))
+                )
                 try:
                     pos = await jm.get_position()
                 except MotorError:

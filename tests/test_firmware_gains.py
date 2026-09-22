@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 from almond_axol.constants import Joint
 from almond_axol.motor import MotorError
+from almond_axol.motor.damiao import DamiaoMotor
 from almond_axol.motor.myactuator import _MA_PID_IDX, MyActuatorMotor
 from almond_axol.robot import FirmwareGains, JointConfig
 from almond_axol.robot.axol import apply_firmware_gains
@@ -54,10 +55,16 @@ class ConfigTest(unittest.TestCase):
                     },
                 )
 
-    def test_damiao_joints_leave_the_motor_alone(self) -> None:
-        arm = AxolConfig().left
-        for name in ("wrist_2", "wrist_3"):
-            self.assertEqual(getattr(arm, name).firmware.as_dict(), {})
+    def test_damiao_wrists_carry_the_position_gain_only(self) -> None:
+        cfg = AxolConfig()
+        for arm in (cfg.left, cfg.right):
+            for name in ("wrist_2", "wrist_3"):
+                self.assertEqual(
+                    getattr(arm, name).firmware.as_dict(), {"position_kp": 400.0}
+                )
+
+    def test_the_gripper_has_no_firmware_block(self) -> None:
+        self.assertFalse(hasattr(AxolConfig().left.gripper, "firmware"))
 
     def test_defaults_survive_the_stiffness_blend(self) -> None:
         cfg = AxolConfig(left_stiffness=0.3).resolved()
@@ -101,6 +108,27 @@ class _FakeMotor(MyActuatorMotor):
                 self.store[index] = value
             return data
         raise AssertionError(f"unexpected frame {data.hex()}")
+
+
+class _FakeDamiao(DamiaoMotor):
+    """A Damiao register store: 0x33 reads and 0x55 writes against a dict, with
+    0xAA stores counted; no bus."""
+
+    def __init__(self, store: dict[int, float]) -> None:
+        super().__init__(MagicMock(), 0x06, 0x16)
+        self.store = store
+        self.writes: list[tuple[int, float]] = []
+        self.stores = 0
+
+    async def _read_register(self, rid, timeout=0.2, attempts=5):  # type: ignore[override]
+        return self.store[rid]
+
+    async def _write_register(self, rid, value):  # type: ignore[override]
+        self.writes.append((rid, float(value)))
+        self.store[rid] = float(value)
+
+    async def _store_parameters(self):  # type: ignore[override]
+        self.stores += 1
 
 
 class _LegacyMotor(_FakeMotor):
@@ -239,13 +267,28 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
             await apply_firmware_gains(arm, [Joint.SHOULDER_1])
         self.assertTrue(any("right.shoulder_1" in m for m in logs.output))
 
-    async def test_gripper_and_non_myactuator_joints_are_skipped(self) -> None:
-        arm = _arm({Joint.GRIPPER: object(), Joint.WRIST_2: object()})
-        # Gripper config has no firmware block; wrist_2 has an empty one.
-        await apply_firmware_gains(arm, [Joint.GRIPPER, Joint.WRIST_2])
+    async def test_gripper_is_skipped(self) -> None:
+        # Gripper config has no firmware block at all.
+        await apply_firmware_gains(_arm({Joint.GRIPPER: object()}), [Joint.GRIPPER])
 
-    async def test_configured_gains_on_a_damiao_joint_warn(self) -> None:
-        arm = _arm({Joint.WRIST_2: object()})
+    async def test_damiao_wrist_is_provisioned_through_its_registers_without_a_reset(
+        self,
+    ) -> None:
+        w2 = _FakeDamiao({25: 0.0037, 26: 0.002, 27: 54.0, 28: 0.0})
+        arm = _arm({Joint.WRIST_2: w2})
+        with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:
+            await apply_firmware_gains(arm, [Joint.WRIST_2])
+        self.assertEqual(w2.store[27], 400.0)
+        self.assertEqual(w2.stores, 1)
+        self.assertTrue(any("written and stored" in m for m in logs.output))
+        # Second pass: already provisioned — no write, no store.
+        w2.writes.clear()
+        w2.stores = 0
+        await apply_firmware_gains(arm, [Joint.WRIST_2])
+        self.assertEqual((w2.writes, w2.stores), ([], 0))
+
+    async def test_configured_gains_on_a_joint_without_a_loop_warn(self) -> None:
+        arm = _arm({Joint.WRIST_2: object()})  # a driver of neither vendor
         arm._arm_config = replace(
             arm._arm_config,
             wrist_2=replace(
@@ -254,7 +297,7 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertLogs("almond_axol.robot.axol", level="WARNING") as logs:
             await apply_firmware_gains(arm, [Joint.WRIST_2])
-        self.assertTrue(any("not a MyActuator" in m for m in logs.output))
+        self.assertTrue(any("no firmware position loop" in m for m in logs.output))
 
 
 if __name__ == "__main__":

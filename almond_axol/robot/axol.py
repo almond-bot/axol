@@ -34,6 +34,7 @@ from ..motor import (
     MotorGains,
     MotorStatus,
 )
+from ..motor.damiao import DamiaoMotor
 from ..motor.myactuator import MyActuatorMotor
 from ..settings import SHARED
 from ..utils.paths import almond_path
@@ -195,10 +196,10 @@ async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
         if not wanted:
             continue
         driver = getattr(arm.motors.get(joint), "_driver", None)
-        if not isinstance(driver, MyActuatorMotor):
+        if not isinstance(driver, (MyActuatorMotor, DamiaoMotor)):
             _logger.warning(
-                "%s.%s: firmware loop gains configured but the joint is not a "
-                "MyActuator; ignored",
+                "%s.%s: firmware loop gains configured but the joint has no "
+                "firmware position loop; ignored",
                 side,
                 joint.value,
             )
@@ -215,7 +216,7 @@ async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
                 exc,
             )
             continue
-        if changed:
+        if changed and isinstance(driver, MyActuatorMotor):
             _logger.info(
                 "%s.%s: firmware loop gains written to ROM: %s — resetting the "
                 "motor so the loop loads them",
@@ -224,6 +225,14 @@ async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
                 ", ".join(f"{n} {b:g} -> {a:g}" for n, (b, a) in changed.items()),
             )
             await driver.reset()
+        elif changed:
+            # Damiao registers take effect on write; the store persisted them.
+            _logger.info(
+                "%s.%s: firmware loop gains written and stored: %s",
+                side,
+                joint.value,
+                ", ".join(f"{n} {b:g} -> {a:g}" for n, (b, a) in changed.items()),
+            )
 
 
 async def _rollback_newly_enabled_motors(

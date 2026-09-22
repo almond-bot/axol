@@ -396,6 +396,14 @@ _X6_ELBOW_FIRMWARE_GAINS = FirmwareGains(
 # is the knee on both at the 400 Hz stream: shoulder_3 0.04° RMS / 9 ms at
 # 3 deg/s with the tone at 0.06 A (1.4 doubled it); wrist_1 0.12° / 10 ms at
 # 12 deg/s, tone 0.04 A (0.025 → 0.071 A from 0.7 → 1.4), sine ripple 0.05.
+# The Damiao DM-J4310 wrists (wrist_2 / wrist_3): their position-velocity
+# loop's KP_APR. Stock 54 trails a 12 deg/s stream by 150 ms (2.0° RMS);
+# 400 gives 0.35° / 26 ms on both, 800 buzzes wrist_2 (0.12° >10 Hz, guard
+# abort). The velocity-loop gains (KP_ASR 0.0037, KI_ASR 0.002) and the
+# profiler ramps changed nothing at 12 deg/s and stay stock; there is no kd.
+# Registers take effect on write and are stored — no reset (2026-09-22).
+_DM_WRIST_FIRMWARE_GAINS = FirmwareGains(position_kp=400.0)
+
 _X6_ROLL_FIRMWARE_GAINS = FirmwareGains(
     position_kp=1.0,
     position_kd=0.5,
@@ -526,6 +534,7 @@ class ArmConfig:
             friction=_ZERO_FRICTION,
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
+            firmware=_DM_WRIST_FIRMWARE_GAINS,
         )
     )
     wrist_3: JointConfig = field(
@@ -535,6 +544,7 @@ class ArmConfig:
             friction=_ZERO_FRICTION,
             mass=0.75,
             com=(-0.0285, 0.0, -0.089453),
+            firmware=_DM_WRIST_FIRMWARE_GAINS,
         )
     )
     gripper: PositionForceConfig = field(

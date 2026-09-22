@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import math
 import struct
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
@@ -543,6 +544,45 @@ class DamiaoMotor(MotorDriver):
             position_kp=float(pos_kp),
             position_ki=float(pos_ki),
         )
+
+    async def ensure_rom_gains(
+        self, wanted: Mapping[str, float]
+    ) -> dict[str, tuple[float, float]]:
+        """Bring the named loop gains to ``wanted`` in flash.
+
+        ``wanted`` maps ``position_kp`` / ``position_ki`` / ``speed_kp`` /
+        ``speed_ki`` (KP_APR / KI_APR / KP_ASR / KI_ASR) to values. Each is
+        read first and written only when it differs beyond float32 rounding;
+        one 0xAA store follows if anything changed. Writes take effect at
+        once, so no reset is needed. Returns ``{name: (before, after)}``.
+        """
+        regs = {
+            "speed_kp": _DM_REG_SPEED_KP,
+            "speed_ki": _DM_REG_SPEED_KI,
+            "position_kp": _DM_REG_POS_KP,
+            "position_ki": _DM_REG_POS_KI,
+        }
+        unknown = set(wanted) - set(regs)
+        if unknown:
+            raise ValueError(f"Damiao loop has no gain(s) {sorted(unknown)}")
+        changed: dict[str, tuple[float, float]] = {}
+        for name, value in wanted.items():
+            before = float(await self._read_register(regs[name]))
+            if abs(before - value) <= 1e-6 * max(1.0, abs(value)):
+                continue
+            await self._write_register(regs[name], float(value))
+            await asyncio.sleep(0.02)
+            after = float(await self._read_register(regs[name]))
+            if abs(after - value) > 1e-6 * max(1.0, abs(value)):
+                raise MotorError(
+                    f"Damiao motor {self._motor_id:#04x}: wrote {name}={value:g} but "
+                    f"reads back {after:g}"
+                )
+            changed[name] = (before, after)
+        if changed:
+            await self._store_parameters()
+            await asyncio.sleep(0.3)
+        return changed
 
     async def set_gains(self, gains: MotorGains) -> None:
         await self._write_register(_DM_REG_SPEED_KP, gains.speed_kp)
