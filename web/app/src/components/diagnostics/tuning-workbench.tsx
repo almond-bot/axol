@@ -463,11 +463,11 @@ const TABS: WbTab[] = [
         hint:
           "impedance (240 Hz) is the production MIT frame: host gravity, " +
           "friction, inertia and damping feed-forward around the firmware PD, " +
-          "compliant. position (400 Hz) hands every joint to its motor's own " +
-          "position loop — MyActuator 0xA4, Damiao position-velocity, the gains " +
-          "on the Firmware-loop tab — streamed at 400 Hz, where the loop's " +
-          "target staircase is gone: stiff, no host feed-forward, NaN torque " +
-          "on the MyActuator joints (contact watchdog blind there). Same " +
+          "compliant. position (400 Hz) hands the five MyActuator joints to " +
+          "their motor's own 0xA4 position loop — the gains on the Firmware-loop " +
+          "tab — streamed at 400 Hz, where the loop's target staircase is gone: " +
+          "stiff, no host feed-forward, NaN torque on those joints (contact " +
+          "watchdog blind there); the Damiao wrists stay on impedance. Same " +
           "motion, same scoring, so the two controllers compare directly.",
       },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
@@ -481,10 +481,12 @@ const TABS: WbTab[] = [
           "their 0xA4 firmware loop for this run only (--a4 side.joint), the rest " +
           "staying on impedance — no compliance, no host feed-forward and NaN " +
           "torque telemetry on that joint. Everything else about the replay is " +
-          "unchanged, so runs compare directly. The Damiao wrists' firmware loop " +
-          "(position-velocity) comes with the position controller above, which " +
-          "puts every joint on its firmware loop at 400 Hz. A joint already " +
-          "configured wire_mode a4 is pinned.",
+          "unchanged, so runs compare directly. The position controller above " +
+          "puts all five at once, at 400 Hz. The Damiao wrists have a " +
+          "position-velocity loop too (wire_mode pv in the robot config), kept " +
+          "off by default: it stick-slips at creep speed and its stiff hold " +
+          "pumps the extended arm's 4 Hz sway. A joint already configured " +
+          "wire_mode a4 is pinned.",
       },
       {
         key: "ik",

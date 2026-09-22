@@ -399,10 +399,10 @@ class Axol(RobotBase):
         controller = self._axol_config().controller
         if controller == "position":
             _logger.warning(
-                "rt: position controller — every joint on its firmware position "
-                "loop (a4 / pv) at %.0f Hz: no compliance, no host feedforward, "
-                "torque telemetry NaN on the MyActuator joints — the contact "
-                "watchdog cannot see them",
+                "rt: position controller — %s on the firmware position loop "
+                "at %.0f Hz: no compliance, no host feedforward, torque telemetry "
+                "NaN on the a4 joints — the contact watchdog cannot see them",
+                ", ".join(firmware),
                 self._loop_hz,
             )
             return
