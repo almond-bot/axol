@@ -387,13 +387,16 @@ _X6_ELBOW_FIRMWARE_GAINS = FirmwareGains(
     speed_ki=1e-5,
 )
 
-# shoulder_3 (RMD-X6-P20, same firmware; stock position_kp 0.06, speed_kp
-# 0.01, position_kd 0.5). At stock it is near-limp under a4: held at rest
-# during a shoulder_2 sweep with the arm extended it wobbled 1° peak-to-peak
-# at ~3 Hz whenever the arm moved (2026-09-22). 1.0 / 0.05 — the elbow's
-# speed gain, one stiffness step below the elbow — tracked a 3 deg/s
-# triangle at 0.04° RMS, 9 ms lag, tone 0.06 A, on the 400 Hz stream.
-_X6_SHOULDER_3_FIRMWARE_GAINS = FirmwareGains(
+# shoulder_3 and wrist_1 (both RMD-X6-P20 on the same firmware, identical
+# stock gains: position_kp 0.06, speed_kp 0.01, position_kd 0.5). At stock
+# they are near-limp under a4: shoulder_3 held at rest during a shoulder_2
+# sweep with the arm extended wobbled 1° peak-to-peak at ~3 Hz whenever the
+# arm moved, and wrist_1 tracked a 12 deg/s triangle 124 ms late (2026-09-22).
+# 1.0 / 0.05 — the elbow's speed gain, one stiffness step below the elbow —
+# is the knee on both at the 400 Hz stream: shoulder_3 0.04° RMS / 9 ms at
+# 3 deg/s with the tone at 0.06 A (1.4 doubled it); wrist_1 0.12° / 10 ms at
+# 12 deg/s, tone 0.04 A (0.025 → 0.071 A from 0.7 → 1.4), sine ripple 0.05.
+_X6_ROLL_FIRMWARE_GAINS = FirmwareGains(
     position_kp=1.0,
     position_kd=0.5,
     speed_kp=0.05,
@@ -481,7 +484,7 @@ class ArmConfig:
             # though wrist_2 has no host damping. Narrowing shoulder_3 from
             # Q=0.8 to Q=3 did not remove it. Keep damping on the motor side;
             # do not chase the coupled wrist symptom with another host term.
-            firmware=_X6_SHOULDER_3_FIRMWARE_GAINS,
+            firmware=_X6_ROLL_FIRMWARE_GAINS,
         )
     )
     elbow: JointConfig = field(
@@ -509,6 +512,7 @@ class ArmConfig:
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(0.0, 0.0, -0.0614121),
+            firmware=_X6_ROLL_FIRMWARE_GAINS,
         )
     )
     wrist_2: JointConfig = field(

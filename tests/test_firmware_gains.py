@@ -40,22 +40,23 @@ class ConfigTest(unittest.TestCase):
                 },
             )
 
-    def test_shoulder_3_carries_its_own_set_on_both_arms(self) -> None:
+    def test_x6_roll_joints_share_a_set_on_both_arms(self) -> None:
         cfg = AxolConfig()
         for arm in (cfg.left, cfg.right):
-            self.assertEqual(
-                arm.shoulder_3.firmware.as_dict(),
-                {
-                    "position_kp": 1.0,
-                    "position_kd": 0.5,
-                    "speed_kp": 0.05,
-                    "speed_ki": 1e-5,
-                },
-            )
+            for joint in (arm.shoulder_3, arm.wrist_1):
+                self.assertEqual(
+                    joint.firmware.as_dict(),
+                    {
+                        "position_kp": 1.0,
+                        "position_kd": 0.5,
+                        "speed_kp": 0.05,
+                        "speed_ki": 1e-5,
+                    },
+                )
 
-    def test_other_joints_leave_the_motor_alone(self) -> None:
+    def test_damiao_joints_leave_the_motor_alone(self) -> None:
         arm = AxolConfig().left
-        for name in ("wrist_1", "wrist_2", "wrist_3"):
+        for name in ("wrist_2", "wrist_3"):
             self.assertEqual(getattr(arm, name).firmware.as_dict(), {})
 
     def test_defaults_survive_the_stiffness_blend(self) -> None:
@@ -210,12 +211,13 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(motor.store[_MA_PID_IDX["speed_ki"]], 1e-5, 9)
             # position_kd 0.1 is already the stock value: read, never written.
             self.assertNotIn(_MA_PID_IDX["position_kd"], [i for i, _ in motor.writes])
-        # wrist_1 has no firmware block configured.
-        self.assertEqual(w1.writes, [])
-        self.assertEqual(sum("written to ROM" in m for m in logs.output), 3)
+        # wrist_1 carries the X6 roll set: its position and speed gains change too.
+        self.assertAlmostEqual(w1.store[_MA_PID_IDX["position_kp"]], 1.0, 6)
+        self.assertAlmostEqual(w1.store[_MA_PID_IDX["speed_kp"]], 0.05, 6)
+        self.assertEqual(sum("written to ROM" in m for m in logs.output), 4)
         # Every motor that took a write is rebooted so its loop loads the new
         # gains; the untouched one is not.
-        self.assertEqual([s1.resets, s2.resets, elbow.resets, w1.resets], [1, 1, 1, 0])
+        self.assertEqual([s1.resets, s2.resets, elbow.resets, w1.resets], [1, 1, 1, 1])
 
     async def test_a_provisioned_motor_is_neither_written_nor_reset(self) -> None:
         s1 = _FakeMotor(_stock())
