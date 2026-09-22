@@ -15,7 +15,10 @@ from almond_axol.robot.axol import AxolHardware
 from almond_axol.robot.config import (
     CONTROLLER_LOOP_HZ,
     CONTROLLERS,
+    IMPEDANCE_LOOP_HZ,
     AxolConfig,
+    check_loop_hz,
+    impedance_joints,
     position_wire_mode,
 )
 from almond_axol.rt import Axol
@@ -67,6 +70,20 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(resolved.right.shoulder_1.wire_mode, "a4")
         self.assertEqual(resolved.right.shoulder_2.wire_mode, "mit")
         self.assertEqual(resolved.loop_hz, 240.0)
+
+    def test_the_rate_rule_counts_only_arm_joints_on_mit(self) -> None:
+        self.assertEqual(IMPEDANCE_LOOP_HZ, 240.0)
+        # The position controller puts every arm joint on a firmware loop;
+        # the gripper, always MIT, does not count.
+        self.assertEqual(impedance_joints(AxolConfig(controller="position")), [])
+        check_loop_hz(AxolConfig(controller="position"), 400.0)
+        check_loop_hz(AxolConfig(controller="position"), 240.0)
+        check_loop_hz(AxolConfig(), 240.0)
+        mit = impedance_joints(AxolConfig())
+        self.assertEqual(len(mit), 2 * len(ARM_JOINTS))
+        self.assertIn("right.shoulder_3", mit)
+        with self.assertRaisesRegex(ValueError, "left.shoulder_1"):
+            check_loop_hz(AxolConfig(), 400.0)
 
     def test_unknown_controller_is_refused(self) -> None:
         with self.assertRaises(ValueError):
@@ -143,6 +160,21 @@ class RealtimeConfigTest(unittest.TestCase):
 
     def test_an_explicit_loop_rate_still_wins(self) -> None:
         rt = Axol._wrap(_hardware(AxolConfig(controller="position")), loop_hz=240.0)
+        self.assertIn("loop_hz 240.0", rt._config_text().splitlines())
+
+    def test_impedance_joints_are_held_to_240_hz(self) -> None:
+        # The run that shook the arm: impedance with two joints on --a4, at
+        # 400 Hz. Refused before any core starts.
+        cfg = AxolConfig()
+        cfg.right.shoulder_1.wire_mode = "a4"
+        cfg.right.elbow.wire_mode = "a4"
+        with self.assertRaisesRegex(ValueError, "impedance runs at 240 Hz only"):
+            Axol._wrap(_hardware(cfg), loop_hz=400.0)
+        # All-impedance at another rate is refused the same way.
+        with self.assertRaisesRegex(ValueError, "240 Hz only"):
+            Axol._wrap(_hardware(AxolConfig()), loop_hz=300.0)
+        # At 240 the mixed split runs.
+        rt = Axol._wrap(_hardware(cfg), loop_hz=240.0)
         self.assertIn("loop_hz 240.0", rt._config_text().splitlines())
 
     def test_a_vendor_mismatched_wire_mode_is_refused(self) -> None:

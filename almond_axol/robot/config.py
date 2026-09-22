@@ -949,6 +949,15 @@ CONTROLLERS: tuple[str, ...] = ("impedance", "position")
 #: Realtime-core tick rate under each controller (see :data:`CONTROLLERS`).
 CONTROLLER_LOOP_HZ: dict[str, float] = {"impedance": 240.0, "position": 400.0}
 
+#: The only tick rate the impedance (MIT) frame runs at. Its gains, host
+#: feedforward and damping filters were tuned and verified at 240 Hz; at
+#: 400 Hz with the firmware-loop joints beside it, right shoulder_3 / wrist_1
+#: on impedance shook the arm hard enough to stop the run (2026-09-22). A
+#: core loop carrying any arm joint on ``wire_mode`` ``mit`` is therefore
+#: held to this rate (:func:`check_loop_hz`); only an all-firmware-loop arm
+#: (``controller`` ``"position"``) runs faster.
+IMPEDANCE_LOOP_HZ: float = CONTROLLER_LOOP_HZ["impedance"]
+
 
 def position_wire_mode(joint: Joint) -> str:
     """The firmware-position-loop wire token for an arm joint's vendor.
@@ -957,6 +966,45 @@ def position_wire_mode(joint: Joint) -> str:
     wrists.
     """
     return "pv" if _JOINT_CONFIG[joint].motor_id >= 6 else "a4"
+
+
+def impedance_joints(config: "AxolConfig") -> list[str]:
+    """``side.joint`` for every arm joint the config runs on the MIT frame.
+
+    Resolved first, so ``controller`` ``"position"`` counts as it runs. The
+    gripper is not an arm joint: it is always MIT and is not what the rate
+    rule protects.
+    """
+    resolved = config.resolved()
+    return [
+        f"{side}.{j.value}"
+        for side in ("left", "right")
+        for j in ARM_JOINTS
+        if str(getattr(getattr(resolved, side), j.value).wire_mode).lower() == "mit"
+    ]
+
+
+def check_loop_hz(config: "AxolConfig", loop_hz: float) -> None:
+    """Refuse a core rate other than :data:`IMPEDANCE_LOOP_HZ` with MIT joints.
+
+    Raises:
+        ValueError: If ``loop_hz`` is not 240 Hz while any arm joint is on
+            the impedance frame — e.g. ``tune.motion --loop-hz 400`` with
+            ``--a4`` putting only some joints on their firmware loops.
+    """
+    if abs(loop_hz - IMPEDANCE_LOOP_HZ) < 1e-6:
+        return
+    mit = impedance_joints(config)
+    if mit:
+        shown = ", ".join(mit[:4]) + (
+            f" and {len(mit) - 4} more" if len(mit) > 4 else ""
+        )
+        raise ValueError(
+            f"a {loop_hz:g} Hz core loop with {shown} on the impedance frame: "
+            f"impedance runs at {IMPEDANCE_LOOP_HZ:g} Hz only. Drop the loop-rate "
+            "override, or put every arm joint on its firmware loop "
+            "(controller 'position') to run faster."
+        )
 
 
 def _on_position_loops(arm: ArmConfig) -> ArmConfig:

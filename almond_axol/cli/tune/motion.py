@@ -53,7 +53,7 @@ import numpy as np
 
 from ...constants import ARM_JOINTS
 from ...robot import Axol
-from ...robot.config import CONTROLLERS, AxolConfig
+from ...robot.config import CONTROLLERS, AxolConfig, check_loop_hz
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
@@ -313,11 +313,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         type=float,
         default=None,
         help="Realtime-core tick rate override. Default follows --controller "
-        "(240 Hz impedance, 400 Hz position). For A/B runs only: e.g. "
-        "--controller position --loop-hz 240 to separate the rate from the "
-        "controller, or --a4 right.elbow --loop-hz 400 for one joint on its "
-        "firmware loop at the position controller's rate. Above 300 Hz the "
-        "core thins the bus schedule (wrists on alternate ticks).",
+        "(240 Hz impedance, 400 Hz position). For A/B runs only, and only "
+        "downward from the position controller's rate: impedance (MIT) runs at "
+        "240 Hz only, so a rate other than 240 is refused while any arm joint "
+        "is on it — e.g. --a4 with --loop-hz 400. --controller position "
+        "--loop-hz 240 separates the rate from the controller. Above 300 Hz "
+        "the core thins the bus schedule (wrists on alternate ticks).",
     )
     p.add_argument(
         "--record",
@@ -588,6 +589,11 @@ async def _run(args: argparse.Namespace) -> None:
         print(f"  wire mode: {side}.{joint} = a4 (firmware position loop)")
     if args.controller is not None:
         config.controller = args.controller
+    try:
+        # Before anything touches the bus: impedance runs at 240 Hz only.
+        check_loop_hz(config, args.loop_hz or config.loop_hz)
+    except ValueError as exc:
+        raise SystemExit(f"tune.motion: {exc}") from None
     print(
         f"  controller: {config.controller} "
         f"({(args.loop_hz or config.loop_hz):.0f} Hz core loop"

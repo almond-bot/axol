@@ -86,7 +86,7 @@ from ..robot.axol import (
     apply_firmware_gains,
 )
 from ..robot.base import RobotBase, mark_hardware_cleanup_uncertain
-from ..robot.config import AxolConfig
+from ..robot.config import AxolConfig, check_loop_hz
 from ..settings import SHARED
 from .link import FeedbackSlot, RtLink, config_header
 
@@ -250,6 +250,8 @@ class Axol(RobotBase):
         self._robot = hardware
         if loop_hz is None:
             loop_hz = self._axol_config().loop_hz
+        # Impedance (MIT) joints run at 240 Hz only, whoever asked otherwise.
+        check_loop_hz(self._axol_config(), loop_hz)
         # ``_core_started``: an ``axol-rt`` process exists for this session
         # (from ``enable`` until teardown) — teardown must go through the
         # core. ``_armed``: the core holds the buses (from its ``arm`` ack
