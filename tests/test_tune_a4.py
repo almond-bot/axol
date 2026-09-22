@@ -128,6 +128,9 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(smooth["stuck_frac"], 0.0)
         self.assertLess(math.degrees(smooth["band_1_4"]), 0.01)
         self.assertAlmostEqual(smooth["iq_rms"], 1.5)
+        # A constant current is a gravity hold, not vibration: no spread, no mode.
+        self.assertAlmostEqual(smooth["iq_sd"], 0.0)
+        self.assertAlmostEqual(smooth["iq_mode"], 0.0)
         # A 2 Hz ±0.3° wobble on the same creep shows up in the band and ripple.
         wobbly = a4.a4_metrics(self._log(0.1, math.radians(0.3)), 200.0)
         self.assertGreater(math.degrees(wobbly["band_1_4"]), 0.15)
@@ -155,3 +158,33 @@ class SpeedCapTest(unittest.TestCase):
     def test_frame_carries_the_per_sample_cap(self) -> None:
         frame = a4._a4_frame(0.0, a4.speed_cap(math.radians(3.0), 60.0, 1.2, 1.0))
         self.assertEqual(int.from_bytes(frame[2:4], "little"), 4)  # 3.6 rounds to 4 dps
+
+
+class CurrentModeMetricTest(unittest.TestCase):
+    def test_mode_current_isolates_the_3_to_8_hz_shudder(self) -> None:
+        rate = 200.0
+        n = 2400
+        t = np.arange(n) / rate
+        # 5 Hz, 1 A amplitude on a -8 A gravity hold, plus a 60 Hz 0.3 A buzz.
+        iq = (
+            -8.0
+            + 1.0 * np.sin(2 * math.pi * 5.0 * t)
+            + 0.3 * np.sin(2 * math.pi * 60.0 * t)
+        )
+        log = [
+            {
+                "t": ti,
+                "target": 0.0,
+                "actual": 0.0,
+                "error": 0.0,
+                "v_cmd": 0.1,
+                "iq": qi,
+            }
+            for ti, qi in zip(t, iq)
+        ]
+        m = a4.a4_metrics(log, rate)
+        # sd of the two sines: sqrt(0.5 + 0.045) ≈ 0.738 A
+        self.assertAlmostEqual(m["iq_sd"], math.sqrt(0.5 + 0.045), places=2)
+        # The 3-8 Hz share is the 5 Hz tone's std alone: 1/sqrt(2) ≈ 0.707 A.
+        self.assertAlmostEqual(m["iq_mode"], 1.0 / math.sqrt(2), places=1)
+        self.assertLess(m["iq_mode"], m["iq_sd"])

@@ -1852,6 +1852,8 @@ const A4_COLS: ScoreCol[] = [
   { key: "stuck_frac", label: "stuck", digits: 2, warn: 0.05, bad: 0.3 },
   { key: "band_1_4", label: "1–4 Hz °", deg: true, digits: 3, warn: 0.1, bad: 0.3 },
   { key: "buzz", label: ">10 Hz buzz °", deg: true, digits: 3, warn: 0.02, bad: 0.1 },
+  { key: "iq_mode", label: "3–8 Hz mode A", digits: 2, warn: 0.5, bad: 1.0 },
+  { key: "iq_sd", label: "current spread A", digits: 2, warn: 1.3, bad: 1.8 },
   { key: "iq_rms", label: "current RMS A", digits: 2 },
   { key: "iq_max", label: "peak A", digits: 1 },
   { key: "hz", label: "loop Hz", digits: 0 },
@@ -1906,8 +1908,11 @@ const A4_LEGEND =
   "followed. vel ripple = std of measured minus commanded velocity over the " +
   "commanded speed — the MIT frame's stick-slip sits near 0.8, smooth is under 0.2. " +
   "stuck = fraction of the pass with the joint not moving. 1–4 Hz = the stick-slip " +
-  "band in the error; >10 Hz buzz = high-frequency position motion (the current " +
-  "columns show a speed-loop buzz the 0.01° position read cannot)."
+  "band in the error; >10 Hz buzz = high-frequency position motion. 3–8 Hz mode = " +
+  "the position loop's own mode in the current — the shudder felt at speed (a 12 deg/s " +
+  "triangle's reversals kick it to ~1.9 A at position_kp 0.7; 0.2 A is quiet); current " +
+  "spread = all current variation, the gravity hold removed. Anything above 100 Hz is " +
+  "invisible to the 200 Hz stream, so an audible buzz can leave every column clean."
 
 const SCORE_LEGEND: Record<string, string> = {
   motion:

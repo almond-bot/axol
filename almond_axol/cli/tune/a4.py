@@ -254,6 +254,21 @@ def a4_metrics(log: list[dict], rate: float) -> dict[str, Any]:
     m["buzz"] = float(math.sqrt(F[f >= 10].sum() / tot) * e.std()) if tot > 0 else 0.0
     m["iq_rms"] = float(np.sqrt(np.nanmean(iq * iq)))
     m["iq_max"] = float(np.nanmax(np.abs(iq)))
+    # Current *variation* — what the operator feels. The mean current is the
+    # gravity hold and says nothing about smoothness; its spread does, and
+    # the 3-8 Hz band of it is the position loop's own mode (~5 Hz on the
+    # X8-P20 shoulders), the shudder a 12 deg/s triangle's reversals kick up
+    # (1.9 A at position_kp 0.7 against 0.2 A at 3 deg/s) that neither the
+    # >10 Hz position "buzz" nor the >20 Hz current band track.
+    iq_c = iq - np.nanmean(iq)
+    m["iq_sd"] = float(np.nanstd(iq))
+    Fi = np.abs(np.fft.rfft(np.nan_to_num(iq_c) * np.hanning(n))) ** 2
+    tot_i = float(Fi.sum())
+    m["iq_mode"] = (
+        float(math.sqrt(Fi[(f >= 3) & (f <= 8)].sum() / tot_i) * m["iq_sd"])
+        if tot_i > 0
+        else 0.0
+    )
     return m
 
 
@@ -751,7 +766,9 @@ async def _run(args: argparse.Namespace) -> None:
         f"  velocity ripple {metrics['v_ripple']:.2f} (MIT stick-slip ≈ 0.8, smooth < 0.2)   stuck windows {metrics['stuck_frac']:.2f}"
     )
     print(
-        f"  current RMS {metrics['iq_rms']:.2f} A   peak {metrics['iq_max']:.2f} A   loop {metrics['hz']:.0f} Hz"
+        f"  current RMS {metrics['iq_rms']:.2f} A   peak {metrics['iq_max']:.2f} A   "
+        f"spread {metrics['iq_sd']:.2f} A   3-8 Hz mode {metrics['iq_mode']:.2f} A   "
+        f"loop {metrics['hz']:.0f} Hz"
     )
     print(f"{'─' * 66}")
     if args.save_run:
