@@ -271,6 +271,32 @@ def _a4_frame(position_rad: float, cap_dps: float) -> bytes:
     )
 
 
+def speed_cap(
+    v_cmd_rad_s: float, cap_dps: float, track: float, floor_dps: float
+) -> float:
+    """The 0xA4 speed cap (deg/s) for one streamed sample.
+
+    ``track <= 0``: the fixed ``cap_dps``. Otherwise the cap follows the
+    commanded speed — ``track × |v_cmd|``, floored at ``floor_dps`` so a
+    stationary or reversing target can still be corrected, and never above
+    ``cap_dps``.
+
+    Why: with the planner at its maximum (60000 dps/s) and a fixed 60 dps
+    cap, each 200 Hz target is a 0.015° step at 3 deg/s that the planner
+    covers in ~0.5 ms at the cap and then idles for the remaining 4.5 ms —
+    the joint moves in bursts at twenty times the commanded speed with a
+    5 % duty cycle. On the right elbow that was 0.019° RMS tracking with
+    four times the current spread of direct tracking (1.28 A vs 0.33 A,
+    0.76 A above 20 Hz, 68–82 Hz velocity content). A cap of ~1.1–1.2× the
+    commanded speed lets the planner run continuously at about that speed
+    and arrive just before the next target instead.
+    """
+    if track <= 0.0:
+        return cap_dps
+    want = track * abs(math.degrees(v_cmd_rad_s))
+    return min(cap_dps, max(floor_dps, want))
+
+
 def _decode_a4_reply(resp: bytes) -> tuple[float, float]:
     """(iq A, speed rad/s) from a 0xA4 reply."""
     iq = struct.unpack_from("<h", resp, 2)[0] * 0.01
@@ -322,6 +348,8 @@ async def _stream(
     rate: float,
     guard: BuzzGuard,
     live: LiveStream,
+    cap_track: float = 0.0,
+    cap_floor_dps: float = 1.0,
 ) -> tuple[list[dict], str | None]:
     """Stream the wave; returns the log and the abort reason, if any."""
     offset = motor.offset
@@ -331,7 +359,8 @@ async def _stream(
     deadline = t0
     for _t_nominal, target, v_cmd in samples:
         deadline += period
-        resp = await driver._request(_a4_frame(target - offset, cap_dps))
+        cap = speed_cap(v_cmd, cap_dps, cap_track, cap_floor_dps)
+        resp = await driver._request(_a4_frame(target - offset, cap))
         iq, speed = _decode_a4_reply(resp)
         fine = await driver._request(bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0]))
         pos = struct.unpack_from("<i", fine, 4)[0] * (0.01 * math.pi / 180.0) + offset
@@ -426,6 +455,24 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--cap", type=float, default=60.0, help="0xA4 speed cap, deg/s (default: 60)"
     )
     p.add_argument(
+        "--cap-track",
+        type=float,
+        default=0.0,
+        help="Make the per-command speed cap follow the wave: cap = this × |commanded "
+        "speed| (floored at --cap-floor, never above --cap). 0 (default) = fixed --cap. "
+        f"With --accel {_ACCEL_STEP_FOLLOW} a fixed cap lets the planner burst through "
+        "each 200 Hz step at the cap and idle the rest of the tick (4x the current "
+        "spread on the elbow); 1.1-1.2 keeps it moving continuously at about the "
+        "commanded speed.",
+    )
+    p.add_argument(
+        "--cap-floor",
+        type=float,
+        default=1.0,
+        help="Lowest cap --cap-track may set, deg/s, so a stationary or reversing "
+        "target can still be corrected (default: 1)",
+    )
+    p.add_argument(
         "--accel",
         type=int,
         default=None,
@@ -514,6 +561,11 @@ async def _run(args: argparse.Namespace) -> None:
         f"  {args.mode} about {math.degrees(center):+.1f}° ±{args.amp:g}°, "
         + (f"{args.freq:g} Hz" if args.mode == "sine" else f"{args.speed:g} deg/s")
         + f", {args.duration:g} s at {args.rate:g} Hz, speed cap {args.cap:g} dps"
+        + (
+            f" tracking {args.cap_track:g}× commanded speed (floor {args.cap_floor:g})"
+            if args.cap_track > 0
+            else ""
+        )
     )
 
     channel = resolve_channel(args)
@@ -602,7 +654,15 @@ async def _run(args: argparse.Namespace) -> None:
             live = LiveStream("sine", joint)
             print("  Running ...")
             log, reason = await _stream(
-                motor, driver, samples, args.cap, args.rate, guard, live
+                motor,
+                driver,
+                samples,
+                args.cap,
+                args.rate,
+                guard,
+                live,
+                cap_track=args.cap_track,
+                cap_floor_dps=args.cap_floor,
             )
             live.flush()
             if reason is not None:
@@ -691,6 +751,8 @@ async def _run(args: argparse.Namespace) -> None:
             "duration_s": args.duration,
             "rate_hz": args.rate,
             "cap_dps": args.cap,
+            "cap_track": args.cap_track,
+            "cap_floor_dps": args.cap_floor,
             "accel": list(accel_used) if accel_used else None,
             "persist": args.persist,
         }

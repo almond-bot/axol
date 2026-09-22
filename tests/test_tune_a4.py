@@ -136,3 +136,22 @@ class MetricsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpeedCapTest(unittest.TestCase):
+    def test_zero_track_is_the_fixed_cap(self) -> None:
+        self.assertEqual(a4.speed_cap(math.radians(3.0), 60.0, 0.0, 1.0), 60.0)
+        self.assertEqual(a4.speed_cap(0.0, 60.0, 0.0, 1.0), 60.0)
+
+    def test_tracking_cap_follows_commanded_speed_with_floor_and_ceiling(self) -> None:
+        # 3 deg/s commanded, 1.2× → 3.6 dps, sign-independent.
+        self.assertAlmostEqual(a4.speed_cap(math.radians(3.0), 60.0, 1.2, 1.0), 3.6)
+        self.assertAlmostEqual(a4.speed_cap(-math.radians(3.0), 60.0, 1.2, 1.0), 3.6)
+        # A stationary target keeps the floor so it can still be corrected …
+        self.assertEqual(a4.speed_cap(0.0, 60.0, 1.2, 1.0), 1.0)
+        # … and the fixed cap remains the ceiling.
+        self.assertEqual(a4.speed_cap(math.radians(100.0), 60.0, 1.2, 1.0), 60.0)
+
+    def test_frame_carries_the_per_sample_cap(self) -> None:
+        frame = a4._a4_frame(0.0, a4.speed_cap(math.radians(3.0), 60.0, 1.2, 1.0))
+        self.assertEqual(int.from_bytes(frame[2:4], "little"), 4)  # 3.6 rounds to 4 dps

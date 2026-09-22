@@ -370,6 +370,24 @@ const TABS: WbTab[] = [
       { key: "rate", label: "rate (Hz)", type: "number", placeholder: "200" },
       { key: "cap", label: "speed cap (°/s)", type: "number", placeholder: "60" },
       {
+        key: "cap_track",
+        label: "cap tracks speed ×",
+        type: "number",
+        placeholder: "0",
+        hint:
+          "0 = fixed cap. With planner accel 60000 a fixed cap lets the planner burst " +
+          "through each 200 Hz step at the cap and idle the rest of the tick (4× the " +
+          "current spread on the elbow); 1.1–1.2 sets the per-command cap to that " +
+          "multiple of the commanded speed so the joint moves continuously",
+      },
+      {
+        key: "cap_floor",
+        label: "cap floor (°/s)",
+        type: "number",
+        placeholder: "1",
+        hint: "lowest cap the tracking cap may set, so a stationary target still corrects",
+      },
+      {
         key: "accel",
         label: "planner accel (dps/s)",
         type: "text",
@@ -1132,6 +1150,8 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
     put("duration", p.duration_s)
     put("rate", p.rate_hz)
     put("cap", p.cap_dps)
+    if (typeof p.cap_track === "number" && p.cap_track > 0) put("cap_track", p.cap_track)
+    if (typeof p.cap_track === "number" && p.cap_track > 0) put("cap_floor", p.cap_floor_dps)
     if (Array.isArray(p.accel) && typeof p.accel[0] === "number") out["accel"] = String(p.accel[0])
     for (const k of ["position_kp", "position_ki", "position_kd", "speed_kp", "speed_ki"]) {
       const v = g[k]
