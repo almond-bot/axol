@@ -27,9 +27,22 @@ class ConfigTest(unittest.TestCase):
                 self.assertEqual(joint.firmware.as_dict(), _X8)
                 self.assertIsNone(joint.firmware.position_ki)
 
+    def test_elbow_carries_its_own_set_on_both_arms(self) -> None:
+        cfg = AxolConfig()
+        for arm in (cfg.left, cfg.right):
+            self.assertEqual(
+                arm.elbow.firmware.as_dict(),
+                {
+                    "position_kp": 0.2,
+                    "position_kd": 0.1,
+                    "speed_kp": 0.1,
+                    "speed_ki": 1e-5,
+                },
+            )
+
     def test_other_joints_leave_the_motor_alone(self) -> None:
         arm = AxolConfig().left
-        for name in ("shoulder_3", "elbow", "wrist_1", "wrist_2", "wrist_3"):
+        for name in ("shoulder_3", "wrist_1", "wrist_2", "wrist_3"):
             self.assertEqual(getattr(arm, name).firmware.as_dict(), {})
 
     def test_defaults_survive_the_stiffness_blend(self) -> None:
@@ -154,21 +167,33 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    async def test_cold_shoulders_get_the_config_gains_and_others_are_untouched(
+    async def test_cold_configured_joints_get_their_gains_and_others_are_untouched(
         self,
     ) -> None:
-        s1, s2, elbow = _FakeMotor(_stock()), _FakeMotor(_stock()), _FakeMotor(_stock())
-        arm = _arm({Joint.SHOULDER_1: s1, Joint.SHOULDER_2: s2, Joint.ELBOW: elbow})
+        s1, s2, elbow, s3 = (_FakeMotor(_stock()) for _ in range(4))
+        arm = _arm(
+            {
+                Joint.SHOULDER_1: s1,
+                Joint.SHOULDER_2: s2,
+                Joint.ELBOW: elbow,
+                Joint.SHOULDER_3: s3,
+            }
+        )
         with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:
             await apply_firmware_gains(
-                arm, [Joint.SHOULDER_1, Joint.SHOULDER_2, Joint.ELBOW]
+                arm, [Joint.SHOULDER_1, Joint.SHOULDER_2, Joint.ELBOW, Joint.SHOULDER_3]
             )
         for motor in (s1, s2):
             self.assertAlmostEqual(motor.store[_MA_PID_IDX["position_kp"]], 0.3, 6)
+        self.assertAlmostEqual(elbow.store[_MA_PID_IDX["position_kp"]], 0.2, 6)
+        for motor in (s1, s2, elbow):
             self.assertAlmostEqual(motor.store[_MA_PID_IDX["speed_kp"]], 0.1, 6)
             self.assertAlmostEqual(motor.store[_MA_PID_IDX["speed_ki"]], 1e-5, 9)
-        self.assertEqual(elbow.writes, [])
-        self.assertEqual(sum("written to ROM" in m for m in logs.output), 2)
+            # position_kd 0.1 is already the stock value: read, never written.
+            self.assertNotIn(_MA_PID_IDX["position_kd"], [i for i, _ in motor.writes])
+        # shoulder_3 has no firmware block configured.
+        self.assertEqual(s3.writes, [])
+        self.assertEqual(sum("written to ROM" in m for m in logs.output), 3)
 
     async def test_held_joints_are_not_in_the_list_so_nothing_is_written(self) -> None:
         s1 = _FakeMotor(_stock())

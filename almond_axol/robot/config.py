@@ -364,6 +364,18 @@ _X8_FIRMWARE_GAINS = FirmwareGains(
     speed_ki=1e-5,
 )
 
+# The X6-P20 elbow's set (its stock position_kp is 0.15, speed_kp 0.01 on
+# firmware 2025070202): position_kp 0.2 with the shoulders' speed loop.
+# Chosen on 2026-09-21 after the elbow first tracked under 0xA4 at stock
+# gains — the earlier "elbow does not move" runs were the planner write,
+# not the loop (see ``tune.a4``). Same ROM write at enable, same a4-only.
+_X6_ELBOW_FIRMWARE_GAINS = FirmwareGains(
+    position_kp=0.2,
+    position_kd=0.1,
+    speed_kp=0.1,
+    speed_ki=1e-5,
+)
+
 
 @dataclass
 class ArmConfig:
@@ -462,6 +474,7 @@ class ArmConfig:
             # active at 9.55 Hz. Hardware step/replay A/Bs found that term
             # increased overshoot without removing a ring; firmware kd=5
             # settled the joint without the host-loop phase risk.
+            firmware=_X6_ELBOW_FIRMWARE_GAINS,
         )
     )
     wrist_1: JointConfig = field(
