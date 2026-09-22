@@ -120,6 +120,13 @@ def _hardware(config: AxolConfig) -> AxolHardware:
 
 
 class RealtimeConfigTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # Only the config text is exercised; no core is spawned, so CI needs
+        # no built axol-rt binary.
+        patcher = patch("almond_axol.rt.link.find_binary", return_value="/fake/axol-rt")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _joint_tokens(self, rt: Axol) -> dict[str, str]:
         out = {}
         for line in rt._config_text().splitlines():
