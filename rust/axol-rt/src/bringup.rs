@@ -89,6 +89,13 @@ pub enum WireMode {
     /// per tick for 0.01° position; the reply's torque channel is iq in
     /// amps, so measured torque is reported as NaN on these joints.
     A4,
+    /// Damiao position-velocity mode (0x100 + id, control-mode register 2):
+    /// the wrist firmware's own position → speed cascade (KP_APR/KP_ASR
+    /// registers, ACC/DEC ramps) tracks the streamed target under a speed
+    /// cap. The feedback frame is the MIT one, so position, velocity and
+    /// torque all come back with each command. Like `A4`, no host
+    /// feedforward reaches the motor.
+    Pv,
 }
 
 impl WireMode {
@@ -96,7 +103,17 @@ impl WireMode {
         match token {
             "mit" => Some(Self::Mit),
             "a4" => Some(Self::A4),
+            "pv" => Some(Self::Pv),
             _ => None,
+        }
+    }
+
+    /// The Damiao control-mode register value a wrist must be in for this
+    /// wire's command frame to be acted on.
+    pub fn dm_mode(self) -> u32 {
+        match self {
+            Self::Pv => proto::DM_MODE_POS_VEL,
+            Self::Mit | Self::A4 => proto::DM_MODE_MIT,
         }
     }
 }
@@ -292,14 +309,33 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
     for spec in specs.iter().filter(|s| s.motor_id >= 6) {
         let id = spec.motor_id as u16;
         let mode = read_dm_register(sock, id, proto::DM_REG_CTRL_MODE)?;
-        // Wrists run MIT (1); the gripper must already be in POSITION_FORCE
-        // (4), set by the Python side's calibration flow before arming.
-        let expected = if spec.gripper { 4.0 } else { 1.0 };
-        if mode != expected {
-            return Err(err(format!(
-                "{} (0x{id:02X}): control mode {mode} (expected {expected}) — not enabling",
-                spec.joint
-            )));
+        if spec.gripper {
+            // The gripper must already be in POSITION_FORCE (4), set by the
+            // Python side's calibration flow before arming.
+            let expected = proto::DM_MODE_POS_FORCE as f64;
+            if mode != expected {
+                return Err(err(format!(
+                    "{} (0x{id:02X}): control mode {mode} (expected {expected}) — not enabling",
+                    spec.joint
+                )));
+            }
+        } else {
+            // A wrist runs in the mode its wire wants — MIT (1) or, for
+            // `wire_mode pv`, position-velocity (2). Put it there (RAM
+            // write, effective at once) rather than refusing: a wrist left
+            // in the other mode by the previous session is the normal case
+            // when the controller choice changes between runs.
+            let wanted = spec.wire.dm_mode();
+            if mode != wanted as f64 {
+                write_dm_register(sock, id, proto::DM_REG_CTRL_MODE, wanted.to_le_bytes())?;
+                let now = read_dm_register(sock, id, proto::DM_REG_CTRL_MODE)?;
+                if now != wanted as f64 {
+                    return Err(err(format!(
+                        "{} (0x{id:02X}): control mode {now} after asking for {wanted} — not enabling",
+                        spec.joint
+                    )));
+                }
+            }
         }
         let p_max = read_dm_register(sock, id, proto::DM_REG_PMAX)?;
         let v_max = read_dm_register(sock, id, proto::DM_REG_VMAX)?;
@@ -374,6 +410,18 @@ pub fn read_dm_register(sock: &CanSock, motor_id: u16, rid: u8) -> io::Result<f6
     Err(io::Error::other(format!(
         "damiao 0x{motor_id:02X}: register {rid} read timed out"
     )))
+}
+
+/// Register write (RAM, 0x55). The motor does not acknowledge; callers
+/// read the register back. A short settle lets the firmware apply it before
+/// the readback.
+pub fn write_dm_register(sock: &CanSock, motor_id: u16, rid: u8, value: [u8; 4]) -> io::Result<()> {
+    sock.send(
+        proto::DM_REG_ARB,
+        &proto::dm_write_register(motor_id, rid, value),
+    )?;
+    std::thread::sleep(Duration::from_millis(5));
+    Ok(())
 }
 
 /// Enable every cold motor. Motors found holding by [`prepare`] are left

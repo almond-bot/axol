@@ -9,7 +9,25 @@ use std::time::{Duration, Instant};
 
 const JOINTS: usize = 8;
 const WINDOW: Duration = Duration::from_secs(2);
-const TARGET_HZ: f64 = 240.0;
+/// The loop rates the core runs at: 240 Hz on the impedance controller,
+/// 400 Hz on the firmware position controller (`AxolConfig.controller`).
+/// The passive observer is not told which; it takes the one nearest the
+/// measured command rate, so deadline misses are counted against the loop
+/// that is actually running.
+const LOOP_RATES_HZ: [f64; 2] = [240.0, 400.0];
+
+/// The nominal loop rate behind a measured command rate (240 Hz until the
+/// measurement exists).
+fn target_hz(command_hz: Option<f64>) -> f64 {
+    let Some(hz) = command_hz else {
+        return LOOP_RATES_HZ[0];
+    };
+    LOOP_RATES_HZ
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - hz).abs().total_cmp(&(b - hz).abs()))
+        .unwrap_or(LOOP_RATES_HZ[0])
+}
 
 #[derive(Default)]
 struct JointEvents {
@@ -133,7 +151,8 @@ impl TimingAggregator {
                 headroom.push(period - cycle);
             }
         }
-        let nominal = 1.0 / TARGET_HZ;
+        let target = target_hz(rate(&commands));
+        let nominal = 1.0 / target;
         let deadline_misses: usize = command_dt
             .iter()
             .map(|dt| ((*dt / nominal + 0.5) as usize).saturating_sub(1))
@@ -162,8 +181,8 @@ impl TimingAggregator {
                 .map(|t| now.duration_since(*t).as_secs_f64() * 1e3)
         };
         Some(format!(
-            "{{\"sourceJoint\":\"{}\",\"targetHz\":240.0,\"commandHz\":{},\"feedbackHz\":{},\"commandPeriodMs\":{},\"feedbackPeriodMs\":{},\"commandJitterP95Ms\":{},\"feedbackJitterP95Ms\":{},\"commandGapMaxMs\":{},\"feedbackGapMaxMs\":{},\"commandBatchP50Ms\":{},\"commandBatchP95Ms\":{},\"feedbackBatchP95Ms\":{},\"canCycleP50Ms\":{},\"canCycleP95Ms\":{},\"canUtilizationP95Pct\":{},\"canHeadroomP05Ms\":{},\"roundTripP50Ms\":{},\"roundTripP95Ms\":{},\"deadlineMisses\":{},\"missedFeedback\":{},\"commandAgeMs\":{},\"feedbackAgeMs\":{}}}",
-            names[slot], js(rate(&commands)), js(rate(&feedback)), js(median(&command_dt).map(ms)),
+            "{{\"sourceJoint\":\"{}\",\"targetHz\":{},\"commandHz\":{},\"feedbackHz\":{},\"commandPeriodMs\":{},\"feedbackPeriodMs\":{},\"commandJitterP95Ms\":{},\"feedbackJitterP95Ms\":{},\"commandGapMaxMs\":{},\"feedbackGapMaxMs\":{},\"commandBatchP50Ms\":{},\"commandBatchP95Ms\":{},\"feedbackBatchP95Ms\":{},\"canCycleP50Ms\":{},\"canCycleP95Ms\":{},\"canUtilizationP95Pct\":{},\"canHeadroomP05Ms\":{},\"roundTripP50Ms\":{},\"roundTripP95Ms\":{},\"deadlineMisses\":{},\"missedFeedback\":{},\"commandAgeMs\":{},\"feedbackAgeMs\":{}}}",
+            names[slot], js(Some(target)), js(rate(&commands)), js(rate(&feedback)), js(median(&command_dt).map(ms)),
             js(median(&feedback_dt).map(ms)), js(jitter(&command_dt)), js(jitter(&feedback_dt)),
             js(command_dt.iter().copied().reduce(f64::max).map(ms)),
             js(feedback_dt.iter().copied().reduce(f64::max).map(ms)),
@@ -277,7 +296,28 @@ mod tests {
             .snapshot_json(start + Duration::from_millis(14))
             .unwrap();
         assert!(json.contains("\"sourceJoint\":\"SHOULDER_1\""));
+        assert!(json.contains("\"targetHz\":240.000000000"));
         assert!(json.contains("\"commandHz\":240.000000000"));
         assert!(json.contains("\"roundTripP95Ms\":1.000000000"));
+    }
+
+    #[test]
+    fn a_400_hz_stream_is_judged_against_400_hz() {
+        assert_eq!(target_hz(None), 240.0);
+        assert_eq!(target_hz(Some(238.0)), 240.0);
+        assert_eq!(target_hz(Some(396.0)), 400.0);
+        let mut timing = TimingAggregator::new();
+        let start = Instant::now();
+        for tick in 0..8 {
+            let at = start + Duration::from_secs_f64(tick as f64 / 400.0);
+            timing.observe(0x141, &[0xA4, 0, 0, 0, 0, 0, 0, 0], at);
+            timing.observe(0x501, &[0; 8], at + Duration::from_micros(500));
+        }
+        let json = timing
+            .snapshot_json(start + Duration::from_millis(19))
+            .unwrap();
+        assert!(json.contains("\"targetHz\":400.000000000"), "{json}");
+        // 400 Hz ticks are not 240 Hz deadline misses.
+        assert!(json.contains("\"deadlineMisses\":0"), "{json}");
     }
 }

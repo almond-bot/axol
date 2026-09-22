@@ -22,12 +22,14 @@ The arm moves to the motion's start and back to rest on collision-aware planned 
 | `--torque-threshold NM` | Contact watchdog threshold (default: 8.0; 0 disables) |
 | `--no-save-run` | Don't persist the run artifact (dry run) |
 | `--a4 SIDE.JOINT` | Drive one MyActuator joint with the firmware position loop (0xA4) instead of the MIT frame for this run, e.g. `right.shoulder_1`; repeatable. No compliance, no host feed-forward, NaN torque on that joint — see `wire_mode` in the [config reference](/cli/configuration) |
+| `--controller impedance\|position` | Which control law the core runs the arms on for this run: `impedance` (the config default) is the production MIT frame at 240 Hz with the host feed-forward; `position` puts every joint on its motor's own position loop — MyActuator 0xA4, Damiao position-velocity, the `firmware.*` gains — streamed at 400 Hz. Stiff, no host feed-forward, NaN torque on the MyActuator joints. Same motion and scoring, so the two controllers compare directly; `--a4` still adds single joints inside the impedance controller. See `controller` in the [config reference](/cli/configuration) |
 | `--arms both\|left\|right` | Which arm(s) to bring up and drive (default: `both`). The other arm's bus is left untouched, so an unpowered arm or a single-arm bench does not block the run |
 | `--no-gripper` | Run on the gripperless SKU |
 
 ```bash
 axol tune.motion --motion reach-and-place                             # baseline run
 axol tune.motion --motion reach-and-place --gain left.elbow.kd=4.5    # A/B a gain
+axol tune.motion --motion slow_osc --controller position               # firmware position loops, 400 Hz
 axol tune.motion --motion reach-and-place --gain shoulder_3.kd_host=8 --label "s3 damp"
 axol tune.motion --motion reach-and-place --noise network             # raw noise, no filters
 axol tune.motion --motion reach-and-place --noise network --filter    # same noise, stack on

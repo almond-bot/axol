@@ -37,6 +37,7 @@ Examples:
     axol tune.motion --motion reach-and-place --stiffness 0.8
     axol tune.motion --motion reach-and-place --ik   # drive through the IK solver
     axol tune.motion --motion slow_osc --arms right  # one arm only
+    axol tune.motion --motion slow_osc --controller position  # firmware loops, 400 Hz
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ import numpy as np
 
 from ...constants import ARM_JOINTS
 from ...robot import Axol
-from ...robot.config import AxolConfig
+from ...robot.config import CONTROLLERS, AxolConfig
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
@@ -255,6 +256,18 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "e.g. right.shoulder_1. Repeatable. The joint then has no compliance, no "
         "host feedforward and NaN torque telemetry (contact watchdog blind on it); "
         "everything else about the replay is unchanged, so runs compare directly.",
+    )
+    p.add_argument(
+        "--controller",
+        choices=CONTROLLERS,
+        default=None,
+        help="Which control law the core runs the arms on for this run. "
+        "'impedance' (the config default) is the production MIT frame at 240 Hz "
+        "with the host feedforward; 'position' puts every joint on its motor's "
+        "own position loop (MyActuator 0xA4, Damiao position-velocity; the "
+        "firmware.* gains) streamed at 400 Hz — stiff, no host feedforward, "
+        "NaN torque on the MyActuator joints. --a4 still adds single joints "
+        "inside the impedance controller.",
     )
     p.add_argument(
         "--arms",
@@ -499,6 +512,17 @@ async def _run(args: argparse.Namespace) -> None:
             raise SystemExit(f"--a4: unknown joint {joint!r}")
         getattr(getattr(config, side), joint).wire_mode = "a4"
         print(f"  wire mode: {side}.{joint} = a4 (firmware position loop)")
+    if args.controller is not None:
+        config.controller = args.controller
+    print(
+        f"  controller: {config.controller} "
+        f"({config.loop_hz:.0f} Hz core loop"
+        + (
+            ", every joint on its firmware position loop)"
+            if config.controller == "position"
+            else ")"
+        )
+    )
 
     # The kinematics stack plans the collision-aware approach/return moves.
     print("Loading kinematics solver (JIT compile may take a few seconds) ...")
@@ -760,6 +784,9 @@ async def _run(args: argparse.Namespace) -> None:
                 # Joints driven on the firmware position loop (--a4) for this
                 # run, so the dashboard can re-arm the same controller split.
                 "a4": list(args.a4),
+                # The control law the whole run ran on (impedance at 240 Hz
+                # or the firmware position loops at 400 Hz).
+                "controller": config.controller,
                 **stream_info,
             },
             label=args.label,

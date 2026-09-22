@@ -32,7 +32,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
-from ..constants import ARM_JOINTS
+from ..constants import ARM_JOINTS, Joint
+from ..motor.motor import _JOINT_CONFIG
 from .calibration import (
     CALIBRATION_PATH,
     FACTORY_CALIBRATION_PATH,
@@ -264,27 +265,35 @@ class JointConfig:
         dither_hz: Dither frequency; above the arm's structural modes
                   (~35 Hz), below the core's 120 Hz Nyquist.
         wire_mode: Which frame the realtime core commands this joint with
-                  (MyActuator joints only; Damiao joints, the gripper,
-                  gravity comp and the limp fallback always use MIT).
-                  ``"mit"`` (default) is the impedance frame and the
-                  production law. ``"a4"`` hands the joint to the firmware's
-                  own position loop (0xA4 absolute position closed-loop,
-                  speed-capped at the tracker's velocity limit) from its
-                  first frame, holds included — the X6-P20's 2025070202
-                  firmware ignores 0xA4 after an MIT frame until the motor
-                  is reset, so an a4 joint hand-guided in gravity comp needs
-                  a re-enable before it tracks again. Its position/speed PI
-                  on the motor-side encoder is the candidate for creeping
-                  through the X8-P20's stick-slip; its gains are the
-                  ``firmware`` block below and its stored planner
-                  acceleration must be 0 or 60000 (see ``tune.a4``).
-                  Costs: no compliance (the joint holds position with
-                  integral action and pushes back up to motor torque), no
-                  host feedforward (gravity, friction, stiction, dither and
-                  damping are all inert), and no torque telemetry — the
-                  reply carries q-axis current, so measured torque reads
-                  NaN and the contact watchdog is blind on that joint.
-                  Position stays 0.01° via a paired 0x92 read each tick.
+                  (the gripper, gravity comp and the limp fallback always
+                  use MIT). ``"mit"`` (default) is the impedance frame and
+                  the production law. ``"a4"`` hands a **MyActuator** joint
+                  to the firmware's own position loop (0xA4 absolute
+                  position closed-loop, speed-capped at the tracker's
+                  velocity limit) from its first frame, holds included —
+                  the X6-P20's 2025070202 firmware ignores 0xA4 after an
+                  MIT frame until the motor is reset, so an a4 joint
+                  hand-guided in gravity comp needs a re-enable before it
+                  tracks again. Its position/speed PI on the motor-side
+                  encoder is the candidate for creeping through the
+                  X8-P20's stick-slip; its gains are the ``firmware`` block
+                  below and its stored planner acceleration must be 0 or
+                  60000 (see ``tune.a4``). ``"pv"`` is the same thing for a
+                  **Damiao** wrist: its position-velocity mode (0x100+ID,
+                  control-mode register 2, which the core sets at bring-up
+                  and toggles back to MIT for limp / gravity comp), gains
+                  ``firmware.position_kp`` etc. in the KP_APR/KP_ASR
+                  registers. Costs of either: no compliance (the joint
+                  holds position with integral action and pushes back up to
+                  motor torque), no host feedforward (gravity, friction,
+                  stiction, dither and damping are all inert), and on a4 no
+                  torque telemetry — the reply carries q-axis current, so
+                  measured torque reads NaN and the contact watchdog is
+                  blind on that joint (a pv wrist keeps its torque channel).
+                  Position stays 0.01° on a4 via a paired 0x92 read.
+                  ``AxolConfig.controller`` ``"position"`` sets every
+                  joint's position wire mode at once (and runs the core at
+                  400 Hz); this field is the per-joint override.
         stribeck_gain: Friction cancellation on *measured* velocity (see
                   :func:`almond_axol.robot.control.stribeck_excess`), as a
                   fraction of the measured static-minus-sliding excess.
@@ -890,6 +899,46 @@ def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
     )
 
 
+#: The two control laws the realtime core can run the arms on
+#: (:attr:`AxolConfig.controller`).
+#:
+#: ``"impedance"`` is the production MIT frame: host gravity / friction /
+#: inertia feedforward and host damping around the firmware PD, compliant,
+#: at 240 Hz. ``"position"`` hands every joint to its motor's own position
+#: loop — 0xA4 on the MyActuator joints, position-velocity on the Damiao
+#: wrists, gains from each joint's ``firmware`` block — streamed at 400 Hz,
+#: where the loop's target staircase (audible at 200 Hz) is gone. It is
+#: stiff: no compliance, no host feedforward, the contact watchdog blind on
+#: the MyActuator joints. The bus cannot carry every motor every tick at
+#: 400 Hz, so the core thins its schedule (wrists commanded on alternate
+#: ticks, one a4 fine-position read per tick round-robin, gripper in that
+#: rotation); the MyActuator commands themselves go out every tick.
+CONTROLLERS: tuple[str, ...] = ("impedance", "position")
+
+#: Realtime-core tick rate under each controller (see :data:`CONTROLLERS`).
+CONTROLLER_LOOP_HZ: dict[str, float] = {"impedance": 240.0, "position": 400.0}
+
+
+def position_wire_mode(joint: Joint) -> str:
+    """The firmware-position-loop wire token for an arm joint's vendor.
+
+    ``"a4"`` for the MyActuator joints (ids 1-5), ``"pv"`` for the Damiao
+    wrists.
+    """
+    return "pv" if _JOINT_CONFIG[joint].motor_id >= 6 else "a4"
+
+
+def _on_position_loops(arm: ArmConfig) -> ArmConfig:
+    """Every arm joint on its vendor's firmware position loop."""
+    return replace(
+        arm,
+        **{
+            j.value: replace(getattr(arm, j.value), wire_mode=position_wire_mode(j))
+            for j in ARM_JOINTS
+        },
+    )
+
+
 @dataclass
 class AxolConfig:
     """Top-level configuration for both arms and grippers.
@@ -935,6 +984,18 @@ class AxolConfig:
                          round-trips cleanly (loading a dumped config and
                          resolving it again is idempotent).
         right_stiffness: Same, for the **right** arm.
+        controller:      Which control law the realtime core runs the arms
+                         on — see :data:`CONTROLLERS`. ``"impedance"``
+                         (default) is the production MIT frame at 240 Hz.
+                         ``"position"`` puts every joint on its firmware
+                         position loop (``wire_mode`` ``a4`` / ``pv``, the
+                         ``firmware`` gains) at 400 Hz. Like stiffness it is
+                         baked into the per-joint ``wire_mode`` fields by
+                         :meth:`resolved`; a per-joint ``wire_mode`` set
+                         explicitly under ``"impedance"`` is kept, so one
+                         joint can still be tried on its firmware loop
+                         inside the impedance controller (``tune.motion
+                         --a4``).
     """
 
     left: ArmConfig = field(
@@ -947,6 +1008,12 @@ class AxolConfig:
     max_step_rad: float = 0.5
     left_stiffness: float | list[float] = 1.0
     right_stiffness: float | list[float] = 1.0
+    controller: str = "impedance"
+
+    @property
+    def loop_hz(self) -> float:
+        """The realtime-core tick rate this controller runs at."""
+        return CONTROLLER_LOOP_HZ[self.controller]
 
     def resolved(self) -> "AxolConfig":
         """Return a copy with stiffness baked into the ``left``/``right`` gains.
@@ -959,11 +1026,26 @@ class AxolConfig:
         applied once at the single robot-construction boundary
         (``Axol.__init__``) so every consumer sees consistent gains while
         the unresolved config stays safe to serialize and reload.
+
+        The ``controller`` is baked in the same way: ``"position"`` sets
+        every joint's ``wire_mode`` to its vendor's firmware position loop
+        (:func:`position_wire_mode`); ``"impedance"`` leaves the per-joint
+        fields as configured. The field itself is kept (the core reads its
+        loop rate from it).
         """
+        if self.controller not in CONTROLLERS:
+            raise ValueError(
+                f"controller {self.controller!r} is not one of {list(CONTROLLERS)}"
+            )
+        left = _apply_stiffness(self.left, self.left_stiffness)
+        right = _apply_stiffness(self.right, self.right_stiffness)
+        if self.controller == "position":
+            left = _on_position_loops(left)
+            right = _on_position_loops(right)
         return replace(
             self,
-            left=_apply_stiffness(self.left, self.left_stiffness),
-            right=_apply_stiffness(self.right, self.right_stiffness),
+            left=left,
+            right=right,
             left_stiffness=1.0,
             right_stiffness=1.0,
         )

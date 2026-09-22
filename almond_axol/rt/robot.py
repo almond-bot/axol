@@ -101,7 +101,12 @@ _N_ARM = len(ARM_JOINTS)
 _LIMP_KD = 0.25
 
 # Wire-mode tokens the core understands (``bringup::WireMode::parse``).
-_WIRE_MODES = frozenset({"mit", "a4"})
+_WIRE_MODES = frozenset({"mit", "a4", "pv"})
+#: The firmware-position-loop tokens and the motor ids they are valid for:
+#: ``a4`` is a MyActuator command (ids 1-5), ``pv`` a Damiao one (the
+#: wrists, 6-7). The core would refuse neither on the wire — the motor would
+#: simply ignore the frame — so the mismatch is caught here.
+_WIRE_VENDOR_IDS = {"a4": range(1, 6), "pv": range(6, 8)}
 
 
 class Axol(RobotBase):
@@ -140,7 +145,7 @@ class Axol(RobotBase):
         left_joints: Iterable[Joint] | None = None,
         right_joints: Iterable[Joint] | None = None,
         *,
-        loop_hz: float = 240.0,
+        loop_hz: float | None = None,
         watchdog_ms: float = 150.0,
         max_vel: float = 2.0 * math.pi,
         max_accel: float = 7.0 * math.pi,
@@ -174,7 +179,10 @@ class Axol(RobotBase):
         changing:
 
         Args:
-            loop_hz: Core tick rate.
+            loop_hz: Core tick rate. ``None`` (default) follows
+                ``config.controller``: 240 Hz on the impedance controller,
+                400 Hz on the firmware position controller
+                (:data:`almond_axol.robot.config.CONTROLLER_LOOP_HZ`).
             watchdog_ms: Core watchdog — how long it holds the last target
                 without a fresh one before treating the host as gone.
             max_vel: Teleop joint-velocity cap (rad/s) — the core's tracker
@@ -206,7 +214,7 @@ class Axol(RobotBase):
         cls,
         hardware: AxolHardware,
         *,
-        loop_hz: float = 240.0,
+        loop_hz: float | None = None,
         watchdog_ms: float = 150.0,
         max_vel: float = 2.0 * math.pi,
         max_accel: float = 7.0 * math.pi,
@@ -233,13 +241,15 @@ class Axol(RobotBase):
         self,
         hardware: AxolHardware,
         *,
-        loop_hz: float,
+        loop_hz: float | None,
         watchdog_ms: float,
         max_vel: float,
         max_accel: float,
         record: str | None,
     ) -> None:
         self._robot = hardware
+        if loop_hz is None:
+            loop_hz = self._axol_config().loop_hz
         # ``_core_started``: an ``axol-rt`` process exists for this session
         # (from ``enable`` until teardown) — teardown must go through the
         # core. ``_armed``: the core holds the buses (from its ``arm`` ack
@@ -306,6 +316,10 @@ class Axol(RobotBase):
                 "enable(), or after disable()."
             )
 
+    def _axol_config(self) -> AxolConfig:
+        """The (resolved) robot config the arms were built from."""
+        return self._arms()[0][1]._config
+
     def _arms(self) -> list[tuple[int, AxolArm]]:
         out = []
         if self._robot.left is not None:
@@ -315,15 +329,24 @@ class Axol(RobotBase):
         return out
 
     def _config_text(self) -> str:
-        def _wire_token(mode: str) -> str:
+        def _wire_token(mode: str, joint: Joint, motor_id: int) -> str:
             token = str(mode).lower()
             if token not in _WIRE_MODES:
                 raise ValueError(
                     f"wire_mode {mode!r} is not one of {sorted(_WIRE_MODES)}"
                 )
+            ids = _WIRE_VENDOR_IDS.get(token)
+            if ids is not None and motor_id not in ids:
+                vendor = "MyActuator" if token == "a4" else "Damiao"
+                raise ValueError(
+                    f"wire_mode {token!r} is the {vendor} position loop; "
+                    f"{joint.value} (motor {motor_id}) is not a {vendor} motor — "
+                    f"use {'pv' if token == 'a4' else 'a4'}, or "
+                    "AxolConfig.controller = 'position' to pick per vendor"
+                )
             return token
 
-        max_step = self._arms()[0][1]._config.max_step_rad
+        max_step = self._axol_config().max_step_rad
         lines = [
             *config_header(),
             f"loop_hz {self._loop_hz}",
@@ -352,7 +375,7 @@ class Axol(RobotBase):
                     f"{f.fc} {f.k} {f.fv} {f.fo} "
                     f"{gains.stiction_gain} {math.radians(gains.stiction_err_deg)} "
                     f"{gains.stiction_load_gain} {gains.dither_nm} {gains.dither_hz} "
-                    f"{_wire_token(gains.wire_mode)} "
+                    f"{_wire_token(gains.wire_mode, j, motor_id)} "
                     f"{gains.stribeck_gain} {gains.stribeck_dfs} "
                     f"{gains.stribeck_load_gain} {gains.stribeck_vs} {f.fl} "
                     f"{gains.stribeck_pole}"
@@ -364,20 +387,31 @@ class Axol(RobotBase):
         return "\n".join(lines) + "\n"
 
     def _warn_wire_modes(self) -> None:
-        a4 = [
+        firmware = [
             f"{'left' if side == 0 else 'right'}.{j.value}"
             for side, arm in self._arms()
             for j in ARM_JOINTS
             if j in arm.motors
-            and str(getattr(arm._arm_config, j.value).wire_mode).lower() == "a4"
+            and str(getattr(arm._arm_config, j.value).wire_mode).lower() in ("a4", "pv")
         ]
-        if a4:
+        if not firmware:
+            return
+        controller = self._axol_config().controller
+        if controller == "position":
             _logger.warning(
-                "rt: %s on the firmware position loop (wire_mode a4): no "
-                "compliance, no host feedforward, torque telemetry NaN — the "
-                "contact watchdog cannot see these joints",
-                ", ".join(a4),
+                "rt: position controller — every joint on its firmware position "
+                "loop (a4 / pv) at %.0f Hz: no compliance, no host feedforward, "
+                "torque telemetry NaN on the MyActuator joints — the contact "
+                "watchdog cannot see them",
+                self._loop_hz,
             )
+            return
+        _logger.warning(
+            "rt: %s on the firmware position loop (wire_mode a4 / pv): no "
+            "compliance, no host feedforward, torque telemetry NaN on a4 joints "
+            "— the contact watchdog cannot see these joints",
+            ", ".join(firmware),
+        )
 
     async def enable(self, hold: bool = True) -> None:
         """Bring every motor up.

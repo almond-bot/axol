@@ -453,6 +453,23 @@ const TABS: WbTab[] = [
     presets: {},
     fields: [
       { key: "motion", label: "motion", type: "select", options: [] },
+      {
+        key: "controller",
+        label: "controller",
+        type: "select",
+        options: ["impedance", "position"],
+        placeholder: "impedance",
+        width: "w-40",
+        hint:
+          "impedance (240 Hz) is the production MIT frame: host gravity, " +
+          "friction, inertia and damping feed-forward around the firmware PD, " +
+          "compliant. position (400 Hz) hands every joint to its motor's own " +
+          "position loop — MyActuator 0xA4, Damiao position-velocity, the gains " +
+          "on the Firmware-loop tab — streamed at 400 Hz, where the loop's " +
+          "target staircase is gone: stiff, no host feed-forward, NaN torque " +
+          "on the MyActuator joints (contact watchdog blind there). Same " +
+          "motion, same scoring, so the two controllers compare directly.",
+      },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
       { key: "gain", label: "gains — edit a cell to override it for this run", type: "overrides" },
       {
@@ -460,14 +477,14 @@ const TABS: WbTab[] = [
         label: "controller per joint — click a cell to put that joint on the firmware loop",
         type: "wire",
         hint:
-          "impedance is the production MIT frame with the host's gravity, " +
-          "friction and damping feed-forward; firmware hands the joint to the " +
-          "motor's own 0xA4 position loop (the gains on the Firmware-loop tab, " +
-          "written to ROM at enable) for this run only — no compliance, no host " +
-          "feed-forward and NaN torque telemetry on that joint. Everything else " +
-          "about the replay is unchanged, so runs compare directly. Only " +
-          "MyActuator joints have a firmware loop; the Damiao wrists stay on " +
-          "impedance. A joint already configured wire_mode a4 is pinned.",
+          "inside the impedance controller, single MyActuator joints can go on " +
+          "their 0xA4 firmware loop for this run only (--a4 side.joint), the rest " +
+          "staying on impedance — no compliance, no host feed-forward and NaN " +
+          "torque telemetry on that joint. Everything else about the replay is " +
+          "unchanged, so runs compare directly. The Damiao wrists' firmware loop " +
+          "(position-velocity) comes with the position controller above, which " +
+          "puts every joint on its firmware loop at 400 Hz. A joint already " +
+          "configured wire_mode a4 is pinned.",
       },
       {
         key: "ik",
@@ -1207,6 +1224,7 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       break
     case "motion": {
       put("motion", p.motion)
+      put("controller", p.controller)
       put("stiffness", p.stiffness)
       put("noise", p.noise)
       if (p.ik === true) out["ik"] = "true"
