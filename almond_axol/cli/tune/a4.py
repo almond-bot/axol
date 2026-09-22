@@ -60,7 +60,7 @@ from typing import Any
 import numpy as np
 
 from ...constants import ARM_JOINTS, Joint
-from ...motor import CanBus, ControlMode, Motor
+from ...motor import CanBus, ControlMode, Motor, MotorError
 from ...motor.myactuator import _MA_PID_IDX, MyActuatorMotor
 from ...tuning import (
     JointFrameMotor,
@@ -94,6 +94,10 @@ _FLASH_SETTLE_S = 0.3
 _ACCEL_STEP_FOLLOW = 60000
 
 GAIN_NAMES: tuple[str, ...] = tuple(_MA_PID_IDX)
+
+#: A joint held on its own firmware position loop while another joint runs
+#: the wave should not move; past this (rad, ~1°) it let go or sagged.
+_HOLD_DRIFT_TOL = math.radians(1.0)
 
 #: Position error (rad) past which the wave is abandoned — the loop is not
 #: following at all (planner in profiled mode, or a runaway).
@@ -697,6 +701,36 @@ async def _run(args: argparse.Namespace) -> None:
                 cap_floor_dps=args.cap_floor,
             )
             live.flush()
+            # The other joints were parked on their own 0xA4 loops and then
+            # received no frames for the whole wave. Say so if any let go:
+            # the elbow was found several degrees off rest across runs
+            # (2026-09-22), and a motor with the communication-interruption
+            # protection (0xB3) armed cuts its output when the bus goes quiet
+            # on it — exactly a wave on another joint.
+            drifted: list[str] = []
+            for j, jm in motors.items():
+                if j == joint:
+                    continue
+                hold = other_targets.get(j, 0.0)
+                try:
+                    pos = await jm.get_position()
+                except MotorError:
+                    drifted.append(f"{j.value} (no position reply)")
+                    continue
+                if abs(pos - hold) > _HOLD_DRIFT_TOL:
+                    drifted.append(
+                        f"{j.value} {math.degrees(pos - hold):+.1f}° off its "
+                        f"{math.degrees(hold):+.0f}° hold"
+                    )
+            if drifted:
+                print(
+                    "  ! held joints moved during the wave: "
+                    + ", ".join(drifted)
+                    + " — a joint that lets go while another is streamed points at "
+                    "its communication-interruption protection (0xB3: output cut "
+                    "after N ms without a frame); the tuner sends held joints "
+                    "nothing during the wave"
+                )
             if reason is not None:
                 print(f"\n  ! aborted: {reason}")
                 if before_gains is not None:
