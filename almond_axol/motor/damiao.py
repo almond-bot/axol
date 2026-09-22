@@ -551,34 +551,49 @@ class DamiaoMotor(MotorDriver):
         """Bring the named loop gains to ``wanted`` in flash.
 
         ``wanted`` maps ``position_kp`` / ``position_ki`` / ``speed_kp`` /
-        ``speed_ki`` (KP_APR / KI_APR / KP_ASR / KI_ASR) to values. Each is
-        read first and written only when it differs beyond float32 rounding;
-        one 0xAA store follows if anything changed. Writes take effect at
-        once, so no reset is needed. Returns ``{name: (before, after)}``.
+        ``speed_ki`` (KP_APR / KI_APR / KP_ASR / KI_ASR) to values, plus
+        ``profile_acc``, the position-velocity profiler ramp written to ACC
+        and, negated, to DEC. Each is read first and written only when it
+        differs beyond float32 rounding; one 0xAA store follows if anything
+        changed. Writes take effect at once, so no reset is needed. Returns
+        ``{name: (before, after)}`` (``profile_acc`` reports the ACC side).
         """
         regs = {
             "speed_kp": _DM_REG_SPEED_KP,
             "speed_ki": _DM_REG_SPEED_KI,
             "position_kp": _DM_REG_POS_KP,
             "position_ki": _DM_REG_POS_KI,
+            "profile_acc": _DM_REG_ACC,
         }
         unknown = set(wanted) - set(regs)
         if unknown:
             raise ValueError(f"Damiao loop has no gain(s) {sorted(unknown)}")
         changed: dict[str, tuple[float, float]] = {}
         for name, value in wanted.items():
-            before = float(await self._read_register(regs[name]))
-            if abs(before - value) <= 1e-6 * max(1.0, abs(value)):
+            # The profiler ramp is one knob over two registers: ACC = +v,
+            # DEC = -v (the firmware wants the deceleration negative).
+            targets = (
+                [(_DM_REG_ACC, float(value)), (_DM_REG_DEC, -abs(float(value)))]
+                if name == "profile_acc"
+                else [(regs[name], float(value))]
+            )
+            before = float(await self._read_register(targets[0][0]))
+            matches = abs(before - targets[0][1]) <= 1e-6 * max(1.0, abs(targets[0][1]))
+            for rid, v in targets[1:]:
+                have = float(await self._read_register(rid))
+                matches = matches and abs(have - v) <= 1e-6 * max(1.0, abs(v))
+            if matches:
                 continue
-            await self._write_register(regs[name], float(value))
-            await asyncio.sleep(0.02)
-            after = float(await self._read_register(regs[name]))
-            if abs(after - value) > 1e-6 * max(1.0, abs(value)):
-                raise MotorError(
-                    f"Damiao motor {self._motor_id:#04x}: wrote {name}={value:g} but "
-                    f"reads back {after:g}"
-                )
-            changed[name] = (before, after)
+            for rid, v in targets:
+                await self._write_register(rid, v)
+                await asyncio.sleep(0.02)
+                after = float(await self._read_register(rid))
+                if abs(after - v) > 1e-6 * max(1.0, abs(v)):
+                    raise MotorError(
+                        f"Damiao motor {self._motor_id:#04x}: wrote {name}={v:g} "
+                        f"(register {rid}) but reads back {after:g}"
+                    )
+            changed[name] = (before, targets[0][1])
         if changed:
             await self._store_parameters()
             await asyncio.sleep(0.3)

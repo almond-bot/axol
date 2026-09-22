@@ -60,7 +60,8 @@ class ConfigTest(unittest.TestCase):
         for arm in (cfg.left, cfg.right):
             for name in ("wrist_2", "wrist_3"):
                 self.assertEqual(
-                    getattr(arm, name).firmware.as_dict(), {"position_kp": 400.0}
+                    getattr(arm, name).firmware.as_dict(),
+                    {"position_kp": 400.0, "profile_acc": 50.0},
                 )
 
     def test_the_gripper_has_no_firmware_block(self) -> None:
@@ -274,7 +275,7 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
     async def test_damiao_wrist_is_provisioned_through_its_registers_without_a_reset(
         self,
     ) -> None:
-        w2 = _FakeDamiao({25: 0.0037, 26: 0.002, 27: 54.0, 28: 0.0})
+        w2 = _FakeDamiao({25: 0.0037, 26: 0.002, 27: 54.0, 28: 0.0, 4: 50.0, 5: -50.0})
         arm = _arm({Joint.WRIST_2: w2})
         with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:
             await apply_firmware_gains(arm, [Joint.WRIST_2])
@@ -286,6 +287,32 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         w2.stores = 0
         await apply_firmware_gains(arm, [Joint.WRIST_2])
         self.assertEqual((w2.writes, w2.stores), ([], 0))
+
+    async def test_damiao_profile_ramp_writes_acc_and_negative_dec(self) -> None:
+        # Stock wrists: KP_APR 54, ramps ±2 rad/s². Config wants 400 and 50.
+        w2 = _FakeDamiao({25: 0.0037, 26: 0.002, 27: 54.0, 28: 0.0, 4: 2.0, 5: -2.0})
+        arm = _arm({Joint.WRIST_2: w2})
+        with self.assertLogs("almond_axol.robot.axol", level="INFO"):
+            await apply_firmware_gains(arm, [Joint.WRIST_2])
+        self.assertEqual((w2.store[27], w2.store[4], w2.store[5]), (400.0, 50.0, -50.0))
+        self.assertEqual(w2.stores, 1)
+        w2.writes.clear()
+        w2.stores = 0
+        await apply_firmware_gains(arm, [Joint.WRIST_2])
+        self.assertEqual((w2.writes, w2.stores), ([], 0))
+        # A DEC that drifted alone is repaired too.
+        w2.store[5] = -2.0
+        await apply_firmware_gains(arm, [Joint.WRIST_2])
+        self.assertEqual(w2.store[5], -50.0)
+        self.assertEqual(w2.stores, 1)
+
+    def test_wrists_carry_the_profile_ramp_and_myactuator_joints_do_not(self) -> None:
+        cfg = AxolConfig()
+        for arm in (cfg.left, cfg.right):
+            self.assertEqual(arm.wrist_2.firmware.profile_acc, 50.0)
+            self.assertEqual(arm.wrist_3.firmware.profile_acc, 50.0)
+            self.assertIsNone(arm.elbow.firmware.profile_acc)
+            self.assertIsNone(arm.shoulder_1.firmware.profile_acc)
 
     async def test_configured_gains_on_a_joint_without_a_loop_warn(self) -> None:
         arm = _arm({Joint.WRIST_2: object()})  # a driver of neither vendor

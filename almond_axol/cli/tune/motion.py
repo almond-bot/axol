@@ -85,6 +85,15 @@ _GAIN_FIELDS = (
     "friction.fv",
     "friction.fo",
     "friction.fl",
+    # Firmware position-loop gains (``firmware.*`` on JointConfig), for A/B
+    # runs of the position controller: written to the motors' ROM at enable
+    # like the config values they replace (so a run leaves them there).
+    "firmware.position_kp",
+    "firmware.position_ki",
+    "firmware.position_kd",
+    "firmware.speed_kp",
+    "firmware.speed_ki",
+    "firmware.profile_acc",
 )
 
 # Column names of a 14-wide motion row: left arm then right arm.
@@ -138,9 +147,10 @@ def _parse_gain_overrides(specs: list[str]) -> dict[tuple[str, str, str], float]
             value = float(raw)
         except ValueError:
             raise SystemExit(f"--gain: bad value in {spec!r} (want PATH=NUMBER)")
-        # ``[side.]joint.friction.fc``: fold the sub-field back into one token.
-        if len(parts) >= 2 and parts[-2] == "friction":
-            parts = parts[:-2] + [f"friction.{parts[-1]}"]
+        # ``[side.]joint.friction.fc`` / ``joint.firmware.speed_kp``: fold the
+        # sub-field back into one token.
+        if len(parts) >= 2 and parts[-2] in ("friction", "firmware"):
+            parts = parts[:-2] + [f"{parts[-2]}.{parts[-1]}"]
         if len(parts) == 3:
             sides, joint, fld = [parts[0]], parts[1], parts[2]
             if sides[0] not in ("left", "right"):
@@ -256,6 +266,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "e.g. right.shoulder_1. Repeatable. The joint then has no compliance, no "
         "host feedforward and NaN torque telemetry (contact watchdog blind on it); "
         "everything else about the replay is unchanged, so runs compare directly.",
+    )
+    p.add_argument(
+        "--loop-hz",
+        type=float,
+        default=None,
+        help="Realtime-core tick rate override. Default follows --controller "
+        "(240 Hz impedance, 400 Hz position). For A/B runs only: e.g. "
+        "--controller position --loop-hz 240 to separate the rate from the "
+        "controller, or --a4 right.elbow --loop-hz 400 for one joint on its "
+        "firmware loop at the position controller's rate. Above 300 Hz the "
+        "core thins the bus schedule (wrists on alternate ticks).",
     )
     p.add_argument(
         "--record",
@@ -510,6 +531,8 @@ async def _run(args: argparse.Namespace) -> None:
         target = getattr(getattr(config, side), joint)
         if fld.startswith("friction."):
             setattr(target.friction, fld.split(".", 1)[1], value)
+        elif fld.startswith("firmware."):
+            setattr(target.firmware, fld.split(".", 1)[1], value)
         else:
             setattr(target, fld, value)
         print(f"  gain override: {side}.{joint}.{fld} = {value}")
@@ -526,7 +549,7 @@ async def _run(args: argparse.Namespace) -> None:
         config.controller = args.controller
     print(
         f"  controller: {config.controller} "
-        f"({config.loop_hz:.0f} Hz core loop"
+        f"({(args.loop_hz or config.loop_hz):.0f} Hz core loop"
         + (
             ", every joint on its firmware position loop)"
             if config.controller == "position"
@@ -652,7 +675,9 @@ async def _run(args: argparse.Namespace) -> None:
         arm_channels["left_channel"] = None
     elif args.arms == "left":
         arm_channels["right_channel"] = None
-    robot = Axol(config=config, record=args.record, **arm_channels)
+    robot = Axol(
+        config=config, record=args.record, loop_hz=args.loop_hz, **arm_channels
+    )
 
     async with robot as axol:
         contact: tuple[str, float] | None = None
@@ -803,6 +828,7 @@ async def _run(args: argparse.Namespace) -> None:
                 # The control law the whole run ran on (impedance at 240 Hz
                 # or the firmware position loops at 400 Hz).
                 "controller": config.controller,
+                "loop_hz": args.loop_hz or config.loop_hz,
                 "record": args.record,
                 **stream_info,
             },

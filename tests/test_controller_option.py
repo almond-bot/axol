@@ -158,6 +158,24 @@ class TuneMotionFlagTest(unittest.TestCase):
         tune_motion.add_parser(sub)
         return parser.parse_args(["tune.motion", "--motion", "slow_osc", *argv])
 
+    def test_loop_hz_override_and_firmware_gain_overrides_parse(self) -> None:
+        ns = self._parse(
+            "--loop-hz", "240", "--gain", "right.elbow.firmware.speed_kp=0.03"
+        )
+        self.assertEqual(ns.loop_hz, 240.0)
+        overrides = tune_motion._parse_gain_overrides(ns.gain)
+        self.assertEqual(overrides, {("right", "elbow", "firmware.speed_kp"): 0.03})
+        both = tune_motion._parse_gain_overrides(["wrist_2.firmware.profile_acc=200"])
+        self.assertEqual(
+            both,
+            {
+                ("left", "wrist_2", "firmware.profile_acc"): 200.0,
+                ("right", "wrist_2", "firmware.profile_acc"): 200.0,
+            },
+        )
+        with self.assertRaises(SystemExit):
+            tune_motion._parse_gain_overrides(["elbow.firmware.bogus=1"])
+
     def test_controller_flag_takes_the_two_laws_and_defaults_to_config(self) -> None:
         self.assertIsNone(self._parse().controller)
         self.assertEqual(self._parse("--controller", "position").controller, "position")

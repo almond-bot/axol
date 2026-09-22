@@ -115,6 +115,18 @@ class FirmwareGains:
                   joint: the integrator winds up while the joint is stuck and
                   dumps it at release, so the stock 1e-4 feeds the surge
                   (2e-4 limit-cycled at 5 Hz); 1e-5 halves the mode's current.
+        profile_acc: **Damiao only.** The position-velocity mode's profiler
+                  ramp, rad/s² — written to both ACC and (negated) DEC. Every
+                  streamed target is reached along a trapezoid under this
+                  acceleration, so it caps how fast the wrist can follow: the
+                  wrists ship at 2 rad/s² (115 deg/s²), which cannot keep up
+                  with a 200 Hz stream — the loop hunts at ~5 Hz, 3x the
+                  impedance frame's 3-15 Hz error — and would take half a
+                  second to reach teleop speed. 50 is above the core
+                  tracker's 33 rad/s² limit (the profile never binds) while
+                  still rounding each 5 ms step; 50 and 200 scored alike in
+                  ``tune.a4``. A MyActuator joint has no such register
+                  (its planner acceleration is 0, direct tracking).
     """
 
     position_kp: float | None = None
@@ -122,6 +134,7 @@ class FirmwareGains:
     position_kd: float | None = None
     speed_kp: float | None = None
     speed_ki: float | None = None
+    profile_acc: float | None = None
 
     def as_dict(self) -> dict[str, float]:
         """The set gains, keyed by their MyActuator parameter name."""
@@ -411,7 +424,7 @@ _X6_ELBOW_FIRMWARE_GAINS = FirmwareGains(
 # abort). The velocity-loop gains (KP_ASR 0.0037, KI_ASR 0.002) and the
 # profiler ramps changed nothing at 12 deg/s and stay stock; there is no kd.
 # Registers take effect on write and are stored — no reset (2026-09-22).
-_DM_WRIST_FIRMWARE_GAINS = FirmwareGains(position_kp=400.0)
+_DM_WRIST_FIRMWARE_GAINS = FirmwareGains(position_kp=400.0, profile_acc=50.0)
 
 _X6_ROLL_FIRMWARE_GAINS = FirmwareGains(
     position_kp=1.0,
