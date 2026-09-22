@@ -53,7 +53,12 @@ import numpy as np
 
 from ...constants import ARM_JOINTS
 from ...robot import Axol
-from ...robot.config import CONTROLLERS, AxolConfig, check_loop_hz
+from ...robot.config import (
+    CONTROLLERS,
+    IMPEDANCE_LOOP_HZ,
+    AxolConfig,
+    check_loop_hz,
+)
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
@@ -312,13 +317,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--loop-hz",
         type=float,
         default=None,
-        help="Realtime-core tick rate override. Default follows --controller "
-        "(240 Hz impedance, 400 Hz position). For A/B runs only, and only "
-        "downward from the position controller's rate: impedance (MIT) runs at "
-        "240 Hz only, so a rate other than 240 is refused while any arm joint "
-        "is on it — e.g. --a4 with --loop-hz 400. --controller position "
-        "--loop-hz 240 separates the rate from the controller. Above 300 Hz "
-        "the core thins the bus schedule (wrists on alternate ticks).",
+        help="Realtime-core tick rate override. Default follows the wire modes: "
+        "240 Hz all impedance, 400 Hz all firmware loops (--controller "
+        "position), 480 Hz mixed (--a4 joints every tick, impedance joints on "
+        "alternate ticks). Impedance (MIT) is commanded at 240 Hz only, so with "
+        "any arm joint on it only 240 or 480 is accepted. For A/B runs: "
+        "--controller position --loop-hz 240 separates the rate from the "
+        "controller. Above 300 Hz the core thins the bus schedule.",
     )
     p.add_argument(
         "--record",
@@ -594,13 +599,19 @@ async def _run(args: argparse.Namespace) -> None:
         check_loop_hz(config, args.loop_hz or config.loop_hz)
     except ValueError as exc:
         raise SystemExit(f"tune.motion: {exc}") from None
+    core_hz = args.loop_hz or config.loop_hz
+    mixed = config.controller != "position" and core_hz > IMPEDANCE_LOOP_HZ
     print(
         f"  controller: {config.controller} "
-        f"({(args.loop_hz or config.loop_hz):.0f} Hz core loop"
+        f"({core_hz:.0f} Hz core loop"
         + (
             ", every joint on its firmware position loop)"
             if config.controller == "position"
-            else ")"
+            else (
+                f", impedance joints on alternate ticks at {IMPEDANCE_LOOP_HZ:.0f} Hz)"
+                if mixed
+                else ")"
+            )
         )
     )
 

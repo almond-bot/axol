@@ -949,14 +949,19 @@ CONTROLLERS: tuple[str, ...] = ("impedance", "position")
 #: Realtime-core tick rate under each controller (see :data:`CONTROLLERS`).
 CONTROLLER_LOOP_HZ: dict[str, float] = {"impedance": 240.0, "position": 400.0}
 
-#: The only tick rate the impedance (MIT) frame runs at. Its gains, host
+#: The only rate the impedance (MIT) frame is commanded at. Its gains, host
 #: feedforward and damping filters were tuned and verified at 240 Hz; at
 #: 400 Hz with the firmware-loop joints beside it, right shoulder_3 / wrist_1
-#: on impedance shook the arm hard enough to stop the run (2026-09-22). A
-#: core loop carrying any arm joint on ``wire_mode`` ``mit`` is therefore
-#: held to this rate (:func:`check_loop_hz`); only an all-firmware-loop arm
-#: (``controller`` ``"position"``) runs faster.
+#: on impedance shook the arm hard enough to stop the run (2026-09-22).
 IMPEDANCE_LOOP_HZ: float = CONTROLLER_LOOP_HZ["impedance"]
+
+#: The core loop of an arm that mixes impedance joints with firmware-loop
+#: ones (``wire_mode`` ``a4`` / ``pv`` on some joints only): twice
+#: :data:`IMPEDANCE_LOOP_HZ`. The core commands each impedance joint on
+#: alternate ticks — exactly 240 Hz, its whole host pipeline stepped at that
+#: rate — and the firmware-loop joints every tick, above the position
+#: controller's 400 Hz (see ``Thinning`` in ``rust/axol-rt/src/serve.rs``).
+MIXED_LOOP_HZ: float = 2.0 * IMPEDANCE_LOOP_HZ
 
 
 def position_wire_mode(joint: Joint) -> str:
@@ -985,14 +990,18 @@ def impedance_joints(config: "AxolConfig") -> list[str]:
 
 
 def check_loop_hz(config: "AxolConfig", loop_hz: float) -> None:
-    """Refuse a core rate other than :data:`IMPEDANCE_LOOP_HZ` with MIT joints.
+    """Refuse a core rate that would command an MIT joint at other than 240 Hz.
+
+    With any arm joint on the impedance frame the core runs at
+    :data:`IMPEDANCE_LOOP_HZ`, or at :data:`MIXED_LOOP_HZ` with the impedance
+    joints on alternate ticks. Without one, any rate goes.
 
     Raises:
-        ValueError: If ``loop_hz`` is not 240 Hz while any arm joint is on
-            the impedance frame — e.g. ``tune.motion --loop-hz 400`` with
-            ``--a4`` putting only some joints on their firmware loops.
+        ValueError: If ``loop_hz`` is neither while an arm joint is on the
+            impedance frame — e.g. ``tune.motion --loop-hz 400`` with ``--a4``
+            putting only some joints on their firmware loops.
     """
-    if abs(loop_hz - IMPEDANCE_LOOP_HZ) < 1e-6:
+    if any(abs(loop_hz - hz) < 1e-6 for hz in (IMPEDANCE_LOOP_HZ, MIXED_LOOP_HZ)):
         return
     mit = impedance_joints(config)
     if mit:
@@ -1001,9 +1010,10 @@ def check_loop_hz(config: "AxolConfig", loop_hz: float) -> None:
         )
         raise ValueError(
             f"a {loop_hz:g} Hz core loop with {shown} on the impedance frame: "
-            f"impedance runs at {IMPEDANCE_LOOP_HZ:g} Hz only. Drop the loop-rate "
-            "override, or put every arm joint on its firmware loop "
-            "(controller 'position') to run faster."
+            f"impedance runs at {IMPEDANCE_LOOP_HZ:g} Hz only — a "
+            f"{IMPEDANCE_LOOP_HZ:g} Hz loop, or {MIXED_LOOP_HZ:g} Hz with it on "
+            "alternate ticks (the default when some joints are on their "
+            "firmware loops). Drop the loop-rate override."
         )
 
 
@@ -1091,8 +1101,20 @@ class AxolConfig:
 
     @property
     def loop_hz(self) -> float:
-        """The realtime-core tick rate this controller runs at."""
-        return CONTROLLER_LOOP_HZ[self.controller]
+        """The realtime-core tick rate this config runs at.
+
+        :data:`CONTROLLER_LOOP_HZ` for a uniform arm — 240 Hz all on
+        impedance, 400 Hz all on firmware loops (``controller``
+        ``"position"``) — and :data:`MIXED_LOOP_HZ` when some arm joints are
+        on their firmware loops and some on impedance, so the impedance ones
+        keep exactly 240 Hz on alternate ticks.
+        """
+        mit = impedance_joints(self)
+        if not mit:
+            return CONTROLLER_LOOP_HZ["position"]
+        if len(mit) < 2 * len(ARM_JOINTS):
+            return MIXED_LOOP_HZ
+        return CONTROLLER_LOOP_HZ["impedance"]
 
     def resolved(self) -> "AxolConfig":
         """Return a copy with stiffness baked into the ``left``/``right`` gains.

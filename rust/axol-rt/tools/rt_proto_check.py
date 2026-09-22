@@ -72,7 +72,9 @@ joint_line = (
     b"joint 0 can_alm_axol_l wrist_2 6 130 3.5 9.4 33.0 0 0 0 0"
     b" 0 0 0 0 60 pv 0 0.3 0.1 0.1 0 20\n"
 )
-cfg = b"C" + f"proto {CONFIG_PROTO}\n".encode() + b"loop_hz 400\n" + joint_line
+# A mixed bus (a4 + mit + pv): the core runs it at 480 Hz with the impedance
+# joint on alternate ticks; 400 would be refused (impedance is 240 Hz only).
+cfg = b"C" + f"proto {CONFIG_PROTO}\n".encode() + b"loop_hz 480\n" + joint_line
 
 
 async def clean(send, recv, w):

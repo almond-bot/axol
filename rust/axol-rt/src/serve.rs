@@ -249,7 +249,11 @@ const HOLDOVER_MAX: f64 = 0.080;
 /// - 10: the wire token gains `pv` (Damiao position-velocity,
 ///   `bringup::WireMode::Pv`); `loop_hz` above `THIN_ABOVE_HZ` thins the bus
 ///   schedule (`Thinning`).
-const CONFIG_PROTO: u32 = 10;
+/// - 11: impedance joints run at `IMPEDANCE_HZ` only — `loop_hz` 240, or
+///   `MIXED_LOOP_HZ` with them on alternate ticks (`Thinning::mit_lane`) —
+///   and anything else is refused. A proto-10 core given 480 would command
+///   them at 480.
+const CONFIG_PROTO: u32 = 11;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -625,6 +629,42 @@ fn pv_wire(vendor: Vendor, wire: WireMode, tracked: bool, kp: f64) -> bool {
 /// (2.5 ms, of which `REPLY_GUARD` is reserved).
 const THIN_ABOVE_HZ: f64 = 300.0;
 
+/// The only rate an impedance (MIT) arm joint is commanded at. Its gains,
+/// feedforward and damping filters were tuned and verified at 240 Hz; on a
+/// loop mixing it with firmware-loop joints that run faster, it gets its own
+/// 240 Hz cadence inside the faster loop (`Thinning::mit_lane`), not the
+/// loop's rate — at 400 Hz with the firmware joints beside it, right
+/// shoulder_3 / wrist_1 on impedance shook the arm (2026-09-22).
+const IMPEDANCE_HZ: f64 = 240.0;
+
+/// The loop rate of a bus that mixes impedance arm joints with firmware-loop
+/// ones: twice `IMPEDANCE_HZ`, so every impedance joint lands on alternate
+/// ticks at exactly 240 Hz while the 0xA4 joints get 480 Hz (above the
+/// position controller's 400, so no audible 200 Hz staircase either).
+const MIXED_LOOP_HZ: f64 = 2.0 * IMPEDANCE_HZ;
+
+/// Refuse a loop rate an impedance arm joint cannot run at: 240 Hz, or
+/// `MIXED_LOOP_HZ` with it on alternate ticks. Anything else would command
+/// it at a rate its tuning was never verified at.
+fn check_impedance_rate(loop_hz: f64, specs: &[MotorSpec]) -> io::Result<()> {
+    let ok = |hz: f64| (loop_hz - hz).abs() < 1e-6;
+    if ok(IMPEDANCE_HZ) || ok(MIXED_LOOP_HZ) {
+        return Ok(());
+    }
+    if let Some(s) = specs.iter().find(|s| !s.gripper && s.wire == WireMode::Mit) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "config: loop_hz {loop_hz} with {} on the impedance frame — impedance \
+                 runs at {IMPEDANCE_HZ} Hz only (loop_hz {IMPEDANCE_HZ}, or {MIXED_LOOP_HZ} \
+                 with it on alternate ticks)",
+                s.joint
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The bus schedule when the loop runs faster than the bus (`THIN_ABOVE_HZ`).
 ///
 /// Every MyActuator command still goes out every tick — that is the point
@@ -641,11 +681,24 @@ const THIN_ABOVE_HZ: f64 = 300.0;
 ///   forward from the last read on the speed its command echo reports
 ///   every tick (`a4_extrapolate`).
 ///
+/// On a bus that mixes impedance (MIT) arm joints with firmware-loop ones
+/// the loop runs at `MIXED_LOOP_HZ` and the impedance joints form their own
+/// lane instead: each is commanded every other tick, at exactly 240 Hz, the
+/// lane split across both phases so each tick carries half of them. Their
+/// whole host pipeline runs on those ticks only (see `bus_loop`), so they
+/// behave as the verified 240 Hz loop, interleaved.
+///
 /// Below the threshold nothing is thinned: every motor is commanded, and
 /// every a4 joint read, every tick.
 struct Thinning {
     enabled: bool,
-    /// Motor indices of the Damiao wrists, one commanded per tick.
+    /// Impedance (MIT) arm joints as `(motor index, phase)`: commanded on
+    /// ticks where `tick % mit_div == phase`.
+    mit_lane: Vec<(usize, u64)>,
+    /// Ticks per impedance command: 2 on a mixed bus, 1 otherwise.
+    mit_div: u64,
+    /// Motor indices of the Damiao wrists not in `mit_lane`, one commanded
+    /// per tick.
     dm_lane: Vec<usize>,
     /// Motor indices of the a4 joints and the gripper, one served per tick.
     read_lane: Vec<usize>,
@@ -656,10 +709,33 @@ struct Thinning {
 impl Thinning {
     fn plan(motors: &[ReadyMotor], loop_hz: f64) -> Self {
         let enabled = loop_hz > THIN_ABOVE_HZ;
+        let mit: Vec<usize> = motors
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.gripper && m.wire == WireMode::Mit)
+            .map(|(i, _)| i)
+            .collect();
+        // `check_impedance_rate` has held a bus with impedance joints to 240
+        // or 480 Hz, so above the threshold this is 2.
+        let mit_div = if enabled && !mit.is_empty() {
+            (loop_hz / IMPEDANCE_HZ).round().max(1.0) as u64
+        } else {
+            1
+        };
+        let mit_lane: Vec<(usize, u64)> = if mit_div > 1 {
+            mit.iter()
+                .enumerate()
+                .map(|(k, &idx)| (idx, k as u64 % mit_div))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let dm_lane = motors
             .iter()
             .enumerate()
-            .filter(|(_, m)| m.vendor == Vendor::Damiao && !m.gripper)
+            .filter(|(i, m)| {
+                m.vendor == Vendor::Damiao && !m.gripper && !mit_lane.iter().any(|(j, _)| j == i)
+            })
             .map(|(i, _)| i)
             .collect();
         let read_lane = motors
@@ -673,10 +749,21 @@ impl Thinning {
         let gripper = motors.iter().position(|m| m.gripper);
         Self {
             enabled,
+            mit_lane,
+            mit_div,
             dm_lane,
             read_lane,
             gripper,
         }
+    }
+
+    /// The phase of an impedance joint on its own 240 Hz cadence, or `None`
+    /// for a motor commanded at the loop's rate (or its round-robin lane).
+    fn mit_phase(&self, idx: usize) -> Option<u64> {
+        self.mit_lane
+            .iter()
+            .find(|(j, _)| *j == idx)
+            .map(|(_, phase)| *phase)
     }
 
     fn turn(lane: &[usize], tick: u64) -> Option<usize> {
@@ -691,6 +778,9 @@ impl Thinning {
     fn commanded(&self, idx: usize, tick: u64) -> bool {
         if !self.enabled {
             return true;
+        }
+        if let Some(phase) = self.mit_phase(idx) {
+            return tick % self.mit_div == phase;
         }
         if self.dm_lane.contains(&idx) {
             return Self::turn(&self.dm_lane, tick) == Some(idx);
@@ -1166,6 +1256,9 @@ fn parse_config(text: &str) -> io::Result<Config> {
             "config: no joints",
         ));
     }
+    for (_, _, specs) in &buses {
+        check_impedance_rate(loop_hz, specs)?;
+    }
     Ok(Config {
         loop_hz,
         watchdog_ms,
@@ -1519,23 +1612,139 @@ mod tests {
     }
 
     #[test]
-    fn thinning_only_reads_a4_joints_and_leaves_mit_joints_alone() {
+    fn thinning_only_reads_a4_joints_and_puts_mit_joints_on_their_own_lane() {
         let motors = vec![
             ready(1, Vendor::MyActuator, WireMode::Mit),
             ready(2, Vendor::MyActuator, WireMode::A4),
             ready(6, Vendor::Damiao, WireMode::Pv),
         ];
-        let sched = Thinning::plan(&motors, 400.0);
+        let sched = Thinning::plan(&motors, MIXED_LOOP_HZ);
         assert_eq!(sched.read_lane, vec![1]);
         assert_eq!(sched.dm_lane, vec![2]);
+        assert_eq!(sched.mit_lane, vec![(0, 0)]);
         for tick in 0..8 {
-            assert!(sched.commanded(0, tick));
+            // The impedance joint alternates (240 Hz); the a4 joint and the
+            // only pv wrist go every tick, and the a4 joint is read every tick.
+            assert_eq!(sched.commanded(0, tick), tick % 2 == 0);
             assert!(sched.commanded(1, tick));
-            // The only wrist is commanded every tick; the only a4 joint is
-            // read every tick.
             assert!(sched.commanded(2, tick));
             assert!(sched.a4_read(1, tick));
         }
+    }
+
+    /// shoulder_1 + elbow on 0xA4, the rest on impedance: the split that
+    /// shook the arm when it all ran at 400 Hz.
+    fn mixed_arm() -> Vec<ReadyMotor> {
+        vec![
+            ready(1, Vendor::MyActuator, WireMode::A4),
+            ready(2, Vendor::MyActuator, WireMode::Mit),
+            ready(3, Vendor::MyActuator, WireMode::Mit),
+            ready(4, Vendor::MyActuator, WireMode::A4),
+            ready(5, Vendor::MyActuator, WireMode::Mit),
+            ready(6, Vendor::Damiao, WireMode::Mit),
+            ready(7, Vendor::Damiao, WireMode::Mit),
+            ready(8, Vendor::Damiao, WireMode::Mit),
+        ]
+    }
+
+    #[test]
+    fn a_mixed_bus_commands_every_impedance_joint_at_exactly_240_hz() {
+        let motors = mixed_arm();
+        let sched = Thinning::plan(&motors, MIXED_LOOP_HZ);
+        assert!(sched.enabled);
+        assert_eq!(sched.mit_div, 2);
+        // The wrists are impedance joints here, so they ride the impedance
+        // lane rather than taking turns with each other.
+        assert!(sched.dm_lane.is_empty());
+        let mit: Vec<usize> = sched.mit_lane.iter().map(|(i, _)| *i).collect();
+        assert_eq!(mit, vec![1, 2, 4, 5, 6]);
+        let mut last: [Option<u64>; 8] = [None; 8];
+        let mut worst_frames = 0;
+        for tick in 0..240u64 {
+            let mut frames = 0;
+            let mut mit_this_tick = 0;
+            for idx in 0..motors.len() {
+                if !sched.commanded(idx, tick) {
+                    continue;
+                }
+                frames += 2;
+                if let Some(prev) = last[idx] {
+                    if sched.mit_phase(idx).is_some() {
+                        // Evenly spaced: exactly every other tick, never 1 or 3.
+                        assert_eq!(tick - prev, 2, "motor {idx}");
+                    }
+                }
+                last[idx] = Some(tick);
+                if sched.mit_phase(idx).is_some() {
+                    mit_this_tick += 1;
+                }
+                if motors[idx].wire == WireMode::A4 {
+                    assert_eq!(tick - last[idx].unwrap(), 0);
+                    if sched.a4_read(idx, tick) {
+                        frames += 2;
+                    }
+                }
+            }
+            // Five impedance joints split 3 / 2 across the two phases.
+            assert!(mit_this_tick == 2 || mit_this_tick == 3);
+            // The 0xA4 joints go every tick.
+            assert!(sched.commanded(0, tick) && sched.commanded(3, tick));
+            worst_frames = worst_frames.max(frames);
+        }
+        // Fits the 480 Hz tick: 2.08 ms less the reply guard at ~0.13 ms a
+        // frame is ~14 frames.
+        assert!(worst_frames <= 14, "{worst_frames} frames");
+    }
+
+    #[test]
+    fn the_position_controller_has_no_impedance_lane() {
+        let sched = Thinning::plan(&full_arm_position_controller(), 400.0);
+        assert!(sched.mit_lane.is_empty());
+        assert_eq!(sched.mit_div, 1);
+        // An all-impedance arm at 240 Hz is not thinned at all.
+        let all_mit: Vec<ReadyMotor> = (1..=7)
+            .map(|id| {
+                ready(
+                    id,
+                    if id <= 5 {
+                        Vendor::MyActuator
+                    } else {
+                        Vendor::Damiao
+                    },
+                    WireMode::Mit,
+                )
+            })
+            .collect();
+        let sched = Thinning::plan(&all_mit, IMPEDANCE_HZ);
+        assert!(!sched.enabled && sched.mit_lane.is_empty());
+        assert!((0..7).all(|i| sched.commanded(i, 1)));
+    }
+
+    #[test]
+    fn impedance_joints_run_at_240_hz_only() {
+        let spec = |wire: &str, gripper: bool| {
+            let text = if gripper {
+                "proto 11\ngripper 0 canL 8\n".to_string()
+            } else {
+                format!(
+                    "proto 11\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                )
+            };
+            text
+        };
+        for hz in [240.0, 480.0] {
+            assert!(parse_config(&format!("loop_hz {hz}\n{}", spec("mit", false))).is_ok());
+        }
+        for hz in [200.0, 300.0, 400.0, 960.0] {
+            let err = parse_config(&format!("loop_hz {hz}\n{}", spec("mit", false)))
+                .err()
+                .expect("refused")
+                .to_string();
+            assert!(err.contains("240 Hz only"), "{err}");
+        }
+        // Firmware-loop joints, and the always-MIT gripper, are not held to it.
+        assert!(parse_config(&format!("loop_hz 400\n{}", spec("a4", false))).is_ok());
+        assert!(parse_config(&format!("loop_hz 400\n{}", spec("", true))).is_ok());
     }
 
     #[test]
@@ -1714,7 +1923,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 10\n\
+            "proto 11\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
@@ -1766,39 +1975,39 @@ mod tests {
         );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 10\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+            "proto 11\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 10\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 11\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
         // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 10\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 11\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 10\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 11\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 10\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 11\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 10\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 11\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 10\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 11\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 10\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 11\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 10\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 11\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -1809,7 +2018,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 10\n\
+            "proto 11\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
@@ -1823,15 +2032,15 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 10\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 11\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 10\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 11\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 10\n\
+            "proto 11\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
@@ -1857,12 +2066,12 @@ mod tests {
         // A future client generation this core does not understand.
         let err = error_of(&format!("proto 99\n{joint}"));
         assert!(err.contains("proto 99"), "{err}");
-        assert!(err.contains("proto 10"), "{err}");
+        assert!(err.contains("proto 11"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 10\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 11\n")).is_ok());
     }
 }
 
@@ -2395,6 +2604,9 @@ fn bus_loop(
         })
         .collect();
     let mut prev_tick: Option<Instant> = None;
+    // Impedance joints on their own 240 Hz cadence (`Thinning::mit_lane`):
+    // when each last ran, for a time step and overrun of its own.
+    let mut own_prev: [Option<Instant>; N_SLOTS] = [None; N_SLOTS];
     // Latest decoded feedback per slot, shipped to Python once per tick as
     // an `F` packet — the core is the only CAN consumer; Python fills its
     // Motor caches from these instead of passively reading the bus.
@@ -2486,6 +2698,18 @@ fn bus_loop(
         })
         .collect();
     let sched = Thinning::plan(&motors, cfg.loop_hz);
+    if !sched.mit_lane.is_empty() {
+        send_text(
+            out_tx,
+            b'L',
+            &format!(
+                "{iface}: {:.0} Hz loop — {} impedance joint(s) on alternate ticks at {:.0} Hz each, firmware-loop joints every tick",
+                cfg.loop_hz,
+                sched.mit_lane.len(),
+                cfg.loop_hz / sched.mit_div as f64,
+            ),
+        );
+    }
     if sched.enabled {
         send_text(
             out_tx,
@@ -2777,6 +3001,26 @@ fn bus_loop(
             attempted.fill(false);
             let mut trace_pending: [Option<TraceRow>; N_SLOTS] = [None; N_SLOTS];
             for (motor_index, m) in motors.iter().enumerate() {
+                // An impedance joint on its own 240 Hz cadence runs nothing on
+                // its off-ticks — not the tracker, derivatives, band-pass or
+                // dither — and on its own ticks steps them over its own
+                // interval, so it is the verified 240 Hz loop, interleaved.
+                // Every other motor steps at the loop's rate as before.
+                let (tick_dt, cmd_dt, overrun) = if sched.mit_phase(motor_index).is_some() {
+                    if !sched.commanded(motor_index, ticks) {
+                        continue;
+                    }
+                    let nominal = period.as_secs_f64() * sched.mit_div as f64;
+                    let dt =
+                        own_prev[m.slot].map_or(0.0, |p| began.duration_since(p).as_secs_f64());
+                    own_prev[m.slot] = Some(began);
+                    // Its own cycle slipped a whole period: the same rule the
+                    // loop applies to itself, at the joint's own rate.
+                    let own_overrun = dt >= 2.0 * nominal;
+                    (dt, if own_overrun { nominal } else { dt }, own_overrun)
+                } else {
+                    (tick_dt, cmd_dt, overrun)
+                };
                 let c = if is_limp && !m.gripper {
                     // Limp is enforced here, whatever the target says: no
                     // stiffness, firmware damping only, no host damping or
@@ -3302,7 +3546,14 @@ fn bus_loop(
                 let complete = reply_complete(&expected, &seen, idx);
                 feedback_fresh[motor.slot] = complete;
                 let health = &mut feedback_health[motor.slot];
-                match health.record(complete, silent_limit) {
+                // Counted in the joint's own commands, so the silent limit
+                // stays `SILENT_FEEDBACK_FAULT` of wall time on the 240 Hz lane.
+                let limit = if sched.mit_phase(idx).is_some() {
+                    silent_limit.div_ceil(sched.mit_div as u32)
+                } else {
+                    silent_limit
+                };
+                match health.record(complete, limit) {
                     FeedbackVerdict::Steady => {}
                     FeedbackVerdict::Degraded => {
                         degraded_episodes += 1;
@@ -3342,7 +3593,7 @@ fn bus_loop(
                                 "{iface}: {} silent for {} consecutive ticks ({:.1} s) — motor unreachable; going limp rather than commanding it stiff and blind",
                                 motor.joint,
                                 health.consecutive_misses,
-                                health.consecutive_misses as f64 / cfg.loop_hz,
+                                health.consecutive_misses as f64 * sched.mit_phase(idx).map_or(1.0, |_| sched.mit_div as f64) / cfg.loop_hz,
                             ),
                         );
                     }

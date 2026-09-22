@@ -16,6 +16,7 @@ from almond_axol.robot.config import (
     CONTROLLER_LOOP_HZ,
     CONTROLLERS,
     IMPEDANCE_LOOP_HZ,
+    MIXED_LOOP_HZ,
     AxolConfig,
     check_loop_hz,
     impedance_joints,
@@ -69,7 +70,8 @@ class ConfigTest(unittest.TestCase):
         resolved = cfg.resolved()
         self.assertEqual(resolved.right.shoulder_1.wire_mode, "a4")
         self.assertEqual(resolved.right.shoulder_2.wire_mode, "mit")
-        self.assertEqual(resolved.loop_hz, 240.0)
+        # A mixed arm runs the core at 480 Hz, impedance on alternate ticks.
+        self.assertEqual(resolved.loop_hz, MIXED_LOOP_HZ)
 
     def test_the_rate_rule_counts_only_arm_joints_on_mit(self) -> None:
         self.assertEqual(IMPEDANCE_LOOP_HZ, 240.0)
@@ -84,6 +86,17 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("right.shoulder_3", mit)
         with self.assertRaisesRegex(ValueError, "left.shoulder_1"):
             check_loop_hz(AxolConfig(), 400.0)
+        check_loop_hz(AxolConfig(), MIXED_LOOP_HZ)
+        self.assertEqual(MIXED_LOOP_HZ, 2 * IMPEDANCE_LOOP_HZ)
+
+    def test_the_default_rate_follows_the_wire_mode_mix(self) -> None:
+        self.assertEqual(AxolConfig().loop_hz, 240.0)
+        self.assertEqual(AxolConfig(controller="position").loop_hz, 400.0)
+        mixed = AxolConfig()
+        mixed.right.shoulder_1.wire_mode = "a4"
+        mixed.right.elbow.wire_mode = "a4"
+        self.assertEqual(mixed.loop_hz, 480.0)
+        check_loop_hz(mixed, mixed.loop_hz)
 
     def test_unknown_controller_is_refused(self) -> None:
         with self.assertRaises(ValueError):
@@ -173,9 +186,12 @@ class RealtimeConfigTest(unittest.TestCase):
         # All-impedance at another rate is refused the same way.
         with self.assertRaisesRegex(ValueError, "240 Hz only"):
             Axol._wrap(_hardware(AxolConfig()), loop_hz=300.0)
-        # At 240 the mixed split runs.
+        # At 240 the mixed split runs, and by default at 480 — every
+        # impedance joint on alternate ticks, so still 240 Hz each.
         rt = Axol._wrap(_hardware(cfg), loop_hz=240.0)
         self.assertIn("loop_hz 240.0", rt._config_text().splitlines())
+        rt = Axol._wrap(_hardware(cfg))
+        self.assertIn("loop_hz 480.0", rt._config_text().splitlines())
 
     def test_a_vendor_mismatched_wire_mode_is_refused(self) -> None:
         cfg = AxolConfig()
