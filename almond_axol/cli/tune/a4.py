@@ -8,6 +8,16 @@ closed-loop) — the loop the realtime core drives when a joint's
 choose, reads the fine 0.01° position (0x92) every cycle, scores tracking and
 smoothness, and saves the run for the diagnostics dashboard.
 
+Planner acceleration: ``0`` is the documented direct-tracking mode, and the
+protocol maximum ``60000`` makes the planner finish each 200 Hz step inside
+the tick — on the X6-P20 elbow the latter tracked a 3 deg/s triangle to
+0.02° RMS with 4 ms lag against 0.23° / 74 ms for direct tracking. Values in
+between re-plan every target and the joint barely moves. The value is
+written *before* the mode-switch reset: on the elbow's 2025070202 firmware
+a 0 written into a running position loop is silently ignored (the joint
+holds and executes nothing), while the same 0 applied through the reset
+works; non-zero values apply live on every firmware seen.
+
 Why a separate tool: ``tune.pid`` tunes the MIT impedance frame, whose gains
 live in the host. Under 0xA4 the whole controller is the motor's own
 position PI → speed PI → current loop, so the knobs are the firmware gains
@@ -74,6 +84,14 @@ _MA_READ_GAIN = 0x30
 _MA_WRITE_GAIN_RAM = 0x31
 _MA_WRITE_GAIN_ROM = 0x32
 _FLASH_SETTLE_S = 0.3
+
+#: Planner acceleration (dps/s, the protocol maximum) at which the firmware
+#: completes each 200 Hz step's plan inside the tick, so a re-planning
+#: position loop follows the stream instead of stalling on it. On the right
+#: elbow (X6-P20) this tracked a 3 deg/s triangle to 0.02° RMS with 4 ms lag
+#: — better than direct tracking (accel 0: 0.23°, 74 ms) — while 5000 dps/s
+#: never finished a plan before the next target and the joint barely moved.
+_ACCEL_STEP_FOLLOW = 60000
 
 GAIN_NAMES: tuple[str, ...] = tuple(_MA_PID_IDX)
 
@@ -411,9 +429,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--accel",
         type=int,
         default=None,
-        help="Position-planner acceleration (dps/s) for the run: 0 = direct PI tracking of the "
-        "stream (required for it to follow at all); default: leave the stored value. Written to "
-        "ROM and restored afterwards unless --keep",
+        help="Position-planner acceleration (dps/s) for the run, written to ROM before the "
+        "mode-switch reset and restored afterwards unless --keep; default: leave the stored "
+        f"value. 0 = direct PI tracking of the stream; {_ACCEL_STEP_FOLLOW} (the protocol "
+        "maximum) = the planner completes each 200 Hz step within the tick, which tracked the "
+        "X6-P20 elbow better than 0 (0.02° vs 0.23° RMS). Anything in between re-plans every "
+        "target and will not follow the wave.",
     )
     for name in GAIN_NAMES:
         p.add_argument(
@@ -499,15 +520,7 @@ async def _run(args: argparse.Namespace) -> None:
     async with CanBus(channel) as bus:
         raw = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw.values()])
-        motors = await joint_frame_motors(raw, is_left)
-        await asyncio.gather(
-            *[
-                m.set_control_mode(ControlMode.POSITION_VELOCITY)
-                for m in motors.values()
-            ]
-        )
-        motor = motors[joint]
-        driver = motor.motor._driver
+        driver = raw[joint]._driver
         if not isinstance(driver, MyActuatorMotor):
             raise SystemExit(f"{joint.value} is not a MyActuator joint")
         before_gains: dict[str, float] | None = None
@@ -516,6 +529,44 @@ async def _run(args: argparse.Namespace) -> None:
         reason: str | None = None
         used_gains: dict[str, float] = {}
         accel_used: tuple[int, int] | None = None
+
+        # Planner acceleration goes in *before* the mode switch below: that
+        # switch is a 0x76 reset, and the reset is what makes a planner value
+        # of 0 take effect. On the X6-P20 elbow (firmware 2025070202) a 0
+        # written into a running position loop is ignored — the joint held
+        # its target and executed nothing for a whole run (2026-09-21) while
+        # the same 0 stored before the reset gave the documented direct
+        # tracking. Non-zero values do apply live on that firmware (5000 →
+        # 60000 took effect mid-session); the X8-P20 shoulders (2026042402)
+        # apply 0 live as well. Writing first is right for every one of them.
+        stored_accel = await _read_accel(driver)
+        print(
+            f"  planner accel/decel stored: {stored_accel[0]}/{stored_accel[1]} dps/s"
+        )
+        if args.accel is not None and stored_accel != (args.accel, args.accel):
+            before_accel = stored_accel
+            accel_used = await _write_accel(driver, args.accel, args.accel)
+            print(
+                f"  planner accel/decel {stored_accel[0]}/{stored_accel[1]} → {accel_used[0]}/{accel_used[1]} dps/s"
+            )
+        else:
+            accel_used = stored_accel
+        if accel_used[0] not in (0, _ACCEL_STEP_FOLLOW):
+            print(
+                f"  ! planner acceleration is {accel_used[0]} dps/s: the firmware re-plans "
+                "every streamed target and will not follow the wave — pass --accel 0 "
+                f"(direct PI tracking) or --accel {_ACCEL_STEP_FOLLOW} (planner completes "
+                "each step within the tick)"
+            )
+
+        motors = await joint_frame_motors(raw, is_left)
+        await asyncio.gather(
+            *[
+                m.set_control_mode(ControlMode.POSITION_VELOCITY)
+                for m in motors.values()
+            ]
+        )
+        motor = motors[joint]
         try:
             print("  Homing all joints to rest ...")
             await _home_all(motors)
@@ -528,25 +579,8 @@ async def _run(args: argparse.Namespace) -> None:
             await _ramp_verified(motors, {joint: center})
             await asyncio.sleep(0.3)
 
-            # Planner and gains: written after every mode switch/homing is
-            # done (those reset the motor and reload ROM).
-            stored_accel = await _read_accel(driver)
-            print(
-                f"  planner accel/decel stored: {stored_accel[0]}/{stored_accel[1]} dps/s"
-            )
-            if args.accel is not None and stored_accel != (args.accel, args.accel):
-                before_accel = stored_accel
-                accel_used = await _write_accel(driver, args.accel, args.accel)
-                print(
-                    f"  planner accel/decel {stored_accel[0]}/{stored_accel[1]} → {accel_used[0]}/{accel_used[1]} dps/s"
-                )
-            else:
-                accel_used = stored_accel
-            if accel_used[0] != 0:
-                print(
-                    f"  ! planner acceleration is {accel_used[0]} dps/s: the firmware re-plans "
-                    "every streamed target and will not follow the wave — pass --accel 0"
-                )
+            # Gains are written here, after the mode switch and homing: RAM
+            # gains (0x31) do not survive the reset those perform.
             stock = await _read_gains(driver)
             used_gains = {**stock, **requested}
             if requested:

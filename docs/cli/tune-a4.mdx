@@ -5,7 +5,7 @@ description: "Tune a MyActuator joint's firmware position loop (0xA4) with a sin
 
 Tunes the **firmware** position loop of one MyActuator joint — the controller the realtime core hands a joint to when its `wire_mode` is `a4` (see the [config reference](/cli/configuration)). Streams a sine or a constant-speed triangle target over 0xA4 at `--rate` Hz with the firmware gains, 0xA4 speed cap and planner acceleration you choose, reads the fine 0.01° position (0x92) every cycle, scores tracking and creep smoothness, and saves the run for the diagnostics dashboard (Tuning → Firmware loop). Also available from the dashboard (`axol serve`).
 
-[`tune.pid`](/cli/tune-pid) tunes the MIT impedance frame, whose gains are the host's. Under 0xA4 the whole controller is the motor's own position PI → speed PI → current loop, so the knobs here are the firmware gains (`position_kp/ki/kd`, `speed_kp/ki`, `current_kp/ki`), the speed cap, and the position planner's acceleration: **0 puts the loop in direct PI tracking of the stream; any other value re-plans every streamed target and the joint will not follow the wave at all.**
+[`tune.pid`](/cli/tune-pid) tunes the MIT impedance frame, whose gains are the host's. Under 0xA4 the whole controller is the motor's own position PI → speed PI → current loop, so the knobs here are the firmware gains (`position_kp/ki/kd`, `speed_kp/ki`, `current_kp/ki`), the speed cap, and the position planner's acceleration: **0 puts the loop in direct PI tracking of the stream, and the protocol maximum 60000 makes the planner finish each 200 Hz step inside the tick — anything in between re-plans every streamed target and the joint will not follow the wave.** On the X6-P20 elbow 60000 tracked a 3 deg/s triangle to 0.02° RMS with 4 ms lag against 0.23° / 74 ms for direct tracking, so try both. The tool writes the planner **before** the mode-switch reset: on the elbow's 2025-07 firmware a 0 written into a running position loop is silently ignored (the joint holds and executes nothing), while the same 0 applied through the reset works.
 
 The triangle is the stick-slip probe: every pass runs at one creep speed, so the behaviour is not confined to the sine's turnarounds. Compare runs on **velocity ripple** (std of measured minus commanded velocity over the commanded speed: the MIT frame's stick-slip sits near 0.8, smooth is under 0.2), **stuck windows**, the **1–4 Hz error band**, **lag** and **>10 Hz buzz**.
 
@@ -28,7 +28,7 @@ Safety, built in:
 | `--duration S` | Seconds of wave (default: 12) |
 | `--rate HZ` | Command rate (default: 200) |
 | `--cap DPS` | 0xA4 speed cap (default: 60) |
-| `--accel DPS/S` | Planner acceleration for the run; `0` = direct tracking. Written to ROM, restored afterwards unless `--keep` |
+| `--accel DPS/S` | Planner acceleration for the run, written to ROM before the mode-switch reset and restored afterwards unless `--keep`. `0` = direct PI tracking; `60000` = step-follow (see above); values in between will not follow a stream |
 | `--position-kp`, `--position-ki`, `--position-kd`, `--speed-kp`, `--speed-ki`, `--current-kp`, `--current-ki` | Firmware gains for the run (default: leave as is). The tool prints the motor's live values at start; the dashboard tab shows them next to each field and seeds its sliders there |
 | `--persist` | Write gains to ROM instead of RAM |
 | `--keep` | Leave the run's gains and planner acceleration in the motor |
