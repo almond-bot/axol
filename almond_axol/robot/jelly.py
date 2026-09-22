@@ -70,6 +70,7 @@ from pathlib import Path
 
 from ..constants import CAN_BASE
 from ..rt.link import find_binary
+from .battery import BatteryStatus
 from .lift import (
     DOWN,
     JOG_SPEED,
@@ -99,6 +100,10 @@ WHEEL_SIGNS: dict[int, float] = {1: 1.0, 2: -1.0, 3: 1.0, 4: -1.0}
 # hold's dynamics are ~1 s, so this resolves them without flooding a console
 # the 50 Hz command loop has to keep up with.
 _YAW_TRACE_HZ = 10.0
+
+# Wheel speed (rad/s) above which the wheels count as a load on the battery
+# rail, so the battery estimate holds its resting value while driving.
+_WHEEL_LOAD_RAD_S = 0.5
 
 # Seconds of driving with the IMU requested but no yaw sample ever fed
 # before Jelly says the heading hold is dead.
@@ -499,6 +504,15 @@ class Jelly:
         """Latest jelly_legs status frame, or None (no lift / board silent)."""
         return self._lift.status if self._lift is not None else None
 
+    @property
+    def battery(self) -> BatteryStatus | None:
+        """Battery estimate from the lift board's rail voltage, or None.
+
+        Read through the lift board, so it needs the lift (``has_lift``) and
+        firmware that answers ``GET_POWER``; see :mod:`almond_axol.robot.battery`.
+        """
+        return self._lift.battery if self._lift is not None else None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -871,6 +885,11 @@ class Jelly:
                 self.send_failed = bool(flags & 4)
                 self.linked = bool(flags & 8)
                 self.wheel_fault = bool(flags & 16)
+                if self._lift is not None:
+                    # Turning wheels sag the rail the battery estimate reads.
+                    self._lift.external_load = any(
+                        abs(speed) > _WHEEL_LOAD_RAD_S for speed in self.wheel_speeds
+                    )
                 if yaw_log is not None:
                     sample = self._yaw_rate
                     rate = sample[0] if sample is not None else None

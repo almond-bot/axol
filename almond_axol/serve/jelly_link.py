@@ -11,9 +11,12 @@ wheels) — and this module gives each of them the same treatment:
 - **wheels**: open the wheel bus and ping the four motors once a second
   (status, temperature, bus voltage). Never enables or commands a motor.
 - **lift**: open the lift's bus and poll the jelly_legs board's status
-  (homed, height, moving, stall/driver faults) once a second. Never sends a
-  motion opcode — only ``SET_RATE 0`` (quiet the board's broadcast) and
-  ``GET_STATUS``.
+  (homed, height, moving, stall/driver faults) and power telemetry (the 24 V
+  rail, i.e. Jelly's battery — see :mod:`almond_axol.robot.battery`) once a
+  second. Never sends a motion opcode — only ``SET_RATE 0`` (quiet the
+  board's broadcast), ``GET_STATUS`` and ``GET_POWER``. The last battery
+  estimate outlives a hand-over to a task, reported with its age, since the
+  pack drains over hours and "as of a few minutes ago" beats nothing.
 
 Each device is its own state machine (``disconnected`` → ``connecting`` →
 ``connected``, ``busy`` while a task owns the bus, ``error``), so the panel
@@ -39,14 +42,19 @@ from typing import Any, Literal
 from ..constants import CAN_BASE
 from ..motor import CanBus, MotorError
 from ..motor.damiao import DamiaoMotor
+from ..robot.battery import BatteryEstimator, BatteryStatus
 from ..robot.jelly import WHEELS
 from ..robot.lift import (
     _ID_CMD,
+    _ID_POWER,
     _ID_STATUS,
+    _OP_GET_POWER,
     _OP_GET_STATUS,
     _OP_SET_RATE,
     LiftStatus,
+    decode_power,
     decode_status,
+    power_under_load,
     resolve_lift_channel,
 )
 from .robot_link import (
@@ -69,6 +77,8 @@ _PING_TIMEOUT_S = 0.5
 # A lift status frame older than this (with GET_STATUS polled every second)
 # means the board stopped answering: unpowered, unplugged, or not on this bus.
 _LIFT_FRESH_S = 3.0
+# Same for the power frame (GET_POWER polled every second).
+_POWER_FRESH_S = 3.0
 
 # Damiao feedback (MST) ID = 0x10 + motor ID, the factory convention Jelly's
 # wheels follow (see ``almond_axol.motor.motor.make_driver``).
@@ -208,16 +218,30 @@ class _LiftDevice:
         self._bus: CanBus | None = None
         self.status: LiftStatus | None = None
         self.last_status_monotonic: float | None = None
+        self._estimator = BatteryEstimator()
+        # Last estimate and when it was measured; kept across close/open.
+        self.battery: BatteryStatus | None = None
+        self.last_power_monotonic: float | None = None
 
     def _on_message(self, msg) -> None:  # noqa: ANN001 - can.Message, typed lazily
         if msg.arbitration_id == _ID_STATUS and len(msg.data) >= 6:
             self.status = decode_status(bytes(msg.data))
             self.last_status_monotonic = time.monotonic()
+        elif msg.arbitration_id == _ID_POWER and len(msg.data) >= 8:
+            power = decode_power(bytes(msg.data))
+            self.battery = self._estimator.update(
+                power.supply_volts, under_load=power_under_load(power, self.status)
+            )
+            self.last_power_monotonic = time.monotonic()
 
     async def open(self) -> None:
         self.channel = lift_channel()
         self.status = None
         self.last_status_monotonic = None
+        # Keep showing the last battery estimate until a new frame lands, but
+        # start the average afresh: the pack may have drained while a task
+        # owned the bus.
+        self._estimator.reset()
         self._bus = CanBus(self.channel)
         self._bus._add_listener(self._on_message)
         await self._bus.start()
@@ -226,6 +250,7 @@ class _LiftDevice:
         # poll instead (the same sequence the lift driver and can.setup use).
         await self._bus._send(_ID_CMD, bytes([_OP_SET_RATE, 0x00, 0x00]))
         await self._bus._send(_ID_CMD, bytes([_OP_GET_STATUS]))
+        await self._bus._send(_ID_CMD, bytes([_OP_GET_POWER]))
 
     async def close(self) -> None:
         if self._bus is not None:
@@ -233,16 +258,19 @@ class _LiftDevice:
         self._bus = None
 
     async def ping(self) -> None:
-        """Solicit one status frame; never raises."""
+        """Solicit one status and one power frame; never raises."""
         if self._bus is None:
             return
-        try:
-            await asyncio.wait_for(
-                self._bus._send(_ID_CMD, bytes([_OP_GET_STATUS])),
-                timeout=_PING_TIMEOUT_S,
-            )
-        except Exception as exc:  # noqa: BLE001 - keep the loop alive
-            _logger.debug("lift status poll on %s failed: %s", self.channel, exc)
+        for op in (_OP_GET_STATUS, _OP_GET_POWER):
+            try:
+                await asyncio.wait_for(
+                    self._bus._send(_ID_CMD, bytes([op])),
+                    timeout=_PING_TIMEOUT_S,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                _logger.debug(
+                    "lift poll 0x%02x on %s failed: %s", op, self.channel, exc
+                )
 
     def reachable(self) -> bool:
         return (
@@ -250,9 +278,27 @@ class _LiftDevice:
             and time.monotonic() - self.last_status_monotonic <= _LIFT_FRESH_S
         )
 
+    def battery_snapshot(self, *, polling: bool) -> dict[str, Any] | None:
+        battery = self.battery
+        if battery is None or self.last_power_monotonic is None:
+            return None
+        age = max(0.0, time.monotonic() - self.last_power_monotonic)
+        return {
+            "voltage": round(battery.voltage, 2),
+            "percent": round(battery.percent, 1),
+            "charging": battery.charging,
+            "underLoad": battery.under_load,
+            # Server-side age: the browser's clock need not match the robot's.
+            "ageSeconds": round(age, 1),
+            # False while a task owns the bus or the board stopped answering:
+            # the numbers are the last known ones.
+            "live": polling and age <= _POWER_FRESH_S,
+        }
+
     def snapshot(self, *, polling: bool) -> dict[str, Any]:
         status = self.status
         return {
+            "battery": self.battery_snapshot(polling=polling),
             # Unknown while nobody polls the board (a task owns the bus).
             "reachable": self.reachable() if polling else None,
             "status": (

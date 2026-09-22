@@ -2,8 +2,9 @@ import { ArrowUpFromLine, CircleDot, Cpu, Loader2, Plug, Unplug } from "lucide-r
 import type { ReactNode } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { WheelGrid } from "@/components/jelly-status"
+import { BatteryIndicator, WheelGrid } from "@/components/jelly-status"
 import {
+  jellyBattery,
   jellyDeviceView,
   liftSummaryText,
   STATUS_DOT_CLASS,
@@ -238,7 +239,8 @@ export function HardwareOverview({
     const busy = jellyBusy[device] ?? false
     const live = view.state === "connected" || view.state === "busy"
     const channel = jelly?.[device]?.channel ?? canDevices?.[device]?.channel ?? "—"
-    const status =
+    const battery = device === "lift" && jellySupported ? jellyBattery(jelly) : null
+    const summary =
       jelly && view.state === "connected" && !view.fault ? (
         device === "wheels" ? (
           <WheelGrid status={jelly.wheels} />
@@ -252,6 +254,14 @@ export function HardwareOverview({
       ) : (
         <Text title={view.label}>{view.label}</Text>
       )
+    const status = battery ? (
+      <>
+        {summary}
+        <BatteryIndicator battery={battery} />
+      </>
+    ) : (
+      summary
+    )
     const action = live ? (
       <Button
         variant="outline"
