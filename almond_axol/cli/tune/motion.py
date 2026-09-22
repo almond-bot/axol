@@ -47,6 +47,7 @@ import asyncio
 import logging
 import math
 import time
+from typing import Any
 
 import numpy as np
 
@@ -105,6 +106,46 @@ _COLUMNS = [f"left.{j.value}" for j in ARM_JOINTS] + [
 #: A joint further than this (rad, ~3°) from the motion's first row after the
 #: approach move did not follow it, and playback must not start from there.
 _START_POSE_TOL = 0.05
+
+
+def retime_measurements(
+    t: np.ndarray, offsets: np.ndarray, actual: np.ndarray, torque: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Put cache reads back on the command clock.
+
+    ``offsets[k, i]`` is how long before log time ``t[k]`` joint ``i``'s
+    cached sample was really taken (≤ 0; ``0`` when unknown). Each column
+    is interpolated from its true sample times ``t + offsets`` back onto
+    ``t``, so the scorecard compares the target with the measurement at the
+    same instant instead of with a sample up to one core tick old — the
+    sawtooth in that age is what a 400 Hz core read at 240 Hz shows as an
+    80 Hz buzz on every joint. Duplicate samples (the same tick read twice)
+    collapse to one point; NaN columns (absent arm) pass through.
+    """
+    if len(t) < 2 or offsets.shape != actual.shape:
+        return actual, torque
+    out_a = actual.copy()
+    out_q = torque.copy()
+    for i in range(actual.shape[1]):
+        col = actual[:, i]
+        if not np.any(np.isfinite(col)) or not np.any(offsets[:, i] != 0.0):
+            continue
+        ts = t + offsets[:, i]
+        keep = np.concatenate([[True], np.diff(ts) > 0])
+        keep &= np.isfinite(col)
+        if keep.sum() < 2:
+            continue
+        out_a[:, i] = np.interp(
+            t, ts[keep], col[keep], left=col[keep][0], right=col[keep][-1]
+        )
+        tq = torque[:, i]
+        if np.any(np.isfinite(tq)):
+            kq = keep & np.isfinite(tq)
+            if kq.sum() >= 2:
+                out_q[:, i] = np.interp(
+                    t, ts[kq], tq[kq], left=tq[kq][0], right=tq[kq][-1]
+                )
+    return out_a, out_q
 
 
 def start_pose_stragglers(
@@ -604,6 +645,22 @@ async def _run(args: argparse.Namespace) -> None:
     log_sent: list[np.ndarray] = []
     log_actual: list[np.ndarray] = []
     log_torque: list[np.ndarray] = []
+    # When each measured sample was actually taken on the wire (seconds
+    # relative to the sample's own log time, ≤ 0): the core refreshes the
+    # caches at its tick rate, this loop reads them at the motion rate, and
+    # the varying cache age between the two clocks is a sawtooth that a
+    # 400 Hz core sampled at 240 Hz turns into an 80 Hz "buzz" on every
+    # joint. Re-timing each sample removes it.
+    log_meas_offset: list[np.ndarray] = []
+
+    def _feedback_offsets(arm: Any, now_wall: float) -> np.ndarray:
+        out = np.zeros(7, dtype=np.float64)
+        for i, j in enumerate(ARM_JOINTS):
+            motor = arm.motors.get(j)
+            ts = getattr(motor, "_feedback_ts", None) if motor is not None else None
+            if ts is not None:
+                out[i] = min(0.0, ts - now_wall)
+        return out
 
     async def execute(
         axol: Axol,
@@ -637,13 +694,18 @@ async def _run(args: argparse.Namespace) -> None:
             if record:
                 row_a = np.full(14, np.nan, dtype=np.float32)
                 row_tq = np.full(14, np.nan, dtype=np.float32)
+                row_off = np.zeros(14, dtype=np.float64)
+                now_wall = time.time()
                 if axol.left is not None:
                     row_a[:7] = axol.left.positions[:7]
                     row_tq[:7] = axol.left.torques[:7]
+                    row_off[:7] = _feedback_offsets(axol.left, now_wall)
                 if axol.right is not None:
                     row_a[7:] = axol.right.positions[:7]
                     row_tq[7:] = axol.right.torques[:7]
+                    row_off[7:] = _feedback_offsets(axol.right, now_wall)
                 log_t.append(time.perf_counter() - t0)
+                log_meas_offset.append(row_off)
                 row_cmd = np.concatenate(
                     [q[solver.left_indices], q[solver.right_indices]]
                 ).astype(np.float32)
@@ -766,6 +828,7 @@ async def _run(args: argparse.Namespace) -> None:
     target = np.stack(log_target)
     actual = np.stack(log_actual)
     torque = np.stack(log_torque)
+    actual, torque = retime_measurements(t, np.stack(log_meas_offset), actual, torque)
 
     # Tracking quality is only scored for joints that actually moved (> ~1°
     # of commanded travel) — a joint parked at rest tracks meaninglessly
