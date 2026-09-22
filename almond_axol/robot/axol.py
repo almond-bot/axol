@@ -168,6 +168,15 @@ async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
     the bus is quiet: a MyActuator commits a ROM write only when disabled,
     and joints found holding from a previous session are never touched.
 
+    A motor that took a write is **reset** afterwards (0x76, ~2 s): on the
+    X6-P20's 2025070202 firmware a ROM gain write does not reach the running
+    loop until the motor reboots — the right elbow provisioned here and then
+    streamed to on the firmware loop held its pose for a whole replay
+    (2026-09-21). The reset costs nothing on a provisioned motor (no write,
+    no reset) and only happens while the joint is already disabled. Callers
+    that derive anything from the motor's post-reset state (multi-turn
+    offsets) must do so after this returns.
+
     A joint that will not take the write (pre-V4.2 firmware, no answer, or a
     read-back mismatch) keeps its stored gains and is logged as a warning —
     it tracks with whatever the motor holds, which is safe, just not the
@@ -208,11 +217,13 @@ async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
             continue
         if changed:
             _logger.info(
-                "%s.%s: firmware loop gains written to ROM: %s",
+                "%s.%s: firmware loop gains written to ROM: %s — resetting the "
+                "motor so the loop loads them",
                 side,
                 joint.value,
                 ", ".join(f"{n} {b:g} -> {a:g}" for n, (b, a) in changed.items()),
             )
+            await driver.reset()
 
 
 async def _rollback_newly_enabled_motors(

@@ -493,12 +493,24 @@ class MyActuatorMotor(MotorDriver):
     async def disable(self) -> None:
         await self._request(self._cmd(_MA_SHUTDOWN))
 
+    async def reset(self) -> None:
+        """0x76 system reset and the settle the motor needs before it answers.
+
+        Reboots the motor: torque drops, RAM state (0x31 gains) is lost, and
+        the ROM parameters — loop gains written with 0x32, the planner
+        acceleration — are (re)loaded. On the X6-P20's 2025070202 firmware a
+        0x32 write does not reach the running loop without this: the right
+        elbow provisioned at enable and streamed straight after held its
+        pose through a whole replay (2026-09-21), and tracked once rebooted.
+        """
+        await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
+        await asyncio.sleep(_MA_RESET_SETTLE_S)
+
     async def set_control_mode(self, mode: ControlMode) -> None:
         # MyActuator has no persistent control mode register; the active mode is
         # determined by which command is sent. Reset the motor to clear internal
         # state so it comes back ready for the next command type.
-        await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
-        await asyncio.sleep(_MA_RESET_SETTLE_S)
+        await self.reset()
 
     async def clear_errors(self) -> None:
         pass  # MyActuator has no clear-errors command

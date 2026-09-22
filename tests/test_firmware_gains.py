@@ -71,6 +71,10 @@ class _FakeMotor(MyActuatorMotor):
         self.store = store
         self.enabled = enabled
         self.writes: list[tuple[int, float]] = []
+        self.resets = 0
+
+    async def reset(self) -> None:  # type: ignore[override]
+        self.resets += 1
 
     async def _request(self, data: bytes, *args, **kwargs) -> bytes:  # type: ignore[override]
         cmd, index = data[0], data[1]
@@ -194,6 +198,17 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         # shoulder_3 has no firmware block configured.
         self.assertEqual(s3.writes, [])
         self.assertEqual(sum("written to ROM" in m for m in logs.output), 3)
+        # Every motor that took a write is rebooted so its loop loads the new
+        # gains; the untouched one is not.
+        self.assertEqual([s1.resets, s2.resets, elbow.resets, s3.resets], [1, 1, 1, 0])
+
+    async def test_a_provisioned_motor_is_neither_written_nor_reset(self) -> None:
+        s1 = _FakeMotor(_stock())
+        await apply_firmware_gains(_arm({Joint.SHOULDER_1: s1}), [Joint.SHOULDER_1])
+        s1.writes.clear()
+        s1.resets = 0
+        await apply_firmware_gains(_arm({Joint.SHOULDER_1: s1}), [Joint.SHOULDER_1])
+        self.assertEqual((s1.writes, s1.resets), ([], 0))
 
     async def test_held_joints_are_not_in_the_list_so_nothing_is_written(self) -> None:
         s1 = _FakeMotor(_stock())

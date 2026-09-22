@@ -347,6 +347,14 @@ class AxolEnableRollbackKeepsHeldJointsTest(unittest.IsolatedAsyncioTestCase):
             joint: self.enterContext(patch.object(motor, "disable", AsyncMock()))
             for joint, motor in self.arm.motors.items()
         }
+        # The enable-time firmware-gain provisioning talks to the motors over
+        # the (mocked) bus like the other bring-up writes stubbed below.
+        self.enterContext(
+            patch(
+                "almond_axol.motor.myactuator.MyActuatorMotor.ensure_rom_gains",
+                AsyncMock(return_value={}),
+            )
+        )
 
     def _assert_only_cold_joints_torqued_off(self) -> None:
         for joint, disable in self.disables.items():

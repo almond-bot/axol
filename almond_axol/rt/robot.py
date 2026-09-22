@@ -488,12 +488,15 @@ class Axol(RobotBase):
         self._enable_cold = cold
 
         for side, arm in self._arms():
-            await arm.resolve_joint_offsets()
             # The configured firmware loop gains (wire_mode a4's controller)
             # go to ROM now: the cold joints have just been reset by prep and
             # are disabled, which is the only state a MyActuator commits a
-            # ROM write in, and the bus is quiet. Held joints are skipped.
+            # ROM write in, and the bus is quiet. Held joints are skipped. A
+            # motor that took a write is reset again so its loop loads the
+            # new gains — hence this runs *before* the offsets are resolved
+            # from the (post-reset) multi-turn reading.
             await apply_firmware_gains(arm, cold_joints.get(side, []))
+            await arm.resolve_joint_offsets()
             # Python never calls Motor.enable() in production control, so run the
             # MyActuator capability detection (position/torque decode ranges)
             # and undervoltage provisioning explicitly. Otherwise passive
