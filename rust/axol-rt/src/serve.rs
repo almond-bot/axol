@@ -3291,9 +3291,12 @@ fn bus_loop(
                 }
                 if !attempted[idx] {
                     // Not this motor's tick on the thinned schedule: no
-                    // reply was owed, so none is missing — but the sample
-                    // the damping chain would act on is a tick old.
-                    feedback_fresh[motor.slot] = false;
+                    // reply was owed, so none is missing, and the latest
+                    // sample stays "fresh" — it is the newest the schedule
+                    // can produce. Clearing it here would leave the
+                    // feedforwards that need a sample (stiction, Stribeck,
+                    // host damping) permanently off on a thinned MIT joint,
+                    // since every commanded tick follows an off-tick.
                     continue;
                 }
                 let complete = reply_complete(&expected, &seen, idx);
