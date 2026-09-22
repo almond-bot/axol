@@ -12,6 +12,10 @@ import asyncio
 import os
 import struct
 import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+from almond_axol.rt.link import CONFIG_PROTO  # noqa: E402
 
 BIN = os.environ.get(
     "AXOL_RT_BIN",
@@ -57,8 +61,18 @@ async def session(name, actions):
     return proc.returncode, out.decode(), result
 
 
-joint_line = b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
-cfg = b"C" + b"proto 2\n" + b"loop_hz 240\n" + joint_line
+# One joint per wire token, in the current `joint` line layout (see the
+# `parse_config` tests in serve.rs): the package's CONFIG_PROTO must be the
+# binary's, or the clean check fails with the core's version-skew message.
+joint_line = (
+    b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02"
+    b" 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20\n"
+    b"joint 0 can_alm_axol_l elbow 4 130 5.0 9.4 33.0 0.6 250 0.15 0.02"
+    b" 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+    b"joint 0 can_alm_axol_l wrist_2 6 130 3.5 9.4 33.0 0 0 0 0"
+    b" 0 0 0 0 60 pv 0 0.3 0.1 0.1 0 20\n"
+)
+cfg = b"C" + f"proto {CONFIG_PROTO}\n".encode() + b"loop_hz 400\n" + joint_line
 
 
 async def clean(send, recv, w):
@@ -93,10 +107,8 @@ def check_feedback_parse():
     its `feedback_packet_layout` unit test) and asserts `RtLink._parse_feedback`
     recovers the values, including the age -> timestamp reconstruction.
     """
-    import sys
     import time
 
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     from almond_axol.rt.link import RtLink
 
     slots_in = {0: (1.5, -0.25, 3.0, 1200), 7: (0.5, 0.0, 0.1, 0)}
