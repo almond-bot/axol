@@ -20,8 +20,16 @@ import {
   type TuningRecording,
   type TuningRunData,
   type TuningRunMeta,
+  type TuningWireModes,
 } from "@/lib/tuning"
 import { fetchMotorDetails } from "@/lib/telemetry"
+import {
+  MYACTUATOR_JOINTS,
+  SIDES,
+  effectiveWireMode,
+  parseA4Tokens,
+  toggleA4Token,
+} from "@/lib/wire-mode"
 
 const COMMANDED_COLOR = "rgba(255,255,255,0.45)"
 const ACTUAL_COLOR = "#eff483"
@@ -56,7 +64,7 @@ const KNOWN_KINDS = new Set(["sine", "step", "motion", "gravity", "filter", "bui
 interface WbField {
   key: string
   label: string
-  type: "number" | "text" | "select" | "boolean" | "overrides" | "pose"
+  type: "number" | "text" | "select" | "boolean" | "overrides" | "pose" | "wire"
   options?: string[]
   /** Placeholder shown when empty; empty means "command default". */
   placeholder?: string
@@ -409,6 +417,20 @@ const TABS: WbTab[] = [
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
       { key: "gain", label: "gains — edit a cell to override it for this run", type: "overrides" },
       {
+        key: "a4",
+        label: "controller per joint — click a cell to put that joint on the firmware loop",
+        type: "wire",
+        hint:
+          "impedance is the production MIT frame with the host's gravity, " +
+          "friction and damping feed-forward; firmware hands the joint to the " +
+          "motor's own 0xA4 position loop (the gains on the Firmware-loop tab, " +
+          "written to ROM at enable) for this run only — no compliance, no host " +
+          "feed-forward and NaN torque telemetry on that joint. Everything else " +
+          "about the replay is unchanged, so runs compare directly. Only " +
+          "MyActuator joints have a firmware loop; the Damiao wrists stay on " +
+          "impedance. A joint already configured wire_mode a4 is pinned.",
+      },
+      {
         key: "ik",
         label: "run as IK",
         type: "boolean",
@@ -684,6 +706,103 @@ const OVERRIDE_FIELDS = [
 function fmtGain(v: unknown): string {
   if (typeof v !== "number" || !Number.isFinite(v)) return ""
   return String(Number(v.toFixed(3)))
+}
+
+/**
+ * Per-joint controller picker for tune.motion: one row per MyActuator joint,
+ * one cell per arm, each a two-way toggle between the MIT impedance frame
+ * and the firmware position loop (`--a4 side.joint`). Cells the robot's
+ * config already pins to `wire_mode a4` show as firmware and cannot be
+ * switched back — a run can only add `--a4` joints. Serializes to the token
+ * string the CLI takes, so the launch path and run re-arming stay generic.
+ */
+function WireModeEditor({
+  value,
+  onChange,
+  disabled,
+  configModes,
+}: {
+  value: string
+  onChange: (v: string) => void
+  disabled: boolean
+  configModes: TuningWireModes | null
+}) {
+  const picked = parseA4Tokens(value)
+  return (
+    <div className="flex flex-col gap-1.5 overflow-x-auto">
+      <table className="w-fit border-separate border-spacing-0">
+        <thead>
+          <tr>
+            <th />
+            {SIDES.map((side) => (
+              <th
+                key={side}
+                className="px-1 pb-1 text-left text-[0.65rem] font-normal text-white/40"
+              >
+                {side}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {MYACTUATOR_JOINTS.map((joint) => (
+            <tr key={joint}>
+              <td className="pr-2 text-xs text-white/55">{joint}</td>
+              {SIDES.map((side) => {
+                const mode = effectiveWireMode(value, configModes, side, joint)
+                const pinned =
+                  (configModes?.[side]?.[joint] ?? "mit").toLowerCase() === "a4" &&
+                  !picked.has(`${side}.${joint}`)
+                const dirty = picked.has(`${side}.${joint}`)
+                return (
+                  <td key={side} className="p-0.5">
+                    <button
+                      type="button"
+                      disabled={disabled || pinned}
+                      title={
+                        pinned
+                          ? "wire_mode a4 in this robot's config — the run cannot put it back on impedance"
+                          : mode === "a4"
+                            ? "firmware position loop (0xA4) for this run — click for impedance"
+                            : "MIT impedance frame — click to run this joint on the firmware loop"
+                      }
+                      onClick={() => onChange(toggleA4Token(value, side, joint))}
+                      className={cn(
+                        "h-7 w-24 rounded-md border px-2 text-left font-mono text-[0.7rem] outline-none disabled:cursor-not-allowed",
+                        dirty
+                          ? "border-[#eff483]/60 bg-[#eff483]/10 text-[#eff483]"
+                          : mode === "a4"
+                            ? "border-white/10 bg-[#1c1c1c] text-white/55"
+                            : "border-white/10 bg-[#1c1c1c] text-white/70 hover:border-white/25"
+                      )}
+                    >
+                      {mode === "a4" ? "firmware" : "impedance"}
+                      {pinned && <span className="text-white/30"> · config</span>}
+                    </button>
+                  </td>
+                )
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {picked.size > 0 && (
+        <div className="flex items-center gap-2 text-[0.65rem] text-white/40">
+          <span>
+            {picked.size} joint{picked.size === 1 ? "" : "s"} on the firmware loop this run
+          </span>
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onChange("")}
+            className="text-white/55 underline-offset-2 hover:underline disabled:opacity-40"
+          >
+            reset
+          </button>
+        </div>
+      )}
+    </div>
+  )
 }
 
 /**
@@ -1013,6 +1132,9 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
         .map(([k, v]) => `${k}=${v}`)
         .join(" ")
       if (overrides) out["gain"] = overrides
+      if (Array.isArray(p.a4) && p.a4.length > 0) {
+        out["a4"] = p.a4.filter((t): t is string => typeof t === "string").join(" ")
+      }
       break
     }
     case "gravity":
@@ -2020,6 +2142,7 @@ export function TuningWorkbench({
   // Effective per-joint config gains (defaults + calibration): the slider
   // baselines and "config N" labels on the gain fields.
   const [gains, setGains] = useState<TuningGains | null>(null)
+  const [wireModes, setWireModes] = useState<TuningWireModes | null>(null)
   // The selected motor's live firmware loop gains (Firmware-loop tab): read
   // from the motor over the idle link whenever arm/joint change or a run
   // ends, so the baselines are what the motor actually holds right now.
@@ -2069,7 +2192,10 @@ export function TuningWorkbench({
 
   const refreshGains = useCallback(() => {
     fetchTuningGains()
-      .then(({ gains }) => setGains(gains))
+      .then(({ gains, wire_modes }) => {
+        setGains(gains)
+        setWireModes(wire_modes ?? null)
+      })
       .catch(() => {})
   }, [])
 
@@ -2454,6 +2580,13 @@ export function TuningWorkbench({
                     onChange={(v) => setValue(f.key, v)}
                     disabled={runningOurs || busy}
                     gains={gains}
+                  />
+                ) : f.type === "wire" ? (
+                  <WireModeEditor
+                    value={tabValues[f.key] ?? ""}
+                    onChange={(v) => setValue(f.key, v)}
+                    disabled={runningOurs || busy}
+                    configModes={wireModes}
                   />
                 ) : f.type === "pose" ? (
                   <PoseEditor

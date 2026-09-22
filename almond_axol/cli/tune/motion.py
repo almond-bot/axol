@@ -700,6 +700,9 @@ async def _run(args: argparse.Namespace) -> None:
                 "rate": motion.rate,
                 "stiffness": args.stiffness,
                 "columns": _COLUMNS,
+                # Joints driven on the firmware position loop (--a4) for this
+                # run, so the dashboard can re-arm the same controller split.
+                "a4": list(args.a4),
                 **stream_info,
             },
             label=args.label,

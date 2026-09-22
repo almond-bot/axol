@@ -1936,7 +1936,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         file overlaid — exactly what a tuning run uses when a gain field is
         left empty. The workbench shows these as the slider baselines.
         ``kd_host_hz`` is resolved to the shared default where a joint
-        doesn't set its own band centre.
+        doesn't set its own band centre. ``wire_modes`` carries each joint's
+        configured controller (``mit`` impedance or ``a4`` firmware position
+        loop): the Recorded-motion tab's per-joint controller picker seeds
+        from it, since a run adds ``--a4`` joints on top of the config.
         """
         import math
 
@@ -1947,11 +1950,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         def _load() -> dict[str, Any]:
             cfg = AxolConfig()
             out: dict[str, Any] = {}
+            wire: dict[str, Any] = {}
             for side in ("left", "right"):
                 arm_cfg = getattr(cfg, side)
                 joints: dict[str, Any] = {}
+                modes: dict[str, str] = {}
                 for j in ARM_JOINTS:
                     jc = getattr(arm_cfg, j.value)
+                    modes[j.value] = str(jc.wire_mode).lower()
                     joints[j.value] = {
                         "kp": jc.kp,
                         "kd": jc.kd,
@@ -1971,9 +1977,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         "stribeck_gain": jc.stribeck_gain,
                     }
                 out[side] = joints
-            return out
+                wire[side] = modes
+            return {"gains": out, "wire_modes": wire}
 
-        return {"gains": await asyncio.to_thread(_load)}
+        return await asyncio.to_thread(_load)
 
     @app.get("/api/tuning/runs")
     async def tuning_runs() -> dict[str, Any]:
