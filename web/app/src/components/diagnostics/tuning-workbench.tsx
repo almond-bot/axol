@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { useToast } from "@/components/ui/toast"
 import { cn } from "@/lib/utils"
+import { type FirmwareVendor, shownForJoint } from "@/lib/firmware-loop"
 import { RunChart, type RunChartSeries } from "@/components/diagnostics/run-chart"
 import type { CommandSpec, FormValue } from "@/lib/supervisor"
 import {
@@ -85,6 +86,11 @@ interface WbField {
   fwGainKey?: string
   /** Render a slider next to the value box, over this range. */
   slider?: { min: number; max: number; step: number }
+  /**
+   * The motor vendors whose firmware loop has this knob; the field hides for
+   * a joint of any other vendor (see `lib/firmware-loop`). Unset = always.
+   */
+  vendors?: readonly FirmwareVendor[]
 }
 
 interface WbTab {
@@ -155,9 +161,11 @@ const GAIN_FIELDS: WbField[] = [
 /**
  * The firmware loop gains of the Firmware-loop tab. Each shows the selected
  * motor's *live* value ("motor N", read over the idle link when arm and joint
- * are picked) and a slider seeded there; an empty box runs with the motor's
- * value. Ranges are deliberately tight: on the X8 shoulders 3× the stock
- * speed_kp already vibrated, so a sweep steps in small increments.
+ * are picked); an empty box runs with the motor's value. Plain number boxes,
+ * no sliders: the two vendors' gains live on different scales (a MyActuator
+ * position_kp near 1, a Damiao KP_APR in the hundreds), so no one range fits.
+ * Fields tagged with `vendors` show only for a joint on that vendor's motor —
+ * the Damiao wrists have no position D, no exposed current loop.
  */
 const FW_GAIN_FIELDS: WbField[] = [
   {
@@ -165,58 +173,56 @@ const FW_GAIN_FIELDS: WbField[] = [
     label: "position_kp",
     type: "text",
     fwGainKey: "position_kp",
-    slider: { min: 0, max: 0.3, step: 0.001 },
-    hint: "firmware position loop P — lag ∝ 1/kp; X8 shoulders read 0.008, elbow 0.06",
+    hint:
+      "position loop P — lag ∝ 1/kp. MyActuator: config 1.0 (elbow 1.4), stock 0.008 " +
+      "on the X8 shoulders. Damiao KP_APR: config 400",
   },
   {
     key: "position_ki",
     label: "position_ki",
     type: "text",
     fwGainKey: "position_ki",
-    slider: { min: 0, max: 0.02, step: 0.0001 },
-    hint: "firmware position loop I",
+    hint: "position loop I (Damiao KI_APR)",
   },
   {
     key: "position_kd",
     label: "position_kd",
     type: "text",
     fwGainKey: "position_kd",
-    slider: { min: 0, max: 2, step: 0.01 },
-    hint: "firmware position loop D",
+    vendors: ["myactuator"],
+    hint: "position loop D — measured inert in the 0xA4 loop on the X8-P20",
   },
   {
     key: "speed_kp",
     label: "speed_kp",
     type: "text",
     fwGainKey: "speed_kp",
-    slider: { min: 0, max: 0.15, step: 0.001 },
     hint:
-      "firmware speed loop P — the loop that cycles at creep; 0.1 vibrated on shoulder_1 " +
-      "(stock 0.03)",
+      "speed loop P (Damiao KP_ASR) — on MyActuator the only damping term and the " +
+      "buzz knob; 0.1 vibrated on shoulder_1 (stock 0.03)",
   },
   {
     key: "speed_ki",
     label: "speed_ki",
     type: "text",
     fwGainKey: "speed_ki",
-    slider: { min: 0, max: 0.005, step: 0.00005 },
-    hint: "firmware speed loop I — what pushes through stiction",
+    hint: "speed loop I (Damiao KI_ASR) — what pushes through stiction",
   },
   {
     key: "current_kp",
     label: "current_kp",
     type: "text",
     fwGainKey: "current_kp",
-    slider: { min: 0, max: 2, step: 0.01 },
-    hint: "firmware current loop P — leave unless the vendor says otherwise",
+    vendors: ["myactuator"],
+    hint: "current loop P — leave unless the vendor says otherwise",
   },
   {
     key: "current_ki",
     label: "current_ki",
     type: "text",
     fwGainKey: "current_ki",
-    slider: { min: 0, max: 0.5, step: 0.001 },
-    hint: "firmware current loop I",
+    vendors: ["myactuator"],
+    hint: "current loop I",
   },
 ]
 
@@ -338,8 +344,9 @@ const TABS: WbTab[] = [
     label: "Firmware loop",
     command: "tune.a4",
     description:
-      "Tune a MyActuator joint's own position loop (0xA4, the controller " +
-      "behind wire_mode a4) with a sine or a constant-speed triangle. Firmware " +
+      "Tune a joint's own firmware position loop — 0xA4 on the MyActuator joints " +
+      "(wire_mode a4), position-velocity on the Damiao wrists (pv) — with a sine or " +
+      "a constant-speed triangle; the gain boxes follow the joint's motor. Firmware " +
       "gains are written to RAM for the run and restored afterwards (persist " +
       "writes ROM, keep leaves them); planner acceleration must be 0 for the " +
       "joint to follow a stream. A buzz guard restores the previous gains on " +
@@ -400,9 +407,10 @@ const TABS: WbTab[] = [
       },
       {
         key: "dm_acc",
-        label: "Damiao ACC/DEC (rad/s²)",
+        label: "ACC/DEC (rad/s²)",
         type: "number",
         placeholder: "stored",
+        vendors: ["damiao"],
         hint:
           "wrist_2 / wrist_3 only: the position-velocity profiler's acceleration (and " +
           "-deceleration), written to the registers for the run and restored afterwards " +
@@ -413,6 +421,7 @@ const TABS: WbTab[] = [
         label: "planner accel (dps/s)",
         type: "text",
         fwGainKey: "planner_accel",
+        vendors: ["myactuator"],
         width: "w-24",
         hint:
           "shows what the motor stores; 0 = direct PI tracking (required to follow the " +
@@ -2517,6 +2526,9 @@ export function TuningWorkbench({
     if (miss.length > 0) return
     const args: Record<string, FormValue> = { ...tab.presets }
     for (const f of tab.fields) {
+      // A value typed for the other vendor's knob stays in the form (it
+      // comes back if the joint does) but is never sent: tune.a4 refuses it.
+      if (!shownForJoint(f.vendors, tabValues["joint"])) continue
       const raw = (tabValues[f.key] ?? "").trim()
       if (!raw) continue
       args[f.key] = f.type === "boolean" ? raw === "true" : raw
@@ -2693,137 +2705,142 @@ export function TuningWorkbench({
         <p className="max-w-3xl text-xs leading-relaxed text-white/45">{tab.description}</p>
 
         <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
-          {tab.fields.map((f) => {
-            const cfg = configValue(f)
-            return (
-              <label key={f.key} className="flex flex-col gap-1">
-                <span className="text-[0.65rem] text-white/40">
-                  {f.label}
-                  {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
-                  {cfg != null && (
-                    <span className="text-white/25">
-                      {f.fwGainKey ? " · motor " : " · config "}
-                      {baselineText(f, cfg)}
-                    </span>
-                  )}
-                  {f.fwGainKey && cfg == null && fwArm && fwJoint && (
-                    <span className="text-white/25"> · motor …</span>
-                  )}
-                </span>
-                {f.type === "overrides" ? (
-                  <GainOverrideEditor
-                    value={tabValues[f.key] ?? ""}
-                    onChange={(v) => setValue(f.key, v)}
-                    disabled={runningOurs || busy}
-                    gains={gains}
-                  />
-                ) : f.type === "wire" ? (
-                  <WireModeEditor
-                    value={tabValues[f.key] ?? ""}
-                    onChange={(v) => setValue(f.key, v)}
-                    disabled={runningOurs || busy}
-                    configModes={wireModes}
-                  />
-                ) : f.type === "pose" ? (
-                  <PoseEditor
-                    value={tabValues[f.key] ?? ""}
-                    onChange={(v) => setValue(f.key, v)}
-                    disabled={runningOurs || busy}
-                    excludeJoint={tabValues["joint"] ?? ""}
-                  />
-                ) : f.type === "boolean" ? (
-                  <span className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/70">
-                    <input
-                      type="checkbox"
-                      checked={tabValues[f.key] === "true"}
-                      disabled={runningOurs || busy}
-                      onChange={(e) => setValue(f.key, e.target.checked ? "true" : "")}
-                      className="accent-[#eff483]"
-                    />
-                    {tabValues[f.key] === "true" ? "on" : "off"}
-                  </span>
-                ) : f.type === "select" ? (
-                  <select
-                    value={tabValues[f.key] ?? ""}
-                    onChange={(e) => setValue(f.key, e.target.value)}
-                    disabled={runningOurs || busy}
-                    className={cn(
-                      "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/85 outline-none focus:border-[#eff483]/40",
-                      f.width ?? "w-32"
-                    )}
-                  >
-                    <option value="">
-                      {tab.required.includes(f.key) ? "select…" : (f.placeholder ?? "default")}
-                    </option>
-                    {(f.key === "motion"
-                      ? motions.map((m) => ({ value: m.name, label: m.name }))
-                      : f.key === "prefix" && tab.key === "build"
-                        ? recordings.map((r) => ({
-                            value: r.name,
-                            label:
-                              `${r.name} — ` +
-                              (r.kind === "gravity-comp" ? "hand-guided" : "teleop") +
-                              (r.durationS != null ? ` · ${Math.round(r.durationS)}s` : ""),
-                          }))
-                        : (f.options ?? []).map((o) => ({ value: o, label: o }))
-                    ).map((o) => (
-                      <option key={o.value} value={o.value}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </select>
-                ) : f.slider ? (
-                  (() => {
-                    // The slider tracks the typed value (first number of a
-                    // sweep) and starts at the joint's config value; dragging
-                    // it fills the box, an empty box runs with config.
-                    const raw = (tabValues[f.key] ?? "").trim()
-                    const first = Number.parseFloat(raw.split(/\s+/)[0] ?? "")
-                    const sliderVal = Number.isFinite(first) ? first : (cfg ?? f.slider.min)
-                    return (
-                      <span className="flex h-8 items-center gap-2">
-                        <input
-                          type="range"
-                          min={f.slider.min}
-                          max={f.slider.max}
-                          step={f.slider.step}
-                          value={sliderVal}
-                          onChange={(e) => setValue(f.key, e.target.value)}
-                          disabled={runningOurs || busy || (cfg == null && !raw)}
-                          title={f.hint}
-                          className="w-24 accent-[#eff483] disabled:opacity-40"
-                        />
-                        <input
-                          type="text"
-                          inputMode="decimal"
-                          value={tabValues[f.key] ?? ""}
-                          placeholder={baselineText(f, cfg)}
-                          title={f.hint}
-                          onChange={(e) => setValue(f.key, e.target.value)}
-                          disabled={runningOurs || busy}
-                          className="h-8 w-16 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40"
-                        />
+          {tab.fields
+            .filter((f) => shownForJoint(f.vendors, tabValues["joint"]))
+            .map((f) => {
+              const cfg = configValue(f)
+              return (
+                <label key={f.key} className="flex flex-col gap-1">
+                  <span className="text-[0.65rem] text-white/40">
+                    {f.label}
+                    {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
+                    {cfg != null && (
+                      <span className="text-white/25">
+                        {f.fwGainKey ? " · motor " : " · config "}
+                        {baselineText(f, cfg)}
                       </span>
-                    )
-                  })()
-                ) : (
-                  <input
-                    type="text"
-                    inputMode={f.type === "number" ? "decimal" : undefined}
-                    value={tabValues[f.key] ?? ""}
-                    placeholder={f.placeholder}
-                    title={f.hint}
-                    onChange={(e) => setValue(f.key, e.target.value)}
-                    disabled={runningOurs || busy}
-                    className={cn(
-                      "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40",
-                      f.width ?? (f.type === "number" ? "w-24" : "w-28")
                     )}
-                  />
-                )}
-              </label>
-            )
-          })}
+                    {f.fwGainKey && cfg == null && fwArm && fwJoint && (
+                      <span className="text-white/25"> · motor …</span>
+                    )}
+                  </span>
+                  {f.type === "overrides" ? (
+                    <GainOverrideEditor
+                      value={tabValues[f.key] ?? ""}
+                      onChange={(v) => setValue(f.key, v)}
+                      disabled={runningOurs || busy}
+                      gains={gains}
+                    />
+                  ) : f.type === "wire" ? (
+                    <WireModeEditor
+                      value={tabValues[f.key] ?? ""}
+                      onChange={(v) => setValue(f.key, v)}
+                      disabled={runningOurs || busy}
+                      configModes={wireModes}
+                    />
+                  ) : f.type === "pose" ? (
+                    <PoseEditor
+                      value={tabValues[f.key] ?? ""}
+                      onChange={(v) => setValue(f.key, v)}
+                      disabled={runningOurs || busy}
+                      excludeJoint={tabValues["joint"] ?? ""}
+                    />
+                  ) : f.type === "boolean" ? (
+                    <span className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/70">
+                      <input
+                        type="checkbox"
+                        checked={tabValues[f.key] === "true"}
+                        disabled={runningOurs || busy}
+                        onChange={(e) => setValue(f.key, e.target.checked ? "true" : "")}
+                        className="accent-[#eff483]"
+                      />
+                      {tabValues[f.key] === "true" ? "on" : "off"}
+                    </span>
+                  ) : f.type === "select" ? (
+                    <select
+                      value={tabValues[f.key] ?? ""}
+                      onChange={(e) => setValue(f.key, e.target.value)}
+                      disabled={runningOurs || busy}
+                      className={cn(
+                        "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/85 outline-none focus:border-[#eff483]/40",
+                        f.width ?? "w-32"
+                      )}
+                    >
+                      <option value="">
+                        {tab.required.includes(f.key) ? "select…" : (f.placeholder ?? "default")}
+                      </option>
+                      {(f.key === "motion"
+                        ? motions.map((m) => ({ value: m.name, label: m.name }))
+                        : f.key === "prefix" && tab.key === "build"
+                          ? recordings.map((r) => ({
+                              value: r.name,
+                              label:
+                                `${r.name} — ` +
+                                (r.kind === "gravity-comp" ? "hand-guided" : "teleop") +
+                                (r.durationS != null ? ` · ${Math.round(r.durationS)}s` : ""),
+                            }))
+                          : (f.options ?? []).map((o) => ({ value: o, label: o }))
+                      ).map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </select>
+                  ) : f.slider ? (
+                    (() => {
+                      // The slider tracks the typed value (first number of a
+                      // sweep) and starts at the joint's config value; dragging
+                      // it fills the box, an empty box runs with config.
+                      const raw = (tabValues[f.key] ?? "").trim()
+                      const first = Number.parseFloat(raw.split(/\s+/)[0] ?? "")
+                      const sliderVal = Number.isFinite(first) ? first : (cfg ?? f.slider.min)
+                      return (
+                        <span className="flex h-8 items-center gap-2">
+                          <input
+                            type="range"
+                            min={f.slider.min}
+                            max={f.slider.max}
+                            step={f.slider.step}
+                            value={sliderVal}
+                            onChange={(e) => setValue(f.key, e.target.value)}
+                            disabled={runningOurs || busy || (cfg == null && !raw)}
+                            title={f.hint}
+                            className="w-24 accent-[#eff483] disabled:opacity-40"
+                          />
+                          <input
+                            type="text"
+                            inputMode="decimal"
+                            value={tabValues[f.key] ?? ""}
+                            placeholder={baselineText(f, cfg)}
+                            title={f.hint}
+                            onChange={(e) => setValue(f.key, e.target.value)}
+                            disabled={runningOurs || busy}
+                            className="h-8 w-16 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40"
+                          />
+                        </span>
+                      )
+                    })()
+                  ) : (
+                    <input
+                      type="text"
+                      inputMode={f.type === "number" ? "decimal" : undefined}
+                      value={tabValues[f.key] ?? ""}
+                      placeholder={
+                        f.placeholder ??
+                        (f.fwGainKey || f.gainKey ? baselineText(f, cfg) : undefined)
+                      }
+                      title={f.hint}
+                      onChange={(e) => setValue(f.key, e.target.value)}
+                      disabled={runningOurs || busy}
+                      className={cn(
+                        "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40",
+                        f.width ?? (f.type === "number" ? "w-24" : "w-28")
+                      )}
+                    />
+                  )}
+                </label>
+              )
+            })}
           <div className="ml-auto">
             {runningThisTab ? (
               <Button variant="destructive" size="sm" onClick={onStop} disabled={busy}>
