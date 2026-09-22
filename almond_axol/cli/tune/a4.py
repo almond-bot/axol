@@ -562,7 +562,8 @@ async def _run(args: argparse.Namespace) -> None:
         + (f"{args.freq:g} Hz" if args.mode == "sine" else f"{args.speed:g} deg/s")
         + f", {args.duration:g} s at {args.rate:g} Hz, speed cap {args.cap:g} dps"
         + (
-            f" tracking {args.cap_track:g}× commanded speed (floor {args.cap_floor:g})"
+            f" tracking {args.cap_track:g}× commanded speed (floor {args.cap_floor:g}"
+            ", planner permitting)"
             if args.cap_track > 0
             else ""
         )
@@ -610,6 +611,19 @@ async def _run(args: argparse.Namespace) -> None:
                 f"(direct PI tracking) or --accel {_ACCEL_STEP_FOLLOW} (planner completes "
                 "each step within the tick)"
             )
+
+        cap_track = args.cap_track
+        if accel_used[0] == 0 and cap_track > 0:
+            # Under direct tracking the cap is a hard limit on the PI output:
+            # pinned near the commanded speed the loop can never catch up
+            # (right elbow, pKp 0.5, cap-track 1.1: 1.8° RMS, 480 ms lag).
+            # The knob exists for the planner's per-tick bursts, which
+            # direct tracking does not have.
+            print(
+                f"  ! --cap-track {cap_track:g} ignored: the planner is at 0 (direct "
+                "PI tracking), where the cap would only throttle the loop"
+            )
+            cap_track = 0.0
 
         motors = await joint_frame_motors(raw, is_left)
         await asyncio.gather(
@@ -661,7 +675,7 @@ async def _run(args: argparse.Namespace) -> None:
                 args.rate,
                 guard,
                 live,
-                cap_track=args.cap_track,
+                cap_track=cap_track,
                 cap_floor_dps=args.cap_floor,
             )
             live.flush()
@@ -751,7 +765,7 @@ async def _run(args: argparse.Namespace) -> None:
             "duration_s": args.duration,
             "rate_hz": args.rate,
             "cap_dps": args.cap,
-            "cap_track": args.cap_track,
+            "cap_track": cap_track,
             "cap_floor_dps": args.cap_floor,
             "accel": list(accel_used) if accel_used else None,
             "persist": args.persist,
