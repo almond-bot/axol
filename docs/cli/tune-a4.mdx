@@ -43,6 +43,10 @@ axol tune.a4 --r --joint shoulder_1 --accel 0 --speed-kp 0.05 --speed-ki 0.0005 
 axol tune.a4 --r --joint shoulder_1 --mode sine --freq 0.3 --accel 0 --position-kp 0.02 --save-run
 ```
 
+<Note>
+  A winning set does not have to be persisted from here. The robot config carries per-joint `firmware.*` gains (see the [config reference](/cli/configuration)); `enable()` compares them with the motor's ROM while the joint is still disabled and writes only what differs. The X8-P20 shoulders ship configured with `position_kp 0.3`, `position_kd 0.1`, `speed_kp 0.1`, `speed_ki 1e-5` from these sweeps.
+</Note>
+
 <Warning>
   A joint left with planner acceleration 0 executes any stored position target at the speed cap the moment it wakes. `tune.a4` restores the stored acceleration unless you pass `--keep`; if you keep it, do not drive that joint with any other position command until you have set it back.
 </Warning>

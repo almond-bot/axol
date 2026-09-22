@@ -13,6 +13,7 @@ import logging
 import math
 import re
 import struct
+from collections.abc import Mapping
 from typing import Callable
 
 import can
@@ -51,6 +52,9 @@ _MA_FC_SET_CANID = 0x05  # function control index: set CAN ID
 # driver tells the two formats apart at runtime.
 _MA_READ_GAINS = 0x30
 _MA_WRITE_GAINS_ROM = 0x32  # persistent by command; 0x31 (RAM) is not used
+# Settle after a 0x32 write before the read-back: the flash commit is not
+# instant, and a read that races it returns the old value.
+_MA_ROM_SETTLE_S = 0.3
 
 # Indexed float32 parameter indices for 0x30/0x31/0x32 (V4.2+).
 _MA_PID_IDX = {
@@ -62,6 +66,13 @@ _MA_PID_IDX = {
     "position_ki": 0x08,
     "position_kd": 0x09,
 }
+
+
+def _gain_matches(stored: float, wanted: float) -> bool:
+    """``stored`` is ``wanted`` up to float32 rounding of the wire value."""
+    return abs(stored - wanted) <= 1e-6 * max(1.0, abs(wanted))
+
+
 _MA_SET_ACCELERATION = 0x43  # write acceleration to RAM and ROM; persistent by command
 _MA_READ_ACCELERATION = 0x42  # read one acceleration type; int32 dps/s in bytes 4-7
 
@@ -633,6 +644,53 @@ class MyActuatorMotor(MotorDriver):
                 )
             values[name] = value
         return MotorGains(**values)
+
+    async def ensure_rom_gains(
+        self, wanted: Mapping[str, float]
+    ) -> dict[str, tuple[float, float]]:
+        """Bring the named firmware loop gains to ``wanted`` in ROM (0x32).
+
+        ``wanted`` maps parameter names (keys of ``_MA_PID_IDX``) to values.
+        Each gain is read first and written only when it differs beyond
+        float32 rounding, so a provisioned motor costs reads only and the
+        flash is written once per change. Every write is read back.
+
+        Returns ``{name: (before, after)}`` for the gains that were written.
+
+        The motor must be **disabled**: the firmware commits a 0x32 write to
+        ROM only in that state (protocol V4.4 §2.3) and silently keeps the
+        old value otherwise, which the read-back turns into a
+        :class:`MotorError`. Pre-V4.2 firmware (bulk uint8 gains) is refused
+        with a :class:`MotorError` rather than written.
+        """
+        unknown = set(wanted) - set(_MA_PID_IDX)
+        if unknown:
+            raise ValueError(f"unknown firmware gain(s) {sorted(unknown)}")
+        changed: dict[str, tuple[float, float]] = {}
+        for name, value in wanted.items():
+            index = _MA_PID_IDX[name]
+            before = await self._read_gain_indexed(index)
+            if before is None:
+                raise MotorError(
+                    f"MyActuator motor {self._motor_id:#04x}: firmware predates the "
+                    f"indexed gain format (protocol V4.2); cannot set {name}"
+                )
+            if _gain_matches(before, value):
+                continue
+            await self._request(
+                bytes([_MA_WRITE_GAINS_ROM, index, 0, 0])
+                + struct.pack("<f", float(value))
+            )
+            await asyncio.sleep(_MA_ROM_SETTLE_S)
+            after = await self._read_gain_indexed(index)
+            if after is None or not _gain_matches(after, value):
+                raise MotorError(
+                    f"MyActuator motor {self._motor_id:#04x}: wrote {name}={value:g} "
+                    f"to ROM but the motor reads back {after}; ROM writes only take "
+                    "while the motor is disabled"
+                )
+            changed[name] = (before, after)
+        return changed
 
     async def set_gains(self, gains: MotorGains) -> None:
         # Command 0x32 writes directly to ROM — no separate store step needed.

@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 from ..constants import ARM_JOINTS
@@ -76,6 +76,59 @@ class FrictionParams:
     fv: float
     fo: float
     fl: float = 0.0
+
+
+@dataclass
+class FirmwareGains:
+    """MyActuator firmware loop gains, written to the motor's ROM at enable.
+
+    These are the gains of the motor's own cascaded controller — position
+    PI → speed PI → current PI — which is the loop a joint runs on when its
+    ``wire_mode`` is ``a4``. Under the MIT impedance frame (``wire_mode``
+    ``mit``, the production law) the firmware ignores them; ``kp`` / ``kd``
+    on :class:`JointConfig` are the impedance gains and travel with every
+    command. Each field is ``None`` by default, meaning "leave whatever the
+    motor holds". A set value is compared against the motor's stored gain
+    while the joint is still disabled at enable (the only state a MyActuator
+    accepts a ROM write in) and written only if it differs, so the flash is
+    touched once per change, not once per bring-up. Identified with
+    ``axol tune.a4``; protocol V4.2+ firmware only.
+
+    Attributes:
+        position_kp: Position loop proportional gain: position error →
+                  speed setpoint. Sets the loop bandwidth. Stock 0.008 on the
+                  X8-P20 shoulders (~0.3 Hz), which stick-slips at creep
+                  speed; 0.2 removes the stairs and 0.3 is the knee before
+                  the loop's ~5 Hz mode and a speed-loop buzz appear.
+        position_ki: Position loop integral gain. Leave at the stock 0: on
+                  top of the speed integrator it hunts around the target.
+        position_kd: Position loop derivative gain (protocol V4.2+ index
+                  0x09). Stored and read back by the firmware but measured
+                  inert in the 0xA4 loop on the X8-P20 — 0.1, 0.3 and 0.6
+                  produced identical traces — so it is carried for
+                  completeness, not as a damping knob.
+        speed_kp: Speed loop proportional gain: velocity error → current.
+                  The only damping term the 0xA4 loop has; also the buzz
+                  knob (0.15 doubled the >20 Hz current on shoulder_1).
+        speed_ki: Speed loop integral gain. Lower is smoother on a geared
+                  joint: the integrator winds up while the joint is stuck and
+                  dumps it at release, so the stock 1e-4 feeds the surge
+                  (2e-4 limit-cycled at 5 Hz); 1e-5 halves the mode's current.
+    """
+
+    position_kp: float | None = None
+    position_ki: float | None = None
+    position_kd: float | None = None
+    speed_kp: float | None = None
+    speed_ki: float | None = None
+
+    def as_dict(self) -> dict[str, float]:
+        """The set gains, keyed by their MyActuator parameter name."""
+        return {
+            f.name: float(v)
+            for f in fields(self)
+            if (v := getattr(self, f.name)) is not None
+        }
 
 
 @dataclass
@@ -245,6 +298,10 @@ class JointConfig:
                   the cancellation in the first A/B; 40-80 rad/s follows the
                   surge more closely at the cost of encoder-step noise in
                   the torque (a 16-bit count at 240 Hz is 0.09 rad/s).
+        firmware: :class:`FirmwareGains` written to the motor's ROM at
+                  enable — the position/speed loop gains behind
+                  ``wire_mode`` ``a4``. All ``None`` (the default) leaves the
+                  motor's stored gains alone; MyActuator joints only.
     """
 
     kp: float
@@ -267,6 +324,7 @@ class JointConfig:
     stribeck_load_gain: float = 0.1
     stribeck_vs: float = 0.1
     stribeck_pole: float = 20.0
+    firmware: FirmwareGains = field(default_factory=FirmwareGains)
 
 
 @dataclass
@@ -286,6 +344,25 @@ class PositionForceConfig:
 # values are injected by :class:`AxolConfig` via the ``_LEFT_FRICTION`` /
 # ``_RIGHT_FRICTION`` maps below.
 _ZERO_FRICTION = FrictionParams(fc=0.0, k=1.0, fv=0.0, fo=0.0)
+
+
+# Firmware loop gains for the X8-P20 shoulders (shoulder_1 / shoulder_2),
+# from the ``tune.a4`` sweeps on right shoulder_1 (2026-09-18/21, 3 and
+# 12 deg/s triangles at -45°): position_kp 0.3 is the knee where the creep
+# stairs are gone (velocity ripple 0.26 vs 0.86 stock, zero stuck windows)
+# and the >20 Hz current is still at the stock floor; 0.5 starts a ~5 Hz
+# loop mode, 1.0 buzzes. speed_kp 0.1 (3x stock) is the damping — 0.15
+# doubled the buzz. speed_ki is *lowered* from the stock 1e-4: the
+# integrator winds up while the joint is stuck and dumps it at release.
+# position_kd is the stock value; the firmware stores it but the 0xA4 loop
+# measured inert to it. Written to ROM once at enable (see
+# :class:`FirmwareGains`); they only act under ``wire_mode`` ``a4``.
+_X8_FIRMWARE_GAINS = FirmwareGains(
+    position_kp=0.3,
+    position_kd=0.1,
+    speed_kp=0.1,
+    speed_ki=1e-5,
+)
 
 
 @dataclass
@@ -333,6 +410,7 @@ class ArmConfig:
             # Pose-tracked band-pass centre (kd_host_hz None): the shoulder
             # mode is the impedance mode, moving with reflected inertia.
             kd_host=40.0,
+            firmware=_X8_FIRMWARE_GAINS,
         )
     )
     shoulder_2: JointConfig = field(
@@ -344,6 +422,7 @@ class ArmConfig:
             com=(0.0, 0.0115864, -0.0302711),
             j_eff=1.1,
             kd_host=35.0,
+            firmware=_X8_FIRMWARE_GAINS,
         )
     )
     shoulder_3: JointConfig = field(
@@ -527,6 +606,9 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     friction = entry.get("friction")
     if friction is not None:
         overrides["friction"] = FrictionParams(**friction)
+    firmware = entry.get("firmware")
+    if firmware is not None:
+        overrides["firmware"] = FirmwareGains(**firmware)
     com = entry.get("com")
     if com is not None:
         # Fitted by ``axol tune.gravity --save``; already per-side (measured

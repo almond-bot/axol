@@ -16,6 +16,7 @@ from .base import RobotBase
 from .config import (
     ArmConfig,
     AxolConfig,
+    FirmwareGains,
     FrictionParams,
     JointConfig,
     PositionForceConfig,
@@ -37,6 +38,7 @@ __all__ = [
     "Jelly",
     "JellyConfig",
     "detect_jelly",
+    "FirmwareGains",
     "FrictionParams",
     "JointConfig",
     "PositionForceConfig",

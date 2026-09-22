@@ -79,7 +79,12 @@ from ..constants import ARM_JOINTS
 from ..motor import ControlMode, Joint, Motor, MotorError, MotorGains, MotorStatus
 from ..motor.bus import CanBus
 from ..motor.motor import _JOINT_CONFIG
-from ..robot.axol import AxolArm, AxolHardware, _rollback_newly_enabled_motors
+from ..robot.axol import (
+    AxolArm,
+    AxolHardware,
+    _rollback_newly_enabled_motors,
+    apply_firmware_gains,
+)
 from ..robot.base import RobotBase, mark_hardware_cleanup_uncertain
 from ..robot.config import AxolConfig
 from ..settings import SHARED
@@ -472,16 +477,23 @@ class Axol(RobotBase):
         # is still holding, so this is exactly the classic held/cold split.
         # Only the cold set is rolled back if the bring-up fails from here.
         cold: list[tuple[str, Motor]] = []
+        cold_joints: dict[int, list[Joint]] = {}
         for side, arm in self._arms():
             label = "left" if side == 0 else "right"
             flags = await arm.get_holding()
             for joint, holding in zip(arm.motors, flags):
                 if not holding:
                     cold.append((f"{label}.{joint.value}", arm.motors[joint]))
+                    cold_joints.setdefault(side, []).append(joint)
         self._enable_cold = cold
 
-        for _side, arm in self._arms():
+        for side, arm in self._arms():
             await arm.resolve_joint_offsets()
+            # The configured firmware loop gains (wire_mode a4's controller)
+            # go to ROM now: the cold joints have just been reset by prep and
+            # are disabled, which is the only state a MyActuator commits a
+            # ROM write in, and the bus is quiet. Held joints are skipped.
+            await apply_firmware_gains(arm, cold_joints.get(side, []))
             # Python never calls Motor.enable() in production control, so run the
             # MyActuator capability detection (position/torque decode ranges)
             # and undervoltage provisioning explicitly. Otherwise passive

@@ -34,18 +34,19 @@ from ..motor import (
     MotorGains,
     MotorStatus,
 )
+from ..motor.myactuator import MyActuatorMotor
 from ..settings import SHARED
 from ..utils.paths import almond_path
 from ..utils.state_files import secure_atomic_write_json, secure_read_text
 from .base import RobotBase, mark_hardware_cleanup_uncertain
 from .config import AxolConfig
 from .control import (
-    BandPass,
     DAMP_BP_Q,
     DAMP_BP_W0,
+    VEL_CUTOFF_FREQ,
+    BandPass,
     Differentiator,
     TorqueDither,
-    VEL_CUTOFF_FREQ,
     compute_friction,
     stiction_amplitude,
     stiction_compensation,
@@ -154,6 +155,64 @@ async def _arm_is_unpowered(arm: "AxolArm", bus: CanBus) -> bool:
     return bool(results) and all(
         isinstance(result, (MotorError, can.CanOperationError)) for result in results
     )
+
+
+async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
+    """Write the configured firmware loop gains of ``joints`` to their motors' ROM.
+
+    For each joint whose :class:`~almond_axol.robot.config.JointConfig`
+    carries set :class:`~almond_axol.robot.config.FirmwareGains`, the
+    MyActuator driver compares them with the motor's stored gains and writes
+    the ones that differ (see ``MyActuatorMotor.ensure_rom_gains``). Meant for
+    the *cold* joints of a bring-up, called while they are still disabled and
+    the bus is quiet: a MyActuator commits a ROM write only when disabled,
+    and joints found holding from a previous session are never touched.
+
+    A joint that will not take the write (pre-V4.2 firmware, no answer, or a
+    read-back mismatch) keeps its stored gains and is logged as a warning —
+    it tracks with whatever the motor holds, which is safe, just not the
+    tuned set — so one joint's firmware cannot fail the whole enable.
+    """
+    arm_config = getattr(arm, "_arm_config", None)
+    if arm_config is None:
+        # A bench or test arm built without a config carries no firmware
+        # gains to apply; there is nothing to compare the motors against.
+        return
+    side = "left" if getattr(arm, "_is_left", True) else "right"
+    for joint in joints:
+        jc = getattr(arm_config, joint.value, None)
+        firmware = getattr(jc, "firmware", None)
+        wanted = firmware.as_dict() if firmware is not None else {}
+        if not wanted:
+            continue
+        driver = getattr(arm.motors.get(joint), "_driver", None)
+        if not isinstance(driver, MyActuatorMotor):
+            _logger.warning(
+                "%s.%s: firmware loop gains configured but the joint is not a "
+                "MyActuator; ignored",
+                side,
+                joint.value,
+            )
+            continue
+        try:
+            changed = await driver.ensure_rom_gains(wanted)
+        except MotorError as exc:
+            _logger.warning(
+                "%s.%s: could not apply firmware loop gains %s (%s); the motor "
+                "keeps its stored gains",
+                side,
+                joint.value,
+                wanted,
+                exc,
+            )
+            continue
+        if changed:
+            _logger.info(
+                "%s.%s: firmware loop gains written to ROM: %s",
+                side,
+                joint.value,
+                ", ".join(f"{n} {b:g} -> {a:g}" for n, (b, a) in changed.items()),
+            )
 
 
 async def _rollback_newly_enabled_motors(
@@ -1145,6 +1204,9 @@ class AxolArm:
         self, held: list[Joint], cold: list[Joint], *, hold: bool
     ) -> None:
         """Attach held motors and bring cold motors up after state is sampled."""
+        # Firmware loop gains go to ROM first, while the cold motors are still
+        # disabled — the only state a MyActuator commits a 0x32 write in.
+        await apply_firmware_gains(self, cold)
         await _await_all_hardware_actions(
             *[
                 self.motors[j].attach(
