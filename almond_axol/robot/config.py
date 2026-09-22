@@ -387,6 +387,19 @@ _X6_ELBOW_FIRMWARE_GAINS = FirmwareGains(
     speed_ki=1e-5,
 )
 
+# shoulder_3 (RMD-X6-P20, same firmware; stock position_kp 0.06, speed_kp
+# 0.01, position_kd 0.5). At stock it is near-limp under a4: held at rest
+# during a shoulder_2 sweep with the arm extended it wobbled 1° peak-to-peak
+# at ~3 Hz whenever the arm moved (2026-09-22). 1.0 / 0.05 — the elbow's
+# speed gain, one stiffness step below the elbow — tracked a 3 deg/s
+# triangle at 0.04° RMS, 9 ms lag, tone 0.06 A, on the 400 Hz stream.
+_X6_SHOULDER_3_FIRMWARE_GAINS = FirmwareGains(
+    position_kp=1.0,
+    position_kd=0.5,
+    speed_kp=0.05,
+    speed_ki=1e-5,
+)
+
 
 @dataclass
 class ArmConfig:
@@ -468,6 +481,7 @@ class ArmConfig:
             # though wrist_2 has no host damping. Narrowing shoulder_3 from
             # Q=0.8 to Q=3 did not remove it. Keep damping on the motor side;
             # do not chase the coupled wrist symptom with another host term.
+            firmware=_X6_SHOULDER_3_FIRMWARE_GAINS,
         )
     )
     elbow: JointConfig = field(
