@@ -64,6 +64,7 @@ from ...motor import CanBus, ControlMode, Motor, MotorError
 from ...motor.damiao import DamiaoMotor
 from ...motor.myactuator import _MA_PID_IDX, MyActuatorMotor
 from ...robot.axol import arm_limits
+from ...robot.config import position_wire_mode
 from ...tuning import (
     JointFrameMotor,
     joint_frame_motors,
@@ -357,6 +358,63 @@ def parse_pose(
                 "elbow straight — pose the elbow bent too, e.g. --pose elbow=75"
             )
     return pose
+
+
+def parse_held_gains(
+    specs: list[str] | None, joint: Joint, is_left: bool
+) -> dict[Joint, dict[str, float]]:
+    """``--held-gain [SIDE.]JOINT.GAIN=VALUE`` flags → RAM gains per held joint.
+
+    A ring every held joint shares is fed by the held joints' own firmware
+    loops (see :func:`ring_power`), which ``--position-kp`` etc. cannot
+    reach: those set the test joint only. The side may be omitted but must
+    match the run's arm when given; the joint must be another arm joint, and
+    the gain one its motor's loop has (a Damiao wrist: position/speed kp/ki
+    only). Checked before any motor is enabled.
+    """
+    side = "left" if is_left else "right"
+    known = set(GAIN_NAMES)
+    out: dict[Joint, dict[str, float]] = {}
+    for spec in specs or []:
+        name, eq, value = spec.partition("=")
+        parts = name.split(".")
+        if not eq or len(parts) not in (2, 3):
+            raise SystemExit(
+                f"--held-gain: {spec!r} is not [SIDE.]JOINT.GAIN=VALUE "
+                "(e.g. shoulder_2.position_kp=0.5)"
+            )
+        if len(parts) == 3:
+            if parts[0] != side:
+                raise SystemExit(
+                    f"--held-gain: {spec!r} names the {parts[0]} arm; this run is {side}"
+                )
+            parts = parts[1:]
+        jname, gain = parts
+        try:
+            hj = Joint(jname)
+        except ValueError:
+            raise SystemExit(f"--held-gain: unknown joint {jname!r}") from None
+        if hj not in ARM_JOINTS:
+            raise SystemExit(f"--held-gain: {jname} is not an arm joint")
+        if hj == joint:
+            raise SystemExit(
+                f"--held-gain: {jname} is the test joint — set its gains with "
+                f"--{gain.replace('_', '-')}"
+            )
+        if gain not in known:
+            raise SystemExit(
+                f"--held-gain: unknown gain {gain!r} (one of {', '.join(GAIN_NAMES)})"
+            )
+        if position_wire_mode(hj) == "pv" and gain not in _DM_GAIN_REGS:
+            raise SystemExit(
+                f"--held-gain: {jname} is a Damiao motor: its loop has "
+                f"{', '.join(_DM_GAIN_REGS)} only (not {gain})"
+            )
+        try:
+            out.setdefault(hj, {})[gain] = float(value)
+        except ValueError:
+            raise SystemExit(f"--held-gain: bad value in {spec!r}") from None
+    return out
 
 
 def held_summary(
@@ -830,6 +888,19 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "return to rest afterwards.",
     )
     p.add_argument(
+        "--held-gain",
+        action="append",
+        default=None,
+        metavar="[SIDE.]JOINT.GAIN=VALUE",
+        help="Set a *held* joint's firmware loop gain for the run, in RAM, "
+        "restored afterwards (unless --keep), e.g. --held-gain "
+        "shoulder_2.position_kp=0.5 --held-gain wrist_2.position_kp=200 "
+        "(repeatable). The held joints' loops are what feed a ring they all "
+        "share — the power table names them — and the per-gain flags only reach "
+        "the test joint. Written after the mode switch, like the test joint's "
+        "(the reset reloads ROM). Damiao wrists take position/speed kp/ki only",
+    )
+    p.add_argument(
         "--cap-track",
         type=float,
         default=0.0,
@@ -922,6 +993,7 @@ async def _run(args: argparse.Namespace) -> None:
     requested = {
         n: getattr(args, n) for n in GAIN_NAMES if getattr(args, n) is not None
     }
+    held_gains = parse_held_gains(args.held_gain, joint, is_left)
     samples = waveform(
         args.mode,
         center,
@@ -981,6 +1053,9 @@ async def _run(args: argparse.Namespace) -> None:
         held_dyn: dict[str, list[tuple[float, float, float]]] = {}
         ring_at: float | None = None
         ring_scores: dict[str, dict[str, float]] = {}
+        # Held joints' gains as found (restored at the end) and as run.
+        held_before: dict[Joint, dict[str, float]] = {}
+        held_used: dict[str, dict[str, float]] = {}
         current_label = "torque" if is_dm else "current"
         current_unit = "Nm" if is_dm else "A"
 
@@ -1097,6 +1172,22 @@ async def _run(args: argparse.Namespace) -> None:
                     print(f"  {n:12s} {stock[n]:.6g} → {used_gains[n]:.6g}{flag}")
             else:
                 print("  gains: " + ", ".join(f"{n}={v:.6g}" for n, v in stock.items()))
+            for hj, hgains in held_gains.items():
+                hdrv = raw[hj]._driver
+                found = await _read_gains(hdrv)
+                held_before[hj] = {n: found[n] for n in hgains}
+                await _write_gains(hdrv, hgains, False)
+                got = await _read_gains(hdrv)
+                held_used[hj.value] = {n: got[n] for n in hgains}
+                for n, want in hgains.items():
+                    flag = (
+                        ""
+                        if abs(got[n] - want) <= 1e-6 * max(1.0, abs(want))
+                        else "  (! not accepted)"
+                    )
+                    print(
+                        f"  held {hj.value}.{n:12s} {found[n]:.6g} → {got[n]:.6g}{flag}"
+                    )
 
             guard = BuzzGuard(args.rate, math.radians(args.buzz_abort), args.iq_abort)
             live = LiveStream("sine", joint)
@@ -1243,6 +1334,12 @@ async def _run(args: argparse.Namespace) -> None:
                     print("  previous gains restored")
                 elif before_gains is not None:
                     print("  gains kept (--keep)")
+                for hj, prev in held_before.items():
+                    if args.keep:
+                        print(f"  held {hj.value} gains kept (--keep)")
+                        continue
+                    await _write_gains(raw[hj]._driver, prev, False)
+                    print(f"  held {hj.value} gains restored")
                 if (
                     before_ramps is not None
                     and not args.keep
@@ -1315,6 +1412,7 @@ async def _run(args: argparse.Namespace) -> None:
             "dm_acc": list(ramps_used) if ramps_used else None,
             "persist": args.persist,
             "pose": args.pose or None,
+            "held_gains": held_used or None,
         }
         run_id = save_run(
             "sine",

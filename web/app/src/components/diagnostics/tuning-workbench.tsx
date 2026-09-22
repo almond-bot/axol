@@ -428,6 +428,19 @@ const TABS: WbTab[] = [
           "stream). Written for the run and restored afterwards unless kept",
       },
       ...FW_GAIN_FIELDS,
+      {
+        key: "held_gain",
+        label: "held joint gains",
+        type: "text",
+        width: "w-72",
+        placeholder: "shoulder_2.position_kp=0.5 wrist_2.position_kp=200",
+        hint:
+          "space-separated JOINT.GAIN=VALUE for the joints *held* during the wave, in " +
+          "RAM and restored afterwards unless kept. The held loops are what feed a ring " +
+          "they all share — the run's power table names the ones putting energy in; " +
+          "the gain boxes above set the test joint only. Damiao wrists: position/speed " +
+          "kp/ki only",
+      },
       { key: "buzz_abort", label: "buzz abort (°)", type: "number", placeholder: "0.3" },
       {
         key: "iq_abort",

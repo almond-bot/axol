@@ -404,3 +404,69 @@ class HeldSamplingTest(unittest.TestCase):
             self.assertAlmostEqual(row["iq"], 1.5)
             self.assertAlmostEqual(row["speed"], math.radians(10))
             guard.feed.assert_any_call(row["actual"], 1.5)
+
+
+class HeldGainTest(unittest.TestCase):
+    """``--held-gain``: RAM gains for the joints held during another's wave."""
+
+    def test_joint_or_side_qualified_specs_group_by_joint(self) -> None:
+        from almond_axol.constants import Joint
+
+        out = a4.parse_held_gains(
+            [
+                "shoulder_2.position_kp=0.5",
+                "right.shoulder_2.speed_kp=0.06",
+                "wrist_2.position_kp=200",
+            ],
+            Joint.SHOULDER_3,
+            False,
+        )
+        self.assertEqual(
+            out,
+            {
+                Joint.SHOULDER_2: {"position_kp": 0.5, "speed_kp": 0.06},
+                Joint.WRIST_2: {"position_kp": 200.0},
+            },
+        )
+        self.assertEqual(a4.parse_held_gains(None, Joint.ELBOW, True), {})
+
+    def test_refuses_what_the_run_cannot_apply(self) -> None:
+        from almond_axol.constants import Joint
+
+        bad = {
+            "shoulder_2.position_kp": r"not \[SIDE\.\]JOINT",
+            "position_kp=0.5": r"not \[SIDE\.\]JOINT",
+            "left.shoulder_2.position_kp=0.5": "this run is right",
+            "hip.position_kp=1": "unknown joint",
+            "gripper.position_kp=1": "not an arm joint",
+            "shoulder_3.position_kp=1": "is the test joint",
+            "elbow.bogus=1": "unknown gain",
+            "elbow.position_kp=fast": "bad value",
+            # The Damiao wrists' pv loop has no position D or current loop.
+            "wrist_3.position_kd=0.1": "Damiao motor",
+            "wrist_2.current_kp=1": "Damiao motor",
+        }
+        for spec, message in bad.items():
+            with self.subTest(spec=spec), self.assertRaisesRegex(SystemExit, message):
+                a4.parse_held_gains([spec], Joint.SHOULDER_3, False)
+
+    def test_the_flag_is_repeatable_on_the_cli(self) -> None:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        a4.add_parser(parser.add_subparsers())
+        ns = parser.parse_args(
+            [
+                "tune.a4",
+                "--r",
+                "--joint",
+                "shoulder_3",
+                "--held-gain",
+                "shoulder_2.position_kp=0.5",
+                "--held-gain",
+                "wrist_2.position_kp=200",
+            ]
+        )
+        self.assertEqual(
+            ns.held_gain, ["shoulder_2.position_kp=0.5", "wrist_2.position_kp=200"]
+        )
