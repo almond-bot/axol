@@ -258,6 +258,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "everything else about the replay is unchanged, so runs compare directly.",
     )
     p.add_argument(
+        "--record",
+        metavar="PREFIX",
+        default=None,
+        help="Flight-recorder prefix, as teleop's --teleop.record: the replay's "
+        "measured joints go to PREFIX_meas.npz and the realtime core's per-tick "
+        "trace (target, command, measured position, motor speed, feed-forward "
+        "terms) to PREFIX_rt.npz for `axol diag.teleop-jitter` or offline "
+        "analysis. A bare name lands in the recordings directory.",
+    )
+    p.add_argument(
         "--controller",
         choices=CONTROLLERS,
         default=None,
@@ -642,7 +652,7 @@ async def _run(args: argparse.Namespace) -> None:
         arm_channels["left_channel"] = None
     elif args.arms == "left":
         arm_channels["right_channel"] = None
-    robot = Axol(config=config, **arm_channels)
+    robot = Axol(config=config, record=args.record, **arm_channels)
 
     async with robot as axol:
         contact: tuple[str, float] | None = None
@@ -667,12 +677,18 @@ async def _run(args: argparse.Namespace) -> None:
                 raise _NotAtStart(stragglers)
 
             print(f"Replaying {motion.duration:.1f} s of motion ...")
-            contact = await execute(
-                axol,
-                traj_playback,
-                record=True,
-                refs=ref if stream_differs else None,
-            )
+            # The flight recorder captures the replay segment only, like
+            # teleop's engage→disengage.
+            axol.set_recording_engaged(True)
+            try:
+                contact = await execute(
+                    axol,
+                    traj_playback,
+                    record=True,
+                    refs=ref if stream_differs else None,
+                )
+            finally:
+                axol.set_recording_engaged(False)
             if contact is not None:
                 raise _Contact(contact)
         except _NotAtStart as exc:
@@ -787,6 +803,7 @@ async def _run(args: argparse.Namespace) -> None:
                 # The control law the whole run ran on (impedance at 240 Hz
                 # or the firmware position loops at 400 Hz).
                 "controller": config.controller,
+                "record": args.record,
                 **stream_info,
             },
             label=args.label,
