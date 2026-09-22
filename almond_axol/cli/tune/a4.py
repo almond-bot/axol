@@ -62,6 +62,7 @@ import numpy as np
 from ...constants import ARM_JOINTS, Joint
 from ...motor import CanBus, ControlMode, Motor, MotorError
 from ...motor.myactuator import _MA_PID_IDX, MyActuatorMotor
+from ...robot.axol import arm_limits
 from ...tuning import (
     JointFrameMotor,
     joint_frame_motors,
@@ -281,6 +282,106 @@ def a4_metrics(log: list[dict], rate: float) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def parse_pose(
+    specs: list[str] | None, joint: Joint, is_left: bool
+) -> dict[Joint, float]:
+    """``--pose JOINT=DEG`` flags → joint-frame hold targets (rad), validated.
+
+    Same rules as ``tune.pid``: known arm joint, not the test joint, inside
+    the arm's limits, shoulder_2 outboard only (the base is inboard), and
+    wrist_2's inboard half only with the elbow bent ≥ 30°.
+
+    Why a pose here at all: a firmware position loop that is well damped
+    with the arm hanging can go underdamped with the arm extended — the
+    reflected inertia about shoulder_2 is several times larger with
+    shoulder_1 raised and the elbow bent — and right shoulder_2 was seen
+    oscillating on exactly that hold during a shoulder_3 sweep
+    (2026-09-22). Tune the worst-case pose, not just the rest pose.
+    """
+    side = "left" if is_left else "right"
+    pose: dict[Joint, float] = {}
+    for spec in specs or []:
+        name, _, deg = spec.partition("=")
+        try:
+            pj = Joint(name)
+        except ValueError:
+            raise SystemExit(f"--pose: unknown joint {name!r}") from None
+        if pj == joint:
+            raise SystemExit(f"--pose: {name} is the test joint")
+        if pj not in ARM_JOINTS:
+            raise SystemExit(f"--pose: {name} is not an arm joint")
+        try:
+            rad = math.radians(float(deg))
+        except ValueError:
+            raise SystemExit(
+                f"--pose: bad angle in {spec!r} (want JOINT=DEG)"
+            ) from None
+        lo, hi = arm_limits(pj, is_left)
+        if not (lo <= rad <= hi):
+            raise SystemExit(
+                f"--pose: {name}={deg}° is outside "
+                f"[{math.degrees(lo):.0f}, {math.degrees(hi):.0f}]° for the {side} arm"
+            )
+        pose[pj] = rad
+    s2 = pose.get(Joint.SHOULDER_2)
+    s2_out = -1.0 if is_left else 1.0
+    if s2 is not None and s2 * s2_out < 0:
+        raise SystemExit(
+            f"--pose: shoulder_2 must stay outboard "
+            f"({'negative' if s2_out < 0 else 'positive'} on the {side} arm) — "
+            "the robot base is inboard"
+        )
+    w2 = pose.get(Joint.WRIST_2)
+    w2_out = 1.0 if is_left else -1.0
+    if w2 is not None and w2 * w2_out < 0:
+        elbow_pose = pose.get(Joint.ELBOW)
+        if elbow_pose is None or abs(elbow_pose) < math.radians(30.0):
+            raise SystemExit(
+                "--pose: wrist_2 posed in its inboard half meets the base with the "
+                "elbow straight — pose the elbow bent too, e.g. --pose elbow=75"
+            )
+    return pose
+
+
+def held_summary(
+    held_log: dict[str, list[tuple[float, float]]], holds: dict[str, float]
+) -> dict[str, dict[str, float]]:
+    """Score each held joint's motion during the wave.
+
+    Per joint (degrees): ``drift`` = mean position minus its hold, ``p2p``
+    = peak-to-peak excursion, ``std`` = standard deviation, ``hz`` =
+    dominant frequency of that motion (NaN below ~1 s of samples). A held
+    joint sits on its own firmware position loop: std above a few
+    hundredths of a degree with a clear ``hz`` is the loop oscillating in
+    that pose; a large ``drift`` with little ``std`` is a joint that let go.
+    """
+    out: dict[str, dict[str, float]] = {}
+    for name, samples in held_log.items():
+        if len(samples) < 4:
+            continue
+        t = np.array([a for a, _ in samples])
+        q = np.degrees(np.array([b for _, b in samples]))
+        hold = math.degrees(holds.get(name, 0.0))
+        row = {
+            "drift": float(q.mean() - hold),
+            "p2p": float(np.ptp(q)),
+            "std": float(q.std()),
+            "hz": math.nan,
+        }
+        if t[-1] - t[0] > 1.0:
+            fs = (len(t) - 1) / (t[-1] - t[0])
+            tu = np.arange(t[0], t[-1], 1.0 / fs)
+            x = np.interp(tu, t, q)
+            x = x - x.mean()
+            F = np.abs(np.fft.rfft(x * np.hanning(len(x))))
+            f = np.fft.rfftfreq(len(x), 1.0 / fs)
+            m = f >= 0.5
+            if m.any() and F[m].max() > 0:
+                row["hz"] = float(f[m][int(np.argmax(F[m]))])
+        out[name] = row
+    return out
+
+
 def _a4_frame(position_rad: float, cap_dps: float) -> bytes:
     cap = int(max(0.0, min(65535.0, round(cap_dps))))
     return (
@@ -369,14 +470,24 @@ async def _stream(
     live: LiveStream,
     cap_track: float = 0.0,
     cap_floor_dps: float = 1.0,
-) -> tuple[list[dict], str | None]:
-    """Stream the wave; returns the log and the abort reason, if any."""
+    held: dict[Joint, JointFrameMotor] | None = None,
+) -> tuple[list[dict], str | None, dict[str, list[tuple[float, float]]]]:
+    """Stream the wave; returns the log, the abort reason (if any), and the
+    held joints' ``{joint: [(t, position_rad), ...]}`` sampled round-robin —
+    one 0x92 read of one held joint per tick, so each is seen at
+    ``rate / len(held)`` Hz and the wave's own two round trips stay first."""
     offset = motor.offset
     period = 1.0 / rate
     log: list[dict] = []
+    held_items = [
+        (j.value, jm.motor._driver, jm.offset)
+        for j, jm in (held or {}).items()
+        if isinstance(jm.motor._driver, MyActuatorMotor)
+    ]
+    held_log: dict[str, list[tuple[float, float]]] = {n: [] for n, _, _ in held_items}
     t0 = time.perf_counter()
     deadline = t0
-    for _t_nominal, target, v_cmd in samples:
+    for k, (_t_nominal, target, v_cmd) in enumerate(samples):
         deadline += period
         cap = speed_cap(v_cmd, cap_dps, cap_track, cap_floor_dps)
         resp = await driver._request(_a4_frame(target - offset, cap))
@@ -384,6 +495,21 @@ async def _stream(
         fine = await driver._request(bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0]))
         pos = struct.unpack_from("<i", fine, 4)[0] * (0.01 * math.pi / 180.0) + offset
         now = time.perf_counter() - t0
+        if held_items:
+            name, hdrv, hoff = held_items[k % len(held_items)]
+            try:
+                hf = await hdrv._request(
+                    bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0])
+                )
+                held_log[name].append(
+                    (
+                        now,
+                        struct.unpack_from("<i", hf, 4)[0] * (0.01 * math.pi / 180.0)
+                        + hoff,
+                    )
+                )
+            except MotorError:
+                pass
         log.append(
             {
                 "t": now,
@@ -401,9 +527,9 @@ async def _stream(
         if reason is None and abs(pos - target) > _ERR_ABORT:
             reason = f"tracking error {math.degrees(pos - target):+.1f}° — the loop is not following"
         if reason is not None:
-            return log, reason
+            return log, reason, held_log
         await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
-    return log, None
+    return log, None, held_log
 
 
 async def _hold(
@@ -475,6 +601,18 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     )
     p.add_argument(
         "--cap", type=float, default=60.0, help="0xA4 speed cap, deg/s (default: 60)"
+    )
+    p.add_argument(
+        "--pose",
+        action="append",
+        default=None,
+        metavar="JOINT=DEG",
+        help="Hold another joint at this joint-frame angle (degrees) during the run, "
+        "e.g. --pose shoulder_1=-90 --pose elbow=-75 (repeatable; overrides the sweep's "
+        "own clearance pose for that joint). A firmware loop that is well damped with "
+        "the arm hanging can oscillate with it extended — right shoulder_2 did, held "
+        "during a shoulder_3 sweep — so tune the worst-case pose too. Posed joints "
+        "return to rest afterwards.",
     )
     p.add_argument(
         "--cap-track",
@@ -604,6 +742,7 @@ async def _run(args: argparse.Namespace) -> None:
         reason: str | None = None
         used_gains: dict[str, float] = {}
         accel_used: tuple[int, int] | None = None
+        held_scores: dict[str, dict[str, float]] = {}
 
         # Planner acceleration goes in *before* the mode switch below: that
         # switch is a 0x76 reset, and the reset is what makes a planner value
@@ -661,6 +800,15 @@ async def _run(args: argparse.Namespace) -> None:
             other_targets, _lo, _hi, notes = sweep_safety(joint, is_left)
             for note in notes:
                 print(f"  {note}")
+            pose = parse_pose(args.pose, joint, is_left)
+            if pose:
+                other_targets.update(pose)
+                print(
+                    "  Posing "
+                    + ", ".join(
+                        f"{j.value} at {math.degrees(q):+.0f}°" for j, q in pose.items()
+                    )
+                )
             for stage in ramp_stages(other_targets):
                 await _ramp_verified(motors, stage)
             print(f"  Ramping {joint.value} to {math.degrees(center):+.1f}° ...")
@@ -689,7 +837,7 @@ async def _run(args: argparse.Namespace) -> None:
             guard = BuzzGuard(args.rate, math.radians(args.buzz_abort), args.iq_abort)
             live = LiveStream("sine", joint)
             print("  Running ...")
-            log, reason = await _stream(
+            log, reason, held_log = await _stream(
                 motor,
                 driver,
                 samples,
@@ -699,8 +847,27 @@ async def _run(args: argparse.Namespace) -> None:
                 live,
                 cap_track=cap_track,
                 cap_floor_dps=args.cap_floor,
+                held={j: jm for j, jm in motors.items() if j != joint},
             )
             live.flush()
+            held_scores = held_summary(
+                held_log, {j.value: q for j, q in other_targets.items()}
+            )
+            if held_scores:
+                print(
+                    "  held joints during the wave (drift / p2p / std / dominant Hz):"
+                )
+                for name, r in held_scores.items():
+                    flag = (
+                        "  <-- oscillating"
+                        if r["std"] > 0.05 and r["hz"] == r["hz"]
+                        else ""
+                    )
+                    print(
+                        f"    {name:12s} {r['drift']:+6.2f}° / {r['p2p']:5.2f}° / {r['std']:5.3f}° / "
+                        + (f"{r['hz']:4.1f} Hz" if r["hz"] == r["hz"] else "   — ")
+                        + flag
+                    )
             # The other joints were parked on their own 0xA4 loops and then
             # received no frames for the whole wave. Say so if any let go:
             # the elbow was found several degrees off rest across runs
@@ -792,6 +959,8 @@ async def _run(args: argparse.Namespace) -> None:
         return
     metrics = a4_metrics(log, args.rate)
     metrics["aborted"] = reason is not None
+    if held_scores:
+        metrics["held"] = held_scores
     print(f"\n{'─' * 66}")
     print(
         f"  tracking RMS {math.degrees(metrics['rms']):.3f}°   max {math.degrees(metrics['max']):.3f}°   lag {metrics['lag_ms']:.0f} ms"
@@ -823,6 +992,7 @@ async def _run(args: argparse.Namespace) -> None:
             "cap_floor_dps": args.cap_floor,
             "accel": list(accel_used) if accel_used else None,
             "persist": args.persist,
+            "pose": args.pose or None,
         }
         run_id = save_run(
             "sine",

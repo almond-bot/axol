@@ -188,3 +188,44 @@ class CurrentModeMetricTest(unittest.TestCase):
         # The 3-8 Hz share is the 5 Hz tone's std alone: 1/sqrt(2) ≈ 0.707 A.
         self.assertAlmostEqual(m["iq_mode"], 1.0 / math.sqrt(2), places=1)
         self.assertLess(m["iq_mode"], m["iq_sd"])
+
+
+class PoseAndHeldJointsTest(unittest.TestCase):
+    def test_pose_parses_validates_and_mirrors_shoulder_2_outboard(self) -> None:
+        from almond_axol.constants import Joint
+
+        pose = a4.parse_pose(["shoulder_1=-90", "elbow=-75"], Joint.SHOULDER_2, False)
+        self.assertAlmostEqual(pose[Joint.SHOULDER_1], math.radians(-90))
+        self.assertAlmostEqual(pose[Joint.ELBOW], math.radians(-75))
+        self.assertEqual(a4.parse_pose(None, Joint.ELBOW, True), {})
+        with self.assertRaisesRegex(SystemExit, "outside"):
+            a4.parse_pose(["shoulder_1=120"], Joint.ELBOW, False)  # right limit is +90
+        with self.assertRaisesRegex(SystemExit, "test joint"):
+            a4.parse_pose(["elbow=10"], Joint.ELBOW, False)
+        with self.assertRaisesRegex(SystemExit, "outboard"):
+            a4.parse_pose(
+                ["shoulder_2=-10"], Joint.SHOULDER_3, False
+            )  # right: positive
+        with self.assertRaisesRegex(SystemExit, "unknown joint"):
+            a4.parse_pose(["hip=1"], Joint.ELBOW, True)
+
+    def test_held_summary_scores_drift_and_oscillation(self) -> None:
+        t = np.arange(0, 4.0, 1 / 80)
+        # shoulder_2 oscillating at 2.5 Hz, ±0.5°, around a +10° hold.
+        s2 = math.radians(10) + math.radians(0.5) * np.sin(2 * math.pi * 2.5 * t)
+        # elbow let go: parked 6° below its 0° hold, no oscillation.
+        el = np.full_like(t, math.radians(-6.0))
+        out = a4.held_summary(
+            {
+                "shoulder_2": list(zip(t, s2)),
+                "elbow": list(zip(t, el)),
+                "wrist_1": [(0.0, 0.0)],
+            },
+            {"shoulder_2": math.radians(10), "elbow": 0.0},
+        )
+        self.assertNotIn("wrist_1", out)  # too few samples to score
+        self.assertAlmostEqual(out["shoulder_2"]["hz"], 2.5, delta=0.3)
+        self.assertAlmostEqual(out["shoulder_2"]["p2p"], 1.0, delta=0.05)
+        self.assertAlmostEqual(out["shoulder_2"]["drift"], 0.0, delta=0.05)
+        self.assertAlmostEqual(out["elbow"]["drift"], -6.0, places=6)
+        self.assertEqual(out["elbow"]["std"], 0.0)

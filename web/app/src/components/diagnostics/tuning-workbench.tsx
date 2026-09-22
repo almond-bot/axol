@@ -364,6 +364,17 @@ const TABS: WbTab[] = [
         hint: "joint-frame centre (0 = rest); probe under gravity load, e.g. -35 on shoulder_1",
       },
       { key: "amp", label: "half-travel (°)", type: "number", placeholder: "10" },
+      {
+        key: "pose",
+        label: "pose — hold other joints (°)",
+        type: "pose",
+        hint:
+          "hold other joints at an angle during the run (overrides the sweep's own " +
+          "clearance pose for that joint). A firmware loop that is well damped with the " +
+          "arm hanging can oscillate with it extended — right shoulder_2 did, held during " +
+          "a shoulder_3 sweep — so tune the worst-case pose too; the held joints are " +
+          "sampled during the wave and scored",
+      },
       { key: "speed", label: "triangle speed (°/s)", type: "number", placeholder: "3" },
       { key: "freq", label: "sine freq (Hz)", type: "number", placeholder: "0.3" },
       { key: "duration", label: "duration (s)", type: "number", placeholder: "12" },
@@ -1153,6 +1164,7 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
     if (typeof p.cap_track === "number" && p.cap_track > 0) put("cap_track", p.cap_track)
     if (typeof p.cap_track === "number" && p.cap_track > 0) put("cap_floor", p.cap_floor_dps)
     if (Array.isArray(p.accel) && typeof p.accel[0] === "number") out["accel"] = String(p.accel[0])
+    if (Array.isArray(p.pose) && p.pose.length > 0) out["pose"] = p.pose.join(" ")
     for (const k of ["position_kp", "position_ki", "position_kd", "speed_kp", "speed_ki"]) {
       const v = g[k]
       if (typeof v === "number" && Number.isFinite(v)) out[k] = fmtFwGain(v)
