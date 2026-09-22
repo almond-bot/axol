@@ -684,6 +684,27 @@ const KIND_TABS: Record<string, string> = {
   kinematics: "ik",
 }
 
+/**
+ * A `tune.a4` run: saved as kind `sine` (it shares the sine/triangle charts)
+ * but tagged `wire: "a4"` — it belongs to the Firmware-loop tab, carries the
+ * firmware gains instead of impedance gains, and is scored on creep
+ * smoothness rather than the impedance score.
+ */
+function isA4Run(meta: TuningRunMeta): boolean {
+  return meta.kind === "sine" && meta.params?.wire === "a4"
+}
+
+/** The launcher tab a saved run re-arms, or null for kinds without one. */
+function runTab(meta: TuningRunMeta): string | null {
+  if (isA4Run(meta)) return "a4"
+  return KIND_TABS[meta.kind] ?? null
+}
+
+/** What to call a run in badges: its kind, except firmware-loop runs. */
+function runKindLabel(meta: TuningRunMeta): string {
+  return isA4Run(meta) ? "a4" : meta.kind
+}
+
 /* ------------------------------------------------------------------ */
 /* Gain-override editor (Recorded motion tab)                          */
 /* ------------------------------------------------------------------ */
@@ -1099,6 +1120,25 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
     } else if (typeof v === "string" && v) {
       out[key] = v
     }
+  }
+  if (isA4Run(meta)) {
+    put("arm", meta.side)
+    put("joint", meta.joint)
+    put("mode", p.mode)
+    put("center", p.center_deg)
+    put("amp", p.amp_deg)
+    put("speed", p.speed_dps)
+    put("freq", p.freq_hz)
+    put("duration", p.duration_s)
+    put("rate", p.rate_hz)
+    put("cap", p.cap_dps)
+    if (Array.isArray(p.accel) && typeof p.accel[0] === "number") out["accel"] = String(p.accel[0])
+    for (const k of ["position_kp", "position_ki", "position_kd", "speed_kp", "speed_ki"]) {
+      const v = g[k]
+      if (typeof v === "number" && Number.isFinite(v)) out[k] = fmtFwGain(v)
+    }
+    if (p.persist === true) out["persist"] = "true"
+    return out
   }
   switch (meta.kind) {
     case "sine":
@@ -1782,6 +1822,21 @@ const SINE_COLS: ScoreCol[] = [
   { key: "score", label: "score", digits: 3 },
 ]
 
+// tune.a4's creep-smoothness scorecard (see a4_metrics): the MIT frame's
+// stick-slip sits near 0.8 velocity ripple, smooth is under 0.2.
+const A4_COLS: ScoreCol[] = [
+  { key: "rms", label: "tracking RMS °", deg: true, digits: 3, warn: 0.5, bad: 2.0 },
+  { key: "max", label: "max err °", deg: true, digits: 3, warn: 1.5, bad: 5 },
+  { key: "lag_ms", label: "lag ms", digits: 0, warn: 100, bad: 300 },
+  { key: "v_ripple", label: "vel ripple", digits: 2, warn: 0.3, bad: 0.8 },
+  { key: "stuck_frac", label: "stuck", digits: 2, warn: 0.05, bad: 0.3 },
+  { key: "band_1_4", label: "1–4 Hz °", deg: true, digits: 3, warn: 0.1, bad: 0.3 },
+  { key: "buzz", label: ">10 Hz buzz °", deg: true, digits: 3, warn: 0.02, bad: 0.1 },
+  { key: "iq_rms", label: "current RMS A", digits: 2 },
+  { key: "iq_max", label: "peak A", digits: 1 },
+  { key: "hz", label: "loop Hz", digits: 0 },
+]
+
 const FILTER_COLS: ScoreCol[] = [
   { key: "input_rms", label: "noise in °", deg: true, digits: 3 },
   { key: "rms_err", label: "error out °", deg: true, digits: 3 },
@@ -1825,6 +1880,14 @@ const STEP_COLS: ScoreCol[] = [
   { key: "holder_peak_deg", label: "holder wobble °", digits: 2, warn: 0.2, bad: 0.5 },
   { key: "score", label: "score", digits: 3 },
 ]
+
+const A4_LEGEND =
+  "firmware position loop (0xA4). tracking RMS / max / lag = how the stream was " +
+  "followed. vel ripple = std of measured minus commanded velocity over the " +
+  "commanded speed — the MIT frame's stick-slip sits near 0.8, smooth is under 0.2. " +
+  "stuck = fraction of the pass with the joint not moving. 1–4 Hz = the stick-slip " +
+  "band in the error; >10 Hz buzz = high-frequency position motion (the current " +
+  "columns show a speed-loop buzz the 0.01° position read cannot)."
 
 const SCORE_LEGEND: Record<string, string> = {
   motion:
@@ -1909,7 +1972,13 @@ function scoreRows(
   }
   if (meta.kind === "sine" || meta.kind === "step" || meta.kind === "gravity") {
     return {
-      cols: meta.kind === "sine" ? SINE_COLS : meta.kind === "step" ? STEP_COLS : GRAVITY_COLS,
+      cols: isA4Run(meta)
+        ? A4_COLS
+        : meta.kind === "sine"
+          ? SINE_COLS
+          : meta.kind === "step"
+            ? STEP_COLS
+            : GRAVITY_COLS,
       rows: [{ joint: meta.joint ?? "joint", values: m }],
     }
   }
@@ -2234,7 +2303,7 @@ export function TuningWorkbench({
     (meta: TuningRunMeta) => {
       select(meta.id)
       const form = runFormValues(meta)
-      const tabFor = KIND_TABS[meta.kind]
+      const tabFor = runTab(meta)
       if (!form || !tabFor) return
       setTabKey(tabFor)
       setValues((prev) => ({ ...prev, [tabFor]: form }))
@@ -2423,7 +2492,7 @@ export function TuningWorkbench({
     return single ? [single] : []
   }, [run, arm, armed])
   const scores = meta ? scoreRows(meta, armed ? arm : null) : null
-  const legend = meta ? SCORE_LEGEND[meta.kind] : null
+  const legend = meta ? (isA4Run(meta) ? A4_LEGEND : SCORE_LEGEND[meta.kind]) : null
   const perJoint = (meta?.metrics as Record<string, unknown> | undefined)?.per_joint as
     | Record<string, Record<string, unknown>>
     | undefined
@@ -2946,7 +3015,7 @@ export function TuningWorkbench({
       {/* Selected run: what it is, arm tabs, per-joint graphs, scores. */}
       {!comparing && meta && (
         <div className="flex flex-wrap items-center gap-2 text-xs">
-          <Badge variant="neutral">{meta.kind}</Badge>
+          <Badge variant="neutral">{runKindLabel(meta)}</Badge>
           <span className="text-white/60">
             {meta.joint ? `${meta.side} ${meta.joint}` : ""}
             {meta.params.motion ? `${meta.params.motion as string}` : ""}
@@ -3132,7 +3201,7 @@ export function TuningWorkbench({
                       {cmpIdx === 0 ? "A" : "B"}
                     </span>
                   )}
-                  <Badge variant="neutral">{r.kind}</Badge>
+                  <Badge variant="neutral">{runKindLabel(r)}</Badge>
                   <span className="text-white/70">
                     {[
                       r.side,
