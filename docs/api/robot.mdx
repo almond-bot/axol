@@ -184,6 +184,50 @@ if cfg is not None:
     jelly = Jelly(cfg)
 ```
 
+### Battery
+
+Jelly's charge is estimated from the 24 V rail that the jelly_legs lift
+controller measures (its `GET_POWER` telemetry). The estimate uses the resting
+LiFePO4 curve of the two 24 V 50 Ah packs wired in parallel (8S, 100 Ah).
+While Jelly is enabled with its lift, `jelly.battery` updates about once a
+second. It returns `None` before the first reading, with no pack connected (the
+board is running from USB), or on firmware that doesn't answer `GET_POWER`.
+`read_battery()` takes a single reading without enabling anything. It never
+sends a motion command.
+
+```python
+import asyncio
+from almond_axol.robot import read_battery, read_power
+
+async def main():
+    battery = await read_battery()         # None if the lift board is silent
+    if battery is not None:
+        print(f"{battery.percent:.0f}% ({battery.voltage:.2f} V)")
+        print(battery.charging, battery.under_load, battery.remaining_ah)
+
+    power = await read_power()             # raw telemetry: rail volts, leg amps
+    if power is not None:
+        print(power.supply_volts, power.leg_currents)
+
+asyncio.run(main())
+```
+
+Both return a `BatteryStatus`:
+
+| Field | Description |
+|---|---|
+| `percent` | State of charge, 0–100, from the resting-voltage curve |
+| `voltage` | Pack voltage (smoothed while resting) |
+| `charging` | Rail above any resting voltage (≥ 27.6 V): a charger is connected; `percent` clamps to 100 |
+| `under_load` | Only a reading taken while the lift or wheels were moving exists, so the estimate reads low |
+
+`battery.remaining_ah` converts `percent` into amp-hours of the 100 Ah capacity.
+
+The curve is LiTime's own resting-voltage chart for these packs. LiFePO4
+voltage barely moves above about 25% charge (about 0.5 V from 25% to full), so
+treat `percent` as a band. The estimate also can't be better than the board's
+ADC, which can be off by a few hundred millivolts.
+
 ## `Sim`
 
 `Sim` implements the same interface as `Axol`. Use it to visualise motion without hardware. Requires the `sim` extra.

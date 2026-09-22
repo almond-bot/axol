@@ -42,6 +42,12 @@ README is the spec):
   the broadcast off (``SET_RATE 0``) and polls with ``GET_STATUS`` instead. A
   slower receive-only broadcast can be selected for diagnostics with
   ``status_period_ms``.
+- ``GET_POWER`` (opcode 0x08) answers one power frame on **0x422**: the 24 V
+  rail (VM) in mV, each leg's motor current in mA, and the same driver
+  health bytes as status. In polling mode the driver asks for one every
+  second; the rail is Jelly's battery voltage (see
+  :mod:`almond_axol.robot.battery`). Older firmware ignores the opcode, so
+  :attr:`Lift.power` simply stays ``None``.
 
 A leg stalling mid-move sets the ``stall fault`` status flag and aborts the
 move. Any new motion command clears the fault and retries, so a host must
@@ -63,6 +69,7 @@ from pathlib import Path
 
 from ..constants import CAN_BASE, CAN_CHEST
 from ..motor import CanBus
+from .battery import BatteryEstimator, BatteryStatus, estimate_battery
 
 _logger = logging.getLogger(__name__)
 
@@ -74,6 +81,7 @@ DOWN = -1
 # share the wheel bus (see the module docstring).
 _ID_CMD = 0x420
 _ID_STATUS = 0x421
+_ID_POWER = 0x422
 
 _SYS_NET = Path("/sys/class/net")
 
@@ -105,6 +113,7 @@ _OP_HOME = 0x03
 _OP_GET_STATUS = 0x04
 _OP_SET_RATE = 0x05
 _OP_JOG = 0x06
+_OP_GET_POWER = 0x08
 
 # Default jog speed in encoder counts/s (650 ≈ the firmware's full speed).
 JOG_SPEED = 650
@@ -114,6 +123,13 @@ JOG_SPEED = 650
 _JOG_RESEND_S = 0.05
 # Status poll cadence (broadcast is off — see the module docstring).
 _STATUS_POLL_S = 0.2
+# Power telemetry poll cadence (polling mode only). The pack voltage moves
+# over minutes; this is plenty and adds one frame a second to the bus.
+_POWER_POLL_S = 1.0
+# A power frame older than this no longer describes the battery.
+_POWER_FRESH_S = 5.0
+# A leg drawing more than this is moving (idle reads ~25 mA of ADC offset).
+_LEG_LOAD_A = 0.3
 # Retry receive-only mode after this many missing broadcast intervals.
 _BROADCAST_STALE_FRAMES = 3
 # One warning if the board never answers (chest unpowered / unplugged).
@@ -190,6 +206,41 @@ def decode_status(data: bytes) -> LiftStatus:
 _decode_status = decode_status
 
 
+@dataclass(frozen=True)
+class PowerStatus:
+    """One decoded jelly_legs power frame (``0x422``)."""
+
+    supply_volts: float  # VM, the 24 V rail (Jelly's battery)
+    leg_currents: tuple[float, float]  # amps, leg 1 / leg 2 motor
+    driver_fault_mask: int
+    drivers_enabled: bool
+    vm_present: bool
+    flash_interlock: bool
+    save_pending: bool
+
+
+def decode_power(data: bytes) -> PowerStatus:
+    """Decode one jelly_legs power frame (``0x422`` payload, 8 bytes)."""
+    if len(data) < 8:
+        raise ValueError(f"jelly_legs power frame needs 8 bytes, got {len(data)}")
+    vm_mv, m1_ma, m2_ma, fault_mask, state = struct.unpack("<HHHBB", data[:8])
+    return PowerStatus(
+        supply_volts=vm_mv / 1000.0,
+        leg_currents=(m1_ma / 1000.0, m2_ma / 1000.0),
+        driver_fault_mask=fault_mask,
+        drivers_enabled=bool(state & 0x01),
+        vm_present=bool(state & 0x02),
+        flash_interlock=bool(state & 0x04),
+        save_pending=bool(state & 0x08),
+    )
+
+
+def power_under_load(power: PowerStatus, status: LiftStatus | None) -> bool:
+    """Whether a power sample was taken while the legs drew current."""
+    moving = status is not None and (status.moving or status.homing)
+    return moving or max(power.leg_currents) > _LEG_LOAD_A
+
+
 class Lift:
     """Hold-to-move lift commands over the lift's CAN bus (chest or shared wheel bus).
 
@@ -261,6 +312,12 @@ class Lift:
         # A diagnostic can temporarily suppress solicited recovery traffic
         # while proving that firmware broadcasts really arrive on their own.
         self._recover_stale_broadcasts = True
+        self._power: PowerStatus | None = None
+        self._last_power_monotonic: float | None = None
+        self._battery = BatteryEstimator()
+        # Set by the owner while something else on the rail draws current
+        # (Jelly: the wheels are turning), so the sag is not read as charge.
+        self.external_load = False
 
     @staticmethod
     def _validate_jog_speed(speed: int) -> int:
@@ -325,6 +382,31 @@ class Lift:
         """Height as percent of homed travel, or None (not homed / no reply)."""
         return self._status.height_percent if self._status is not None else None
 
+    @property
+    def power(self) -> PowerStatus | None:
+        """The latest power frame, or None (no reply yet / older firmware)."""
+        return self._power
+
+    @property
+    def power_age(self) -> float | None:
+        """Seconds since the latest power frame, or None before any reply."""
+        if self._last_power_monotonic is None:
+            return None
+        return max(0.0, time.monotonic() - self._last_power_monotonic)
+
+    @property
+    def battery(self) -> BatteryStatus | None:
+        """Jelly's battery estimate from the board's rail voltage.
+
+        ``None`` before the first power frame, once the frames stop arriving
+        (board silent, or firmware without ``GET_POWER``), or when no pack is
+        connected (the board is running from USB).
+        """
+        age = self.power_age
+        if age is None or age > _POWER_FRESH_S:
+            return None
+        return self._battery.status
+
     async def start(self, *, request_status: bool = True) -> None:
         """Open the lift's bus and start the jog/status task.
 
@@ -343,6 +425,9 @@ class Lift:
         self._status = None
         self._last_status_monotonic = None
         self._status_timestamps.clear()
+        self._power = None
+        self._last_power_monotonic = None
+        self._battery.reset()
         self._direction = STOP
         self._last_jog_sent = STOP
         self._stop_requested = False
@@ -659,6 +744,14 @@ class Lift:
             received_at = time.monotonic()
             self._last_status_monotonic = received_at
             self._status_timestamps.append(received_at)
+        elif msg.arbitration_id == _ID_POWER and len(msg.data) >= 8:
+            power = decode_power(bytes(msg.data))
+            self._power = power
+            self._last_power_monotonic = time.monotonic()
+            self._battery.update(
+                power.supply_volts,
+                under_load=power_under_load(power, self._status) or self.external_load,
+            )
 
     async def _send(self, op: int, payload: bytes = b"") -> bool:
         assert self._bus is not None
@@ -684,6 +777,8 @@ class Lift:
         """
         next_poll = 0.0
         started = asyncio.get_running_loop().time()
+        # First power request a beat after the first status poll.
+        next_power = started + _POWER_POLL_S
         warned_silent = False
         prev_stall = False
         while True:
@@ -755,6 +850,11 @@ class Lift:
                         _OP_SET_RATE, struct.pack("<H", self._status_period_ms)
                     )
                 await self._send(_OP_GET_STATUS)
+            if self._status_period_ms == 0 and now >= next_power:
+                # Polling mode only: broadcast mode is for diagnostics that
+                # keep this host's TX quiet while the legs move.
+                next_power = now + _POWER_POLL_S
+                await self._send(_OP_GET_POWER)
 
             if (
                 not warned_silent
@@ -771,3 +871,64 @@ class Lift:
                 )
 
             await asyncio.sleep(_JOG_RESEND_S)
+
+
+async def read_power(
+    channel: str | None = None, *, timeout: float = 2.0
+) -> PowerStatus | None:
+    """One-shot read of the lift board's power telemetry (never moves the legs).
+
+    Opens the lift's bus, quiets the board's status broadcast (``SET_RATE 0``,
+    the same bring-up every other host tool does), asks for one power frame,
+    and closes. Returns ``None`` when the board does not answer within
+    ``timeout`` — unpowered, not on this bus, or firmware without
+    ``GET_POWER``. Feed :attr:`PowerStatus.supply_volts` to
+    :func:`almond_axol.robot.battery.estimate_battery` for the charge.
+    """
+    from ..cli.can.setup import bring_up_interfaces, iface_up
+
+    channel = resolve_lift_channel(channel)
+    if not iface_up(channel):
+        bring_up_interfaces([channel])
+    loop = asyncio.get_running_loop()
+    reply: asyncio.Future[PowerStatus] = loop.create_future()
+
+    def on_message(msg) -> None:  # noqa: ANN001 - can.Message, typed lazily
+        if msg.arbitration_id == _ID_POWER and len(msg.data) >= 8 and not reply.done():
+            reply.set_result(decode_power(bytes(msg.data)))
+
+    bus = CanBus(channel)
+    bus._add_listener(on_message)
+    await bus.start()
+    try:
+        await bus._send(_ID_CMD, bytes([_OP_SET_RATE, 0x00, 0x00]))
+        deadline = loop.time() + timeout
+        # Re-ask a few times: one lost frame should not read as "no board".
+        while not reply.done() and loop.time() < deadline:
+            await bus._send(_ID_CMD, bytes([_OP_GET_POWER]))
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(reply), min(0.25, deadline - loop.time())
+                )
+            except asyncio.TimeoutError:
+                continue
+        return reply.result() if reply.done() else None
+    finally:
+        await bus.close()
+
+
+async def read_battery(
+    channel: str | None = None, *, timeout: float = 2.0
+) -> BatteryStatus | None:
+    """One-shot battery estimate from the lift board, or ``None``.
+
+    A single sample: if the legs happen to be moving the reading sags and
+    ``under_load`` is set. ``None`` when the board is silent or reports no
+    pack (running from USB).
+    """
+    power = await read_power(channel, timeout=timeout)
+    if power is None:
+        return None
+    return estimate_battery(
+        power.supply_volts, under_load=power_under_load(power, None)
+    )
