@@ -529,11 +529,11 @@ async def _stream(
     held joints' ``{joint: [(t, position_rad), ...]}`` sampled round-robin —
     one 0x92 read of one held joint per tick, so each is seen at
     ``rate / len(held)`` Hz and the wave's own two round trips stay first."""
-    offset = motor.offset
+    offset = motor.frame_offset
     period = 1.0 / rate
     log: list[dict] = []
     held_items = [
-        (j.value, jm.motor._driver, jm.offset)
+        (j.value, jm.motor._driver, jm.frame_offset)
         for j, jm in (held or {}).items()
         if isinstance(jm.motor._driver, (MyActuatorMotor, DamiaoMotor))
     ]
@@ -621,10 +621,10 @@ async def _hold(
     while time.perf_counter() < end:
         if isinstance(driver, DamiaoMotor):
             await driver._raw_send(
-                dm_frame(pose - motor.offset, cap_dps), 0x100 + driver._motor_id
+                dm_frame(pose - motor.frame_offset, cap_dps), 0x100 + driver._motor_id
             )
         else:
-            await driver._request(_a4_frame(pose - motor.offset, cap_dps))
+            await driver._request(_a4_frame(pose - motor.frame_offset, cap_dps))
         await asyncio.sleep(period)
 
 

@@ -131,6 +131,30 @@ async def _ramp_verified(
     joints = list(targets)
     if not joints:
         return
+    # Read before commanding. The read re-derives each fixed-stop joint's
+    # ±360° boot wrap (see JointFrameMotor) — the MyActuator reset that
+    # precedes every ramp can leave a reading a full turn off, and a command
+    # against it drives the motor a full turn (right elbow into its hard
+    # stop at 40 Nm, 2026-09-22). Then refuse anything still implausible.
+    pre = await asyncio.gather(*[motors[j].get_position() for j in joints])
+    bad = []
+    for j, pos in zip(joints, pre):
+        is_left = getattr(motors[j], "_is_left", None)
+        if is_left is None:
+            continue
+        lo, hi = arm_limits(j, is_left)
+        if not (lo - _RAMP_SANITY_SLACK <= pos <= hi + _RAMP_SANITY_SLACK):
+            bad.append(
+                f"{j.value} reads {math.degrees(pos):+.1f}° (limits "
+                f"[{math.degrees(lo):+.0f}, {math.degrees(hi):+.0f}]°)"
+            )
+    if bad:
+        raise RuntimeError(
+            "refusing to ramp — implausible joint reading(s): "
+            + ", ".join(bad)
+            + " — a multi-turn wrap or an unset zero; power-cycle or reset "
+            "the motor and re-run `axol motor.set-zero-pos --guided` if it persists"
+        )
     positions: list[float] = []
     for _attempt in range(2):
         await asyncio.gather(
@@ -165,6 +189,9 @@ async def _ramp_verified(
 #: A joint this far (rad) from its rest pose still carries gravity load; the
 #: tuners refuse to reset/disable it and leave it holding instead.
 _REST_TOL = math.radians(5.0)
+#: A joint reading this far outside its arm limits is not a position, it is
+#: a wrapped multi-turn count or an unset zero — never ramp from it.
+_RAMP_SANITY_SLACK = math.radians(15.0)
 
 
 async def _safe_torque_off(
