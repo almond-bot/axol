@@ -405,6 +405,17 @@ fn configure_bus_scheduling(
 /// start-to-start period gives up an unobservable amount of wall-clock phase
 /// instead: lateness can lower the average rate briefly, but can never produce
 /// a catch-up command faster than the configured rate.
+/// `(p50, p95, max)` of the per-tick bus-busy fractions since the last stats
+/// line; NaN when no tick had a reply. Sorts in place.
+fn bus_busy_percentiles(busy: &mut [f64]) -> (f64, f64, f64) {
+    if busy.is_empty() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    busy.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let at = |q: f64| busy[((busy.len() - 1) as f64 * q).round() as usize];
+    (at(0.5), at(0.95), busy[busy.len() - 1])
+}
+
 fn next_bus_deadline(began: Instant, period: Duration) -> Instant {
     began + period
 }
@@ -1253,6 +1264,17 @@ mod tests {
         assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
         assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
         assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Degraded);
+    }
+
+    #[test]
+    fn bus_busy_percentiles_report_median_tail_and_peak() {
+        let mut busy = vec![0.5, 0.7, 0.6, 0.9, 0.55, 0.65, 0.6, 0.62, 0.58, 0.61, 0.95];
+        let (p50, p95, max) = bus_busy_percentiles(&mut busy);
+        assert_eq!(p50, 0.61);
+        assert_eq!(p95, 0.95);
+        assert_eq!(max, 0.95);
+        let (a, b, c) = bus_busy_percentiles(&mut []);
+        assert!(a.is_nan() && b.is_nan() && c.is_nan());
     }
 
     #[test]
@@ -2142,6 +2164,13 @@ fn bus_loop(
     let mut ticks: u64 = 0;
     let mut watchdog_frozen = false;
     let mut next_stats = Instant::now() + Duration::from_secs(5);
+    // Bus occupancy per tick: tick start → last reply received, as a
+    // fraction of the period. This is what bounds the loop rate — at 240 Hz
+    // with three a4 joints (two request/reply pairs each) the right arm is
+    // estimated near three quarters of a 1 Mbps bus — so it is reported in
+    // the 5 s stats line to size any rate change against a measurement.
+    let mut bus_busy: Vec<f64> = Vec::with_capacity(2048);
+    let mut bus_last_reply: Option<Instant> = None;
     // TX-stall (e-stop) tracking — see `guarded_send`. A dead bus skips the
     // motor disable on the way out (nothing is powered to hear it, and the
     // freshly purged queue should stay empty).
@@ -2755,6 +2784,7 @@ fn bus_loop(
             // later, or the overrun lands on the next tick as lateness.
             let reply_deadline = began + period.saturating_sub(REPLY_GUARD);
             seen.fill(0);
+            bus_last_reply = None;
             let mut pending: usize = expected.iter().map(|&n| n as usize).sum();
             while pending > 0 {
                 let now = Instant::now();
@@ -2764,6 +2794,7 @@ fn bus_loop(
                 let Some(frame) = sock.recv_timeout(reply_deadline - now)? else {
                     break;
                 };
+                bus_last_reply = Some(Instant::now());
                 let (idx, pos, vel, tau) = match frame.id {
                     id if (0x501..=0x505).contains(&id) => {
                         let motor_id = (id - 0x500) as u8;
@@ -2950,16 +2981,24 @@ fn bus_loop(
                 let _ = out_tx.send(build_feedback(side, &latest, Instant::now()));
             }
 
+            if let Some(t) = bus_last_reply {
+                bus_busy.push(t.duration_since(began).as_secs_f64() / period.as_secs_f64());
+            }
             if began >= next_stats {
                 next_stats = began + Duration::from_secs(5);
+                let (busy_p50, busy_p95, busy_max) = bus_busy_percentiles(&mut bus_busy);
+                bus_busy.clear();
                 send_text(
                     out_tx,
                     b'L',
                     &format!(
-                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {overruns} overruns, {timing_degraded_ticks} timing-degraded ticks in {timing_degraded_episodes} episodes, {missed} missed replies, {degraded_ticks} feedback-degraded ticks in {degraded_episodes} episodes, {rejected} rejected targets, {held_ticks} held-over ticks (oldest target {:.1} ms, cadence {:.1} ms), {trace_dropped} trace drops, seq {:?}",
+                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {overruns} overruns, {timing_degraded_ticks} timing-degraded ticks in {timing_degraded_episodes} episodes, {missed} missed replies, {degraded_ticks} feedback-degraded ticks in {degraded_episodes} episodes, {rejected} rejected targets, {held_ticks} held-over ticks (oldest target {:.1} ms, cadence {:.1} ms), bus busy p50 {:.0}% p95 {:.0}% max {:.0}% of the tick, {trace_dropped} trace drops, seq {:?}",
                         late as f64 / ticks as f64 * 100.0,
                         worst_target_age * 1e3,
                         cadence.get().unwrap_or(f64::NAN) * 1e3,
+                        busy_p50 * 100.0,
+                        busy_p95 * 100.0,
+                        busy_max * 100.0,
                         last_seq,
                     ),
                 );
