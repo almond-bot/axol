@@ -19,7 +19,7 @@ Safety, built in:
 |---|---|
 | `--l` / `--r` | Arm side (required) |
 | `--channel IFACE` | SocketCAN interface override |
-| `--joint JOINT` | MyActuator joint: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1` (required) |
+| `--joint JOINT` | Any arm joint with a firmware position loop: the MyActuator `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1` on 0xA4, or the Damiao `wrist_2`, `wrist_3` on their position-velocity mode (required) |
 | `--mode sine\|triangle` | Wave shape (default: `triangle`) |
 | `--center DEG` | Centre, joint-frame degrees (default: midpoint of the safe range) |
 | `--amp DEG` | Half-travel, degrees (default: 10) |
@@ -28,6 +28,7 @@ Safety, built in:
 | `--duration S` | Seconds of wave (default: 12) |
 | `--rate HZ` | Command rate (default: 400, the rate the realtime core streams a4 joints at; tune at the rate you will run — the step size is the excitation, and 200 Hz put an audible staircase on the shoulder at 12 deg/s that 400 removed) |
 | `--cap DPS` | 0xA4 speed cap (default: 60) |
+| `--dm-acc RAD_S2` | Damiao wrists (`wrist_2`, `wrist_3`) only: the position-velocity profiler's ACC and −DEC registers for the run, restored afterwards unless `--keep` (`--persist` stores them). The Damiao loop is the same cascade with its gains in RAM registers (`position_kp`/`position_ki` = KP_APR/KI_APR, `speed_kp`/`speed_ki` = KP_ASR/KI_ASR, no kd or current gains) behind an always-on trapezoidal profiler; each 0x100 command answers with the feedback frame, so position is 16-bit and the "current" columns carry torque in Nm. The wrists were found at 2 rad/s² (~115 °/s²) |
 | `--pose JOINT=DEG` | Hold another joint at this joint-frame angle during the run, repeatable, overriding the sweep's own clearance pose for that joint (same rules as [`tune.pid`](/cli/tune-pid): inside the arm's limits, shoulder_2 outboard only). A firmware loop that is well damped with the arm hanging can oscillate with it extended — right shoulder_2 did, held 10° outboard with shoulder_1 raised and the elbow bent during a shoulder_3 sweep — so tune the worst-case pose too. Every held joint is sampled round-robin during the wave (one 0x92 read per tick) and scored: drift from its hold, peak-to-peak, std and dominant frequency, printed and saved under `metrics.held` |
 | `--cap-track K` | Per-command cap = `K × |commanded speed|`, floored at `--cap-floor`, never above `--cap` (default: 0 = fixed cap). With `--accel 60000` a fixed cap lets the planner burst through each 200 Hz step at the cap and idle the rest of the tick — 4× the current spread on the elbow, 68–82 Hz velocity content; `1.1`–`1.2` keeps the joint moving continuously at about the commanded speed. Ignored (with a warning) when the planner is at 0: under direct tracking the cap is a hard limit on the PI output and would only throttle the loop |
 | `--cap-floor DPS` | Lowest cap `--cap-track` may set, so a stationary or reversing target still corrects (default: 1) |

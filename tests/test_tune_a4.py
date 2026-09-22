@@ -229,3 +229,29 @@ class PoseAndHeldJointsTest(unittest.TestCase):
         self.assertAlmostEqual(out["shoulder_2"]["drift"], 0.0, delta=0.05)
         self.assertAlmostEqual(out["elbow"]["drift"], -6.0, places=6)
         self.assertEqual(out["elbow"]["std"], 0.0)
+
+
+class DamiaoPathTest(unittest.TestCase):
+    def test_dm_frame_is_two_little_endian_floats_in_rad_units(self) -> None:
+        import struct
+
+        frame = a4.dm_frame(1.25, 60.0)
+        self.assertEqual(len(frame), 8)
+        p, v = struct.unpack("<ff", frame)
+        self.assertAlmostEqual(p, 1.25, places=6)
+        self.assertAlmostEqual(v, math.radians(60.0), places=5)
+        # A negative cap cannot be sent: the profiler's v_des is a magnitude.
+        self.assertEqual(struct.unpack("<ff", a4.dm_frame(0.0, -5.0))[1], 0.0)
+
+    def test_damiao_gain_registers_match_the_manual(self) -> None:
+        # DM-J4310 register map: 0x19 KP_ASR, 0x1A KI_ASR, 0x1B KP_APR, 0x1C KI_APR.
+        self.assertEqual(
+            a4._DM_GAIN_REGS,
+            {
+                "speed_kp": 0x19,
+                "speed_ki": 0x1A,
+                "position_kp": 0x1B,
+                "position_ki": 0x1C,
+            },
+        )
+        self.assertEqual((a4._DM_REG_ACC, a4._DM_REG_DEC, a4._DM_REG_PM), (4, 5, 0x50))

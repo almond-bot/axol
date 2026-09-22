@@ -353,7 +353,7 @@ const TABS: WbTab[] = [
         key: "joint",
         label: "joint",
         type: "select",
-        options: ["shoulder_1", "shoulder_2", "shoulder_3", "elbow", "wrist_1"],
+        options: ARM_JOINT_OPTIONS,
       },
       { key: "mode", label: "wave", type: "select", options: ["triangle", "sine"] },
       {
@@ -397,6 +397,16 @@ const TABS: WbTab[] = [
         type: "number",
         placeholder: "1",
         hint: "lowest cap the tracking cap may set, so a stationary target still corrects",
+      },
+      {
+        key: "dm_acc",
+        label: "Damiao ACC/DEC (rad/s²)",
+        type: "number",
+        placeholder: "stored",
+        hint:
+          "wrist_2 / wrist_3 only: the position-velocity profiler's acceleration (and " +
+          "-deceleration), written to the registers for the run and restored afterwards " +
+          "unless kept. Found at 2 rad/s² (~115 °/s²), far too slow to follow a stream",
       },
       {
         key: "accel",
@@ -1164,6 +1174,8 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
     if (typeof p.cap_track === "number" && p.cap_track > 0) put("cap_track", p.cap_track)
     if (typeof p.cap_track === "number" && p.cap_track > 0) put("cap_floor", p.cap_floor_dps)
     if (Array.isArray(p.accel) && typeof p.accel[0] === "number") out["accel"] = String(p.accel[0])
+    if (Array.isArray(p.dm_acc) && typeof p.dm_acc[0] === "number")
+      out["dm_acc"] = String(p.dm_acc[0])
     if (Array.isArray(p.pose) && p.pose.length > 0) out["pose"] = p.pose.join(" ")
     for (const k of ["position_kp", "position_ki", "position_kd", "speed_kp", "speed_ki"]) {
       const v = g[k]

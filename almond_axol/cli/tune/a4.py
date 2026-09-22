@@ -61,6 +61,7 @@ import numpy as np
 
 from ...constants import ARM_JOINTS, Joint
 from ...motor import CanBus, ControlMode, Motor, MotorError
+from ...motor.damiao import DamiaoMotor
 from ...motor.myactuator import _MA_PID_IDX, MyActuatorMotor
 from ...robot.axol import arm_limits
 from ...tuning import (
@@ -93,6 +94,20 @@ _FLASH_SETTLE_S = 0.3
 #: — better than direct tracking (accel 0: 0.23°, 74 ms) — while 5000 dps/s
 #: never finished a plan before the next target and the joint barely moved.
 _ACCEL_STEP_FOLLOW = 60000
+
+# Damiao (the wrists): the position-velocity mode is the same three-loop
+# cascade with the gains in RAM registers (0x55 writes take effect at once,
+# 0xAA stores them) — KP_APR / KI_APR position, KP_ASR / KI_ASR velocity —
+# and its own trapezoidal profiler whose ACC / DEC registers (rad/s², DEC
+# negative) shape every streamed target. Each 0x100+ID command (p_des,
+# v_des cap, both float32 LE) is answered with the MIT feedback frame, so
+# position comes back at 16 bits over ±PMAX (0.022° at 12.5 rad), no paired
+# read needed. Register 0x50 (p_m) is the float position for held joints.
+_DM_GAIN_REGS = {"speed_kp": 25, "speed_ki": 26, "position_kp": 27, "position_ki": 28}
+_DM_REG_ACC = 4
+_DM_REG_DEC = 5
+_DM_REG_PM = 80
+_DM_REPLY_TIMEOUT_S = 0.02
 
 GAIN_NAMES: tuple[str, ...] = tuple(_MA_PID_IDX)
 
@@ -424,8 +439,12 @@ def _decode_a4_reply(resp: bytes) -> tuple[float, float]:
     return iq, speed
 
 
-async def _read_gains(driver: MyActuatorMotor) -> dict[str, float]:
+async def _read_gains(driver: MyActuatorMotor | DamiaoMotor) -> dict[str, float]:
     out: dict[str, float] = {}
+    if isinstance(driver, DamiaoMotor):
+        for name, rid in _DM_GAIN_REGS.items():
+            out[name] = float(await driver._read_register(rid))
+        return out
     for name, index in _MA_PID_IDX.items():
         resp = await driver._request(bytes([_MA_READ_GAIN, index, 0, 0, 0, 0, 0, 0]))
         out[name] = float(struct.unpack_from("<f", resp, 4)[0])
@@ -433,14 +452,48 @@ async def _read_gains(driver: MyActuatorMotor) -> dict[str, float]:
 
 
 async def _write_gains(
-    driver: MyActuatorMotor, gains: dict[str, float], persist: bool
+    driver: MyActuatorMotor | DamiaoMotor, gains: dict[str, float], persist: bool
 ) -> None:
+    if isinstance(driver, DamiaoMotor):
+        # RAM registers take effect immediately; 0xAA stores them all.
+        for name, value in gains.items():
+            await driver._write_register(_DM_GAIN_REGS[name], float(value))
+            await asyncio.sleep(0.02)
+        if persist:
+            await driver._store_parameters()
+            await asyncio.sleep(_FLASH_SETTLE_S)
+        return
     cmd = _MA_WRITE_GAIN_ROM if persist else _MA_WRITE_GAIN_RAM
     for name, value in gains.items():
         await driver._request(
             bytes([cmd, _MA_PID_IDX[name], 0, 0]) + struct.pack("<f", float(value))
         )
         await asyncio.sleep(_FLASH_SETTLE_S if persist else 0.02)
+
+
+def dm_frame(position_rad: float, cap_dps: float) -> bytes:
+    """The Damiao position-velocity command: ``(p_des rad, v_des rad/s)`` LE."""
+    return struct.pack("<ff", float(position_rad), math.radians(max(0.0, cap_dps)))
+
+
+async def _dm_read_ramps(driver: DamiaoMotor) -> tuple[float, float]:
+    return (
+        float(await driver._read_register(_DM_REG_ACC)),
+        float(await driver._read_register(_DM_REG_DEC)),
+    )
+
+
+async def _dm_write_ramps(
+    driver: DamiaoMotor, acc: float, dec: float, persist: bool
+) -> tuple[float, float]:
+    await driver._write_register(_DM_REG_ACC, float(acc))
+    await asyncio.sleep(0.02)
+    await driver._write_register(_DM_REG_DEC, float(dec))
+    await asyncio.sleep(0.02)
+    if persist:
+        await driver._store_parameters()
+        await asyncio.sleep(_FLASH_SETTLE_S)
+    return await _dm_read_ramps(driver)
 
 
 async def _read_accel(driver: MyActuatorMotor) -> tuple[int, int]:
@@ -462,7 +515,7 @@ async def _write_accel(driver: MyActuatorMotor, acc: int, dec: int) -> tuple[int
 
 async def _stream(
     motor: JointFrameMotor,
-    driver: MyActuatorMotor,
+    driver: MyActuatorMotor | DamiaoMotor,
     samples: list[tuple[float, float, float]],
     cap_dps: float,
     rate: float,
@@ -482,32 +535,56 @@ async def _stream(
     held_items = [
         (j.value, jm.motor._driver, jm.offset)
         for j, jm in (held or {}).items()
-        if isinstance(jm.motor._driver, MyActuatorMotor)
+        if isinstance(jm.motor._driver, (MyActuatorMotor, DamiaoMotor))
     ]
     held_log: dict[str, list[tuple[float, float]]] = {n: [] for n, _, _ in held_items}
+    is_dm = isinstance(driver, DamiaoMotor)
+    loop = asyncio.get_running_loop()
     t0 = time.perf_counter()
     deadline = t0
     for k, (_t_nominal, target, v_cmd) in enumerate(samples):
         deadline += period
         cap = speed_cap(v_cmd, cap_dps, cap_track, cap_floor_dps)
-        resp = await driver._request(_a4_frame(target - offset, cap))
-        iq, speed = _decode_a4_reply(resp)
-        fine = await driver._request(bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0]))
-        pos = struct.unpack_from("<i", fine, 4)[0] * (0.01 * math.pi / 180.0) + offset
+        if is_dm:
+            # One 0x100 command, one feedback frame back: position (16-bit),
+            # velocity and torque. Torque fills the ``iq`` channel, in Nm.
+            fut = loop.create_future()
+            driver._feedback_waiters.append(fut)
+            await driver._raw_send(
+                dm_frame(target - offset, cap), 0x100 + driver._motor_id
+            )
+            try:
+                fb = await asyncio.wait_for(fut, _DM_REPLY_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                fb = driver._feedback
+            if fb is None:
+                raise MotorError(f"Damiao motor {driver._motor_id:#04x}: no feedback")
+            pos, iq, speed = fb.position + offset, fb.torque, fb.velocity
+        else:
+            resp = await driver._request(_a4_frame(target - offset, cap))
+            iq, speed = _decode_a4_reply(resp)
+            fine = await driver._request(
+                bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0])
+            )
+            pos = (
+                struct.unpack_from("<i", fine, 4)[0] * (0.01 * math.pi / 180.0) + offset
+            )
         now = time.perf_counter() - t0
         if held_items:
             name, hdrv, hoff = held_items[k % len(held_items)]
             try:
-                hf = await hdrv._request(
-                    bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0])
-                )
-                held_log[name].append(
-                    (
-                        now,
-                        struct.unpack_from("<i", hf, 4)[0] * (0.01 * math.pi / 180.0)
-                        + hoff,
+                if isinstance(hdrv, DamiaoMotor):
+                    hp = float(
+                        await hdrv._read_register(
+                            _DM_REG_PM, timeout=_DM_REPLY_TIMEOUT_S, attempts=1
+                        )
                     )
-                )
+                else:
+                    hf = await hdrv._request(
+                        bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0])
+                    )
+                    hp = struct.unpack_from("<i", hf, 4)[0] * (0.01 * math.pi / 180.0)
+                held_log[name].append((now, hp + hoff))
             except MotorError:
                 pass
         log.append(
@@ -533,7 +610,7 @@ async def _stream(
 
 
 async def _hold(
-    driver: MyActuatorMotor,
+    driver: MyActuatorMotor | DamiaoMotor,
     motor: JointFrameMotor,
     pose: float,
     cap_dps: float,
@@ -542,7 +619,12 @@ async def _hold(
     period = 0.01
     end = time.perf_counter() + seconds
     while time.perf_counter() < end:
-        await driver._request(_a4_frame(pose - motor.offset, cap_dps))
+        if isinstance(driver, DamiaoMotor):
+            await driver._raw_send(
+                dm_frame(pose - motor.offset, cap_dps), 0x100 + driver._motor_id
+            )
+        else:
+            await driver._request(_a4_frame(pose - motor.offset, cap_dps))
         await asyncio.sleep(period)
 
 
@@ -601,6 +683,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     )
     p.add_argument(
         "--cap", type=float, default=60.0, help="0xA4 speed cap, deg/s (default: 60)"
+    )
+    p.add_argument(
+        "--dm-acc",
+        type=float,
+        default=None,
+        help="Damiao wrists only: the position-velocity profiler's ACC (and -DEC), rad/s², "
+        "written to the registers for the run and restored afterwards unless --keep "
+        "(--persist stores them). The wrists were found at 2 rad/s² (~115 deg/s²), far "
+        "too slow to follow a streamed target.",
     )
     p.add_argument(
         "--pose",
@@ -734,15 +825,36 @@ async def _run(args: argparse.Namespace) -> None:
         raw = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw.values()])
         driver = raw[joint]._driver
-        if not isinstance(driver, MyActuatorMotor):
-            raise SystemExit(f"{joint.value} is not a MyActuator joint")
+        if not isinstance(driver, (MyActuatorMotor, DamiaoMotor)):
+            raise SystemExit(f"{joint.value} has no firmware position loop to tune")
+        is_dm = isinstance(driver, DamiaoMotor)
+        if is_dm:
+            unsupported = sorted(set(requested) - set(_DM_GAIN_REGS))
+            if unsupported:
+                raise SystemExit(
+                    f"{joint.value} is a Damiao motor: its loop has "
+                    f"{', '.join(_DM_GAIN_REGS)} only (not {', '.join(unsupported)})"
+                )
+            if args.accel is not None:
+                raise SystemExit(
+                    f"{joint.value} is a Damiao motor: its profiler is ACC/DEC in rad/s² — "
+                    "use --dm-acc, not --accel"
+                )
+        elif args.dm_acc is not None:
+            raise SystemExit(
+                f"--dm-acc is for the Damiao wrists; {joint.value} takes --accel"
+            )
         before_gains: dict[str, float] | None = None
         before_accel: tuple[int, int] | None = None
+        before_ramps: tuple[float, float] | None = None
         log: list[dict] = []
         reason: str | None = None
         used_gains: dict[str, float] = {}
         accel_used: tuple[int, int] | None = None
+        ramps_used: tuple[float, float] | None = None
         held_scores: dict[str, dict[str, float]] = {}
+        current_label = "torque" if is_dm else "current"
+        current_unit = "Nm" if is_dm else "A"
 
         # Planner acceleration goes in *before* the mode switch below: that
         # switch is a 0x76 reset, and the reset is what makes a planner value
@@ -753,28 +865,52 @@ async def _run(args: argparse.Namespace) -> None:
         # tracking. Non-zero values do apply live on that firmware (5000 →
         # 60000 took effect mid-session); the X8-P20 shoulders (2026042402)
         # apply 0 live as well. Writing first is right for every one of them.
-        stored_accel = await _read_accel(driver)
-        print(
-            f"  planner accel/decel stored: {stored_accel[0]}/{stored_accel[1]} dps/s"
-        )
-        if args.accel is not None and stored_accel != (args.accel, args.accel):
-            before_accel = stored_accel
-            accel_used = await _write_accel(driver, args.accel, args.accel)
-            print(
-                f"  planner accel/decel {stored_accel[0]}/{stored_accel[1]} → {accel_used[0]}/{accel_used[1]} dps/s"
-            )
-        else:
-            accel_used = stored_accel
-        if accel_used[0] not in (0, _ACCEL_STEP_FOLLOW):
-            print(
-                f"  ! planner acceleration is {accel_used[0]} dps/s: the firmware re-plans "
-                "every streamed target and will not follow the wave — pass --accel 0 "
-                f"(direct PI tracking) or --accel {_ACCEL_STEP_FOLLOW} (planner completes "
-                "each step within the tick)"
-            )
-
         cap_track = args.cap_track
-        if accel_used[0] == 0 and cap_track > 0:
+        if is_dm:
+            # Damiao: the profiler is always on (ACC in (0, fmax), DEC < 0),
+            # registers in RAM, no reset needed for them to take effect. A
+            # stored 2 rad/s² (the wrists as found) is ~115 deg/s² — far too
+            # slow to follow a streamed target; the sweep says what does.
+            stored_ramps = await _dm_read_ramps(driver)
+            print(
+                f"  profiler ACC/DEC stored: {stored_ramps[0]:g}/{stored_ramps[1]:g} rad/s²"
+            )
+            if args.dm_acc is not None and (stored_ramps[0], -stored_ramps[1]) != (
+                args.dm_acc,
+                args.dm_acc,
+            ):
+                before_ramps = stored_ramps
+                ramps_used = await _dm_write_ramps(
+                    driver, args.dm_acc, -abs(args.dm_acc), args.persist
+                )
+                print(
+                    f"  profiler ACC/DEC {stored_ramps[0]:g}/{stored_ramps[1]:g} → "
+                    f"{ramps_used[0]:g}/{ramps_used[1]:g} rad/s²"
+                )
+            else:
+                ramps_used = stored_ramps
+        else:
+            stored_accel = await _read_accel(driver)
+            print(
+                f"  planner accel/decel stored: {stored_accel[0]}/{stored_accel[1]} dps/s"
+            )
+            if args.accel is not None and stored_accel != (args.accel, args.accel):
+                before_accel = stored_accel
+                accel_used = await _write_accel(driver, args.accel, args.accel)
+                print(
+                    f"  planner accel/decel {stored_accel[0]}/{stored_accel[1]} → {accel_used[0]}/{accel_used[1]} dps/s"
+                )
+            else:
+                accel_used = stored_accel
+            if accel_used[0] not in (0, _ACCEL_STEP_FOLLOW):
+                print(
+                    f"  ! planner acceleration is {accel_used[0]} dps/s: the firmware re-plans "
+                    "every streamed target and will not follow the wave — pass --accel 0 "
+                    f"(direct PI tracking) or --accel {_ACCEL_STEP_FOLLOW} (planner completes "
+                    "each step within the tick)"
+                )
+
+        if accel_used is not None and accel_used[0] == 0 and cap_track > 0:
             # Under direct tracking the cap is a hard limit on the PI output:
             # pinned near the commanded speed the loop can never catch up
             # (right elbow, pKp 0.5, cap-track 1.1: 1.8° RMS, 480 ms lag).
@@ -941,6 +1077,21 @@ async def _run(args: argparse.Namespace) -> None:
                     print("  previous gains restored")
                 elif before_gains is not None:
                     print("  gains kept (--keep)")
+                if (
+                    before_ramps is not None
+                    and not args.keep
+                    and isinstance(driver, DamiaoMotor)
+                ):
+                    got = await _dm_write_ramps(
+                        driver, before_ramps[0], before_ramps[1], args.persist
+                    )
+                    print(
+                        f"  profiler ACC/DEC restored to {got[0]:g}/{got[1]:g} rad/s²"
+                    )
+                elif before_ramps is not None and ramps_used is not None:
+                    print(
+                        f"  profiler left at {ramps_used[0]:g}/{ramps_used[1]:g} rad/s² (--keep)"
+                    )
                 if before_accel is not None and not args.keep:
                     got = await _write_accel(driver, before_accel[0], before_accel[1])
                     print(f"  planner accel/decel restored to {got[0]}/{got[1]} dps/s")
@@ -972,9 +1123,10 @@ async def _run(args: argparse.Namespace) -> None:
         f"  velocity ripple {metrics['v_ripple']:.2f} (MIT stick-slip ≈ 0.8, smooth < 0.2)   stuck windows {metrics['stuck_frac']:.2f}"
     )
     print(
-        f"  current RMS {metrics['iq_rms']:.2f} A   peak {metrics['iq_max']:.2f} A   "
-        f"spread {metrics['iq_sd']:.2f} A   3-8 Hz mode {metrics['iq_mode']:.2f} A   "
-        f"loop {metrics['hz']:.0f} Hz"
+        f"  {current_label} RMS {metrics['iq_rms']:.2f} {current_unit}   "
+        f"peak {metrics['iq_max']:.2f} {current_unit}   "
+        f"spread {metrics['iq_sd']:.2f} {current_unit}   "
+        f"3-8 Hz mode {metrics['iq_mode']:.2f} {current_unit}   loop {metrics['hz']:.0f} Hz"
     )
     print(f"{'─' * 66}")
     if args.save_run:
@@ -991,6 +1143,8 @@ async def _run(args: argparse.Namespace) -> None:
             "cap_track": cap_track,
             "cap_floor_dps": args.cap_floor,
             "accel": list(accel_used) if accel_used else None,
+            "vendor": "damiao" if is_dm else "myactuator",
+            "dm_acc": list(ramps_used) if ramps_used else None,
             "persist": args.persist,
             "pose": args.pose or None,
         }
