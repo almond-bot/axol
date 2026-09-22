@@ -7,7 +7,7 @@ Replays a [reference motion](/cli/motion-build) through the production Rust-core
 
 Every run persists a tuning-run artifact (full per-joint time series + metrics) under `~/.almond/diagnostics/tuning/` for charting and side-by-side comparison.
 
-The arm moves to the motion's start and back to rest on collision-aware planned trajectories; a contact watchdog aborts playback if a sustained torque residual says the arm is pushing on something that isn't in the plan.
+The arm moves to the motion's start and back to rest on collision-aware planned trajectories; a contact watchdog aborts playback if a sustained torque residual says the arm is pushing on something that isn't in the plan. Arrival at the start pose is checked before playback: a joint more than ~3° off is named and playback is skipped (the arm returns to rest). A `--a4` joint that fails this almost always has a stored planner acceleration that is neither 0 nor 60000 — read it with `scripts/fw_gains.py --id <id>`; anything in between re-plans every streamed target and the joint barely moves (see [`tune.a4`](/cli/tune-a4)).
 
 | Flag | Description |
 |---|---|

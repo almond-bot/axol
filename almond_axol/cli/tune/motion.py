@@ -92,6 +92,35 @@ _COLUMNS = [f"left.{j.value}" for j in ARM_JOINTS] + [
 ]
 
 
+#: A joint further than this (rad, ~3°) from the motion's first row after the
+#: approach move did not follow it, and playback must not start from there.
+_START_POSE_TOL = 0.05
+
+
+def start_pose_stragglers(
+    q_now: np.ndarray,
+    q_start: np.ndarray,
+    left_indices: np.ndarray,
+    right_indices: np.ndarray,
+    tol: float = _START_POSE_TOL,
+) -> list[tuple[str, float]]:
+    """Joints not at the motion start pose: ``[(column, error_deg), ...]``.
+
+    The approach move is streamed, not verified — a joint that will not
+    follow the stream (a ``--a4`` joint whose stored planner acceleration
+    is neither 0 nor 60000 barely moves, see ``tune.a4``) is silently left
+    at rest, and replaying from there scores garbage for that joint and
+    swings the others around a pose the motion never planned for.
+    """
+    out: list[tuple[str, float]] = []
+    for side, indices in (("left", left_indices), ("right", right_indices)):
+        for j, idx in zip(ARM_JOINTS, indices):
+            err = float(q_now[idx] - q_start[idx])
+            if abs(err) > tol:
+                out.append((f"{side}.{j.value}", math.degrees(err)))
+    return out
+
+
 def _parse_gain_overrides(specs: list[str]) -> dict[tuple[str, str, str], float]:
     """Parse ``--gain [side.]joint.field=value`` into ``{(side, joint, field): v}``.
 
@@ -599,6 +628,11 @@ async def _run(args: argparse.Namespace) -> None:
                 if contact is not None:
                     raise _Contact(contact)
                 await asyncio.sleep(0.5)
+            stragglers = start_pose_stragglers(
+                snapshot(axol), q_start, solver.left_indices, solver.right_indices
+            )
+            if stragglers:
+                raise _NotAtStart(stragglers)
 
             print(f"Replaying {motion.duration:.1f} s of motion ...")
             contact = await execute(
@@ -609,6 +643,19 @@ async def _run(args: argparse.Namespace) -> None:
             )
             if contact is not None:
                 raise _Contact(contact)
+        except _NotAtStart as exc:
+            print(
+                "\n  ! not at the motion start pose after the approach — playback "
+                "skipped: "
+                + ", ".join(f"{name} {err:+.1f}° off" for name, err in exc.stragglers)
+            )
+            if args.a4:
+                print(
+                    "    a --a4 joint that did not follow the approach usually has a "
+                    "stored planner acceleration that is neither 0 nor 60000 (read it "
+                    "with scripts/fw_gains.py --id <id>; anything in between re-plans "
+                    "every streamed target and barely moves)"
+                )
         except _Contact as exc:
             joint, residual = exc.trip
             print(
@@ -715,6 +762,13 @@ class _Contact(Exception):
 
     def __init__(self, trip: tuple[str, float]) -> None:
         self.trip = trip
+
+
+class _NotAtStart(Exception):
+    """Internal: the approach left joints off the start pose; skip playback."""
+
+    def __init__(self, stragglers: list[tuple[str, float]]) -> None:
+        self.stragglers = stragglers
 
 
 def _load_motion_or_exit(name: str) -> ReferenceMotion:
