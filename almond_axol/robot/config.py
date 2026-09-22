@@ -935,16 +935,12 @@ def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
 #:
 #: ``"impedance"`` is the production MIT frame: host gravity / friction /
 #: inertia feedforward and host damping around the firmware PD, compliant,
-#: at 240 Hz. ``"position"`` hands the five MyActuator joints to their
-#: motor's own position loop (0xA4, gains from each joint's ``firmware``
-#: block) streamed at 400 Hz, where the loop's target staircase (audible at
-#: 200 Hz) is gone. They are stiff: no compliance, no host feedforward, the
-#: contact watchdog blind on them. The Damiao wrists stay on the impedance
-#: frame: their position-velocity loop (``wire_mode`` ``pv``) stick-slips at
-#: creep speed (3x the impedance frame's 3-15 Hz error at 4 deg/s) and its
-#: stiff hold pumps the extended arm's 4.3 Hz sway (2026-09-22, both
-#: shoulders at 0.27° p2p in the wrist-sweep pose), so it stays a per-joint
-#: opt-in for experiments. The bus cannot carry every motor every tick at
+#: at 240 Hz. ``"position"`` hands every joint to its motor's own position
+#: loop — 0xA4 on the MyActuator joints, position-velocity on the Damiao
+#: wrists, gains from each joint's ``firmware`` block — streamed at 400 Hz,
+#: where the loop's target staircase (audible at 200 Hz) is gone. It is
+#: stiff: no compliance, no host feedforward, the contact watchdog blind on
+#: the MyActuator joints. The bus cannot carry every motor every tick at
 #: 400 Hz, so the core thins its schedule (wrists commanded on alternate
 #: ticks, one a4 fine-position read per tick round-robin, gripper in that
 #: rotation); the MyActuator commands themselves go out every tick.
@@ -964,13 +960,12 @@ def position_wire_mode(joint: Joint) -> str:
 
 
 def _on_position_loops(arm: ArmConfig) -> ArmConfig:
-    """The MyActuator joints on 0xA4; the Damiao wrists as configured."""
+    """Every arm joint on its vendor's firmware position loop."""
     return replace(
         arm,
         **{
-            j.value: replace(getattr(arm, j.value), wire_mode="a4")
+            j.value: replace(getattr(arm, j.value), wire_mode=position_wire_mode(j))
             for j in ARM_JOINTS
-            if _JOINT_CONFIG[j].motor_id <= 5
         },
     )
 
@@ -1023,16 +1018,15 @@ class AxolConfig:
         controller:      Which control law the realtime core runs the arms
                          on — see :data:`CONTROLLERS`. ``"impedance"``
                          (default) is the production MIT frame at 240 Hz.
-                         ``"position"`` puts the MyActuator joints on their
-                         firmware position loop (``wire_mode`` ``a4``, the
-                         ``firmware`` gains) at 400 Hz; the Damiao wrists
-                         keep their configured ``wire_mode`` (``mit`` unless
-                         set to ``pv``). Like stiffness it is baked into the
-                         per-joint ``wire_mode`` fields by :meth:`resolved`;
-                         a per-joint ``wire_mode`` set explicitly under
-                         ``"impedance"`` is kept, so one joint can still be
-                         tried on its firmware loop inside the impedance
-                         controller (``tune.motion --a4``).
+                         ``"position"`` puts every joint on its firmware
+                         position loop (``wire_mode`` ``a4`` / ``pv``, the
+                         ``firmware`` gains) at 400 Hz. Like stiffness it is
+                         baked into the per-joint ``wire_mode`` fields by
+                         :meth:`resolved`; a per-joint ``wire_mode`` set
+                         explicitly under ``"impedance"`` is kept, so one
+                         joint can still be tried on its firmware loop
+                         inside the impedance controller (``tune.motion
+                         --a4``).
     """
 
     left: ArmConfig = field(

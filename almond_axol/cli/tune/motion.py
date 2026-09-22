@@ -335,11 +335,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         default=None,
         help="Which control law the core runs the arms on for this run. "
         "'impedance' (the config default) is the production MIT frame at 240 Hz "
-        "with the host feedforward; 'position' puts the MyActuator joints on "
-        "their motor's own 0xA4 position loop (the firmware.* gains) streamed at "
-        "400 Hz — stiff, no host feedforward, NaN torque on those joints — with "
-        "the Damiao wrists staying on impedance (a wrist's wire_mode pv opts it "
-        "in). --a4 still adds single joints inside the impedance controller.",
+        "with the host feedforward; 'position' puts every joint on its motor's "
+        "own position loop (MyActuator 0xA4, Damiao position-velocity; the "
+        "firmware.* gains) streamed at 400 Hz — stiff, no host feedforward, "
+        "NaN torque on the MyActuator joints. --a4 still adds single joints "
+        "inside the impedance controller.",
     )
     p.add_argument(
         "--arms",
@@ -592,7 +592,7 @@ async def _run(args: argparse.Namespace) -> None:
         f"  controller: {config.controller} "
         f"({(args.loop_hz or config.loop_hz):.0f} Hz core loop"
         + (
-            ", MyActuator joints on their firmware position loop)"
+            ", every joint on its firmware position loop)"
             if config.controller == "position"
             else ")"
         )

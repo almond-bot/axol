@@ -41,7 +41,7 @@ class ConfigTest(unittest.TestCase):
             for j in ARM_JOINTS:
                 self.assertEqual(getattr(arm, j.value).wire_mode, "mit")
 
-    def test_position_puts_the_myactuator_joints_on_a4_at_400_hz(self) -> None:
+    def test_position_puts_every_joint_on_its_vendors_loop_at_400_hz(self) -> None:
         cfg = AxolConfig(controller="position")
         self.assertEqual(cfg.loop_hz, 400.0)
         resolved = cfg.resolved()
@@ -49,20 +49,10 @@ class ConfigTest(unittest.TestCase):
         for arm in (resolved.left, resolved.right):
             for j in _MYACTUATOR:
                 self.assertEqual(getattr(arm, j.value).wire_mode, "a4", j)
-            # The Damiao wrists keep the impedance frame (their pv loop
-            # stick-slips at creep and pumps the arm's 4 Hz sway).
             for j in _DAMIAO:
-                self.assertEqual(getattr(arm, j.value).wire_mode, "mit", j)
+                self.assertEqual(getattr(arm, j.value).wire_mode, "pv", j)
         # Idempotent, like the stiffness blend.
         self.assertEqual(resolved.resolved(), resolved)
-
-    def test_a_wrist_opted_into_pv_survives_the_position_controller(self) -> None:
-        cfg = AxolConfig(controller="position")
-        cfg.right.wrist_2.wire_mode = "pv"
-        resolved = cfg.resolved()
-        self.assertEqual(resolved.right.wrist_2.wire_mode, "pv")
-        self.assertEqual(resolved.right.wrist_3.wire_mode, "mit")
-        self.assertEqual(resolved.right.elbow.wire_mode, "a4")
 
     def test_position_wire_mode_follows_the_motor_vendor(self) -> None:
         for j in _MYACTUATOR:
@@ -141,7 +131,7 @@ class RealtimeConfigTest(unittest.TestCase):
         self.assertIn("loop_hz 240.0", lines)
         self.assertEqual(set(self._joint_tokens(rt).values()), {"mit"})
 
-    def test_position_core_runs_at_400_with_a4_tokens_and_mit_wrists(self) -> None:
+    def test_position_core_runs_at_400_with_a4_and_pv_tokens(self) -> None:
         rt = Axol._wrap(_hardware(AxolConfig(controller="position")))
         lines = rt._config_text().splitlines()
         self.assertIn("loop_hz 400.0", lines)
@@ -149,7 +139,7 @@ class RealtimeConfigTest(unittest.TestCase):
         for j in _MYACTUATOR:
             self.assertEqual(tokens[j.value], "a4")
         for j in _DAMIAO:
-            self.assertEqual(tokens[j.value], "mit")
+            self.assertEqual(tokens[j.value], "pv")
 
     def test_an_explicit_loop_rate_still_wins(self) -> None:
         rt = Axol._wrap(_hardware(AxolConfig(controller="position")), loop_hz=240.0)
