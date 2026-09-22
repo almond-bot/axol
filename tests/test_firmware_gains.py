@@ -33,7 +33,7 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(
                 arm.elbow.firmware.as_dict(),
                 {
-                    "position_kp": 0.2,
+                    "position_kp": 0.5,
                     "position_kd": 0.1,
                     "speed_kp": 0.1,
                     "speed_ki": 1e-5,
@@ -189,7 +189,7 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
             )
         for motor in (s1, s2):
             self.assertAlmostEqual(motor.store[_MA_PID_IDX["position_kp"]], 0.3, 6)
-        self.assertAlmostEqual(elbow.store[_MA_PID_IDX["position_kp"]], 0.2, 6)
+        self.assertAlmostEqual(elbow.store[_MA_PID_IDX["position_kp"]], 0.5, 6)
         for motor in (s1, s2, elbow):
             self.assertAlmostEqual(motor.store[_MA_PID_IDX["speed_kp"]], 0.1, 6)
             self.assertAlmostEqual(motor.store[_MA_PID_IDX["speed_ki"]], 1e-5, 9)
