@@ -572,6 +572,25 @@ fn go_limp(limp: &AtomicBool, out_tx: &mpsc::Sender<Vec<u8>>, reason: &str) -> b
     true
 }
 
+/// Whether this tick's frame for a joint is the 0xA4 position command.
+///
+/// Only MyActuator joints on `wire_mode a4`, and for them on every tick that
+/// commands a position: tracked ticks *and* passthrough holds (bring-up
+/// hold, a stalled stream, Python's hold-at-measured-pose), which is any
+/// tick with a position gain. The alternative — MIT for the hold, 0xA4 once
+/// tracking starts — is what the classic design did, and it is exactly what
+/// the X6-P20's 2025070202 firmware refuses: after an MIT frame, 0xA4 is
+/// ignored until the motor is reset. The right elbow held its pose through
+/// two whole replays that way (2026-09-21) while the X8-P20 shoulders, whose
+/// 2026042402 firmware switches freely, tracked. Keeping an a4 joint on 0xA4
+/// from its first frame works on both. Limp and gravity comp (`kp == 0`)
+/// stay MIT: those exist to make the joint compliant, which the firmware
+/// position loop cannot be — so on the older firmware a joint that has been
+/// hand-guided needs a re-enable before it will track on a4 again.
+fn a4_wire(vendor: Vendor, wire: WireMode, tracked: bool, kp: f64) -> bool {
+    vendor == Vendor::MyActuator && wire == WireMode::A4 && (tracked || kp > 0.0)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JointCmd {
     pub p_des: f64,
@@ -1234,6 +1253,19 @@ mod tests {
         assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
         assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
         assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Degraded);
+    }
+
+    #[test]
+    fn a4_joints_stay_on_the_position_frame_through_holds_but_not_limp() {
+        use crate::bringup::{Vendor, WireMode};
+        // Tracked and holding (kp > 0) both take 0xA4 on an a4 MyActuator …
+        assert!(a4_wire(Vendor::MyActuator, WireMode::A4, true, 250.0));
+        assert!(a4_wire(Vendor::MyActuator, WireMode::A4, false, 250.0));
+        // … limp / gravity comp (kp = 0) fall back to MIT for compliance …
+        assert!(!a4_wire(Vendor::MyActuator, WireMode::A4, false, 0.0));
+        // … and nothing else ever does, whatever the tick.
+        assert!(!a4_wire(Vendor::MyActuator, WireMode::Mit, true, 250.0));
+        assert!(!a4_wire(Vendor::Damiao, WireMode::A4, true, 250.0));
     }
 
     #[test]
@@ -2634,12 +2666,12 @@ fn bus_loop(
                             fb_dt: f64::NAN,
                         });
                     }
-                    if tracked && m.vendor == Vendor::MyActuator && m.wire == WireMode::A4 {
-                        // Firmware position loop: the streamed trajectory as
-                        // an absolute 0.01° target under the tracker's own
-                        // velocity limit as the speed cap. No feedforward
-                        // reaches the wire; the 0x92 read below restores
-                        // fine position to the host.
+                    if a4_wire(m.vendor, m.wire, tracked, c.kp) {
+                        // Firmware position loop: the streamed trajectory (or
+                        // the hold pose) as an absolute 0.01° target under the
+                        // tracker's own velocity limit as the speed cap. No
+                        // feedforward reaches the wire; the 0x92 read below
+                        // restores fine position to the host.
                         a4_follow[motor_index] = true;
                         (
                             proto::MA_REQ + m.id as u16,

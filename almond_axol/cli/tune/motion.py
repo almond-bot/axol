@@ -100,11 +100,13 @@ _START_POSE_TOL = 0.05
 def start_pose_stragglers(
     q_now: np.ndarray,
     q_start: np.ndarray,
-    left_indices: np.ndarray,
-    right_indices: np.ndarray,
+    arms: list[tuple[str, np.ndarray]],
     tol: float = _START_POSE_TOL,
 ) -> list[tuple[str, float]]:
     """Joints not at the motion start pose: ``[(column, error_deg), ...]``.
+
+    ``arms`` lists the arms actually driven, ``(side, full-N indices)`` —
+    an arm left off with ``--arms`` reads as rest and must not be judged.
 
     The approach move is streamed, not verified — a joint that will not
     follow the stream (a ``--a4`` joint whose stored planner acceleration
@@ -113,7 +115,7 @@ def start_pose_stragglers(
     swings the others around a pose the motion never planned for.
     """
     out: list[tuple[str, float]] = []
-    for side, indices in (("left", left_indices), ("right", right_indices)):
+    for side, indices in arms:
         for j, idx in zip(ARM_JOINTS, indices):
             err = float(q_now[idx] - q_start[idx])
             if abs(err) > tol:
@@ -628,9 +630,15 @@ async def _run(args: argparse.Namespace) -> None:
                 if contact is not None:
                     raise _Contact(contact)
                 await asyncio.sleep(0.5)
-            stragglers = start_pose_stragglers(
-                snapshot(axol), q_start, solver.left_indices, solver.right_indices
-            )
+            driven = [
+                (side, idx)
+                for side, arm, idx in (
+                    ("left", axol.left, solver.left_indices),
+                    ("right", axol.right, solver.right_indices),
+                )
+                if arm is not None
+            ]
+            stragglers = start_pose_stragglers(snapshot(axol), q_start, driven)
             if stragglers:
                 raise _NotAtStart(stragglers)
 
@@ -651,10 +659,12 @@ async def _run(args: argparse.Namespace) -> None:
             )
             if args.a4:
                 print(
-                    "    a --a4 joint that did not follow the approach usually has a "
-                    "stored planner acceleration that is neither 0 nor 60000 (read it "
-                    "with scripts/fw_gains.py --id <id>; anything in between re-plans "
-                    "every streamed target and barely moves)"
+                    "    a --a4 joint that did not follow the approach: check its stored "
+                    "planner acceleration (scripts/fw_gains.py --id <id>; 0 or 60000 "
+                    "follow a stream, anything in between barely moves) and that the "
+                    "realtime core is built from a checkout that holds a4 joints on the "
+                    "position frame (the X6-P20's 2025-07 firmware ignores 0xA4 after "
+                    "an MIT frame until reset)"
                 )
         except _Contact as exc:
             joint, residual = exc.trip

@@ -264,14 +264,20 @@ class JointConfig:
         dither_hz: Dither frequency; above the arm's structural modes
                   (~35 Hz), below the core's 120 Hz Nyquist.
         wire_mode: Which frame the realtime core commands this joint with
-                  while tracking (MyActuator joints only; Damiao joints,
-                  the gripper, gravity comp and the limp fallback always use
-                  MIT). ``"mit"`` (default) is the impedance frame and the
+                  (MyActuator joints only; Damiao joints, the gripper,
+                  gravity comp and the limp fallback always use MIT).
+                  ``"mit"`` (default) is the impedance frame and the
                   production law. ``"a4"`` hands the joint to the firmware's
                   own position loop (0xA4 absolute position closed-loop,
-                  speed-capped at the tracker's velocity limit): its kHz
-                  position/speed PI on the motor-side encoder is the
-                  candidate for creeping through the X8-P20's stick-slip.
+                  speed-capped at the tracker's velocity limit) from its
+                  first frame, holds included — the X6-P20's 2025070202
+                  firmware ignores 0xA4 after an MIT frame until the motor
+                  is reset, so an a4 joint hand-guided in gravity comp needs
+                  a re-enable before it tracks again. Its position/speed PI
+                  on the motor-side encoder is the candidate for creeping
+                  through the X8-P20's stick-slip; its gains are the
+                  ``firmware`` block below and its stored planner
+                  acceleration must be 0 or 60000 (see ``tune.a4``).
                   Costs: no compliance (the joint holds position with
                   integral action and pushes back up to motor torque), no
                   host feedforward (gravity, friction, stiction, dither and

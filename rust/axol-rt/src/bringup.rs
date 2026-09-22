@@ -73,8 +73,11 @@ pub enum Vendor {
 }
 
 /// Which frame a MyActuator arm joint is commanded with in tracked mode.
-/// Damiao joints, the gripper, and every passthrough/limp tick use MIT
-/// regardless.
+/// Damiao joints, the gripper, and every limp / gravity-comp tick (kp = 0)
+/// use MIT regardless. An a4 joint's *holds* (bring-up, stalled stream) are
+/// 0xA4 too: the X6-P20's 2025070202 firmware ignores 0xA4 after an MIT
+/// frame until reset, so an a4 joint must see the position frame from its
+/// first tick (see `serve::a4_wire`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum WireMode {
     /// The 0x400 impedance frame: the production control law.
