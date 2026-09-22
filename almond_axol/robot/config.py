@@ -371,12 +371,15 @@ _X8_FIRMWARE_GAINS = FirmwareGains(
 )
 
 # The X6-P20 elbow's set (its stock position_kp is 0.15, speed_kp 0.01 on
-# firmware 2025070202): position_kp 0.2 with the shoulders' speed loop.
-# Chosen on 2026-09-21 after the elbow first tracked under 0xA4 at stock
-# gains — the earlier "elbow does not move" runs were the planner write,
-# not the loop (see ``tune.a4``). Same ROM write at enable, same a4-only.
+# firmware 2025070202): position_kp 0.5 with the shoulders' speed loop, from
+# the 2026-09-21 direct-tracking sweep on right elbow (3 deg/s triangle at
+# -75°, planner 0): 0.2 → 0.3 → 0.5 took tracking 0.17° → 0.11° → 0.07°
+# RMS and lag 54 → 37 → 23 ms with every smoothness figure at the floor
+# (velocity ripple 0.13, buzz 0.005°, current spread 0.31 A) and >20 Hz
+# current only 0.05 → 0.12 A; the shoulder's buzz began past 0.5, so this
+# is the knee, not a ceiling. Same ROM write at enable, same a4-only.
 _X6_ELBOW_FIRMWARE_GAINS = FirmwareGains(
-    position_kp=0.2,
+    position_kp=0.5,
     position_kd=0.1,
     speed_kp=0.1,
     speed_ki=1e-5,
