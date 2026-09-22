@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import unittest
 
+from almond_axol.cli.tune.friction import rest_target
 from almond_axol.constants import ARM_JOINTS, Joint
 from almond_axol.robot.axol import arm_limits
 from almond_axol.tuning.runner import probe_clearance_targets, sweep_safety
@@ -42,6 +43,17 @@ class ClearancePosesTest(unittest.TestCase):
         # And the note tells the operator the signed value the arm will take.
         _, _, _, notes = sweep_safety(Joint.SHOULDER_3, False)
         self.assertTrue(any("-90°" in n for n in notes))
+
+
+class RestTargetTest(unittest.TestCase):
+    def test_joints_whose_rest_is_a_hard_stop_park_two_degrees_inside(self) -> None:
+        # Right elbow: limits −150..0, so 0 is the stop; the left elbow mirrors.
+        self.assertAlmostEqual(math.degrees(rest_target(Joint.ELBOW, False)), -2.0)
+        self.assertAlmostEqual(math.degrees(rest_target(Joint.ELBOW, True)), 2.0)
+        # Everything else rests at 0.
+        for j in (Joint.SHOULDER_1, Joint.SHOULDER_2, Joint.SHOULDER_3, Joint.WRIST_1):
+            self.assertEqual(rest_target(j, False), 0.0)
+        self.assertEqual(rest_target(Joint.ELBOW, None), 0.0)
 
 
 if __name__ == "__main__":

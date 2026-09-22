@@ -237,18 +237,42 @@ async def _safe_torque_off(
     return True
 
 
+#: How far inside its range a joint is parked when its rest pose (0) sits on
+#: a hard stop. Held on a firmware position loop *at* the stop, the loop
+#: leans on the stop, the motor's stall protection cuts its output and the
+#: joint hangs limp: the right elbow (limits −150..0) sagged 2–6° and swung
+#: with whatever else was moving during every wrist run (2026-09-22). Two
+#: degrees inside is still within ``_REST_TOL`` of rest for the torque-off.
+_STOP_STANDOFF = math.radians(2.0)
+
+
+def rest_target(joint: Joint, is_left: bool | None) -> float:
+    """The hold target for a homed joint: 0, or 2° inside a limit that is 0."""
+    if is_left is None:
+        return 0.0
+    lo, hi = arm_limits(joint, is_left)
+    if abs(hi) < _STOP_STANDOFF:
+        return hi - _STOP_STANDOFF
+    if abs(lo) < _STOP_STANDOFF:
+        return lo + _STOP_STANDOFF
+    return 0.0
+
+
 async def _home_all(
     motors: dict[Joint, JointFrameMotor], exclude: Joint | None = None
 ) -> None:
-    """Ramp every joint to 0 (the rest pose), one at a time in ``_HOME_ORDER``.
+    """Ramp every joint to rest, one at a time in ``_HOME_ORDER``.
 
-    Joints already at rest verify in one poll, so a mostly-homed arm costs
-    a fraction of a second per joint.
+    Rest is 0, except a joint whose 0 is a hard stop, which parks 2° inside
+    (see :func:`rest_target`). Joints already at rest verify in one poll, so
+    a mostly-homed arm costs a fraction of a second per joint.
     """
     for j in _HOME_ORDER:
         if j == exclude or j not in motors:
             continue
-        await _ramp_verified(motors, {j: 0.0})
+        await _ramp_verified(
+            motors, {j: rest_target(j, getattr(motors[j], "_is_left", None))}
+        )
 
 
 async def _run_sweep_raw(
