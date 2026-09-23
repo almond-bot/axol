@@ -31,7 +31,9 @@ ZED X One GS, serial 308393615) showed on 2026-09-23:
 - ``get_linear_acceleration()`` is m/s² and ``get_angular_velocity()`` deg/s,
   both calibrated (bias, scale, misalignment); ranges ±78.5 m/s², ±1000 deg/s.
 - ``IMUData.timestamp`` is the acquisition time in UNIX nanoseconds (the
-  wall clock), mapped here onto ``perf_counter``.
+  wall clock), mapped here onto ``perf_counter``. Right after ``open()`` the
+  first sample can be stale — 36 minutes old on the jelly robot's wrist
+  cameras (SDK 5.2.3) — so a sample older than ``_STALE_S`` is dropped.
 - ``get_sensors_data_batch`` (every sample of the last grabbed frame) is
   lossless too, but only behind a ``grab()`` loop — the 1080p/30 fps image
   pipeline running for nothing — so it is not used.
@@ -53,6 +55,8 @@ import numpy as np
 _POLL_S = 0.00025
 # An open camera that has delivered no IMU sample for this long is reported.
 _SILENT_S = 1.0
+# A sample this much older than the moment it is read is a leftover, not data.
+_STALE_S = 0.5
 
 
 def write_samples(
@@ -118,7 +122,8 @@ def record(
             ):
                 imu = sensors.get_imu_data()
                 stamp = imu.timestamp.get_nanoseconds()
-                if stamp and stamp != last:
+                fresh = time.time() - stamp * 1e-9 < _STALE_S
+                if stamp and stamp != last and fresh:
                     last = stamp
                     last_new = time.perf_counter()
                     ts.append(stamp * 1e-9 - wall_minus_perf)
