@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import logging
 import math
 import time
@@ -348,6 +349,19 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "inside the impedance controller.",
     )
     p.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Replay the motion N times back to back in one session (default 1; "
+        "0 = until Ctrl-C): no homing in between — each pass after the first "
+        "starts with a planned move back to the start pose if the motion does "
+        "not end there. Each pass is scored and saved as its own run (label "
+        "suffixed [k/N]) and a one-line-per-pass summary closes the session; "
+        "--record captures the whole session in one trace. For soak runs and "
+        "catching an intermittent buzz.",
+    )
+    p.add_argument(
         "--arms",
         choices=("both", "left", "right"),
         default="both",
@@ -594,6 +608,8 @@ async def _run(args: argparse.Namespace) -> None:
         print(f"  wire mode: {side}.{joint} = a4 (firmware position loop)")
     if args.controller is not None:
         config.controller = args.controller
+    if args.repeat < 0:
+        raise SystemExit("tune.motion: --repeat must be 0 (until Ctrl-C) or more")
     try:
         # Before anything touches the bus: impedance runs at 240 Hz only.
         check_loop_hz(config, args.loop_hz or config.loop_hz)
@@ -669,6 +685,8 @@ async def _run(args: argparse.Namespace) -> None:
     # 400 Hz core sampled at 240 Hz turns into an 80 Hz "buzz" on every
     # joint. Re-timing each sample removes it.
     log_meas_offset: list[np.ndarray] = []
+    # [start, end) of each pass's samples in the logs above (--repeat).
+    passes_run: list[tuple[int, int]] = []
 
     def _feedback_offsets(arm: Any, now_wall: float) -> np.ndarray:
         out = np.zeros(7, dtype=np.float64)
@@ -780,21 +798,47 @@ async def _run(args: argparse.Namespace) -> None:
             if stragglers:
                 raise _NotAtStart(stragglers)
 
-            print(f"Replaying {motion.duration:.1f} s of motion ...")
             # The flight recorder captures the replay segment only, like
-            # teleop's engage→disengage.
+            # teleop's engage→disengage — one segment for the whole session
+            # when repeating (each new segment truncates the last), so a
+            # buzz on the move back to the start is in the trace too.
             axol.set_recording_engaged(True)
             try:
-                contact = await execute(
-                    axol,
-                    traj_playback,
-                    record=True,
-                    refs=ref if stream_differs else None,
-                )
+                passes = itertools.count() if args.repeat == 0 else range(args.repeat)
+                total = "∞" if args.repeat == 0 else str(args.repeat)
+                for k in passes:
+                    if k > 0:
+                        q_now = snapshot(axol)
+                        if float(np.max(np.abs(q_now - q_start))) > 0.02:
+                            print("Back to the motion start pose ...")
+                            contact = await execute(axol, plan(q_now, q_start))
+                            if contact is not None:
+                                raise _Contact(contact)
+                        stragglers = start_pose_stragglers(
+                            snapshot(axol), q_start, driven
+                        )
+                        if stragglers:
+                            raise _NotAtStart(stragglers)
+                    print(
+                        f"Replaying {motion.duration:.1f} s of motion"
+                        + (f" (pass {k + 1}/{total})" if args.repeat != 1 else "")
+                        + " ..."
+                    )
+                    pass_start = len(log_t)
+                    passes_run.append((pass_start, pass_start))
+                    try:
+                        contact = await execute(
+                            axol,
+                            traj_playback,
+                            record=True,
+                            refs=ref if stream_differs else None,
+                        )
+                    finally:
+                        passes_run[-1] = (pass_start, len(log_t))
+                    if contact is not None:
+                        raise _Contact(contact)
             finally:
                 axol.set_recording_engaged(False)
-            if contact is not None:
-                raise _Contact(contact)
         except _NotAtStart as exc:
             print(
                 "\n  ! not at the motion start pose after the approach — playback "
@@ -840,12 +884,8 @@ async def _run(args: argparse.Namespace) -> None:
     if not log_t:
         print("No playback samples recorded — nothing to score.")
         return
-
-    t = np.asarray(log_t)
-    target = np.stack(log_target)
-    actual = np.stack(log_actual)
-    torque = np.stack(log_torque)
-    actual, torque = retime_measurements(t, np.stack(log_meas_offset), actual, torque)
+    if not passes_run:
+        passes_run.append((0, len(log_t)))
 
     # Tracking quality is only scored for joints that actually moved (> ~1°
     # of commanded travel) — a joint parked at rest tracks meaninglessly
@@ -861,60 +901,106 @@ async def _run(args: argparse.Namespace) -> None:
         "peak_hz",
         "amplification",
     )
-    per_joint: dict[str, dict[str, float]] = {}
-    moved: dict[str, dict[str, float]] = {}
-    for i, name in enumerate(_COLUMNS):
-        if np.isnan(actual[:, i]).all():
-            continue
-        m = tracking_metrics(t, target[:, i], actual[:, i], torque[:, i])
-        if float(np.ptp(target[:, i])) >= math.radians(1.0):
-            moved[name] = m
-        else:
-            for key in _TRACKING_KEYS:
-                m[key] = math.nan
-        per_joint[name] = m
-    if not moved:
-        print("No joint moved more than 1° — nothing to score.")
-        return
 
-    _print_metrics_table(per_joint)
+    def score_pass(a: int, b: int, tag: str) -> dict[str, Any] | None:
+        """Score and save one pass's slice of the logs; its summary, or None.
 
-    worst = max(moved.items(), key=lambda kv: kv[1]["rms_err"])
-    summary = {
-        "per_joint": per_joint,
-        "worst_joint": worst[0],
-        "mean_rms_err": float(np.mean([m["rms_err"] for m in moved.values()])),
-        "mean_jitter": float(np.mean([m["err_band_mid"] for m in moved.values()])),
-        "completed": bool(len(log_t) >= len(sent)),
-    }
-
-    if not args.no_save_run:
-        series = {"t": t, "target": target, "actual": actual, "torque": torque}
-        if log_sent:
-            series["sent"] = np.stack(log_sent)
-        run_id = save_run(
-            "motion",
-            series,
-            summary,
-            gains={f"{s}.{j}.{f}": v for (s, j, f), v in overrides.items()},
-            params={
-                "motion": motion.name,
-                "rate": motion.rate,
-                "stiffness": args.stiffness,
-                "columns": _COLUMNS,
-                # Joints driven on the firmware position loop (--a4) for this
-                # run, so the dashboard can re-arm the same controller split.
-                "a4": list(args.a4),
-                # The control law the whole run ran on (impedance at 240 Hz
-                # or the firmware position loops at 400 Hz).
-                "controller": config.controller,
-                "loop_hz": args.loop_hz or config.loop_hz,
-                "record": args.record,
-                **stream_info,
-            },
-            label=args.label,
+        ``tag`` ("[k/N] ", empty for a single pass) heads the scorecard and is
+        appended to the saved run's label.
+        """
+        if b - a < 2:
+            return None
+        t = np.asarray(log_t[a:b])
+        target = np.stack(log_target[a:b])
+        actual = np.stack(log_actual[a:b])
+        torque = np.stack(log_torque[a:b])
+        actual, torque = retime_measurements(
+            t, np.stack(log_meas_offset[a:b]), actual, torque
         )
-        print(f"\nSaved tuning run {run_id} (kind=motion, motion={motion.name!r})")
+        per_joint: dict[str, dict[str, float]] = {}
+        moved: dict[str, dict[str, float]] = {}
+        for i, name in enumerate(_COLUMNS):
+            if np.isnan(actual[:, i]).all():
+                continue
+            m = tracking_metrics(t, target[:, i], actual[:, i], torque[:, i])
+            if float(np.ptp(target[:, i])) >= math.radians(1.0):
+                moved[name] = m
+            else:
+                for key in _TRACKING_KEYS:
+                    m[key] = math.nan
+            per_joint[name] = m
+        if not moved:
+            print(f"{tag}No joint moved more than 1° — nothing to score.")
+            return None
+
+        if tag:
+            print(f"\n{tag.strip()}")
+        _print_metrics_table(per_joint)
+
+        worst = max(moved.items(), key=lambda kv: kv[1]["rms_err"])
+        summary = {
+            "per_joint": per_joint,
+            "worst_joint": worst[0],
+            "mean_rms_err": float(np.mean([m["rms_err"] for m in moved.values()])),
+            "mean_jitter": float(np.mean([m["err_band_mid"] for m in moved.values()])),
+            "completed": bool(b - a >= len(sent)),
+        }
+
+        if not args.no_save_run:
+            series = {"t": t, "target": target, "actual": actual, "torque": torque}
+            if log_sent:
+                series["sent"] = np.stack(log_sent[a:b])
+            label = " ".join(x for x in (args.label, tag.strip()) if x) or None
+            run_id = save_run(
+                "motion",
+                series,
+                summary,
+                gains={f"{s}.{j}.{f}": v for (s, j, f), v in overrides.items()},
+                params={
+                    "motion": motion.name,
+                    "rate": motion.rate,
+                    "stiffness": args.stiffness,
+                    "columns": _COLUMNS,
+                    # Joints driven on the firmware position loop (--a4) for
+                    # this run, so the dashboard can re-arm the same split.
+                    "a4": list(args.a4),
+                    # The control law the whole run ran on (impedance at
+                    # 240 Hz or the firmware position loops at 400 Hz).
+                    "controller": config.controller,
+                    "loop_hz": args.loop_hz or config.loop_hz,
+                    "record": args.record,
+                    **stream_info,
+                },
+                label=label,
+            )
+            print(f"\nSaved tuning run {run_id} (kind=motion, motion={motion.name!r})")
+        return summary
+
+    many = len(passes_run) > 1
+    summaries = [
+        score_pass(a, b, f"[{k + 1}/{len(passes_run)}] " if many else "")
+        for k, (a, b) in enumerate(passes_run)
+    ]
+    if many:
+        # One line per pass: the intermittent faults (a buzz on one pass in
+        # five) are what repeating is for.
+        print(f"\n{'─' * 78}\n  passes: worst buzz / mean jitter / worst joint")
+        for k, sm in enumerate(summaries):
+            if sm is None:
+                print(f"    [{k + 1}] too short to score")
+                continue
+            name, m = max(
+                sm["per_joint"].items(),
+                key=lambda kv: (
+                    kv[1]["buzz"] if math.isfinite(kv[1].get("buzz", math.nan)) else 0.0
+                ),
+            )
+            print(
+                f"    [{k + 1}] {math.degrees(m.get('buzz', math.nan)):.3f}° on {name} "
+                f"@ {m.get('buzz_hz', math.nan):.0f} Hz / "
+                f"{math.degrees(sm['mean_jitter']):.3f}° / {sm['worst_joint']}"
+                + ("" if sm["completed"] else "  (cut short)")
+            )
 
 
 class _Contact(Exception):

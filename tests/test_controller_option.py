@@ -231,6 +231,11 @@ class TuneMotionFlagTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             tune_motion._parse_gain_overrides(["elbow.firmware.bogus=1"])
 
+    def test_repeat_defaults_to_one_pass(self) -> None:
+        self.assertEqual(self._parse().repeat, 1)
+        self.assertEqual(self._parse("--repeat", "5").repeat, 5)
+        self.assertEqual(self._parse("--repeat", "0").repeat, 0)  # until Ctrl-C
+
     def test_controller_flag_takes_the_two_laws_and_defaults_to_config(self) -> None:
         self.assertIsNone(self._parse().controller)
         self.assertEqual(self._parse("--controller", "position").controller, "position")

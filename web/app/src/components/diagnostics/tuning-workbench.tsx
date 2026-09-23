@@ -493,6 +493,16 @@ const TABS: WbTab[] = [
           "motion, same scoring, so the two controllers compare directly.",
       },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
+      {
+        key: "repeat",
+        label: "repeat",
+        type: "number",
+        placeholder: "1",
+        hint:
+          "replay the motion this many times back to back (0 = until stopped), each " +
+          "pass scored and saved as its own run [k/N] — for soak runs and catching an " +
+          "intermittent buzz",
+      },
       { key: "gain", label: "gains — edit a cell to override it for this run", type: "overrides" },
       {
         key: "a4",
