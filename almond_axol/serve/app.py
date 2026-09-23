@@ -45,6 +45,7 @@ from ..utils.sudo import prime_sudo
 from .commands import (
     COMMANDS,
     NoSuggestionProvider,
+    check_strict_fields,
     command_specs,
     field_suggestions,
     flag_default,
@@ -2649,6 +2650,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     req.op, settings.merged_args(req.op, req.args)
                 )
                 requested_mantis = flag_enabled(launch_args.get("mantis"))
+                # A strict per-run field (a task catalog, say) takes only a
+                # value from its pick list; the provider may do I/O, so it
+                # runs off the loop. Refused here, before any hardware
+                # survey, as a plain form error.
+                await asyncio.to_thread(check_strict_fields, req.op, launch_args)
             except ValueError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
 

@@ -51,6 +51,8 @@ export interface CommandSpec {
   perRunFields?: string[]
   /** Per-run fields with a server-side pick list (/api/commands/{id}/suggestions/{field}). */
   suggestedFields?: string[]
+  /** Suggested fields whose value must be one of the suggestions (rendered as a select). */
+  strictFields?: string[]
   /** Drives episodes the panel can start / save / discard. */
   episodeControl?: boolean
   /** Arg name that means "no hardware", or null when the robot is required. */
@@ -1405,6 +1407,8 @@ export interface OperationMeta {
   fields: string[]
   /** Per-run fields whose values the host suggests (typing stays free-form). */
   suggestedFields: string[]
+  /** Suggested fields that take only a suggested value: a select, no free typing. */
+  strictFields: string[]
   /** Needs the persistent robot connection (CAN) to run. */
   requiresRobot: boolean
   /** Needs at least one camera serial configured (collect-data / run-policy). */
@@ -1442,6 +1446,7 @@ export const OPERATIONS: OperationMeta[] = [
     description: "Drive Axol from VR; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
     fields: ["sim"],
     suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: true,
@@ -1459,6 +1464,7 @@ export const OPERATIONS: OperationMeta[] = [
     description: "Hold the arms weightless so they can be moved by hand.",
     fields: ["free_joints"],
     suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
@@ -1477,6 +1483,7 @@ export const OPERATIONS: OperationMeta[] = [
       "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
     fields: ["repo_id", "task"],
     suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
@@ -1498,6 +1505,7 @@ export const OPERATIONS: OperationMeta[] = [
     description: "Replay a recorded episode of a LeRobot dataset on Axol, then return to rest.",
     fields: ["repo_id", "episode", "loop", "interpolate"],
     suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
@@ -1516,6 +1524,7 @@ export const OPERATIONS: OperationMeta[] = [
       "Run a trained policy on Axol via LeRobot async inference, locally or on a remote inference server.",
     fields: ["policy_path", "policy_type", "task", "repo_id"],
     suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
@@ -1545,6 +1554,7 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     description: s.description,
     fields: s.perRunFields ?? [],
     suggestedFields: s.suggestedFields ?? [],
+    strictFields: s.strictFields ?? [],
     // Every in-process operation drives the arms; only a sim run doesn't, and
     // that's decided per run from simFlag.
     requiresRobot: true,
