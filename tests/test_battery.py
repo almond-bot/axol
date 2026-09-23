@@ -11,6 +11,7 @@ from almond_axol.cli.can import setup as can_setup
 from almond_axol.robot import lift as lift_module
 from almond_axol.robot.battery import (
     CAPACITY_AH,
+    CHARGING_CLEAR_VOLTS,
     CHARGING_VOLTS,
     LIFEPO4_8S_CURVE,
     BatteryEstimator,
@@ -86,6 +87,27 @@ class BatteryCurveTest(unittest.TestCase):
         self.assertTrue(status.charging)
         self.assertEqual(status.percent, 100.0)
 
+    def test_bulk_charging_voltage_reports_charging(self) -> None:
+        # Measured on Jelly on the charger, nearly full: the rail sat at 27.5 V,
+        # far below the charger's 29.2 V absorption voltage.
+        status = estimate_battery(27.5)
+        assert status is not None
+        self.assertTrue(status.charging)
+
+    def test_full_resting_pack_is_not_charging(self) -> None:
+        # Measured on Jelly, full and unplugged: the board read 27.0 V.
+        for volts in (26.7, 27.0):
+            status = estimate_battery(volts)
+            assert status is not None
+            self.assertFalse(status.charging)
+            self.assertEqual(status.percent, 100.0)
+        # Nor does the estimator, even coming off the charger.
+        est = BatteryEstimator()
+        est.update(27.5)
+        for _ in range(20):
+            status = est.update(27.0)
+        self.assertFalse(status.charging)
+
     def test_no_pack_is_none_not_empty(self) -> None:
         # The board on USB power alone reads a few volts of nothing.
         self.assertIsNone(estimate_battery(0.4))
@@ -129,10 +151,35 @@ class BatteryEstimatorTest(unittest.TestCase):
         assert charging is not None
         self.assertTrue(charging.charging)
         self.assertAlmostEqual(charging.voltage, 29.1)
-        unplugged = est.update(27.0)
+        unplugged = est.update(26.6)
         assert unplugged is not None
-        self.assertAlmostEqual(unplugged.voltage, 27.0)
-        self.assertLess(unplugged.voltage, CHARGING_VOLTS)
+        self.assertFalse(unplugged.charging)
+        self.assertAlmostEqual(unplugged.voltage, 26.6)
+
+    def test_charging_has_hysteresis(self) -> None:
+        est = BatteryEstimator()
+        est.update(26.5)
+        self.assertTrue(est.update(CHARGING_VOLTS + 0.3).charging)
+        # Dipping just under the set threshold keeps it charging...
+        between = (CHARGING_VOLTS + CHARGING_CLEAR_VOLTS) / 2
+        for _ in range(20):
+            status = est.update(between)
+        self.assertTrue(status.charging)
+        # ...until the rail drops below the clear threshold.
+        self.assertFalse(est.update(CHARGING_CLEAR_VOLTS - 0.3).charging)
+        # And from rest the same in-between voltage does not set it.
+        est = BatteryEstimator()
+        for _ in range(20):
+            status = est.update(between)
+        self.assertFalse(status.charging)
+
+    def test_reset_clears_charging(self) -> None:
+        est = BatteryEstimator()
+        est.update(28.0)
+        est.reset()
+        status = est.update((CHARGING_VOLTS + CHARGING_CLEAR_VOLTS) / 2)
+        assert status is not None
+        self.assertFalse(status.charging)
 
     def test_pack_removed_clears_the_estimate(self) -> None:
         est = BatteryEstimator()

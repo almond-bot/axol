@@ -15,9 +15,16 @@ as the reading:
   (open-circuit) one; samples taken while the lift or the wheels draw
   current are flagged ``under_load`` and never displace a resting estimate
   (see :class:`BatteryEstimator`).
-- **Charging reads high.** A connected charger holds the rail near its
-  29.2 V absorption voltage, well above any resting voltage; readings above
-  :data:`CHARGING_VOLTS` report ``charging`` and clamp to 100 %.
+- **Charging reads high.** A connected charger lifts the rail above any
+  resting voltage, and the charger's 29.2 V absorption voltage is only
+  reached at the very end. Measured on Jelly with this board: 27.5 V
+  charging a nearly full pack, 27.0 V for the same pack full and unplugged.
+  Readings at or above :data:`CHARGING_VOLTS` report ``charging`` (the
+  percentage then clamps to 100 % and means nothing); the estimator keeps
+  it until the rail drops under :data:`CHARGING_CLEAR_VOLTS` so it does not
+  flicker. Early in a charge, a low pack can sit under the threshold and
+  read as a resting (too high) percentage: voltage alone cannot tell that
+  apart from a full pack at rest.
 - **ADC accuracy.** The board divides VM 100k/6.8k into a 12-bit ADC
   referenced to its own 3.3 V rail, so a few hundred millivolts of absolute
   error are possible; treat the percentage as a band, not a gauge.
@@ -47,9 +54,16 @@ LIFEPO4_8S_CURVE: tuple[tuple[float, float], ...] = (
 # Two 50 Ah packs in parallel.
 CAPACITY_AH = 100.0
 
-# 3.45 V/cell: above anything a resting LiFePO4 pack settles to, so the rail
-# is being held up by a charger.
-CHARGING_VOLTS = 27.6
+# Just above what the board reads for a full pack at rest (27.0 V, above the
+# chart's 26.66 V: the ADC reads high and a just-charged pack settles slowly),
+# well under a nearly full pack on the charger (27.5 V), both measured on
+# Jelly. Kept low to catch as much of a charge as possible; the ADC noise is
+# ~10 mV, well inside the margin.
+CHARGING_VOLTS = 27.1
+
+# Hysteresis: once charging, the rail must fall below this to clear it. Still
+# above the 27.0 V a full resting pack reads.
+CHARGING_CLEAR_VOLTS = 27.05
 
 # Below this the lift board reports no motor supply at all (its own
 # DRIVER_VM_READY_VOLTS): the board is on USB power and the pack is
@@ -111,20 +125,27 @@ class BatteryEstimator:
 
     Resting samples are averaged (exponentially). A sample taken under load
     only counts while there is no resting estimate to keep; once the load
-    ends the next resting sample replaces it outright. A pack that goes
-    absent (VM gone) clears the estimate.
+    ends the next resting sample replaces it outright. ``charging`` sets at
+    :data:`CHARGING_VOLTS` and clears below :data:`CHARGING_CLEAR_VOLTS`. A
+    pack that goes absent (VM gone) clears the estimate.
     """
 
     def __init__(self) -> None:
         self._volts: float | None = None
         self._under_load = False
+        self._charging = False
 
     @property
     def status(self) -> BatteryStatus | None:
         """The current estimate, or ``None`` before any sample / with no pack."""
         if self._volts is None:
             return None
-        return estimate_battery(self._volts, under_load=self._under_load)
+        return BatteryStatus(
+            voltage=self._volts,
+            percent=battery_percent(self._volts),
+            charging=self._charging,
+            under_load=self._under_load,
+        )
 
     def update(self, volts: float, *, under_load: bool = False) -> BatteryStatus | None:
         """Fold one sample in and return the resulting estimate."""
@@ -138,13 +159,18 @@ class BatteryEstimator:
         elif self._volts is None or self._under_load:
             self._volts = volts
             self._under_load = False
-        elif volts >= CHARGING_VOLTS or self._volts >= CHARGING_VOLTS:
+        elif self._charging != self._charging_at(volts):
             # A charger connecting or leaving is a step, not noise.
             self._volts = volts
         else:
             self._volts += _SMOOTHING * (volts - self._volts)
+        self._charging = self._charging_at(self._volts)
         return self.status
+
+    def _charging_at(self, volts: float) -> bool:
+        return volts >= (CHARGING_CLEAR_VOLTS if self._charging else CHARGING_VOLTS)
 
     def reset(self) -> None:
         self._volts = None
         self._under_load = False
+        self._charging = False
