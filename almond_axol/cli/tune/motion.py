@@ -69,6 +69,15 @@ from ...tuning.motion import ReferenceMotion, list_motions, load_motion
 from ...utils.logquiet import quiet_noisy_loggers
 
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — approach/return trajectory speed
+
+#: A firmware-loop joint (0xA4 / pv) this far (rad) from its command has left
+#: its target: the replay stops and returns to rest. Firmware-loop joints
+#: carry no torque telemetry for the contact watchdog, and the core has no
+#: position-deviation abort (a pushed impedance joint is normal), so nothing
+#: else catches one — right elbow on the 0xA4 planner ended 117° from its
+#: command (2026-09-22). ``tune.a4``'s own abort is the same 20°; normal lag
+#: is ~1° at the approach speed.
+_FW_DEVIATION_ABORT = math.radians(20.0)
 _PLAN_MIN_DURATION = 1.5  # s
 
 _GAIN_FIELDS = (
@@ -780,6 +789,16 @@ async def _run(args: argparse.Namespace) -> None:
         )
 
     watchdog = ContactWatchdog(args.torque_threshold)
+    # Firmware-loop joints, as (side, index in the arm's 7, name), for the
+    # deviation guard in execute().
+    resolved_cfg = config.resolved()
+    fw_joints = [
+        (side, i, f"{side}.{j.value}")
+        for side in ("left", "right")
+        for i, j in enumerate(ARM_JOINTS)
+        if str(getattr(getattr(resolved_cfg, side), j.value).wire_mode).lower()
+        in ("a4", "pv")
+    ]
     log_t: list[float] = []
     log_target: list[np.ndarray] = []
     log_sent: list[np.ndarray] = []
@@ -833,6 +852,14 @@ async def _run(args: argparse.Namespace) -> None:
                 left=left if axol.left is not None else None,
                 right=right if axol.right is not None else None,
             )
+            for side, i, name in fw_joints:
+                arm = axol.left if side == "left" else axol.right
+                if arm is None:
+                    continue
+                cmd = float((left if side == "left" else right)[i])
+                off = float(arm.positions[i]) - cmd
+                if abs(off) > _FW_DEVIATION_ABORT:
+                    raise _Runaway(name, math.degrees(off))
             if record:
                 row_a = np.full(14, np.nan, dtype=np.float32)
                 row_tq = np.full(14, np.nan, dtype=np.float32)
@@ -961,6 +988,12 @@ async def _run(args: argparse.Namespace) -> None:
                     "position frame (the X6-P20's 2025-07 firmware ignores 0xA4 after "
                     "an MIT frame until reset)"
                 )
+        except _Runaway as exc:
+            print(
+                f"\n  ! {exc.joint} is {exc.deg:+.1f}° from its command on the "
+                f"firmware loop (limit {math.degrees(_FW_DEVIATION_ABORT):.0f}°) — it "
+                "has left its target; playback aborted, returning to rest"
+            )
         except _Contact as exc:
             joint, residual = exc.trip
             print(
@@ -1111,6 +1144,14 @@ async def _run(args: argparse.Namespace) -> None:
                 f"{math.degrees(sm['mean_jitter']):.3f}° / {sm['worst_joint']}"
                 + ("" if sm["completed"] else "  (cut short)")
             )
+
+
+class _Runaway(Exception):
+    """Internal: a firmware-loop joint left its target (``_FW_DEVIATION_ABORT``)."""
+
+    def __init__(self, joint: str, deg: float) -> None:
+        self.joint = joint
+        self.deg = deg
 
 
 class _Contact(Exception):
