@@ -87,7 +87,7 @@ from ..robot.axol import (
     held_firmware_gain_mismatches,
 )
 from ..robot.base import RobotBase, mark_hardware_cleanup_uncertain
-from ..robot.config import AxolConfig, check_loop_hz
+from ..robot.config import AxolConfig, JointConfig, check_loop_hz
 from ..settings import SHARED
 from .link import FeedbackSlot, RtLink, config_header
 
@@ -108,6 +108,18 @@ _WIRE_MODES = frozenset({"mit", "a4", "pv"})
 #: wrists, 6-7). The core would refuse neither on the wire — the motor would
 #: simply ignore the frame — so the mismatch is caught here.
 _WIRE_VENDOR_IDS = {"a4": range(1, 6), "pv": range(6, 8)}
+
+
+def tf_nm_per_pct(joint: Joint, gains: JointConfig) -> float:
+    """The 0x73 feedforward scale the core takes for a joint: output-shaft Nm
+    per 1% of rated current — its torque constant times
+    ``firmware.tf_rated_current_a`` over 100 — or 0 (plain 0xA4) when the
+    rated current is unset or the joint is not a MyActuator motor."""
+    cfg = _JOINT_CONFIG[joint]
+    rated = gains.firmware.tf_rated_current_a
+    if rated is None or cfg.motor_id > 5:
+        return 0.0
+    return float(cfg.kt) * float(rated) / 100.0
 
 
 class Axol(RobotBase):
@@ -331,7 +343,15 @@ class Axol(RobotBase):
             out.append((1, self._robot.right))
         return out
 
-    def _config_text(self) -> str:
+    def _config_text(self, *, cogging: bool = False) -> str:
+        """The core's config.
+
+        ``cogging``: also the joints' ``cogging`` lines (position-periodic
+        torque cancellation), which need the resolved joint offsets — the
+        motor-frame series is the joint-frame one shifted by the offset — so
+        they go on the second configure, after :meth:`_enable` resolved them.
+        """
+
         def _wire_token(mode: str, joint: Joint, motor_id: int) -> str:
             token = str(mode).lower()
             if token not in _WIRE_MODES:
@@ -353,6 +373,7 @@ class Axol(RobotBase):
         lines = [
             *config_header(),
             f"loop_hz {self._loop_hz}",
+            f"impedance_hz {self._axol_config().impedance_hz}",
             f"watchdog_ms {self._watchdog_ms}",
             # Corruption defense on the core side; the Python max-step gate
             # in motion_control is the real per-command limit.
@@ -382,11 +403,21 @@ class Axol(RobotBase):
                     f"{gains.stribeck_gain} {gains.stribeck_dfs} "
                     f"{gains.stribeck_load_gain} {gains.stribeck_vs} {f.fl} "
                     f"{gains.stribeck_pole} "
-                    # 0xA4 speed-cap tracking (the planner's; 0 = fixed cap)
-                    # and target lead (ms).
+                    # 0xA4 speed-cap tracking (the planner's; 0 = fixed cap),
+                    # target lead (ms), and the 0x73 feedforward scale (0 =
+                    # plain 0xA4).
                     f"{gains.firmware.cap_track or 0.0} "
-                    f"{gains.firmware.planner_lead_ms or 0.0}"
+                    f"{gains.firmware.planner_lead_ms or 0.0} "
+                    f"{tf_nm_per_pct(j, gains)}"
                 )
+                if cogging and gains.cogging is not None and gains.cogging_gain != 0.0:
+                    offset = float(arm._joint_offsets[ARM_JOINTS.index(j)])
+                    if math.isfinite(offset):
+                        terms = gains.cogging.motor_terms(offset, gains.cogging_gain)
+                        lines.append(
+                            f"cogging {side} {iface} {motor_id} {len(terms)} "
+                            + " ".join(f"{w!r} {a!r} {b!r}" for w, a, b in terms)
+                        )
             if arm._has_gripper:
                 lines.append(
                     f"gripper {side} {iface} {_JOINT_CONFIG[Joint.GRIPPER].motor_id}"
@@ -563,6 +594,17 @@ class Axol(RobotBase):
                     driver = arm.motors[j]._driver
                     await driver._detect_capabilities()
                     await driver._apply_low_voltage_threshold()
+
+        # The offsets are resolved: hand the core the cogging cancellation,
+        # which lives in the motor frame. Re-sending the config replaces the
+        # one the prep ran from; the bus threads start from this one at arm.
+        if any(
+            getattr(arm._arm_config, j.value).cogging is not None
+            for _side, arm in self._arms()
+            for j in ARM_JOINTS
+            if j in arm.motors
+        ):
+            await self._link.configure(self._config_text(cogging=True))
 
         # Gripper bring-up runs from Python while the bus is still quiet —
         # the exact classic flow (enable/calibrate or attach/restore) the

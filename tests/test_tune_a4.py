@@ -522,3 +522,55 @@ class LeadTest(unittest.TestCase):
         self.assertEqual(ns.lead_ms, 0.0)
         ns = parser.parse_args(["tune.a4", "--r", "--joint", "elbow", "--lead-ms", "5"])
         self.assertEqual(ns.lead_ms, 5.0)
+
+
+class TfProbeTest(unittest.TestCase):
+    """``--tf-probe``: 0x73 frames and the rated-current estimate."""
+
+    def test_the_0x73_frame_is_the_0xa4_frame_with_the_feedforward(self) -> None:
+        # Vendor manual V4.4 §2.25 example 1: 60% feedforward, 500 dps, +360°.
+        self.assertEqual(
+            a4._tf_frame(2 * math.pi, 500.0, 60.0),
+            bytes([0x73, 0x3C, 0xF4, 0x01, 0xA0, 0x8C, 0x00, 0x00]),
+        )
+        self.assertEqual(a4._tf_frame(0.0, 0.0, -1.0)[1], 0xFF)
+        self.assertEqual(a4._tf_frame(0.0, 0.0, 500.0)[1], 127)
+
+    def test_the_probe_steps_zero_plus_zero_minus(self) -> None:
+        half = a4.TF_PROBE_HALF_S
+        got = [a4.tf_probe_ff((k + 0.5) * half, 5.0) for k in range(8)]
+        self.assertEqual(got, [0.0, 5.0, 0.0, -5.0, 0.0, 5.0, 0.0, -5.0])
+
+    def test_the_estimate_reads_the_current_jump_at_each_switch(self) -> None:
+        # 0.12 A per 1% (a 12 A rated motor) on top of 9 A of gravity, the loop
+        # then unwinding the step over ~20 ms, plus sensor noise.
+        rng = np.random.default_rng(0)
+        rate, pct = 400.0, 5.0
+        samples = []
+        integ = 0.0
+        for k in range(int(8 * rate)):
+            t = k / rate
+            ff = a4.tf_probe_ff(t, pct)
+            # The reply comes back right after the frame; the loop unwinds the
+            # step in the tick that follows.
+            iq = 9.0 + 0.12 * ff - integ + 0.01 * rng.standard_normal()
+            samples.append((t, ff, iq))
+            integ += (0.12 * ff - integ) * (1.0 / rate) / 0.02
+        est = a4.tf_step_estimate(samples)
+        self.assertGreater(est["edges"], 20)
+        self.assertAlmostEqual(est["amps_per_pct"], 0.12, delta=0.01)
+        self.assertEqual(a4.tf_step_estimate([])["edges"], 0)
+
+    def test_flags(self) -> None:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        a4.add_parser(parser.add_subparsers())
+        ns = parser.parse_args(["tune.a4", "--r", "--joint", "shoulder_1"])
+        self.assertIsNone(ns.tf_probe)
+        self.assertFalse(ns.no_imu)
+        ns = parser.parse_args(
+            ["tune.a4", "--r", "--joint", "shoulder_1", "--tf-probe", "5", "--no-imu"]
+        )
+        self.assertEqual(ns.tf_probe, 5.0)
+        self.assertTrue(ns.no_imu)

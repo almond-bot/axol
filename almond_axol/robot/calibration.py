@@ -34,6 +34,13 @@ tune.gravity --save``. It overrides the CAD value in the gravity model, which
 is what fixes the static droop a few-percent mass/CoM error causes under
 load (parked error = unmodeled torque / kp).
 
+``cogging`` is a joint's position-periodic torque (cogging / gear mesh) as a
+Fourier series in the joint angle, written by ``scripts/cogging_map.py
+--save``: ``{"period_deg": 3.62, "harmonics": [[1, a, b], [2, a, b], ...]}``
+— harmonic ``k`` contributes ``a·cos(2πkθ/P) + b·sin(2πkθ/P)`` Nm, the
+torque to *add* so the motor cancels it. The realtime core feeds it forward
+on tracked ticks (``JointConfig.cogging``, scaled by ``cogging_gain``).
+
 ``kp`` / ``kd`` are the tuned gains — the top of the stiffness blend
 (``s=1.0``, the production default) — exactly like the :class:`JointConfig`
 defaults they replace.
@@ -46,6 +53,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +76,39 @@ _SIDES = ("left", "right")
 # ``kd_soft`` entries written by older versions are silently dropped on load.
 _SCALAR_FIELDS = ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
 _FRICTION_FIELDS = ("fc", "k", "fv", "fo")
+# A cogging series longer than this is a fit gone wrong, not a motor.
+_COGGING_MAX_HARMONICS = 16
+
+
+def clean_cogging(entry: Any) -> dict[str, Any] | None:
+    """Validate a ``cogging`` entry: ``None`` if it is not a usable series.
+
+    Returns ``{"period_deg": P, "harmonics": [[k, a, b], ...]}`` with ``P >
+    0``, integer ``k >= 1`` and finite coefficients.
+    """
+    if not isinstance(entry, dict):
+        return None
+    period = _coerce_float(entry.get("period_deg"))
+    harmonics = entry.get("harmonics")
+    if (
+        period is None
+        or not math.isfinite(period)
+        or period <= 0.0
+        or not isinstance(harmonics, (list, tuple))
+    ):
+        return None
+    out: list[list[float]] = []
+    for h in harmonics[:_COGGING_MAX_HARMONICS]:
+        if not isinstance(h, (list, tuple)) or len(h) != 3:
+            return None
+        k, a, b = (_coerce_float(v) for v in h)
+        if k is None or a is None or b is None:
+            return None
+        if not all(math.isfinite(v) for v in (k, a, b)) or k < 1 or k != int(k):
+            return None
+        out.append([int(k), a, b])
+    return {"period_deg": period, "harmonics": out} if out else None
+
 
 # A corrupt file must never take the robot down, but silently ignoring it
 # would make a bad calibration mysterious — warn once per process.
@@ -196,6 +237,17 @@ def load_calibration(
                         side,
                         joint,
                     )
+            if "cogging" in entry:
+                cogging = clean_cogging(entry["cogging"])
+                if cogging is not None:
+                    clean["cogging"] = cogging
+                else:
+                    _logger.warning(
+                        "Calibration for %s %s has a malformed cogging entry; "
+                        "ignoring it.",
+                        side,
+                        joint,
+                    )
             friction = entry.get("friction")
             if isinstance(friction, dict):
                 fclean = {f: _coerce_float(friction.get(f)) for f in _FRICTION_FIELDS}
@@ -264,6 +316,7 @@ def update_joint_calibration(
     kd_host_q: float | None = None,
     friction: dict[str, float] | None = None,
     com: tuple[float, float, float] | None = None,
+    cogging: dict[str, Any] | None = None,
     hub_serial: str | None = None,
     path: Path = CALIBRATION_PATH,
 ) -> Path:
@@ -272,7 +325,8 @@ def update_joint_calibration(
     Only the provided fields are touched — saving PID gains or its host
     damping band does not clobber a previously saved friction fit, and vice
     versa. ``friction`` must carry all of ``fc`` / ``k`` / ``fv`` / ``fo``;
-    ``com`` is the link's fitted centre of mass (metres, URDF link frame).
+    ``com`` is the link's fitted centre of mass (metres, URDF link frame);
+    ``cogging`` a position-periodic torque series (see the module docstring).
     The document is scoped to ``hub_serial`` (auto-detected when omitted) and
     stale data for another robot is never merged into it. If an existing file
     is unscoped or belongs to another robot, it is preserved in a numbered
@@ -285,6 +339,11 @@ def update_joint_calibration(
         missing = [f for f in _FRICTION_FIELDS if f not in friction]
         if missing:
             raise ValueError(f"friction is missing fields: {', '.join(missing)}")
+    cogging_clean = None
+    if cogging is not None:
+        cogging_clean = clean_cogging(cogging)
+        if cogging_clean is None:
+            raise ValueError(f"not a usable cogging series: {cogging!r}")
 
     if hub_serial is None:
         hub_serial = current_hub_serial()
@@ -360,6 +419,8 @@ def update_joint_calibration(
         if len(com) != 3:
             raise ValueError(f"com must have 3 components, got {len(com)}")
         entry["com"] = [float(v) for v in com]
+    if cogging_clean is not None:
+        entry["cogging"] = cogging_clean
     entry["updated_at"] = (
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     )

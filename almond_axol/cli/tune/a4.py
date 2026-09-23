@@ -62,7 +62,7 @@ import numpy as np
 from ...constants import ARM_JOINTS, Joint
 from ...motor import CanBus, ControlMode, Motor, MotorError
 from ...motor.damiao import DamiaoMotor
-from ...motor.myactuator import _MA_PID_IDX, MyActuatorMotor
+from ...motor.myactuator import _MA_FW_V44_VERSION, _MA_PID_IDX, MyActuatorMotor
 from ...robot.axol import arm_limits
 from ...robot.config import position_wire_mode
 from ...tuning import (
@@ -76,10 +76,12 @@ from ...tuning import (
     sweep_safety,
 )
 from ...tuning.runner import LiveStream, report_achieved_rate
+from ...tuning.wrist_imu import WristImu, format_imu
 from ..motor import add_side_and_channel_arguments, resolve_channel
 from .friction import _home_all, _ramp_verified, _safe_torque_off, rest_target
 
 _MA_POS_CONTROL = 0xA4
+_MA_TF_CONTROL = 0x73  # V4.4: position control with torque feedforward
 _MA_MULTI_TURN_ANGLE = 0x92
 _MA_STATUS2 = 0x9C  # temperature, iq (0.01 A), speed (dps), angle
 _MA_READ_ACCEL = 0x42
@@ -555,6 +557,79 @@ def _a4_frame(position_rad: float, cap_dps: float) -> bytes:
     )
 
 
+def _tf_frame(position_rad: float, cap_dps: float, ff_pct: float) -> bytes:
+    """0x73 (protocol V4.4): the 0xA4 frame with an int8 torque feedforward in
+    1% of rated current in byte 1."""
+    ff = int(max(-128, min(127, round(ff_pct))))
+    return bytes([_MA_TF_CONTROL, ff & 0xFF]) + _a4_frame(position_rad, cap_dps)[2:]
+
+
+#: The ``--tf-probe`` square wave: feedforward 0, +P, 0, -P % for this long each.
+TF_PROBE_HALF_S = 0.25
+
+
+def tf_probe_ff(t: float, pct: float) -> float:
+    """The probe's feedforward (% rated current) at ``t`` seconds in."""
+    return (0.0, pct, 0.0, -pct)[int(t / TF_PROBE_HALF_S) % 4]
+
+
+def tf_step_estimate(samples: list[tuple[float, float, float]]) -> dict[str, float]:
+    """Amps of q-axis current per 1% of rated current, from a probe's
+    ``(t, ff_pct, iq_A)`` samples.
+
+    At each feedforward switch the firmware adds the new current at once
+    (its current loop runs at kHz), while the position and speed PIs answer
+    only once the joint has moved: the reply to the first frame carrying the
+    new feedforward (sent back within a fraction of a millisecond) against
+    the mean of the few before the switch, over the jump in percent, is the
+    current one percent buys. Later samples are already unwinding under the
+    loops, so only that first one is used. The median over every switch
+    rejects the odd step a control-loop transient spoiled.
+
+    Returns ``{"amps_per_pct", "spread", "edges"}`` — the spread is the
+    interquartile range across switches; ``amps_per_pct`` is NaN with no
+    usable switch.
+    """
+    ratios = []
+    for i in range(6, len(samples)):
+        d_ff = samples[i][1] - samples[i - 1][1]
+        if d_ff == 0 or samples[i - 1][1] != samples[i - 6][1]:
+            continue
+        before = float(np.mean([s[2] for s in samples[i - 5 : i]]))
+        after = samples[i][2]
+        ratios.append((after - before) / d_ff)
+    if not ratios:
+        return {"amps_per_pct": math.nan, "spread": math.nan, "edges": 0}
+    q1, med, q3 = np.percentile(ratios, [25, 50, 75])
+    return {"amps_per_pct": float(med), "spread": float(q3 - q1), "edges": len(ratios)}
+
+
+async def _tf_probe(
+    driver: MyActuatorMotor,
+    motor: JointFrameMotor,
+    pose: float,
+    cap_dps: float,
+    rate: float,
+    pct: float,
+    seconds: float = 8.0,
+) -> list[tuple[float, float, float]]:
+    """Hold ``pose`` on 0x73 with the ``tf_probe_ff`` square wave; returns
+    ``(t, ff_pct, iq_A)`` per reply."""
+    target = pose - motor.frame_offset
+    period = 1.0 / rate
+    out: list[tuple[float, float, float]] = []
+    t0 = time.perf_counter()
+    deadline = t0
+    for k in range(int(seconds * rate)):
+        deadline += period
+        ff = tf_probe_ff(k * period, pct)
+        resp = await driver._request(_tf_frame(target, cap_dps, ff))
+        iq, _speed = _decode_a4_reply(resp)
+        out.append((time.perf_counter() - t0, ff, iq))
+        await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+    return out
+
+
 def speed_cap(
     v_cmd_rad_s: float, cap_dps: float, track: float, floor_dps: float
 ) -> float:
@@ -814,6 +889,63 @@ async def _hold(
         await asyncio.sleep(period)
 
 
+async def _report_tf_probe(
+    driver: MyActuatorMotor | DamiaoMotor,
+    motor: JointFrameMotor,
+    joint: Joint,
+    pose: float,
+    args: argparse.Namespace,
+) -> None:
+    """Run ``--tf-probe`` at the held pose and print the rated current it
+    implies (the ``firmware.tf_rated_current_a`` to configure)."""
+    if not isinstance(driver, MyActuatorMotor):
+        print(f"  ! --tf-probe: {joint.value} is not a MyActuator motor")
+        return
+    version = driver._fw_version or await driver._read_firmware_version()
+    if version < _MA_FW_V44_VERSION:
+        print(
+            f"  ! --tf-probe: firmware {version} predates 0x73 (protocol V4.4, "
+            f"VersionDate {_MA_FW_V44_VERSION} or later) — this joint stays on 0xA4"
+        )
+        return
+    pct = float(args.tf_probe)
+    print(
+        f"  0x73 probe: holding {math.degrees(pose):+.1f}° with feedforward "
+        f"0 / +{pct:g} / 0 / -{pct:g} % rated current, {TF_PROBE_HALF_S:g} s each ..."
+    )
+    samples = await _tf_probe(driver, motor, pose, args.cap, args.rate, pct)
+    await _hold(driver, motor, pose, args.cap, 0.3)
+    est = tf_step_estimate(samples)
+    if not est["edges"] or not math.isfinite(est["amps_per_pct"]):
+        print("  ! no usable feedforward switch in the probe — nothing to estimate")
+        return
+    if est["amps_per_pct"] <= 0.0:
+        print(
+            f"  ! +1% feedforward moved iq by {est['amps_per_pct']:+.4f} A — not the "
+            "positive step 0x73 is documented to give. Do not enable the core's 0x73 "
+            "feedforward on this joint until that is understood (a sign flip would "
+            "double the gravity load instead of carrying it)."
+        )
+        return
+    kt = float(driver._kt)
+    rated = 100.0 * est["amps_per_pct"]
+    print(f"\n{'─' * 66}")
+    print(
+        f"  iq per 1% feedforward: {est['amps_per_pct']:.4f} A "
+        f"(IQR {est['spread']:.4f} over {est['edges']} switches)"
+    )
+    print(
+        f"  → rated current ≈ {rated:.2f} A; with kt {kt:g} Nm/A that is "
+        f"{kt * est['amps_per_pct']:.4f} Nm per %"
+    )
+    print(
+        f"  configure: firmware.tf_rated_current_a = {rated:.2f} (or its datasheet "
+        f"value) — e.g. tune.motion --gain {joint.value}.firmware.tf_rated_current_a="
+        f"{rated:.2f}"
+    )
+    print(f"{'─' * 66}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -934,6 +1066,26 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "tick, so it cruises at the cap instead. 0 (default) = no lead.",
     )
     p.add_argument(
+        "--no-imu",
+        action="store_true",
+        help="Do not record the wrist camera's IMU (recorded by default: the run "
+        "gets an 'imu' shake score — 3-15 Hz displacement p2p in mm at the gripper).",
+    )
+    p.add_argument(
+        "--tf-probe",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Instead of the wave: hold the joint at --center on 0x73 (protocol "
+        "V4.4 position control with torque feedforward) and step the feedforward "
+        f"0 / +PCT / 0 / -PCT %% of rated current ({TF_PROBE_HALF_S:g} s each, 8 s) — "
+        "the q-axis current jump at each step, before the loop reacts, measures "
+        "the current 1%% buys, i.e. the motor's rated current: the "
+        "firmware.tf_rated_current_a the realtime core scales its 0x73 "
+        "feedforward with. 5 is a gentle ~1 Nm on a shoulder. MyActuator V4.4 "
+        "firmware only; run it with --accel 0.",
+    )
+    p.add_argument(
         "--accel",
         type=int,
         default=None,
@@ -1044,6 +1196,10 @@ async def _run(args: argparse.Namespace) -> None:
     )
 
     channel = resolve_channel(args)
+    # The wrist camera's IMU: opened before the motors, stopped after them.
+    imu = WristImu([side], enabled=not args.no_imu and args.tf_probe is None)
+    imu.start()
+    stream_origin: float | None = None
     async with CanBus(channel) as bus:
         raw = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw.values()])
@@ -1216,9 +1372,13 @@ async def _run(args: argparse.Namespace) -> None:
                         f"  held {hj.value}.{n:12s} {found[n]:.6g} → {got[n]:.6g}{flag}"
                     )
 
+            if args.tf_probe is not None:
+                await _report_tf_probe(driver, motor, joint, center, args)
+                return
             guard = BuzzGuard(args.rate, math.radians(args.buzz_abort), args.iq_abort)
             live = LiveStream("sine", joint)
             print("  Running ...")
+            stream_origin = time.perf_counter()
             log, reason, held_log, held_dyn = await _stream(
                 motor,
                 driver,
@@ -1396,11 +1556,20 @@ async def _run(args: argparse.Namespace) -> None:
                 print("  (torque-off will be refused unless every joint is at rest)")
             await _safe_torque_off(motors, raw)
 
+    imu.stop()
     if len(log) < 20:
         print("\nToo few samples to score.")
         return
     metrics = a4_metrics(log, args.rate)
     metrics["aborted"] = reason is not None
+    imu_metrics: dict[str, dict[str, float]] = {}
+    imu_series: dict[str, np.ndarray] = {}
+    if stream_origin is not None:
+        imu_metrics, imu_series = imu.run_blocks(
+            stream_origin, stream_origin + float(log[-1]["t"]), stream_origin
+        )
+    if imu_metrics:
+        metrics["imu"] = imu_metrics
     if held_scores:
         metrics["held"] = held_scores
     if ring_scores:
@@ -1421,6 +1590,8 @@ async def _run(args: argparse.Namespace) -> None:
         f"spread {metrics['iq_sd']:.2f} {current_unit}   "
         f"3-8 Hz mode {metrics['iq_mode']:.2f} {current_unit}   loop {metrics['hz']:.0f} Hz"
     )
+    for line in format_imu(imu_metrics):
+        print(line)
     print(f"{'─' * 66}")
     if args.save_run:
         params = {
@@ -1445,7 +1616,7 @@ async def _run(args: argparse.Namespace) -> None:
         }
         run_id = save_run(
             "sine",
-            {**log_to_series(log), **held_series(held_log, held_dyn)},
+            {**log_to_series(log), **held_series(held_log, held_dyn), **imu_series},
             metrics,
             side=side,
             joint=joint.value,

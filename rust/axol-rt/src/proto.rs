@@ -141,6 +141,23 @@ pub fn ma_a4_encode(p_des: f64, cap_dps: f64) -> [u8; 8] {
     [0xA4, 0x00, c[0], c[1], p[0], p[1], p[2], p[3]]
 }
 
+/// 0x73 (protocol V4.4, "TF"): the 0xA4 position command plus a feedforward
+/// torque — `[0x73, ff, cap_lo, cap_hi, p0, p1, p2, p3]`, `ff` an int8 in 1%
+/// of the motor's rated current. In direct tracking (planner acceleration
+/// 0) the firmware adds it to the current command beneath its position and
+/// speed PIs; with the planner on the protocol makes it plain 0xA4. The
+/// reply has the 0xA4 layout (`ma_decode_a4_reply`) with 0x73 in byte 0.
+pub const MA_TF_CMD: u8 = 0x73;
+
+/// Encode a 0x73 frame: [`ma_a4_encode`]'s target and cap plus `ff_pct`
+/// (percent of rated current, rounded and clamped to the int8 range).
+pub fn ma_tf_encode(p_des: f64, cap_dps: f64, ff_pct: f64) -> [u8; 8] {
+    let mut frame = ma_a4_encode(p_des, cap_dps);
+    frame[0] = MA_TF_CMD;
+    frame[1] = (ff_pct.round().clamp(-128.0, 127.0) as i8) as u8;
+    frame
+}
+
 /// The 0x92 multi-turn angle request, paired with an 0xA4 command so the
 /// host still gets 0.01 deg position (the 0xA4 reply's own angle is 1 deg).
 pub const MA_MULTI_TURN_REQUEST: [u8; 8] = [MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0];
@@ -398,6 +415,21 @@ mod tests {
         assert!((iq + 1.0).abs() < 1e-9);
         assert!((speed + 500.0_f64.to_radians()).abs() < 1e-9);
         assert!((angle + 45.0_f64.to_radians()).abs() < 1e-9);
+    }
+
+    /// Vendor manual §2.25 (V4.4) example 1: 60% rated current feedforward,
+    /// 500 dps cap, +360° target — the 0xA4 layout with 0x73 and the int8
+    /// feedforward in byte 1.
+    #[test]
+    fn tf_frames_match_the_vendor_example() {
+        assert_eq!(
+            ma_tf_encode(2.0 * std::f64::consts::PI, 500.0, 60.0),
+            [0x73, 0x3C, 0xF4, 0x01, 0xA0, 0x8C, 0x00, 0x00]
+        );
+        // Negative feedforward is two's complement; out of range clamps.
+        assert_eq!(ma_tf_encode(0.0, 0.0, -1.4)[1], 0xFF);
+        assert_eq!(ma_tf_encode(0.0, 0.0, 300.0)[1], 127);
+        assert_eq!(ma_tf_encode(0.0, 0.0, -300.0)[1], 0x80);
     }
 
     #[test]

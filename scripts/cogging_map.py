@@ -14,6 +14,18 @@ period in *time* and therefore change spatial period with speed.
 Usage:
     uv run python scripts/cogging_map.py ~/fric-s1-raw.csv
     uv run python scripts/cogging_map.py ~/fric-s1-raw.csv --grid-deg 0.1 --table ~/cog-s1.json
+    uv run python scripts/cogging_map.py ~/fric-s1-raw.csv --fit            # Fourier series
+    uv run python scripts/cogging_map.py ~/fric-s1-raw.csv --fit --save     # → calibration
+
+``--fit`` fits the Fourier series the realtime core cancels
+(``almond_axol.tuning.cogging``: a ``--period`` fundamental, default 3.62°,
+with ``--harmonics``, default 1 2 4 — the right shoulder_1's 3.62° / 1.81° /
+0.905° ripple), reports each pass's fit and how well it predicts the *other*
+passes (the out-of-sample test — a series that only fits its own pass cancels
+nothing), and with ``--save`` writes it to this robot's calibration file as
+the joint's ``cogging`` entry. It then applies on every bring-up: added to the
+MIT feedforward on an impedance joint, carried by 0x73 on a firmware-loop joint
+with ``firmware.tf_rated_current_a`` set.
 
 The table (``--table``) is ``{"joint", "side", "grid_deg", "q_deg": [...],
 "tau_nm": [...]}``: the periodic torque to *add* to the feedforward at each
@@ -162,7 +174,9 @@ def analyse(path: Path, grid_deg: float, table: Path | None) -> None:
                     "side": side,
                     "grid_deg": grid_deg,
                     "q_deg": [float(q) for q in centres[common]],
-                    "tau_nm": [float(-t) for t in mean_resid],
+                    # The torque the motor supplied through each bump is what
+                    # it has to be given ahead of time: the residual as-is.
+                    "tau_nm": [float(t) for t in mean_resid],
                     "note": "feedforward to ADD at each joint-frame angle to cancel the measured position-periodic torque",
                 }
                 table.write_text(json.dumps(out, indent=1))
@@ -172,6 +186,70 @@ def analyse(path: Path, grid_deg: float, table: Path | None) -> None:
         "between speeds is cogging or gear mesh and can be cancelled from a table; peaks that "
         "move with speed are time-domain (stick-slip, structural) and cannot."
     )
+
+
+def fit_series(
+    path: Path, period_deg: float, harmonics: tuple[int, ...], save: bool
+) -> None:
+    """Fit the Fourier series per pass and pooled; optionally save it."""
+    from almond_axol.robot.calibration import update_joint_calibration
+    from almond_axol.tuning.cogging import fit_cogging, prediction_r
+
+    passes: dict[int, list[tuple[float, float, str]]] = defaultdict(list)
+    joint = side = ""
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            joint, side = row["joint"], row["side"]
+            passes[int(row.get("pass", 0) or 0)].append(
+                (float(row["q_rad"]), float(row["tau_nm"]), row["direction"])
+            )
+    if not passes:
+        raise SystemExit("no samples in the CSV")
+
+    def cols(rows: list[tuple[float, float, str]]):
+        q, t, d = zip(*rows)
+        return np.array(q), np.array(t), np.array(d)
+
+    names = ", ".join(f"{period_deg / k:.3g}°" for k in harmonics)
+    print(f"\n{side} {joint}: Fourier fit, {period_deg}° fundamental ({names})")
+    fits = {}
+    for k in sorted(passes):
+        try:
+            fits[k] = fit_cogging(
+                *cols(passes[k]), period_deg=period_deg, harmonics=harmonics
+            )
+        except ValueError as exc:
+            print(f"   pass {k}: {exc}")
+    for k, fit in fits.items():
+        others = {o: prediction_r(fit.model, *cols(passes[o])) for o in fits if o != k}
+        amps = ", ".join(
+            f"{period_deg / h:.3g}°: {a:.3f} Nm"
+            for h, a in zip(harmonics, fit.amplitudes)
+        )
+        pred = ", ".join(f"#{o} r={r:+.2f}" for o, r in others.items())
+        print(
+            f"   pass {k}: R² {fit.r2:.2f} of {fit.ripple_rms:.3f} Nm ripple — {amps}"
+            + (f" | predicts {pred}" if pred else "")
+        )
+    pooled = fit_cogging(
+        *cols([r for rows in passes.values() for r in rows]),
+        period_deg=period_deg,
+        harmonics=harmonics,
+    )
+    amps = ", ".join(
+        f"{period_deg / h:.3g}°: {a:.3f} Nm"
+        for h, a in zip(harmonics, pooled.amplitudes)
+    )
+    print(f"   pooled: R² {pooled.r2:.2f} — {amps}")
+    print(
+        "   Worth cancelling when every pass shows the same amplitudes and each "
+        "predicts the others at r ≳ 0.4."
+    )
+    if save:
+        if side not in ("left", "right") or not joint:
+            raise SystemExit("the CSV names no side/joint — cannot save")
+        out = update_joint_calibration(side, joint, cogging=pooled.model.as_dict())
+        print(f"   saved {side}.{joint} cogging → {out}")
 
 
 def main() -> None:
@@ -188,8 +266,33 @@ def main() -> None:
         default=None,
         help="Write the cancellation table here (JSON)",
     )
+    p.add_argument(
+        "--fit",
+        action="store_true",
+        help="Fit the Fourier series the realtime core cancels (see the docstring)",
+    )
+    p.add_argument(
+        "--period",
+        type=float,
+        default=3.62,
+        help="Fundamental period of the fit, degrees (default: 3.62)",
+    )
+    p.add_argument(
+        "--harmonics",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4],
+        help="Harmonic numbers to fit (default: 1 2 4)",
+    )
+    p.add_argument(
+        "--save",
+        action="store_true",
+        help="With --fit: write the pooled series to this robot's calibration file",
+    )
     args = p.parse_args()
     analyse(args.csv, args.grid_deg, args.table)
+    if args.fit or args.save:
+        fit_series(args.csv, args.period, tuple(args.harmonics), args.save)
 
 
 if __name__ == "__main__":

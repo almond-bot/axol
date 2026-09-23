@@ -75,6 +75,7 @@ from ...tuning import (
     sine_metrics,
     step_metrics,
 )
+from ...tuning.wrist_imu import WristImu, format_imu
 from ..motor import add_side_and_channel_arguments, resolve_channel
 
 
@@ -374,6 +375,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "machine",
     )
     p.add_argument(
+        "--no-imu",
+        action="store_true",
+        help="Do not record the wrist camera's IMU (recorded by default: each "
+        "candidate gets an 'imu' shake score — 3-15 Hz displacement p2p in mm).",
+    )
+    p.add_argument(
         "--save-run",
         action="store_true",
         help="Persist each candidate's full time series and metrics as a "
@@ -596,14 +603,35 @@ async def _run(args: argparse.Namespace) -> None:
     # One shared group id per invocation links the sweep's runs for A/B.
     run_group = uuid.uuid4().hex[:8] if args.save_run else None
 
+    # The wrist camera's IMU, recorded for the whole session; each saved run
+    # takes its own window of it.
+    imu = WristImu([side_str], enabled=not args.no_imu)
+
     def _persist_run(
-        kp: float, kd: float, log: list[dict], metrics: dict, mode_label: str
+        kp: float,
+        kd: float,
+        log: list[dict],
+        metrics: dict,
+        mode_label: str,
+        t_end: float | None = None,
     ) -> None:
+        imu_series: dict[str, np.ndarray] = {}
+        if imu.sides and log and t_end is not None:
+            # The log's own clock ends where the run returned.
+            origin = t_end - float(log[-1]["t"])
+            imu.flush()
+            imu_metrics, imu_series = imu.run_blocks(
+                origin + float(log[0]["t"]), t_end, origin
+            )
+            if imu_metrics:
+                metrics["imu"] = imu_metrics
+                for line in format_imu(imu_metrics):
+                    print(line)
         if not args.save_run or not log:
             return
         run_id = save_run(
             args.mode,
-            log_to_series(log),
+            {**log_to_series(log), **imu_series},
             metrics,
             side=side_str,
             joint=joint.value,
@@ -639,6 +667,7 @@ async def _run(args: argparse.Namespace) -> None:
     results: list[dict] = []
     ref_kp, ref_kd = candidates[0]
 
+    imu.start()
     async with CanBus(channel) as bus:
         raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw_motors.values()])
@@ -850,10 +879,11 @@ async def _run(args: argparse.Namespace) -> None:
                         ff,
                         relative=True,
                     )
+                    t_end = time.perf_counter()
                     metrics = step_metrics(log, amp, args.hold)
                     _print_stats_step(metrics, len(log), kp, kd)
                     pose_results.append({"kp": kp, "kd": kd, "metrics": metrics})
-                    _persist_run(kp, kd, log, metrics, f"step@pose{pose_n}")
+                    _persist_run(kp, kd, log, metrics, f"step@pose{pose_n}", t_end)
                     if csv_writer is not None:
                         for r in log:
                             csv_writer.writerow(
@@ -963,6 +993,7 @@ async def _run(args: argparse.Namespace) -> None:
                         monitor=monitor,
                         center=center_rad,
                     )
+                    t_end = time.perf_counter()
                     metrics = sine_metrics(log)
                     _print_stats_sine(metrics, len(log), kp, kd)
                 else:
@@ -979,6 +1010,7 @@ async def _run(args: argparse.Namespace) -> None:
                         monitor=monitor,
                         center=center_rad,
                     )
+                    t_end = time.perf_counter()
                     metrics = step_metrics(log, amp, args.hold)
                     _print_stats_step(metrics, len(log), kp, kd)
                 metrics["holder_wobble_deg"] = monitor.report()
@@ -988,7 +1020,7 @@ async def _run(args: argparse.Namespace) -> None:
                 _print_holder_wobble(metrics["holder_wobble_deg"])
 
                 results.append({"kp": kp, "kd": kd, "metrics": metrics})
-                _persist_run(kp, kd, log, metrics, args.mode)
+                _persist_run(kp, kd, log, metrics, args.mode, t_end)
                 if csv_writer is not None:
                     for r in log:
                         csv_writer.writerow(
@@ -1096,3 +1128,4 @@ async def _run(args: argparse.Namespace) -> None:
                     ]
                 )
             await asyncio.gather(*[m.disable() for m in motors.values()])
+    imu.stop()

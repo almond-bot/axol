@@ -5,6 +5,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::can::CanSock;
+use crate::filter::CogTerm;
 use crate::proto;
 use crate::safety::purge_tx_queue;
 use crate::txn;
@@ -74,6 +75,16 @@ pub struct MotorSpec {
     /// along the tracker velocity, so the planner cruises through its step
     /// instead of reaching the target and stopping for the rest of it.
     pub lead_s: f64,
+    /// 0x73 torque feedforward scale for an a4 joint: output-shaft Nm per 1%
+    /// of the motor's rated current (the Python side's `kt × rated A / 100`).
+    /// `> 0` sends the position command as 0x73 carrying the host
+    /// feedforward, where the firmware supports it (protocol V4.4,
+    /// `proto::MA_FW_V44`); `0` keeps plain 0xA4.
+    pub tf_nm_per_pct: f64,
+    /// Position-periodic torque to cancel (`filter::cogging`), motor frame,
+    /// already scaled by the joint's gain. Empty = none. Arrives on the
+    /// second configure, after the Python side has resolved joint offsets.
+    pub cogging: Vec<CogTerm>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -168,6 +179,24 @@ pub struct ReadyMotor {
     pub cap_track: f64,
     /// See `MotorSpec::lead_s`.
     pub lead_s: f64,
+    /// The firmware VersionDate read at prep (MyActuator only).
+    pub fw_version: Option<u32>,
+    /// `MotorSpec::tf_nm_per_pct` where the firmware takes 0x73, else 0 —
+    /// the bus loop sends 0x73 exactly when this is positive.
+    pub tf_nm_per_pct: f64,
+    /// See `MotorSpec::cogging`.
+    pub cogging: Vec<CogTerm>,
+}
+
+/// The 0x73 scale a joint actually runs: its configured one on firmware that
+/// implements 0x73 (protocol V4.4, VersionDate `proto::MA_FW_V44` or later),
+/// 0 otherwise (older firmware, an unread version, or none configured).
+pub fn tf_scale(spec_scale: f64, version: Option<u32>) -> f64 {
+    if spec_scale > 0.0 && version.is_some_and(|v| v >= proto::MA_FW_V44) {
+        spec_scale
+    } else {
+        0.0
+    }
 }
 
 /// Status-probe attempts before a silent motor fails the bring-up.
@@ -319,6 +348,9 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             fl: spec.fl,
             cap_track: spec.cap_track,
             lead_s: spec.lead_s,
+            fw_version: version,
+            tf_nm_per_pct: tf_scale(spec.tf_nm_per_pct, version),
+            cogging: spec.cogging.clone(),
         });
     }
 
@@ -400,6 +432,9 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             fl: spec.fl,
             cap_track: spec.cap_track,
             lead_s: spec.lead_s,
+            fw_version: None,
+            tf_nm_per_pct: 0.0,
+            cogging: spec.cogging.clone(),
         });
     }
     Ok(motors)
@@ -518,4 +553,22 @@ fn disable_inner(sock: &CanSock, motors: &[ReadyMotor]) -> bool {
         }
     }
     complete
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 0x73 only on protocol V4.4 firmware: the X8-P20 shoulders' 2026042402
+    /// takes it, the X6-P20 elbow's 2025070202 does not (it falls back to
+    /// plain 0xA4), and an unread version or an unset scale never sends it.
+    #[test]
+    fn tf_runs_only_on_v44_firmware_with_a_scale() {
+        assert_eq!(tf_scale(0.2, Some(2026042402)), 0.2);
+        assert_eq!(tf_scale(0.2, Some(2026090101)), 0.2);
+        assert_eq!(tf_scale(0.2, Some(2025070202)), 0.0);
+        assert_eq!(tf_scale(0.2, None), 0.0);
+        assert_eq!(tf_scale(0.0, Some(2026042402)), 0.0);
+        assert_eq!(tf_scale(-1.0, Some(2026042402)), 0.0);
+    }
 }

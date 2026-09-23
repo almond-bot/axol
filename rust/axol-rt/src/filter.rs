@@ -182,6 +182,43 @@ pub fn dither_step(phase: &mut f64, nm: f64, hz: f64, dt: f64) -> f64 {
     nm * phase.sin()
 }
 
+/// One harmonic of a joint's position-periodic torque (cogging / gear mesh)
+/// in the motor frame: `a·cos(w·q) + b·sin(w·q)` Nm, `w` in rad⁻¹ (2πk over
+/// the period). The Python side fits the joint-frame series
+/// (`almond_axol.tuning.cogging`), shifts it by the joint offset and scales
+/// it by the joint's `cogging_gain` before it reaches the core, so the core
+/// only evaluates it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CogTerm {
+    pub w: f64,
+    pub a: f64,
+    pub b: f64,
+}
+
+/// The torque to add to cancel a joint's measured position-periodic torque
+/// at motor-frame position `q` — the "osc cancellation" feedforward. The
+/// right shoulder_1's 1.81° / 0.905° ripple is what it was built for: in slow
+/// motion (2–5 deg/s) those bumps land at 1–6 Hz and were ~70% of the tool
+/// tip's vertical shake (2026-09-23). Empty series → 0.
+pub fn cogging(terms: &[CogTerm], q: f64) -> f64 {
+    terms
+        .iter()
+        .map(|t| t.a * (t.w * q).cos() + t.b * (t.w * q).sin())
+        .sum()
+}
+
+/// Seconds the 0x73 torque feedforward takes to fade in when a joint starts
+/// taking it (and after every stretch without it). The firmware's speed
+/// integrator was carrying gravity before; a step of the whole gravity
+/// torque would kick the joint until the integrator unwound. Ramping it in
+/// hands the load over gradually.
+pub const TF_RAMP_S: f64 = 1.0;
+
+/// Advance a 0x73 feedforward fade-in: `ramp` rises by `dt / TF_RAMP_S` to 1.
+pub fn tf_ramp_step(ramp: f64, dt: f64) -> f64 {
+    (ramp + dt.max(0.0) / TF_RAMP_S).min(1.0)
+}
+
 /// Velocity/acceleration-limited target tracker — the per-joint
 /// `TrapezoidalFilter` from `almond_axol.teleop.filter`, ported per-scalar
 /// with a per-step `dt` (the Python original fixes dt at construction).
@@ -677,6 +714,48 @@ mod tests {
         assert_eq!(stribeck_excess(0.05, 0.0, 0.1), 0.0);
         assert!((stribeck_amplitude(1.0, 0.3, 0.1, -12.0) - 1.5).abs() < 1e-12);
         assert_eq!(stribeck_amplitude(0.0, 0.3, 0.1, 12.0), 0.0);
+    }
+
+    /// The cogging series is a plain Fourier sum in the motor frame: zero
+    /// with no terms, and each harmonic's cos/sin coefficient read back at
+    /// the quarter points of its period.
+    #[test]
+    fn cogging_sums_its_harmonics() {
+        assert_eq!(cogging(&[], 1.0), 0.0);
+        let period = 1.81_f64.to_radians();
+        let terms = [
+            CogTerm {
+                w: 2.0 * std::f64::consts::PI / period,
+                a: 0.3,
+                b: -0.1,
+            },
+            CogTerm {
+                w: 4.0 * std::f64::consts::PI / period,
+                a: 0.0,
+                b: 0.2,
+            },
+        ];
+        assert!((cogging(&terms, 0.0) - 0.3).abs() < 1e-12);
+        // A quarter of the fundamental: cos → 0, sin → 1; the second harmonic
+        // is at half its period, sin → 0.
+        assert!((cogging(&terms, period / 4.0) + 0.1).abs() < 1e-9);
+        // Periodic in the fundamental.
+        let q = 0.37;
+        assert!((cogging(&terms, q) - cogging(&terms, q + 3.0 * period)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tf_ramp_fades_in_over_its_time_and_saturates() {
+        let mut r = 0.0;
+        for _ in 0..240 {
+            r = tf_ramp_step(r, TF_RAMP_S / 480.0);
+        }
+        assert!((r - 0.5).abs() < 1e-9);
+        for _ in 0..1000 {
+            r = tf_ramp_step(r, 0.01);
+        }
+        assert_eq!(r, 1.0);
+        assert_eq!(tf_ramp_step(0.25, -1.0), 0.25);
     }
 
     /// Reference vectors from `almond_axol.robot.control.dither_step`:

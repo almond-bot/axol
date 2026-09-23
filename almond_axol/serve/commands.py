@@ -561,6 +561,8 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         drives_motors=True,
         hardware_profiles=("axol",),
+        # Records the wrist cameras' IMUs (almond_axol.tuning.wrist_imu).
+        uses_cameras=True,
         section="tuning",
     ),
     "tune.a4": CommandDef(
@@ -579,6 +581,8 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         drives_motors=True,
         hardware_profiles=("axol",),
+        # Records the wrist cameras' IMUs (almond_axol.tuning.wrist_imu).
+        uses_cameras=True,
         section="tuning",
     ),
     "tune.friction": CommandDef(
@@ -658,6 +662,8 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         drives_motors=True,
         hardware_profiles=("axol",),
+        # Records the wrist cameras' IMUs (almond_axol.tuning.wrist_imu).
+        uses_cameras=True,
         section="tuning",
     ),
     "tune.filter": CommandDef(

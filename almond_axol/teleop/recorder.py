@@ -91,7 +91,12 @@ _RT_TRACE_COLUMNS = (
     "damp_q",
     "tick_dt",
     "fb_dt",
+    "cogging_ff",
+    "tf_pct",
 )
+# The layout before the cogging cancellation and 0x73 feedforward columns: a
+# CSV a proto-14 core left behind still compacts.
+_RT_TRACE_COLUMNS_V1 = _RT_TRACE_COLUMNS[:-2]
 
 
 def resolve_prefix(prefix: str) -> str:
@@ -126,18 +131,25 @@ def compact_rt_trace(prefix: str) -> Path | None:
         with path.open("rb") as raw:
             header = raw.readline().decode("ascii", "replace").strip().split(",")
             has_rows = bool(raw.read(1))
-        if header != list(_RT_TRACE_COLUMNS):
+        if header == list(_RT_TRACE_COLUMNS):
+            columns = _RT_TRACE_COLUMNS
+        elif header == list(_RT_TRACE_COLUMNS_V1):
+            columns = _RT_TRACE_COLUMNS_V1
+        else:
             raise ValueError(f"unexpected Rust trace schema in {path}")
         if not has_rows:
             continue
         values = np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)
-        if values.shape[1] != len(_RT_TRACE_COLUMNS):
+        if values.shape[1] != len(columns):
             raise ValueError(
                 f"unexpected Rust trace width in {path}: {values.shape[1]}"
             )
         found_rows = True
         chunks["side"].append(np.full(len(values), side, dtype=np.uint8))
-        for index, source_name in enumerate(_RT_TRACE_COLUMNS):
+        for source_name in _RT_TRACE_COLUMNS[len(columns) :]:
+            # A legacy file has no such column: NaN, so both sides concatenate.
+            chunks[source_name].append(np.full(len(values), np.nan, dtype=np.float32))
+        for index, source_name in enumerate(columns):
             name = "t" if source_name == "time_s" else source_name
             if source_name == "tick":
                 array = values[:, index].astype(np.uint64)

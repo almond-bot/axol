@@ -282,6 +282,15 @@ const TABS: WbTab[] = [
         type: "number",
         placeholder: "off",
       },
+      {
+        key: "no_imu",
+        label: "skip wrist IMU",
+        type: "boolean",
+        hint:
+          "by default the wrist ZED X One's IMU is recorded and the run gets an IMU " +
+          "shake score — 3–15 Hz displacement at the gripper, 1 s peak-to-peak in mm " +
+          "(what the joint encoders cannot see: backlash, flex)",
+      },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
     required: ["arm", "joint"],
@@ -334,6 +343,15 @@ const TABS: WbTab[] = [
         options: ["full", "gravity", "friction", "none"],
       },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "—" },
+      {
+        key: "no_imu",
+        label: "skip wrist IMU",
+        type: "boolean",
+        hint:
+          "by default the wrist ZED X One's IMU is recorded and the run gets an IMU " +
+          "shake score — 3–15 Hz displacement at the gripper, 1 s peak-to-peak in mm " +
+          "(what the joint encoders cannot see: backlash, flex)",
+      },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
     required: ["arm", "joint"],
@@ -451,8 +469,31 @@ const TABS: WbTab[] = [
           "a loaded X8 shoulder holds ~10 A of gravity alone at -55°; keep this above the " +
           "pose's static current",
       },
+      {
+        key: "tf_probe",
+        label: "0x73 probe (% rated)",
+        type: "number",
+        placeholder: "off",
+        vendors: ["myactuator"],
+        hint:
+          "instead of the wave: hold the joint at center on 0x73 (position control with " +
+          "torque feedforward, V4.4 firmware) and step the feedforward 0 / +P / 0 / −P % " +
+          "of rated current — the current jump per step gives the motor's rated current, " +
+          "the firmware.tf_rated_current_a the realtime core scales its 0x73 feedforward " +
+          "with. 5 is a gentle ~1 Nm on a shoulder; planner accel must be 0",
+      },
       { key: "persist", label: "persist gains to ROM", type: "boolean" },
       { key: "keep", label: "keep gains + planner after run", type: "boolean" },
+      {
+        key: "no_imu",
+        label: "skip wrist IMU",
+        type: "boolean",
+        hint:
+          "by default the wrist ZED X One's IMU is recorded and the run gets an IMU " +
+          "shake score — 3–15 Hz displacement at the gripper, 1 s peak-to-peak in mm " +
+          "(what the joint encoders cannot see: backlash, flex)",
+      },
+
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
     required: ["arm", "joint"],
@@ -504,6 +545,17 @@ const TABS: WbTab[] = [
       },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
       {
+        key: "impedance_hz",
+        label: "impedance rate (Hz)",
+        type: "select",
+        options: ["240", "480"],
+        placeholder: "240",
+        hint:
+          "command rate of the MyActuator impedance joints: 240 is the verified rate; " +
+          "480 runs them every tick of a 480 Hz core loop while the Damiao wrists stay " +
+          "at 240 Hz on alternate ticks — an experiment (the gains were tuned at 240)",
+      },
+      {
         key: "loop_hz",
         label: "core loop (Hz)",
         type: "number",
@@ -511,8 +563,8 @@ const TABS: WbTab[] = [
         hint:
           "realtime-core tick rate override; auto follows the wire modes (240 all " +
           "impedance, 400 all firmware loops, 480 mixed — impedance joints on " +
-          "alternate ticks). With any arm joint on impedance only 240 or 480 is " +
-          "accepted: impedance runs at 240 Hz only",
+          "alternate ticks — or at impedance rate 480). With any arm joint on " +
+          "impedance only 240 or 480 is accepted (only 480 at impedance rate 480)",
       },
       {
         key: "record",
@@ -545,6 +597,15 @@ const TABS: WbTab[] = [
           "replay the motion this many times back to back (0 = until stopped), each " +
           "pass scored and saved as its own run [k/N] — for soak runs and catching an " +
           "intermittent buzz",
+      },
+      {
+        key: "no_imu",
+        label: "skip wrist IMU",
+        type: "boolean",
+        hint:
+          "by default each driven arm's wrist ZED X One IMU is recorded and every pass " +
+          "gets an IMU shake score — 3–15 Hz displacement at the gripper, 1 s " +
+          "peak-to-peak in mm (what the joint encoders cannot see: backlash, flex)",
       },
       { key: "gain", label: "gains — edit a cell to override it for this run", type: "overrides" },
       {
@@ -852,6 +913,9 @@ const OVERRIDE_FIELDS = [
   "stiction_load_gain",
   "dither_nm",
   "stribeck_gain",
+  // Share of the joint's calibrated cogging series fed forward (the "osc
+  // cancellation"; blank = no series calibrated for the joint).
+  "cogging_gain",
   // The firmware position loop (0xA4 / pv), in effect on --a4 joints and
   // under the position controller; written to ROM at enable.
   "firmware.position_kp",
@@ -862,6 +926,9 @@ const OVERRIDE_FIELDS = [
   "firmware.planner_accel",
   "firmware.cap_track",
   "firmware.planner_lead_ms",
+  // MyActuator 0x73: the rated current that scales the torque feedforward
+  // (gravity + inertia + cogging) on V4.4 firmware; blank = plain 0xA4.
+  "firmware.tf_rated_current_a",
 ]
 
 /**
@@ -879,6 +946,7 @@ const MYACTUATOR_ONLY_FIELDS = new Set([
   "firmware.planner_accel",
   "firmware.cap_track",
   "firmware.planner_lead_ms",
+  "firmware.tf_rated_current_a",
 ])
 
 /** Grid header for an override field (`firmware.x` shortened to `fw x`). */
@@ -1508,6 +1576,38 @@ function headline(meta: TuningRunMeta): { label: string; value: string } | null 
     return { label: "EE RMS", value: `${fmtNum(Math.max(...vals))} mm` }
   }
   return null
+}
+
+/** One side's wrist-IMU shake score (`almond_axol.tuning.wrist_imu`). */
+interface ImuScore {
+  shake_mm: number
+  shake_mm_p90: number
+  vertical_mm: number
+  vertical_mm_p90: number
+  acc_rms: number
+  gyro_rms: number | null
+  peak_hz: number
+}
+
+/** A run's `imu` metrics block, per side, or null when it recorded none. */
+function imuScores(meta: TuningRunMeta): Record<string, ImuScore> | null {
+  const block = (meta.metrics as Record<string, unknown>).imu
+  if (!block || typeof block !== "object") return null
+  const out: Record<string, ImuScore> = {}
+  for (const [side, v] of Object.entries(block as Record<string, unknown>)) {
+    if (v && typeof v === "object" && typeof (v as ImuScore).shake_mm === "number") {
+      out[side] = v as ImuScore
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null
+}
+
+/** The worst side's IMU shake (mm, 1 s peak-to-peak), for the run list. */
+function imuHeadline(meta: TuningRunMeta): string | null {
+  const s = imuScores(meta)
+  if (!s) return null
+  const worst = Math.max(...Object.values(s).map((v) => v.shake_mm))
+  return `${fmtNum(worst)} mm`
 }
 
 /** One per-joint chart: commanded vs actual position for a single joint. */
@@ -3403,6 +3503,47 @@ export function TuningWorkbench({
         </Card>
       )}
 
+      {/* Wrist IMU shake: what the joint encoders cannot see. */}
+      {!comparing && meta && imuScores(meta) && (
+        <Card className="gap-3 p-4">
+          <h3 className="font-heading text-sm font-semibold">Wrist IMU shake</h3>
+          <div className="overflow-x-auto">
+            <table className="w-full max-w-3xl text-xs">
+              <thead>
+                <tr className="text-left text-white/40">
+                  <th className="py-1 pr-4 font-normal">side</th>
+                  <th className="py-1 pr-4 font-normal">shake p2p (mm)</th>
+                  <th className="py-1 pr-4 font-normal">p90 (mm)</th>
+                  <th className="py-1 pr-4 font-normal">vertical (mm)</th>
+                  <th className="py-1 pr-4 font-normal">accel (m/s²)</th>
+                  <th className="py-1 pr-4 font-normal">gyro (°/s)</th>
+                  <th className="py-1 pr-4 font-normal">peak (Hz)</th>
+                </tr>
+              </thead>
+              <tbody className="font-mono tabular-nums">
+                {Object.entries(imuScores(meta) ?? {}).map(([side, v]) => (
+                  <tr key={side} className="border-t border-white/[0.06]">
+                    <td className="py-1 pr-4 font-sans text-white/55">{side}</td>
+                    <td className="py-1 pr-4">{fmtNum(v.shake_mm)}</td>
+                    <td className="py-1 pr-4">{fmtNum(v.shake_mm_p90)}</td>
+                    <td className="py-1 pr-4">{fmtNum(v.vertical_mm)}</td>
+                    <td className="py-1 pr-4">{fmtNum(v.acc_rms, 3)}</td>
+                    <td className="py-1 pr-4">{v.gyro_rms == null ? "–" : fmtNum(v.gyro_rms)}</td>
+                    <td className="py-1 pr-4">{fmtNum(v.peak_hz, 1)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="max-w-3xl text-[0.65rem] leading-relaxed text-white/35">
+            The wrist ZED X One&apos;s IMU during the run: acceleration band-passed to 3–15 Hz
+            (above the motion, below the buzz), integrated to displacement, and scored as the median
+            1 s peak-to-peak excursion at the gripper — overall and along gravity (vertical). Unlike
+            the joint scores it sees backlash, link flex and the gripper itself.
+          </p>
+        </Card>
+      )}
+
       {/* Past runs, compact. */}
       <div className="flex flex-col gap-2">
         <div className="flex flex-wrap items-center gap-3">
@@ -3506,6 +3647,14 @@ export function TuningWorkbench({
                   {head && (
                     <span className="font-mono text-white/60 tabular-nums">
                       {head.label} {head.value}
+                    </span>
+                  )}
+                  {imuHeadline(r) && (
+                    <span
+                      className="font-mono text-white/60 tabular-nums"
+                      title="wrist IMU: 3–15 Hz displacement at the gripper, 1 s peak-to-peak (worst side)"
+                    >
+                      IMU {imuHeadline(r)}
                     </span>
                   )}
                   <span className="ml-auto text-white/35">{fmtWhen(r.startedAt)}</span>

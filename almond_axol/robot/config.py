@@ -32,6 +32,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
+import numpy as np
+
 from ..constants import ARM_JOINTS, Joint
 from ..motor.motor import _JOINT_CONFIG
 from .calibration import (
@@ -152,6 +154,21 @@ class FirmwareGains:
                   right elbow's speed error at 60-120 Hz on the 240 Hz lane);
                   a few ms ahead keeps it cruising. 0-50; not written to the
                   motor.
+        tf_rated_current_a: **Host side, MyActuator 0xA4 joints.** The motor's
+                  rated current (A, from its datasheet, or estimated with
+                  ``tune.a4 --tf-probe``). Set, the realtime core sends the
+                  joint's position command as **0x73** (protocol V4.4:
+                  position control with torque feedforward) carrying the host
+                  feedforward — gravity, inertia and the cogging cancellation
+                  — in the int8 1%-of-rated-current unit the firmware takes,
+                  scaled with the joint's torque constant; faded in over a
+                  second so the speed integrator can hand the load over. Only
+                  on firmware that implements 0x73 (VersionDate 2026042402 or
+                  later: the X8-P20 shoulders, not the X6-P20 elbow's
+                  2025070202) — elsewhere the joint stays on plain 0xA4 and
+                  the core logs why. Unset (default): plain 0xA4. Direct
+                  tracking only (``planner_accel`` 0): with the planner on the
+                  firmware ignores the feedforward. Not written to the motor.
     """
 
     position_kp: float | None = None
@@ -163,14 +180,22 @@ class FirmwareGains:
     planner_accel: float | None = None
     cap_track: float | None = None
     planner_lead_ms: float | None = None
+    tf_rated_current_a: float | None = None
 
     def __post_init__(self) -> None:
         check_firmware_extras(self.planner_accel, self.cap_track, self.planner_lead_ms)
+        if self.tf_rated_current_a is not None and not (
+            math.isfinite(self.tf_rated_current_a) and self.tf_rated_current_a > 0.0
+        ):
+            raise ValueError(
+                f"tf_rated_current_a {self.tf_rated_current_a:g}: the motor's rated "
+                "current in amps (> 0), or unset for plain 0xA4"
+            )
 
     def as_dict(self) -> dict[str, float]:
-        """The set motor parameters, keyed by name (``cap_track`` excluded:
-        and ``planner_lead_ms`` excluded: they are the realtime core's, not
-        the motor's)."""
+        """The set motor parameters, keyed by name (``cap_track``,
+        ``planner_lead_ms`` and ``tf_rated_current_a`` excluded: they are the
+        realtime core's, not the motor's)."""
         return {
             f.name: float(v)
             for f in fields(self)
@@ -180,7 +205,9 @@ class FirmwareGains:
 
 
 #: ``FirmwareGains`` fields the realtime core uses; never written to a motor.
-_HOST_FIRMWARE_FIELDS = frozenset({"cap_track", "planner_lead_ms"})
+_HOST_FIRMWARE_FIELDS = frozenset(
+    {"cap_track", "planner_lead_ms", "tf_rated_current_a"}
+)
 
 
 def check_firmware_extras(
@@ -208,6 +235,67 @@ def check_firmware_extras(
         )
     if planner_lead_ms is not None and not 0.0 <= planner_lead_ms <= 50.0:
         raise ValueError(f"planner_lead_ms {planner_lead_ms:g}: must be within 0..50")
+
+
+@dataclass(frozen=True)
+class CoggingModel:
+    """A joint's position-periodic torque (cogging / gear mesh) to cancel.
+
+    A Fourier series in the **joint** angle: harmonic ``(k, a, b)`` adds
+    ``a·cos(2πkθ/P) + b·sin(2πkθ/P)`` Nm, ``P`` = ``period_deg`` — the torque
+    to *add* so the motor cancels the ripple. Fitted from a slow friction
+    sweep (``axol tune.friction --raw-csv`` then ``scripts/cogging_map.py
+    --save``) and stored in the calibration file; the right shoulder_1's is a
+    3.62° series whose 1.81° and 0.905° harmonics carry most of it — the
+    bumps that land at 1–6 Hz in slow motion (2026-09-23).
+    """
+
+    period_deg: float
+    harmonics: tuple[tuple[int, float, float], ...]
+
+    @classmethod
+    def from_dict(cls, entry: dict[str, Any]) -> "CoggingModel":
+        """From a calibration-file ``cogging`` entry."""
+        return cls(
+            period_deg=float(entry["period_deg"]),
+            harmonics=tuple(
+                (int(k), float(a), float(b)) for k, a, b in entry["harmonics"]
+            ),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        """The calibration-file form (inverse of :meth:`from_dict`)."""
+        return {
+            "period_deg": self.period_deg,
+            "harmonics": [list(h) for h in self.harmonics],
+        }
+
+    def torque(self, q_joint: float | np.ndarray) -> float | np.ndarray:
+        """The series at joint angle ``q_joint`` (rad), Nm."""
+        period = math.radians(self.period_deg)
+        return sum(
+            a * np.cos(2.0 * math.pi * k * q_joint / period)
+            + b * np.sin(2.0 * math.pi * k * q_joint / period)
+            for k, a, b in self.harmonics
+        )
+
+    def motor_terms(
+        self, offset: float, gain: float = 1.0
+    ) -> list[tuple[float, float, float]]:
+        """The series in the **motor** frame, for the realtime core.
+
+        ``joint = motor + offset``, so each harmonic's phase shifts by its
+        spatial frequency times the offset; torque needs no sign change (the
+        motor frame is the joint frame shifted). Returns ``(w, a', b')`` with
+        ``w`` in rad⁻¹, scaled by ``gain``.
+        """
+        period = math.radians(self.period_deg)
+        out = []
+        for k, a, b in self.harmonics:
+            w = 2.0 * math.pi * k / period
+            c, s = math.cos(w * offset), math.sin(w * offset)
+            out.append((w, gain * (a * c + b * s), gain * (b * c - a * s)))
+        return out
 
 
 @dataclass
@@ -395,6 +483,17 @@ class JointConfig:
                   enable — the position/speed loop gains behind
                   ``wire_mode`` ``a4``. All ``None`` (the default) leaves the
                   motor's stored gains alone; MyActuator joints only.
+        cogging:  :class:`CoggingModel` — the joint's position-periodic torque,
+                  cancelled by feedforward on tracked ticks (the "osc
+                  cancellation"): added to the MIT ``t_ff`` on an impedance
+                  joint, carried by 0x73 on a firmware-loop joint with
+                  ``firmware.tf_rated_current_a`` set (a plain-0xA4 joint
+                  takes no feedforward, so it has no effect there). Evaluated
+                  in the core at the measured angle. ``None`` (default): none.
+                  Loaded from the calibration file.
+        cogging_gain: Fraction of ``cogging`` applied, for A/B runs (``1.0``
+                  default; ``0`` off; ``tune.motion --gain
+                  shoulder_1.cogging_gain=0.5``).
     """
 
     kp: float
@@ -418,6 +517,8 @@ class JointConfig:
     stribeck_vs: float = 0.1
     stribeck_pole: float = 20.0
     firmware: FirmwareGains = field(default_factory=FirmwareGains)
+    cogging: CoggingModel | None = None
+    cogging_gain: float = 1.0
 
     def __post_init__(self) -> None:
         # The per-type defaults (_X8_FIRMWARE_GAINS, _ZERO_FRICTION, ...) are
@@ -803,6 +904,9 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     firmware = entry.get("firmware")
     if firmware is not None:
         overrides["firmware"] = FirmwareGains(**firmware)
+    cogging = entry.get("cogging")
+    if cogging is not None:
+        overrides["cogging"] = CoggingModel.from_dict(cogging)
     com = entry.get("com")
     if com is not None:
         # Fitted by ``axol tune.gravity --save``; already per-side (measured
@@ -1073,6 +1177,16 @@ IMPEDANCE_LOOP_HZ: float = CONTROLLER_LOOP_HZ["impedance"]
 #: controller's 400 Hz (see ``Thinning`` in ``rust/axol-rt/src/serve.rs``).
 MIXED_LOOP_HZ: float = 2.0 * IMPEDANCE_LOOP_HZ
 
+#: ``AxolConfig.impedance_hz`` values: the verified 240 Hz, or 480 Hz on the
+#: MyActuator impedance joints — commanded every tick of a 480 Hz loop, their
+#: host pipeline stepped at 480, while the Damiao wrists stay at 240 Hz on
+#: alternate ticks. 480 is an experiment (the gains were tuned at 240) and is
+#: never the default.
+IMPEDANCE_RATES: tuple[float, ...] = (IMPEDANCE_LOOP_HZ, 2.0 * IMPEDANCE_LOOP_HZ)
+
+#: The fast impedance rate (see :data:`IMPEDANCE_RATES`).
+FAST_IMPEDANCE_HZ: float = IMPEDANCE_RATES[1]
+
 
 def position_wire_mode(joint: Joint) -> str:
     """The firmware-position-loop wire token for an arm joint's vendor.
@@ -1100,24 +1214,35 @@ def impedance_joints(config: "AxolConfig") -> list[str]:
 
 
 def check_loop_hz(config: "AxolConfig", loop_hz: float) -> None:
-    """Refuse a core rate that would command an MIT joint at other than 240 Hz.
+    """Refuse a core rate that would command an MIT joint off its rate.
 
     With any arm joint on the impedance frame the core runs at
     :data:`IMPEDANCE_LOOP_HZ`, or at :data:`MIXED_LOOP_HZ` with the impedance
-    joints on alternate ticks. Without one, any rate goes.
+    joints on alternate ticks — or, at ``impedance_hz``
+    :data:`FAST_IMPEDANCE_HZ`, at exactly that rate (MyActuator impedance
+    joints every tick, wrists on alternate ticks). Without an impedance
+    joint, any rate goes.
 
     Raises:
-        ValueError: If ``loop_hz`` is neither while an arm joint is on the
-            impedance frame — e.g. ``tune.motion --loop-hz 400`` with ``--a4``
-            putting only some joints on their firmware loops.
+        ValueError: If ``loop_hz`` is not one of those while an arm joint is
+            on the impedance frame — e.g. ``tune.motion --loop-hz 400`` with
+            ``--a4`` putting only some joints on their firmware loops.
     """
-    if any(abs(loop_hz - hz) < 1e-6 for hz in (IMPEDANCE_LOOP_HZ, MIXED_LOOP_HZ)):
+    fast = abs(config.impedance_hz - FAST_IMPEDANCE_HZ) < 1e-6
+    allowed = (FAST_IMPEDANCE_HZ,) if fast else (IMPEDANCE_LOOP_HZ, MIXED_LOOP_HZ)
+    if any(abs(loop_hz - hz) < 1e-6 for hz in allowed):
         return
     mit = impedance_joints(config)
     if mit:
         shown = ", ".join(mit[:4]) + (
             f" and {len(mit) - 4} more" if len(mit) > 4 else ""
         )
+        if fast:
+            raise ValueError(
+                f"a {loop_hz:g} Hz core loop with {shown} on the impedance frame at "
+                f"impedance_hz {FAST_IMPEDANCE_HZ:g}: that runs the loop at "
+                f"{FAST_IMPEDANCE_HZ:g} Hz only. Drop the loop-rate override."
+            )
         raise ValueError(
             f"a {loop_hz:g} Hz core loop with {shown} on the impedance frame: "
             f"impedance runs at {IMPEDANCE_LOOP_HZ:g} Hz only — a "
@@ -1195,6 +1320,13 @@ class AxolConfig:
                          joint can still be tried on its firmware loop
                          inside the impedance controller (``tune.motion
                          --a4``).
+        impedance_hz:    Command rate of the MyActuator impedance joints —
+                         see :data:`IMPEDANCE_RATES`. ``240.0`` (default) is
+                         the verified rate. ``480.0`` runs them every tick of
+                         a 480 Hz core loop with the Damiao wrists at 240 Hz
+                         on alternate ticks (``tune.motion --impedance-hz
+                         480``) — an experiment: their gains, host damping
+                         and feedforward were tuned at 240.
     """
 
     left: ArmConfig = field(
@@ -1208,6 +1340,7 @@ class AxolConfig:
     left_stiffness: float | list[float] = 1.0
     right_stiffness: float | list[float] = 1.0
     controller: str = "impedance"
+    impedance_hz: float = IMPEDANCE_LOOP_HZ
 
     @property
     def loop_hz(self) -> float:
@@ -1217,11 +1350,14 @@ class AxolConfig:
         impedance, 400 Hz all on firmware loops (``controller``
         ``"position"``) — and :data:`MIXED_LOOP_HZ` when some arm joints are
         on their firmware loops and some on impedance, so the impedance ones
-        keep exactly 240 Hz on alternate ticks.
+        keep exactly 240 Hz on alternate ticks. At ``impedance_hz``
+        :data:`FAST_IMPEDANCE_HZ` any impedance joint makes it that rate.
         """
         mit = impedance_joints(self)
         if not mit:
             return CONTROLLER_LOOP_HZ["position"]
+        if abs(self.impedance_hz - FAST_IMPEDANCE_HZ) < 1e-6:
+            return FAST_IMPEDANCE_HZ
         if len(mit) < 2 * len(ARM_JOINTS):
             return MIXED_LOOP_HZ
         return CONTROLLER_LOOP_HZ["impedance"]
@@ -1247,6 +1383,11 @@ class AxolConfig:
         if self.controller not in CONTROLLERS:
             raise ValueError(
                 f"controller {self.controller!r} is not one of {list(CONTROLLERS)}"
+            )
+        if not any(abs(self.impedance_hz - hz) < 1e-6 for hz in IMPEDANCE_RATES):
+            raise ValueError(
+                f"impedance_hz {self.impedance_hz:g} is not one of "
+                f"{[f'{hz:g}' for hz in IMPEDANCE_RATES]}"
             )
         left = _apply_stiffness(self.left, self.left_stiffness)
         right = _apply_stiffness(self.right, self.right_stiffness)

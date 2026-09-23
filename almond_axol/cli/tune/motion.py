@@ -58,7 +58,9 @@ from ...robot import Axol
 from ...robot.axol import arm_limits
 from ...robot.config import (
     CONTROLLERS,
+    FAST_IMPEDANCE_HZ,
     IMPEDANCE_LOOP_HZ,
+    IMPEDANCE_RATES,
     AxolConfig,
     check_firmware_extras,
     check_loop_hz,
@@ -66,6 +68,7 @@ from ...robot.config import (
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
+from ...tuning.wrist_imu import WristImu, format_imu
 from ...utils.logquiet import quiet_noisy_loggers
 
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — approach/return trajectory speed
@@ -118,6 +121,12 @@ _GAIN_FIELDS = (
     "firmware.planner_accel",
     "firmware.cap_track",
     "firmware.planner_lead_ms",
+    # MyActuator 0x73: the rated current that scales the torque feedforward
+    # (set = the joint's position command carries gravity + inertia +
+    # cogging; unset = plain 0xA4).
+    "firmware.tf_rated_current_a",
+    # The cogging ("osc") cancellation's share of the calibrated series.
+    "cogging_gain",
 )
 
 # Column names of a 14-wide motion row: left arm then right arm.
@@ -270,6 +279,14 @@ def _parse_gain_overrides(specs: list[str]) -> dict[tuple[str, str, str], float]
                 f"--gain: unknown field {fld!r} in {spec!r} "
                 f"(one of {', '.join(_GAIN_FIELDS)})"
             )
+        if fld == "firmware.tf_rated_current_a":
+            if joint in ("wrist_2", "wrist_3"):
+                raise SystemExit(
+                    f"--gain: {fld} scales the MyActuator 0x73 feedforward; {joint} "
+                    "is a Damiao wrist"
+                )
+            if not (math.isfinite(value) and value > 0.0):
+                raise SystemExit(f"--gain {spec}: the rated current in amps, > 0")
         if fld in (
             "firmware.planner_accel",
             "firmware.cap_track",
@@ -434,6 +451,24 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "any arm joint on it only 240 or 480 is accepted. For A/B runs: "
         "--controller position --loop-hz 240 separates the rate from the "
         "controller. Above 300 Hz the core thins the bus schedule.",
+    )
+    p.add_argument(
+        "--no-imu",
+        action="store_true",
+        help="Do not record the wrist cameras' IMUs (by default each driven arm's "
+        "wrist ZED X One IMU is recorded and the run gets an 'imu' shake score: "
+        "3-15 Hz displacement p2p in mm, what the encoders cannot see).",
+    )
+    p.add_argument(
+        "--impedance-hz",
+        type=float,
+        choices=IMPEDANCE_RATES,
+        default=None,
+        help="Command rate of the MyActuator impedance joints for this run: 240 "
+        "(the config default, verified) or 480 — every tick of a 480 Hz core "
+        "loop with the Damiao wrists staying at 240 Hz on alternate ticks. An "
+        "experiment: the impedance gains, host damping and feedforward were "
+        "tuned at 240.",
     )
     p.add_argument(
         "--record",
@@ -712,6 +747,8 @@ async def _run(args: argparse.Namespace) -> None:
     holds = _parse_holds(args.hold)
     if args.controller is not None:
         config.controller = args.controller
+    if args.impedance_hz is not None:
+        config.impedance_hz = args.impedance_hz
     if args.repeat < 0:
         raise SystemExit("tune.motion: --repeat must be 0 (until Ctrl-C) or more")
     try:
@@ -720,6 +757,7 @@ async def _run(args: argparse.Namespace) -> None:
     except ValueError as exc:
         raise SystemExit(f"tune.motion: {exc}") from None
     core_hz = args.loop_hz or config.loop_hz
+    fast = config.impedance_hz == FAST_IMPEDANCE_HZ
     mixed = config.controller != "position" and core_hz > IMPEDANCE_LOOP_HZ
     print(
         f"  controller: {config.controller} "
@@ -728,9 +766,14 @@ async def _run(args: argparse.Namespace) -> None:
             ", every joint on its firmware position loop)"
             if config.controller == "position"
             else (
-                f", impedance joints on alternate ticks at {IMPEDANCE_LOOP_HZ:.0f} Hz)"
-                if mixed
-                else ")"
+                ", MyActuator impedance joints every tick, wrists at "
+                f"{IMPEDANCE_LOOP_HZ:.0f} Hz on alternate ticks)"
+                if fast
+                else (
+                    f", impedance joints on alternate ticks at {IMPEDANCE_LOOP_HZ:.0f} Hz)"
+                    if mixed
+                    else ")"
+                )
             )
         )
     )
@@ -806,6 +849,9 @@ async def _run(args: argparse.Namespace) -> None:
         in ("a4", "pv")
     ]
     log_t: list[float] = []
+    # The same samples on the absolute perf_counter clock: log_t restarts at
+    # 0 with every execute(), the wrist IMU record does not.
+    log_abs: list[float] = []
     log_target: list[np.ndarray] = []
     log_sent: list[np.ndarray] = []
     log_actual: list[np.ndarray] = []
@@ -879,7 +925,9 @@ async def _run(args: argparse.Namespace) -> None:
                     row_a[7:] = axol.right.positions[:7]
                     row_tq[7:] = axol.right.torques[:7]
                     row_off[7:] = _feedback_offsets(axol.right, now_wall)
-                log_t.append(time.perf_counter() - t0)
+                now = time.perf_counter()
+                log_t.append(now - t0)
+                log_abs.append(now)
                 log_meas_offset.append(row_off)
                 row_cmd = np.concatenate(
                     [q[solver.left_indices], q[solver.right_indices]]
@@ -915,6 +963,15 @@ async def _run(args: argparse.Namespace) -> None:
     robot = Axol(
         config=config, record=args.record, loop_hz=args.loop_hz, **arm_channels
     )
+
+    # The wrist cameras' IMUs see what the encoders cannot (backlash, flex,
+    # the gripper itself). Opened before bring-up, so a camera that is slow
+    # to open costs time while nothing moves; stopped after return to rest.
+    imu = WristImu(
+        ["left", "right"] if args.arms == "both" else [args.arms],
+        enabled=not args.no_imu,
+    )
+    imu.start()
 
     async with robot as axol:
         contact: tuple[str, float] | None = None
@@ -1027,6 +1084,9 @@ async def _run(args: argparse.Namespace) -> None:
                     "return-to-rest failed", exc_info=True
                 )
 
+    # A daemon subprocess: an exception out of the block above ends it with
+    # the process; here it hands over its samples.
+    imu.stop()
     if not log_t:
         print("No playback samples recorded — nothing to score.")
         return
@@ -1091,9 +1151,20 @@ async def _run(args: argparse.Namespace) -> None:
             "mean_jitter": float(np.mean([m["err_band_mid"] for m in moved.values()])),
             "completed": bool(b - a >= len(sent)),
         }
+        # The pass on the wrist IMUs' clock: its log origin is the execute()
+        # start, so the IMU series shares the run's time axis.
+        origin = log_abs[a] - log_t[a]
+        imu_metrics, imu_series = imu.run_blocks(
+            origin + float(t[0]), origin + float(t[-1]), origin
+        )
+        if imu_metrics:
+            summary["imu"] = imu_metrics
+            for line in format_imu(imu_metrics):
+                print(line)
 
         if not args.no_save_run:
             series = {"t": t, "target": target, "actual": actual, "torque": torque}
+            series.update(imu_series)
             if log_sent:
                 series["sent"] = np.stack(log_sent[a:b])
             label = " ".join(x for x in (args.label, tag.strip()) if x) or None
@@ -1117,6 +1188,7 @@ async def _run(args: argparse.Namespace) -> None:
                     # 240 Hz or the firmware position loops at 400 Hz).
                     "controller": config.controller,
                     "loop_hz": args.loop_hz or config.loop_hz,
+                    "impedance_hz": config.impedance_hz,
                     "record": args.record,
                     **stream_info,
                 },

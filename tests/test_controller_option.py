@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import unittest
+from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
 
@@ -15,9 +16,12 @@ from almond_axol.robot.axol import AxolHardware
 from almond_axol.robot.config import (
     CONTROLLER_LOOP_HZ,
     CONTROLLERS,
+    FAST_IMPEDANCE_HZ,
     IMPEDANCE_LOOP_HZ,
+    IMPEDANCE_RATES,
     MIXED_LOOP_HZ,
     AxolConfig,
+    CoggingModel,
     check_loop_hz,
     impedance_joints,
     position_wire_mode,
@@ -97,6 +101,33 @@ class ConfigTest(unittest.TestCase):
         mixed.right.elbow.wire_mode = "a4"
         self.assertEqual(mixed.loop_hz, 480.0)
         check_loop_hz(mixed, mixed.loop_hz)
+
+    def test_fast_impedance_runs_the_loop_at_480_only(self) -> None:
+        self.assertEqual(IMPEDANCE_RATES, (240.0, 480.0))
+        fast = AxolConfig(impedance_hz=FAST_IMPEDANCE_HZ)
+        self.assertEqual(fast.loop_hz, 480.0)
+        check_loop_hz(fast, 480.0)
+        with self.assertRaisesRegex(ValueError, "480 Hz only"):
+            check_loop_hz(fast, 240.0)
+        # Mixed or all-impedance alike: any impedance joint makes it 480.
+        fast.right.shoulder_1.wire_mode = "a4"
+        self.assertEqual(fast.loop_hz, 480.0)
+        # No impedance joint left: the rule does not apply.
+        pos = AxolConfig(controller="position", impedance_hz=FAST_IMPEDANCE_HZ)
+        self.assertEqual(pos.loop_hz, 400.0)
+        check_loop_hz(pos, 400.0)
+        with self.assertRaisesRegex(ValueError, "impedance_hz 300"):
+            AxolConfig(impedance_hz=300.0).resolved()
+
+    def test_the_rated_current_is_host_side_and_must_be_positive(self) -> None:
+        from almond_axol.robot.config import FirmwareGains
+
+        fw = FirmwareGains(position_kp=1.0, tf_rated_current_a=12.0)
+        # Never written to the motor: not a ROM parameter.
+        self.assertEqual(fw.as_dict(), {"position_kp": 1.0})
+        for bad in (0.0, -3.0, float("nan")):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                FirmwareGains(tf_rated_current_a=bad)
 
     def test_unknown_controller_is_refused(self) -> None:
         with self.assertRaises(ValueError):
@@ -192,6 +223,71 @@ class RealtimeConfigTest(unittest.TestCase):
         self.assertIn("loop_hz 240.0", rt._config_text().splitlines())
         rt = Axol._wrap(_hardware(cfg))
         self.assertIn("loop_hz 480.0", rt._config_text().splitlines())
+
+    def test_the_core_gets_the_impedance_rate(self) -> None:
+        rt = Axol._wrap(_hardware(AxolConfig()))
+        self.assertIn("impedance_hz 240.0", rt._config_text().splitlines())
+        rt = Axol._wrap(_hardware(AxolConfig(impedance_hz=480.0)))
+        lines = rt._config_text().splitlines()
+        self.assertIn("impedance_hz 480.0", lines)
+        self.assertIn("loop_hz 480.0", lines)
+        with self.assertRaisesRegex(ValueError, "480 Hz only"):
+            Axol._wrap(_hardware(AxolConfig(impedance_hz=480.0)), loop_hz=240.0)
+
+    def test_the_core_gets_the_0x73_scale_from_the_rated_current(self) -> None:
+        cfg = AxolConfig()
+        cfg.left.shoulder_1.wire_mode = "a4"
+        cfg.left.shoulder_1.firmware = replace(
+            cfg.left.shoulder_1.firmware, tf_rated_current_a=12.0
+        )
+        cfg.left.wrist_2.firmware = replace(
+            cfg.left.wrist_2.firmware, tf_rated_current_a=3.0
+        )
+        rt = Axol._wrap(_hardware(cfg))
+        scale = {
+            f[3]: float(f[27])
+            for f in (ln.split() for ln in rt._config_text().splitlines())
+            if f and f[0] == "joint"
+        }
+        # kt (2 Nm/A on shoulder_1) × 12 A / 100 = Nm per 1%.
+        self.assertAlmostEqual(scale["shoulder_1"], 0.24)
+        self.assertEqual(scale["shoulder_2"], 0.0)
+        # A Damiao wrist has no 0x73: never a scale, whatever is configured.
+        self.assertEqual(scale["wrist_2"], 0.0)
+
+    def test_cogging_lines_arrive_only_with_the_offsets(self) -> None:
+        import math
+
+        cfg = AxolConfig()
+        model = CoggingModel(3.62, ((1, 0.03, 0.0), (2, 0.4, -0.2)))
+        cfg.left.shoulder_1.cogging = model
+        cfg.left.shoulder_1.cogging_gain = 0.5
+        cfg.left.elbow.cogging = model
+        cfg.left.elbow.cogging_gain = 0.0  # off: no line at all
+        rt = Axol._wrap(_hardware(cfg))
+        self.assertFalse(
+            [ln for ln in rt._config_text().splitlines() if ln.startswith("cogging")]
+        )
+        lines = [
+            ln.split()
+            for ln in rt._config_text(cogging=True).splitlines()
+            if ln.startswith("cogging")
+        ]
+        self.assertEqual(len(lines), 1)
+        f = lines[0]
+        self.assertEqual(f[:5], ["cogging", "0", "can0", "1", "2"])
+        # The motor-frame series, halved, reproduces the joint-frame one at
+        # joint = motor + offset.
+        offset = float(rt._robot.left._joint_offsets[0])
+        terms = [tuple(map(float, f[5 + 3 * k : 8 + 3 * k])) for k in range(2)]
+        for q_motor in (-0.4, 0.1, 0.77):
+            got = sum(
+                a * math.cos(w * q_motor) + b * math.sin(w * q_motor)
+                for w, a, b in terms
+            )
+            self.assertAlmostEqual(
+                got, 0.5 * float(model.torque(q_motor + offset)), places=9
+            )
 
     def test_a_vendor_mismatched_wire_mode_is_refused(self) -> None:
         cfg = AxolConfig()
@@ -324,6 +420,31 @@ class TuneMotionFlagTest(unittest.TestCase):
         self.assertEqual(self._parse().repeat, 1)
         self.assertEqual(self._parse("--repeat", "5").repeat, 5)
         self.assertEqual(self._parse("--repeat", "0").repeat, 0)  # until Ctrl-C
+
+    def test_impedance_rate_flag_and_the_new_gain_fields(self) -> None:
+        self.assertIsNone(self._parse().impedance_hz)
+        self.assertEqual(self._parse("--impedance-hz", "480").impedance_hz, 480.0)
+        with self.assertRaises(SystemExit):
+            self._parse("--impedance-hz", "400")
+        self.assertFalse(self._parse().no_imu)
+        self.assertTrue(self._parse("--no-imu").no_imu)
+        got = tune_motion._parse_gain_overrides(
+            [
+                "right.shoulder_1.firmware.tf_rated_current_a=12",
+                "right.shoulder_1.cogging_gain=0.5",
+            ]
+        )
+        cfg = AxolConfig()
+        tune_motion._apply_gain_overrides(cfg, got)
+        self.assertEqual(cfg.right.shoulder_1.firmware.tf_rated_current_a, 12.0)
+        self.assertIsNone(cfg.right.shoulder_2.firmware.tf_rated_current_a)
+        self.assertEqual(cfg.right.shoulder_1.cogging_gain, 0.5)
+        for spec, message in {
+            "right.wrist_2.firmware.tf_rated_current_a=3": "Damiao wrist",
+            "right.elbow.firmware.tf_rated_current_a=0": "> 0",
+        }.items():
+            with self.subTest(spec=spec), self.assertRaisesRegex(SystemExit, message):
+                tune_motion._parse_gain_overrides([spec])
 
     def test_controller_flag_takes_the_two_laws_and_defaults_to_config(self) -> None:
         self.assertIsNone(self._parse().controller)
