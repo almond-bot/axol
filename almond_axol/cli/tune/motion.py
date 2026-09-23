@@ -52,8 +52,9 @@ from typing import Any
 
 import numpy as np
 
-from ...constants import ARM_JOINTS
+from ...constants import ARM_JOINTS, Joint
 from ...robot import Axol
+from ...robot.axol import arm_limits
 from ...robot.config import (
     CONTROLLERS,
     IMPEDANCE_LOOP_HZ,
@@ -107,6 +108,46 @@ _GAIN_FIELDS = (
 _COLUMNS = [f"left.{j.value}" for j in ARM_JOINTS] + [
     f"right.{j.value}" for j in ARM_JOINTS
 ]
+
+
+def _parse_holds(specs: list[str]) -> dict[int, float | None]:
+    """``--hold SIDE.JOINT[=DEG]`` → ``{column: angle rad, or None}``.
+
+    ``None`` holds the joint at the motion's own first-row angle; an angle
+    must sit inside the arm's joint limits.
+    """
+    out: dict[int, float | None] = {}
+    for spec in specs:
+        name, eq, deg = spec.partition("=")
+        if name not in _COLUMNS:
+            raise SystemExit(
+                f"--hold wants SIDE.JOINT[=DEG] with an arm joint, got {spec!r}"
+            )
+        angle: float | None = None
+        if eq:
+            try:
+                angle = math.radians(float(deg))
+            except ValueError:
+                raise SystemExit(f"--hold: bad angle in {spec!r}") from None
+            side, joint = name.split(".")
+            lo, hi = arm_limits(Joint(joint), side == "left")
+            if not lo <= angle <= hi:
+                raise SystemExit(
+                    f"--hold: {name}={deg}° is outside "
+                    f"[{math.degrees(lo):.0f}, {math.degrees(hi):.0f}]° for that arm"
+                )
+        out[_COLUMNS.index(name)] = angle
+    return out
+
+
+def _apply_holds(
+    rows: np.ndarray, holds: dict[int, float | None], first: np.ndarray
+) -> np.ndarray:
+    """A copy of ``rows`` with each held column constant (``first`` = row 0)."""
+    out = np.array(rows, dtype=float, copy=True)
+    for col, angle in holds.items():
+        out[:, col] = first[col] if angle is None else angle
+    return out
 
 
 #: A joint further than this (rad, ~3°) from the motion's first row after the
@@ -313,6 +354,19 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "e.g. right.shoulder_1. Repeatable. The joint then has no compliance, no "
         "host feedforward and NaN torque telemetry (contact watchdog blind on it); "
         "everything else about the replay is unchanged, so runs compare directly.",
+    )
+    p.add_argument(
+        "--hold",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT[=DEG]",
+        help="Hold this joint steady for the replay instead of following the "
+        "motion, e.g. right.elbow (at the motion's own start angle) or "
+        "right.elbow=-75 (at that joint-frame angle, degrees; the approach goes "
+        "there). Repeatable. The joint keeps its controller and gains, commanded "
+        "to one pose, and is scored as a parked joint (buzz / chatter only). "
+        "Only the approach is collision-checked: a joint frozen while the others "
+        "move can bring links closer than the recording ever did.",
     )
     p.add_argument(
         "--loop-hz",
@@ -606,6 +660,7 @@ async def _run(args: argparse.Namespace) -> None:
             raise SystemExit(f"--a4: unknown joint {joint!r}")
         getattr(getattr(config, side), joint).wire_mode = "a4"
         print(f"  wire mode: {side}.{joint} = a4 (firmware position loop)")
+    holds = _parse_holds(args.hold)
     if args.controller is not None:
         config.controller = args.controller
     if args.repeat < 0:
@@ -671,6 +726,24 @@ async def _run(args: argparse.Namespace) -> None:
         print(f"Re-solving {len(sent)} waypoints through the IK solver ...")
         sent = _ik_stream(solver, sent, to_full, stream_info)
         stream_differs = True
+    if holds:
+        # After any IK re-solve, so the solver cannot move a held joint back.
+        # The scoring reference is held the same way: the joint is scored as
+        # parked (buzz / chatter), not against the motion it no longer runs.
+        first = np.asarray(ref[0], dtype=float)
+        sent = _apply_holds(sent, holds, np.asarray(sent[0], dtype=float))
+        ref = _apply_holds(ref, holds, first)
+        for col, angle in holds.items():
+            at = (
+                f"{math.degrees(angle):+.1f}°"
+                if angle is not None
+                else f"{math.degrees(first[col]):+.1f}° (the motion's start)"
+            )
+            print(f"  hold: {_COLUMNS[col]} at {at}")
+        print(
+            "  ! held joints: only the approach is collision-checked — a frozen "
+            "joint can bring links closer than the recording did; watch the first pass"
+        )
 
     watchdog = ContactWatchdog(args.torque_threshold)
     log_t: list[float] = []
@@ -964,6 +1037,8 @@ async def _run(args: argparse.Namespace) -> None:
                     # Joints driven on the firmware position loop (--a4) for
                     # this run, so the dashboard can re-arm the same split.
                     "a4": list(args.a4),
+                    # Joints held steady instead of following the motion.
+                    "hold": list(args.hold),
                     # The control law the whole run ran on (impedance at
                     # 240 Hz or the firmware position loops at 400 Hz).
                     "controller": config.controller,

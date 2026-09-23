@@ -231,6 +231,36 @@ class TuneMotionFlagTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             tune_motion._parse_gain_overrides(["elbow.firmware.bogus=1"])
 
+    def test_hold_freezes_a_column_at_the_start_or_a_given_angle(self) -> None:
+        import math
+
+        import numpy as np
+
+        holds = tune_motion._parse_holds(["right.elbow", "right.wrist_2=10"])
+        elbow = tune_motion._COLUMNS.index("right.elbow")
+        wrist_2 = tune_motion._COLUMNS.index("right.wrist_2")
+        self.assertEqual(holds[elbow], None)
+        self.assertAlmostEqual(holds[wrist_2], math.radians(10))
+        rows = np.arange(3 * 14, dtype=float).reshape(3, 14)
+        held = tune_motion._apply_holds(rows, holds, rows[0])
+        np.testing.assert_array_equal(held[:, elbow], rows[0, elbow])
+        np.testing.assert_allclose(held[:, wrist_2], math.radians(10))
+        # Every other column still follows the motion; the input is untouched.
+        other = [i for i in range(14) if i not in (elbow, wrist_2)]
+        np.testing.assert_array_equal(held[:, other], rows[:, other])
+        self.assertEqual(rows[1, elbow], 14 + elbow)
+        self.assertEqual(self._parse("--hold", "right.elbow").hold, ["right.elbow"])
+
+    def test_hold_refuses_what_it_cannot_do(self) -> None:
+        for spec, message in {
+            "elbow": "SIDE.JOINT",
+            "right.hip": "SIDE.JOINT",
+            "right.elbow=bent": "bad angle",
+            "right.elbow=45": "outside",  # the right elbow is -150..0
+        }.items():
+            with self.subTest(spec=spec), self.assertRaisesRegex(SystemExit, message):
+                tune_motion._parse_holds([spec])
+
     def test_repeat_defaults_to_one_pass(self) -> None:
         self.assertEqual(self._parse().repeat, 1)
         self.assertEqual(self._parse("--repeat", "5").repeat, 5)

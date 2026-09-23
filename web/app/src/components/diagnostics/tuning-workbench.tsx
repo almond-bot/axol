@@ -494,6 +494,17 @@ const TABS: WbTab[] = [
       },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
       {
+        key: "hold",
+        label: "hold joints steady",
+        type: "text",
+        width: "w-56",
+        placeholder: "right.elbow right.wrist_2=10",
+        hint:
+          "space-separated SIDE.JOINT[=DEG]: held at the motion's start angle (or the " +
+          "given one) instead of following it, same controller and gains, scored as " +
+          "parked. Only the approach is collision-checked — watch the first pass",
+      },
+      {
         key: "repeat",
         label: "repeat",
         type: "number",
