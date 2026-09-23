@@ -15,6 +15,26 @@ written to ``PATH``), ``error <text>`` for anything that goes wrong; ``stop``
 ``PATH`` is an ``.npz`` of ``t`` (``time.perf_counter`` seconds —
 ``CLOCK_MONOTONIC``, shared across processes, the clock the tuning logs use),
 ``acc`` (m/s², gravity included) and ``gyro`` (deg/s).
+
+What the SDK (5.4.1, ``pyzed/sl.pyi``) specifies and the right wrist camera (a
+ZED X One GS, serial 308393615) showed on 2026-09-23:
+
+- ``CameraOne.get_sensors_data(data, TIME_REFERENCE.CURRENT)`` returns the
+  latest sample received (the SDK's advice: poll at 800 Hz in a thread to get
+  them all). It needs no ``grab()`` — an open, never-grabbed camera delivers.
+  800 Hz is not enough here: a 1 ms poll (~940 calls/s) phase-locked with the
+  SDK's update and caught only 128 of the ~200 samples a second; 0.5 ms lost
+  2%; 0.2–0.3 ms caught all of them for ~5% of a core, hence ``_POLL_S``.
+- The IMU is specified at 400 Hz (``sensors_configuration``) but delivers
+  ~200 Hz (``IMUData.effective_rate`` 202): 5 ms apart, the newest ~5 ms old.
+  Nyquist 100 Hz — the 3–15 Hz shake band is well inside it.
+- ``get_linear_acceleration()`` is m/s² and ``get_angular_velocity()`` deg/s,
+  both calibrated (bias, scale, misalignment); ranges ±78.5 m/s², ±1000 deg/s.
+- ``IMUData.timestamp`` is the acquisition time in UNIX nanoseconds (the
+  wall clock), mapped here onto ``perf_counter``.
+- ``get_sensors_data_batch`` (every sample of the last grabbed frame) is
+  lossless too, but only behind a ``grab()`` loop — the 1080p/30 fps image
+  pipeline running for nothing — so it is not used.
 """
 
 from __future__ import annotations
@@ -29,10 +49,10 @@ from typing import Any
 
 import numpy as np
 
-# No new IMU sample for this long after opening → drive grab() as well (a
-# camera whose SDK only refreshes sensors on grab).
-_GRAB_FALLBACK_S = 1.0
-_POLL_S = 0.001
+# Poll period (s): 0.25 ms catches every ~200 Hz sample (1 ms caught 64%).
+_POLL_S = 0.00025
+# An open camera that has delivered no IMU sample for this long is reported.
+_SILENT_S = 1.0
 
 
 def write_samples(
@@ -83,28 +103,15 @@ def record(
     ts: list[float] = []
     acc: list[tuple[float, float, float]] = []
     gyro: list[tuple[float, float, float]] = []
-    grab_thread: threading.Thread | None = None
-    grab_stop = threading.Event()
-
-    def _grab() -> None:
-        while not grab_stop.is_set():
-            zed.grab()
-
     try:
         sensors = sl.SensorsData()
-        # The SDK stamps sensors on the wall clock; map to CLOCK_MONOTONIC.
+        # IMU stamps are UNIX nanoseconds; map them to CLOCK_MONOTONIC.
         wall_minus_perf = time.time() - time.perf_counter()
         last = None
-        opened = time.perf_counter()
+        last_new = time.perf_counter()
+        silent_reported = False
         ready.set()
         while not stop.is_set():
-            if (
-                grab_thread is None
-                and not ts
-                and time.perf_counter() - opened > _GRAB_FALLBACK_S
-            ):
-                grab_thread = threading.Thread(target=_grab, daemon=True)
-                grab_thread.start()
             if (
                 zed.get_sensors_data(sensors, sl.TIME_REFERENCE.CURRENT)
                 == sl.ERROR_CODE.SUCCESS
@@ -113,9 +120,13 @@ def record(
                 stamp = imu.timestamp.get_nanoseconds()
                 if stamp and stamp != last:
                     last = stamp
+                    last_new = time.perf_counter()
                     ts.append(stamp * 1e-9 - wall_minus_perf)
                     acc.append(tuple(imu.get_linear_acceleration()))
                     gyro.append(tuple(imu.get_angular_velocity()))
+            if not silent_reported and time.perf_counter() - last_new > _SILENT_S:
+                silent_reported = True
+                errors.put(f"camera {serial}: no IMU sample for {_SILENT_S:g} s")
             if dump.is_set():
                 dump.clear()
                 write_samples(out_path, ts, acc, gyro)
@@ -124,13 +135,7 @@ def record(
     except Exception as exc:  # noqa: BLE001 - reported to the parent
         errors.put(f"camera {serial}: {exc}")
     finally:
-        grab_stop.set()
-        if grab_thread is not None:
-            grab_thread.join(timeout=2.0)
-        # Closing while grab() is in flight segfaults the SDK: only close a
-        # camera whose grab thread (if any) has exited.
-        if grab_thread is None or not grab_thread.is_alive():
-            zed.close()
+        zed.close()
         write_samples(out_path, ts, acc, gyro)
 
 
