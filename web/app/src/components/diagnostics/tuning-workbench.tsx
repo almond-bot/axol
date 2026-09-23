@@ -288,7 +288,7 @@ const TABS: WbTab[] = [
         type: "boolean",
         hint:
           "by default the wrist ZED X One's IMU is recorded and the run gets an IMU " +
-          "shake score — 3–15 Hz displacement at the gripper, 1 s peak-to-peak in mm " +
+          "shake score — 1–15 Hz displacement at the gripper, 2 s peak-to-peak in mm " +
           "(what the joint encoders cannot see: backlash, flex)",
       },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
@@ -349,7 +349,7 @@ const TABS: WbTab[] = [
         type: "boolean",
         hint:
           "by default the wrist ZED X One's IMU is recorded and the run gets an IMU " +
-          "shake score — 3–15 Hz displacement at the gripper, 1 s peak-to-peak in mm " +
+          "shake score — 1–15 Hz displacement at the gripper, 2 s peak-to-peak in mm " +
           "(what the joint encoders cannot see: backlash, flex)",
       },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
@@ -490,7 +490,7 @@ const TABS: WbTab[] = [
         type: "boolean",
         hint:
           "by default the wrist ZED X One's IMU is recorded and the run gets an IMU " +
-          "shake score — 3–15 Hz displacement at the gripper, 1 s peak-to-peak in mm " +
+          "shake score — 1–15 Hz displacement at the gripper, 2 s peak-to-peak in mm " +
           "(what the joint encoders cannot see: backlash, flex)",
       },
 
@@ -615,7 +615,7 @@ const TABS: WbTab[] = [
         type: "boolean",
         hint:
           "by default each driven arm's wrist ZED X One IMU is recorded and every pass " +
-          "gets an IMU shake score — 3–15 Hz displacement at the gripper, 1 s " +
+          "gets an IMU shake score — 1–15 Hz displacement at the gripper, 2 s " +
           "peak-to-peak in mm (what the joint encoders cannot see: backlash, flex)",
       },
       { key: "gain", label: "gains — edit a cell to override it for this run", type: "overrides" },
@@ -1600,6 +1600,8 @@ interface ImuScore {
   shake_mm_p90: number
   vertical_mm: number
   vertical_mm_p90: number
+  low_mm?: number
+  high_mm?: number
   acc_rms: number
   gyro_rms: number | null
   peak_hz: number
@@ -3531,6 +3533,8 @@ export function TuningWorkbench({
                   <th className="py-1 pr-4 font-normal">shake p2p (mm)</th>
                   <th className="py-1 pr-4 font-normal">p90 (mm)</th>
                   <th className="py-1 pr-4 font-normal">vertical (mm)</th>
+                  <th className="py-1 pr-4 font-normal">1–3 Hz (mm)</th>
+                  <th className="py-1 pr-4 font-normal">3–15 Hz (mm)</th>
                   <th className="py-1 pr-4 font-normal">accel (m/s²)</th>
                   <th className="py-1 pr-4 font-normal">gyro (°/s)</th>
                   <th className="py-1 pr-4 font-normal">peak (Hz)</th>
@@ -3543,6 +3547,8 @@ export function TuningWorkbench({
                     <td className="py-1 pr-4">{fmtNum(v.shake_mm)}</td>
                     <td className="py-1 pr-4">{fmtNum(v.shake_mm_p90)}</td>
                     <td className="py-1 pr-4">{fmtNum(v.vertical_mm)}</td>
+                    <td className="py-1 pr-4">{v.low_mm == null ? "–" : fmtNum(v.low_mm)}</td>
+                    <td className="py-1 pr-4">{v.high_mm == null ? "–" : fmtNum(v.high_mm)}</td>
                     <td className="py-1 pr-4">{fmtNum(v.acc_rms, 3)}</td>
                     <td className="py-1 pr-4">{v.gyro_rms == null ? "–" : fmtNum(v.gyro_rms)}</td>
                     <td className="py-1 pr-4">{fmtNum(v.peak_hz, 1)}</td>
@@ -3552,10 +3558,11 @@ export function TuningWorkbench({
             </table>
           </div>
           <p className="max-w-3xl text-[0.65rem] leading-relaxed text-white/35">
-            The wrist ZED X One&apos;s IMU during the run: acceleration band-passed to 3–15 Hz
+            The wrist ZED X One&apos;s IMU during the run: acceleration band-passed to 1–15 Hz
             (above the motion, below the buzz), integrated to displacement, and scored as the median
-            1 s peak-to-peak excursion at the gripper — overall and along gravity (vertical). Unlike
-            the joint scores it sees backlash, link flex and the gripper itself.
+            2 s peak-to-peak excursion at the gripper — overall and along gravity (vertical), the
+            vertical split into 1–3 Hz (the impedance sway) and 3–15 Hz. Unlike the joint scores it
+            sees backlash, link flex and the gripper itself.
           </p>
         </Card>
       )}
@@ -3668,7 +3675,7 @@ export function TuningWorkbench({
                   {imuHeadline(r) && (
                     <span
                       className="font-mono text-white/60 tabular-nums"
-                      title="wrist IMU: 3–15 Hz displacement at the gripper, 1 s peak-to-peak (worst side)"
+                      title="wrist IMU: 1–15 Hz displacement at the gripper, 2 s peak-to-peak (worst side)"
                     >
                       IMU {imuHeadline(r)}
                     </span>

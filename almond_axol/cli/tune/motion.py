@@ -458,7 +458,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         action="store_true",
         help="Do not record the wrist cameras' IMUs (by default each driven arm's "
         "wrist ZED X One IMU is recorded and the run gets an 'imu' shake score: "
-        "3-15 Hz displacement p2p in mm, what the encoders cannot see).",
+        "1-15 Hz displacement p2p in mm, what the encoders cannot see).",
     )
     p.add_argument(
         "--fast-impedance",

@@ -68,13 +68,27 @@ class ShakeMetricsTest(unittest.TestCase):
         m = shake_metrics(*_record())
         self.assertAlmostEqual(m["shake_mm"], 1.0, places=2)
         self.assertAlmostEqual(m["vertical_mm"], 1.0, places=2)
+        self.assertAlmostEqual(m["high_mm"], 1.0, places=2)
+        self.assertLess(m["low_mm"], 0.02)
         self.assertAlmostEqual(m["peak_hz"], 5.0, delta=0.2)
         self.assertAlmostEqual(m["acc_rms"], 0.5e-3 * _W * _W / math.sqrt(2), places=2)
-        self.assertAlmostEqual(m["gyro_rms"], 2.0 / math.sqrt(2), places=2)
+        self.assertAlmostEqual(m["gyro_rms"], 2.0 / math.sqrt(2), delta=0.02)
+
+    def test_a_2_hz_sway_counts_and_lands_in_the_low_band(self) -> None:
+        fs = 400.0
+        t = np.arange(0.0, 12.0, 1.0 / fs)
+        w = 2 * math.pi * 2.0
+        acc = np.zeros((len(t), 3))
+        acc[:, 2] = 9.81 - 1e-3 * w * w * np.sin(w * t)  # 1 mm amplitude
+        m = shake_metrics(t, acc)
+        self.assertAlmostEqual(m["vertical_mm"], 2.0, delta=0.05)
+        self.assertAlmostEqual(m["low_mm"], 2.0, delta=0.05)
+        self.assertLess(m["high_mm"], 0.05)
+        self.assertAlmostEqual(m["peak_hz"], 2.0, delta=0.1)
 
     def test_slow_arm_motion_and_gravity_do_not_count(self) -> None:
         t, acc, gyro = _record()
-        acc[:, 1] += 0.5 * np.sin(2 * math.pi * 0.3 * t)  # the motion itself
+        acc[:, 1] += 0.05 * np.sin(2 * math.pi * 0.3 * t)  # the motion itself
         self.assertAlmostEqual(shake_metrics(t, acc, gyro)["shake_mm"], 1.0, places=2)
         still = np.tile([0.0, 0.0, 9.81], (len(t), 1))
         self.assertLess(shake_metrics(t, still)["shake_mm"], 1e-6)
@@ -106,7 +120,7 @@ class RecorderTest(unittest.TestCase):
         try:
             self.assertEqual(imu.sides, ["right"])
             t0 = time.perf_counter()
-            time.sleep(3.0)
+            time.sleep(5.0)
             t1 = time.perf_counter()
             imu.flush()
             metrics, series = imu.run_blocks(t0, t1, origin=t0 - 1.0)

@@ -1069,7 +1069,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--no-imu",
         action="store_true",
         help="Do not record the wrist camera's IMU (recorded by default: the run "
-        "gets an 'imu' shake score — 3-15 Hz displacement p2p in mm at the gripper).",
+        "gets an 'imu' shake score — 1-15 Hz displacement p2p in mm at the gripper).",
     )
     p.add_argument(
         "--tf-probe",

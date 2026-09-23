@@ -39,7 +39,7 @@ Safety, built in:
 | `--buzz-abort DEG` | Abort past this >10 Hz position motion, degrees RMS over 0.1 s (default: 0.3; 0 off) |
 | `--iq-abort A` | Abort past this reply current (default: 30; 0 off). A loaded X8 shoulder draws ~10 A just holding gravity at −55°, so keep this above the pose's static current |
 | `--tf-probe PCT` | Instead of the wave: hold the joint at `--center` on **0x73** (protocol V4.4 position control with torque feed-forward) and step the feed-forward 0 / +PCT / 0 / −PCT % of rated current, 0.25 s each for 8 s. The q-axis current jump at each step — read from the reply to the first frame carrying it, before the loops react — is the current 1% buys, so it prints the motor's rated current: the `firmware.tf_rated_current_a` the realtime core scales its 0x73 feed-forward with. `5` is a gentle ~1 Nm on a shoulder. V4.4 firmware only; run with `--accel 0` |
-| `--no-imu` | Skip the wrist IMU (recorded by default: the run gets an `imu` shake score — 3–15 Hz displacement p2p in mm at the gripper, see [`tune.motion`](/cli/tune-motion)) |
+| `--no-imu` | Skip the wrist IMU (recorded by default: the run gets an `imu` shake score — 1–15 Hz displacement p2p in mm at the gripper, see [`tune.motion`](/cli/tune-motion)) |
 | `--save-run` | Persist the run artifact |
 | `--label TEXT`, `--group ID` | Note and sweep id stored on the run |
 

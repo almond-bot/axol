@@ -19,11 +19,12 @@ previews meanwhile), and a camera that cannot be opened just means no IMU
 metrics — the run itself goes ahead.
 
 The metric (:func:`shake_metrics`): acceleration band-passed to the shake
-band (3–15 Hz — above the motion, below the structure's buzz), integrated
+band (1–15 Hz — above the motion, below the structure's buzz), integrated
 twice in the frequency domain to displacement, and reported as the median and
-90th-percentile 1 s peak-to-peak excursion in millimetres — overall (3-D) and
-along gravity (vertical, the direction the tool tip was seen to bounce) —
-plus the band's acceleration and angular-rate RMS and its dominant frequency.
+90th-percentile 2 s peak-to-peak excursion in millimetres — overall (3-D) and
+along gravity (vertical, the direction the tool tip was seen to bounce), the
+vertical split into 1–3 Hz (the impedance sway) and 3–15 Hz — plus the band's
+acceleration and angular-rate RMS and its dominant frequency.
 """
 
 from __future__ import annotations
@@ -44,9 +45,16 @@ import numpy as np
 
 _logger = logging.getLogger(__name__)
 
-#: The shake band (Hz): the slow-motion wobble lived at 3–6 Hz on the right
-#: arm, the joint loops ring below ~15 Hz; the arm's own motion is below 1 Hz.
-SHAKE_BAND = (3.0, 15.0)
+#: The shake band (Hz). Under impedance the visible wobble is at 1–3 Hz —
+#: ~2 mm in each of 1–2 and 2–3 Hz on the jelly robot's right arm, against
+#: ~1 mm in 3–6 and 0.3 mm in 6–15 (2026-09-23) — so the band starts at 1 Hz;
+#: ``slow_osc``'s own commanded motion is below 1 Hz (0.3 mm left in 1–2 Hz).
+#: A faster motion leaks more of itself in: the score does not subtract the
+#: commanded motion.
+SHAKE_BAND = (1.0, 15.0)
+#: Sub-bands reported alongside: the impedance sway and the faster shake.
+LOW_BAND = (1.0, 3.0)
+HIGH_BAND = (3.0, 15.0)
 
 _OPEN_TIMEOUT_S = 12.0
 _STOP_TIMEOUT_S = 6.0
@@ -332,9 +340,11 @@ def format_imu(metrics: dict[str, dict[str, float]]) -> list[str]:
     """One scorecard line per side of an ``imu`` metrics block."""
     return [
         f"  wrist IMU ({side}): shake {m['shake_mm']:.2f} mm p2p "
-        f"(p90 {m['shake_mm_p90']:.2f}; vertical {m['vertical_mm']:.2f}), "
-        f"{SHAKE_BAND[0]:g}-{SHAKE_BAND[1]:g} Hz accel {m['acc_rms']:.3f} m/s², "
-        f"gyro {m['gyro_rms']:.2f} °/s, peak {m['peak_hz']:.1f} Hz"
+        f"(p90 {m['shake_mm_p90']:.2f}; vertical {m['vertical_mm']:.2f} = "
+        f"{LOW_BAND[0]:g}-{LOW_BAND[1]:g} Hz {m.get('low_mm', math.nan):.2f} + "
+        f"{HIGH_BAND[0]:g}-{HIGH_BAND[1]:g} Hz {m.get('high_mm', math.nan):.2f}), "
+        f"accel {m['acc_rms']:.3f} m/s², gyro {m['gyro_rms']:.2f} °/s, "
+        f"peak {m['peak_hz']:.1f} Hz"
         for side, m in metrics.items()
     ]
 
@@ -357,7 +367,7 @@ def shake_metrics(
     gyro: np.ndarray | None = None,
     *,
     band: tuple[float, float] = SHAKE_BAND,
-    window_s: float = 1.0,
+    window_s: float = 2.0,
 ) -> dict[str, float]:
     """Score the shake in an IMU record.
 
@@ -367,16 +377,19 @@ def shake_metrics(
             the band-pass's DC and gives the vertical).
         gyro: ``(N, 3)`` angular rate (deg/s), optional.
         band: Shake band (Hz).
-        window_s: Peak-to-peak window.
+        window_s: Peak-to-peak window — 2 s holds two cycles of the 1 Hz
+            band edge.
 
     Returns:
         ``{"shake_mm", "shake_mm_p90", "vertical_mm", "vertical_mm_p90",
-        "acc_rms", "gyro_rms", "peak_hz", "rate_hz", "seconds"}`` — the 1 s
-        peak-to-peak displacement (3-D: twice the largest excursion from the
-        window's mean; vertical: along the record's mean acceleration, i.e.
-        gravity), band acceleration RMS (m/s²), band angular-rate RMS
-        (deg/s), the band's dominant frequency. Empty when the record is too
-        short (under two windows or 50 samples).
+        "low_mm", "high_mm", "acc_rms", "gyro_rms", "peak_hz", "rate_hz",
+        "seconds"}`` — the windowed peak-to-peak displacement over ``band``
+        (3-D: twice the largest excursion from the window's mean; vertical:
+        along the record's mean acceleration, i.e. gravity), the vertical
+        one again within :data:`LOW_BAND` and :data:`HIGH_BAND`, band
+        acceleration RMS (m/s²), band angular-rate RMS (deg/s), the band's
+        dominant frequency. Empty when the record is too short (under two
+        windows or 50 samples).
     """
     from scipy.signal import butter, sosfiltfilt
 
@@ -401,16 +414,24 @@ def shake_metrics(
     a_bp = sosfiltfilt(sos, a, axis=0)
     disp = _band_integrate(a, fs, (band[0], hi))
     vert = disp @ up
+    low_v = _band_integrate(a, fs, (LOW_BAND[0], min(LOW_BAND[1], hi))) @ up
+    high_v = (
+        _band_integrate(a, fs, (HIGH_BAND[0], min(HIGH_BAND[1], hi))) @ up
+        if hi > HIGH_BAND[0]
+        else np.zeros(len(grid))
+    )
     w = max(2, int(round(window_s * fs)))
     edge = min(w // 2, len(grid) // 4)
     starts = range(edge, len(grid) - w - edge + 1, max(1, w // 2))
-    p2p_3d, p2p_v = [], []
+    p2p_3d, p2p_v, p2p_low, p2p_high = [], [], [], []
     for s in starts:
         seg = disp[s : s + w]
         p2p_3d.append(
             2.0 * float(np.max(np.linalg.norm(seg - seg.mean(axis=0), axis=1)))
         )
         p2p_v.append(float(np.ptp(vert[s : s + w])))
+        p2p_low.append(float(np.ptp(low_v[s : s + w])))
+        p2p_high.append(float(np.ptp(high_v[s : s + w])))
     if not p2p_3d:
         return {}
     # Power summed over the axes: a magnitude would rectify each axis and
@@ -424,6 +445,8 @@ def shake_metrics(
         "shake_mm_p90": 1e3 * float(np.percentile(p2p_3d, 90)),
         "vertical_mm": 1e3 * float(np.median(p2p_v)),
         "vertical_mm_p90": 1e3 * float(np.percentile(p2p_v, 90)),
+        "low_mm": 1e3 * float(np.median(p2p_low)),
+        "high_mm": 1e3 * float(np.median(p2p_high)),
         "acc_rms": float(np.sqrt(np.mean(np.sum(a_bp**2, axis=1)))),
         "gyro_rms": math.nan,
         "peak_hz": float(freq[inband][np.argmax(spec[inband])])
