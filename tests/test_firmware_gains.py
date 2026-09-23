@@ -409,3 +409,39 @@ class PlannerConfigTest(unittest.TestCase):
         self.assertEqual(
             gains.as_dict(), {"position_kp": 1.0, "planner_accel": 60000.0}
         )
+
+
+class HeldGainCheckTest(unittest.IsolatedAsyncioTestCase):
+    """A held joint is never written, so the run must refuse if it differs."""
+
+    async def asyncSetUp(self) -> None:
+        patcher = patch("almond_axol.motor.myactuator._MA_ROM_SETTLE_S", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_a_held_joint_running_other_gains_is_reported(self) -> None:
+        from almond_axol.robot.axol import held_firmware_gain_mismatches
+
+        # Stock gains and the planner a test run left on: not the config set.
+        s1 = _FakeMotor(_stock(), enabled=True, planner=(60000, 60000))
+        got = await held_firmware_gain_mismatches(
+            _arm({Joint.SHOULDER_1: s1}, is_left=False), [Joint.SHOULDER_1]
+        )
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].startswith("right.shoulder_1: "), got)
+        self.assertIn("planner_accel 60000 (wanted 0)", got[0])
+        self.assertIn("(wanted 1)", got[0])  # position_kp
+        # Reads only: nothing was written to the held motor.
+        self.assertEqual((s1.writes, s1.planner_writes, s1.resets), ([], [], 0))
+
+    async def test_a_held_joint_on_the_config_set_passes(self) -> None:
+        from almond_axol.robot.axol import held_firmware_gain_mismatches
+
+        s1 = _FakeMotor(_stock())
+        arm = _arm({Joint.SHOULDER_1: s1})
+        await apply_firmware_gains(arm, [Joint.SHOULDER_1])  # provision it
+        s1.enabled = True  # then it is found holding next session
+        self.assertEqual(
+            await held_firmware_gain_mismatches(arm, [Joint.SHOULDER_1]), []
+        )
+        self.assertEqual(await held_firmware_gain_mismatches(arm, []), [])

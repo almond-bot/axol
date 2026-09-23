@@ -84,6 +84,7 @@ from ..robot.axol import (
     AxolHardware,
     _rollback_newly_enabled_motors,
     apply_firmware_gains,
+    held_firmware_gain_mismatches,
 )
 from ..robot.base import RobotBase, mark_hardware_cleanup_uncertain
 from ..robot.config import AxolConfig, check_loop_hz
@@ -526,6 +527,21 @@ class Axol(RobotBase):
                     cold.append((f"{label}.{joint.value}", arm.motors[joint]))
                     cold_joints.setdefault(side, []).append(joint)
         self._enable_cold = cold
+
+        # A held joint is never reset, so apply_firmware_gains cannot reach
+        # it: refuse a run whose held joints do not already run the firmware
+        # gains it asks for, rather than silently test the old ones.
+        stale: list[str] = []
+        for side, arm in self._arms():
+            held = [j for j in arm.motors if j not in cold_joints.get(side, [])]
+            stale += await held_firmware_gain_mismatches(arm, held)
+        if stale:
+            raise MotorError(
+                "joints found holding from an earlier session run different firmware "
+                "gains than this run wants — a holding motor cannot take a ROM write: "
+                + "; ".join(stale)
+                + ". Power-cycle the arm (or disable it) and run again."
+            )
 
         for side, arm in self._arms():
             # The configured firmware loop gains (wire_mode a4's controller)

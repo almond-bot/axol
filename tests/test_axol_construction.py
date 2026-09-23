@@ -361,6 +361,14 @@ class AxolEnableRollbackKeepsHeldJointsTest(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value={}),
             )
         )
+        # ... and so does the held-joint check that precedes it (reads only).
+        for cls in ("myactuator.MyActuatorMotor", "damiao.DamiaoMotor"):
+            self.enterContext(
+                patch(
+                    f"almond_axol.motor.{cls}.firmware_gain_mismatches",
+                    AsyncMock(return_value={}),
+                )
+            )
 
     def _assert_only_cold_joints_torqued_off(self) -> None:
         for joint, disable in self.disables.items():

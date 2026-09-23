@@ -599,6 +599,27 @@ class DamiaoMotor(MotorDriver):
             await asyncio.sleep(0.3)
         return changed
 
+    async def firmware_gain_mismatches(
+        self, wanted: Mapping[str, float]
+    ) -> dict[str, tuple[float, float]]:
+        """``{name: (running, wanted)}`` for each of ``wanted`` that differs.
+
+        Register reads only, so it works on an enabled, holding wrist.
+        """
+        regs = {
+            "speed_kp": _DM_REG_SPEED_KP,
+            "speed_ki": _DM_REG_SPEED_KI,
+            "position_kp": _DM_REG_POS_KP,
+            "position_ki": _DM_REG_POS_KI,
+            "profile_acc": _DM_REG_ACC,
+        }
+        out: dict[str, tuple[float, float]] = {}
+        for name, value in wanted.items():
+            have = float(await self._read_register(regs[name]))
+            if abs(have - float(value)) > 1e-6 * max(1.0, abs(float(value))):
+                out[name] = (have, float(value))
+        return out
+
     async def set_gains(self, gains: MotorGains) -> None:
         await self._write_register(_DM_REG_SPEED_KP, gains.speed_kp)
         await self._write_register(_DM_REG_SPEED_KI, gains.speed_ki)

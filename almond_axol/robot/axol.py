@@ -235,6 +235,54 @@ async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
             )
 
 
+async def held_firmware_gain_mismatches(
+    arm: "AxolArm", joints: Iterable[Joint]
+) -> list[str]:
+    """Why the *held* ``joints`` would not run the firmware gains configured.
+
+    :func:`apply_firmware_gains` writes only cold joints: a MyActuator takes
+    a ROM write only while disabled, and a joint found holding from a
+    previous session is attached to, never reset. Such a joint keeps running
+    whatever it holds — a cut run's test gains included — so a run that
+    changed a gain would silently not test it (right shoulder_1 kept its
+    previous speed_kp through a speed_kp sweep, 2026-09-22). This reads each
+    held joint's running gains (reads work while holding) and returns one
+    line per joint that differs; empty means every held joint matches. A
+    joint whose gains cannot be read is skipped with a warning.
+    """
+    arm_config = getattr(arm, "_arm_config", None)
+    if arm_config is None:
+        return []
+    side = "left" if getattr(arm, "_is_left", True) else "right"
+    out: list[str] = []
+    for joint in joints:
+        firmware = getattr(getattr(arm_config, joint.value, None), "firmware", None)
+        wanted = firmware.as_dict() if firmware is not None else {}
+        driver = getattr(arm.motors.get(joint), "_driver", None)
+        if not wanted or not isinstance(driver, (MyActuatorMotor, DamiaoMotor)):
+            continue
+        try:
+            differs = await driver.firmware_gain_mismatches(wanted)
+        except MotorError as exc:
+            _logger.warning(
+                "%s.%s: held joint's firmware gains could not be read (%s); "
+                "cannot confirm it runs the configured set",
+                side,
+                joint.value,
+                exc,
+            )
+            continue
+        if differs:
+            out.append(
+                f"{side}.{joint.value}: "
+                + ", ".join(
+                    f"{n} {have:g} (wanted {want:g})"
+                    for n, (have, want) in differs.items()
+                )
+            )
+    return out
+
+
 async def _rollback_newly_enabled_motors(
     motors: list[tuple[str, Motor]], setup_error: BaseException
 ) -> list[tuple[str, Motor, BaseException]]:

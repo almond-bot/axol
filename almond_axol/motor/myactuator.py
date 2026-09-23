@@ -487,6 +487,28 @@ class MyActuatorMotor(MotorDriver):
             out.append(int(struct.unpack_from("<i", resp, 4)[0]))
         return out[0], out[1]
 
+    async def firmware_gain_mismatches(
+        self, wanted: Mapping[str, float]
+    ) -> dict[str, tuple[float, float]]:
+        """``{name: (running, wanted)}`` for each of ``wanted`` that differs.
+
+        Reads only (0x30 gains, 0x42 planner), so it works on a motor that is
+        enabled and holding — the values its running loop uses. A gain the
+        firmware cannot report (pre-V4.2 indexed format) is left out.
+        """
+        wanted = dict(wanted)
+        out: dict[str, tuple[float, float]] = {}
+        planner = wanted.pop("planner_accel", None)
+        if planner is not None:
+            acc, dec = await self.get_planner_acceleration()
+            if acc != int(round(planner)) or dec != int(round(planner)):
+                out["planner_accel"] = (float(acc), float(planner))
+        for name, value in wanted.items():
+            have = await self._read_gain_indexed(_MA_PID_IDX[name])
+            if have is not None and not _gain_matches(have, value):
+                out[name] = (have, float(value))
+        return out
+
     async def _ensure_planner_acceleration(
         self, value: int
     ) -> tuple[float, float] | None:
