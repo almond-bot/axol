@@ -416,7 +416,9 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
                         "0.0",
                         "20.0",
                         # 0xA4 cap tracking off (fixed cap), no target lead,
-                        # no 0x73 feedforward (plain 0xA4).
+                        # no 0x73 feedforward (plain 0xA4), the config-wide
+                        # impedance rate.
+                        "0.0",
                         "0.0",
                         "0.0",
                         "0.0",

@@ -494,6 +494,13 @@ class JointConfig:
         cogging_gain: Fraction of ``cogging`` applied, for A/B runs (``1.0``
                   default; ``0`` off; ``tune.motion --gain
                   shoulder_1.cogging_gain=0.5``).
+        impedance_hz: This joint's impedance command rate: ``480.0`` commands
+                  it every tick of a 480 Hz core loop (its host feedforward,
+                  damping and tracker stepped at 480), ``240.0`` keeps it on
+                  the verified 240 Hz lane, ``None`` (default) follows
+                  ``AxolConfig.impedance_hz`` (which at 480 covers the
+                  MyActuator joints only). Any joint at 480 runs the core
+                  at 480 Hz. ``tune.motion --fast-impedance right.shoulder_1``.
     """
 
     kp: float
@@ -519,6 +526,7 @@ class JointConfig:
     firmware: FirmwareGains = field(default_factory=FirmwareGains)
     cogging: CoggingModel | None = None
     cogging_gain: float = 1.0
+    impedance_hz: float | None = None
 
     def __post_init__(self) -> None:
         # The per-type defaults (_X8_FIRMWARE_GAINS, _ZERO_FRICTION, ...) are
@@ -1213,6 +1221,30 @@ def impedance_joints(config: "AxolConfig") -> list[str]:
     ]
 
 
+def fast_impedance_joints(config: "AxolConfig") -> list[str]:
+    """``side.joint`` of every impedance joint that runs at
+    :data:`FAST_IMPEDANCE_HZ`: its own ``impedance_hz`` 480, or (none of its
+    own) the config-wide 480 on a MyActuator joint — the rule
+    ``fast_mit`` in ``rust/axol-rt/src/serve.rs`` applies."""
+    resolved = config.resolved()
+    out = []
+    for side in ("left", "right"):
+        for j in ARM_JOINTS:
+            jc = getattr(getattr(resolved, side), j.value)
+            if str(jc.wire_mode).lower() != "mit":
+                continue
+            own = jc.impedance_hz
+            if own is not None and abs(own - FAST_IMPEDANCE_HZ) < 1e-6:
+                out.append(f"{side}.{j.value}")
+            elif (
+                own is None
+                and _JOINT_CONFIG[j].motor_id <= 5
+                and abs(config.impedance_hz - FAST_IMPEDANCE_HZ) < 1e-6
+            ):
+                out.append(f"{side}.{j.value}")
+    return out
+
+
 def check_loop_hz(config: "AxolConfig", loop_hz: float) -> None:
     """Refuse a core rate that would command an MIT joint off its rate.
 
@@ -1228,7 +1260,7 @@ def check_loop_hz(config: "AxolConfig", loop_hz: float) -> None:
             on the impedance frame — e.g. ``tune.motion --loop-hz 400`` with
             ``--a4`` putting only some joints on their firmware loops.
     """
-    fast = abs(config.impedance_hz - FAST_IMPEDANCE_HZ) < 1e-6
+    fast = fast_impedance_joints(config)
     allowed = (FAST_IMPEDANCE_HZ,) if fast else (IMPEDANCE_LOOP_HZ, MIXED_LOOP_HZ)
     if any(abs(loop_hz - hz) < 1e-6 for hz in allowed):
         return
@@ -1239,9 +1271,9 @@ def check_loop_hz(config: "AxolConfig", loop_hz: float) -> None:
         )
         if fast:
             raise ValueError(
-                f"a {loop_hz:g} Hz core loop with {shown} on the impedance frame at "
-                f"impedance_hz {FAST_IMPEDANCE_HZ:g}: that runs the loop at "
-                f"{FAST_IMPEDANCE_HZ:g} Hz only. Drop the loop-rate override."
+                f"a {loop_hz:g} Hz core loop with {fast[0]} running impedance at "
+                f"{FAST_IMPEDANCE_HZ:g} Hz: the loop is {FAST_IMPEDANCE_HZ:g} Hz only "
+                "then. Drop the loop-rate override."
             )
         raise ValueError(
             f"a {loop_hz:g} Hz core loop with {shown} on the impedance frame: "
@@ -1356,7 +1388,7 @@ class AxolConfig:
         mit = impedance_joints(self)
         if not mit:
             return CONTROLLER_LOOP_HZ["position"]
-        if abs(self.impedance_hz - FAST_IMPEDANCE_HZ) < 1e-6:
+        if fast_impedance_joints(self):
             return FAST_IMPEDANCE_HZ
         if len(mit) < 2 * len(ARM_JOINTS):
             return MIXED_LOOP_HZ
@@ -1389,6 +1421,16 @@ class AxolConfig:
                 f"impedance_hz {self.impedance_hz:g} is not one of "
                 f"{[f'{hz:g}' for hz in IMPEDANCE_RATES]}"
             )
+        for side in ("left", "right"):
+            for j in ARM_JOINTS:
+                own = getattr(getattr(self, side), j.value).impedance_hz
+                if own is not None and not any(
+                    abs(own - hz) < 1e-6 for hz in IMPEDANCE_RATES
+                ):
+                    raise ValueError(
+                        f"{side}.{j.value}.impedance_hz {own:g} is not one of "
+                        f"{[f'{hz:g}' for hz in IMPEDANCE_RATES]}"
+                    )
         left = _apply_stiffness(self.left, self.left_stiffness)
         right = _apply_stiffness(self.right, self.right_stiffness)
         if self.controller == "position":

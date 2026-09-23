@@ -545,6 +545,17 @@ const TABS: WbTab[] = [
       },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
       {
+        key: "fast_impedance",
+        label: "480 Hz impedance joints",
+        type: "text",
+        width: "w-56",
+        placeholder: "right.shoulder_1 right.elbow",
+        hint:
+          "space-separated SIDE.JOINT run at 480 Hz — every tick of a 480 Hz core " +
+          "loop — while every other impedance joint stays at 240 Hz on alternate " +
+          "ticks. An experiment: the gains were tuned at 240",
+      },
+      {
         key: "impedance_hz",
         label: "impedance rate (Hz)",
         type: "select",
@@ -1431,6 +1442,11 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       }
       if (Array.isArray(p.hold) && p.hold.length > 0) {
         out["hold"] = p.hold.filter((t): t is string => typeof t === "string").join(" ")
+      }
+      if (Array.isArray(p.fast_impedance) && p.fast_impedance.length > 0) {
+        out["fast_impedance"] = p.fast_impedance
+          .filter((t): t is string => typeof t === "string")
+          .join(" ")
       }
       if (p.arms === "left" || p.arms === "right") out["arms"] = p.arms
       break

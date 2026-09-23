@@ -64,6 +64,7 @@ from ...robot.config import (
     AxolConfig,
     check_firmware_extras,
     check_loop_hz,
+    fast_impedance_joints,
 )
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
@@ -460,6 +461,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "3-15 Hz displacement p2p in mm, what the encoders cannot see).",
     )
     p.add_argument(
+        "--fast-impedance",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT",
+        help="Run this impedance joint at 480 Hz — every tick of a 480 Hz core "
+        "loop, its host feedforward, damping and tracker stepped at 480 — while "
+        "every other impedance joint stays at 240 Hz on alternate ticks, e.g. "
+        "--fast-impedance right.shoulder_1 --fast-impedance right.elbow. "
+        "Repeatable. An experiment: the gains were tuned at 240.",
+    )
+    p.add_argument(
         "--impedance-hz",
         type=float,
         choices=IMPEDANCE_RATES,
@@ -749,6 +761,15 @@ async def _run(args: argparse.Namespace) -> None:
         config.controller = args.controller
     if args.impedance_hz is not None:
         config.impedance_hz = args.impedance_hz
+    for spec in args.fast_impedance:
+        parts = spec.split(".")
+        if len(parts) != 2 or parts[0] not in ("left", "right"):
+            raise SystemExit(f"--fast-impedance wants SIDE.JOINT, got {spec!r}")
+        side, joint = parts
+        if joint not in {j.value for j in ARM_JOINTS}:
+            raise SystemExit(f"--fast-impedance: unknown joint {joint!r}")
+        getattr(getattr(config, side), joint).impedance_hz = FAST_IMPEDANCE_HZ
+        print(f"  impedance rate: {side}.{joint} = {FAST_IMPEDANCE_HZ:.0f} Hz")
     if args.repeat < 0:
         raise SystemExit("tune.motion: --repeat must be 0 (until Ctrl-C) or more")
     try:
@@ -757,7 +778,7 @@ async def _run(args: argparse.Namespace) -> None:
     except ValueError as exc:
         raise SystemExit(f"tune.motion: {exc}") from None
     core_hz = args.loop_hz or config.loop_hz
-    fast = config.impedance_hz == FAST_IMPEDANCE_HZ
+    fast = bool(fast_impedance_joints(config))
     mixed = config.controller != "position" and core_hz > IMPEDANCE_LOOP_HZ
     print(
         f"  controller: {config.controller} "
@@ -766,8 +787,8 @@ async def _run(args: argparse.Namespace) -> None:
             ", every joint on its firmware position loop)"
             if config.controller == "position"
             else (
-                ", MyActuator impedance joints every tick, wrists at "
-                f"{IMPEDANCE_LOOP_HZ:.0f} Hz on alternate ticks)"
+                f", {', '.join(fast_impedance_joints(config))} every tick, the other "
+                f"impedance joints at {IMPEDANCE_LOOP_HZ:.0f} Hz on alternate ticks)"
                 if fast
                 else (
                     f", impedance joints on alternate ticks at {IMPEDANCE_LOOP_HZ:.0f} Hz)"
@@ -1189,6 +1210,9 @@ async def _run(args: argparse.Namespace) -> None:
                     "controller": config.controller,
                     "loop_hz": args.loop_hz or config.loop_hz,
                     "impedance_hz": config.impedance_hz,
+                    # Joints commanded at 480 Hz (--fast-impedance / the
+                    # config-wide 480).
+                    "fast_impedance": fast_impedance_joints(config),
                     "record": args.record,
                     **stream_info,
                 },

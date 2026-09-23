@@ -408,7 +408,9 @@ class Axol(RobotBase):
                     # plain 0xA4).
                     f"{gains.firmware.cap_track or 0.0} "
                     f"{gains.firmware.planner_lead_ms or 0.0} "
-                    f"{tf_nm_per_pct(j, gains)}"
+                    f"{tf_nm_per_pct(j, gains)} "
+                    # This joint's impedance rate (0 = the config-wide one).
+                    f"{gains.impedance_hz or 0.0}"
                 )
                 if cogging and gains.cogging is not None and gains.cogging_gain != 0.0:
                     offset = float(arm._joint_offsets[ARM_JOINTS.index(j)])

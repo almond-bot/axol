@@ -265,7 +265,10 @@ const HOLDOVER_MAX: f64 = 0.080;
 ///   `cogging` lines (position-periodic torque cancellation, sent on a
 ///   second configure once joint offsets are known). A proto-14 core would
 ///   refuse the new lines — or worse, run 480 Hz impedance at 240.
-const CONFIG_PROTO: u32 = 15;
+/// - 16: an optional per-joint `impedance_hz` after `tf_nm_per_pct` (240 |
+///   480 | 0 = the config's): single impedance joints at 480 Hz, the rest on
+///   the 240 Hz lane. A proto-15 core would run them all at one rate.
+const CONFIG_PROTO: u32 = 16;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -665,17 +668,36 @@ const MIXED_LOOP_HZ: f64 = 2.0 * IMPEDANCE_HZ;
 /// never the config default.
 const FAST_IMPEDANCE_HZ: f64 = 2.0 * IMPEDANCE_HZ;
 
+/// Whether an arm joint runs impedance at `FAST_IMPEDANCE_HZ` — every tick of
+/// a 480 Hz loop — rather than on the 240 Hz half-rate lane: its own
+/// `impedance_hz` 480, or (with none of its own) the config-wide 480, which
+/// covers the MyActuator joints only (the Damiao wrists stay at 240).
+fn fast_mit(
+    wire: WireMode,
+    gripper: bool,
+    myactuator: bool,
+    mit_hz: f64,
+    impedance_hz: f64,
+) -> bool {
+    let is = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    wire == WireMode::Mit
+        && !gripper
+        && (is(mit_hz, FAST_IMPEDANCE_HZ)
+            || (mit_hz <= 0.0 && myactuator && is(impedance_hz, FAST_IMPEDANCE_HZ)))
+}
+
 /// Refuse a loop rate an impedance arm joint cannot run at.
 ///
-/// `impedance_hz` 240 (the default): the loop is 240 Hz, or `MIXED_LOOP_HZ`
-/// with the impedance joints on alternate ticks. `impedance_hz` 480: the
-/// loop must be `FAST_IMPEDANCE_HZ` whenever an arm joint is on the
-/// impedance frame — the MyActuator ones every tick, the Damiao wrists on
-/// alternate ticks at 240. Anything else would command a joint at a rate it
-/// was never meant to run at.
+/// Every impedance joint runs at 240 Hz or at `FAST_IMPEDANCE_HZ` — per
+/// joint (`impedance_hz` on its joint line: 240, 480, or 0 for the
+/// config-wide `impedance_hz`). With any joint at 480 the loop must be 480
+/// (the rest on alternate ticks); otherwise 240, or `MIXED_LOOP_HZ` with the
+/// impedance joints on alternate ticks. Anything else would command a joint
+/// at a rate it was never meant to run at.
 fn check_impedance_rate(loop_hz: f64, impedance_hz: f64, specs: &[MotorSpec]) -> io::Result<()> {
     let is = |a: f64, b: f64| (a - b).abs() < 1e-6;
-    if !is(impedance_hz, IMPEDANCE_HZ) && !is(impedance_hz, FAST_IMPEDANCE_HZ) {
+    let rate_ok = |hz: f64| is(hz, IMPEDANCE_HZ) || is(hz, FAST_IMPEDANCE_HZ);
+    if !rate_ok(impedance_hz) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -684,7 +706,19 @@ fn check_impedance_rate(loop_hz: f64, impedance_hz: f64, specs: &[MotorSpec]) ->
             ),
         ));
     }
-    let allowed: &[f64] = if is(impedance_hz, FAST_IMPEDANCE_HZ) {
+    if let Some(s) = specs.iter().find(|s| s.mit_hz > 0.0 && !rate_ok(s.mit_hz)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "config: {} impedance_hz {} — {IMPEDANCE_HZ} or {FAST_IMPEDANCE_HZ} only",
+                s.joint, s.mit_hz
+            ),
+        ));
+    }
+    let fast = specs
+        .iter()
+        .find(|s| fast_mit(s.wire, s.gripper, s.motor_id <= 5, s.mit_hz, impedance_hz));
+    let allowed: &[f64] = if fast.is_some() {
         &[FAST_IMPEDANCE_HZ]
     } else {
         &[IMPEDANCE_HZ, MIXED_LOOP_HZ]
@@ -693,13 +727,15 @@ fn check_impedance_rate(loop_hz: f64, impedance_hz: f64, specs: &[MotorSpec]) ->
         return Ok(());
     }
     if let Some(s) = specs.iter().find(|s| !s.gripper && s.wire == WireMode::Mit) {
-        let rule = if is(impedance_hz, FAST_IMPEDANCE_HZ) {
-            format!("impedance_hz {FAST_IMPEDANCE_HZ} runs the loop at {FAST_IMPEDANCE_HZ} Hz only")
-        } else {
-            format!(
+        let rule = match fast {
+            Some(f) => format!(
+                "{} runs impedance at {FAST_IMPEDANCE_HZ} Hz, so the loop is {FAST_IMPEDANCE_HZ} Hz only",
+                f.joint
+            ),
+            None => format!(
                 "impedance runs at {IMPEDANCE_HZ} Hz only (loop_hz {IMPEDANCE_HZ}, or \
                  {MIXED_LOOP_HZ} with it on alternate ticks)"
-            )
+            ),
         };
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -713,7 +749,8 @@ fn check_impedance_rate(loop_hz: f64, impedance_hz: f64, specs: &[MotorSpec]) ->
 }
 
 /// Ticks between read-lane turns (the a4 0x92 reads and the gripper) when
-/// the MyActuator impedance joints run every tick at 480 Hz. Five MIT
+/// impedance joints run every tick at 480 Hz (at most all five MyActuator
+/// ones). Five MIT
 /// request/reply pairs plus one wrist pair is 12 frames, ~1.6 ms of the
 /// 2.08 ms tick; one more pair on every tick would leave no margin before
 /// `REPLY_GUARD`, so the lane takes a turn on one tick in this many (60 Hz
@@ -770,11 +807,19 @@ struct Thinning {
 impl Thinning {
     fn plan(motors: &[ReadyMotor], loop_hz: f64, impedance_hz: f64) -> Self {
         let enabled = loop_hz > THIN_ABOVE_HZ;
-        // Fast impedance: the MyActuator impedance joints run at the loop's
-        // own 480 Hz, off the half-rate lane; the Damiao wrists stay on it.
-        let fast_mit = enabled
-            && (impedance_hz - FAST_IMPEDANCE_HZ).abs() < 1e-6
-            && (loop_hz - FAST_IMPEDANCE_HZ).abs() < 1e-6;
+        // Fast impedance joints (`fast_mit`) run at the loop's own 480 Hz,
+        // off the half-rate lane; every other impedance joint stays on it.
+        let at_480 = enabled && (loop_hz - FAST_IMPEDANCE_HZ).abs() < 1e-6;
+        let is_fast = |m: &ReadyMotor| {
+            at_480
+                && fast_mit(
+                    m.wire,
+                    m.gripper,
+                    m.vendor == Vendor::MyActuator,
+                    m.mit_hz,
+                    impedance_hz,
+                )
+        };
         // The half-rate lane: impedance arm joints (the Damiao ones only at
         // fast impedance), and 0xA4 joints on the firmware planner
         // (`cap_track > 0`, planner acceleration 60000). The planner plans
@@ -785,9 +830,7 @@ impl Thinning {
             .iter()
             .enumerate()
             .filter(|(_, m)| {
-                !m.gripper
-                    && ((m.wire == WireMode::Mit && !(fast_mit && m.vendor == Vendor::MyActuator))
-                        || is_planner(m))
+                !m.gripper && ((m.wire == WireMode::Mit && !is_fast(m)) || is_planner(m))
             })
             .map(|(i, _)| i)
             .collect();
@@ -830,10 +873,7 @@ impl Thinning {
             .map(|(i, _)| i)
             .collect();
         let gripper = motors.iter().position(|m| m.gripper);
-        let every_tick_mit = motors
-            .iter()
-            .any(|m| !m.gripper && m.vendor == Vendor::MyActuator && m.wire == WireMode::Mit);
-        let read_div = if fast_mit && every_tick_mit {
+        let read_div = if motors.iter().any(is_fast) {
             FAST_MIT_READ_DIV
         } else {
             1
@@ -1339,7 +1379,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                 //       <dither_nm> <dither_hz> <wire mit|a4|pv>
                 //       <stribeck_gain> <stribeck_dfs> <stribeck_load_gain> <stribeck_vs>
                 //       <fl> <stribeck_pole> [<cap_track> [<lead_ms>
-                //       [<tf_nm_per_pct>]]]
+                //       [<tf_nm_per_pct> [<impedance_hz>]]]]
                 // gripper <side 0|1> <iface> <motor_id>
                 let gripper = f[0] == "gripper";
                 let side: u8 = f
@@ -1391,6 +1431,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         cap_track: 0.0,
                         lead_s: 0.0,
                         tf_nm_per_pct: 0.0,
+                        mit_hz: 0.0,
                         cogging: Vec::new(),
                     }
                 } else {
@@ -1447,6 +1488,11 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         // Optional: the 0x73 feedforward scale (0 = 0xA4).
                         tf_nm_per_pct: match f.get(27) {
                             Some(_) => num(27)?,
+                            None => 0.0,
+                        },
+                        // Optional: this joint's impedance rate (0 = config's).
+                        mit_hz: match f.get(28) {
+                            Some(_) => num(28)?,
                             None => 0.0,
                         },
                         cogging: Vec::new(),
@@ -1772,6 +1818,7 @@ mod tests {
             lead_s: 0.0,
             fw_version: None,
             tf_nm_per_pct: 0.0,
+            mit_hz: 0.0,
             cogging: Vec::new(),
         }
     }
@@ -1994,10 +2041,10 @@ mod tests {
     fn impedance_joints_run_at_240_hz_only() {
         let spec = |wire: &str, gripper: bool| {
             let text = if gripper {
-                "proto 15\ngripper 0 canL 8\n".to_string()
+                "proto 16\ngripper 0 canL 8\n".to_string()
             } else {
                 format!(
-                    "proto 15\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                    "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
                 )
             };
             text
@@ -2234,7 +2281,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 15\n\
+            "proto 16\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
@@ -2286,39 +2333,39 @@ mod tests {
         );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 15\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 15\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 16\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
         // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 15\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 15\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 15\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 15\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 15\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 15\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 15\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -2329,7 +2376,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 15\n\
+            "proto 16\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
@@ -2343,15 +2390,15 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 15\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 16\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 15\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 16\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 15\n\
+            "proto 16\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
@@ -2377,12 +2424,12 @@ mod tests {
         // A future client generation this core does not understand.
         let err = error_of(&format!("proto 99\n{joint}"));
         assert!(err.contains("proto 99"), "{err}");
-        assert!(err.contains("proto 15"), "{err}");
+        assert!(err.contains("proto 16"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 15\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 16\n")).is_ok());
     }
 
     const S1_A4: &str = "joint 1 canR shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
@@ -2392,7 +2439,7 @@ mod tests {
     #[test]
     fn parse_config_takes_tf_scale_and_cogging_series() {
         let cfg = parse_config(&format!(
-            "proto 15\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
+            "proto 16\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
              joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              cogging 1 canR 1 2 198.9 0.3 -0.1 397.8 0 0.2\n"
         ))
@@ -2425,7 +2472,7 @@ mod tests {
             "cogging 0 canR 1 1 198.9 0.3 0\n",
         ] {
             assert!(
-                parse_config(&format!("proto 15\nloop_hz 480\n{S1_A4}\n{bad}")).is_err(),
+                parse_config(&format!("proto 16\nloop_hz 480\n{S1_A4}\n{bad}")).is_err(),
                 "{bad}"
             );
         }
@@ -2437,29 +2484,84 @@ mod tests {
     #[test]
     fn fast_impedance_needs_a_480_hz_loop() {
         let mit = "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n";
-        let cfg = parse_config(&format!("proto 15\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
+        let cfg = parse_config(&format!("proto 16\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
         assert_eq!(cfg.impedance_hz, FAST_IMPEDANCE_HZ);
         assert_eq!(
-            parse_config(&format!("proto 15\n{mit}"))
+            parse_config(&format!("proto 16\n{mit}"))
                 .unwrap()
                 .impedance_hz,
             IMPEDANCE_HZ
         );
-        let err = parse_config(&format!("proto 15\nloop_hz 240\nimpedance_hz 480\n{mit}"))
+        let err = parse_config(&format!("proto 16\nloop_hz 240\nimpedance_hz 480\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("480 Hz only"), "{err}");
-        let err = parse_config(&format!("proto 15\nloop_hz 480\nimpedance_hz 400\n{mit}"))
+        let err = parse_config(&format!("proto 16\nloop_hz 480\nimpedance_hz 400\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("impedance_hz 400"), "{err}");
         // A bus with no impedance joint is not held to the rule.
         assert!(parse_config(&format!(
-            "proto 15\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
+            "proto 16\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
         ))
         .is_ok());
+    }
+
+    /// Per-joint fast impedance: shoulder_1 and the elbow at 480 Hz (joint
+    /// field 28), every other impedance joint on the 240 Hz lane, the loop
+    /// held to 480 by the rule.
+    #[test]
+    fn single_joints_can_run_impedance_at_480() {
+        let line = |name: &str, id: u8, hz: f64| {
+            format!(
+                "joint 1 canR {name} {id} 250 3.5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20 0 0 0 {hz}\n"
+            )
+        };
+        let text = format!(
+            "proto 16\nloop_hz 480\n{}{}{}{}",
+            line("shoulder_1", 1, 480.0),
+            line("shoulder_2", 2, 0.0),
+            line("elbow", 4, 480.0),
+            line("wrist_2", 6, 0.0),
+        );
+        let cfg = parse_config(&text).unwrap();
+        let specs = &cfg.buses[0].2;
+        assert_eq!(
+            specs.iter().map(|s| s.mit_hz).collect::<Vec<_>>(),
+            vec![480.0, 0.0, 480.0, 0.0]
+        );
+        // The rule: a 480 Hz joint needs the 480 Hz loop.
+        let err = parse_config(&text.replace("loop_hz 480", "loop_hz 240"))
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("shoulder_1 runs impedance at 480"), "{err}");
+        assert!(parse_config(&text.replace(" 480\n", " 400\n")).is_err());
+        // The schedule: shoulder_1 (0) and the elbow (2) every tick, the rest
+        // on the lane.
+        let mut motors = vec![
+            ready(1, Vendor::MyActuator, WireMode::Mit),
+            ready(2, Vendor::MyActuator, WireMode::Mit),
+            ready(4, Vendor::MyActuator, WireMode::Mit),
+            ready(6, Vendor::Damiao, WireMode::Mit),
+        ];
+        motors[0].mit_hz = 480.0;
+        motors[2].mit_hz = 480.0;
+        let sched = Thinning::plan(&motors, FAST_IMPEDANCE_HZ, IMPEDANCE_HZ);
+        assert_eq!(sched.mit_lane, vec![(1, 0), (3, 1)]);
+        for tick in 0..8u64 {
+            assert!(sched.commanded(0, tick) && sched.commanded(2, tick));
+            assert_ne!(sched.commanded(1, tick), sched.commanded(3, tick));
+        }
+        assert_eq!(sched.read_div, FAST_MIT_READ_DIV);
+        // Without a per-joint rate nothing is fast at the default 240.
+        motors[0].mit_hz = 0.0;
+        motors[2].mit_hz = 0.0;
+        let slow = Thinning::plan(&motors, MIXED_LOOP_HZ, IMPEDANCE_HZ);
+        assert_eq!(slow.mit_lane.len(), 4);
+        assert_eq!(slow.read_div, 1);
     }
 
     /// Fast impedance: the MyActuator impedance joints go every tick, the
@@ -3147,7 +3249,16 @@ fn bus_loop(
             out_tx,
             b'L',
             &format!(
-                "{iface}: fast impedance — MyActuator impedance joints every tick at {:.0} Hz, wrists at {:.0} Hz on alternate ticks, read lane one tick in {}",
+                "{iface}: fast impedance — {} every tick at {:.0} Hz; the other impedance joints at {:.0} Hz on alternate ticks; read lane one tick in {}",
+                motors
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, m)| !m.gripper
+                        && m.wire == WireMode::Mit
+                        && sched.mit_phase(*i).is_none())
+                    .map(|(_, m)| m.joint.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 cfg.loop_hz,
                 cfg.loop_hz / sched.mit_div as f64,
                 sched.read_div,

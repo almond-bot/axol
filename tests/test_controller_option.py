@@ -119,6 +119,36 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "impedance_hz 300"):
             AxolConfig(impedance_hz=300.0).resolved()
 
+    def test_single_joints_can_run_impedance_at_480(self) -> None:
+        from almond_axol.robot.config import fast_impedance_joints
+
+        cfg = AxolConfig()
+        self.assertEqual(fast_impedance_joints(cfg), [])
+        cfg.right.shoulder_1.impedance_hz = 480.0
+        cfg.right.elbow.impedance_hz = 480.0
+        self.assertEqual(
+            fast_impedance_joints(cfg), ["right.shoulder_1", "right.elbow"]
+        )
+        self.assertEqual(cfg.loop_hz, 480.0)
+        check_loop_hz(cfg, 480.0)
+        with self.assertRaisesRegex(ValueError, "right.shoulder_1 running impedance"):
+            check_loop_hz(cfg, 240.0)
+        # A joint on its firmware loop is not an impedance joint at any rate.
+        cfg.right.shoulder_1.wire_mode = "a4"
+        self.assertEqual(fast_impedance_joints(cfg), ["right.elbow"])
+        # The config-wide 480 covers the MyActuator joints, not the wrists; a
+        # joint's own 240 opts it out.
+        wide = AxolConfig(impedance_hz=480.0)
+        wide.left.elbow.impedance_hz = 240.0
+        fast = fast_impedance_joints(wide)
+        self.assertIn("left.shoulder_1", fast)
+        self.assertNotIn("left.elbow", fast)
+        self.assertNotIn("left.wrist_2", fast)
+        bad = AxolConfig()
+        bad.left.elbow.impedance_hz = 400.0
+        with self.assertRaisesRegex(ValueError, "left.elbow.impedance_hz 400"):
+            bad.resolved()
+
     def test_the_rated_current_is_host_side_and_must_be_positive(self) -> None:
         from almond_axol.robot.config import FirmwareGains
 
@@ -233,6 +263,20 @@ class RealtimeConfigTest(unittest.TestCase):
         self.assertIn("loop_hz 480.0", lines)
         with self.assertRaisesRegex(ValueError, "480 Hz only"):
             Axol._wrap(_hardware(AxolConfig(impedance_hz=480.0)), loop_hz=240.0)
+
+    def test_the_core_gets_each_joints_impedance_rate(self) -> None:
+        cfg = AxolConfig()
+        cfg.left.shoulder_1.impedance_hz = 480.0
+        rt = Axol._wrap(_hardware(cfg))
+        lines = rt._config_text().splitlines()
+        self.assertIn("loop_hz 480.0", lines)
+        rate = {
+            f[3]: float(f[28])
+            for f in (ln.split() for ln in lines)
+            if f and f[0] == "joint"
+        }
+        self.assertEqual(rate["shoulder_1"], 480.0)
+        self.assertEqual(rate["elbow"], 0.0)
 
     def test_the_core_gets_the_0x73_scale_from_the_rated_current(self) -> None:
         cfg = AxolConfig()
@@ -427,6 +471,15 @@ class TuneMotionFlagTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self._parse("--impedance-hz", "400")
         self.assertFalse(self._parse().no_imu)
+        self.assertEqual(
+            self._parse(
+                "--fast-impedance",
+                "right.shoulder_1",
+                "--fast-impedance",
+                "right.elbow",
+            ).fast_impedance,
+            ["right.shoulder_1", "right.elbow"],
+        )
         self.assertTrue(self._parse("--no-imu").no_imu)
         got = tune_motion._parse_gain_overrides(
             [

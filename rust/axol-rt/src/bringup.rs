@@ -81,6 +81,10 @@ pub struct MotorSpec {
     /// feedforward, where the firmware supports it (protocol V4.4,
     /// `proto::MA_FW_V44`); `0` keeps plain 0xA4.
     pub tf_nm_per_pct: f64,
+    /// This joint's impedance command rate (Hz): `FAST_IMPEDANCE_HZ` (480) to
+    /// command it every tick of a 480 Hz loop, 240 for the half-rate lane, 0
+    /// to follow the config-wide `impedance_hz`. Only meaningful on MIT.
+    pub mit_hz: f64,
     /// Position-periodic torque to cancel (`filter::cogging`), motor frame,
     /// already scaled by the joint's gain. Empty = none. Arrives on the
     /// second configure, after the Python side has resolved joint offsets.
@@ -181,6 +185,8 @@ pub struct ReadyMotor {
     pub lead_s: f64,
     /// The firmware VersionDate read at prep (MyActuator only).
     pub fw_version: Option<u32>,
+    /// See `MotorSpec::mit_hz`.
+    pub mit_hz: f64,
     /// `MotorSpec::tf_nm_per_pct` where the firmware takes 0x73, else 0 —
     /// the bus loop sends 0x73 exactly when this is positive.
     pub tf_nm_per_pct: f64,
@@ -350,6 +356,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             lead_s: spec.lead_s,
             fw_version: version,
             tf_nm_per_pct: tf_scale(spec.tf_nm_per_pct, version),
+            mit_hz: spec.mit_hz,
             cogging: spec.cogging.clone(),
         });
     }
@@ -434,6 +441,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             lead_s: spec.lead_s,
             fw_version: None,
             tf_nm_per_pct: 0.0,
+            mit_hz: spec.mit_hz,
             cogging: spec.cogging.clone(),
         });
     }
