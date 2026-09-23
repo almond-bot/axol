@@ -2876,7 +2876,15 @@ export function TuningWorkbench({
             .map((f) => {
               const cfg = configValue(f)
               return (
-                <label key={f.key} className="flex flex-col gap-1">
+                <label
+                  key={f.key}
+                  className={cn(
+                    "flex flex-col gap-1",
+                    // Table fields take the row and scroll inside it; a flex
+                    // item's min-width would otherwise stretch it past the card.
+                    (f.type === "overrides" || f.type === "wire") && "w-full min-w-0"
+                  )}
+                >
                   <span className="text-[0.65rem] text-white/40">
                     {f.label}
                     {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
