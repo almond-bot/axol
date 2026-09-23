@@ -2923,35 +2923,58 @@ export function TuningWorkbench({
                       {tabValues[f.key] === "true" ? "on" : "off"}
                     </span>
                   ) : f.type === "select" ? (
-                    <select
-                      value={tabValues[f.key] ?? ""}
-                      onChange={(e) => setValue(f.key, e.target.value)}
-                      disabled={runningOurs || busy}
-                      className={cn(
-                        "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/85 outline-none focus:border-[#eff483]/40",
-                        f.width ?? "w-32"
-                      )}
-                    >
-                      <option value="">
-                        {tab.required.includes(f.key) ? "select…" : (f.placeholder ?? "default")}
-                      </option>
-                      {(f.key === "motion"
-                        ? motions.map((m) => ({ value: m.name, label: m.name }))
-                        : f.key === "prefix" && tab.key === "build"
-                          ? recordings.map((r) => ({
-                              value: r.name,
-                              label:
-                                `${r.name} — ` +
-                                (r.kind === "gravity-comp" ? "hand-guided" : "teleop") +
-                                (r.durationS != null ? ` · ${Math.round(r.durationS)}s` : ""),
-                            }))
-                          : (f.options ?? []).map((o) => ({ value: o, label: o }))
-                      ).map((o) => (
-                        <option key={o.value} value={o.value}>
-                          {o.label}
-                        </option>
-                      ))}
-                    </select>
+                    (() => {
+                      // A default that is itself one of the options (controller
+                      // "impedance", arms "both") is that option, marked, not a
+                      // separate blank entry that duplicates it; picking it
+                      // clears the field so the command keeps its default.
+                      const defaultOpt =
+                        !tab.required.includes(f.key) &&
+                        f.placeholder != null &&
+                        (f.options ?? []).includes(f.placeholder)
+                          ? f.placeholder
+                          : null
+                      return (
+                        <select
+                          value={tabValues[f.key] || defaultOpt || ""}
+                          onChange={(e) =>
+                            setValue(f.key, e.target.value === defaultOpt ? "" : e.target.value)
+                          }
+                          disabled={runningOurs || busy}
+                          className={cn(
+                            "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/85 outline-none focus:border-[#eff483]/40",
+                            f.width ?? "w-32"
+                          )}
+                        >
+                          {defaultOpt == null && (
+                            <option value="">
+                              {tab.required.includes(f.key)
+                                ? "select…"
+                                : (f.placeholder ?? "default")}
+                            </option>
+                          )}
+                          {(f.key === "motion"
+                            ? motions.map((m) => ({ value: m.name, label: m.name }))
+                            : f.key === "prefix" && tab.key === "build"
+                              ? recordings.map((r) => ({
+                                  value: r.name,
+                                  label:
+                                    `${r.name} — ` +
+                                    (r.kind === "gravity-comp" ? "hand-guided" : "teleop") +
+                                    (r.durationS != null ? ` · ${Math.round(r.durationS)}s` : ""),
+                                }))
+                              : (f.options ?? []).map((o) => ({
+                                  value: o,
+                                  label: o === defaultOpt ? `${o} (default)` : o,
+                                }))
+                          ).map((o) => (
+                            <option key={o.value} value={o.value}>
+                              {o.label}
+                            </option>
+                          ))}
+                        </select>
+                      )
+                    })()
                   ) : f.slider ? (
                     (() => {
                       // The slider tracks the typed value (first number of a
