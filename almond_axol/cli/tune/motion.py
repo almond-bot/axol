@@ -48,6 +48,7 @@ import itertools
 import logging
 import math
 import time
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -275,6 +276,27 @@ def _parse_gain_overrides(specs: list[str]) -> dict[tuple[str, str, str], float]
         for side in sides:
             out[(side, joint, fld)] = value
     return out
+
+
+def _apply_gain_overrides(
+    config: AxolConfig, overrides: dict[tuple[str, str, str], float]
+) -> None:
+    """Set each ``(side, joint, field)`` override on ``config``, that joint only.
+
+    The ``friction`` / ``firmware`` blocks are shared instances across the
+    joints of a motor type (shoulder_1 + shoulder_2, both elbows, ...), so
+    those are replaced with this joint's own copy, never mutated in place —
+    an in-place set once carried a shoulder_1 planner override onto
+    shoulder_2 (2026-09-22).
+    """
+    for (side, joint, fld), value in overrides.items():
+        target = getattr(getattr(config, side), joint)
+        if fld.startswith("friction."):
+            target.friction = replace(target.friction, **{fld.split(".", 1)[1]: value})
+        elif fld.startswith("firmware."):
+            target.firmware = replace(target.firmware, **{fld.split(".", 1)[1]: value})
+        else:
+            setattr(target, fld, value)
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -660,14 +682,8 @@ async def _run(args: argparse.Namespace) -> None:
         right_stiffness=args.stiffness,
         has_gripper=not args.no_gripper,
     )
+    _apply_gain_overrides(config, overrides)
     for (side, joint, fld), value in overrides.items():
-        target = getattr(getattr(config, side), joint)
-        if fld.startswith("friction."):
-            setattr(target.friction, fld.split(".", 1)[1], value)
-        elif fld.startswith("firmware."):
-            setattr(target.firmware, fld.split(".", 1)[1], value)
-        else:
-            setattr(target, fld, value)
         print(f"  gain override: {side}.{joint}.{fld} = {value}")
     for spec in args.a4:
         parts = spec.split(".")

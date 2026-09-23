@@ -261,6 +261,34 @@ class TuneMotionFlagTest(unittest.TestCase):
             with self.subTest(spec=spec), self.assertRaisesRegex(SystemExit, message):
                 tune_motion._parse_holds([spec])
 
+    def test_an_override_touches_only_its_own_joint(self) -> None:
+        # shoulder_1 and shoulder_2 share one firmware-gains object (and the
+        # zero-friction joints one friction object) in the config; an
+        # override on one joint must not reach the others, or the next config.
+        cfg = AxolConfig()
+        tune_motion._apply_gain_overrides(
+            cfg,
+            tune_motion._parse_gain_overrides(
+                [
+                    "right.shoulder_1.firmware.planner_accel=60000",
+                    "right.elbow.friction.fc=0.3",
+                    "right.shoulder_1.kd=2.0",
+                ]
+            ),
+        )
+        self.assertEqual(cfg.right.shoulder_1.firmware.planner_accel, 60000.0)
+        self.assertEqual(cfg.right.shoulder_2.firmware.planner_accel, 0.0)
+        self.assertEqual(cfg.left.shoulder_1.firmware.planner_accel, 0.0)
+        self.assertEqual(cfg.right.elbow.friction.fc, 0.3)
+        self.assertEqual(
+            cfg.left.elbow.friction.fc, AxolConfig().left.elbow.friction.fc
+        )
+        self.assertEqual(
+            cfg.right.wrist_2.friction.fc, AxolConfig().right.wrist_2.friction.fc
+        )
+        self.assertEqual(cfg.right.shoulder_1.kd, 2.0)
+        self.assertEqual(AxolConfig().right.shoulder_1.firmware.planner_accel, 0.0)
+
     def test_planner_overrides_are_checked_before_the_bus(self) -> None:
         got = tune_motion._parse_gain_overrides(
             [
