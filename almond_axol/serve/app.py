@@ -1985,6 +1985,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                                 "speed_ki",
                                 "planner_accel",
                                 "cap_track",
+                                "planner_lead_ms",
                             )
                         },
                     }

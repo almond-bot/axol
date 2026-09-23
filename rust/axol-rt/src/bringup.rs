@@ -70,6 +70,10 @@ pub struct MotorSpec {
     /// so the planner moves continuously instead of bursting through each
     /// step at a fixed cap. `<= 0` keeps the fixed cap (direct tracking).
     pub cap_track: f64,
+    /// 0xA4 target lead (s): each command's target is sent this far ahead
+    /// along the tracker velocity, so the planner cruises through its step
+    /// instead of reaching the target and stopping for the rest of it.
+    pub lead_s: f64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -162,6 +166,8 @@ pub struct ReadyMotor {
     pub fl: f64,
     /// See `MotorSpec::cap_track`.
     pub cap_track: f64,
+    /// See `MotorSpec::lead_s`.
+    pub lead_s: f64,
 }
 
 /// Status-probe attempts before a silent motor fails the bring-up.
@@ -312,6 +318,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             stribeck_vs: spec.stribeck_vs,
             fl: spec.fl,
             cap_track: spec.cap_track,
+            lead_s: spec.lead_s,
         });
     }
 
@@ -392,6 +399,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             stribeck_vs: spec.stribeck_vs,
             fl: spec.fl,
             cap_track: spec.cap_track,
+            lead_s: spec.lead_s,
         });
     }
     Ok(motors)

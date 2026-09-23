@@ -861,10 +861,15 @@ const OVERRIDE_FIELDS = [
   // tracking (>= 1). The Damiao wrists' cells are disabled.
   "firmware.planner_accel",
   "firmware.cap_track",
+  "firmware.planner_lead_ms",
 ]
 
 /** Override fields that exist only on the MyActuator (0xA4) joints. */
-const MYACTUATOR_ONLY_FIELDS = new Set(["firmware.planner_accel", "firmware.cap_track"])
+const MYACTUATOR_ONLY_FIELDS = new Set([
+  "firmware.planner_accel",
+  "firmware.cap_track",
+  "firmware.planner_lead_ms",
+])
 
 /** Grid header for an override field (`firmware.x` shortened to `fw x`). */
 function overrideLabel(field: string): string {

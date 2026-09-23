@@ -258,7 +258,8 @@ const HOLDOVER_MAX: f64 = 0.080;
 /// - 13: a joint with `cap_track > 0` (the 0xA4 planner) rides the half-rate
 ///   lane — 240 Hz in a 480 Hz loop, 200 Hz at 400 — where the planner
 ///   follows; a proto-12 core would command it every tick, where it does not.
-const CONFIG_PROTO: u32 = 13;
+/// - 14: an optional `lead_ms` after `cap_track` (`a4_target`).
+const CONFIG_PROTO: u32 = 14;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -836,6 +837,15 @@ fn is_planner(m: &ReadyMotor) -> bool {
     m.vendor == Vendor::MyActuator && m.wire == WireMode::A4 && m.cap_track > 0.0
 }
 
+/// The 0xA4 target for one tick: the tracker position led `lead_s` along
+/// its velocity. On the firmware planner a target reached within the step
+/// stops the joint for the rest of it — a speed ripple at the step rate,
+/// which put ~half the right elbow's speed error at 60-120 Hz on the 240 Hz
+/// lane (2026-09-22); a target a few ms ahead keeps it cruising. 0 = none.
+fn a4_target(p_cmd: f64, v_trk: f64, lead_s: f64) -> f64 {
+    p_cmd + v_trk * lead_s
+}
+
 /// Lowest 0xA4 speed cap a tracking cap sets (dps), so a stationary target
 /// still corrects (`tune.a4 --cap-floor`'s default).
 const A4_CAP_FLOOR_DPS: f64 = 1.0;
@@ -1189,7 +1199,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                 //       <stiction_gain> <stiction_err> <stiction_load_gain>
                 //       <dither_nm> <dither_hz> <wire mit|a4|pv>
                 //       <stribeck_gain> <stribeck_dfs> <stribeck_load_gain> <stribeck_vs>
-                //       <fl> <stribeck_pole> [<cap_track>]
+                //       <fl> <stribeck_pole> [<cap_track> [<lead_ms>]]
                 // gripper <side 0|1> <iface> <motor_id>
                 let gripper = f[0] == "gripper";
                 let side: u8 = f
@@ -1239,6 +1249,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         fl: 0.0,
                         stribeck_pole: 0.0,
                         cap_track: 0.0,
+                        lead_s: 0.0,
                     }
                 } else {
                     let motor_id: u8 = f
@@ -1284,6 +1295,11 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         // Optional: absent = fixed 0xA4 cap (direct tracking).
                         cap_track: match f.get(25) {
                             Some(_) => num(25)?,
+                            None => 0.0,
+                        },
+                        // Optional: the 0xA4 target lead, ms on the wire.
+                        lead_s: match f.get(26) {
+                            Some(_) => num(26)? / 1e3,
                             None => 0.0,
                         },
                     }
@@ -1604,6 +1620,7 @@ mod tests {
             stribeck_vs: 0.0,
             fl: 0.0,
             cap_track: 0.0,
+            lead_s: 0.0,
         }
     }
 
@@ -1825,10 +1842,10 @@ mod tests {
     fn impedance_joints_run_at_240_hz_only() {
         let spec = |wire: &str, gripper: bool| {
             let text = if gripper {
-                "proto 13\ngripper 0 canL 8\n".to_string()
+                "proto 14\ngripper 0 canL 8\n".to_string()
             } else {
                 format!(
-                    "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                    "proto 14\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
                 )
             };
             text
@@ -1861,6 +1878,22 @@ mod tests {
         assert_eq!(a4_speed_cap(1.2, 0.0, max_vel), A4_CAP_FLOOR_DPS);
         // ... nor above the tracker limit.
         assert_eq!(a4_speed_cap(1.2, 100.0, max_vel), max_vel.to_degrees());
+    }
+
+    #[test]
+    fn a4_target_leads_along_the_tracker_velocity() {
+        assert_eq!(a4_target(1.0, 2.0, 0.0), 1.0);
+        assert!((a4_target(1.0, 2.0, 0.005) - 1.01).abs() < 1e-12);
+        assert!((a4_target(1.0, -2.0, 0.005) - 0.99).abs() < 1e-12);
+        let line = "joint 0 canL elbow 4 130 5.0 9.4 33.0 0 0 0 0 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
+        let cfg = parse_config(&format!(
+            "proto {CONFIG_PROTO}\nloop_hz 400\n{line} 1.05 5\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.buses[0].2[0].lead_s, 0.005);
+        let cfg =
+            parse_config(&format!("proto {CONFIG_PROTO}\nloop_hz 400\n{line} 1.05\n")).unwrap();
+        assert_eq!(cfg.buses[0].2[0].lead_s, 0.0);
     }
 
     #[test]
@@ -2049,7 +2082,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 13\n\
+            "proto 14\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
@@ -2101,39 +2134,39 @@ mod tests {
         );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+            "proto 14\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 13\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 14\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
         // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 14\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 14\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 14\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 14\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 14\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 14\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 14\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -2144,7 +2177,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 13\n\
+            "proto 14\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
@@ -2158,15 +2191,15 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 13\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 14\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 13\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 14\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 13\n\
+            "proto 14\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
@@ -2192,12 +2225,12 @@ mod tests {
         // A future client generation this core does not understand.
         let err = error_of(&format!("proto 99\n{joint}"));
         assert!(err.contains("proto 99"), "{err}");
-        assert!(err.contains("proto 13"), "{err}");
+        assert!(err.contains("proto 14"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 13\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 14\n")).is_ok());
     }
 }
 
@@ -3377,7 +3410,10 @@ fn bus_loop(
                         a4_follow[motor_index] = true;
                         (
                             proto::MA_REQ + m.id as u16,
-                            proto::ma_a4_encode(p_cmd, a4_speed_cap(m.cap_track, v_trk, m.max_vel)),
+                            proto::ma_a4_encode(
+                                a4_target(p_cmd, v_trk, m.lead_s),
+                                a4_speed_cap(m.cap_track, v_trk, m.max_vel),
+                            ),
                         )
                     } else if pv_wire(m.vendor, m.wire, tracked, c.kp) {
                         // Damiao firmware position loop: same target, the

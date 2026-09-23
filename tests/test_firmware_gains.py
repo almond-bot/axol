@@ -84,7 +84,7 @@ class ConfigTest(unittest.TestCase):
         out = _calibrated_joint(base, {"firmware": {"position_kp": 0.05}})
         self.assertEqual(out.firmware.as_dict(), {"position_kp": 0.05})
         # Untouched entries keep the config's block.
-        self.assertIs(_calibrated_joint(base, {"kp": 100.0}).firmware, base.firmware)
+        self.assertEqual(_calibrated_joint(base, {"kp": 100.0}).firmware, base.firmware)
 
     def test_firmware_gains_is_exported_and_replaceable(self) -> None:
         jc = replace(AxolConfig().left.elbow, firmware=FirmwareGains(speed_kp=0.05))
@@ -310,6 +310,9 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
     async def test_the_planner_override_reaches_the_motor(self) -> None:
         cfg = AxolConfig()
         cfg.left.shoulder_1.firmware.planner_accel = 60000.0
+        # Each joint owns its block: the shoulder_2 and a fresh config keep 0.
+        self.assertEqual(cfg.left.shoulder_2.firmware.planner_accel, 0.0)
+        self.assertEqual(AxolConfig().left.shoulder_1.firmware.planner_accel, 0.0)
         s1 = _FakeMotor(_stock())
         await apply_firmware_gains(
             _arm({Joint.SHOULDER_1: s1}, config=cfg.left), [Joint.SHOULDER_1]
@@ -394,8 +397,15 @@ class PlannerConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "never keeps up"):
             FirmwareGains(cap_track=0.8)
 
+    def test_lead_is_bounded(self) -> None:
+        FirmwareGains(planner_lead_ms=5.0)
+        with self.assertRaisesRegex(ValueError, "0..50"):
+            FirmwareGains(planner_lead_ms=80.0)
+
     def test_cap_track_is_the_cores_not_the_motors(self) -> None:
-        gains = FirmwareGains(position_kp=1.0, planner_accel=60000.0, cap_track=1.2)
+        gains = FirmwareGains(
+            position_kp=1.0, planner_accel=60000.0, cap_track=1.2, planner_lead_ms=5.0
+        )
         self.assertEqual(
             gains.as_dict(), {"position_kp": 1.0, "planner_accel": 60000.0}
         )

@@ -144,6 +144,14 @@ class FirmwareGains:
                   there the cap is a hard limit on the PI output and a tight
                   one never lets the loop catch up. Not a motor parameter:
                   carried to the realtime core, never written to the motor.
+        planner_lead_ms: **Host side, 0xA4 joints on the planner.** Each
+                  tick's 0xA4 target is sent this far ahead along the core
+                  tracker's velocity. The planner reaches a target that is
+                  exactly on the trajectory before its step ends and stops for
+                  the rest of it — a speed ripple at the step rate (half the
+                  right elbow's speed error at 60-120 Hz on the 240 Hz lane);
+                  a few ms ahead keeps it cruising. 0-50; not written to the
+                  motor.
     """
 
     position_kp: float | None = None
@@ -154,26 +162,38 @@ class FirmwareGains:
     profile_acc: float | None = None
     planner_accel: float | None = None
     cap_track: float | None = None
+    planner_lead_ms: float | None = None
 
     def __post_init__(self) -> None:
-        check_firmware_extras(self.planner_accel, self.cap_track)
+        check_firmware_extras(self.planner_accel, self.cap_track, self.planner_lead_ms)
 
     def as_dict(self) -> dict[str, float]:
         """The set motor parameters, keyed by name (``cap_track`` excluded:
-        it is the realtime core's, not the motor's)."""
+        and ``planner_lead_ms`` excluded: they are the realtime core's, not
+        the motor's)."""
         return {
             f.name: float(v)
             for f in fields(self)
-            if f.name != "cap_track" and (v := getattr(self, f.name)) is not None
+            if f.name not in _HOST_FIRMWARE_FIELDS
+            and (v := getattr(self, f.name)) is not None
         }
 
 
-def check_firmware_extras(planner_accel: float | None, cap_track: float | None) -> None:
+#: ``FirmwareGains`` fields the realtime core uses; never written to a motor.
+_HOST_FIRMWARE_FIELDS = frozenset({"cap_track", "planner_lead_ms"})
+
+
+def check_firmware_extras(
+    planner_accel: float | None,
+    cap_track: float | None,
+    planner_lead_ms: float | None = None,
+) -> None:
     """Refuse a planner acceleration or cap tracking that cannot follow a stream.
 
     Raises:
-        ValueError: ``planner_accel`` not 0 / 60000, or ``cap_track`` below 1
-            (a cap under the commanded speed can never keep up).
+        ValueError: ``planner_accel`` not 0 / 60000, ``cap_track`` below 1
+            (a cap under the commanded speed can never keep up), or
+            ``planner_lead_ms`` outside 0..50.
     """
     if planner_accel is not None and float(planner_accel) not in (0.0, 60000.0):
         raise ValueError(
@@ -186,6 +206,8 @@ def check_firmware_extras(planner_accel: float | None, cap_track: float | None) 
             f"cap_track {cap_track:g}: a cap under the commanded speed never keeps "
             "up — use >= 1 (1.1-1.2 tested), or 0 / unset for the fixed cap"
         )
+    if planner_lead_ms is not None and not 0.0 <= planner_lead_ms <= 50.0:
+        raise ValueError(f"planner_lead_ms {planner_lead_ms:g}: must be within 0..50")
 
 
 @dataclass
@@ -396,6 +418,15 @@ class JointConfig:
     stribeck_vs: float = 0.1
     stribeck_pole: float = 20.0
     firmware: FirmwareGains = field(default_factory=FirmwareGains)
+
+    def __post_init__(self) -> None:
+        # The per-type defaults (_X8_FIRMWARE_GAINS, _ZERO_FRICTION, ...) are
+        # module-level instances every matching joint is built from; each
+        # joint keeps its own copy so setting a field on one joint — a
+        # tune.motion override, a calibration overlay, a test — can never
+        # reach another joint or the next config built.
+        self.friction = replace(self.friction)
+        self.firmware = replace(self.firmware)
 
 
 @dataclass

@@ -309,15 +309,16 @@ class TuneMotionFlagTest(unittest.TestCase):
         cfg = AxolConfig()
         cfg.left.elbow.wire_mode = "a4"
         cfg.left.elbow.firmware.cap_track = 1.2
+        cfg.left.elbow.firmware.planner_lead_ms = 5.0
         with patch("almond_axol.rt.link.find_binary", return_value="/fake/axol-rt"):
             rt = Axol._wrap(_hardware(cfg))
         caps = {
-            f[3]: f[25]
+            f[3]: (f[25], f[26])
             for f in (ln.split() for ln in rt._config_text().splitlines())
             if f[0] == "joint"
         }
-        self.assertEqual(caps["elbow"], "1.2")
-        self.assertEqual(caps["shoulder_1"], "0.0")
+        self.assertEqual(caps["elbow"], ("1.2", "5.0"))
+        self.assertEqual(caps["shoulder_1"], ("0.0", "0.0"))
 
     def test_repeat_defaults_to_one_pass(self) -> None:
         self.assertEqual(self._parse().repeat, 1)

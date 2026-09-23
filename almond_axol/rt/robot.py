@@ -381,8 +381,10 @@ class Axol(RobotBase):
                     f"{gains.stribeck_gain} {gains.stribeck_dfs} "
                     f"{gains.stribeck_load_gain} {gains.stribeck_vs} {f.fl} "
                     f"{gains.stribeck_pole} "
-                    # 0xA4 speed-cap tracking (the planner's; 0 = fixed cap).
-                    f"{gains.firmware.cap_track or 0.0}"
+                    # 0xA4 speed-cap tracking (the planner's; 0 = fixed cap)
+                    # and target lead (ms).
+                    f"{gains.firmware.cap_track or 0.0} "
+                    f"{gains.firmware.planner_lead_ms or 0.0}"
                 )
             if arm._has_gripper:
                 lines.append(
