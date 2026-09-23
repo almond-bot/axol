@@ -500,8 +500,10 @@ class MyActuatorMotor(MotorDriver):
         out: dict[str, tuple[float, float]] = {}
         planner = wanted.pop("planner_accel", None)
         if planner is not None:
-            acc, dec = await self.get_planner_acceleration()
-            if acc != int(round(planner)) or dec != int(round(planner)):
+            # Acceleration only: it selects the loop, and the deceleration
+            # has a firmware floor (see _ensure_planner_acceleration).
+            acc, _dec = await self.get_planner_acceleration()
+            if acc != int(round(planner)):
                 out["planner_accel"] = (float(acc), float(planner))
         for name, value in wanted.items():
             have = await self._read_gain_indexed(_MA_PID_IDX[name])
@@ -512,15 +514,22 @@ class MyActuatorMotor(MotorDriver):
     async def _ensure_planner_acceleration(
         self, value: int
     ) -> tuple[float, float] | None:
-        """Set the position planner's accel and decel to ``value`` if they differ.
+        """Set the position planner's acceleration to ``value`` if it differs.
+
+        The acceleration is what selects the loop (0 = direct tracking,
+        60000 = the planner). The deceleration is written the same, but not
+        required to match: the X8-P20's 2026042402 firmware keeps its own
+        floor of 10 dps/s and reads back ``0/10`` after a 0 — requiring 0
+        there made every enable fail to apply shoulder_1 / shoulder_2's
+        firmware gains (2026-09-22).
 
         Returns ``(before, after)`` acceleration when written, else None. The
         caller resets the motor afterwards: on the X6-P20's 2025070202
         firmware a 0 written into a running position loop is ignored until
         the reset (non-zero values apply live on every firmware seen).
         """
-        acc, dec = await self.get_planner_acceleration()
-        if acc == value and dec == value:
+        acc, _dec = await self.get_planner_acceleration()
+        if acc == value:
             return None
         for kind in (_MA_ACC_POS_PLAN, _MA_DEC_POS_PLAN):
             await self._request(
@@ -529,7 +538,7 @@ class MyActuatorMotor(MotorDriver):
             )
             await asyncio.sleep(_MA_ROM_SETTLE_S)
         after, after_dec = await self.get_planner_acceleration()
-        if after != value or after_dec != value:
+        if after != value:
             raise MotorError(
                 f"MyActuator motor {self._motor_id:#04x}: wrote planner accel/decel "
                 f"{value} but the motor reads back {after}/{after_dec}"

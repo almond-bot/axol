@@ -112,6 +112,7 @@ class _FakeMotor(MyActuatorMotor):
         *,
         enabled: bool = False,
         planner: tuple[int, int] = (0, 0),
+        decel_floor: int = 0,
     ) -> None:
         super().__init__(MagicMock(), 0x01, kt=2.0)
         self.store = store
@@ -121,6 +122,8 @@ class _FakeMotor(MyActuatorMotor):
         # Position planner accel/decel (0x42 types 0/1), 0x43 writes.
         self.planner = {0: planner[0], 1: planner[1]}
         self.planner_writes: list[tuple[int, int]] = []
+        # The X8-P20 firmware keeps decel >= 10 whatever is written.
+        self.decel_floor = decel_floor
 
     async def reset(self) -> None:  # type: ignore[override]
         self.resets += 1
@@ -140,7 +143,7 @@ class _FakeMotor(MyActuatorMotor):
         if cmd == 0x43:
             value = struct.unpack_from("<I", data, 4)[0]
             self.planner_writes.append((index, value))
-            self.planner[index] = value
+            self.planner[index] = max(value, self.decel_floor) if index == 1 else value
             return data
         raise AssertionError(f"unexpected frame {data.hex()}")
 
@@ -318,6 +321,30 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(s1.planner_writes, [(0, 0), (1, 0)])
         self.assertEqual(s1.resets, 1)
         self.assertTrue(any("planner_accel 60000 -> 0" in m for m in logs.output))
+
+    async def test_a_decel_floor_does_not_block_the_gains(self) -> None:
+        # Right shoulder_1 as found: accel 0 (direct), decel 10 — the X8
+        # firmware's floor. It is already on direct tracking: the gains must
+        # still be written (this read-back used to fail the whole joint), and
+        # a held joint in that state must not count as a mismatch.
+        from almond_axol.robot.axol import held_firmware_gain_mismatches
+
+        s1 = _FakeMotor(_stock(), planner=(0, 10), decel_floor=10)
+        arm = _arm({Joint.SHOULDER_1: s1})
+        with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:
+            await apply_firmware_gains(arm, [Joint.SHOULDER_1])
+        self.assertTrue(any("written to ROM" in m for m in logs.output), logs.output)
+        self.assertFalse(any("could not apply" in m for m in logs.output))
+        self.assertAlmostEqual(s1.store[_MA_PID_IDX["position_kp"]], 1.0, 6)
+        self.assertEqual(s1.planner_writes, [])  # accel already 0
+        s1.enabled = True
+        self.assertEqual(
+            await held_firmware_gain_mismatches(arm, [Joint.SHOULDER_1]), []
+        )
+        # Coming back from the planner: accel returns to 0, decel stays at 10.
+        s1 = _FakeMotor(_stock(), planner=(60000, 60000), decel_floor=10)
+        await apply_firmware_gains(_arm({Joint.SHOULDER_1: s1}), [Joint.SHOULDER_1])
+        self.assertEqual(s1.planner, {0: 0, 1: 10})
 
     async def test_the_planner_override_reaches_the_motor(self) -> None:
         cfg = AxolConfig()
