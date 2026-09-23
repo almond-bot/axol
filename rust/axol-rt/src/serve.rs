@@ -255,7 +255,10 @@ const HOLDOVER_MAX: f64 = 0.080;
 ///   them at 480.
 /// - 12: an optional trailing `cap_track` per joint line (`a4_speed_cap`);
 ///   a proto-11 core would ignore it and run a planner joint at a fixed cap.
-const CONFIG_PROTO: u32 = 12;
+/// - 13: a joint with `cap_track > 0` (the 0xA4 planner) rides the half-rate
+///   lane — 240 Hz in a 480 Hz loop, 200 Hz at 400 — where the planner
+///   follows; a proto-12 core would command it every tick, where it does not.
+const CONFIG_PROTO: u32 = 13;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -694,8 +697,10 @@ fn check_impedance_rate(loop_hz: f64, specs: &[MotorSpec]) -> io::Result<()> {
 /// every a4 joint read, every tick.
 struct Thinning {
     enabled: bool,
-    /// Impedance (MIT) arm joints as `(motor index, phase)`: commanded on
-    /// ticks where `tick % mit_div == phase`.
+    /// The half-rate lane — impedance (MIT) arm joints and 0xA4 joints on
+    /// the firmware planner — as `(motor index, phase)`: commanded on ticks
+    /// where `tick % mit_div == phase`, their host pipeline stepped at that
+    /// rate (see `bus_loop`).
     mit_lane: Vec<(usize, u64)>,
     /// Ticks per impedance command: 2 on a mixed bus, 1 otherwise.
     mit_div: u64,
@@ -711,14 +716,20 @@ struct Thinning {
 impl Thinning {
     fn plan(motors: &[ReadyMotor], loop_hz: f64) -> Self {
         let enabled = loop_hz > THIN_ABOVE_HZ;
+        // The half-rate lane: impedance arm joints, and 0xA4 joints on the
+        // firmware planner (`cap_track > 0`, planner acceleration 60000). The
+        // planner plans to each target and needs ~4 ms between them: on the
+        // right elbow a 50 deg/s sine tracked at 240 / 200 Hz (0.7° RMS,
+        // 13 ms) and fell 20° behind at 480 Hz (2026-09-22).
         let mit: Vec<usize> = motors
             .iter()
             .enumerate()
-            .filter(|(_, m)| !m.gripper && m.wire == WireMode::Mit)
+            .filter(|(_, m)| !m.gripper && (m.wire == WireMode::Mit || is_planner(m)))
             .map(|(i, _)| i)
             .collect();
         // `check_impedance_rate` has held a bus with impedance joints to 240
-        // or 480 Hz, so above the threshold this is 2.
+        // or 480 Hz, so above the threshold this is 2 (and 2 at 400 Hz, the
+        // position controller, for planner joints: 200 Hz).
         let mit_div = if enabled && !mit.is_empty() {
             (loop_hz / IMPEDANCE_HZ).round().max(1.0) as u64
         } else {
@@ -740,11 +751,17 @@ impl Thinning {
             })
             .map(|(i, _)| i)
             .collect();
+        // Half-rate planner joints read their fine position on every one of
+        // their own commands (`a4_read`), so the round-robin read lane keeps
+        // only the every-tick a4 joints and the gripper.
         let read_lane = motors
             .iter()
             .enumerate()
-            .filter(|(_, m)| {
-                m.gripper || (m.vendor == Vendor::MyActuator && m.wire == WireMode::A4)
+            .filter(|(i, m)| {
+                m.gripper
+                    || (m.vendor == Vendor::MyActuator
+                        && m.wire == WireMode::A4
+                        && !mit_lane.iter().any(|(j, _)| j == i))
             })
             .map(|(i, _)| i)
             .collect();
@@ -759,8 +776,9 @@ impl Thinning {
         }
     }
 
-    /// The phase of an impedance joint on its own 240 Hz cadence, or `None`
-    /// for a motor commanded at the loop's rate (or its round-robin lane).
+    /// The phase of a half-rate-lane joint (impedance, or 0xA4 on the
+    /// planner) on its own cadence, or `None` for a motor commanded at the
+    /// loop's rate (or its round-robin lane).
     fn mit_phase(&self, idx: usize) -> Option<u64> {
         self.mit_lane
             .iter()
@@ -794,8 +812,11 @@ impl Thinning {
     }
 
     /// Whether an a4 joint's command on `tick` is followed by its 0x92 read.
+    /// A half-rate (planner) joint reads on each of its own commands.
     fn a4_read(&self, idx: usize, tick: u64) -> bool {
-        !self.enabled || Self::turn(&self.read_lane, tick) == Some(idx)
+        !self.enabled
+            || self.mit_phase(idx).is_some()
+            || Self::turn(&self.read_lane, tick) == Some(idx)
     }
 }
 
@@ -806,6 +827,13 @@ impl Thinning {
 /// resolution — and a joint at rest (speed 0) never drifts.
 fn a4_extrapolate(anchor: (f64, Instant), speed: f64, now: Instant) -> f64 {
     anchor.0 + speed * now.saturating_duration_since(anchor.1).as_secs_f64()
+}
+
+/// An 0xA4 joint on the firmware planner: speed-cap tracking is what the
+/// planner route sets (`FirmwareGains.cap_track` alongside planner
+/// acceleration 60000), and such a joint rides the half-rate lane.
+fn is_planner(m: &ReadyMotor) -> bool {
+    m.vendor == Vendor::MyActuator && m.wire == WireMode::A4 && m.cap_track > 0.0
 }
 
 /// Lowest 0xA4 speed cap a tracking cap sets (dps), so a stationary target
@@ -1729,6 +1757,47 @@ mod tests {
     }
 
     #[test]
+    fn planner_joints_ride_the_half_rate_lane_and_read_every_own_command() {
+        // shoulder_1 on direct tracking, the elbow on the planner, the rest
+        // on impedance: the elbow alternates with the impedance joints.
+        let mut motors = mixed_arm();
+        motors[3].cap_track = 1.2; // elbow
+        let sched = Thinning::plan(&motors, MIXED_LOOP_HZ);
+        assert!(sched.mit_phase(3).is_some());
+        assert!(sched.mit_phase(0).is_none()); // shoulder_1: every tick
+        assert_eq!(sched.read_lane, vec![0, 7]); // shoulder_1 + gripper only
+        let mut worst = 0;
+        let mut last = None;
+        for tick in 0..96u64 {
+            assert!(sched.commanded(0, tick));
+            let mut frames = 0;
+            for idx in 0..motors.len() {
+                if !sched.commanded(idx, tick) {
+                    continue;
+                }
+                frames += 2;
+                if motors[idx].wire == WireMode::A4 && sched.a4_read(idx, tick) {
+                    frames += 2;
+                }
+            }
+            if sched.commanded(3, tick) {
+                // Every elbow command carries its fine-position read.
+                assert!(sched.a4_read(3, tick));
+                if let Some(prev) = last {
+                    assert_eq!(tick - prev, 2); // 240 Hz, evenly spaced
+                }
+                last = Some(tick);
+            }
+            worst = worst.max(frames);
+        }
+        assert!(worst <= 14, "{worst} frames");
+        // Direct-tracking a4 joints stay out of the lane, as before.
+        assert!(Thinning::plan(&mixed_arm(), MIXED_LOOP_HZ)
+            .mit_phase(3)
+            .is_none());
+    }
+
+    #[test]
     fn the_position_controller_has_no_impedance_lane() {
         let sched = Thinning::plan(&full_arm_position_controller(), 400.0);
         assert!(sched.mit_lane.is_empty());
@@ -1756,10 +1825,10 @@ mod tests {
     fn impedance_joints_run_at_240_hz_only() {
         let spec = |wire: &str, gripper: bool| {
             let text = if gripper {
-                "proto 12\ngripper 0 canL 8\n".to_string()
+                "proto 13\ngripper 0 canL 8\n".to_string()
             } else {
                 format!(
-                    "proto 12\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                    "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
                 )
             };
             text
@@ -1980,7 +2049,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 12\n\
+            "proto 13\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
@@ -2032,39 +2101,39 @@ mod tests {
         );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 12\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 12\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 13\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
         // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 12\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 12\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 12\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 12\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 12\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 12\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 12\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 13\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -2075,7 +2144,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 12\n\
+            "proto 13\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
@@ -2089,15 +2158,15 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 12\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 13\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 12\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 13\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 12\n\
+            "proto 13\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
@@ -2123,12 +2192,12 @@ mod tests {
         // A future client generation this core does not understand.
         let err = error_of(&format!("proto 99\n{joint}"));
         assert!(err.contains("proto 99"), "{err}");
-        assert!(err.contains("proto 12"), "{err}");
+        assert!(err.contains("proto 13"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 12\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 13\n")).is_ok());
     }
 }
 
@@ -2760,10 +2829,12 @@ fn bus_loop(
             out_tx,
             b'L',
             &format!(
-                "{iface}: {:.0} Hz loop — {} impedance joint(s) on alternate ticks at {:.0} Hz each, firmware-loop joints every tick",
+                "{iface}: {:.0} Hz loop — {} joint(s) on alternate ticks at {:.0} Hz each ({} impedance, {} on the 0xA4 planner), other firmware-loop joints every tick",
                 cfg.loop_hz,
                 sched.mit_lane.len(),
                 cfg.loop_hz / sched.mit_div as f64,
+                sched.mit_lane.iter().filter(|(i, _)| motors[*i].wire == WireMode::Mit).count(),
+                sched.mit_lane.iter().filter(|(i, _)| is_planner(&motors[*i])).count(),
             ),
         );
     }

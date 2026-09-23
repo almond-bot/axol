@@ -103,9 +103,10 @@ class RtLinkConfigureTest(unittest.IsolatedAsyncioTestCase):
         # mode token; 7: Stribeck fields; 8: load-proportional friction fl;
         # 9: the Stribeck velocity pole on every joint line; 10: the pv wire
         # token; 11: impedance joints at 240 Hz only (480 = alternate ticks);
-        # 12: the optional trailing 0xA4 cap_track field on joint lines.
+        # 12: the optional trailing 0xA4 cap_track field on joint lines;
+        # 13: cap_track > 0 (the planner) puts a joint on the half-rate lane.
         # Bump both sides together (rust/axol-rt/src/serve.rs CONFIG_PROTO).
-        self.assertEqual(link.CONFIG_PROTO, 12)
+        self.assertEqual(link.CONFIG_PROTO, 13)
 
     async def test_configure_names_a_stale_binary_when_the_core_exits(self) -> None:
         rt = self._link(_ExitedProc())

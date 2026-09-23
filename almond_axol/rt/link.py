@@ -41,7 +41,7 @@ _ARM_TIMEOUT_S = 15.0
 #: both together whenever the config or target layout changes meaning — a
 #: package and a binary from different checkouts must fail at configure
 #: time, not arm and then silently reject every target.
-CONFIG_PROTO = 12
+CONFIG_PROTO = 13
 
 
 def config_header() -> list[str]:
