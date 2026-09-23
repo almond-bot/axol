@@ -599,16 +599,7 @@ class ArmConfig:
     )
     wrist_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            # 100 (was 130): the field wrist buzz below is kp-driven. Captured
-            # on the right arm 2026-09-22 at 85 Hz, wrist_3 largest then
-            # wrist_2 (the elbow and shoulder_1 carried along), intermittent
-            # and independent of the controller split; every episode ended in
-            # lost replies and a stalled bus. A slow_osc replay with both
-            # wrists' kd lowered (1.8 / 1.5) still buzzed and faulted; with
-            # both at kp 100 it ran clean (wrist buzz 0.005° at 22 Hz, the
-            # healthy floor). One clean run of an intermittent fault — re-verify
-            # with repeats (and on the left arm, which shares these defaults).
-            kp=100.0,
+            kp=130.0,
             # The same trace measured 0.36° RMS at the coupled 3.5 Hz mode
             # versus 0.08° commanded, with materially weaker motor damping
             # than shoulder_3. The bracket above is firm: kd=5 produced a
@@ -632,9 +623,7 @@ class ArmConfig:
     )
     wrist_3: JointConfig = field(
         default_factory=lambda: JointConfig(
-            # 100 (was 130), with wrist_2: the larger mover in the 85 Hz
-            # buzz — see wrist_2.
-            kp=100.0,
+            kp=130.0,
             kd=2.0,
             friction=_ZERO_FRICTION,
             mass=0.75,
@@ -897,17 +886,11 @@ class _ArmGains:
 #
 # wrist_2 is currently the one exception: its tuned kd came down to 2.25
 # (see the joint) without its soft endpoint following, so the consistent
-# value here would be 2.25·sqrt(25/100) = 1.13 rather than 1.5. The blend
+# value here would be 2.25·sqrt(25/130) = 0.99 rather than 1.5. The blend
 # therefore carries ~1.5x the tuned damping ratio at s=0, tapering to the
 # tuned one at s=1 — i.e. soft sessions are over-damped rather than
 # under-damped, which is the safe direction but no longer the documented
 # invariant. Re-derive this once the tuned kd settles.
-#
-# wrist_3 is the second: its tuned kp came down to 100 (see wrist_2), so the
-# consistent soft kd is now 2.0·sqrt(25/100) = 1.0, not 0.9 — soft sessions
-# run ~10% under the tuned damping ratio at s=0. Left at 0.9 because the
-# partial-arm bench mode runs on exactly this endpoint (tests/
-# test_rom_partial_arm.py); re-derive both wrists together with a bench run.
 _SOFT_GAINS = _ArmGains(
     shoulder_1=(40.0, 1.4),
     shoulder_2=(50.0, 1.57),
