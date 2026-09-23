@@ -125,8 +125,25 @@ class FirmwareGains:
                   second to reach teleop speed. 50 is above the core
                   tracker's 33 rad/s² limit (the profile never binds) while
                   still rounding each 5 ms step; 50 and 200 scored alike in
-                  ``tune.a4``. A MyActuator joint has no such register
-                  (its planner acceleration is 0, direct tracking).
+                  ``tune.a4``. A MyActuator joint uses ``planner_accel``.
+        planner_accel: **MyActuator only.** The 0xA4 position planner's stored
+                  acceleration and deceleration, dps/s (0x43), written at
+                  enable like the gains. Only two values follow a stream:
+                  ``0`` is direct PI tracking of each target, ``60000`` (the
+                  protocol maximum) makes the planner finish each step within
+                  the tick — anything between re-plans every target and the
+                  joint barely moves. On the X6-P20 elbow ``tune.a4`` tracked a
+                  3 deg/s triangle to 0.02° RMS with 4 ms lag at 60000 against
+                  0.23° / 74 ms direct. 60000 wants ``cap_track`` too.
+        cap_track: **Host side, 0xA4 joints with the planner on.** Each tick's
+                  0xA4 speed cap as this multiple of the commanded speed
+                  (floor 1 dps) instead of the fixed tracker limit: at a fixed
+                  cap the planner bursts through each step and idles the rest
+                  of the tick (4x the current spread on the elbow); 1.1-1.2
+                  moved it continuously. Leave unset under direct tracking —
+                  there the cap is a hard limit on the PI output and a tight
+                  one never lets the loop catch up. Not a motor parameter:
+                  carried to the realtime core, never written to the motor.
     """
 
     position_kp: float | None = None
@@ -135,14 +152,40 @@ class FirmwareGains:
     speed_kp: float | None = None
     speed_ki: float | None = None
     profile_acc: float | None = None
+    planner_accel: float | None = None
+    cap_track: float | None = None
+
+    def __post_init__(self) -> None:
+        check_firmware_extras(self.planner_accel, self.cap_track)
 
     def as_dict(self) -> dict[str, float]:
-        """The set gains, keyed by their MyActuator parameter name."""
+        """The set motor parameters, keyed by name (``cap_track`` excluded:
+        it is the realtime core's, not the motor's)."""
         return {
             f.name: float(v)
             for f in fields(self)
-            if (v := getattr(self, f.name)) is not None
+            if f.name != "cap_track" and (v := getattr(self, f.name)) is not None
         }
+
+
+def check_firmware_extras(planner_accel: float | None, cap_track: float | None) -> None:
+    """Refuse a planner acceleration or cap tracking that cannot follow a stream.
+
+    Raises:
+        ValueError: ``planner_accel`` not 0 / 60000, or ``cap_track`` below 1
+            (a cap under the commanded speed can never keep up).
+    """
+    if planner_accel is not None and float(planner_accel) not in (0.0, 60000.0):
+        raise ValueError(
+            f"planner_accel {planner_accel:g}: only 0 (direct tracking) or 60000 "
+            "(the planner finishing each step within the tick) follow a stream — "
+            "values in between re-plan every target and the joint barely moves"
+        )
+    if cap_track is not None and not (cap_track == 0.0 or cap_track >= 1.0):
+        raise ValueError(
+            f"cap_track {cap_track:g}: a cap under the commanded speed never keeps "
+            "up — use >= 1 (1.1-1.2 tested), or 0 / unset for the fixed cap"
+        )
 
 
 @dataclass
@@ -392,6 +435,9 @@ _X8_FIRMWARE_GAINS = FirmwareGains(
     position_kd=0.1,
     speed_kp=0.07,
     speed_ki=1e-5,
+    # Direct tracking, pinned: a planner left at 60000 by a test run must
+    # not carry into the next session (see FirmwareGains.planner_accel).
+    planner_accel=0.0,
 )
 
 # The X6-P20 elbow's set (stock position_kp 0.15, speed_kp 0.01 on firmware
@@ -407,6 +453,9 @@ _X6_ELBOW_FIRMWARE_GAINS = FirmwareGains(
     position_kd=0.1,
     speed_kp=0.05,
     speed_ki=1e-5,
+    # Direct tracking, pinned: a planner left at 60000 by a test run must
+    # not carry into the next session (see FirmwareGains.planner_accel).
+    planner_accel=0.0,
 )
 
 # shoulder_3 and wrist_1 (both RMD-X6-P20 on the same firmware, identical
@@ -431,6 +480,9 @@ _X6_ROLL_FIRMWARE_GAINS = FirmwareGains(
     position_kd=0.5,
     speed_kp=0.05,
     speed_ki=1e-5,
+    # Direct tracking, pinned: a planner left at 60000 by a test run must
+    # not carry into the next session (see FirmwareGains.planner_accel).
+    planner_accel=0.0,
 )
 
 

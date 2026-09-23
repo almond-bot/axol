@@ -487,6 +487,33 @@ class MyActuatorMotor(MotorDriver):
             out.append(int(struct.unpack_from("<i", resp, 4)[0]))
         return out[0], out[1]
 
+    async def _ensure_planner_acceleration(
+        self, value: int
+    ) -> tuple[float, float] | None:
+        """Set the position planner's accel and decel to ``value`` if they differ.
+
+        Returns ``(before, after)`` acceleration when written, else None. The
+        caller resets the motor afterwards: on the X6-P20's 2025070202
+        firmware a 0 written into a running position loop is ignored until
+        the reset (non-zero values apply live on every firmware seen).
+        """
+        acc, dec = await self.get_planner_acceleration()
+        if acc == value and dec == value:
+            return None
+        for kind in (_MA_ACC_POS_PLAN, _MA_DEC_POS_PLAN):
+            await self._request(
+                bytes([_MA_SET_ACCELERATION, kind, 0, 0])
+                + struct.pack("<I", max(0, value))
+            )
+            await asyncio.sleep(_MA_ROM_SETTLE_S)
+        after, after_dec = await self.get_planner_acceleration()
+        if after != value or after_dec != value:
+            raise MotorError(
+                f"MyActuator motor {self._motor_id:#04x}: wrote planner accel/decel "
+                f"{value} but the motor reads back {after}/{after_dec}"
+            )
+        return float(acc), float(after)
+
     async def get_model(self) -> str | None:
         return await self._read_model()
 
@@ -662,7 +689,11 @@ class MyActuatorMotor(MotorDriver):
     ) -> dict[str, tuple[float, float]]:
         """Bring the named firmware loop gains to ``wanted`` in ROM (0x32).
 
-        ``wanted`` maps parameter names (keys of ``_MA_PID_IDX``) to values.
+        ``wanted`` maps parameter names (keys of ``_MA_PID_IDX``) to values,
+        plus ``planner_accel``: the 0xA4 position planner's acceleration and
+        deceleration (dps/s, 0x43 — RAM and ROM in one command), written raw
+        so 0 (direct tracking) is reachable; :meth:`set_acceleration` clamps
+        to its 100 dps/s floor.
         Each gain is read first and written only when it differs beyond
         float32 rounding, so a provisioned motor costs reads only and the
         flash is written once per change. Every write is read back.
@@ -675,10 +706,16 @@ class MyActuatorMotor(MotorDriver):
         :class:`MotorError`. Pre-V4.2 firmware (bulk uint8 gains) is refused
         with a :class:`MotorError` rather than written.
         """
+        wanted = dict(wanted)
+        planner = wanted.pop("planner_accel", None)
         unknown = set(wanted) - set(_MA_PID_IDX)
         if unknown:
             raise ValueError(f"unknown firmware gain(s) {sorted(unknown)}")
         changed: dict[str, tuple[float, float]] = {}
+        if planner is not None:
+            moved = await self._ensure_planner_acceleration(int(round(planner)))
+            if moved is not None:
+                changed["planner_accel"] = moved
         for name, value in wanted.items():
             index = _MA_PID_IDX[name]
             before = await self._read_gain_indexed(index)

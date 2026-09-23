@@ -261,6 +261,36 @@ class TuneMotionFlagTest(unittest.TestCase):
             with self.subTest(spec=spec), self.assertRaisesRegex(SystemExit, message):
                 tune_motion._parse_holds([spec])
 
+    def test_planner_overrides_are_checked_before_the_bus(self) -> None:
+        got = tune_motion._parse_gain_overrides(
+            [
+                "right.elbow.firmware.planner_accel=60000",
+                "right.elbow.firmware.cap_track=1.2",
+            ]
+        )
+        self.assertEqual(got[("right", "elbow", "firmware.planner_accel")], 60000.0)
+        for spec, message in {
+            "right.elbow.firmware.planner_accel=5000": "barely moves",
+            "right.elbow.firmware.cap_track=0.5": "never keeps up",
+            "right.wrist_2.firmware.planner_accel=60000": "Damiao wrist",
+        }.items():
+            with self.subTest(spec=spec), self.assertRaisesRegex(SystemExit, message):
+                tune_motion._parse_gain_overrides([spec])
+
+    def test_the_core_gets_each_joints_cap_track(self) -> None:
+        cfg = AxolConfig()
+        cfg.left.elbow.wire_mode = "a4"
+        cfg.left.elbow.firmware.cap_track = 1.2
+        with patch("almond_axol.rt.link.find_binary", return_value="/fake/axol-rt"):
+            rt = Axol._wrap(_hardware(cfg))
+        caps = {
+            f[3]: f[25]
+            for f in (ln.split() for ln in rt._config_text().splitlines())
+            if f[0] == "joint"
+        }
+        self.assertEqual(caps["elbow"], "1.2")
+        self.assertEqual(caps["shoulder_1"], "0.0")
+
     def test_repeat_defaults_to_one_pass(self) -> None:
         self.assertEqual(self._parse().repeat, 1)
         self.assertEqual(self._parse("--repeat", "5").repeat, 5)

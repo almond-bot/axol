@@ -59,6 +59,7 @@ from ...robot.config import (
     CONTROLLERS,
     IMPEDANCE_LOOP_HZ,
     AxolConfig,
+    check_firmware_extras,
     check_loop_hz,
 )
 from ...robot.control import ContactWatchdog
@@ -102,6 +103,10 @@ _GAIN_FIELDS = (
     "firmware.speed_kp",
     "firmware.speed_ki",
     "firmware.profile_acc",
+    # MyActuator 0xA4: the position planner (0 direct / 60000) and the
+    # core's per-tick speed-cap tracking that the planner wants.
+    "firmware.planner_accel",
+    "firmware.cap_track",
 )
 
 # Column names of a 14-wide motion row: left arm then right arm.
@@ -254,6 +259,19 @@ def _parse_gain_overrides(specs: list[str]) -> dict[tuple[str, str, str], float]
                 f"--gain: unknown field {fld!r} in {spec!r} "
                 f"(one of {', '.join(_GAIN_FIELDS)})"
             )
+        if fld in ("firmware.planner_accel", "firmware.cap_track"):
+            if joint in ("wrist_2", "wrist_3"):
+                raise SystemExit(
+                    f"--gain: {fld} is the MyActuator 0xA4 planner's; {joint} is a "
+                    "Damiao wrist (its profiler is firmware.profile_acc)"
+                )
+            try:
+                check_firmware_extras(
+                    value if fld == "firmware.planner_accel" else None,
+                    value if fld == "firmware.cap_track" else None,
+                )
+            except ValueError as exc:
+                raise SystemExit(f"--gain {spec}: {exc}") from None
         for side in sides:
             out[(side, joint, fld)] = value
     return out

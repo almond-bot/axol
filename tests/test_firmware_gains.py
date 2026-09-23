@@ -17,7 +17,13 @@ from almond_axol.robot import FirmwareGains, JointConfig
 from almond_axol.robot.axol import apply_firmware_gains
 from almond_axol.robot.config import AxolConfig, _calibrated_joint
 
-_X8 = {"position_kp": 1.0, "position_kd": 0.1, "speed_kp": 0.07, "speed_ki": 1e-5}
+_X8 = {
+    "position_kp": 1.0,
+    "position_kd": 0.1,
+    "speed_kp": 0.07,
+    "speed_ki": 1e-5,
+    "planner_accel": 0.0,
+}
 
 
 class ConfigTest(unittest.TestCase):
@@ -38,6 +44,7 @@ class ConfigTest(unittest.TestCase):
                     "position_kd": 0.1,
                     "speed_kp": 0.05,
                     "speed_ki": 1e-5,
+                    "planner_accel": 0.0,
                 },
             )
 
@@ -52,6 +59,7 @@ class ConfigTest(unittest.TestCase):
                         "position_kd": 0.5,
                         "speed_kp": 0.05,
                         "speed_ki": 1e-5,
+                        "planner_accel": 0.0,
                     },
                 )
 
@@ -88,12 +96,21 @@ class _FakeMotor(MyActuatorMotor):
     """A V4.2+ motor's gain store behind ``_request``; ROM writes take only
     while ``enabled`` is False, as on hardware."""
 
-    def __init__(self, store: dict[int, float], *, enabled: bool = False) -> None:
+    def __init__(
+        self,
+        store: dict[int, float],
+        *,
+        enabled: bool = False,
+        planner: tuple[int, int] = (0, 0),
+    ) -> None:
         super().__init__(MagicMock(), 0x01, kt=2.0)
         self.store = store
         self.enabled = enabled
         self.writes: list[tuple[int, float]] = []
         self.resets = 0
+        # Position planner accel/decel (0x42 types 0/1), 0x43 writes.
+        self.planner = {0: planner[0], 1: planner[1]}
+        self.planner_writes: list[tuple[int, int]] = []
 
     async def reset(self) -> None:  # type: ignore[override]
         self.resets += 1
@@ -107,6 +124,13 @@ class _FakeMotor(MyActuatorMotor):
             self.writes.append((index, value))
             if not self.enabled:
                 self.store[index] = value
+            return data
+        if cmd == 0x42:
+            return bytes([0x42, index, 0, 0]) + struct.pack("<i", self.planner[index])
+        if cmd == 0x43:
+            value = struct.unpack_from("<I", data, 4)[0]
+            self.planner_writes.append((index, value))
+            self.planner[index] = value
             return data
         raise AssertionError(f"unexpected frame {data.hex()}")
 
@@ -199,11 +223,13 @@ class EnsureRomGainsTest(unittest.IsolatedAsyncioTestCase):
             await _FakeMotor(_stock()).ensure_rom_gains({"current_kd": 1.0})
 
 
-def _arm(drivers: dict[Joint, object], *, is_left: bool = True) -> SimpleNamespace:
+def _arm(
+    drivers: dict[Joint, object], *, is_left: bool = True, config: object = None
+) -> SimpleNamespace:
     cfg = AxolConfig()
     return SimpleNamespace(
         _is_left=is_left,
-        _arm_config=cfg.left if is_left else cfg.right,
+        _arm_config=config or (cfg.left if is_left else cfg.right),
         motors={j: SimpleNamespace(_driver=d) for j, d in drivers.items()},
     )
 
@@ -268,6 +294,28 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
             await apply_firmware_gains(arm, [Joint.SHOULDER_1])
         self.assertTrue(any("right.shoulder_1" in m for m in logs.output))
 
+    async def test_a_planner_left_on_is_put_back_to_direct_tracking(self) -> None:
+        # A test run left the shoulder's planner at 60000 (decel 10 as found
+        # on right shoulder_1): enable pins both back to the config's 0 and
+        # reboots the motor, since the X6-P20's 2025-07 firmware ignores a 0
+        # written into a running loop until the reset.
+        s1 = _FakeMotor(_stock(), planner=(60000, 10))
+        with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:
+            await apply_firmware_gains(_arm({Joint.SHOULDER_1: s1}), [Joint.SHOULDER_1])
+        self.assertEqual(s1.planner, {0: 0, 1: 0})
+        self.assertEqual(s1.planner_writes, [(0, 0), (1, 0)])
+        self.assertEqual(s1.resets, 1)
+        self.assertTrue(any("planner_accel 60000 -> 0" in m for m in logs.output))
+
+    async def test_the_planner_override_reaches_the_motor(self) -> None:
+        cfg = AxolConfig()
+        cfg.left.shoulder_1.firmware.planner_accel = 60000.0
+        s1 = _FakeMotor(_stock())
+        await apply_firmware_gains(
+            _arm({Joint.SHOULDER_1: s1}, config=cfg.left), [Joint.SHOULDER_1]
+        )
+        self.assertEqual(s1.planner, {0: 60000, 1: 60000})
+
     async def test_gripper_is_skipped(self) -> None:
         # Gripper config has no firmware block at all.
         await apply_firmware_gains(_arm({Joint.GRIPPER: object()}), [Joint.GRIPPER])
@@ -329,3 +377,25 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlannerConfigTest(unittest.TestCase):
+    """``planner_accel`` / ``cap_track``: the 0xA4 planner and its speed cap."""
+
+    def test_only_the_two_accelerations_that_follow_a_stream(self) -> None:
+        FirmwareGains(planner_accel=0.0)
+        FirmwareGains(planner_accel=60000.0)
+        with self.assertRaisesRegex(ValueError, "barely moves"):
+            FirmwareGains(planner_accel=5000.0)
+
+    def test_cap_track_must_keep_up_with_the_command(self) -> None:
+        FirmwareGains(cap_track=1.2)
+        FirmwareGains(cap_track=0.0)
+        with self.assertRaisesRegex(ValueError, "never keeps up"):
+            FirmwareGains(cap_track=0.8)
+
+    def test_cap_track_is_the_cores_not_the_motors(self) -> None:
+        gains = FirmwareGains(position_kp=1.0, planner_accel=60000.0, cap_track=1.2)
+        self.assertEqual(
+            gains.as_dict(), {"position_kp": 1.0, "planner_accel": 60000.0}
+        )

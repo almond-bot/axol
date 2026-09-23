@@ -1975,6 +1975,18 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         "stiction_load_gain": jc.stiction_load_gain,
                         "dither_nm": jc.dither_nm,
                         "stribeck_gain": jc.stribeck_gain,
+                        # Firmware position-loop set (tune.motion's
+                        # ``firmware.*`` overrides): the grid's baselines.
+                        **{
+                            f"firmware.{name}": getattr(jc.firmware, name)
+                            for name in (
+                                "position_kp",
+                                "speed_kp",
+                                "speed_ki",
+                                "planner_accel",
+                                "cap_track",
+                            )
+                        },
                     }
                 out[side] = joints
                 wire[side] = modes

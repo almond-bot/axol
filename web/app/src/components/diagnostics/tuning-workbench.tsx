@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { useToast } from "@/components/ui/toast"
 import { cn } from "@/lib/utils"
-import { type FirmwareVendor, shownForJoint } from "@/lib/firmware-loop"
+import { type FirmwareVendor, jointVendor, shownForJoint } from "@/lib/firmware-loop"
 import { RunChart, type RunChartSeries } from "@/components/diagnostics/run-chart"
 import type { CommandSpec, FormValue } from "@/lib/supervisor"
 import {
@@ -852,12 +852,30 @@ const OVERRIDE_FIELDS = [
   "stiction_load_gain",
   "dither_nm",
   "stribeck_gain",
+  // The firmware position loop (0xA4 / pv), in effect on --a4 joints and
+  // under the position controller; written to ROM at enable.
+  "firmware.position_kp",
+  "firmware.speed_kp",
+  "firmware.speed_ki",
+  // MyActuator 0xA4 only: the planner (0 direct / 60000) and its speed-cap
+  // tracking (>= 1). The Damiao wrists' cells are disabled.
+  "firmware.planner_accel",
+  "firmware.cap_track",
 ]
+
+/** Override fields that exist only on the MyActuator (0xA4) joints. */
+const MYACTUATOR_ONLY_FIELDS = new Set(["firmware.planner_accel", "firmware.cap_track"])
+
+/** Grid header for an override field (`firmware.x` shortened to `fw x`). */
+function overrideLabel(field: string): string {
+  return field.startsWith("firmware.") ? `fw ${field.slice("firmware.".length)}` : field
+}
 
 /** Format a config gain for seeding/comparison (trims float32 noise). */
 function fmtGain(v: unknown): string {
   if (typeof v !== "number" || !Number.isFinite(v)) return ""
-  return String(Number(v.toFixed(3)))
+  // Four significant digits: kp 250 and speed_ki 1e-5 both survive.
+  return String(Number(v.toPrecision(4)))
 }
 
 /**
@@ -1001,7 +1019,9 @@ function GainOverrideEditor({
       for (const tok of tokens.split(/\s+/).filter(Boolean)) {
         const [path = "", v = ""] = tok.split("=")
         const parts = path.split(".")
-        const key = parts.length === 3 ? `${parts[1]}.${parts[2]}` : path
+        // `side.joint.field[.sub]` and `joint.field[.sub]` both map to the
+        // side-less cell key.
+        const key = parts[0] === "left" || parts[0] === "right" ? parts.slice(1).join(".") : path
         if (key in cells) cells[key] = v
       }
       return cells
@@ -1053,7 +1073,7 @@ function GainOverrideEditor({
             <th />
             {OVERRIDE_FIELDS.map((f) => (
               <th key={f} className="px-1 pb-1 text-left text-[0.65rem] font-normal text-white/40">
-                {f}
+                {overrideLabel(f)}
               </th>
             ))}
           </tr>
@@ -1081,9 +1101,12 @@ function GainOverrideEditor({
                           setCells((prev) => ({ ...prev, [key]: seeds[key].text }))
                         }
                       }}
-                      disabled={disabled}
+                      disabled={
+                        disabled ||
+                        (MYACTUATOR_ONLY_FIELDS.has(field) && jointVendor(joint) === "damiao")
+                      }
                       className={cn(
-                        "h-7 w-16 rounded border bg-[#1c1c1c] px-1.5 font-mono text-xs outline-none placeholder:text-white/25 focus:border-[#eff483]/40",
+                        "h-7 w-16 rounded border bg-[#1c1c1c] px-1.5 font-mono text-xs outline-none placeholder:text-white/25 focus:border-[#eff483]/40 disabled:opacity-30",
                         dirty
                           ? "border-[#eff483]/50 text-[#eff483]"
                           : "border-white/10 text-white/60"

@@ -415,6 +415,8 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
                         "0.1",
                         "0.0",
                         "20.0",
+                        # 0xA4 cap tracking off (fixed cap).
+                        "0.0",
                     ],
                     line,
                 )

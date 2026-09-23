@@ -85,6 +85,7 @@ pub fn parse_params(path: &str) -> io::Result<Vec<JointParams>> {
                     stribeck_vs: 0.0,
                     fl: 0.0,
                     stribeck_pole: 0.0,
+                    cap_track: 0.0,
                 },
                 t_ff: fields.get(5)?.parse().ok()?,
             })

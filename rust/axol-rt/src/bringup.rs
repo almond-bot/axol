@@ -64,6 +64,12 @@ pub struct MotorSpec {
     /// Low-pass pole (rad/s) of the measured velocity the Stribeck term
     /// follows; `<= 0` falls back to the control derivative pole.
     pub stribeck_pole: f64,
+    /// 0xA4 joints with the firmware planner on (planner acceleration
+    /// 60000, written by the Python side at enable): each tick's speed cap
+    /// is this multiple of the commanded speed (floor `A4_CAP_FLOOR_DPS`),
+    /// so the planner moves continuously instead of bursting through each
+    /// step at a fixed cap. `<= 0` keeps the fixed cap (direct tracking).
+    pub cap_track: f64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -154,6 +160,8 @@ pub struct ReadyMotor {
     pub stribeck_load_gain: f64,
     pub stribeck_vs: f64,
     pub fl: f64,
+    /// See `MotorSpec::cap_track`.
+    pub cap_track: f64,
 }
 
 /// Status-probe attempts before a silent motor fails the bring-up.
@@ -303,6 +311,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             stribeck_load_gain: spec.stribeck_load_gain,
             stribeck_vs: spec.stribeck_vs,
             fl: spec.fl,
+            cap_track: spec.cap_track,
         });
     }
 
@@ -382,6 +391,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             stribeck_load_gain: spec.stribeck_load_gain,
             stribeck_vs: spec.stribeck_vs,
             fl: spec.fl,
+            cap_track: spec.cap_track,
         });
     }
     Ok(motors)
