@@ -470,3 +470,55 @@ class HeldGainTest(unittest.TestCase):
         self.assertEqual(
             ns.held_gain, ["shoulder_2.position_kp=0.5", "wrist_2.position_kp=200"]
         )
+
+
+class LeadTest(unittest.TestCase):
+    """``--lead-ms``: the 0xA4 target runs ahead along the commanded velocity."""
+
+    def test_the_motor_gets_the_led_target_and_the_log_keeps_the_wave(self) -> None:
+        import asyncio
+        import struct
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from almond_axol.motor.myactuator import MyActuatorMotor
+
+        sent: list[float] = []
+        d = MagicMock(spec=MyActuatorMotor)
+
+        async def request(frame: bytes) -> bytes:
+            if frame[0] == 0xA4:
+                sent.append(math.radians(struct.unpack_from("<i", frame, 4)[0] / 100.0))
+                return bytes([0xA4, 0]) + struct.pack("<hhh", 0, 0, 0)
+            return bytes([0x92, 0, 0, 0]) + struct.pack("<i", 0)
+
+        d._request = AsyncMock(side_effect=request)
+        guard = MagicMock()
+        guard.feed.return_value = None
+        # 0.2 rad target moving at 1 rad/s; 5 ms lead -> 0.205 rad on the wire.
+        samples = [(0.0, 0.2, 1.0), (1 / 400, 0.2, -1.0)]
+        log, *_ = asyncio.run(
+            a4._stream(
+                SimpleNamespace(frame_offset=0.0),
+                d,
+                samples,
+                60.0,
+                400.0,
+                guard,
+                MagicMock(),
+                lead_s=0.005,
+            )
+        )
+        self.assertAlmostEqual(sent[0], 0.205, delta=5e-4)  # 0.01° frame steps
+        self.assertAlmostEqual(sent[1], 0.195, delta=5e-4)
+        self.assertEqual([r["target"] for r in log], [0.2, 0.2])
+
+    def test_flag_defaults_off(self) -> None:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        a4.add_parser(parser.add_subparsers())
+        ns = parser.parse_args(["tune.a4", "--r", "--joint", "elbow"])
+        self.assertEqual(ns.lead_ms, 0.0)
+        ns = parser.parse_args(["tune.a4", "--r", "--joint", "elbow", "--lead-ms", "5"])
+        self.assertEqual(ns.lead_ms, 5.0)

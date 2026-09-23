@@ -672,6 +672,7 @@ async def _stream(
     live: LiveStream,
     cap_track: float = 0.0,
     cap_floor_dps: float = 1.0,
+    lead_s: float = 0.0,
     held: dict[Joint, JointFrameMotor] | None = None,
 ) -> tuple[
     list[dict],
@@ -706,13 +707,16 @@ async def _stream(
     for k, (_t_nominal, target, v_cmd) in enumerate(samples):
         deadline += period
         cap = speed_cap(v_cmd, cap_dps, cap_track, cap_floor_dps)
+        # The commanded target, led along the wave's velocity (--lead-ms); the
+        # log keeps the true target, so the run scores against the wave.
+        sent = target + v_cmd * lead_s
         if is_dm:
             # One 0x100 command, one feedback frame back: position (16-bit),
             # velocity and torque. Torque fills the ``iq`` channel, in Nm.
             fut = loop.create_future()
             driver._feedback_waiters.append(fut)
             await driver._raw_send(
-                dm_frame(target - offset, cap), 0x100 + driver._motor_id
+                dm_frame(sent - offset, cap), 0x100 + driver._motor_id
             )
             try:
                 fb = await asyncio.wait_for(fut, _DM_REPLY_TIMEOUT_S)
@@ -722,7 +726,7 @@ async def _stream(
                 raise MotorError(f"Damiao motor {driver._motor_id:#04x}: no feedback")
             pos, iq, speed = fb.position + offset, fb.torque, fb.velocity
         else:
-            resp = await driver._request(_a4_frame(target - offset, cap))
+            resp = await driver._request(_a4_frame(sent - offset, cap))
             iq, speed = _decode_a4_reply(resp)
             fine = await driver._request(
                 bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0])
@@ -919,6 +923,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "target can still be corrected (default: 1)",
     )
     p.add_argument(
+        "--lead-ms",
+        type=float,
+        default=0.0,
+        help="Send each command's target this far ahead along the commanded velocity "
+        "(target + v_cmd × lead); the run is still scored against the true wave. With "
+        f"--accel {_ACCEL_STEP_FOLLOW} the planner plans to *stop* at each target, so at "
+        "a fixed command rate it cannot average more than ~accel × tick / 4 (≈31 deg/s at "
+        "480 Hz) whatever the cap; a target a few ms ahead is never reached within the "
+        "tick, so it cruises at the cap instead. 0 (default) = no lead.",
+    )
+    p.add_argument(
         "--accel",
         type=int,
         default=None,
@@ -994,6 +1009,8 @@ async def _run(args: argparse.Namespace) -> None:
         n: getattr(args, n) for n in GAIN_NAMES if getattr(args, n) is not None
     }
     held_gains = parse_held_gains(args.held_gain, joint, is_left)
+    if not 0.0 <= args.lead_ms <= 50.0:
+        raise SystemExit("--lead-ms must be within 0..50")
     samples = waveform(
         args.mode,
         center,
@@ -1003,6 +1020,15 @@ async def _run(args: argparse.Namespace) -> None:
         freq=args.freq,
         speed=math.radians(args.speed),
     )
+    # A led target runs ahead of the wave by up to v_max × lead; keep that
+    # inside the 2° range margin checked above.
+    lead_reach = max(abs(v) for _, _, v in samples) * args.lead_ms / 1e3
+    if lead_reach > math.radians(1.0):
+        raise SystemExit(
+            f"--lead-ms {args.lead_ms:g} leads the target up to "
+            f"{math.degrees(lead_reach):.2f}° past the wave (max 1°): lower the lead "
+            "or the speed"
+        )
     print(f"\ntune.a4 — {side} {joint.value}: firmware position loop (0xA4)")
     print(
         f"  {args.mode} about {math.degrees(center):+.1f}° ±{args.amp:g}°, "
@@ -1014,6 +1040,7 @@ async def _run(args: argparse.Namespace) -> None:
             if args.cap_track > 0
             else ""
         )
+        + (f", targets led {args.lead_ms:g} ms" if args.lead_ms else "")
     )
 
     channel = resolve_channel(args)
@@ -1202,6 +1229,7 @@ async def _run(args: argparse.Namespace) -> None:
                 live,
                 cap_track=cap_track,
                 cap_floor_dps=args.cap_floor,
+                lead_s=args.lead_ms / 1e3,
                 held={j: jm for j, jm in motors.items() if j != joint},
             )
             live.flush()
@@ -1407,6 +1435,7 @@ async def _run(args: argparse.Namespace) -> None:
             "cap_dps": args.cap,
             "cap_track": cap_track,
             "cap_floor_dps": args.cap_floor,
+            "lead_ms": args.lead_ms,
             "accel": list(accel_used) if accel_used else None,
             "vendor": "damiao" if is_dm else "myactuator",
             "dm_acc": list(ramps_used) if ramps_used else None,
