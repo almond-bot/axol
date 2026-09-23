@@ -476,6 +476,16 @@ const TABS: WbTab[] = [
     fields: [
       { key: "motion", label: "motion", type: "select", options: [] },
       {
+        key: "arms",
+        label: "arms",
+        type: "select",
+        options: ["both", "left", "right"],
+        placeholder: "both",
+        hint:
+          "which arm(s) to bring up and drive; the other arm's channel is left " +
+          "untouched, so a single-arm run does not need the other arm powered",
+      },
+      {
         key: "controller",
         label: "controller",
         type: "select",
@@ -493,6 +503,28 @@ const TABS: WbTab[] = [
           "motion, same scoring, so the two controllers compare directly.",
       },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
+      {
+        key: "loop_hz",
+        label: "core loop (Hz)",
+        type: "number",
+        placeholder: "auto",
+        hint:
+          "realtime-core tick rate override; auto follows the wire modes (240 all " +
+          "impedance, 400 all firmware loops, 480 mixed — impedance joints on " +
+          "alternate ticks). With any arm joint on impedance only 240 or 480 is " +
+          "accepted: impedance runs at 240 Hz only",
+      },
+      {
+        key: "record",
+        label: "record",
+        type: "text",
+        width: "w-32",
+        placeholder: "prefix",
+        hint:
+          "flight-recorder prefix: measured joints to PREFIX_meas.npz and the " +
+          "realtime core's per-tick trace to PREFIX_rt.npz in the recordings " +
+          "directory, for diag.teleop-jitter or offline analysis",
+      },
       {
         key: "hold",
         label: "hold joints steady",
@@ -1237,6 +1269,17 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
     if (Array.isArray(p.dm_acc) && typeof p.dm_acc[0] === "number")
       out["dm_acc"] = String(p.dm_acc[0])
     if (Array.isArray(p.pose) && p.pose.length > 0) out["pose"] = p.pose.join(" ")
+    // Held joints' gains, as run: {joint: {gain: value}} → "joint.gain=value …".
+    if (p.held_gains && typeof p.held_gains === "object") {
+      const held = Object.entries(p.held_gains as Record<string, Record<string, unknown>>)
+        .flatMap(([j, gains]) =>
+          Object.entries(gains ?? {})
+            .filter(([, v]) => typeof v === "number" && Number.isFinite(v))
+            .map(([n, v]) => `${j}.${n}=${fmtFwGain(v)}`)
+        )
+        .join(" ")
+      if (held) out["held_gain"] = held
+    }
     for (const k of ["position_kp", "position_ki", "position_kd", "speed_kp", "speed_ki"]) {
       const v = g[k]
       if (typeof v === "number" && Number.isFinite(v)) out[k] = fmtFwGain(v)
@@ -1280,6 +1323,10 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       if (Array.isArray(p.a4) && p.a4.length > 0) {
         out["a4"] = p.a4.filter((t): t is string => typeof t === "string").join(" ")
       }
+      if (Array.isArray(p.hold) && p.hold.length > 0) {
+        out["hold"] = p.hold.filter((t): t is string => typeof t === "string").join(" ")
+      }
+      if (p.arms === "left" || p.arms === "right") out["arms"] = p.arms
       break
     }
     case "gravity":
@@ -1428,6 +1475,11 @@ function headline(meta: TuningRunMeta): { label: string; value: string } | null 
 /** One per-joint chart: commanded vs actual position for a single joint. */
 interface JointChart {
   joint: string
+  /**
+   * Shown after the joint in the chart title: "held" for a joint the run
+   * held steady (`tune.motion --hold`), "parked" for one it never moved.
+   */
+  note?: string
   series: RunChartSeries[]
   /** Error lane (reference − output, in degrees) under the position plot. */
   sub: RunChartSeries[]
@@ -1460,10 +1512,39 @@ function errorLane(
 }
 
 /** Commanded-vs-actual charts for every joint of `arm` that actually moved. */
+/** `side.joint` columns a motion run held steady (`--hold SIDE.JOINT[=DEG]`). */
+function heldColumns(run: TuningRunData): Set<string> {
+  const hold = run.meta.params.hold
+  return new Set(
+    (Array.isArray(hold) ? hold : [])
+      .filter((h): h is string => typeof h === "string")
+      .map((h) => h.split("=")[0] ?? h)
+  )
+}
+
+/** Whether a commanded series moves less than ~1° (0.017 rad) end to end. */
+function isStationary(values: (number | null)[]): boolean {
+  let min = Infinity
+  let max = -Infinity
+  for (const v of values) {
+    if (v == null) continue
+    if (v < min) min = v
+    if (v > max) max = v
+  }
+  return max - min < 0.017
+}
+
+/**
+ * Commanded vs actual per joint for a motion run. Joints that moved come
+ * first; joints the run held steady (`--hold`) or never moved follow, noted
+ * as such — a parked joint still buzzes or sags, which is worth seeing.
+ */
 function motionJointCharts(run: TuningRunData, arm: string): JointChart[] {
   const columns = (run.meta.params.columns as string[] | undefined) ?? []
   const t = run.series.t ?? []
+  const held = heldColumns(run)
   const out: JointChart[] = []
+  const still: JointChart[] = []
   for (let i = 0; i < columns.length; i++) {
     const name = columns[i]
     if (!name?.startsWith(`${arm}.`)) continue
@@ -1471,15 +1552,7 @@ function motionJointCharts(run: TuningRunData, arm: string): JointChart[] {
     const actual = run.series[`actual/${i}`]
     const sent = run.series[`sent/${i}`]
     if (!commanded || !actual || !actual.some((v) => v != null)) continue
-    // Only joints that were actually commanded to move (> ~1° of travel).
-    let min = Infinity
-    let max = -Infinity
-    for (const v of commanded) {
-      if (v == null) continue
-      if (v < min) min = v
-      if (v > max) max = v
-    }
-    if (max - min < 0.017) continue
+    const note = held.has(name) ? "held" : isStationary(commanded) ? "parked" : undefined
     const series: RunChartSeries[] = [
       { label: "commanded", color: COMMANDED_COLOR, x: t, data: degSeries(commanded) },
     ]
@@ -1489,13 +1562,14 @@ function motionJointCharts(run: TuningRunData, arm: string): JointChart[] {
       series.push({ label: "sent", color: NOISY_COLOR, x: t, data: degSeries(sent) })
     }
     series.push({ label: "actual", color: ACTUAL_COLOR, x: t, data: degSeries(actual) })
-    out.push({
+    ;(note ? still : out).push({
       joint: name.slice(arm.length + 1),
+      note,
       series,
       sub: errorLane(t, commanded, actual),
     })
   }
-  return out
+  return [...out, ...still]
 }
 
 /**
@@ -1857,7 +1931,10 @@ function compareJointCharts(a: TuningRunData, b: TuningRunData, arm: string | nu
   const colsA = (a.meta.params.columns as string[] | undefined) ?? []
   const colsB = (b.meta.params.columns as string[] | undefined) ?? []
   const idxB = new Map(colsB.map((n, i) => [n, i]))
+  const heldA = kind === "motion" ? heldColumns(a) : new Set<string>()
+  const heldB = kind === "motion" ? heldColumns(b) : new Set<string>()
   const out: JointChart[] = []
+  const still: JointChart[] = []
   for (let i = 0; i < colsA.length; i++) {
     const name = colsA[i]
     if (arm != null && !name?.startsWith(`${arm}.`)) continue
@@ -1867,16 +1944,21 @@ function compareJointCharts(a: TuningRunData, b: TuningRunData, arm: string | nu
     const refB = j != null ? b.series[`${refKey}/${j}`] : undefined
     const outB = j != null ? b.series[`${outKey}/${j}`] : undefined
     if (!refA || !outA || !refB || !outB) continue
-    let min = Infinity
-    let max = -Infinity
-    for (const v of refA) {
-      if (v == null) continue
-      if (v < min) min = v
-      if (v > max) max = v
-    }
-    if (max - min < 0.017) continue
-    out.push({
+    // Motion runs keep held / parked joints (after the moving ones); a filter
+    // channel that never moves has nothing to compare.
+    const stationary = isStationary(refA)
+    if (stationary && kind !== "motion") continue
+    const note =
+      kind !== "motion"
+        ? undefined
+        : heldA.has(name) || heldB.has(name)
+          ? `held (${[heldA.has(name) && "A", heldB.has(name) && "B"].filter(Boolean).join(", ")})`
+          : stationary
+            ? "parked"
+            : undefined
+    ;(note ? still : out).push({
       joint: arm != null ? name.slice(arm.length + 1) : name,
+      note,
       series: [
         { label: refLabel, color: COMMANDED_COLOR, x: tA, data: degSeries(refA) },
         { label: "A", color: ACTUAL_COLOR, x: tA, data: degSeries(outA) },
@@ -1888,7 +1970,7 @@ function compareJointCharts(a: TuningRunData, b: TuningRunData, arm: string | nu
       ],
     })
   }
-  return out
+  return [...out, ...still]
 }
 
 /** A scorecard column: which metric key, how to show it. */
@@ -3030,7 +3112,7 @@ export function TuningWorkbench({
                 <RunChart
                   key={c.joint}
                   id={`cmp-chart-${c.joint}`}
-                  title={c.joint}
+                  title={c.note ? `${c.joint} · ${c.note}` : c.joint}
                   unit={c.unit ?? "°"}
                   xUnit={c.xUnit}
                   series={c.series}
@@ -3181,7 +3263,7 @@ export function TuningWorkbench({
             <RunChart
               key={c.joint}
               id={`joint-chart-${c.joint}`}
-              title={c.joint}
+              title={c.note ? `${c.joint} · ${c.note}` : c.joint}
               unit={c.unit ?? "°"}
               xUnit={c.xUnit}
               series={c.series}

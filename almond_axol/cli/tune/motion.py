@@ -1039,6 +1039,7 @@ async def _run(args: argparse.Namespace) -> None:
                     "a4": list(args.a4),
                     # Joints held steady instead of following the motion.
                     "hold": list(args.hold),
+                    "arms": args.arms,
                     # The control law the whole run ran on (impedance at
                     # 240 Hz or the firmware position loops at 400 Hz).
                     "controller": config.controller,
