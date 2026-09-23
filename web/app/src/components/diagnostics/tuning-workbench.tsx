@@ -864,6 +864,16 @@ const OVERRIDE_FIELDS = [
   "firmware.planner_lead_ms",
 ]
 
+/**
+ * Fields whose value belongs to the selected joint — its gains (config or
+ * live motor baseline) and the joint-frame / vendor-specific wave settings —
+ * cleared when the arm or joint changes (see `setValue`).
+ */
+const PER_JOINT_KEYS = new Set(["center", "dm_acc"])
+function isPerJointField(f: WbField): boolean {
+  return f.gainKey != null || f.fwGainKey != null || PER_JOINT_KEYS.has(f.key)
+}
+
 /** Override fields that exist only on the MyActuator (0xA4) joints. */
 const MYACTUATOR_ONLY_FIELDS = new Set([
   "firmware.planner_accel",
@@ -2602,9 +2612,21 @@ export function TuningWorkbench({
 
   const setValue = useCallback(
     (key: string, v: string) => {
-      setValues((prev) => ({ ...prev, [tab.key]: { ...(prev[tab.key] ?? {}), [key]: v } }))
+      setValues((prev) => {
+        const cur = prev[tab.key] ?? {}
+        const next = { ...cur, [key]: v }
+        // A new arm or joint starts from that joint's own values: drop what
+        // was typed into the per-joint fields for the previous one, so each
+        // box falls back to the new joint's config / live-motor baseline.
+        if ((key === "arm" || key === "joint") && (cur[key] ?? "") !== v) {
+          for (const f of tab.fields) {
+            if (isPerJointField(f)) delete next[f.key]
+          }
+        }
+        return { ...prev, [tab.key]: next }
+      })
     },
-    [tab.key]
+    [tab.key, tab.fields]
   )
   const tabValues = useMemo(() => values[tab.key] ?? {}, [values, tab.key])
 
