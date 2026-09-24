@@ -90,6 +90,7 @@ import { LogConsole } from "@/components/log-console"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
 import { defaultSettingsTab, type SettingsScope, type SettingsTab } from "@/lib/settings-scope"
+import { loadHostHistory, recordHost } from "@/lib/host-history"
 import { SiteNav } from "@/components/site-nav"
 import { useToast } from "@/components/ui/toast"
 import { Button } from "@/components/ui/button"
@@ -151,6 +152,7 @@ export default function ControlPanel() {
   const [serverHost, setServerHost] = useState<string>(
     () => localStorage.getItem("axolServerHost") ?? ""
   )
+  const [hostHistory, setHostHistory] = useState<string[]>(loadHostHistory)
   const [hostInfo, setHostInfo] = useState<ServerInfo | null>(null)
   const [viewerPort, setViewerPort] = useState(8002)
   const [update, setUpdate] = useState<UpdateStatus | null>(null)
@@ -416,6 +418,7 @@ export default function ControlPanel() {
         setCommands(cmds)
         setConn({ state: "ok" })
         setSetupOpen(false)
+        setHostHistory(recordHost(host))
       } catch (e) {
         if (generation !== connectionGenerationRef.current) return
         setCommands([])
@@ -1917,6 +1920,7 @@ export default function ControlPanel() {
         open={setupOpen}
         onClose={() => setSetupOpen(false)}
         host={serverHost}
+        hostHistory={hostHistory}
         onChangeHost={updateServerHost}
         conn={conn}
         onConnect={() => loadServer(serverHost)}

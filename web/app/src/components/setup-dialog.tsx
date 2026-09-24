@@ -3,7 +3,7 @@ import { AlertTriangle, Loader2, Plug, Server, ShieldCheck, X } from "lucide-rea
 import { serverHttpBase } from "@/lib/supervisor"
 import { authorizeCert } from "@/lib/cert-accept"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
+import { SuggestInput } from "@/components/suggest-input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 
@@ -18,6 +18,7 @@ export function SetupDialog({
   open,
   onClose,
   host,
+  hostHistory,
   onChangeHost,
   conn,
   onConnect,
@@ -25,6 +26,8 @@ export function SetupDialog({
   open: boolean
   onClose: () => void
   host: string
+  /** Recently connected hosts, newest first, offered as a dropdown. */
+  hostHistory: string[]
   onChangeHost: (value: string) => void
   conn: { state: ConnState; message?: string }
   onConnect: () => void
@@ -72,10 +75,12 @@ export function SetupDialog({
                 onConnect()
               }}
             >
-              <Input
+              <SuggestInput
                 id="setup-server-host"
+                className="flex-1"
                 value={host}
-                onChange={(e) => onChangeHost(e.target.value)}
+                suggestions={hostHistory.map((h) => ({ value: h }))}
+                onChange={onChangeHost}
                 placeholder="192.168.1.42"
                 spellCheck={false}
                 autoCapitalize="off"
