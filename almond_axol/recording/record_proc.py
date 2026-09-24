@@ -3679,12 +3679,13 @@ def _recorder_main(
 
     # Imports done. Unless the caller shares the IK core with this recorder
     # (the policy ops, whose relay leaves the background cores ~5 % idle —
-    # see affinity.pin_background_and_ik), narrow to the background cores
+    # see affinity.pin_background_and_ik), narrow to the recorder cores
     # before the readers spawn their gst threads (threads inherit the
     # spawning thread's affinity), so nothing of the steady state lands on
-    # the IK core.
+    # the IK core. On 12+ core hosts those are two cores of its own, free of
+    # FIFO camera work; elsewhere they are the background cores.
     if pinned and not config.get("share_ik_core", False):
-        affinity.pin_background()
+        affinity.pin_recorder()
 
     # Build a per-source frame reader matching the relay's chosen transport.
     # gstshm-h264: an EncodedAuReader (shmsrc → gdpdepay → h264parse → appsink)
@@ -4107,6 +4108,8 @@ class DatasetRecorderProcess:
     all real-time, the background cores leave the CFS recorder too little to
     sustain 60 rows/s and every take ends on ``encoded-AU backlog exceeded``
     after 25-30 s — see :func:`almond_axol.utils.affinity.pin_background_and_ik`.
+    On 12+ core hosts the recorder has cores of its own free of FIFO camera
+    work, nothing is borrowed, and the flag has no effect.
     """
 
     def __init__(

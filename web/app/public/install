@@ -4,10 +4,12 @@
 #   curl https://axol.almond.bot/install -fsS | bash
 #
 # Installs uv, installs the axol CLI from PyPI as a uv tool (pinned to the latest
-# GitHub release tag, all extras), provisions the camera stack, adb, and the
-# required axol-rt control core, and registers a root systemd service that
-# keeps `axol serve` running at boot and restarts it if it ever goes down. Safe
-# to re-run: re-running upgrades to the latest release.
+# GitHub release tag, all extras), provisions the camera stack, adb, the
+# required axol-rt control core, and the host's real-time tuning (Jetson Orin
+# NX / AGX Orin / Thor: power mode, clocks, CAN interrupt, camera daemon), and
+# registers a root systemd service that re-applies that tuning at every boot
+# and keeps `axol serve` running. Safe to re-run: re-running upgrades to the
+# latest release.
 
 set -euo pipefail
 
@@ -112,7 +114,11 @@ say "axol installed at $(command -v axol)."
 # camera driver with the pinned release (`axol zed.driver`); the new driver
 # only loads at boot, so provision prints a REBOOT REQUIRED notice we surface
 # in the summary below rather than rebooting the box mid-install.
-say "Provisioning system dependencies (camera stack + adb + axol-rt)..."
+# Its last step applies the per-boot host tuning (on a Jetson: max nvpmodel
+# mode, engine + CPU clocks, CAN interrupt onto a CAN core, Argus daemon
+# SCHED_FIFO), so the box is tuned now, without a reboot or a second command;
+# the unit below re-applies it at every boot with `axol provision --boot`.
+say "Provisioning system dependencies (camera stack + adb + axol-rt + host tuning)..."
 PROVISION_LOG="$(mktemp)"
 # Most provisioning steps remain best-effort because they self-gate on
 # optional hardware. --require-rt makes the one mandatory step fail the
@@ -147,15 +153,6 @@ if [ -n "${QUEST_USER}" ] && [ "${QUEST_USER}" != "root" ]; then
         && say "Added ${QUEST_USER} to 'dialout' for Quest-over-USB adb access." \
         || true
 fi
-
-# -- Jetson clocks ------------------------------------------------------------
-
-# Pin the NVENC/VIC engine clocks (encode latency) and the CPU governor (IK
-# loop rate). These reset on reboot, so the systemd unit below re-pins them at
-# every boot via ExecStartPre; do it once now too so it takes effect without a
-# reboot. No-op off a Jetson.
-say "Pinning Jetson clocks for the real-time loops..."
-axol jetson.setup || say "WARNING: jetson.setup failed (non-Jetson, or needs root)."
 
 # -- Dataset storage location -------------------------------------------------
 
@@ -194,13 +191,17 @@ say "Writing ${SERVICE_FILE}..."
 cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=Axol control panel (axol serve)
-After=network-online.target
+# nvpmodel.service applies the power mode \`axol provision\` recorded for the
+# next boot; the tuning below reads that mode, so it must run first. Ordering
+# after a unit that does not exist (off a Jetson) is a no-op.
+After=network-online.target nvpmodel.service
 Wants=network-online.target
 
 [Service]
-# Re-pin the Jetson clocks at every boot (they reset on reboot). The leading
-# '-' makes a failure non-fatal, so serve still starts on non-Jetson hosts.
-ExecStartPre=-${BIN_DIR}/axol jetson.setup
+# Re-apply the host tuning \`axol provision\` set (Jetson power mode, clocks,
+# CAN interrupt, camera daemon scheduling) at every boot: it resets on reboot.
+# A no-op off a Jetson; the leading '-' keeps a failure from blocking serve.
+ExecStartPre=-${BIN_DIR}/axol provision --boot
 ExecStart=${BIN_DIR}/axol serve
 Restart=always
 RestartSec=3

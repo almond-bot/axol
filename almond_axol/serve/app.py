@@ -878,8 +878,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # and intentionally regenerated for every app lifetime.
     server_instance_id = secrets.token_hex(16)
     # System setup (Jetson clock pinning, GStreamer install) is owned by the
-    # host installer and its boot service (`axol jetson.setup` runs as an
-    # ExecStartPre on axol.service; `axol provision` runs at install time). The
+    # host installer and its boot service (`axol provision` runs at install
+    # time and applies the Jetson tuning; `axol provision --boot` re-applies
+    # that tuning as an ExecStartPre on axol.service). The
     # one exception is the self-updater (below), which delegates upgrades to
     # the hosted transaction and retains a legacy startup-provision self-heal.
 
